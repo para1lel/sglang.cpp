@@ -1,4 +1,4 @@
-#include "decoder_internal.h"
+#include "sglang/decoder_internal.h"
 
 #include <algorithm>
 #include <cmath>

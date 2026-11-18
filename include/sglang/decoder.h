@@ -9,10 +9,13 @@
 
 namespace sglang {
 
+inline constexpr int decoder_max_mtp_steps = 4;
+
 struct DecoderOptions {
     int max_new_tokens = 1;
     std::optional<int> stop_token_id;
     int top_logits = 0;
+    int mtp_steps = 0;
 };
 
 enum class DecoderFinishReason {
@@ -36,11 +39,15 @@ struct DecoderResult {
     DecoderFinishReason finish_reason = DecoderFinishReason::length;
     std::vector<std::vector<DecoderLogit>> step_top_logits;
     std::size_t peak_device_allocation_bytes = 0;
+    std::size_t mtp_drafted_tokens = 0;
+    std::size_t mtp_accepted_tokens = 0;
+    std::size_t mtp_rounds = 0;
 };
 
 class Decoder {
 public:
     explicit Decoder(const std::filesystem::path& checkpoint, int cuda_device = 0);
+    Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp);
     ~Decoder();
 
     Decoder(const Decoder&) = delete;

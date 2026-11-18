@@ -64,6 +64,8 @@ Separate startup, model load, JIT compilation, and graph capture from steady exe
 
 Report one row per engine, workload, and mode. Include absolute metrics, successful and attempted requests, and the agreed limits. For paired runs, also report the candidate/baseline throughput ratio and latency differences. For workloads with open limits, set numerical margins from repeated baseline measurements before candidate timing.
 
+For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and any graph capture. Allocation metrics include resident request storage on the serial graph path. Keep the JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L170)<!-- prefix: "Measurements" -->
+
 ### Frozen W1 and W2 timing
 
 Use the [frozen streaming protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) and its GPU3 reference for W1 and W2. Run the native server in default or explicit `--max-active 1` mode. Preserve the device, fixtures, request bytes, warmups, repetitions, and timing definitions. For native timing, run the frozen client with `--url` and a new `--output` directory. Omit `--reference`, which couples timing evaluation to the frozen vLLM IDs. The client then checks stream validity and exact greedy IDs across native repetitions. Verify the client, fixture, and request hashes against the frozen manifest.
@@ -74,13 +76,21 @@ For each workload, require every warmup and measured request to pass stream vali
 
 W3 and W6 each require four active requests. Use `--max-active 4` after the [native streaming checks](development.md#streaming-verification) pass. Verify full-width decode and memory capacity at each workload's lengths. Use the [concurrent baseline procedure](../benchmarks/concurrent/README.md#conditions-and-gates) for paired timing and acceptance. W4 and W5 exceed the native server's four-lane limit and remain unsupported at their specified concurrency.
 
+### Native serial MTP
+
+Run the [greedy MTP correctness checks](development.md#serial-greedy-mtp) before timing. Report any serial MTP measurement as a separate experiment against MTP off at the same request lengths. Record the proposal limit, eager and graph dispatch, and device allocations. The reference verifier adds draft work and synchronization to ordered eager target forwards. The [frozen W3-MTP variant](../benchmarks/variants/README.md) requires four active requests and remains unsupported by the serial verifier.
+
+Generator JSON includes MTP counters only for positive `--mtp-steps`, from the first measured request. `mtp_drafted_tokens` counts proposals read back, including tails that verification may skip. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts draft rounds started. Count all committed output tokens from `output_token_ids`, including the first greedy token, target corrections, and target bonuses. Report accepted/drafted and accepted/rounds when their denominators are positive. [JSON fields](../apps/sglang-generate.cpp#L193)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder.cpp#L157)<!-- prefix: "bool propose" --> · [Commit](../src/decoder.cpp#L131)<!-- prefix: "std::optiona" -->
+
+The generator has no separate verified-proposal counter. In a verification trace, count proposals actually compared, including the first mismatch. Count target bonus rows separately. Check `accepted ≤ verified ≤ drafted` and `drafted ≤ rounds × mtp_steps`. Require one target decode row per committed output after the first for completed requests. For completed requests with zero or one output, require zero proposals, accepts, and rounds. Keep the trace separate from timing. [Target verification](../src/decoder.cpp#L177)<!-- prefix: "std::optiona" -->
+
 ## Correctness, memory, and diagnosis
 
 Performance acceptance requires [native implementation correctness](development.md#verification), repeatability, and comparable memory and feature settings. Run correctness checks separately when instrumentation changes timing. Apply the remaining proposed checks at their applicable milestones.
 
 - **Memory.** Record HBM after load and peak HBM during prefill and decode. Budget weights and scales, GQA KV pages, GDN live state and checkpoints, activations, workspaces, graph pools, vision weights and buffers, and runtime allocations. State the measurement method, capacity, and headroom for each input length and concurrency.
 - **Cache.** Record reusable prefix tokens divided by eligible prompt tokens, the initial cache state, page occupancy, evictions, and recurrent checkpoint restores and replay lengths. Compare cold and primed continuations with fresh execution. Check reclamation after cancellation and memory pressure.
-- **MTP.** Record drafted and accepted tokens, verification rounds, acceptance rate (accepted/drafted), and accepted length per round. Check actual draft and target execution. Compare greedy continuations and sampled distributions with MTP off. Exercise rejection across a recurrent checkpoint boundary.
+- **MTP.** Check actual draft and target execution. For future sampled paths, compare distributions with MTP off. When target rollback is available, exercise rejection across a recurrent checkpoint boundary.
 - **Multimodal.** Verify image and video processing, visual token positions, and reference output behavior on each fixture. Include client-visible preprocessing and transport in end-to-end measurements. Record server processing and vision-encoder time separately when observable.
 - **Profiling.** Record GPU utilization, kernel time, JIT time, scheduler time, and queue delay with their collection methods. Profile a separate run if tracing changes throughput. Tie each optimization to its bottleneck, correctness result, and end-to-end result on the same workload.
 

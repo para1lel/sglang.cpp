@@ -12,7 +12,7 @@ class BatchService;
 class Socket;
 
 void complete(const Socket& connection, const Decoder& decoder, std::string_view body,
-              bool trace = false);
+              bool trace = false, int mtp_steps = 0);
 void complete(const Socket& connection, BatchService& service, int slot, std::string_view body);
 void write_error(const Socket& connection, std::string_view status, const char* message);
 

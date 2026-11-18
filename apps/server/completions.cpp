@@ -202,10 +202,13 @@ void write_error(const Socket& connection, std::string_view status, const char* 
     write_json(connection, status, error_body(message));
 }
 
-void complete(const Socket& connection, const Decoder& decoder, std::string_view body, bool trace) {
+void complete(const Socket& connection, const Decoder& decoder, std::string_view body,
+              bool trace, int mtp_steps) {
     stream_completion(connection, body,
                       [&](const CompletionRequest& request, const DecoderCallbacks& callbacks) {
-        return decoder.generate(request.prompt, request.options, callbacks);
+        auto options = request.options;
+        options.mtp_steps = mtp_steps;
+        return decoder.generate(request.prompt, options, callbacks);
     }, trace);
 }
 

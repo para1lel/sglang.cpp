@@ -379,10 +379,9 @@ Workspace::Workspace(Allocations& allocations)
 Request::Request(int device, bool reusable)
     : memory(device), work(memory), decode_position(reusable ? memory.allocate<int>(1) : nullptr) {}
 
-Request::Request(int device, int capacity, std::shared_ptr<const Allocations> weights,
-                 bool reusable)
+Request::Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable)
     : Request(device, reusable) {
-    memory.open_stream(std::move(weights));
+    memory.open_stream(std::move(owners));
     initialize(capacity, memory.stream());
 }
 

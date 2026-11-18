@@ -31,6 +31,7 @@ struct Arguments {
 void usage(std::ostream& output) {
     output << "Usage: sglang-generate (--prompt-ids ID,ID,... | --prompt-file FILE)\n"
            << "                       [--max-new-tokens N] [--stop-token ID] [--top-logits N]\n"
+           << "                       [--mtp-steps N] (0–4, default 0)\n"
            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
               "Device is a CUDA ordinal.\n"
@@ -101,6 +102,11 @@ Arguments parse_arguments(int argc, char** argv) {
             arguments.options.stop_token_id = positive_or_zero(value, option);
         } else if (option == "--top-logits") {
             arguments.options.top_logits = positive_or_zero(value, option);
+        } else if (option == "--mtp-steps") {
+            arguments.options.mtp_steps = positive_or_zero(value, option);
+            if (arguments.options.mtp_steps > sglang::decoder_max_mtp_steps) {
+                throw std::invalid_argument("Expected --mtp-steps in [0, 4]");
+            }
         } else if (option == "--warmup") {
             arguments.warmup = positive_or_zero(value, option);
         } else if (option == "--repeats") {
@@ -202,6 +208,11 @@ void write_result(const Arguments& arguments, const Measurements& measured,
         output << ",\"step_top_logits\":";
         write_array(output, result.step_top_logits, write_step);
     }
+    if (arguments.options.mtp_steps != 0) {
+        output << ",\"mtp_drafted_tokens\":" << result.mtp_drafted_tokens
+               << ",\"mtp_accepted_tokens\":" << result.mtp_accepted_tokens
+               << ",\"mtp_rounds\":" << result.mtp_rounds;
+    }
     output << ",\"device\":" << arguments.device << ",\"warmup\":" << arguments.warmup
            << ",\"repeats\":" << arguments.repeats << ",\"load_ms\":" << load_ms
            << ",\"model_device_allocation_bytes\":" << model_bytes
@@ -221,7 +232,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         const auto start = Clock::now();
-        const sglang::Decoder decoder(arguments.checkpoint, arguments.device);
+        const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
+                                      arguments.options.mtp_steps != 0);
         const double load_ms = milliseconds(Clock::now() - start);
         const auto measured = measure(decoder, arguments);
         write_result(arguments, measured, decoder.model_device_allocation_bytes(), load_ms);

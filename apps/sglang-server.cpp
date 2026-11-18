@@ -1,3 +1,4 @@
+#include "sglang/decoder.h"
 #include "sglang/decoder_batch.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
@@ -19,6 +20,7 @@ struct Arguments {
     int device = 0;
     int port = 17384;
     int max_active = 1;
+    int mtp_steps = 0;
     bool trace_batches = false;
 };
 
@@ -59,9 +61,18 @@ Arguments parse_arguments(int argc, char** argv) {
                 arguments.max_active > sglang::decoder_batch_max_lanes) {
                 throw std::invalid_argument(error);
             }
+        } else if (option == "--mtp-steps") {
+            const auto error = "Expected --mtp-steps in [0, 4]";
+            arguments.mtp_steps = parse_integer(value, error);
+            if (arguments.mtp_steps > sglang::decoder_max_mtp_steps) {
+                throw std::invalid_argument(error);
+            }
         } else {
             throw std::invalid_argument("Invalid argument " + std::string(option));
         }
+    }
+    if (arguments.mtp_steps != 0 && arguments.max_active != 1) {
+        throw std::invalid_argument("--mtp-steps requires --max-active 1");
     }
     return arguments;
 }
@@ -142,15 +153,17 @@ void serve_batch(const Socket& listener, BatchService& service, int max_active) 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
-                     " [--max-active N] [--trace-batches]\n"
+                     " [--max-active N] [--mtp-steps N] [--trace-batches]\n"
                      "Active requests: 1 by default, up to 4.\n"
+                     "MTP steps: 0 by default, up to 4 with one active request.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
         return 0;
     }
     try {
         const auto arguments = parse_arguments(argc, argv);
         install_shutdown_handlers();
-        const sglang::Decoder decoder(arguments.checkpoint, arguments.device);
+        const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
+                                      arguments.mtp_steps != 0);
         if (stopping()) {
             return 0;
         }
@@ -158,7 +171,7 @@ int main(int argc, char** argv) {
         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
         if (arguments.max_active == 1) {
             serve_connections(listener, [&](const Socket& connection, std::string_view body) {
-                complete(connection, decoder, body, arguments.trace_batches);
+                complete(connection, decoder, body, arguments.trace_batches, arguments.mtp_steps);
             });
         } else {
             BatchService service(decoder, arguments.trace_batches);

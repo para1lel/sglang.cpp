@@ -19,6 +19,8 @@ class Checkpoint;
 
 namespace sglang::decoder {
 
+class MtpDraftWeights;
+
 using Bf16 = __nv_bfloat16;
 
 inline constexpr int hidden_size = 5120;
@@ -37,7 +39,8 @@ constexpr bool is_full_attention(int layer_index) {
 }
 
 void check(cudaError_t status, const char* operation);
-void validate_request(const std::vector<int>& prompt, const DecoderOptions& options);
+void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
+                      bool allow_mtp = false);
 
 class DeviceScope {
 public:
@@ -161,8 +164,7 @@ struct Workspace {
 
 struct Request {
     explicit Request(int device, bool reusable = false);
-    Request(int device, int capacity, std::shared_ptr<const Allocations> weights,
-            bool reusable = false);
+    Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false);
 
     void initialize(int capacity, cudaStream_t stream);
     void reset(cudaStream_t stream);
@@ -191,13 +193,22 @@ struct ForwardLane {
 namespace sglang {
 
 struct Decoder::Model {
+    struct MtpGeneration;
+
     Model(const std::filesystem::path& checkpoint, int cuda_device);
 
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     void decode_graph(decoder::Request& request) const;
+    void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request) const;
     void compute_logits(decoder::Workspace& work, cudaStream_t stream) const;
+    void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
+                         const DecoderCallbacks& callbacks, DecoderResult& result) const;
+    DecoderFinishReason generate_mtp(const std::vector<int>& prompt,
+                                     const DecoderOptions& options,
+                                     const DecoderCallbacks& callbacks,
+                                     DecoderResult& result) const;
 
     template <typename Lane>
     void forward_layers(const Lane* lanes, int count, cudaStream_t stream) const;
@@ -208,6 +219,7 @@ struct Decoder::Model {
     const decoder::Bf16* embedding = nullptr;
     const decoder::Bf16* final_norm = nullptr;
     decoder::Bf16Weight lm_head{};
+    std::shared_ptr<const decoder::MtpDraftWeights> mtp_weights;
     mutable std::atomic_flag request_in_use = ATOMIC_FLAG_INIT;
     mutable std::unique_ptr<decoder::Request> decode_request;
 };

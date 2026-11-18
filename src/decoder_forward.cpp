@@ -198,9 +198,13 @@ void Decoder::Model::compute_logits(Request& request) const {
     compute_logits(request.work, request.memory.stream());
 }
 
-void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream) const {
+void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream) const {
     check(text_rms_norm(work.hidden, work.residual, final_norm, hidden_size,
                         work.normalized, nullptr, stream), "Normalize final residual");
+}
+
+void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream) const {
+    normalize_final(work, stream);
     project(lm_head, work.normalized, work.logits, stream);
     check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
           "Select greedy token");

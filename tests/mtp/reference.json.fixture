@@ -1,0 +1,157 @@
+{
+  "checkpoint_revision": "c3a462cc3d38cf351f3b26cbd763469eeb74ef81",
+  "vllm_revision": "81a8cb063e6247fe254d7caf7e98a6691d71022a",
+  "trace_sha256": "79bd7bf89307146fd6b9f558751717bc7aa3f16573b730adffebaa34cd3d906f",
+  "operator_catalog_sha256": "4286c348ecf11a2242993524568055af3cd949dcdffd66c86dea67227b15e75f",
+  "speculative_steps": 3,
+  "cases": [
+    {
+      "name": "capital",
+      "prompt_token_ids": [760, 6511, 314, 9338, 369],
+      "max_tokens": 3,
+      "output_ids": [11751, 13, 198],
+      "rounds": [
+        {
+          "target_input_ids": [760, 6511, 314, 9338, 369],
+          "target_positions": [0, 1, 2, 3, 4],
+          "greedy_next_ids": [11751],
+          "verified_proposal_ids": [],
+          "accepted_count": 0,
+          "rejected_count": 0,
+          "extra_kind": "ordinary",
+          "worker_sampled_ids": [11751],
+          "committed_ids": [11751],
+          "trimmed_ids": [],
+          "processed_after_commit": 5,
+          "draft_inputs": [
+            {"ids": [6511, 314, 9338, 369, 11751], "positions": [0, 1, 2, 3, 4], "sample_row": 4},
+            {"ids": [13], "positions": [5], "sample_row": 0},
+            {"ids": [248046], "positions": [6], "sample_row": 0}
+          ]
+        },
+        {
+          "target_input_ids": [11751, 13, 248046, 198],
+          "target_positions": [5, 6, 7, 8],
+          "greedy_next_ids": [13, 198, 198, 248045],
+          "verified_proposal_ids": [13, 248046, 198],
+          "accepted_count": 1,
+          "rejected_count": 2,
+          "extra_kind": "correction",
+          "worker_sampled_ids": [13, 198],
+          "committed_ids": [13, 198],
+          "trimmed_ids": [],
+          "processed_after_commit": 7,
+          "draft_inputs": [
+            {"ids": [13, 198], "positions": [5, 6], "sample_row": 1},
+            {"ids": [760], "positions": [7], "sample_row": 0},
+            {"ids": [6511], "positions": [8], "sample_row": 0}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "silver-key",
+      "prompt_token_ids": [32, 14527, 1328, 10641, 28428, 279, 8598, 13, 561, 5020, 1301, 25],
+      "max_tokens": 16,
+      "output_ids": [1001, 760, 854, 369, 220, 16, 17, 25, 15, 15, 13, 561, 1328, 15417, 279, 5817],
+      "rounds": [
+        {
+          "target_input_ids": [32, 14527, 1328, 10641, 28428, 279, 8598, 13, 561, 5020, 1301, 25],
+          "greedy_next_ids": [1001],
+          "verified_proposal_ids": [],
+          "accepted_count": 0,
+          "rejected_count": 0,
+          "extra_kind": "ordinary",
+          "worker_sampled_ids": [1001],
+          "committed_ids": [1001],
+          "trimmed_ids": [],
+          "processed_after_commit": 12
+        },
+        {
+          "target_input_ids": [1001, 760, 1328, 369],
+          "greedy_next_ids": [760, 854, 15417, 524],
+          "verified_proposal_ids": [760, 1328, 369],
+          "accepted_count": 1,
+          "rejected_count": 2,
+          "extra_kind": "correction",
+          "worker_sampled_ids": [760, 854],
+          "committed_ids": [760, 854],
+          "trimmed_ids": [],
+          "processed_after_commit": 14
+        },
+        {
+          "target_input_ids": [854, 369, 220, 16],
+          "greedy_next_ids": [369, 220, 16, 17],
+          "verified_proposal_ids": [369, 220, 16],
+          "accepted_count": 3,
+          "rejected_count": 0,
+          "extra_kind": "bonus",
+          "worker_sampled_ids": [369, 220, 16, 17],
+          "committed_ids": [369, 220, 16, 17],
+          "trimmed_ids": [],
+          "processed_after_commit": 18
+        },
+        {
+          "target_input_ids": [17, 25, 15, 15],
+          "greedy_next_ids": [25, 15, 15, 13],
+          "verified_proposal_ids": [25, 15, 15],
+          "accepted_count": 3,
+          "rejected_count": 0,
+          "extra_kind": "bonus",
+          "worker_sampled_ids": [25, 15, 15, 13],
+          "committed_ids": [25, 15, 15, 13],
+          "trimmed_ids": [],
+          "processed_after_commit": 22
+        },
+        {
+          "target_input_ids": [13, 561, 854, 369],
+          "greedy_next_ids": [561, 1328, 369, 220],
+          "verified_proposal_ids": [561, 854, 369],
+          "accepted_count": 1,
+          "rejected_count": 2,
+          "extra_kind": "correction",
+          "worker_sampled_ids": [561, 1328],
+          "committed_ids": [561, 1328],
+          "trimmed_ids": [],
+          "processed_after_commit": 24
+        },
+        {
+          "target_input_ids": [1328, 369, 220, 16],
+          "greedy_next_ids": [15417, 524, 16, 17],
+          "verified_proposal_ids": [369, 220, 16],
+          "accepted_count": 0,
+          "rejected_count": 3,
+          "extra_kind": "correction",
+          "worker_sampled_ids": [15417],
+          "committed_ids": [15417],
+          "trimmed_ids": [],
+          "processed_after_commit": 25
+        },
+        {
+          "target_input_ids": [15417, 506, 220, 16],
+          "greedy_next_ids": [279, 220, 16, 17],
+          "verified_proposal_ids": [506, 220, 16],
+          "accepted_count": 0,
+          "rejected_count": 3,
+          "extra_kind": "correction",
+          "worker_sampled_ids": [279],
+          "committed_ids": [279],
+          "trimmed_ids": [],
+          "processed_after_commit": 26
+        },
+        {
+          "target_input_ids": [279, 5817, 506, 220],
+          "greedy_next_ids": [5817, 506, 220, 16],
+          "verified_proposal_ids": [5817, 506, 220],
+          "accepted_count": 3,
+          "rejected_count": 0,
+          "extra_kind": "bonus",
+          "worker_sampled_ids": [5817, 506, 220, 16],
+          "committed_ids": [5817],
+          "trimmed_ids": [506, 220, 16],
+          "processed_after_commit": 27
+        }
+      ]
+    }
+  ]
+}

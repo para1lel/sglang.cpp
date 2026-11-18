@@ -26,6 +26,13 @@ The checkpoint lives at `/data0/shared/Qwen3.8-27B-FP8`. Keep its weights and ge
 artifacts outside version control. Use SGLang as the architecture reference and the pinned
 vLLM installation as the independent performance comparator.
 
+- [Checkpoint and SGLang source map](docs/research/checkpoint.md) identifies the upstream
+  revision and records content verification for all 81 files and 1,606 indexed tensors.
+- [Development milestones](docs/development.md) define the path from the runtime probe to
+  a decoder that matches reference tokens, then to serving and single-card optimization.
+- [Benchmark agreement](docs/performance.md) specifies the vLLM commit, the small greedy
+  fixture, and the throughput, latency, and correctness evidence for W1–W6.
+
 Start a maintenance session by explicitly invoking `.agents/skills/main-mode/SKILL.md`
 with the milestone you want to advance. Main assigns the repository's local research,
 coding, test, and documentation roles. See the [repository instructions](AGENTS.md).

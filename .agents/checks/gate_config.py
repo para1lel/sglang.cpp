@@ -179,7 +179,10 @@ def test_report(root, name):
         raise ValueError("The required test check executed zero cases or skipped every case.")
     if any(case.find(tag) is not None for case in cases for tag in ("failure", "error")):
         raise ValueError("The test report contains a failure or error.")
-    if any(tree.getroot().iter("error")) or any(tree.getroot().iter("failure")):
+    if any(tree.find(f".//{tag}") is not None for tag in ("error", "failure")):
+        raise ValueError("The test report contains a collection or suite failure.")
+    suites = (node for node in tree.iter() if node.tag in {"testsuite", "testsuites"})
+    if any(int(suite.get(key, "0")) != 0 for suite in suites for key in ("errors", "failures")):
         raise ValueError("The test report contains a collection or suite failure.")
 
 

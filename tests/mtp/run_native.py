@@ -6,12 +6,20 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 ROOT = Path(__file__).resolve().parent
 BATCH = ROOT.parent / "batch"
 sys.path.insert(0, str(ROOT.parent))
-from batch.run_native import Stream, choose_port, require, stop_server, wait_until_ready, write_json
+from batch.run_native import (
+    Stream,
+    choose_port,
+    require,
+    stop_server,
+    wait_until_ready,
+    write_json,
+)
 
 COUNTERS = ("mtp_drafted_tokens", "mtp_accepted_tokens", "mtp_rounds")
 STEPS = (1, 2, 3, 4)
@@ -75,16 +83,18 @@ def load_cases():
     return cases["capital"], cases["silver-key"], page[:127]
 
 
-def generate(args, name, case, arm):
+def generate(args, name, case, arm, *, reference=False):
     prompt, budget, stop = case
-    command = [str(args.generate), "--checkpoint", str(args.checkpoint),
+    executable = args.reference_generate if reference else args.generate
+    command = [str(executable), "--checkpoint", str(args.checkpoint),
                "--device", str(args.device), "--prompt-ids", ",".join(map(str, prompt)),
                "--max-new-tokens", str(budget), "--top-logits", "64"]
     if stop is not None:
         command += ["--stop-token", str(stop)]
     if arm != "default":
         command += ["--mtp-steps", str(arm)]
-    evidence = args.evidence / f"{name}-{arm}"
+    evidence_name = f"{name}-reference" if reference else name
+    evidence = args.evidence / f"{evidence_name}-{arm}"
     evidence.mkdir()
     write_json(evidence / "command.json", command)
     with (
@@ -145,6 +155,8 @@ def serial_server(args, steps):
                str(args.device), "--port", str(port)]
     if steps != "default":
         command += ["--max-active", "1", "--mtp-steps", str(steps)]
+    if steps == max(STEPS):
+        command.append("--trace-batches")
     write_json(evidence / "command.json", command)
     log_path = evidence / "server.log"
     with log_path.open("wb") as log:
@@ -154,6 +166,43 @@ def serial_server(args, steps):
             yield port, evidence
         finally:
             stop_server(process, None)
+
+
+def await_serial_retirement(log_path, offset):
+    marker = b"batch width=0 decode=0 request_bytes=0\n"
+    deadline = time.monotonic() + 5
+    with log_path.open("rb") as log:
+        while time.monotonic() < deadline:
+            log.seek(offset)
+            if marker in log:
+                return (0, 0, 0)
+            time.sleep(0.01)
+    raise AssertionError(f"Canceled serial request did not retire. See {log_path}")
+
+
+def check_recovery(port, evidence, prompt, target):
+    output = target["output_token_ids"]
+    cancelled = {"name": "cancel-after-verification", "prompt": prompt,
+                 "max_tokens": len(output), "output": output, "finish_reason": "length"}
+    log_path = evidence / "server.log"
+    offset = log_path.stat().st_size
+    with CompletionStream(port, cancelled, budget=128) as stream:
+        stream.post()
+        stream.open()
+        for token in output[:2]:
+            stream.choice([token])
+        stream.reset()
+    retirement = await_serial_retirement(log_path, offset)
+    write_json(evidence / "cancel-after-verification.json",
+               {**stream.evidence(), "retirement": retirement})
+
+    continuation = {"name": "resume", "prompt": prompt + output[:2],
+                    "max_tokens": len(output) - 2, "output": output[2:],
+                    "finish_reason": target["finish_reason"]}
+    with CompletionStream(port, continuation) as stream:
+        stream.post()
+        stream.complete()
+        write_json(evidence / "resume.json", stream.evidence())
 
 
 def check_http(args, cases, controls):
@@ -174,18 +223,24 @@ def check_http(args, cases, controls):
                     stream.post()
                     stream.complete()
                     write_json(evidence / f"{name}.json", stream.evidence())
+            if steps == max(STEPS):
+                check_recovery(port, evidence, cases["silver-key"][0], controls["silver-key"])
         print(f"HTTP steps={steps}: exact serial SSE tokens, finish, and usage")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generate", type=Path, required=True)
+    parser.add_argument("--reference-generate", type=Path,
+                        help="Previous native generator with per-token target verification")
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=Path("/data0/shared/Qwen3.8-27B-FP8"))
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
     args.generate = args.generate.resolve()
+    if args.reference_generate:
+        args.reference_generate = args.reference_generate.resolve()
     args.server = args.server.resolve()
     args.evidence.mkdir(parents=True)
     capital, silver, page = load_cases()
@@ -208,10 +263,17 @@ def main():
     }
     require(controls["capital"]["output_token_ids"][:3] == [11751, 13, 198],
             "Capital trace prefill and correction")
-    compare(controls["capital"], generate(args, "capital", cases["capital"], 0), 0, "capital")
+    for name, case in cases.items():
+        compare(controls[name], generate(args, name, case, 0), 0, name)
     for steps in STEPS:
-        for name in cases:
-            compare(controls[name], generate(args, name, cases[name], steps), steps, name)
+        for name, case in cases.items():
+            candidate = generate(args, name, case, steps)
+            compare(controls[name], candidate, steps, name)
+            if args.reference_generate and name == "silver-key":
+                reference = generate(args, name, case, steps, reference=True)
+                for key in (*COUNTERS, "output_token_ids", "finish_reason", "step_top_logits"):
+                    require(candidate[key] == reference[key],
+                            f"{name}: steps={steps}: changed {key} from per-token verifier")
     for name, (parent, budget, stop, steps) in edges.items():
         cases[name] = (cases[parent][0], budget, stop)
         controls[name] = trim_control(controls[parent], budget, stop)

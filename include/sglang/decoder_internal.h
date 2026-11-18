@@ -20,6 +20,7 @@ namespace sglang::decoder {
 
 class MtpDraftWeights;
 class PrefillWorkspace;
+class TargetVerification;
 
 using Bf16 = __nv_bfloat16;
 
@@ -62,6 +63,7 @@ struct TransferBuffers {
     std::vector<std::int32_t> logical_pages;
     int winner = -1;
     std::vector<Bf16> logits;
+    std::shared_ptr<void> verification_results;
 };
 
 class Allocations {
@@ -138,7 +140,8 @@ struct Layer {
 };
 
 struct Workspace {
-    explicit Workspace(Allocations& allocations);
+    explicit Workspace(Allocations& allocations, Bf16* verification_attention = nullptr,
+                       TextLogitCandidate* verification_winner = nullptr);
 
     ExactGqaWorkspace gqa_scores(int capacity) const;
 
@@ -165,6 +168,9 @@ struct Workspace {
     TextLogitCandidate* argmax;
 };
 
+using GdnBank = std::array<TextGdnState, gdn_layers>;
+void allocate_gdn(Allocations& memory, GdnBank& states);
+
 struct Request {
     explicit Request(int device, bool reusable = false);
     Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false);
@@ -178,7 +184,7 @@ struct Request {
     int* decode_position;
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
-    std::array<TextGdnState, gdn_layers> states;
+    GdnBank states;
 };
 
 void copy_greedy_token(Request& request, cudaStream_t stream);
@@ -203,6 +209,8 @@ struct Decoder::Model {
     Fp8PrefillPolicy fp8_prefill() const { return fp8_prefill_; }
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
+    void forward_verify(decoder::TargetVerification& verification, int position,
+                        const int* tokens, int count, cudaStream_t stream) const;
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
                        decoder::PrefillWorkspace& workspace) const;
     void decode_graph(decoder::Request& request) const;

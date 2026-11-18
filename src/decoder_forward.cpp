@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/decoder_verify.h"
 
 #include <type_traits>
 
@@ -26,6 +27,15 @@ DecodeFp8Projection decode_projection(Fp8Weight weight, Bf16* output) {
 }
 
 template <typename Lane>
+Workspace& workspace(const Lane& lane) {
+    return lane.request->work;
+}
+
+Workspace& workspace(const VerificationRow& row) {
+    return *row.work;
+}
+
+template <typename Lane>
 struct LayerBatch {
     const Lane* lanes;
     int count;
@@ -38,7 +48,7 @@ struct LayerBatch {
     template <typename Function>
     void each(Function function) const {
         for (int index = 0; index < count; ++index) {
-            function(lanes[index], lanes[index].request->work);
+            function(lanes[index], workspace(lanes[index]));
         }
     }
 
@@ -51,7 +61,7 @@ struct LayerBatch {
 
     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
         if (count == 1) {
-            const auto& work = lanes[0].request->work;
+            const auto& work = workspace(lanes[0]);
             const TextFp8ActivationView input{work.activation.values, work.activation.scales};
             const auto status = single_decode()
                 ? decode_fp8_project(input, decode_projection(weight, work.*output),
@@ -62,15 +72,26 @@ struct LayerBatch {
             return;
         }
         static_assert(decoder_batch_max_lanes <= text_fp8_max_batch);
-        std::array<TextFp8Projection, decoder_batch_max_lanes> projections;
+        std::array<TextFp8Projection, text_fp8_max_batch> projections;
         for (int index = 0; index < count; ++index) {
-            const auto& work = lanes[index].request->work;
+            const auto& work = workspace(lanes[index]);
             projections[index] = {{work.activation.values, work.activation.scales}, work.*output};
         }
         check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
                             projections.data(), count, stream), "Run batched FP8 projection");
     }
 };
+
+void project(Bf16Weight weight, const LayerBatch<VerificationRow>& batch,
+             Bf16* Workspace::*output) {
+    std::array<TextBf16Projection, target_verify_max_rows> projections;
+    for (int index = 0; index < batch.count; ++index) {
+        const auto& work = workspace(batch.lanes[index]);
+        projections[index] = {work.normalized, work.*output};
+    }
+    check(text_bf16_gemm(weight.values, weight.rows, weight.columns, projections.data(),
+                         batch.count, batch.stream), "Run batched BF16 projection");
+}
 
 template <typename Lane>
 void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_index) {
@@ -90,11 +111,22 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
     batch.project(layer.output, &Workspace::projected_attention);
 }
 
+void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, int state_index) {
+    auto& verification = *batch.lanes[0].verification;
+    verification.bind_gdn(state_index);
+    batch.quantize(&Workspace::normalized, hidden_size);
+    batch.project(layer.qkv, &Workspace::gdn_qkv);
+    batch.project(layer.z, &Workspace::gdn_z);
+    project(layer.b, batch, &Workspace::gdn_b);
+    project(layer.a, batch, &Workspace::gdn_a);
+    verification.advance_gdn(state_index, layer.recurrent);
+    batch.quantize(&Workspace::attention, text_gdn_value_width);
+    batch.project(layer.output, &Workspace::projected_attention);
+}
+
 template <typename Position>
-cudaError_t read_gqa(Request& request, Mxfp8KvCache cache, Position position, TextGdnMode mode,
-                     cudaStream_t stream) {
-    const auto& work = request.work;
-    const auto pages = request.pages;
+cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
+                     Position position, TextGdnMode mode, cudaStream_t stream) {
     const int capacity = pages.page_count * mxfp8_page_size;
     const auto scores = work.gqa_scores(capacity);
     if constexpr (std::is_same_v<Position, int>) {
@@ -113,23 +145,22 @@ cudaError_t read_gqa(Request& request, Mxfp8KvCache cache, Position position, Te
 }
 
 template <typename Position>
-void attend_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
+void attend_gqa(const GqaLayer& layer, Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
                 Position position, TextGdnMode mode, cudaStream_t stream) {
-    auto& work = request.work;
     if constexpr (std::is_same_v<Position, int>) {
         check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm,
                                   layer.key_norm, work.rope_queries, work.rope_keys, stream),
               "Normalize and rotate Q/K");
-        check(mxfp8_kv_append(cache, request.pages, position, 1, work.rope_keys, work.values,
+        check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values,
                               stream), "Append MXFP8 KV");
     } else {
         check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
                                     layer.key_norm, work.rope_queries, work.rope_keys, stream),
               "Normalize and rotate decode Q/K");
-        check(decode_kv_append(cache, request.pages, position, work.rope_keys, work.values, stream),
+        check(decode_kv_append(cache, pages, position, work.rope_keys, work.values, stream),
               "Append decode MXFP8 KV");
     }
-    check(read_gqa(request, cache, position, mode, stream), "Read causal MXFP8 attention");
+    check(read_gqa(work, pages, cache, position, mode, stream), "Read causal MXFP8 attention");
     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
           "Gate grouped-query attention");
 }
@@ -139,7 +170,7 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     batch.quantize(&Workspace::normalized, hidden_size);
     if (batch.single_decode() && layer.q_gate.columns == hidden_size &&
         layer.key.columns == hidden_size && layer.value.columns == hidden_size) {
-        const auto& work = batch.lanes[0].request->work;
+        const auto& work = workspace(batch.lanes[0]);
         check(decode_fp8_qkv({work.activation.values, work.activation.scales},
                              decode_projection(layer.q_gate, work.q_gate),
                              decode_projection(layer.key, work.keys),
@@ -150,10 +181,10 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
         batch.project(layer.key, &Workspace::keys);
         batch.project(layer.value, &Workspace::values);
     }
-    batch.each([&](const Lane& lane, Workspace&) {
+    batch.each([&](const Lane& lane, Workspace& work) {
         auto& request = *lane.request;
-        attend_gqa(layer, request, request.caches[cache_index], lane.position, lane.mode,
-                   batch.stream);
+        attend_gqa(layer, work, request.pages, request.caches[cache_index], lane.position,
+                   lane.mode, batch.stream);
     });
     batch.quantize(&Workspace::attention, text_gqa_q_width);
     batch.project(layer.output, &Workspace::projected_attention);
@@ -164,7 +195,7 @@ void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
     batch.quantize(&Workspace::normalized, hidden_size);
     if (batch.single_decode() && layer.mlp_gate.columns == hidden_size &&
         layer.mlp_up.columns == hidden_size) {
-        const auto& work = batch.lanes[0].request->work;
+        const auto& work = workspace(batch.lanes[0]);
         check(decode_fp8_gate_up({work.activation.values, work.activation.scales},
                                  decode_projection(layer.mlp_gate, work.mlp_gate),
                                  decode_projection(layer.mlp_up, work.mlp_up), hidden_size,
@@ -198,6 +229,26 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
                              lane.request->work.residual, stream), "Look up token embedding");
     }
     forward_layers(lanes, count, stream);
+}
+
+void Decoder::Model::forward_verify(TargetVerification& verification, int position,
+                                    const int* tokens, int count, cudaStream_t stream) const {
+    verification.begin(position, count, stream);
+    std::array<VerificationRow, target_verify_max_rows> rows;
+    for (int index = 0; index < count; ++index) {
+        auto& row = rows[index];
+        row = verification.row(index);
+        check(text_embedding(embedding, vocab_size, hidden_size, tokens[index],
+                             row.work->residual, stream), "Look up verification input");
+    }
+    forward_layers(rows.data(), count, stream);
+    const LayerBatch<VerificationRow> batch{rows.data(), count, stream};
+    batch.each([&](const VerificationRow&, Workspace& work) { normalize_final(work, stream); });
+    project(lm_head, batch, &Workspace::logits);
+    batch.each([&](const VerificationRow&, Workspace& work) {
+        check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+              "Select target verification winner");
+    });
 }
 
 void Decoder::Model::decode_graph(Request& request) const {

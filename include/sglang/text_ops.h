@@ -8,7 +8,7 @@
 namespace sglang {
 
 inline constexpr int text_fp8_group_size = 128;
-inline constexpr int text_fp8_max_batch = 4;
+inline constexpr int text_fp8_max_batch = 5;
 
 constexpr int text_fp8_group_count(int width) {
     return width / text_fp8_group_size + (width % text_fp8_group_size != 0);
@@ -26,6 +26,11 @@ struct TextFp8ActivationView {
 
 struct TextFp8Projection {
     TextFp8ActivationView input;
+    __nv_bfloat16* output;
+};
+
+struct TextBf16Projection {
+    const __nv_bfloat16* input;
     __nv_bfloat16* output;
 };
 
@@ -63,6 +68,8 @@ cudaError_t text_bf16_gemv(const __nv_bfloat16* weight, const __nv_bfloat16* inp
 cudaError_t text_bf16_gemv_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                                 int out_width, int in_width, int rows, __nv_bfloat16* output,
                                 cudaStream_t stream);
+cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_width,
+                           const TextBf16Projection* projections, int count, cudaStream_t stream);
 
 /// Writes width E4M3 bytes and text_fp8_group_count(width) FP32 scales.
 /// Each scale is max(amax, 1e-10) / 448. Quantization rounds to nearest even

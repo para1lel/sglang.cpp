@@ -32,6 +32,15 @@ struct TextGdnState {
     float* recurrent;        ///< [48,128,128], indexed [head,value,key].
 };
 
+inline constexpr int text_gdn_max_verify_rows = 5;
+
+struct TextGdnReplayRows {
+    __nv_bfloat16* qkv;
+    __nv_bfloat16* convolved;
+    __nv_bfloat16* b;
+    __nv_bfloat16* a;
+};
+
 /// All arrays are contiguous device arrays. Keep inputs, outputs, state, and
 /// workspace alive and ordered on the supplied stream through completion.
 /// Arrays must be disjoint except for the exact postgate alias allowed below.
@@ -61,6 +70,14 @@ cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloa
                              TextGdnState state, __nv_bfloat16* workspace,
                              std::size_t workspace_bytes, __nv_bfloat16* output,
                              cudaStream_t stream);
+
+cudaError_t text_gdn_verify_tail(int token_count, TextGdnReplayRows rows,
+                                const __nv_bfloat16* z, TextGdnWeights weights,
+                                TextGdnState initial, TextGdnState tail,
+                                __nv_bfloat16* observable, __nv_bfloat16* output,
+                                cudaStream_t stream);
+cudaError_t text_gdn_replay_prefix(int token_count, TextGdnReplayRows rows, TextGdnWeights weights,
+                                  TextGdnState initial, TextGdnState result, cudaStream_t stream);
 
 /// q_gate is [tokens,24,2,256] with Q then gate within each head. keys and
 /// rope_keys are [tokens,4,256]. rope_queries is [tokens,24,256].

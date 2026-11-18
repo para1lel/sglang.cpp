@@ -97,14 +97,15 @@ that match the target. Corrections, bonus tokens, and the first greedy token are
 excluded from that count. Zero steps selects the default decoder.
 
 MTP prompt seeding uses row-wise target forwards with either prefill policy.
-The draft uses final-normalized target hidden rows and shifted token IDs. Each
-round verifies proposals with ordered eager target forwards, stops at the first
-mismatch, and emits the target correction. If all proposals match and output
-budget remains, the target emits a bonus token. Target KV and recurrent state
-advance along the committed sequence. Draft KV is rewound and extended from the
-committed target rows, using the correction or bonus as the shift for the next
-round. This implementation adds draft work and per-row
-synchronization to ordinary eager target forwards.
+The draft uses final-normalized target rows and shifted token IDs. Each target
+layer processes up to five positions per round, with one synchronization to read
+the winners and any requested logits. The verifier accepts matches in order and
+emits the target correction at the first mismatch. If all proposals match, it
+can emit a bonus token within the stop rule and budget.
+
+Target KV follows the committed prefix. The verifier retains one additional
+recurrent state bank and replays the consumed rows after a partial commit.
+Draft KV rewinds and refreshes from the committed target rows.
 
 To enable MTP from C++, construct `Decoder(checkpoint, device, true)` and set
 `DecoderOptions::mtp_steps` for the request. The constructor loads the draft
@@ -130,9 +131,9 @@ to batch concurrent requests on the resident model. Extra connections wait in th
 listener backlog until a socket worker is available.
 The FP8 prefill policy applies to both serial and batched requests.
 
-Add `--mtp-steps 1` through `--mtp-steps 4` to enable the same eager verifier for
-serial HTTP requests with `--max-active 1`. The SSE events and usage fields are
-the same as for ordinary serial generation.
+Add `--mtp-steps 1` through `--mtp-steps 4` to enable the parallel target verifier
+for serial HTTP requests with `--max-active 1`. The SSE events and usage fields
+follow the ordinary serial generation contract.
 
 Set `--eager` to run serial requests without graph capture or replay.
 This option requires `--max-active 1` and `--mtp-steps 0`.

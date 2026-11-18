@@ -52,17 +52,6 @@ void zero(Element* buffer, std::size_t count, cudaStream_t stream) {
     check(cudaMemsetAsync(buffer, 0, count * sizeof(Element), stream), "Reset request state");
 }
 
-void allocate_gdn(Request& request) {
-    const std::size_t history_count = gdn_layers * gdn_history_elements;
-    const std::size_t recurrent_count = gdn_layers * gdn_state_elements;
-    auto* history = request.memory.allocate<Bf16>(history_count);
-    auto* recurrent = request.memory.allocate<float>(recurrent_count);
-    for (int index = 0; index < gdn_layers; ++index) {
-        request.states[index] = {history + index * gdn_history_elements,
-                                 recurrent + index * gdn_state_elements};
-    }
-}
-
 void allocate_kv(Request& request, int capacity, cudaStream_t stream) {
     const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     auto* table = request.memory.allocate<std::int32_t>(page_count);
@@ -351,12 +340,14 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
     return blocks.back();
 }
 
-Workspace::Workspace(Allocations& allocations)
+Workspace::Workspace(Allocations& allocations, Bf16* verification_attention,
+                     TextLogitCandidate* verification_winner)
     : hidden(allocations.allocate<Bf16>(hidden_size)),
       normalized(allocations.allocate<Bf16>(hidden_size)),
       residual(allocations.allocate<Bf16>(hidden_size)),
       projected_attention(allocations.allocate<Bf16>(hidden_size)),
-      attention(allocations.allocate<Bf16>(text_gqa_q_width)),
+      attention(verification_attention ? verification_attention :
+                allocations.allocate<Bf16>(text_gqa_q_width)),
       mlp_gate(allocations.allocate<Bf16>(intermediate_size)),
       mlp_up(allocations.allocate<Bf16>(intermediate_size)),
       q_gate(allocations.allocate<Bf16>(text_gqa_q_gate_width)),
@@ -364,17 +355,19 @@ Workspace::Workspace(Allocations& allocations)
       values(allocations.allocate<Bf16>(text_gqa_kv_width)),
       rope_queries(allocations.allocate<Bf16>(text_gqa_q_width)),
       rope_keys(allocations.allocate<Bf16>(text_gqa_kv_width)),
-      gdn_qkv(allocations.allocate<Bf16>(text_gdn_qkv_width)),
-      gdn_z(allocations.allocate<Bf16>(text_gdn_value_width)),
-      gdn_b(allocations.allocate<Bf16>(text_gdn_value_heads)),
-      gdn_a(allocations.allocate<Bf16>(text_gdn_value_heads)),
-      gdn_scratch(allocations.allocate<Bf16>(text_gdn_workspace_bytes(1) / sizeof(Bf16))),
+      gdn_qkv(verification_attention ? nullptr : allocations.allocate<Bf16>(text_gdn_qkv_width)),
+      gdn_z(verification_attention ? nullptr : allocations.allocate<Bf16>(text_gdn_value_width)),
+      gdn_b(verification_attention ? nullptr : allocations.allocate<Bf16>(text_gdn_value_heads)),
+      gdn_a(verification_attention ? nullptr : allocations.allocate<Bf16>(text_gdn_value_heads)),
+      gdn_scratch(verification_attention ? nullptr : allocations.allocate<Bf16>(
+          text_gdn_workspace_bytes(1) / sizeof(Bf16))),
       logits(reinterpret_cast<Bf16*>(allocations.allocate<std::byte>(vocab_size * sizeof(Bf16)))),
       activation{allocations.allocate<std::uint8_t>(intermediate_size),
                  allocations.allocate<float>(text_fp8_group_count(intermediate_size))},
       argmax_scratch(
           allocations.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
-      argmax(allocations.allocate<TextLogitCandidate>(1)) {
+      argmax(verification_winner ? verification_winner :
+             allocations.allocate<TextLogitCandidate>(1)) {
     static_assert(text_gqa_q_width == text_gdn_value_width);
 }
 
@@ -382,6 +375,15 @@ ExactGqaWorkspace Workspace::gqa_scores(int capacity) const {
     constexpr int bytes_per_page = mxfp8_page_size * mxfp8_query_heads * sizeof(float);
     constexpr int score_pages = vocab_size * sizeof(Bf16) / bytes_per_page;
     return {reinterpret_cast<float*>(logits), std::min(capacity, score_pages * mxfp8_page_size)};
+}
+
+void allocate_gdn(Allocations& memory, GdnBank& states) {
+    auto* history = memory.allocate<Bf16>(gdn_layers * gdn_history_elements);
+    auto* recurrent = memory.allocate<float>(gdn_layers * gdn_state_elements);
+    for (int index = 0; index < gdn_layers; ++index) {
+        states[index] = {history + index * gdn_history_elements,
+                         recurrent + index * gdn_state_elements};
+    }
 }
 
 Request::Request(int device, bool reusable)
@@ -395,7 +397,7 @@ Request::Request(int device, int capacity, std::shared_ptr<const void> owners, b
 
 void Request::initialize(int capacity, cudaStream_t stream) {
     allocate_kv(*this, capacity, stream);
-    allocate_gdn(*this);
+    allocate_gdn(memory, states);
 }
 
 void Request::reset(cudaStream_t stream) {

@@ -137,6 +137,54 @@ __global__ void bf16_gemv_kernel(const __nv_bfloat16* weight, const __nv_bfloat1
     }
 }
 
+template <int Count>
+struct Bf16Projections {
+    TextBf16Projection entries[Count];
+};
+
+template <int Count>
+__global__ void bf16_batch_packed_kernel(const __nv_bfloat16* weight, int out_width,
+                                         int in_width, Bf16Projections<Count> batch) {
+    const int lane = threadIdx.x % warp_width;
+    const int row = blockIdx.x * block_warps + threadIdx.x / warp_width;
+    if (row >= out_width) {
+        return;
+    }
+    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
+    constexpr int pack = 8;
+    float sums[Count]{};
+    float second_sums[Count]{};
+    for (std::size_t col = lane * pack; col < static_cast<std::size_t>(in_width);
+         col += warp_width * pack) {
+        const uint4 lhs = load_128(row_weight + col);
+#pragma unroll
+        for (int index = 0; index < Count; ++index) {
+            const uint4 rhs = load_128(batch.entries[index].input + col);
+            sums[index] = bf16x2_dot(lhs.x, rhs.x, sums[index]);
+            second_sums[index] = bf16x2_dot(lhs.y, rhs.y, second_sums[index]);
+            sums[index] = bf16x2_dot(lhs.z, rhs.z, sums[index]);
+            second_sums[index] = bf16x2_dot(lhs.w, rhs.w, second_sums[index]);
+        }
+    }
+#pragma unroll
+    for (int index = 0; index < Count; ++index) {
+        const float sum = warp_sum(sums[index] + second_sums[index]);
+        if (lane == 0) {
+            batch.entries[index].output[row] = __float2bfloat16_rn(sum);
+        }
+    }
+}
+
+template <int Count>
+cudaError_t launch_bf16_batch(const __nv_bfloat16* weight, int out_width, int in_width,
+                              const TextBf16Projection* projections, cudaStream_t stream) {
+    Bf16Projections<Count> batch;
+    std::copy_n(projections, Count, batch.entries);
+    void* args[] = {&weight, &out_width, &in_width, &batch};
+    return cudaLaunchKernel(bf16_batch_packed_kernel<Count>, divide_up(out_width, block_warps),
+                            block_threads, args, 0, stream);
+}
+
 template <bool Batched>
 __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
                                     TextFp8Activation output) {
@@ -628,6 +676,42 @@ cudaError_t text_bf16_gemv_rows(const __nv_bfloat16* weight, const __nv_bfloat16
                             block_threads, args, 0, stream);
 }
 
+cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_width,
+                           const TextBf16Projection* projections, int count, cudaStream_t stream) {
+    if (!weight || !projections || out_width <= 0 || in_width <= 0 ||
+        count < 1 || count > text_fp8_max_batch) {
+        return cudaErrorInvalidValue;
+    }
+    bool packed = in_width % 8 == 0 && aligned(weight, 16);
+    for (int index = 0; index < count; ++index) {
+        if (!projections[index].input || !projections[index].output) {
+            return cudaErrorInvalidValue;
+        }
+        packed = packed && aligned(projections[index].input, 16);
+    }
+    if (packed) {
+        switch (count) {
+        case 5:
+            return launch_bf16_batch<5>(weight, out_width, in_width, projections, stream);
+        case 4:
+            return launch_bf16_batch<4>(weight, out_width, in_width, projections, stream);
+        case 3:
+            return launch_bf16_batch<3>(weight, out_width, in_width, projections, stream);
+        case 2:
+            return launch_bf16_batch<2>(weight, out_width, in_width, projections, stream);
+        }
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& entry = projections[index];
+        const auto status = text_bf16_gemv(weight, entry.input, out_width, in_width,
+                                          entry.output, stream);
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
+}
+
 cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
                              cudaStream_t stream) {
     if (input == nullptr || output.values == nullptr || output.scales == nullptr || width <= 0) {
@@ -680,6 +764,9 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
             return cudaErrorInvalidValue;
         }
         wide = wide && supports_wide_fp8(weight, entry.input, in_width);
+    }
+    if (wide && count == 5) {
+        return launch_fp8_batch<5>(weight, weight_scales, out_width, in_width, projections, stream);
     }
     if (wide && count == 4) {
         return launch_fp8_batch<4>(weight, weight_scales, out_width, in_width, projections, stream);

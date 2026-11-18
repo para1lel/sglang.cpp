@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_mtp.h"
+#include "sglang/decoder_verify.h"
 
 #include <algorithm>
 #include <cmath>
@@ -83,13 +84,13 @@ private:
     bool owns_slot_;
 };
 
-std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_t count,
+std::vector<DecoderLogit> top_logits(const Bf16* scores, std::size_t count,
                                     std::vector<DecoderLogit>& ranking) {
     ranking.clear();
-    for (std::size_t index = 0; index < scores.size(); ++index) {
+    for (int index = 0; index < vocab_size; ++index) {
         const float logit = __bfloat162float(scores[index]);
         if (!std::isnan(logit)) {
-            ranking.push_back({static_cast<int>(index), logit});
+            ranking.push_back({index, logit});
         }
     }
     const auto end = ranking.begin() + std::min(count, ranking.size());
@@ -131,7 +132,7 @@ struct Decoder::Model::MtpGeneration {
 
     bool cancelled() const { return callbacks.is_cancelled && callbacks.is_cancelled(); }
 
-    std::optional<DecoderFinishReason> emit(int token, bool accepted = false) {
+    std::optional<DecoderFinishReason> emit(int token, const Bf16* logits, bool accepted = false) {
         if (cancelled()) {
             return DecoderFinishReason::cancelled;
         }
@@ -141,7 +142,7 @@ struct Decoder::Model::MtpGeneration {
         const bool keep_running = !callbacks.on_token || callbacks.on_token(token);
         if (options.top_logits > 0) {
             result.step_top_logits.push_back(
-                top_logits(target.memory.transfers().logits, options.top_logits, ranking));
+                top_logits(logits, options.top_logits, ranking));
         }
         if (!keep_running) {
             return DecoderFinishReason::cancelled;
@@ -155,13 +156,14 @@ struct Decoder::Model::MtpGeneration {
         return std::nullopt;
     }
 
-    using Proposals = std::array<int, decoder_max_mtp_steps>;
+    using VerificationTokens = std::array<int, target_verify_max_rows>;
 
-    bool propose(Proposals& proposals, int count) {
+    bool propose(VerificationTokens& tokens, int count) {
         const auto stream = target.memory.stream();
         const int first_draft_position = next_target_position - 1;
         const Bf16* hidden = target.work.normalized;
         int shifted_token = seed;
+        tokens.front() = seed;
         ++result.mtp_rounds;
         for (int index = 0; index < count; ++index) {
             if (cancelled()) {
@@ -171,32 +173,56 @@ struct Decoder::Model::MtpGeneration {
                                    stream);
             check(cudaStreamSynchronize(stream), "Complete MTP draft step");
             shifted_token = draft.read_token();
-            proposals[index] = shifted_token;
+            tokens[index + 1] = shifted_token;
             ++result.mtp_drafted_tokens;
         }
         return true;
     }
 
-    std::optional<DecoderFinishReason> verify(const Proposals& proposals, int count) {
-        draft.rewind(next_target_position);
-        for (int index = 0; index <= count; ++index) {
-            if (cancelled()) {
+    std::optional<DecoderFinishReason> consume(TargetVerification& verification,
+                                               const VerificationTokens& tokens, int rows,
+                                               int count, int& processed) {
+        for (int index = 0; index < rows; ++index) {
+            if (index > 0 && cancelled()) {
                 return DecoderFinishReason::cancelled;
             }
-            const int position = next_target_position++;
-            model.forward(target, seed, position, TextGdnMode::decode);
-            model.compute_logits(target);
-            const int token = read_step(target);
-            const bool accepted = index < count && token == proposals[index];
-            if (const auto finish = emit(token, accepted)) {
+            ++processed;
+            const int token = verification.winner(index);
+            const bool accepted = index < count && token == tokens[index + 1];
+            if (const auto finish = emit(token, verification.logits(index), accepted)) {
                 return finish;
             }
             if (!accepted) {
                 return std::nullopt;
             }
-            draft.enqueue(position, seed, target.work.normalized, false, target.memory.stream());
+            const auto row = verification.row(index);
+            draft.enqueue(row.position, seed, row.work->normalized, false, target.memory.stream());
         }
         return std::nullopt;
+    }
+
+    std::optional<DecoderFinishReason> verify(TargetVerification& verification,
+                                              const VerificationTokens& tokens, int count,
+                                              int remaining) {
+        draft.rewind(next_target_position);
+        if (cancelled()) {
+            return DecoderFinishReason::cancelled;
+        }
+        const auto stream = target.memory.stream();
+        const int rows = std::min(remaining, count + 1);
+        model.forward_verify(verification, next_target_position, tokens.data(), rows, stream);
+        verification.read();
+        int processed = 0;
+        const auto finish = consume(verification, tokens, rows, count, processed);
+        if (!finish) {
+            const auto* hidden = verification.row(processed - 1).work->normalized;
+            check(cudaMemcpyAsync(target.work.normalized, hidden, hidden_size * sizeof(Bf16),
+                                  cudaMemcpyDeviceToDevice, stream),
+                  "Carry committed target hidden state into next draft");
+        }
+        verification.commit(processed);
+        next_target_position += processed;
+        return finish;
     }
 
     DecoderFinishReason run(const std::vector<int>& prompt) {
@@ -215,18 +241,24 @@ struct Decoder::Model::MtpGeneration {
             }
         }
         model.compute_logits(target);
-        if (const auto finish = emit(read_step(target))) {
+        const int token = read_step(target);
+        if (const auto finish = emit(token, target.memory.transfers().logits.data())) {
             return *finish;
         }
+        const auto before = target.memory.bytes();
+        const int rows = std::min(options.max_new_tokens - 1, options.mtp_steps + 1);
+        TargetVerification verification(target, prompt_count + options.max_new_tokens - 1,
+                                        next_target_position, rows, options.top_logits > 0);
+        result.peak_device_allocation_bytes += target.memory.bytes() - before;
         while (!cancelled()) {
             const int remaining = options.max_new_tokens -
                                   static_cast<int>(result.output_token_ids.size());
             const int count = std::min(remaining, options.mtp_steps);
-            Proposals proposals{};
-            if (!propose(proposals, count)) {
+            VerificationTokens tokens{};
+            if (!propose(tokens, count)) {
                 break;
             }
-            if (const auto finish = verify(proposals, count)) {
+            if (const auto finish = verify(verification, tokens, count, remaining)) {
                 return *finish;
             }
         }
@@ -358,7 +390,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
                 if (options.top_logits > 0) {
                     result.step_top_logits.push_back(
-                        top_logits(transfers.logits, options.top_logits, ranking));
+                        top_logits(transfers.logits.data(), options.top_logits, ranking));
                 }
                 if (!keep_running) {
                     return DecoderFinishReason::cancelled;

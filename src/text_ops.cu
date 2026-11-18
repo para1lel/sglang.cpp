@@ -735,12 +735,107 @@ cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* 
     return cudaSuccess;
 }
 
+namespace {
+
+constexpr int rms_hidden_width = 5120;
+
+__device__ void stage_rms_vector(const __nv_bfloat16* input, __nv_bfloat16* shared) {
+    const uint4 vector = load_128(input);
+    const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(shared));
+    asm("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+        :: "r"(address), "r"(vector.x), "r"(vector.y), "r"(vector.z), "r"(vector.w)
+        : "memory");
+}
+
+__device__ __forceinline__ float rms_inverse(float squares, int width) {
+    __shared__ float warp_squares[block_warps];
+    __shared__ float inverse_rms;
+    const int lane = threadIdx.x % warp_width;
+    const int warp = threadIdx.x / warp_width;
+    squares = warp_sum(squares);
+    if (lane == 0) {
+        warp_squares[warp] = squares;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        squares = warp_sum(lane < block_warps ? warp_squares[lane] : 0.0f);
+        if (lane == 0) {
+            inverse_rms = rsqrtf(squares / static_cast<float>(width) + rms_epsilon);
+        }
+    }
+    __syncthreads();
+    return inverse_rms;
+}
+
+__device__ void store_rms(float value, float inverse_rms, const __nv_bfloat16* weight,
+                          std::size_t col, __nv_bfloat16* output,
+                          __nv_bfloat16* residual_output) {
+    const float gain = 1.0f + __bfloat162float(weight[col]);
+    if (residual_output != nullptr) {
+        residual_output[col] = __float2bfloat16_rn(value);
+    }
+    output[col] = __float2bfloat16_rn((value * inverse_rms) * gain);
+}
+
+template <bool HasResidual, bool StoresResidual>
+__global__ void rms_norm_vector_kernel(const __nv_bfloat16* branch,
+                                       const __nv_bfloat16* residual,
+                                       const __nv_bfloat16* weight, __nv_bfloat16* output,
+                                       __nv_bfloat16* residual_output) {
+    __shared__ alignas(16) __nv_bfloat16 branch_values[rms_hidden_width];
+    __shared__ alignas(16) __nv_bfloat16 residual_values[HasResidual ? rms_hidden_width : 1];
+    __shared__ alignas(16) __nv_bfloat16 gains[rms_hidden_width];
+    constexpr int vector_width = sizeof(uint4) / sizeof(__nv_bfloat16);
+    static_assert(rms_hidden_width % block_threads == 0 && rms_hidden_width % vector_width == 0);
+    for (int col = threadIdx.x * vector_width; col < rms_hidden_width;
+         col += block_threads * vector_width) {
+        stage_rms_vector(branch + col, branch_values + col);
+        if constexpr (HasResidual) {
+            stage_rms_vector(residual + col, residual_values + col);
+        }
+        stage_rms_vector(weight + col, gains + col);
+    }
+    __syncthreads();
+
+    constexpr int values_per_thread = rms_hidden_width / block_threads;
+    float values[values_per_thread];
+    float squares = 0.0f;
+#pragma unroll
+    for (int index = 0; index < values_per_thread; ++index) {
+        const int col = threadIdx.x + index * block_threads;
+        const float value = residual_sum(branch_values, HasResidual ? residual_values : nullptr,
+                                         col);
+        values[index] = value;
+        squares = fmaf(value, value, squares);
+    }
+    const float inverse_rms = rms_inverse(squares, rms_hidden_width);
+#pragma unroll
+    for (int index = 0; index < values_per_thread; ++index) {
+        const int col = threadIdx.x + index * block_threads;
+        store_rms(values[index], inverse_rms, gains, col, output,
+                  StoresResidual ? residual_output : nullptr);
+    }
+}
+
+}
+
 cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
                          const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
                          __nv_bfloat16* residual_output, cudaStream_t stream) {
     if (branch == nullptr || weight == nullptr || output == nullptr || width <= 0 ||
         output == residual_output) {
         return cudaErrorInvalidValue;
+    }
+    if (width == rms_hidden_width && aligned(branch, alignof(uint4)) &&
+        aligned(residual, alignof(uint4)) && aligned(weight, alignof(uint4))) {
+        void* args[] = {&branch, &residual, &weight, &output, &residual_output};
+        const bool store_residual = residual_output != nullptr;
+        const auto kernel = residual == nullptr
+            ? (store_residual ? rms_norm_vector_kernel<false, true>
+                              : rms_norm_vector_kernel<false, false>)
+            : (store_residual ? rms_norm_vector_kernel<true, true>
+                              : rms_norm_vector_kernel<true, false>);
+        return cudaLaunchKernel(kernel, 1, block_threads, args, 0, stream);
     }
     void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
     return cudaLaunchKernel(rms_norm_kernel<false>, 1, block_threads, args, 0, stream);

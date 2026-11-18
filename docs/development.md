@@ -104,19 +104,21 @@ The decoder checks tensor names, dtypes, and shapes before upload. Upload retain
 
 Serial MTP-off generation reuses its stream and request storage, growing capacity as needed. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L272)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L401)<!-- prefix: "void Request" -->
 
-MTP-off prefill runs layers across up to 128 consecutive tokens, preserving row arithmetic, recurrent order, and causal attention. Single rows use row-wise prefill. The final row supplies the first logits. Serial decode replays a graph. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L313)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L172)<!-- prefix: "void Decoder" -->
+MTP-off prefill processes up to 128 consecutive tokens per layer, preserving row arithmetic, recurrent order, and causal attention. Single rows use row-wise prefill. The final row supplies initial logits. Serial decode replays a graph. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L313)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L172)<!-- prefix: "void Decoder" -->
 
-Target prefill and MTP draft attention use the direct kernel. Eager target decode, including MTP verification, selects exact attention when the zero-based position is below score capacity. Graph capture selects exact attention when the page-rounded KV allocation fits that capacity. Both exact graph kernels read the device position. Other decode steps use direct attention. [GQA dispatch](../src/decoder_forward.cpp#L82)<!-- prefix: "cudaError_t " -->
+Target prefill and MTP drafts use direct attention. Eager target decode, including MTP verification, selects exact attention when the zero-based position is below score capacity. Graph capture selects exact attention when page-rounded KV fits that capacity. Both exact graph kernels read the device position. Other decode steps use direct attention. [GQA dispatch](../src/decoder_forward.cpp#L82)<!-- prefix: "cudaError_t " -->
 
-Per lane, the stream orders KV append, scoring, replay, and gating. Score capacity is the lesser of allocated KV slots and 5,120. Layers reuse the request's logits allocation for 24 FP32 scores per slot. The LM head then writes logits. [Workspace](../src/decoder_resources.cpp#L381)<!-- prefix: "ExactGqaWork" -->
+The lane stream orders KV append, scoring, replay, and gating. Score capacity is the lesser of allocated KV slots and 5,120. Layers store 24 FP32 scores per slot in the logits allocation. The LM head then writes logits. [Workspace](../src/decoder_resources.cpp#L381)<!-- prefix: "ExactGqaWork" -->
 
-Single positions use FP8 GEMV. The wide kernel uses four warps per block for widths divisible by 512 and 16-byte-aligned FP8 buffers. Eligible one-position lanes share weight loads in packed GEMM. Ineligible projections use separate GEMVs. Other operators run per lane. [Projection dispatch](../src/decoder_forward.cpp#L44)<!-- prefix: "void project" --> · [GEMV](../src/text_ops.cu#L651)<!-- prefix: "cudaError_t " --> · [GEMM](../src/text_ops.cu#L669)<!-- prefix: "cudaError_t " -->
+Single positions use FP8 GEMV. Its wide kernel uses four warps per block for widths divisible by 512 and 16-byte-aligned buffers. Eligible one-position projections share packed GEMM weight loads. Other operators and GEMV fallbacks run per lane. [Projection dispatch](../src/decoder_forward.cpp#L44)<!-- prefix: "void project" --> · [GEMV](../src/text_ops.cu#L651)<!-- prefix: "cudaError_t " --> · [GEMM](../src/text_ops.cu#L669)<!-- prefix: "cudaError_t " -->
+
+Single-row BF16 RMSNorm uses vector loads at width 5,120 with 16-byte-aligned branch, gains, and optional residual. Other single rows and multirow calls use generic kernels. [RMSNorm dispatch](../src/text_ops.cu#L822)<!-- prefix: "cudaError_t " -->
 
 #### Constraints and failure behavior
 
 Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decimal IDs with commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus budget must fit 262,144 tokens. The default budget is one. Zero budget returns no tokens and `length`. [CLI options](../apps/sglang-generate.cpp#L31)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L19)<!-- prefix: "void validat" -->
 
-Greedy selection takes the highest BF16 logit and breaks ties by lowest ID. A `--stop-token` match emits the token and returns `stop`, even at the budget. Otherwise the budget gives `length`. The CLI applies no implicit EOS. Input, load, execution, or explicit cleanup errors log to stderr and exit with status 1. [Selection](../src/text_ops.cu#L491)<!-- prefix: "__device__ T" --> · [Generation loop](../src/decoder.cpp#L272)<!-- prefix: "void Decoder" -->
+Greedy selection takes the highest BF16 logit, breaking ties by lowest ID. `--stop-token` emits a match and returns `stop`, even at the budget. Budget exhaustion returns `length`. The CLI applies no implicit EOS. Input, load, execution, and explicit cleanup errors report to stderr and exit 1. [Selection](../src/text_ops.cu#L491)<!-- prefix: "__device__ T" --> · [Generation loop](../src/decoder.cpp#L272)<!-- prefix: "void Decoder" -->
 
 The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/decoder_resources.cpp#L105)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L286)<!-- prefix: "Allocations:" -->
 
@@ -138,7 +140,7 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     --device 0 --prompt-ids 760,6511,314,9338,369 --max-new-tokens 8 --repeats 2
 ```
 
-Check the echoed prompt, eight in-range output IDs, and finish reason `length`. Require identical native IDs and finish reasons across both runs. Set the budget to one and `--stop-token` to the first native ID. Require one output ID and `stop`. With a zero budget, require no output IDs and `length`. To check state reset, repeat the prompt after another request on the same decoder.
+Check the echoed prompt, eight in-range output IDs, and `length`. Require identical IDs and finish reasons across runs. Set budget one and `--stop-token` to the first native ID. Require one output ID and `stop`. At zero budget, require no IDs and `length`. To check reset, repeat the prompt after another request on the same decoder.
 
 Check greedy selection against the BF16 maximum and the lowest token ID at a tie. Compare captured logits with independent calculations. Use `--top-logits 248320` on a short request to check vocabulary shape and ranking. [Request ranking check](../tests/decoder/request_check.cpp#L171)<!-- prefix: "void check_r" -->
 

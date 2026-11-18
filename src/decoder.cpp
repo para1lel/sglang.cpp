@@ -231,11 +231,24 @@ struct Decoder::Model::MtpGeneration {
     }
 };
 
+Decoder::Model::Model(const std::filesystem::path& checkpoint, int cuda_device,
+                      Fp8PrefillPolicy fp8_prefill)
+    : Model(checkpoint, cuda_device) {
+    fp8_prefill_ = fp8_prefill;
+}
+
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device)
-    : model_(std::make_unique<Model>(checkpoint, cuda_device)) {}
+    : Decoder(checkpoint, cuda_device, false) {}
 
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp)
-    : Decoder(checkpoint, cuda_device) {
+    : Decoder(checkpoint, cuda_device, enable_mtp, Fp8PrefillPolicy::exact) {}
+
+Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
+                 Fp8PrefillPolicy fp8_prefill) {
+    if (fp8_prefill != Fp8PrefillPolicy::exact && fp8_prefill != Fp8PrefillPolicy::tensor_core) {
+        throw std::invalid_argument("Invalid FP8 prefill policy");
+    }
+    model_ = std::make_unique<Model>(checkpoint, cuda_device, fp8_prefill);
     if (enable_mtp) {
         model_->mtp_weights = std::make_shared<MtpDraftWeights>(
             checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head);

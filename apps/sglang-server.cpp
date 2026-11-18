@@ -1,3 +1,5 @@
+#include "fp8_prefill_option.h"
+
 #include "sglang/decoder.h"
 #include "sglang/decoder_batch.h"
 #include "sglang/server/batch_service.h"
@@ -17,6 +19,7 @@ using namespace sglang::server;
 
 struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
+    sglang::Fp8PrefillPolicy fp8_prefill = sglang::Fp8PrefillPolicy::exact;
     int device = 0;
     int port = 17384;
     int max_active = 1;
@@ -47,6 +50,8 @@ Arguments parse_arguments(int argc, char** argv) {
         const std::string_view value = argv[index];
         if (option == "--checkpoint" && !value.empty()) {
             arguments.checkpoint = value;
+        } else if (option == "--fp8-prefill") {
+            arguments.fp8_prefill = sglang::cli::parse_fp8_prefill(value);
         } else if (option == "--device") {
             arguments.device = parse_integer(value, "Expected a nonnegative CUDA device ordinal");
         } else if (option == "--port") {
@@ -153,17 +158,19 @@ void serve_batch(const Socket& listener, BatchService& service, int max_active) 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
-                     " [--max-active N] [--mtp-steps N] [--trace-batches]\n"
+                     " [--max-active N] [--mtp-steps N]\n"
+                     "                     [--fp8-prefill exact|tensor-core] [--trace-batches]\n"
                      "Active requests: 1 by default, up to 4.\n"
                      "MTP steps: 0 by default, up to 4 with one active request.\n"
-                     "Serves on 127.0.0.1 only. Default port: 17384.\n";
+                     "Serves on 127.0.0.1 only. Default port: 17384.\n"
+                  << sglang::cli::fp8_prefill_usage;
         return 0;
     }
     try {
         const auto arguments = parse_arguments(argc, argv);
         install_shutdown_handlers();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
-                                      arguments.mtp_steps != 0);
+                                      arguments.mtp_steps != 0, arguments.fp8_prefill);
         if (stopping()) {
             return 0;
         }

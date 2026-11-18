@@ -24,3 +24,27 @@ and four. The batch trace must show multiple chunked lanes, decode alongside pre
 at most 128 positions per step. The width-four check resets a connection after a chunk is traced
 and before any completion arrives, waits for request allocations to return to zero, then
 checks a replacement stream. Require `passed` in the resulting `status.json`.
+
+For the FP8 prefill policy options, run the CPU-only check against the release binaries.
+It hides all CUDA devices and verifies help and argument rejection before model load.
+
+```sh
+python -B tests/prefill/run_native.py --check-policy \
+    --generate build/bin/sglang-generate --server build/bin/sglang-server
+```
+
+Build the tensor-core operator check against the release CUDA libraries in the default Pixi
+environment. Run it with a reserved SM100 device visible.
+
+```sh
+toolkit="$CONDA_PREFIX/targets/x86_64-linux"
+c++ -std=c++17 -O3 -I include -isystem "$toolkit/include" \
+    tests/prefill/tensor_core_check.cpp build/lib/libsglang_prefill_fp8_sm100.a \
+    build/lib/libsglang_cuda.a \
+    -L "$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -o build/tensor-core-check
+build/tensor-core-check
+```
+
+The operator check verifies FP64-derived BF16 output and output guards for 197 channels
+and 1,024 inputs. It covers tensor-core launches at 3, 127, and 128 rows and exact fallback
+at 2 and 129 rows. It also checks alignment, odd input widths, and invalid arguments.

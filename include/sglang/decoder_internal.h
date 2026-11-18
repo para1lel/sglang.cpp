@@ -198,8 +198,9 @@ namespace sglang {
 struct Decoder::Model {
     struct MtpGeneration;
 
-    Model(const std::filesystem::path& checkpoint, int cuda_device);
+    Model(const std::filesystem::path& checkpoint, int cuda_device, Fp8PrefillPolicy fp8_prefill);
 
+    Fp8PrefillPolicy fp8_prefill() const { return fp8_prefill_; }
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
@@ -227,6 +228,11 @@ struct Decoder::Model {
     std::shared_ptr<const decoder::MtpDraftWeights> mtp_weights;
     mutable std::atomic_flag request_in_use = ATOMIC_FLAG_INIT;
     mutable std::unique_ptr<decoder::Request> decode_request;
+
+private:
+    Model(const std::filesystem::path& checkpoint, int cuda_device);
+
+    Fp8PrefillPolicy fp8_prefill_ = Fp8PrefillPolicy::exact;
 };
 
 }

@@ -44,10 +44,17 @@ struct DecoderResult {
     std::size_t mtp_rounds = 0;
 };
 
+enum class Fp8PrefillPolicy {
+    exact,
+    tensor_core,
+};
+
 class Decoder {
 public:
     explicit Decoder(const std::filesystem::path& checkpoint, int cuda_device = 0);
     Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp);
+    Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
+            Fp8PrefillPolicy fp8_prefill);
     ~Decoder();
 
     Decoder(const Decoder&) = delete;

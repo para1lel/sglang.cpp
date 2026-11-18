@@ -1,3 +1,5 @@
+#include "fp8_prefill_option.h"
+
 #include "sglang/decoder.h"
 
 #include <algorithm>
@@ -22,6 +24,7 @@ struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
     std::vector<int> prompt;
     sglang::DecoderOptions options;
+    sglang::Fp8PrefillPolicy fp8_prefill = sglang::Fp8PrefillPolicy::exact;
     int device = 0;
     int warmup = 0;
     int repeats = 1;
@@ -32,10 +35,12 @@ void usage(std::ostream& output) {
     output << "Usage: sglang-generate (--prompt-ids ID,ID,... | --prompt-file FILE)\n"
            << "                       [--max-new-tokens N] [--stop-token ID] [--top-logits N]\n"
            << "                       [--mtp-steps N] (0–4, default 0)\n"
+           << "                       [--fp8-prefill exact|tensor-core]\n"
            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
               "Device is a CUDA ordinal.\n"
-           << "Prompt IDs may be separated by commas or whitespace. Results are written as JSON.\n";
+           << "Prompt IDs may be separated by commas or whitespace. Results are written as JSON.\n"
+           << sglang::cli::fp8_prefill_usage;
 }
 
 int positive_or_zero(std::string_view input, std::string_view option) {
@@ -96,6 +101,8 @@ Arguments parse_arguments(int argc, char** argv) {
             have_prompt = true;
         } else if (option == "--checkpoint") {
             arguments.checkpoint = value;
+        } else if (option == "--fp8-prefill") {
+            arguments.fp8_prefill = sglang::cli::parse_fp8_prefill(value);
         } else if (option == "--max-new-tokens") {
             arguments.options.max_new_tokens = positive_or_zero(value, option);
         } else if (option == "--stop-token") {
@@ -233,7 +240,7 @@ int main(int argc, char** argv) {
         }
         const auto start = Clock::now();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
-                                      arguments.options.mtp_steps != 0);
+                                      arguments.options.mtp_steps != 0, arguments.fp8_prefill);
         const double load_ms = milliseconds(Clock::now() - start);
         const auto measured = measure(decoder, arguments);
         write_result(arguments, measured, decoder.model_device_allocation_bytes(), load_ms);

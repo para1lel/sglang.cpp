@@ -1,4 +1,5 @@
 #include "sglang/decoder_prefill.h"
+#include "sglang/prefill_fp8.h"
 
 #include <algorithm>
 #include <atomic>
@@ -168,6 +169,7 @@ struct Chunk {
     int position;
     int rows;
     cudaStream_t stream;
+    bool tensor_core_fp8;
 
     TextFp8ActivationView quantize(const Bf16* input, int width) const {
         check(text_quantize_fp8_rows(input, width, rows, work.activation, stream),
@@ -176,6 +178,15 @@ struct Chunk {
     }
 
     void project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output) const {
+        if (tensor_core_fp8) {
+            const auto status = try_text_fp8_gemm_sm100(
+                weight.values, weight.scales, input, rows, weight.rows, weight.columns,
+                output, stream);
+            if (status) {
+                check(*status, "Run tensor-core prefill FP8 projection");
+                return;
+            }
+        }
         check(text_fp8_gemv_rows(weight.values, weight.scales, input, weight.rows, weight.columns,
                                  rows, output, stream), "Run exact prefill FP8 projection");
     }
@@ -330,7 +341,8 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         return;
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
-    const Chunk chunk{TileBuffers(layout, workspace.capacity()), position, rows, stream};
+    const Chunk chunk{TileBuffers(layout, workspace.capacity()), position, rows, stream,
+                      fp8_prefill() == Fp8PrefillPolicy::tensor_core};
     const auto& work = chunk.work;
     check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens, rows,
                                work.residual, stream), "Gather prefill embeddings");

@@ -64,7 +64,7 @@ Separate startup, model load, JIT compilation, and graph capture from steady exe
 
 Report one row per engine, workload, and mode. Include absolute metrics, successful and attempted requests, and the agreed limits. For paired runs, also report the candidate/baseline throughput ratio and latency differences. For workloads with open limits, set numerical margins from repeated baseline measurements before candidate timing.
 
-For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and any graph capture. Allocation metrics include resident request storage on the serial graph path. Keep the JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L170)<!-- prefix: "Measurements" -->
+For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and any graph capture. Allocation metrics include resident request storage on the serial graph path. Keep the JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L177)<!-- prefix: "Measurements" -->
 
 ### Frozen W1 and W2 timing
 
@@ -90,6 +90,18 @@ The 128-row tile requests 31,944,704 scratch bytes. One row requires zero scratc
 
 The historical serial prototype reduced CUDA prefill time against the row-wise native control on W1 and W2. It missed all four paired GPU6 vLLM targets on both workloads. Frozen GPU3 W1/W2 acceptance and W3/W6 concurrent acceptance require measurements of the promoted implementation under their respective protocols.
 
+### FP8 tensor-core prefill
+
+Compare `--fp8-prefill tensor-core` with explicit `--fp8-prefill exact` on the same native binary. Match the checkpoint, GPU UUID, KV and GDN policies, and MTP setting. Freeze request bytes, arrival order, concurrency, output budgets, stop rules, warmups, and repetitions. Put the full launch commands and flags in the immutable run manifest. Record source and binary hashes, toolchain and driver identities, and the requested mode. Trace effective dispatch, row counts, shapes, and fallbacks separately from timing.
+
+Keep the [exact prefill checks](development.md#chunked-prefill-verification) as the regression gate. Compare tensor-core projections with an independent reference using predefined tolerances. Require bitwise equality between fallback and exact projections on identical inputs. Check default and explicit `exact` in the generator and server. Exercise full chunks, tails, mixed prefill and decode, and unsupported dispatch conditions. Check tokens and finish reasons across repetitions within each mode under a fixed schedule.
+
+Compare full-vocabulary BF16 logits at the same positions with identical token histories. Use a shared teacher-forced continuation after greedy outputs diverge. Keep the same prefill and decode boundaries. Report logit errors, top ranks, greedy IDs, and top-two margins for both modes. Keep free-running IDs and the first divergence separately. Reduction differences can accumulate across layers and change the highest-scoring token even when the lead is large. Apply the predefined numerical tolerances to cross-mode score comparisons.
+
+Gate external parity separately against the pinned serving reference on identical histories. Record the reference execution mode and KV and GDN policies. Report targeted diagnostic rows with their selection criteria and use the frozen fixtures for workload-level results.
+
+Measure prompt device time and HTTP TTFT as specified for [chunked prefill](#chunked-prefill). Retain TPOT, end-to-end latency, and output tokens/s under the applicable frozen protocol. Use separate result rows for the two native modes and preserve the vLLM controls. Qualify the promoted backend with its own measurements.
+
 ### Native concurrent workloads
 
 W3 and W6 each require four active requests. Use `--max-active 4` after the [native streaming checks](development.md#streaming-verification) pass. Verify full-width decode and memory capacity at each workload's lengths. Use the [concurrent baseline procedure](../benchmarks/concurrent/README.md#conditions-and-gates) for paired timing and acceptance. W4 and W5 exceed the native server's four-lane limit and remain unsupported at their specified concurrency.
@@ -98,7 +110,7 @@ W3 and W6 each require four active requests. Use `--max-active 4` after the [nat
 
 Run the [greedy MTP correctness checks](development.md#serial-greedy-mtp) before timing. Report any serial MTP measurement as a separate experiment against MTP off at the same request lengths. Record the proposal limit, eager and graph dispatch, and device allocations. The reference verifier adds draft work and synchronization to ordered eager target forwards. The [frozen W3-MTP variant](../benchmarks/variants/README.md) requires four active requests and remains unsupported by the serial verifier.
 
-Generator JSON includes MTP counters only for positive `--mtp-steps`, from the first measured request. `mtp_drafted_tokens` counts proposals read back, including tails that verification may skip. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts draft rounds started. Count all committed output tokens from `output_token_ids`, including the first greedy token, target corrections, and target bonuses. Report accepted/drafted and accepted/rounds when their denominators are positive. [JSON fields](../apps/sglang-generate.cpp#L193)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder.cpp#L157)<!-- prefix: "bool propose" --> · [Commit](../src/decoder.cpp#L131)<!-- prefix: "std::optiona" -->
+Generator JSON includes MTP counters only for positive `--mtp-steps`, from the first measured request. `mtp_drafted_tokens` counts proposals read back, including tails that verification may skip. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts draft rounds started. Count all committed output tokens from `output_token_ids`, including the first greedy token, target corrections, and target bonuses. Report accepted/drafted and accepted/rounds when their denominators are positive. [JSON fields](../apps/sglang-generate.cpp#L200)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder.cpp#L157)<!-- prefix: "bool propose" --> · [Commit](../src/decoder.cpp#L131)<!-- prefix: "std::optiona" -->
 
 The generator has no separate verified-proposal counter. In a verification trace, count proposals actually compared, including the first mismatch. Count target bonus rows separately. Check `accepted ≤ verified ≤ drafted` and `drafted ≤ rounds × mtp_steps`. Require one target decode row per committed output after the first for completed requests. For completed requests with zero or one output, require zero proposals, accepts, and rounds. Keep the trace separate from timing. [Target verification](../src/decoder.cpp#L177)<!-- prefix: "std::optiona" -->
 

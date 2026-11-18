@@ -7,7 +7,7 @@ and carries Gated DeltaNet state through the other 48 layers. Prefill and the fi
 greedy selection run eagerly. Subsequent serial decode steps use a CUDA graph.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L47)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L52)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
@@ -79,12 +79,24 @@ decode step captures the graph on demand, and later steps and requests replay it
 capacity suffices. Overlapping calls that cannot acquire the serial slot use private
 request buffers and eager decode.
 
+The generator and HTTP server accept `--fp8-prefill exact|tensor-core`. The default
+`exact` uses the exact FP8 projection path. `tensor-core` uses SM100 Tensor Cores for
+eligible FP8 projections in chunks of 3 to 128 prompt positions. Smaller chunks and
+ineligible projections use the exact path. Tensor Core prefill accumulates FP32 sums in
+a different order. Model scores and generated token IDs can differ, including when
+the highest scores are far apart.
+
+The selection applies to the model for its lifetime. For C++, pass
+`sglang::Fp8PrefillPolicy::tensor_core` as the fourth argument to
+`Decoder(checkpoint, device, enable_mtp, policy)`.
+
 Pass `--mtp-steps 1` through `--mtp-steps 4` to enable greedy multi-token prediction
 (MTP). The generator reports `mtp_drafted_tokens`, `mtp_accepted_tokens`, and
 `mtp_rounds` for the first measured request. Accepted tokens count emitted proposals
 that match the target. Corrections, bonus tokens, and the first greedy token are
 excluded from that count. Zero steps selects the default decoder.
 
+MTP prompt seeding uses row-wise target forwards with either prefill policy.
 The draft uses final-normalized target hidden rows and shifted token IDs. Each
 round verifies proposals with ordered eager target forwards, stops at the first
 mismatch, and emits the target correction. If all proposals match and output
@@ -117,6 +129,7 @@ for model `benchmark` with token ID input. By default and with `--max-active 1`,
 requests run serially and reuse the decode graph. Set `--max-active 2`, `3`, or `4`
 to batch concurrent requests on the resident model. Extra connections wait in the
 listener backlog until a socket worker is available.
+The FP8 prefill policy applies to both serial and batched requests.
 
 Add `--mtp-steps 1` through `--mtp-steps 4` to enable the same eager verifier for
 serial HTTP requests with `--max-active 1`. The SSE events and usage fields are

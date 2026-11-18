@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import select
 from pathlib import Path
@@ -51,6 +52,33 @@ def score_digest(rows):
         for score in row:
             digest.update(struct.pack("<If", score["token_id"], score["logit"]))
     return digest.hexdigest()
+
+
+def check_policy(args):
+    environment = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+    for executable, serving in ((args.generate, False), (args.server, True)):
+        if executable is None:
+            continue
+        executable = executable.resolve(strict=True)
+        cases = [
+            (["--help"], 0, "--fp8-prefill exact|tensor-core"),
+            (["--fp8-prefill", "auto"], 1, "Expected --fp8-prefill exact or tensor-core"),
+            (["--fp8-prefill", ""], 1, "Expected --fp8-prefill exact or tensor-core"),
+        ]
+        missing = "value" if serving else "argument"
+        cases.append((["--fp8-prefill"], 1, f"Missing {missing} for --fp8-prefill"))
+        if serving:
+            cases.append((
+                ["--fp8-prefill", "tensor-core", "--max-active", "2", "--mtp-steps", "1"],
+                1, "--mtp-steps requires --max-active 1",
+            ))
+        for flags, status, message in cases:
+            result = subprocess.run([str(executable), *flags], env=environment, text=True,
+                                    capture_output=True, timeout=10)
+            output = result.stdout if status == 0 else result.stderr
+            require(result.returncode == status and message in output,
+                    f"{executable.name} {flags}: {result.returncode}, {output}")
+    print("FP8 prefill policy option checks passed with CUDA devices hidden")
 
 
 def check_cli(args, cases):
@@ -135,7 +163,14 @@ def main():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--check-fixtures", action="store_true")
+    parser.add_argument("--check-policy", action="store_true",
+                        help="Check CLI options without CUDA")
     args = parser.parse_args()
+    if args.check_policy:
+        if not (args.generate or args.server):
+            parser.error("Provide at least one release executable for --check-policy")
+        check_policy(args)
+        return
     cases = load_cases()
     if args.check_fixtures and not (args.generate or args.server):
         print("Six prefill boundary fixtures passed")

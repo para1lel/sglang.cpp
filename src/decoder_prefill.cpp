@@ -22,6 +22,8 @@ struct PrefillPool {
     const int device;
     cudaMemPool_t handle = nullptr;
     void* pending = nullptr;
+    bool retains_backing = false;
+    PrefillPool* next_retained = nullptr;
     std::unique_ptr<PrefillPool> next;
 };
 
@@ -34,8 +36,45 @@ using namespace decoder;
 
 class PrefillPools {
 public:
+    void configure_retention(PrefillPool& pool) {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            for (auto* owner = retained_; owner; owner = owner->next_retained) {
+                if (owner->device == pool.device) {
+                    return;
+                }
+            }
+            pool.next_retained = retained_;
+            retained_ = &pool;
+        }
+
+        std::uint64_t threshold = 32 * 1024 * 1024;
+        const auto status =
+            cudaMemPoolSetAttribute(pool.handle, cudaMemPoolAttrReleaseThreshold, &threshold);
+        if (status == cudaSuccess) {
+            pool.retains_backing = true;
+            return;
+        }
+
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            auto** link = &retained_;
+            while (*link != &pool) {
+                link = &(*link)->next_retained;
+            }
+            *link = pool.next_retained;
+            pool.next_retained = nullptr;
+        }
+        if (status != cudaErrorNotSupported) {
+            check(status, "Configure prefill pool retention");
+        }
+    }
+
     std::unique_ptr<PrefillPool> take_idle(int device) {
         const std::lock_guard<std::mutex> lock(mutex_);
+        if (auto pool = take(idle_, device, true)) {
+            return pool;
+        }
         return take(idle_, device);
     }
 
@@ -64,9 +103,11 @@ public:
     }
 
 private:
-    static std::unique_ptr<PrefillPool> take(std::unique_ptr<PrefillPool>& list, int device) {
+    static std::unique_ptr<PrefillPool> take(std::unique_ptr<PrefillPool>& list, int device,
+                                             bool must_retain_backing = false) {
         auto* link = &list;
-        while (*link && (*link)->device != device) {
+        while (*link && ((*link)->device != device ||
+                        (must_retain_backing && !(*link)->retains_backing))) {
             link = &(*link)->next;
         }
         auto pool = std::move(*link);
@@ -77,6 +118,7 @@ private:
     }
 
     std::mutex mutex_;
+    PrefillPool* retained_ = nullptr;
     std::atomic<bool> has_pending_{false};
     std::unique_ptr<PrefillPool> idle_;
     std::unique_ptr<PrefillPool> pending_;
@@ -277,6 +319,7 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
         int disabled = 0;
         check(cudaMemPoolSetAttribute(pool->handle, cudaMemPoolReuseAllowInternalDependencies,
                                       &disabled), "Configure prefill workspace pool");
+        pools.configure_retention(*pool);
     }
     ScratchLayout layout;
     const TileBuffers buffers(layout, capacity);

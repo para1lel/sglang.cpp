@@ -1,11 +1,13 @@
 # sglang.cpp
 
 A C++ and CUDA C++ inference engine in development for **Qwen3.8-27B-FP8 on one NVIDIA B200**.
-The native `sglang_cuda` library implements paged MXFP8 KV-cache writes and single-request
-causal grouped-query attention for the checkpoint's full-attention shape. Model loading,
-token generation, and serving are subsequent milestones.
+The native decoder loads the official text weights and runs all 64 layers for one eager
+greedy token-ID request. It uses paged MXFP8 KV storage in the 16 full-attention layers
+and carries Gated DeltaNet state through the other 48 layers.
 
-The public C++ API is in
+The reusable runtime API is in
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L34)<!-- prefix: "class Decode" -->.
+The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
 [`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L32)<!-- prefix: "__device__ i" -->.
@@ -22,8 +24,9 @@ nvidia-smi --query-gpu=index,name,uuid,memory.free --format=csv
 bash tools/build.sh --build-dir build --gpu 4
 ```
 
-Choose an available B200 index in the last command. The build compiles `sglang_cuda` and
-both toolchain probes. It verifies the AOT probe's native cubin and resolved CUDA runtime.
+Choose an available B200 index in the last command. The build compiles `sglang-generate`,
+its native libraries, and both toolchain probes. It verifies the AOT probe's native cubin
+and resolved CUDA runtime.
 With `--gpu`, the AOT probe launches one kernel and checks its return value.
 Without `--build-dir`, the script uses a temporary build directory.
 
@@ -46,6 +49,29 @@ bash tools/build.sh --build-dir build --mxfp8-check
 
 `mxfp8-gqa-check` links `sglang_cuda`. Run the reported executable on a reserved B200
 to check cache bytes and attention outputs. This build command only compiles and links the check.
+
+## Generate text token IDs
+
+Use the absolute executable path printed by the build as `Native generator`. Select the
+UUID of a reserved B200 from the `nvidia-smi` output.
+
+```bash
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
+  "$GENERATOR" --device 0 --prompt-ids 760,6511,314,9338,369 \
+  --max-new-tokens 8 --warmup 2 --repeats 7
+```
+
+Set `GENERATOR` to that executable path before running the command. The default checkpoint is
+`/data0/shared/Qwen3.8-27B-FP8`. Use `--prompt-file` for IDs separated by commas or ASCII whitespace,
+`--stop-token` to finish after emitting that ID, and `--top-logits` to report the highest
+raw logits per generated token.
+
+The JSON report includes token IDs, finish reason, model load time, completed request times,
+and output tokens per second. Each request starts with fresh attention state and includes
+prompt processing and generation. The timing samples exclude warmups and model loading.
+Peak device allocation bytes count the decoder's requested CUDA allocations for the model
+and one request. C++ callers link the `sglang_decoder` target and reuse `sglang::Decoder`
+across requests.
 
 ## Continue development
 

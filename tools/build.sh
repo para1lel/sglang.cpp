@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
     echo "Usage: bash tools/build.sh [--build-dir DIRECTORY] [--gpu INDEX] [--nvrtc]"
     echo "                           [--mxfp8-check]"
-    echo "The default gate builds the library and probes, then removes temporary files."
+    echo "The default gate builds sglang-generate, its libraries, and the toolchain probes."
     echo "Use --build-dir to retain incremental build files for this checkout."
     echo "Use --gpu to run on the physical device listed by nvidia-smi."
     echo "Add --nvrtc to select the runtime compilation probe for the GPU run."

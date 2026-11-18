@@ -73,8 +73,11 @@ fi
 echo "NVRTC library: $nvrtc"
 sha256sum "$nvrtc_probe" "$nvrtc"
 
-"$xmake" build -v sglang_cuda
-sha256sum "$work/build/lib/libsglang_cuda.a"
+"$xmake" build -v sglang-generate
+generator="$work/build/bin/sglang-generate"
+echo "Native generator: $generator"
+sha256sum "$generator" "$work/build/lib/libsglang_checkpoint.a" \
+    "$work/build/lib/libsglang_cuda.a" "$work/build/lib/libsglang_decoder.a"
 if [[ "$check" == y ]]; then
     "$xmake" build -v mxfp8-gqa-check
     sha256sum "$work/build/bin/mxfp8-gqa-check"

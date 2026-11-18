@@ -72,6 +72,16 @@ Use the [frozen streaming protocol](../benchmarks/streaming/README.md#frozen-mea
 
 For each workload, require every warmup and measured request to pass stream validation. Divide the native median output tokens/s by the frozen baseline median. Require that ratio to exceed `strict_throughput_ratio_gt` in the frozen reference. Compare native p95 TTFT, TPOT, and end-to-end latency with `p95_latency_ceilings_ms` from the same reference. Require each value to meet its ceiling. Retain the frozen output IDs as historical diagnostics.
 
+### Fused FP8 decode
+
+Compare with the published native control under the same checkpoint and precision policy. Require identical greedy IDs and full-vocabulary BF16 logit bits for W1 and W2. Check eager decode and fresh and reused graphs. Exercise exact GQA and direct fallback at their [dispatch bounds](development.md#runtime-path). Run the [prefill](development.md#chunked-prefill-verification), [streaming](development.md#streaming-verification), and [MTP](development.md#serial-greedy-mtp) checks before timing.
+
+Trace actual forward group sizes and row modes. Confirm fused launches for an eligible single target decode row and packed projections for eligible groups of two to four rows. Include a group containing decode and single-row prefill. Compare shape and alignment fallbacks with the separate native operations. For steady decode timing, match execution mode, context length, and KV capacity. Record graph captures and replays.
+
+Compare fused SwiGLU BF16 results with identical and disjoint gate and up output spans. Require `cudaErrorInvalidValue` before launch for identical gate and up spans in fallback, partial output overlaps, and output overlaps with inputs.
+
+The studies in `artifacts/fp8-decode-next/report.md` and `artifacts/decode-combined/report.md` used earlier source. Qualify the promoted build under the frozen serial and concurrent protocols.
+
 ### Chunked prefill
 
 Before timing, run the [prefill acceptance checks](development.md#chunked-prefill-verification). Compare full BF16 logit rows and committed KV and GDN state with the row-wise native control under the same precision policy. For device prefill time, place CUDA events around prompt processing. End the interval before the first LM head. For HTTP TTFT, measure from submission to the first token. Record chunk sizes, tails, and active lanes. Measure decode token gaps while mixed steps process prompt chunks.

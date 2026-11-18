@@ -21,7 +21,7 @@ The first `sm_100` cubin built with XMake, GCC 15.3.0, and CUDA 13.4.92. It retu
 
 ## First task and next evidence
 
-From the repository root, run `bash tools/build.sh` to build the generator, libraries, and probes. For a device run, set `GPU_INDEX` to the reserved B200's physical index.
+Run `bash tools/build.sh` from the repository root. For a device run, set `GPU_INDEX` to the reserved B200's physical index.
 
 ```bash
 bash tools/build.sh --gpu "${GPU_INDEX:?set the reserved B200 index}"
@@ -35,15 +35,15 @@ The [baseline smoke procedure](performance.md#first-baseline-run) produced the s
 
 ### P1 runtime probe
 
-Use the managed default Pixi toolchain and reserve one B200. From the repository root, set `GPU_INDEX` to its physical index and run:
+Use the managed Pixi toolchain. Set `GPU_INDEX` to the reserved B200's physical index.
 
 ```bash
 bash tools/build.sh --build-dir build --nvrtc --gpu "${GPU_INDEX:?set the reserved B200 index}"
 ```
 
-The script checks that NVRTC resolves inside Pixi and that `libcuda.so.1` resolves outside Pixi. It exposes only the selected GPU by UUID. Check that the probe reports that UUID, `compute_capability=10.0`, `architecture=sm_100`, and the device allocation size.
+The script checks NVRTC inside Pixi and `libcuda.so.1` outside Pixi. It exposes only the selected GPU. Check its UUID, `compute_capability=10.0`, `architecture=sm_100`, and the allocation size.
 
-The [probe](../tools/nvrtc-probe.cpp#L265)<!-- prefix: "void run_pro" --> uses one CUDA context for both launches. The cold lookup compiles a native cubin and loads its function. The warm lookup reuses that function in the same context. The probe disables NVRTC's persistent cache.
+The [probe](../tools/nvrtc-probe.cpp#L265)<!-- prefix: "void run_pro" --> disables NVRTC's persistent cache. The cold lookup compiles a native cubin and loads its function. The warm lookup reuses the function in the same CUDA context.
 
 Expect these results in order:
 
@@ -51,13 +51,13 @@ Expect these results in order:
 - `phase=warm cache=hit compiled=0` with `compile_ms=0.000000`.
 - `NVRTC probe passed` followed by exit status zero.
 
-Both phase lines must report `verified_elements=257 first=42 last=298`. The probe checks every element after each launch. The `kernel_ms` field measures each completed launch with CUDA events, after buffer reset and before the host copy.
+Both phases verify all elements and report `verified_elements=257 first=42 last=298`. CUDA events measure `kernel_ms` after buffer reset and before the host copy.
 
-Keep the command, full output, allocation size, and device, library, and binary identities. A missing phase, incorrect result, or nonzero exit fails this fixed-kernel and context-scoped cache check.
+Keep the command, full output, allocation size, and device, library, and binary identities.
 
 ### P2 GQA cache contract
 
-K and V use E4M3 for four 256-channel heads, with one E8M0 scale per 32 contiguous channels. FP8 weights use BF16 inverse scales per 128×128 block. [Checkpoint investigation](research/checkpoint.md)
+K and V use E4M3 for four 256-channel heads, with one E8M0 scale per 32 contiguous channels. E4M3 weights use BF16 inverse scales per 128×128 block. [Checkpoint investigation](research/checkpoint.md)
 
 Separate K and V buffers use 131,072 payload bytes and 4,096 scale bytes per tensor per 128-token page. The device table maps logical pages to distinct physical pages. [Cache layout](../include/sglang/mxfp8_gqa.h#L22)<!-- prefix: "/// Separate" --> · [Page table](../include/sglang/mxfp8_gqa.h#L34)<!-- prefix: "struct Mxfp8" -->
 
@@ -94,25 +94,29 @@ The [exact decode check](../tests/mxfp8_gqa_check.cu#L518)<!-- prefix: "void che
 | --- | --- | --- |
 | `sglang-generate` | Parse one token-ID prompt, run requests serially, and write one JSON result. | [CLI entry](../apps/sglang-generate.cpp#L227)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests using operators from `sglang_cuda`. | [Decoder API](../include/sglang/decoder.h#L47)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L190)<!-- prefix: "void Decoder" --> |
+| `sglang_decoder` | Own device weights and run requests using `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L47)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L221)<!-- prefix: "void Decoder" --> |
 
-The loader uses LLVM Support 23.1.5 from Pixi (`llvmdev` and `libllvm23`, Apache-2.0 WITH LLVM-exception) only to parse checkpoint JSON. The loader owns the safetensors validation and mapping. [JSON parser](../src/checkpoint.cpp#L170)<!-- prefix: "json::Object" --> · [Link configuration](../xmake.lua#L60)<!-- prefix: "target(\"sgla" -->
+The loader uses Pixi's LLVM Support 23.1.5 (`llvmdev` and `libllvm23`, Apache-2.0 WITH LLVM-exception) only for JSON. [JSON parser](../src/checkpoint.cpp#L170)<!-- prefix: "json::Object" --> · [Link configuration](../xmake.lua#L60)<!-- prefix: "target(\"sgla" -->
 
 #### Runtime path
 
-The decoder checks tensor names, dtypes, and shapes before upload. Upload retains mappings and allocations through completion. Requests retain shared weights through deferred cleanup. FP8 projections use E4M3 weights and BF16 inverse scales. BF16 inputs quantize to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L97)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L171)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L141)<!-- prefix: "__global__ v" -->
+The decoder validates tensor names, dtypes, and shapes before upload. Upload retains mappings and allocations until completion. Deferred cleanup retains shared weights. FP8 projections quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L97)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L171)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L141)<!-- prefix: "__global__ v" -->
 
-Serial MTP-off generation reuses its stream and request storage, growing capacity as needed. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L272)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L401)<!-- prefix: "void Request" -->
+Serial MTP-off generation reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L272)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L401)<!-- prefix: "void Request" -->
 
-MTP-off prefill processes up to 128 consecutive tokens per layer, preserving row arithmetic, recurrent order, and causal attention. Single rows use row-wise prefill. The final row supplies initial logits. Serial decode replays a graph. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L313)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L172)<!-- prefix: "void Decoder" -->
+MTP-off prefill processes up to 128 consecutive tokens per layer, preserving row arithmetic, recurrent order, and causality. Single rows use row-wise prefill. The final row supplies initial logits. Serial decode replays a graph. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L313)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L203)<!-- prefix: "void Decoder" -->
 
-Target prefill and MTP drafts use direct attention. Eager target decode, including MTP verification, selects exact attention when the zero-based position is below score capacity. Graph capture selects exact attention when page-rounded KV fits that capacity. Both exact graph kernels read the device position. Other decode steps use direct attention. [GQA dispatch](../src/decoder_forward.cpp#L82)<!-- prefix: "cudaError_t " -->
+Target prefill and MTP drafts use direct attention. Eager target decode selects exact attention at zero-based positions below score capacity. Graph capture selects exact attention when page-rounded KV slots fit that capacity. Exact graphs read device positions. Other decode uses direct attention. [GQA dispatch](../src/decoder_forward.cpp#L94)<!-- prefix: "cudaError_t " -->
 
-The lane stream orders KV append, scoring, replay, and gating. Score capacity is the lesser of allocated KV slots and 5,120. Layers store 24 FP32 scores per slot in the logits allocation. The LM head then writes logits. [Workspace](../src/decoder_resources.cpp#L381)<!-- prefix: "ExactGqaWork" -->
+The lane stream orders KV append, scoring, replay, and gating. Score capacity is the lesser of allocated KV slots and 5,120. The logits allocation holds 24 FP32 scores per slot until the LM head writes logits. [Workspace](../src/decoder_resources.cpp#L381)<!-- prefix: "ExactGqaWork" -->
 
-Single positions use FP8 GEMV. Its wide kernel uses four warps per block for widths divisible by 512 and 16-byte-aligned buffers. Eligible one-position projections share packed GEMM weight loads. Other operators and GEMV fallbacks run per lane. [Projection dispatch](../src/decoder_forward.cpp#L44)<!-- prefix: "void project" --> · [GEMV](../src/text_ops.cu#L651)<!-- prefix: "cudaError_t " --> · [GEMM](../src/text_ops.cu#L669)<!-- prefix: "cudaError_t " -->
+Tuned FP8 projections require a forward group containing only one target decode row. This covers graph and eager decode, including MTP verification. A lone batch decode row can qualify when prefill chunks run separately. GQA combines Q/gate, K, and V in one launch. The MLP fusion rounds gate and up to BF16 before SwiGLU. GDN QKV and Z stay separate. [Lane selection](../src/decoder_forward.cpp#L34)<!-- prefix: "bool single_" --> · [Batch grouping](../src/decoder_batch.cpp#L186)<!-- prefix: "if (rows[slo" -->
 
-Single-row BF16 RMSNorm uses vector loads at width 5,120 with 16-byte-aligned branch, gains, and optional residual. Other single rows and multirow calls use generic kernels. [RMSNorm dispatch](../src/text_ops.cu#L822)<!-- prefix: "cudaError_t " -->
+Tuned GEMV requires 16-byte-aligned FP8 weights and activations and input widths of 5,120, 6,144, or 17,408. Both fusions require the same alignment and width 5,120. Q/gate, K, and V require 12,288, 1,024, and 1,024 output rows. Gate and up require 17,408 each. Other valid inputs use separate operations. Output spans must be disjoint from inputs and each other. Fused SwiGLU permits identical gate and up spans. [Tuned GEMV](../src/text_decode_fp8.cu#L276)<!-- prefix: "cudaError_t " --> · [Fused QKV](../src/text_decode_fp8.cu#L298)<!-- prefix: "cudaError_t " --> · [Fused SwiGLU](../src/text_decode_fp8.cu#L321)<!-- prefix: "cudaError_t " --> · [Buffers](../include/sglang/decoder_cuda.cuh#L49)<!-- prefix: "// Read-only" -->
+
+Row-wise prefill and MTP drafts use GEMV. Eligible groups of two to four lanes use packed GEMM, with per-lane GEMV fallback. Wide GEMV and packed GEMM require 512-divisible input widths and 16-byte-aligned FP8 payloads. A general FP8 GEMM backend remains pending. [GEMV](../src/text_ops.cu#L651)<!-- prefix: "cudaError_t " --> · [GEMM](../src/text_ops.cu#L669)<!-- prefix: "cudaError_t " -->
+
+Single-row BF16 RMSNorm uses vector loads at width 5,120 with 16-byte-aligned branch, gains, and optional residual. Other calls use generic kernels. [RMSNorm dispatch](../src/text_ops.cu#L822)<!-- prefix: "cudaError_t " -->
 
 #### Constraints and failure behavior
 
@@ -128,11 +132,11 @@ Multirow scratch uses per-device pools. Out-of-memory or unsupported pooling sel
 
 #### Verification
 
-Freeze independent reference inputs and precision-aware tolerances before comparison. Check tensor names, shapes, dtypes, and scales. Compare layer outputs and state on model shapes. Require exact metadata and specified packed bytes.
+Freeze independent inputs and precision-aware tolerances. Compare layer outputs and state on model shapes. Require exact tensor names, shapes, dtypes, scales, and specified packed bytes.
 
-Use the [P2 verifier](#p2-gqa-verification) for MXFP8 encoding, causal attention, and page reuse. Check KV positions and page ownership through append and decode. Check BF16 convolution history and FP32 recurrent state through GDN transitions. Compare supported cache restores and continuations with fresh native execution under the same precision policy. [Independent GDN check](../tests/decoder/gdn_check.cu#L239)<!-- prefix: "void verify_" -->
+Use the [P2 verifier](#p2-gqa-verification) for MXFP8 encoding, causal attention, and page reuse. Check KV positions and ownership through append and decode. Check BF16 convolution history and FP32 recurrent state. Compare supported cache restores and continuations with fresh native execution under the same precision policy. [Independent GDN check](../tests/decoder/gdn_check.cu#L239)<!-- prefix: "void verify_" -->
 
-Follow the [host build procedure](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to the printed generator. Reserve a B200 with space for weights and request state. Set `GPU_UUID` to its UUID. The process sees that UUID as CUDA ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L76)<!-- prefix: "\"$xmake\" bui" -->
+Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to its path and `GPU_UUID` to the reserved B200 UUID. CUDA exposes it as ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L76)<!-- prefix: "\"$xmake\" bui" -->
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
@@ -140,11 +144,11 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     --device 0 --prompt-ids 760,6511,314,9338,369 --max-new-tokens 8 --repeats 2
 ```
 
-Check the echoed prompt, eight in-range output IDs, and `length`. Require identical IDs and finish reasons across runs. Set budget one and `--stop-token` to the first native ID. Require one output ID and `stop`. At zero budget, require no IDs and `length`. To check reset, repeat the prompt after another request on the same decoder.
+Check the prompt echo, eight in-range IDs, and `length`. Require identical IDs and finish reasons across runs. At budget one, set `--stop-token` to the first native ID. Require one ID and `stop`. At zero budget, require no IDs and `length`. Check reset by repeating the prompt after another request on the same decoder.
 
-Check greedy selection against the BF16 maximum and the lowest token ID at a tie. Compare captured logits with independent calculations. Use `--top-logits 248320` on a short request to check vocabulary shape and ranking. [Request ranking check](../tests/decoder/request_check.cpp#L171)<!-- prefix: "void check_r" -->
+Check BF16 argmax and lowest-ID tie breaking. Compare logits with independent calculations. Use `--top-logits 248320` to check vocabulary shape and ranking on a short request. [Request ranking check](../tests/decoder/request_check.cpp#L171)<!-- prefix: "void check_r" -->
 
-The [FP8 fixture](../benchmarks/vllm/small-fp8.json#L2)<!-- prefix: "\"prompt_toke" --> supplies the short prompt. Use the [vLLM IDs](../benchmarks/vllm/small-fp8-result.json#L20)<!-- prefix: "\"output_ids\"" --> and frozen raw logits for historical diagnostics. Capture identity is in `artifacts/native-decoder-verification/final-evidence.sha256`. The [historical verifier](../tests/decoder/run_native.py#L117)<!-- prefix: "def validate" --> applies the former cross-engine checks.
+Historical diagnostics use the [FP8 prompt](../benchmarks/vllm/small-fp8.json#L2)<!-- prefix: "\"prompt_toke" -->, [vLLM IDs](../benchmarks/vllm/small-fp8-result.json#L20)<!-- prefix: "\"output_ids\"" -->, and frozen logits. See `artifacts/native-decoder-verification/final-evidence.sha256` and the [cross-engine verifier](../tests/decoder/run_native.py#L117)<!-- prefix: "def validate" -->.
 
 #### Chunked prefill verification
 
@@ -203,16 +207,16 @@ Require `passed` in `status.json` for each mode. Check serial oracle streams and
 
 ## Runnable milestones
 
-The discussion proposes these stages after adoption. Each row gives a test and the evidence needed to close it if approved. Preserve the exact invocation, inputs, expected result, and actual output with each milestone.
+For each proposed milestone, retain the exact invocation, inputs, expected result, and actual output.
 
 | Stage | Run | Accept when |
 | --- | --- | --- |
-| P0 · Model and baseline | Inspect the pinned tensors and configuration. Run one fixed greedy text request through isolated vLLM on the B200. | The manifest resolves the model identity. The request reproduces. Record the single-card memory budget, reference map, dependency decisions, and smallest experiment for each open risk. |
-| P1 · Runtime | Run the [P1 runtime probe](#p1-runtime-probe) on one B200. | The cold miss and warm hit each complete and verify the full output. Retain the device, build, cache, allocation, and timing evidence. |
-| P2 · Operators and one layer | Run FP8 GEMM, normalization, RoPE, [MXFP8 GQA](#p2-gqa-cache-contract), GDN, FFN, and sampling on verified model shapes. Exercise each applicable layer type. | Operator and layer outputs meet prespecified independent reference tolerances. Capture state updates and per-shape timings. |
-| P3 · Text generation | Run the [native text decoder checks](#verification) with the real checkpoint. | Independent math checks pass under the native precision policy. Greedy selection, deterministic repeats, state, counts, and finish behavior meet the native contract. Record output tokens/s, latency, and peak memory. |
-| P4 · Cache and MTP | Compare fresh execution with prefix hits, restore and replay, and native MTP on and off. Exercise zero, partial, and full acceptance, cancellation, eviction, and reuse. | Committed state and continuation agree with fresh target execution. Sampling preserves the target distribution. Rejected tokens never enter a shared prefix. Released storage is safe to reuse. |
-| P5 · Serving and media | Use an independent client for text, image, and video requests. Exercise streams, all constraint modes, continuous batching, chunked prefill, cancellation, and a sustained concurrent run. | Verify the agreed API fixtures, media inputs and outputs, stop reasons, valid constrained outputs, and cleanup. Check for leaks and stale state across requests. |
-| P6 · End-to-end performance | Profile a named workload. Change the limiting path. Repeat the baseline and candidate runs under the benchmark agreement. | Each required row meets its agreed throughput and latency targets and passes correctness. Retain raw samples, before/after profiles, and the decision to keep or revert the change. |
+| P0 · Model and baseline | Inspect pinned tensors and configuration. Run the fixed greedy request with isolated vLLM on B200. | Reproduce the request and resolve model identity. Record memory budget, reference map, dependency decisions, and experiments for open risks. |
+| P1 · Runtime | Run the [P1 runtime probe](#p1-runtime-probe). | Cold and warm launches verify every element and meet the probe's cache checks. |
+| P2 · Operators and one layer | Exercise FP8 GEMM, normalization, RoPE, [MXFP8 GQA](#p2-gqa-cache-contract), GDN, FFN, and sampling on model shapes. | Operator and layer outputs meet prespecified independent tolerances. Record state updates and per-shape timings. |
+| P3 · Text generation | Run the [native decoder checks](#verification) with the checkpoint. | Math, greedy repeats, state, counts, and finish behavior pass. Record output tokens/s, latency, and peak memory. |
+| P4 · Cache and MTP | Compare fresh execution with prefix hits, restore and replay, and MTP on and off. Test zero, partial, and full acceptance, cancellation, eviction, and reuse. | Committed state and continuation match fresh execution. Sampling preserves the target distribution. Shared prefixes exclude rejected tokens. Released storage is safe to reuse. |
+| P5 · Serving and media | Use an independent client for text, image, and video. Exercise streaming, all constraints, batching, chunked prefill, cancellation, and sustained concurrency. | API fixtures, media inputs and outputs, stop reasons, constrained outputs, and cleanup pass. Check leaks and stale state. |
+| P6 · End-to-end performance | Profile a workload and change its limiting path. Repeat paired runs under the [benchmark agreement](performance.md). | Required rows pass correctness and meet throughput and latency targets. Keep raw samples, before/after profiles, and the adoption decision. |
 
-The proposed P0 time budget is three to five working days. Open questions need an owner and a discriminating experiment. Record raw runs in ignored `artifacts/` storage. Keep accepted decisions and reproducible procedures in the maintained documents.
+P0 has a proposed budget of three to five working days. Assign an owner and experiment to each open question. Keep raw runs in ignored `artifacts/` and accepted procedures in maintained docs.

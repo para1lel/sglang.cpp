@@ -39,4 +39,25 @@ cudaError_t exact_decode_gqa_attention(
     Mxfp8KvCache cache, Mxfp8PageTable pages, const int* position, const __nv_bfloat16* queries,
     __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream);
 
+struct DecodeFp8Projection {
+    const std::uint8_t* values;
+    const __nv_bfloat16* scales;
+    __nv_bfloat16* output;
+    int rows;
+};
+
+// Read-only activation and weight spans may overlap. Output spans must be disjoint from every
+// input span and from each other, including when they are views of one allocation. Invalid spans
+// return cudaErrorInvalidValue before launch. Gate/up has the fused exception documented below.
+cudaError_t decode_fp8_project(TextFp8ActivationView input, DecodeFp8Projection projection,
+                               int width, cudaStream_t stream);
+cudaError_t decode_fp8_qkv(TextFp8ActivationView input, DecodeFp8Projection query,
+                           DecodeFp8Projection key, DecodeFp8Projection value, int width,
+                           cudaStream_t stream);
+// The fused 5120-by-17408 path requires 16-byte-aligned FP8 values. It writes only gate.output and
+// accepts identical gate and up output spans. Fallback uses up.output as scratch and requires
+// disjoint spans. Both paths return SwiGLU in gate.output.
+cudaError_t decode_fp8_gate_up(TextFp8ActivationView input, DecodeFp8Projection gate,
+                               DecodeFp8Projection up, int width, cudaStream_t stream);
+
 }

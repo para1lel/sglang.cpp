@@ -21,11 +21,19 @@ struct GraphLane {
     TextGdnMode mode;
 };
 
+DecodeFp8Projection decode_projection(Fp8Weight weight, Bf16* output) {
+    return {weight.values, weight.scales, output, weight.rows};
+}
+
 template <typename Lane>
 struct LayerBatch {
     const Lane* lanes;
     int count;
     cudaStream_t stream;
+
+    bool single_decode() const {
+        return count == 1 && lanes[0].mode == TextGdnMode::decode;
+    }
 
     template <typename Function>
     void each(Function function) const {
@@ -45,8 +53,12 @@ struct LayerBatch {
         if (count == 1) {
             const auto& work = lanes[0].request->work;
             const TextFp8ActivationView input{work.activation.values, work.activation.scales};
-            check(text_fp8_gemv(weight.values, weight.scales, input, weight.rows, weight.columns,
-                                work.*output, stream), "Run FP8 projection");
+            const auto status = single_decode()
+                ? decode_fp8_project(input, decode_projection(weight, work.*output),
+                                     weight.columns, stream)
+                : text_fp8_gemv(weight.values, weight.scales, input, weight.rows, weight.columns,
+                                 work.*output, stream);
+            check(status, "Run FP8 projection");
             return;
         }
         static_assert(decoder_batch_max_lanes <= text_fp8_max_batch);
@@ -125,9 +137,19 @@ void attend_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
 template <typename Lane>
 void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
     batch.quantize(&Workspace::normalized, hidden_size);
-    batch.project(layer.q_gate, &Workspace::q_gate);
-    batch.project(layer.key, &Workspace::keys);
-    batch.project(layer.value, &Workspace::values);
+    if (batch.single_decode() && layer.q_gate.columns == hidden_size &&
+        layer.key.columns == hidden_size && layer.value.columns == hidden_size) {
+        const auto& work = batch.lanes[0].request->work;
+        check(decode_fp8_qkv({work.activation.values, work.activation.scales},
+                             decode_projection(layer.q_gate, work.q_gate),
+                             decode_projection(layer.key, work.keys),
+                             decode_projection(layer.value, work.values), hidden_size,
+                             batch.stream), "Run decode QKV projections");
+    } else {
+        batch.project(layer.q_gate, &Workspace::q_gate);
+        batch.project(layer.key, &Workspace::keys);
+        batch.project(layer.value, &Workspace::values);
+    }
     batch.each([&](const Lane& lane, Workspace&) {
         auto& request = *lane.request;
         attend_gqa(layer, request, request.caches[cache_index], lane.position, lane.mode,
@@ -140,12 +162,21 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
 template <typename Lane>
 void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
     batch.quantize(&Workspace::normalized, hidden_size);
-    batch.project(layer.mlp_gate, &Workspace::mlp_gate);
-    batch.project(layer.mlp_up, &Workspace::mlp_up);
-    batch.each([&](const Lane&, Workspace& work) {
-        check(text_swiglu(work.mlp_gate, work.mlp_up, intermediate_size, work.mlp_gate,
-                          batch.stream), "Apply SwiGLU");
-    });
+    if (batch.single_decode() && layer.mlp_gate.columns == hidden_size &&
+        layer.mlp_up.columns == hidden_size) {
+        const auto& work = batch.lanes[0].request->work;
+        check(decode_fp8_gate_up({work.activation.values, work.activation.scales},
+                                 decode_projection(layer.mlp_gate, work.mlp_gate),
+                                 decode_projection(layer.mlp_up, work.mlp_up), hidden_size,
+                                 batch.stream), "Run decode gate and up projections with SwiGLU");
+    } else {
+        batch.project(layer.mlp_gate, &Workspace::mlp_gate);
+        batch.project(layer.mlp_up, &Workspace::mlp_up);
+        batch.each([&](const Lane&, Workspace& work) {
+            check(text_swiglu(work.mlp_gate, work.mlp_up, intermediate_size, work.mlp_gate,
+                              batch.stream), "Apply SwiGLU");
+        });
+    }
     batch.quantize(&Workspace::mlp_gate, intermediate_size);
     batch.project(layer.mlp_down, &Workspace::hidden);
 }

@@ -54,7 +54,7 @@ target("sglang_cuda")
     add_linkdirs(path.join(toolkit, "lib"), {public = true})
     add_rpathdirs(path.join(toolkit, "lib"), {interface = true})
     add_syslinks("cudart", {public = true})
-    add_files("src/mxfp8_gqa.cu")
+    add_files("src/mxfp8_gqa.cu", "src/text_decode_fp8.cu")
     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
 
 target("sglang_checkpoint")

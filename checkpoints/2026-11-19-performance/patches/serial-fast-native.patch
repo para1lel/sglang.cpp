@@ -1,0 +1,2988 @@
+diff --git a/selected/apps/fp8_prefill_option.h b/source/apps/fp8_prefill_option.h
+index 62761ec..e6a8367 100644
+--- a/selected/apps/fp8_prefill_option.h
++++ b/source/apps/fp8_prefill_option.h
+@@ -14,12 +14,17 @@ inline Fp8PrefillPolicy parse_fp8_prefill(std::string_view value) {
+     if (value == "tensor-core") {
+         return Fp8PrefillPolicy::tensor_core;
+     }
+-    throw std::invalid_argument("Expected --fp8-prefill exact or tensor-core");
++    if (value == "fast-native") {
++        return Fp8PrefillPolicy::fast_native;
++    }
++    throw std::invalid_argument("Expected --fp8-prefill exact, tensor-core or fast-native");
+ }
+ 
+ inline constexpr char fp8_prefill_usage[] =
+     "FP8 prefill defaults to exact. Tensor Core prefill uses a different FP32 summation order.\n"
+     "Model scores and output token IDs can differ, even when the top scores are far apart.\n"
+-    "MTP prompt seeding uses row-wise execution with either policy.\n";
++    "MTP prompt seeding uses row-wise execution with exact and tensor-core.\n"
++    "Fast-native selects tensor-core prefill, staged GDN, MXFP8 Flash prefill, and guarded "
++    "serial graph decode. It requires MTP off.\n";
+ 
+ }
+diff --git a/selected/apps/sglang-generate.cpp b/source/apps/sglang-generate.cpp
+index 9932d9d..00bf358 100644
+--- a/selected/apps/sglang-generate.cpp
++++ b/source/apps/sglang-generate.cpp
+@@ -35,5 +35,5 @@ void usage(std::ostream& output) {
+     output << "Usage: sglang-generate (--prompt-ids ID,ID,... | --prompt-file FILE)\n"
+            << "                       [--max-new-tokens N] [--stop-token ID] [--top-logits N]\n"
+            << "                       [--mtp-steps N] (0–4, default 0)\n"
+-           << "                       [--fp8-prefill exact|tensor-core]\n"
++           << "                       [--fp8-prefill exact|tensor-core|fast-native]\n"
+            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
+diff --git a/selected/apps/sglang-server.cpp b/source/apps/sglang-server.cpp
+index 47bbc45..ba62de0 100644
+--- a/selected/apps/sglang-server.cpp
++++ b/source/apps/sglang-server.cpp
+@@ -79,6 +79,10 @@ Arguments parse_arguments(int argc, char** argv) {
+     if (arguments.mtp_steps != 0 && arguments.max_active != 1) {
+         throw std::invalid_argument("--mtp-steps requires --max-active 1");
+     }
++    if (arguments.fp8_prefill == sglang::Fp8PrefillPolicy::fast_native &&
++        arguments.max_active != 1) {
++        throw std::invalid_argument("Fast-native requires --max-active 1");
++    }
+     return arguments;
+ }
+ 
+@@ -159,7 +163,7 @@ int main(int argc, char** argv) {
+     if (argc == 2 && std::string_view(argv[1]) == "--help") {
+         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
+                      " [--max-active N] [--mtp-steps N]\n"
+-                     "                     [--fp8-prefill exact|tensor-core] [--trace-batches]\n"
++                     "                     [--fp8-prefill exact|tensor-core|fast-native] [--trace-batches]\n"
+                      "Active requests: 1 by default, up to 4.\n"
+                      "MTP steps: 0 by default, up to 4 with one active request.\n"
+                      "Serves on 127.0.0.1 only. Default port: 17384.\n"
+diff --git a/selected/include/sglang/decoder.h b/source/include/sglang/decoder.h
+index 7111b4c..ae12c05 100644
+--- a/selected/include/sglang/decoder.h
++++ b/source/include/sglang/decoder.h
+@@ -27,6 +27,7 @@ enum class DecoderFinishReason {
+ struct DecoderCallbacks {
+     std::function<bool(int)> on_token;
+     std::function<bool()> is_cancelled;
++    std::function<int(int, const std::byte*, std::size_t)> teacher_token;
+ };
+ 
+ struct DecoderLogit {
+@@ -47,6 +48,7 @@ struct DecoderResult {
+ enum class Fp8PrefillPolicy {
+     exact,
+     tensor_core,
++    fast_native,
+ };
+ 
+ class Decoder {
+diff --git a/selected/include/sglang/decoder_internal.h b/source/include/sglang/decoder_internal.h
+index 3cb49a6..d1ce4db 100644
+--- a/selected/include/sglang/decoder_internal.h
++++ b/source/include/sglang/decoder_internal.h
+@@ -82,8 +82,8 @@ public:
+     std::size_t bytes() const;
+     TransferBuffers& transfers();
+     cudaStream_t stream() const;
+-    cudaGraphExec_t graph() const;
+-    void capture_graph(const std::function<void()>& enqueue);
++    cudaGraphExec_t graph(bool fast_attention) const;
++    void capture_graph(bool fast_attention, const std::function<void()>& enqueue);
+     void reclaim_deferred();
+     void open_stream(std::shared_ptr<const void> owners = nullptr);
+     void close_stream();
+@@ -163,6 +163,7 @@ struct Workspace {
+     TextFp8Activation activation;
+     TextLogitCandidate* argmax_scratch;
+     TextLogitCandidate* argmax;
++    float* fast_gqa_scratch = nullptr;
+ };
+ 
+ struct Request {
+@@ -205,7 +206,7 @@ struct Decoder::Model {
+     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
+     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
+                        decoder::PrefillWorkspace& workspace) const;
+-    void decode_graph(decoder::Request& request) const;
++    void decode_graph(decoder::Request& request, bool fast_attention) const;
+     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
+     void compute_logits(decoder::Request& request) const;
+     void compute_logits(decoder::Workspace& work, cudaStream_t stream) const;
+diff --git a/selected/include/sglang/decoder_prefill.h b/source/include/sglang/decoder_prefill.h
+index 65b3cf7..08343a2 100644
+--- a/selected/include/sglang/decoder_prefill.h
++++ b/source/include/sglang/decoder_prefill.h
+@@ -12,7 +12,7 @@ void reclaim_prefill_workspaces(int device);
+ 
+ class PrefillWorkspace {
+ public:
+-    PrefillWorkspace(cudaStream_t stream, int capacity);
++    PrefillWorkspace(cudaStream_t stream, int capacity, bool fast_native = false);
+     ~PrefillWorkspace();
+     PrefillWorkspace(const PrefillWorkspace&) = delete;
+     PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
+@@ -22,6 +22,7 @@ public:
+ 
+     cudaStream_t stream() const { return stream_; }
+     int capacity() const { return capacity_; }
++    bool fast_native() const { return fast_native_; }
+     void* data() const { return data_; }
+ 
+ private:
+@@ -29,6 +30,7 @@ private:
+ 
+     cudaStream_t stream_;
+     int capacity_;
++    bool fast_native_;
+     void* data_ = nullptr;
+     std::size_t bytes_ = 0;
+     cudaError_t release_status_ = cudaSuccess;
+diff --git a/source/include/sglang/mxfp8_fast_decode.h b/source/include/sglang/mxfp8_fast_decode.h
+new file mode 100644
+index 0000000..94c7d6c
+--- /dev/null
++++ b/source/include/sglang/mxfp8_fast_decode.h
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include "sglang/mxfp8_gqa.h"
++
++namespace sglang::decoder {
++
++inline constexpr int fast_gqa_max_lanes = 4;
++inline constexpr int fast_gqa_min_tokens = 512;
++inline constexpr int fast_gqa_max_tokens = 65536;
++inline constexpr int fast_gqa_max_parts = 64;
++inline constexpr int fast_gqa_partial_stride = 2 * mxfp8_head_dim + 3;
++
++constexpr int fast_gqa_parts(int capacity) {
++    const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
++    return pages < fast_gqa_max_parts ? pages : fast_gqa_max_parts;
++}
++
++constexpr std::size_t fast_gqa_workspace_elements(int capacity) {
++    return capacity >= fast_gqa_min_tokens && capacity <= fast_gqa_max_tokens
++        ? mxfp8_query_heads * (fast_gqa_parts(capacity) * fast_gqa_partial_stride + 1)
++        : 0;
++}
++
++struct FastGqaLane {
++    Mxfp8KvCache cache;
++    Mxfp8PageTable pages;
++    const __nv_bfloat16* queries;
++    __nv_bfloat16* output;
++    float* scratch;
++    const int* device_position;
++    int position;
++};
++
++struct FastGqaBatch {
++    FastGqaLane lanes[fast_gqa_max_lanes];
++};
++
++cudaError_t fast_decode_gqa_attention(FastGqaBatch batch, int count, cudaStream_t stream);
++cudaError_t fast_decode_gqa_fallback(FastGqaBatch batch, int count, cudaStream_t stream);
++
++}
+diff --git a/source/include/sglang/mxfp8_flash.h b/source/include/sglang/mxfp8_flash.h
+new file mode 100644
+index 0000000..df30f7c
+--- /dev/null
++++ b/source/include/sglang/mxfp8_flash.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "sglang/mxfp8_gqa.h"
++
++namespace sglang {
++
++enum class Mxfp8FlashWeights { compensated, bf16 };
++
++std::size_t mxfp8_flash_workspace_bytes(int first_query_position, int query_count);
++
++// Uses the native append format and attention buffer contract in mxfp8_gqa.h.
++// Scratch is optional, float-aligned, stream-owned and disjoint from the other buffers.
++cudaError_t mxfp8_flash_prefill(Mxfp8KvCache cache, Mxfp8PageTable pages, int valid_tokens,
++                               int first_query_position, int query_count,
++                               const __nv_bfloat16* queries, __nv_bfloat16* output,
++                               Mxfp8FlashWeights weights, void* scratch,
++                               std::size_t scratch_bytes, cudaStream_t stream);
++
++}
+diff --git a/source/include/sglang/text_gdn_chunk.h b/source/include/sglang/text_gdn_chunk.h
+new file mode 100644
+index 0000000..77d957a
+--- /dev/null
++++ b/source/include/sglang/text_gdn_chunk.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include "sglang/text_attention.h"
++
++namespace sglang {
++
++struct TextGdnPrepared {
++    const __nv_bfloat16* q;
++    const __nv_bfloat16* k;
++    const __nv_bfloat16* v;
++    const float* decay;
++    const float* beta;
++};
++
++struct TextGdnChunkScratch {
++    void* data = nullptr;
++    std::size_t bytes = 0;
++};
++
++inline constexpr std::size_t text_gdn_chunk_scratch_alignment = 16;
++
++std::size_t text_gdn_chunk_scratch_bytes(int token_count);
++std::size_t text_gdn_prefill_chunked_workspace_bytes(int token_count);
++
++cudaError_t text_gdn_chunk_forward(int token_count, TextGdnPrepared prepared,
++                                   float* recurrent, __nv_bfloat16* observable,
++                                   cudaStream_t stream, TextGdnChunkScratch scratch = {});
++
++cudaError_t text_gdn_chunk_convolved(int token_count, const __nv_bfloat16* convolved,
++                                     const __nv_bfloat16* b, const __nv_bfloat16* a,
++                                     TextGdnWeights weights, float* recurrent,
++                                     __nv_bfloat16* observable, cudaStream_t stream,
++                                     TextGdnChunkScratch scratch = {});
++
++cudaError_t text_gdn_prefill_chunked(int token_count, const __nv_bfloat16* qkv,
++                                     const __nv_bfloat16* z, const __nv_bfloat16* b,
++                                     const __nv_bfloat16* a, TextGdnWeights weights,
++                                     TextGdnState state, __nv_bfloat16* workspace,
++                                     std::size_t workspace_bytes, __nv_bfloat16* output,
++                                     cudaStream_t stream);
++
++}
+diff --git a/selected/src/decoder.cpp b/source/src/decoder.cpp
+index 610eda3..03f5613 100644
+--- a/selected/src/decoder.cpp
++++ b/source/src/decoder.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "sglang/decoder_cuda.cuh"
+ #include "sglang/decoder_mtp.h"
++#include "sglang/mxfp8_fast_decode.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -245,9 +246,13 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool
+ 
+ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
+                  Fp8PrefillPolicy fp8_prefill) {
+-    if (fp8_prefill != Fp8PrefillPolicy::exact && fp8_prefill != Fp8PrefillPolicy::tensor_core) {
++    if (fp8_prefill != Fp8PrefillPolicy::exact && fp8_prefill != Fp8PrefillPolicy::tensor_core
++        && fp8_prefill != Fp8PrefillPolicy::fast_native) {
+         throw std::invalid_argument("Invalid FP8 prefill policy");
+     }
++    if (enable_mtp && fp8_prefill == Fp8PrefillPolicy::fast_native) {
++        throw std::invalid_argument("Fast-native requires MTP off");
++    }
+     model_ = std::make_unique<Model>(checkpoint, cuda_device, fp8_prefill);
+     if (enable_mtp) {
+         model_->mtp_weights = std::make_shared<MtpDraftWeights>(
+@@ -287,6 +292,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
+                                      DecoderResult& result) const {
+     const auto cancelled = [&] { return callbacks.is_cancelled && callbacks.is_cancelled(); };
+     const int prompt_count = static_cast<int>(prompt.size());
++    const bool fast_native = fp8_prefill() == Fp8PrefillPolicy::fast_native;
+     int capacity = prompt_count + options.max_new_tokens - 1;
+     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
+     const RequestLease lease(request_in_use);
+@@ -304,11 +310,18 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
+             storage->memory.reclaim_deferred();
+         } else {
+             storage = std::make_unique<Request>(device, capacity, memory, lease.owns_slot());
++            if (fast_native && storage->decode_position) {
++                const auto elements = fast_gqa_workspace_elements(
++                    storage->pages.page_count * mxfp8_page_size);
++                if (elements != 0) {
++                    storage->work.fast_gqa_scratch = storage->memory.allocate<float>(elements);
++                }
++            }
+         }
+         auto& request = *storage;
+         request.reset();
+         auto& transfers = request.memory.transfers();
+-        transfers.logits.resize(options.top_logits > 0 ? vocab_size : 0);
++        transfers.logits.resize(options.top_logits > 0 || callbacks.teacher_token ? vocab_size : 0);
+         std::vector<DecoderLogit> ranking;
+         if (options.top_logits > 0) {
+             ranking.reserve(vocab_size);
+@@ -320,7 +333,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
+             }
+             {
+                 PrefillWorkspace workspace(request.memory.stream(),
+-                                           std::min(prompt_count, prefill_chunk_rows));
++                                           std::min(prompt_count, prefill_chunk_rows), fast_native);
+                 result.peak_device_allocation_bytes += workspace.bytes();
+                 const int tile_rows = workspace.bytes() ? workspace.capacity() : 1;
+                 for (int position = 0; position < prompt_count; position += tile_rows) {
+@@ -334,6 +347,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
+                 workspace.close();
+             }
+             int winner = -1;
++            int consumed = -1;
+             for (int step = 0; step < options.max_new_tokens; ++step) {
+                 if (cancelled()) {
+                     return DecoderFinishReason::cancelled;
+@@ -343,14 +357,30 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
+                         check(set_decode_position(request.decode_position, prompt_count,
+                                                   request.memory.stream()), "Set decode position");
+                     }
+-                    decode_graph(request);
++                    if (consumed != winner) {
++                        check(set_decode_position(&request.work.argmax->token_id, consumed,
++                                                  request.memory.stream()), "Set teacher token");
++                    }
++                    const int visible_tokens = prompt_count + step;
++                    const bool fast_attention = request.work.fast_gqa_scratch
++                        && visible_tokens >= fast_gqa_min_tokens;
++                    decode_graph(request, fast_attention);
+                 } else {
+                     if (step != 0) {
+-                        forward(request, winner, prompt_count + step - 1, TextGdnMode::decode);
++                        forward(request, consumed, prompt_count + step - 1, TextGdnMode::decode);
+                     }
+                     compute_logits(request);
+                 }
+                 winner = read_step(request);
++                consumed = winner;
++                if (callbacks.teacher_token) {
++                    consumed = callbacks.teacher_token(
++                        winner, reinterpret_cast<const std::byte*>(transfers.logits.data()),
++                        transfers.logits.size() * sizeof(Bf16));
++                    if (!valid_token(consumed)) {
++                        throw std::invalid_argument("Teacher token falls outside the vocabulary");
++                    }
++                }
+                 result.output_token_ids.push_back(winner);
+                 const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
+                 if (options.top_logits > 0) {
+@@ -385,6 +415,9 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+     if (options.mtp_steps != 0 && !model_->mtp_weights) {
+         throw std::invalid_argument("MTP weights must be enabled when constructing the decoder");
+     }
++    if (options.mtp_steps != 0 && callbacks.teacher_token) {
++        throw std::invalid_argument("Teacher forcing requires MTP off");
++    }
+     DecoderResult result;
+     result.peak_device_allocation_bytes = model_device_allocation_bytes();
+     if (callbacks.is_cancelled && callbacks.is_cancelled()) {
+diff --git a/selected/src/decoder_batch.cpp b/source/src/decoder_batch.cpp
+index 89f0f57..0e9af49 100644
+--- a/selected/src/decoder_batch.cpp
++++ b/source/src/decoder_batch.cpp
+@@ -119,7 +119,12 @@ struct DecoderBatch::State {
+ };
+ 
+ DecoderBatch::DecoderBatch(const Decoder& decoder)
+-    : state_(std::make_unique<State>(*decoder.model_)) {}
++{
++    if (decoder.model_->fp8_prefill() == Fp8PrefillPolicy::fast_native) {
++        throw std::invalid_argument("Fast-native requires serial generation");
++    }
++    state_ = std::make_unique<State>(*decoder.model_);
++}
+ 
+ DecoderBatch::~DecoderBatch() = default;
+ 
+diff --git a/selected/src/decoder_forward.cpp b/source/src/decoder_forward.cpp
+index 0df4618..3957729 100644
+--- a/selected/src/decoder_forward.cpp
++++ b/source/src/decoder_forward.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "sglang/decoder_batch.h"
+ #include "sglang/decoder_cuda.cuh"
++#include "sglang/mxfp8_fast_decode.h"
+ 
+ #include <type_traits>
+ 
+@@ -19,6 +20,7 @@ struct GraphLane {
+     Request* request;
+     const int* position;
+     TextGdnMode mode;
++    bool fast_attention;
+ };
+ 
+ DecodeFp8Projection decode_projection(Fp8Weight weight, Bf16* output) {
+@@ -114,7 +116,7 @@ cudaError_t read_gqa(Request& request, Mxfp8KvCache cache, Position position, Te
+ 
+ template <typename Position>
+ void attend_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
+-                Position position, TextGdnMode mode, cudaStream_t stream) {
++                Position position, TextGdnMode mode, bool fast_attention, cudaStream_t stream) {
+     auto& work = request.work;
+     if constexpr (std::is_same_v<Position, int>) {
+         check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm,
+@@ -128,8 +130,15 @@ void attend_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
+               "Normalize and rotate decode Q/K");
+         check(decode_kv_append(cache, request.pages, position, work.rope_keys, work.values, stream),
+               "Append decode MXFP8 KV");
++        if (fast_attention) {
++            const FastGqaBatch fast{{{cache, request.pages, work.rope_queries, work.attention,
++                                      work.fast_gqa_scratch, position, 0}}};
++            check(fast_decode_gqa_attention(fast, 1, stream), "Read guarded MXFP8 decode");
++        }
++    }
++    if (!fast_attention) {
++        check(read_gqa(request, cache, position, mode, stream), "Read causal MXFP8 attention");
+     }
+-    check(read_gqa(request, cache, position, mode, stream), "Read causal MXFP8 attention");
+     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
+           "Gate grouped-query attention");
+ }
+@@ -152,8 +161,12 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
+     }
+     batch.each([&](const Lane& lane, Workspace&) {
+         auto& request = *lane.request;
++        bool fast_attention = false;
++        if constexpr (std::is_same_v<Lane, GraphLane>) {
++            fast_attention = lane.fast_attention;
++        }
+         attend_gqa(layer, request, request.caches[cache_index], lane.position, lane.mode,
+-                   batch.stream);
++                   fast_attention, batch.stream);
+     });
+     batch.quantize(&Workspace::attention, text_gqa_q_width);
+     batch.project(layer.output, &Workspace::projected_attention);
+@@ -200,21 +213,22 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
+     forward_layers(lanes, count, stream);
+ }
+ 
+-void Decoder::Model::decode_graph(Request& request) const {
++void Decoder::Model::decode_graph(Request& request, bool fast_attention) const {
+     const auto stream = request.memory.stream();
+-    if (!request.memory.graph()) {
+-        request.memory.capture_graph([&] {
++    if (!request.memory.graph(fast_attention)) {
++        request.memory.capture_graph(fast_attention, [&] {
+             check(decode_embedding(embedding, vocab_size, hidden_size, request.work.argmax,
+                                    request.work.residual, stream),
+                   "Look up decode token embedding");
+-            const GraphLane lane{&request, request.decode_position, TextGdnMode::decode};
++            const GraphLane lane{&request, request.decode_position, TextGdnMode::decode,
++                                 fast_attention};
+             forward_layers(&lane, 1, stream);
+             compute_logits(request);
+             check(advance_decode_position(request.decode_position, stream),
+                   "Advance decode position");
+         });
+     }
+-    check(cudaGraphLaunch(request.memory.graph(), stream), "Replay decode graph");
++    check(cudaGraphLaunch(request.memory.graph(fast_attention), stream), "Replay decode graph");
+ }
+ 
+ template <typename Lane>
+diff --git a/selected/src/decoder_prefill.cpp b/source/src/decoder_prefill.cpp
+index 12f4c4f..2e4abec 100644
+--- a/selected/src/decoder_prefill.cpp
++++ b/source/src/decoder_prefill.cpp
+@@ -1,5 +1,7 @@
+ #include "sglang/decoder_prefill.h"
++#include "sglang/mxfp8_flash.h"
+ #include "sglang/prefill_fp8.h"
++#include "sglang/text_gdn_chunk.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -122,7 +124,7 @@ struct ScratchLayout {
+ };
+ 
+ struct TileBuffers {
+-    TileBuffers(ScratchLayout& layout, int rows)
++    TileBuffers(ScratchLayout& layout, int rows, bool fast_native)
+         : hidden(layout.take<Bf16>(rows * hidden_size)),
+           normalized(layout.take<Bf16>(rows * hidden_size)),
+           residual(layout.take<Bf16>(rows * hidden_size)),
+@@ -139,7 +141,9 @@ struct TileBuffers {
+           gdn_z(layout.take<Bf16>(rows * text_gdn_value_width)),
+           gdn_b(layout.take<Bf16>(rows * text_gdn_value_heads)),
+           gdn_a(layout.take<Bf16>(rows * text_gdn_value_heads)),
+-          gdn_scratch(layout.take<Bf16>(text_gdn_workspace_bytes(rows) / sizeof(Bf16))),
++          gdn_scratch_bytes(fast_native ? text_gdn_prefill_chunked_workspace_bytes(rows)
++                                       : text_gdn_workspace_bytes(rows)),
++          gdn_scratch(layout.take<Bf16>(gdn_scratch_bytes / sizeof(Bf16))),
+           activation{
+               layout.take<std::uint8_t>(rows * intermediate_size),
+               layout.take<float>(rows * text_fp8_group_count(intermediate_size))} {}
+@@ -160,6 +164,7 @@ struct TileBuffers {
+     Bf16* gdn_z;
+     Bf16* gdn_b;
+     Bf16* gdn_a;
++    std::size_t gdn_scratch_bytes;
+     Bf16* gdn_scratch;
+     TextFp8Activation activation;
+ };
+@@ -170,6 +175,7 @@ struct Chunk {
+     int rows;
+     cudaStream_t stream;
+     bool tensor_core_fp8;
++    bool fast_native;
+ 
+     TextFp8ActivationView quantize(const Bf16* input, int width) const {
+         check(text_quantize_fp8_rows(input, width, rows, work.activation, stream),
+@@ -202,10 +208,17 @@ struct Chunk {
+         project(layer.z, input, work.gdn_z);
+         project(layer.b, work.normalized, work.gdn_b);
+         project(layer.a, work.normalized, work.gdn_a);
+-        check(text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
+-                               work.gdn_a, layer.recurrent, state, work.gdn_scratch,
+-                               text_gdn_workspace_bytes(rows), work.attention, stream),
+-              "Advance prefill Gated DeltaNet state");
++        if (fast_native) {
++            check(text_gdn_prefill_chunked(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
++                                           layer.recurrent, state, work.gdn_scratch,
++                                           work.gdn_scratch_bytes, work.attention, stream),
++                  "Advance staged prefill Gated DeltaNet state");
++        } else {
++            check(text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
++                                   work.gdn_a, layer.recurrent, state, work.gdn_scratch,
++                                   work.gdn_scratch_bytes, work.attention, stream),
++                  "Advance prefill Gated DeltaNet state");
++        }
+         project(layer.output, quantize(work.attention, text_gdn_value_width),
+                 work.projected_attention);
+     }
+@@ -220,8 +233,16 @@ struct Chunk {
+               "Normalize and rotate prefill Q/K");
+         check(mxfp8_kv_append(cache, pages, position, rows, work.rope_keys, work.values, stream),
+               "Append prefill MXFP8 KV");
+-        check(mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
+-                                 work.attention, stream), "Read causal prefill MXFP8 attention");
++        if (fast_native) {
++            check(mxfp8_flash_prefill(cache, pages, position + rows, position, rows,
++                                      work.rope_queries, work.attention,
++                                      Mxfp8FlashWeights::compensated, nullptr, 0, stream),
++                  "Read causal prefill MXFP8 FlashAttention");
++        } else {
++            check(mxfp8_gqa_attention(cache, pages, position + rows, position, rows,
++                                      work.rope_queries, work.attention, stream),
++                  "Read causal prefill MXFP8 attention");
++        }
+         check(text_gqa_postgate(rows, work.q_gate, work.attention, work.attention, stream),
+               "Gate prefill grouped-query attention");
+         project(layer.output, quantize(work.attention, text_gqa_q_width), work.projected_attention);
+@@ -250,8 +271,8 @@ void decoder::reclaim_prefill_workspaces(int device) {
+     }
+ }
+ 
+-PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
+-    : stream_(stream), capacity_(capacity) {
++PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, bool fast_native)
++    : stream_(stream), capacity_(capacity), fast_native_(fast_native) {
+     if (!stream || capacity < 1 || capacity > prefill_chunk_rows) {
+         throw std::invalid_argument("Invalid decoder prefill workspace");
+     }
+@@ -279,7 +300,7 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
+                                       &disabled), "Configure prefill workspace pool");
+     }
+     ScratchLayout layout;
+-    const TileBuffers buffers(layout, capacity);
++    const TileBuffers buffers(layout, capacity, fast_native_);
+     void* data = nullptr;
+     const auto status = cudaMallocFromPoolAsync(&data, layout.bytes, pool->handle, stream);
+     if (status != cudaSuccess) {
+@@ -341,8 +362,9 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
+         return;
+     }
+     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
+-    const Chunk chunk{TileBuffers(layout, workspace.capacity()), position, rows, stream,
+-                      fp8_prefill() == Fp8PrefillPolicy::tensor_core};
++    const bool fast_native = workspace.fast_native();
++    const Chunk chunk{TileBuffers(layout, workspace.capacity(), fast_native), position, rows,
++                      stream, fp8_prefill() != Fp8PrefillPolicy::exact, fast_native};
+     const auto& work = chunk.work;
+     check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens, rows,
+                                work.residual, stream), "Gather prefill embeddings");
+diff --git a/selected/src/decoder_resources.cpp b/source/src/decoder_resources.cpp
+index 0b1b593..57d6ff9 100644
+--- a/selected/src/decoder_resources.cpp
++++ b/source/src/decoder_resources.cpp
+@@ -148,7 +148,7 @@ struct Allocations::State {
+     int device;
+     cudaStream_t stream = nullptr;
+     cudaGraph_t capture = nullptr;
+-    cudaGraphExec_t graph = nullptr;
++    std::array<cudaGraphExec_t, 2> graphs{};
+     bool uncertain_stream = false;
+     bool uncertain_graph = false;
+     std::vector<void*> blocks;
+@@ -176,7 +176,10 @@ CleanupError Allocations::State::close_stream(std::shared_ptr<const void>& drain
+     if (sync) {
+         return failure(sync);
+     }
+-    if (graph) {
++    for (auto& graph : graphs) {
++        if (!graph) {
++            continue;
++        }
+         const CleanupError destroy{cudaGraphExecDestroy(graph), "Destroy decode executable graph"};
+         if (destroy) {
+             uncertain_graph = true;
+@@ -298,9 +301,11 @@ TransferBuffers& Allocations::transfers() { return state_->transfers; }
+ 
+ cudaStream_t Allocations::stream() const { return state_->stream; }
+ 
+-cudaGraphExec_t Allocations::graph() const { return state_->graph; }
++cudaGraphExec_t Allocations::graph(bool fast_attention) const {
++    return state_->graphs[fast_attention];
++}
+ 
+-void Allocations::capture_graph(const std::function<void()>& enqueue) {
++void Allocations::capture_graph(bool fast_attention, const std::function<void()>& enqueue) {
+     const auto stream = state_->stream;
+     check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+           "Begin decode graph capture");
+@@ -312,8 +317,10 @@ void Allocations::capture_graph(const std::function<void()>& enqueue) {
+         throw;
+     }
+     check(cudaStreamEndCapture(stream, &state_->capture), "End decode graph capture");
+-    check(cudaGraphInstantiate(&state_->graph, state_->capture, 0),
++    check(cudaGraphInstantiate(&state_->graphs[fast_attention], state_->capture, 0),
+           "Instantiate decode graph");
++    check(cudaGraphDestroy(state_->capture), "Destroy decode capture graph");
++    state_->capture = nullptr;
+ }
+ 
+ void Allocations::reclaim_deferred() {
+diff --git a/source/src/mxfp8_fast_decode.cu b/source/src/mxfp8_fast_decode.cu
+new file mode 100644
+index 0000000..b004478
+--- /dev/null
++++ b/source/src/mxfp8_fast_decode.cu
+@@ -0,0 +1,453 @@
++#include "sglang/mxfp8_fast_decode.h"
++
++#include <cuda_fp8.h>
++#include <cuda_runtime.h>
++#include <math_constants.h>
++
++namespace sglang::decoder {
++namespace {
++
++using Bf16 = __nv_bfloat16;
++using Word = unsigned int;
++constexpr int dim = mxfp8_head_dim;
++constexpr int q_heads = mxfp8_query_heads;
++constexpr int kv_heads = mxfp8_kv_heads;
++constexpr int ratio = q_heads / kv_heads;
++constexpr int query_tile = 16;
++constexpr int key_tile = 32;
++constexpr int channel_stride = dim + 8;
++constexpr int weight_stride = key_tile + 8;
++constexpr int warps = 4;
++constexpr int fragments = dim / (warps * 8);
++constexpr int partial_stride = fast_gqa_partial_stride;
++constexpr Word lanes = 0xffffffffu;
++constexpr float log2e = 1.4426950408889634f;
++constexpr int cache_vector = 4;
++constexpr int accumulation_tokens = 128;
++
++static_assert(dim == 256 && ratio == 6 && mxfp8_page_size % key_tile == 0);
++
++struct Smem {
++    alignas(16) Bf16 q[query_tile][channel_stride];
++    alignas(16) Bf16 k[key_tile][channel_stride];
++    alignas(16) Bf16 v[key_tile][channel_stride];
++    alignas(16) Bf16 high[query_tile][weight_stride];
++    alignas(16) Bf16 low[query_tile][weight_stride];
++    float scores[query_tile][key_tile];
++    float rescale[query_tile];
++    float maximum[query_tile];
++    float denominator[query_tile];
++    float merged_max[query_tile];
++    float merged_denominator[query_tile];
++    float tile_scale[query_tile];
++    int invalid;
++};
++
++__device__ void load_a(const Bf16* pointer, Word (&fragment)[4]) {
++    const Word offset = __cvta_generic_to_shared(pointer);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
++                 : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
++                 : "r"(offset));
++}
++
++template <bool transpose>
++__device__ void load_b(const Bf16* pointer, Word (&fragment)[2]) {
++    const Word offset = __cvta_generic_to_shared(pointer);
++    if constexpr (transpose) {
++        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
++                     : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(offset));
++    } else {
++        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
++                     : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(offset));
++    }
++}
++
++__device__ void mma(float (&acc)[4], const Word (&left)[4], const Word (&right)[2]) {
++    asm volatile(
++        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
++        : "r"(left[0]), "r"(left[1]), "r"(left[2]), "r"(left[3]),
++          "r"(right[0]), "r"(right[1]));
++}
++
++__device__ bool decodable(Word bits, int exponent) {
++    constexpr Word magnitude = 0x7f7f7f7fu;
++    const Word unmatched = (bits & magnitude) ^ magnitude;
++    const Word nan_bytes = (unmatched - 0x01010101u) & ~unmatched & 0x80808080u;
++    return exponent >= 10 && exponent <= 246 && nan_bytes == 0;
++}
++
++__device__ Word decode_pair(unsigned short bits, Word power) {
++    const auto raw = __nv_cvt_fp8x2_to_bf162raw(bits, __NV_E4M3);
++    const Word values = static_cast<Word>(raw.x) | static_cast<Word>(raw.y) << 16;
++    Word scaled;
++    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(scaled) : "r"(values), "r"(power));
++    return scaled;
++}
++
++__device__ uint2 decode_vector(Word bits, Word scale) {
++    const Word power = scale << 7;
++    const Word pair = power | power << 16;
++    return {decode_pair(static_cast<unsigned short>(bits), pair),
++            decode_pair(static_cast<unsigned short>(bits >> 16), pair)};
++}
++
++__device__ void load_kv(Smem& shared, Mxfp8KvCache cache, int page, int kv_head,
++                        int position, int end) {
++    const int page_token = position % mxfp8_page_size;
++    const auto payload_page = static_cast<std::size_t>(page) * mxfp8_payload_bytes_per_page;
++    const auto scale_head = (static_cast<std::size_t>(page) * kv_heads + kv_head)
++                          * mxfp8_page_size * mxfp8_groups;
++    int invalid = 0;
++    for (int index = threadIdx.x * cache_vector; index < key_tile * dim;
++         index += blockDim.x * cache_vector) {
++        const int row = index / dim;
++        const int channel = index % dim;
++        uint2 key{}, value{};
++        if (position + row < end) {
++            const int token = page_token + row;
++            const auto payload = payload_page + (token * kv_heads + kv_head) * dim + channel;
++            constexpr int token_groups = mxfp8_page_size / mxfp8_group_size;
++            const auto scale = scale_head + ((token % mxfp8_group_size) * token_groups
++                              + token / mxfp8_group_size) * mxfp8_groups
++                             + channel / mxfp8_group_size;
++            const auto key_bits = *reinterpret_cast<const Word*>(cache.key_payload + payload);
++            const auto value_bits = *reinterpret_cast<const Word*>(cache.value_payload + payload);
++            const int key_scale = cache.key_scales[scale];
++            const int value_scale = cache.value_scales[scale];
++            if (decodable(key_bits, key_scale) && decodable(value_bits, value_scale)) {
++                key = decode_vector(key_bits, key_scale);
++                value = decode_vector(value_bits, value_scale);
++            } else {
++                invalid = 1;
++            }
++        }
++        *reinterpret_cast<uint2*>(&shared.k[row][channel]) = key;
++        *reinterpret_cast<uint2*>(&shared.v[row][channel]) = value;
++    }
++    if (__any_sync(lanes, invalid) && threadIdx.x % 32 == 0) {
++        atomicExch(&shared.invalid, 1);
++    }
++}
++
++__device__ void qk(Smem& shared, int warp, int lane) {
++    float acc[4]{};
++    #pragma unroll 4
++    for (int channel = 0; channel < dim; channel += 16) {
++        Word query[4], key[2];
++        load_a(&shared.q[lane % 16][channel + (lane / 16) * 8], query);
++        load_b<false>(&shared.k[warp * 8 + lane % 8][channel + ((lane / 8) % 2) * 8], key);
++        mma(acc, query, key);
++    }
++    #pragma unroll
++    for (int element = 0; element < 4; ++element) {
++        shared.scores[lane / 4 + (element / 2) * 8][warp * 8 + (lane % 4) * 2 + element % 2]
++            = acc[element] / 16.0f;
++    }
++}
++
++__device__ void softmax(Smem& shared, int end, int position, int warp, int lane) {
++    #pragma unroll
++    for (int row = warp; row < ratio; row += warps) {
++        const bool visible = position + lane < end;
++        const float score = visible ? shared.scores[row][lane] : -CUDART_INF_F;
++        if (__any_sync(lanes, visible && !isfinite(score)) && lane == 0) {
++            atomicExch(&shared.invalid, 1);
++        }
++        float maximum = score;
++        #pragma unroll
++        for (int delta = 16; delta > 0; delta /= 2) {
++            maximum = fmaxf(maximum, __shfl_xor_sync(lanes, maximum, delta));
++        }
++        const float previous = __shfl_sync(lanes, lane == 0 ? shared.maximum[row] : 0.0f, 0);
++        maximum = fmaxf(previous, maximum);
++        const float rescale = isfinite(previous) ? exp2f((previous - maximum) * log2e) : 0.0f;
++        const float weight = visible ? exp2f((score - maximum) * log2e) : 0.0f;
++        const Bf16 high = __float2bfloat16_rn(weight);
++        shared.high[row][lane] = high;
++        shared.low[row][lane] = __float2bfloat16_rn(weight - __bfloat162float(high));
++        float sum = weight;
++        #pragma unroll
++        for (int delta = 16; delta > 0; delta /= 2) {
++            sum += __shfl_xor_sync(lanes, sum, delta);
++        }
++        if (lane == 0) {
++            shared.rescale[row] = rescale;
++            shared.maximum[row] = maximum;
++            shared.denominator[row] = fmaf(rescale, shared.denominator[row], sum);
++        }
++    }
++}
++
++__device__ void pv(Smem& shared, int warp, int lane, float (&acc)[fragments][4],
++                   float (&mass)[fragments][4]) {
++    const float top = shared.rescale[lane / 4];
++    const float bottom = shared.rescale[lane / 4 + 8];
++    #pragma unroll
++    for (int fragment = 0; fragment < fragments; ++fragment) {
++        acc[fragment][0] *= top;
++        acc[fragment][1] *= top;
++        acc[fragment][2] *= bottom;
++        acc[fragment][3] *= bottom;
++        mass[fragment][0] *= top;
++        mass[fragment][1] *= top;
++        mass[fragment][2] *= bottom;
++        mass[fragment][3] *= bottom;
++    }
++    #pragma unroll
++    for (int row = 0; row < key_tile; row += 16) {
++        Word high[4], low[4];
++        const int source = row + (lane / 16) * 8;
++        load_a(&shared.high[lane % 16][source], high);
++        load_a(&shared.low[lane % 16][source], low);
++        #pragma unroll
++        for (int fragment = 0; fragment < fragments; ++fragment) {
++            Word value[2];
++            load_b<true>(&shared.v[row + lane % 16][(warp * fragments + fragment) * 8], value);
++            mma(acc[fragment], low, value);
++            mma(acc[fragment], high, value);
++            const Word absolute[] = {value[0] & 0x7fff7fffu, value[1] & 0x7fff7fffu};
++            mma(mass[fragment], high, absolute);
++        }
++    }
++}
++
++__device__ void combine(Smem& shared, int lane, float (&total)[fragments][4],
++                        float (&tile)[fragments][4], float (&mass)[fragments][4],
++                        float (&tile_mass)[fragments][4]) {
++    if (threadIdx.x < query_tile) {
++        const int row = threadIdx.x;
++        const float prior = shared.merged_max[row];
++        const float local = shared.maximum[row];
++        const float maximum = fmaxf(prior, local);
++        const float before = isfinite(prior) ? exp2f((prior - maximum) * log2e) : 0.0f;
++        const float current = isfinite(local) ? exp2f((local - maximum) * log2e) : 0.0f;
++        shared.rescale[row] = before;
++        shared.tile_scale[row] = current;
++        shared.merged_max[row] = maximum;
++        shared.merged_denominator[row] =
++            fmaf(current, shared.denominator[row], before * shared.merged_denominator[row]);
++        shared.maximum[row] = -CUDART_INF_F;
++        shared.denominator[row] = 0.0f;
++    }
++    __syncthreads();
++    const int row = lane / 4;
++    const float before_top = shared.rescale[row];
++    const float tile_top = shared.tile_scale[row];
++    const float before_bottom = shared.rescale[row + 8];
++    const float tile_bottom = shared.tile_scale[row + 8];
++    #pragma unroll
++    for (int fragment = 0; fragment < fragments; ++fragment) {
++        mass[fragment][0] = fmaf(tile_top, tile_mass[fragment][0], before_top * mass[fragment][0]);
++        mass[fragment][1] = fmaf(tile_top, tile_mass[fragment][1], before_top * mass[fragment][1]);
++        mass[fragment][2] =
++            fmaf(tile_bottom, tile_mass[fragment][2], before_bottom * mass[fragment][2]);
++        mass[fragment][3] =
++            fmaf(tile_bottom, tile_mass[fragment][3], before_bottom * mass[fragment][3]);
++        total[fragment][0] = fmaf(tile_top, tile[fragment][0], before_top * total[fragment][0]);
++        total[fragment][1] = fmaf(tile_top, tile[fragment][1], before_top * total[fragment][1]);
++        total[fragment][2] = fmaf(tile_bottom, tile[fragment][2], before_bottom * total[fragment][2]);
++        total[fragment][3] = fmaf(tile_bottom, tile[fragment][3], before_bottom * total[fragment][3]);
++        #pragma unroll
++        for (int element = 0; element < 4; ++element) {
++            tile[fragment][element] = 0.0f;
++            tile_mass[fragment][element] = 0.0f;
++        }
++    }
++    __syncthreads();
++}
++
++__device__ void store(Smem& shared, float (&acc)[fragments][4],
++                      float (&mass)[fragments][4], float* partial) {
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int row = lane / 4;
++    if (row >= ratio) {
++        return;
++    }
++    auto* data = partial + row * partial_stride;
++    if (warp == 0 && lane % 4 == 0) {
++        data[2 * dim] = shared.merged_max[row];
++        data[2 * dim + 1] = shared.merged_denominator[row];
++        data[2 * dim + 2] = static_cast<float>(shared.invalid);
++    }
++    #pragma unroll
++    for (int fragment = 0; fragment < fragments; ++fragment) {
++        const int channel = (warp * fragments + fragment) * 8 + (lane % 4) * 2;
++        data[channel] = acc[fragment][0];
++        data[channel + 1] = acc[fragment][1];
++        data[dim + channel] = mass[fragment][0];
++        data[dim + channel + 1] = mass[fragment][1];
++    }
++}
++
++struct Partitions {
++    int width;
++    int count;
++};
++
++__device__ Partitions partitions(int tokens) {
++    const int pages = (tokens + mxfp8_page_size - 1) / mxfp8_page_size;
++    const int pages_per_part = max(1, (pages + fast_gqa_max_parts - 1) / fast_gqa_max_parts);
++    const int width = pages_per_part * mxfp8_page_size;
++    return {width, (tokens + width - 1) / width};
++}
++
++__device__ int token_count(const FastGqaLane& request) {
++    return (request.device_position ? *request.device_position : request.position) + 1;
++}
++
++__global__ void split_kernel(FastGqaBatch batch) {
++    __shared__ Smem shared;
++    const auto& request = batch.lanes[blockIdx.z];
++    const int tokens = token_count(request);
++    if (tokens < fast_gqa_min_tokens) {
++        return;
++    }
++    const auto split = partitions(tokens);
++    if (blockIdx.x >= split.count) {
++        return;
++    }
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int kv_head = blockIdx.y;
++    const int begin = blockIdx.x * split.width;
++    const int end = min(tokens, begin + split.width);
++    if (threadIdx.x == 0) {
++        shared.invalid = 0;
++    }
++    for (int index = threadIdx.x; index < query_tile * dim; index += blockDim.x) {
++        const int row = index / dim;
++        const int channel = index % dim;
++        shared.q[row][channel] = row < ratio
++            ? request.queries[(kv_head * ratio + row) * dim + channel]
++            : __float2bfloat16_rn(0.0f);
++    }
++    if (threadIdx.x < query_tile) {
++        shared.maximum[threadIdx.x] = -CUDART_INF_F;
++        shared.denominator[threadIdx.x] = 0.0f;
++        shared.merged_max[threadIdx.x] = -CUDART_INF_F;
++        shared.merged_denominator[threadIdx.x] = 0.0f;
++        shared.rescale[threadIdx.x] = 0.0f;
++    }
++    for (int index = threadIdx.x; index < query_tile * key_tile; index += blockDim.x) {
++        const int row = index / key_tile;
++        const int column = index % key_tile;
++        shared.high[row][column] = __float2bfloat16_rn(0.0f);
++        shared.low[row][column] = __float2bfloat16_rn(0.0f);
++    }
++    __syncthreads();
++    float acc[fragments][4]{}, tile[fragments][4]{};
++    float mass[fragments][4]{}, tile_mass[fragments][4]{};
++    for (int position = begin; position < end; position += key_tile) {
++        load_kv(shared, request.cache, request.pages.device_pages[position / mxfp8_page_size],
++                kv_head, position, end);
++        __syncthreads();
++        qk(shared, warp, lane);
++        __syncthreads();
++        softmax(shared, end, position, warp, lane);
++        __syncthreads();
++        pv(shared, warp, lane, tile, tile_mass);
++        __syncthreads();
++        if ((position + key_tile) % accumulation_tokens == 0 || position + key_tile >= end) {
++            combine(shared, lane, acc, tile, mass, tile_mass);
++        }
++    }
++    store(shared, acc, mass, request.scratch + q_heads
++        + (blockIdx.x * q_heads + kv_head * ratio) * partial_stride);
++}
++
++__global__ void merge_kernel(FastGqaBatch batch) {
++    const auto& request = batch.lanes[blockIdx.y];
++    const int head = blockIdx.x;
++    const int channel = threadIdx.x;
++    const int tokens = token_count(request);
++    if (tokens < fast_gqa_min_tokens) {
++        if (channel == 0) {
++            request.scratch[head] = 1.0f;
++        }
++        return;
++    }
++    const int parts = partitions(tokens).count;
++    constexpr int span = q_heads * partial_stride;
++    const float* data = request.scratch + q_heads + head * partial_stride;
++    __shared__ float weights[fast_gqa_max_parts];
++    __shared__ float denominator;
++    __shared__ int invalid;
++    if (channel == 0) {
++        float maximum = -CUDART_INF_F;
++        int failed = 0;
++        for (int part = 0; part < parts; ++part) {
++            const float* tile = data + part * span;
++            maximum = fmaxf(maximum, tile[2 * dim]);
++            failed |= static_cast<int>(tile[2 * dim + 2]);
++        }
++        float sum = 0.0f;
++        for (int part = 0; part < parts; ++part) {
++            const float* tile = data + part * span;
++            weights[part] = exp2f((tile[2 * dim] - maximum) * log2e);
++            sum = fmaf(weights[part], tile[2 * dim + 1], sum);
++        }
++        denominator = sum;
++        invalid = failed || !(sum > 0.0f) || !isfinite(sum);
++    }
++    __syncthreads();
++    float sum = 0.0f;
++    float magnitude = 0.0f;
++    for (int part = 0; part < parts; ++part) {
++        sum = fmaf(weights[part], data[part * span + channel], sum);
++        magnitude = fmaf(weights[part], data[part * span + dim + channel], magnitude);
++    }
++    const float result = sum / denominator;
++    const bool cancellation = magnitude > 0.0f && fabsf(sum) <= 0x1p-18f * magnitude;
++    if (__any_sync(lanes, !isfinite(result) || !isfinite(magnitude) || cancellation)
++        && channel % 32 == 0) {
++        atomicExch(&invalid, 1);
++    }
++    __syncthreads();
++    if (channel == 0) {
++        request.scratch[head] = static_cast<float>(invalid);
++    }
++    if (!invalid) {
++        request.output[head * dim + channel] = __float2bfloat16_rn(result);
++    }
++}
++
++}
++
++cudaError_t fast_decode_gqa_attention(FastGqaBatch batch, int count, cudaStream_t stream) {
++    if (count < 1 || count > fast_gqa_max_lanes) {
++        return cudaErrorInvalidValue;
++    }
++    int max_parts = 1;
++    for (int lane = 0; lane < count; ++lane) {
++        const auto& request = batch.lanes[lane];
++        const int pages = request.pages.page_count;
++        const auto& cache = request.cache;
++        if (pages < fast_gqa_min_tokens / mxfp8_page_size
++            || pages > fast_gqa_max_tokens / mxfp8_page_size
++            || pages > cache.page_count || !request.pages.device_pages
++            || !cache.key_payload || !cache.value_payload || !cache.key_scales
++            || !cache.value_scales || !request.queries || !request.output || !request.scratch
++            || (!request.device_position
++                && (request.position < 0 || request.position >= pages * mxfp8_page_size))
++            || reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(Word)
++            || reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(Word)
++            || reinterpret_cast<std::uintptr_t>(request.scratch) % alignof(float)) {
++            return cudaErrorInvalidValue;
++        }
++        const int parts = fast_gqa_parts(request.device_position
++            ? pages * mxfp8_page_size : request.position + 1);
++        max_parts = parts > max_parts ? parts : max_parts;
++    }
++    void* arguments[] = {&batch};
++    auto status = cudaLaunchKernel(split_kernel, dim3(max_parts, kv_heads, count), warps * 32,
++                                   arguments, 0, stream);
++    if (status == cudaSuccess) {
++        status = cudaLaunchKernel(merge_kernel, dim3(q_heads, count), dim, arguments, 0, stream);
++    }
++    return status == cudaSuccess ? fast_decode_gqa_fallback(batch, count, stream) : status;
++}
++
++}
+diff --git a/source/src/mxfp8_flash.cu b/source/src/mxfp8_flash.cu
+new file mode 100644
+index 0000000..bdbd5b4
+--- /dev/null
++++ b/source/src/mxfp8_flash.cu
+@@ -0,0 +1,409 @@
++#include "sglang/mxfp8_flash.h"
++
++#include <cuda_fp8.h>
++#include <cuda_runtime.h>
++#include <math_constants.h>
++
++#include <algorithm>
++#include <limits>
++
++namespace sglang {
++namespace {
++
++using Bf16 = __nv_bfloat16;
++using Word = unsigned int;
++constexpr int dim = mxfp8_head_dim;
++constexpr int q_heads = mxfp8_query_heads;
++constexpr int kv_heads = mxfp8_kv_heads;
++constexpr int ratio = q_heads / kv_heads;
++constexpr int query_tile = 16;
++constexpr int key_tile = 32;
++constexpr int channel_stride = dim + 8;
++constexpr int weight_stride = key_tile + 8;
++constexpr int warps = 4;
++constexpr int fragments = dim / (warps * 8);
++constexpr int partial_stride = dim + 2;
++constexpr int max_parts = 32;
++constexpr Word lanes = 0xffffffffu;
++constexpr float log2e = 1.4426950408889634f;
++constexpr int cache_vector = 4;
++constexpr int accumulation_tokens = 128;
++
++static_assert(dim == 256 && ratio == 6 && mxfp8_page_size % key_tile == 0);
++
++struct Smem {
++    alignas(16) Bf16 q[query_tile][channel_stride];
++    alignas(16) Bf16 k[key_tile][channel_stride];
++    alignas(16) Bf16 v[key_tile][channel_stride];
++    alignas(16) Bf16 high[query_tile][weight_stride];
++    alignas(16) Bf16 low[query_tile][weight_stride];
++    float scores[query_tile][key_tile];
++    float rescale[query_tile];
++    float maximum[query_tile];
++    float denominator[query_tile];
++    float merged_max[query_tile];
++    float merged_denominator[query_tile];
++    float tile_scale[query_tile];
++};
++
++__device__ void load_a(const Bf16* pointer, Word (&fragment)[4]) {
++    const Word offset = __cvta_generic_to_shared(pointer);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
++                 : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
++                 : "r"(offset));
++}
++
++template <bool transpose>
++__device__ void load_b(const Bf16* pointer, Word (&fragment)[2]) {
++    const Word offset = __cvta_generic_to_shared(pointer);
++    if constexpr (transpose) {
++        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
++                     : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(offset));
++    } else {
++        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
++                     : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(offset));
++    }
++}
++
++__device__ void mma(float (&acc)[4], const Word (&left)[4], const Word (&right)[2]) {
++    asm volatile(
++        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
++        : "r"(left[0]), "r"(left[1]), "r"(left[2]), "r"(left[3]),
++          "r"(right[0]), "r"(right[1]));
++}
++
++__device__ std::size_t query_offset(int grouped_row, int kv_head) {
++    return (static_cast<std::size_t>(grouped_row / ratio) * q_heads
++            + kv_head * ratio + grouped_row % ratio) * dim;
++}
++
++__device__ Word decode_pair(unsigned short bits, Word power) {
++    const auto raw = __nv_cvt_fp8x2_to_bf162raw(bits, __NV_E4M3);
++    const Word values = static_cast<Word>(raw.x) | static_cast<Word>(raw.y) << 16;
++    Word scaled;
++    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(scaled) : "r"(values), "r"(power));
++    return scaled;
++}
++
++__device__ uint2 decode_vector(Word bits, Word scale) {
++    const Word power = scale == 0 ? 0x0040u : scale << 7;
++    const Word pair = power | power << 16;
++    return {decode_pair(static_cast<unsigned short>(bits), pair),
++            decode_pair(static_cast<unsigned short>(bits >> 16), pair)};
++}
++
++__device__ void load_kv(Smem& shared, Mxfp8KvCache cache, int page, int kv_head,
++                        int position, int end) {
++    const int page_token = position % mxfp8_page_size;
++    const auto payload_page = static_cast<std::size_t>(page) * mxfp8_payload_bytes_per_page;
++    const auto scale_head = (static_cast<std::size_t>(page) * kv_heads + kv_head)
++                          * mxfp8_page_size * mxfp8_groups;
++    for (int index = threadIdx.x * cache_vector; index < key_tile * dim;
++         index += blockDim.x * cache_vector) {
++        const int row = index / dim;
++        const int channel = index % dim;
++        uint2 key{}, value{};
++        if (position + row < end) {
++            const int token = page_token + row;
++            const auto payload = payload_page + (token * kv_heads + kv_head) * dim + channel;
++            constexpr int token_groups = mxfp8_page_size / mxfp8_group_size;
++            const auto scale = scale_head + ((token % mxfp8_group_size) * token_groups
++                              + token / mxfp8_group_size) * mxfp8_groups
++                             + channel / mxfp8_group_size;
++            key = decode_vector(*reinterpret_cast<const Word*>(cache.key_payload + payload),
++                                cache.key_scales[scale]);
++            value = decode_vector(*reinterpret_cast<const Word*>(cache.value_payload + payload),
++                                  cache.value_scales[scale]);
++        }
++        *reinterpret_cast<uint2*>(&shared.k[row][channel]) = key;
++        *reinterpret_cast<uint2*>(&shared.v[row][channel]) = value;
++    }
++}
++
++__device__ void qk(Smem& shared, int warp, int lane) {
++    float acc[4]{};
++    #pragma unroll 4
++    for (int channel = 0; channel < dim; channel += 16) {
++        Word query[4], key[2];
++        load_a(&shared.q[lane % 16][channel + (lane / 16) * 8], query);
++        load_b<false>(&shared.k[warp * 8 + lane % 8][channel + ((lane / 8) % 2) * 8], key);
++        mma(acc, query, key);
++    }
++    #pragma unroll
++    for (int element = 0; element < 4; ++element) {
++        shared.scores[lane / 4 + (element / 2) * 8][warp * 8 + (lane % 4) * 2 + element % 2]
++            = acc[element] / 16.0f;
++    }
++}
++
++template <bool compensated>
++__device__ void softmax(Smem& shared, int first, int grouped, int end, int position,
++                        int warp, int lane) {
++    #pragma unroll
++    for (int row = warp; row < query_tile; row += warps) {
++        const bool visible = position + lane <= first + (grouped + row) / ratio
++                          && position + lane < end;
++        const float score = visible ? shared.scores[row][lane] : -CUDART_INF_F;
++        float maximum = score;
++        #pragma unroll
++        for (int delta = 16; delta > 0; delta /= 2) {
++            maximum = fmaxf(maximum, __shfl_xor_sync(lanes, maximum, delta));
++        }
++        const float previous = __shfl_sync(lanes, lane == 0 ? shared.maximum[row] : 0.0f, 0);
++        maximum = fmaxf(previous, maximum);
++        const float rescale = isfinite(previous) ? exp2f((previous - maximum) * log2e) : 0.0f;
++        const float weight = visible ? exp2f((score - maximum) * log2e) : 0.0f;
++        const Bf16 high = __float2bfloat16_rn(weight);
++        shared.high[row][lane] = high;
++        if constexpr (compensated) {
++            shared.low[row][lane] = __float2bfloat16_rn(weight - __bfloat162float(high));
++        }
++        float sum = weight;
++        #pragma unroll
++        for (int delta = 16; delta > 0; delta /= 2) {
++            sum += __shfl_xor_sync(lanes, sum, delta);
++        }
++        if (lane == 0) {
++            shared.rescale[row] = rescale;
++            shared.maximum[row] = maximum;
++            shared.denominator[row] = fmaf(rescale, shared.denominator[row], sum);
++        }
++    }
++}
++
++template <bool compensated>
++__device__ void pv(Smem& shared, int warp, int lane, float (&acc)[fragments][4]) {
++    const float top = shared.rescale[lane / 4];
++    const float bottom = shared.rescale[lane / 4 + 8];
++    #pragma unroll
++    for (int fragment = 0; fragment < fragments; ++fragment) {
++        acc[fragment][0] *= top;
++        acc[fragment][1] *= top;
++        acc[fragment][2] *= bottom;
++        acc[fragment][3] *= bottom;
++    }
++    #pragma unroll
++    for (int row = 0; row < key_tile; row += 16) {
++        Word high[4], low[4];
++        const int source = row + (lane / 16) * 8;
++        load_a(&shared.high[lane % 16][source], high);
++        if constexpr (compensated) {
++            load_a(&shared.low[lane % 16][source], low);
++        }
++        #pragma unroll
++        for (int fragment = 0; fragment < fragments; ++fragment) {
++            Word value[2];
++            load_b<true>(&shared.v[row + lane % 16][(warp * fragments + fragment) * 8], value);
++            if constexpr (compensated) {
++                mma(acc[fragment], low, value);
++            }
++            mma(acc[fragment], high, value);
++        }
++    }
++}
++
++__device__ void combine(Smem& shared, int lane, float (&total)[fragments][4],
++                         float (&tile)[fragments][4]) {
++    if (threadIdx.x < query_tile) {
++        const int row = threadIdx.x;
++        const float prior = shared.merged_max[row];
++        const float local = shared.maximum[row];
++        const float maximum = fmaxf(prior, local);
++        const float before = isfinite(prior) ? exp2f((prior - maximum) * log2e) : 0.0f;
++        const float current = isfinite(local) ? exp2f((local - maximum) * log2e) : 0.0f;
++        shared.rescale[row] = before;
++        shared.tile_scale[row] = current;
++        shared.merged_max[row] = maximum;
++        shared.merged_denominator[row] =
++            fmaf(current, shared.denominator[row], before * shared.merged_denominator[row]);
++        shared.maximum[row] = -CUDART_INF_F;
++        shared.denominator[row] = 0.0f;
++    }
++    __syncthreads();
++    const int row = lane / 4;
++    const float before_top = shared.rescale[row];
++    const float tile_top = shared.tile_scale[row];
++    const float before_bottom = shared.rescale[row + 8];
++    const float tile_bottom = shared.tile_scale[row + 8];
++    #pragma unroll
++    for (int fragment = 0; fragment < fragments; ++fragment) {
++        total[fragment][0] = fmaf(tile_top, tile[fragment][0], before_top * total[fragment][0]);
++        total[fragment][1] = fmaf(tile_top, tile[fragment][1], before_top * total[fragment][1]);
++        total[fragment][2] = fmaf(tile_bottom, tile[fragment][2], before_bottom * total[fragment][2]);
++        total[fragment][3] = fmaf(tile_bottom, tile[fragment][3], before_bottom * total[fragment][3]);
++        #pragma unroll
++        for (int element = 0; element < 4; ++element) {
++            tile[fragment][element] = 0.0f;
++        }
++    }
++    __syncthreads();
++}
++
++__device__ void store(Smem& shared, float (&acc)[fragments][4], int grouped, int total,
++                      int kv_head, Bf16* output, float* partial) {
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    #pragma unroll
++    for (int half = 0; half < 2; ++half) {
++        const int row = lane / 4 + half * 8;
++        if (grouped + row < total) {
++            const auto offset = query_offset(grouped + row, kv_head);
++            const float denominator = shared.merged_denominator[row];
++            auto* data = partial ? partial + offset / dim * partial_stride : nullptr;
++            if (data && warp == 0 && lane % 4 == 0) {
++                data[dim] = shared.merged_max[row];
++                data[dim + 1] = denominator;
++            }
++            #pragma unroll
++            for (int fragment = 0; fragment < fragments; ++fragment) {
++                const int channel = (warp * fragments + fragment) * 8 + (lane % 4) * 2;
++                const float even = acc[fragment][half * 2];
++                const float odd = acc[fragment][half * 2 + 1];
++                if (data) {
++                    data[channel] = even;
++                    data[channel + 1] = odd;
++                } else {
++                    output[offset + channel] = __float2bfloat16_rn(even / denominator);
++                    output[offset + channel + 1] = __float2bfloat16_rn(odd / denominator);
++                }
++            }
++        }
++    }
++}
++
++template <bool compensated>
++__global__ void flash(Mxfp8KvCache cache, const std::int32_t* pages,
++                      int first, int rows, const Bf16* queries, Bf16* output,
++                      int partition_width, float* partial) {
++    __shared__ Smem shared;
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int grouped = blockIdx.x * query_tile;
++    const int kv_head = blockIdx.y;
++    const int total = rows * ratio;
++    const int last_grouped = min(grouped + query_tile, total) - 1;
++    const int begin = blockIdx.z * partition_width;
++    const int end = min(first + last_grouped / ratio + 1, begin + partition_width);
++    for (int index = threadIdx.x; index < query_tile * dim; index += blockDim.x) {
++        const int row = index / dim;
++        const int channel = index % dim;
++        shared.q[row][channel] = grouped + row < total
++            ? queries[query_offset(grouped + row, kv_head) + channel]
++            : __float2bfloat16_rn(0.0f);
++    }
++    if (threadIdx.x < query_tile) {
++        shared.maximum[threadIdx.x] = -CUDART_INF_F;
++        shared.denominator[threadIdx.x] = 0.0f;
++        shared.merged_max[threadIdx.x] = -CUDART_INF_F;
++        shared.merged_denominator[threadIdx.x] = 0.0f;
++    }
++    __syncthreads();
++    float acc[fragments][4]{}, tile[fragments][4]{};
++    for (int position = begin; position < end; position += key_tile) {
++        load_kv(shared, cache, pages[position / mxfp8_page_size], kv_head, position, end);
++        __syncthreads();
++        qk(shared, warp, lane);
++        __syncthreads();
++        softmax<compensated>(shared, first, grouped, end, position, warp, lane);
++        __syncthreads();
++        pv<compensated>(shared, warp, lane, tile);
++        __syncthreads();
++        if ((position + key_tile) % accumulation_tokens == 0 || position + key_tile >= end) {
++            combine(shared, lane, acc, tile);
++        }
++    }
++    const auto span = static_cast<std::size_t>(rows) * q_heads * partial_stride;
++    store(shared, acc, grouped, total, kv_head, output,
++          partial ? partial + blockIdx.z * span : nullptr);
++}
++
++__global__ void merge(const float* partial, int total, int parts, Bf16* output) {
++    const int head_row = blockIdx.x;
++    const int channel = threadIdx.x;
++    const auto span = static_cast<std::size_t>(total) * partial_stride;
++    const float* data = partial + static_cast<std::size_t>(head_row) * partial_stride;
++    __shared__ float weights[max_parts];
++    __shared__ float denominator;
++    if (channel == 0) {
++        float maximum = -CUDART_INF_F;
++        for (int part = 0; part < parts; ++part) {
++            maximum = fmaxf(maximum, data[part * span + dim]);
++        }
++        float sum = 0.0f;
++        for (int part = 0; part < parts; ++part) {
++            const float* tile = data + part * span;
++            weights[part] = exp2f((tile[dim] - maximum) * log2e);
++            sum = fmaf(weights[part], tile[dim + 1], sum);
++        }
++        denominator = sum;
++    }
++    __syncthreads();
++    float sum = 0.0f;
++    for (int part = 0; part < parts; ++part) {
++        sum = fmaf(weights[part], data[part * span + channel], sum);
++    }
++    output[static_cast<std::size_t>(head_row) * dim + channel] =
++        __float2bfloat16_rn(sum / denominator);
++}
++
++int partitions(int first, int rows) {
++    if (first < 512 || rows < 1 || rows > 64
++        || first > std::numeric_limits<int>::max() - rows - 2 * mxfp8_page_size) {
++        return 1;
++    }
++    const int query_blocks = ((rows * ratio + query_tile - 1) / query_tile) * kv_heads;
++    const int pages = (first + rows + mxfp8_page_size - 1) / mxfp8_page_size;
++    return std::clamp(192 / query_blocks, 1, std::min(pages, max_parts));
++}
++
++}
++
++std::size_t mxfp8_flash_workspace_bytes(int first, int rows) {
++    const int parts = partitions(first, rows);
++    return parts > 1 ? static_cast<std::size_t>(rows) * q_heads * partial_stride * parts
++                     * sizeof(float) : 0;
++}
++
++cudaError_t mxfp8_flash_prefill(Mxfp8KvCache cache, Mxfp8PageTable pages, int valid_tokens,
++                               int first, int rows, const Bf16* queries, Bf16* output,
++                               Mxfp8FlashWeights weights, void* scratch,
++                               std::size_t scratch_bytes, cudaStream_t stream) {
++    if (rows == 0) {
++        return cudaSuccess;
++    }
++    constexpr int maximum = std::numeric_limits<int>::max() / q_heads;
++    if (first < 0 || rows < 0 || rows > maximum || first > maximum - rows
++        || first + rows > valid_tokens || (valid_tokens - 1) / mxfp8_page_size >= pages.page_count
++        || (valid_tokens - 1) / mxfp8_page_size >= cache.page_count || !pages.device_pages
++        || !cache.key_payload || !cache.value_payload || !cache.key_scales || !cache.value_scales
++        || !queries || !output || reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(Word)
++        || reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(Word)
++        || (scratch && reinterpret_cast<std::uintptr_t>(scratch) % alignof(float))
++        || (weights != Mxfp8FlashWeights::compensated && weights != Mxfp8FlashWeights::bf16)) {
++        return cudaErrorInvalidValue;
++    }
++    const auto required = mxfp8_flash_workspace_bytes(first, rows);
++    const int parts = scratch && required && scratch_bytes >= required ? partitions(first, rows) : 1;
++    int width = parts > 1
++        ? ((first + rows + parts * mxfp8_page_size - 1) / (parts * mxfp8_page_size))
++            * mxfp8_page_size
++        : first + rows;
++    const int active_parts = (first + rows + width - 1) / width;
++    auto* partial = active_parts > 1 ? static_cast<float*>(scratch) : nullptr;
++    const auto kernel = weights == Mxfp8FlashWeights::compensated ? flash<true> : flash<false>;
++    void* arguments[] = {&cache, &pages.device_pages, &first, &rows, &queries, &output,
++                         &width, &partial};
++    const dim3 blocks((rows * ratio + query_tile - 1) / query_tile, kv_heads, active_parts);
++    auto status = cudaLaunchKernel(kernel, blocks, dim3(warps * 32), arguments, 0, stream);
++    if (status == cudaSuccess && partial) {
++        int total = rows * q_heads;
++        int count = active_parts;
++        void* merge_arguments[] = {&partial, &total, &count, &output};
++        status = cudaLaunchKernel(merge, dim3(total), dim3(dim), merge_arguments, 0, stream);
++    }
++    return status;
++}
++
++}
+diff --git a/selected/src/mxfp8_gqa.cu b/source/src/mxfp8_gqa.cu
+index ec62763..46792ed 100644
+--- a/selected/src/mxfp8_gqa.cu
++++ b/source/src/mxfp8_gqa.cu
+@@ -1,6 +1,7 @@
+ #include "sglang/mxfp8_gqa.h"
+ 
+ #include "sglang/decoder_cuda.cuh"
++#include "sglang/mxfp8_fast_decode.h"
+ 
+ #include <algorithm>
+ #include <limits>
+@@ -84,22 +85,20 @@ __device__ float warp_sum(float value) {
+     return value;
+ }
+ 
+-template <typename Position>
+-__global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
+-                                 Position first_query_position, const __nv_bfloat16* queries,
+-                                 __nv_bfloat16* output) {
+-    __shared__ float warp_dots[mxfp8_groups];
+-    __shared__ float history_weight;
+-    __shared__ float token_weight;
+-    __shared__ float denominator;
++struct OrderedAttention {
++    float warp_dots[mxfp8_groups];
++    float history_weight;
++    float token_weight;
++    float denominator;
++};
+ 
+-    const int query_head = blockIdx.y;
++__device__ __forceinline__ void ordered_attention(
++    OrderedAttention& shared, Mxfp8KvCache cache, const std::int32_t* pages, int last_position,
++    int query_index, int query_head, const __nv_bfloat16* queries, __nv_bfloat16* output) {
+     const int kv_head = query_head / queries_per_kv_head;
+     const int channel = threadIdx.x;
+     const int group = channel / mxfp8_group_size;
+-    const auto row = row_offset(blockIdx.x, mxfp8_query_heads, query_head) + channel;
+-    const int last_position =
+-        decoder::position_value(first_query_position) + static_cast<int>(blockIdx.x);
++    const auto row = row_offset(query_index, mxfp8_query_heads, query_head) + channel;
+     const float query = __bfloat162float(queries[row]);
+     float max_score = -CUDART_INF_F;
+     float weight_sum = 0.0f;
+@@ -113,32 +112,41 @@ __global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
+         const float key = decode(cache.key_payload[payload], cache.key_scales[scale]);
+         const float product = warp_sum(query * key);
+         if (channel % mxfp8_group_size == 0) {
+-            warp_dots[group] = product;
++            shared.warp_dots[group] = product;
+         }
+         __syncthreads();
+ 
+         if (channel == 0) {
+             float dot = 0.0f;
+             for (int warp = 0; warp < mxfp8_groups; ++warp) {
+-                dot += warp_dots[warp];
++                dot += shared.warp_dots[warp];
+             }
+             const float score = dot * softmax_scale;
+             const float next_max = fmaxf(max_score, score);
+-            history_weight = expf(max_score - next_max);
+-            token_weight = expf(score - next_max);
+-            weight_sum = fmaf(history_weight, weight_sum, token_weight);
++            shared.history_weight = expf(max_score - next_max);
++            shared.token_weight = expf(score - next_max);
++            weight_sum = fmaf(shared.history_weight, weight_sum, shared.token_weight);
+             max_score = next_max;
+         }
+         const float value = decode(cache.value_payload[payload], cache.value_scales[scale]);
+         __syncthreads();
+-        weighted_value = fmaf(token_weight, value, history_weight * weighted_value);
++        weighted_value = fmaf(shared.token_weight, value, shared.history_weight * weighted_value);
+     }
+ 
+     if (channel == 0) {
+-        denominator = weight_sum;
++        shared.denominator = weight_sum;
+     }
+     __syncthreads();
+-    output[row] = __float2bfloat16_rn(weighted_value / denominator);
++    output[row] = __float2bfloat16_rn(weighted_value / shared.denominator);
++}
++
++template <typename Position>
++__global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
++                                 Position first_query_position, const __nv_bfloat16* queries,
++                                 __nv_bfloat16* output) {
++    __shared__ OrderedAttention shared;
++    const int last = decoder::position_value(first_query_position) + static_cast<int>(blockIdx.x);
++    ordered_attention(shared, cache, pages, last, blockIdx.x, blockIdx.y, queries, output);
+ }
+ 
+ bool cache_covers(Mxfp8KvCache cache, Mxfp8PageTable pages, std::int64_t token_count) {
+@@ -154,15 +162,12 @@ constexpr int score_warps = 8;
+ constexpr int replay_tile = 32;
+ static_assert(mxfp8_page_size % replay_tile == 0 && replay_tile == mxfp8_group_size);
+ 
+-template <typename Position>
+-__global__ void exact_scores_kernel(
+-    Mxfp8KvCache cache, const std::int32_t* pages, Position position,
+-    const __nv_bfloat16* queries, decoder::ExactGqaWorkspace workspace) {
++__device__ __forceinline__ void exact_scores(
++    Mxfp8KvCache cache, const std::int32_t* pages, int last, int query_head,
++    const __nv_bfloat16* queries, float* scores) {
+     const int warp = threadIdx.x / mxfp8_group_size;
+     const int lane = threadIdx.x % mxfp8_group_size;
+-    const int query_head = blockIdx.y;
+     const int kv_head = query_head / queries_per_kv_head;
+-    const int last = decoder::position_value(position);
+     const int first = blockIdx.x * score_warps + warp;
+     if (first > last) {
+         return;
+@@ -174,7 +179,6 @@ __global__ void exact_scores_kernel(
+         query[group] =
+             __bfloat162float(queries[row_offset(0, mxfp8_query_heads, query_head) + channel]);
+     }
+-    auto* scores = workspace.scores + query_head * workspace.capacity;
+     const int stride = gridDim.x * score_warps;
+     for (int index = first; index <= last; index += stride) {
+         const int physical_page = pages[index / mxfp8_page_size];
+@@ -197,6 +201,77 @@ __global__ void exact_scores_kernel(
+     }
+ }
+ 
++template <typename Position>
++__global__ void exact_scores_kernel(
++    Mxfp8KvCache cache, const std::int32_t* pages, Position position,
++    const __nv_bfloat16* queries, decoder::ExactGqaWorkspace workspace) {
++    const int head = blockIdx.y;
++    exact_scores(cache, pages, decoder::position_value(position), head,
++                 queries, workspace.scores + head * workspace.capacity);
++}
++
++struct ExactReplay {
++    float prefix_maximum[replay_tile + 1];
++    float history_weight[replay_tile];
++    float token_weight[replay_tile];
++    float denominator;
++};
++
++__device__ __forceinline__ void exact_replay(
++    ExactReplay& shared, Mxfp8KvCache cache, const std::int32_t* pages, int last,
++    int query_head, const float* scores, __nv_bfloat16* output) {
++    const int kv_head = query_head / queries_per_kv_head;
++    const int channel = threadIdx.x;
++    const int group = channel / mxfp8_group_size;
++    float maximum = -CUDART_INF_F;
++    float weight_sum = 0.0f;
++    float weighted_value = 0.0f;
++
++    for (int first = 0; first <= last; first += replay_tile) {
++        const int count = min(replay_tile, last - first + 1);
++        if (channel == 0) {
++            shared.prefix_maximum[0] = maximum;
++            for (int index = 0; index < count; ++index) {
++                maximum = fmaxf(maximum, scores[first + index]);
++                shared.prefix_maximum[index + 1] = maximum;
++            }
++        }
++        const int physical_page = pages[first / mxfp8_page_size];
++        const int token = first % mxfp8_page_size;
++        const auto payload = payload_offset(physical_page, token, kv_head) + channel;
++        const auto scale = scale_offset(physical_page, token, kv_head, group);
++        __syncthreads();
++
++        if (channel < count) {
++            const float next_maximum = shared.prefix_maximum[channel + 1];
++            shared.history_weight[channel] = expf(shared.prefix_maximum[channel] - next_maximum);
++            shared.token_weight[channel] = expf(scores[first + channel] - next_maximum);
++        }
++        __syncthreads();
++
++        #pragma unroll 4
++        for (int index = 0; index < count; ++index) {
++            const auto payload_index = payload + index * mxfp8_kv_heads * mxfp8_head_dim;
++            const auto scale_index = scale + index * (mxfp8_page_size / mxfp8_group_size)
++                                                  * mxfp8_groups;
++            const float value =
++                decode(cache.value_payload[payload_index], cache.value_scales[scale_index]);
++            weighted_value = fmaf(shared.token_weight[index], value,
++                                  shared.history_weight[index] * weighted_value);
++        }
++        if (channel == 0) {
++            for (int index = 0; index < count; ++index) {
++                weight_sum = fmaf(shared.history_weight[index], weight_sum,
++                                  shared.token_weight[index]);
++            }
++            shared.denominator = weight_sum;
++        }
++        __syncthreads();
++    }
++    output[row_offset(0, mxfp8_query_heads, query_head) + channel] =
++        __float2bfloat16_rn(weighted_value / shared.denominator);
++}
++
+ template <typename Position>
+ __global__ void exact_replay_kernel(
+     Mxfp8KvCache cache, const std::int32_t* pages, Position position,
+@@ -260,6 +335,50 @@ __global__ void exact_replay_kernel(
+         __float2bfloat16_rn(weighted_value / denominator);
+ }
+ 
++__device__ __forceinline__ int fallback_score_capacity(const decoder::FastGqaLane& lane) {
++    return min(lane.pages.page_count, decoder::fast_gqa_max_parts)
++        * decoder::fast_gqa_partial_stride;
++}
++
++__device__ __forceinline__ float* fallback_scores(
++    const decoder::FastGqaLane& lane, int head, int capacity) {
++    return lane.scratch + mxfp8_query_heads + head * capacity;
++}
++
++__global__ void guarded_fast_decode_scores(decoder::FastGqaBatch batch) {
++    const auto& lane = batch.lanes[blockIdx.z];
++    const int head = blockIdx.y;
++    if (lane.scratch[head] != 1.0f) {
++        return;
++    }
++    const int last = lane.device_position ? *lane.device_position : lane.position;
++    const int capacity = fallback_score_capacity(lane);
++    if (last < decoder::fast_gqa_min_tokens - 1 || last >= capacity) {
++        return;
++    }
++    exact_scores(lane.cache, lane.pages.device_pages, last, head, lane.queries,
++                 fallback_scores(lane, head, capacity));
++}
++
++__global__ void guarded_fast_decode_fallback(decoder::FastGqaBatch batch) {
++    __shared__ ExactReplay replay;
++    __shared__ OrderedAttention direct;
++    const auto& lane = batch.lanes[blockIdx.y];
++    const int head = blockIdx.x;
++    if (lane.scratch[head] != 1.0f) {
++        return;
++    }
++    const int last = lane.device_position ? *lane.device_position : lane.position;
++    const int capacity = fallback_score_capacity(lane);
++    if (last >= decoder::fast_gqa_min_tokens - 1 && last < capacity) {
++        exact_replay(replay, lane.cache, lane.pages.device_pages, last, head,
++                     fallback_scores(lane, head, capacity), lane.output);
++        return;
++    }
++    ordered_attention(direct, lane.cache, lane.pages.device_pages, last, 0, head,
++                      lane.queries, lane.output);
++}
++
+ template <typename Position>
+ cudaError_t launch_exact_attention(
+     Mxfp8KvCache cache, Mxfp8PageTable pages, Position position, const __nv_bfloat16* queries,
+@@ -336,6 +455,19 @@ cudaError_t decoder::decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pag
+                             dim3(mxfp8_head_dim), arguments, 0, stream);
+ }
+ 
++cudaError_t decoder::fast_decode_gqa_fallback(
++    FastGqaBatch batch, int count, cudaStream_t stream) {
++    void* arguments[] = {&batch};
++    const auto status = cudaLaunchKernel(guarded_fast_decode_scores,
++                                         dim3(16, mxfp8_query_heads, count),
++                                         score_warps * mxfp8_group_size, arguments, 0, stream);
++    if (status != cudaSuccess) {
++        return status;
++    }
++    return cudaLaunchKernel(guarded_fast_decode_fallback, dim3(mxfp8_query_heads, count),
++                            mxfp8_head_dim, arguments, 0, stream);
++}
++
+ cudaError_t decoder::exact_decode_gqa_attention(
+     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,
+     __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream) {
+diff --git a/selected/src/text_attention_gdn.cu b/source/src/text_attention_gdn.cu
+index 164f2ad..1dbb86d 100644
+--- a/selected/src/text_attention_gdn.cu
++++ b/source/src/text_attention_gdn.cu
+@@ -1,6 +1,8 @@
+ #include "sglang/text_attention.h"
++#include "sglang/text_gdn_chunk.h"
+ 
+ #include <cuda_runtime.h>
++#include <cstdint>
+ 
+ namespace sglang {
+ namespace {
+@@ -60,6 +62,62 @@ __global__ void gdn_convolve(const __nv_bfloat16* qkv, const __nv_bfloat16* hist
+         __float2bfloat16(value * sigmoid(value));
+ }
+ 
++constexpr int packed_channels = 4;
++constexpr int packed_conv_blocks = text_gdn_qkv_width / (conv_threads * packed_channels);
++static_assert(text_gdn_qkv_width % (conv_threads * packed_channels) == 0);
++
++__device__ __nv_bfloat16 unpack_channel(uint2 words, int index) {
++    const auto word = index < 2 ? words.x : words.y;
++    return __ushort_as_bfloat16(static_cast<unsigned short>(word >> (16 * (index % 2))));
++}
++
++__device__ unsigned pack_channels(float first, float second) {
++    const auto packed = __floats2bfloat162_rn(first, second);
++    return __bfloat16_as_ushort(packed.x) | unsigned(__bfloat16_as_ushort(packed.y)) << 16;
++}
++
++__global__ void gdn_convolve_packed(const __nv_bfloat16* qkv, const __nv_bfloat16* history,
++                                    const __nv_bfloat16* weights, __nv_bfloat16* convolved) {
++    const int row = blockIdx.x / packed_conv_blocks;
++    const int first = ((blockIdx.x % packed_conv_blocks) * conv_threads + threadIdx.x)
++                      * packed_channels;
++    float values[packed_channels]{};
++    uint2 taps[packed_channels];
++    #pragma unroll
++    for (int index = 0; index < packed_channels; ++index) {
++        taps[index] = *reinterpret_cast<const uint2*>(weights + (first + index) * conv_taps);
++    }
++    #pragma unroll
++    for (int tap = 0; tap < conv_taps; ++tap) {
++        const int sample = row - text_gdn_history_taps + tap;
++        __nv_bfloat16 raw[packed_channels];
++        if (sample >= 0) {
++            const auto packed = *reinterpret_cast<const uint2*>(
++                qkv + std::size_t(sample) * text_gdn_qkv_width + first);
++            #pragma unroll
++            for (int index = 0; index < packed_channels; ++index) {
++                raw[index] = unpack_channel(packed, index);
++            }
++        } else {
++            #pragma unroll
++            for (int index = 0; index < packed_channels; ++index) {
++                raw[index] = raw_sample(qkv, history, sample, first + index);
++            }
++        }
++        #pragma unroll
++        for (int index = 0; index < packed_channels; ++index) {
++            values[index] = fmaf(__bfloat162float(raw[index]),
++                                 __bfloat162float(unpack_channel(taps[index], tap)), values[index]);
++        }
++    }
++    #pragma unroll
++    for (int index = 0; index < packed_channels; ++index) {
++        values[index] *= sigmoid(values[index]);
++    }
++    *reinterpret_cast<uint2*>(convolved + std::size_t(row) * text_gdn_qkv_width + first)
++        = make_uint2(pack_channels(values[0], values[1]), pack_channels(values[2], values[3]));
++}
++
+ template <bool round_qk>
+ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
+                           const __nv_bfloat16* b, const __nv_bfloat16* a,
+@@ -180,14 +238,50 @@ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv
+                                     * (gate * sigmoid(gate)));
+ }
+ 
++constexpr int finish_warps = 8;
++static_assert(text_gdn_qkv_width % (finish_warps * warp_size) == 0);
++
++__global__ void gdn_finish_packed(int token_count, const __nv_bfloat16* qkv,
++                                  const __nv_bfloat16* z, const __nv_bfloat16* norm,
++                                  const __nv_bfloat16* observable, __nv_bfloat16* history,
++                                  __nv_bfloat16* output) {
++    const int norm_rows = token_count * text_gdn_value_heads;
++    const int row = blockIdx.x * finish_warps + threadIdx.x / warp_size;
++    const int lane = threadIdx.x % warp_size;
++    if (row >= norm_rows) {
++        const int feature = (row - norm_rows) * warp_size + lane;
++        #pragma unroll
++        for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
++            history[feature * text_gdn_history_taps + tap] =
++                raw_sample(qkv, history, token_count - text_gdn_history_taps + tap, feature);
++        }
++        return;
++    }
++    const std::size_t base = std::size_t(row) * text_gdn_head_dim + lane;
++    float values[keys_per_lane];
++    float squares = 0.0f;
++    #pragma unroll
++    for (int part = 0; part < keys_per_lane; ++part) {
++        const int offset = part * warp_size;
++        const float value = __bfloat162float(observable[base + offset]);
++        values[part] = value;
++        squares += warp_sum(value * value);
++    }
++    const float inverse_rms = rsqrtf(squares / text_gdn_head_dim + norm_epsilon);
++    #pragma unroll
++    for (int part = 0; part < keys_per_lane; ++part) {
++        const int offset = part * warp_size;
++        const float gate = __bfloat162float(z[base + offset]);
++        output[base + offset] = __float2bfloat16(
++            values[part] * inverse_rms * __bfloat162float(norm[lane + offset])
++            * (gate * sigmoid(gate)));
++    }
+ }
+ 
+-cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
+-                             const __nv_bfloat16* z, const __nv_bfloat16* b,
+-                             const __nv_bfloat16* a, TextGdnWeights weights,
+-                             TextGdnState state, __nv_bfloat16* workspace,
+-                             std::size_t workspace_bytes, __nv_bfloat16* output,
+-                             cudaStream_t stream) {
++cudaError_t forward(int token_count, TextGdnMode mode, bool chunked, const __nv_bfloat16* qkv,
++                    const __nv_bfloat16* z, const __nv_bfloat16* b, const __nv_bfloat16* a,
++                    TextGdnWeights weights, TextGdnState state, __nv_bfloat16* workspace,
++                    std::size_t workspace_bytes, __nv_bfloat16* output, cudaStream_t stream) {
+     if (token_count == 0) {
+         return cudaSuccess;
+     }
+@@ -202,17 +296,33 @@ cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloa
+ 
+     auto* observable = workspace + static_cast<std::size_t>(token_count) * text_gdn_qkv_width;
+     void* conv_arguments[] = {&qkv, &state.history, &weights.convolution, &workspace};
+-    cudaError_t status = cudaLaunchKernel(gdn_convolve, dim3(token_count * conv_blocks_per_token),
+-                                         dim3(conv_threads), conv_arguments, 0, stream);
++    const bool packed = chunked && (reinterpret_cast<std::uintptr_t>(qkv) % alignof(uint2) == 0)
++        && (reinterpret_cast<std::uintptr_t>(weights.convolution) % alignof(uint2) == 0)
++        && (reinterpret_cast<std::uintptr_t>(workspace) % alignof(uint2) == 0);
++    const auto convolve = packed ? gdn_convolve_packed : gdn_convolve;
++    const int conv_blocks = token_count * (packed ? packed_conv_blocks : conv_blocks_per_token);
++    cudaError_t status = cudaLaunchKernel(convolve, dim3(conv_blocks), dim3(conv_threads),
++                                         conv_arguments, 0, stream);
+     if (status != cudaSuccess) {
+         return status;
+     }
+-    constexpr int recurrent_blocks = text_gdn_value_heads * value_blocks_per_head;
+-    const auto recur = mode == TextGdnMode::prefill ? gdn_recur<true> : gdn_recur<false>;
+-    void* recurrent_arguments[] = {
+-        &token_count, &workspace, &b, &a, &weights, &state.recurrent, &observable};
+-    status = cudaLaunchKernel(recur, dim3(recurrent_blocks), dim3(recurrent_threads),
+-                              recurrent_arguments, 0, stream);
++    if (chunked) {
++        TextGdnChunkScratch scratch;
++        auto* extra = workspace + required_bytes / sizeof(*workspace);
++        if (workspace_bytes >= text_gdn_prefill_chunked_workspace_bytes(token_count)
++            && reinterpret_cast<std::uintptr_t>(extra) % text_gdn_chunk_scratch_alignment == 0) {
++            scratch = {extra, workspace_bytes - required_bytes};
++        }
++        status = text_gdn_chunk_convolved(token_count, workspace, b, a, weights, state.recurrent,
++                                          observable, stream, scratch);
++    } else {
++        constexpr int recurrent_blocks = text_gdn_value_heads * value_blocks_per_head;
++        const auto recur = mode == TextGdnMode::prefill ? gdn_recur<true> : gdn_recur<false>;
++        void* recurrent_arguments[] = {
++            &token_count, &workspace, &b, &a, &weights, &state.recurrent, &observable};
++        status = cudaLaunchKernel(recur, dim3(recurrent_blocks), dim3(recurrent_threads),
++                                  recurrent_arguments, 0, stream);
++    }
+     if (status != cudaSuccess) {
+         return status;
+     }
+@@ -220,8 +330,37 @@ cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloa
+         token_count * text_gdn_value_heads + text_gdn_qkv_width / text_gdn_head_dim;
+     void* finish_arguments[] = {
+         &token_count, &qkv, &z, &weights.norm, &observable, &state.history, &output};
++    if (chunked) {
++        static_assert(text_gdn_value_heads % finish_warps == 0);
++        const int blocks = (token_count * text_gdn_value_heads + text_gdn_qkv_width / warp_size)
++                          / finish_warps;
++        return cudaLaunchKernel(gdn_finish_packed, dim3(blocks), dim3(finish_warps * warp_size),
++                                finish_arguments, 0, stream);
++    }
+     return cudaLaunchKernel(gdn_finish, dim3(finish_blocks), dim3(text_gdn_head_dim),
+                             finish_arguments, 0, stream);
+ }
+ 
+ }
++
++cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
++                             const __nv_bfloat16* z, const __nv_bfloat16* b,
++                             const __nv_bfloat16* a, TextGdnWeights weights,
++                             TextGdnState state, __nv_bfloat16* workspace,
++                             std::size_t workspace_bytes, __nv_bfloat16* output,
++                             cudaStream_t stream) {
++    return forward(token_count, mode, false, qkv, z, b, a, weights, state, workspace,
++                   workspace_bytes, output, stream);
++}
++
++cudaError_t text_gdn_prefill_chunked(int token_count, const __nv_bfloat16* qkv,
++                                     const __nv_bfloat16* z, const __nv_bfloat16* b,
++                                     const __nv_bfloat16* a, TextGdnWeights weights,
++                                     TextGdnState state, __nv_bfloat16* workspace,
++                                     std::size_t workspace_bytes, __nv_bfloat16* output,
++                                     cudaStream_t stream) {
++    return forward(token_count, TextGdnMode::prefill, true, qkv, z, b, a, weights, state,
++                   workspace, workspace_bytes, output, stream);
++}
++
++}
+diff --git a/source/src/text_gdn_chunk.cu b/source/src/text_gdn_chunk.cu
+new file mode 100644
+index 0000000..cbc9378
+--- /dev/null
++++ b/source/src/text_gdn_chunk.cu
+@@ -0,0 +1,781 @@
++#include "sglang/text_gdn_chunk.h"
++
++#include <cuda_runtime.h>
++#include <cstdint>
++#include <type_traits>
++
++namespace sglang {
++namespace {
++
++using Bf16 = __nv_bfloat16;
++constexpr int rows = 64;
++constexpr int features = text_gdn_head_dim;
++constexpr int value_rows = 16;
++constexpr int blocks_per_head = features / value_rows;
++constexpr int warp_size = 32;
++constexpr int warps = 4;
++constexpr int threads = warp_size * warps;
++constexpr int score_warps = 16;
++constexpr int tile_m = 16;
++constexpr int tile_n = 8;
++constexpr int feature_stride = features + 8;
++constexpr int row_stride = rows + 8;
++constexpr int heads_per_qk = text_gdn_value_heads / text_gdn_qk_heads;
++constexpr unsigned all_lanes = 0xffffffffu;
++constexpr float query_scale = 0.08838834764831845f;
++
++struct alignas(16) Matrices {
++    Bf16 q[rows][feature_stride];
++    Bf16 k[rows][feature_stride];
++    Bf16 inverse[rows][row_stride];
++    Bf16 qk[rows][row_stride];
++    float prefix[rows];
++    float retained[rows];
++};
++
++struct alignas(16) RecurrenceTemps {
++    Bf16 high[value_rows][feature_stride];
++    Bf16 low[value_rows][feature_stride];
++    Bf16 corrected[value_rows][row_stride];
++    Bf16 update[value_rows][row_stride];
++    Bf16 retained_update[value_rows][row_stride];
++    Bf16 values[rows][value_rows];
++};
++
++struct alignas(16) ScoreTemps {
++    Bf16 intermediate[32][40];
++    float transfer[rows][rows + 1];
++    float decay[rows];
++    float beta[rows];
++};
++
++struct alignas(16) ScoreShared : Matrices, ScoreTemps {};
++struct alignas(16) RecurrentShared : Matrices, RecurrenceTemps {};
++struct alignas(16) FusedShared : Matrices, ScoreTemps, RecurrenceTemps {};
++
++struct Convolved {
++    const Bf16* qkv;
++    const Bf16* b;
++    const Bf16* a;
++    const Bf16* a_log;
++    const Bf16* dt_bias;
++};
++
++struct alignas(16) Scores {
++    Bf16 inverse[rows][rows];
++    Bf16 qk[rows][rows];
++    float prefix[rows];
++    float retained[rows];
++};
++
++struct alignas(16) QueryKey {
++    Bf16 q[rows][features];
++    Bf16 k[rows][features];
++};
++
++struct Staged {
++    Scores* scores;
++    QueryKey* query_key;
++};
++
++struct Fragment {
++    float first;
++    float second;
++    float third;
++    float fourth;
++};
++
++struct Warp {
++    int index;
++    int lane;
++
++    __device__ int row() const { return lane / 4; }
++    __device__ int col() const { return (lane % 4) * 2; }
++};
++
++__device__ unsigned shared_address(const Bf16* pointer) {
++    return static_cast<unsigned>(__cvta_generic_to_shared(pointer));
++}
++
++template <bool rhs_transposed, int reduction>
++__device__ Fragment multiply(const Bf16* lhs, int lhs_stride, const Bf16* rhs,
++                             int rhs_stride, int lane, Fragment sum = {}) {
++    const unsigned lhs_start = shared_address(lhs + (lane % 16) * lhs_stride + lane / 16 * 8);
++    const unsigned rhs_start = rhs_transposed
++        ? shared_address(rhs + (lane % 8) * rhs_stride + (lane / 8 % 2) * 8)
++        : shared_address(rhs + (lane % 16) * rhs_stride);
++    #pragma unroll
++    for (int slice = 0; slice < reduction; slice += 16) {
++        unsigned left0, left1, left2, left3, right0, right1;
++        asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
++            : "=r"(left0), "=r"(left1), "=r"(left2), "=r"(left3)
++            : "r"(lhs_start + slice * int(sizeof(Bf16))) : "memory");
++        if constexpr (rhs_transposed) {
++            asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
++                : "=r"(right0), "=r"(right1)
++                : "r"(rhs_start + slice * int(sizeof(Bf16))) : "memory");
++        } else {
++            asm("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
++                : "=r"(right0), "=r"(right1)
++                : "r"(rhs_start + slice * rhs_stride * int(sizeof(Bf16))) : "memory");
++        }
++        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++            : "+f"(sum.first), "+f"(sum.second), "+f"(sum.third), "+f"(sum.fourth)
++            : "r"(left0), "r"(left1), "r"(left2), "r"(left3), "r"(right0), "r"(right1));
++    }
++    return sum;
++}
++
++__device__ void store_pair(Bf16* ptr, float first, float second) {
++    *reinterpret_cast<__nv_bfloat162*>(ptr) = __floats2bfloat162_rn(first, second);
++}
++
++__device__ void store_tile(Bf16* ptr, int stride, Fragment result) {
++    store_pair(ptr, result.first, result.second);
++    store_pair(ptr + 8 * stride, result.third, result.fourth);
++}
++
++__device__ float warp_sum(float value) {
++    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
++        value += __shfl_xor_sync(all_lanes, value, offset);
++    }
++    return value;
++}
++
++template <int workers>
++__device__ void prepare_qk(Matrices& shared, const TextGdnPrepared& input, int first,
++                           int valid, int qk_head, Warp) {
++    for (int index = threadIdx.x; index < rows * features; index += workers * warp_size) {
++        const int row = index / features;
++        const int key = index % features;
++        const auto offset = std::size_t(first + row) * text_gdn_qk_width + qk_head * features;
++        shared.q[row][key] = row < valid ? input.q[offset + key] : Bf16{};
++        shared.k[row][key] = row < valid ? input.k[offset + key] : Bf16{};
++    }
++}
++
++template <int workers>
++__device__ void prepare_qk(Matrices& shared, const Convolved& input, int first,
++                           int valid, int qk_head, Warp warp) {
++    for (int item = warp.index; item < 2 * rows; item += workers) {
++        const int row = item % rows;
++        auto* output = item < rows ? shared.q[row] : shared.k[row];
++        const auto offset = std::size_t(first + row) * text_gdn_qkv_width
++                            + (item / rows) * text_gdn_qk_width + qk_head * features;
++        float components[features / warp_size];
++        float squares = 0.0f;
++        #pragma unroll
++        for (int part = 0; part < features / warp_size; ++part) {
++            const int key = part * warp_size + warp.lane;
++            const float value = row < valid ? __bfloat162float(input.qkv[offset + key]) : 0.0f;
++            components[part] = value;
++            squares += warp_sum(value * value);
++        }
++        const float inverse_norm = rsqrtf(squares + 1.0e-6f);
++        #pragma unroll
++        for (int part = 0; part < features / warp_size; ++part) {
++            output[part * warp_size + warp.lane] =
++                __float2bfloat16_rn(components[part] * inverse_norm);
++        }
++    }
++}
++
++__device__ float load_gate(const TextGdnPrepared& input, int index, int, float& beta) {
++    beta = input.beta[index];
++    return input.decay[index];
++}
++
++__device__ float load_gate(const Convolved& input, int index, int head, float& beta) {
++    const float negative_a = -expf(__bfloat162float(input.a_log[head]));
++    const float delta = __bfloat162float(input.a[index]) + __bfloat162float(input.dt_bias[head]);
++    const float softplus = fmaxf(delta, 0.0f) + log1pf(expf(-fabsf(delta)));
++    beta = 1.0f / (1.0f + expf(-__bfloat162float(input.b[index])));
++    return expf(negative_a * softplus);
++}
++
++template <class Input>
++__device__ void prepare_gates(ScoreTemps& shared, const Input& input, int first, int valid,
++                              int head) {
++    const int row = threadIdx.x;
++    if (row < rows) {
++        float beta = 0.0f;
++        shared.decay[row] = row < valid
++            ? load_gate(input, (first + row) * text_gdn_value_heads + head, head, beta)
++            : 1.0f;
++        shared.beta[row] = beta;
++    }
++}
++
++template <class Shared>
++__device__ void scan_decay(Shared& shared) {
++    const int row = threadIdx.x;
++    if (row < rows) {
++        float transfer = 1.0f;
++        for (int col = row; col >= 0; --col) {
++            shared.transfer[row][col] = transfer;
++            transfer *= shared.decay[col];
++        }
++        shared.prefix[row] = transfer;
++    }
++    __syncthreads();
++    if (row < rows) {
++        shared.retained[row] = shared.transfer[rows - 1][row];
++    }
++}
++
++__device__ void copy_to_global(Bf16* destination, const Bf16* source) {
++    *reinterpret_cast<uint4*>(destination) = *reinterpret_cast<const uint4*>(source);
++}
++
++__device__ void copy_to_shared(Bf16* destination, const Bf16* source) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
++                 :: "r"(shared_address(destination)), "l"(source) : "memory");
++}
++
++template <class Input>
++__device__ void load_values(RecurrenceTemps& shared, const Input& input, int first,
++                            int valid, int value_start) {
++    constexpr bool convolved = std::is_same_v<Input, Convolved>;
++    constexpr int stride = convolved ? text_gdn_qkv_width : text_gdn_value_width;
++    const Bf16* source;
++    if constexpr (convolved) {
++        source = input.qkv + 2 * text_gdn_qk_width;
++    } else {
++        source = input.v;
++    }
++    source += std::size_t(first) * stride + value_start;
++    if (reinterpret_cast<std::uintptr_t>(source) % alignof(uint4) == 0) {
++        for (int index = threadIdx.x * 8; index < valid * value_rows; index += threads * 8) {
++            const int token = index / value_rows;
++            const int value = index % value_rows;
++            copy_to_shared(&shared.values[token][value], source + token * stride + value);
++        }
++    } else {
++        for (int index = threadIdx.x; index < valid * value_rows; index += threads) {
++            const int token = index / value_rows;
++            const int value = index % value_rows;
++            shared.values[token][value] = source[token * stride + value];
++        }
++    }
++    asm volatile("cp.async.commit_group;" ::: "memory");
++}
++
++template <bool strict>
++__device__ float causal_score(const ScoreTemps& shared, float product, int row, int col) {
++    if (strict ? row <= col : row < col) {
++        return 0.0f;
++    }
++    return product * shared.transfer[row][col] * (strict ? shared.beta[row] : query_scale);
++}
++
++template <bool strict, class Shared>
++__device__ void store_scores(Shared& shared, Warp warp, int row, int col, Fragment result) {
++    row += warp.row();
++    col += warp.col();
++    auto& matrix = strict ? shared.inverse : shared.qk;
++    store_pair(&matrix[row][col], causal_score<strict>(shared, result.first, row, col),
++               causal_score<strict>(shared, result.second, row, col + 1));
++    row += 8;
++    store_pair(&matrix[row][col], causal_score<strict>(shared, result.third, row, col),
++               causal_score<strict>(shared, result.fourth, row, col + 1));
++}
++
++template <int workers, class Shared>
++__device__ void form_scores(Shared& shared, Warp warp) {
++    constexpr int columns = rows / tile_n;
++    for (int item = warp.index; item < rows / tile_m * columns; item += workers) {
++        const int row = item / columns * tile_m;
++        const int col = item % columns * tile_n;
++        Fragment kk{}, qk{};
++        if (col < row + tile_m) {
++            kk = multiply<true, features>(shared.k[row], feature_stride, shared.k[col],
++                                          feature_stride, warp.lane);
++            qk = multiply<true, features>(shared.q[row], feature_stride, shared.k[col],
++                                          feature_stride, warp.lane);
++        }
++        store_scores<true>(shared, warp, row, col, kk);
++        store_scores<false>(shared, warp, row, col, qk);
++    }
++}
++
++__device__ void invert_eight(Matrices& shared) {
++    if (threadIdx.x < rows) {
++        constexpr int width = 8;
++        const int row = threadIdx.x;
++        const int diagonal = row % width;
++        const int first = row - diagonal;
++        float values[width];
++        #pragma unroll
++        for (int col = 0; col < width; ++col) {
++            values[col] = col == diagonal ? 1.0f
++                                          : __bfloat162float(shared.inverse[row][first + col]);
++        }
++        #pragma unroll
++        for (int pivot = 0; pivot < width - 1; ++pivot) {
++            const float negative = -values[pivot];
++            #pragma unroll
++            for (int col = 0; col < pivot; ++col) {
++                const float prior = __shfl_sync(all_lanes, values[col], pivot, width);
++                if (diagonal > pivot) {
++                    values[col] = fmaf(negative, prior, values[col]);
++                }
++            }
++            if (diagonal > pivot) {
++                values[pivot] = negative;
++            }
++        }
++        #pragma unroll
++        for (int col = 0; col < width; ++col) {
++            shared.inverse[row][first + col] = __float2bfloat16_rn(values[col]);
++        }
++    }
++    __syncthreads();
++}
++
++__device__ unsigned pack_bf16(Bf16 first, Bf16 second) {
++    return unsigned(__bfloat16_as_ushort(first)) | (unsigned(__bfloat16_as_ushort(second)) << 16);
++}
++
++__device__ void mma_eight(unsigned lhs, unsigned rhs, float& first, float& second) {
++    asm("{ .reg .f32 ignored_first, ignored_second;\n"
++        "mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
++        "{%0,%1,ignored_first,ignored_second}, {%2,%2}, {%3}, {%4,%4,%4,%4}; }"
++        : "=f"(first), "=f"(second) : "r"(lhs), "r"(rhs), "f"(0.0f));
++}
++
++__device__ void invert_sixteen(Matrices& shared, Warp warp) {
++    if (warp.index < rows / 16) {
++        const int first = warp.index * 16;
++        const int lower = first + 8;
++        const int row = warp.row();
++        const int col = warp.col();
++        const auto diagonal = pack_bf16(shared.inverse[lower + row][lower + col],
++                                        shared.inverse[lower + row][lower + col + 1]);
++        const auto off_diagonal = pack_bf16(shared.inverse[lower + col][first + row],
++                                            shared.inverse[lower + col + 1][first + row]);
++        const auto upper = pack_bf16(shared.inverse[first + col][first + row],
++                                      shared.inverse[first + col + 1][first + row]);
++        float first_result, second_result;
++        mma_eight(diagonal, off_diagonal, first_result, second_result);
++        const auto correction = pack_bf16(__float2bfloat16_rn(-first_result),
++                                          __float2bfloat16_rn(-second_result));
++        mma_eight(correction, upper, first_result, second_result);
++        __syncwarp(all_lanes);
++        store_pair(&shared.inverse[lower + row][first + col], first_result, second_result);
++    }
++    __syncthreads();
++}
++
++template <int half, bool finishing, int workers, class Shared>
++__device__ void invert_rectangle(Shared& shared, Warp warp) {
++    constexpr int column_tiles = half / tile_n;
++    constexpr int tiles = half / tile_m * column_tiles;
++    constexpr int stride = 40;
++    for (int item = warp.index; item < rows / (2 * half) * tiles; item += workers) {
++        const int block = item / tiles;
++        const int first = 2 * half * block;
++        const int row = item % tiles / column_tiles * tile_m;
++        const int col = item % column_tiles * tile_n;
++        auto* intermediate = shared.intermediate[block * half + row];
++        const int lane_row = warp.row();
++        const int lane_col = col + warp.col();
++        if constexpr (finishing) {
++            const auto result = multiply<false, half>(intermediate, stride,
++                &shared.inverse[first][first + col], row_stride, warp.lane);
++            store_tile(&shared.inverse[first + half + row + lane_row][first + lane_col],
++                       row_stride, result);
++        } else {
++            const auto* diagonal = &shared.inverse[first + half + row][first + half];
++            const auto result = multiply<false, half>(diagonal, row_stride,
++                &shared.inverse[first + half][first + col], row_stride, warp.lane);
++            store_tile(intermediate + lane_row * stride + lane_col, stride,
++                       {-result.first, -result.second, -result.third, -result.fourth});
++        }
++    }
++    __syncthreads();
++}
++
++template <int workers, class Shared>
++__device__ void invert(Shared& shared, Warp warp) {
++    invert_eight(shared);
++    invert_sixteen(shared, warp);
++    invert_rectangle<16, false, workers>(shared, warp);
++    invert_rectangle<16, true, workers>(shared, warp);
++    invert_rectangle<32, false, workers>(shared, warp);
++    invert_rectangle<32, true, workers>(shared, warp);
++    for (int index = threadIdx.x * 2; index < rows * rows; index += workers * warp_size * 2) {
++        const int row = index / rows;
++        const int col = index % rows;
++        auto* ptr = &shared.inverse[row][col];
++        store_pair(ptr, __bfloat162float(ptr[0]) * shared.beta[col],
++                   __bfloat162float(ptr[1]) * shared.beta[col + 1]);
++    }
++}
++
++constexpr int state_columns = features / tile_n;
++constexpr int state_tiles_per_warp = value_rows / tile_m * state_columns / warps;
++
++struct StateTiles {
++    Fragment part[state_tiles_per_warp];
++
++    __device__ int row(Warp warp, int item) const {
++        return (item * warps + warp.index) / state_columns * tile_m;
++    }
++
++    __device__ int col(Warp warp, int item) const {
++        return (item * warps + warp.index) % state_columns * tile_n;
++    }
++
++    __device__ void load(const float* state, Warp warp) {
++        #pragma unroll
++        for (int item = 0; item < state_tiles_per_warp; ++item) {
++            const auto* ptr = state + (row(warp, item) + warp.row()) * features
++                              + col(warp, item) + warp.col();
++            part[item] = {ptr[0], ptr[1], ptr[8 * features], ptr[8 * features + 1]};
++        }
++    }
++
++    __device__ void store(float* state, Warp warp) const {
++        #pragma unroll
++        for (int item = 0; item < state_tiles_per_warp; ++item) {
++            auto* ptr = state + (row(warp, item) + warp.row()) * features
++                        + col(warp, item) + warp.col();
++            const auto value = part[item];
++            ptr[0] = value.first;
++            ptr[1] = value.second;
++            ptr[8 * features] = value.third;
++            ptr[8 * features + 1] = value.fourth;
++        }
++    }
++
++    __device__ void split(RecurrenceTemps& shared, Warp warp) const {
++        #pragma unroll
++        for (int item = 0; item < state_tiles_per_warp; ++item) {
++            const int value_row = row(warp, item) + warp.row();
++            const int key = col(warp, item) + warp.col();
++            const auto value = part[item];
++            const auto top = __floats2bfloat162_rn(value.first, value.second);
++            const auto bottom = __floats2bfloat162_rn(value.third, value.fourth);
++            *reinterpret_cast<__nv_bfloat162*>(&shared.high[value_row][key]) = top;
++            *reinterpret_cast<__nv_bfloat162*>(&shared.high[value_row + 8][key]) = bottom;
++            store_pair(&shared.low[value_row][key], value.first - __low2float(top),
++                       value.second - __high2float(top));
++            store_pair(&shared.low[value_row + 8][key], value.third - __low2float(bottom),
++                       value.fourth - __high2float(bottom));
++        }
++    }
++
++    template <class Shared>
++    __device__ void advance(const Shared& shared, Warp warp) {
++        const float retention = shared.prefix[rows - 1];
++        #pragma unroll
++        for (int item = 0; item < state_tiles_per_warp; ++item) {
++            const auto value = part[item];
++            const Fragment seed{value.first * retention, value.second * retention,
++                                value.third * retention, value.fourth * retention};
++            part[item] = multiply<false, rows>(shared.retained_update[row(warp, item)],
++                row_stride, shared.k[0] + col(warp, item), feature_stride, warp.lane, seed);
++        }
++    }
++};
++
++__device__ Fragment project_state(const RecurrenceTemps& shared, const Bf16* qk,
++                                  int row, Warp warp) {
++    const auto low = multiply<true, features>(shared.low[row], feature_stride, qk,
++                                              feature_stride, warp.lane);
++    return multiply<true, features>(shared.high[row], feature_stride, qk,
++                                    feature_stride, warp.lane, low);
++}
++
++template <class Shared>
++__device__ float residual(const Shared& shared, float dot, int token, int value, int valid) {
++    return token < valid
++        ? fmaf(-dot, shared.prefix[token], __bfloat162float(shared.values[token][value]))
++        : 0.0f;
++}
++
++template <class Shared>
++__device__ void correct_values(Shared& shared, int valid, Warp warp) {
++    for (int item = warp.index; item < value_rows / tile_m * (rows / tile_n); item += warps) {
++        const int row = item / (rows / tile_n) * tile_m;
++        const int col = item % (rows / tile_n) * tile_n;
++        const auto dot = project_state(shared, shared.k[col], row, warp);
++        const int token = col + warp.col();
++        const int value = row + warp.row();
++        store_pair(&shared.corrected[value][token],
++                   residual(shared, dot.first, token, value, valid),
++                   residual(shared, dot.second, token + 1, value, valid));
++        store_pair(&shared.corrected[value + 8][token],
++                   residual(shared, dot.third, token, value + 8, valid),
++                   residual(shared, dot.fourth, token + 1, value + 8, valid));
++    }
++}
++
++template <class Shared>
++__device__ void update_values(Shared& shared, Warp warp) {
++    for (int item = warp.index; item < value_rows / tile_m * (rows / tile_n); item += warps) {
++        const int row = item / (rows / tile_n) * tile_m;
++        const int col = item % (rows / tile_n) * tile_n;
++        const auto result = multiply<true, rows>(shared.corrected[row], row_stride,
++                                                 shared.inverse[col], row_stride, warp.lane);
++        const int value = row + warp.row();
++        const int token = col + warp.col();
++        const float left = shared.retained[token];
++        const float right = shared.retained[token + 1];
++        store_tile(&shared.update[value][token], row_stride, result);
++        store_tile(&shared.retained_update[value][token], row_stride,
++                   {result.first * left, result.second * right,
++                    result.third * left, result.fourth * right});
++    }
++}
++
++template <class Shared>
++__device__ void form_observable(Shared& shared, Warp warp) {
++    for (int item = warp.index; item < value_rows / tile_m * (rows / tile_n); item += warps) {
++        const int row = item / (rows / tile_n) * tile_m;
++        const int col = item % (rows / tile_n) * tile_n;
++        const int value = row + warp.row();
++        const int token = col + warp.col();
++        const auto dot = project_state(shared, shared.q[col], row, warp);
++        const float left = shared.prefix[token];
++        const float right = shared.prefix[token + 1];
++        const Fragment seed{dot.first * left * query_scale, dot.second * right * query_scale,
++                            dot.third * left * query_scale, dot.fourth * right * query_scale};
++        const auto result = multiply<true, rows>(shared.update[row], row_stride, shared.qk[col],
++                                                 row_stride, warp.lane, seed);
++        shared.values[token][value] = __float2bfloat16_rn(result.first);
++        shared.values[token][value + 8] = __float2bfloat16_rn(result.third);
++        shared.values[token + 1][value] = __float2bfloat16_rn(result.second);
++        shared.values[token + 1][value + 8] = __float2bfloat16_rn(result.fourth);
++    }
++}
++
++__device__ void write_observable(const RecurrenceTemps& shared, Bf16* output, int valid) {
++    if (reinterpret_cast<std::uintptr_t>(output) % alignof(uint4) == 0) {
++        for (int index = threadIdx.x * 8; index < valid * value_rows; index += threads * 8) {
++            const int token = index / value_rows;
++            const int value = index % value_rows;
++            copy_to_global(output + token * text_gdn_value_width + value,
++                           &shared.values[token][value]);
++        }
++    } else {
++        for (int index = threadIdx.x; index < valid * value_rows; index += threads) {
++            const int token = index / value_rows;
++            const int value = index % value_rows;
++            output[token * text_gdn_value_width + value] = shared.values[token][value];
++        }
++    }
++}
++
++template <class Shared>
++__device__ void advance_chunk(Shared& shared, StateTiles& tiles, int first, int valid,
++                              Bf16* observable, Warp warp) {
++    correct_values(shared, valid, warp);
++    __syncthreads();
++    update_values(shared, warp);
++    __syncthreads();
++    form_observable(shared, warp);
++    tiles.advance(shared, warp);
++    __syncthreads();
++    write_observable(shared, observable + std::size_t(first) * text_gdn_value_width, valid);
++    __syncthreads();
++}
++
++template <class Input>
++__global__ void recur(int token_count, Input input, float* recurrent, Bf16* observable) {
++    extern __shared__ __align__(16) unsigned char storage[];
++    auto& shared = *reinterpret_cast<FusedShared*>(storage);
++    const int head = blockIdx.x / blocks_per_head;
++    const int value_start = head * features + blockIdx.x % blocks_per_head * value_rows;
++    const Warp warp{int(threadIdx.x) / warp_size, int(threadIdx.x) % warp_size};
++    auto* state = recurrent + value_start * features;
++    StateTiles tiles;
++    tiles.load(state, warp);
++    for (int first = 0; first < token_count; first += rows) {
++        const int valid = min(token_count - first, rows);
++        load_values(shared, input, first, valid, value_start);
++        prepare_gates(shared, input, first, valid, head);
++        prepare_qk<warps>(shared, input, first, valid, head / heads_per_qk, warp);
++        tiles.split(shared, warp);
++        __syncthreads();
++        scan_decay(shared);
++        form_scores<warps>(shared, warp);
++        __syncthreads();
++        invert<warps>(shared, warp);
++        asm volatile("cp.async.wait_group 0;" ::: "memory");
++        __syncthreads();
++        advance_chunk(shared, tiles, first, valid, observable + value_start, warp);
++    }
++    tiles.store(state, warp);
++}
++
++template <class Input>
++__global__ void stage(int token_count, Input input, Staged staged) {
++    extern __shared__ __align__(16) unsigned char storage[];
++    auto& shared = *reinterpret_cast<ScoreShared*>(storage);
++    const int head = blockIdx.x % text_gdn_value_heads;
++    const int chunk = blockIdx.x / text_gdn_value_heads;
++    const int qk_head = head / heads_per_qk;
++    const int first = chunk * rows;
++    const int valid = min(token_count - first, rows);
++    const Warp warp{int(threadIdx.x) / warp_size, int(threadIdx.x) % warp_size};
++    prepare_gates(shared, input, first, valid, head);
++    prepare_qk<score_warps>(shared, input, first, valid, qk_head, warp);
++    __syncthreads();
++    scan_decay(shared);
++    form_scores<score_warps>(shared, warp);
++    __syncthreads();
++    invert<score_warps>(shared, warp);
++    __syncthreads();
++    if (head % heads_per_qk == 0) {
++        auto& qk = staged.query_key[chunk * text_gdn_qk_heads + qk_head];
++        for (int index = threadIdx.x * 8; index < rows * features;
++             index += score_warps * warp_size * 8) {
++            const int row = index / features;
++            const int col = index % features;
++            copy_to_global(&qk.q[row][col], &shared.q[row][col]);
++            copy_to_global(&qk.k[row][col], &shared.k[row][col]);
++        }
++    }
++    auto& scores = staged.scores[blockIdx.x];
++    if (threadIdx.x < rows) {
++        scores.prefix[threadIdx.x] = shared.prefix[threadIdx.x];
++        scores.retained[threadIdx.x] = shared.retained[threadIdx.x];
++    }
++    for (int index = threadIdx.x * 8; index < rows * rows;
++         index += score_warps * warp_size * 8) {
++        const int row = index / rows;
++        const int col = index % rows;
++        copy_to_global(&scores.inverse[row][col], &shared.inverse[row][col]);
++        copy_to_global(&scores.qk[row][col], &shared.qk[row][col]);
++    }
++}
++
++__device__ void load_stage(Matrices& shared, const Scores& scores, const QueryKey& qk) {
++    for (int index = threadIdx.x * 8; index < rows * features; index += threads * 8) {
++        const int row = index / features;
++        const int col = index % features;
++        copy_to_shared(&shared.q[row][col], &qk.q[row][col]);
++        copy_to_shared(&shared.k[row][col], &qk.k[row][col]);
++    }
++    for (int index = threadIdx.x * 8; index < rows * rows; index += threads * 8) {
++        const int row = index / rows;
++        const int col = index % rows;
++        copy_to_shared(&shared.inverse[row][col], &scores.inverse[row][col]);
++        copy_to_shared(&shared.qk[row][col], &scores.qk[row][col]);
++    }
++    asm volatile("cp.async.commit_group;" ::: "memory");
++    if (threadIdx.x < rows) {
++        shared.prefix[threadIdx.x] = scores.prefix[threadIdx.x];
++        shared.retained[threadIdx.x] = scores.retained[threadIdx.x];
++    }
++}
++
++template <class Input>
++__global__ void recur_staged(int tokens, Input input, float* recurrent, Bf16* observable,
++                             Staged staged) {
++    extern __shared__ __align__(16) unsigned char storage[];
++    auto& shared = *reinterpret_cast<RecurrentShared*>(storage);
++    const int head = blockIdx.x / blocks_per_head;
++    const int value_start = head * features + blockIdx.x % blocks_per_head * value_rows;
++    const Warp warp{int(threadIdx.x) / warp_size, int(threadIdx.x) % warp_size};
++    auto* state = recurrent + value_start * features;
++    StateTiles tiles;
++    tiles.load(state, warp);
++    for (int first = 0; first < tokens; first += rows) {
++        const int chunk = first / rows;
++        const int valid = min(tokens - first, rows);
++        load_stage(shared, staged.scores[chunk * text_gdn_value_heads + head],
++                   staged.query_key[chunk * text_gdn_qk_heads + head / heads_per_qk]);
++        load_values(shared, input, first, valid, value_start);
++        tiles.split(shared, warp);
++        asm volatile("cp.async.wait_group 0;" ::: "memory");
++        __syncthreads();
++        advance_chunk(shared, tiles, first, valid, observable + value_start, warp);
++    }
++    tiles.store(state, warp);
++}
++
++template <class Shared, int workers = warps, class Kernel>
++cudaError_t launch_grid(Kernel kernel, int blocks, void** arguments, cudaStream_t stream) {
++    const auto status = cudaFuncSetAttribute(
++        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared));
++    if (status != cudaSuccess) {
++        return status;
++    }
++    return cudaLaunchKernel(kernel, dim3(blocks), dim3(workers * warp_size), arguments,
++                            sizeof(Shared), stream);
++}
++
++template <class Input>
++cudaError_t launch(int tokens, Input input, float* recurrent, Bf16* observable,
++                    cudaStream_t stream, TextGdnChunkScratch scratch) {
++    constexpr int blocks = text_gdn_value_heads * blocks_per_head;
++    if (!scratch.data && scratch.bytes == 0) {
++        void* arguments[] = {&tokens, &input, &recurrent, &observable};
++        return launch_grid<FusedShared>(recur<Input>, blocks, arguments, stream);
++    }
++    if (!scratch.data || scratch.bytes < text_gdn_chunk_scratch_bytes(tokens)
++        || reinterpret_cast<std::uintptr_t>(scratch.data) % text_gdn_chunk_scratch_alignment) {
++        return cudaErrorInvalidValue;
++    }
++    const int chunks = (tokens + rows - 1) / rows;
++    const int score_tiles = chunks * text_gdn_value_heads;
++    static_assert(alignof(Scores) == text_gdn_chunk_scratch_alignment);
++    static_assert(alignof(QueryKey) == text_gdn_chunk_scratch_alignment);
++    auto* scores = static_cast<Scores*>(scratch.data);
++    Staged staged{scores, reinterpret_cast<QueryKey*>(scores + score_tiles)};
++    void* stage_args[] = {&tokens, &input, &staged};
++    const auto status =
++        launch_grid<ScoreShared, score_warps>(stage<Input>, score_tiles, stage_args, stream);
++    if (status != cudaSuccess) {
++        return status;
++    }
++    void* recurrent_args[] = {&tokens, &input, &recurrent, &observable, &staged};
++    return launch_grid<RecurrentShared>(recur_staged<Input>, blocks, recurrent_args, stream);
++}
++
++}
++
++std::size_t text_gdn_chunk_scratch_bytes(int token_count) {
++    if (token_count <= 0 || token_count > text_attention_max_tokens) {
++        return 0;
++    }
++    return std::size_t((token_count + rows - 1) / rows)
++           * (text_gdn_value_heads * sizeof(Scores) + text_gdn_qk_heads * sizeof(QueryKey));
++}
++
++std::size_t text_gdn_prefill_chunked_workspace_bytes(int token_count) {
++    return text_gdn_workspace_bytes(token_count) + text_gdn_chunk_scratch_bytes(token_count);
++}
++
++cudaError_t text_gdn_chunk_forward(int token_count, TextGdnPrepared input,
++                                   float* recurrent, Bf16* observable, cudaStream_t stream,
++                                   TextGdnChunkScratch scratch) {
++    if (token_count == 0) {
++        return cudaSuccess;
++    }
++    if (token_count < 0 || token_count > text_attention_max_tokens || !input.q || !input.k
++        || !input.v || !input.decay || !input.beta || !recurrent || !observable) {
++        return cudaErrorInvalidValue;
++    }
++    return launch(token_count, input, recurrent, observable, stream, scratch);
++}
++
++cudaError_t text_gdn_chunk_convolved(int token_count, const Bf16* convolved,
++                                     const Bf16* b, const Bf16* a, TextGdnWeights weights,
++                                     float* recurrent, Bf16* observable, cudaStream_t stream,
++                                     TextGdnChunkScratch scratch) {
++    if (token_count == 0) {
++        return cudaSuccess;
++    }
++    if (token_count < 0 || token_count > text_attention_max_tokens || !convolved || !b || !a
++        || !weights.a_log || !weights.dt_bias || !recurrent || !observable) {
++        return cudaErrorInvalidValue;
++    }
++    return launch(token_count, Convolved{convolved, b, a, weights.a_log, weights.dt_bias},
++                  recurrent, observable, stream, scratch);
++}
++
++}
+diff --git a/selected/tests/prefill/run_native.py b/source/tests/prefill/run_native.py
+index 7a16d2c..9e3b756 100644
+--- a/selected/tests/prefill/run_native.py
++++ b/source/tests/prefill/run_native.py
+@@ -61,17 +61,23 @@ def check_policy(args):
+             continue
+         executable = executable.resolve(strict=True)
+         cases = [
+-            (["--help"], 0, "--fp8-prefill exact|tensor-core"),
+-            (["--fp8-prefill", "auto"], 1, "Expected --fp8-prefill exact or tensor-core"),
+-            (["--fp8-prefill", ""], 1, "Expected --fp8-prefill exact or tensor-core"),
++            (["--help"], 0, "--fp8-prefill exact|tensor-core|fast-native"),
++            (["--fp8-prefill", "auto"], 1, "Expected --fp8-prefill"),
++            (["--fp8-prefill", ""], 1, "Expected --fp8-prefill"),
+         ]
+         missing = "value" if serving else "argument"
+         cases.append((["--fp8-prefill"], 1, f"Missing {missing} for --fp8-prefill"))
+         if serving:
+-            cases.append((
++            cases.extend([(
+                 ["--fp8-prefill", "tensor-core", "--max-active", "2", "--mtp-steps", "1"],
+                 1, "--mtp-steps requires --max-active 1",
+-            ))
++            ), (
++                ["--fp8-prefill", "fast-native", "--max-active", "2"],
++                1, "Fast-native requires --max-active 1",
++            ), (
++                ["--fp8-prefill", "fast-native", "--mtp-steps", "1"],
++                1, "Fast-native requires MTP off",
++            )])
+         for flags, status, message in cases:
+             result = subprocess.run([str(executable), *flags], env=environment, text=True,
+                                     capture_output=True, timeout=10)
+diff --git a/source/tools/serial-score-probe.cpp b/source/tools/serial-score-probe.cpp
+new file mode 100644
+index 0000000..4683adf
+--- /dev/null
++++ b/source/tools/serial-score-probe.cpp
+@@ -0,0 +1,122 @@
++#include "fp8_prefill_option.h"
++#include "sglang/decoder.h"
++
++#include <algorithm>
++#include <fstream>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++
++namespace {
++
++std::vector<int> read_ids(const std::filesystem::path& path) {
++    std::ifstream input(path);
++    std::vector<int> ids;
++    for (int token; input >> token;) {
++        ids.push_back(token);
++    }
++    if (!input.eof() || ids.empty()) {
++        throw std::runtime_error("Invalid token fixture " + path.string());
++    }
++    return ids;
++}
++
++void score(sglang::Decoder& decoder, const std::filesystem::path& directory,
++           const std::string& workload) {
++    const auto prompt = read_ids(directory / (workload + ".prompt"));
++    const auto teacher = read_ids(directory / (workload + ".teacher"));
++    std::ofstream raw(directory / (workload + ".bf16"), std::ios::binary);
++    std::ofstream outputs(directory / (workload + ".winners"));
++    raw.exceptions(std::ios::failbit | std::ios::badbit);
++    outputs.exceptions(std::ios::failbit | std::ios::badbit);
++    sglang::DecoderOptions options;
++    options.max_new_tokens = static_cast<int>(teacher.size());
++    std::size_t step = 0;
++    sglang::DecoderCallbacks callbacks;
++    callbacks.teacher_token = [&](int winner, const std::byte* data, std::size_t bytes) {
++        raw.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
++        outputs << winner << '\n';
++        return teacher.at(step++);
++    };
++    const auto report = decoder.generate(prompt, options, callbacks);
++    if (step != teacher.size() || report.finish_reason != sglang::DecoderFinishReason::length) {
++        throw std::runtime_error("Incomplete score run");
++    }
++    raw.close();
++    outputs.close();
++    std::cout << workload << " score rows " << step
++              << ", accounted CUDA bytes " << report.peak_device_allocation_bytes << std::endl;
++}
++
++void verify_reset(sglang::Decoder& decoder, const std::filesystem::path& directory) {
++    const auto short_prompt = read_ids(directory / "W1.prompt");
++    const auto long_prompt = read_ids(directory / "W2.prompt");
++    sglang::DecoderOptions options;
++    options.max_new_tokens = 8;
++    const auto fresh_short = decoder.generate(short_prompt, options).output_token_ids;
++    const auto fresh_long = decoder.generate(long_prompt, options).output_token_ids;
++    sglang::DecoderCallbacks callbacks;
++    int emitted = 0;
++    callbacks.on_token = [&](int) { return ++emitted < 4; };
++    const auto cancelled_decode = decoder.generate(long_prompt, options, callbacks);
++    const auto short_after_cancel = decoder.generate(short_prompt, options).output_token_ids;
++    if (cancelled_decode.finish_reason != sglang::DecoderFinishReason::cancelled ||
++        cancelled_decode.output_token_ids.size() != 4 ||
++        !std::equal(cancelled_decode.output_token_ids.begin(),
++                    cancelled_decode.output_token_ids.end(), fresh_long.begin()) ||
++        short_after_cancel != fresh_short) {
++        throw std::runtime_error("Decode cancellation or cross-prompt reuse changed IDs");
++    }
++    callbacks.on_token = {};
++    int cancellation_polls = 0;
++    callbacks.is_cancelled = [&] { return ++cancellation_polls == 3; };
++    const auto cancelled_prefill = decoder.generate(long_prompt, options, callbacks);
++    const auto long_after_cancel = decoder.generate(long_prompt, options).output_token_ids;
++    if (cancelled_prefill.finish_reason != sglang::DecoderFinishReason::cancelled ||
++        !cancelled_prefill.output_token_ids.empty() || long_after_cancel != fresh_long) {
++        throw std::runtime_error("Interrupted prefill changed reused K/V or GDN behavior");
++    }
++    struct ProbeFailure {};
++    callbacks.is_cancelled = {};
++    callbacks.on_token = [&](int) -> bool {
++        if (++emitted == 6) {
++            throw ProbeFailure{};
++        }
++        return true;
++    };
++    try {
++        decoder.generate(long_prompt, options, callbacks);
++        throw std::runtime_error("Injected decode failure did not propagate");
++    } catch (const ProbeFailure&) {
++        if (decoder.generate(long_prompt, options).output_token_ids != fresh_long) {
++            throw std::runtime_error("Failure cleanup changed regenerated IDs");
++        }
++    }
++    std::cout << "Decode cancellation, prefill interruption, failure cleanup and reuse passed"
++              << std::endl;
++}
++
++}
++
++int main(int argc, char** argv) {
++    try {
++        if (argc != 5) {
++            throw std::invalid_argument(
++                "Usage: serial-score-probe CHECKPOINT POLICY DIRECTORY score|reset");
++        }
++        sglang::Decoder decoder(argv[1], 0, false, sglang::cli::parse_fp8_prefill(argv[2]));
++        const std::filesystem::path directory(argv[3]);
++        const std::string mode(argv[4]);
++        if (mode == "score") {
++            score(decoder, directory, "W1");
++            score(decoder, directory, "W2");
++        } else if (mode == "reset") {
++            verify_reset(decoder, directory);
++        } else {
++            throw std::invalid_argument("Unknown run mode " + mode);
++        }
++    } catch (const std::exception& error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/selected/xmake.lua b/source/xmake.lua
+index 35215a9..865a254 100644
+--- a/selected/xmake.lua
++++ b/source/xmake.lua
+@@ -56,6 +56,7 @@ target("sglang_cuda")
+     add_syslinks("cudart", {public = true})
+     add_files("src/mxfp8_gqa.cu", "src/text_decode_fp8.cu")
+     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
++    add_files("src/text_gdn_chunk.cu", "src/mxfp8_flash.cu", "src/mxfp8_fast_decode.cu")
+ 
+ target("sglang_prefill_fp8_sm100")
+     set_kind("static")
+@@ -106,6 +107,16 @@ target("sglang-server")
+     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
+               "apps/server/completions.cpp", "apps/server/http.cpp")
+ 
++target("serial-score-probe")
++    set_kind("binary")
++    set_default(false)
++    set_toolchains("host-pixi")
++    set_targetdir("$(builddir)/bin")
++    add_deps("sglang_decoder")
++    add_includedirs("apps")
++    add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
++    add_files("tools/serial-score-probe.cpp")
++
+ option("mxfp8-gqa-check")
+     set_default(false)
+ option_end()

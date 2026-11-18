@@ -1,0 +1,240 @@
+{
+  "checkpoint": "c3a462cc3d38cf351f3b26cbd763469eeb74ef81",
+  "vllm_revision": "81a8cb063e6247fe254d7caf7e98a6691d71022a",
+  "sglang_vision_revision": "f04d886bf79aa3d6237cbb12a3311838eb9f9bd8",
+  "gpu": "NVIDIA B200, TP1, driver 590.48.01",
+  "serial": {
+    "workloads": {"W1": [128, 128], "W2": [2048, 512]},
+    "workload_columns": ["prompt_ids", "output_ids"],
+    "protocol": [
+      "Greedy HTTP SSE, serial native CUDA graphs, MTP off, three warmups and nine ",
+      "measurements per workload and arm. GPU1 and GPU4 measurements have separate ",
+      "same-device pins."
+    ],
+    "metric_columns": [
+      "output_ids_per_second_p50",
+      "ttft_ms_p50",
+      "ttft_ms_p95",
+      "tpot_ms_p95",
+      "e2e_ms_p95"
+    ],
+    "gpu1": {
+      "fast_native": {
+        "W1": [123.60, 21.37, 672.76, 7.988, 1687.26],
+        "W2": [105.33, 356.23, 574.84, 8.818, 5078.25]
+      },
+      "serial-vector": {
+        "W1": [130.40, 17.93, 31.25, 7.590, 994.99],
+        "W2": [121.41, 356.04, 360.91, 7.559, 4221.59]
+      },
+      "serial-quant": {
+        "W1": [130.84, 18.25, 37.47, 7.559, 997.47],
+        "W2": [121.73, 358.56, 415.36, 7.531, 4263.10]
+      },
+      "vllm": {
+        "W1": [115.32, 20.69, 21.24, 8.585, 1111.24],
+        "W2": [114.03, 79.80, 81.85, 8.632, 4490.94]
+      }
+    },
+    "gpu4": {
+      "serial-cta": {
+        "W1": [130.02, 19.03, 408.02, 7.602, 1372.00],
+        "W2": [121.18, 355.06, 416.25, 7.581, 4288.95]
+      },
+      "vllm": {
+        "W1": [116.34, 20.61, 21.11, 8.504, 1100.64],
+        "W2": [115.09, 79.20, 80.29, 8.553, 4450.74]
+      }
+    },
+    "accuracy": {
+      "vector_and_quant_on_same_fast_native_history": {
+        "equal_bf16_logit_words": 158924800,
+        "argmax_equal": 640,
+        "argmax_total": 640
+      },
+      "cta_vs_warp_w2_first_id": {"warp": 2981, "cta": 271},
+      "cta_vs_warp_w2_free_running_ids_equal": [9, 512],
+      "integrated_exact_vs_published_exact_argmax_equal": [640, 640]
+    },
+    "provenance": {
+      "study_fast_base_original_commit": "1afb61d078df461115a0009d92f497f4ed9c7673",
+      "study_fast_base_published_equivalent_tree": "bf09eb9f1bc310a34d84155271253c4702261c0b",
+      "fast_native_donor": "w1-w2-fast-native/runs/native.xXD2JIaG/frozen/fast-native.patch",
+      "vector_and_quant_donors": "w2-throughput-target/evidence/{vector,quant}-from-fast.patch",
+      "gpu1_multi_arm_frozen_source_list_sha256":
+        "77cbf10c4d34a12aac31f9390718cc48737bf37032ccb1d6b5af6198060f0b9f",
+      "gpu1_verified_pair_sha256":
+        "6531a0cbe1cee061abbdb01d824fd0704229c53a4a204c2cb6009cd981a823a0",
+      "cta_production_patch": "serial-native-combined/serial-native-combined.patch",
+      "cta_upstream_patch": "flash-gqa-prefill-tc/flash-gqa-prefill-tc.patch",
+      "cta_gpu4_candidate_summary_sha256":
+        "336d152f608debbeb1403984a08dd04863225be5d134faf3c154758aaef17734",
+      "cta_gpu4_vllm_summary_sha256":
+        "448c5dd86c8022719fefc0e5c4c020fd543f8791355b36efe95bcc9a5d58ea06"
+    }
+  },
+  "w3": {
+    "protocol": [
+      "Frozen GPU2 W3 greedy SSE. Four lanes, 8192 prompt and 1024 output IDs per ",
+      "lane, two warmups and five timed cohorts. Split decode, Flash prefill, CUDA ",
+      "graphs, fast GDN and 8192 prefill rows."
+    ],
+    "metric_columns": ["output_ids_per_second_p50", "ttft_ms_p95", "tpot_ms_p95", "e2e_ms_p95"],
+    "w3-flash8192": [131.627, 4461.608, 27.162, 31529.575],
+    "w3-fused": [144.837, 4885.428, 23.764, 29194.977],
+    "vllm": [379.524, 1374.971, 10.186, 10795.382],
+    "w3_fused_all_timing_gates_failed": true,
+    "accuracy": {
+      "streamed_ids_equal_to_vllm_including_warmups": [28672, 28672],
+      "same_native_history_equal_bf16_logit_words": 127139840,
+      "same_native_history_argmax_equal": [512, 512],
+      "ordered_native_reference_argmax_equal": [512, 512],
+      "ordered_native_reference_mean_kl": 0.00000305,
+      "ordered_native_reference_max_abs_logit_delta": 15.875
+    },
+    "provenance": {
+      "flash_donor": "fast-w3-attention/builds/flash-fused8192-01",
+      "original_flash_overlay_sha256":
+        "ab5caac78b18bd2917cda703cde7eebfdb056fd9398e706303b9d0b007518919",
+      "flash_donor_frozen_source_list_sha256":
+        "00ab7983355bb52df0dedbf786db06a49f6c8a7ae4d3963d54cd81bad4ecf4d3",
+      "layer_family_donor": "w3-weight-layout/builds/fused-01",
+      "original_layer_family_overlay_sha256":
+        "bdadb52f60f999c4df5d3cf073aeba21ebb132b1c0fa370071b548a8ec93eed2",
+      "layer_family_frozen_source_list_sha256":
+        "7f3322145ce2c4628f3a097b3156ca2adbdff24e8d919f0f6058cfd95ab15f06",
+      "official_http_audit_sha256":
+        "c421c137a2b5aef21e16525a33be7c3b6402d46278ee8173274967eee8415eab",
+      "exact_numerical_audit_sha256":
+        "10936014c22440cc40c7c8d8310e604d3eb192b72aaeb4dca54be7e0c3206578"
+    }
+  },
+  "wide_capacity": {
+    "gpu_index": 7,
+    "workload_columns": [
+      "lanes",
+      "prompt_ids_per_lane",
+      "reserved_output_ids_per_lane",
+      "peak_request_bytes"
+    ],
+    "W4": [16, 32768, 1024, 20745480704],
+    "W5": [32, 32768, 4096, 44812853248],
+    "prefill_rows_executed_per_cohort_before_reset": 2048,
+    "output_ids_per_admission_cohort": 0,
+    "request_bytes_after_reset": 0,
+    "w5_peak_sampled_nvml_mib": 71786,
+    "single_real_w4_lane": {
+      "prompt_ids": 32768,
+      "output_ids": 8,
+      "ttft_ms": 64746,
+      "mean_token_gap_ms": 586.61
+    },
+    "short_eager_graph_output_parity_widths": [4, 8, 16, 32],
+    "provenance": {
+      "production_patch": "wide-fast-batch/wide-fast-batch.patch",
+      "inputs": [
+        "wide-batch-native projections and direct GQA",
+        "fast-batch-serving prefill and GDN",
+        "batch-cuda-graphs measured binding"
+      ],
+      "capacity_results_sha256": "d9121927d004074065f611ad6305fed65ac8effbe775a31e1c53434df71a2f36"
+    }
+  },
+  "wide_gqa": {
+    "synthetic_operator": {
+      "context_ids": 32768,
+      "columns": ["lanes", "direct_p95_ms", "split_p95_ms"],
+      "rows": [[16, 33.274, 10.067], [32, 34.050, 12.400]],
+      "rebound_graph_vs_eager_equal_bf16_words": 589824,
+      "optional_workspace_bytes": 202902528,
+      "visible_length_range": [8192, 65536],
+      "controls": [
+        "Ordered guarded-head fallback, out-of-range fallback, graph rebinding and ",
+        "recovery after injected optional-workspace OOM."
+      ]
+    },
+    "http_protocol": [
+      "Same-device eager control versus split graph on W4 and W5. Steady step ",
+      "excludes capture and retirement. P95 uses nearest rank."
+    ],
+    "http_columns": ["control", "split"],
+    "W4_short": {
+      "gpu_index": 6, "lanes": 16, "prompt_ids": 8192, "output_ids": 16,
+      "steady_full_width_step_p95_ms": [475.545, 89.241],
+      "request_tpot_p95_ms": [506.050, 111.282],
+      "ttft_p95_ms": [132978, 132477],
+      "cohort_output_ids_per_second": [1.821, 1.909],
+      "equal_output_ids": 214, "total_output_ids": 256, "equal_first_ids": 16, "diverging_lanes": 5
+    },
+    "W5_short": {
+      "gpu_index": 3, "lanes": 32, "prompt_ids": 8192, "output_ids": 16,
+      "steady_full_width_step_p95_ms": [950.320, 166.093],
+      "all_full_width_step_p95_ms": [1067.840, 1951.210],
+      "request_tpot_p95_ms": [966.109, 302.159],
+      "ttft_p95_ms": [510090.746, 516506.891],
+      "cohort_output_ids_per_second": [0.976054, 0.982692],
+      "equal_output_ids": 379,
+      "total_output_ids": 512,
+      "equal_first_ids": 32,
+      "diverging_lanes": 16,
+      "split_path_lane_steps": 480, "graph_captures": 1, "graph_replays": 14
+    },
+    "W4_single_32k_lane": {
+      "prompt_ids": 32768, "output_ids": 12, "equal_output_ids": 12,
+      "dispatch": "Both eager",
+      "steady_step_p95_ms": [576.245, 22.257],
+      "repeat_steady_step_p95_ms": [576.283, 22.246]
+    },
+    "official_full_cohorts_measured": false,
+    "provenance": {
+      "production_patch": "wide-gqa-decode/wide-gqa-decode.patch",
+      "operator_donor": "gqa-fast-decode/build.04-w3.iQrisWej/fast-gqa.patch",
+      "wide_control_server_sha256":
+        "c6de186ad6f3be5f26db41c5e86d95a21c101bc2beb4ae390f391f11ecb9fa89",
+      "operator_verification_sha256":
+        "b30483712fbbb0231194cb551562f17efa4b88cc398a5115c5e949c66f984eca",
+      "w4_and_single_32k_audit_sha256":
+        "8c967bd51abb1761864b0c11364223d634108f4becad5584061f4528294ad137",
+      "combined_verification_sha256":
+        "2149be6493055c175e77c9c507def9e6ffafa32e193dbc4034b3478ce7bc773b",
+      "w5_recomputed_audit_sha256":
+        "85668a65c6eb85a3a2ba8c94d8bd135d104052b2003e682b11907f0f7d2502d1"
+    }
+  },
+  "vision": {
+    "gpu_index": 7,
+    "columns": ["prior_native", "corrected_native"],
+    "worst_projected_row_relative_rmse_percent_vs_sglang": {
+      "image": [21.00, 5.11],
+      "video": [6.70, 3.32]
+    },
+    "projected_tensor_relative_rmse_percent_vs_sglang": {
+      "image": [4.50, 1.86],
+      "video": [1.44, 1.10]
+    },
+    "teacher_forced_logit_relative_rmse_percent_vs_native_with_sglang_rows": {
+      "image": [11.56, 10.89],
+      "video": [18.92, 19.65]
+    },
+    "coverage": [
+      "Pinned SGLang vision tower on B200, 333 BF16 tensors, nongraph FA4. Torch ",
+      "2.14.0+cu132 and Transformers 5.23.0 differ from the upstream package pins. ",
+      "Four teacher-forced rows per fixture. Image worst row exceeds 5%."
+    ],
+    "provenance": {
+      "donors": [
+        "vision-parity/{vision-serving-precision,vision-regression-harness,decoder-re",
+        "play-label}.patch"
+      ],
+      "prior_stage_report": "vision-parity/serving-stage-comparison.json",
+      "prior_stage_comparison": "native_prior_vs_sglang",
+      "prior_stage_report_sha256":
+        "2bec985c234596bd26497a90261063928fa86985075792c105c5c87d0904bff0",
+      "corrected_stage_report": "vision-parity/online-stage-comparison.json",
+      "corrected_stage_comparison": "native_online_vs_sglang",
+      "corrected_stage_report_sha256":
+        "c9f6669a85cdc85bd44edc3405e49711b18166b489afcca7bc0df93dfb0f9388",
+      "logit_report_sha256": "18424f35396825575b55d8ae8d46a8b1e8af232f0f71e777a904f9666c11f0f1"
+    }
+  }
+}

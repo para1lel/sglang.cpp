@@ -1,0 +1,1153 @@
+diff --git a/apps/server/batch_service.cpp b/apps/server/batch_service.cpp
+index 9e87d03..1203b24 100644
+--- a/apps/server/batch_service.cpp
++++ b/apps/server/batch_service.cpp
+@@ -32,6 +32,13 @@ using Selection = std::array<bool, decoder_batch_max_lanes>;
+ constexpr auto disconnect_poll = std::chrono::milliseconds(10);
+ constexpr auto mailbox_grace = std::chrono::milliseconds(1);
+ 
++void trace_prefill_rows(const DecoderBatchStepStats& stats) {
++    const auto& rows = stats.prefill_rows;
++    std::cerr << ("batch prefill_rows=" + std::to_string(rows[0]) + ',' + std::to_string(rows[1]) +
++                  ',' + std::to_string(rows[2]) + ',' + std::to_string(rows[3]) +
++                  " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) + '\n');
++}
++
+ }
+ 
+ struct BatchService::State {
+@@ -106,9 +113,12 @@ std::optional<Jobs> BatchService::State::wait_for_jobs() {
+             return job && job->ready();
+         });
+     });
++    const bool admitting = std::any_of(jobs.begin(), jobs.end(), [](const auto& job) {
++        return job && !job->admitted && !job->cancelled;
++    });
+     changed.wait_for(lock, mailbox_grace, [&] {
+-        return closing || std::all_of(jobs.begin(), jobs.end(), [](const auto& job) {
+-            return !job || job->ready();
++        return closing || std::all_of(jobs.begin(), jobs.end(), [admitting](const auto& job) {
++            return job ? job->ready() : !admitting;
+         });
+     });
+     if (closing) {
+@@ -175,8 +185,9 @@ void BatchService::State::process(DecoderBatch& batch) {
+         }
+         const int width = std::count(selected.begin(), selected.end(), true);
+         std::array<DecoderBatchStep, decoder_batch_max_lanes> steps{};
++        DecoderBatchStepStats stats;
+         if (width) {
+-            steps = batch.advance(selected);
++            steps = batch.advance_chunked(selected, trace ? &stats : nullptr);
+         }
+         if (trace) {
+             const auto bytes = batch.request_device_allocation_bytes();
+@@ -184,6 +195,9 @@ void BatchService::State::process(DecoderBatch& batch) {
+                                               [](const auto& step) { return step.decode; });
+             if (width || bytes != traced_bytes) {
+                 trace_batch_step(width, decode, bytes);
++                if (width) {
++                    trace_prefill_rows(stats);
++                }
+                 traced_bytes = bytes;
+             }
+         }
+diff --git a/include/sglang/decoder_batch.h b/include/sglang/decoder_batch.h
+index bb8544a..279b4d0 100644
+--- a/include/sglang/decoder_batch.h
++++ b/include/sglang/decoder_batch.h
+@@ -14,6 +14,11 @@ struct DecoderBatchStep {
+     bool decode = false;
+ };
+ 
++struct DecoderBatchStepStats {
++    std::array<int, decoder_batch_max_lanes> prefill_rows{};
++    std::size_t prefill_workspace_bytes = 0;
++};
++
+ /// The Decoder must outlive the batch. Use one host thread to operate a batch.
+ /// Each slot owns its request state until cancel() or a finishing step.
+ class DecoderBatch {
+@@ -29,6 +34,13 @@ public:
+     std::array<DecoderBatchStep, decoder_batch_max_lanes>
+     advance(const std::array<bool, decoder_batch_max_lanes>& selected);
+ 
++    /// Share one bounded position budget across selected slots. Each ready
++    /// decode slot advances once. Report submitted prompt positions and peak
++    /// shared scratch bytes when requested.
++    std::array<DecoderBatchStep, decoder_batch_max_lanes>
++    advance_chunked(const std::array<bool, decoder_batch_max_lanes>& selected,
++                    DecoderBatchStepStats* stats = nullptr);
++
+     std::size_t request_device_allocation_bytes() const;
+ 
+ private:
+diff --git a/include/sglang/decoder_internal.h b/include/sglang/decoder_internal.h
+index 650a782..b0d8403 100644
+--- a/include/sglang/decoder_internal.h
++++ b/include/sglang/decoder_internal.h
+@@ -19,6 +19,7 @@ class Checkpoint;
+ namespace sglang::decoder {
+ 
+ class MtpDraftWeights;
++class PrefillWorkspace;
+ 
+ using Bf16 = __nv_bfloat16;
+ 
+@@ -29,6 +30,7 @@ inline constexpr int layer_count = 64;
+ inline constexpr int full_attention_interval = 4;
+ inline constexpr int full_attention_layers = layer_count / full_attention_interval;
+ inline constexpr int gdn_layers = layer_count - full_attention_layers;
++inline constexpr int prefill_chunk_rows = text_embedding_max_rows;
+ inline constexpr std::size_t gdn_history_elements = text_gdn_qkv_width * text_gdn_history_taps;
+ inline constexpr std::size_t gdn_state_elements =
+     text_gdn_value_heads * text_gdn_head_dim * text_gdn_head_dim;
+@@ -200,6 +202,8 @@ struct Decoder::Model {
+ 
+     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
+     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
++    void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
++                       decoder::PrefillWorkspace& workspace) const;
+     void decode_graph(decoder::Request& request) const;
+     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
+     void compute_logits(decoder::Request& request) const;
+diff --git a/include/sglang/decoder_prefill.h b/include/sglang/decoder_prefill.h
+new file mode 100644
+index 0000000..65b3cf7
+--- /dev/null
++++ b/include/sglang/decoder_prefill.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include "sglang/decoder_internal.h"
++
++#include <memory>
++
++namespace sglang::decoder {
++
++struct PrefillPool;
++
++void reclaim_prefill_workspaces(int device);
++
++class PrefillWorkspace {
++public:
++    PrefillWorkspace(cudaStream_t stream, int capacity);
++    ~PrefillWorkspace();
++    PrefillWorkspace(const PrefillWorkspace&) = delete;
++    PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
++
++    std::size_t bytes() const { return bytes_; }
++    void close();
++
++    cudaStream_t stream() const { return stream_; }
++    int capacity() const { return capacity_; }
++    void* data() const { return data_; }
++
++private:
++    cudaError_t release() noexcept;
++
++    cudaStream_t stream_;
++    int capacity_;
++    void* data_ = nullptr;
++    std::size_t bytes_ = 0;
++    cudaError_t release_status_ = cudaSuccess;
++    std::unique_ptr<PrefillPool> pool_;
++};
++
++}
+diff --git a/include/sglang/text_ops.h b/include/sglang/text_ops.h
+index c6d3525..c6b1b1a 100644
+--- a/include/sglang/text_ops.h
++++ b/include/sglang/text_ops.h
+@@ -49,18 +49,30 @@ constexpr int text_argmax_scratch_count(int vocab_size) {
+ cudaError_t text_embedding(const __nv_bfloat16* weight, int vocab_size, int width, int token_id,
+                            __nv_bfloat16* output, cudaStream_t stream);
+ 
++inline constexpr int text_embedding_max_rows = 128;
++cudaError_t text_embedding_rows(const __nv_bfloat16* weight, int vocab_size, int width,
++                                const int* host_token_ids, int rows, __nv_bfloat16* output,
++                                cudaStream_t stream);
++
+ /// BF16 [out_width, in_width] matrix times a BF16 vector, with FP32
+ /// accumulation and BF16 output. Also applies to the LM head.
+ cudaError_t text_bf16_gemv(const __nv_bfloat16* weight, const __nv_bfloat16* input,
+                            int out_width, int in_width, __nv_bfloat16* output,
+                            cudaStream_t stream);
+ 
++cudaError_t text_bf16_gemv_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,
++                                int out_width, int in_width, int rows, __nv_bfloat16* output,
++                                cudaStream_t stream);
++
+ /// Writes width E4M3 bytes and text_fp8_group_count(width) FP32 scales.
+ /// Each scale is max(amax, 1e-10) / 448. Quantization rounds to nearest even
+ /// and saturates to the finite E4M3 range.
+ cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
+                              cudaStream_t stream);
+ 
++cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int rows,
++                                  TextFp8Activation output, cudaStream_t stream);
++
+ /// E4M3 [out_width, in_width] weights and BF16 multiply scales laid out as
+ /// [text_fp8_group_count(out_width), text_fp8_group_count(in_width)].
+ /// Each input group dot product is accumulated and scaled in FP32. Quantized
+@@ -75,6 +87,10 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
+                           int out_width, int in_width, const TextFp8Projection* projections,
+                           int count, cudaStream_t stream);
+ 
++cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                               TextFp8ActivationView input, int out_width, int in_width, int rows,
++                               __nv_bfloat16* output, cudaStream_t stream);
++
+ /// Computes RMSNorm with eps 1e-6 and FP32 (1 + weight). A null residual
+ /// selects standalone normalization. A nonnull residual_output receives the
+ /// BF16-rounded sum, while normalization uses the FP32 sum. Output may alias
+@@ -83,6 +99,11 @@ cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* resi
+                          const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
+                          __nv_bfloat16* residual_output, cudaStream_t stream);
+ 
++cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
++                              const __nv_bfloat16* weight, int width, int rows,
++                              __nv_bfloat16* output, __nv_bfloat16* residual_output,
++                              cudaStream_t stream);
++
+ /// Stores BF16(BF16(SiLU(gate)) * up). Output may alias gate or up exactly.
+ cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,
+                         __nv_bfloat16* output, cudaStream_t stream);
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index eb99067..919b37a 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -1,4 +1,4 @@
+-#include "sglang/decoder_internal.h"
++#include "sglang/decoder_prefill.h"
+ 
+ #include "sglang/decoder_cuda.cuh"
+ #include "sglang/decoder_mtp.h"
+@@ -302,11 +302,23 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
+         }
+         result.peak_device_allocation_bytes += request.memory.bytes();
+         const auto run_request = [&] {
+-            for (int position = 0; position < prompt_count; ++position) {
+-                if (cancelled()) {
+-                    return DecoderFinishReason::cancelled;
++            if (cancelled()) {
++                return DecoderFinishReason::cancelled;
++            }
++            {
++                PrefillWorkspace workspace(request.memory.stream(),
++                                           std::min(prompt_count, prefill_chunk_rows));
++                result.peak_device_allocation_bytes += workspace.bytes();
++                const int tile_rows = workspace.bytes() ? workspace.capacity() : 1;
++                for (int position = 0; position < prompt_count; position += tile_rows) {
++                    const int rows = std::min(tile_rows, prompt_count - position);
++                    prefill_chunk(request, prompt.data() + position, rows, position, workspace);
++                    if (cancelled()) {
++                        workspace.close();
++                        return DecoderFinishReason::cancelled;
++                    }
+                 }
+-                forward(request, prompt[position], position, TextGdnMode::prefill);
++                workspace.close();
+             }
+             int winner = -1;
+             for (int step = 0; step < options.max_new_tokens; ++step) {
+@@ -370,6 +382,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+         return result;
+     }
+     DeviceScope selected_device(model_->device);
++    reclaim_prefill_workspaces(model_->device);
+     result.output_token_ids.reserve(options.max_new_tokens);
+     if (options.mtp_steps == 0) {
+         model_->generate_serial(prompt_token_ids, options, callbacks, result);
+diff --git a/src/decoder_batch.cpp b/src/decoder_batch.cpp
+index 4339285..2f70b73 100644
+--- a/src/decoder_batch.cpp
++++ b/src/decoder_batch.cpp
+@@ -1,7 +1,9 @@
+ #include "sglang/decoder_internal.h"
+ 
+ #include "sglang/decoder_batch.h"
++#include "sglang/decoder_prefill.h"
+ 
++#include <algorithm>
+ #include <utility>
+ 
+ namespace sglang {
+@@ -17,15 +19,15 @@ struct Lane {
+     int generated = 0;
+     int last_token = 0;
+ 
++    int remaining_prompt() const { return std::max(0, static_cast<int>(prompt.size()) - position); }
++
+     ForwardLane input() const {
+-        if (static_cast<std::size_t>(position) < prompt.size()) {
++        if (remaining_prompt()) {
+             return {request.get(), prompt[position], position, TextGdnMode::prefill};
+         }
+         return {request.get(), last_token, position, TextGdnMode::decode};
+     }
+ 
+-    bool produces_token() const { return static_cast<std::size_t>(position) + 1 >= prompt.size(); }
+-
+     void select_token(int token, DecoderBatchStep& result) {
+         last_token = token;
+         ++generated;
+@@ -51,6 +53,34 @@ void retire(std::optional<Lane>& lane) {
+ 
+ using Selection = std::array<bool, decoder_batch_max_lanes>;
+ using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
++using PrefillRows = std::array<int, decoder_batch_max_lanes>;
++
++PrefillRows plan_prefill(const BatchStorage& storage, const Selection& selected, bool chunked) {
++    PrefillRows rows{};
++    PrefillRows remaining{};
++    int unused = prefill_chunk_rows;
++    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++        const auto& lane = storage.slots[slot];
++        if (selected[slot] && lane && lane->request) {
++            --unused;
++            remaining[slot] = lane->remaining_prompt();
++            rows[slot] = std::min(1, remaining[slot]);
++        }
++    }
++    while (chunked && unused > 0) {
++        const int before = unused;
++        for (int slot = 0; slot < decoder_batch_max_lanes && unused > 0; ++slot) {
++            if (rows[slot] < remaining[slot]) {
++                ++rows[slot];
++                --unused;
++            }
++        }
++        if (unused == before) {
++            break;
++        }
++    }
++    return rows;
++}
+ 
+ }
+ 
+@@ -63,7 +93,8 @@ struct DecoderBatch::State {
+         device.restore();
+     }
+ 
+-    Steps advance(const Selection& selected);
++    Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats);
++    std::size_t submit(const Selection& selected, const PrefillRows& rows, Steps& results);
+ 
+     void require_ready() const {
+         if (failed) {
+@@ -140,33 +171,49 @@ std::size_t DecoderBatch::request_device_allocation_bytes() const {
+     return bytes;
+ }
+ 
+-Steps DecoderBatch::State::advance(const Selection& selected) {
+-    DeviceScope device(model.device);
++std::size_t DecoderBatch::State::submit(const Selection& selected, const PrefillRows& rows,
++                                        Steps& results) {
+     const auto stream = execution.stream();
+     auto& slots = storage->slots;
+-    Steps results{};
+     std::array<ForwardLane, decoder_batch_max_lanes> work;
+     std::array<Request*, decoder_batch_max_lanes> scoring{};
++    const int max_rows = *std::max_element(rows.begin(), rows.end());
+     int count = 0;
+     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+         if (selected[slot] && slots[slot] && slots[slot]->request) {
+             auto& lane = *slots[slot];
+-            const auto input = lane.input();
+-            work[count++] = input;
+-            results[slot].decode = input.mode == TextGdnMode::decode;
+-            if (lane.produces_token()) {
+-                scoring[slot] = input.request;
++            if (rows[slot] <= 1) {
++                work[count++] = lane.input();
++            }
++            results[slot].decode = rows[slot] == 0;
++            if (rows[slot] == lane.remaining_prompt()) {
++                scoring[slot] = lane.request.get();
+             }
+         }
+     }
+     if (count != 0) {
+         model.forward(work.data(), count, stream);
+-        for (auto* request : scoring) {
+-            if (request) {
+-                model.compute_logits(request->work, stream);
+-                copy_greedy_token(*request, stream);
++    }
++    std::size_t workspace_bytes = 0;
++    if (max_rows > 1) {
++        PrefillWorkspace workspace(stream, max_rows);
++        workspace_bytes = workspace.bytes();
++        for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++            if (rows[slot] > 1) {
++                auto& lane = *slots[slot];
++                model.prefill_chunk(*lane.request, lane.prompt.data() + lane.position,
++                                     rows[slot], lane.position, workspace);
+             }
+         }
++        workspace.close();
++    }
++    for (auto* request : scoring) {
++        if (request) {
++            model.compute_logits(request->work, stream);
++            copy_greedy_token(*request, stream);
++        }
++    }
++    if (count != 0 || max_rows > 1) {
+         check(cudaStreamSynchronize(stream), "Complete decoder batch step");
+     }
+     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+@@ -174,36 +221,53 @@ Steps DecoderBatch::State::advance(const Selection& selected) {
+             results[slot].token = read_greedy_token(*scoring[slot]);
+         }
+     }
+-    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+-        auto& lane = slots[slot];
+-        auto& result = results[slot];
+-        if (!selected[slot] || !lane) {
+-            continue;
+-        }
+-        if (!lane->request) {
+-            result.finish_reason = DecoderFinishReason::length;
+-        } else {
+-            if (result.token) {
+-                lane->select_token(*result.token, result);
++    return workspace_bytes;
++}
++
++Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
++                                   DecoderBatchStepStats* stats) {
++    require_ready();
++    try {
++        DeviceScope device(model.device);
++        auto& slots = storage->slots;
++        Steps results{};
++        const auto rows = plan_prefill(*storage, selected, chunked);
++        const auto workspace_bytes = submit(selected, rows, results);
++        for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++            auto& lane = slots[slot];
++            auto& result = results[slot];
++            if (!selected[slot] || !lane) {
++                continue;
++            }
++            if (!lane->request) {
++                result.finish_reason = DecoderFinishReason::length;
++            } else {
++                if (result.token) {
++                    lane->select_token(*result.token, result);
++                }
++                lane->position += std::max(1, rows[slot]);
++            }
++            if (result.finish_reason) {
++                retire(lane);
+             }
+-            ++lane->position;
+         }
+-        if (result.finish_reason) {
+-            retire(lane);
++        device.restore();
++        if (stats) {
++            *stats = {rows, workspace_bytes};
+         }
++        return results;
++    } catch (...) {
++        disable();
++        throw;
+     }
+-    device.restore();
+-    return results;
+ }
+ 
+ Steps DecoderBatch::advance(const Selection& selected) {
+-    state_->require_ready();
+-    try {
+-        return state_->advance(selected);
+-    } catch (...) {
+-        state_->disable();
+-        throw;
+-    }
++    return state_->advance(selected, false, nullptr);
++}
++
++Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats* stats) {
++    return state_->advance(selected, true, stats);
+ }
+ 
+ }
+diff --git a/src/decoder_prefill.cpp b/src/decoder_prefill.cpp
+new file mode 100644
+index 0000000..b9ad47a
+--- /dev/null
++++ b/src/decoder_prefill.cpp
+@@ -0,0 +1,364 @@
++#include "sglang/decoder_prefill.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstddef>
++#include <cstdio>
++#include <mutex>
++#include <utility>
++
++namespace sglang::decoder {
++
++struct PrefillPool {
++    explicit PrefillPool(int ordinal) : device(ordinal) {}
++
++    ~PrefillPool() {
++        if (handle) {
++            cudaMemPoolDestroy(handle);
++        }
++    }
++
++    const int device;
++    cudaMemPool_t handle = nullptr;
++    void* pending = nullptr;
++    std::unique_ptr<PrefillPool> next;
++};
++
++}
++
++namespace sglang {
++namespace {
++
++using namespace decoder;
++
++class PrefillPools {
++public:
++    std::unique_ptr<PrefillPool> take_idle(int device) {
++        const std::lock_guard<std::mutex> lock(mutex_);
++        return take(idle_, device);
++    }
++
++    std::unique_ptr<PrefillPool> take_pending(int device) {
++        if (!has_pending_.load(std::memory_order_relaxed)) {
++            return {};
++        }
++        const std::lock_guard<std::mutex> lock(mutex_);
++        std::unique_ptr<PrefillPool> pending;
++        while (auto pool = take(pending_, device)) {
++            pool->next = std::move(pending);
++            pending = std::move(pool);
++        }
++        has_pending_.store(pending_ != nullptr, std::memory_order_relaxed);
++        return pending;
++    }
++
++    void put(std::unique_ptr<PrefillPool> pool) {
++        const std::lock_guard<std::mutex> lock(mutex_);
++        auto& list = pool->pending ? pending_ : idle_;
++        pool->next = std::move(list);
++        list = std::move(pool);
++        if (pending_) {
++            has_pending_.store(true, std::memory_order_relaxed);
++        }
++    }
++
++private:
++    static std::unique_ptr<PrefillPool> take(std::unique_ptr<PrefillPool>& list, int device) {
++        auto* link = &list;
++        while (*link && (*link)->device != device) {
++            link = &(*link)->next;
++        }
++        auto pool = std::move(*link);
++        if (pool) {
++            *link = std::move(pool->next);
++        }
++        return pool;
++    }
++
++    std::mutex mutex_;
++    std::atomic<bool> has_pending_{false};
++    std::unique_ptr<PrefillPool> idle_;
++    std::unique_ptr<PrefillPool> pending_;
++};
++
++PrefillPools& prefill_pools() {
++    static PrefillPools pools;
++    return pools;
++}
++
++void recover_prefill_pool(PrefillPool& pool) noexcept {
++    int device = 0;
++    if (cudaGetDevice(&device) != cudaSuccess || device != pool.device ||
++        cudaDeviceSynchronize() != cudaSuccess) {
++        return;
++    }
++    std::uint64_t used = 0;
++    if (cudaMemPoolGetAttribute(pool.handle, cudaMemPoolAttrUsedMemCurrent, &used) != cudaSuccess) {
++        return;
++    }
++    if (used == 0 ||
++        (cudaFreeAsync(pool.pending, cudaStreamPerThread) == cudaSuccess &&
++         cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess)) {
++        pool.pending = nullptr;
++    }
++}
++
++bool prefill_allocation_unavailable(cudaError_t status) {
++    return status == cudaErrorMemoryAllocation || status == cudaErrorNotSupported;
++}
++
++struct ScratchLayout {
++    std::byte* data = nullptr;
++    std::size_t bytes = 0;
++
++    template <typename Element>
++    Element* take(std::size_t count) {
++        constexpr std::size_t alignment = 16;
++        const auto offset = (bytes + alignment - 1) / alignment * alignment;
++        bytes = offset + count * sizeof(Element);
++        return data ? reinterpret_cast<Element*>(data + offset) : nullptr;
++    }
++};
++
++struct TileBuffers {
++    TileBuffers(ScratchLayout& layout, int rows)
++        : hidden(layout.take<Bf16>(rows * hidden_size)),
++          normalized(layout.take<Bf16>(rows * hidden_size)),
++          residual(layout.take<Bf16>(rows * hidden_size)),
++          projected_attention(layout.take<Bf16>(rows * hidden_size)),
++          attention(layout.take<Bf16>(rows * std::max(text_gdn_value_width, text_gqa_q_width))),
++          mlp_gate(layout.take<Bf16>(rows * intermediate_size)),
++          mlp_up(layout.take<Bf16>(rows * intermediate_size)),
++          q_gate(layout.take<Bf16>(rows * text_gqa_q_gate_width)),
++          keys(layout.take<Bf16>(rows * text_gqa_kv_width)),
++          values(layout.take<Bf16>(rows * text_gqa_kv_width)),
++          rope_queries(layout.take<Bf16>(rows * text_gqa_q_width)),
++          rope_keys(layout.take<Bf16>(rows * text_gqa_kv_width)),
++          gdn_qkv(layout.take<Bf16>(rows * text_gdn_qkv_width)),
++          gdn_z(layout.take<Bf16>(rows * text_gdn_value_width)),
++          gdn_b(layout.take<Bf16>(rows * text_gdn_value_heads)),
++          gdn_a(layout.take<Bf16>(rows * text_gdn_value_heads)),
++          gdn_scratch(layout.take<Bf16>(text_gdn_workspace_bytes(rows) / sizeof(Bf16))),
++          activation{
++              layout.take<std::uint8_t>(rows * intermediate_size),
++              layout.take<float>(rows * text_fp8_group_count(intermediate_size))} {}
++
++    Bf16* hidden;
++    Bf16* normalized;
++    Bf16* residual;
++    Bf16* projected_attention;
++    Bf16* attention;
++    Bf16* mlp_gate;
++    Bf16* mlp_up;
++    Bf16* q_gate;
++    Bf16* keys;
++    Bf16* values;
++    Bf16* rope_queries;
++    Bf16* rope_keys;
++    Bf16* gdn_qkv;
++    Bf16* gdn_z;
++    Bf16* gdn_b;
++    Bf16* gdn_a;
++    Bf16* gdn_scratch;
++    TextFp8Activation activation;
++};
++
++struct Chunk {
++    TileBuffers work;
++    int position;
++    int rows;
++    cudaStream_t stream;
++
++    TextFp8ActivationView quantize(const Bf16* input, int width) const {
++        check(text_quantize_fp8_rows(input, width, rows, work.activation, stream),
++              "Quantize prefill projection input");
++        return {work.activation.values, work.activation.scales};
++    }
++
++    void project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output) const {
++        check(text_fp8_gemv_rows(weight.values, weight.scales, input, weight.rows, weight.columns,
++                                 rows, output, stream), "Run exact prefill FP8 projection");
++    }
++
++    void project(Bf16Weight weight, const Bf16* input, Bf16* output) const {
++        check(text_bf16_gemv_rows(weight.values, input, weight.rows, weight.columns,
++                                  rows, output, stream), "Run exact prefill BF16 projection");
++    }
++
++    void gdn(const GdnLayer& layer, TextGdnState state) const {
++        const auto input = quantize(work.normalized, hidden_size);
++        project(layer.qkv, input, work.gdn_qkv);
++        project(layer.z, input, work.gdn_z);
++        project(layer.b, work.normalized, work.gdn_b);
++        project(layer.a, work.normalized, work.gdn_a);
++        check(text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
++                               work.gdn_a, layer.recurrent, state, work.gdn_scratch,
++                               text_gdn_workspace_bytes(rows), work.attention, stream),
++              "Advance prefill Gated DeltaNet state");
++        project(layer.output, quantize(work.attention, text_gdn_value_width),
++                work.projected_attention);
++    }
++
++    void gqa(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages) const {
++        const auto input = quantize(work.normalized, hidden_size);
++        project(layer.q_gate, input, work.q_gate);
++        project(layer.key, input, work.keys);
++        project(layer.value, input, work.values);
++        check(text_gqa_preprocess(position, rows, work.q_gate, work.keys, layer.query_norm,
++                                  layer.key_norm, work.rope_queries, work.rope_keys, stream),
++              "Normalize and rotate prefill Q/K");
++        check(mxfp8_kv_append(cache, pages, position, rows, work.rope_keys, work.values, stream),
++              "Append prefill MXFP8 KV");
++        check(mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
++                                 work.attention, stream), "Read causal prefill MXFP8 attention");
++        check(text_gqa_postgate(rows, work.q_gate, work.attention, work.attention, stream),
++              "Gate prefill grouped-query attention");
++        project(layer.output, quantize(work.attention, text_gqa_q_width), work.projected_attention);
++    }
++
++    void mlp(const Layer& layer) const {
++        const auto input = quantize(work.normalized, hidden_size);
++        project(layer.mlp_gate, input, work.mlp_gate);
++        project(layer.mlp_up, input, work.mlp_up);
++        check(text_swiglu(work.mlp_gate, work.mlp_up, rows * intermediate_size,
++                          work.mlp_gate, stream), "Apply prefill SwiGLU");
++        project(layer.mlp_down, quantize(work.mlp_gate, intermediate_size), work.hidden);
++    }
++};
++
++}
++
++void decoder::reclaim_prefill_workspaces(int device) {
++    auto& pools = prefill_pools();
++    auto pending = pools.take_pending(device);
++    while (pending) {
++        auto pool = std::move(pending);
++        pending = std::move(pool->next);
++        recover_prefill_pool(*pool);
++        pools.put(std::move(pool));
++    }
++}
++
++PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
++    : stream_(stream), capacity_(capacity) {
++    if (!stream || capacity < 1 || capacity > prefill_chunk_rows) {
++        throw std::invalid_argument("Invalid decoder prefill workspace");
++    }
++    if (capacity == 1) {
++        return;
++    }
++    int device = 0;
++    check(cudaGetDevice(&device), "Get CUDA device for prefill workspace");
++    reclaim_prefill_workspaces(device);
++    auto& pools = prefill_pools();
++    auto pool = pools.take_idle(device);
++    if (!pool) {
++        pool = std::make_unique<PrefillPool>(device);
++        cudaMemPoolProps props{};
++        props.allocType = cudaMemAllocationTypePinned;
++        props.location.type = cudaMemLocationTypeDevice;
++        props.location.id = device;
++        const auto created = cudaMemPoolCreate(&pool->handle, &props);
++        if (prefill_allocation_unavailable(created)) {
++            return;
++        }
++        check(created, "Create prefill workspace pool");
++        int disabled = 0;
++        check(cudaMemPoolSetAttribute(pool->handle, cudaMemPoolReuseAllowInternalDependencies,
++                                      &disabled), "Configure prefill workspace pool");
++    }
++    ScratchLayout layout;
++    const TileBuffers buffers(layout, capacity);
++    void* data = nullptr;
++    const auto status = cudaMallocFromPoolAsync(&data, layout.bytes, pool->handle, stream);
++    if (status != cudaSuccess) {
++        pools.put(std::move(pool));
++        if (!prefill_allocation_unavailable(status)) {
++            check(status, "Allocate prefill workspace");
++        }
++        return;
++    }
++    pool_ = std::move(pool);
++    data_ = data;
++    bytes_ = layout.bytes;
++}
++
++PrefillWorkspace::~PrefillWorkspace() {
++    if (release_status_ == cudaSuccess) {
++        const auto status = release();
++        if (status != cudaSuccess) {
++            std::fprintf(stderr, "Release prefill workspace: %s\n", cudaGetErrorString(status));
++        }
++    }
++}
++
++cudaError_t PrefillWorkspace::release() noexcept {
++    if (data_ && release_status_ == cudaSuccess) {
++        release_status_ = cudaFreeAsync(data_, stream_);
++        if (release_status_ != cudaSuccess) {
++            pool_->pending = data_;
++            recover_prefill_pool(*pool_);
++        }
++        prefill_pools().put(std::move(pool_));
++        data_ = nullptr;
++    }
++    stream_ = nullptr;
++    return release_status_;
++}
++
++void PrefillWorkspace::close() {
++    check(release(), "Release prefill workspace");
++}
++
++void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
++                                   PrefillWorkspace& workspace) const {
++    const auto stream = workspace.stream();
++    if (!stream || !tokens || rows < 1 || rows > workspace.capacity() || position < 0 ||
++        position > text_attention_max_tokens - rows ||
++        (position + rows - 1) / mxfp8_page_size >= request.pages.page_count) {
++        throw std::invalid_argument("Invalid decoder prefill tile");
++    }
++    if (rows == 1 || !workspace.data()) {
++        if (!std::all_of(tokens, tokens + rows,
++                         [](int token) { return token >= 0 && token < vocab_size; })) {
++            throw std::invalid_argument("Invalid decoder prefill token");
++        }
++        for (int row = 0; row < rows; ++row) {
++            const ForwardLane lane{&request, tokens[row], position + row, TextGdnMode::prefill};
++            forward(&lane, 1, stream);
++        }
++        return;
++    }
++    ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
++    const Chunk chunk{TileBuffers(layout, workspace.capacity()), position, rows, stream};
++    const auto& work = chunk.work;
++    check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens, rows,
++                               work.residual, stream), "Gather prefill embeddings");
++    int gqa_index = 0;
++    int gdn_index = 0;
++    for (int index = 0; index < layer_count; ++index) {
++        const auto& layer = layers[index];
++        const auto* input = index == 0 ? work.residual : work.hidden;
++        auto* residual = index == 0 ? nullptr : work.residual;
++        check(text_rms_norm_rows(input, residual, layer.input_norm, hidden_size, rows,
++                                 work.normalized, residual, stream),
++              "Normalize prefill layer input");
++        if (is_full_attention(index)) {
++            chunk.gqa(layer.gqa, request.caches[gqa_index++], request.pages);
++        } else {
++            chunk.gdn(layer.gdn, request.states[gdn_index++]);
++        }
++        check(text_rms_norm_rows(work.projected_attention, work.residual, layer.attention_norm,
++                                 hidden_size, rows, work.normalized, work.residual, stream),
++              "Normalize prefill post-attention residual");
++        chunk.mlp(layer);
++    }
++    const int last = (rows - 1) * hidden_size;
++    const auto bytes = hidden_size * sizeof(Bf16);
++    check(cudaMemcpyAsync(request.work.hidden, work.hidden + last, bytes,
++                          cudaMemcpyDeviceToDevice, stream), "Stage final prefill hidden row");
++    check(cudaMemcpyAsync(request.work.residual, work.residual + last, bytes,
++                          cudaMemcpyDeviceToDevice, stream), "Stage final prefill residual row");
++}
++
++}
+diff --git a/src/text_ops.cu b/src/text_ops.cu
+index b6766fe..c2b6fa3 100644
+--- a/src/text_ops.cu
++++ b/src/text_ops.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "sglang/decoder_cuda.cuh"
+ 
++#include <algorithm>
+ #include <cstddef>
+ 
+ #include <cuda_fp8.h>
+@@ -51,6 +52,20 @@ __global__ void embedding_kernel(const __nv_bfloat16* row, int width, __nv_bfloa
+     }
+ }
+ 
++struct EmbeddingTokens {
++    int ids[text_embedding_max_rows];
++};
++
++__global__ void embedding_rows_kernel(const __nv_bfloat16* weight, int width,
++                                      const __grid_constant__ EmbeddingTokens tokens,
++                                      __nv_bfloat16* output) {
++    const auto col = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (col < static_cast<std::size_t>(width)) {
++        output[static_cast<std::size_t>(blockIdx.y) * width + col] =
++            weight[static_cast<std::size_t>(tokens.ids[blockIdx.y]) * width + col];
++    }
++}
++
+ __global__ void decode_embedding_kernel(const __nv_bfloat16* weight, int vocab_size, int width,
+                                           const TextLogitCandidate* previous,
+                                           __nv_bfloat16* output) {
+@@ -84,9 +99,13 @@ __device__ float bf16x2_dot(unsigned int lhs, unsigned int rhs, float sum) {
+     return fmaf(__uint_as_float(lhs & 0xffff0000u), __uint_as_float(rhs & 0xffff0000u), sum);
+ }
+ 
+-template <bool Packed>
++template <bool Packed, bool Batched = false>
+ __global__ void bf16_gemv_kernel(const __nv_bfloat16* weight, const __nv_bfloat16* input,
+                                  int out_width, int in_width, __nv_bfloat16* output) {
++    if constexpr (Batched) {
++        input += static_cast<std::size_t>(blockIdx.y) * in_width;
++        output += static_cast<std::size_t>(blockIdx.y) * out_width;
++    }
+     const int lane = threadIdx.x % warp_width;
+     const int row = blockIdx.x * block_warps + threadIdx.x / warp_width;
+     if (row >= out_width) {
+@@ -118,11 +137,18 @@ __global__ void bf16_gemv_kernel(const __nv_bfloat16* weight, const __nv_bfloat1
+     }
+ }
+ 
++template <bool Batched>
+ __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
+                                     TextFp8Activation output) {
+     constexpr int group_warps = text_fp8_group_size / warp_width;
+     __shared__ float warp_maxima[group_warps];
+     __shared__ float reciprocal_scale;
++    if constexpr (Batched) {
++        const auto offset = static_cast<std::size_t>(blockIdx.y) * width;
++        input += offset;
++        output.values += offset;
++        output.scales += static_cast<std::size_t>(blockIdx.y) * gridDim.x;
++    }
+     const int lane = threadIdx.x % warp_width;
+     const int warp = threadIdx.x / warp_width;
+     const auto col = static_cast<std::size_t>(blockIdx.x) * text_fp8_group_size + threadIdx.x;
+@@ -330,15 +356,96 @@ cudaError_t launch_fp8_batch(const std::uint8_t* weight, const __nv_bfloat16* we
+                             fp8_packed_warps * warp_width, args, 0, stream);
+ }
+ 
++__device__ float fp8_pack_dot(uint4 lhs, uint4 rhs) {
++    const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
++    const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
++    return low + high;
++}
++
++template <int Count>
++__global__ void fp8_prefill_tile_kernel(const std::uint8_t* weight,
++                                        const __nv_bfloat16* weight_scales,
++                                        TextFp8ActivationView input, int out_width, int in_width,
++                                        int groups, int rows, int tiles, __nv_bfloat16* output) {
++    constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
++    const int lane = threadIdx.x % warp_width;
++    const int row = (blockIdx.x / tiles) * fp8_packed_warps + threadIdx.x / warp_width;
++    if (row >= out_width) {
++        return;
++    }
++    const int first = (blockIdx.x % tiles) * Count;
++    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
++    const auto* row_scales =
++        weight_scales + static_cast<std::size_t>(row / text_fp8_group_size) * groups;
++    const auto* values = input.values + static_cast<std::size_t>(first) * in_width;
++    const auto* scales = input.scales + static_cast<std::size_t>(first) * groups;
++    float sums[Count]{};
++    for (int group = 0; group < groups; group += fp8_groups_per_warp) {
++        const auto col = static_cast<std::size_t>(group) * text_fp8_group_size +
++                         lane * fp8_pack_bytes;
++        const auto lhs = load_fp8_weight(row_weight + col);
++        const int scale_index = group + lane / lanes_per_group;
++        const float weight_scale = __bfloat162float(row_scales[scale_index]);
++#pragma unroll
++        for (int item = 0; item < Count; ++item) {
++            if (first + item < rows) {
++                const auto rhs = load_128(values + static_cast<std::size_t>(item) * in_width + col);
++                const float scaled =
++                    fp8_pack_dot(lhs, rhs) *
++                    scales[static_cast<std::size_t>(item) * groups + scale_index];
++                sums[item] = fmaf(scaled, weight_scale, sums[item]);
++            }
++        }
++    }
++#pragma unroll
++    for (int item = 0; item < Count; ++item) {
++        if (first + item < rows) {
++            const float sum = warp_sum(sums[item]);
++            if (lane == 0) {
++                output[static_cast<std::size_t>(first + item) * out_width + row] =
++                    __float2bfloat16_rn(sum);
++            }
++        }
++    }
++}
++
++template <int Count>
++cudaError_t launch_fp8_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                            TextFp8ActivationView input, int out_width, int in_width, int rows,
++                            __nv_bfloat16* output, cudaStream_t stream) {
++    int groups = text_fp8_group_count(in_width);
++    int tiles = divide_up(rows, Count);
++    const auto blocks = static_cast<std::uint64_t>(divide_up(out_width, fp8_packed_warps)) * tiles;
++    if (blocks > 2147483647u) {
++        return cudaErrorInvalidConfiguration;
++    }
++    void* args[] = {&weight, &weight_scales, &input, &out_width, &in_width,
++                     &groups, &rows, &tiles, &output};
++    return cudaLaunchKernel(fp8_prefill_tile_kernel<Count>, static_cast<unsigned int>(blocks),
++                            fp8_packed_warps * warp_width, args, 0, stream);
++}
++
+ __device__ float residual_sum(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                               std::size_t col) {
+     const float value = __bfloat162float(branch[col]);
+     return residual == nullptr ? value : value + __bfloat162float(residual[col]);
+ }
+ 
++template <bool Batched>
+ __global__ void rms_norm_kernel(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                                 const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
+                                 __nv_bfloat16* residual_output) {
++    if constexpr (Batched) {
++        const auto offset = static_cast<std::size_t>(blockIdx.x) * width;
++        branch += offset;
++        output += offset;
++        if (residual != nullptr) {
++            residual += offset;
++        }
++        if (residual_output != nullptr) {
++            residual_output += offset;
++        }
++    }
+     __shared__ float warp_squares[block_warps];
+     __shared__ float inverse_rms;
+     const int lane = threadIdx.x % warp_width;
+@@ -458,6 +565,24 @@ cudaError_t text_embedding(const __nv_bfloat16* weight, int vocab_size, int widt
+                             args, 0, stream);
+ }
+ 
++cudaError_t text_embedding_rows(const __nv_bfloat16* weight, int vocab_size, int width,
++                                const int* host_token_ids, int rows, __nv_bfloat16* output,
++                                cudaStream_t stream) {
++    if (!weight || !host_token_ids || !output || vocab_size <= 0 || width <= 0 ||
++        rows <= 0 || rows > text_embedding_max_rows) {
++        return cudaErrorInvalidValue;
++    }
++    EmbeddingTokens tokens{};
++    std::copy_n(host_token_ids, rows, tokens.ids);
++    if (std::any_of(tokens.ids, tokens.ids + rows,
++                    [vocab_size](int token) { return token < 0 || token >= vocab_size; })) {
++        return cudaErrorInvalidValue;
++    }
++    void* args[] = {&weight, &width, &tokens, &output};
++    return cudaLaunchKernel(embedding_rows_kernel, dim3(divide_up(width, block_threads), rows),
++                            block_threads, args, 0, stream);
++}
++
+ cudaError_t decoder::decode_embedding(const __nv_bfloat16* weight, int vocab_size, int width,
+                                       const TextLogitCandidate* previous, __nv_bfloat16* output,
+                                       cudaStream_t stream) {
+@@ -489,14 +614,38 @@ cudaError_t text_bf16_gemv(const __nv_bfloat16* weight, const __nv_bfloat16* inp
+                             divide_up(out_width, block_warps), block_threads, args, 0, stream);
+ }
+ 
++cudaError_t text_bf16_gemv_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,
++                                int out_width, int in_width, int rows, __nv_bfloat16* output,
++                                cudaStream_t stream) {
++    if (!weight || !input || !output || out_width <= 0 || in_width <= 0 ||
++        rows <= 0 || rows > 65535) {
++        return cudaErrorInvalidValue;
++    }
++    const bool packed = in_width % 8 == 0 && aligned(weight, 16) && aligned(input, 16);
++    void* args[] = {&weight, &input, &out_width, &in_width, &output};
++    const auto kernel = packed ? bf16_gemv_kernel<true, true> : bf16_gemv_kernel<false, true>;
++    return cudaLaunchKernel(kernel, dim3(divide_up(out_width, block_warps), rows),
++                            block_threads, args, 0, stream);
++}
++
+ cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
+                              cudaStream_t stream) {
+     if (input == nullptr || output.values == nullptr || output.scales == nullptr || width <= 0) {
+         return cudaErrorInvalidValue;
+     }
+     void* args[] = {&input, &width, &output};
+-    return cudaLaunchKernel(quantize_fp8_kernel, text_fp8_group_count(width), text_fp8_group_size,
+-                            args, 0, stream);
++    return cudaLaunchKernel(quantize_fp8_kernel<false>, text_fp8_group_count(width),
++                            text_fp8_group_size, args, 0, stream);
++}
++
++cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int rows,
++                                  TextFp8Activation output, cudaStream_t stream) {
++    if (!input || !output.values || !output.scales || width <= 0 || rows <= 0 || rows > 65535) {
++        return cudaErrorInvalidValue;
++    }
++    void* args[] = {&input, &width, &output};
++    return cudaLaunchKernel(quantize_fp8_kernel<true>, dim3(text_fp8_group_count(width), rows),
++                            text_fp8_group_size, args, 0, stream);
+ }
+ 
+ cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+@@ -552,6 +701,40 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
+     return cudaSuccess;
+ }
+ 
++cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                               TextFp8ActivationView input, int out_width, int in_width, int rows,
++                               __nv_bfloat16* output, cudaStream_t stream) {
++    if (!weight || !weight_scales || !input.values || !input.scales || !output ||
++        out_width <= 0 || in_width <= 0 || rows <= 0 || rows > 65535) {
++        return cudaErrorInvalidValue;
++    }
++    if (rows > 1 && supports_wide_fp8(weight, input, in_width)) {
++        if (rows <= 8 || (rows <= 16 && (out_width <= 1024 || in_width >= 16384))) {
++            return launch_fp8_rows<2>(weight, weight_scales, input, out_width, in_width, rows,
++                                      output, stream);
++        }
++        if (rows < 64 || out_width <= 1024) {
++            return launch_fp8_rows<4>(weight, weight_scales, input, out_width, in_width, rows,
++                                      output, stream);
++        }
++        return launch_fp8_rows<8>(weight, weight_scales, input, out_width, in_width, rows,
++                                  output, stream);
++    }
++    const int groups = text_fp8_group_count(in_width);
++    for (int row = 0; row < rows; ++row) {
++        const TextFp8ActivationView source{
++            input.values + static_cast<std::size_t>(row) * in_width,
++            input.scales + static_cast<std::size_t>(row) * groups};
++        const auto status = text_fp8_gemv(weight, weight_scales, source, out_width, in_width,
++                                          output + static_cast<std::size_t>(row) * out_width,
++                                          stream);
++        if (status != cudaSuccess) {
++            return status;
++        }
++    }
++    return cudaSuccess;
++}
++
+ cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                          const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
+                          __nv_bfloat16* residual_output, cudaStream_t stream) {
+@@ -560,7 +743,18 @@ cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* resi
+         return cudaErrorInvalidValue;
+     }
+     void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
+-    return cudaLaunchKernel(rms_norm_kernel, 1, block_threads, args, 0, stream);
++    return cudaLaunchKernel(rms_norm_kernel<false>, 1, block_threads, args, 0, stream);
++}
++
++cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
++                              const __nv_bfloat16* weight, int width, int rows,
++                              __nv_bfloat16* output, __nv_bfloat16* residual_output,
++                              cudaStream_t stream) {
++    if (!branch || !weight || !output || width <= 0 || rows <= 0 || output == residual_output) {
++        return cudaErrorInvalidValue;
++    }
++    void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
++    return cudaLaunchKernel(rms_norm_kernel<true>, rows, block_threads, args, 0, stream);
+ }
+ 
+ cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,
+diff --git a/xmake.lua b/xmake.lua
+index 6f84ab6..4c0e386 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -75,7 +75,8 @@ target("sglang_decoder")
+     add_includedirs("include", {public = true})
+     add_deps("sglang_checkpoint", "sglang_cuda")
+     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
+-              "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp")
++              "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp",
++              "src/decoder_prefill.cpp")
+ 
+ target("sglang-generate")
+     set_kind("binary")

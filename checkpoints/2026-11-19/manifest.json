@@ -1,0 +1,548 @@
+{
+  "format": 1,
+  "frozen_manifest_sha256": "304f7e7bb07213191422744cd8403db16b77488f67e3baf03c1e4352dacb031c",
+  "publication_anchor": "723eb810d18336baf5d5e21bb5423119cf6e655a",
+  "anchor_tree": "78b367c055e642e83e674dedf758eb80127d5259",
+  "checkpoint_revision": "c3a462cc3d38cf351f3b26cbd763469eeb74ef81",
+  "reference_vllm_revision": "81a8cb063e6247fe254d7caf7e98a6691d71022a",
+  "validation": {
+    "source_replay": "All source hashes matched after replay in a clone without a checkout.",
+    "device_evidence": "Device results are historical. Promotion reran the vision CPU replay.",
+    "release_builds": "The packaging review built all 19 release targets with devices hidden.",
+    "production_status": "Independent candidates pending integration and production acceptance."
+  },
+  "series": {
+    "raw-text": {
+      "base": "dc087912a794372485e78c0a6de5140ac43746e7",
+      "base_tree": "8d560b48ab8129e1442ae56cddff92198e7917d4",
+      "apply": [
+        "raw-text"
+      ],
+      "build_targets": [
+        "sglang-server",
+        "sglang-generate"
+      ],
+      "sources": "sources/raw-text.sha256",
+      "sources_sha256": "9b372a808b848e2402984e72e50c95f49f927f29fae41171d123e243baf93e5b",
+      "checks": "40,794 tokenizer differential cases. B200 raw HTTP matched direct IDs.",
+      "limits": "Greedy completions with a 1 MiB prompt limit."
+    },
+    "chat": {
+      "base": "dc087912a794372485e78c0a6de5140ac43746e7",
+      "base_tree": "8d560b48ab8129e1442ae56cddff92198e7917d4",
+      "apply": [
+        "raw-text",
+        "chat"
+      ],
+      "build_targets": [
+        "sglang-server"
+      ],
+      "sources": "sources/chat.sha256",
+      "sources_sha256": "20d8f65c0b7fea8e3e93fb72d5fe1964722dfd9657df477ba9d01b599cae0e52",
+      "checks": "136 exact HF prompt and ID cases, 135 HTTP mocks, and 156 parent responses.",
+      "limits": "No chat GPU run. External media and forced tool calls are unsupported."
+    },
+    "mtp-one-sync": {
+      "base": "b816c2ab85360fd98adecd3b2fc5998d3ec09307",
+      "base_tree": "276b5d1a0d9e498ed6435bfcb94244306d78f8c5",
+      "apply": [
+        "mtp-foundation",
+        "mtp-one-sync"
+      ],
+      "build_targets": [
+        "sglang-generate"
+      ],
+      "sources": "sources/mtp-one-sync.sha256",
+      "sources_sha256": "f47964379c384fd327d248ea268a4b0260708b0a2872d72f282615126bc5213b",
+      "checks": "24 state trials and 96 generation trials on reconstructed candidate-04.",
+      "limits": "The 1.42–1.92x speedup measures the isolated verifier on short cases."
+    },
+    "mtp-state-replay": {
+      "base": "dc087912a794372485e78c0a6de5140ac43746e7",
+      "base_tree": "8d560b48ab8129e1442ae56cddff92198e7917d4",
+      "apply": [
+        "mtp-state-replay"
+      ],
+      "build_targets": [
+        "sglang-generate"
+      ],
+      "sources": "sources/mtp-state-replay.sha256",
+      "sources_sha256": "053aca12173591eeba880d76d84909f6817fe3eeeabd8df31492474be39b5c3c",
+      "checks": "180 exact state and logit trials, two boundary cases, and 33 timing pairs.",
+      "limits": "Isolated CLI verification. Continuous batching has a separate series."
+    },
+    "mtp-continuous-batch": {
+      "base": "723eb810d18336baf5d5e21bb5423119cf6e655a",
+      "base_tree": "78b367c055e642e83e674dedf758eb80127d5259",
+      "apply": [
+        "mtp-continuous-batch"
+      ],
+      "build_targets": [
+        "sglang-server",
+        "sglang-generate"
+      ],
+      "sources": "sources/mtp-continuous-batch.sha256",
+      "sources_sha256": "de1f184481580b36009c5ffb07a1829e1bb6a0da12694db5953ad6fac45ba07e",
+      "checks": "Short HTTP comparisons matched at widths 2 and 4 across MTP depths 0–4.",
+      "limits": "Measured throughput varied by depth and scheduling."
+    },
+    "multi-lane-graphs": {
+      "base": "df9335cb5ce2f1f8e4f462c0b3c5d76a9c513250",
+      "base_tree": "8fed1d9a23dca61a1aa8ece9253716d5789e5ba6",
+      "apply": [
+        "multi-lane-graphs"
+      ],
+      "build_targets": [
+        "sglang-server"
+      ],
+      "sources": "sources/multi-lane-graphs.sha256",
+      "sources_sha256": "ab6df6239dd5f01aa2e751cc612458c8c54ee5f9929b43b894adf31afa3b6095",
+      "checks": "39 exact IDs and top-16 scores, eight CUPTI replays, and memcheck.",
+      "limits": "Prefill, mixed steps and width-one batch steps execute eagerly."
+    },
+    "wide-batch": {
+      "base": "dc087912a794372485e78c0a6de5140ac43746e7",
+      "base_tree": "8d560b48ab8129e1442ae56cddff92198e7917d4",
+      "apply": [
+        "wide-batch"
+      ],
+      "build_targets": [
+        "sglang-server"
+      ],
+      "sources": "sources/wide-batch.sha256",
+      "sources_sha256": "eab8ecfe9bc34a8117eb9d216a0484bf9a15e80d24c5aa6a7c02239f028f05a5",
+      "checks": "HTTP reached widths 8, 16 and 32. BF16 scores matched at 1,073 lane steps.",
+      "limits": "Full W4/W5 serving runs remain open."
+    },
+    "sampling": {
+      "base": "946e18f874beb4e22f1021155e43dc6bd74b2b9b",
+      "base_tree": "17f0533dab7abc3ae51e9075b35c1dc9264dcb81",
+      "apply": [
+        "sampling"
+      ],
+      "build_targets": [
+        "sglang-server",
+        "sglang-generate"
+      ],
+      "sources": "sources/sampling.sha256",
+      "sources_sha256": "ff629925ef0743fed8ee3d1bb2027e69dfcaed5a21093584c8820d60a16bb460",
+      "checks": "CPU distribution, seeded replay, greedy fallback, CLI and HTTP selection.",
+      "limits": "Positive temperature transfers BF16 logits to the host and requires MTP off."
+    },
+    "gqa-flash": {
+      "base": "dc087912a794372485e78c0a6de5140ac43746e7",
+      "base_tree": "8d560b48ab8129e1442ae56cddff92198e7917d4",
+      "apply": [
+        "gqa-flash"
+      ],
+      "build_targets": [
+        "sglang-generate"
+      ],
+      "sources": "sources/gqa-flash.sha256",
+      "sources_sha256": "5fd1b7e15ad2ee97000413bb1083dde53013ecaf15d37006ed1d41930416ee4f",
+      "checks": "Real 128-, 2,048- and 8,192-token layer-3 shapes passed the FP64 budget.",
+      "limits": "Synthetic long cases can exceed the budget. Exact stays the default."
+    },
+    "gqa-long-decode": {
+      "base": "723eb810d18336baf5d5e21bb5423119cf6e655a",
+      "base_tree": "78b367c055e642e83e674dedf758eb80127d5259",
+      "apply": [
+        "gqa-long-decode"
+      ],
+      "build_targets": [
+        "sglang-server"
+      ],
+      "sources": "sources/gqa-long-decode.sha256",
+      "sources_sha256": "550098071eaa8e2cb12968443b629681c81e4ae712e9d95d32ecc72f9ba554ec",
+      "checks": "Clean source build and W2 CUDA profiling.",
+      "limits": "Up to 32 partitions and exact fallback. Full long-context parity is open."
+    },
+    "fast-w3": {
+      "base": "dc087912a794372485e78c0a6de5140ac43746e7",
+      "base_tree": "8d560b48ab8129e1442ae56cddff92198e7917d4",
+      "apply": [
+        "w3-exact",
+        "w3-combined-02"
+      ],
+      "build_targets": [
+        "sglang-server"
+      ],
+      "sources": "sources/fast-w3.sha256",
+      "sources_sha256": "0e9448250d896a7c9042323500b9342703951c2b1be9a413bfd039871651dc95",
+      "checks": "4,096 W3 vLLM IDs matched per cohort in two warmups and five measured runs.",
+      "limits": "25.955 versus 379.524 IDs/s. All four timing gates failed."
+    },
+    "w3-bounded-decode": {
+      "base": "dc087912a794372485e78c0a6de5140ac43746e7",
+      "base_tree": "8d560b48ab8129e1442ae56cddff92198e7917d4",
+      "apply": [
+        "w3-exact",
+        "w3-combined-02",
+        "w3-flash-bounded"
+      ],
+      "build_targets": [
+        "sglang-server"
+      ],
+      "sources": "sources/w3-bounded-decode.sha256",
+      "sources_sha256": "ddeacd7c4f6eef3034381632c6668a01745b5a175981c6734b2f07371c9ed8b7",
+      "checks": "Five measured W3 cohorts each matched 4,096 IDs with Flash and split decode.",
+      "limits": "94.58–105.80 output IDs/s, below the 383.32 output IDs/s adoption threshold."
+    },
+    "chunked-prefix-cache": {
+      "base": "946e18f874beb4e22f1021155e43dc6bd74b2b9b",
+      "base_tree": "17f0533dab7abc3ae51e9075b35c1dc9264dcb81",
+      "apply": [
+        "chunked-prefix-cache"
+      ],
+      "build_targets": [
+        "sglang-server"
+      ],
+      "sources": "sources/chunked-prefix-cache.sha256",
+      "sources_sha256": "4e089c3d046e6674ccab3c5c5f57131ffd10466e0ec99a406e6174fdb802b6db",
+      "checks": "Warm W3 matched 4,096 fresh IDs. State, eviction, and cancellation passed.",
+      "limits": "Requires MTP off. Timings were affected by interference."
+    },
+    "vision": {
+      "base": "dc087912a794372485e78c0a6de5140ac43746e7",
+      "base_tree": "8d560b48ab8129e1442ae56cddff92198e7917d4",
+      "apply": [
+        "vision-language",
+        "vision-tools"
+      ],
+      "build_targets": [
+        "vision-encoder",
+        "vision-language-check",
+        "sglang-generate"
+      ],
+      "sources": "sources/vision.sha256",
+      "sources_sha256": "4759978d8600bb122840453688cfae4adfc6a6748b97c9e42457ed54367506b6",
+      "checks": "Eight CPU cases matched 2,347,008 patch elements per dtype. Builds passed.",
+      "limits": "Offline tensors. Merged worst-row error was 19.98% image and 7.87% video."
+    }
+  },
+  "patches": {
+    "raw-text": {
+      "file": "patches/raw-text.patch",
+      "sha256": "1cd54859b105cd3cc90dd7498538370792b92a7057d1a5340984b8a57084c67b",
+      "paths": [
+        "apps/server/batch_service.cpp",
+        "apps/server/completion_request.cpp",
+        "apps/server/completion_request.h",
+        "apps/server/completions.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/decoder.h",
+        "include/sglang/json.h",
+        "include/sglang/server/completions.h",
+        "include/sglang/tokenizer/digest.h",
+        "include/sglang/tokenizer/tokenizer.h",
+        "include/sglang/tokenizer/unicode.h",
+        "include/sglang/utf8.h",
+        "src/checkpoint.cpp",
+        "src/decoder.cpp",
+        "src/decoder_batch.cpp",
+        "src/json.cpp",
+        "src/tokenizer/digest.cpp",
+        "src/tokenizer/tokenizer.cpp",
+        "src/tokenizer/unicode.cpp",
+        "src/tokenizer/unicode/canonical_compositions_9.inc",
+        "src/tokenizer/unicode/canonical_decompositions_9.inc",
+        "src/tokenizer/unicode/character_properties_16.inc",
+        "src/tokenizer/unicode/combining_classes_9.inc",
+        "src/utf8.cpp",
+        "tools/unicode/LICENSE",
+        "tools/unicode/generate.py",
+        "xmake.lua"
+      ]
+    },
+    "chat": {
+      "file": "patches/chat.patch",
+      "sha256": "9e9f92a6a4e92b93e59eeed6bbedc2988bdd8e698f8574276d1d13df1aa43adc",
+      "paths": [
+        "apps/server/chat_template.cpp",
+        "apps/server/chat_template.h",
+        "apps/server/completion_request.cpp",
+        "apps/server/completion_request.h",
+        "apps/server/completions.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/json.h",
+        "include/sglang/server/completions.h",
+        "src/json.cpp"
+      ]
+    },
+    "mtp-foundation": {
+      "file": "patches/mtp-foundation.patch",
+      "sha256": "6521efda63df7096daf008af870c8db0fc0aab1ae470e99bd5425bc6e8018234",
+      "paths": [
+        "apps/server/completions.cpp",
+        "apps/sglang-generate.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/decoder.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/decoder_mtp.h",
+        "include/sglang/server/completions.h",
+        "src/decoder.cpp",
+        "src/decoder_forward.cpp",
+        "src/decoder_mtp.cpp",
+        "src/decoder_resources.cpp",
+        "xmake.lua"
+      ]
+    },
+    "mtp-one-sync": {
+      "file": "patches/mtp-one-sync.patch",
+      "sha256": "95259c94a55c6337dd4292ae03ad86a1d5e2d93ce1134f27939b0acea41f3560",
+      "paths": [
+        "apps/sglang-generate.cpp",
+        "include/sglang/decoder.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/text_attention.h",
+        "include/sglang/text_ops.h",
+        "src/decoder.cpp",
+        "src/decoder_forward.cpp",
+        "src/decoder_resources.cpp",
+        "src/decoder_verify.cpp",
+        "src/text_attention_gdn.cu",
+        "src/text_ops.cu",
+        "xmake.lua"
+      ]
+    },
+    "mtp-state-replay": {
+      "file": "patches/mtp-state-replay.patch",
+      "sha256": "e791903d2d351d31c2765c538be95ee44ff8f1ae90ddebf021efa945e1d0c8d7",
+      "paths": [
+        "apps/sglang-generate.cpp",
+        "include/sglang/decoder.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/text_attention.h",
+        "include/sglang/text_ops.h",
+        "src/decoder.cpp",
+        "src/decoder_forward.cpp",
+        "src/decoder_resources.cpp",
+        "src/decoder_verify.cpp",
+        "src/text_attention_gdn.cu",
+        "src/text_ops.cu",
+        "xmake.lua"
+      ]
+    },
+    "mtp-continuous-batch": {
+      "file": "patches/mtp-continuous-batch.patch",
+      "sha256": "63a80804918614ec5c7482d2a43f381ef461328211d0d968c09c41f7f5e29860",
+      "paths": [
+        "apps/server/batch_service.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/decoder_batch.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/server/batch_service.h",
+        "include/sglang/text_attention.h",
+        "include/sglang/text_ops.h",
+        "src/decoder_batch.cpp",
+        "src/decoder_batch_verify.cpp",
+        "src/decoder_forward.cpp",
+        "src/decoder_prefill.cpp",
+        "src/decoder_resources.cpp",
+        "src/text_attention_gdn.cu",
+        "src/text_ops.cu",
+        "xmake.lua"
+      ]
+    },
+    "multi-lane-graphs": {
+      "file": "patches/multi-lane-graphs.patch",
+      "sha256": "7071baba07918bf6667df88a69c1c860b1b8e8ab1e5f33dc7f72993e36be567c",
+      "paths": [
+        "apps/server/batch_service.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/decoder_batch.h",
+        "include/sglang/decoder_cuda.cuh",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/server/batch_service.h",
+        "src/decoder.cpp",
+        "src/decoder_batch.cpp",
+        "src/decoder_forward.cpp",
+        "src/decoder_resources.cpp",
+        "src/mxfp8_gqa.cu",
+        "src/text_attention_gdn.cu"
+      ]
+    },
+    "wide-batch": {
+      "file": "patches/wide-batch.patch",
+      "sha256": "f7b5e94e2a2d310519a3b9ed8533c9b874427f775d3be63b6782867c6ca6cb8d",
+      "paths": [
+        "apps/server/batch_service.cpp",
+        "apps/server/http.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/decoder_batch.h",
+        "include/sglang/decoder_batch_probe.h",
+        "include/sglang/decoder_cuda.cuh",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/server/batch_service.h",
+        "include/sglang/text_ops.h",
+        "src/decoder_batch.cpp",
+        "src/decoder_forward.cpp",
+        "src/decoder_resources.cpp",
+        "src/mxfp8_gqa.cu",
+        "src/text_ops.cu"
+      ]
+    },
+    "sampling": {
+      "file": "patches/sampling.patch",
+      "sha256": "b31b48e1118f5d8972c86a81fbb9b233796f63cce34a9b60cfa2bbbde15ce72a",
+      "paths": [
+        "apps/server/completions.cpp",
+        "apps/sglang-generate.cpp",
+        "include/sglang/decoder.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/decoder_sampling.h",
+        "src/decoder.cpp",
+        "src/decoder_batch.cpp",
+        "src/decoder_forward.cpp",
+        "src/decoder_sampling.cpp",
+        "xmake.lua"
+      ]
+    },
+    "gqa-flash": {
+      "file": "patches/gqa-flash.patch",
+      "sha256": "1d313f5d7e21b3a468d5b3e984e2cc5ebb49ce02591cb5875217efb15dadeb2d",
+      "paths": [
+        "apps/sglang-generate.cpp",
+        "include/sglang/decoder.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/mxfp8_flash.h",
+        "include/sglang/mxfp8_gqa.h",
+        "include/sglang/text_ops.h",
+        "src/decoder.cpp",
+        "src/decoder_prefill.cpp",
+        "src/mxfp8_flash.cu",
+        "src/mxfp8_gqa.cu",
+        "src/text_ops.cu",
+        "xmake.lua"
+      ]
+    },
+    "gqa-long-decode": {
+      "file": "patches/gqa-long-decode.patch",
+      "sha256": "7ca169a5d9893ddae47fa5be432e00d99e473b888391eb4f30212616b405c98e",
+      "paths": [
+        "include/sglang/decoder_internal.h",
+        "include/sglang/mxfp8_fast_decode.h",
+        "src/decoder_forward.cpp",
+        "src/decoder_resources.cpp",
+        "src/mxfp8_fast_decode.cu",
+        "src/mxfp8_gqa.cu",
+        "xmake.lua"
+      ]
+    },
+    "w3-exact": {
+      "file": "patches/w3-exact.patch",
+      "sha256": "465efca4460dfb26f2db624e982deebc1e00e44d292487228686e63f2478af51",
+      "paths": [
+        "apps/server/batch_service.cpp",
+        "include/sglang/decoder_batch.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/decoder_prefill.h",
+        "include/sglang/text_ops.h",
+        "src/decoder.cpp",
+        "src/decoder_batch.cpp",
+        "src/decoder_prefill.cpp",
+        "src/text_ops.cu",
+        "xmake.lua"
+      ]
+    },
+    "w3-combined-02": {
+      "file": "patches/w3-combined-02.patch",
+      "sha256": "3e5700351a8aaad7642813ea3fcf57a854f87fadbcb0160f7b8915f5557a55e5",
+      "paths": [
+        "apps/server/batch_service.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/decoder_batch.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/decoder_prefill.h",
+        "include/sglang/mxfp8_gqa.h",
+        "include/sglang/prefill_fp8.h",
+        "include/sglang/server/batch_service.h",
+        "include/sglang/text_gdn_chunk.h",
+        "include/sglang/text_ops.h",
+        "src/decoder_batch.cpp",
+        "src/decoder_prefill.cpp",
+        "src/decoder_resources.cpp",
+        "src/mxfp8_gqa.cu",
+        "src/prefill_fp8_sm100.cu",
+        "src/text_attention_gdn.cu",
+        "src/text_gdn_chunk.cu",
+        "src/text_ops.cu",
+        "xmake.lua"
+      ]
+    },
+    "w3-flash-bounded": {
+      "file": "patches/w3-flash-bounded.patch",
+      "sha256": "6a09fe0823832a20f78be89c6bd36ed1519961375fcdb9f71d8c795a5ba5a751",
+      "paths": [
+        "apps/server/batch_service.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/decoder_batch.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/mxfp8_bounded16.h",
+        "include/sglang/mxfp8_flash.h",
+        "include/sglang/server/batch_service.h",
+        "src/decoder_batch.cpp",
+        "src/decoder_forward.cpp",
+        "src/decoder_prefill.cpp",
+        "src/mxfp8_bounded16.cu",
+        "src/mxfp8_flash.cu",
+        "xmake.lua"
+      ]
+    },
+    "chunked-prefix-cache": {
+      "file": "patches/chunked-prefix-cache.patch",
+      "sha256": "b4868eeda76784970cb58e0a76014a2e6099c5431999cf1feef26133efeb3f3f",
+      "paths": [
+        "apps/server/batch_service.cpp",
+        "apps/server/completions.cpp",
+        "apps/sglang-server.cpp",
+        "include/sglang/decoder.h",
+        "include/sglang/decoder_batch.h",
+        "include/sglang/decoder_internal.h",
+        "include/sglang/decoder_prefix_cache.h",
+        "include/sglang/server/batch_service.h",
+        "src/decoder_batch.cpp",
+        "src/decoder_prefix_cache.cpp",
+        "src/decoder_resources.cpp",
+        "xmake.lua"
+      ]
+    },
+    "vision-language": {
+      "file": "patches/vision-language.patch",
+      "sha256": "2160ba77d168c6ff1ebe872bb229c52cccc9d5a305e6b3f39b176f3fc05e41d8",
+      "paths": [
+        "include/sglang/decoder.h",
+        "include/sglang/decoder_cuda.cuh",
+        "include/sglang/decoder_internal.h",
+        "src/decoder.cpp",
+        "src/decoder_forward.cpp",
+        "src/text_attention_gqa.cu",
+        "tools/vision-language-check.cu",
+        "xmake.lua"
+      ]
+    },
+    "vision-tools": {
+      "file": "patches/vision-tools.patch",
+      "sha256": "4e8a34684cd474dbe1a12bdaf21cf1cd3c75a8364e612d17f199bacbebf8bae0",
+      "paths": [
+        "vision/encoder/encoder.cuh",
+        "vision/encoder/kernels.cuh",
+        "vision/encoder/main.cu",
+        "vision/encoder/prepare.py",
+        "vision/encoder/xmake.lua",
+        "vision/preprocess/oracle.py",
+        "vision/preprocess/preprocess.cpp"
+      ]
+    }
+  },
+  "vision_cpu_replay": {
+    "recipe": "vision/replay-preprocess.sh",
+    "fixture_base": "df9335cb5ce2f1f8e4f462c0b3c5d76a9c513250",
+    "reference_sglang_revision": "f04d886bf79aa3d6237cbb12a3311838eb9f9bd8",
+    "generated_sha256": {
+      "fixtures/results.json": "f27c049c6c09f34371e92b86f7b08e6a071f95772ca8c094ea7018f7d4f87932",
+      "manifest/checkpoint_manifest.inc":
+        "36cdf21bf5719d6fb2c203d77ae856fe02986d45b43c1864b229d0229f6a4d1e"
+    }
+  }
+}

@@ -1,0 +1,983 @@
+diff -ruN selected/apps/server/batch_service.cpp source/apps/server/batch_service.cpp
+--- selected/apps/server/batch_service.cpp	2026-11-19 01:55:26.000000000 +0800
++++ source/apps/server/batch_service.cpp	2026-11-19 02:29:27.221716468 +0800
+@@ -1,6 +1,6 @@
+ #include "sglang/server/batch_service.h"
+ 
+-#include "sglang/decoder_batch.h"
++#include "sglang/server/http.h"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -21,6 +21,7 @@
+     std::optional<int> token;
+     std::optional<DecoderFinishReason> finish;
+     std::exception_ptr error;
++    int cached_tokens = 0;
+     bool admitted = false;
+     bool cancelled = false;
+ 
+@@ -39,10 +40,25 @@
+                   " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) + '\n');
+ }
+ 
++void trace_cache(const DecoderBatchCacheStats& stats, int checkpoint_splits) {
++    std::cerr << ("prefix cached=" + std::to_string(stats.cached_tokens) +
++                  " prefill=" + std::to_string(stats.prefill_rows) +
++                  " decode=" + std::to_string(stats.decode_rows) +
++                  " restores=" + std::to_string(stats.restores) +
++                  " copies=" + std::to_string(stats.checkpoint_copies) +
++                  " published=" + std::to_string(stats.published) +
++                  " evictions=" + std::to_string(stats.evictions) +
++                  " live_pages=" + std::to_string(stats.live_pages) +
++                  " live_checkpoints=" + std::to_string(stats.live_checkpoints) +
++                  " indexed=" + std::to_string(stats.indexed) +
++                  " arena_bytes=" + std::to_string(stats.arena_bytes) +
++                  " checkpoint_splits=" + std::to_string(checkpoint_splits) + '\n');
++}
++
+ }
+ 
+ struct BatchService::State {
+-    State(const Decoder& decoder, bool trace);
++    State(const Decoder& decoder, bool trace, DecoderBatchCacheOptions cache);
+     ~State();
+ 
+     void run(const Decoder& decoder, std::promise<void> started);
+@@ -53,6 +69,7 @@
+     void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);
+ 
+     const bool trace;
++    const DecoderBatchCacheOptions cache;
+     std::mutex mutex;
+     std::condition_variable changed;
+     Jobs jobs;
+@@ -61,7 +78,8 @@
+     std::thread worker;
+ };
+ 
+-BatchService::State::State(const Decoder& decoder, bool trace) : trace(trace) {
++BatchService::State::State(const Decoder& decoder, bool trace, DecoderBatchCacheOptions cache)
++    : trace(trace), cache(cache) {
+     std::promise<void> started;
+     auto ready = started.get_future();
+     worker = std::thread(&State::run, this, std::cref(decoder), std::move(started));
+@@ -85,7 +103,7 @@
+ void BatchService::State::run(const Decoder& decoder, std::promise<void> started) {
+     std::unique_ptr<DecoderBatch> batch;
+     try {
+-        batch = std::make_unique<DecoderBatch>(decoder);
++        batch = std::make_unique<DecoderBatch>(decoder, cache);
+     } catch (...) {
+         started.set_exception(std::current_exception());
+         return;
+@@ -147,12 +165,18 @@
+         return false;
+     }
+     if (!job->admitted) {
++        std::exception_ptr error;
+         try {
+-            batch.admit(slot, std::move(job->prompt), job->options);
++            job->cached_tokens = batch.admit(slot, std::move(job->prompt), job->options);
+             job->admitted = true;
+         } catch (const std::invalid_argument&) {
++            error = std::current_exception();
++        } catch (const std::length_error& exhausted) {
++            error = std::make_exception_ptr(HttpError("503 Service Unavailable", exhausted.what()));
++        }
++        if (error) {
+             const std::lock_guard lock(mutex);
+-            job->error = std::current_exception();
++            job->error = std::move(error);
+             jobs[slot].reset();
+             changed.notify_all();
+             return false;
+@@ -187,7 +211,10 @@
+         std::array<DecoderBatchStep, decoder_batch_max_lanes> steps{};
+         DecoderBatchStepStats stats;
+         if (width) {
+-            steps = batch.advance_chunked(selected, trace ? &stats : nullptr);
++            steps = batch.advance_chunked(selected, trace ? &stats : nullptr, [&](int slot) {
++                const std::lock_guard lock(mutex);
++                return (*snapshot)[slot]->cancelled;
++            });
+         }
+         if (trace) {
+             const auto bytes = batch.request_device_allocation_bytes();
+@@ -198,6 +225,9 @@
+                 if (width) {
+                     trace_prefill_rows(stats);
+                 }
++                if (cache.pages != 0) {
++                    trace_cache(batch.cache_stats(), stats.checkpoint_splits);
++                }
+                 traced_bytes = bytes;
+             }
+         }
+@@ -219,8 +249,8 @@
+     changed.wait(lock, [&] { return jobs[slot].get() != &job; });
+ }
+ 
+-BatchService::BatchService(const Decoder& decoder, bool trace)
+-    : state_(std::make_unique<State>(decoder, trace)) {}
++BatchService::BatchService(const Decoder& decoder, bool trace, DecoderBatchCacheOptions cache)
++    : state_(std::make_unique<State>(decoder, trace, cache)) {}
+ 
+ BatchService::~BatchService() = default;
+ 
+@@ -269,6 +299,7 @@
+                 state_->changed.notify_all();
+             } else if (job->finish) {
+                 result.finish_reason = *job->finish;
++                result.cached_prompt_tokens = job->cached_tokens;
+                 return result;
+             } else {
+                 state_->changed.wait_for(lock, disconnect_poll);
+diff -ruN selected/apps/server/completions.cpp source/apps/server/completions.cpp
+--- selected/apps/server/completions.cpp	2026-11-19 01:55:26.000000000 +0800
++++ source/apps/server/completions.cpp	2026-11-19 01:59:52.300906788 +0800
+@@ -112,14 +112,15 @@
+     });
+ }
+ 
+-std::string usage_event(std::size_t prompt_tokens, std::size_t completion_tokens) {
++std::string usage_event(std::size_t prompt_tokens, std::size_t completion_tokens,
++                        std::size_t cached_tokens) {
+     return encode_json([&](json::OStream& writer) {
+         writer.attribute("choices", json::Array{});
+         writer.attributeObject("usage", [&] {
+             writer.attribute("prompt_tokens", static_cast<std::int64_t>(prompt_tokens));
+             writer.attribute("completion_tokens", static_cast<std::int64_t>(completion_tokens));
+             writer.attributeObject("prompt_tokens_details", [&] {
+-                writer.attribute("cached_tokens", 0);
++                writer.attribute("cached_tokens", static_cast<std::int64_t>(cached_tokens));
+             });
+         });
+     });
+@@ -153,7 +154,8 @@
+     const auto* prompt = streaming ? nullptr : &request.prompt;
+     if (begin_stream(connection, streaming) &&
+         write_event(connection, choice_event(std::nullopt, prompt, stopped ? "stop" : "length")) &&
+-        write_event(connection, usage_event(request.prompt.size(), output_count)) &&
++        write_event(connection, usage_event(request.prompt.size(), output_count,
++                                            result.cached_prompt_tokens)) &&
+         write_event(connection, "[DONE]")) {
+         end_events(connection);
+     }
+diff -ruN selected/apps/sglang-server.cpp source/apps/sglang-server.cpp
+--- selected/apps/sglang-server.cpp	2026-11-19 01:55:26.000000000 +0800
++++ source/apps/sglang-server.cpp	2026-11-19 01:59:52.301906763 +0800
+@@ -21,6 +21,7 @@
+     int port = 17384;
+     int max_active = 1;
+     int mtp_steps = 0;
++    sglang::DecoderBatchCacheOptions prefix_cache;
+     bool trace_batches = false;
+ };
+ 
+@@ -67,6 +68,19 @@
+             if (arguments.mtp_steps > sglang::decoder_max_mtp_steps) {
+                 throw std::invalid_argument(error);
+             }
++        } else if (option == "--prefix-cache-pages") {
++            const auto error = "Expected --prefix-cache-pages in [0, 2048]";
++            arguments.prefix_cache.pages = parse_integer(value, error);
++            if (arguments.prefix_cache.pages > 2048) {
++                throw std::invalid_argument(error);
++            }
++        } else if (option == "--prefix-cache-checkpoints") {
++            const auto error = "Expected --prefix-cache-checkpoints in [1, 64]";
++            arguments.prefix_cache.checkpoints = parse_integer(value, error);
++            if (arguments.prefix_cache.checkpoints == 0 ||
++                arguments.prefix_cache.checkpoints > 64) {
++                throw std::invalid_argument(error);
++            }
+         } else {
+             throw std::invalid_argument("Invalid argument " + std::string(option));
+         }
+@@ -74,6 +88,9 @@
+     if (arguments.mtp_steps != 0 && arguments.max_active != 1) {
+         throw std::invalid_argument("--mtp-steps requires --max-active 1");
+     }
++    if (arguments.mtp_steps != 0 && arguments.prefix_cache.pages != 0) {
++        throw std::invalid_argument("--mtp-steps requires --prefix-cache-pages 0");
++    }
+     return arguments;
+ }
+ 
+@@ -154,8 +171,10 @@
+     if (argc == 2 && std::string_view(argv[1]) == "--help") {
+         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
+                      " [--max-active N] [--mtp-steps N] [--trace-batches]\n"
++                     "              [--prefix-cache-pages N] [--prefix-cache-checkpoints N]\n"
+                      "Active requests: 1 by default, up to 4.\n"
+                      "MTP steps: 0 by default, up to 4 with one active request.\n"
++                     "Prefix cache: 0 pages (off) by default, 2 indexed checkpoints when on.\n"
+                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
+         return 0;
+     }
+@@ -167,15 +186,18 @@
+         if (stopping()) {
+             return 0;
+         }
++        std::optional<BatchService> service;
++        if (arguments.max_active != 1 || arguments.prefix_cache.pages != 0) {
++            service.emplace(decoder, arguments.trace_batches, arguments.prefix_cache);
++        }
+         const auto listener = listen_loopback(arguments.port);
+         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
+-        if (arguments.max_active == 1) {
++        if (service) {
++            serve_batch(listener, *service, arguments.max_active);
++        } else {
+             serve_connections(listener, [&](const Socket& connection, std::string_view body) {
+                 complete(connection, decoder, body, arguments.trace_batches, arguments.mtp_steps);
+             });
+-        } else {
+-            BatchService service(decoder, arguments.trace_batches);
+-            serve_batch(listener, service, arguments.max_active);
+         }
+     } catch (const std::exception& error) {
+         std::cerr << "sglang-server: " << error.what() << '\n';
+diff -ruN selected/include/sglang/decoder.h source/include/sglang/decoder.h
+--- selected/include/sglang/decoder.h	2026-11-19 01:55:26.000000000 +0800
++++ source/include/sglang/decoder.h	2026-11-19 01:59:52.297906861 +0800
+@@ -42,6 +42,7 @@
+     std::size_t mtp_drafted_tokens = 0;
+     std::size_t mtp_accepted_tokens = 0;
+     std::size_t mtp_rounds = 0;
++    std::size_t cached_prompt_tokens = 0;
+ };
+ 
+ class Decoder {
+diff -ruN selected/include/sglang/decoder_batch.h source/include/sglang/decoder_batch.h
+--- selected/include/sglang/decoder_batch.h	2026-11-19 01:55:26.000000000 +0800
++++ source/include/sglang/decoder_batch.h	2026-11-19 01:58:13.600315187 +0800
+@@ -3,6 +3,7 @@
+ #include "sglang/decoder.h"
+ 
+ #include <array>
++#include <cstdint>
+ 
+ namespace sglang {
+ 
+@@ -17,16 +18,36 @@
+ struct DecoderBatchStepStats {
+     std::array<int, decoder_batch_max_lanes> prefill_rows{};
+     std::size_t prefill_workspace_bytes = 0;
++    int checkpoint_splits = 0;
++};
++
++struct DecoderBatchCacheOptions {
++    int pages = 0;
++    int checkpoints = 2;
++};
++
++struct DecoderBatchCacheStats {
++    std::size_t cached_tokens = 0;
++    std::size_t prefill_rows = 0;
++    std::size_t decode_rows = 0;
++    std::size_t restores = 0;
++    std::size_t checkpoint_copies = 0;
++    std::size_t published = 0;
++    std::size_t evictions = 0;
++    std::size_t live_pages = 0;
++    std::size_t live_checkpoints = 0;
++    std::size_t indexed = 0;
++    std::size_t arena_bytes = 0;
+ };
+ 
+ /// The Decoder must outlive the batch. Use one host thread to operate a batch.
+ /// Each slot owns its request state until cancel() or a finishing step.
+ class DecoderBatch {
+ public:
+-    explicit DecoderBatch(const Decoder& decoder);
++    explicit DecoderBatch(const Decoder& decoder, DecoderBatchCacheOptions cache = {});
+     ~DecoderBatch();
+ 
+-    void admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
++    int admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
+     void cancel(int slot);
+ 
+     /// Advance each selected slot by one model position. A zero-budget slot
+@@ -39,9 +60,12 @@
+     /// shared scratch bytes when requested.
+     std::array<DecoderBatchStep, decoder_batch_max_lanes>
+     advance_chunked(const std::array<bool, decoder_batch_max_lanes>& selected,
+-                    DecoderBatchStepStats* stats = nullptr);
++                    DecoderBatchStepStats* stats = nullptr,
++                    const std::function<bool(int)>& is_cancelled = {});
+ 
+     std::size_t request_device_allocation_bytes() const;
++    DecoderBatchCacheStats cache_stats() const;
++    std::vector<std::uint8_t> checkpoint_bytes(const std::vector<int>& prefix) const;
+ 
+ private:
+     struct State;
+diff -ruN selected/include/sglang/decoder_internal.h source/include/sglang/decoder_internal.h
+--- selected/include/sglang/decoder_internal.h	2026-11-19 01:55:26.000000000 +0800
++++ source/include/sglang/decoder_internal.h	2026-11-19 01:56:40.593584652 +0800
+@@ -170,6 +170,8 @@
+     Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false);
+ 
+     void initialize(int capacity, cudaStream_t stream);
++    void initialize_shared_kv(const std::array<Mxfp8KvCache, full_attention_layers>& arena,
++                              std::vector<std::int32_t> physical_pages, cudaStream_t stream);
+     void reset(cudaStream_t stream);
+     void reset();
+ 
+@@ -181,6 +183,8 @@
+     std::array<TextGdnState, gdn_layers> states;
+ };
+ 
++std::array<Mxfp8KvCache, full_attention_layers> allocate_kv_storage(Allocations& memory,
++                                                                   int page_count);
+ void copy_greedy_token(Request& request, cudaStream_t stream);
+ int read_greedy_token(Request& request);
+ 
+diff -ruN selected/include/sglang/decoder_prefix_cache.h source/include/sglang/decoder_prefix_cache.h
+--- selected/include/sglang/decoder_prefix_cache.h	1970-01-01 08:00:00.000000000 +0800
++++ source/include/sglang/decoder_prefix_cache.h	2026-11-19 01:56:40.593584652 +0800
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include "sglang/decoder_batch.h"
++#include "sglang/decoder_internal.h"
++
++namespace sglang::decoder {
++
++using PageLease = std::shared_ptr<const std::int32_t>;
++
++struct PrefixEntry {
++    std::vector<int> key;
++    std::vector<PageLease> pages;
++    std::shared_ptr<const TextGdnState> state;
++};
++
++class BatchPrefixCache {
++public:
++    BatchPrefixCache(int device, const DecoderBatchCacheOptions& options);
++
++    PrefixEntry reserve(const std::vector<int>& prompt, int capacity);
++    void initialize(Request& request, const PrefixEntry& lease, cudaStream_t stream);
++    PrefixEntry checkpoint(const std::vector<int>& prompt, const PrefixEntry& lease, int depth);
++    void copy_checkpoint(const PrefixEntry& entry, const Request& request, cudaStream_t stream);
++    void publish(PrefixEntry entry);
++    void clear() { entries_.clear(); }
++    DecoderBatchCacheStats stats() const;
++    std::vector<std::uint8_t> bytes(const std::vector<int>& prefix) const;
++
++    DecoderBatchCacheStats counters;
++
++private:
++    void evict();
++
++    Allocations memory_;
++    int limit_;
++    std::array<Mxfp8KvCache, full_attention_layers> arena_;
++    std::vector<PageLease> pages_;
++    std::vector<std::shared_ptr<const TextGdnState>> states_;
++    std::vector<PrefixEntry> entries_;
++};
++
++}
+diff -ruN selected/include/sglang/server/batch_service.h source/include/sglang/server/batch_service.h
+--- selected/include/sglang/server/batch_service.h	2026-11-19 01:55:26.000000000 +0800
++++ source/include/sglang/server/batch_service.h	2026-11-19 01:59:52.297906861 +0800
+@@ -1,12 +1,12 @@
+ #pragma once
+ 
+-#include "sglang/decoder.h"
++#include "sglang/decoder_batch.h"
+ 
+ namespace sglang::server {
+ 
+ class BatchService {
+ public:
+-    BatchService(const Decoder& decoder, bool trace);
++    BatchService(const Decoder& decoder, bool trace, DecoderBatchCacheOptions cache = {});
+     ~BatchService();
+ 
+     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
+diff -ruN selected/src/decoder_batch.cpp source/src/decoder_batch.cpp
+--- selected/src/decoder_batch.cpp	2026-11-19 01:55:26.000000000 +0800
++++ source/src/decoder_batch.cpp	2026-11-19 01:58:13.601315163 +0800
+@@ -2,6 +2,7 @@
+ 
+ #include "sglang/decoder_batch.h"
+ #include "sglang/decoder_prefill.h"
++#include "sglang/decoder_prefix_cache.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -18,9 +19,17 @@
+     int position = 0;
+     int generated = 0;
+     int last_token = 0;
++    PrefixEntry lease;
++    PrefixEntry staged;
+ 
+     int remaining_prompt() const { return std::max(0, static_cast<int>(prompt.size()) - position); }
+ 
++    int checkpoint_offset(int rows) const {
++        const auto end = static_cast<int>(prompt.size()) / mxfp8_page_size * mxfp8_page_size;
++        const int offset = end - position;
++        return offset > 0 && offset <= rows ? offset : 0;
++    }
++
+     ForwardLane input() const {
+         if (remaining_prompt()) {
+             return {request.get(), prompt[position], position, TextGdnMode::prefill};
+@@ -41,6 +50,7 @@
+ 
+ struct BatchStorage {
+     std::shared_ptr<const Allocations> weights;
++    std::optional<BatchPrefixCache> cache;
+     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
+ };
+ 
+@@ -85,16 +95,26 @@
+ }
+ 
+ struct DecoderBatch::State {
+-    explicit State(const Decoder::Model& owner)
++    State(const Decoder::Model& owner, const DecoderBatchCacheOptions& cache)
+         : model(owner), storage(std::make_shared<BatchStorage>()), execution(model.device) {
+         DeviceScope device(model.device);
+         storage->weights = model.memory;
++        if (cache.pages < 0 || cache.pages > text_attention_max_tokens / mxfp8_page_size *
++                                              decoder_batch_max_lanes ||
++            cache.checkpoints < 1 || cache.checkpoints > 64) {
++            throw std::invalid_argument("Invalid decoder batch prefix cache capacity");
++        }
++        if (cache.pages != 0) {
++            storage->cache.emplace(model.device, cache);
++        }
+         execution.open_stream(storage);
+         device.restore();
+     }
+ 
+-    Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats);
+-    std::size_t submit(const Selection& selected, const PrefillRows& rows, Steps& results);
++    Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats,
++                  const std::function<bool(int)>& is_cancelled);
++    bool submit(const Selection& selected, Steps& results, DecoderBatchStepStats& stats);
++    void capture(Lane& lane, int depth, cudaStream_t stream);
+ 
+     void require_ready() const {
+         if (failed) {
+@@ -110,20 +130,24 @@
+             return;
+         }
+         storage->slots = {};
++        if (storage->cache) {
++            storage->cache->clear();
++        }
+     }
+ 
+     const Decoder::Model& model;
+     std::shared_ptr<BatchStorage> storage;
+     Allocations execution;
++    DecoderBatchCacheStats uncached;
+     bool failed = false;
+ };
+ 
+-DecoderBatch::DecoderBatch(const Decoder& decoder)
+-    : state_(std::make_unique<State>(*decoder.model_)) {}
++DecoderBatch::DecoderBatch(const Decoder& decoder, DecoderBatchCacheOptions cache)
++    : state_(std::make_unique<State>(*decoder.model_, cache)) {}
+ 
+ DecoderBatch::~DecoderBatch() = default;
+ 
+-void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
++int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
+     state_->require_ready();
+     auto& lane = state_->storage->slots.at(slot);
+     if (lane || options.top_logits != 0) {
+@@ -131,20 +155,34 @@
+     }
+     validate_request(prompt, options);
+     if (options.max_new_tokens == 0) {
+-        lane.emplace(Lane{nullptr, std::move(prompt), options});
+-        return;
++        lane.emplace(Lane{nullptr, std::move(prompt), options, 0, 0, 0, {}, {}});
++        return 0;
+     }
++    const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
++    auto& cache = state_->storage->cache;
++    auto lease = cache ? cache->reserve(prompt, capacity) : PrefixEntry{};
++    const auto hit = static_cast<int>(lease.key.size());
+     try {
+         DeviceScope device(state_->model.device);
+         reclaim_prefill_workspaces(state_->model.device);
+-        const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
+         auto request = std::make_unique<Request>(state_->model.device);
+-        lane.emplace(Lane{std::move(request), std::move(prompt), options});
++        lane.emplace(Lane{std::move(request), std::move(prompt), options, hit, 0, 0,
++                          std::move(lease), {}});
+         const auto stream = state_->execution.stream();
+-        lane->request->initialize(capacity, stream);
+-        lane->request->reset(stream);
++        if (cache) {
++            cache->initialize(*lane->request, lane->lease, stream);
++        } else {
++            lane->request->initialize(capacity, stream);
++            lane->request->reset(stream);
++        }
+         check(cudaStreamSynchronize(stream), "Initialize decoder batch slot");
+         device.restore();
++        if (hit != 0) {
++            cache->counters.cached_tokens += hit;
++            ++cache->counters.restores;
++            lane->lease.state.reset();
++        }
++        return hit;
+     } catch (...) {
+         state_->disable();
+         throw;
+@@ -172,10 +210,30 @@
+     return bytes;
+ }
+ 
+-std::size_t DecoderBatch::State::submit(const Selection& selected, const PrefillRows& rows,
+-                                        Steps& results) {
++DecoderBatchCacheStats DecoderBatch::cache_stats() const {
++    const auto& cache = state_->storage->cache;
++    return cache ? cache->stats() : state_->uncached;
++}
++
++std::vector<std::uint8_t> DecoderBatch::checkpoint_bytes(const std::vector<int>& prefix) const {
++    state_->require_ready();
++    DeviceScope device(state_->model.device);
++    const auto& cache = state_->storage->cache;
++    return cache ? cache->bytes(prefix) : std::vector<std::uint8_t>{};
++}
++
++void DecoderBatch::State::capture(Lane& lane, int depth, cudaStream_t stream) {
++    auto& cache = *storage->cache;
++    lane.staged = cache.checkpoint(lane.prompt, lane.lease, depth);
++    cache.copy_checkpoint(lane.staged, *lane.request, stream);
++}
++
++bool DecoderBatch::State::submit(const Selection& selected, Steps& results,
++                                 DecoderBatchStepStats& stats) {
+     const auto stream = execution.stream();
+     auto& slots = storage->slots;
++    const auto& rows = stats.prefill_rows;
++    PrefillRows checkpoint{};
+     std::array<ForwardLane, decoder_batch_max_lanes> work;
+     std::array<Request*, decoder_batch_max_lanes> scoring{};
+     const int max_rows = *std::max_element(rows.begin(), rows.end());
+@@ -190,20 +248,38 @@
+             if (rows[slot] == lane.remaining_prompt()) {
+                 scoring[slot] = lane.request.get();
+             }
++            if (storage->cache) {
++                checkpoint[slot] = lane.checkpoint_offset(rows[slot]);
++            }
+         }
+     }
+     if (count != 0) {
+         model.forward(work.data(), count, stream);
+     }
+-    std::size_t workspace_bytes = 0;
++    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++        if (checkpoint[slot] == 1 && rows[slot] == 1) {
++            auto& lane = *slots[slot];
++            capture(lane, lane.position + 1, stream);
++        }
++    }
+     if (max_rows > 1) {
+         PrefillWorkspace workspace(stream, max_rows);
+-        workspace_bytes = workspace.bytes();
++        stats.prefill_workspace_bytes = workspace.bytes();
+         for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+             if (rows[slot] > 1) {
+                 auto& lane = *slots[slot];
+-                model.prefill_chunk(*lane.request, lane.prompt.data() + lane.position,
+-                                     rows[slot], lane.position, workspace);
++                const int boundary = checkpoint[slot];
++                const int first_rows = boundary == 0 ? rows[slot] : boundary;
++                const auto* tokens = lane.prompt.data() + lane.position;
++                model.prefill_chunk(*lane.request, tokens, first_rows, lane.position, workspace);
++                if (boundary != 0) {
++                    capture(lane, lane.position + boundary, stream);
++                }
++                if (first_rows < rows[slot]) {
++                    ++stats.checkpoint_splits;
++                    model.prefill_chunk(*lane.request, tokens + first_rows, rows[slot] - first_rows,
++                                        lane.position + first_rows, workspace);
++                }
+             }
+         }
+         workspace.close();
+@@ -214,47 +290,71 @@
+             copy_greedy_token(*request, stream);
+         }
+     }
+-    if (count != 0 || max_rows > 1) {
+-        check(cudaStreamSynchronize(stream), "Complete decoder batch step");
+-    }
+-    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+-        if (scoring[slot]) {
+-            results[slot].token = read_greedy_token(*scoring[slot]);
+-        }
+-    }
+-    return workspace_bytes;
++    return count != 0 || max_rows > 1;
+ }
+ 
+ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
+-                                   DecoderBatchStepStats* stats) {
++                                   DecoderBatchStepStats* stats,
++                                   const std::function<bool(int)>& is_cancelled) {
+     require_ready();
+     try {
+         DeviceScope device(model.device);
+         auto& slots = storage->slots;
++        auto& cache = storage->cache;
++        auto& counters = cache ? cache->counters : uncached;
+         Steps results{};
+-        const auto rows = plan_prefill(*storage, selected, chunked);
+-        const auto workspace_bytes = submit(selected, rows, results);
++        DecoderBatchStepStats executed{plan_prefill(*storage, selected, chunked)};
++        const auto& rows = executed.prefill_rows;
++        const bool submitted = submit(selected, results, executed);
++        Selection cancelled{};
++        if (submitted) {
++            if (is_cancelled) {
++                for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++                    cancelled[slot] = selected[slot] && slots[slot] && is_cancelled(slot);
++                }
++            }
++            check(cudaStreamSynchronize(execution.stream()), "Complete decoder batch step");
++        }
++        std::array<PrefixEntry, decoder_batch_max_lanes> publication;
+         for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+             auto& lane = slots[slot];
+             auto& result = results[slot];
+             if (!selected[slot] || !lane) {
+                 continue;
+             }
+-            if (!lane->request) {
++            if (lane->request) {
++                counters.prefill_rows += rows[slot];
++                counters.decode_rows += result.decode;
++                if (lane->checkpoint_offset(rows[slot]) != 0 && lane->staged.state) {
++                    ++counters.checkpoint_copies;
++                }
++            }
++            if (cancelled[slot] || (is_cancelled && is_cancelled(slot))) {
++                result.finish_reason = DecoderFinishReason::cancelled;
++            } else if (!lane->request) {
+                 result.finish_reason = DecoderFinishReason::length;
+             } else {
+-                if (result.token) {
++                if (rows[slot] == lane->remaining_prompt()) {
++                    result.token = read_greedy_token(*lane->request);
+                     lane->select_token(*result.token, result);
+                 }
+                 lane->position += std::max(1, rows[slot]);
+             }
+             if (result.finish_reason) {
++                if (result.finish_reason != DecoderFinishReason::cancelled) {
++                    publication[slot] = std::move(lane->staged);
++                }
+                 retire(lane);
+             }
+         }
+         device.restore();
++        for (auto& entry : publication) {
++            if (entry.state) {
++                cache->publish(std::move(entry));
++            }
++        }
+         if (stats) {
+-            *stats = {rows, workspace_bytes};
++            *stats = executed;
+         }
+         return results;
+     } catch (...) {
+@@ -264,11 +364,12 @@
+ }
+ 
+ Steps DecoderBatch::advance(const Selection& selected) {
+-    return state_->advance(selected, false, nullptr);
++    return state_->advance(selected, false, nullptr, {});
+ }
+ 
+-Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats* stats) {
+-    return state_->advance(selected, true, stats);
++Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats* stats,
++                                    const std::function<bool(int)>& is_cancelled) {
++    return state_->advance(selected, true, stats, is_cancelled);
+ }
+ 
+ }
+diff -ruN selected/src/decoder_prefix_cache.cpp source/src/decoder_prefix_cache.cpp
+--- selected/src/decoder_prefix_cache.cpp	1970-01-01 08:00:00.000000000 +0800
++++ source/src/decoder_prefix_cache.cpp	2026-11-19 01:56:40.593584652 +0800
+@@ -0,0 +1,181 @@
++#include "sglang/decoder_prefix_cache.h"
++
++#include <algorithm>
++#include <utility>
++
++namespace sglang::decoder {
++namespace {
++
++constexpr std::size_t history_count = gdn_layers * gdn_history_elements;
++constexpr std::size_t recurrent_count = gdn_layers * gdn_state_elements;
++
++void copy_state(TextGdnState destination, TextGdnState source, cudaStream_t stream) {
++    check(cudaMemcpyAsync(destination.history, source.history, history_count * sizeof(Bf16),
++                          cudaMemcpyDeviceToDevice, stream), "Copy GDN history checkpoint");
++    check(cudaMemcpyAsync(destination.recurrent, source.recurrent, recurrent_count * sizeof(float),
++                          cudaMemcpyDeviceToDevice, stream), "Copy GDN recurrent checkpoint");
++}
++
++template <typename Items>
++std::size_t live(const Items& items) {
++    return std::count_if(items.begin(), items.end(), [](const auto& item) {
++        return item.use_count() > 1;
++    });
++}
++
++}
++
++BatchPrefixCache::BatchPrefixCache(int device, const DecoderBatchCacheOptions& options)
++    : memory_(device), limit_(options.checkpoints),
++      arena_(allocate_kv_storage(memory_, options.pages)) {
++    pages_.reserve(options.pages);
++    for (int page = 0; page < options.pages; ++page) {
++        pages_.push_back(std::make_shared<std::int32_t>(page));
++    }
++    const auto state_count = limit_ + decoder_batch_max_lanes;
++    auto* history = memory_.allocate<Bf16>(history_count * state_count);
++    auto* recurrent = memory_.allocate<float>(recurrent_count * state_count);
++    for (int index = 0; index < state_count; ++index) {
++        states_.push_back(std::make_shared<TextGdnState>(
++            TextGdnState{history + index * history_count, recurrent + index * recurrent_count}));
++    }
++    entries_.reserve(limit_);
++}
++
++PrefixEntry BatchPrefixCache::reserve(const std::vector<int>& prompt, int capacity) {
++    auto hit = entries_.end();
++    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
++        if (it->key.size() < prompt.size() &&
++            (hit == entries_.end() || hit->key.size() < it->key.size()) &&
++            std::equal(it->key.begin(), it->key.end(), prompt.begin())) {
++            hit = it;
++        }
++    }
++    PrefixEntry lease;
++    if (hit != entries_.end()) {
++        lease = *hit;
++    }
++    const auto page_count = static_cast<std::size_t>((capacity - 1) / mxfp8_page_size + 1);
++    if (page_count > pages_.size()) {
++        throw std::length_error("Prefix KV arena cannot fit this request");
++    }
++    const auto needed = page_count - lease.pages.size();
++    lease.pages.reserve(page_count);
++    std::vector<long> cache_refs(pages_.size(), 1);
++    for (const auto& entry : entries_) {
++        for (const auto& page : entry.pages) {
++            ++cache_refs[*page];
++        }
++    }
++    const auto available = std::count_if(pages_.begin(), pages_.end(), [&](const auto& page) {
++        return page.use_count() == cache_refs[*page];
++    });
++    if (static_cast<std::size_t>(available) < needed) {
++        throw std::length_error("Prefix KV arena is full with active requests");
++    }
++    if (hit != entries_.end()) {
++        std::rotate(hit, hit + 1, entries_.end());
++    }
++    while (pages_.size() - live(pages_) < needed) {
++        evict();
++    }
++    for (const auto& page : pages_) {
++        if (lease.pages.size() == page_count) {
++            break;
++        }
++        if (page.use_count() == 1) {
++            lease.pages.push_back(page);
++        }
++    }
++    return lease;
++}
++
++void BatchPrefixCache::initialize(Request& request, const PrefixEntry& lease, cudaStream_t stream) {
++    std::vector<std::int32_t> table;
++    table.reserve(lease.pages.size());
++    for (const auto& page : lease.pages) {
++        table.push_back(*page);
++    }
++    request.initialize_shared_kv(arena_, std::move(table), stream);
++    if (lease.state) {
++        copy_state(request.states.front(), *lease.state, stream);
++    } else {
++        request.reset(stream);
++    }
++}
++
++PrefixEntry BatchPrefixCache::checkpoint(const std::vector<int>& prompt, const PrefixEntry& lease,
++                                        int depth) {
++    const auto state = std::find_if(states_.begin(), states_.end(), [](const auto& block) {
++        return block.use_count() == 1;
++    });
++    if (state == states_.end()) {
++        throw std::logic_error("Prefix staging snapshot pool invariant");
++    }
++    return {{prompt.begin(), prompt.begin() + depth},
++            {lease.pages.begin(), lease.pages.begin() + depth / mxfp8_page_size}, *state};
++}
++
++void BatchPrefixCache::copy_checkpoint(const PrefixEntry& entry, const Request& request,
++                                       cudaStream_t stream) {
++    copy_state(*entry.state, request.states.front(), stream);
++}
++
++void BatchPrefixCache::publish(PrefixEntry entry) {
++    const auto old = std::find_if(entries_.begin(), entries_.end(), [&](const auto& candidate) {
++        return entry.key == candidate.key;
++    });
++    if (old != entries_.end()) {
++        std::rotate(old, old + 1, entries_.end());
++        return;
++    }
++    if (static_cast<int>(entries_.size()) == limit_) {
++        evict();
++    }
++    entries_.push_back(std::move(entry));
++    ++counters.published;
++}
++
++void BatchPrefixCache::evict() {
++    entries_.erase(entries_.begin());
++    ++counters.evictions;
++}
++
++DecoderBatchCacheStats BatchPrefixCache::stats() const {
++    auto value = counters;
++    value.live_pages = live(pages_);
++    value.live_checkpoints = live(states_);
++    value.indexed = entries_.size();
++    value.arena_bytes = memory_.bytes();
++    return value;
++}
++
++std::vector<std::uint8_t> BatchPrefixCache::bytes(const std::vector<int>& prefix) const {
++    const auto hit = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
++        return entry.key == prefix;
++    });
++    if (hit == entries_.end()) {
++        return {};
++    }
++    std::vector<std::uint8_t> packed(history_count * sizeof(Bf16) + recurrent_count * sizeof(float) +
++        hit->pages.size() * full_attention_layers * 2 *
++            (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page));
++    auto* output = packed.data();
++    const auto read = [&](const void* input, std::size_t size) {
++        check(cudaMemcpy(output, input, size, cudaMemcpyDeviceToHost), "Inspect prefix checkpoint");
++        output += size;
++    };
++    read(hit->state->history, history_count * sizeof(Bf16));
++    read(hit->state->recurrent, recurrent_count * sizeof(float));
++    for (const auto& cache : arena_) {
++        for (const auto& page : hit->pages) {
++            read(cache.key_payload + *page * mxfp8_payload_bytes_per_page, mxfp8_payload_bytes_per_page);
++            read(cache.value_payload + *page * mxfp8_payload_bytes_per_page, mxfp8_payload_bytes_per_page);
++            read(cache.key_scales + *page * mxfp8_scale_bytes_per_page, mxfp8_scale_bytes_per_page);
++            read(cache.value_scales + *page * mxfp8_scale_bytes_per_page, mxfp8_scale_bytes_per_page);
++        }
++    }
++    return packed;
++}
++
++}
+diff -ruN selected/src/decoder_resources.cpp source/src/decoder_resources.cpp
+--- selected/src/decoder_resources.cpp	2026-11-19 01:55:26.000000000 +0800
++++ source/src/decoder_resources.cpp	2026-11-19 01:56:40.593584652 +0800
+@@ -63,32 +63,26 @@
+     }
+ }
+ 
+-void allocate_kv(Request& request, int capacity, cudaStream_t stream) {
+-    const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
+-    auto* table = request.memory.allocate<std::int32_t>(page_count);
++}
++
++std::array<Mxfp8KvCache, full_attention_layers> allocate_kv_storage(Allocations& memory,
++                                                                   int page_count) {
+     const auto payload_per_layer = page_count * mxfp8_payload_bytes_per_page;
+     const auto scales_per_layer = page_count * mxfp8_scale_bytes_per_page;
+     const auto scale_bytes = full_attention_layers * scales_per_layer;
+-    auto* keys = request.memory.allocate<std::uint8_t>(full_attention_layers * payload_per_layer);
+-    auto* values = request.memory.allocate<std::uint8_t>(full_attention_layers * payload_per_layer);
+-    auto* key_scales = request.memory.allocate<std::uint8_t>(scale_bytes);
+-    auto* val_scales = request.memory.allocate<std::uint8_t>(scale_bytes);
++    auto* keys = memory.allocate<std::uint8_t>(full_attention_layers * payload_per_layer);
++    auto* values = memory.allocate<std::uint8_t>(full_attention_layers * payload_per_layer);
++    auto* key_scales = memory.allocate<std::uint8_t>(scale_bytes);
++    auto* val_scales = memory.allocate<std::uint8_t>(scale_bytes);
++    std::array<Mxfp8KvCache, full_attention_layers> caches;
+     for (int index = 0; index < full_attention_layers; ++index) {
+-        request.caches[index] = {
++        caches[index] = {
+             keys + index * payload_per_layer, values + index * payload_per_layer,
+             key_scales + index * scales_per_layer, val_scales + index * scales_per_layer,
+             page_count,
+         };
+     }
+-    auto& logical_pages = request.memory.transfers().logical_pages;
+-    logical_pages.resize(page_count);
+-    std::iota(logical_pages.begin(), logical_pages.end(), 0);
+-    check(cudaMemcpyAsync(table, logical_pages.data(), logical_pages.size() * sizeof(std::int32_t),
+-                          cudaMemcpyHostToDevice, stream),
+-          "Upload MXFP8 page table");
+-    request.pages = {table, page_count};
+-}
+-
++    return caches;
+ }
+ 
+ struct Allocations::State {
+@@ -394,7 +388,21 @@
+ }
+ 
+ void Request::initialize(int capacity, cudaStream_t stream) {
+-    allocate_kv(*this, capacity, stream);
++    const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
++    std::vector<std::int32_t> physical_pages(page_count);
++    std::iota(physical_pages.begin(), physical_pages.end(), 0);
++    initialize_shared_kv(allocate_kv_storage(memory, page_count), std::move(physical_pages), stream);
++}
++
++void Request::initialize_shared_kv(const std::array<Mxfp8KvCache, full_attention_layers>& arena,
++                                   std::vector<std::int32_t> physical_pages, cudaStream_t stream) {
++    caches = arena;
++    auto& logical_pages = memory.transfers().logical_pages;
++    logical_pages = std::move(physical_pages);
++    auto* table = memory.allocate<std::int32_t>(logical_pages.size());
++    check(cudaMemcpyAsync(table, logical_pages.data(), logical_pages.size() * sizeof(*table),
++                          cudaMemcpyHostToDevice, stream), "Upload MXFP8 page table");
++    pages = {table, static_cast<int>(logical_pages.size())};
+     allocate_gdn(*this);
+ }
+ 
+diff -ruN selected/xmake.lua source/xmake.lua
+--- selected/xmake.lua	2026-11-19 01:55:26.000000000 +0800
++++ source/xmake.lua	2026-11-19 01:58:13.602315138 +0800
+@@ -76,7 +76,7 @@
+     add_deps("sglang_checkpoint", "sglang_cuda")
+     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
+               "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp",
+-              "src/decoder_prefill.cpp")
++              "src/decoder_prefill.cpp", "src/decoder_prefix_cache.cpp")
+ 
+ target("sglang-generate")
+     set_kind("binary")

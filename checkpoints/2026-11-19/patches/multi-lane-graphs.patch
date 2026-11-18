@@ -1,0 +1,915 @@
+diff --git a/apps/server/batch_service.cpp b/apps/server/batch_service.cpp
+index 9e87d03..faf8ca9 100644
+--- a/apps/server/batch_service.cpp
++++ b/apps/server/batch_service.cpp
+@@ -35,7 +35,7 @@ constexpr auto mailbox_grace = std::chrono::milliseconds(1);
+ }
+ 
+ struct BatchService::State {
+-    State(const Decoder& decoder, bool trace);
++    State(const Decoder& decoder, bool trace, bool cuda_graphs);
+     ~State();
+ 
+     void run(const Decoder& decoder, std::promise<void> started);
+@@ -46,6 +46,7 @@ struct BatchService::State {
+     void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);
+ 
+     const bool trace;
++    const bool cuda_graphs;
+     std::mutex mutex;
+     std::condition_variable changed;
+     Jobs jobs;
+@@ -54,7 +55,8 @@ struct BatchService::State {
+     std::thread worker;
+ };
+ 
+-BatchService::State::State(const Decoder& decoder, bool trace) : trace(trace) {
++BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs)
++    : trace(trace), cuda_graphs(cuda_graphs) {
+     std::promise<void> started;
+     auto ready = started.get_future();
+     worker = std::thread(&State::run, this, std::cref(decoder), std::move(started));
+@@ -78,7 +80,7 @@ BatchService::State::~State() {
+ void BatchService::State::run(const Decoder& decoder, std::promise<void> started) {
+     std::unique_ptr<DecoderBatch> batch;
+     try {
+-        batch = std::make_unique<DecoderBatch>(decoder);
++        batch = std::make_unique<DecoderBatch>(decoder, DecoderBatchOptions{cuda_graphs});
+     } catch (...) {
+         started.set_exception(std::current_exception());
+         return;
+@@ -132,7 +134,9 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
+             batch.cancel(slot);
+         }
+         const std::lock_guard lock(mutex);
+-        publish(slot, *job, {std::nullopt, DecoderFinishReason::cancelled});
++        DecoderBatchStep cancelled_step;
++        cancelled_step.finish_reason = DecoderFinishReason::cancelled;
++        publish(slot, *job, cancelled_step);
+         changed.notify_all();
+         return false;
+     }
+@@ -186,6 +190,16 @@ void BatchService::State::process(DecoderBatch& batch) {
+                 trace_batch_step(width, decode, bytes);
+                 traced_bytes = bytes;
+             }
++            int graph_slots = 0;
++            for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++                if (steps[slot].graph) {
++                    graph_slots |= 1 << slot;
++                }
++            }
++            if (graph_slots) {
++                std::cerr << ("batch graph width=" + std::to_string(decode) +
++                              " slots=" + std::to_string(graph_slots) + '\n');
++            }
+         }
+         {
+             const std::lock_guard lock(mutex);
+@@ -205,8 +219,8 @@ void BatchService::State::cancel(std::unique_lock<std::mutex>& lock, int slot, J
+     changed.wait(lock, [&] { return jobs[slot].get() != &job; });
+ }
+ 
+-BatchService::BatchService(const Decoder& decoder, bool trace)
+-    : state_(std::make_unique<State>(decoder, trace)) {}
++BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs)
++    : state_(std::make_unique<State>(decoder, trace, cuda_graphs)) {}
+ 
+ BatchService::~BatchService() = default;
+ 
+diff --git a/apps/sglang-server.cpp b/apps/sglang-server.cpp
+index 174cbc3..f5c45f7 100644
+--- a/apps/sglang-server.cpp
++++ b/apps/sglang-server.cpp
+@@ -22,6 +22,7 @@ struct Arguments {
+     int max_active = 1;
+     int mtp_steps = 0;
+     bool trace_batches = false;
++    bool batch_cuda_graphs = false;
+ };
+ 
+ int parse_integer(std::string_view value, const char* error) {
+@@ -41,6 +42,10 @@ Arguments parse_arguments(int argc, char** argv) {
+             arguments.trace_batches = true;
+             continue;
+         }
++        if (option == "--batch-cuda-graphs") {
++            arguments.batch_cuda_graphs = true;
++            continue;
++        }
+         if (++index == argc) {
+             throw std::invalid_argument("Missing value for " + std::string(option));
+         }
+@@ -74,6 +79,9 @@ Arguments parse_arguments(int argc, char** argv) {
+     if (arguments.mtp_steps != 0 && arguments.max_active != 1) {
+         throw std::invalid_argument("--mtp-steps requires --max-active 1");
+     }
++    if (arguments.batch_cuda_graphs && arguments.max_active == 1) {
++        throw std::invalid_argument("--batch-cuda-graphs requires --max-active in [2, 4]");
++    }
+     return arguments;
+ }
+ 
+@@ -153,7 +161,7 @@ void serve_batch(const Socket& listener, BatchService& service, int max_active)
+ int main(int argc, char** argv) {
+     if (argc == 2 && std::string_view(argv[1]) == "--help") {
+         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
+-                     " [--max-active N] [--mtp-steps N] [--trace-batches]\n"
++                     " [--max-active N] [--mtp-steps N] [--trace-batches] [--batch-cuda-graphs]\n"
+                      "Active requests: 1 by default, up to 4.\n"
+                      "MTP steps: 0 by default, up to 4 with one active request.\n"
+                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
+@@ -174,7 +182,7 @@ int main(int argc, char** argv) {
+                 complete(connection, decoder, body, arguments.trace_batches, arguments.mtp_steps);
+             });
+         } else {
+-            BatchService service(decoder, arguments.trace_batches);
++            BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs);
+             serve_batch(listener, service, arguments.max_active);
+         }
+     } catch (const std::exception& error) {
+diff --git a/include/sglang/decoder_batch.h b/include/sglang/decoder_batch.h
+index bb8544a..578ee59 100644
+--- a/include/sglang/decoder_batch.h
++++ b/include/sglang/decoder_batch.h
+@@ -12,13 +12,20 @@ struct DecoderBatchStep {
+     std::optional<int> token;
+     std::optional<DecoderFinishReason> finish_reason;
+     bool decode = false;
++    bool graph = false;
++    std::vector<DecoderLogit> top_logits;
++};
++
++struct DecoderBatchOptions {
++    bool cuda_graphs = false;
++    int top_logits = 0;
+ };
+ 
+ /// The Decoder must outlive the batch. Use one host thread to operate a batch.
+ /// Each slot owns its request state until cancel() or a finishing step.
+ class DecoderBatch {
+ public:
+-    explicit DecoderBatch(const Decoder& decoder);
++    explicit DecoderBatch(const Decoder& decoder, DecoderBatchOptions options = {});
+     ~DecoderBatch();
+ 
+     void admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
+diff --git a/include/sglang/decoder_cuda.cuh b/include/sglang/decoder_cuda.cuh
+index d1f55f8..340beb6 100644
+--- a/include/sglang/decoder_cuda.cuh
++++ b/include/sglang/decoder_cuda.cuh
+@@ -26,5 +26,15 @@ cudaError_t decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, const int
+ cudaError_t decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, const int* position,
+                                  const __nv_bfloat16* queries, __nv_bfloat16* output,
+                                  cudaStream_t stream);
++cudaError_t decode_kv_append(const Mxfp8KvCache* cache, const Mxfp8PageTable* pages,
++                            const int* position, const __nv_bfloat16* keys,
++                            const __nv_bfloat16* values, cudaStream_t stream);
++cudaError_t decode_gqa_attention(const Mxfp8KvCache* cache, const Mxfp8PageTable* pages,
++                                const int* position, const __nv_bfloat16* queries,
++                                __nv_bfloat16* output, cudaStream_t stream);
++cudaError_t decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
++                       const __nv_bfloat16* b, const __nv_bfloat16* a,
++                       TextGdnWeights weights, const TextGdnState* state,
++                       __nv_bfloat16* workspace, __nv_bfloat16* output, cudaStream_t stream);
+ 
+ }
+diff --git a/include/sglang/decoder_internal.h b/include/sglang/decoder_internal.h
+index 8293348..8be25b0 100644
+--- a/include/sglang/decoder_internal.h
++++ b/include/sglang/decoder_internal.h
+@@ -81,8 +81,8 @@ public:
+     std::size_t bytes() const;
+     TransferBuffers& transfers();
+     cudaStream_t stream() const;
+-    cudaGraphExec_t graph() const;
+-    void capture_graph(const std::function<void()>& enqueue);
++    cudaGraphExec_t graph(std::size_t index = 0) const;
++    void capture_graph(const std::function<void()>& enqueue, std::size_t index = 0);
+     void reclaim_deferred();
+     void open_stream(std::shared_ptr<const void> owners = nullptr);
+     void close_stream();
+@@ -179,7 +179,10 @@ struct Request {
+ };
+ 
+ void copy_greedy_token(Request& request, cudaStream_t stream);
++void copy_greedy_token(Request& request, const Workspace& work, cudaStream_t stream);
+ int read_greedy_token(Request& request);
++std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_t count,
++                                    std::vector<DecoderLogit>& ranking);
+ 
+ struct ForwardLane {
+     Request* request;
+@@ -188,6 +191,19 @@ struct ForwardLane {
+     TextGdnMode mode;
+ };
+ 
++struct BatchDecodeBinding {
++    TextLogitCandidate input;
++    int position;
++    Mxfp8PageTable pages;
++    Mxfp8KvCache caches[full_attention_layers];
++    TextGdnState states[gdn_layers];
++};
++
++struct BatchGraphLane {
++    Workspace* work;
++    const BatchDecodeBinding* binding;
++};
++
+ }
+ 
+ namespace sglang {
+@@ -200,6 +216,8 @@ struct Decoder::Model {
+     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
+     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
+     void decode_graph(decoder::Request& request) const;
++    void decode_batch_graph(const decoder::BatchGraphLane* lanes, int count,
++                            decoder::Allocations& execution) const;
+     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
+     void compute_logits(decoder::Request& request) const;
+     void compute_logits(decoder::Workspace& work, cudaStream_t stream) const;
+diff --git a/include/sglang/server/batch_service.h b/include/sglang/server/batch_service.h
+index cfc86d7..34b45cf 100644
+--- a/include/sglang/server/batch_service.h
++++ b/include/sglang/server/batch_service.h
+@@ -6,7 +6,7 @@ namespace sglang::server {
+ 
+ class BatchService {
+ public:
+-    BatchService(const Decoder& decoder, bool trace);
++    BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false);
+     ~BatchService();
+ 
+     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index eb99067..a0df16b 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -40,8 +40,12 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
+ }
+ 
+ void copy_greedy_token(Request& request, cudaStream_t stream) {
++    copy_greedy_token(request, request.work, stream);
++}
++
++void copy_greedy_token(Request& request, const Workspace& work, cudaStream_t stream) {
+     auto& winner = request.memory.transfers().winner;
+-    check(cudaMemcpyAsync(&winner, &request.work.argmax->token_id, sizeof(winner),
++    check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner),
+                           cudaMemcpyDeviceToHost, stream), "Read greedy token");
+ }
+ 
+@@ -80,8 +84,10 @@ private:
+     bool owns_slot_;
+ };
+ 
+-std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_t count,
+-                                    std::vector<DecoderLogit>& ranking) {
++}
++
++std::vector<DecoderLogit> decoder::top_logits(const std::vector<Bf16>& scores, std::size_t count,
++                                             std::vector<DecoderLogit>& ranking) {
+     ranking.clear();
+     for (std::size_t index = 0; index < scores.size(); ++index) {
+         const float logit = __bfloat162float(scores[index]);
+@@ -100,6 +106,10 @@ std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_
+     return {ranking.begin(), end};
+ }
+ 
++namespace {
++
++using namespace decoder;
++
+ int read_step(Request& request) {
+     const auto stream = request.memory.stream();
+     auto& host_logits = request.memory.transfers().logits;
+diff --git a/src/decoder_batch.cpp b/src/decoder_batch.cpp
+index 4339285..1e2dfa8 100644
+--- a/src/decoder_batch.cpp
++++ b/src/decoder_batch.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "sglang/decoder_batch.h"
+ 
++#include <algorithm>
+ #include <utility>
+ 
+ namespace sglang {
+@@ -40,6 +41,7 @@ struct Lane {
+ struct BatchStorage {
+     std::shared_ptr<const Allocations> weights;
+     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
++    std::array<BatchDecodeBinding, decoder_batch_max_lanes> bindings;
+ };
+ 
+ void retire(std::optional<Lane>& lane) {
+@@ -55,8 +57,12 @@ using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
+ }
+ 
+ struct DecoderBatch::State {
+-    explicit State(const Decoder::Model& owner)
+-        : model(owner), storage(std::make_shared<BatchStorage>()), execution(model.device) {
++    State(const Decoder::Model& owner, DecoderBatchOptions options)
++        : model(owner), options(options), storage(std::make_shared<BatchStorage>()),
++          execution(model.device) {
++        if (options.top_logits < 0 || options.top_logits > vocab_size) {
++            throw std::invalid_argument("Batch top-logit count falls outside the vocabulary");
++        }
+         DeviceScope device(model.device);
+         storage->weights = model.memory;
+         execution.open_stream(storage);
+@@ -64,6 +70,7 @@ struct DecoderBatch::State {
+     }
+ 
+     Steps advance(const Selection& selected);
++    void replay(const ForwardLane* work, int count);
+ 
+     void require_ready() const {
+         if (failed) {
+@@ -82,13 +89,17 @@ struct DecoderBatch::State {
+     }
+ 
+     const Decoder::Model& model;
++    const DecoderBatchOptions options;
+     std::shared_ptr<BatchStorage> storage;
+     Allocations execution;
++    BatchDecodeBinding* device_bindings = nullptr;
++    std::array<std::optional<Workspace>, decoder_batch_max_lanes> graph_workspaces;
++    std::vector<DecoderLogit> ranking;
+     bool failed = false;
+ };
+ 
+-DecoderBatch::DecoderBatch(const Decoder& decoder)
+-    : state_(std::make_unique<State>(*decoder.model_)) {}
++DecoderBatch::DecoderBatch(const Decoder& decoder, DecoderBatchOptions options)
++    : state_(std::make_unique<State>(*decoder.model_, options)) {}
+ 
+ DecoderBatch::~DecoderBatch() = default;
+ 
+@@ -110,6 +121,9 @@ void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions
+         lane.emplace(Lane{std::move(request), std::move(prompt), options});
+         const auto stream = state_->execution.stream();
+         lane->request->initialize(capacity, stream);
++        if (state_->options.top_logits != 0) {
++            lane->request->memory.transfers().logits.resize(vocab_size);
++        }
+         lane->request->reset(stream);
+         check(cudaStreamSynchronize(stream), "Initialize decoder batch slot");
+         device.restore();
+@@ -140,6 +154,32 @@ std::size_t DecoderBatch::request_device_allocation_bytes() const {
+     return bytes;
+ }
+ 
++void DecoderBatch::State::replay(const ForwardLane* work, int count) {
++    if (!device_bindings) {
++        device_bindings = execution.allocate<BatchDecodeBinding>(decoder_batch_max_lanes);
++    }
++    std::array<BatchGraphLane, decoder_batch_max_lanes> lanes;
++    for (int index = 0; index < count; ++index) {
++        auto& workspace = graph_workspaces[index];
++        if (!workspace) {
++            workspace.emplace(execution);
++        }
++        const auto& input = work[index];
++        const auto& request = *input.request;
++        auto& binding = storage->bindings[index];
++        binding.input = {0.0f, input.token_id};
++        binding.position = input.position;
++        binding.pages = request.pages;
++        std::copy(request.caches.begin(), request.caches.end(), binding.caches);
++        std::copy(request.states.begin(), request.states.end(), binding.states);
++        lanes[index] = {&*workspace, device_bindings + index};
++    }
++    check(cudaMemcpyAsync(device_bindings, storage->bindings.data(),
++                          count * sizeof(BatchDecodeBinding), cudaMemcpyHostToDevice,
++                          execution.stream()), "Upload live batch decode bindings");
++    model.decode_batch_graph(lanes.data(), count, execution);
++}
++
+ Steps DecoderBatch::State::advance(const Selection& selected) {
+     DeviceScope device(model.device);
+     const auto stream = execution.stream();
+@@ -147,24 +187,44 @@ Steps DecoderBatch::State::advance(const Selection& selected) {
+     Steps results{};
+     std::array<ForwardLane, decoder_batch_max_lanes> work;
+     std::array<Request*, decoder_batch_max_lanes> scoring{};
++    std::array<int, decoder_batch_max_lanes> graph_lanes{};
+     int count = 0;
++    int decode = 0;
+     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+         if (selected[slot] && slots[slot] && slots[slot]->request) {
+             auto& lane = *slots[slot];
+             const auto input = lane.input();
+-            work[count++] = input;
+             results[slot].decode = input.mode == TextGdnMode::decode;
++            decode += results[slot].decode;
++            graph_lanes[slot] = count;
++            work[count++] = input;
+             if (lane.produces_token()) {
+                 scoring[slot] = input.request;
+             }
+         }
+     }
+     if (count != 0) {
+-        model.forward(work.data(), count, stream);
+-        for (auto* request : scoring) {
+-            if (request) {
+-                model.compute_logits(request->work, stream);
+-                copy_greedy_token(*request, stream);
++        const bool graph = options.cuda_graphs && count >= 2 && decode == count;
++        if (graph) {
++            replay(work.data(), count);
++        } else {
++            model.forward(work.data(), count, stream);
++        }
++        for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++            auto* request = scoring[slot];
++            if (!request) {
++                continue;
++            }
++            results[slot].graph = graph;
++            auto& output = graph ? *graph_workspaces[graph_lanes[slot]] : request->work;
++            if (!graph) {
++                model.compute_logits(output, stream);
++            }
++            copy_greedy_token(*request, output, stream);
++            auto& scores = request->memory.transfers().logits;
++            if (!scores.empty()) {
++                check(cudaMemcpyAsync(scores.data(), output.logits, scores.size() * sizeof(Bf16),
++                                      cudaMemcpyDeviceToHost, stream), "Read batch step logits");
+             }
+         }
+         check(cudaStreamSynchronize(stream), "Complete decoder batch step");
+@@ -172,6 +232,10 @@ Steps DecoderBatch::State::advance(const Selection& selected) {
+     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+         if (scoring[slot]) {
+             results[slot].token = read_greedy_token(*scoring[slot]);
++            if (options.top_logits != 0) {
++                results[slot].top_logits = top_logits(scoring[slot]->memory.transfers().logits,
++                                                     options.top_logits, ranking);
++            }
+         }
+     }
+     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+diff --git a/src/decoder_forward.cpp b/src/decoder_forward.cpp
+index a42adb0..7d0bba6 100644
+--- a/src/decoder_forward.cpp
++++ b/src/decoder_forward.cpp
+@@ -21,6 +21,15 @@ struct GraphLane {
+     TextGdnMode mode;
+ };
+ 
++template <typename Lane>
++Workspace& lane_workspace(const Lane& lane) {
++    return lane.request->work;
++}
++
++Workspace& lane_workspace(const BatchGraphLane& lane) {
++    return *lane.work;
++}
++
+ template <typename Lane>
+ struct LayerBatch {
+     const Lane* lanes;
+@@ -30,7 +39,7 @@ struct LayerBatch {
+     template <typename Function>
+     void each(Function function) const {
+         for (int index = 0; index < count; ++index) {
+-            function(lanes[index], lanes[index].request->work);
++            function(lanes[index], lane_workspace(lanes[index]));
+         }
+     }
+ 
+@@ -43,7 +52,7 @@ struct LayerBatch {
+ 
+     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
+         if (count == 1) {
+-            const auto& work = lanes[0].request->work;
++            const auto& work = lane_workspace(lanes[0]);
+             const TextFp8ActivationView input{work.activation.values, work.activation.scales};
+             check(text_fp8_gemv(weight.values, weight.scales, input, weight.rows, weight.columns,
+                                 work.*output, stream), "Run FP8 projection");
+@@ -52,7 +61,7 @@ struct LayerBatch {
+         static_assert(decoder_batch_max_lanes <= text_fp8_max_batch);
+         std::array<TextFp8Projection, decoder_batch_max_lanes> projections;
+         for (int index = 0; index < count; ++index) {
+-            const auto& work = lanes[index].request->work;
++            const auto& work = lane_workspace(lanes[index]);
+             projections[index] = {{work.activation.values, work.activation.scales}, work.*output};
+         }
+         check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
+@@ -69,35 +78,40 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
+         const auto stream = batch.stream;
+         project(layer.b, work.normalized, work.gdn_b, stream);
+         project(layer.a, work.normalized, work.gdn_a, stream);
+-        check(text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+-                               layer.recurrent, lane.request->states[state_index],
+-                               work.gdn_scratch, text_gdn_workspace_bytes(1), work.attention,
+-                               stream), "Advance Gated DeltaNet state");
++        if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
++            check(decode_gdn(work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a, layer.recurrent,
++                             &lane.binding->states[state_index], work.gdn_scratch, work.attention,
++                             stream), "Advance bound Gated DeltaNet state");
++        } else {
++            check(text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
++                                   layer.recurrent, lane.request->states[state_index],
++                                   work.gdn_scratch, text_gdn_workspace_bytes(1), work.attention,
++                                   stream), "Advance Gated DeltaNet state");
++        }
+     });
+     batch.quantize(&Workspace::attention, text_gdn_value_width);
+     batch.project(layer.output, &Workspace::projected_attention);
+ }
+ 
+-template <typename Position>
+-void attend_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
++template <typename Cache, typename Pages, typename Position>
++void attend_gqa(const GqaLayer& layer, Workspace& work, Cache cache, Pages pages,
+                 Position position, cudaStream_t stream) {
+-    auto& work = request.work;
+     if constexpr (std::is_same_v<Position, int>) {
+         check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm,
+                                   layer.key_norm, work.rope_queries, work.rope_keys, stream),
+               "Normalize and rotate Q/K");
+-        check(mxfp8_kv_append(cache, request.pages, position, 1, work.rope_keys, work.values,
++        check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values,
+                               stream), "Append MXFP8 KV");
+-        check(mxfp8_gqa_attention(cache, request.pages, position + 1, position, 1,
++        check(mxfp8_gqa_attention(cache, pages, position + 1, position, 1,
+                                   work.rope_queries, work.attention, stream),
+               "Read causal MXFP8 attention");
+     } else {
+         check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
+                                     layer.key_norm, work.rope_queries, work.rope_keys, stream),
+               "Normalize and rotate decode Q/K");
+-        check(decode_kv_append(cache, request.pages, position, work.rope_keys, work.values, stream),
++        check(decode_kv_append(cache, pages, position, work.rope_keys, work.values, stream),
+               "Append decode MXFP8 KV");
+-        check(decode_gqa_attention(cache, request.pages, position, work.rope_queries,
++        check(decode_gqa_attention(cache, pages, position, work.rope_queries,
+                                    work.attention, stream), "Read causal decode MXFP8 attention");
+     }
+     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
+@@ -110,9 +124,16 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
+     batch.project(layer.q_gate, &Workspace::q_gate);
+     batch.project(layer.key, &Workspace::keys);
+     batch.project(layer.value, &Workspace::values);
+-    batch.each([&](const Lane& lane, Workspace&) {
+-        auto& request = *lane.request;
+-        attend_gqa(layer, request, request.caches[cache_index], lane.position, batch.stream);
++    batch.each([&](const Lane& lane, Workspace& work) {
++        if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
++            const auto* binding = lane.binding;
++            attend_gqa(layer, work, &binding->caches[cache_index], &binding->pages,
++                       &binding->position, batch.stream);
++        } else {
++            const auto& request = *lane.request;
++            attend_gqa(layer, work, request.caches[cache_index], request.pages,
++                       lane.position, batch.stream);
++        }
+     });
+     batch.quantize(&Workspace::attention, text_gqa_q_width);
+     batch.project(layer.output, &Workspace::projected_attention);
+@@ -167,6 +188,26 @@ void Decoder::Model::decode_graph(Request& request) const {
+     check(cudaGraphLaunch(request.memory.graph(), stream), "Replay decode graph");
+ }
+ 
++void Decoder::Model::decode_batch_graph(const BatchGraphLane* lanes, int count,
++                                        Allocations& execution) const {
++    const auto stream = execution.stream();
++    const auto bucket = static_cast<std::size_t>(count - 2);
++    const LayerBatch<BatchGraphLane> batch{lanes, count, stream};
++    if (!execution.graph(bucket)) {
++        execution.capture_graph([&] {
++            batch.each([&](const BatchGraphLane& lane, Workspace& work) {
++                check(decode_embedding(embedding, vocab_size, hidden_size, &lane.binding->input,
++                                       work.residual, stream), "Look up bound token embedding");
++            });
++            forward_layers(lanes, count, stream);
++            batch.each([&](const BatchGraphLane&, Workspace& work) {
++                compute_logits(work, stream);
++            });
++        }, bucket);
++    }
++    check(cudaGraphLaunch(execution.graph(bucket), stream), "Replay batch decode graph");
++}
++
+ template <typename Lane>
+ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream) const {
+     const LayerBatch<Lane> batch{lanes, count, stream};
+diff --git a/src/decoder_resources.cpp b/src/decoder_resources.cpp
+index 757c962..e5b673c 100644
+--- a/src/decoder_resources.cpp
++++ b/src/decoder_resources.cpp
+@@ -1,6 +1,7 @@
+ #include "sglang/decoder_internal.h"
+ 
+ #include "sglang/checkpoint.h"
++#include "sglang/decoder_batch.h"
+ 
+ #include <cstdio>
+ #include <mutex>
+@@ -145,8 +146,11 @@ struct Allocations::State {
+ 
+     int device;
+     cudaStream_t stream = nullptr;
+-    cudaGraph_t capture = nullptr;
+-    cudaGraphExec_t graph = nullptr;
++    struct Graph {
++        cudaGraph_t capture = nullptr;
++        cudaGraphExec_t executable = nullptr;
++    };
++    std::array<Graph, decoder_batch_max_lanes - 1> graphs;
+     bool uncertain_stream = false;
+     bool uncertain_graph = false;
+     std::vector<void*> blocks;
+@@ -174,23 +178,27 @@ CleanupError Allocations::State::close_stream(std::shared_ptr<const void>& drain
+     if (sync) {
+         return failure(sync);
+     }
+-    if (graph) {
+-        const CleanupError destroy{cudaGraphExecDestroy(graph), "Destroy decode executable graph"};
+-        if (destroy) {
+-            uncertain_graph = true;
+-            uncertain = destroy;
+-            return failure(destroy);
++    for (auto& graph : graphs) {
++        if (graph.executable) {
++            const CleanupError destroy{cudaGraphExecDestroy(graph.executable),
++                                       "Destroy decode executable graph"};
++            if (destroy) {
++                uncertain_graph = true;
++                uncertain = destroy;
++                return failure(destroy);
++            }
++            graph.executable = nullptr;
+         }
+-        graph = nullptr;
+-    }
+-    if (capture) {
+-        const CleanupError destroy{cudaGraphDestroy(capture), "Destroy decode capture graph"};
+-        if (destroy) {
+-            uncertain_graph = true;
+-            uncertain = destroy;
+-            return failure(destroy);
++        if (graph.capture) {
++            const CleanupError destroy{cudaGraphDestroy(graph.capture),
++                                       "Destroy decode capture graph"};
++            if (destroy) {
++                uncertain_graph = true;
++                uncertain = destroy;
++                return failure(destroy);
++            }
++            graph.capture = nullptr;
+         }
+-        capture = nullptr;
+     }
+     transfers = {};
+     drained_owners = std::move(owners);
+@@ -296,21 +304,24 @@ TransferBuffers& Allocations::transfers() { return state_->transfers; }
+ 
+ cudaStream_t Allocations::stream() const { return state_->stream; }
+ 
+-cudaGraphExec_t Allocations::graph() const { return state_->graph; }
++cudaGraphExec_t Allocations::graph(std::size_t index) const {
++    return state_->graphs.at(index).executable;
++}
+ 
+-void Allocations::capture_graph(const std::function<void()>& enqueue) {
++void Allocations::capture_graph(const std::function<void()>& enqueue, std::size_t index) {
+     const auto stream = state_->stream;
++    auto& graph = state_->graphs.at(index);
+     check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+           "Begin decode graph capture");
+     try {
+         enqueue();
+     } catch (...) {
+-        report_cleanup(cudaStreamEndCapture(stream, &state_->capture),
++        report_cleanup(cudaStreamEndCapture(stream, &graph.capture),
+                        "End interrupted decode graph capture");
+         throw;
+     }
+-    check(cudaStreamEndCapture(stream, &state_->capture), "End decode graph capture");
+-    check(cudaGraphInstantiate(&state_->graph, state_->capture, 0),
++    check(cudaStreamEndCapture(stream, &graph.capture), "End decode graph capture");
++    check(cudaGraphInstantiate(&graph.executable, graph.capture, 0),
+           "Instantiate decode graph");
+ }
+ 
+diff --git a/src/mxfp8_gqa.cu b/src/mxfp8_gqa.cu
+index 6f45db5..bc0ff20 100644
+--- a/src/mxfp8_gqa.cu
++++ b/src/mxfp8_gqa.cu
+@@ -52,10 +52,20 @@ __device__ float decode(std::uint8_t payload, std::uint8_t exponent) {
+     return ldexpf(static_cast<float>(value), static_cast<int>(exponent) - 127);
+ }
+ 
+-template <typename Position>
+-__global__ void append_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
+-                              Position first_position,
++__device__ Mxfp8KvCache cache_value(Mxfp8KvCache cache) { return cache; }
++__device__ Mxfp8KvCache cache_value(const Mxfp8KvCache* cache) { return *cache; }
++
++__device__ const std::int32_t* page_values(const std::int32_t* pages) { return pages; }
++__device__ const std::int32_t* page_values(const Mxfp8PageTable* pages) {
++    return pages->device_pages;
++}
++
++template <typename Position, typename Cache = Mxfp8KvCache,
++          typename Pages = const std::int32_t*>
++__global__ void append_kernel(Cache cache_binding, Pages page_binding, Position first_position,
+                               const __nv_bfloat16* keys, const __nv_bfloat16* values) {
++    const auto cache = cache_value(cache_binding);
++    const auto* pages = page_values(page_binding);
+     const int position = decoder::position_value(first_position) + static_cast<int>(blockIdx.x);
+     const int token = position % mxfp8_page_size;
+     const int physical_page = pages[position / mxfp8_page_size];
+@@ -83,8 +93,9 @@ __device__ float warp_sum(float value) {
+     return value;
+ }
+ 
+-template <typename Position>
+-__global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
++template <typename Position, typename Cache = Mxfp8KvCache,
++          typename Pages = const std::int32_t*>
++__global__ void attention_kernel(Cache cache_binding, Pages page_binding,
+                                  Position first_query_position, const __nv_bfloat16* queries,
+                                  __nv_bfloat16* output) {
+     __shared__ float warp_dots[mxfp8_groups];
+@@ -92,6 +103,8 @@ __global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
+     __shared__ float token_weight;
+     __shared__ float denominator;
+ 
++    const auto cache = cache_value(cache_binding);
++    const auto* pages = page_values(page_binding);
+     const int query_head = blockIdx.y;
+     const int kv_head = query_head / queries_per_kv_head;
+     const int channel = threadIdx.x;
+@@ -200,4 +213,22 @@ cudaError_t decoder::decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pag
+                             dim3(mxfp8_head_dim), arguments, 0, stream);
+ }
+ 
++cudaError_t decoder::decode_kv_append(const Mxfp8KvCache* cache, const Mxfp8PageTable* pages,
++                                      const int* position, const __nv_bfloat16* keys,
++                                      const __nv_bfloat16* values, cudaStream_t stream) {
++    void* arguments[] = {&cache, &pages, &position, &keys, &values};
++    const auto kernel = append_kernel<const int*, const Mxfp8KvCache*, const Mxfp8PageTable*>;
++    return cudaLaunchKernel(kernel, dim3(1, mxfp8_kv_heads), dim3(mxfp8_head_dim),
++                            arguments, 0, stream);
++}
++
++cudaError_t decoder::decode_gqa_attention(const Mxfp8KvCache* cache, const Mxfp8PageTable* pages,
++                                          const int* position, const __nv_bfloat16* queries,
++                                          __nv_bfloat16* output, cudaStream_t stream) {
++    void* arguments[] = {&cache, &pages, &position, &queries, &output};
++    const auto kernel = attention_kernel<const int*, const Mxfp8KvCache*, const Mxfp8PageTable*>;
++    return cudaLaunchKernel(kernel, dim3(1, mxfp8_query_heads), dim3(mxfp8_head_dim),
++                            arguments, 0, stream);
++}
++
+ }
+diff --git a/src/text_attention_gdn.cu b/src/text_attention_gdn.cu
+index 164f2ad..cb7db04 100644
+--- a/src/text_attention_gdn.cu
++++ b/src/text_attention_gdn.cu
+@@ -1,4 +1,5 @@
+ #include "sglang/text_attention.h"
++#include "sglang/decoder_cuda.cuh"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -45,8 +46,15 @@ __device__ __nv_bfloat16 raw_sample(const __nv_bfloat16* qkv,
+     return qkv[static_cast<std::size_t>(row) * text_gdn_qkv_width + channel];
+ }
+ 
+-__global__ void gdn_convolve(const __nv_bfloat16* qkv, const __nv_bfloat16* history,
++__device__ __nv_bfloat16* history_value(__nv_bfloat16* history) { return history; }
++__device__ __nv_bfloat16* history_value(const TextGdnState* state) { return state->history; }
++__device__ float* recurrent_value(float* recurrent) { return recurrent; }
++__device__ float* recurrent_value(const TextGdnState* state) { return state->recurrent; }
++
++template <typename History>
++__global__ void gdn_convolve(const __nv_bfloat16* qkv, History binding,
+                              const __nv_bfloat16* weights, __nv_bfloat16* convolved) {
++    const auto* history = history_value(binding);
+     const int row = blockIdx.x / conv_blocks_per_token;
+     const int channel = (blockIdx.x % conv_blocks_per_token) * conv_threads + threadIdx.x;
+     float value = 0.0f;
+@@ -60,10 +68,10 @@ __global__ void gdn_convolve(const __nv_bfloat16* qkv, const __nv_bfloat16* hist
+         __float2bfloat16(value * sigmoid(value));
+ }
+ 
+-template <bool round_qk>
++template <bool round_qk, typename Recurrent>
+ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
+                           const __nv_bfloat16* b, const __nv_bfloat16* a,
+-                          TextGdnWeights weights, float* recurrent, __nv_bfloat16* observable) {
++                          TextGdnWeights weights, Recurrent binding, __nv_bfloat16* observable) {
+     __shared__ float qk[2][text_gdn_head_dim];
+     __shared__ float warp_squares[recurrent_threads / warp_size];
+     __shared__ float decay;
+@@ -75,7 +83,7 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
+     const int lane = threadIdx.x % warp_size;
+     const int value = (blockIdx.x % value_blocks_per_head) * value_rows_per_block + warp;
+     const int feature = head * text_gdn_head_dim + value;
+-    float* const state_row = recurrent + feature * text_gdn_head_dim;
++    float* const state_row = recurrent_value(binding) + feature * text_gdn_head_dim;
+     const int q_or_k = threadIdx.x / text_gdn_head_dim;
+     const int qk_channel = threadIdx.x % text_gdn_head_dim;
+     const int qk_offset = q_or_k * text_gdn_qk_width + qk_head * text_gdn_head_dim;
+@@ -146,12 +154,14 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
+     }
+ }
+ 
++template <typename History>
+ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
+                            const __nv_bfloat16* norm, const __nv_bfloat16* observable,
+-                           __nv_bfloat16* history, __nv_bfloat16* output) {
++                           History binding, __nv_bfloat16* output) {
+     const int norm_blocks = token_count * text_gdn_value_heads;
+     const int channel = threadIdx.x;
+     if (blockIdx.x >= norm_blocks) {
++        auto* history = history_value(binding);
+         const int feature = (blockIdx.x - norm_blocks) * text_gdn_head_dim + channel;
+         #pragma unroll
+         for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
+@@ -180,6 +190,38 @@ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv
+                                     * (gate * sigmoid(gate)));
+ }
+ 
++template <typename History, typename Recurrent>
++cudaError_t launch_gdn(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
++                        const __nv_bfloat16* z, const __nv_bfloat16* b,
++                        const __nv_bfloat16* a, TextGdnWeights weights, History history,
++                        Recurrent recurrent, __nv_bfloat16* workspace, __nv_bfloat16* output,
++                        cudaStream_t stream) {
++    auto* observable = workspace + static_cast<std::size_t>(token_count) * text_gdn_qkv_width;
++    void* conv_arguments[] = {&qkv, &history, &weights.convolution, &workspace};
++    cudaError_t status = cudaLaunchKernel(gdn_convolve<History>,
++                                          dim3(token_count * conv_blocks_per_token),
++                                          dim3(conv_threads), conv_arguments, 0, stream);
++    if (status != cudaSuccess) {
++        return status;
++    }
++    constexpr int recurrent_blocks = text_gdn_value_heads * value_blocks_per_head;
++    const auto recur = mode == TextGdnMode::prefill ? gdn_recur<true, Recurrent>
++                                                   : gdn_recur<false, Recurrent>;
++    void* recurrent_arguments[] = {
++        &token_count, &workspace, &b, &a, &weights, &recurrent, &observable};
++    status = cudaLaunchKernel(recur, dim3(recurrent_blocks), dim3(recurrent_threads),
++                              recurrent_arguments, 0, stream);
++    if (status != cudaSuccess) {
++        return status;
++    }
++    const int finish_blocks =
++        token_count * text_gdn_value_heads + text_gdn_qkv_width / text_gdn_head_dim;
++    void* finish_arguments[] = {
++        &token_count, &qkv, &z, &weights.norm, &observable, &history, &output};
++    return cudaLaunchKernel(gdn_finish<History>, dim3(finish_blocks), dim3(text_gdn_head_dim),
++                            finish_arguments, 0, stream);
++}
++
+ }
+ 
+ cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
+@@ -199,29 +241,17 @@ cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloa
+         || !workspace || !output) {
+         return cudaErrorInvalidValue;
+     }
++    return launch_gdn(token_count, mode, qkv, z, b, a, weights, state.history, state.recurrent,
++                      workspace, output, stream);
++}
+ 
+-    auto* observable = workspace + static_cast<std::size_t>(token_count) * text_gdn_qkv_width;
+-    void* conv_arguments[] = {&qkv, &state.history, &weights.convolution, &workspace};
+-    cudaError_t status = cudaLaunchKernel(gdn_convolve, dim3(token_count * conv_blocks_per_token),
+-                                         dim3(conv_threads), conv_arguments, 0, stream);
+-    if (status != cudaSuccess) {
+-        return status;
+-    }
+-    constexpr int recurrent_blocks = text_gdn_value_heads * value_blocks_per_head;
+-    const auto recur = mode == TextGdnMode::prefill ? gdn_recur<true> : gdn_recur<false>;
+-    void* recurrent_arguments[] = {
+-        &token_count, &workspace, &b, &a, &weights, &state.recurrent, &observable};
+-    status = cudaLaunchKernel(recur, dim3(recurrent_blocks), dim3(recurrent_threads),
+-                              recurrent_arguments, 0, stream);
+-    if (status != cudaSuccess) {
+-        return status;
+-    }
+-    const int finish_blocks =
+-        token_count * text_gdn_value_heads + text_gdn_qkv_width / text_gdn_head_dim;
+-    void* finish_arguments[] = {
+-        &token_count, &qkv, &z, &weights.norm, &observable, &state.history, &output};
+-    return cudaLaunchKernel(gdn_finish, dim3(finish_blocks), dim3(text_gdn_head_dim),
+-                            finish_arguments, 0, stream);
++cudaError_t decoder::decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
++                                 const __nv_bfloat16* b, const __nv_bfloat16* a,
++                                 TextGdnWeights weights, const TextGdnState* state,
++                                 __nv_bfloat16* workspace, __nv_bfloat16* output,
++                                 cudaStream_t stream) {
++    return launch_gdn(1, TextGdnMode::decode, qkv, z, b, a, weights, state, state,
++                      workspace, output, stream);
+ }
+ 
+ }

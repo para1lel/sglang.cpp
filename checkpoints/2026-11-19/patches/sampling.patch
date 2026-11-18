@@ -1,0 +1,574 @@
+--- a/apps/server/completions.cpp
++++ b/apps/server/completions.cpp
+@@ -1,12 +1,16 @@
+ #include "sglang/server/completions.h"
+ 
++#include "sglang/decoder_sampling.h"
+ #include "sglang/server/batch_service.h"
+ #include "sglang/server/http.h"
+ 
+ #include <llvm/Support/Error.h>
++#include <llvm/Support/FormatVariadic.h>
+ #include <llvm/Support/JSON.h>
+ #include <llvm/Support/raw_ostream.h>
+ 
++#include <array>
++#include <charconv>
+ #include <cstdint>
+ #include <iostream>
+ #include <limits>
+@@ -26,6 +30,38 @@
+     return value ? value->getAsUINT64() : std::nullopt;
+ }
+ 
++std::optional<std::int64_t> sampling_integer(const json::Object& object, llvm::StringRef key) {
++    const auto* field = object.get(key);
++    if (!field || field->kind() == json::Value::Null) {
++        return std::nullopt;
++    }
++    const auto text = llvm::formatv("{0}", *field).str();
++    std::int64_t number{};
++    const auto result = std::from_chars(text.data(), text.data() + text.size(), number);
++    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
++        throw std::invalid_argument(key.str() + " must be a signed 64-bit integer");
++    }
++    return number;
++}
++
++double sampling_number(const json::Object& object, llvm::StringRef key, double fallback) {
++    if (const auto* field = object.get(key); field && field->kind() != json::Value::Null) {
++        if (const auto value = field->getAsNumber()) {
++            return *value;
++        }
++        throw std::invalid_argument(key.str() + " must be a number");
++    }
++    return fallback;
++}
++
++void parse_sampling(const json::Object& object, DecoderOptions& options) {
++    options.temperature = sampling_number(object, "temperature", options.temperature);
++    options.top_p = sampling_number(object, "top_p", options.top_p);
++    options.top_k = sampling_integer(object, "top_k").value_or(options.top_k);
++    options.seed = sampling_integer(object, "seed");
++    decoder::validate_sampling(options);
++}
++
+ CompletionRequest parse_completion(std::string_view body) {
+     auto parsed = json::parse(llvm::StringRef(body.data(), body.size()));
+     if (!parsed) {
+@@ -34,9 +70,15 @@
+     }
+     const auto* object = parsed->getAsObject();
+     const auto* stops = object ? object->get("stop_token_ids") : nullptr;
+-    if (!object || object->size() != (stops ? 12 : 11) ||
++    constexpr std::array optional_fields{"stop_token_ids", "temperature", "seed", "top_k", "top_p"};
++    std::size_t expected_fields = 9;
++    if (object) {
++        for (const auto* field : optional_fields) {
++            expected_fields += object->get(field) != nullptr;
++        }
++    }
++    if (!object || object->size() != expected_fields ||
+         object->getString("model") != "benchmark" ||
+-        object->getNumber("temperature") != 0.0 || unsigned_integer(*object, "seed") != 0 ||
+         object->getBoolean("ignore_eos") != true || object->getBoolean("stream") != true ||
+         object->getBoolean("return_token_ids") != true ||
+         unsigned_integer(*object, "stream_interval") != 1 ||
+@@ -58,6 +100,7 @@
+     }
+     CompletionRequest request;
+     request.options.max_new_tokens = static_cast<int>(*output_budget);
++    parse_sampling(*object, request.options);
+     if (stops) {
+         const auto* tokens = stops->getAsArray();
+         const auto id = tokens && tokens->size() == 1
+--- a/apps/sglang-generate.cpp
++++ b/apps/sglang-generate.cpp
+@@ -1,4 +1,5 @@
+ #include "sglang/decoder.h"
++#include "sglang/decoder_sampling.h"
+ 
+ #include <algorithm>
+ #include <charconv>
+@@ -31,6 +32,7 @@
+ void usage(std::ostream& output) {
+     output << "Usage: sglang-generate (--prompt-ids ID,ID,... | --prompt-file FILE)\n"
+            << "                       [--max-new-tokens N] [--stop-token ID] [--top-logits N]\n"
++           << "                       [--temperature T] [--top-k K] [--top-p P] [--seed N]\n"
+            << "                       [--mtp-steps N] (0–4, default 0)\n"
+            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
+            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
+@@ -38,10 +40,19 @@
+            << "Prompt IDs may be separated by commas or whitespace. Results are written as JSON.\n";
+ }
+ 
+-int positive_or_zero(std::string_view input, std::string_view option) {
+-    int value = 0;
++template <typename Value>
++Value parse_number(std::string_view input, std::string_view option) {
++    Value value{};
+     const auto result = std::from_chars(input.data(), input.data() + input.size(), value);
+-    if (input.empty() || result.ec != std::errc{} || result.ptr != input.end() || value < 0) {
++    if (input.empty() || result.ec != std::errc{} || result.ptr != input.end()) {
++        throw std::invalid_argument("Invalid number for " + std::string(option));
++    }
++    return value;
++}
++
++int positive_or_zero(std::string_view input, std::string_view option) {
++    const int value = parse_number<int>(input, option);
++    if (value < 0) {
+         throw std::invalid_argument("Expected a nonnegative integer for " + std::string(option));
+     }
+     return value;
+@@ -102,6 +113,14 @@
+             arguments.options.stop_token_id = positive_or_zero(value, option);
+         } else if (option == "--top-logits") {
+             arguments.options.top_logits = positive_or_zero(value, option);
++        } else if (option == "--temperature") {
++            arguments.options.temperature = parse_number<double>(value, option);
++        } else if (option == "--top-k") {
++            arguments.options.top_k = parse_number<std::int64_t>(value, option);
++        } else if (option == "--top-p") {
++            arguments.options.top_p = parse_number<double>(value, option);
++        } else if (option == "--seed") {
++            arguments.options.seed = parse_number<std::int64_t>(value, option);
+         } else if (option == "--mtp-steps") {
+             arguments.options.mtp_steps = positive_or_zero(value, option);
+             if (arguments.options.mtp_steps > sglang::decoder_max_mtp_steps) {
+@@ -120,6 +139,7 @@
+     if (arguments.prompt.empty() || arguments.repeats == 0) {
+         throw std::invalid_argument("A nonempty prompt and at least one repetition are required");
+     }
++    sglang::decoder::validate_sampling(arguments.options);
+     return arguments;
+ }
+ 
+@@ -164,11 +184,13 @@
+     sglang::DecoderResult result;
+     std::vector<double> samples;
+     std::size_t peak_bytes = 0;
++    std::size_t output_tokens = 0;
+     double elapsed_ms = 0;
+ };
+ 
+ Measurements measure(const sglang::Decoder& decoder, const Arguments& arguments) {
+     Measurements measured;
++    const bool repeatable = arguments.options.seed || !sglang::decoder::uses_sampling(arguments.options);
+     for (int index = 0; index < arguments.warmup; ++index) {
+         const auto result = decoder.generate(arguments.prompt, arguments.options);
+         measured.peak_bytes = std::max(measured.peak_bytes, result.peak_device_allocation_bytes);
+@@ -180,11 +202,12 @@
+         measured.samples.push_back(elapsed);
+         measured.elapsed_ms += elapsed;
+         measured.peak_bytes = std::max(measured.peak_bytes, result.peak_device_allocation_bytes);
++        measured.output_tokens += result.output_token_ids.size();
+         if (index == 0) {
+             measured.result = std::move(result);
+-        } else if (result.output_token_ids != measured.result.output_token_ids ||
+-                   result.finish_reason != measured.result.finish_reason) {
+-            throw std::runtime_error("Greedy output changed between measured requests");
++        } else if (repeatable && (result.output_token_ids != measured.result.output_token_ids ||
++                                  result.finish_reason != measured.result.finish_reason)) {
++            throw std::runtime_error("Deterministic output changed between measured requests");
+         }
+     }
+     return measured;
+@@ -195,7 +218,7 @@
+     const auto& result = measured.result;
+     const bool stopped = result.finish_reason == sglang::DecoderFinishReason::stop;
+     const double rate = measured.elapsed_ms == 0 ? 0 :
+-        result.output_token_ids.size() * (1000.0 * arguments.repeats / measured.elapsed_ms);
++        measured.output_tokens * (1000.0 / measured.elapsed_ms);
+     auto& output = std::cout;
+     output.imbue(std::locale::classic());
+     output << std::setprecision(12);
+--- a/include/sglang/decoder.h
++++ b/include/sglang/decoder.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <filesystem>
+ #include <functional>
+ #include <memory>
+@@ -16,6 +17,10 @@
+     std::optional<int> stop_token_id;
+     int top_logits = 0;
+     int mtp_steps = 0;
++    double temperature = 0.0;
++    std::int64_t top_k = -1;
++    double top_p = 1.0;
++    std::optional<std::int64_t> seed;
+ };
+ 
+ enum class DecoderFinishReason {
+--- a/include/sglang/decoder_internal.h
++++ b/include/sglang/decoder_internal.h
+@@ -2,6 +2,7 @@
+ 
+ #include "sglang/decoder.h"
+ #include "sglang/decoder_cuda.cuh"
++#include "sglang/decoder_sampling.h"
+ 
+ #include <array>
+ #include <atomic>
+@@ -183,6 +184,8 @@
+ 
+ void copy_greedy_token(Request& request, cudaStream_t stream);
+ int read_greedy_token(Request& request);
++void copy_step_logits(Request& request, cudaStream_t stream);
++int read_sampled_token(Request& request, RequestSampler& sampler, int position);
+ 
+ struct ForwardLane {
+     Request* request;
+@@ -206,6 +209,7 @@
+                        decoder::PrefillWorkspace& workspace) const;
+     void decode_graph(decoder::Request& request) const;
+     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
++    void project_logits(decoder::Workspace& work, cudaStream_t stream) const;
+     void compute_logits(decoder::Request& request) const;
+     void compute_logits(decoder::Workspace& work, cudaStream_t stream) const;
+     void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
+--- /dev/null
++++ b/include/sglang/decoder_sampling.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include "sglang/decoder.h"
++
++namespace sglang::decoder {
++
++bool uses_sampling(const DecoderOptions& options);
++void validate_sampling(const DecoderOptions& options);
++
++class RequestSampler {
++public:
++    RequestSampler(const DecoderOptions& options, int vocabulary);
++
++    float* logits() { return logits_.data(); }
++    int sample(std::uint64_t position);
++
++private:
++    double temperature_;
++    double top_p_;
++    std::uint64_t seed_;
++    int top_k_;
++    std::vector<float> logits_;
++    std::vector<int> ranking_;
++    std::vector<double> weights_;
++};
++
++}
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -18,6 +18,7 @@
+ 
+ void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
+                       bool allow_mtp) {
++    validate_sampling(options);
+     if (prompt.empty() || !std::all_of(prompt.begin(), prompt.end(), valid_token)) {
+         throw std::invalid_argument("Prompt must contain token IDs in [0, 248320)");
+     }
+@@ -53,6 +54,22 @@
+     return winner;
+ }
+ 
++void copy_step_logits(Request& request, cudaStream_t stream) {
++    auto& logits = request.memory.transfers().logits;
++    if (!logits.empty()) {
++        check(cudaMemcpyAsync(logits.data(), request.work.logits, logits.size() * sizeof(Bf16),
++                              cudaMemcpyDeviceToHost, stream), "Read step logits");
++    }
++}
++
++int read_sampled_token(Request& request, RequestSampler& sampler, int position) {
++    auto& transfers = request.memory.transfers();
++    std::transform(transfers.logits.begin(), transfers.logits.end(), sampler.logits(),
++                   [](Bf16 value) { return __bfloat162float(value); });
++    transfers.winner = sampler.sample(position);
++    return transfers.winner;
++}
++
+ }
+ 
+ namespace {
+@@ -100,17 +117,20 @@
+     return {ranking.begin(), end};
+ }
+ 
+-int read_step(Request& request) {
++int read_step(Request& request, RequestSampler* sampler = nullptr, int position = 0) {
+     const auto stream = request.memory.stream();
+-    auto& host_logits = request.memory.transfers().logits;
+-    copy_greedy_token(request, stream);
+-    if (!host_logits.empty()) {
+-        check(cudaMemcpyAsync(host_logits.data(), request.work.logits,
+-                              host_logits.size() * sizeof(Bf16), cudaMemcpyDeviceToHost, stream),
+-              "Read step logits");
++    if (!sampler) {
++        copy_greedy_token(request, stream);
+     }
++    copy_step_logits(request, stream);
+     check(cudaStreamSynchronize(stream), "Complete decoder step");
+-    return read_greedy_token(request);
++    return sampler ? read_sampled_token(request, *sampler, position) : read_greedy_token(request);
++}
++
++void set_graph_token(Request& request) {
++    const auto& winner = request.memory.transfers().winner;
++    check(cudaMemcpyAsync(&request.work.argmax->token_id, &winner, sizeof(winner),
++                          cudaMemcpyHostToDevice, request.memory.stream()), "Set sampled token");
+ }
+ 
+ }
+@@ -295,7 +315,11 @@
+         auto& request = *storage;
+         request.reset();
+         auto& transfers = request.memory.transfers();
+-        transfers.logits.resize(options.top_logits > 0 ? vocab_size : 0);
++        std::optional<RequestSampler> sampler;
++        if (uses_sampling(options)) {
++            sampler.emplace(options, vocab_size);
++        }
++        transfers.logits.resize(sampler || options.top_logits > 0 ? vocab_size : 0);
+         std::vector<DecoderLogit> ranking;
+         if (options.top_logits > 0) {
+             ranking.reserve(vocab_size);
+@@ -330,14 +354,21 @@
+                         check(set_decode_position(request.decode_position, prompt_count,
+                                                   request.memory.stream()), "Set decode position");
+                     }
++                    if (sampler) {
++                        set_graph_token(request);
++                    }
+                     decode_graph(request);
+                 } else {
+                     if (step != 0) {
+                         forward(request, winner, prompt_count + step - 1, TextGdnMode::decode);
+                     }
+-                    compute_logits(request);
++                    if (sampler) {
++                        project_logits(request.work, request.memory.stream());
++                    } else {
++                        compute_logits(request);
++                    }
+                 }
+-                winner = read_step(request);
++                winner = read_step(request, sampler ? &*sampler : nullptr, prompt_count + step - 1);
+                 result.output_token_ids.push_back(winner);
+                 const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
+                 if (options.top_logits > 0) {
+--- a/src/decoder_batch.cpp
++++ b/src/decoder_batch.cpp
+@@ -18,6 +18,7 @@
+     int position = 0;
+     int generated = 0;
+     int last_token = 0;
++    std::optional<RequestSampler> sampler = std::nullopt;
+ 
+     int remaining_prompt() const { return std::max(0, static_cast<int>(prompt.size()) - position); }
+ 
+@@ -140,6 +141,10 @@
+         const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
+         auto request = std::make_unique<Request>(state_->model.device);
+         lane.emplace(Lane{std::move(request), std::move(prompt), options});
++        if (uses_sampling(options)) {
++            lane->sampler.emplace(options, vocab_size);
++            lane->request->memory.transfers().logits.resize(vocab_size);
++        }
+         const auto stream = state_->execution.stream();
+         lane->request->initialize(capacity, stream);
+         lane->request->reset(stream);
+@@ -177,7 +182,7 @@
+     const auto stream = execution.stream();
+     auto& slots = storage->slots;
+     std::array<ForwardLane, decoder_batch_max_lanes> work;
+-    std::array<Request*, decoder_batch_max_lanes> scoring{};
++    Selection scoring{};
+     const int max_rows = *std::max_element(rows.begin(), rows.end());
+     int count = 0;
+     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+@@ -188,7 +193,7 @@
+             }
+             results[slot].decode = rows[slot] == 0;
+             if (rows[slot] == lane.remaining_prompt()) {
+-                scoring[slot] = lane.request.get();
++                scoring[slot] = true;
+             }
+         }
+     }
+@@ -208,10 +213,16 @@
+         }
+         workspace.close();
+     }
+-    for (auto* request : scoring) {
+-        if (request) {
+-            model.compute_logits(request->work, stream);
+-            copy_greedy_token(*request, stream);
++    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++        if (scoring[slot]) {
++            auto& lane = *slots[slot];
++            if (lane.sampler) {
++                model.project_logits(lane.request->work, stream);
++                copy_step_logits(*lane.request, stream);
++            } else {
++                model.compute_logits(lane.request->work, stream);
++                copy_greedy_token(*lane.request, stream);
++            }
+         }
+     }
+     if (count != 0 || max_rows > 1) {
+@@ -219,7 +230,11 @@
+     }
+     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+         if (scoring[slot]) {
+-            results[slot].token = read_greedy_token(*scoring[slot]);
++            auto& lane = *slots[slot];
++            const int position = lane.position + std::max(1, rows[slot]) - 1;
++            results[slot].token = lane.sampler
++                ? read_sampled_token(*lane.request, *lane.sampler, position)
++                : read_greedy_token(*lane.request);
+         }
+     }
+     return workspace_bytes;
+--- a/src/decoder_forward.cpp
++++ b/src/decoder_forward.cpp
+@@ -222,9 +222,13 @@
+                         work.normalized, nullptr, stream), "Normalize final residual");
+ }
+ 
+-void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream) const {
++void Decoder::Model::project_logits(Workspace& work, cudaStream_t stream) const {
+     normalize_final(work, stream);
+     project(lm_head, work.normalized, work.logits, stream);
++}
++
++void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream) const {
++    project_logits(work, stream);
+     check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+           "Select greedy token");
+ }
+--- /dev/null
++++ b/src/decoder_sampling.cpp
+@@ -0,0 +1,108 @@
++#include "sglang/decoder_sampling.h"
++
++#include <algorithm>
++#include <cmath>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++
++namespace sglang::decoder {
++namespace {
++
++constexpr double sampling_epsilon = 1e-6;
++
++std::uint64_t request_seed(const std::optional<std::int64_t>& seed) {
++    if (seed) {
++        return static_cast<std::uint64_t>(*seed);
++    }
++    std::random_device entropy;
++    return (static_cast<std::uint64_t>(entropy()) << 32) | entropy();
++}
++
++double sample_uniform(std::uint64_t seed, std::uint64_t position) {
++    std::uint64_t bits = seed + 0x9e3779b97f4a7c15ULL * (position + 1);
++    bits = (bits ^ (bits >> 30)) * 0xbf58476d1ce4e5b9ULL;
++    bits = (bits ^ (bits >> 27)) * 0x94d049bb133111ebULL;
++    return static_cast<double>((bits ^ (bits >> 31)) >> 11) * 0x1.0p-53;
++}
++
++float finite_logit(float logit) {
++    if (std::isfinite(logit)) {
++        return logit;
++    }
++    return std::isinf(logit) && logit > 0 ? 1e30f : -1e30f;
++}
++
++}
++
++bool uses_sampling(const DecoderOptions& options) {
++    return options.temperature >= sampling_epsilon;
++}
++
++void validate_sampling(const DecoderOptions& options) {
++    if (!std::isfinite(options.temperature) || options.temperature < 0) {
++        throw std::invalid_argument("temperature must be a finite nonnegative number");
++    }
++    if (!(options.top_p > 0 && options.top_p <= 1)) {
++        throw std::invalid_argument("top_p must be in (0, 1]");
++    }
++    if (uses_sampling(options) && options.top_k != -1 && options.top_k < 1) {
++        throw std::invalid_argument("top_k must be -1 or at least 1");
++    }
++    if (uses_sampling(options) && options.mtp_steps != 0) {
++        throw std::invalid_argument("MTP requires greedy generation (temperature < 1e-6)");
++    }
++}
++
++RequestSampler::RequestSampler(const DecoderOptions& options, int vocabulary)
++    : temperature_(options.temperature), top_p_(options.top_p), seed_(request_seed(options.seed)),
++      top_k_(options.top_k == -1 ? vocabulary : std::min<std::int64_t>(options.top_k, vocabulary)),
++      logits_(vocabulary), ranking_(top_k_ < vocabulary || top_p_ < 1 ? vocabulary : 0),
++      weights_(top_k_) {}
++
++int RequestSampler::sample(std::uint64_t position) {
++    std::transform(logits_.begin(), logits_.end(), logits_.begin(), finite_logit);
++    const auto maximum = std::max_element(logits_.begin(), logits_.end());
++    if (top_k_ == 1) {
++        return static_cast<int>(maximum - logits_.begin());
++    }
++    const auto weight = [&](float logit) {
++        return std::exp((static_cast<double>(logit) - *maximum) / temperature_);
++    };
++    const auto before = [&](int left, int right) {
++        return logits_[left] == logits_[right] ? left < right : logits_[left] > logits_[right];
++    };
++    if (!ranking_.empty()) {
++        std::iota(ranking_.begin(), ranking_.end(), 0);
++        if (top_k_ == static_cast<int>(ranking_.size())) {
++            std::sort(ranking_.begin(), ranking_.end(), before);
++        } else {
++            std::partial_sort(ranking_.begin(), ranking_.begin() + top_k_, ranking_.end(), before);
++        }
++    }
++    const auto token = [&](int rank) { return ranking_.empty() ? rank : ranking_[rank]; };
++    long double cutoff = 0;
++    if (top_p_ < 1) {
++        for (const float logit : logits_) {
++            cutoff += weight(logit);
++        }
++        cutoff *= top_p_;
++    }
++    long double mass = 0;
++    int kept = 0;
++    for (; kept < top_k_ && (top_p_ == 1 || mass <= cutoff); ++kept) {
++        weights_[kept] = weight(logits_[token(kept)]);
++        mass += weights_[kept];
++    }
++    const long double draw = sample_uniform(seed_, position) * mass;
++    long double cumulative = 0;
++    for (int rank = 0; rank < kept; ++rank) {
++        cumulative += weights_[rank];
++        if (draw < cumulative) {
++            return token(rank);
++        }
++    }
++    return static_cast<int>(maximum - logits_.begin());
++}
++
++}
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -76,7 +76,7 @@
+     add_deps("sglang_checkpoint", "sglang_cuda")
+     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
+               "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp",
+-              "src/decoder_prefill.cpp")
++              "src/decoder_prefill.cpp", "src/decoder_sampling.cpp")
+ 
+ target("sglang-generate")
+     set_kind("binary")

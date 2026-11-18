@@ -1,0 +1,979 @@
+diff --git a/apps/server/completions.cpp b/apps/server/completions.cpp
+index e2cdade..00d0667 100644
+--- a/apps/server/completions.cpp
++++ b/apps/server/completions.cpp
+@@ -202,10 +202,13 @@ void write_error(const Socket& connection, std::string_view status, const char*
+     write_json(connection, status, error_body(message));
+ }
+ 
+-void complete(const Socket& connection, const Decoder& decoder, std::string_view body, bool trace) {
++void complete(const Socket& connection, const Decoder& decoder, std::string_view body,
++              bool trace, int mtp_steps) {
+     stream_completion(connection, body,
+                       [&](const CompletionRequest& request, const DecoderCallbacks& callbacks) {
+-        return decoder.generate(request.prompt, request.options, callbacks);
++        auto options = request.options;
++        options.mtp_steps = mtp_steps;
++        return decoder.generate(request.prompt, options, callbacks);
+     }, trace);
+ }
+ 
+diff --git a/apps/sglang-generate.cpp b/apps/sglang-generate.cpp
+index 475dade..698e758 100644
+--- a/apps/sglang-generate.cpp
++++ b/apps/sglang-generate.cpp
+@@ -31,6 +31,7 @@ struct Arguments {
+ void usage(std::ostream& output) {
+     output << "Usage: sglang-generate (--prompt-ids ID,ID,... | --prompt-file FILE)\n"
+            << "                       [--max-new-tokens N] [--stop-token ID] [--top-logits N]\n"
++           << "                       [--mtp-steps N] (0–4, default 0)\n"
+            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
+            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
+               "Device is a CUDA ordinal.\n"
+@@ -101,6 +102,11 @@ Arguments parse_arguments(int argc, char** argv) {
+             arguments.options.stop_token_id = positive_or_zero(value, option);
+         } else if (option == "--top-logits") {
+             arguments.options.top_logits = positive_or_zero(value, option);
++        } else if (option == "--mtp-steps") {
++            arguments.options.mtp_steps = positive_or_zero(value, option);
++            if (arguments.options.mtp_steps > sglang::decoder_max_mtp_steps) {
++                throw std::invalid_argument("Expected --mtp-steps in [0, 4]");
++            }
+         } else if (option == "--warmup") {
+             arguments.warmup = positive_or_zero(value, option);
+         } else if (option == "--repeats") {
+@@ -202,6 +208,11 @@ void write_result(const Arguments& arguments, const Measurements& measured,
+         output << ",\"step_top_logits\":";
+         write_array(output, result.step_top_logits, write_step);
+     }
++    if (arguments.options.mtp_steps != 0) {
++        output << ",\"mtp_drafted_tokens\":" << result.mtp_drafted_tokens
++               << ",\"mtp_accepted_tokens\":" << result.mtp_accepted_tokens
++               << ",\"mtp_rounds\":" << result.mtp_rounds;
++    }
+     output << ",\"device\":" << arguments.device << ",\"warmup\":" << arguments.warmup
+            << ",\"repeats\":" << arguments.repeats << ",\"load_ms\":" << load_ms
+            << ",\"model_device_allocation_bytes\":" << model_bytes
+@@ -221,7 +232,8 @@ int main(int argc, char** argv) {
+             return 0;
+         }
+         const auto start = Clock::now();
+-        const sglang::Decoder decoder(arguments.checkpoint, arguments.device);
++        const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
++                                      arguments.options.mtp_steps != 0);
+         const double load_ms = milliseconds(Clock::now() - start);
+         const auto measured = measure(decoder, arguments);
+         write_result(arguments, measured, decoder.model_device_allocation_bytes(), load_ms);
+diff --git a/apps/sglang-server.cpp b/apps/sglang-server.cpp
+index 6f386bf..174cbc3 100644
+--- a/apps/sglang-server.cpp
++++ b/apps/sglang-server.cpp
+@@ -1,3 +1,4 @@
++#include "sglang/decoder.h"
+ #include "sglang/decoder_batch.h"
+ #include "sglang/server/batch_service.h"
+ #include "sglang/server/completions.h"
+@@ -19,6 +20,7 @@ struct Arguments {
+     int device = 0;
+     int port = 17384;
+     int max_active = 1;
++    int mtp_steps = 0;
+     bool trace_batches = false;
+ };
+ 
+@@ -59,10 +61,19 @@ Arguments parse_arguments(int argc, char** argv) {
+                 arguments.max_active > sglang::decoder_batch_max_lanes) {
+                 throw std::invalid_argument(error);
+             }
++        } else if (option == "--mtp-steps") {
++            const auto error = "Expected --mtp-steps in [0, 4]";
++            arguments.mtp_steps = parse_integer(value, error);
++            if (arguments.mtp_steps > sglang::decoder_max_mtp_steps) {
++                throw std::invalid_argument(error);
++            }
+         } else {
+             throw std::invalid_argument("Invalid argument " + std::string(option));
+         }
+     }
++    if (arguments.mtp_steps != 0 && arguments.max_active != 1) {
++        throw std::invalid_argument("--mtp-steps requires --max-active 1");
++    }
+     return arguments;
+ }
+ 
+@@ -142,15 +153,17 @@ void serve_batch(const Socket& listener, BatchService& service, int max_active)
+ int main(int argc, char** argv) {
+     if (argc == 2 && std::string_view(argv[1]) == "--help") {
+         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
+-                     " [--max-active N] [--trace-batches]\n"
++                     " [--max-active N] [--mtp-steps N] [--trace-batches]\n"
+                      "Active requests: 1 by default, up to 4.\n"
++                     "MTP steps: 0 by default, up to 4 with one active request.\n"
+                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
+         return 0;
+     }
+     try {
+         const auto arguments = parse_arguments(argc, argv);
+         install_shutdown_handlers();
+-        const sglang::Decoder decoder(arguments.checkpoint, arguments.device);
++        const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
++                                      arguments.mtp_steps != 0);
+         if (stopping()) {
+             return 0;
+         }
+@@ -158,7 +171,7 @@ int main(int argc, char** argv) {
+         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
+         if (arguments.max_active == 1) {
+             serve_connections(listener, [&](const Socket& connection, std::string_view body) {
+-                complete(connection, decoder, body, arguments.trace_batches);
++                complete(connection, decoder, body, arguments.trace_batches, arguments.mtp_steps);
+             });
+         } else {
+             BatchService service(decoder, arguments.trace_batches);
+diff --git a/include/sglang/decoder.h b/include/sglang/decoder.h
+index 6195cf8..66a87a3 100644
+--- a/include/sglang/decoder.h
++++ b/include/sglang/decoder.h
+@@ -9,10 +9,13 @@
+ 
+ namespace sglang {
+ 
++inline constexpr int decoder_max_mtp_steps = 4;
++
+ struct DecoderOptions {
+     int max_new_tokens = 1;
+     std::optional<int> stop_token_id;
+     int top_logits = 0;
++    int mtp_steps = 0;
+ };
+ 
+ enum class DecoderFinishReason {
+@@ -36,11 +39,15 @@ struct DecoderResult {
+     DecoderFinishReason finish_reason = DecoderFinishReason::length;
+     std::vector<std::vector<DecoderLogit>> step_top_logits;
+     std::size_t peak_device_allocation_bytes = 0;
++    std::size_t mtp_drafted_tokens = 0;
++    std::size_t mtp_accepted_tokens = 0;
++    std::size_t mtp_rounds = 0;
+ };
+ 
+ class Decoder {
+ public:
+     explicit Decoder(const std::filesystem::path& checkpoint, int cuda_device = 0);
++    Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp);
+     ~Decoder();
+ 
+     Decoder(const Decoder&) = delete;
+diff --git a/include/sglang/decoder_internal.h b/include/sglang/decoder_internal.h
+index 77ffac0..8293348 100644
+--- a/include/sglang/decoder_internal.h
++++ b/include/sglang/decoder_internal.h
+@@ -19,6 +19,8 @@ class Checkpoint;
+ 
+ namespace sglang::decoder {
+ 
++class MtpDraftWeights;
++
+ using Bf16 = __nv_bfloat16;
+ 
+ inline constexpr int hidden_size = 5120;
+@@ -37,7 +39,8 @@ constexpr bool is_full_attention(int layer_index) {
+ }
+ 
+ void check(cudaError_t status, const char* operation);
+-void validate_request(const std::vector<int>& prompt, const DecoderOptions& options);
++void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
++                      bool allow_mtp = false);
+ 
+ class DeviceScope {
+ public:
+@@ -161,8 +164,7 @@ struct Workspace {
+ 
+ struct Request {
+     explicit Request(int device, bool reusable = false);
+-    Request(int device, int capacity, std::shared_ptr<const Allocations> weights,
+-            bool reusable = false);
++    Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false);
+ 
+     void initialize(int capacity, cudaStream_t stream);
+     void reset(cudaStream_t stream);
+@@ -191,13 +193,22 @@ struct ForwardLane {
+ namespace sglang {
+ 
+ struct Decoder::Model {
++    struct MtpGeneration;
++
+     Model(const std::filesystem::path& checkpoint, int cuda_device);
+ 
+     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
+     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
+     void decode_graph(decoder::Request& request) const;
++    void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
+     void compute_logits(decoder::Request& request) const;
+     void compute_logits(decoder::Workspace& work, cudaStream_t stream) const;
++    void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
++                         const DecoderCallbacks& callbacks, DecoderResult& result) const;
++    DecoderFinishReason generate_mtp(const std::vector<int>& prompt,
++                                     const DecoderOptions& options,
++                                     const DecoderCallbacks& callbacks,
++                                     DecoderResult& result) const;
+ 
+     template <typename Lane>
+     void forward_layers(const Lane* lanes, int count, cudaStream_t stream) const;
+@@ -208,6 +219,7 @@ struct Decoder::Model {
+     const decoder::Bf16* embedding = nullptr;
+     const decoder::Bf16* final_norm = nullptr;
+     decoder::Bf16Weight lm_head{};
++    std::shared_ptr<const decoder::MtpDraftWeights> mtp_weights;
+     mutable std::atomic_flag request_in_use = ATOMIC_FLAG_INIT;
+     mutable std::unique_ptr<decoder::Request> decode_request;
+ };
+diff --git a/include/sglang/decoder_mtp.h b/include/sglang/decoder_mtp.h
+new file mode 100644
+index 0000000..1af6492
+--- /dev/null
++++ b/include/sglang/decoder_mtp.h
+@@ -0,0 +1,48 @@
++#pragma once
++
++#include "sglang/decoder_internal.h"
++
++namespace sglang::decoder {
++
++class MtpDraftWeights {
++public:
++    MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
++                    std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
++                    Bf16Weight lm_head);
++    ~MtpDraftWeights();
++
++    std::size_t device_allocation_bytes() const;
++
++private:
++    struct State;
++    std::unique_ptr<const State> state_;
++    friend class MtpDraftRequest;
++};
++
++/// Retain this request in the submitted stream's ownership until completion.
++/// Serialize use on one stream and select the weights' CUDA device before enqueueing.
++class MtpDraftRequest {
++public:
++    MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity);
++    ~MtpDraftRequest();
++
++    /// Append at valid_prefix() using the shifted token and the corresponding
++    /// normalized hidden row. The returned device row survives until the next
++    /// enqueue writes it. The row can also be passed as that enqueue's input.
++    const Bf16* enqueue(int position, int shifted_token, const Bf16* hidden, bool score,
++                        cudaStream_t stream);
++
++    /// Read the most recent scored enqueue after its stream has completed.
++    int read_token() const;
++
++    int valid_prefix() const;
++    /// Shorten logical KV coverage. Subsequent enqueues overwrite the suffix.
++    void rewind(int valid_tokens);
++    std::size_t device_allocation_bytes() const;
++
++private:
++    struct State;
++    std::unique_ptr<State> state_;
++};
++
++}
+diff --git a/include/sglang/server/completions.h b/include/sglang/server/completions.h
+index faa5162..f143b97 100644
+--- a/include/sglang/server/completions.h
++++ b/include/sglang/server/completions.h
+@@ -12,7 +12,7 @@ class BatchService;
+ class Socket;
+ 
+ void complete(const Socket& connection, const Decoder& decoder, std::string_view body,
+-              bool trace = false);
++              bool trace = false, int mtp_steps = 0);
+ void complete(const Socket& connection, BatchService& service, int slot, std::string_view body);
+ void write_error(const Socket& connection, std::string_view status, const char* message);
+ 
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index b55a245..eb99067 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -1,6 +1,7 @@
+ #include "sglang/decoder_internal.h"
+ 
+ #include "sglang/decoder_cuda.cuh"
++#include "sglang/decoder_mtp.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -15,7 +16,8 @@ bool valid_token(int id) {
+ 
+ }
+ 
+-void validate_request(const std::vector<int>& prompt, const DecoderOptions& options) {
++void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
++                      bool allow_mtp) {
+     if (prompt.empty() || !std::all_of(prompt.begin(), prompt.end(), valid_token)) {
+         throw std::invalid_argument("Prompt must contain token IDs in [0, 248320)");
+     }
+@@ -25,6 +27,12 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
+     if (options.top_logits < 0 || options.top_logits > vocab_size) {
+         throw std::invalid_argument("Top-logit count falls outside the vocabulary");
+     }
++    if (options.mtp_steps < 0 || options.mtp_steps > decoder_max_mtp_steps) {
++        throw std::invalid_argument("MTP proposal count must be in [0, 4]");
++    }
++    if (!allow_mtp && options.mtp_steps != 0) {
++        throw std::invalid_argument("MTP requires serial generation");
++    }
+     if (options.max_new_tokens < 0 || options.max_new_tokens > text_attention_max_tokens ||
+         prompt.size() > std::size_t(text_attention_max_tokens - options.max_new_tokens)) {
+         throw std::invalid_argument("Prompt and output budget must fit the 262144-token context");
+@@ -107,37 +115,170 @@ int read_step(Request& request) {
+ 
+ }
+ 
++struct Decoder::Model::MtpGeneration {
++    const Model& model;
++    Request& target;
++    MtpDraftRequest& draft;
++    const DecoderOptions& options;
++    const DecoderCallbacks& callbacks;
++    DecoderResult& result;
++    std::vector<DecoderLogit> ranking{};
++    int next_target_position = 0;
++    int seed = -1;
++
++    bool cancelled() const { return callbacks.is_cancelled && callbacks.is_cancelled(); }
++
++    std::optional<DecoderFinishReason> emit(int token, bool accepted = false) {
++        if (cancelled()) {
++            return DecoderFinishReason::cancelled;
++        }
++        seed = token;
++        result.output_token_ids.push_back(token);
++        result.mtp_accepted_tokens += accepted;
++        const bool keep_running = !callbacks.on_token || callbacks.on_token(token);
++        if (options.top_logits > 0) {
++            result.step_top_logits.push_back(
++                top_logits(target.memory.transfers().logits, options.top_logits, ranking));
++        }
++        if (!keep_running) {
++            return DecoderFinishReason::cancelled;
++        }
++        if (options.stop_token_id == token) {
++            return DecoderFinishReason::stop;
++        }
++        if (result.output_token_ids.size() == static_cast<std::size_t>(options.max_new_tokens)) {
++            return DecoderFinishReason::length;
++        }
++        return std::nullopt;
++    }
++
++    using Proposals = std::array<int, decoder_max_mtp_steps>;
++
++    bool propose(Proposals& proposals, int count) {
++        const auto stream = target.memory.stream();
++        const int first_draft_position = next_target_position - 1;
++        const Bf16* hidden = target.work.normalized;
++        int shifted_token = seed;
++        ++result.mtp_rounds;
++        for (int index = 0; index < count; ++index) {
++            if (cancelled()) {
++                return false;
++            }
++            hidden = draft.enqueue(first_draft_position + index, shifted_token, hidden, true,
++                                   stream);
++            check(cudaStreamSynchronize(stream), "Complete MTP draft step");
++            shifted_token = draft.read_token();
++            proposals[index] = shifted_token;
++            ++result.mtp_drafted_tokens;
++        }
++        return true;
++    }
++
++    std::optional<DecoderFinishReason> verify(const Proposals& proposals, int count) {
++        draft.rewind(next_target_position);
++        for (int index = 0; index <= count; ++index) {
++            if (cancelled()) {
++                return DecoderFinishReason::cancelled;
++            }
++            const int position = next_target_position++;
++            model.forward(target, seed, position, TextGdnMode::decode);
++            model.compute_logits(target);
++            const int token = read_step(target);
++            const bool accepted = index < count && token == proposals[index];
++            if (const auto finish = emit(token, accepted)) {
++                return finish;
++            }
++            if (!accepted) {
++                return std::nullopt;
++            }
++            draft.enqueue(position, seed, target.work.normalized, false, target.memory.stream());
++        }
++        return std::nullopt;
++    }
++
++    DecoderFinishReason run(const std::vector<int>& prompt) {
++        const auto stream = target.memory.stream();
++        const int prompt_count = static_cast<int>(prompt.size());
++        for (; next_target_position < prompt_count; ++next_target_position) {
++            if (cancelled()) {
++                return DecoderFinishReason::cancelled;
++            }
++            const int position = next_target_position;
++            model.forward(target, prompt[position], position, TextGdnMode::prefill);
++            if (position + 1 < prompt_count) {
++                model.normalize_final(target.work, stream);
++                draft.enqueue(position, prompt[position + 1], target.work.normalized, false,
++                              stream);
++            }
++        }
++        model.compute_logits(target);
++        if (const auto finish = emit(read_step(target))) {
++            return *finish;
++        }
++        while (!cancelled()) {
++            const int remaining = options.max_new_tokens -
++                                  static_cast<int>(result.output_token_ids.size());
++            const int count = std::min(remaining, options.mtp_steps);
++            Proposals proposals{};
++            if (!propose(proposals, count)) {
++                break;
++            }
++            if (const auto finish = verify(proposals, count)) {
++                return *finish;
++            }
++        }
++        return DecoderFinishReason::cancelled;
++    }
++};
++
+ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device)
+     : model_(std::make_unique<Model>(checkpoint, cuda_device)) {}
+ 
++Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp)
++    : Decoder(checkpoint, cuda_device) {
++    if (enable_mtp) {
++        model_->mtp_weights = std::make_shared<MtpDraftWeights>(
++            checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head);
++    }
++}
++
+ Decoder::~Decoder() = default;
+ 
+ std::size_t Decoder::model_device_allocation_bytes() const {
+-    return model_->memory->bytes();
++    return model_->memory->bytes() + (model_->mtp_weights ?
++                                     model_->mtp_weights->device_allocation_bytes() : 0);
+ }
+ 
+-DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+-                                const DecoderOptions& options,
+-                                const DecoderCallbacks& callbacks) const {
+-    validate_request(prompt_token_ids, options);
+-    DecoderResult result;
+-    result.peak_device_allocation_bytes = model_device_allocation_bytes();
+-    const auto cancelled = [&] { return callbacks.is_cancelled && callbacks.is_cancelled(); };
+-    if (cancelled()) {
+-        result.finish_reason = DecoderFinishReason::cancelled;
+-        return result;
++DecoderFinishReason Decoder::Model::generate_mtp(const std::vector<int>& prompt,
++                                                const DecoderOptions& options,
++                                                const DecoderCallbacks& callbacks,
++                                                DecoderResult& result) const {
++    const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
++    const auto draft = std::make_shared<MtpDraftRequest>(mtp_weights, capacity);
++    Request target(device, capacity, draft);
++    target.reset();
++    target.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
++    result.peak_device_allocation_bytes +=
++        target.memory.bytes() + draft->device_allocation_bytes();
++    MtpGeneration generation{*this, target, *draft, options, callbacks, result};
++    if (options.top_logits > 0) {
++        generation.ranking.reserve(vocab_size);
+     }
+-    if (options.max_new_tokens == 0) {
+-        return result;
+-    }
+-    DeviceScope selected_device(model_->device);
+-    const int prompt_count = static_cast<int>(prompt_token_ids.size());
++    const auto finish = generation.run(prompt);
++    target.memory.close();
++    return finish;
++}
++
++void Decoder::Model::generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
++                                     const DecoderCallbacks& callbacks,
++                                     DecoderResult& result) const {
++    const auto cancelled = [&] { return callbacks.is_cancelled && callbacks.is_cancelled(); };
++    const int prompt_count = static_cast<int>(prompt.size());
+     int capacity = prompt_count + options.max_new_tokens - 1;
+     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
+-    result.output_token_ids.reserve(options.max_new_tokens);
+-    const RequestLease lease(model_->request_in_use);
++    const RequestLease lease(request_in_use);
+     std::unique_ptr<Request> eager_request;
+-    auto& storage = lease.owns_slot() ? model_->decode_request : eager_request;
++    auto& storage = lease.owns_slot() ? decode_request : eager_request;
+     try {
+         if (storage && storage->pages.page_count < pages) {
+             const int previous_capacity = storage->pages.page_count * mxfp8_page_size;
+@@ -149,8 +290,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+         if (storage) {
+             storage->memory.reclaim_deferred();
+         } else {
+-            storage = std::make_unique<Request>(model_->device, capacity, model_->memory,
+-                                                lease.owns_slot());
++            storage = std::make_unique<Request>(device, capacity, memory, lease.owns_slot());
+         }
+         auto& request = *storage;
+         request.reset();
+@@ -166,8 +306,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+                 if (cancelled()) {
+                     return DecoderFinishReason::cancelled;
+                 }
+-                model_->forward(request, prompt_token_ids[position], position,
+-                                TextGdnMode::prefill);
++                forward(request, prompt[position], position, TextGdnMode::prefill);
+             }
+             int winner = -1;
+             for (int step = 0; step < options.max_new_tokens; ++step) {
+@@ -179,13 +318,12 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+                         check(set_decode_position(request.decode_position, prompt_count,
+                                                   request.memory.stream()), "Set decode position");
+                     }
+-                    model_->decode_graph(request);
++                    decode_graph(request);
+                 } else {
+                     if (step != 0) {
+-                        model_->forward(request, winner, prompt_count + step - 1,
+-                                        TextGdnMode::decode);
++                        forward(request, winner, prompt_count + step - 1, TextGdnMode::decode);
+                     }
+-                    model_->compute_logits(request);
++                    compute_logits(request);
+                 }
+                 winner = read_step(request);
+                 result.output_token_ids.push_back(winner);
+@@ -213,6 +351,31 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+         storage.reset();
+         throw;
+     }
++}
++
++DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
++                                const DecoderOptions& options,
++                                const DecoderCallbacks& callbacks) const {
++    validate_request(prompt_token_ids, options, true);
++    if (options.mtp_steps != 0 && !model_->mtp_weights) {
++        throw std::invalid_argument("MTP weights must be enabled when constructing the decoder");
++    }
++    DecoderResult result;
++    result.peak_device_allocation_bytes = model_device_allocation_bytes();
++    if (callbacks.is_cancelled && callbacks.is_cancelled()) {
++        result.finish_reason = DecoderFinishReason::cancelled;
++        return result;
++    }
++    if (options.max_new_tokens == 0) {
++        return result;
++    }
++    DeviceScope selected_device(model_->device);
++    result.output_token_ids.reserve(options.max_new_tokens);
++    if (options.mtp_steps == 0) {
++        model_->generate_serial(prompt_token_ids, options, callbacks, result);
++    } else {
++        result.finish_reason = model_->generate_mtp(prompt_token_ids, options, callbacks, result);
++    }
+     selected_device.restore();
+     return result;
+ }
+diff --git a/src/decoder_forward.cpp b/src/decoder_forward.cpp
+index 8b6d9c5..a42adb0 100644
+--- a/src/decoder_forward.cpp
++++ b/src/decoder_forward.cpp
+@@ -198,9 +198,13 @@ void Decoder::Model::compute_logits(Request& request) const {
+     compute_logits(request.work, request.memory.stream());
+ }
+ 
+-void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream) const {
++void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream) const {
+     check(text_rms_norm(work.hidden, work.residual, final_norm, hidden_size,
+                         work.normalized, nullptr, stream), "Normalize final residual");
++}
++
++void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream) const {
++    normalize_final(work, stream);
+     project(lm_head, work.normalized, work.logits, stream);
+     check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+           "Select greedy token");
+diff --git a/src/decoder_mtp.cpp b/src/decoder_mtp.cpp
+new file mode 100644
+index 0000000..3c15a28
+--- /dev/null
++++ b/src/decoder_mtp.cpp
+@@ -0,0 +1,333 @@
++#include "sglang/decoder_mtp.h"
++
++#include "sglang/checkpoint.h"
++
++#include <numeric>
++#include <string>
++#include <utility>
++
++namespace sglang::decoder {
++namespace {
++
++class DraftWeightUpload {
++public:
++    explicit DraftWeightUpload(Allocations& memory)
++        : memory_(memory), checkpoint_(*memory.transfers().checkpoint) {}
++
++    const Bf16* norm(const std::string& name, int width) {
++        return bf16(name, {extent(width)});
++    }
++
++    Bf16Weight fc(int rows, int columns) {
++        return {bf16("mtp.fc.weight", {extent(rows), extent(columns)}), rows, columns};
++    }
++
++    Fp8Weight projection(const std::string& name, int rows, int columns) {
++        const auto* values = upload(name + ".weight", TensorDtype::F8_E4M3,
++                                    {extent(rows), extent(columns)});
++        const auto* scales = bf16(name + ".weight_scale_inv",
++                                  {extent(text_fp8_group_count(rows)),
++                                   extent(text_fp8_group_count(columns))});
++        return {values, scales, rows, columns};
++    }
++
++private:
++    static std::uint64_t extent(int size) { return static_cast<std::uint64_t>(size); }
++
++    const Bf16* bf16(const std::string& name, std::initializer_list<std::uint64_t> shape) {
++        return reinterpret_cast<const Bf16*>(upload(name, TensorDtype::BF16, shape));
++    }
++
++    const std::uint8_t* upload(const std::string& name, TensorDtype dtype,
++                               std::initializer_list<std::uint64_t> shape) {
++        const auto& tensor = checkpoint_.tensor(name, dtype, shape);
++        auto* destination = memory_.allocate<std::uint8_t>(tensor.size_bytes);
++        check(cudaMemcpyAsync(destination, tensor.data, tensor.size_bytes, cudaMemcpyHostToDevice,
++                              memory_.stream()), name.c_str());
++        return destination;
++    }
++
++    Allocations& memory_;
++    const Checkpoint& checkpoint_;
++};
++
++struct DraftWorkspace {
++    explicit DraftWorkspace(Allocations& memory)
++        : embedding(memory.allocate<Bf16>(hidden_size)),
++          concatenated(memory.allocate<Bf16>(2 * hidden_size)),
++          residual(memory.allocate<Bf16>(hidden_size)),
++          normalized(memory.allocate<Bf16>(hidden_size)),
++          branch(memory.allocate<Bf16>(hidden_size)),
++          q_gate(memory.allocate<Bf16>(text_gqa_q_gate_width)),
++          keys(memory.allocate<Bf16>(text_gqa_kv_width)),
++          values(memory.allocate<Bf16>(text_gqa_kv_width)),
++          rope_queries(memory.allocate<Bf16>(text_gqa_q_width)),
++          rope_keys(memory.allocate<Bf16>(text_gqa_kv_width)),
++          attention(memory.allocate<Bf16>(text_gqa_q_width)),
++          gate(memory.allocate<Bf16>(intermediate_size)),
++          up(memory.allocate<Bf16>(intermediate_size)),
++          logits(memory.allocate<Bf16>(vocab_size)),
++          activation{memory.allocate<std::uint8_t>(intermediate_size),
++                     memory.allocate<float>(text_fp8_group_count(intermediate_size))},
++          argmax_scratch(
++              memory.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
++          argmax(memory.allocate<TextLogitCandidate>(1)) {}
++
++    Bf16* embedding;
++    Bf16* concatenated;
++    Bf16* residual;
++    Bf16* normalized;
++    Bf16* branch;
++    Bf16* q_gate;
++    Bf16* keys;
++    Bf16* values;
++    Bf16* rope_queries;
++    Bf16* rope_keys;
++    Bf16* attention;
++    Bf16* gate;
++    Bf16* up;
++    Bf16* logits;
++    TextFp8Activation activation;
++    TextLogitCandidate* argmax_scratch;
++    TextLogitCandidate* argmax;
++};
++
++void quantize(const Bf16* input, int width, const DraftWorkspace& work, cudaStream_t stream) {
++    check(text_quantize_fp8(input, width, work.activation, stream), "Quantize MTP activation");
++}
++
++void project(Fp8Weight weight, const DraftWorkspace& work, Bf16* output, cudaStream_t stream) {
++    const TextFp8ActivationView input{work.activation.values, work.activation.scales};
++    check(text_fp8_gemv(weight.values, weight.scales, input, weight.rows, weight.columns, output,
++                        stream), "Run MTP FP8 projection");
++}
++
++}
++
++struct MtpDraftWeights::State {
++    State(const std::filesystem::path& directory, int device,
++          std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
++          Bf16Weight lm_head)
++        : device(device), target_weights(std::move(target_weights)), memory(device),
++          embedding(embedding), lm_head(lm_head) {
++        if (!this->target_weights || !embedding || !lm_head.values ||
++            lm_head.rows != vocab_size || lm_head.columns != hidden_size) {
++            throw std::invalid_argument("Invalid MTP target embedding or LM head");
++        }
++        DeviceScope selected_device(device);
++        auto& checkpoint = memory.transfers().checkpoint;
++        checkpoint = std::make_unique<Checkpoint>(directory);
++        memory.open_stream();
++        DraftWeightUpload upload(memory);
++        embedding_norm = upload.norm("mtp.pre_fc_norm_embedding.weight", hidden_size);
++        hidden_norm = upload.norm("mtp.pre_fc_norm_hidden.weight", hidden_size);
++        fc = upload.fc(hidden_size, 2 * hidden_size);
++        input_norm = upload.norm("mtp.layers.0.input_layernorm.weight", hidden_size);
++        attention_norm = upload.norm("mtp.layers.0.post_attention_layernorm.weight", hidden_size);
++        const std::string attention = "mtp.layers.0.self_attn.";
++        gqa = {
++            upload.projection(attention + "q_proj", text_gqa_q_gate_width, hidden_size),
++            upload.projection(attention + "k_proj", text_gqa_kv_width, hidden_size),
++            upload.projection(attention + "v_proj", text_gqa_kv_width, hidden_size),
++            upload.norm(attention + "q_norm.weight", mxfp8_head_dim),
++            upload.norm(attention + "k_norm.weight", mxfp8_head_dim),
++            upload.projection(attention + "o_proj", hidden_size, text_gqa_q_width),
++        };
++        const std::string mlp = "mtp.layers.0.mlp.";
++        mlp_gate = upload.projection(mlp + "gate_proj", intermediate_size, hidden_size);
++        mlp_up = upload.projection(mlp + "up_proj", intermediate_size, hidden_size);
++        mlp_down = upload.projection(mlp + "down_proj", hidden_size, intermediate_size);
++        final_norm = upload.norm("mtp.norm.weight", hidden_size);
++        memory.close_stream();
++        selected_device.restore();
++    }
++
++    int device;
++    std::shared_ptr<const Allocations> target_weights;
++    Allocations memory;
++    const Bf16* embedding;
++    Bf16Weight lm_head;
++    const Bf16* embedding_norm;
++    const Bf16* hidden_norm;
++    Bf16Weight fc;
++    const Bf16* input_norm;
++    const Bf16* attention_norm;
++    GqaLayer gqa;
++    Fp8Weight mlp_gate;
++    Fp8Weight mlp_up;
++    Fp8Weight mlp_down;
++    const Bf16* final_norm;
++};
++
++struct MtpDraftRequest::State {
++    State(std::shared_ptr<const MtpDraftWeights> weights, int capacity);
++    void prepare(int shifted_token, const Bf16* hidden, cudaStream_t stream);
++    void attend(int position, cudaStream_t stream);
++    void run_mlp(cudaStream_t stream);
++    void score(cudaStream_t stream);
++
++    std::shared_ptr<const MtpDraftWeights> weights;
++    Allocations memory;
++    DraftWorkspace work;
++    int capacity;
++    Mxfp8KvCache cache;
++    Mxfp8PageTable pages;
++    int prefix = 0;
++    bool scored = false;
++    bool failed = false;
++};
++
++MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, int capacity)
++    : weights(std::move(weights)), memory(this->weights->state_->device), work(memory),
++      capacity(capacity) {
++    const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
++    const auto payload = page_count * mxfp8_payload_bytes_per_page;
++    const auto scales = page_count * mxfp8_scale_bytes_per_page;
++    cache = {
++        memory.allocate<std::uint8_t>(payload), memory.allocate<std::uint8_t>(payload),
++        memory.allocate<std::uint8_t>(scales), memory.allocate<std::uint8_t>(scales), page_count,
++    };
++    auto* table = memory.allocate<std::int32_t>(page_count);
++    pages = {table, page_count};
++    auto& host_pages = memory.transfers().logical_pages;
++    host_pages.resize(page_count);
++    std::iota(host_pages.begin(), host_pages.end(), 0);
++    memory.open_stream();
++    check(cudaMemcpyAsync(table, host_pages.data(), host_pages.size() * sizeof(std::int32_t),
++                          cudaMemcpyHostToDevice, memory.stream()), "Upload MTP KV page table");
++    memory.close_stream();
++}
++
++void MtpDraftRequest::State::prepare(int shifted_token, const Bf16* hidden, cudaStream_t stream) {
++    const auto& model = *weights->state_;
++    check(text_embedding(model.embedding, vocab_size, hidden_size, shifted_token,
++                         work.embedding, stream), "Look up shifted MTP token");
++    check(text_rms_norm(work.embedding, nullptr, model.embedding_norm, hidden_size,
++                        work.concatenated, nullptr, stream), "Normalize MTP embedding");
++    check(text_rms_norm(hidden, nullptr, model.hidden_norm, hidden_size,
++                        work.concatenated + hidden_size, nullptr, stream), "Normalize MTP hidden");
++    check(text_bf16_gemv(model.fc.values, work.concatenated, model.fc.rows, model.fc.columns,
++                         work.residual, stream), "Run BF16 MTP FC");
++    check(text_rms_norm(work.residual, nullptr, model.input_norm, hidden_size, work.normalized,
++                        nullptr, stream), "Normalize MTP layer input");
++}
++
++void MtpDraftRequest::State::attend(int position, cudaStream_t stream) {
++    const auto& model = *weights->state_;
++    const auto& gqa = model.gqa;
++    quantize(work.normalized, hidden_size, work, stream);
++    project(gqa.q_gate, work, work.q_gate, stream);
++    project(gqa.key, work, work.keys, stream);
++    project(gqa.value, work, work.values, stream);
++    check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, gqa.query_norm, gqa.key_norm,
++                              work.rope_queries, work.rope_keys, stream), "Rotate MTP Q/K");
++    check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values, stream),
++          "Append MTP MXFP8 KV");
++    check(mxfp8_gqa_attention(cache, pages, position + 1, position, 1, work.rope_queries,
++                              work.attention, stream), "Read MTP MXFP8 attention");
++    check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
++          "Gate MTP attention");
++    quantize(work.attention, text_gqa_q_width, work, stream);
++    project(gqa.output, work, work.branch, stream);
++    check(text_rms_norm(work.branch, work.residual, model.attention_norm, hidden_size,
++                        work.normalized, work.residual, stream),
++          "Normalize MTP post-attention residual");
++}
++
++void MtpDraftRequest::State::run_mlp(cudaStream_t stream) {
++    const auto& model = *weights->state_;
++    quantize(work.normalized, hidden_size, work, stream);
++    project(model.mlp_gate, work, work.gate, stream);
++    project(model.mlp_up, work, work.up, stream);
++    check(text_swiglu(work.gate, work.up, intermediate_size, work.gate, stream),
++          "Apply MTP SwiGLU");
++    quantize(work.gate, intermediate_size, work, stream);
++    project(model.mlp_down, work, work.branch, stream);
++    check(text_rms_norm(work.branch, work.residual, model.final_norm, hidden_size, work.normalized,
++                        nullptr, stream), "Normalize MTP output");
++}
++
++void MtpDraftRequest::State::score(cudaStream_t stream) {
++    const auto& head = weights->state_->lm_head;
++    check(text_bf16_gemv(head.values, work.normalized, head.rows, head.columns,
++                         work.logits, stream), "Run shared LM head for MTP");
++    check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
++          "Select MTP token");
++    auto& winner = memory.transfers().winner;
++    check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner), cudaMemcpyDeviceToHost,
++                          stream), "Copy MTP token");
++    scored = true;
++}
++
++MtpDraftWeights::MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
++                                 std::shared_ptr<const Allocations> target_weights,
++                                 const Bf16* embedding, Bf16Weight lm_head)
++    : state_(std::make_unique<State>(checkpoint, device, std::move(target_weights), embedding,
++                                     lm_head)) {}
++
++MtpDraftWeights::~MtpDraftWeights() = default;
++
++std::size_t MtpDraftWeights::device_allocation_bytes() const { return state_->memory.bytes(); }
++
++MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity) {
++    if (!weights || capacity < 1 || capacity > text_attention_max_tokens) {
++        throw std::invalid_argument("Invalid MTP draft weights or capacity");
++    }
++    DeviceScope selected_device(weights->state_->device);
++    state_ = std::make_unique<State>(std::move(weights), capacity);
++    selected_device.restore();
++}
++
++MtpDraftRequest::~MtpDraftRequest() = default;
++
++const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16* hidden,
++                                    bool score, cudaStream_t stream) {
++    auto& request = *state_;
++    if (request.failed) {
++        throw std::logic_error("MTP draft request failed");
++    }
++    if (position != request.prefix || position >= request.capacity || shifted_token < 0 ||
++        shifted_token >= vocab_size || !hidden) {
++        throw std::invalid_argument("Invalid MTP draft input");
++    }
++    try {
++        request.prepare(shifted_token, hidden, stream);
++        request.attend(position, stream);
++        request.run_mlp(stream);
++        if (score) {
++            request.score(stream);
++        }
++    } catch (...) {
++        request.failed = true;
++        throw;
++    }
++    ++request.prefix;
++    return request.work.normalized;
++}
++
++int MtpDraftRequest::read_token() const {
++    if (state_->failed || !state_->scored) {
++        throw std::logic_error("MTP draft has no completed score to read");
++    }
++    const int token = state_->memory.transfers().winner;
++    if (token < 0 || token >= vocab_size) {
++        throw std::runtime_error("MTP argmax did not return a valid token ID");
++    }
++    return token;
++}
++
++int MtpDraftRequest::valid_prefix() const { return state_->prefix; }
++
++void MtpDraftRequest::rewind(int valid_tokens) {
++    if (state_->failed) {
++        throw std::logic_error("MTP draft request failed");
++    }
++    if (valid_tokens < 0 || valid_tokens > state_->prefix) {
++        throw std::invalid_argument("Invalid MTP draft rewind");
++    }
++    state_->prefix = valid_tokens;
++}
++
++std::size_t MtpDraftRequest::device_allocation_bytes() const { return state_->memory.bytes(); }
++
++}
+diff --git a/src/decoder_resources.cpp b/src/decoder_resources.cpp
+index 30834db..757c962 100644
+--- a/src/decoder_resources.cpp
++++ b/src/decoder_resources.cpp
+@@ -379,10 +379,9 @@ Workspace::Workspace(Allocations& allocations)
+ Request::Request(int device, bool reusable)
+     : memory(device), work(memory), decode_position(reusable ? memory.allocate<int>(1) : nullptr) {}
+ 
+-Request::Request(int device, int capacity, std::shared_ptr<const Allocations> weights,
+-                 bool reusable)
++Request::Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable)
+     : Request(device, reusable) {
+-    memory.open_stream(std::move(weights));
++    memory.open_stream(std::move(owners));
+     initialize(capacity, memory.stream());
+ }
+ 
+diff --git a/xmake.lua b/xmake.lua
+index 14b58a9..6f84ab6 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -75,7 +75,7 @@ target("sglang_decoder")
+     add_includedirs("include", {public = true})
+     add_deps("sglang_checkpoint", "sglang_cuda")
+     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
+-              "src/decoder_weights.cpp", "src/decoder_batch.cpp")
++              "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp")
+ 
+ target("sglang-generate")
+     set_kind("binary")

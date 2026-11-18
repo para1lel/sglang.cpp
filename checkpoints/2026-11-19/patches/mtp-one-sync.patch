@@ -1,0 +1,999 @@
+--- a/apps/sglang-generate.cpp
++++ b/apps/sglang-generate.cpp
+@@ -32,6 +32,7 @@
+     output << "Usage: sglang-generate (--prompt-ids ID,ID,... | --prompt-file FILE)\n"
+            << "                       [--max-new-tokens N] [--stop-token ID] [--top-logits N]\n"
+            << "                       [--mtp-steps N] (0–4, default 0)\n"
++           << "                       [--mtp-verify serial|parallel] (default serial)\n"
+            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
+            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
+               "Device is a CUDA ordinal.\n"
+@@ -109,6 +110,11 @@
+             }
+         } else if (option == "--warmup") {
+             arguments.warmup = positive_or_zero(value, option);
++        } else if (option == "--mtp-verify") {
++            if (value != "serial" && value != "parallel") {
++                throw std::invalid_argument("Expected --mtp-verify serial or parallel");
++            }
++            arguments.options.mtp_parallel_verify = value == "parallel";
+         } else if (option == "--repeats") {
+             arguments.repeats = positive_or_zero(value, option);
+         } else if (option == "--device") {
+@@ -120,6 +126,9 @@
+     if (arguments.prompt.empty() || arguments.repeats == 0) {
+         throw std::invalid_argument("A nonempty prompt and at least one repetition are required");
+     }
++    if (arguments.options.mtp_parallel_verify && arguments.options.mtp_steps == 0) {
++        throw std::invalid_argument("--mtp-verify parallel requires positive --mtp-steps");
++    }
+     return arguments;
+ }
+ 
+@@ -211,7 +220,11 @@
+     if (arguments.options.mtp_steps != 0) {
+         output << ",\"mtp_drafted_tokens\":" << result.mtp_drafted_tokens
+                << ",\"mtp_accepted_tokens\":" << result.mtp_accepted_tokens
+-               << ",\"mtp_rounds\":" << result.mtp_rounds;
++               << ",\"mtp_rounds\":" << result.mtp_rounds
++               << ",\"mtp_verified_rows\":" << result.mtp_verified_rows
++               << ",\"mtp_verification_syncs\":" << result.mtp_verification_syncs
++               << ",\"mtp_verifier_device_bytes\":" << result.mtp_verifier_device_bytes
++               << ",\"mtp_verifier_pinned_bytes\":" << result.mtp_verifier_pinned_bytes;
+     }
+     output << ",\"device\":" << arguments.device << ",\"warmup\":" << arguments.warmup
+            << ",\"repeats\":" << arguments.repeats << ",\"load_ms\":" << load_ms
+--- a/include/sglang/decoder.h
++++ b/include/sglang/decoder.h
+@@ -16,6 +16,7 @@
+     std::optional<int> stop_token_id;
+     int top_logits = 0;
+     int mtp_steps = 0;
++    bool mtp_parallel_verify = false;
+ };
+ 
+ enum class DecoderFinishReason {
+@@ -42,6 +43,10 @@
+     std::size_t mtp_drafted_tokens = 0;
+     std::size_t mtp_accepted_tokens = 0;
+     std::size_t mtp_rounds = 0;
++    std::size_t mtp_verified_rows = 0;
++    std::size_t mtp_verification_syncs = 0;
++    std::size_t mtp_verifier_device_bytes = 0;
++    std::size_t mtp_verifier_pinned_bytes = 0;
+ };
+ 
+ class Decoder {
+--- a/include/sglang/decoder_internal.h
++++ b/include/sglang/decoder_internal.h
+@@ -61,6 +61,7 @@
+     std::vector<std::int32_t> logical_pages;
+     int winner = -1;
+     std::vector<Bf16> logits;
++    std::shared_ptr<void> verification_host;
+ };
+ 
+ class Allocations {
+@@ -136,8 +137,18 @@
+     GqaLayer gqa;
+ };
+ 
++struct VerifyGdnRow {
++    Bf16* qkv;
++    Bf16* z;
++    Bf16* b;
++    Bf16* a;
++    Bf16* scratch;
++    Bf16* attention;
++};
++
+ struct Workspace {
+-    explicit Workspace(Allocations& allocations);
++    explicit Workspace(Allocations& allocations, const VerifyGdnRow* gdn = nullptr,
++                       TextLogitCandidate* winner = nullptr);
+ 
+     Bf16* hidden;
+     Bf16* normalized;
+@@ -178,6 +189,44 @@
+     std::array<TextGdnState, gdn_layers> states;
+ };
+ 
++inline constexpr int target_verify_max_rows = decoder_max_mtp_steps + 1;
++using GdnBank = std::array<TextGdnState, gdn_layers>;
++
++struct VerificationRow {
++    Request* request;
++    Workspace* work;
++    int position;
++    const GdnBank* checkpoints;
++};
++
++class TargetVerification {
++public:
++    TargetVerification(Request& request, int capacity, int prefix, int max_rows, bool logits);
++
++    void begin(int position, int count);
++    void read();
++    void commit(int processed_rows);
++    VerificationRow row(int index);
++    int winner(int index) const;
++    const Bf16* logits(int index) const;
++    int valid_prefix() const { return valid_prefix_; }
++    std::size_t device_bytes() const { return device_bytes_; }
++    std::size_t pinned_bytes() const { return pinned_bytes_; }
++
++private:
++    Request& request_;
++    int capacity_;
++    int valid_prefix_;
++    int pending_rows_ = 0;
++    std::size_t device_bytes_ = 0;
++    std::size_t pinned_bytes_ = 0;
++    std::vector<Workspace> work_;
++    std::array<GdnBank, target_verify_max_rows> checkpoints_{};
++    TextLogitCandidate* device_winners_ = nullptr;
++    TextLogitCandidate* host_winners_ = nullptr;
++    Bf16* host_logits_ = nullptr;
++};
++
+ void copy_greedy_token(Request& request, cudaStream_t stream);
+ int read_greedy_token(Request& request);
+ 
+@@ -199,6 +248,8 @@
+ 
+     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
+     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
++    void forward_verify(decoder::TargetVerification& batch, int position, const int* tokens,
++                        int count, cudaStream_t stream) const;
+     void decode_graph(decoder::Request& request) const;
+     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
+     void compute_logits(decoder::Request& request) const;
+--- a/include/sglang/text_attention.h
++++ b/include/sglang/text_attention.h
+@@ -32,6 +32,12 @@
+     float* recurrent;        ///< [48,128,128], indexed [head,value,key].
+ };
+ 
++inline constexpr int text_gdn_max_verify_rows = 5;
++
++struct TextGdnCheckpoints {
++    TextGdnState rows[text_gdn_max_verify_rows]{};
++};
++
+ /// All arrays are contiguous device arrays. Keep inputs, outputs, state, and
+ /// workspace alive and ordered on the supplied stream through completion.
+ /// Arrays must be disjoint except for the exact postgate alias allowed below.
+@@ -62,6 +68,13 @@
+                              std::size_t workspace_bytes, __nv_bfloat16* output,
+                              cudaStream_t stream);
+ 
++cudaError_t text_gdn_verify(int token_count, const __nv_bfloat16* qkv,
++                            const __nv_bfloat16* z, const __nv_bfloat16* b,
++                            const __nv_bfloat16* a, TextGdnWeights weights,
++                            TextGdnState initial, TextGdnCheckpoints checkpoints,
++                            __nv_bfloat16* workspace, std::size_t workspace_bytes,
++                            __nv_bfloat16* output, cudaStream_t stream);
++
+ /// q_gate is [tokens,24,2,256] with Q then gate within each head. keys and
+ /// rope_keys are [tokens,4,256]. rope_queries is [tokens,24,256].
+ /// Norms are [256] Gemma weights; the BF16 normalized Q/K receive text RoPE
+--- a/include/sglang/text_ops.h
++++ b/include/sglang/text_ops.h
+@@ -8,7 +8,7 @@
+ namespace sglang {
+ 
+ inline constexpr int text_fp8_group_size = 128;
+-inline constexpr int text_fp8_max_batch = 4;
++inline constexpr int text_fp8_max_batch = 5;
+ 
+ constexpr int text_fp8_group_count(int width) {
+     return width / text_fp8_group_size + (width % text_fp8_group_size != 0);
+@@ -29,6 +29,11 @@
+     __nv_bfloat16* output;
+ };
+ 
++struct TextBf16Projection {
++    const __nv_bfloat16* input;
++    __nv_bfloat16* output;
++};
++
+ struct TextLogitCandidate {
+     float score;
+     int token_id;
+@@ -55,6 +60,9 @@
+                            int out_width, int in_width, __nv_bfloat16* output,
+                            cudaStream_t stream);
+ 
++cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_width,
++                           const TextBf16Projection* projections, int count, cudaStream_t stream);
++
+ /// Writes width E4M3 bytes and text_fp8_group_count(width) FP32 scales.
+ /// Each scale is max(amax, 1e-10) / 448. Quantization rounds to nearest even
+ /// and saturates to the finite E4M3 range.
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -33,6 +33,9 @@
+     if (!allow_mtp && options.mtp_steps != 0) {
+         throw std::invalid_argument("MTP requires serial generation");
+     }
++    if (options.mtp_parallel_verify && options.mtp_steps == 0) {
++        throw std::invalid_argument("Parallel target verification requires MTP");
++    }
+     if (options.max_new_tokens < 0 || options.max_new_tokens > text_attention_max_tokens ||
+         prompt.size() > std::size_t(text_attention_max_tokens - options.max_new_tokens)) {
+         throw std::invalid_argument("Prompt and output budget must fit the 262144-token context");
+@@ -80,13 +83,13 @@
+     bool owns_slot_;
+ };
+ 
+-std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_t count,
++std::vector<DecoderLogit> top_logits(const Bf16* scores, std::size_t count,
+                                     std::vector<DecoderLogit>& ranking) {
+     ranking.clear();
+-    for (std::size_t index = 0; index < scores.size(); ++index) {
++    for (int index = 0; index < vocab_size; ++index) {
+         const float logit = __bfloat162float(scores[index]);
+         if (!std::isnan(logit)) {
+-            ranking.push_back({static_cast<int>(index), logit});
++            ranking.push_back({index, logit});
+         }
+     }
+     const auto end = ranking.begin() + std::min(count, ranking.size());
+@@ -122,13 +125,16 @@
+     const DecoderOptions& options;
+     const DecoderCallbacks& callbacks;
+     DecoderResult& result;
++    TargetVerification* parallel;
+     std::vector<DecoderLogit> ranking{};
+     int next_target_position = 0;
+     int seed = -1;
++    const Bf16* draft_hidden = target.work.normalized;
+ 
+     bool cancelled() const { return callbacks.is_cancelled && callbacks.is_cancelled(); }
+ 
+-    std::optional<DecoderFinishReason> emit(int token, bool accepted = false) {
++    std::optional<DecoderFinishReason> emit(int token, bool accepted = false,
++                                            const Bf16* scores = nullptr) {
+         if (cancelled()) {
+             return DecoderFinishReason::cancelled;
+         }
+@@ -137,8 +143,8 @@
+         result.mtp_accepted_tokens += accepted;
+         const bool keep_running = !callbacks.on_token || callbacks.on_token(token);
+         if (options.top_logits > 0) {
+-            result.step_top_logits.push_back(
+-                top_logits(target.memory.transfers().logits, options.top_logits, ranking));
++            const auto* logits = scores ? scores : target.memory.transfers().logits.data();
++            result.step_top_logits.push_back(top_logits(logits, options.top_logits, ranking));
+         }
+         if (!keep_running) {
+             return DecoderFinishReason::cancelled;
+@@ -157,7 +163,7 @@
+     bool propose(Proposals& proposals, int count) {
+         const auto stream = target.memory.stream();
+         const int first_draft_position = next_target_position - 1;
+-        const Bf16* hidden = target.work.normalized;
++        const Bf16* hidden = draft_hidden;
+         int shifted_token = seed;
+         ++result.mtp_rounds;
+         for (int index = 0; index < count; ++index) {
+@@ -174,7 +180,7 @@
+         return true;
+     }
+ 
+-    std::optional<DecoderFinishReason> verify(const Proposals& proposals, int count) {
++    std::optional<DecoderFinishReason> verify_serial(const Proposals& proposals, int count) {
+         draft.rewind(next_target_position);
+         for (int index = 0; index <= count; ++index) {
+             if (cancelled()) {
+@@ -184,6 +190,8 @@
+             model.forward(target, seed, position, TextGdnMode::decode);
+             model.compute_logits(target);
+             const int token = read_step(target);
++            ++result.mtp_verified_rows;
++            ++result.mtp_verification_syncs;
+             const bool accepted = index < count && token == proposals[index];
+             if (const auto finish = emit(token, accepted)) {
+                 return finish;
+@@ -196,6 +204,45 @@
+         return std::nullopt;
+     }
+ 
++    std::optional<DecoderFinishReason> verify_parallel(const Proposals& proposals, int count,
++                                                       int remaining) {
++        if (cancelled()) {
++            return DecoderFinishReason::cancelled;
++        }
++        std::array<int, target_verify_max_rows> input{};
++        input[0] = seed;
++        std::copy_n(proposals.begin(), count, input.begin() + 1);
++        const int rows = std::min(count + 1, remaining);
++        const auto stream = target.memory.stream();
++        model.forward_verify(*parallel, next_target_position, input.data(), rows, stream);
++        parallel->read();
++        result.mtp_verified_rows += rows;
++        ++result.mtp_verification_syncs;
++
++        draft.rewind(next_target_position);
++        int processed = 0;
++        std::optional<DecoderFinishReason> finish;
++        while (processed < rows) {
++            if (cancelled()) {
++                finish = DecoderFinishReason::cancelled;
++                break;
++            }
++            const int index = processed++;
++            const auto row = parallel->row(index);
++            draft_hidden = row.work->normalized;
++            const int token = parallel->winner(index);
++            const bool accepted = index < count && token == proposals[index];
++            finish = emit(token, accepted, parallel->logits(index));
++            if (finish || !accepted) {
++                break;
++            }
++            draft.enqueue(row.position, token, draft_hidden, false, stream);
++        }
++        parallel->commit(processed);
++        next_target_position = parallel->valid_prefix();
++        return finish;
++    }
++
+     DecoderFinishReason run(const std::vector<int>& prompt) {
+         const auto stream = target.memory.stream();
+         const int prompt_count = static_cast<int>(prompt.size());
+@@ -223,7 +270,9 @@
+             if (!propose(proposals, count)) {
+                 break;
+             }
+-            if (const auto finish = verify(proposals, count)) {
++            const auto finish = parallel ? verify_parallel(proposals, count, remaining) :
++                                           verify_serial(proposals, count);
++            if (finish) {
+                 return *finish;
+             }
+         }
+@@ -258,9 +307,17 @@
+     Request target(device, capacity, draft);
+     target.reset();
+     target.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
++    std::unique_ptr<TargetVerification> parallel;
++    if (options.mtp_parallel_verify && options.max_new_tokens > 1) {
++        const int max_rows = std::min(options.mtp_steps + 1, options.max_new_tokens - 1);
++        parallel = std::make_unique<TargetVerification>(target, capacity, prompt.size(), max_rows,
++                                                        options.top_logits > 0);
++        result.mtp_verifier_device_bytes = parallel->device_bytes();
++        result.mtp_verifier_pinned_bytes = parallel->pinned_bytes();
++    }
+     result.peak_device_allocation_bytes +=
+         target.memory.bytes() + draft->device_allocation_bytes();
+-    MtpGeneration generation{*this, target, *draft, options, callbacks, result};
++    MtpGeneration generation{*this, target, *draft, options, callbacks, result, parallel.get()};
+     if (options.top_logits > 0) {
+         generation.ranking.reserve(vocab_size);
+     }
+@@ -330,7 +387,7 @@
+                 const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
+                 if (options.top_logits > 0) {
+                     result.step_top_logits.push_back(
+-                        top_logits(transfers.logits, options.top_logits, ranking));
++                        top_logits(transfers.logits.data(), options.top_logits, ranking));
+                 }
+                 if (!keep_running) {
+                     return DecoderFinishReason::cancelled;
+--- a/src/decoder_forward.cpp
++++ b/src/decoder_forward.cpp
+@@ -22,6 +22,15 @@
+ };
+ 
+ template <typename Lane>
++Workspace& workspace(const Lane& lane) {
++    return lane.request->work;
++}
++
++Workspace& workspace(const VerificationRow& row) {
++    return *row.work;
++}
++
++template <typename Lane>
+ struct LayerBatch {
+     const Lane* lanes;
+     int count;
+@@ -30,7 +39,7 @@
+     template <typename Function>
+     void each(Function function) const {
+         for (int index = 0; index < count; ++index) {
+-            function(lanes[index], lanes[index].request->work);
++            function(lanes[index], workspace(lanes[index]));
+         }
+     }
+ 
+@@ -43,21 +52,31 @@
+ 
+     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
+         if (count == 1) {
+-            const auto& work = lanes[0].request->work;
++            const auto& work = workspace(lanes[0]);
+             const TextFp8ActivationView input{work.activation.values, work.activation.scales};
+             check(text_fp8_gemv(weight.values, weight.scales, input, weight.rows, weight.columns,
+                                 work.*output, stream), "Run FP8 projection");
+             return;
+         }
+         static_assert(decoder_batch_max_lanes <= text_fp8_max_batch);
+-        std::array<TextFp8Projection, decoder_batch_max_lanes> projections;
++        std::array<TextFp8Projection, text_fp8_max_batch> projections;
+         for (int index = 0; index < count; ++index) {
+-            const auto& work = lanes[index].request->work;
++            const auto& work = workspace(lanes[index]);
+             projections[index] = {{work.activation.values, work.activation.scales}, work.*output};
+         }
+         check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
+                             projections.data(), count, stream), "Run batched FP8 projection");
+     }
++
++    void project_bf16(Bf16Weight weight, Bf16* Workspace::*output) const {
++        std::array<TextBf16Projection, text_fp8_max_batch> projections;
++        for (int index = 0; index < count; ++index) {
++            auto& work = workspace(lanes[index]);
++            projections[index] = {work.normalized, work.*output};
++        }
++        check(text_bf16_gemm(weight.values, weight.rows, weight.columns, projections.data(),
++                             count, stream), "Run batched BF16 projection");
++    }
+ };
+ 
+ template <typename Lane>
+@@ -78,26 +97,45 @@
+     batch.project(layer.output, &Workspace::projected_attention);
+ }
+ 
++void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, int state_index) {
++    batch.quantize(&Workspace::normalized, hidden_size);
++    batch.project(layer.qkv, &Workspace::gdn_qkv);
++    batch.project(layer.z, &Workspace::gdn_z);
++    batch.project_bf16(layer.b, &Workspace::gdn_b);
++    batch.project_bf16(layer.a, &Workspace::gdn_a);
++    TextGdnCheckpoints checkpoints;
++    for (int index = 0; index < batch.count; ++index) {
++        checkpoints.rows[index] = (*batch.lanes[index].checkpoints)[state_index];
++    }
++    const auto& first = batch.lanes[0];
++    const auto& work = *first.work;
++    check(text_gdn_verify(batch.count, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
++                          layer.recurrent, first.request->states[state_index], checkpoints,
++                          work.gdn_scratch, text_gdn_workspace_bytes(batch.count), work.attention,
++                          batch.stream), "Advance and checkpoint target verification GDN");
++    batch.quantize(&Workspace::attention, text_gdn_value_width);
++    batch.project(layer.output, &Workspace::projected_attention);
++}
++
+ template <typename Position>
+-void attend_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
++void attend_gqa(const GqaLayer& layer, Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
+                 Position position, cudaStream_t stream) {
+-    auto& work = request.work;
+     if constexpr (std::is_same_v<Position, int>) {
+         check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm,
+                                   layer.key_norm, work.rope_queries, work.rope_keys, stream),
+               "Normalize and rotate Q/K");
+-        check(mxfp8_kv_append(cache, request.pages, position, 1, work.rope_keys, work.values,
++        check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values,
+                               stream), "Append MXFP8 KV");
+-        check(mxfp8_gqa_attention(cache, request.pages, position + 1, position, 1,
++        check(mxfp8_gqa_attention(cache, pages, position + 1, position, 1,
+                                   work.rope_queries, work.attention, stream),
+               "Read causal MXFP8 attention");
+     } else {
+         check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
+                                     layer.key_norm, work.rope_queries, work.rope_keys, stream),
+               "Normalize and rotate decode Q/K");
+-        check(decode_kv_append(cache, request.pages, position, work.rope_keys, work.values, stream),
++        check(decode_kv_append(cache, pages, position, work.rope_keys, work.values, stream),
+               "Append decode MXFP8 KV");
+-        check(decode_gqa_attention(cache, request.pages, position, work.rope_queries,
++        check(decode_gqa_attention(cache, pages, position, work.rope_queries,
+                                    work.attention, stream), "Read causal decode MXFP8 attention");
+     }
+     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
+@@ -110,9 +148,10 @@
+     batch.project(layer.q_gate, &Workspace::q_gate);
+     batch.project(layer.key, &Workspace::keys);
+     batch.project(layer.value, &Workspace::values);
+-    batch.each([&](const Lane& lane, Workspace&) {
+-        auto& request = *lane.request;
+-        attend_gqa(layer, request, request.caches[cache_index], lane.position, batch.stream);
++    batch.each([&](const Lane& lane, Workspace& work) {
++        const auto& request = *lane.request;
++        attend_gqa(layer, work, request.pages, request.caches[cache_index], lane.position,
++                   batch.stream);
+     });
+     batch.quantize(&Workspace::attention, text_gqa_q_width);
+     batch.project(layer.output, &Workspace::projected_attention);
+@@ -150,6 +189,29 @@
+     forward_layers(lanes, count, stream);
+ }
+ 
++void Decoder::Model::forward_verify(TargetVerification& verification, int position,
++                                    const int* tokens, int count, cudaStream_t stream) const {
++    if (!tokens) {
++        throw std::invalid_argument("Missing target verification tokens");
++    }
++    verification.begin(position, count);
++    std::array<VerificationRow, target_verify_max_rows> rows;
++    for (int index = 0; index < count; ++index) {
++        rows[index] = verification.row(index);
++        check(text_embedding(embedding, vocab_size, hidden_size, tokens[index],
++                             rows[index].work->residual, stream),
++              "Look up target verification embedding");
++    }
++    forward_layers(rows.data(), count, stream);
++    const LayerBatch<VerificationRow> batch{rows.data(), count, stream};
++    batch.each([&](const VerificationRow&, Workspace& work) { normalize_final(work, stream); });
++    batch.project_bf16(lm_head, &Workspace::logits);
++    batch.each([&](const VerificationRow&, Workspace& work) {
++        check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
++              "Select target verification winner");
++    });
++}
++
+ void Decoder::Model::decode_graph(Request& request) const {
+     const auto stream = request.memory.stream();
+     if (!request.memory.graph()) {
+--- a/src/decoder_resources.cpp
++++ b/src/decoder_resources.cpp
+@@ -349,12 +349,12 @@
+     return blocks.back();
+ }
+ 
+-Workspace::Workspace(Allocations& allocations)
++Workspace::Workspace(Allocations& allocations, const VerifyGdnRow* gdn, TextLogitCandidate* winner)
+     : hidden(allocations.allocate<Bf16>(hidden_size)),
+       normalized(allocations.allocate<Bf16>(hidden_size)),
+       residual(allocations.allocate<Bf16>(hidden_size)),
+       projected_attention(allocations.allocate<Bf16>(hidden_size)),
+-      attention(allocations.allocate<Bf16>(text_gqa_q_width)),
++      attention(gdn ? gdn->attention : allocations.allocate<Bf16>(text_gqa_q_width)),
+       mlp_gate(allocations.allocate<Bf16>(intermediate_size)),
+       mlp_up(allocations.allocate<Bf16>(intermediate_size)),
+       q_gate(allocations.allocate<Bf16>(text_gqa_q_gate_width)),
+@@ -362,17 +362,18 @@
+       values(allocations.allocate<Bf16>(text_gqa_kv_width)),
+       rope_queries(allocations.allocate<Bf16>(text_gqa_q_width)),
+       rope_keys(allocations.allocate<Bf16>(text_gqa_kv_width)),
+-      gdn_qkv(allocations.allocate<Bf16>(text_gdn_qkv_width)),
+-      gdn_z(allocations.allocate<Bf16>(text_gdn_value_width)),
+-      gdn_b(allocations.allocate<Bf16>(text_gdn_value_heads)),
+-      gdn_a(allocations.allocate<Bf16>(text_gdn_value_heads)),
+-      gdn_scratch(allocations.allocate<Bf16>(text_gdn_workspace_bytes(1) / sizeof(Bf16))),
++      gdn_qkv(gdn ? gdn->qkv : allocations.allocate<Bf16>(text_gdn_qkv_width)),
++      gdn_z(gdn ? gdn->z : allocations.allocate<Bf16>(text_gdn_value_width)),
++      gdn_b(gdn ? gdn->b : allocations.allocate<Bf16>(text_gdn_value_heads)),
++      gdn_a(gdn ? gdn->a : allocations.allocate<Bf16>(text_gdn_value_heads)),
++      gdn_scratch(gdn ? gdn->scratch :
++                  allocations.allocate<Bf16>(text_gdn_workspace_bytes(1) / sizeof(Bf16))),
+       logits(allocations.allocate<Bf16>(vocab_size)),
+       activation{allocations.allocate<std::uint8_t>(intermediate_size),
+                  allocations.allocate<float>(text_fp8_group_count(intermediate_size))},
+       argmax_scratch(
+           allocations.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
+-      argmax(allocations.allocate<TextLogitCandidate>(1)) {
++      argmax(winner ? winner : allocations.allocate<TextLogitCandidate>(1)) {
+     static_assert(text_gqa_q_width == text_gdn_value_width);
+ }
+ 
+--- /dev/null
++++ b/src/decoder_verify.cpp
+@@ -0,0 +1,138 @@
++#include "sglang/decoder_internal.h"
++
++#include <cstdio>
++
++namespace sglang::decoder {
++namespace {
++
++static_assert(target_verify_max_rows == text_gdn_max_verify_rows);
++static_assert(target_verify_max_rows == text_fp8_max_batch);
++
++struct GdnRows {
++    Bf16* qkv;
++    Bf16* z;
++    Bf16* b;
++    Bf16* a;
++    Bf16* scratch;
++    Bf16* attention;
++
++    GdnRows(Allocations& memory, int count)
++        : qkv(memory.allocate<Bf16>(count * text_gdn_qkv_width)),
++          z(memory.allocate<Bf16>(count * text_gdn_value_width)),
++          b(memory.allocate<Bf16>(count * text_gdn_value_heads)),
++          a(memory.allocate<Bf16>(count * text_gdn_value_heads)),
++          scratch(memory.allocate<Bf16>(text_gdn_workspace_bytes(count) / sizeof(Bf16))),
++          attention(memory.allocate<Bf16>(count * text_gdn_value_width)) {}
++
++    VerifyGdnRow row(int index) const {
++        return {qkv + index * text_gdn_qkv_width, z + index * text_gdn_value_width,
++                b + index * text_gdn_value_heads, a + index * text_gdn_value_heads,
++                scratch, attention + index * text_gdn_value_width};
++    }
++};
++
++void allocate_checkpoint(Allocations& memory, GdnBank& bank) {
++    auto* history = memory.allocate<Bf16>(gdn_layers * gdn_history_elements);
++    auto* recurrent = memory.allocate<float>(gdn_layers * gdn_state_elements);
++    for (int layer = 0; layer < gdn_layers; ++layer) {
++        bank[layer] = {history + layer * gdn_history_elements,
++                       recurrent + layer * gdn_state_elements};
++    }
++}
++
++void free_verification_host(void* buffer) {
++    const auto status = cudaFreeHost(buffer);
++    if (status != cudaSuccess) {
++        std::fprintf(stderr, "sglang decoder: Free verification transfer: %s\n",
++                     cudaGetErrorString(status));
++    }
++}
++
++}
++
++TargetVerification::TargetVerification(Request& request, int capacity, int prefix, int max_rows,
++                                       bool logits)
++    : request_(request), capacity_(capacity), valid_prefix_(prefix) {
++    auto& memory = request.memory;
++    auto& host_owner = memory.transfers().verification_host;
++    if (!memory.stream() || host_owner || max_rows < 1 || max_rows > target_verify_max_rows ||
++        prefix < 0 || prefix > capacity || capacity > text_attention_max_tokens ||
++        request.pages.page_count < (capacity + mxfp8_page_size - 1) / mxfp8_page_size ||
++        !request.states.front().history) {
++        throw std::invalid_argument("Invalid target verification storage");
++    }
++    const auto before = memory.bytes();
++    const GdnRows gdn(memory, max_rows);
++    device_winners_ = memory.allocate<TextLogitCandidate>(max_rows);
++    work_.reserve(max_rows);
++    for (int index = 0; index < max_rows; ++index) {
++        const auto row = gdn.row(index);
++        work_.emplace_back(memory, &row, device_winners_ + index);
++        allocate_checkpoint(memory, checkpoints_[index]);
++    }
++    device_bytes_ = memory.bytes() - before;
++    const auto winner_bytes = max_rows * sizeof(TextLogitCandidate);
++    pinned_bytes_ = winner_bytes + (logits ? max_rows * vocab_size * sizeof(Bf16) : 0);
++    void* host = nullptr;
++    check(cudaMallocHost(&host, pinned_bytes_), "Allocate pinned target verification results");
++    host_owner = std::shared_ptr<void>(host, free_verification_host);
++    host_winners_ = static_cast<TextLogitCandidate*>(host);
++    if (logits) {
++        host_logits_ = reinterpret_cast<Bf16*>(host_winners_ + max_rows);
++    }
++}
++
++void TargetVerification::begin(int position, int count) {
++    if (pending_rows_ != 0 || position != valid_prefix_ || count < 1 ||
++        count > static_cast<int>(work_.size()) || count > capacity_ - position) {
++        throw std::invalid_argument("Invalid target verification interval");
++    }
++    pending_rows_ = count;
++}
++
++VerificationRow TargetVerification::row(int index) {
++    return {&request_, &work_.at(index), valid_prefix_ + index, &checkpoints_.at(index)};
++}
++
++void TargetVerification::read() {
++    if (pending_rows_ == 0) {
++        throw std::logic_error("No target verification results pending");
++    }
++    const auto stream = request_.memory.stream();
++    check(cudaMemcpyAsync(host_winners_, device_winners_,
++                          pending_rows_ * sizeof(TextLogitCandidate), cudaMemcpyDeviceToHost,
++                          stream), "Read target verification winners");
++    if (host_logits_) {
++        for (int index = 0; index < pending_rows_; ++index) {
++            check(cudaMemcpyAsync(host_logits_ + index * vocab_size, work_[index].logits,
++                                  vocab_size * sizeof(Bf16), cudaMemcpyDeviceToHost, stream),
++                  "Read target verification logits");
++        }
++    }
++    check(cudaStreamSynchronize(stream), "Complete target verification round");
++}
++
++void TargetVerification::commit(int processed_rows) {
++    if (pending_rows_ == 0 || processed_rows < 0 || processed_rows > pending_rows_) {
++        throw std::logic_error("Invalid target verification commit");
++    }
++    if (processed_rows != 0) {
++        request_.states.swap(checkpoints_[processed_rows - 1]);
++        valid_prefix_ += processed_rows;
++    }
++    pending_rows_ = 0;
++}
++
++int TargetVerification::winner(int index) const {
++    const int token = host_winners_[index].token_id;
++    if (token < 0 || token >= vocab_size) {
++        throw std::runtime_error("Target verification winner falls outside vocabulary");
++    }
++    return token;
++}
++
++const Bf16* TargetVerification::logits(int index) const {
++    return host_logits_ ? host_logits_ + index * vocab_size : nullptr;
++}
++
++}
+--- a/src/text_attention_gdn.cu
++++ b/src/text_attention_gdn.cu
+@@ -60,10 +60,11 @@
+         __float2bfloat16(value * sigmoid(value));
+ }
+ 
+-template <bool round_qk>
++template <bool round_qk, bool checkpoint>
+ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
+                           const __nv_bfloat16* b, const __nv_bfloat16* a,
+-                          TextGdnWeights weights, float* recurrent, __nv_bfloat16* observable) {
++                          TextGdnWeights weights, float* recurrent, __nv_bfloat16* observable,
++                          TextGdnCheckpoints checkpoints) {
+     __shared__ float qk[2][text_gdn_head_dim];
+     __shared__ float warp_squares[recurrent_threads / warp_size];
+     __shared__ float decay;
+@@ -137,26 +138,41 @@
+             observable[static_cast<std::size_t>(row) * text_gdn_value_width + feature] =
+                 __float2bfloat16(sum);
+         }
++        if constexpr (checkpoint) {
++            auto* saved = checkpoints.rows[row].recurrent + feature * text_gdn_head_dim;
++            #pragma unroll
++            for (int part = 0; part < keys_per_lane; ++part) {
++                saved[part * warp_size + lane] = state_keys[part];
++            }
++        }
+         __syncthreads();
+     }
+ 
+-    #pragma unroll
+-    for (int part = 0; part < keys_per_lane; ++part) {
+-        state_row[part * warp_size + lane] = state_keys[part];
++    if constexpr (!checkpoint) {
++        #pragma unroll
++        for (int part = 0; part < keys_per_lane; ++part) {
++            state_row[part * warp_size + lane] = state_keys[part];
++        }
+     }
+ }
+ 
++template <bool checkpoint>
+ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
+                            const __nv_bfloat16* norm, const __nv_bfloat16* observable,
+-                           __nv_bfloat16* history, __nv_bfloat16* output) {
++                           __nv_bfloat16* history, __nv_bfloat16* output,
++                           TextGdnCheckpoints checkpoints) {
+     const int norm_blocks = token_count * text_gdn_value_heads;
+     const int channel = threadIdx.x;
+     if (blockIdx.x >= norm_blocks) {
+-        const int feature = (blockIdx.x - norm_blocks) * text_gdn_head_dim + channel;
++        constexpr int history_blocks = text_gdn_qkv_width / text_gdn_head_dim;
++        const int block = blockIdx.x - norm_blocks;
++        const int prefix = checkpoint ? block / history_blocks + 1 : token_count;
++        const int feature = (block % history_blocks) * text_gdn_head_dim + channel;
++        auto* output_history = checkpoint ? checkpoints.rows[prefix - 1].history : history;
+         #pragma unroll
+         for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
+-            history[feature * text_gdn_history_taps + tap] =
+-                raw_sample(qkv, history, token_count - text_gdn_history_taps + tap, feature);
++            output_history[feature * text_gdn_history_taps + tap] =
++                raw_sample(qkv, history, prefix - text_gdn_history_taps + tap, feature);
+         }
+         return;
+     }
+@@ -180,14 +196,12 @@
+                                     * (gate * sigmoid(gate)));
+ }
+ 
+-}
+-
+-cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
+-                             const __nv_bfloat16* z, const __nv_bfloat16* b,
+-                             const __nv_bfloat16* a, TextGdnWeights weights,
+-                             TextGdnState state, __nv_bfloat16* workspace,
+-                             std::size_t workspace_bytes, __nv_bfloat16* output,
+-                             cudaStream_t stream) {
++template <bool checkpoint>
++cudaError_t launch_gdn(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
++                       const __nv_bfloat16* z, const __nv_bfloat16* b, const __nv_bfloat16* a,
++                       TextGdnWeights weights, TextGdnState state, TextGdnCheckpoints checkpoints,
++                       __nv_bfloat16* workspace, std::size_t workspace_bytes,
++                       __nv_bfloat16* output, cudaStream_t stream) {
+     if (token_count == 0) {
+         return cudaSuccess;
+     }
+@@ -208,20 +222,59 @@
+         return status;
+     }
+     constexpr int recurrent_blocks = text_gdn_value_heads * value_blocks_per_head;
+-    const auto recur = mode == TextGdnMode::prefill ? gdn_recur<true> : gdn_recur<false>;
++    const auto recur = mode == TextGdnMode::prefill ? gdn_recur<true, checkpoint>
++                                                   : gdn_recur<false, checkpoint>;
+     void* recurrent_arguments[] = {
+-        &token_count, &workspace, &b, &a, &weights, &state.recurrent, &observable};
++        &token_count, &workspace, &b, &a, &weights, &state.recurrent, &observable, &checkpoints};
+     status = cudaLaunchKernel(recur, dim3(recurrent_blocks), dim3(recurrent_threads),
+                               recurrent_arguments, 0, stream);
+     if (status != cudaSuccess) {
+         return status;
+     }
+-    const int finish_blocks =
+-        token_count * text_gdn_value_heads + text_gdn_qkv_width / text_gdn_head_dim;
++    const int finish_blocks = token_count * text_gdn_value_heads +
++        (checkpoint ? token_count : 1) * (text_gdn_qkv_width / text_gdn_head_dim);
+     void* finish_arguments[] = {
+-        &token_count, &qkv, &z, &weights.norm, &observable, &state.history, &output};
+-    return cudaLaunchKernel(gdn_finish, dim3(finish_blocks), dim3(text_gdn_head_dim),
++        &token_count, &qkv, &z, &weights.norm, &observable, &state.history, &output, &checkpoints};
++    return cudaLaunchKernel(gdn_finish<checkpoint>, dim3(finish_blocks), dim3(text_gdn_head_dim),
+                             finish_arguments, 0, stream);
+ }
+ 
+ }
++
++cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
++                             const __nv_bfloat16* z, const __nv_bfloat16* b,
++                             const __nv_bfloat16* a, TextGdnWeights weights,
++                             TextGdnState state, __nv_bfloat16* workspace,
++                             std::size_t workspace_bytes, __nv_bfloat16* output,
++                             cudaStream_t stream) {
++    return launch_gdn<false>(token_count, mode, qkv, z, b, a, weights, state, {},
++                             workspace, workspace_bytes, output, stream);
++}
++
++cudaError_t text_gdn_verify(int token_count, const __nv_bfloat16* qkv,
++                            const __nv_bfloat16* z, const __nv_bfloat16* b,
++                            const __nv_bfloat16* a, TextGdnWeights weights,
++                            TextGdnState initial, TextGdnCheckpoints checkpoints,
++                            __nv_bfloat16* workspace, std::size_t workspace_bytes,
++                            __nv_bfloat16* output, cudaStream_t stream) {
++    if (token_count < 1 || token_count > text_gdn_max_verify_rows) {
++        return cudaErrorInvalidValue;
++    }
++    for (int index = 0; index < token_count; ++index) {
++        const auto& row = checkpoints.rows[index];
++        if (!row.history || !row.recurrent || row.history == initial.history ||
++            row.recurrent == initial.recurrent) {
++            return cudaErrorInvalidValue;
++        }
++        for (int previous = 0; previous < index; ++previous) {
++            if (row.history == checkpoints.rows[previous].history ||
++                row.recurrent == checkpoints.rows[previous].recurrent) {
++                return cudaErrorInvalidValue;
++            }
++        }
++    }
++    return launch_gdn<true>(token_count, TextGdnMode::decode, qkv, z, b, a, weights, initial,
++                            checkpoints, workspace, workspace_bytes, output, stream);
++}
++
++}
+--- a/src/text_ops.cu
++++ b/src/text_ops.cu
+@@ -118,6 +118,56 @@
+     }
+ }
+ 
++template <int Count>
++struct Bf16Projections {
++    TextBf16Projection entries[Count];
++};
++
++template <int Count>
++__global__ void bf16_batch_packed_kernel(const __nv_bfloat16* weight, int out_width,
++                                         int in_width, Bf16Projections<Count> batch) {
++    const int lane = threadIdx.x % warp_width;
++    const int row = blockIdx.x * block_warps + threadIdx.x / warp_width;
++    if (row >= out_width) {
++        return;
++    }
++    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
++    constexpr int pack = 8;
++    float sums[Count]{};
++    float second_sums[Count]{};
++    for (std::size_t col = lane * pack; col < static_cast<std::size_t>(in_width);
++         col += warp_width * pack) {
++        const uint4 lhs = load_128(row_weight + col);
++#pragma unroll
++        for (int index = 0; index < Count; ++index) {
++            const uint4 rhs = load_128(batch.entries[index].input + col);
++            sums[index] = bf16x2_dot(lhs.x, rhs.x, sums[index]);
++            second_sums[index] = bf16x2_dot(lhs.y, rhs.y, second_sums[index]);
++            sums[index] = bf16x2_dot(lhs.z, rhs.z, sums[index]);
++            second_sums[index] = bf16x2_dot(lhs.w, rhs.w, second_sums[index]);
++        }
++    }
++#pragma unroll
++    for (int index = 0; index < Count; ++index) {
++        const float sum = warp_sum(sums[index] + second_sums[index]);
++        if (lane == 0) {
++            batch.entries[index].output[row] = __float2bfloat16_rn(sum);
++        }
++    }
++}
++
++template <int Count>
++cudaError_t launch_bf16_batch(const __nv_bfloat16* weight, int out_width, int in_width,
++                              const TextBf16Projection* projections, cudaStream_t stream) {
++    Bf16Projections<Count> batch;
++    for (int index = 0; index < Count; ++index) {
++        batch.entries[index] = projections[index];
++    }
++    void* args[] = {&weight, &out_width, &in_width, &batch};
++    return cudaLaunchKernel(bf16_batch_packed_kernel<Count>, divide_up(out_width, block_warps),
++                            block_threads, args, 0, stream);
++}
++
+ __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
+                                     TextFp8Activation output) {
+     constexpr int group_warps = text_fp8_group_size / warp_width;
+@@ -489,6 +539,42 @@
+                             divide_up(out_width, block_warps), block_threads, args, 0, stream);
+ }
+ 
++cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_width,
++                           const TextBf16Projection* projections, int count, cudaStream_t stream) {
++    if (!weight || !projections || out_width <= 0 || in_width <= 0 ||
++        count < 1 || count > text_fp8_max_batch) {
++        return cudaErrorInvalidValue;
++    }
++    bool packed = in_width % 8 == 0 && aligned(weight, 16);
++    for (int index = 0; index < count; ++index) {
++        if (!projections[index].input || !projections[index].output) {
++            return cudaErrorInvalidValue;
++        }
++        packed = packed && aligned(projections[index].input, 16);
++    }
++    if (packed) {
++        switch (count) {
++        case 5:
++            return launch_bf16_batch<5>(weight, out_width, in_width, projections, stream);
++        case 4:
++            return launch_bf16_batch<4>(weight, out_width, in_width, projections, stream);
++        case 3:
++            return launch_bf16_batch<3>(weight, out_width, in_width, projections, stream);
++        case 2:
++            return launch_bf16_batch<2>(weight, out_width, in_width, projections, stream);
++        }
++    }
++    for (int index = 0; index < count; ++index) {
++        const auto& entry = projections[index];
++        const auto status = text_bf16_gemv(weight, entry.input, out_width, in_width,
++                                          entry.output, stream);
++        if (status != cudaSuccess) {
++            return status;
++        }
++    }
++    return cudaSuccess;
++}
++
+ cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
+                              cudaStream_t stream) {
+     if (input == nullptr || output.values == nullptr || output.scales == nullptr || width <= 0) {
+@@ -532,6 +618,9 @@
+         }
+         wide = wide && supports_wide_fp8(weight, entry.input, in_width);
+     }
++    if (wide && count == 5) {
++        return launch_fp8_batch<5>(weight, weight_scales, out_width, in_width, projections, stream);
++    }
+     if (wide && count == 4) {
+         return launch_fp8_batch<4>(weight, weight_scales, out_width, in_width, projections, stream);
+     }
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -75,7 +75,8 @@
+     add_includedirs("include", {public = true})
+     add_deps("sglang_checkpoint", "sglang_cuda")
+     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
+-              "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp")
++              "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp",
++              "src/decoder_verify.cpp")
+ 
+ target("sglang-generate")
+     set_kind("binary")

@@ -1,6 +1,6 @@
 # Single-B200 benchmark agreement
 
-Compare `sglang.cpp` with an independent vLLM process on the **same physical B200 and the same immutable checkpoint**. Report output tokens/s and client-observed latency for each named workload. Measure vLLM first, then agree on per-workload throughput floors and latency ceilings before evaluating the candidate.
+The project goal is higher inference throughput than pinned vLLM on the **same physical B200 and the same immutable checkpoint**. A workload earns a speedup only when the candidate passes its correctness checks, its measured candidate/vLLM output-token throughput ratio exceeds 1.0, and it meets the agreed latency ceilings. Measure vLLM first. Freeze the workloads, repetition policy, noise margin, and latency ceilings before timing the candidate.
 
 ## Implementations and controls
 
@@ -56,7 +56,7 @@ The offline smoke case requests eight output tokens. Inspect the reported run di
 
 Separate startup, model load, JIT compilation, and graph capture from steady execution. Warm both engines under the declared cache policy. Reset reusable prefixes before a cold-prefix measurement. Use the same workload order or a recorded counterbalanced order. **Proposed repeat policy.** Collect at least five measured cohorts per engine and workload after warmup. Preserve each cohort's output tokens/s. Report the median and range across cohorts. Report p50 and p95 for TTFT, TPOT, and end-to-end latency over requests per workload, with sample counts and the percentile method.
 
-Report one row per engine, workload, and mode. Include absolute metrics, successful and attempted requests, and the agreed limits. For paired runs, also report the candidate/baseline throughput ratio and latency differences. Freeze thresholds, warmup, repeats, percentile choices, and correctness criteria before candidate timing. No numerical speedup or latency target has been established at adoption.
+Report one row per engine, workload, and mode. Include absolute metrics, successful and attempted requests, and the agreed limits. For paired runs, also report the candidate/baseline throughput ratio and latency differences. At adoption, the required improvement above parity and the latency budgets still need numerical margins from repeated baseline measurements.
 
 ## Correctness, memory, and diagnosis
 

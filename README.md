@@ -26,6 +26,8 @@ The checkpoint lives at `/data0/shared/Qwen3.8-27B-FP8`. Keep its weights and ge
 artifacts outside version control. Use SGLang as the architecture reference and the pinned
 vLLM installation as the independent performance comparator.
 
+- [Isolated vLLM setup and single-B200 smoke run](benchmarks/vllm/README.md) gives the
+  commands to generate the first reference token IDs and measure serial request latency.
 - [Checkpoint and SGLang source map](docs/research/checkpoint.md) identifies the upstream
   revision and records content verification for all 81 files and 1,606 indexed tensors.
 - [Development milestones](docs/development.md) define the path from the runtime probe to

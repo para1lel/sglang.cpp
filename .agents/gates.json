@@ -49,6 +49,17 @@
       ],
       "report": ".gate-results/contracts.xml",
       "timeout": 90
+    },
+    {
+      "name": "offline benchmark fixture",
+      "kind": "test",
+      "paths": ["benchmarks/vllm/*", "tests/test_vllm_fixture.py"],
+      "command": [
+        "{python}", "-IB", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "tests/test_vllm_fixture.py", "--junitxml=.gate-results/benchmark.xml"
+      ],
+      "report": ".gate-results/benchmark.xml",
+      "timeout": 90
     }
   ],
   "shared_paths": ["tests/conftest.py"]

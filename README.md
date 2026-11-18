@@ -11,7 +11,7 @@ The reusable runtime API is in
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
-[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L34)<!-- prefix: "__device__ i" -->.
+[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L35)<!-- prefix: "__device__ i" -->.
 
 ## Build on the project host
 

@@ -57,32 +57,34 @@ Keep the command, full output, allocation size, and device, library, and binary 
 
 ### P2 GQA cache contract
 
-Store K and V as E4M3 with one E8M0 scale per 32 contiguous channels. Each 256-channel vector carries eight scales. The checkpoint has four KV heads. FP8 weights use BF16 inverse scales per 128×128 weight block. GDN uses separate convolution history and FP32 recurrent state. [Checkpoint investigation](research/checkpoint.md)
+K and V use E4M3 for four 256-channel heads, with one E8M0 scale per 32 contiguous channels. FP8 weights use BF16 inverse scales per 128×128 block. [Checkpoint investigation](research/checkpoint.md)
 
-Allocate separate device buffers for K and V payloads and scales. Each 128-token physical page needs 131,072 payload bytes and 4,096 scale bytes for K, and the same for V. Map logical pages to distinct physical pages with the device page table. [Cache layout](../include/sglang/mxfp8_gqa.h#L22)<!-- prefix: "/// Separate" --> · [Page table](../include/sglang/mxfp8_gqa.h#L34)<!-- prefix: "struct Mxfp8" -->
+Separate K and V buffers use 131,072 payload bytes and 4,096 scale bytes per tensor per 128-token page. The device table maps logical pages to distinct physical pages. [Cache layout](../include/sglang/mxfp8_gqa.h#L22)<!-- prefix: "/// Separate" --> · [Page table](../include/sglang/mxfp8_gqa.h#L34)<!-- prefix: "struct Mxfp8" -->
 
-Link the CUDA consumer to the static `sglang_cuda` target. Apply RoPE to K and Q before calling the cache writer and attention, respectively. Pass contiguous BF16 K and V tensors shaped `[tokens, 4, 256]` to `mxfp8_kv_append`. Once the required KV prefix is ready on the stream, call `mxfp8_gqa_attention` with the valid prefix length and first query position. Q and output are BF16 with shape `[queries, 24, 256]`. Query row `r` attends through position `first_query_position + r` inclusive. Check each launch status. Observe stream completion before releasing or reusing storage. [Library target](../xmake.lua#L46)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L55)<!-- prefix: "cudaError_t " -->
+Link `sglang_cuda`. Apply RoPE to K before appending contiguous BF16 `[tokens, 4, 256]` K and V. Apply RoPE to Q. Pass the ready KV prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Keep storage live through stream completion. [Library](../xmake.lua#L46)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L55)<!-- prefix: "cudaError_t " -->
 
-For each K or V group, the writer uses maximum magnitude `amax`. It stores `ceil(log2(max(amax, 1e-30) / 448)) + 127`, clamped to `[0, 254]`. The attention kernel decodes packed K and V to FP32 and converts BF16 Q to FP32 for the dot product. [Scale calculation](../src/mxfp8_gqa.cu#L34)<!-- prefix: "__device__ i" --> · [Attention kernel](../src/mxfp8_gqa.cu#L87)<!-- prefix: "__global__ v" -->
+For each K or V group's maximum magnitude `amax`, store `ceil(log2(max(amax, 1e-30) / 448)) + 127`, clamped to `[0, 254]`. Attention decodes K and V and converts BF16 Q to FP32. [Scale calculation](../src/mxfp8_gqa.cu#L35)<!-- prefix: "__device__ i" --> · [Direct attention](../src/mxfp8_gqa.cu#L88)<!-- prefix: "__global__ v" -->
+
+Exact scoring preserves the direct FP32 group reductions, ordered sum of eight groups, and `1/16` scale. Replay computes `expf` weights in parallel in 32-token tiles. Running maxima, denominator FMAs, and value FMAs follow token order. FP32 division precedes one BF16 rounding. [Score](../src/mxfp8_gqa.cu#L158)<!-- prefix: "__global__ v" --> · [Replay](../src/mxfp8_gqa.cu#L201)<!-- prefix: "__global__ v" -->
 
 #### P2 GQA verification
 
-Build the optional verifier with the managed Pixi toolchain from the repository root.
+Build the verifier from the repository root with the managed Pixi toolchain.
 
 ```bash
 bash tools/build.sh --build-dir build --mxfp8-check
 ```
 
-Set `BUILD_WORK_DIR` to the path printed after `Build directory:`. Set `GPU_UUID` to the reserved B200 UUID. Run the verifier with only that UUID visible.
+Set `BUILD_WORK_DIR` to the printed build directory and `GPU_UUID` to the reserved B200 UUID.
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     "${BUILD_WORK_DIR:?set the printed build directory}/build/bin/mxfp8-gqa-check"
 ```
 
-Expect `compute_capability=10.0` and checks for prefix append, cross-page append, causal prefill, decode, and page reuse. The [verifier](../tests/mxfp8_gqa_check.cu#L450)<!-- prefix: "void run_che" --> compares K and V payloads and scale bytes with an independent encoder. It compares all BF16 outputs with an independent causal attention reference. Require `MXFP8 GQA check passed` and exit status zero.
+Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The [verifier](../tests/mxfp8_gqa_check.cu#L616)<!-- prefix: "void run_che" --> compares append, prefill, decode, and page reuse against independent packed KV and BF16 references.
 
-Keep the invocation, device UUID, binary identity, and full check output. Record the executed path, effective Q dtype, scale policy, and test shapes. Measure operator timings separately.
+The [exact decode check](../tests/mxfp8_gqa_check.cu#L518)<!-- prefix: "void check_e" --> compares BF16 bits with direct attention across tile and page boundaries in eager launches and one reused graph. It checks input preservation, score bounds, and rejection of invalid arguments.
 
 ### P3 native text decoder
 
@@ -92,17 +94,21 @@ Keep the invocation, device UUID, binary identity, and full check output. Record
 | --- | --- | --- |
 | `sglang-generate` | Parse one token-ID prompt, run requests serially, and write one JSON result. | [CLI entry](../apps/sglang-generate.cpp#L227)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests using operators from `sglang_cuda`. | [Decoder API](../include/sglang/decoder.h#L47)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L171)<!-- prefix: "void Decoder" --> |
+| `sglang_decoder` | Own device weights and run requests using operators from `sglang_cuda`. | [Decoder API](../include/sglang/decoder.h#L47)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L190)<!-- prefix: "void Decoder" --> |
 
 The loader uses LLVM Support 23.1.5 from Pixi (`llvmdev` and `libllvm23`, Apache-2.0 WITH LLVM-exception) only to parse checkpoint JSON. The loader owns the safetensors validation and mapping. [JSON parser](../src/checkpoint.cpp#L170)<!-- prefix: "json::Object" --> · [Link configuration](../xmake.lua#L60)<!-- prefix: "target(\"sgla" -->
 
 #### Runtime path
 
-Before upload, the decoder checks required tensor names, dtypes, and shapes. Upload retains checkpoint mappings and allocations through stream completion. Requests share device weights and retain references through completion, including deferred cleanup. FP8 projections use E4M3 weights and BF16 inverse scales. They quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L97)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L169)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L121)<!-- prefix: "__global__ v" -->
+Before upload, the decoder checks tensor names, dtypes, and shapes. Upload retains mappings and allocations through stream completion. Requests retain shared weights through completion, including deferred cleanup. FP8 projections use E4M3 weights and BF16 inverse scales. They quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L97)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L171)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L121)<!-- prefix: "__global__ v" -->
 
-With MTP off, serial generation reuses a resident stream, workspace, and caches. Larger requests replace undersized storage. Before prefill, the decoder zeros BF16 convolution history and FP32 recurrent state for 48 GDN layers. The 16 GQA layers rebuild the valid prefix in [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. [Generation loop](../src/decoder.cpp#L272)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L393)<!-- prefix: "void Request" -->
+Serial MTP-off generation reuses its stream, workspace, and caches, replacing undersized storage. Before prefill, the decoder zeros BF16 convolution history and FP32 recurrent state for 48 GDN layers. GQA rebuilds the prefix in [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. [Generation loop](../src/decoder.cpp#L272)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L401)<!-- prefix: "void Request" -->
 
-Prefill runs eagerly one prompt token at a time. Eager scoring selects the first output token. Later steps replay a CUDA graph that consumes the previous selection. The decoder captures the graph on the first decode step for that storage. An overlapping call uses private eager storage and closes it before returning. The host synchronizes before reading each selection. [Decode graph](../src/decoder_forward.cpp#L153)<!-- prefix: "void Decoder" -->
+Eager prefill advances one prompt token at a time, then scores the first output. Serial decode captures a graph and replays it with the previous selection. Overlapping calls use private eager storage. The host synchronizes before reading each selection. [Decode graph](../src/decoder_forward.cpp#L172)<!-- prefix: "void Decoder" -->
+
+Target prefill and MTP draft attention use the direct kernel. Eager target decode, including MTP verification, selects exact attention when the zero-based position is below score capacity. Graph capture selects exact attention when the page-rounded KV allocation fits that capacity. Both exact graph kernels read the device position. Other decode steps use direct attention. [GQA dispatch](../src/decoder_forward.cpp#L82)<!-- prefix: "cudaError_t " -->
+
+Per lane, the stream orders KV append, scoring, replay, and gating. Score capacity is the lesser of allocated KV slots and 5,120. Layers reuse the request's logits allocation for 24 FP32 scores per slot. The LM head then writes logits. [Workspace](../src/decoder_resources.cpp#L381)<!-- prefix: "ExactGqaWork" -->
 
 A single model position uses FP8 GEMV. The wide kernel uses four warps per block with input widths divisible by 512 and 16-byte-aligned FP8 buffers. With two to four lanes, eligible FP8 projections share weight loads in packed GEMM. Ineligible projections use separate GEMVs. Embedding, quantization, normalization, BF16 projections, attention, state updates, SwiGLU, and scoring run per lane. [Projection dispatch](../src/decoder_forward.cpp#L44)<!-- prefix: "void project" --> · [GEMV](../src/text_ops.cu#L502)<!-- prefix: "cudaError_t " --> · [GEMM](../src/text_ops.cu#L520)<!-- prefix: "cudaError_t " -->
 
@@ -112,7 +118,7 @@ Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Use decimal tok
 
 The decoder chooses the highest BF16 logit, with ties going to the lowest ID. A `--stop-token` match emits the token and returns `stop`, including at the output limit. Otherwise it returns `length`. The CLI applies no implicit EOS rule. Input, load, execution, or explicit cleanup errors produce a diagnostic on stderr and exit status 1. [Selection](../src/text_ops.cu#L384)<!-- prefix: "__device__ T" --> · [Generation loop](../src/decoder.cpp#L272)<!-- prefix: "void Decoder" -->
 
-If cleanup cannot confirm completion, the decoder retains pending CUDA resources and transfer buffers. Model load and request setup retry recoverable cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until process exit. [Deferred cleanup](../src/decoder_resources.cpp#L103)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L284)<!-- prefix: "Allocations:" -->
+If cleanup cannot confirm completion, the decoder retains pending CUDA resources and transfer buffers. Model load and request setup retry recoverable cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until process exit. [Deferred cleanup](../src/decoder_resources.cpp#L105)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L286)<!-- prefix: "Allocations:" -->
 
 Use `--top-logits N` to report up to `N` raw scores per output token, ordered by descending score then ascending ID. The range is 0 to 248,320 and the default is 0. [Logit output](../apps/sglang-generate.cpp#L193)<!-- prefix: "void write_r" -->
 

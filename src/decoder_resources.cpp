@@ -2,6 +2,8 @@
 
 #include "sglang/checkpoint.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <mutex>
 #include <numeric>
@@ -367,13 +369,19 @@ Workspace::Workspace(Allocations& allocations)
       gdn_b(allocations.allocate<Bf16>(text_gdn_value_heads)),
       gdn_a(allocations.allocate<Bf16>(text_gdn_value_heads)),
       gdn_scratch(allocations.allocate<Bf16>(text_gdn_workspace_bytes(1) / sizeof(Bf16))),
-      logits(allocations.allocate<Bf16>(vocab_size)),
+      logits(reinterpret_cast<Bf16*>(allocations.allocate<std::byte>(vocab_size * sizeof(Bf16)))),
       activation{allocations.allocate<std::uint8_t>(intermediate_size),
                  allocations.allocate<float>(text_fp8_group_count(intermediate_size))},
       argmax_scratch(
           allocations.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
       argmax(allocations.allocate<TextLogitCandidate>(1)) {
     static_assert(text_gqa_q_width == text_gdn_value_width);
+}
+
+ExactGqaWorkspace Workspace::gqa_scores(int capacity) const {
+    constexpr int bytes_per_page = mxfp8_page_size * mxfp8_query_heads * sizeof(float);
+    constexpr int score_pages = vocab_size * sizeof(Bf16) / bytes_per_page;
+    return {reinterpret_cast<float*>(logits), std::min(capacity, score_pages * mxfp8_page_size)};
 }
 
 Request::Request(int device, bool reusable)

@@ -27,4 +27,16 @@ cudaError_t decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, const
                                  const __nv_bfloat16* queries, __nv_bfloat16* output,
                                  cudaStream_t stream);
 
+struct ExactGqaWorkspace {
+    float* scores;
+    int capacity;
+};
+
+cudaError_t exact_decode_gqa_attention(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,
+    __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream);
+cudaError_t exact_decode_gqa_attention(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, const int* position, const __nv_bfloat16* queries,
+    __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream);
+
 }

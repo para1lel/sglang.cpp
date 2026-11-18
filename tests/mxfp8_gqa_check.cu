@@ -1,3 +1,4 @@
+#include "sglang/decoder_cuda.cuh"
 #include "sglang/mxfp8_gqa.h"
 
 #include <algorithm>
@@ -5,9 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -18,7 +21,7 @@ constexpr int query_heads = 24;
 constexpr int group_width = 32;
 constexpr int groups = head_width / group_width;
 constexpr int page_tokens = 128;
-constexpr int physical_pages = 4;
+constexpr int physical_pages = 18;
 constexpr int prefix_tokens = page_tokens - 1;
 constexpr int prefill_tokens = 3;
 constexpr int prefill_end = page_tokens + 1;
@@ -293,6 +296,41 @@ private:
     Element* data_ = nullptr;
 };
 
+class Graph {
+public:
+    Graph() = default;
+    Graph(const Graph&) = delete;
+    Graph& operator=(const Graph&) = delete;
+
+    ~Graph() {
+        if (executable_) {
+            cudaGraphExecDestroy(executable_);
+        }
+        if (graph_) {
+            cudaGraphDestroy(graph_);
+        }
+    }
+
+    template <class Submit>
+    void capture(cudaStream_t stream, Submit submit) {
+        check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                   "Begin attention capture");
+        const auto launch_status = submit();
+        const auto capture_status = cudaStreamEndCapture(stream, &graph_);
+        check_cuda(launch_status, "Submit captured attention");
+        check_cuda(capture_status, "End attention capture");
+        check_cuda(cudaGraphInstantiate(&executable_, graph_, 0), "Instantiate attention graph");
+    }
+
+    void replay(cudaStream_t stream) const {
+        check_cuda(cudaGraphLaunch(executable_, stream), "Replay attention graph");
+    }
+
+private:
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t executable_ = nullptr;
+};
+
 struct Pages {
     const std::vector<std::int32_t> mapping;
     DeviceBuffer<std::int32_t> device{mapping.size()};
@@ -435,6 +473,134 @@ void check_attention(const char* phase, const TestCache& cache, const Pages& pag
     verify_attention(phase, output.download(stream), expected);
 }
 
+constexpr int query_elements = query_heads * head_width;
+constexpr int long_position = 2048;
+constexpr int score_capacity = physical_pages * page_tokens;
+constexpr Byte attention_sentinel = 0xff;
+
+void compare_decode(const char* phase, int position, const std::vector<BFloat>& actual,
+                    const std::vector<BFloat>& direct) {
+    const auto bytes = reinterpret_cast<const Byte*>(actual.data());
+    for (const auto guard : {bytes, bytes + (query_elements + 1) * sizeof(BFloat)}) {
+        if (!std::all_of(guard, guard + sizeof(BFloat),
+                         [](Byte byte) { return byte == attention_sentinel; })) {
+            throw std::runtime_error("Decode overwrote an output guard");
+        }
+    }
+    for (int index = 0; index < query_elements; ++index) {
+        if (std::memcmp(&actual[index + 1], &direct[index], sizeof(BFloat)) != 0) {
+            std::fprintf(stderr, "%s position=%d head=%d channel=%d got %.9g expected %.9g\n",
+                         phase, position, index / head_width, index % head_width,
+                         __bfloat162float(actual[index + 1]), __bfloat162float(direct[index]));
+            throw std::runtime_error("Decode differs bitwise from direct attention");
+        }
+    }
+}
+
+void check_score_tail(const DeviceBuffer<float>& scores, int position, cudaStream_t stream) {
+    const auto host = scores.download(stream);
+    const auto bytes = reinterpret_cast<const Byte*>(host.data());
+    const auto check = [](const Byte* first, const Byte* end) {
+        if (!std::all_of(first, end, [](Byte byte) { return byte == attention_sentinel; })) {
+            throw std::runtime_error("Decode overwrote an inactive score slot");
+        }
+    };
+    check(bytes, bytes + sizeof(float));
+    for (int head = 0; head < query_heads; ++head) {
+        const int row = head * score_capacity + 1;
+        check(bytes + (row + position + 1) * sizeof(float),
+              bytes + (row + score_capacity) * sizeof(float));
+    }
+    const auto end = bytes + host.size() * sizeof(float);
+    check(end - sizeof(float), end);
+}
+
+void check_exact_decode(cudaStream_t stream) {
+    TestCache cache;
+    cache.keys.initialize(stream);
+    cache.values.initialize(stream);
+    std::vector<std::int32_t> mapping(physical_pages, std::numeric_limits<int>::max());
+    for (int page = 0; page <= long_position / page_tokens; ++page) {
+        mapping[page] = physical_pages - 1 - page;
+    }
+    const Pages pages{std::move(mapping)};
+    pages.device.upload(pages.mapping.data(), stream);
+    const KvSequence input(long_position + 1, 13);
+    check_append("exact decode cache append", cache, pages, input, 0, long_position + 1, stream);
+
+    const auto queries = make_queries(long_position, 1);
+    const DeviceBuffer<BFloat> device_queries(query_elements);
+    const DeviceBuffer<BFloat> direct(query_elements);
+    const DeviceBuffer<BFloat> output(query_elements + 2);
+    const DeviceBuffer<float> scores(query_heads * score_capacity + 2);
+    const DeviceBuffer<int> position(1);
+    const sglang::decoder::ExactGqaWorkspace workspace{scores.get() + 1, score_capacity};
+    device_queries.upload(queries.data(), stream);
+    const auto view = cache.view();
+    const auto table = pages.view();
+    const auto invalid = [](cudaError_t result) {
+        if (result != cudaErrorInvalidValue) {
+            throw std::runtime_error("Exact decode accepted invalid arguments");
+        }
+    };
+    const auto eager = [&](int last, sglang::decoder::ExactGqaWorkspace scratch) {
+        return sglang::decoder::exact_decode_gqa_attention(view, table, last,
+            device_queries.get(), output.get() + 1, scratch, stream);
+    };
+    output.fill(attention_sentinel, stream);
+    scores.fill(attention_sentinel, stream);
+    invalid(eager(-1, workspace));
+    invalid(eager(score_capacity, workspace));
+    invalid(eager(0, {nullptr, score_capacity}));
+    invalid(eager(0, {scores.get() + 1, 0}));
+    invalid(eager(0, {scores.get() + 1, score_capacity + 1}));
+    invalid(sglang::decoder::exact_decode_gqa_attention(view, table,
+        static_cast<const int*>(nullptr), device_queries.get(), output.get() + 1,
+        workspace, stream));
+    const auto untouched = output.download(stream);
+    const auto first = reinterpret_cast<const Byte*>(untouched.data());
+    if (!std::all_of(first, first + untouched.size() * sizeof(BFloat),
+                     [](Byte byte) { return byte == attention_sentinel; })) {
+        throw std::runtime_error("Invalid decode overwrote output");
+    }
+    check_score_tail(scores, -1, stream);
+
+    Graph graph;
+    graph.capture(stream, [&] {
+        return sglang::decoder::exact_decode_gqa_attention(view, table, position.get(),
+            device_queries.get(), output.get() + 1, workspace, stream);
+    });
+
+    for (const int last : {0, 31, 32, 127, 128, long_position, 1024, 1}) {
+        check_cuda(sglang::mxfp8_gqa_attention(view, table, last + 1, last, 1,
+            device_queries.get(), direct.get(), stream), "Launch direct decode oracle");
+        const auto expected = direct.download(stream);
+        output.fill(attention_sentinel, stream);
+        scores.fill(attention_sentinel, stream);
+        check_cuda(eager(last, workspace), "Launch eager decode");
+        compare_decode("eager decode", last, output.download(stream), expected);
+        check_score_tail(scores, last, stream);
+        output.fill(attention_sentinel, stream);
+        scores.fill(attention_sentinel, stream);
+        check_cuda(sglang::decoder::set_decode_position(position.get(), last, stream),
+                   "Set device decode position");
+        graph.replay(stream);
+        compare_decode("graph decode", last, output.download(stream), expected);
+        check_score_tail(scores, last, stream);
+        if (position.download(stream).front() != last) {
+            throw std::runtime_error("Attention changed the graph position");
+        }
+    }
+    const auto actual_queries = device_queries.download(stream);
+    if (std::memcmp(actual_queries.data(), queries.data(), query_elements * sizeof(BFloat)) != 0 ||
+        pages.device.download(stream) != pages.mapping) {
+        throw std::runtime_error("Decode changed its queries or page table");
+    }
+    cache.keys.verify("exact decode preserves cache", stream);
+    cache.values.verify("exact decode preserves cache", stream);
+    std::puts("Exact BF16 decode matched eager and repeated graph positions through 2048");
+}
+
 void check_device() {
     int device = 0;
     cudaDeviceProp properties{};
@@ -471,6 +637,7 @@ void run_check() {
     const KvSequence replacement(1, 9);
     check_append("reused page append", cache, reused, replacement, 0, 1, stream.get());
     check_attention("reused page decode", cache, reused, replacement, 1, 0, 1, stream.get());
+    check_exact_decode(stream.get());
 }
 
 }

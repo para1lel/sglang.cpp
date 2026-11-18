@@ -1,8 +1,7 @@
 #pragma once
 
 #include "sglang/decoder.h"
-#include "sglang/text_attention.h"
-#include "sglang/text_ops.h"
+#include "sglang/decoder_cuda.cuh"
 
 #include <array>
 #include <atomic>
@@ -138,6 +137,8 @@ struct Layer {
 
 struct Workspace {
     explicit Workspace(Allocations& allocations);
+
+    ExactGqaWorkspace gqa_scores(int capacity) const;
 
     Bf16* hidden;
     Bf16* normalized;

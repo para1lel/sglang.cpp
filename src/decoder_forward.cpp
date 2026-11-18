@@ -79,8 +79,30 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
 }
 
 template <typename Position>
+cudaError_t read_gqa(Request& request, Mxfp8KvCache cache, Position position, TextGdnMode mode,
+                     cudaStream_t stream) {
+    const auto& work = request.work;
+    const auto pages = request.pages;
+    const int capacity = pages.page_count * mxfp8_page_size;
+    const auto scores = work.gqa_scores(capacity);
+    if constexpr (std::is_same_v<Position, int>) {
+        if (mode == TextGdnMode::prefill || position >= scores.capacity) {
+            return mxfp8_gqa_attention(cache, pages, position + 1, position, 1,
+                                       work.rope_queries, work.attention, stream);
+        }
+    } else {
+        if (capacity > scores.capacity) {
+            return decode_gqa_attention(cache, pages, position, work.rope_queries,
+                                        work.attention, stream);
+        }
+    }
+    return exact_decode_gqa_attention(cache, pages, position, work.rope_queries, work.attention,
+                                      scores, stream);
+}
+
+template <typename Position>
 void attend_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
-                Position position, cudaStream_t stream) {
+                Position position, TextGdnMode mode, cudaStream_t stream) {
     auto& work = request.work;
     if constexpr (std::is_same_v<Position, int>) {
         check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm,
@@ -88,18 +110,14 @@ void attend_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
               "Normalize and rotate Q/K");
         check(mxfp8_kv_append(cache, request.pages, position, 1, work.rope_keys, work.values,
                               stream), "Append MXFP8 KV");
-        check(mxfp8_gqa_attention(cache, request.pages, position + 1, position, 1,
-                                  work.rope_queries, work.attention, stream),
-              "Read causal MXFP8 attention");
     } else {
         check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
                                     layer.key_norm, work.rope_queries, work.rope_keys, stream),
               "Normalize and rotate decode Q/K");
         check(decode_kv_append(cache, request.pages, position, work.rope_keys, work.values, stream),
               "Append decode MXFP8 KV");
-        check(decode_gqa_attention(cache, request.pages, position, work.rope_queries,
-                                   work.attention, stream), "Read causal decode MXFP8 attention");
     }
+    check(read_gqa(request, cache, position, mode, stream), "Read causal MXFP8 attention");
     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
           "Gate grouped-query attention");
 }
@@ -112,7 +130,8 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     batch.project(layer.value, &Workspace::values);
     batch.each([&](const Lane& lane, Workspace&) {
         auto& request = *lane.request;
-        attend_gqa(layer, request, request.caches[cache_index], lane.position, batch.stream);
+        attend_gqa(layer, request, request.caches[cache_index], lane.position, lane.mode,
+                   batch.stream);
     });
     batch.quantize(&Workspace::attention, text_gqa_q_width);
     batch.project(layer.output, &Workspace::projected_attention);

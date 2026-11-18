@@ -31,7 +31,7 @@ The build checks the `sm_100` image and the loaded CUDA runtime. The device run 
 
 For P0, inspect the official configuration, weight index, tensor metadata, tokenizer, chat template, processor, and model implementation together. Record layer order, dimensions, weight formats and scales, state updates, position encoding, MTP weights, and media inputs. Map the applicable behavior to files at the pinned SGLang revision. Propose the API version, endpoints, parameters, streaming events, and constraint semantics for review. If the checkpoint conflicts with a proposed feature, record the evidence and request a scope decision.
 
-Use the [baseline smoke procedure](performance.md#first-baseline-run) to preserve input and output token IDs, launch arguments, effective precision, and device identity. Reuse this fixture when the project's decoder becomes available.
+The [baseline smoke procedure](performance.md#first-baseline-run) completed on physical B200 1. The seven measured requests produced the same eight greedy IDs with BF16 KV and MTP disabled. Give the first candidate decoder this five-token prompt and compare all eight IDs on that same UUID. Then schedule the longer streaming workloads separately.
 
 ## Runtime and state ownership
 

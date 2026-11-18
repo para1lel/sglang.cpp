@@ -32,7 +32,9 @@ Setup uses `git`, `curl`, `jq`, `flock`, and `uv` from the host. Every package i
 the isolated interpreter explicitly. Network access uses Mihomo at `127.0.0.1:7890`. The runner
 requires the local checkpoint and hashes the weight, configuration, tokenizer, and template files
 before loading. It sets Hugging Face offline mode. vLLM and kernel libraries can have additional
-first-run initialization or compilation costs.
+first-run initialization or compilation costs. The runner sets `FLASHINFER_WORKSPACE_BASE`
+to the benchmark's `XDG_CACHE_HOME` under `/data1/shared/dongwu.chen/cache`. FlashInfer appends
+`.cache/flashinfer` to this directory for its generated kernels and autotuning data.
 
 ## Small fixture
 
@@ -52,6 +54,21 @@ in seconds. The stored individual samples allow both rates to be recalculated. T
 ten-minute engine timeout. Its printed run directory contains per-trial samples, output IDs,
 the engine log, settings, and before/after device snapshots. A failed run preserves its log
 and exit status.
+
+## Measured result
+
+On November 18, 2026, `run.GeXtAT` exited 0 on GPU 1. All nine requests returned the same eight
+greedy token IDs. The seven timed requests emitted 56 tokens in 2.16324338 seconds, yielding
+**25.8871 output tokens/s**. Median whole-request latency was **309.060392 ms**, with a range
+of 307.310171–310.591344 ms. The portable `small-result.json` includes all samples, IDs, and
+runtime settings verified against the engine log. The log reports 27.55 GiB for model loading
+and 1.0 GiB explicitly reserved for the BF16 KV cache. The cache held 1,216 tokens.
+
+The raw files are under the environment's `runs/run.GeXtAT/` directory. The engine logged a
+chat-template warmup warning because this token-ID fixture skips tokenizer initialization.
+The earlier `runs/run.sxPaAx/` attempt generated a result and exited 127 during the launcher's
+final print step. That directory retains its exit status and the original combined output in
+`engine-and-launcher.log`. The reported samples come exclusively from `run.GeXtAT`.
 
 ## Pairing with sglang.cpp
 

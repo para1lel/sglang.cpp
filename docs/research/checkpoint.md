@@ -54,9 +54,9 @@ These are source observations from 2026-11-18. The upstream archive identifies c
 
 **Capacity estimate.** With BF16 convolution history and configured FP32 recurrent state, one complete target snapshot costs `48 × (10240 × 3 × 2 + 48 × 128 × 128 × 4)` = 146.8125 MiB. A proposed snapshot every 8,192 tokens costs 4.59 GiB across 32 boundaries at native context. An unaligned request end can require another slot. For 16 GQA layers, ideal MXFP8 K and V cost `16 × 2 × 4 × (256 + 8)` = 33,792 bytes/token, or 8.25 GiB at native context. These estimates exclude padding, allocator overhead, draft KV, live and speculative state, workspaces, and graph pools.
 
-## Open P0 experiments
+## P0 experiments
 
-The host reported eight B200s with 183,359 MiB each and driver `590.48.01`. This investigation used CPU probes and source inspection. Main can assign the four single-GPU probes below to runtime and test owners under the existing contracts.
+The host reported eight B200s with 183,359 MiB each and driver `590.48.01`. The checkpoint investigation used CPU probes and source inspection. The [independent vLLM smoke](../../benchmarks/vllm/README.md) subsequently completed the eight-token fixture on B200 1 using BF16 KV. The table preserves the experiment specifications, including outstanding peak-memory, cache, MTP, and media checks.
 
 | Experiment | Smallest useful result |
 | --- | --- |

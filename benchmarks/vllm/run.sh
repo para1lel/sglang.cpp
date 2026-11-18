@@ -37,6 +37,7 @@ export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy ALL_PROXY=$https_proxy
 export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
 export VLLM_NO_USAGE_STATS=1 HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 MAX_JOBS=2
 export XDG_CACHE_HOME="$base/cache/vllm-81a8cb063e62"
+export FLASHINFER_WORKSPACE_BASE="$XDG_CACHE_HOME"
 export TRITON_CACHE_DIR="$XDG_CACHE_HOME/triton"
 export CUDA_HOME=/usr/local/cuda-13.2
 export PATH="$root/venv/bin:$CUDA_HOME/bin:$PATH"

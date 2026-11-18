@@ -1,8 +1,14 @@
 # sglang.cpp
 
 A C++ and CUDA C++ inference engine in development for **Qwen3.8-27B-FP8 on one NVIDIA B200**.
-The first build target checks that the managed toolchain compiles, links, and runs a native
-`sm_100` kernel. Model loading, token generation, and serving are subsequent milestones.
+The native `sglang_cuda` library implements paged MXFP8 KV-cache writes and single-request
+causal grouped-query attention for the checkpoint's full-attention shape. Model loading,
+token generation, and serving are subsequent milestones.
+
+The public C++ API is in
+[`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
+The CUDA implementation is in
+[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L32)<!-- prefix: "__device__ i" -->.
 
 ## Build on the project host
 
@@ -16,8 +22,9 @@ nvidia-smi --query-gpu=index,name,uuid,memory.free --format=csv
 bash tools/build.sh --build-dir build --gpu 4
 ```
 
-Choose an available B200 index in the last command. The build verifies the native cubin and
-resolved CUDA runtime. The device probe launches one kernel and checks its return value.
+Choose an available B200 index in the last command. The build compiles `sglang_cuda` and
+both toolchain probes. It verifies the AOT probe's native cubin and resolved CUDA runtime.
+With `--gpu`, the AOT probe launches one kernel and checks its return value.
 Without `--build-dir`, the script uses a temporary build directory.
 
 To run the P1 NVRTC probe, use the physical index of a reserved B200.
@@ -31,14 +38,23 @@ context for the second launch. Both launches verify all 257 integers. The output
 the device UUID and properties, allocation size, cold and warm cache results,
 NVRTC compilation time, and completed kernel time from CUDA events.
 
+Build the candidate MXFP8 correctness check without using a GPU.
+
+```bash
+bash tools/build.sh --build-dir build --mxfp8-check
+```
+
+`mxfp8-gqa-check` links `sglang_cuda`. Run the reported executable on a reserved B200
+to check cache bytes and attention outputs. This build command only compiles and links the check.
+
 ## Continue development
 
 The checkpoint lives at `/data0/shared/Qwen3.8-27B-FP8`. Keep its weights and generated
 artifacts outside version control. Use SGLang as the architecture reference and the pinned
 vLLM installation as the independent performance comparator.
 
-- [Isolated vLLM setup and single-B200 smoke run](benchmarks/vllm/README.md) reproduces
-  the reference token IDs for the first candidate decoder. vLLM `81a8cb063e62` reached
+- [Isolated vLLM setup and single-B200 baseline](benchmarks/vllm/README.md) reproduces
+  the reference token IDs for the first candidate decoder. Baseline vLLM `81a8cb063e62` reached
   **25.89 output tokens/s** and **309.06 ms** median request latency on this serial fixture
   (five prompt tokens, eight generated tokens, two warmups, seven measured requests).
   The W1–W6 serving comparison remains open.

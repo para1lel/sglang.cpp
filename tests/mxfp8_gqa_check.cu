@@ -1,0 +1,487 @@
+#include "sglang/mxfp8_gqa.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr int head_width = 256;
+constexpr int kv_heads = 4;
+constexpr int query_heads = 24;
+constexpr int group_width = 32;
+constexpr int groups = head_width / group_width;
+constexpr int page_tokens = 128;
+constexpr int physical_pages = 4;
+constexpr int prefix_tokens = page_tokens - 1;
+constexpr int prefill_tokens = 3;
+constexpr int prefill_end = page_tokens + 1;
+constexpr int decode_end = prefill_end + 1;
+constexpr double softmax_scale = 1.0 / 16.0;
+constexpr double scale_amax_floor = 1e-30;
+constexpr std::size_t kv_elements_per_token = kv_heads * head_width;
+constexpr std::size_t payload_bytes = physical_pages * page_tokens * kv_elements_per_token;
+constexpr std::size_t scale_bytes = physical_pages * kv_heads * page_tokens * groups;
+
+using BFloat = __nv_bfloat16;
+using Byte = std::uint8_t;
+
+enum class KvKind { key, value };
+
+std::size_t row_index(int token, int head, int heads) {
+    return static_cast<std::size_t>(token) * heads + head;
+}
+
+std::size_t scale_index(int page, int head, int slot, int group) {
+    const auto page_head = row_index(page, head, kv_heads);
+    return ((page_head * group_width + slot % group_width) *
+            (page_tokens / group_width) + slot / group_width) * groups + group;
+}
+
+double positive_e4m3(int code) {
+    const int exponent = code / 8;
+    const int fraction = code % 8;
+    if (exponent == 0) {
+        return std::ldexp(fraction, -9);
+    }
+    return std::ldexp(8 + fraction, exponent - 10);
+}
+
+Byte encode_e4m3(double value) {
+    const double magnitude = std::abs(value);
+    int lower = 0;
+    int upper = 0x7e;
+    while (upper - lower > 1) {
+        const int middle = (lower + upper) / 2;
+        if (positive_e4m3(middle) < magnitude) {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    const double midpoint = (positive_e4m3(lower) + positive_e4m3(upper)) * 0.5;
+    const int code = magnitude < midpoint || (magnitude == midpoint && lower % 2 == 0)
+                         ? lower : upper;
+    return static_cast<Byte>(code | (std::signbit(value) ? 0x80 : 0));
+}
+
+Byte encode_e8m0(double amax) {
+    const double target = std::max(amax, scale_amax_floor);
+    int lower = 0;
+    int upper = 254;
+    while (lower < upper) {
+        const int middle = (lower + upper) / 2;
+        if (std::ldexp(448.0, middle - 127) < target) {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    return static_cast<Byte>(lower);
+}
+
+double decode_value(Byte code, Byte scale) {
+    const double magnitude = positive_e4m3(code & 0x7f);
+    const double value = (code & 0x80) != 0 ? -magnitude : magnitude;
+    return std::ldexp(value, static_cast<int>(scale) - 127);
+}
+
+struct Encoded {
+    std::vector<Byte> data;
+    std::vector<Byte> scales;
+    std::vector<double> decoded;
+};
+
+Encoded encode_rows(const std::vector<BFloat>& input) {
+    const auto scale_count = input.size() / group_width;
+    Encoded result{std::vector<Byte>(input.size()), std::vector<Byte>(scale_count),
+                   std::vector<double>(input.size())};
+    for (std::size_t group = 0; group < scale_count; ++group) {
+        const auto start = group * group_width;
+        double amax = 0;
+        for (int lane = 0; lane < group_width; ++lane) {
+            amax = std::max(amax, std::abs(static_cast<double>(
+                                     __bfloat162float(input[start + lane]))));
+        }
+        const Byte scale = encode_e8m0(amax);
+        result.scales[group] = scale;
+        for (int lane = 0; lane < group_width; ++lane) {
+            const auto offset = start + lane;
+            const double value = __bfloat162float(input[offset]);
+            const Byte code = encode_e4m3(std::ldexp(value, 127 - static_cast<int>(scale)));
+            result.data[offset] = code;
+            result.decoded[offset] = decode_value(code, scale);
+        }
+    }
+    return result;
+}
+
+double kv_sample(KvKind kind, int token, int head, int group, int lane, int generation) {
+    const int plane = kind == KvKind::key ? 0 : 1;
+    if ((token + 3 * head + 5 * group + 7 * plane + generation) % 37 == 0) {
+        return 0;
+    }
+    const int pattern = (token + head + group + plane + generation) % 3;
+    const int peak = 446 + 2 * pattern;
+    const int exponent = -9 + (token * 3 + head * 5 + group * 7 + plane + generation) % 4;
+    const int scale_exponent = exponent + (peak > 448 ? 1 : 0);
+    const int sign = (token + head + lane / 4 + plane + generation) % 2 == 0 ? 1 : -1;
+    constexpr double ties[] = {0, 1.0625, 1.1875, -1.0625, -1.1875, 1.0 / 1024,
+                               3.0 / 1024, -3.0 / 1024, -1.0 / 1024, -0.0};
+    if (lane < static_cast<int>(sizeof(ties) / sizeof(ties[0]))) {
+        return std::ldexp(ties[lane], scale_exponent);
+    }
+    if (lane == group_width - 1) {
+        return std::ldexp(sign * peak, exponent);
+    }
+    const int amplitude = 16 + (token * 17 + head * 13 + group * 11 + lane * 7 +
+                                plane * 19 + generation * 23) % 80;
+    return std::ldexp(sign * amplitude, scale_exponent);
+}
+
+std::vector<BFloat> make_kv(KvKind kind, int tokens, int generation) {
+    std::vector<BFloat> result(static_cast<std::size_t>(tokens) * kv_heads * head_width);
+    for (int token = 0; token < tokens; ++token) {
+        for (int head = 0; head < kv_heads; ++head) {
+            const auto start = row_index(token, head, kv_heads) * head_width;
+            for (int channel = 0; channel < head_width; ++channel) {
+                const double value = kv_sample(kind, token, head, channel / group_width,
+                                               channel % group_width, generation);
+                result[start + channel] = __float2bfloat16_rn(static_cast<float>(value));
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<BFloat> make_queries(int start_token, int count) {
+    std::vector<BFloat> result(static_cast<std::size_t>(count) * query_heads * head_width);
+    for (int token = 0; token < count; ++token) {
+        for (int head = 0; head < query_heads; ++head) {
+            const auto start = row_index(token, head, query_heads) * head_width;
+            for (int channel = 0; channel < head_width; ++channel) {
+                const int position = start_token + token;
+                const int pattern = ((position + channel + 5) * (head + 3) + channel / 7) % 29;
+                result[start + channel] = __float2bfloat16_rn((pattern - 14) / 16.0f);
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<double> reference_attention(const std::vector<BFloat>& queries,
+                                        const Encoded& keys, const Encoded& values,
+                                        int start_token, int count) {
+    std::vector<double> result(queries.size());
+    std::vector<double> scores(start_token + count);
+    for (int query = 0; query < count; ++query) {
+        const int visible = start_token + query + 1;
+        for (int head = 0; head < query_heads; ++head) {
+            const int kv_head = head / (query_heads / kv_heads);
+            const auto query_row = row_index(query, head, query_heads) * head_width;
+            for (int token = 0; token < visible; ++token) {
+                const auto kv_row = row_index(token, kv_head, kv_heads) * head_width;
+                double score = 0;
+                for (int channel = 0; channel < head_width; ++channel) {
+                    score += __bfloat162float(queries[query_row + channel]) *
+                             keys.decoded[kv_row + channel];
+                }
+                scores[token] = score * softmax_scale;
+            }
+            const double maximum = *std::max_element(scores.begin(), scores.begin() + visible);
+            double denominator = 0;
+            for (int token = 0; token < visible; ++token) {
+                scores[token] = std::exp(scores[token] - maximum);
+                denominator += scores[token];
+            }
+            for (int token = 0; token < visible; ++token) {
+                const auto kv_row = row_index(token, kv_head, kv_heads) * head_width;
+                const double weight = scores[token] / denominator;
+                for (int channel = 0; channel < head_width; ++channel) {
+                    result[query_row + channel] += weight * values.decoded[kv_row + channel];
+                }
+            }
+        }
+    }
+    return result;
+}
+
+double output_tolerance(double expected) {
+    const double magnitude = std::abs(expected);
+    const int exponent = magnitude < std::numeric_limits<float>::min()
+                             ? -126 : std::ilogb(magnitude);
+    const double half_bfloat_ulp = std::ldexp(1.0, exponent - 8);
+    constexpr double fp32_accumulation_allowance = 2e-5;
+    return half_bfloat_ulp + fp32_accumulation_allowance * std::max(1.0, magnitude);
+}
+
+void check_reference_codes() {
+    if (encode_e8m0(0) != 19 || encode_e8m0(224) != 126 || encode_e8m0(446) != 127 ||
+        encode_e8m0(448) != 127 || encode_e8m0(450) != 128) {
+        throw std::runtime_error("Independent scale encoder failed a known-answer case");
+    }
+    if (encode_e4m3(1.0625) != 0x38 || encode_e4m3(1.1875) != 0x3a ||
+        encode_e4m3(-1.1875) != 0xba || encode_e4m3(1.0 / 1024) != 0 ||
+        encode_e4m3(3.0 / 1024) != 2 || encode_e4m3(-1.0 / 1024) != 0x80 ||
+        encode_e4m3(448) != 0x7e || decode_value(0xba, 128) != -2.5) {
+        throw std::runtime_error("Independent payload encoder failed a known-answer case");
+    }
+}
+
+void check_cuda(cudaError_t status, const char* operation) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + " failed with " +
+                                 cudaGetErrorString(status));
+    }
+}
+
+class Stream {
+public:
+    Stream() {
+        check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
+                   "Create test stream");
+    }
+    ~Stream() { cudaStreamDestroy(stream_); }
+    Stream(const Stream&) = delete;
+    Stream& operator=(const Stream&) = delete;
+
+    cudaStream_t get() const { return stream_; }
+
+private:
+    cudaStream_t stream_ = nullptr;
+};
+
+template <class Element>
+class DeviceBuffer {
+public:
+    explicit DeviceBuffer(std::size_t count) : count_(count) {
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&data_), bytes()), "Allocate test buffer");
+    }
+    ~DeviceBuffer() { cudaFree(data_); }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    Element* get() const { return data_; }
+
+    void upload(const Element* source, cudaStream_t stream) const {
+        check_cuda(cudaMemcpyAsync(data_, source, bytes(), cudaMemcpyHostToDevice, stream),
+                   "Upload test buffer");
+    }
+
+    void fill(Byte sentinel, cudaStream_t stream) const {
+        check_cuda(cudaMemsetAsync(data_, sentinel, bytes(), stream), "Fill test buffer");
+    }
+
+    std::vector<Element> download(cudaStream_t stream) const {
+        std::vector<Element> result(count_);
+        check_cuda(cudaMemcpyAsync(result.data(), data_, bytes(), cudaMemcpyDeviceToHost, stream),
+                   "Download test buffer");
+        check_cuda(cudaStreamSynchronize(stream), "Complete test stream");
+        return result;
+    }
+
+private:
+    std::size_t bytes() const { return count_ * sizeof(Element); }
+
+    std::size_t count_;
+    Element* data_ = nullptr;
+};
+
+struct Pages {
+    const std::vector<std::int32_t> mapping;
+    DeviceBuffer<std::int32_t> device{mapping.size()};
+
+    sglang::Mxfp8PageTable view() const {
+        return {device.get(), static_cast<int>(mapping.size())};
+    }
+};
+
+struct KvSequence {
+    KvSequence(int tokens, int generation)
+        : keys(make_kv(KvKind::key, tokens, generation)),
+          values(make_kv(KvKind::value, tokens, generation)),
+          encoded_keys(encode_rows(keys)),
+          encoded_values(encode_rows(values)) {}
+
+    const std::vector<BFloat> keys;
+    const std::vector<BFloat> values;
+    const Encoded encoded_keys;
+    const Encoded encoded_values;
+};
+
+void check_bytes(const char* phase, const char* plane, const char* buffer,
+                 const std::vector<Byte>& actual, const std::vector<Byte>& expected) {
+    for (std::size_t offset = 0; offset < expected.size(); ++offset) {
+        if (actual[offset] != expected[offset]) {
+            std::fprintf(stderr, "%s %s %s byte %zu got 0x%02x expected 0x%02x\n",
+                         phase, plane, buffer, offset, static_cast<unsigned>(actual[offset]),
+                         static_cast<unsigned>(expected[offset]));
+            throw std::runtime_error("Cache bytes differ from independent encoding");
+        }
+    }
+}
+
+class CachePlane {
+public:
+    explicit CachePlane(const char* name) : name_(name) {}
+
+    Byte* data() const { return data_.get(); }
+    Byte* scales() const { return scales_.get(); }
+
+    void initialize(cudaStream_t stream) const {
+        data_.fill(payload_sentinel, stream);
+        scales_.fill(scale_sentinel, stream);
+    }
+
+    void record_append(const Encoded& encoded, const Pages& pages, int first, int count) {
+        for (int position = first; position < first + count; ++position) {
+            const int page = pages.mapping[position / page_tokens];
+            const int slot = position % page_tokens;
+            const int physical_token = page * page_tokens + slot;
+            for (int head = 0; head < kv_heads; ++head) {
+                const auto logical_row = row_index(position, head, kv_heads);
+                const auto physical_row = row_index(physical_token, head, kv_heads);
+                std::copy_n(encoded.data.begin() + logical_row * head_width, head_width,
+                            expected_data_.begin() + physical_row * head_width);
+                for (int group = 0; group < groups; ++group) {
+                    expected_scales_[scale_index(page, head, slot, group)] =
+                        encoded.scales[logical_row * groups + group];
+                }
+            }
+        }
+    }
+
+    void verify(const char* phase, cudaStream_t stream) const {
+        check_bytes(phase, name_, "payload", data_.download(stream), expected_data_);
+        check_bytes(phase, name_, "scale", scales_.download(stream), expected_scales_);
+    }
+
+private:
+    static constexpr Byte payload_sentinel = 0xa5;
+    static constexpr Byte scale_sentinel = 0xf0;
+    const char* name_;
+    DeviceBuffer<Byte> data_{payload_bytes};
+    DeviceBuffer<Byte> scales_{scale_bytes};
+    std::vector<Byte> expected_data_ = std::vector<Byte>(payload_bytes, payload_sentinel);
+    std::vector<Byte> expected_scales_ = std::vector<Byte>(scale_bytes, scale_sentinel);
+};
+
+struct TestCache {
+    CachePlane keys{"key"};
+    CachePlane values{"value"};
+
+    sglang::Mxfp8KvCache view() const {
+        return {keys.data(), values.data(), keys.scales(), values.scales(), physical_pages};
+    }
+};
+
+void check_append(const char* phase, TestCache& cache, const Pages& pages, const KvSequence& input,
+                  int first, int count, cudaStream_t stream) {
+    const auto offset = first * kv_elements_per_token;
+    const auto elements = count * kv_elements_per_token;
+    const DeviceBuffer<BFloat> keys(elements);
+    const DeviceBuffer<BFloat> values(elements);
+    keys.upload(input.keys.data() + offset, stream);
+    values.upload(input.values.data() + offset, stream);
+    check_cuda(sglang::mxfp8_kv_append(cache.view(), pages.view(), first, count, keys.get(),
+                                      values.get(), stream), phase);
+    cache.keys.record_append(input.encoded_keys, pages, first, count);
+    cache.values.record_append(input.encoded_values, pages, first, count);
+    cache.keys.verify(phase, stream);
+    cache.values.verify(phase, stream);
+    std::printf("%s verified interval [%d,%d) across %zu cache bytes\n",
+                phase, first, first + count, 2 * (payload_bytes + scale_bytes));
+}
+
+void verify_attention(const char* phase, const std::vector<BFloat>& actual,
+                      const std::vector<double>& expected) {
+    double max_error = 0;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const double got = __bfloat162float(actual[index]);
+        const double error = std::abs(got - expected[index]);
+        const double tolerance = output_tolerance(expected[index]);
+        if (!std::isfinite(got) || error > tolerance) {
+            std::fprintf(stderr, "%s row %zu head %zu channel %zu got %.9g expected %.9g "
+                                 "allowed error %.9g\n",
+                         phase, index / (head_width * query_heads),
+                         index / head_width % query_heads, index % head_width,
+                         got, expected[index], tolerance);
+            throw std::runtime_error("Attention differs from independent causal reference");
+        }
+        max_error = std::max(max_error, error);
+    }
+    std::printf("%s verified %zu BF16 outputs with maximum absolute error %.9g\n",
+                phase, expected.size(), max_error);
+}
+
+void check_attention(const char* phase, const TestCache& cache, const Pages& pages,
+                     const KvSequence& input, int valid, int first, int count,
+                     cudaStream_t stream) {
+    const auto queries = make_queries(first, count);
+    const auto expected = reference_attention(queries, input.encoded_keys, input.encoded_values,
+                                              first, count);
+    const DeviceBuffer<BFloat> device_queries(queries.size());
+    const DeviceBuffer<BFloat> output(queries.size());
+    device_queries.upload(queries.data(), stream);
+    output.fill(0xff, stream);
+    check_cuda(sglang::mxfp8_gqa_attention(cache.view(), pages.view(), valid, first, count,
+                                         device_queries.get(), output.get(), stream), phase);
+    verify_attention(phase, output.download(stream), expected);
+}
+
+void check_device() {
+    int device = 0;
+    cudaDeviceProp properties{};
+    check_cuda(cudaGetDevice(&device), "Select current CUDA device");
+    check_cuda(cudaGetDeviceProperties(&properties, device), "Read CUDA device properties");
+    if (properties.major != 10 || properties.minor != 0) {
+        throw std::runtime_error("The MXFP8 GQA check requires an SM100 device");
+    }
+    std::printf("device=%s compute_capability=%d.%d\n", properties.name,
+                properties.major, properties.minor);
+}
+
+void run_check() {
+    check_reference_codes();
+    check_device();
+    const Stream stream;
+    TestCache cache;
+    cache.keys.initialize(stream.get());
+    cache.values.initialize(stream.get());
+
+    const Pages pages{{3, 1}};
+    pages.device.upload(pages.mapping.data(), stream.get());
+    const KvSequence original(decode_end, 0);
+    check_append("prefix append", cache, pages, original, 0, prefix_tokens, stream.get());
+    check_append("cross-page append", cache, pages, original, prefix_tokens,
+                 prefill_end - prefix_tokens, stream.get());
+    check_attention("causal prefill", cache, pages, original, prefill_end,
+                    prefill_end - prefill_tokens, prefill_tokens, stream.get());
+    check_append("decode append", cache, pages, original, prefill_end, 1, stream.get());
+    check_attention("decode", cache, pages, original, decode_end, prefill_end, 1, stream.get());
+
+    const Pages reused{{1}};
+    reused.device.upload(reused.mapping.data(), stream.get());
+    const KvSequence replacement(1, 9);
+    check_append("reused page append", cache, reused, replacement, 0, 1, stream.get());
+    check_attention("reused page decode", cache, reused, replacement, 1, 0, 1, stream.get());
+}
+
+}
+
+int main() {
+    try {
+        run_check();
+        std::puts("MXFP8 GQA check passed");
+        return 0;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "MXFP8 GQA check failed. %s\n", error.what());
+        return 1;
+    }
+}

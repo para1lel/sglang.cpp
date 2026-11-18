@@ -42,7 +42,12 @@ unset NVCC_PREPEND_FLAGS
 "$host" --version | sed -n '1p'
 "$prefix/bin/nvcc" --version
 sha256sum "$base/pixi.toml" "$base/pixi.lock"
-"$xmake" f -o "$work/build" -p linux -a x86_64 -m release
+check=${SGLANG_MXFP8_CHECK:-n}
+if [[ "$check" == y && ! -f tests/mxfp8_gqa_check.cu ]]; then
+    echo "The optional MXFP8 check requires tests/mxfp8_gqa_check.cu." >&2
+    exit 1
+fi
+"$xmake" f -o "$work/build" -p linux -a x86_64 -m release --mxfp8-gqa-check="$check"
 "$xmake" build -v toolchain-probe
 
 probe="$work/build/bin/toolchain-probe"
@@ -67,6 +72,13 @@ if [[ "$(realpath -e -- "$nvrtc")" != "$prefix/"* ]]; then
 fi
 echo "NVRTC library: $nvrtc"
 sha256sum "$nvrtc_probe" "$nvrtc"
+
+"$xmake" build -v sglang_cuda
+sha256sum "$work/build/lib/libsglang_cuda.a"
+if [[ "$check" == y ]]; then
+    "$xmake" build -v mxfp8-gqa-check
+    sha256sum "$work/build/bin/mxfp8-gqa-check"
+fi
 
 if [[ -n "$SGLANG_GPU_INDEX" ]]; then
     if [[ ${SGLANG_GPU_PROBE:-} == nvrtc-probe ]]; then

@@ -73,7 +73,10 @@ final print step. That directory retains its exit status and the original combin
 ## Pairing with sglang.cpp
 
 1. Reuse the exact checkpoint manifest, prompt IDs, greedy sampling settings, and output length.
-   Match TP, effective cache precision, prefix cache, eager execution, and speculation settings.
+   Match TP, prefix cache, eager execution, and speculation settings. The
+   [benchmark agreement](../../docs/performance.md#gqa-cache-comparison) permits measured vLLM
+   `fp8_e4m3` GQA KV against the candidate's native MXFP8 GQA KV. Verify and record both engines'
+   effective cache formats and scale policies. The historical BF16 result is diagnostic only.
 2. Run each implementation with exclusive access to the same UUID. Preserve both hardware
    snapshots, client and runtime versions, engine logs, and warmup policy. Record differences
    in kernel dispatch and environment.

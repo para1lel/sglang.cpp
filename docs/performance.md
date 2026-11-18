@@ -12,7 +12,13 @@ The project goal is higher inference throughput than pinned vLLM on the **same p
 
 Run each engine alone on the selected UUID. Record driver, CUDA runtimes, host and client configuration, clocks, power settings, and other GPU activity. Keep isolation between the baseline environment and the candidate build. Disclose required software differences and their effect on the comparison.
 
-Match model revision, weight shards and scales, tokenizer, chat template, processor, effective weight and KV precision, and sampling policy. Freeze request bytes, token IDs, arrival order, concurrency, seeds, output limits, and stop rules. Match prefix-cache state, MTP mode, and media preprocessing. Check actual dispatch and token counts. If either engine lacks a required mode, mark that row unsupported and leave the comparison open.
+Match model revision, weight shards and scales, tokenizer, chat template, processor, effective weight precision, and sampling policy. Match cache and state precision under the [GQA cache comparison](#gqa-cache-comparison). Freeze request bytes, token IDs, arrival order, concurrency, seeds, output limits, and stop rules. Match prefix-cache state, MTP mode, and media preprocessing. Check actual dispatch and token counts. If either engine lacks a required mode, mark that row unsupported and leave the comparison open.
+
+## GQA cache comparison
+
+Use the candidate's [native MXFP8 GQA path](development.md#p2-gqa-cache-contract). For the pinned vLLM comparator, request `kv_cache_dtype="fp8_e4m3"` (`--kv-cache-dtype fp8_e4m3` on the server CLI). Pair the runs only after vLLM dispatches with plain E4M3 GQA KV on the required workload. The pin supports per-tensor K and V scales and defaults both to `1.0` when the checkpoint supplies neither. The local checkpoint index contains no attention scales. Verify the effective scale policy in the run. [vLLM cache setting](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/config/cache.py#L251)<!-- prefix: "CUDA 11.8+ s" --> · [vLLM scale initialization](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/model_executor/layers/quantization/kv_cache.py#L118)<!-- prefix: "elif layer.k" -->
+
+This pairing permits different GQA KV formats and scale granularity. Record each engine's requested and effective KV format and the scale dtype, granularity, and source. Record the effective attention Q dtype, any Q scaling, and the attention backend and fallback status. Match and record the GDN state dtypes. The checkpoint FP8 weights and their scales remain a separate control. Apply the same memory, feature, correctness, and latency requirements. Require exact output IDs, token counts, and completion reasons for the paired greedy fixture.
 
 ## First baseline run
 
@@ -23,7 +29,7 @@ bash benchmarks/vllm/setup.sh
 GPU="${GPU_INDEX:?set the reserved B200 index}" bash benchmarks/vllm/run.sh benchmarks/vllm/small.json
 ```
 
-The offline smoke case requests eight output tokens. Inspect the reported run directory for the device UUID, effective configuration, output IDs, and individual request timings. Repeats must finish at the requested length with identical greedy token IDs. This case measures whole-request latency and output tokens/s. W1–W6 require separate runs with a streaming client to measure first-token latency.
+The offline smoke case requests eight output tokens using checkpoint FP8 weights and BF16 KV. Inspect the reported run directory for the device UUID, effective configuration, output IDs, and individual request timings. Repeats must finish at the requested length with identical greedy token IDs. This independent diagnostic measures whole-request latency and output tokens/s. Paired acceptance requires a separate run under the GQA cache comparison. W1–W6 require separate runs with a streaming client to measure first-token latency.
 
 ## Named workloads
 

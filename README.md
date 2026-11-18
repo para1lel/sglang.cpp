@@ -53,6 +53,16 @@ python -IB .agents/checks/check_rules.py package .agents/skills --policy-root .
 git hook run pre-commit
 ```
 
+To verify the handoff independently, run the installed hooks in disposable clones and save
+the observations. The proof checks staged and unstaged disagreements, an alternate index,
+the frozen size limits, test failures, and the XMake compile gate.
+
+```bash
+mkdir -p artifacts/handoff
+python -B tests/prove_handoff.py --revision HEAD > artifacts/handoff/verification.jsonl
+tail -1 artifacts/handoff/verification.jsonl
+```
+
 Push each verified commit to the private `origin` and compare `git rev-parse HEAD` with
 `git ls-remote origin refs/heads/main`. The hardware run and performance measurements are
 separate from the staged build and host checks.

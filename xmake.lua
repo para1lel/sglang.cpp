@@ -57,6 +57,7 @@ target("sglang_cuda")
     add_files("src/mxfp8_gqa.cu", "src/text_decode_fp8.cu")
     add_files("src/text_decode_bandwidth.cu")
     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
+    add_files("src/text_normalization.cu")
 
 target("sglang_prefill_fp8_sm100")
     set_kind("static")

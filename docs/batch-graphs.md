@@ -24,7 +24,7 @@ Scratch OOM and recognized capture, instantiation, or synchronous launch rejecti
 
 ## Verification
 
-Follow the [batch graph test runbook](../tests/batch/README.md) to build the release server, `mxfp8-gqa-check`, and `batch-graph-lanes`. Enable `--mxfp8-gqa-check=y` and `--batch-graph-lanes=y` in XMake. The runner checks bound operators, lane reuse, fault recovery, and HTTP parity under both prefill policies. Its CPU regression rejects a mask with the correct population count that includes a zero-budget slot. [Test target](../xmake.lua#L158)<!-- prefix: "option(\"batc" -->
+Follow the [batch graph test runbook](../tests/batch/README.md) to build the release server, `mxfp8-gqa-check`, and `batch-graph-lanes`. Enable `--mxfp8-gqa-check=y` and `--batch-graph-lanes=y` in XMake. The runner checks bound operators, lane reuse, fault recovery, and HTTP parity under both prefill policies. Its CPU regression rejects a mask with the correct population count that includes a zero-budget slot. [Test target](../xmake.lua#L159)<!-- prefix: "option(\"batc" -->
 
 On the reserved B200, compare each width against eager with identical inputs under the same prefill policy. Use a C++ probe to compare greedy IDs and a score observer to compare full BF16 rows. Cross positions 127–129. Change slot masks and lane positions at one width. Cancel and reuse a slot. Cross from position 5,119 to 5,120 with enough KV capacity. Select a zero-budget lane alongside replaying lanes. After retirement, require zero request bytes.
 

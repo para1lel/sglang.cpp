@@ -2,6 +2,8 @@
 
 #include "sglang/decoder_cuda.cuh"
 
+#include "text_cuda_primitives.cuh"
+
 #include <algorithm>
 #include <cstddef>
 
@@ -12,37 +14,14 @@
 namespace sglang {
 namespace {
 
-constexpr int warp_width = 32;
-constexpr int block_threads = 256;
-constexpr int block_warps = block_threads / warp_width;
-constexpr unsigned int warp_mask = 0xffffffffu;
-constexpr float fp8_max = 448.0f;
-constexpr float quant_epsilon = 1.0e-10f;
-constexpr float rms_epsilon = 1.0e-6f;
+using namespace text_kernel;
+
 constexpr int argmax_tile = 4 * block_threads;
 static_assert(text_argmax_scratch_count(argmax_tile) == 1);
 static_assert(text_argmax_scratch_count(argmax_tile + 1) == 2);
 
 constexpr int divide_up(int count, int tile) {
     return count / tile + (count % tile != 0);
-}
-
-bool aligned(const void* pointer, std::size_t alignment) {
-    return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
-}
-
-__device__ float warp_sum(float value) {
-    for (int offset = warp_width / 2; offset > 0; offset /= 2) {
-        value += __shfl_down_sync(warp_mask, value, offset);
-    }
-    return value;
-}
-
-__device__ float warp_max(float value) {
-    for (int offset = warp_width / 2; offset > 0; offset /= 2) {
-        value = fmaxf(value, __shfl_down_sync(warp_mask, value, offset));
-    }
-    return value;
 }
 
 __global__ void embedding_kernel(const __nv_bfloat16* row, int width, __nv_bfloat16* output) {
@@ -83,15 +62,6 @@ __global__ void set_decode_position_kernel(int* position, int value) {
 
 __global__ void advance_decode_position_kernel(int* position) {
     ++*position;
-}
-
-__device__ uint4 load_128(const void* address) {
-    uint4 bits;
-    const auto global = __cvta_generic_to_global(address);
-    asm("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
-        : "l"(global) : "memory");
-    return bits;
 }
 
 __device__ float bf16x2_dot(unsigned int lhs, unsigned int rhs, float sum) {
@@ -185,15 +155,24 @@ cudaError_t launch_bf16_batch(const __nv_bfloat16* weight, int out_width, int in
                             block_threads, args, 0, stream);
 }
 
-template <bool Batched>
+__device__ __nv_bfloat16 swiglu(__nv_bfloat16 gate, __nv_bfloat16 up) {
+    const float value = __bfloat162float(gate);
+    const auto activated = __float2bfloat16_rn(value / (1.0f + expf(-value)));
+    return __float2bfloat16_rn(__bfloat162float(activated) * __bfloat162float(up));
+}
+
+template <bool Batched, bool ApplySwiglu = false>
 __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
-                                    TextFp8Activation output) {
+                                    TextFp8Activation output, const __nv_bfloat16* up) {
     constexpr int group_warps = text_fp8_group_size / warp_width;
     __shared__ float warp_maxima[group_warps];
     __shared__ float reciprocal_scale;
     if constexpr (Batched) {
         const auto offset = static_cast<std::size_t>(blockIdx.y) * width;
         input += offset;
+        if constexpr (ApplySwiglu) {
+            up += offset;
+        }
         output.values += offset;
         output.scales += static_cast<std::size_t>(blockIdx.y) * gridDim.x;
     }
@@ -201,7 +180,11 @@ __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
     const int warp = threadIdx.x / warp_width;
     const auto col = static_cast<std::size_t>(blockIdx.x) * text_fp8_group_size + threadIdx.x;
     const bool valid = col < static_cast<std::size_t>(width);
-    const float value = valid ? __bfloat162float(input[col]) : 0.0f;
+    float value = 0.0f;
+    if (valid) {
+        const auto element = ApplySwiglu ? swiglu(input[col], up[col]) : input[col];
+        value = __bfloat162float(element);
+    }
     const float maximum = warp_max(fabsf(value));
     if (lane == 0) {
         warp_maxima[warp] = maximum;
@@ -473,76 +456,11 @@ cudaError_t launch_fp8_rows(const std::uint8_t* weight, const __nv_bfloat16* wei
                             fp8_packed_warps * warp_width, args, 0, stream);
 }
 
-__device__ float residual_sum(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
-                              std::size_t col) {
-    const float value = __bfloat162float(branch[col]);
-    return residual == nullptr ? value : value + __bfloat162float(residual[col]);
-}
-
-__device__ __forceinline__ void rms_norm_row(const __nv_bfloat16* branch,
-                                             const __nv_bfloat16* residual,
-                                             const __nv_bfloat16* weight, int width,
-                                             __nv_bfloat16* output,
-                                             __nv_bfloat16* residual_output) {
-    __shared__ float warp_squares[block_warps];
-    __shared__ float inverse_rms;
-    const int lane = threadIdx.x % warp_width;
-    const int warp = threadIdx.x / warp_width;
-    const auto count = static_cast<std::size_t>(width);
-    float squares = 0.0f;
-    for (std::size_t col = threadIdx.x; col < count; col += block_threads) {
-        const float value = residual_sum(branch, residual, col);
-        squares = fmaf(value, value, squares);
-    }
-    squares = warp_sum(squares);
-    if (lane == 0) {
-        warp_squares[warp] = squares;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        squares = warp_sum(lane < block_warps ? warp_squares[lane] : 0.0f);
-        if (lane == 0) {
-            inverse_rms = rsqrtf(squares / static_cast<float>(width) + rms_epsilon);
-        }
-    }
-    __syncthreads();
-    for (std::size_t col = threadIdx.x; col < count; col += block_threads) {
-        const float value = residual_sum(branch, residual, col);
-        const float gain = 1.0f + __bfloat162float(weight[col]);
-        if (residual_output != nullptr) {
-            residual_output[col] = __float2bfloat16_rn(value);
-        }
-        output[col] = __float2bfloat16_rn((value * inverse_rms) * gain);
-    }
-}
-
-template <bool Batched>
-__global__ void rms_norm_kernel(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
-                                const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
-                                __nv_bfloat16* residual_output) {
-    const auto offset = Batched ? static_cast<std::size_t>(blockIdx.x) * width : 0;
-    rms_norm_row(branch + offset, residual ? residual + offset : nullptr, weight, width,
-                 output + offset, residual_output ? residual_output + offset : nullptr);
-}
-
-__global__ void rms_norm_pair_rows_kernel(const __nv_bfloat16* first, const __nv_bfloat16* second,
-                                          const __nv_bfloat16* first_weight,
-                                          const __nv_bfloat16* second_weight, int width,
-                                          __nv_bfloat16* output) {
-    const auto offset = static_cast<std::size_t>(blockIdx.x) * width;
-    const bool second_half = blockIdx.y != 0;
-    rms_norm_row((second_half ? second : first) + offset, nullptr,
-                 second_half ? second_weight : first_weight, width,
-                 output + 2 * offset + blockIdx.y * static_cast<std::size_t>(width), nullptr);
-}
-
 __global__ void swiglu_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,
                               __nv_bfloat16* output) {
     const auto col = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col < static_cast<std::size_t>(width)) {
-        const float value = __bfloat162float(gate[col]);
-        const auto activated = __float2bfloat16_rn(value / (1.0f + expf(-value)));
-        output[col] = __float2bfloat16_rn(__bfloat162float(activated) * __bfloat162float(up[col]));
+        output[col] = swiglu(gate[col], up[col]);
     }
 }
 
@@ -727,7 +645,8 @@ cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Acti
     if (input == nullptr || output.values == nullptr || output.scales == nullptr || width <= 0) {
         return cudaErrorInvalidValue;
     }
-    void* args[] = {&input, &width, &output};
+    const __nv_bfloat16* up = nullptr;
+    void* args[] = {&input, &width, &output, &up};
     return cudaLaunchKernel(quantize_fp8_kernel<false>, text_fp8_group_count(width),
                             text_fp8_group_size, args, 0, stream);
 }
@@ -737,8 +656,18 @@ cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int ro
     if (!input || !output.values || !output.scales || width <= 0 || rows <= 0 || rows > 65535) {
         return cudaErrorInvalidValue;
     }
-    void* args[] = {&input, &width, &output};
+    const __nv_bfloat16* up = nullptr;
+    void* args[] = {&input, &width, &output, &up};
     return cudaLaunchKernel(quantize_fp8_kernel<true>, dim3(text_fp8_group_count(width), rows),
+                            text_fp8_group_size, args, 0, stream);
+}
+
+cudaError_t decoder::tensor_core_prefill_swiglu_quantize(
+    const __nv_bfloat16* gate, const __nv_bfloat16* up, int width, int rows,
+    TextFp8Activation activation, cudaStream_t stream) {
+    void* args[] = {&gate, &width, &activation, &up};
+    const dim3 grid(text_fp8_group_count(width), rows);
+    return cudaLaunchKernel(quantize_fp8_kernel<true, true>, grid,
                             text_fp8_group_size, args, 0, stream);
 }
 
@@ -830,136 +759,6 @@ cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* 
         }
     }
     return cudaSuccess;
-}
-
-namespace {
-
-constexpr int rms_hidden_width = 5120;
-
-__device__ void stage_rms_vector(const __nv_bfloat16* input, __nv_bfloat16* shared) {
-    const uint4 vector = load_128(input);
-    const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(shared));
-    asm("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
-        :: "r"(address), "r"(vector.x), "r"(vector.y), "r"(vector.z), "r"(vector.w)
-        : "memory");
-}
-
-__device__ __forceinline__ float rms_inverse(float squares, int width) {
-    __shared__ float warp_squares[block_warps];
-    __shared__ float inverse_rms;
-    const int lane = threadIdx.x % warp_width;
-    const int warp = threadIdx.x / warp_width;
-    squares = warp_sum(squares);
-    if (lane == 0) {
-        warp_squares[warp] = squares;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        squares = warp_sum(lane < block_warps ? warp_squares[lane] : 0.0f);
-        if (lane == 0) {
-            inverse_rms = rsqrtf(squares / static_cast<float>(width) + rms_epsilon);
-        }
-    }
-    __syncthreads();
-    return inverse_rms;
-}
-
-__device__ void store_rms(float value, float inverse_rms, const __nv_bfloat16* weight,
-                          std::size_t col, __nv_bfloat16* output,
-                          __nv_bfloat16* residual_output) {
-    const float gain = 1.0f + __bfloat162float(weight[col]);
-    if (residual_output != nullptr) {
-        residual_output[col] = __float2bfloat16_rn(value);
-    }
-    output[col] = __float2bfloat16_rn((value * inverse_rms) * gain);
-}
-
-template <bool HasResidual, bool StoresResidual>
-__global__ void rms_norm_vector_kernel(const __nv_bfloat16* branch,
-                                       const __nv_bfloat16* residual,
-                                       const __nv_bfloat16* weight, __nv_bfloat16* output,
-                                       __nv_bfloat16* residual_output) {
-    __shared__ alignas(16) __nv_bfloat16 branch_values[rms_hidden_width];
-    __shared__ alignas(16) __nv_bfloat16 residual_values[HasResidual ? rms_hidden_width : 1];
-    __shared__ alignas(16) __nv_bfloat16 gains[rms_hidden_width];
-    constexpr int vector_width = sizeof(uint4) / sizeof(__nv_bfloat16);
-    static_assert(rms_hidden_width % block_threads == 0 && rms_hidden_width % vector_width == 0);
-    for (int col = threadIdx.x * vector_width; col < rms_hidden_width;
-         col += block_threads * vector_width) {
-        stage_rms_vector(branch + col, branch_values + col);
-        if constexpr (HasResidual) {
-            stage_rms_vector(residual + col, residual_values + col);
-        }
-        stage_rms_vector(weight + col, gains + col);
-    }
-    __syncthreads();
-
-    constexpr int values_per_thread = rms_hidden_width / block_threads;
-    float values[values_per_thread];
-    float squares = 0.0f;
-#pragma unroll
-    for (int index = 0; index < values_per_thread; ++index) {
-        const int col = threadIdx.x + index * block_threads;
-        const float value = residual_sum(branch_values, HasResidual ? residual_values : nullptr,
-                                         col);
-        values[index] = value;
-        squares = fmaf(value, value, squares);
-    }
-    const float inverse_rms = rms_inverse(squares, rms_hidden_width);
-#pragma unroll
-    for (int index = 0; index < values_per_thread; ++index) {
-        const int col = threadIdx.x + index * block_threads;
-        store_rms(values[index], inverse_rms, gains, col, output,
-                  StoresResidual ? residual_output : nullptr);
-    }
-}
-
-}
-
-cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
-                         const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
-                         __nv_bfloat16* residual_output, cudaStream_t stream) {
-    if (branch == nullptr || weight == nullptr || output == nullptr || width <= 0 ||
-        output == residual_output) {
-        return cudaErrorInvalidValue;
-    }
-    if (width == rms_hidden_width && aligned(branch, alignof(uint4)) &&
-        aligned(residual, alignof(uint4)) && aligned(weight, alignof(uint4))) {
-        void* args[] = {&branch, &residual, &weight, &output, &residual_output};
-        const bool store_residual = residual_output != nullptr;
-        const auto kernel = residual == nullptr
-            ? (store_residual ? rms_norm_vector_kernel<false, true>
-                              : rms_norm_vector_kernel<false, false>)
-            : (store_residual ? rms_norm_vector_kernel<true, true>
-                              : rms_norm_vector_kernel<true, false>);
-        return cudaLaunchKernel(kernel, 1, block_threads, args, 0, stream);
-    }
-    void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
-    return cudaLaunchKernel(rms_norm_kernel<false>, 1, block_threads, args, 0, stream);
-}
-
-cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
-                              const __nv_bfloat16* weight, int width, int rows,
-                              __nv_bfloat16* output, __nv_bfloat16* residual_output,
-                              cudaStream_t stream) {
-    if (!branch || !weight || !output || width <= 0 || rows <= 0 || output == residual_output) {
-        return cudaErrorInvalidValue;
-    }
-    void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
-    return cudaLaunchKernel(rms_norm_kernel<true>, rows, block_threads, args, 0, stream);
-}
-
-cudaError_t text_rms_norm_pair_rows(const __nv_bfloat16* first, const __nv_bfloat16* second,
-                                   const __nv_bfloat16* first_weight,
-                                   const __nv_bfloat16* second_weight, int width, int rows,
-                                   __nv_bfloat16* output, cudaStream_t stream) {
-    if (!first || !second || !first_weight || !second_weight || !output ||
-        width <= 0 || rows <= 0) {
-        return cudaErrorInvalidValue;
-    }
-    void* args[] = {&first, &second, &first_weight, &second_weight, &width, &output};
-    return cudaLaunchKernel(rms_norm_pair_rows_kernel, dim3(rows, 2), block_threads, args, 0,
-                            stream);
 }
 
 cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,

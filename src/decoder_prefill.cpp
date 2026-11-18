@@ -225,21 +225,26 @@ struct Chunk : PrefillProjections {
     }
 
     void gdn(const GdnLayer& layer, TextGdnState state) const {
-        const auto input = quantize(work.normalized, hidden_size);
+        const TextFp8ActivationView input{activation.values, activation.scales};
         project(layer.qkv, input, work.gdn_qkv);
         project(layer.z, input, work.gdn_z);
         project(layer.b, work.normalized, work.gdn_b);
         project(layer.a, work.normalized, work.gdn_a);
-        check(text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
+        static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
+        const auto status = tensor_core_fp8
+            ? tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+                                      layer.recurrent, state, work.gdn_scratch,
+                                      reinterpret_cast<float2*>(work.keys), work.attention, stream)
+            : text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
                                work.gdn_a, layer.recurrent, state, work.gdn_scratch,
-                               text_gdn_workspace_bytes(rows), work.attention, stream),
-              "Advance prefill Gated DeltaNet state");
+                               text_gdn_workspace_bytes(rows), work.attention, stream);
+        check(status, "Advance prefill Gated DeltaNet state");
         project(layer.output, quantize(work.attention, text_gdn_value_width),
                 work.projected_attention);
     }
 
     void gqa(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages) const {
-        const auto input = quantize(work.normalized, hidden_size);
+        const TextFp8ActivationView input{activation.values, activation.scales};
         project(layer.q_gate, input, work.q_gate);
         project(layer.key, input, work.keys);
         project(layer.value, input, work.values);
@@ -248,20 +253,43 @@ struct Chunk : PrefillProjections {
               "Normalize and rotate prefill Q/K");
         check(mxfp8_kv_append(cache, pages, position, rows, work.rope_keys, work.values, stream),
               "Append prefill MXFP8 KV");
-        check(mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
-                                 work.attention, stream), "Read causal prefill MXFP8 attention");
+        const auto status = tensor_core_fp8
+            ? tensor_core_prefill_gqa(cache, pages, position, rows, work.rope_queries,
+                                      work.attention, stream)
+            : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
+                                   work.attention, stream);
+        check(status, "Read causal prefill MXFP8 attention");
         check(text_gqa_postgate(rows, work.q_gate, work.attention, work.attention, stream),
               "Gate prefill grouped-query attention");
         project(layer.output, quantize(work.attention, text_gqa_q_width), work.projected_attention);
     }
 
     void mlp(const Layer& layer) const {
-        const auto input = quantize(work.normalized, hidden_size);
+        const TextFp8ActivationView input{activation.values, activation.scales};
         project(layer.mlp_gate, input, work.mlp_gate);
         project(layer.mlp_up, input, work.mlp_up);
+        if (tensor_core_fp8) {
+            check(tensor_core_prefill_swiglu_quantize(work.mlp_gate, work.mlp_up,
+                                                      intermediate_size, rows, activation, stream),
+                  "Apply and quantize prefill SwiGLU");
+            project(layer.mlp_down, input, work.hidden);
+            return;
+        }
         check(text_swiglu(work.mlp_gate, work.mlp_up, rows * intermediate_size,
                           work.mlp_gate, stream), "Apply prefill SwiGLU");
         project(layer.mlp_down, quantize(work.mlp_gate, intermediate_size), work.hidden);
+    }
+
+    void normalize(const Bf16* branch, Bf16* residual, const Bf16* weight) const {
+        if (tensor_core_fp8) {
+            check(tensor_core_prefill_rms_quantize(branch, residual, weight, hidden_size, rows,
+                                                   work.normalized, activation, stream),
+                  "Normalize and quantize prefill residual");
+            return;
+        }
+        check(text_rms_norm_rows(branch, residual, weight, hidden_size, rows,
+                                 work.normalized, residual, stream), "Normalize prefill residual");
+        quantize(work.normalized, hidden_size);
     }
 };
 
@@ -415,17 +443,13 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         const auto& layer = layers[index];
         const auto* input = index == 0 ? work.residual : work.hidden;
         auto* residual = index == 0 ? nullptr : work.residual;
-        check(text_rms_norm_rows(input, residual, layer.input_norm, hidden_size, rows,
-                                 work.normalized, residual, stream),
-              "Normalize prefill layer input");
+        chunk.normalize(input, residual, layer.input_norm);
         if (is_full_attention(index)) {
             chunk.gqa(layer.gqa, request.caches[gqa_index++], request.pages);
         } else {
             chunk.gdn(layer.gdn, request.states[gdn_index++]);
         }
-        check(text_rms_norm_rows(work.projected_attention, work.residual, layer.attention_norm,
-                                 hidden_size, rows, work.normalized, work.residual, stream),
-              "Normalize prefill post-attention residual");
+        chunk.normalize(work.projected_attention, work.residual, layer.attention_norm);
         chunk.mlp(layer);
     }
     if (draft && prompt_remaining > 1) {

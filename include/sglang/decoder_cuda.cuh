@@ -24,6 +24,24 @@ cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16
 cudaError_t decode_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
                                 cudaStream_t stream);
 
+cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
+                                    const __nv_bfloat16* b, const __nv_bfloat16* a,
+                                    TextGdnWeights weights, TextGdnState state,
+                                    __nv_bfloat16* workspace, float2* gates,
+                                    __nv_bfloat16* output, cudaStream_t stream);
+
+cudaError_t tensor_core_prefill_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
+                                    int rows, const __nv_bfloat16* queries,
+                                    __nv_bfloat16* output, cudaStream_t stream);
+
+cudaError_t tensor_core_prefill_rms_quantize(
+    const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,
+    cudaStream_t stream);
+cudaError_t tensor_core_prefill_swiglu_quantize(
+    const __nv_bfloat16* gate, const __nv_bfloat16* up, int width, int rows,
+    TextFp8Activation activation, cudaStream_t stream);
+
 cudaError_t decode_gqa_preprocess(const int* position, const __nv_bfloat16* q_gate,
                                   const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
                                   const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries,

@@ -790,6 +790,46 @@ void check_bound_gdn(cudaStream_t stream) {
     std::puts("Rebound GDN history and recurrent banks on six device graph replays");
 }
 
+void check_tiled_prefill_scales(cudaStream_t stream) {
+    constexpr int rows = 2;
+    constexpr int first = page_tokens - 1;
+    constexpr auto page_payload = page_tokens * kv_elements_per_token;
+    constexpr auto page_scales = scale_bytes / physical_pages;
+    const Pages pages{{1, 0}};
+    pages.device.upload(pages.mapping.data(), stream);
+    const TestCache cache;
+    const auto view = cache.view();
+    const auto table = pages.view();
+    const DeviceBuffer<BFloat> queries(rows * query_elements);
+    const DeviceBuffer<BFloat> direct(rows * query_elements);
+    const DeviceBuffer<BFloat> tiled(rows * query_elements);
+    const auto host_queries = make_queries(first, rows);
+    queries.upload(host_queries.data(), stream);
+    check_cuda(cudaMemsetAsync(view.key_payload, 0, 2 * page_payload, stream), "Clear keys");
+    check_cuda(cudaMemsetAsync(view.key_scales, 127, 2 * page_scales, stream), "Set key scales");
+    for (const auto [exponent, payload] : {std::pair{0, 0x38}, std::pair{255, 0x01}}) {
+        check_cuda(cudaMemsetAsync(view.value_payload, payload | 0x80, page_payload, stream),
+                   "Set negative FP8 values");
+        check_cuda(cudaMemsetAsync(view.value_payload + page_payload, payload, page_payload,
+                                   stream), "Set positive FP8 values");
+        check_cuda(cudaMemsetAsync(view.value_scales, exponent, 2 * page_scales, stream),
+                   "Set value scales");
+        check_cuda(sglang::mxfp8_gqa_attention(view, table, first + rows, first, rows,
+                   queries.get(), direct.get(), stream), "Launch direct prefill oracle");
+        check_cuda(sglang::decoder::tensor_core_prefill_gqa(view, table, first, rows,
+                   queries.get(), tiled.get(), stream), "Launch tiled prefill");
+        const auto expected = direct.download(stream);
+        const auto actual = tiled.download(stream);
+        const float first_value = __bfloat162float(expected.front());
+        if (!std::isfinite(first_value) || first_value <= 0.0f ||
+            std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(BFloat)) != 0) {
+            throw std::runtime_error("Tiled prefill scale mismatch at exponent " +
+                                     std::to_string(exponent));
+        }
+    }
+    std::puts("Tiled prefill scales match across a remapped page boundary");
+}
+
 }
 
 int main() {
@@ -798,6 +838,7 @@ int main() {
         run_check(stream);
         check_bound_cache(stream.get());
         check_bound_gdn(stream.get());
+        check_tiled_prefill_scales(stream.get());
         std::puts("MXFP8 GQA check passed");
         return 0;
     } catch (const std::exception& error) {

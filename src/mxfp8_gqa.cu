@@ -164,6 +164,108 @@ constexpr int score_warps = 8;
 constexpr int replay_tile = 32;
 static_assert(mxfp8_page_size % replay_tile == 0 && replay_tile == mxfp8_group_size);
 
+__device__ float decode_e8m0(std::uint8_t payload, std::uint8_t exponent) {
+    if (exponent == 255) {
+        return decode(payload, exponent);
+    }
+    __nv_fp8_e4m3 value;
+    value.__x = payload;
+    const auto scale_bits = exponent == 0 ? 0x00400000u :
+                                           static_cast<unsigned int>(exponent) << 23;
+    return __fmul_rn(static_cast<float>(value), __uint_as_float(scale_bits));
+}
+
+__global__ void tiled_prefill_attention(Mxfp8KvCache cache, const std::int32_t* pages,
+                                         int first_query_position, const __nv_bfloat16* queries,
+                                         __nv_bfloat16* output) {
+    __shared__ float scores[replay_tile];
+    __shared__ float history_weight[replay_tile];
+    __shared__ float token_weight[replay_tile];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    const int query_head = blockIdx.y;
+    const int kv_head = query_head / queries_per_kv_head;
+    const int channel = threadIdx.x;
+    const int warp = channel / mxfp8_group_size;
+    const int lane = channel % mxfp8_group_size;
+    const auto row = row_offset(blockIdx.x, mxfp8_query_heads, query_head);
+    const int last = first_query_position + static_cast<int>(blockIdx.x);
+    float query[mxfp8_groups];
+    #pragma unroll
+    for (int group = 0; group < mxfp8_groups; ++group) {
+        query[group] = __bfloat162float(queries[row + group * mxfp8_group_size + lane]);
+    }
+    if (channel == 0) {
+        maximum = -CUDART_INF_F;
+    }
+    float weight_sum = 0.0f;
+    float weighted_value = 0.0f;
+    for (int first = 0; first <= last; first += replay_tile) {
+        const int count = min(replay_tile, last - first + 1);
+        const int physical_page = pages[first / mxfp8_page_size];
+        const int token = first % mxfp8_page_size;
+        const auto payload = payload_offset(physical_page, token, kv_head);
+        const auto scale = scale_offset(physical_page, token, kv_head, 0);
+        constexpr int payload_stride = mxfp8_kv_heads * mxfp8_head_dim;
+        constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
+        for (int index = warp; index < count; index += score_warps) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int group = 0; group < mxfp8_groups; ++group) {
+                const auto key_index =
+                    payload + index * payload_stride + group * mxfp8_group_size;
+                const auto key_exponent = cache.key_scales[scale + index * scale_stride + group];
+                const float key = decode_e8m0(cache.key_payload[key_index + lane], key_exponent);
+                const float product = warp_sum(query[group] * key);
+                if (lane == 0) {
+                    dot += product;
+                }
+            }
+            if (lane == 0) {
+                scores[index] = dot * softmax_scale;
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+            const float prior_maximum = maximum;
+            const float score = lane < count ? scores[lane] : -CUDART_INF_F;
+            float prefix = fmaxf(prior_maximum, score);
+            #pragma unroll
+            for (int offset = 1; offset < replay_tile; offset *= 2) {
+                const float earlier = __shfl_up_sync(warp_mask, prefix, offset);
+                if (lane >= offset) {
+                    prefix = fmaxf(earlier, prefix);
+                }
+            }
+            const float previous = __shfl_up_sync(warp_mask, prefix, 1);
+            if (lane < count) {
+                history_weight[lane] = expf((lane == 0 ? prior_maximum : previous) - prefix);
+                token_weight[lane] = expf(score - prefix);
+                if (lane + 1 == count) {
+                    maximum = prefix;
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll 4
+        for (int index = 0; index < count; ++index) {
+            const float value = decode_e8m0(
+                cache.value_payload[payload + index * payload_stride + channel],
+                cache.value_scales[scale + index * scale_stride + warp]);
+            weighted_value =
+                fmaf(token_weight[index], value, history_weight[index] * weighted_value);
+        }
+        if (channel == 0) {
+            for (int index = 0; index < count; ++index) {
+                weight_sum = fmaf(history_weight[index], weight_sum, token_weight[index]);
+            }
+            denominator = weight_sum;
+        }
+        __syncthreads();
+    }
+    output[row + channel] = __float2bfloat16_rn(weighted_value / denominator);
+}
+
 template <typename Position, typename Cache, typename Pages>
 __global__ void exact_scores_kernel(
     Cache cache_binding, Pages page_binding, Position position,
@@ -333,6 +435,14 @@ cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int va
     void* arguments[] = {&cache, &pages.device_pages, &first_query_position, &queries, &output};
     return cudaLaunchKernel(attention_kernel<int>, dim3(query_count, mxfp8_query_heads),
                             dim3(mxfp8_head_dim), arguments, 0, stream);
+}
+
+cudaError_t decoder::tensor_core_prefill_gqa(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream) {
+    void* args[] = {&cache, &pages.device_pages, &position, &queries, &output};
+    return cudaLaunchKernel(tiled_prefill_attention, dim3(rows, mxfp8_query_heads),
+                            mxfp8_head_dim, args, 0, stream);
 }
 
 cudaError_t decoder::decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages,

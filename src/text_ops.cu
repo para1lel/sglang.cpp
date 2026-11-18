@@ -49,7 +49,7 @@ __global__ void embedding_kernel(const __nv_bfloat16* row, int width, __nv_bfloa
     }
 }
 
-__device__ uint4 load_bf16x8(const __nv_bfloat16* address) {
+__device__ uint4 load_128(const void* address) {
     uint4 bits;
     const auto global = __cvta_generic_to_global(address);
     asm("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
@@ -78,8 +78,8 @@ __global__ void bf16_gemv_kernel(const __nv_bfloat16* weight, const __nv_bfloat1
         constexpr int pack = 8;
         float second_sum = 0.0f;
         for (std::size_t col = lane * pack; col < width; col += warp_width * pack) {
-            const uint4 rhs = load_bf16x8(input + col);
-            const uint4 lhs = load_bf16x8(row_weight + col);
+            const uint4 rhs = load_128(input + col);
+            const uint4 lhs = load_128(row_weight + col);
             sum = bf16x2_dot(lhs.x, rhs.x, sum);
             second_sum = bf16x2_dot(lhs.y, rhs.y, second_sum);
             sum = bf16x2_dot(lhs.z, rhs.z, sum);
@@ -180,6 +180,53 @@ __global__ void fp8_gemv_kernel(const std::uint8_t* weight, const __nv_bfloat16*
             sum = fmaf(scaled_dot, __bfloat162float(row_scales[group]), sum);
         }
     }
+    if (lane == 0) {
+        output[row] = __float2bfloat16_rn(sum);
+    }
+}
+
+__device__ float fp8x4_dot(unsigned int lhs_bits, unsigned int rhs_bits, float sum) {
+    __nv_fp8x4_e4m3 lhs, rhs;
+    lhs.__x = lhs_bits;
+    rhs.__x = rhs_bits;
+    const auto left = static_cast<float4>(lhs);
+    const auto right = static_cast<float4>(rhs);
+    sum = fmaf(left.x, right.x, sum);
+    sum = fmaf(left.y, right.y, sum);
+    sum = fmaf(left.z, right.z, sum);
+    return fmaf(left.w, right.w, sum);
+}
+
+constexpr int fp8_pack_bytes = 16;
+constexpr int fp8_groups_per_warp = warp_width * fp8_pack_bytes / text_fp8_group_size;
+
+__global__ void fp8_gemv_packed_kernel(const std::uint8_t* weight,
+                                       const __nv_bfloat16* weight_scales,
+                                       TextFp8ActivationView input, int out_width, int in_width,
+                                       int groups, __nv_bfloat16* output) {
+    const int lane = threadIdx.x % warp_width;
+    const int row = blockIdx.x * block_warps + threadIdx.x / warp_width;
+    if (row >= out_width) {
+        return;
+    }
+    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
+    const auto* row_scales =
+        weight_scales + static_cast<std::size_t>(row / text_fp8_group_size) * groups;
+    constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
+    const int lane_group = lane / lanes_per_group;
+    const int lane_col = lane * fp8_pack_bytes;
+    float sum = 0.0f;
+    for (int group = 0; group < groups; group += fp8_groups_per_warp) {
+        const auto col = static_cast<std::size_t>(group) * text_fp8_group_size + lane_col;
+        const uint4 rhs = load_128(input.values + col);
+        const uint4 lhs = load_128(row_weight + col);
+        const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
+        const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
+        const int scale_index = group + lane_group;
+        const float scaled = (low + high) * input.scales[scale_index];
+        sum = fmaf(scaled, __bfloat162float(row_scales[scale_index]), sum);
+    }
+    sum = warp_sum(sum);
     if (lane == 0) {
         output[row] = __float2bfloat16_rn(sum);
     }
@@ -344,9 +391,13 @@ cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weigh
         return cudaErrorInvalidValue;
     }
     int groups = text_fp8_group_count(in_width);
+    const bool wide = in_width % (fp8_groups_per_warp * text_fp8_group_size) == 0 &&
+                      aligned(weight, fp8_pack_bytes) && aligned(input.values, fp8_pack_bytes);
     const bool packed = in_width % 4 == 0 && aligned(weight, 4) && aligned(input.values, 4);
     void* args[] = {&weight, &weight_scales, &input, &out_width, &in_width, &groups, &output};
-    return cudaLaunchKernel(packed ? fp8_gemv_kernel<true> : fp8_gemv_kernel<false>,
+    const auto kernel = wide ? fp8_gemv_packed_kernel
+                             : (packed ? fp8_gemv_kernel<true> : fp8_gemv_kernel<false>);
+    return cudaLaunchKernel(kernel,
                             divide_up(out_width, block_warps), block_threads, args, 0, stream);
 }
 

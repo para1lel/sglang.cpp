@@ -75,7 +75,8 @@ target("sglang_decoder")
     add_includedirs("include", {public = true})
     add_deps("sglang_checkpoint", "sglang_cuda")
     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
-              "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp")
+              "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp",
+              "src/decoder_prefill.cpp")
 
 target("sglang-generate")
     set_kind("binary")

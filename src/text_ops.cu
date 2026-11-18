@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_cuda.cuh"
 
+#include <algorithm>
 #include <cstddef>
 
 #include <cuda_fp8.h>
@@ -51,6 +52,20 @@ __global__ void embedding_kernel(const __nv_bfloat16* row, int width, __nv_bfloa
     }
 }
 
+struct EmbeddingTokens {
+    int ids[text_embedding_max_rows];
+};
+
+__global__ void embedding_rows_kernel(const __nv_bfloat16* weight, int width,
+                                      const __grid_constant__ EmbeddingTokens tokens,
+                                      __nv_bfloat16* output) {
+    const auto col = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col < static_cast<std::size_t>(width)) {
+        output[static_cast<std::size_t>(blockIdx.y) * width + col] =
+            weight[static_cast<std::size_t>(tokens.ids[blockIdx.y]) * width + col];
+    }
+}
+
 __global__ void decode_embedding_kernel(const __nv_bfloat16* weight, int vocab_size, int width,
                                           const TextLogitCandidate* previous,
                                           __nv_bfloat16* output) {
@@ -84,9 +99,13 @@ __device__ float bf16x2_dot(unsigned int lhs, unsigned int rhs, float sum) {
     return fmaf(__uint_as_float(lhs & 0xffff0000u), __uint_as_float(rhs & 0xffff0000u), sum);
 }
 
-template <bool Packed>
+template <bool Packed, bool Batched = false>
 __global__ void bf16_gemv_kernel(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                                  int out_width, int in_width, __nv_bfloat16* output) {
+    if constexpr (Batched) {
+        input += static_cast<std::size_t>(blockIdx.y) * in_width;
+        output += static_cast<std::size_t>(blockIdx.y) * out_width;
+    }
     const int lane = threadIdx.x % warp_width;
     const int row = blockIdx.x * block_warps + threadIdx.x / warp_width;
     if (row >= out_width) {
@@ -118,11 +137,18 @@ __global__ void bf16_gemv_kernel(const __nv_bfloat16* weight, const __nv_bfloat1
     }
 }
 
+template <bool Batched>
 __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
                                     TextFp8Activation output) {
     constexpr int group_warps = text_fp8_group_size / warp_width;
     __shared__ float warp_maxima[group_warps];
     __shared__ float reciprocal_scale;
+    if constexpr (Batched) {
+        const auto offset = static_cast<std::size_t>(blockIdx.y) * width;
+        input += offset;
+        output.values += offset;
+        output.scales += static_cast<std::size_t>(blockIdx.y) * gridDim.x;
+    }
     const int lane = threadIdx.x % warp_width;
     const int warp = threadIdx.x / warp_width;
     const auto col = static_cast<std::size_t>(blockIdx.x) * text_fp8_group_size + threadIdx.x;
@@ -330,15 +356,96 @@ cudaError_t launch_fp8_batch(const std::uint8_t* weight, const __nv_bfloat16* we
                             fp8_packed_warps * warp_width, args, 0, stream);
 }
 
+__device__ float fp8_pack_dot(uint4 lhs, uint4 rhs) {
+    const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
+    const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
+    return low + high;
+}
+
+template <int Count>
+__global__ void fp8_prefill_tile_kernel(const std::uint8_t* weight,
+                                        const __nv_bfloat16* weight_scales,
+                                        TextFp8ActivationView input, int out_width, int in_width,
+                                        int groups, int rows, int tiles, __nv_bfloat16* output) {
+    constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
+    const int lane = threadIdx.x % warp_width;
+    const int row = (blockIdx.x / tiles) * fp8_packed_warps + threadIdx.x / warp_width;
+    if (row >= out_width) {
+        return;
+    }
+    const int first = (blockIdx.x % tiles) * Count;
+    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
+    const auto* row_scales =
+        weight_scales + static_cast<std::size_t>(row / text_fp8_group_size) * groups;
+    const auto* values = input.values + static_cast<std::size_t>(first) * in_width;
+    const auto* scales = input.scales + static_cast<std::size_t>(first) * groups;
+    float sums[Count]{};
+    for (int group = 0; group < groups; group += fp8_groups_per_warp) {
+        const auto col = static_cast<std::size_t>(group) * text_fp8_group_size +
+                         lane * fp8_pack_bytes;
+        const auto lhs = load_fp8_weight(row_weight + col);
+        const int scale_index = group + lane / lanes_per_group;
+        const float weight_scale = __bfloat162float(row_scales[scale_index]);
+#pragma unroll
+        for (int item = 0; item < Count; ++item) {
+            if (first + item < rows) {
+                const auto rhs = load_128(values + static_cast<std::size_t>(item) * in_width + col);
+                const float scaled =
+                    fp8_pack_dot(lhs, rhs) *
+                    scales[static_cast<std::size_t>(item) * groups + scale_index];
+                sums[item] = fmaf(scaled, weight_scale, sums[item]);
+            }
+        }
+    }
+#pragma unroll
+    for (int item = 0; item < Count; ++item) {
+        if (first + item < rows) {
+            const float sum = warp_sum(sums[item]);
+            if (lane == 0) {
+                output[static_cast<std::size_t>(first + item) * out_width + row] =
+                    __float2bfloat16_rn(sum);
+            }
+        }
+    }
+}
+
+template <int Count>
+cudaError_t launch_fp8_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+                            TextFp8ActivationView input, int out_width, int in_width, int rows,
+                            __nv_bfloat16* output, cudaStream_t stream) {
+    int groups = text_fp8_group_count(in_width);
+    int tiles = divide_up(rows, Count);
+    const auto blocks = static_cast<std::uint64_t>(divide_up(out_width, fp8_packed_warps)) * tiles;
+    if (blocks > 2147483647u) {
+        return cudaErrorInvalidConfiguration;
+    }
+    void* args[] = {&weight, &weight_scales, &input, &out_width, &in_width,
+                     &groups, &rows, &tiles, &output};
+    return cudaLaunchKernel(fp8_prefill_tile_kernel<Count>, static_cast<unsigned int>(blocks),
+                            fp8_packed_warps * warp_width, args, 0, stream);
+}
+
 __device__ float residual_sum(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
                               std::size_t col) {
     const float value = __bfloat162float(branch[col]);
     return residual == nullptr ? value : value + __bfloat162float(residual[col]);
 }
 
+template <bool Batched>
 __global__ void rms_norm_kernel(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
                                 const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
                                 __nv_bfloat16* residual_output) {
+    if constexpr (Batched) {
+        const auto offset = static_cast<std::size_t>(blockIdx.x) * width;
+        branch += offset;
+        output += offset;
+        if (residual != nullptr) {
+            residual += offset;
+        }
+        if (residual_output != nullptr) {
+            residual_output += offset;
+        }
+    }
     __shared__ float warp_squares[block_warps];
     __shared__ float inverse_rms;
     const int lane = threadIdx.x % warp_width;
@@ -458,6 +565,24 @@ cudaError_t text_embedding(const __nv_bfloat16* weight, int vocab_size, int widt
                             args, 0, stream);
 }
 
+cudaError_t text_embedding_rows(const __nv_bfloat16* weight, int vocab_size, int width,
+                                const int* host_token_ids, int rows, __nv_bfloat16* output,
+                                cudaStream_t stream) {
+    if (!weight || !host_token_ids || !output || vocab_size <= 0 || width <= 0 ||
+        rows <= 0 || rows > text_embedding_max_rows) {
+        return cudaErrorInvalidValue;
+    }
+    EmbeddingTokens tokens{};
+    std::copy_n(host_token_ids, rows, tokens.ids);
+    if (std::any_of(tokens.ids, tokens.ids + rows,
+                    [vocab_size](int token) { return token < 0 || token >= vocab_size; })) {
+        return cudaErrorInvalidValue;
+    }
+    void* args[] = {&weight, &width, &tokens, &output};
+    return cudaLaunchKernel(embedding_rows_kernel, dim3(divide_up(width, block_threads), rows),
+                            block_threads, args, 0, stream);
+}
+
 cudaError_t decoder::decode_embedding(const __nv_bfloat16* weight, int vocab_size, int width,
                                       const TextLogitCandidate* previous, __nv_bfloat16* output,
                                       cudaStream_t stream) {
@@ -489,14 +614,38 @@ cudaError_t text_bf16_gemv(const __nv_bfloat16* weight, const __nv_bfloat16* inp
                             divide_up(out_width, block_warps), block_threads, args, 0, stream);
 }
 
+cudaError_t text_bf16_gemv_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,
+                                int out_width, int in_width, int rows, __nv_bfloat16* output,
+                                cudaStream_t stream) {
+    if (!weight || !input || !output || out_width <= 0 || in_width <= 0 ||
+        rows <= 0 || rows > 65535) {
+        return cudaErrorInvalidValue;
+    }
+    const bool packed = in_width % 8 == 0 && aligned(weight, 16) && aligned(input, 16);
+    void* args[] = {&weight, &input, &out_width, &in_width, &output};
+    const auto kernel = packed ? bf16_gemv_kernel<true, true> : bf16_gemv_kernel<false, true>;
+    return cudaLaunchKernel(kernel, dim3(divide_up(out_width, block_warps), rows),
+                            block_threads, args, 0, stream);
+}
+
 cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
                              cudaStream_t stream) {
     if (input == nullptr || output.values == nullptr || output.scales == nullptr || width <= 0) {
         return cudaErrorInvalidValue;
     }
     void* args[] = {&input, &width, &output};
-    return cudaLaunchKernel(quantize_fp8_kernel, text_fp8_group_count(width), text_fp8_group_size,
-                            args, 0, stream);
+    return cudaLaunchKernel(quantize_fp8_kernel<false>, text_fp8_group_count(width),
+                            text_fp8_group_size, args, 0, stream);
+}
+
+cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int rows,
+                                  TextFp8Activation output, cudaStream_t stream) {
+    if (!input || !output.values || !output.scales || width <= 0 || rows <= 0 || rows > 65535) {
+        return cudaErrorInvalidValue;
+    }
+    void* args[] = {&input, &width, &output};
+    return cudaLaunchKernel(quantize_fp8_kernel<true>, dim3(text_fp8_group_count(width), rows),
+                            text_fp8_group_size, args, 0, stream);
 }
 
 cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
@@ -552,6 +701,40 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
     return cudaSuccess;
 }
 
+cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+                               TextFp8ActivationView input, int out_width, int in_width, int rows,
+                               __nv_bfloat16* output, cudaStream_t stream) {
+    if (!weight || !weight_scales || !input.values || !input.scales || !output ||
+        out_width <= 0 || in_width <= 0 || rows <= 0 || rows > 65535) {
+        return cudaErrorInvalidValue;
+    }
+    if (rows > 1 && supports_wide_fp8(weight, input, in_width)) {
+        if (rows <= 8 || (rows <= 16 && (out_width <= 1024 || in_width >= 16384))) {
+            return launch_fp8_rows<2>(weight, weight_scales, input, out_width, in_width, rows,
+                                      output, stream);
+        }
+        if (rows < 64 || out_width <= 1024) {
+            return launch_fp8_rows<4>(weight, weight_scales, input, out_width, in_width, rows,
+                                      output, stream);
+        }
+        return launch_fp8_rows<8>(weight, weight_scales, input, out_width, in_width, rows,
+                                  output, stream);
+    }
+    const int groups = text_fp8_group_count(in_width);
+    for (int row = 0; row < rows; ++row) {
+        const TextFp8ActivationView source{
+            input.values + static_cast<std::size_t>(row) * in_width,
+            input.scales + static_cast<std::size_t>(row) * groups};
+        const auto status = text_fp8_gemv(weight, weight_scales, source, out_width, in_width,
+                                          output + static_cast<std::size_t>(row) * out_width,
+                                          stream);
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
+}
+
 cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
                          const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
                          __nv_bfloat16* residual_output, cudaStream_t stream) {
@@ -560,7 +743,18 @@ cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* resi
         return cudaErrorInvalidValue;
     }
     void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
-    return cudaLaunchKernel(rms_norm_kernel, 1, block_threads, args, 0, stream);
+    return cudaLaunchKernel(rms_norm_kernel<false>, 1, block_threads, args, 0, stream);
+}
+
+cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                              const __nv_bfloat16* weight, int width, int rows,
+                              __nv_bfloat16* output, __nv_bfloat16* residual_output,
+                              cudaStream_t stream) {
+    if (!branch || !weight || !output || width <= 0 || rows <= 0 || output == residual_output) {
+        return cudaErrorInvalidValue;
+    }
+    void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
+    return cudaLaunchKernel(rms_norm_kernel<true>, rows, block_threads, args, 0, stream);
 }
 
 cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,

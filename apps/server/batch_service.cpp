@@ -32,6 +32,13 @@ using Selection = std::array<bool, decoder_batch_max_lanes>;
 constexpr auto disconnect_poll = std::chrono::milliseconds(10);
 constexpr auto mailbox_grace = std::chrono::milliseconds(1);
 
+void trace_prefill_rows(const DecoderBatchStepStats& stats) {
+    const auto& rows = stats.prefill_rows;
+    std::cerr << ("batch prefill_rows=" + std::to_string(rows[0]) + ',' + std::to_string(rows[1]) +
+                  ',' + std::to_string(rows[2]) + ',' + std::to_string(rows[3]) +
+                  " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) + '\n');
+}
+
 }
 
 struct BatchService::State {
@@ -106,9 +113,12 @@ std::optional<Jobs> BatchService::State::wait_for_jobs() {
             return job && job->ready();
         });
     });
+    const bool admitting = std::any_of(jobs.begin(), jobs.end(), [](const auto& job) {
+        return job && !job->admitted && !job->cancelled;
+    });
     changed.wait_for(lock, mailbox_grace, [&] {
-        return closing || std::all_of(jobs.begin(), jobs.end(), [](const auto& job) {
-            return !job || job->ready();
+        return closing || std::all_of(jobs.begin(), jobs.end(), [admitting](const auto& job) {
+            return job ? job->ready() : !admitting;
         });
     });
     if (closing) {
@@ -175,8 +185,9 @@ void BatchService::State::process(DecoderBatch& batch) {
         }
         const int width = std::count(selected.begin(), selected.end(), true);
         std::array<DecoderBatchStep, decoder_batch_max_lanes> steps{};
+        DecoderBatchStepStats stats;
         if (width) {
-            steps = batch.advance(selected);
+            steps = batch.advance_chunked(selected, trace ? &stats : nullptr);
         }
         if (trace) {
             const auto bytes = batch.request_device_allocation_bytes();
@@ -184,6 +195,9 @@ void BatchService::State::process(DecoderBatch& batch) {
                                               [](const auto& step) { return step.decode; });
             if (width || bytes != traced_bytes) {
                 trace_batch_step(width, decode, bytes);
+                if (width) {
+                    trace_prefill_rows(stats);
+                }
                 traced_bytes = bytes;
             }
         }

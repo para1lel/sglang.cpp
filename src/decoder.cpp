@@ -1,4 +1,4 @@
-#include "sglang/decoder_internal.h"
+#include "sglang/decoder_prefill.h"
 
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_mtp.h"
@@ -302,11 +302,23 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         }
         result.peak_device_allocation_bytes += request.memory.bytes();
         const auto run_request = [&] {
-            for (int position = 0; position < prompt_count; ++position) {
-                if (cancelled()) {
-                    return DecoderFinishReason::cancelled;
+            if (cancelled()) {
+                return DecoderFinishReason::cancelled;
+            }
+            {
+                PrefillWorkspace workspace(request.memory.stream(),
+                                           std::min(prompt_count, prefill_chunk_rows));
+                result.peak_device_allocation_bytes += workspace.bytes();
+                const int tile_rows = workspace.bytes() ? workspace.capacity() : 1;
+                for (int position = 0; position < prompt_count; position += tile_rows) {
+                    const int rows = std::min(tile_rows, prompt_count - position);
+                    prefill_chunk(request, prompt.data() + position, rows, position, workspace);
+                    if (cancelled()) {
+                        workspace.close();
+                        return DecoderFinishReason::cancelled;
+                    }
                 }
-                forward(request, prompt[position], position, TextGdnMode::prefill);
+                workspace.close();
             }
             int winner = -1;
             for (int step = 0; step < options.max_new_tokens; ++step) {
@@ -370,6 +382,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
         return result;
     }
     DeviceScope selected_device(model_->device);
+    reclaim_prefill_workspaces(model_->device);
     result.output_token_ids.reserve(options.max_new_tokens);
     if (options.mtp_steps == 0) {
         model_->generate_serial(prompt_token_ids, options, callbacks, result);

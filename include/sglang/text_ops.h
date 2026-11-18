@@ -49,17 +49,29 @@ constexpr int text_argmax_scratch_count(int vocab_size) {
 cudaError_t text_embedding(const __nv_bfloat16* weight, int vocab_size, int width, int token_id,
                            __nv_bfloat16* output, cudaStream_t stream);
 
+inline constexpr int text_embedding_max_rows = 128;
+cudaError_t text_embedding_rows(const __nv_bfloat16* weight, int vocab_size, int width,
+                                const int* host_token_ids, int rows, __nv_bfloat16* output,
+                                cudaStream_t stream);
+
 /// BF16 [out_width, in_width] matrix times a BF16 vector, with FP32
 /// accumulation and BF16 output. Also applies to the LM head.
 cudaError_t text_bf16_gemv(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                            int out_width, int in_width, __nv_bfloat16* output,
                            cudaStream_t stream);
 
+cudaError_t text_bf16_gemv_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,
+                                int out_width, int in_width, int rows, __nv_bfloat16* output,
+                                cudaStream_t stream);
+
 /// Writes width E4M3 bytes and text_fp8_group_count(width) FP32 scales.
 /// Each scale is max(amax, 1e-10) / 448. Quantization rounds to nearest even
 /// and saturates to the finite E4M3 range.
 cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
                              cudaStream_t stream);
+
+cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int rows,
+                                  TextFp8Activation output, cudaStream_t stream);
 
 /// E4M3 [out_width, in_width] weights and BF16 multiply scales laid out as
 /// [text_fp8_group_count(out_width), text_fp8_group_count(in_width)].
@@ -75,6 +87,10 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
                           int out_width, int in_width, const TextFp8Projection* projections,
                           int count, cudaStream_t stream);
 
+cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+                               TextFp8ActivationView input, int out_width, int in_width, int rows,
+                               __nv_bfloat16* output, cudaStream_t stream);
+
 /// Computes RMSNorm with eps 1e-6 and FP32 (1 + weight). A null residual
 /// selects standalone normalization. A nonnull residual_output receives the
 /// BF16-rounded sum, while normalization uses the FP32 sum. Output may alias
@@ -82,6 +98,11 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
 cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
                          const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
                          __nv_bfloat16* residual_output, cudaStream_t stream);
+
+cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                              const __nv_bfloat16* weight, int width, int rows,
+                              __nv_bfloat16* output, __nv_bfloat16* residual_output,
+                              cudaStream_t stream);
 
 /// Stores BF16(BF16(SiLU(gate)) * up). Output may alias gate or up exactly.
 cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,

@@ -19,6 +19,7 @@ class Checkpoint;
 namespace sglang::decoder {
 
 class MtpDraftWeights;
+class PrefillWorkspace;
 
 using Bf16 = __nv_bfloat16;
 
@@ -29,6 +30,7 @@ inline constexpr int layer_count = 64;
 inline constexpr int full_attention_interval = 4;
 inline constexpr int full_attention_layers = layer_count / full_attention_interval;
 inline constexpr int gdn_layers = layer_count - full_attention_layers;
+inline constexpr int prefill_chunk_rows = text_embedding_max_rows;
 inline constexpr std::size_t gdn_history_elements = text_gdn_qkv_width * text_gdn_history_taps;
 inline constexpr std::size_t gdn_state_elements =
     text_gdn_value_heads * text_gdn_head_dim * text_gdn_head_dim;
@@ -200,6 +202,8 @@ struct Decoder::Model {
 
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
+    void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
+                       decoder::PrefillWorkspace& workspace) const;
     void decode_graph(decoder::Request& request) const;
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request) const;

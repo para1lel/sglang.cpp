@@ -14,6 +14,11 @@ struct DecoderBatchStep {
     bool decode = false;
 };
 
+struct DecoderBatchStepStats {
+    std::array<int, decoder_batch_max_lanes> prefill_rows{};
+    std::size_t prefill_workspace_bytes = 0;
+};
+
 /// The Decoder must outlive the batch. Use one host thread to operate a batch.
 /// Each slot owns its request state until cancel() or a finishing step.
 class DecoderBatch {
@@ -28,6 +33,13 @@ public:
     /// finishes without a model position. A CUDA failure disables the batch.
     std::array<DecoderBatchStep, decoder_batch_max_lanes>
     advance(const std::array<bool, decoder_batch_max_lanes>& selected);
+
+    /// Share one bounded position budget across selected slots. Each ready
+    /// decode slot advances once. Report submitted prompt positions and peak
+    /// shared scratch bytes when requested.
+    std::array<DecoderBatchStep, decoder_batch_max_lanes>
+    advance_chunked(const std::array<bool, decoder_batch_max_lanes>& selected,
+                    DecoderBatchStepStats* stats = nullptr);
 
     std::size_t request_device_allocation_bytes() const;
 

@@ -72,6 +72,14 @@ Use the [frozen streaming protocol](../benchmarks/streaming/README.md#frozen-mea
 
 For each workload, require every warmup and measured request to pass stream validation. Divide the native median output tokens/s by the frozen baseline median. Require that ratio to exceed `strict_throughput_ratio_gt` in the frozen reference. Compare native p95 TTFT, TPOT, and end-to-end latency with `p95_latency_ceilings_ms` from the same reference. Require each value to meet its ceiling. Retain the frozen output IDs as historical diagnostics.
 
+### Chunked prefill
+
+Before timing, run the [prefill acceptance checks](development.md#chunked-prefill-verification). Compare full BF16 logit rows and committed KV and GDN state with the row-wise native control under the same precision policy. For device prefill time, place CUDA events around prompt processing. End the interval before the first LM head. For HTTP TTFT, measure from submission to the first token. Record chunk sizes, tails, and active lanes. Measure decode token gaps while mixed steps process prompt chunks.
+
+The 128-row tile requests 31,944,704 scratch bytes. One row requires zero scratch bytes. Serial generator `peak_device_allocation_bytes` includes transient scratch with model and request storage. In batch mode, `workspace_bytes` counts scratch shared across lanes and sized for the largest lane tile in that step. `request_bytes` counts live request storage after the step. Capture both counters with the lane mix and KV capacity. Record observed peak HBM and headroom for cold and reused requests. Include allocator and graph pool effects in the device measurement.
+
+The historical serial prototype reduced CUDA prefill time against the row-wise native control on W1 and W2. It missed all four paired GPU6 vLLM targets on both workloads. Frozen GPU3 W1/W2 acceptance and W3/W6 concurrent acceptance require measurements of the promoted implementation under their respective protocols.
+
 ### Native concurrent workloads
 
 W3 and W6 each require four active requests. Use `--max-active 4` after the [native streaming checks](development.md#streaming-verification) pass. Verify full-width decode and memory capacity at each workload's lengths. Use the [concurrent baseline procedure](../benchmarks/concurrent/README.md#conditions-and-gates) for paired timing and acceptance. W4 and W5 exceed the native server's four-lane limit and remain unsupported at their specified concurrency.

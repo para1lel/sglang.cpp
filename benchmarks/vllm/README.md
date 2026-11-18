@@ -7,7 +7,7 @@ logical CUDA device 0. Both engines must run sequentially on the same physical U
 
 ```bash
 bash benchmarks/vllm/setup.sh
-GPU=1 bash benchmarks/vllm/run.sh benchmarks/vllm/small.json
+GPU=1 bash benchmarks/vllm/run.sh benchmarks/vllm/small-fp8.json
 ```
 
 ## Environment
@@ -30,13 +30,14 @@ environment record the installed packages and the hashes of vLLM shared objects.
 
 Setup uses `git`, `curl`, `jq`, `flock`, and `uv` from the host. Every package installation names
 the isolated interpreter explicitly. Network access uses Mihomo at `127.0.0.1:7890`. The runner
-requires the local checkpoint and hashes the weight, configuration, tokenizer, and template files
-before loading. It sets Hugging Face offline mode. vLLM and kernel libraries can have additional
-first-run initialization or compilation costs. The runner sets `FLASHINFER_WORKSPACE_BASE`
-to the benchmark's `XDG_CACHE_HOME` under `/data1/shared/dongwu.chen/cache`. FlashInfer appends
-`.cache/flashinfer` to this directory for its generated kernels and autotuning data.
+verifies the provisioned wheel and native vLLM hashes and hashes the local checkpoint
+before loading. It sets Hugging Face offline mode. vLLM and kernel libraries can download
+or compile kernels during initialization. The runner keeps generated kernels, autotuning data,
+and temporary files in the run directory. It seeds the cache from
+`/data1/shared/dongwu.chen/cache/vllm-81a8cb063e62` when present. Set `VLLM_RUNS_DIR` to
+save runs outside the provisioned environment's `runs/` directory.
 
-## Small fixture
+## Small workload
 
 `small.json` supplies the five token IDs for `The capital of France is`. The engine accepts IDs
 directly and returns greedy token IDs without detokenization. One resident eager engine serves
@@ -55,7 +56,36 @@ ten-minute engine timeout. Its printed run directory contains per-trial samples,
 the engine log, settings, and before/after device snapshots. A failed run preserves its log
 and exit status.
 
-## Measured result
+## FP8 comparator
+
+Run `small-fp8.json` with the same launcher after setup. The fixture pins the expected
+eight greedy IDs for all nine requests and requests `fp8_e4m3` GQA KV with FlashInfer
+and BF16 queries. After timing, the runner issues one separate request to check the actual
+FlashInfer `fa2` paged prefill and `trtllm-gen` decode calls, their E4M3 KV inputs,
+the LBHNC cache layout, and BF16 convolution and FP32 recurrent GDN state.
+It checks the checkpoint's scale inventory and verifies unit per-tensor K and V scales
+on all 16 GQA layers. The FP8 subprocess enables vLLM callable serialization for the
+local worker probe. It writes `fp8-dispatch.json` with the observations and succeeds only after
+dispatch, scale, and token checks pass.
+
+The observer checks the phases each request actually exercises. A one-token prompt uses
+TRTLLM-GEN for its first GQA step and prefill for its first GDN step. With a multi-token
+prompt and one output token, GQA and GDN only exercise prefill. Unused GQA phases report
+zero calls with `null` for the entry and backend.
+
+[small-fp8-result.json](small-fp8-result.json#L1)<!-- prefix: "{" -->
+preserves `run.cctk0V`, measured on
+GPU 1 (`GPU-9a94015a-6a0d-1ae1-82db-b6736b77562e`) on November 18, 2026. The seven
+samples yielded **26.0176 output tokens/s** and **307.766493 ms** median request
+latency, with a range of 305.747803–308.984207 ms. The archive includes the runtime
+identity and hashes of the original raw evidence under `artifacts/decoder-oracle/run.cctk0V/`.
+That run used `small.json` with the FP8 engine options applied separately. The standalone FP8
+fixture records the same options and observed IDs. Reproduction uses the checked-in launcher,
+fixture, and pinned environment.
+
+## Historical BF16 result
+
+Run the BF16 diagnostic with `GPU=1 bash benchmarks/vllm/run.sh benchmarks/vllm/small.json`.
 
 On November 18, 2026, `run.GeXtAT` exited 0 on GPU 1. All nine requests returned the same eight
 greedy token IDs. The seven timed requests emitted 56 tokens in 2.16324338 seconds, yielding

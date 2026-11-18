@@ -1,0 +1,136 @@
+{
+  "run": "run.cctk0V",
+  "started_utc": "2026-11-18T12:07:57Z",
+  "finished_utc": "2026-11-18T12:11:49Z",
+  "exit_code": 0,
+  "timing_scope": "offline serial smoke, summed completed LLM.generate calls",
+  "case": {
+    "prompt_token_ids": [760, 6511, 314, 9338, 369],
+    "output_tokens": 8,
+    "warmup": 2,
+    "repeats": 7,
+    "kv_cache_dtype": "fp8_e4m3",
+    "expected_output_ids": [11751, 13, 198, 760, 6511, 314, 9564, 369]
+  },
+  "sampling": {
+    "temperature": 0,
+    "ignore_eos": true,
+    "detokenize": false
+  },
+  "output_ids": [11751, 13, 198, 760, 6511, 314, 9564, 369],
+  "requests_matching_output_ids": 9,
+  "finish_reason": "length",
+  "latency_ms": [
+    305.747803, 307.766493, 308.984207, 308.360156, 307.877308, 307.215952, 306.439787
+  ],
+  "median_ms": 307.766493,
+  "min_ms": 305.747803,
+  "max_ms": 308.984207,
+  "total_output_tokens": 56,
+  "total_request_ms": 2152.3917060000003,
+  "output_tokens_per_second": 26.017569127354736,
+  "output_tokens_per_median_request_second": 25.993732852523355,
+  "project_base": "dc323902bb7ce54e55240090251001c07ce473e8",
+  "source_commit": "81a8cb063e6247fe254d7caf7e98a6691d71022a",
+  "vllm": "0.34.0rc1.dev787+g81a8cb063",
+  "torch": "2.14.0+cu132",
+  "cuda": "13.2",
+  "cuda_toolkit": "/usr/local/cuda-13.2",
+  "cuda_compat_library": "libcuda.so.615.71.10",
+  "flashinfer": "0.7.4",
+  "python": "3.12.3",
+  "driver": "590.48.01",
+  "gpu": "NVIDIA B200",
+  "gpu_index": 1,
+  "gpu_uuid": "GPU-9a94015a-6a0d-1ae1-82db-b6736b77562e",
+  "gpu_pci_bus": "00000000:3A:00.0",
+  "power_limit_w": 1000,
+  "gpu_total_mib": 183359,
+  "gpu_free_before_mib": 182631,
+  "gpu_free_after_mib": 182634,
+  "model": "/data0/shared/Qwen3.8-27B-FP8",
+  "config": {
+    "tensor_parallel_size": 1,
+    "dtype": "bfloat16",
+    "seed": 0,
+    "enforce_eager": true,
+    "max_model_len": 256,
+    "max_num_batched_tokens": 256,
+    "max_num_seqs": 1,
+    "kv_cache_memory_bytes": 1073741824,
+    "gpu_memory_utilization": 0.3,
+    "enable_prefix_caching": false,
+    "language_model_only": true,
+    "skip_tokenizer_init": true,
+    "generation_config": "vllm",
+    "kv_cache_dtype": "fp8_e4m3",
+    "attention_config": {
+      "backend": "FLASHINFER",
+      "disable_flashinfer_q_quantization": true
+    }
+  },
+  "effective": {
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "linear_kernel": "CutlassFp8BlockScaledMMKernel",
+    "gqa_backend": "FLASHINFER",
+    "gqa_layer_count": 16,
+    "gqa_storage_dtype": "torch.uint8",
+    "gqa_kv_dtype": "torch.float8_e4m3fn",
+    "query_dtype": "torch.bfloat16",
+    "cache_layout": "LBHNC",
+    "kernel_layout": "HND",
+    "kv_cache_capacity_tokens": 1280,
+    "prefill": {
+      "entry": "BatchPrefillWithPagedKVCacheWrapper.run",
+      "backend": "fa2",
+      "calls": 16
+    },
+    "decode": {
+      "entry": "trtllm_batch_decode_with_kv_cache",
+      "backend": "trtllm-gen",
+      "calls": 112
+    },
+    "kv_scale_granularity": "per_tensor",
+    "scale_policy":
+      "Unit scales from the pinned loader because the checkpoint lacks attention scales",
+    "q_scale": 1.0,
+    "k_scale": 1.0,
+    "v_scale": 1.0,
+    "gdn": {
+      "conv_dtype": "torch.bfloat16",
+      "recurrent_dtype": "torch.float32",
+      "prefill": "flashinfer",
+      "packed_recurrent_decode": true,
+      "decode_branch": "_forward_core_decode_non_spec"
+    },
+    "cuda_graphs": false,
+    "speculative_config": null,
+    "flashinfer_autotune": true
+  },
+  "checkpoint_scale_audit": {
+    "count": 407,
+    "suffixes": ["weight_scale_inv"],
+    "kv_cache_scheme": null
+  },
+  "scale_probe": {
+    "scope": "Saturating E4M3 round trip on GQA layer inputs in a separate diagnostic request",
+    "k": {"absmax": 22.875, "elements": 196608, "clipped": 0, "relative_l2": 0.02663080169242086},
+    "v": {"absmax": 92.0, "elements": 196608, "clipped": 0, "relative_l2": 0.026378474421062174}
+  },
+  "sha256": {
+    "case.json": "fd02533c8acef36020cb2c9ab85bbc06169ab8749cd14f501265079d7b779136",
+    "checkpoint.sha256": "b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303",
+    "engine.log": "fa4158dcbd993a4b90c7300a2ededa1f7ed020b08cc88ce736ceb0ba756560b9",
+    "fp8-dispatch.json": "5525ff3f043e8a26d4cb3d93b8bcfda72d2384cdebd21b2a4828095bda5e1b52",
+    "fp8-scale-observation.json":
+      "cb76d79a05ad314d4da81232b80de61711eb4354e80972de8f2b20b455058af5",
+    "freeze.txt": "741e96ee25f8452fecee71cf61b0358259a7c41fcfe860f8d8355bc6b032ffbd",
+    "gpu-before.csv": "daa548ecad94460ccf4ba2596115199e6813001a2a8e69a1d677dd7aee630c36",
+    "gpu-after.csv": "f67a3a56e5035d1e9e5ef8814ac425d77acbea54949b80a242ddf4e8d40994a8",
+    "native.sha256": "68618a530609826a814e72965f4e62ee4fa0a912ad6f150fa2cd1b45bb8a697d",
+    "result.json": "99d6c7c2e09f1f7a8f9fb7f1d9f79a13555c433a508c6fe7a2de1c0749cad4e6",
+    "wheel.sha256": "b8d7911f0230e51486d2d30e5c6398dc578387968fbadc15dad51d1e41455139",
+    "measure-fp8.py": "f1144e6e6499e369dc160dd848a97c69bc9449517e9f422f1e5c8eac7317fbef",
+    "oracle-summary.json": "7e9daa500d839f4d8c47e4bb4011b60e0e43fb6360940b48db135d2f8d0a1deb"
+  }
+}

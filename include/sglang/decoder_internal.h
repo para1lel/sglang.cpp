@@ -217,8 +217,8 @@ struct Decoder::Model {
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0) const;
     void decode_graph(decoder::Request& request) const;
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
-    void compute_logits(decoder::Request& request) const;
-    void compute_logits(decoder::Workspace& work, cudaStream_t stream) const;
+    void compute_logits(decoder::Request& request, bool decode = false) const;
+    void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;
     void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
                          const DecoderCallbacks& callbacks, DecoderResult& result) const;
     DecoderFinishReason generate_mtp(const std::vector<int>& prompt,

@@ -88,6 +88,14 @@ Compare fused SwiGLU BF16 results with identical and disjoint gate and up output
 
 The studies in `artifacts/fp8-decode-next/report.md` and `artifacts/decode-combined/report.md` used earlier source. Qualify the promoted build under the frozen serial and concurrent protocols.
 
+### Exact decode bandwidth
+
+Match the published native control's BF16 projections, E4M3 payloads, and FP32 scales byte for byte. Include nonfinite inputs and shape and alignment fallbacks. Trace fresh and reused graphs. Compare full BF16 logits and greedy IDs on shared W1/W2 histories within each policy. Run the [MTP checks](mtp.md#verification).
+
+Time serial HTTP with `--max-active 1 --mtp-steps 0`. Compare within each prefill policy. Apply the [frozen GPU3 criteria](#frozen-w1-and-w2-timing) separately for pinned vLLM.
+
+An earlier GPU1 run compared the unsplit build with the Unit13 runtime. Each arm used three warmups and nine measured requests per workload. W1/W2 median output tokens/s rose from 91.88/35.16 to 95.59/35.70 for exact and from 122.84/57.27 to 129.51/58.70 for tensor-core. All four passed native timing checks. P95 TPOT and end-to-end latency fell throughout. P95 TTFT rose up to 1.00 ms. See `artifacts/exact-decode-after-seed/runs/http.6acmFcnP/`.
+
 ### Chunked prefill
 
 Before timing, run the [prefill acceptance checks](development.md#chunked-prefill-verification). Compare full BF16 logit rows and committed KV and GDN state with the row-wise native control under the same precision policy. For device prefill time, place CUDA events around prompt processing. End the interval before the first LM head. For HTTP TTFT, measure from submission to the first token. Record chunk sizes, tails, and active lanes. Measure decode token gaps while mixed steps process prompt chunks.

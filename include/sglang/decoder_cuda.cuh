@@ -15,6 +15,14 @@ cudaError_t decode_embedding(const __nv_bfloat16* embedding, int vocab_size, int
                              cudaStream_t stream);
 cudaError_t set_decode_position(int* position, int value, cudaStream_t stream);
 cudaError_t advance_decode_position(int* position, cudaStream_t stream);
+cudaError_t decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
+                                  const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
+                                  int rows, int width, __nv_bfloat16* output_b,
+                                  __nv_bfloat16* output_a, cudaStream_t stream);
+cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,
+                               int rows, int width, __nv_bfloat16* output, cudaStream_t stream);
+cudaError_t decode_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
+                                cudaStream_t stream);
 
 cudaError_t decode_gqa_preprocess(const int* position, const __nv_bfloat16* q_gate,
                                   const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,

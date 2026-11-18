@@ -405,7 +405,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                     if (step != 0) {
                         forward(request, winner, prompt_count + step - 1, TextGdnMode::decode);
                     }
-                    compute_logits(request);
+                    compute_logits(request, step != 0);
                 }
                 winner = read_step(request);
                 result.output_token_ids.push_back(winner);

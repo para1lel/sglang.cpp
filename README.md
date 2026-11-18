@@ -79,6 +79,11 @@ subsequent decode step captures the graph on demand, and later steps and request
 it while capacity suffices. Overlapping calls that cannot acquire the serial slot use
 private request buffers and eager decode.
 
+Serial single-row target decode uses packed FP8 activation quantization, fused BF16
+Gated DeltaNet gate projections, and a paired-row BF16 LM head for eligible shapes.
+Graph and eager decode use the same arithmetic for these operations.
+[Decode operators](src/text_decode_bandwidth.cu#L154)<!-- prefix: "cudaError_t " -->
+
 The generator and HTTP server accept `--fp8-prefill exact|tensor-core`. The default
 `exact` uses the exact FP8 projection path. For target-only requests, `tensor-core`
 uses SM100 Tensor Cores for eligible FP8 projections in chunks of 3 to 128 prompt

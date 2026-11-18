@@ -53,6 +53,14 @@ struct LayerBatch {
     }
 
     void quantize(Bf16* Workspace::*source, int width) const {
+        if constexpr (!std::is_same_v<Lane, VerificationRow>) {
+            if (single_decode()) {
+                auto& work = workspace(lanes[0]);
+                check(decode_quantize_fp8(work.*source, width, work.activation, stream),
+                      "Quantize decode projection input");
+                return;
+            }
+        }
         each([&](const Lane&, Workspace& work) {
             check(text_quantize_fp8(work.*source, width, work.activation, stream),
                   "Quantize projection input");
@@ -100,8 +108,15 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
     batch.project(layer.z, &Workspace::gdn_z);
     batch.each([&](const Lane& lane, Workspace& work) {
         const auto stream = batch.stream;
-        project(layer.b, work.normalized, work.gdn_b, stream);
-        project(layer.a, work.normalized, work.gdn_a, stream);
+        if (batch.single_decode() && layer.b.rows == layer.a.rows &&
+            layer.b.columns == layer.a.columns) {
+            check(decode_bf16_gdn_gates(layer.b.values, layer.a.values, work.normalized,
+                                        layer.b.rows, layer.b.columns, work.gdn_b, work.gdn_a,
+                                        stream), "Run decode Gated DeltaNet gate projections");
+        } else {
+            project(layer.b, work.normalized, work.gdn_b, stream);
+            project(layer.a, work.normalized, work.gdn_a, stream);
+        }
         check(text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
                                layer.recurrent, lane.request->states[state_index],
                                work.gdn_scratch, text_gdn_workspace_bytes(1), work.attention,
@@ -260,7 +275,7 @@ void Decoder::Model::decode_graph(Request& request) const {
                   "Look up decode token embedding");
             const GraphLane lane{&request, request.decode_position, TextGdnMode::decode};
             forward_layers(&lane, 1, stream);
-            compute_logits(request);
+            compute_logits(request, true);
             check(advance_decode_position(request.decode_position, stream),
                   "Advance decode position");
         });
@@ -295,8 +310,8 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
     }
 }
 
-void Decoder::Model::compute_logits(Request& request) const {
-    compute_logits(request.work, request.memory.stream());
+void Decoder::Model::compute_logits(Request& request, bool decode) const {
+    compute_logits(request.work, request.memory.stream(), decode);
 }
 
 void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream) const {
@@ -304,9 +319,14 @@ void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream) const
                         work.normalized, nullptr, stream), "Normalize final residual");
 }
 
-void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream) const {
+void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode) const {
     normalize_final(work, stream);
-    project(lm_head, work.normalized, work.logits, stream);
+    if (decode) {
+        check(decode_bf16_lm_head(lm_head.values, work.normalized, lm_head.rows, lm_head.columns,
+                                  work.logits, stream), "Run decode LM head");
+    } else {
+        project(lm_head, work.normalized, work.logits, stream);
+    }
     check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
           "Select greedy token");
 }

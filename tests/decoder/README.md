@@ -17,3 +17,37 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" "$out/decode-fp8-
 ```
 
 Expect `FP8 alias checks passed` and exit status zero. The check uses a small deterministic fixture and needs no checkpoint. It compares lawful aliases with ordinary GEMV and SwiGLU. Rejected aliases must return `cudaErrorInvalidValue` before submitting a CUDA kernel.
+
+## Decode bandwidth
+
+Use the same Pixi environment, Release configuration and reserved B200. Build `sglang-generate`
+to obtain the production decoder and CUDA libraries. Set `checkpoint` to the local
+Qwen3.8-27B-FP8 checkpoint.
+
+```bash
+xmake build -P "$PWD" sglang-generate
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+"$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
+    tests/decoder/decode_bandwidth_check.cpp -L"$out/lib" -L"$toolkit/lib" \
+    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaLaunchKernel -lsglang_cuda -lcudart \
+    -o "$out/decode-bandwidth-check"
+"$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
+    tests/decoder/decode_graph_check.cpp -L"$out/lib" -L"$toolkit/lib" -L"$CONDA_PREFIX/lib" \
+    -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" \
+    -Wl,--wrap=cudaGraphLaunch -Wl,--wrap=cudaStreamBeginCapture \
+    -lsglang_decoder -lsglang_checkpoint -lsglang_cuda -lsglang_prefill_fp8_sm100 -lLLVM-23 \
+    -lcudart -o "$out/decode-graph-check"
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" "$out/decode-bandwidth-check"
+for policy in exact tensor-core; do
+    CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/decode-graph-check" "$checkpoint" "$policy"
+done
+```
+
+The operator check compares output bits and guards with ordinary BF16 GEMV and FP8 quantization.
+It checks successful kernel launch counts and grid and block dimensions for optimized and fallback
+cases. Invalid arguments must submit no kernels.
+
+The checkpoint check expects one capture on the first request, three graph launches on each of
+two default requests, and no capture or launch on the eager request. The second default request
+must reuse the first graph. All three requests must return identical greedy IDs and full score
+bits within each prefill policy.

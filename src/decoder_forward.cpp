@@ -35,6 +35,10 @@ Workspace& workspace(const VerificationRow& row) {
     return *row.work;
 }
 
+Workspace& workspace(const BatchGraphLane& lane) {
+    return *lane.work;
+}
+
 template <typename Lane>
 struct LayerBatch {
     const Lane* lanes;
@@ -42,7 +46,10 @@ struct LayerBatch {
     cudaStream_t stream;
 
     bool single_decode() const {
-        return count == 1 && lanes[0].mode == TextGdnMode::decode;
+        if constexpr (!std::is_same_v<Lane, BatchGraphLane>) {
+            return count == 1 && lanes[0].mode == TextGdnMode::decode;
+        }
+        return false;
     }
 
     template <typename Function>
@@ -117,10 +124,16 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
             project(layer.b, work.normalized, work.gdn_b, stream);
             project(layer.a, work.normalized, work.gdn_a, stream);
         }
-        check(text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                               layer.recurrent, lane.request->states[state_index],
-                               work.gdn_scratch, text_gdn_workspace_bytes(1), work.attention,
-                               stream), "Advance Gated DeltaNet state");
+        if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
+            check(decode_gdn(work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a, layer.recurrent,
+                             &lane.binding->states[state_index], work.gdn_scratch, work.attention,
+                             stream), "Advance bound Gated DeltaNet state");
+        } else {
+            check(text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+                                   layer.recurrent, lane.request->states[state_index],
+                                   work.gdn_scratch, text_gdn_workspace_bytes(1), work.attention,
+                                   stream), "Advance Gated DeltaNet state");
+        }
     });
     batch.quantize(&Workspace::attention, text_gdn_value_width);
     batch.project(layer.output, &Workspace::projected_attention);
@@ -197,9 +210,26 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
         batch.project(layer.value, &Workspace::values);
     }
     batch.each([&](const Lane& lane, Workspace& work) {
-        auto& request = *lane.request;
-        attend_gqa(layer, work, request.pages, request.caches[cache_index], lane.position,
-                   lane.mode, batch.stream);
+        if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
+            const auto* binding = lane.binding;
+            const auto stream = batch.stream;
+            const auto* position = &binding->position;
+            check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
+                                        layer.key_norm, work.rope_queries, work.rope_keys, stream),
+                  "Normalize and rotate bound decode Q/K");
+            check(decode_kv_append(&binding->caches[cache_index], &binding->pages, position,
+                                   work.rope_keys, work.values, stream), "Append bound MXFP8 KV");
+            check(exact_decode_gqa_attention(&binding->caches[cache_index], &binding->pages,
+                                             position, work.rope_queries, work.attention,
+                                             work.gqa_scores(text_attention_max_tokens), stream),
+                  "Read bound causal MXFP8 attention");
+            check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
+                  "Gate grouped-query attention");
+        } else {
+            auto& request = *lane.request;
+            attend_gqa(layer, work, request.pages, request.caches[cache_index], lane.position,
+                       lane.mode, batch.stream);
+        }
     });
     batch.quantize(&Workspace::attention, text_gqa_q_width);
     batch.project(layer.output, &Workspace::projected_attention);
@@ -281,6 +311,19 @@ void Decoder::Model::decode_graph(Request& request) const {
         });
     }
     check(cudaGraphLaunch(request.memory.graph(), stream), "Replay decode graph");
+}
+
+void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count,
+                                          cudaStream_t stream) const {
+    const LayerBatch<BatchGraphLane> batch{lanes, count, stream};
+    batch.each([&](const BatchGraphLane& lane, Workspace& work) {
+        check(decode_embedding(embedding, vocab_size, hidden_size, &lane.binding->input,
+                               work.residual, stream), "Look up bound token embedding");
+    });
+    forward_layers(lanes, count, stream);
+    batch.each([&](const BatchGraphLane&, Workspace& work) {
+        compute_logits(work, stream);
+    });
 }
 
 template <typename Lane>

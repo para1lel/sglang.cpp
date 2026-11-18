@@ -368,11 +368,11 @@ void check_bytes(const char* phase, const char* plane, const char* buffer,
 class CachePlane {
 public:
     explicit CachePlane(const char* name) : name_(name) {}
-
     Byte* data() const { return data_.get(); }
     Byte* scales() const { return scales_.get(); }
-
-    void initialize(cudaStream_t stream) const {
+    void initialize(cudaStream_t stream) {
+        std::fill(expected_data_.begin(), expected_data_.end(), payload_sentinel);
+        std::fill(expected_scales_.begin(), expected_scales_.end(), scale_sentinel);
         data_.fill(payload_sentinel, stream);
         scales_.fill(scale_sentinel, stream);
     }
@@ -613,10 +613,9 @@ void check_device() {
                 properties.major, properties.minor);
 }
 
-void run_check() {
+void run_check(const Stream& stream) {
     check_reference_codes();
     check_device();
-    const Stream stream;
     TestCache cache;
     cache.keys.initialize(stream.get());
     cache.values.initialize(stream.get());
@@ -640,11 +639,165 @@ void run_check() {
     check_exact_decode(stream.get());
 }
 
+void check_bound_cache(cudaStream_t stream) {
+    const DeviceBuffer<sglang::Mxfp8KvCache> binding(1);
+    const DeviceBuffer<sglang::Mxfp8PageTable> table(1);
+    const DeviceBuffer<int> position(1);
+    const DeviceBuffer<BFloat> keys(kv_elements_per_token), values(kv_elements_per_token);
+    const DeviceBuffer<BFloat> queries(query_elements), output(query_elements + 2);
+    const DeviceBuffer<BFloat> direct(query_elements);
+    const DeviceBuffer<float> scores(query_heads * score_capacity + 2);
+    const sglang::decoder::ExactGqaWorkspace workspace{scores.get() + 1, score_capacity};
+    TestCache first, second;
+    const Pages forward{{3, 1}}, reverse{{6, 2}};
+    forward.device.upload(forward.mapping.data(), stream);
+    reverse.device.upload(reverse.mapping.data(), stream);
+    Graph graph;
+    graph.capture(stream, [&] {
+        const auto append = sglang::decoder::decode_kv_append(
+            binding.get(), table.get(), position.get(), keys.get(), values.get(), stream);
+        if (append != cudaSuccess) {
+            return append;
+        }
+        return sglang::decoder::exact_decode_gqa_attention(
+            binding.get(), table.get(), position.get(), queries.get(), output.get() + 1,
+            workspace, stream);
+    });
+    for (int trial = 0; trial < 4; ++trial) {
+        const int last = trial < 2 ? page_tokens - 1 + trial : 1 + trial;
+        auto& cache = trial % 2 ? second : first;
+        const auto& pages = trial % 2 ? reverse : forward;
+        auto& inactive = trial % 2 ? first : second;
+        for (auto* storage : {&first, &second}) {
+            storage->keys.initialize(stream);
+            storage->values.initialize(stream);
+        }
+        const KvSequence input(last + 1, 17 + trial);
+        TestCache oracle;
+        oracle.keys.initialize(stream);
+        oracle.values.initialize(stream);
+        check_append("bound independent prefix", cache, pages, input, 0, last, stream);
+        check_append("bound eager oracle", oracle, pages, input, 0, last + 1, stream);
+        const auto cache_view = cache.view();
+        const auto pages_view = pages.view();
+        const auto query = make_queries(last, 1);
+        binding.upload(&cache_view, stream);
+        table.upload(&pages_view, stream);
+        position.upload(&last, stream);
+        keys.upload(input.keys.data() + last * kv_elements_per_token, stream);
+        values.upload(input.values.data() + last * kv_elements_per_token, stream);
+        queries.upload(query.data(), stream);
+        output.fill(attention_sentinel, stream);
+        scores.fill(attention_sentinel, stream);
+        graph.replay(stream);
+        check_cuda(sglang::mxfp8_gqa_attention(oracle.view(), pages_view, last + 1, last, 1,
+            queries.get(), direct.get(), stream), "Launch bound eager oracle");
+        compare_decode("rebound cache", last, output.download(stream), direct.download(stream));
+        check_score_tail(scores, last, stream);
+        cache.keys.record_append(input.encoded_keys, pages, last, 1);
+        cache.values.record_append(input.encoded_values, pages, last, 1);
+        cache.keys.verify("rebound keys", stream);
+        cache.values.verify("rebound values", stream);
+        inactive.keys.verify("inactive keys", stream);
+        inactive.values.verify("inactive values", stream);
+    }
+    std::puts("Rebound cache, page table and position on four device graph replays");
+}
+
+struct GdnBuffers {
+    DeviceBuffer<BFloat> history{sglang::text_gdn_qkv_width * sglang::text_gdn_history_taps};
+    DeviceBuffer<float> recurrent{sglang::text_gdn_value_width * sglang::text_gdn_head_dim};
+    DeviceBuffer<BFloat> output{sglang::text_gdn_value_width};
+
+    sglang::TextGdnState state() const {
+        return {history.get(), recurrent.get()};
+    }
+
+    void initialize(cudaStream_t stream) {
+        history.fill(0, stream);
+        recurrent.fill(0, stream);
+        output.fill(attention_sentinel, stream);
+    }
+};
+
+template <class Element>
+void require_same(const std::vector<Element>& actual, const std::vector<Element>& expected,
+                  const char* message) {
+    if (actual.size() != expected.size() ||
+        std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(Element)) != 0) {
+        throw std::runtime_error(message);
+    }
+}
+
+void check_bound_gdn(cudaStream_t stream) {
+    using namespace sglang;
+    const DeviceBuffer<BFloat> convolution(text_gdn_qkv_width * (text_gdn_history_taps + 1));
+    const DeviceBuffer<BFloat> head_weights(text_gdn_value_heads), norm(text_gdn_head_dim);
+    const DeviceBuffer<BFloat> qkv(text_gdn_qkv_width), z(text_gdn_value_width);
+    const DeviceBuffer<BFloat> gate(text_gdn_value_heads);
+    const DeviceBuffer<BFloat> scratch(text_gdn_workspace_bytes(1) / sizeof(BFloat));
+    const DeviceBuffer<BFloat> output(text_gdn_value_width);
+    const DeviceBuffer<TextGdnState> binding(1);
+    const std::vector<BFloat> convolution_values(
+        text_gdn_qkv_width * (text_gdn_history_taps + 1), __float2bfloat16_rn(0.25f));
+    const std::vector<BFloat> norm_values(text_gdn_head_dim, __float2bfloat16_rn(1.0f));
+    const std::vector<BFloat> z_values(text_gdn_value_width, __float2bfloat16_rn(0.5f));
+    convolution.upload(convolution_values.data(), stream);
+    head_weights.fill(0, stream);
+    gate.fill(0, stream);
+    norm.upload(norm_values.data(), stream);
+    z.upload(z_values.data(), stream);
+    const TextGdnWeights weights{convolution.get(), head_weights.get(), head_weights.get(),
+                                 norm.get()};
+    GdnBuffers actual[2], eager[2];
+    for (int lane = 0; lane < 2; ++lane) {
+        actual[lane].initialize(stream);
+        eager[lane].initialize(stream);
+    }
+    Graph graph;
+    graph.capture(stream, [&] {
+        return decoder::decode_gdn(qkv.get(), z.get(), gate.get(), gate.get(), weights,
+                                   binding.get(), scratch.get(), output.get(), stream);
+    });
+    for (int trial = 0; trial < 6; ++trial) {
+        const int lane = trial % 2;
+        std::vector<BFloat> input(text_gdn_qkv_width);
+        for (int index = 0; index < text_gdn_qkv_width; ++index) {
+            input[index] = __float2bfloat16_rn(((index * 7 + trial * 13) % 31 - 15) / 16.0f);
+        }
+        const auto state = actual[lane].state();
+        qkv.upload(input.data(), stream);
+        binding.upload(&state, stream);
+        graph.replay(stream);
+        check_cuda(text_gdn_forward(1, TextGdnMode::decode, qkv.get(), z.get(), gate.get(),
+                   gate.get(), weights, eager[lane].state(), scratch.get(),
+                   text_gdn_workspace_bytes(1), eager[lane].output.get(), stream),
+                   "Launch eager GDN oracle");
+        require_same(output.download(stream), eager[lane].output.download(stream),
+                     "Rebound GDN output differs from eager");
+        for (int bank = 0; bank < 2; ++bank) {
+            require_same(actual[bank].history.download(stream),
+                         eager[bank].history.download(stream), "Wrong GDN history bank");
+            require_same(actual[bank].recurrent.download(stream),
+                         eager[bank].recurrent.download(stream), "Wrong GDN recurrent bank");
+        }
+        const auto emitted = output.download(stream);
+        if (std::none_of(emitted.begin(), emitted.end(),
+                         [](BFloat value) { return __bfloat162float(value) != 0.0f; })) {
+            throw std::runtime_error("Degenerate GDN output");
+        }
+    }
+    std::puts("Rebound GDN history and recurrent banks on six device graph replays");
+}
+
 }
 
 int main() {
     try {
-        run_check();
+        const Stream stream;
+        run_check(stream);
+        check_bound_cache(stream.get());
+        check_bound_gdn(stream.get());
         std::puts("MXFP8 GQA check passed");
         return 0;
     } catch (const std::exception& error) {

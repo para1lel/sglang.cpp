@@ -39,9 +39,24 @@ struct Lane {
     }
 };
 
+struct BatchGraphScratch {
+    explicit BatchGraphScratch(int device)
+        : memory(device), device_bindings(memory.allocate<BatchDecodeBinding>(work.size())) {
+        for (auto& workspace : work) {
+            workspace.emplace(memory);
+        }
+    }
+
+    Allocations memory;
+    std::array<std::optional<Workspace>, decoder_batch_max_lanes> work;
+    BatchDecodeBinding* device_bindings;
+    std::array<BatchDecodeBinding, decoder_batch_max_lanes> bindings{};
+};
+
 struct BatchStorage {
     std::shared_ptr<const Allocations> weights;
     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
+    std::unique_ptr<BatchGraphScratch> graph_scratch;
 };
 
 void retire(std::optional<Lane>& lane) {
@@ -85,8 +100,9 @@ PrefillRows plan_prefill(const BatchStorage& storage, const Selection& selected,
 }
 
 struct DecoderBatch::State {
-    explicit State(const Decoder::Model& owner)
-        : model(owner), storage(std::make_shared<BatchStorage>()), execution(model.device) {
+    State(const Decoder::Model& owner, DecoderBatchOptions options)
+        : model(owner), options(options), storage(std::make_shared<BatchStorage>()),
+          execution(model.device) {
         DeviceScope device(model.device);
         storage->weights = model.memory;
         execution.open_stream(storage);
@@ -94,7 +110,9 @@ struct DecoderBatch::State {
     }
 
     Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats);
-    std::size_t submit(const Selection& selected, const PrefillRows& rows, Steps& results);
+    void submit(const Selection& selected, const PrefillRows& rows, Steps& results,
+                DecoderBatchStepStats& stats);
+    bool replay(const ForwardLane* lanes, int count);
 
     void require_ready() const {
         if (failed) {
@@ -110,16 +128,22 @@ struct DecoderBatch::State {
             return;
         }
         storage->slots = {};
+        storage->graph_scratch.reset();
     }
 
     const Decoder::Model& model;
+    const DecoderBatchOptions options;
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;
+    std::array<bool, decoder_batch_max_lanes - 1> graph_warmed{};
     bool failed = false;
 };
 
 DecoderBatch::DecoderBatch(const Decoder& decoder)
-    : state_(std::make_unique<State>(*decoder.model_)) {}
+    : DecoderBatch(decoder, {}) {}
+
+DecoderBatch::DecoderBatch(const Decoder& decoder, DecoderBatchOptions options)
+    : state_(std::make_unique<State>(*decoder.model_, options)) {}
 
 DecoderBatch::~DecoderBatch() = default;
 
@@ -172,18 +196,50 @@ std::size_t DecoderBatch::request_device_allocation_bytes() const {
     return bytes;
 }
 
-std::size_t DecoderBatch::State::submit(const Selection& selected, const PrefillRows& rows,
-                                        Steps& results) {
+bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
+    auto& warmed = graph_warmed[count - 2];
+    if (!std::exchange(warmed, true)) {
+        return false;
+    }
+    return execution.replay_batch_graph(count, [&] {
+        if (!storage->graph_scratch) {
+            storage->graph_scratch = std::make_unique<BatchGraphScratch>(model.device);
+        }
+    }, [&] {
+        auto& scratch = *storage->graph_scratch;
+        std::array<BatchGraphLane, decoder_batch_max_lanes> capture;
+        for (int index = 0; index < count; ++index) {
+            capture[index] = {&*scratch.work[index], scratch.device_bindings + index};
+        }
+        model.capture_batch_decode(capture.data(), count, execution.stream());
+    }, [&] {
+        auto& scratch = *storage->graph_scratch;
+        for (int index = 0; index < count; ++index) {
+            const auto& lane = lanes[index];
+            const auto& request = *lane.request;
+            scratch.bindings[index] = {{0.0f, lane.token_id}, lane.position, request.pages,
+                                       request.caches, request.states};
+        }
+        check(cudaMemcpyAsync(scratch.device_bindings, scratch.bindings.data(),
+                              count * sizeof(BatchDecodeBinding), cudaMemcpyHostToDevice,
+                              execution.stream()), "Upload batch decode bindings");
+    });
+}
+
+void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& rows,
+                                Steps& results, DecoderBatchStepStats& stats) {
     const auto stream = execution.stream();
     auto& slots = storage->slots;
     std::array<ForwardLane, decoder_batch_max_lanes> work;
     std::array<Request*, decoder_batch_max_lanes> scoring{};
+    std::array<int, decoder_batch_max_lanes> packed_slots{};
     const int max_rows = *std::max_element(rows.begin(), rows.end());
     int count = 0;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (selected[slot] && slots[slot] && slots[slot]->request) {
             auto& lane = *slots[slot];
             if (rows[slot] <= 1) {
+                packed_slots[slot] = count;
                 work[count++] = lane.input();
             }
             results[slot].decode = rows[slot] == 0;
@@ -192,13 +248,17 @@ std::size_t DecoderBatch::State::submit(const Selection& selected, const Prefill
             }
         }
     }
-    if (count != 0) {
+    const bool graph = options.cuda_graphs && max_rows == 0 && count >= 2 &&
+        std::all_of(work.begin(), work.begin() + count, [](const auto& lane) {
+            const auto scores = lane.request->work.gqa_scores(text_attention_max_tokens);
+            return lane.position < scores.capacity;
+        }) && replay(work.data(), count);
+    if (count != 0 && !graph) {
         model.forward(work.data(), count, stream);
     }
-    std::size_t workspace_bytes = 0;
     if (max_rows > 1) {
         PrefillWorkspace workspace(stream, max_rows);
-        workspace_bytes = workspace.bytes();
+        stats.prefill_workspace_bytes = workspace.bytes();
         for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
             if (rows[slot] > 1) {
                 auto& lane = *slots[slot];
@@ -208,8 +268,17 @@ std::size_t DecoderBatch::State::submit(const Selection& selected, const Prefill
         }
         workspace.close();
     }
-    for (auto* request : scoring) {
-        if (request) {
+    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+        if (auto* request = scoring[slot]) {
+            if (graph) {
+                auto& scratch = *storage->graph_scratch;
+                auto& winner = request->memory.transfers().winner;
+                const auto* output = &scratch.work[packed_slots[slot]]->argmax->token_id;
+                check(cudaMemcpyAsync(&winner, output, sizeof(winner), cudaMemcpyDeviceToHost,
+                                      stream), "Read batch graph greedy token");
+                stats.graph_slots |= 1u << slot;
+                continue;
+            }
             model.compute_logits(request->work, stream);
             copy_greedy_token(*request, stream);
         }
@@ -222,7 +291,6 @@ std::size_t DecoderBatch::State::submit(const Selection& selected, const Prefill
             results[slot].token = read_greedy_token(*scoring[slot]);
         }
     }
-    return workspace_bytes;
 }
 
 Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
@@ -232,8 +300,10 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         DeviceScope device(model.device);
         auto& slots = storage->slots;
         Steps results{};
-        const auto rows = plan_prefill(*storage, selected, chunked);
-        const auto workspace_bytes = submit(selected, rows, results);
+        DecoderBatchStepStats submitted;
+        submitted.prefill_rows = plan_prefill(*storage, selected, chunked);
+        const auto& rows = submitted.prefill_rows;
+        submit(selected, rows, results, submitted);
         for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
             auto& lane = slots[slot];
             auto& result = results[slot];
@@ -254,7 +324,7 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         }
         device.restore();
         if (stats) {
-            *stats = {rows, workspace_bytes};
+            *stats = submitted;
         }
         return results;
     } catch (...) {

@@ -153,3 +153,18 @@ if has_config("mxfp8-gqa-check") then
         add_files("tests/mxfp8_gqa_check.cu")
     target_end()
 end
+
+option("batch-graph-lanes")
+    set_default(false)
+option_end()
+
+if has_config("batch-graph-lanes") then
+    target("batch-graph-lanes")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_decoder")
+        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_files("tests/batch/batch_graph_lanes.cpp")
+    target_end()
+end

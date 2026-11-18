@@ -1,6 +1,7 @@
 #include "sglang/decoder_internal.h"
 
 #include "sglang/checkpoint.h"
+#include "sglang/decoder_batch.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -20,6 +21,20 @@ struct CleanupError {
     explicit operator bool() const { return status != cudaSuccess; }
     void raise() const { check(status, operation); }
 };
+
+struct CudaError : std::runtime_error {
+    CudaError(cudaError_t status, const char* operation)
+        : std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status)),
+          status(status) {}
+
+    cudaError_t status;
+};
+
+bool capture_rejected(cudaError_t status) {
+    return status == cudaErrorNotSupported || status == cudaErrorMemoryAllocation ||
+        status == cudaErrorStreamCaptureUnsupported ||
+        status == cudaErrorStreamCaptureInvalidated;
+}
 
 void report_cleanup(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
@@ -81,6 +96,12 @@ void allocate_kv(Request& request, int capacity, cudaStream_t stream) {
 }
 
 struct Allocations::State {
+    struct BatchGraph {
+        cudaGraph_t capture = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        bool disabled = false;
+    };
+
     struct Deferred {
         std::mutex mutex;
         std::unique_ptr<State> first;
@@ -133,11 +154,14 @@ struct Allocations::State {
     CleanupError release_selected(std::shared_ptr<const void>& drained_owners);
     CleanupError release(std::shared_ptr<const void>& drained_owners);
     CleanupError failure(CleanupError error);
+    CleanupError destroy_capture(cudaGraph_t& handle);
+    CleanupError destroy_executable(cudaGraphExec_t& handle);
 
     int device;
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
+    std::array<BatchGraph, decoder_batch_max_lanes - 1> batch_graphs{};
     bool uncertain_stream = false;
     bool uncertain_graph = false;
     std::vector<void*> blocks;
@@ -157,6 +181,32 @@ CleanupError Allocations::State::failure(CleanupError error) {
     return error;
 }
 
+CleanupError Allocations::State::destroy_capture(cudaGraph_t& handle) {
+    if (handle) {
+        const CleanupError error{cudaGraphDestroy(handle), "Destroy decode capture graph"};
+        if (error) {
+            uncertain_graph = true;
+            uncertain = error;
+            return failure(error);
+        }
+        handle = nullptr;
+    }
+    return {};
+}
+
+CleanupError Allocations::State::destroy_executable(cudaGraphExec_t& handle) {
+    if (handle) {
+        const CleanupError error{cudaGraphExecDestroy(handle), "Destroy decode executable graph"};
+        if (error) {
+            uncertain_graph = true;
+            uncertain = error;
+            return failure(error);
+        }
+        handle = nullptr;
+    }
+    return {};
+}
+
 CleanupError Allocations::State::close_stream(std::shared_ptr<const void>& drained_owners) {
     if (terminal || uncertain_stream || uncertain_graph || stream == nullptr) {
         return terminal ? terminal : uncertain;
@@ -165,23 +215,19 @@ CleanupError Allocations::State::close_stream(std::shared_ptr<const void>& drain
     if (sync) {
         return failure(sync);
     }
-    if (graph) {
-        const CleanupError destroy{cudaGraphExecDestroy(graph), "Destroy decode executable graph"};
-        if (destroy) {
-            uncertain_graph = true;
-            uncertain = destroy;
-            return failure(destroy);
-        }
-        graph = nullptr;
+    if (const auto error = destroy_executable(graph)) {
+        return error;
     }
-    if (capture) {
-        const CleanupError destroy{cudaGraphDestroy(capture), "Destroy decode capture graph"};
-        if (destroy) {
-            uncertain_graph = true;
-            uncertain = destroy;
-            return failure(destroy);
+    if (const auto error = destroy_capture(capture)) {
+        return error;
+    }
+    for (auto& batch : batch_graphs) {
+        if (const auto error = destroy_executable(batch.executable)) {
+            return error;
         }
-        capture = nullptr;
+        if (const auto error = destroy_capture(batch.capture)) {
+            return error;
+        }
     }
     transfers = {};
     drained_owners = std::move(owners);
@@ -245,7 +291,7 @@ CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_ow
 
 void check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+        throw CudaError(status, operation);
     }
 }
 
@@ -303,6 +349,88 @@ void Allocations::capture_graph(const std::function<void()>& enqueue) {
     check(cudaStreamEndCapture(stream, &state_->capture), "End decode graph capture");
     check(cudaGraphInstantiate(&state_->graph, state_->capture, 0),
           "Instantiate decode graph");
+}
+
+bool Allocations::replay_batch_graph(int width, const std::function<void()>& prepare,
+                                     const std::function<void()>& capture_nodes,
+                                     const std::function<void()>& bind) {
+    auto& batch = state_->batch_graphs.at(width - 2);
+    if (batch.disabled) {
+        return false;
+    }
+    const auto stream = state_->stream;
+    const auto fallback = [&](cudaError_t rejected, const char* operation) {
+        const auto previous = cudaGetLastError();
+        if (previous != rejected && !capture_rejected(previous)) {
+            check(previous, "Check CUDA error before eager batch fallback");
+        }
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        check(cudaStreamIsCapturing(stream, &capture_status), "Check batch capture ended");
+        if (capture_status != cudaStreamCaptureStatusNone) {
+            check(rejected, operation);
+        }
+        check(cudaStreamSynchronize(stream), "Drain stream before eager batch fallback");
+        state_->destroy_executable(batch.executable).raise();
+        state_->destroy_capture(batch.capture).raise();
+        batch.disabled = true;
+        std::fprintf(stderr, "sglang decoder: %s at width %d: %s, using eager batch decode\n",
+                     operation, width, cudaGetErrorString(rejected));
+        return false;
+    };
+    if (!batch.executable) {
+        check(cudaGetLastError(), "Check CUDA error before batch graph capture");
+        try {
+            prepare();
+        } catch (const CudaError& error) {
+            if (error.status == cudaErrorMemoryAllocation) {
+                return fallback(error.status, "Allocate batch decode graph scratch");
+            }
+            throw;
+        }
+        const auto begun = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+        if (capture_rejected(begun)) {
+            return fallback(begun, "Begin batch decode graph capture");
+        }
+        check(begun, "Begin batch decode graph capture");
+        cudaError_t enqueue_status = cudaSuccess;
+        try {
+            capture_nodes();
+        } catch (const CudaError& error) {
+            enqueue_status = error.status;
+            if (!capture_rejected(enqueue_status)) {
+                report_cleanup(cudaStreamEndCapture(stream, &batch.capture),
+                               "End failed batch decode graph capture");
+                throw;
+            }
+        } catch (...) {
+            report_cleanup(cudaStreamEndCapture(stream, &batch.capture),
+                           "End interrupted batch decode graph capture");
+            throw;
+        }
+        const auto ended = cudaStreamEndCapture(stream, &batch.capture);
+        if (capture_rejected(ended)) {
+            return fallback(ended, "End batch decode graph capture");
+        }
+        check(ended, "End batch decode graph capture");
+        if (enqueue_status != cudaSuccess) {
+            return fallback(enqueue_status, "Record batch decode graph");
+        }
+        const auto built = cudaGraphInstantiate(&batch.executable, batch.capture, 0);
+        if (capture_rejected(built) || built == cudaErrorInvalidValue) {
+            return fallback(built, "Instantiate batch decode graph");
+        }
+        check(built, "Instantiate batch decode graph");
+        state_->destroy_capture(batch.capture).raise();
+    }
+    bind();
+    check(cudaGetLastError(), "Check CUDA error before batch graph launch");
+    const auto launched = cudaGraphLaunch(batch.executable, stream);
+    if (launched == cudaErrorInvalidValue || launched == cudaErrorInvalidResourceHandle ||
+        launched == cudaErrorNotSupported) {
+        return fallback(launched, "Launch batch decode graph");
+    }
+    check(launched, "Launch batch decode graph");
+    return true;
 }
 
 void Allocations::reclaim_deferred() {

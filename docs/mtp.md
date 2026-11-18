@@ -6,9 +6,9 @@ Multi-token prediction (MTP) drafts candidates and uses the target model to veri
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Generator and server | Set the proposal limit. The server admits one active request with MTP. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server limit](../apps/sglang-server.cpp#L84)<!-- prefix: "if (argument" --> |
+| Generator and server | Set the proposal limit. The server admits one active request with MTP. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server limit](../apps/sglang-server.cpp#L89)<!-- prefix: "if (argument" --> |
 | MTP controller | Seed the draft, collect proposals, and publish greedy target outputs. | [Controller](../src/decoder.cpp#L228)<!-- prefix: "bool prefill" --> |
-| Target verifier | Process causal rows by layer, read the results, and commit the consumed state prefix. | [Forward](../src/decoder_forward.cpp#L249)<!-- prefix: "void Decoder" --> · [State commit](../src/decoder_verify.cpp#L112)<!-- prefix: "void TargetV" --> |
+| Target verifier | Process causal rows by layer, read the results, and commit the consumed state prefix. | [Forward](../src/decoder_forward.cpp#L279)<!-- prefix: "void Decoder" --> · [State commit](../src/decoder_verify.cpp#L112)<!-- prefix: "void TargetV" --> |
 
 ## Runtime path
 
@@ -24,13 +24,13 @@ Each round starts with the latest emitted token as the first target input. The v
 
 The controller emits matching proposals in order. The first mismatch emits a target correction and ends the round. Full acceptance can emit a target bonus if the stop rule and budget allow. The correction or bonus becomes the next target input if generation continues. The controller rewinds draft KV before verification and refreshes continuing draft state with final-normalized target rows from the accepted prefix. [Result consumption](../src/decoder.cpp#L182)<!-- prefix: "std::optiona" --> · [Draft rewind](../src/decoder_mtp.cpp#L361)<!-- prefix: "void MtpDraf" -->
 
-The verifier writes tentative GDN state into an alternate bank. Full consumption swaps that bank into the request. Partial consumption replays saved inputs for the consumed prefix from the prior bank, then swaps. Zero consumption preserves the initial bank. The target KV prefix advances by the consumed rows. Later forwards bound reads by position and overwrite rejected slots before they become visible. [Causal attention](../src/decoder_forward.cpp#L143)<!-- prefix: "cudaError_t " --> · [State commit](../src/decoder_verify.cpp#L112)<!-- prefix: "void TargetV" -->
+The verifier writes tentative GDN state into an alternate bank. Full consumption swaps that bank into the request. Partial consumption replays saved inputs for the consumed prefix from the prior bank, then swaps. Zero consumption preserves the initial bank. The target KV prefix advances by the consumed rows. Later forwards bound reads by position and overwrite rejected slots before they become visible. [Causal attention](../src/decoder_forward.cpp#L156)<!-- prefix: "cudaError_t " --> · [State commit](../src/decoder_verify.cpp#L112)<!-- prefix: "void TargetV" -->
 
 ## Constraints and failure behavior
 
 Verifier storage is allocated after the initial greedy token if generation continues. Its row capacity is the lesser of the proposal limit plus one and the initial output budget minus one. Five rows add **167,355,584 logical device bytes (159.60 MiB)** per request, independent of prompt length. This includes the alternate GDN bank, saved replay inputs, and row workspaces. Existing target and draft storage is separate. Five-row pinned results use 40 bytes for winners or 2,483,240 bytes with `--top-logits` enabled. [Sizing](../src/decoder.cpp#L268)<!-- prefix: "const int ro" --> · [Storage](../src/decoder_verify.cpp#L24)<!-- prefix: "TargetVerifi" -->
 
-MTP releases its private prefill workspace before queuing the first score. Requests with a cancellation callback wait for each prefill tile and poll between tiles. Stop, budget, and cancellation bound output consumption. Cancellation can leave already computed rows unused. Allocation or execution errors fail the request. Request cleanup retains storage and pinned results while stream completion is uncertain. [Cleanup](../src/decoder_resources.cpp#L160)<!-- prefix: "CleanupError" -->
+MTP releases its private prefill workspace before queuing the first score. Requests with a cancellation callback wait for each prefill tile and poll between tiles. Stop, budget, and cancellation bound output consumption. Cancellation can leave already computed rows unused. Allocation or execution errors fail the request. Request cleanup retains storage and pinned results while stream completion is uncertain. [Cleanup](../src/decoder_resources.cpp#L210)<!-- prefix: "CleanupError" -->
 
 ## Verification
 

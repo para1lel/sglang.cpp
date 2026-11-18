@@ -42,7 +42,7 @@ void trace_prefill_rows(const DecoderBatchStepStats& stats) {
 }
 
 struct BatchService::State {
-    State(const Decoder& decoder, bool trace);
+    State(const Decoder& decoder, bool trace, bool cuda_graphs);
     ~State();
 
     void run(const Decoder& decoder, std::promise<void> started);
@@ -53,6 +53,7 @@ struct BatchService::State {
     void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);
 
     const bool trace;
+    const bool cuda_graphs;
     std::mutex mutex;
     std::condition_variable changed;
     Jobs jobs;
@@ -61,7 +62,8 @@ struct BatchService::State {
     std::thread worker;
 };
 
-BatchService::State::State(const Decoder& decoder, bool trace) : trace(trace) {
+BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs)
+    : trace(trace), cuda_graphs(cuda_graphs) {
     std::promise<void> started;
     auto ready = started.get_future();
     worker = std::thread(&State::run, this, std::cref(decoder), std::move(started));
@@ -85,7 +87,7 @@ BatchService::State::~State() {
 void BatchService::State::run(const Decoder& decoder, std::promise<void> started) {
     std::unique_ptr<DecoderBatch> batch;
     try {
-        batch = std::make_unique<DecoderBatch>(decoder);
+        batch = std::make_unique<DecoderBatch>(decoder, DecoderBatchOptions{cuda_graphs});
     } catch (...) {
         started.set_exception(std::current_exception());
         return;
@@ -197,6 +199,10 @@ void BatchService::State::process(DecoderBatch& batch) {
                 trace_batch_step(width, decode, bytes);
                 if (width) {
                     trace_prefill_rows(stats);
+                    if (stats.graph_slots) {
+                        std::cerr << ("batch graph_slots=" +
+                                     std::to_string(stats.graph_slots) + '\n');
+                    }
                 }
                 traced_bytes = bytes;
             }
@@ -219,8 +225,8 @@ void BatchService::State::cancel(std::unique_lock<std::mutex>& lock, int slot, J
     changed.wait(lock, [&] { return jobs[slot].get() != &job; });
 }
 
-BatchService::BatchService(const Decoder& decoder, bool trace)
-    : state_(std::make_unique<State>(decoder, trace)) {}
+BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs)
+    : state_(std::make_unique<State>(decoder, trace, cuda_graphs)) {}
 
 BatchService::~BatchService() = default;
 

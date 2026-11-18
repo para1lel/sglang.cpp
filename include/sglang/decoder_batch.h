@@ -17,6 +17,11 @@ struct DecoderBatchStep {
 struct DecoderBatchStepStats {
     std::array<int, decoder_batch_max_lanes> prefill_rows{};
     std::size_t prefill_workspace_bytes = 0;
+    unsigned graph_slots = 0;
+};
+
+struct DecoderBatchOptions {
+    bool cuda_graphs = false;
 };
 
 /// The Decoder must outlive the batch. Use one host thread to operate a batch.
@@ -24,6 +29,7 @@ struct DecoderBatchStepStats {
 class DecoderBatch {
 public:
     explicit DecoderBatch(const Decoder& decoder);
+    DecoderBatch(const Decoder& decoder, DecoderBatchOptions options);
     ~DecoderBatch();
 
     void admit(int slot, std::vector<int> prompt, const DecoderOptions& options);

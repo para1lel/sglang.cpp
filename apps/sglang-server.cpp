@@ -26,6 +26,7 @@ struct Arguments {
     int mtp_steps = 0;
     bool eager = false;
     bool trace_batches = false;
+    bool batch_cuda_graphs = false;
 };
 
 int parse_integer(std::string_view value, const char* error) {
@@ -43,6 +44,10 @@ Arguments parse_arguments(int argc, char** argv) {
         const std::string_view option = argv[index];
         if (option == "--trace-batches") {
             arguments.trace_batches = true;
+            continue;
+        }
+        if (option == "--batch-cuda-graphs") {
+            arguments.batch_cuda_graphs = true;
             continue;
         }
         if (option == "--eager") {
@@ -86,6 +91,9 @@ Arguments parse_arguments(int argc, char** argv) {
     }
     if (arguments.eager && (arguments.max_active != 1 || arguments.mtp_steps != 0)) {
         throw std::invalid_argument("--eager requires --max-active 1 and --mtp-steps 0");
+    }
+    if (arguments.batch_cuda_graphs && arguments.max_active == 1) {
+        throw std::invalid_argument("--batch-cuda-graphs requires --max-active 2, 3, or 4");
     }
     return arguments;
 }
@@ -167,7 +175,7 @@ void serve_batch(const Socket& listener, BatchService& service,
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
-                     " [--max-active N] [--mtp-steps N] [--eager]\n"
+                     " [--max-active N] [--mtp-steps N] [--eager] [--batch-cuda-graphs]\n"
                      "                     [--fp8-prefill exact|tensor-core] [--trace-batches]\n"
                      "Active requests: 1 by default, up to 4.\n"
                      "MTP steps: 0 by default, up to 4 with one active request.\n"
@@ -193,7 +201,7 @@ int main(int argc, char** argv) {
                          arguments.mtp_steps, arguments.eager);
             });
         } else {
-            BatchService service(decoder, arguments.trace_batches);
+            BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs);
             serve_batch(listener, service, tokenizer, arguments.max_active);
         }
     } catch (const std::exception& error) {

@@ -87,6 +87,9 @@ public:
     cudaStream_t stream() const;
     cudaGraphExec_t graph() const;
     void capture_graph(const std::function<void()>& enqueue);
+    bool replay_batch_graph(int width, const std::function<void()>& prepare,
+                            const std::function<void()>& capture,
+                            const std::function<void()>& bind);
     void reclaim_deferred();
     void open_stream(std::shared_ptr<const void> owners = nullptr);
     void close_stream();
@@ -198,6 +201,19 @@ struct ForwardLane {
     TextGdnMode mode;
 };
 
+struct BatchDecodeBinding {
+    TextLogitCandidate input;
+    int position;
+    Mxfp8PageTable pages;
+    std::array<Mxfp8KvCache, full_attention_layers> caches;
+    std::array<TextGdnState, gdn_layers> states;
+};
+
+struct BatchGraphLane {
+    Workspace* work;
+    const BatchDecodeBinding* binding;
+};
+
 }
 
 namespace sglang {
@@ -216,6 +232,8 @@ struct Decoder::Model {
                        decoder::PrefillWorkspace& workspace,
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0) const;
     void decode_graph(decoder::Request& request) const;
+    void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
+                              cudaStream_t stream) const;
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request, bool decode = false) const;
     void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;

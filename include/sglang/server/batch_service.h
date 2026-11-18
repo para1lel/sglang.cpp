@@ -6,7 +6,7 @@ namespace sglang::server {
 
 class BatchService {
 public:
-    BatchService(const Decoder& decoder, bool trace);
+    BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false);
     ~BatchService();
 
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,

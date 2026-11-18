@@ -122,7 +122,7 @@ Measure prompt device time and HTTP TTFT as specified for [chunked prefill](#chu
 
 ### Native concurrent workloads
 
-W3 and W6 each require four active requests. Use `--max-active 4` after the [native streaming checks](development.md#streaming-verification) pass. Verify full-width decode and memory capacity at each workload's lengths. Use the [concurrent baseline procedure](../benchmarks/concurrent/README.md#conditions-and-gates) for paired timing and acceptance. W4 and W5 exceed the native server's four-lane limit and remain unsupported at their specified concurrency.
+Run W3 and W6 with `--max-active 4` after the [native streaming checks](development.md#streaming-verification). Verify full-width decode and memory capacity at workload lengths. Follow the [concurrent baseline procedure](../benchmarks/concurrent/README.md#conditions-and-gates) for paired timing and acceptance. W4 and W5 exceed the four-lane limit. See [batch graph timing](batch-graphs.md#timing) for replay eligibility and the historical width-four sample.
 
 ### Native serial MTP
 

@@ -139,6 +139,10 @@ to batch concurrent requests on the resident model. Extra connections wait in th
 listener backlog until a socket worker is available. Both serial and batched target-only
 requests use the selected FP8 prefill policy.
 
+Add `--batch-cuda-graphs` with `--max-active 2`, `3`, or `4` to opt in to graph
+replay for eligible decode-only groups. The server warms each actual decode
+width before capturing it. Mixed decode and prefill steps run eagerly.
+
 Add `--mtp-steps 1` through `--mtp-steps 4` to enable the parallel target verifier
 for serial HTTP requests with `--max-active 1`. The SSE events and usage fields
 follow the ordinary serial generation contract.
@@ -157,6 +161,7 @@ finish. A detected connection reset cancels the associated request and releases 
 Add `--trace-batches` to log `batch width=… decode=… request_bytes=…` on standard error.
 In serial mode the trace describes token-producing steps and reports zero batch request
 bytes. In batch mode `request_bytes` counts live allocations owned by the batch executor.
+With batch graphs enabled, `batch graph_slots=…` gives the bit mask of replayed slots.
 
 `Decoder::generate` accepts optional callbacks. `on_token` receives each selected ID
 synchronously after host readback. Returning `false` cancels the request with that ID

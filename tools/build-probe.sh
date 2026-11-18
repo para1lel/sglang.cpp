@@ -47,8 +47,8 @@ if [[ "$check" == y && ! -f tests/mxfp8_gqa_check.cu ]]; then
     echo "The optional MXFP8 check requires tests/mxfp8_gqa_check.cu." >&2
     exit 1
 fi
-"$xmake" f -o "$work/build" -p linux -a x86_64 -m release --mxfp8-gqa-check="$check"
-"$xmake" build -v toolchain-probe
+"$xmake" f -P . -o "$work/build" -p linux -a x86_64 -m release --mxfp8-gqa-check="$check"
+"$xmake" build -P . -v toolchain-probe
 
 probe="$work/build/bin/toolchain-probe"
 images=$("$prefix/bin/cuobjdump" --list-elf "$probe")
@@ -62,7 +62,7 @@ fi
 echo "CUDA runtime: $runtime"
 sha256sum "$probe"
 
-"$xmake" build -v nvrtc-probe
+"$xmake" build -P . -v nvrtc-probe
 nvrtc_probe="$work/build/bin/nvrtc-probe"
 nvrtc_links=$(ldd "$nvrtc_probe")
 nvrtc=$(awk '$1 ~ /^libnvrtc\.so/ {print $3}' <<< "$nvrtc_links")
@@ -73,13 +73,13 @@ fi
 echo "NVRTC library: $nvrtc"
 sha256sum "$nvrtc_probe" "$nvrtc"
 
-"$xmake" build -v sglang-generate
+"$xmake" build -P . -v sglang-generate
 generator="$work/build/bin/sglang-generate"
 echo "Native generator: $generator"
 sha256sum "$generator" "$work/build/lib/libsglang_checkpoint.a" \
     "$work/build/lib/libsglang_cuda.a" "$work/build/lib/libsglang_decoder.a"
 if [[ "$check" == y ]]; then
-    "$xmake" build -v mxfp8-gqa-check
+    "$xmake" build -P . -v mxfp8-gqa-check
     sha256sum "$work/build/bin/mxfp8-gqa-check"
 fi
 

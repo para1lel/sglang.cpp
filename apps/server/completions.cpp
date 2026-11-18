@@ -3,6 +3,8 @@
 #include "sglang/server/batch_service.h"
 #include "sglang/server/http.h"
 
+#include "text_completion.h"
+
 #include <llvm/Support/Error.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/raw_ostream.h>
@@ -26,13 +28,7 @@ std::optional<std::uint64_t> unsigned_integer(const json::Object& object, llvm::
     return value ? value->getAsUINT64() : std::nullopt;
 }
 
-CompletionRequest parse_completion(std::string_view body) {
-    auto parsed = json::parse(llvm::StringRef(body.data(), body.size()));
-    if (!parsed) {
-        llvm::consumeError(parsed.takeError());
-        throw HttpError("400 Bad Request", "Invalid JSON request body");
-    }
-    const auto* object = parsed->getAsObject();
+CompletionRequest parse_benchmark(const json::Object* object) {
     const auto* stops = object ? object->get("stop_token_ids") : nullptr;
     if (!object || object->size() != (stops ? 12 : 11) ||
         object->getString("model") != "benchmark" ||
@@ -159,10 +155,9 @@ void finish_stream(const Socket& connection, const CompletionRequest& request,
     }
 }
 
-template <typename Generate>
-void stream_completion(const Socket& connection, std::string_view body, Generate generate,
+void stream_completion(const Socket& connection, const CompletionRequest& request,
+                       const TextGenerator& generate,
                        bool trace_serial = false) {
-    const auto request = parse_completion(body);
     bool streaming = false;
     bool first_token = true;
     const DecoderCallbacks callbacks{
@@ -179,7 +174,7 @@ void stream_completion(const Socket& connection, std::string_view body, Generate
     };
 
     try {
-        const auto result = generate(request, callbacks);
+        const auto result = generate(request.prompt, request.options, callbacks);
         if (result.finish_reason != DecoderFinishReason::cancelled) {
             finish_stream(connection, request, result, streaming);
         } else if (trace_serial) {
@@ -196,6 +191,43 @@ void stream_completion(const Socket& connection, std::string_view body, Generate
     }
 }
 
+void dispatch_completion(const Socket& connection, std::string_view body,
+                         const CompletionTokenizer* tokenizer, const TextGenerator& generate,
+                         bool trace = false) {
+    auto parsed = json::parse(llvm::StringRef(body.data(), body.size()));
+    if (!parsed) {
+        llvm::consumeError(parsed.takeError());
+        throw HttpError("400 Bad Request", "Invalid JSON request body");
+    }
+    const auto* object = parsed->getAsObject();
+    const llvm::StringRef text_model(model_name.data(), model_name.size());
+    if (tokenizer && object && object->getString("model") != "benchmark" &&
+        (object->getString("prompt") || object->getString("model") == text_model)) {
+        complete_text(connection, body, *tokenizer, generate, trace);
+        return;
+    }
+    stream_completion(connection, parse_benchmark(object), generate, trace);
+}
+
+void complete_serial(const Socket& connection, const Decoder& decoder,
+                     const CompletionTokenizer* tokenizer, std::string_view body,
+                     bool trace, int mtp_steps, bool eager) {
+    dispatch_completion(connection, body, tokenizer,
+                        [&](const auto& prompt, auto options, const auto& callbacks) {
+        options.mtp_steps = mtp_steps;
+        options.eager = eager;
+        return decoder.generate(prompt, options, callbacks);
+    }, trace);
+}
+
+void complete_batch(const Socket& connection, BatchService& service, int slot,
+                    const CompletionTokenizer* tokenizer, std::string_view body) {
+    dispatch_completion(connection, body, tokenizer,
+                        [&](const auto& prompt, const auto& options, const auto& callbacks) {
+        return service.generate(slot, prompt, options, callbacks);
+    });
+}
+
 }
 
 void write_error(const Socket& connection, std::string_view status, const char* message) {
@@ -204,19 +236,22 @@ void write_error(const Socket& connection, std::string_view status, const char* 
 
 void complete(const Socket& connection, const Decoder& decoder, std::string_view body,
               bool trace, int mtp_steps) {
-    stream_completion(connection, body,
-                      [&](const CompletionRequest& request, const DecoderCallbacks& callbacks) {
-        auto options = request.options;
-        options.mtp_steps = mtp_steps;
-        return decoder.generate(request.prompt, options, callbacks);
-    }, trace);
+    complete_serial(connection, decoder, nullptr, body, trace, mtp_steps, false);
 }
 
 void complete(const Socket& connection, BatchService& service, int slot, std::string_view body) {
-    stream_completion(connection, body,
-                      [&](const CompletionRequest& request, const DecoderCallbacks& callbacks) {
-        return service.generate(slot, request.prompt, request.options, callbacks);
-    });
+    complete_batch(connection, service, slot, nullptr, body);
+}
+
+void complete(const Socket& connection, const Decoder& decoder,
+              const CompletionTokenizer& tokenizer, std::string_view body,
+              bool trace, int mtp_steps, bool eager) {
+    complete_serial(connection, decoder, &tokenizer, body, trace, mtp_steps, eager);
+}
+
+void complete(const Socket& connection, BatchService& service, int slot,
+              const CompletionTokenizer& tokenizer, std::string_view body) {
+    complete_batch(connection, service, slot, &tokenizer, body);
 }
 
 }

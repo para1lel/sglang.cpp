@@ -31,7 +31,7 @@ struct Lane {
     void select_token(int token, DecoderBatchStep& result) {
         last_token = token;
         ++generated;
-        if (options.stop_token_id == token) {
+        if (options.stops_at(token)) {
             result.finish_reason = DecoderFinishReason::stop;
         } else if (options.max_new_tokens == generated) {
             result.finish_reason = DecoderFinishReason::length;

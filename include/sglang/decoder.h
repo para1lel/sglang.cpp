@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 namespace sglang {
@@ -16,6 +17,12 @@ struct DecoderOptions {
     std::optional<int> stop_token_id;
     int top_logits = 0;
     int mtp_steps = 0;
+    std::unordered_set<int> additional_stop_token_ids;
+    bool eager = false;
+
+    bool stops_at(int token) const {
+        return stop_token_id == token || additional_stop_token_ids.count(token) != 0;
+    }
 };
 
 enum class DecoderFinishReason {

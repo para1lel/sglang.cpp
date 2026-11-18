@@ -67,6 +67,21 @@ target("sglang_prefill_fp8_sm100")
     add_includedirs("include", path.join(toolkit, "include"))
     add_files("src/prefill_fp8_sm100.cu")
 
+target("sglang_json")
+    set_kind("static")
+    set_toolchains("host-pixi")
+    set_targetdir("$(builddir)/lib")
+    add_includedirs("include", {public = true})
+    add_files("src/json.cpp", "src/utf8.cpp")
+
+target("sglang_tokenizer")
+    set_kind("static")
+    set_toolchains("host-pixi")
+    set_targetdir("$(builddir)/lib")
+    add_includedirs("include", {public = true})
+    add_deps("sglang_json")
+    add_files("src/tokenizer/*.cpp")
+
 target("sglang_checkpoint")
     set_kind("static")
     set_toolchains("host-pixi")
@@ -100,11 +115,26 @@ target("sglang-server")
     set_kind("binary")
     set_toolchains("host-pixi")
     set_targetdir("$(builddir)/bin")
-    add_deps("sglang_decoder")
+    add_deps("sglang_decoder", "sglang_tokenizer")
     add_sysincludedirs(path.join(prefix, "include"))
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
-              "apps/server/completions.cpp", "apps/server/http.cpp")
+              "apps/server/completions.cpp", "apps/server/http.cpp",
+              "apps/server/text_request.cpp", "apps/server/text_completion.cpp")
+
+option("text-tokenizer-check")
+    set_default(false)
+option_end()
+
+if has_config("text-tokenizer-check") then
+    target("text-tokenizer-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_tokenizer")
+        add_files("tests/text/tokenizer_test.cpp")
+    target_end()
+end
 
 option("mxfp8-gqa-check")
     set_default(false)

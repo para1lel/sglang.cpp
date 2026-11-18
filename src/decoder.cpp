@@ -21,7 +21,9 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     if (prompt.empty() || !std::all_of(prompt.begin(), prompt.end(), valid_token)) {
         throw std::invalid_argument("Prompt must contain token IDs in [0, 248320)");
     }
-    if (options.stop_token_id && !valid_token(*options.stop_token_id)) {
+    if ((options.stop_token_id && !valid_token(*options.stop_token_id)) ||
+        !std::all_of(options.additional_stop_token_ids.begin(),
+                     options.additional_stop_token_ids.end(), valid_token)) {
         throw std::invalid_argument("Stop token ID falls outside the vocabulary");
     }
     if (options.top_logits < 0 || options.top_logits > vocab_size) {
@@ -61,8 +63,9 @@ using namespace decoder;
 
 class RequestLease {
 public:
-    explicit RequestLease(std::atomic_flag& claimed)
-        : claimed_(claimed), owns_slot_(!claimed_.test_and_set(std::memory_order_acquire)) {}
+    RequestLease(std::atomic_flag& claimed, bool reusable)
+        : claimed_(claimed),
+          owns_slot_(reusable && !claimed_.test_and_set(std::memory_order_acquire)) {}
 
     ~RequestLease() {
         if (owns_slot_) {
@@ -143,7 +146,7 @@ struct Decoder::Model::MtpGeneration {
         if (!keep_running) {
             return DecoderFinishReason::cancelled;
         }
-        if (options.stop_token_id == token) {
+        if (options.stops_at(token)) {
             return DecoderFinishReason::stop;
         }
         if (result.output_token_ids.size() == static_cast<std::size_t>(options.max_new_tokens)) {
@@ -289,7 +292,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
     const int prompt_count = static_cast<int>(prompt.size());
     int capacity = prompt_count + options.max_new_tokens - 1;
     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
-    const RequestLease lease(request_in_use);
+    const RequestLease lease(request_in_use, !options.eager);
     std::unique_ptr<Request> eager_request;
     auto& storage = lease.owns_slot() ? decode_request : eager_request;
     try {
@@ -360,7 +363,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 if (!keep_running) {
                     return DecoderFinishReason::cancelled;
                 }
-                if (options.stop_token_id == winner) {
+                if (options.stops_at(winner)) {
                     return DecoderFinishReason::stop;
                 }
             }

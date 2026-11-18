@@ -7,7 +7,7 @@ and carries Gated DeltaNet state through the other 48 layers. Prefill and the fi
 greedy selection run eagerly. Subsequent serial decode steps use a CUDA graph.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L52)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L59)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
@@ -124,8 +124,7 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
 ```
 
 The server loads one model and binds to `127.0.0.1`. `GET /health` returns HTTP 200 after
-model loading. `POST /v1/completions` implements the frozen streaming benchmark contract
-for model `benchmark` with token ID input. By default and with `--max-active 1`,
+model loading. By default and with `--max-active 1`,
 requests run serially and reuse the decode graph. Set `--max-active 2`, `3`, or `4`
 to batch concurrent requests on the resident model. Extra connections wait in the
 listener backlog until a socket worker is available.
@@ -135,6 +134,11 @@ Add `--mtp-steps 1` through `--mtp-steps 4` to enable the same eager verifier fo
 serial HTTP requests with `--max-active 1`. The SSE events and usage fields are
 the same as for ordinary serial generation.
 
+Set `--eager` to run serial requests without graph capture or replay.
+This option requires `--max-active 1` and `--mtp-steps 0`.
+
+For model `benchmark`, send a token ID array to `POST /v1/completions` using the
+[frozen streaming benchmark contract](benchmarks/streaming/README.md#wire-contract).
 Each selected token produces one SSE event. The first choice carries the prompt IDs.
 To stop on a specific output ID, include a single ID in `stop_token_ids`.
 The server emits the matching token and reports `stop`, even at the output limit.
@@ -148,6 +152,24 @@ bytes. In batch mode `request_bytes` counts live allocations owned by the batch 
 `Decoder::generate` accepts optional callbacks. `on_token` receives each selected ID
 synchronously after host readback. Returning `false` cancels the request with that ID
 in the result. `is_cancelled` is checked before request work and between model steps.
+
+### Submit a text prompt
+
+Send a nonempty UTF-8 `prompt` string with model `Qwen3.8-27B-FP8`.
+The prompt limit is 1 MiB. The encoded prompt and output budget share a 262,144-token context.
+The first text request loads the [pinned tokenizer](tools/unicode/README.md) from the checkpoint.
+The server completes the raw prompt with no chat formatting or automatic BOS or EOS insertion.
+
+```bash
+curl -N http://127.0.0.1:17384/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.8-27B-FP8","prompt":"Explain why the sky is blue.","max_tokens":64,"stream":true}'
+```
+
+With `stream: true`, append the valid UTF-8 `choices[0].text` deltas in order until `[DONE]`.
+Omit `stream` to receive one JSON response with complete text and usage.
+The default `max_tokens` is 16.
+See [text completion options and verification](docs/text-serving.md) for the full contract.
 
 ## Continue development
 

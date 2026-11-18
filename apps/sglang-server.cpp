@@ -24,6 +24,7 @@ struct Arguments {
     int port = 17384;
     int max_active = 1;
     int mtp_steps = 0;
+    bool eager = false;
     bool trace_batches = false;
 };
 
@@ -42,6 +43,10 @@ Arguments parse_arguments(int argc, char** argv) {
         const std::string_view option = argv[index];
         if (option == "--trace-batches") {
             arguments.trace_batches = true;
+            continue;
+        }
+        if (option == "--eager") {
+            arguments.eager = true;
             continue;
         }
         if (++index == argc) {
@@ -78,6 +83,9 @@ Arguments parse_arguments(int argc, char** argv) {
     }
     if (arguments.mtp_steps != 0 && arguments.max_active != 1) {
         throw std::invalid_argument("--mtp-steps requires --max-active 1");
+    }
+    if (arguments.eager && (arguments.max_active != 1 || arguments.mtp_steps != 0)) {
+        throw std::invalid_argument("--eager requires --max-active 1 and --mtp-steps 0");
     }
     return arguments;
 }
@@ -117,7 +125,8 @@ void serve_connections(const Socket& listener, const Complete& complete_request)
     }
 }
 
-void serve_batch(const Socket& listener, BatchService& service, int max_active) {
+void serve_batch(const Socket& listener, BatchService& service,
+                 const CompletionTokenizer& tokenizer, int max_active) {
     std::vector<std::thread> workers;
     workers.reserve(max_active);
     std::mutex failure_mutex;
@@ -135,7 +144,7 @@ void serve_batch(const Socket& listener, BatchService& service, int max_active) 
                 try {
                     serve_connections(listener, [&](const Socket& connection,
                                                     std::string_view body) {
-                        complete(connection, service, slot, body);
+                        complete(connection, service, slot, tokenizer, body);
                     });
                 } catch (...) {
                     stop_on_error();
@@ -158,10 +167,11 @@ void serve_batch(const Socket& listener, BatchService& service, int max_active) 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
-                     " [--max-active N] [--mtp-steps N]\n"
+                     " [--max-active N] [--mtp-steps N] [--eager]\n"
                      "                     [--fp8-prefill exact|tensor-core] [--trace-batches]\n"
                      "Active requests: 1 by default, up to 4.\n"
                      "MTP steps: 0 by default, up to 4 with one active request.\n"
+                     "Eager decode: one active request with MTP off.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n"
                   << sglang::cli::fp8_prefill_usage;
         return 0;
@@ -176,13 +186,15 @@ int main(int argc, char** argv) {
         }
         const auto listener = listen_loopback(arguments.port);
         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
+        const CompletionTokenizer tokenizer(arguments.checkpoint);
         if (arguments.max_active == 1) {
             serve_connections(listener, [&](const Socket& connection, std::string_view body) {
-                complete(connection, decoder, body, arguments.trace_batches, arguments.mtp_steps);
+                complete(connection, decoder, tokenizer, body, arguments.trace_batches,
+                         arguments.mtp_steps, arguments.eager);
             });
         } else {
             BatchService service(decoder, arguments.trace_batches);
-            serve_batch(listener, service, arguments.max_active);
+            serve_batch(listener, service, tokenizer, arguments.max_active);
         }
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';

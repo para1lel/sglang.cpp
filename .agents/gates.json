@@ -30,6 +30,16 @@
   "code_paths": [],
   "checks": [
     {
+      "name": "XMake host and SM100 build",
+      "kind": "static",
+      "paths": [
+        "xmake.lua", "tools/*", "src/*", "include/*", "*.cpp", "*.cc", "*.cxx",
+        "*.h", "*.hpp", "*.cu", "*.cuh"
+      ],
+      "command": ["/bin/bash", "tools/build.sh"],
+      "timeout": 180
+    },
+    {
       "name": "maintenance contract",
       "kind": "test",
       "paths": [".agents/*", ".githooks/*", "tests/*"],

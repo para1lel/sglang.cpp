@@ -1,5 +1,7 @@
 #include "sglang/mxfp8_gqa.h"
 
+#include "sglang/decoder_cuda.cuh"
+
 #include <limits>
 
 #include <cuda_fp8.h>
@@ -50,9 +52,11 @@ __device__ float decode(std::uint8_t payload, std::uint8_t exponent) {
     return ldexpf(static_cast<float>(value), static_cast<int>(exponent) - 127);
 }
 
-__global__ void append_kernel(Mxfp8KvCache cache, const std::int32_t* pages, int first_position,
+template <typename Position>
+__global__ void append_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
+                              Position first_position,
                               const __nv_bfloat16* keys, const __nv_bfloat16* values) {
-    const int position = first_position + static_cast<int>(blockIdx.x);
+    const int position = decoder::position_value(first_position) + static_cast<int>(blockIdx.x);
     const int token = position % mxfp8_page_size;
     const int physical_page = pages[position / mxfp8_page_size];
     const int head = blockIdx.y;
@@ -79,8 +83,9 @@ __device__ float warp_sum(float value) {
     return value;
 }
 
+template <typename Position>
 __global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
-                                 int first_query_position, const __nv_bfloat16* queries,
+                                 Position first_query_position, const __nv_bfloat16* queries,
                                  __nv_bfloat16* output) {
     __shared__ float warp_dots[mxfp8_groups];
     __shared__ float history_weight;
@@ -92,7 +97,8 @@ __global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
     const int channel = threadIdx.x;
     const int group = channel / mxfp8_group_size;
     const auto row = row_offset(blockIdx.x, mxfp8_query_heads, query_head) + channel;
-    const int last_position = first_query_position + static_cast<int>(blockIdx.x);
+    const int last_position =
+        decoder::position_value(first_query_position) + static_cast<int>(blockIdx.x);
     const float query = __bfloat162float(queries[row]);
     float max_score = -CUDART_INF_F;
     float weight_sum = 0.0f;
@@ -157,8 +163,8 @@ cudaError_t mxfp8_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, int first_
         return cudaErrorInvalidValue;
     }
     void* arguments[] = {&cache, &pages.device_pages, &first_position, &keys, &values};
-    return cudaLaunchKernel(append_kernel, dim3(token_count, mxfp8_kv_heads), dim3(mxfp8_head_dim),
-                            arguments, 0, stream);
+    return cudaLaunchKernel(append_kernel<int>, dim3(token_count, mxfp8_kv_heads),
+                            dim3(mxfp8_head_dim), arguments, 0, stream);
 }
 
 cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int valid_tokens,
@@ -174,7 +180,23 @@ cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int va
         return cudaErrorInvalidValue;
     }
     void* arguments[] = {&cache, &pages.device_pages, &first_query_position, &queries, &output};
-    return cudaLaunchKernel(attention_kernel, dim3(query_count, mxfp8_query_heads),
+    return cudaLaunchKernel(attention_kernel<int>, dim3(query_count, mxfp8_query_heads),
+                            dim3(mxfp8_head_dim), arguments, 0, stream);
+}
+
+cudaError_t decoder::decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages,
+                                      const int* position, const __nv_bfloat16* keys,
+                                      const __nv_bfloat16* values, cudaStream_t stream) {
+    void* arguments[] = {&cache, &pages.device_pages, &position, &keys, &values};
+    return cudaLaunchKernel(append_kernel<const int*>, dim3(1, mxfp8_kv_heads),
+                            dim3(mxfp8_head_dim), arguments, 0, stream);
+}
+
+cudaError_t decoder::decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages,
+                                          const int* position, const __nv_bfloat16* queries,
+                                          __nv_bfloat16* output, cudaStream_t stream) {
+    void* arguments[] = {&cache, &pages.device_pages, &position, &queries, &output};
+    return cudaLaunchKernel(attention_kernel<const int*>, dim3(1, mxfp8_query_heads),
                             dim3(mxfp8_head_dim), arguments, 0, stream);
 }
 

@@ -59,8 +59,6 @@ void allocate_gdn(Request& request) {
         request.states[index] = {history + index * gdn_history_elements,
                                  recurrent + index * gdn_state_elements};
     }
-    zero(history, history_count, request.memory.stream());
-    zero(recurrent, recurrent_count, request.memory.stream());
 }
 
 void allocate_kv(Request& request, int capacity) {
@@ -147,7 +145,10 @@ struct Allocations::State {
 
     int device;
     cudaStream_t stream = nullptr;
+    cudaGraph_t capture = nullptr;
+    cudaGraphExec_t graph = nullptr;
     bool uncertain_stream = false;
+    bool uncertain_graph = false;
     std::vector<void*> blocks;
     std::size_t uncertain_blocks = 0;
     std::size_t bytes = 0;
@@ -166,12 +167,30 @@ CleanupError Allocations::State::failure(CleanupError error) {
 }
 
 CleanupError Allocations::State::close_stream(std::shared_ptr<const Allocations>& drained_weights) {
-    if (terminal || uncertain_stream || stream == nullptr) {
+    if (terminal || uncertain_stream || uncertain_graph || stream == nullptr) {
         return terminal ? terminal : uncertain;
     }
     const CleanupError sync{cudaStreamSynchronize(stream), "Synchronize decoder stream"};
     if (sync) {
         return failure(sync);
+    }
+    if (graph) {
+        const CleanupError destroy{cudaGraphExecDestroy(graph), "Destroy decode executable graph"};
+        if (destroy) {
+            uncertain_graph = true;
+            uncertain = destroy;
+            return failure(destroy);
+        }
+        graph = nullptr;
+    }
+    if (capture) {
+        const CleanupError destroy{cudaGraphDestroy(capture), "Destroy decode capture graph"};
+        if (destroy) {
+            uncertain_graph = true;
+            uncertain = destroy;
+            return failure(destroy);
+        }
+        capture = nullptr;
     }
     transfers = {};
     drained_weights = std::move(weights);
@@ -278,6 +297,28 @@ TransferBuffers& Allocations::transfers() { return state_->transfers; }
 
 cudaStream_t Allocations::stream() const { return state_->stream; }
 
+cudaGraphExec_t Allocations::graph() const { return state_->graph; }
+
+void Allocations::capture_graph(const std::function<void()>& enqueue) {
+    const auto stream = state_->stream;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+          "Begin decode graph capture");
+    try {
+        enqueue();
+    } catch (...) {
+        report_cleanup(cudaStreamEndCapture(stream, &state_->capture),
+                       "End interrupted decode graph capture");
+        throw;
+    }
+    check(cudaStreamEndCapture(stream, &state_->capture), "End decode graph capture");
+    check(cudaGraphInstantiate(&state_->graph, state_->capture, 0),
+          "Instantiate decode graph");
+}
+
+void Allocations::reclaim_deferred() {
+    State::reclaim(state_->device);
+}
+
 void Allocations::open_stream(std::shared_ptr<const Allocations> weights) {
     check(cudaStreamCreateWithFlags(&state_->stream, cudaStreamNonBlocking),
           "Create decoder stream");
@@ -336,11 +377,17 @@ Workspace::Workspace(Allocations& allocations)
     static_assert(text_gqa_q_width == text_gdn_value_width);
 }
 
-Request::Request(int device, int capacity, std::shared_ptr<const Allocations> weights)
-    : memory(device), work(memory) {
+Request::Request(int device, int capacity, std::shared_ptr<const Allocations> weights,
+                 bool reusable)
+    : memory(device), work(memory), decode_position(reusable ? memory.allocate<int>(1) : nullptr) {
     memory.open_stream(std::move(weights));
     allocate_kv(*this, capacity);
     allocate_gdn(*this);
+}
+
+void Request::reset() {
+    zero(states.front().history, gdn_layers * gdn_history_elements, memory.stream());
+    zero(states.front().recurrent, gdn_layers * gdn_state_elements, memory.stream());
 }
 
 }

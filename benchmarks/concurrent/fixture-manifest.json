@@ -1,0 +1,482 @@
+{
+  "seed": "sglang.cpp-concurrent-baseline-20261118-v2",
+  "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+  "rows": {
+    "W3": {
+      "prompt": 8192,
+      "output": 1024,
+      "concurrency": 4,
+      "lanes": [
+        {
+          "lane": 0,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W3/0",
+          "title": "Amber",
+          "first_token": 5901,
+          "text_sha256": "f5fade80028dd2cb52a61ce4e5b9a0b88e8958dfa335ef44b642ba61d984c945",
+          "request_sha256": "c62deeb2cbe3a15f7cc7f4f353556f5f8dc3b60a050a321b569dabdd021e8264"
+        },
+        {
+          "lane": 1,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W3/1",
+          "title": "Anchor",
+          "first_token": 14254,
+          "text_sha256": "3d7e3096902d10d8dcaa2dfb6457db87c687edd72b72e93654de35222828cc1f",
+          "request_sha256": "5c52e4a41833c6e642b88cd46456f11156e871531329cc8df140c65856cf4b4e"
+        },
+        {
+          "lane": 2,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W3/2",
+          "title": "Apple",
+          "first_token": 25719,
+          "text_sha256": "3eccd6a9267132fea553a050fe01789759f5ed94149208b6cbd3421e8233dcf7",
+          "request_sha256": "637eccd6e7ccce2b723ab015d057230d183f04ae452d300cabb4dbcc0add0e5e"
+        },
+        {
+          "lane": 3,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W3/3",
+          "title": "Aspen",
+          "first_token": 2053,
+          "text_sha256": "18eb0c6ff66eef049d6ab88d1e135a1c7272c93836c79363e82a06504f6de1f1",
+          "request_sha256": "240fabdcba85e3f9ed8b75efa97bd6733aafe3bba919dd44b6ca4ee0fc66fb0e"
+        }
+      ]
+    },
+    "W4": {
+      "prompt": 32768,
+      "output": 1024,
+      "concurrency": 16,
+      "lanes": [
+        {
+          "lane": 0,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/0",
+          "title": "Atlas",
+          "first_token": 59057,
+          "text_sha256": "d76e5c8b1881c08bbb727ed81bc38449293f28aaabd3b8447563326e80f59e81",
+          "request_sha256": "013c31a4184104f034b76255183c5ff0158a3b5ccb5a2fea103a019f0355627d"
+        },
+        {
+          "lane": 1,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/1",
+          "title": "Autumn",
+          "first_token": 19002,
+          "text_sha256": "97a72f12d369e40bdf0ad3ce4710d6bbf0509f3ad99d4fe716ae26eeef97ccf4",
+          "request_sha256": "390527ad4d435ed47cf9f8224768ef7ff491ccc0fe0041024179217c8d533b83"
+        },
+        {
+          "lane": 2,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/2",
+          "title": "Bamboo",
+          "first_token": 33,
+          "text_sha256": "2e53379ec4486f54b2b96156655482a43bdb921972559193ad6fc9d349cafbde",
+          "request_sha256": "ccc0952d807c0c97b45a28ca3644c6bef356c1c153dfd47e397a755fcebb23d9"
+        },
+        {
+          "lane": 3,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/3",
+          "title": "Barrel",
+          "first_token": 3318,
+          "text_sha256": "0671803a0bbb909ed6472d129a4cc7da7b570dcf9af9ebc2168d0935ec6904b9",
+          "request_sha256": "71e6858ada1baf9da388688b25ca715d045c805d29ced5cc45dde7641a154be7"
+        },
+        {
+          "lane": 4,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/4",
+          "title": "Basin",
+          "first_token": 32491,
+          "text_sha256": "83c980aa72f4bfffca337e3fa43b2ac2700d1f65a7ad48160110aaa99180e62d",
+          "request_sha256": "31fb86e74e4840d7ecdcd7feff788a29951b40a8ef48d5df223372cd8e8db2ae"
+        },
+        {
+          "lane": 5,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/5",
+          "title": "Beach",
+          "first_token": 3320,
+          "text_sha256": "d10ae4197f8ae1bf87e8be9c580fc1bfb87614a6e6e43c88a0933778f1938437",
+          "request_sha256": "ee5fdd7706630b0f262ce24f920dbc79caae0d39ac015dff8a334b3d5382a468"
+        },
+        {
+          "lane": 6,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/6",
+          "title": "Birch",
+          "first_token": 245720,
+          "text_sha256": "0d850585135b259104533b705dfd902d9a698ff22cf745a3184bfd93dcffdd10",
+          "request_sha256": "a393540ef92beaa69f73bf8b06fa5264a0318598324b4af65f2ca6e43222db1d"
+        },
+        {
+          "lane": 7,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/7",
+          "title": "Blue",
+          "first_token": 10025,
+          "text_sha256": "d7e73107917e16d7b8b6c7f5314f8898f02751643a8b437d6cbeee8724098199",
+          "request_sha256": "4ddfc95f7a889cfeceb43d3e4795b59a8a1147043f41475357348fb7c3a9ec7f"
+        },
+        {
+          "lane": 8,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/8",
+          "title": "Brass",
+          "first_token": 6614,
+          "text_sha256": "0ec08011631b392f2d7a1055d90e738b3b0f28da341855d2dc1d45667da2d99a",
+          "request_sha256": "4f2af7d74219624a64588bc13fc0f1ff1526b91df2682af1e2d7ab8be517b35d"
+        },
+        {
+          "lane": 9,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/9",
+          "title": "Bridge",
+          "first_token": 31760,
+          "text_sha256": "adc7dad5c2749ddd52a74e8d6f5a6f5d1dfae259937281930168dd27c4fc41c1",
+          "request_sha256": "1e79de66c55a17985fa4cb192cc2ebc78cde71f525670021c6c5c3d8c025227c"
+        },
+        {
+          "lane": 10,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/10",
+          "title": "Bronze",
+          "first_token": 39607,
+          "text_sha256": "ba0d4db397d7671031cc001b1d95e482fdf248fc0afc980a978937dc4c19c1e5",
+          "request_sha256": "1dfdf0ce03323cec03caf826a8d2e8ea59101c90b857156008e8413b6108be7a"
+        },
+        {
+          "lane": 11,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/11",
+          "title": "Cedar",
+          "first_token": 34,
+          "text_sha256": "94928bc388d7a573a09d5b184ac9d010718beb4939a66a24247937a058b2adb2",
+          "request_sha256": "6b46c572ef3a335378c62cfa49cc11a19c5d9ea51a654e8705dbc228366b8b60"
+        },
+        {
+          "lane": 12,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/12",
+          "title": "Chalk",
+          "first_token": 1106,
+          "text_sha256": "05e0dc4e6ced445e2d4baf69ca6cfe06747f35c203aed44eb2f983619d705579",
+          "request_sha256": "292964b780f968786840c825f4f65948166079f0e15181d360d0592433d877a3"
+        },
+        {
+          "lane": 13,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/13",
+          "title": "Clay",
+          "first_token": 4904,
+          "text_sha256": "14a3ab13fbec19e71bc917c32ce0192c879b3da2c12eeeb278ca0fae4fdcf069",
+          "request_sha256": "5f64b00a105e659ee5044f530bf4ac1dc1f93cc2d3ddb6dbb616a8e6b1850dc2"
+        },
+        {
+          "lane": 14,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/14",
+          "title": "Cloud",
+          "first_token": 15582,
+          "text_sha256": "d8a31a382349e601e4addc26a8297ec7546657f3caada889c4733e7b6894246b",
+          "request_sha256": "7616cddefb120829acf7a4dc880d04eba92b8ef354772ba276834cd969d8b0f1"
+        },
+        {
+          "lane": 15,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W4/15",
+          "title": "Crystal",
+          "first_token": 78147,
+          "text_sha256": "c62fe487a5f374c7ce4cea77684f9e0366828f69f2d98f0209129eef5d56783a",
+          "request_sha256": "a21986e47f65656256c6a125e9fcb697f4ea84bd78e2b4add9e9bd194eb5053f"
+        }
+      ]
+    },
+    "W5": {
+      "prompt": 32768,
+      "output": 4096,
+      "concurrency": 32,
+      "lanes": [
+        {
+          "lane": 0,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/0",
+          "title": "Dawn",
+          "first_token": 35,
+          "text_sha256": "1d28bea44edee5190703f0ca85c74e455525f8dc3e3e6badeb542bea64b2d8aa",
+          "request_sha256": "2adb65060484c9e90d0d571a85eb26b7fc61c0abc4b615b9f531bfd48c507415"
+        },
+        {
+          "lane": 1,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/1",
+          "title": "Delta",
+          "first_token": 19661,
+          "text_sha256": "a841ff856dce03b38c2b0e9c0a9453121a47a624ddfb80b71d96468e1ea48b0b",
+          "request_sha256": "b252554f9a33b8f21cfae974987525e4601561d6b49719d6ade7b15731fbadad"
+        },
+        {
+          "lane": 2,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/2",
+          "title": "Elm",
+          "first_token": 6374,
+          "text_sha256": "02fd1fea0f772b89c7f1c2c24e3e195c47d3fa0a3632acfac13fc03f1c6aa23b",
+          "request_sha256": "f965976d7f8cae1bf40be20c5c21b8d650009cda24bb6bb6b69ec1101981af16"
+        },
+        {
+          "lane": 3,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/3",
+          "title": "Falcon",
+          "first_token": 37,
+          "text_sha256": "2d2799b1eb66e23518ef0144d4b78372aa7f4de60bb2d82934f1c734011bb4b5",
+          "request_sha256": "fb27bb7bfcb05296ab0552afdf515e80da2a9e7e775596277ea9524cab4bf701"
+        },
+        {
+          "lane": 4,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/4",
+          "title": "Fern",
+          "first_token": 217796,
+          "text_sha256": "f584b02c6882df7f67298700a79dedb81b5d10c147ac6d75dbf5aa89b81a717b",
+          "request_sha256": "f96fea6e04d886e4d919d09faf4996e4d6fd471f1f4a1973949d9898f0da4fcf"
+        },
+        {
+          "lane": 5,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/5",
+          "title": "Field",
+          "first_token": 1812,
+          "text_sha256": "e03a20492189e4a1ff0df8451d13a9ae169aaab23c3747b2b96130d55d64e345",
+          "request_sha256": "188094d5ee9c058cd1f372feae9b0095fce504117e70060327f739cc50cf2987"
+        },
+        {
+          "lane": 6,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/6",
+          "title": "Flame",
+          "first_token": 3751,
+          "text_sha256": "3ad1ba02bcb39c6ca628947422c72a4d6246651304c70a358458c6a394a2b06e",
+          "request_sha256": "c5f2ea2b1456d5030b3554748e7e562fe5b0bfd37fa1c33eb3f460ae7c73c6c6"
+        },
+        {
+          "lane": 7,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/7",
+          "title": "Forest",
+          "first_token": 47910,
+          "text_sha256": "a093b113efe081e6972b32d6a9c9233a6e2c61015fb1d088c27fdb363430d5e8",
+          "request_sha256": "a06da6f622312e7d045a09f9f01266c0e960f25cb3a4ba0a1cdead39fa388e51"
+        },
+        {
+          "lane": 8,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/8",
+          "title": "Fox",
+          "first_token": 45738,
+          "text_sha256": "aaa35f64d43ffc5b3928e1dd4c60941f4f274db3992dbdab3234383bff5074a2",
+          "request_sha256": "6534cc6b2233d474e1dbff070c1fbe81b97ff66e6b303a217ff8a439a2766ed0"
+        },
+        {
+          "lane": 9,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/9",
+          "title": "Garden",
+          "first_token": 38,
+          "text_sha256": "fe79b6ecf4ce4ec83d75922d54492c679a812aebac60d73c59b6e9be2a9b2af2",
+          "request_sha256": "3bd2bfc4d64cb5e1e179f558ecf20e5588acc3b7e24ef65f0c10ee2139407d68"
+        },
+        {
+          "lane": 10,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/10",
+          "title": "Glass",
+          "first_token": 81107,
+          "text_sha256": "45a31820e4096312786272f1cb87e08cb3a60a39c8f3c5594faf93c7f91c69ce",
+          "request_sha256": "2ddae8539ee6dbcab247b4394c5fa3d984b25d117d67736285a6d5e26bf37f3d"
+        },
+        {
+          "lane": 11,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/11",
+          "title": "Gold",
+          "first_token": 24629,
+          "text_sha256": "0a5fd27d92ccf1093da17c0a852a1e4713731a718888076f25188c157a87138f",
+          "request_sha256": "3f602c7426650b563422063c14116e0e89b79703614ebbdefbe9c92368b4c4d1"
+        },
+        {
+          "lane": 12,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/12",
+          "title": "Grain",
+          "first_token": 6262,
+          "text_sha256": "46c616ea491bf6dc7ff52de8dff1022edc1d6ce4e361cf3e547cc200561899f8",
+          "request_sha256": "f208423e55c47659d05593e10f08fea7d2bb2abcf8501cc162400925745a9024"
+        },
+        {
+          "lane": 13,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/13",
+          "title": "Granite",
+          "first_token": 87600,
+          "text_sha256": "0d48ced96b7d3b6c96297c8c78d77d96e7190652f6d2d9b35c8b6d44b4fd2f66",
+          "request_sha256": "1e7437b9c01eed5fe3ed935fa535e1425c1cf0ae84946ae79381f4e487f14f19"
+        },
+        {
+          "lane": 14,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/14",
+          "title": "Harbor",
+          "first_token": 25642,
+          "text_sha256": "f24473154cd6937275dd206c06b9295aefab0ce7840ec65267f7a62263be6a34",
+          "request_sha256": "eb2008e5270656466f24a2944b89dc2ec173b58675ba0dea7a5ee8569883d45d"
+        },
+        {
+          "lane": 15,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/15",
+          "title": "Hazel",
+          "first_token": 39,
+          "text_sha256": "a1215785b9d432fd71f4623b5d8f6a27453a57830963c77cf33a142be89b3fcf",
+          "request_sha256": "0785bd237f8457aa0167ac6009b8548633604a07e3c350d901cf9cc77950a0a2"
+        },
+        {
+          "lane": 16,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/16",
+          "title": "Iron",
+          "first_token": 44847,
+          "text_sha256": "af1717becbe83237a7417751d53be006ce710daf5b059d165336ace4a3eaf606",
+          "request_sha256": "981683da5c7c2d90b3794882772aa217c8b6753b535b593d77767e46ad10e23d"
+        },
+        {
+          "lane": 17,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/17",
+          "title": "Ivy",
+          "first_token": 40,
+          "text_sha256": "6ce7730b9ff7e22a9a090fd9bfd3ab0b3ac3cda7f7752701da3373b993060124",
+          "request_sha256": "b57f4c9bfce65624210ba83b0a3161a8478c987c312c46170c32006e4fc4d3f1"
+        },
+        {
+          "lane": 18,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/18",
+          "title": "Jade",
+          "first_token": 41,
+          "text_sha256": "5417c07315f84a949f1fd959bb43d7df456874cc396a4ae2ddff8ba8385299be",
+          "request_sha256": "8350ab07613d779e6518b19c80b8a5dbbb1fa5dca6f71571b704233c18d36eed"
+        },
+        {
+          "lane": 19,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/19",
+          "title": "Lake",
+          "first_token": 78486,
+          "text_sha256": "6ff42689f96993051f8ee8a62e875940afe52ce6a6ca037121ac96a978a31f22",
+          "request_sha256": "8a67d0fd52e21c8468bca198943fd9574eea870020400e00c1325d447d2c396d"
+        },
+        {
+          "lane": 20,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/20",
+          "title": "Lark",
+          "first_token": 43,
+          "text_sha256": "3ad497e5112a4762bf7219ea1df9765acd42b1db0c2324f6705f82d03f34be7a",
+          "request_sha256": "1230142022e5ded4eb5e49e6f9adeaf007925129f55646f76aede331e1256aab"
+        },
+        {
+          "lane": 21,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/21",
+          "title": "Laurel",
+          "first_token": 8482,
+          "text_sha256": "bc2da672be64d9a69cdb58d69743c18c2c3e8fe1898d41e5e6c98fafd2b59706",
+          "request_sha256": "b71a7c2254ce091bd6e97accade42d6b0e7aa6300b8c62cdc6e8b6f6859449de"
+        },
+        {
+          "lane": 22,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/22",
+          "title": "Leaf",
+          "first_token": 30427,
+          "text_sha256": "25654dc2809f5b05557dc13201e56c746a2b114751cd84da9543209fc0dc7619",
+          "request_sha256": "e629799a06c013874b4c7695ffba92aaf02e6aeb47d9635670566423ffffbf11"
+        },
+        {
+          "lane": 23,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/23",
+          "title": "Light",
+          "first_token": 13512,
+          "text_sha256": "fe12e2fffd2c61dfa0f3d6aaca6bb2d5ca24290e81c31c809110281f910dffdf",
+          "request_sha256": "9a5aee852e097bd3350f0587d89822088cf21f7b23292966bc3fcc6ddca55e7d"
+        },
+        {
+          "lane": 24,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/24",
+          "title": "Maple",
+          "first_token": 2155,
+          "text_sha256": "89da31fed1ce646fbdd92c6d86087b52e2b72b7e9e0125d34849dfa42003dcd1",
+          "request_sha256": "651bdec2b4e920ea92fff62cd100a0d053caa46a03413937a620252399c530f6"
+        },
+        {
+          "lane": 25,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/25",
+          "title": "Marsh",
+          "first_token": 76966,
+          "text_sha256": "a18504e8f4fd2d19858018f421bb826ff7e64fbf173c5340f3af1437a7553842",
+          "request_sha256": "2e22bfb3bd9cf04a4caf2f2f8978a8cde433ad26d949c05daf0f3d7e75826824"
+        },
+        {
+          "lane": 26,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/26",
+          "title": "Moss",
+          "first_token": 44,
+          "text_sha256": "ceb890c3e9451809a32a8b0ce257194abd945c38ae2e96d834e027dd8c02dd9f",
+          "request_sha256": "24cb65441dd22bcff1fb69a2a992d5c9a6113d72f3713f9dcc71d0bfe477173d"
+        },
+        {
+          "lane": 27,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/27",
+          "title": "Oak",
+          "first_token": 82875,
+          "text_sha256": "fc549de1706fd06f592028ad948860e785e176e82bca3320f44f9f0300a0279f",
+          "request_sha256": "9dfe754b546354316c91406b592a6f80503e12acd75df6b12ce36401a699a935"
+        },
+        {
+          "lane": 28,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/28",
+          "title": "Ocean",
+          "first_token": 92857,
+          "text_sha256": "b8590de1fa4d3b40af9330f5882e2b8d3cdb863bff4e0a6215331d706f3b5f0b",
+          "request_sha256": "5fe9bae7702817908571d672a0b2ade1c48268adf3b3ca21d2d9b7167e286be6"
+        },
+        {
+          "lane": 29,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/29",
+          "title": "Olive",
+          "first_token": 46,
+          "text_sha256": "6e2ec0d21bde07c7a609215c80514e8f29ab3a39c90ac36f4ef56dc5e5b691d9",
+          "request_sha256": "ec036a01fb0e7f7f3c2317399c48cf7b11da21a7f8bf9e6cd228ef9ca96b9b85"
+        },
+        {
+          "lane": 30,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/30",
+          "title": "Onyx",
+          "first_token": 1860,
+          "text_sha256": "bd9362e782a8c3bfff82ac71bb30f3c63dfe033f1f5b6f5fba457dfc083ba5f7",
+          "request_sha256": "7acad1d1cd838fd8c8d07fdbb312db4508c7edaadee1eadcc00b8b60c54462c7"
+        },
+        {
+          "lane": 31,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W5/31",
+          "title": "Orchid",
+          "first_token": 2126,
+          "text_sha256": "0475e5eefe3df6a656ffef680b3e6db5619e7e3ab3d9e33e637343d115772883",
+          "request_sha256": "8fcc27441f9ff4527aa26df29432dcabd996cf3f2fb166bc594d8dc9b430276a"
+        }
+      ]
+    },
+    "W6": {
+      "prompt": 131072,
+      "output": 1024,
+      "concurrency": 4,
+      "lanes": [
+        {
+          "lane": 0,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W6/0",
+          "title": "Otter",
+          "first_token": 81870,
+          "text_sha256": "59f14cdd021c7cf153a239b4a7170054a31910ec9b7de2da44048c1de02609f2",
+          "request_sha256": "2f2de9c0fb59d2daef7bf093ca23453b1a6cee7562193e8e8bd19918d6b03a2c"
+        },
+        {
+          "lane": 1,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W6/1",
+          "title": "Pearl",
+          "first_token": 87905,
+          "text_sha256": "4d8ac69ae464ef5f6777bdc6d9f43226ed31f66ee6ca7d478a935d611c0e4289",
+          "request_sha256": "203a80290e130c888b2baa150d372448ee52d38786a59a4e2f626a6145f01b58"
+        },
+        {
+          "lane": 2,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W6/2",
+          "title": "Pine",
+          "first_token": 47,
+          "text_sha256": "48fa1f6362cef3c9174fe0d441fa6d6a94380b2e15743ccd9d110de2ebec6fee",
+          "request_sha256": "6b1befad9da13b030a793921087a4f7a538acd37dfa60408590f60a39b330f91"
+        },
+        {
+          "lane": 3,
+          "seed": "sglang.cpp-concurrent-baseline-20261118-v2/W6/3",
+          "title": "Plum",
+          "first_token": 2052,
+          "text_sha256": "6431cb30bb346f81322adee51e8c204f7d5868531dd31be38bd886d5ecc5f887",
+          "request_sha256": "660dbbec025f98ef1fbf325adfc7ddd0ad40f4c96546391a3ca7219b4f3cafa2"
+        }
+      ]
+    }
+  }
+}

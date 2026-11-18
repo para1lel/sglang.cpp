@@ -1,0 +1,500 @@
+diff --git a/README.md b/README.md
+index e6c0614141de390e58e7375843b8d73a4e287c40..1aead1a9ccbff1589738e52249b3a7349f6c0d89 100644
+--- a/README.md
++++ b/README.md
+@@ -65 +65 @@ Set `GENERATOR` to that executable path before running the command. The default
+-`/data0/shared/Qwen3.8-27B-FP8`. Use `--prompt-file` for IDs separated by commas or ASCII whitespace,
++`/data0/shared/Qwen3.8-27B-FP8`. Use `--prompt-file` for comma- or whitespace-separated IDs,
+diff --git a/apps/sglang-generate.cpp b/apps/sglang-generate.cpp
+index 475dadeeddf36f3172cc4904988e92f011810830..143d8a30705c3324a5bb17644633c376c92be433 100644
+--- a/apps/sglang-generate.cpp
++++ b/apps/sglang-generate.cpp
+@@ -50,2 +50 @@ std::vector<int> parse_ids(std::string_view input) {
+-    constexpr std::string_view separators = ", \t\n\r\f\v";
+-    constexpr auto whitespace = separators.substr(1);
++    constexpr std::string_view whitespace = " \n\r\t";
+@@ -55 +54 @@ std::vector<int> parse_ids(std::string_view input) {
+-        const auto end = input.find_first_of(separators, start);
++        const auto end = input.find_first_of(" ,\n\r\t", start);
+diff --git a/docs/development.md b/docs/development.md
+index 1c381edc599060fcfc79ed18fa675c300479a402..c74f1f4e3a1d49efdf643aedd6e2c3dcb3a1ff01 100644
+--- a/docs/development.md
++++ b/docs/development.md
+@@ -93 +93 @@ Keep the invocation, device UUID, binary identity, and full check output. Record
+-| `sglang-generate` | Parse one token-ID prompt, run requests serially, and write one JSON result. | [CLI entry](../apps/sglang-generate.cpp#L216)<!-- prefix: "int main(int" --> |
++| `sglang-generate` | Parse one token-ID prompt, run requests serially, and write one JSON result. | [CLI entry](../apps/sglang-generate.cpp#L215)<!-- prefix: "int main(int" --> |
+@@ -101 +101 @@ The loader uses LLVM Support 23.1.5 from Pixi (`llvmdev` and `libllvm23`, Apache
+-The decoder checks the name, dtype, and shape of each required text tensor before upload. The upload state retains the checkpoint mappings and device allocations until CUDA confirms stream completion. The decoder shares its device weights across requests. Each request stream holds a weight reference until CUDA confirms completion, including during deferred cleanup. FP8 projections use the checkpoint's E4M3 weights and BF16 inverse scales. They dynamically quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L97)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L168)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L100)<!-- prefix: "__global__ v" -->
++The decoder checks the name, dtype, and shape of each required text tensor before upload. It keeps the mappings alive until the upload stream completes. The decoder retains the device weights across requests. FP8 projections use the checkpoint's E4M3 weights and BF16 inverse scales. They dynamically quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L97)<!-- prefix: "Decoder::Mod" --> · [Activation quantization](../src/text_ops.cu#L100)<!-- prefix: "__global__ v" -->
+@@ -103 +103 @@ The decoder checks the name, dtype, and shape of each required text tensor befor
+-Each request has its own stream, workspace, and state. The 48 GDN layers start with zeroed BF16 convolution history and FP32 recurrent state. The 16 GQA layers append to private [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Prefill processes the prompt one token at a time and scores its last position. Each subsequent decode step processes the preceding emitted token. The host waits for the stream before reading each selection. [Request allocation](../src/decoder_resources.cpp#L339)<!-- prefix: "Request::Req" --> · [Generation loop](../src/decoder.cpp#L80)<!-- prefix: "DecoderResul" -->
++Each request has its own stream, workspace, and state. The 48 GDN layers start with zeroed BF16 convolution history and FP32 recurrent state. The 16 GQA layers append to private [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Prefill processes the prompt one token at a time and scores its last position. Each subsequent decode step processes the preceding emitted token. The host waits for the stream before reading each selection. [Request allocation](../src/decoder_resources.cpp#L147)<!-- prefix: "Request::Req" --> · [Generation loop](../src/decoder.cpp#L78)<!-- prefix: "DecoderResul" -->
+@@ -107 +107 @@ Each request has its own stream, workspace, and state. The 48 GDN layers start w
+-Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Use decimal token IDs separated by commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus `--max-new-tokens` must fit 262,144 tokens. The output budget defaults to one. A zero budget returns no tokens with finish reason `length` after model load and request validation. [CLI options](../apps/sglang-generate.cpp#L31)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L15)<!-- prefix: "void validat" -->
++Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Use decimal token IDs separated by commas or whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus `--max-new-tokens` must fit 262,144 tokens. The output budget defaults to one. A zero budget returns no tokens with finish reason `length` after model load and request validation. [CLI options](../apps/sglang-generate.cpp#L31)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L15)<!-- prefix: "void validat" -->
+@@ -109 +109 @@ Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Use decimal tok
+-The decoder chooses the highest BF16 logit and breaks ties by lowest token ID. Stopping is optional. A generated `--stop-token` match is included in the output and returns `stop`, even on the last allowed step. Otherwise the request returns `length`. The CLI applies no implicit EOS rule. Input, load, execution, or explicit request cleanup errors produce a diagnostic on stderr and exit status 1. The CLI covers token-ID text generation only. [Selection](../src/text_ops.cu#L239)<!-- prefix: "__device__ T" --> · [Generation loop](../src/decoder.cpp#L80)<!-- prefix: "DecoderResul" -->
++The decoder chooses the highest BF16 logit and breaks ties by lowest token ID. Stopping is optional. A generated `--stop-token` match is included in the output and returns `stop`, even on the last allowed step. Otherwise the request returns `length`. The CLI applies no implicit EOS rule. Input, load, or execution errors produce a diagnostic on stderr and exit status 1. The CLI covers token-ID text generation only. [Selection](../src/text_ops.cu#L239)<!-- prefix: "__device__ T" --> · [Generation loop](../src/decoder.cpp#L78)<!-- prefix: "DecoderResul" -->
+@@ -111,3 +111 @@ The decoder chooses the highest BF16 logit and breaks ties by lowest token ID. S
+-If cleanup cannot confirm stream completion, the decoder retains the pending stream, device storage, and host transfer buffers. Before a model load or generation with a positive output budget, it retries recoverable cleanup on the same device. Terminal errors and ambiguous stream destruction or memory frees keep the affected resources quarantined until process exit. A persistent cleanup error prevents further model loads and requests that require allocation on that device. [Deferred cleanup](../src/decoder_resources.cpp#L105)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L266)<!-- prefix: "Allocations:" -->
+-
+-Use `--top-logits N` to report up to `N` raw scores per emitted token, ranked by score and then by ascending token ID. This option accepts values from 0 to 248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L187)<!-- prefix: "void write_r" -->
++Use `--top-logits N` to report up to `N` raw scores per emitted token, ranked by score and then by ascending token ID. This option accepts values from 0 to 248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L186)<!-- prefix: "void write_r" -->
+@@ -122 +120 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
+-    --device 0 --prompt-ids 760,6511,314,9338,369 --max-new-tokens 8
++    --device 0 --prompt-ids 760,6511,314,9338,369 --max-new-tokens 8 --top-logits 64
+@@ -125 +123 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
+-The [portable FP8 fixture](../benchmarks/vllm/small-fp8.json#L2)<!-- prefix: "\"prompt_toke" --> defines the prompt and run settings. Its [published vLLM result](../benchmarks/vllm/small-fp8-result.json#L20)<!-- prefix: "\"output_ids\"" --> records greedy IDs, finish reason, offline timing, and runtime settings. Expect `[11751, 13, 198, 760, 6511, 314, 9564, 369]` and `length`. Repeat with `--stop-token 198`. Expect `[11751, 13, 198]` and `stop`. Both requests must exit successfully.
++Compare against the [FP8 reference fixture](../benchmarks/vllm/small-fp8.json#L2)<!-- prefix: "\"prompt_toke" --> and its [pinned vLLM result](../benchmarks/vllm/small-fp8-result.json#L20)<!-- prefix: "\"output_ids\"" -->. Expect `[11751, 13, 198, 760, 6511, 314, 9564, 369]` and `length`. Compare the ranked raw logits for each step with the independent reference. Repeat with `--stop-token 198` and require `[11751, 13, 198]` with `stop`. A nonzero exit, mismatched sequence, or mismatched finish reason fails the applicable check.
+@@ -127,17 +125 @@ The [portable FP8 fixture](../benchmarks/vllm/small-fp8.json#L2)<!-- prefix: "\"
+-Raw logits come from a separate capture. The frozen input is `artifacts/native-decoder-verification/fp8-oracle/run.4yNLfl/oracle.json`. Set `FP8_ORACLE_SHA256` to its recorded digest in `artifacts/native-decoder-verification/final-evidence.sha256`. To recapture, reserve the B200 selected by `artifacts/native-decoder-verification/fp8-oracle/run.sh`. Run `bash artifacts/native-decoder-verification/fp8-oracle/run.sh` on the project host. The launcher uses the isolated pinned vLLM environment and the `artifacts/decoder-oracle/` inputs pinned in its `plan.json`. Its `collect.py` captures two runs of the top 16 pre-sampler raw logits per step with `fp8_e4m3` GQA KV.
+-
+-Run the [native verifier](../tests/decoder/run_native.py#L185)<!-- prefix: "def parse_ar" --> on the frozen input. Set `GPU_INDEX` to the physical index for `GPU_UUID`. The verifier requires the per-UUID lock file in the pinned vLLM environment and an idle B200 with at least 65,000 MiB free.
+-
+-```bash
+-/data1/shared/dongwu.chen/.pixi/envs/default/bin/python -IB tests/decoder/run_native.py \
+-    --binary "${SGLANG_GENERATE:?set the printed generator path}" \
+-    --oracle artifacts/native-decoder-verification/fp8-oracle/run.4yNLfl/oracle.json \
+-    --oracle-sha256 "${FP8_ORACLE_SHA256:?set the recorded oracle digest}" \
+-    --gpu-index "${GPU_INDEX:?set the reserved B200 index}" \
+-    --gpu-uuid "${GPU_UUID:?set the reserved B200 UUID}" \
+-    --evidence "${NATIVE_EVIDENCE:?set a new evidence directory under artifacts/}"
+-```
+-
+-The verifier checks exact token IDs and finish reasons across four cases. For each step, it finds reference token IDs among the candidate's top 64. The absolute tolerance is `0.5 + max(2 × BF16 ULP, 4 × repeat delta)` in raw logit units. It uses the first reference score for the ULP and the largest observed repeat difference for that token's delta. A missing reference score or an absolute difference above tolerance fails the check. [Score comparison](../tests/decoder/run_native.py#L95)<!-- prefix: "budget = 0.5" -->
+-
+-For timing, omit `--top-logits` to avoid the host logit copy and ranking. Match `--warmup` and `--repeats` to the reference workload. The defaults are zero warmups and one measured request. `load_ms` covers model initialization. `request_ms` measures each completed request from allocation through generation and cleanup. Allocation metrics count decoder-owned device allocations, including preallocated request state. Keep the JSON, invocation, binary hash, and device UUID. These fixtures cover eager baseline correctness. W1 and W2 acceptance requires separate exact-output comparisons under the [benchmark agreement](performance.md). [Measurement and JSON fields](../apps/sglang-generate.cpp#L164)<!-- prefix: "Measurements" -->
++For timing, omit `--top-logits` to avoid the host logit copy and ranking. Match `--warmup` and `--repeats` to the reference workload. The defaults are zero warmups and one measured request. `load_ms` covers model initialization. `request_ms` measures each completed request from allocation through generation and cleanup. Allocation metrics count decoder-owned device allocations, including preallocated request state. Keep the JSON, invocation, binary hash, and device UUID. Use the [benchmark agreement](performance.md) for acceptance. [Measurement and JSON fields](../apps/sglang-generate.cpp#L163)<!-- prefix: "Measurements" -->
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index d983226fc06e5279bcba86a34fef7fa1be5b11dd..5e830b0e08b8cdd9d54bb44579f421f8372aa5d7 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -31,3 +31,3 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
+-std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_t count,
+-                                    std::vector<DecoderLogit>& ranking) {
+-    ranking.clear();
++std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_t count) {
++    std::vector<DecoderLogit> result;
++    result.reserve(scores.size());
+@@ -37 +37 @@ std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_
+-            ranking.push_back({static_cast<int>(index), logit});
++            result.push_back({static_cast<int>(index), logit});
+@@ -40,2 +40,2 @@ std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_
+-    const auto end = ranking.begin() + std::min(count, ranking.size());
+-    std::partial_sort(ranking.begin(), end, ranking.end(),
++    count = std::min(count, result.size());
++    std::partial_sort(result.begin(), result.begin() + count, result.end(),
+@@ -48 +48,2 @@ std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_
+-    return {ranking.begin(), end};
++    result.resize(count);
++    return result;
+@@ -51,5 +52,2 @@ std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_
+-void read_step(Request& request) {
+-    auto& transfers = request.memory.transfers();
+-    const auto stream = request.memory.stream();
+-    auto& winner = transfers.winner;
+-    auto& host_logits = transfers.logits;
++void read_step(Request& request, TextLogitCandidate& winner, std::vector<Bf16>& host_logits) {
++    const auto stream = request.stream.get();
+@@ -77 +75 @@ std::size_t Decoder::model_device_allocation_bytes() const {
+-    return model_->memory->bytes();
++    return model_->memory.bytes();
+@@ -88 +86 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+-    DeviceScope selected_device(model_->device);
++    const DeviceScope selected_device(model_->device);
+@@ -91,8 +89,3 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+-    Request request(model_->device, capacity, model_->memory);
+-    auto& transfers = request.memory.transfers();
+-    std::vector<DecoderLogit> ranking;
+-    if (options.top_logits > 0) {
+-        transfers.logits.resize(vocab_size);
+-        ranking.reserve(vocab_size);
+-    }
+-    auto& winner = transfers.winner;
++    TextLogitCandidate winner{};
++    std::vector<Bf16> host_logits(options.top_logits == 0 ? 0 : vocab_size);
++    Request request(model_->device, capacity);
+@@ -109 +102 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+-        read_step(request);
++        read_step(request, winner, host_logits);
+@@ -112,2 +105 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+-            result.step_top_logits.push_back(
+-                top_logits(transfers.logits, options.top_logits, ranking));
++            result.step_top_logits.push_back(top_logits(host_logits, options.top_logits));
+@@ -120,2 +111,0 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+-    request.memory.close();
+-    selected_device.restore();
+diff --git a/src/decoder_forward.cpp b/src/decoder_forward.cpp
+index 7637675bb38c8be0b4a0757cf94b58fa7684e588..8cc3fa6fc2acc8b6b8fe42b6b2c2d7488ac2d140 100644
+--- a/src/decoder_forward.cpp
++++ b/src/decoder_forward.cpp
+@@ -26 +26 @@ void run_gdn(const GdnLayer& layer, Request& request, TextGdnState state, TextGd
+-    const auto stream = request.memory.stream();
++    const auto stream = request.stream.get();
+@@ -41 +41 @@ void run_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache, int po
+-    const auto stream = request.memory.stream();
++    const auto stream = request.stream.get();
+@@ -73 +73 @@ void Decoder::Model::forward(Request& request, int token_id, int position, TextG
+-    const auto stream = request.memory.stream();
++    const auto stream = request.stream.get();
+@@ -98 +98 @@ void Decoder::Model::compute_logits(Request& request) const {
+-    const auto stream = request.memory.stream();
++    const auto stream = request.stream.get();
+diff --git a/src/decoder_internal.h b/src/decoder_internal.h
+index 08ea875163cfc3d5dfc81ace80df4facdcbb9475..ab0e87cb6337a5656a15299ce2512640b69dd15b 100644
+--- a/src/decoder_internal.h
++++ b/src/decoder_internal.h
+@@ -10 +9,0 @@
+-#include <memory>
+@@ -14,4 +12,0 @@
+-namespace sglang {
+-class Checkpoint;
+-}
+-
+@@ -46,2 +40,0 @@ public:
+-    void restore();
+-
+@@ -53,7 +45,0 @@ private:
+-struct TransferBuffers {
+-    std::unique_ptr<Checkpoint> checkpoint;
+-    std::vector<std::int32_t> logical_pages;
+-    TextLogitCandidate winner{};
+-    std::vector<Bf16> logits;
+-};
+-
+@@ -75,6 +61 @@ public:
+-    std::size_t bytes() const;
+-    TransferBuffers& transfers();
+-    cudaStream_t stream() const;
+-    void open_stream(std::shared_ptr<const Allocations> weights = nullptr);
+-    void close_stream();
+-    void close();
++    std::size_t bytes() const { return bytes_; }
+@@ -83 +63,0 @@ private:
+-    struct State;
+@@ -86 +66,16 @@ private:
+-    std::unique_ptr<State> state_;
++    int device_;
++    std::vector<void*> blocks_;
++    std::size_t bytes_ = 0;
++};
++
++class Stream {
++public:
++    Stream();
++    ~Stream();
++    Stream(const Stream&) = delete;
++    Stream& operator=(const Stream&) = delete;
++
++    cudaStream_t get() const { return stream_; }
++
++private:
++    cudaStream_t stream_ = nullptr;
+@@ -157 +152 @@ struct Request {
+-    Request(int device, int capacity, std::shared_ptr<const Allocations> weights);
++    Request(int device, int capacity);
+@@ -163,0 +159 @@ struct Request {
++    Stream stream;
+@@ -177 +173 @@ struct Decoder::Model {
+-    std::shared_ptr<decoder::Allocations> memory;
++    decoder::Allocations memory;
+diff --git a/src/decoder_resources.cpp b/src/decoder_resources.cpp
+index 8daf6b7680ad53f03d6bacc217a3cb40d06f4439..f7f008b368b886ab9613dc7e850512c922aeb458 100644
+--- a/src/decoder_resources.cpp
++++ b/src/decoder_resources.cpp
+@@ -3,2 +2,0 @@
+-#include "sglang/checkpoint.h"
+-
+@@ -6 +3,0 @@
+-#include <mutex>
+@@ -9 +5,0 @@
+-#include <utility>
+@@ -14,8 +9,0 @@ namespace {
+-struct CleanupError {
+-    cudaError_t status = cudaSuccess;
+-    const char* operation = "";
+-
+-    explicit operator bool() const { return status != cudaSuccess; }
+-    void raise() const { check(status, operation); }
+-};
+-
+@@ -28,20 +15,0 @@ void report_cleanup(cudaError_t status, const char* operation) {
+-bool terminal_context_error(cudaError_t status) {
+-    switch (status) {
+-    case cudaErrorCudartUnloading:
+-    case cudaErrorContextIsDestroyed:
+-    case cudaErrorECCUncorrectable:
+-    case cudaErrorIllegalAddress:
+-    case cudaErrorLaunchTimeout:
+-    case cudaErrorAssert:
+-    case cudaErrorHardwareStackError:
+-    case cudaErrorIllegalInstruction:
+-    case cudaErrorMisalignedAddress:
+-    case cudaErrorInvalidAddressSpace:
+-    case cudaErrorInvalidPc:
+-    case cudaErrorLaunchFailure:
+-        return true;
+-    default:
+-        return false;
+-    }
+-}
+-
+@@ -62,2 +30,2 @@ void allocate_gdn(Request& request) {
+-    zero(history, history_count, request.memory.stream());
+-    zero(recurrent, recurrent_count, request.memory.stream());
++    zero(history, history_count, request.stream.get());
++    zero(recurrent, recurrent_count, request.stream.get());
+@@ -83,2 +51 @@ void allocate_kv(Request& request, int capacity) {
+-    auto& logical_pages = request.memory.transfers().logical_pages;
+-    logical_pages.resize(page_count);
++    std::vector<std::int32_t> logical_pages(page_count);
+@@ -87,2 +54,2 @@ void allocate_kv(Request& request, int capacity) {
+-                          cudaMemcpyHostToDevice, request.memory.stream()),
+-          "Upload MXFP8 page table");
++                          cudaMemcpyHostToDevice, request.stream.get()), "Upload MXFP8 page table");
++    check(cudaStreamSynchronize(request.stream.get()), "Complete MXFP8 page table transfer");
+@@ -94,143 +60,0 @@ void allocate_kv(Request& request, int capacity) {
+-struct Allocations::State {
+-    struct Deferred {
+-        std::mutex mutex;
+-        std::unique_ptr<State> first;
+-    };
+-
+-    static Deferred& deferred() {
+-        static auto& queue = *new Deferred;
+-        return queue;
+-    }
+-
+-    static void reclaim(int device) {
+-        auto& queue = deferred();
+-        for (;;) {
+-            std::shared_ptr<const Allocations> drained_weights;
+-            std::unique_ptr<State> finished;
+-            CleanupError error;
+-            {
+-                const std::lock_guard lock(queue.mutex);
+-                auto* pending = &queue.first;
+-                while (*pending && (*pending)->device != device) {
+-                    pending = &(*pending)->next;
+-                }
+-                if (!*pending) {
+-                    return;
+-                }
+-                auto& entry = **pending;
+-                error = entry.release(drained_weights);
+-                if (!entry.owns_cuda()) {
+-                    finished = std::move(*pending);
+-                    *pending = std::move(finished->next);
+-                }
+-            }
+-            drained_weights.reset();
+-            error.raise();
+-        }
+-    }
+-
+-    static void retain(std::unique_ptr<State> entry) {
+-        auto& queue = deferred();
+-        const std::lock_guard lock(queue.mutex);
+-        entry->next = std::move(queue.first);
+-        queue.first = std::move(entry);
+-    }
+-
+-    explicit State(int owner) : device(owner) { reclaim(owner); }
+-
+-    bool owns_cuda() const { return stream != nullptr || !blocks.empty(); }
+-
+-    CleanupError close_stream(std::shared_ptr<const Allocations>& drained_weights);
+-    CleanupError release_selected(std::shared_ptr<const Allocations>& drained_weights);
+-    CleanupError release(std::shared_ptr<const Allocations>& drained_weights);
+-    CleanupError failure(CleanupError error);
+-
+-    int device;
+-    cudaStream_t stream = nullptr;
+-    bool uncertain_stream = false;
+-    std::vector<void*> blocks;
+-    std::size_t uncertain_blocks = 0;
+-    std::size_t bytes = 0;
+-    CleanupError uncertain;
+-    CleanupError terminal;
+-    TransferBuffers transfers;
+-    std::shared_ptr<const Allocations> weights;
+-    std::unique_ptr<State> next;
+-};
+-
+-CleanupError Allocations::State::failure(CleanupError error) {
+-    if (terminal_context_error(error.status)) {
+-        terminal = error;
+-    }
+-    return error;
+-}
+-
+-CleanupError Allocations::State::close_stream(std::shared_ptr<const Allocations>& drained_weights) {
+-    if (terminal || uncertain_stream || stream == nullptr) {
+-        return terminal ? terminal : uncertain;
+-    }
+-    const CleanupError sync{cudaStreamSynchronize(stream), "Synchronize decoder stream"};
+-    if (sync) {
+-        return failure(sync);
+-    }
+-    transfers = {};
+-    drained_weights = std::move(weights);
+-    const CleanupError destroy{cudaStreamDestroy(stream), "Destroy decoder stream"};
+-    if (destroy) {
+-        uncertain_stream = true;
+-        uncertain = destroy;
+-        return failure(destroy);
+-    }
+-    stream = nullptr;
+-    return {};
+-}
+-
+-CleanupError Allocations::State::release_selected(
+-    std::shared_ptr<const Allocations>& drained_weights) {
+-    const auto error = close_stream(drained_weights);
+-    if (terminal || (stream && !uncertain_stream)) {
+-        return error;
+-    }
+-    while (blocks.size() > uncertain_blocks) {
+-        const CleanupError freed{cudaFree(blocks.back()), "Free decoder allocation"};
+-        if (!freed) {
+-            blocks.pop_back();
+-            continue;
+-        }
+-        failure(freed);
+-        if (terminal) {
+-            return terminal;
+-        }
+-        if (!uncertain) {
+-            uncertain = freed;
+-        }
+-        std::swap(blocks[uncertain_blocks++], blocks.back());
+-    }
+-    return uncertain;
+-}
+-
+-CleanupError Allocations::State::release(std::shared_ptr<const Allocations>& drained_weights) {
+-    if (terminal || !owns_cuda()) {
+-        return terminal;
+-    }
+-    int previous = 0;
+-    const CleanupError current{cudaGetDevice(&previous), "Get CUDA device for decoder cleanup"};
+-    if (current) {
+-        return failure(current);
+-    }
+-    if (previous == device) {
+-        return release_selected(drained_weights);
+-    }
+-    const CleanupError select{cudaSetDevice(device), "Select CUDA device for decoder cleanup"};
+-    if (select) {
+-        return failure(select);
+-    }
+-    const auto error = release_selected(drained_weights);
+-    const CleanupError restore{cudaSetDevice(previous), "Restore CUDA device after cleanup"};
+-    if (error) {
+-        report_cleanup(restore.status, restore.operation);
+-        return error;
+-    }
+-    return restore;
+-}
+-
+@@ -257,8 +81 @@ DeviceScope::~DeviceScope() {
+-void DeviceScope::restore() {
+-    if (changed_) {
+-        check(cudaSetDevice(previous_), "Restore CUDA device");
+-        changed_ = false;
+-    }
+-}
+-
+-Allocations::Allocations(int device) : state_(std::make_unique<State>(device)) {}
++Allocations::Allocations(int device) : device_(device) {}
+@@ -267,5 +84,10 @@ Allocations::~Allocations() {
+-    std::shared_ptr<const Allocations> drained_weights;
+-    const auto error = state_->release(drained_weights);
+-    report_cleanup(error.status, error.operation);
+-    if (state_->owns_cuda()) {
+-        State::retain(std::move(state_));
++    if (blocks_.empty()) {
++        return;
++    }
++    try {
++        const DeviceScope device(device_);
++        for (auto block = blocks_.rbegin(); block != blocks_.rend(); ++block) {
++            report_cleanup(cudaFree(*block), "Free CUDA allocation");
++        }
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "sglang decoder: %s\n", error.what());
+@@ -273,22 +94,0 @@ Allocations::~Allocations() {
+-}
+-
+-std::size_t Allocations::bytes() const { return state_->bytes; }
+-
+-TransferBuffers& Allocations::transfers() { return state_->transfers; }
+-
+-cudaStream_t Allocations::stream() const { return state_->stream; }
+-
+-void Allocations::open_stream(std::shared_ptr<const Allocations> weights) {
+-    check(cudaStreamCreateWithFlags(&state_->stream, cudaStreamNonBlocking),
+-          "Create decoder stream");
+-    state_->weights = std::move(weights);
+-}
+-
+-void Allocations::close_stream() {
+-    std::shared_ptr<const Allocations> drained_weights;
+-    state_->close_stream(drained_weights).raise();
+-}
+-
+-void Allocations::close() {
+-    std::shared_ptr<const Allocations> drained_weights;
+-    state_->release(drained_weights).raise();
+@@ -298 +98 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
+-    if (bytes > std::numeric_limits<std::size_t>::max() - state_->bytes) {
++    if (bytes > std::numeric_limits<std::size_t>::max() - bytes_) {
+@@ -301,3 +101,2 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
+-    auto& blocks = state_->blocks;
+-    blocks.push_back(nullptr);
+-    const auto status = cudaMalloc(&blocks.back(), bytes);
++    blocks_.push_back(nullptr);
++    const auto status = cudaMalloc(&blocks_.back(), bytes);
+@@ -305 +104 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
+-        blocks.pop_back();
++        blocks_.pop_back();
+@@ -308,2 +107,11 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
+-    state_->bytes += bytes;
+-    return blocks.back();
++    bytes_ += bytes;
++    return blocks_.back();
++}
++
++Stream::Stream() {
++    check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "Create request stream");
++}
++
++Stream::~Stream() {
++    report_cleanup(cudaStreamSynchronize(stream_), "Synchronize request stream");
++    report_cleanup(cudaStreamDestroy(stream_), "Destroy request stream");
+@@ -339,3 +147 @@ Workspace::Workspace(Allocations& allocations)
+-Request::Request(int device, int capacity, std::shared_ptr<const Allocations> weights)
+-    : memory(device), work(memory) {
+-    memory.open_stream(std::move(weights));
++Request::Request(int device, int capacity) : memory(device), work(memory) {
+diff --git a/src/decoder_weights.cpp b/src/decoder_weights.cpp
+index 3aa8b05d96c0e554573880d0bacae0ce80c47b61..8c7b8295142a3f27ab13812d084865b9e79beb8c 100644
+--- a/src/decoder_weights.cpp
++++ b/src/decoder_weights.cpp
+@@ -98,2 +98,2 @@ Decoder::Model::Model(const std::filesystem::path& directory, int cuda_device)
+-    : device(cuda_device), memory(std::make_shared<Allocations>(cuda_device)) {
+-    DeviceScope selected_device(device);
++    : device(cuda_device), memory(cuda_device) {
++    const DeviceScope selected_device(device);
+@@ -105,4 +105,3 @@ Decoder::Model::Model(const std::filesystem::path& directory, int cuda_device)
+-    auto& checkpoint = memory->transfers().checkpoint;
+-    checkpoint = std::make_unique<Checkpoint>(directory);
+-    memory->open_stream();
+-    WeightUpload weights(*checkpoint, *memory, memory->stream());
++    const Checkpoint checkpoint(directory);
++    const Stream transfer;
++    WeightUpload weights(checkpoint, memory, transfer.get());
+@@ -116,2 +115 @@ Decoder::Model::Model(const std::filesystem::path& directory, int cuda_device)
+-    memory->close_stream();
+-    selected_device.restore();
++    check(cudaStreamSynchronize(transfer.get()), "Complete checkpoint transfer");

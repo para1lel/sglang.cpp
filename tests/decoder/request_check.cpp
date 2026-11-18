@@ -132,6 +132,7 @@ struct WeightRead {
     unsigned char expected = 0;
     std::mutex mutex;
     std::condition_variable ready;
+    std::size_t reads_until_queue = two_ids.size();
     int sync_failures = 0;
     bool released = false;
     bool timed_out = false;
@@ -193,10 +194,10 @@ void check_ranking(const sglang::Decoder& decoder) {
     }
 }
 
-void check_live(std::size_t model_allocations) {
+void check_live(std::size_t allocation_count, std::size_t stream_count = 0) {
     require(!calls.bad_handle, "CUDA release attempted on a non-live handle");
-    require(calls.streams.empty(), "CUDA stream remains live outside the request");
-    require(calls.allocations.size() == model_allocations,
+    require(calls.streams.size() == stream_count, "Unexpected number of live CUDA streams");
+    require(calls.allocations.size() == allocation_count,
             "CUDA allocations remain live outside their owner");
 }
 
@@ -205,17 +206,27 @@ void expect_failure(const sglang::Decoder& decoder, const sglang::DecoderOptions
     calls.pending = fault;
     calls.allocation_countdown = 3;
     const std::string_view expected = fault == Fault::allocation ? "Allocate CUDA memory" :
-                                                                  "Synchronize decoder stream";
+                                                                  "Complete decoder step";
+    std::vector<int> emitted;
+    sglang::DecoderCallbacks callbacks;
+    callbacks.on_token = [&](int token) {
+        emitted.push_back(token);
+        return true;
+    };
     std::string error;
     try {
-        decoder.generate(prompt, options);
+        decoder.generate(prompt, options, callbacks);
     } catch (const std::exception& failure) {
         error = failure.what();
     }
     std::cout << "Injected failure reported by generate: " << error << '\n';
     if (fault == Fault::synchronize) {
         require(calls.completed_reads == static_cast<std::size_t>(options.max_new_tokens),
-                "The synchronization check did not complete both greedy reads");
+                "Cleanup did not drain the failed replay read");
+        require(emitted == std::vector<int>{two_ids.front()},
+                "A replay token was published without successful step synchronization");
+    } else {
+        require(emitted.empty(), "Allocation failure published a token");
     }
     require(calls.injections == 1 && calls.pending == Fault::none,
             "The selected CUDA fault was not injected");
@@ -224,31 +235,73 @@ void expect_failure(const sglang::Decoder& decoder, const sglang::DecoderOptions
 }
 
 void check_cleanup(const sglang::Decoder& decoder, Fault fault) {
-    const auto model_allocations = calls.allocations.size();
-    require(model_allocations != 0, "No model allocations reached the CUDA observer");
-    check_live(model_allocations);
+    const auto model_allocations = calls.allocations;
+    require(!model_allocations.empty(), "No model allocations reached the CUDA observer");
+    check_live(model_allocations.size());
     sglang::DecoderOptions options;
     options.max_new_tokens = 2;
+    if (fault == Fault::synchronize) {
+        check_ids(decoder.generate(prompt, options));
+    }
     if (fault != Fault::none) {
         expect_failure(decoder, options, fault);
+        check_live(model_allocations.size());
+        require(calls.allocations == model_allocations, "Failure changed the model allocations");
     }
-    check_ids(decoder.generate(prompt, options));
-    check_live(model_allocations);
-    check_ids(decoder.generate(prompt, options));
-    check_live(model_allocations);
+    const auto first = decoder.generate(prompt, options);
+    check_ids(first);
+    require(calls.allocations.size() > model_allocations.size(),
+            "Reusable request storage was released");
+    check_live(calls.allocations.size(), 1);
+    const auto warm_allocations = calls.allocations;
+    const auto warm_streams = calls.streams;
+    const auto second = decoder.generate(prompt, options);
+    check_ids(second);
+    require(calls.allocations == warm_allocations && calls.streams == warm_streams &&
+                second.peak_device_allocation_bytes == first.peak_device_allocation_bytes,
+            "Warm generation replaced reusable request storage");
+}
+
+void check_growth(const sglang::Decoder& decoder) {
+    sglang::DecoderOptions options;
+    options.max_new_tokens = 2;
+    const auto first = decoder.generate(prompt, options);
+    check_ids(first);
+    const auto allocation_count = calls.allocations.size();
+    check_live(allocation_count, 1);
+    options.max_new_tokens = 130;
+    options.stop_token_id = two_ids.back();
+    const auto grown = decoder.generate(prompt, options);
+    require(grown.output_token_ids == two_ids &&
+                grown.finish_reason == sglang::DecoderFinishReason::stop,
+            "Capacity growth changed the early stop result");
+    require(grown.peak_device_allocation_bytes > first.peak_device_allocation_bytes,
+            "Larger request did not increase page capacity");
+    check_live(allocation_count, 1);
+    const auto retained_allocations = calls.allocations;
+    const auto retained_streams = calls.streams;
+    options.max_new_tokens = 2;
+    options.stop_token_id.reset();
+    const auto reused = decoder.generate(prompt, options);
+    check_ids(reused);
+    require(calls.allocations == retained_allocations && calls.streams == retained_streams &&
+                reused.peak_device_allocation_bytes == grown.peak_device_allocation_bytes,
+            "Short request replaced the grown reusable capacity");
 }
 
 void check_weight_lifetime(const char* checkpoint) {
     const sglang::Decoder standby(checkpoint);
+    sglang::DecoderOptions options;
+    options.max_new_tokens = 2;
+    check_ids(standby.generate(prompt, options));
     const auto baseline = calls.allocations;
     auto victim = std::make_unique<sglang::Decoder>(checkpoint);
     auto weights = calls.allocations;
     for (auto* allocation : baseline) {
         weights.erase(allocation);
     }
+    check_ids(victim->generate(prompt, options));
     WeightRead read(std::move(weights));
-    sglang::DecoderOptions options;
-    options.max_new_tokens = 2;
     std::string error;
     try {
         victim->generate(prompt, options);
@@ -268,7 +321,7 @@ void check_weight_lifetime(const char* checkpoint) {
     check_ids(standby.generate(prompt, options));
     require(read.finished(), "Deferred request did not complete its real CUDA weight read");
     require(calls.allocations == baseline, "Deferred model storage was not reclaimed");
-    check_live(baseline.size());
+    check_live(baseline.size(), 1);
 }
 
 }
@@ -331,7 +384,8 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* destination, const void* sou
                                              cudaStream_t stream) {
     const auto status = __real_cudaMemcpyAsync(destination, source, bytes, kind, stream);
     auto* read = calls.weight_read;
-    if (status == cudaSuccess && read && !read->stream && kind == cudaMemcpyDeviceToHost) {
+    if (status == cudaSuccess && read && !read->stream && kind == cudaMemcpyDeviceToHost &&
+        --read->reads_until_queue == 0) {
         return read->queue(stream);
     }
     if (status == cudaSuccess && calls.pending == Fault::synchronize &&
@@ -351,7 +405,8 @@ extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
         ++read->sync_failures;
         return cudaErrorLaunchOutOfResources;
     }
-    if (calls.completed_reads == two_ids.size() && calls.consume(Fault::synchronize)) {
+    if (calls.read_pending && calls.completed_reads + 1 == two_ids.size() &&
+        calls.consume(Fault::synchronize)) {
         return cudaErrorLaunchOutOfResources;
     }
     const auto status = __real_cudaStreamSynchronize(stream);
@@ -377,6 +432,8 @@ int main(int argc, const char** argv) {
                 check_ranking(decoder);
             } else if (mode == "cleanup") {
                 check_cleanup(decoder, Fault::none);
+            } else if (mode == "growth") {
+                check_growth(decoder);
             } else if (mode == "allocation") {
                 check_cleanup(decoder, Fault::allocation);
             } else if (mode == "synchronize") {

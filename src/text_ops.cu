@@ -1,5 +1,7 @@
 #include "sglang/text_ops.h"
 
+#include "sglang/decoder_cuda.cuh"
+
 #include <cstddef>
 
 #include <cuda_fp8.h>
@@ -47,6 +49,25 @@ __global__ void embedding_kernel(const __nv_bfloat16* row, int width, __nv_bfloa
     if (col < static_cast<std::size_t>(width)) {
         output[col] = row[col];
     }
+}
+
+__global__ void decode_embedding_kernel(const __nv_bfloat16* weight, int vocab_size, int width,
+                                          const TextLogitCandidate* previous,
+                                          __nv_bfloat16* output) {
+    const auto column = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (column < static_cast<std::size_t>(width)) {
+        const int token_id = previous->token_id;
+        const int row = token_id >= 0 && token_id < vocab_size ? token_id : 0;
+        output[column] = weight[static_cast<std::size_t>(row) * width + column];
+    }
+}
+
+__global__ void set_decode_position_kernel(int* position, int value) {
+    *position = value;
+}
+
+__global__ void advance_decode_position_kernel(int* position) {
+    ++*position;
 }
 
 __device__ uint4 load_128(const void* address) {
@@ -358,6 +379,24 @@ cudaError_t text_embedding(const __nv_bfloat16* weight, int vocab_size, int widt
     void* args[] = {&row, &width, &output};
     return cudaLaunchKernel(embedding_kernel, divide_up(width, block_threads), block_threads,
                             args, 0, stream);
+}
+
+cudaError_t decoder::decode_embedding(const __nv_bfloat16* weight, int vocab_size, int width,
+                                      const TextLogitCandidate* previous, __nv_bfloat16* output,
+                                      cudaStream_t stream) {
+    void* arguments[] = {&weight, &vocab_size, &width, &previous, &output};
+    return cudaLaunchKernel(decode_embedding_kernel, divide_up(width, block_threads),
+                            block_threads, arguments, 0, stream);
+}
+
+cudaError_t decoder::set_decode_position(int* position, int value, cudaStream_t stream) {
+    void* arguments[] = {&position, &value};
+    return cudaLaunchKernel(set_decode_position_kernel, 1, 1, arguments, 0, stream);
+}
+
+cudaError_t decoder::advance_decode_position(int* position, cudaStream_t stream) {
+    void* arguments[] = {&position};
+    return cudaLaunchKernel(advance_decode_position_kernel, 1, 1, arguments, 0, stream);
 }
 
 cudaError_t text_bf16_gemv(const __nv_bfloat16* weight, const __nv_bfloat16* input,

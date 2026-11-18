@@ -1,0 +1,155 @@
+diff --git a/benchmarks/streaming/client.py b/benchmarks/streaming/client.py
+index ec08d7e..259500f 100644
+--- a/benchmarks/streaming/client.py
++++ b/benchmarks/streaming/client.py
+@@ -13,6 +13,11 @@ from urllib.parse import urlsplit
+ SHAPES = {"W1": (128, 128), "W2": (2048, 512)}
+ WARMUPS = 3
+ REPEATS = 9
++SCHEDULE = [("warmup", WARMUPS), ("measured", REPEATS)]
++FROZEN_CLIENTS = {
++    "c8fdfde28f6ce35aaea79fff4c2cac2d386d7be2c611ee8e3660ae11b803afcd",
++    "18e8757f05dad65576bf73d7c87e42b52ee6d685690e0d13f7f4ef5eb110cc1b",
++}
+ 
+ 
+ def json_bytes(value):
+@@ -253,14 +258,58 @@ def compare(report, baseline):
+     }
+ 
+ 
++def load_reference(path, manifest, cases, gpu_uuid):
++    raw = path.read_bytes()
++    previous = json.loads(raw)
++    digest = hashlib.sha256(raw).hexdigest()
++    frozen = previous["manifest"]
++    if frozen["client_sha256"] not in FROZEN_CLIENTS | {manifest["client_sha256"]}:
++        raise ValueError("Unknown baseline client SHA-256")
++    if (frozen["clock"] != manifest["clock"] or frozen["workload_order"] != list(SHAPES)
++            or frozen["schedule"] != [list(phase) for phase in SCHEDULE]):
++        raise ValueError("Reference does not use the frozen W1/W2 measurement protocol")
++    for name in cases:
++        for field in ("fixture_sha256", "request_sha256"):
++            if manifest[field][name] != frozen[field][name]:
++                raise ValueError(f"{name} differs from baseline {field}")
++        baseline = previous["workloads"][name]
++        if not baseline["valid"] or "thresholds" not in baseline:
++            raise ValueError(f"{name} reference requires a successful baseline")
++        ids = baseline["greedy_output_ids"]
++        if not token_ids(ids) or len(ids) != SHAPES[name][1]:
++            raise ValueError(f"{name} reference requires the complete baseline output IDs")
++    if gpu_uuid is not None:
++        archive = previous.get("archive")
++        if archive is None:
++            published = Path(__file__).with_name("gpu3-reference.json")
++            archive = json.loads(published.read_bytes())["archive"]
++            if digest != archive["measurement_summary_sha256"]:
++                raise ValueError("Reference lacks a GPU UUID or a matching published archive")
++        if gpu_uuid != archive["gpu"]["uuid"]:
++            raise ValueError("Candidate GPU UUID differs from the frozen baseline")
++    return previous["workloads"], digest
++
++
++def output_diagnostic(candidate_ids, baseline_ids):
++    if candidate_ids is None:
++        return None
++    differences = [
++        index for index, (candidate, baseline) in enumerate(zip(candidate_ids, baseline_ids))
++        if candidate != baseline
++    ]
++    return {
++        "different_positions": len(differences),
++        "first_different_index": differences[0] if differences else None,
++    }
++
++
+ def run(args):
+     url = urlsplit(args.url)
+     if (url.scheme != "http" or not url.hostname or url.username is not None
+             or url.path not in ("", "/") or url.query or url.fragment):
+         raise ValueError("Use an HTTP origin without credentials, query or path")
+     cases = load_cases(args.fixtures)
+-    previous = json.loads(args.reference.read_bytes()) if args.reference else None
+-    schedule = [("warmup", WARMUPS), ("measured", REPEATS)]
++    schedule = SCHEDULE
+     if args.probe:
+         schedule = [("probe", 1)]
+         cases = {args.probe: cases[args.probe]}
+@@ -272,20 +321,16 @@ def run(args):
+         "request_sha256": {name: hashlib.sha256(body).hexdigest() for name, body in bodies.items()},
+         "client_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+     }
+-    expected = {}
+-    if previous is not None:
+-        for name in cases:
+-            baseline = previous["workloads"][name]
+-            for field in ("fixture_sha256", "request_sha256", "client_sha256"):
+-                actual = manifest[field]
+-                frozen = previous["manifest"][field]
+-                if isinstance(actual, dict):
+-                    actual, frozen = actual[name], frozen[name]
+-                if actual != frozen:
+-                    raise ValueError(f"{name} differs from baseline {field}")
+-            if not baseline["valid"] or "thresholds" not in baseline:
+-                raise ValueError(f"{name} reference requires a successful baseline")
+-            expected[name] = baseline["greedy_output_ids"]
++    previous, expected = {}, {}
++    if path := args.reference or args.candidate_reference:
++        previous, digest = load_reference(path, manifest, cases, args.gpu_uuid)
++        manifest["reference_sha256"] = digest
++        if args.candidate_reference:
++            manifest["reference_mode"] = "native-candidate"
++            manifest["gpu_uuid"] = args.gpu_uuid
++        else:
++            manifest["reference_mode"] = "baseline-self-replay"
++            expected = {name: previous[name]["greedy_output_ids"] for name in cases}
+     args.output.mkdir(parents=True)
+     (args.output / "client.json").write_bytes(json_bytes(manifest) + b"\n")
+     for name, body in bodies.items():
+@@ -300,16 +345,21 @@ def run(args):
+                     if "error" not in item:
+                         reference = expected.setdefault(name, item["output_ids"])
+                         if item["output_ids"] != reference:
+-                            item["error"] = "Greedy output IDs differ from the reference"
++                            source = "the frozen baseline" if args.reference else "an earlier repeat"
++                            item["error"] = f"Greedy output IDs differ from {source}"
+                     results[name].append(item)
+                     raw.write(json_bytes(item) + b"\n")
+                     raw.flush()
+                     if "error" in item:
+                         print(f"{name} {phase} {cohort}: {item['error']}", file=sys.stderr)
+     summary = {name: summarize(items, args.freeze_baseline) for name, items in results.items()}
+-    if previous and not args.probe:
++    if args.candidate_reference:
+         for name, report in summary.items():
+-            report["comparison"] = compare(report, previous["workloads"][name])
++            baseline = previous[name]
++            report["comparison"] = compare(report, baseline)
++            report["cross_engine_output_diagnostic"] = output_diagnostic(
++                report["greedy_output_ids"], baseline["greedy_output_ids"]
++            )
+     (args.output / "summary.json").write_text(
+         json.dumps({"manifest": manifest, "workloads": summary}, indent=2) + "\n", encoding="utf-8"
+     )
+@@ -322,11 +372,19 @@ def main():
+     parser.add_argument("--url", required=True)
+     parser.add_argument("--output", type=Path, required=True)
+     parser.add_argument("--fixtures", type=Path, default=Path(__file__).parent)
+-    parser.add_argument("--reference", type=Path)
++    parser.add_argument("--reference", type=Path, help="Require exact frozen baseline IDs")
++    parser.add_argument("--gpu-uuid", help="Physical B200 UUID reserved for the native server")
+     mode = parser.add_mutually_exclusive_group()
++    mode.add_argument("--candidate-reference", type=Path,
++                      help="Compare native repeats with the frozen performance limits")
+     mode.add_argument("--freeze-baseline", action="store_true")
+     mode.add_argument("--probe", choices=SHAPES)
+-    return run(parser.parse_args())
++    args = parser.parse_args()
++    if args.reference and (args.candidate_reference or args.freeze_baseline):
++        parser.error("--reference is for baseline self-replay")
++    if bool(args.candidate_reference) != bool(args.gpu_uuid):
++        parser.error("--candidate-reference and --gpu-uuid must be supplied together")
++    return run(args)
+ 
+ 
+ if __name__ == "__main__":

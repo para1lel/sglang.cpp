@@ -1,5 +1,7 @@
 #include "sglang/decoder_internal.h"
 
+#include "sglang/decoder_cuda.cuh"
+
 #include <algorithm>
 #include <cmath>
 
@@ -11,6 +13,27 @@ using namespace decoder;
 bool valid_token(int id) {
     return id >= 0 && id < vocab_size;
 }
+
+class RequestLease {
+public:
+    explicit RequestLease(std::atomic_flag& claimed)
+        : claimed_(claimed), owns_slot_(!claimed_.test_and_set(std::memory_order_acquire)) {}
+
+    ~RequestLease() {
+        if (owns_slot_) {
+            claimed_.clear(std::memory_order_release);
+        }
+    }
+
+    RequestLease(const RequestLease&) = delete;
+    RequestLease& operator=(const RequestLease&) = delete;
+
+    bool owns_slot() const { return owns_slot_; }
+
+private:
+    std::atomic_flag& claimed_;
+    bool owns_slot_;
+};
 
 void validate_request(const std::vector<int>& prompt, const DecoderOptions& options) {
     if (prompt.empty() || !std::all_of(prompt.begin(), prompt.end(), valid_token)) {
@@ -48,12 +71,12 @@ std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_
     return {ranking.begin(), end};
 }
 
-void read_step(Request& request) {
+int read_step(Request& request) {
     auto& transfers = request.memory.transfers();
     const auto stream = request.memory.stream();
     auto& winner = transfers.winner;
     auto& host_logits = transfers.logits;
-    check(cudaMemcpyAsync(&winner, request.work.argmax, sizeof(winner),
+    check(cudaMemcpyAsync(&winner, &request.work.argmax->token_id, sizeof(winner),
                           cudaMemcpyDeviceToHost, stream), "Read greedy token");
     if (!host_logits.empty()) {
         check(cudaMemcpyAsync(host_logits.data(), request.work.logits,
@@ -61,9 +84,10 @@ void read_step(Request& request) {
               "Read step logits");
     }
     check(cudaStreamSynchronize(stream), "Complete decoder step");
-    if (!valid_token(winner.token_id)) {
+    if (!valid_token(winner)) {
         throw std::runtime_error("Greedy selection did not produce a valid token ID");
     }
+    return winner;
 }
 
 }
@@ -93,51 +117,87 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     }
     DeviceScope selected_device(model_->device);
     const int prompt_count = static_cast<int>(prompt_token_ids.size());
-    const int capacity = prompt_count + options.max_new_tokens - 1;
-    Request request(model_->device, capacity, model_->memory);
-    auto& transfers = request.memory.transfers();
-    std::vector<DecoderLogit> ranking;
-    if (options.top_logits > 0) {
-        transfers.logits.resize(vocab_size);
-        ranking.reserve(vocab_size);
-    }
-    auto& winner = transfers.winner;
-    result.peak_device_allocation_bytes += request.memory.bytes();
+    int capacity = prompt_count + options.max_new_tokens - 1;
+    const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     result.output_token_ids.reserve(options.max_new_tokens);
-    const auto run_request = [&] {
-        for (int position = 0; position < prompt_count; ++position) {
-            if (cancelled()) {
-                return DecoderFinishReason::cancelled;
-            }
-            model_->forward(request, prompt_token_ids[position], position, TextGdnMode::prefill);
+    const RequestLease lease(model_->request_in_use);
+    std::unique_ptr<Request> eager_request;
+    auto& storage = lease.owns_slot() ? model_->decode_request : eager_request;
+    try {
+        if (storage && storage->pages.page_count < pages) {
+            const int previous_capacity = storage->pages.page_count * mxfp8_page_size;
+            capacity = std::max(capacity, std::min(2 * previous_capacity,
+                                                  text_attention_max_tokens));
+            storage->memory.close();
+            storage.reset();
         }
-        for (int step = 0; step < options.max_new_tokens; ++step) {
-            if (cancelled()) {
-                return DecoderFinishReason::cancelled;
-            }
-            if (step != 0) {
-                const int position = prompt_count + step - 1;
-                model_->forward(request, winner.token_id, position, TextGdnMode::decode);
-            }
-            model_->compute_logits(request);
-            read_step(request);
-            result.output_token_ids.push_back(winner.token_id);
-            const bool keep_running = !callbacks.on_token || callbacks.on_token(winner.token_id);
-            if (options.top_logits > 0) {
-                result.step_top_logits.push_back(
-                    top_logits(transfers.logits, options.top_logits, ranking));
-            }
-            if (!keep_running) {
-                return DecoderFinishReason::cancelled;
-            }
-            if (options.stop_token_id == winner.token_id) {
-                return DecoderFinishReason::stop;
-            }
+        if (storage) {
+            storage->memory.reclaim_deferred();
+        } else {
+            storage = std::make_unique<Request>(model_->device, capacity, model_->memory,
+                                                lease.owns_slot());
         }
-        return DecoderFinishReason::length;
-    };
-    result.finish_reason = run_request();
-    request.memory.close();
+        auto& request = *storage;
+        request.reset();
+        auto& transfers = request.memory.transfers();
+        transfers.logits.resize(options.top_logits > 0 ? vocab_size : 0);
+        std::vector<DecoderLogit> ranking;
+        if (options.top_logits > 0) {
+            ranking.reserve(vocab_size);
+        }
+        result.peak_device_allocation_bytes += request.memory.bytes();
+        const auto run_request = [&] {
+            for (int position = 0; position < prompt_count; ++position) {
+                if (cancelled()) {
+                    return DecoderFinishReason::cancelled;
+                }
+                model_->forward(request, prompt_token_ids[position], position,
+                                TextGdnMode::prefill);
+            }
+            int winner = -1;
+            for (int step = 0; step < options.max_new_tokens; ++step) {
+                if (cancelled()) {
+                    return DecoderFinishReason::cancelled;
+                }
+                if (step != 0 && request.decode_position) {
+                    if (step == 1) {
+                        check(set_decode_position(request.decode_position, prompt_count,
+                                                  request.memory.stream()), "Set decode position");
+                    }
+                    model_->decode_graph(request);
+                } else {
+                    if (step != 0) {
+                        model_->forward(request, winner, prompt_count + step - 1,
+                                        TextGdnMode::decode);
+                    }
+                    model_->compute_logits(request);
+                }
+                winner = read_step(request);
+                result.output_token_ids.push_back(winner);
+                const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
+                if (options.top_logits > 0) {
+                    result.step_top_logits.push_back(
+                        top_logits(transfers.logits, options.top_logits, ranking));
+                }
+                if (!keep_running) {
+                    return DecoderFinishReason::cancelled;
+                }
+                if (options.stop_token_id == winner) {
+                    return DecoderFinishReason::stop;
+                }
+            }
+            return DecoderFinishReason::length;
+        };
+        result.finish_reason = run_request();
+        if (eager_request) {
+            request.memory.close();
+        } else if (result.output_token_ids.empty()) {
+            check(cudaStreamSynchronize(request.memory.stream()), "Complete interrupted prefill");
+        }
+    } catch (...) {
+        storage.reset();
+        throw;
+    }
     selected_device.restore();
     return result;
 }

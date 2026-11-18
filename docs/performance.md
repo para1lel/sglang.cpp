@@ -1,6 +1,6 @@
 # Single-B200 benchmark agreement
 
-The project goal is higher inference throughput than pinned vLLM on the **same physical B200 and the same immutable checkpoint**. A workload earns a speedup only when the candidate passes its correctness checks, its measured candidate/vLLM output-token throughput ratio exceeds 1.0, and it meets the agreed latency ceilings. Measure vLLM first. Freeze the workloads, repetition policy, noise margin, and latency ceilings before timing the candidate.
+The project goal is higher inference throughput than pinned vLLM on the **same physical B200 and the same immutable checkpoint**. A workload earns a speedup only after the candidate passes its correctness checks. The measured candidate/vLLM output-token throughput ratio must exceed the agreed threshold above 1.0. The candidate must also meet the agreed latency ceilings. Measure vLLM first. Freeze the workloads, repetition policy, noise margin, and latency ceilings before timing the candidate.
 
 ## Implementations and controls
 
@@ -12,13 +12,13 @@ The project goal is higher inference throughput than pinned vLLM on the **same p
 
 Run each engine alone on the selected UUID. Record driver, CUDA runtimes, host and client configuration, clocks, power settings, and other GPU activity. Keep isolation between the baseline environment and the candidate build. Disclose required software differences and their effect on the comparison.
 
-Match model revision, weight shards and scales, tokenizer, chat template, processor, effective weight precision, and sampling policy. Match cache and state precision under the [GQA cache comparison](#gqa-cache-comparison). Freeze request bytes, token IDs, arrival order, concurrency, seeds, output limits, and stop rules. Match prefix-cache state, MTP mode, and media preprocessing. Check actual dispatch and token counts. If either engine lacks a required mode, mark that row unsupported and leave the comparison open.
+Match model revision, weight shards and scales, tokenizer, chat template, processor, effective weight precision, and sampling policy. Use the precision policies in the [GQA cache comparison](#gqa-cache-comparison). Freeze request bytes, input token IDs, arrival order, concurrency, seeds, output limits, and stop rules. Match prefix-cache state, MTP mode, and media preprocessing. Check actual dispatch and token counts. If either engine lacks a required mode, mark that row unsupported and leave the comparison open.
 
 ## GQA cache comparison
 
 Use the candidate's [native MXFP8 GQA path](development.md#p2-gqa-cache-contract). For the pinned vLLM comparator, request `kv_cache_dtype="fp8_e4m3"` (`--kv-cache-dtype fp8_e4m3` on the server CLI). Pair the runs only after vLLM dispatches with plain E4M3 GQA KV on the required workload. The pin supports per-tensor K and V scales and defaults both to `1.0` when the checkpoint supplies neither. The local checkpoint index contains no attention scales. Verify the effective scale policy in the run. [vLLM cache setting](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/config/cache.py#L251)<!-- prefix: "CUDA 11.8+ s" --> · [vLLM scale initialization](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/model_executor/layers/quantization/kv_cache.py#L118)<!-- prefix: "elif layer.k" -->
 
-This pairing permits different GQA KV formats and scale granularity. Record each engine's requested and effective KV format and the scale dtype, granularity, and source. Record the effective attention Q dtype, any Q scaling, and the attention backend and fallback status. Match and record the GDN state dtypes. The checkpoint FP8 weights and their scales remain a separate control. Apply the same memory, feature, correctness, and latency requirements. Require exact output IDs, token counts, and completion reasons for the paired greedy fixture.
+The native path stores E4M3 values with E8M0 scales per 32 channels. The pinned comparator uses E4M3 values with per-tensor K and V scales. These precision policies can produce different logits and greedy IDs. Report cross-engine output and logit comparisons for diagnosis only. Require each engine to satisfy the workload's token counts, finish conditions, and stream contract. Record each engine's requested and effective KV format and the scale dtype, granularity, and source. Record the effective attention Q dtype, any Q scaling, and the attention backend and fallback status. Match and record the GDN state dtypes. The checkpoint FP8 weights and their scales remain a separate control.
 
 ## First baseline run
 
@@ -29,7 +29,7 @@ bash benchmarks/vllm/setup.sh
 GPU="${GPU_INDEX:?set the reserved B200 index}" bash benchmarks/vllm/run.sh benchmarks/vllm/small.json
 ```
 
-The offline smoke case requests eight output tokens using checkpoint FP8 weights and BF16 KV. Inspect the reported run directory for the device UUID, effective configuration, output IDs, and individual request timings. Repeats must finish at the requested length with identical greedy token IDs. This independent diagnostic measures whole-request latency and output tokens/s. Paired acceptance requires a separate run under the GQA cache comparison. W1–W6 require separate runs with a streaming client to measure first-token latency.
+The offline smoke case requests eight output tokens using checkpoint FP8 weights and BF16 KV. Inspect the reported run directory for the device UUID, effective configuration, output IDs, and individual request timings. Repeats of this vLLM run must finish at the requested length with identical greedy IDs. This historical diagnostic measures whole-request latency and output tokens/s. Paired acceptance requires a separate run under the GQA cache comparison. W1–W6 require separate runs with a streaming client to measure first-token latency.
 
 ## Named workloads
 
@@ -62,13 +62,18 @@ The offline smoke case requests eight output tokens using checkpoint FP8 weights
 
 Separate startup, model load, JIT compilation, and graph capture from steady execution. Warm both engines under the declared cache policy. Reset reusable prefixes before a cold-prefix measurement. Use the same workload order or a recorded counterbalanced order. **Proposed repeat policy.** Collect at least five measured cohorts per engine and workload after warmup. Preserve each cohort's output tokens/s. Report the median and range across cohorts. Report p50 and p95 for TTFT, TPOT, and end-to-end latency over requests per workload, with sample counts and the percentile method.
 
-Report one row per engine, workload, and mode. Include absolute metrics, successful and attempted requests, and the agreed limits. For paired runs, also report the candidate/baseline throughput ratio and latency differences. At adoption, the required improvement above parity and the latency budgets still need numerical margins from repeated baseline measurements.
+Report one row per engine, workload, and mode. Include absolute metrics, successful and attempted requests, and the agreed limits. For paired runs, also report the candidate/baseline throughput ratio and latency differences. For workloads with open limits, set numerical margins from repeated baseline measurements before candidate timing.
+
+### Frozen W1 and W2 timing
+
+Use the [frozen streaming protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) and its GPU3 reference for W1 and W2. Preserve the device, fixtures, request bytes, warmups, repetitions, and timing definitions. For native timing, run the frozen client with `--url` and a new `--output` directory. Omit `--reference`, which couples timing evaluation to the frozen vLLM IDs. The client then checks stream validity and exact greedy IDs across native repetitions. Verify the client, fixture, and request hashes against the frozen manifest.
+
+For each workload, require every warmup and measured request to pass stream validation. Divide the native median output tokens/s by the frozen baseline median. Require that ratio to exceed `strict_throughput_ratio_gt` in the frozen reference. Compare native p95 TTFT, TPOT, and end-to-end latency with `p95_latency_ceilings_ms` from the same reference. Require each value to meet its ceiling. Retain the frozen output IDs as historical diagnostics.
 
 ## Correctness, memory, and diagnosis
 
-Performance acceptance requires repeatability, correctness, and comparable memory and feature settings. The following checks are proposed for the applicable milestones.
+Performance acceptance requires [native implementation correctness](development.md#verification), repeatability, and comparable memory and feature settings. Run correctness checks separately when instrumentation changes timing. Apply the remaining proposed checks at their applicable milestones.
 
-- **Correctness.** Freeze high-precision operator references, logits tolerances, greedy token fixtures, and sampling distribution tests in advance. Validate independent outputs before timing. Check EOS, stop strings, constraints, cancellation, and stream termination. Use a separate correctness run when instrumentation changes timing.
 - **Memory.** Record HBM after load and peak HBM during prefill and decode. Budget weights and scales, GQA KV pages, GDN live state and checkpoints, activations, workspaces, graph pools, vision weights and buffers, and runtime allocations. State the measurement method, capacity, and headroom for each input length and concurrency.
 - **Cache.** Record reusable prefix tokens divided by eligible prompt tokens, the initial cache state, page occupancy, evictions, and recurrent checkpoint restores and replay lengths. Compare cold and primed continuations with fresh execution. Check reclamation after cancellation and memory pressure.
 - **MTP.** Record drafted and accepted tokens, verification rounds, acceptance rate (accepted/drafted), and accepted length per round. Check actual draft and target execution. Compare greedy continuations and sampled distributions with MTP off. Exercise rejection across a recurrent checkpoint boundary.

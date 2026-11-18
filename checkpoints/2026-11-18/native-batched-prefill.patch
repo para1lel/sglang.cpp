@@ -1,0 +1,1172 @@
+diff --git a/include/sglang/decoder_internal.h b/include/sglang/decoder_internal.h
+index 08ea875..d02335c 100644
+--- a/include/sglang/decoder_internal.h
++++ b/include/sglang/decoder_internal.h
+@@ -55,6 +55,7 @@ struct TransferBuffers {
+     std::vector<std::int32_t> logical_pages;
+     TextLogitCandidate winner{};
+     std::vector<Bf16> logits;
++    std::vector<int> prompt_tokens;
+ };
+ 
+ class Allocations {
+@@ -127,8 +128,10 @@ struct Layer {
+     GqaLayer gqa;
+ };
+ 
+-struct Workspace {
+-    explicit Workspace(Allocations& allocations);
++inline constexpr int prefill_chunk_rows = 128;
++
++struct LayerWorkspace {
++    LayerWorkspace(Allocations& allocations, int rows);
+ 
+     Bf16* hidden;
+     Bf16* normalized;
+@@ -147,22 +150,41 @@ struct Workspace {
+     Bf16* gdn_b;
+     Bf16* gdn_a;
+     Bf16* gdn_scratch;
+-    Bf16* logits;
+     TextFp8Activation activation;
++};
++
++struct Workspace : LayerWorkspace {
++    explicit Workspace(Allocations& allocations);
++
++    Bf16* logits;
+     TextLogitCandidate* argmax_scratch;
+     TextLogitCandidate* argmax;
+ };
+ 
++struct PrefillWorkspace : LayerWorkspace {
++    PrefillWorkspace(Allocations& allocations, int prompt_count);
++
++    const int row_capacity;
++    const int prompt_count;
++    int* tokens;
++};
++
+ struct Request {
+     Request(int device, int capacity, std::shared_ptr<const Allocations> weights);
+ 
+     Allocations memory;
+     Workspace work;
++    std::optional<PrefillWorkspace> prefill_work;
+     Mxfp8PageTable pages;
+     std::array<Mxfp8KvCache, full_attention_layers> caches;
+     std::array<TextGdnState, gdn_layers> states;
+ };
+ 
++cudaError_t embed_prefill(const Bf16* embedding, const int* tokens, int rows,
++                         Bf16* output, cudaStream_t stream);
++cudaError_t normalize_prefill(const Bf16* branch, Bf16* residual, const Bf16* weight,
++                              int rows, Bf16* output, cudaStream_t stream);
++
+ }
+ 
+ namespace sglang {
+@@ -172,6 +194,10 @@ struct Decoder::Model {
+ 
+     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
+     void compute_logits(decoder::Request& request) const;
++    void prefill_chunk(decoder::Request& request, const int* tokens, int first_position,
++                       int rows) const;
++    bool prefill(decoder::Request& request, const std::vector<int>& prompt,
++                 const std::function<bool()>& cancelled) const;
+ 
+     int device;
+     std::shared_ptr<decoder::Allocations> memory;
+diff --git a/include/sglang/text_prefill_ops.h b/include/sglang/text_prefill_ops.h
+new file mode 100644
+index 0000000..9cf7d6f
+--- /dev/null
++++ b/include/sglang/text_prefill_ops.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include "sglang/text_ops.h"
++
++namespace sglang {
++
++/// All arrays are contiguous and reside on the stream's device. Calls enqueue
++/// work asynchronously. The caller keeps disjoint buffers alive through work
++/// completion. Dimensions are positive and the inputs are finite.
++
++/// Quantizes BF16 [rows, width] to E4M3 [rows, width] and FP32 scales
++/// [rows, text_fp8_group_count(width)] using the vector quantizer's policy.
++cudaError_t text_quantize_fp8_batch(const __nv_bfloat16* input, int rows, int width,
++                                   TextFp8Activation output, cudaStream_t stream);
++
++/// Multiplies a shared quantized activation [rows, in_width] by checkpoint
++/// weights [out_width, in_width]. Weight scales are BF16 multipliers in
++/// [ceil(out_width / 128), ceil(in_width / 128)] order. Accumulates each input
++/// group separately in FP32, applies its scales and rounds the final output
++/// [rows, out_width] once to BF16.
++cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                         TextFp8ActivationView input, int rows, int out_width,
++                         int in_width, __nv_bfloat16* output, cudaStream_t stream);
++
++/// Multiplies BF16 input [rows, in_width] by BF16 weights
++/// [out_width, in_width], accumulating in FP32 and writing BF16 [rows, out_width].
++cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, const __nv_bfloat16* input,
++                          int rows, int out_width, int in_width, __nv_bfloat16* output,
++                          cudaStream_t stream);
++
++}
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index 69a45b8..37de2ab 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -95,6 +95,9 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+     const int prompt_count = static_cast<int>(prompt_token_ids.size());
+     const int capacity = prompt_count + options.max_new_tokens - 1;
+     Request request(model_->device, capacity, model_->memory);
++    if (prompt_count > 1) {
++        request.prefill_work.emplace(request.memory, prompt_count);
++    }
+     auto& transfers = request.memory.transfers();
+     std::vector<DecoderLogit> ranking;
+     if (options.top_logits > 0) {
+@@ -105,11 +108,8 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
+     result.peak_device_allocation_bytes += request.memory.bytes();
+     result.output_token_ids.reserve(options.max_new_tokens);
+     const auto run_request = [&] {
+-        for (int position = 0; position < prompt_count; ++position) {
+-            if (cancelled()) {
+-                return DecoderFinishReason::cancelled;
+-            }
+-            model_->forward(request, prompt_token_ids[position], position, TextGdnMode::prefill);
++        if (!model_->prefill(request, prompt_token_ids, cancelled)) {
++            return DecoderFinishReason::cancelled;
+         }
+         for (int step = 0; step < options.max_new_tokens; ++step) {
+             if (cancelled()) {
+diff --git a/src/decoder_batch_ops.cu b/src/decoder_batch_ops.cu
+new file mode 100644
+index 0000000..e5584bb
+--- /dev/null
++++ b/src/decoder_batch_ops.cu
+@@ -0,0 +1,94 @@
++#include "sglang/decoder_internal.h"
++
++#include <cuda_runtime.h>
++
++namespace sglang::decoder {
++namespace {
++
++constexpr int warp_size = 32;
++constexpr int block_threads = 256;
++constexpr int block_warps = block_threads / warp_size;
++constexpr float rms_epsilon = 1.0e-6f;
++
++static_assert(hidden_size % block_threads == 0);
++
++__global__ void gather_embeddings(const Bf16* embedding, const int* tokens, Bf16* output) {
++    const auto* source = embedding + static_cast<std::size_t>(tokens[blockIdx.y]) * hidden_size;
++    const int column = blockIdx.x * block_threads + threadIdx.x;
++    output[blockIdx.y * hidden_size + column] = source[column];
++}
++
++__device__ float warp_sum(float value) {
++    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
++        value += __shfl_down_sync(0xffffffffu, value, offset);
++    }
++    return value;
++}
++
++__device__ float residual_sum(const Bf16* branch, const Bf16* residual, int column) {
++    const float value = __bfloat162float(branch[column]);
++    return residual ? value + __bfloat162float(residual[column]) : value;
++}
++
++__global__ void normalize_rows(const Bf16* branch, Bf16* residual, const Bf16* weight,
++                               Bf16* output) {
++    __shared__ float warp_squares[block_warps];
++    __shared__ float inverse_rms;
++    const int row_offset = blockIdx.x * hidden_size;
++    branch += row_offset;
++    output += row_offset;
++    if (residual) {
++        residual += row_offset;
++    }
++    const int lane = threadIdx.x % warp_size;
++    const int warp = threadIdx.x / warp_size;
++    float squares = 0.0f;
++    for (int column = threadIdx.x; column < hidden_size; column += block_threads) {
++        const float value = residual_sum(branch, residual, column);
++        squares = fmaf(value, value, squares);
++    }
++    squares = warp_sum(squares);
++    if (lane == 0) {
++        warp_squares[warp] = squares;
++    }
++    __syncthreads();
++    if (warp == 0) {
++        squares = warp_sum(lane < block_warps ? warp_squares[lane] : 0.0f);
++        if (lane == 0) {
++            inverse_rms = rsqrtf(squares / static_cast<float>(hidden_size) + rms_epsilon);
++        }
++    }
++    __syncthreads();
++    for (int column = threadIdx.x; column < hidden_size; column += block_threads) {
++        const float value = residual_sum(branch, residual, column);
++        const float gain = 1.0f + __bfloat162float(weight[column]);
++        if (residual) {
++            residual[column] = __float2bfloat16_rn(value);
++        }
++        output[column] = __float2bfloat16_rn((value * inverse_rms) * gain);
++    }
++}
++
++}
++
++cudaError_t embed_prefill(const Bf16* embedding, const int* tokens, int rows,
++                          Bf16* output, cudaStream_t stream) {
++    if (!embedding || !tokens || !output || rows < 1 || rows > prefill_chunk_rows) {
++        return cudaErrorInvalidValue;
++    }
++    void* arguments[] = {&embedding, &tokens, &output};
++    return cudaLaunchKernel(gather_embeddings, dim3(hidden_size / block_threads, rows),
++                            block_threads, arguments, 0, stream);
++}
++
++cudaError_t normalize_prefill(const Bf16* branch, Bf16* residual, const Bf16* weight,
++                               int rows, Bf16* output, cudaStream_t stream) {
++    if (!branch || !weight || !output || output == residual
++        || rows < 1 || rows > prefill_chunk_rows) {
++        return cudaErrorInvalidValue;
++    }
++    void* arguments[] = {&branch, &residual, &weight, &output};
++    return cudaLaunchKernel(normalize_rows, rows, block_threads, arguments, 0, stream);
++}
++
++}
+diff --git a/src/decoder_prefill.cpp b/src/decoder_prefill.cpp
+new file mode 100644
+index 0000000..e2665f5
+--- /dev/null
++++ b/src/decoder_prefill.cpp
+@@ -0,0 +1,158 @@
++#include "sglang/decoder_internal.h"
++#include "sglang/text_prefill_ops.h"
++
++#include <algorithm>
++
++namespace sglang {
++namespace {
++
++using namespace decoder;
++
++TextFp8ActivationView quantize_rows(const Bf16* input, int rows, int width,
++                                    TextFp8Activation scratch, cudaStream_t stream) {
++    check(text_quantize_fp8_batch(input, rows, width, scratch, stream),
++          "Quantize prefill projections");
++    return {scratch.values, scratch.scales};
++}
++
++void project_rows(Fp8Weight weight, TextFp8ActivationView input, int rows,
++                  Bf16* output, cudaStream_t stream) {
++    check(text_fp8_gemm(weight.values, weight.scales, input, rows, weight.rows,
++                        weight.columns, output, stream), "Run prefill FP8 projection");
++}
++
++void project_rows(Bf16Weight weight, const Bf16* input, int rows,
++                  Bf16* output, cudaStream_t stream) {
++    check(text_bf16_gemm(weight.values, input, rows, weight.rows, weight.columns, output, stream),
++          "Run prefill BF16 projection");
++}
++
++void prefill_gdn(const GdnLayer& layer, Request& request, TextGdnState state, int rows) {
++    auto& work = *request.prefill_work;
++    const auto stream = request.memory.stream();
++    const auto input = quantize_rows(work.normalized, rows, hidden_size, work.activation, stream);
++    project_rows(layer.qkv, input, rows, work.gdn_qkv, stream);
++    project_rows(layer.z, input, rows, work.gdn_z, stream);
++    project_rows(layer.b, work.normalized, rows, work.gdn_b, stream);
++    project_rows(layer.a, work.normalized, rows, work.gdn_a, stream);
++    check(text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
++                           work.gdn_a, layer.recurrent, state, work.gdn_scratch,
++                           text_gdn_workspace_bytes(work.row_capacity), work.attention, stream),
++          "Advance prefill Gated DeltaNet state");
++    const auto attention =
++        quantize_rows(work.attention, rows, text_gdn_value_width, work.activation, stream);
++    project_rows(layer.output, attention, rows, work.projected_attention, stream);
++}
++
++void prefill_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache,
++                 int first_position, int rows) {
++    auto& work = *request.prefill_work;
++    const auto stream = request.memory.stream();
++    const auto input = quantize_rows(work.normalized, rows, hidden_size, work.activation, stream);
++    project_rows(layer.q_gate, input, rows, work.q_gate, stream);
++    project_rows(layer.key, input, rows, work.keys, stream);
++    project_rows(layer.value, input, rows, work.values, stream);
++    check(text_gqa_preprocess(first_position, rows, work.q_gate, work.keys,
++                              layer.query_norm, layer.key_norm, work.rope_queries, work.rope_keys,
++                              stream), "Normalize and rotate prefill Q/K");
++    check(mxfp8_kv_append(cache, request.pages, first_position, rows,
++                          work.rope_keys, work.values, stream), "Append prefill MXFP8 KV");
++    check(mxfp8_gqa_attention(cache, request.pages, first_position + rows, first_position,
++                             rows, work.rope_queries, work.attention, stream),
++          "Read causal prefill MXFP8 attention");
++    check(text_gqa_postgate(rows, work.q_gate, work.attention, work.attention, stream),
++          "Gate prefill grouped-query attention");
++    const auto attention =
++        quantize_rows(work.attention, rows, text_gqa_q_width, work.activation, stream);
++    project_rows(layer.output, attention, rows, work.projected_attention, stream);
++}
++
++void prefill_mlp(const Layer& layer, PrefillWorkspace& work, int rows, cudaStream_t stream) {
++    const auto input = quantize_rows(work.normalized, rows, hidden_size, work.activation, stream);
++    project_rows(layer.mlp_gate, input, rows, work.mlp_gate, stream);
++    project_rows(layer.mlp_up, input, rows, work.mlp_up, stream);
++    check(text_swiglu(work.mlp_gate, work.mlp_up, rows * intermediate_size, work.mlp_gate, stream),
++          "Apply prefill SwiGLU");
++    const auto activated =
++        quantize_rows(work.mlp_gate, rows, intermediate_size, work.activation, stream);
++    project_rows(layer.mlp_down, activated, rows, work.hidden, stream);
++}
++
++}
++
++void Decoder::Model::prefill_chunk(Request& request, const int* tokens,
++                                   int first_position, int rows) const {
++    if (!request.prefill_work || !tokens || rows < 2 || rows > request.prefill_work->row_capacity
++        || first_position < 0 || first_position > request.prefill_work->prompt_count - rows) {
++        throw std::invalid_argument("Prefill chunk falls outside request capacity");
++    }
++    auto& work = *request.prefill_work;
++    const auto stream = request.memory.stream();
++    check(embed_prefill(embedding, tokens, rows, work.residual, stream),
++          "Gather prefill embeddings");
++    int gdn_index = 0;
++    int gqa_index = 0;
++    for (int index = 0; index < layer_count; ++index) {
++        const auto& layer = layers[index];
++        const auto* input = index == 0 ? work.residual : work.hidden;
++        auto* residual = index == 0 ? nullptr : work.residual;
++        check(normalize_prefill(input, residual, layer.input_norm, rows, work.normalized, stream),
++              "Normalize prefill layer input");
++        if (is_full_attention(index)) {
++            prefill_gqa(layer.gqa, request, request.caches[gqa_index++], first_position, rows);
++        } else {
++            prefill_gdn(layer.gdn, request, request.states[gdn_index++], rows);
++        }
++        check(normalize_prefill(work.projected_attention, work.residual, layer.attention_norm,
++                                rows, work.normalized, stream),
++              "Normalize prefill post-attention residual");
++        prefill_mlp(layer, work, rows, stream);
++    }
++}
++
++bool Decoder::Model::prefill(Request& request, const std::vector<int>& prompt,
++                             const std::function<bool()>& cancelled) const {
++    if (cancelled()) {
++        return false;
++    }
++    if (!request.prefill_work) {
++        for (int position = 0; position < static_cast<int>(prompt.size()); ++position) {
++            if (position != 0 && cancelled()) {
++                return false;
++            }
++            forward(request, prompt[position], position, TextGdnMode::prefill);
++        }
++        return true;
++    }
++    auto& work = *request.prefill_work;
++    auto& host_tokens = request.memory.transfers().prompt_tokens;
++    host_tokens = prompt;
++    const auto stream = request.memory.stream();
++    check(cudaMemcpyAsync(work.tokens, host_tokens.data(), host_tokens.size() * sizeof(int),
++                          cudaMemcpyHostToDevice, stream), "Upload prefill tokens");
++    int final_rows = 0;
++    for (int position = 0; position < work.prompt_count;) {
++        if (position != 0 && cancelled()) {
++            return false;
++        }
++        const int rows = std::min(work.row_capacity, work.prompt_count - position);
++        if (rows == 1) {
++            forward(request, prompt[position], position, TextGdnMode::prefill);
++        } else {
++            prefill_chunk(request, work.tokens + position, position, rows);
++        }
++        final_rows = rows;
++        position += rows;
++    }
++    if (final_rows > 1) {
++        const auto offset = (final_rows - 1) * hidden_size;
++        const auto bytes = hidden_size * sizeof(Bf16);
++        check(cudaMemcpyAsync(request.work.hidden, work.hidden + offset, bytes,
++                              cudaMemcpyDeviceToDevice, stream), "Stage final prefill hidden row");
++        check(cudaMemcpyAsync(request.work.residual, work.residual + offset, bytes,
++                              cudaMemcpyDeviceToDevice, stream), "Stage final prefill residual row");
++    }
++    return true;
++}
++
++}
+diff --git a/src/decoder_resources.cpp b/src/decoder_resources.cpp
+index acf736f..819ea8d 100644
+--- a/src/decoder_resources.cpp
++++ b/src/decoder_resources.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "sglang/checkpoint.h"
+ 
++#include <algorithm>
+ #include <cstdio>
+ #include <mutex>
+ #include <numeric>
+@@ -309,32 +310,40 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
+     return blocks.back();
+ }
+ 
++LayerWorkspace::LayerWorkspace(Allocations& allocations, int rows)
++    : hidden(allocations.allocate<Bf16>(rows * hidden_size)),
++      normalized(allocations.allocate<Bf16>(rows * hidden_size)),
++      residual(allocations.allocate<Bf16>(rows * hidden_size)),
++      projected_attention(allocations.allocate<Bf16>(rows * hidden_size)),
++      attention(allocations.allocate<Bf16>(rows * text_gqa_q_width)),
++      mlp_gate(allocations.allocate<Bf16>(rows * intermediate_size)),
++      mlp_up(allocations.allocate<Bf16>(rows * intermediate_size)),
++      q_gate(allocations.allocate<Bf16>(rows * text_gqa_q_gate_width)),
++      keys(allocations.allocate<Bf16>(rows * text_gqa_kv_width)),
++      values(allocations.allocate<Bf16>(rows * text_gqa_kv_width)),
++      rope_queries(allocations.allocate<Bf16>(rows * text_gqa_q_width)),
++      rope_keys(allocations.allocate<Bf16>(rows * text_gqa_kv_width)),
++      gdn_qkv(allocations.allocate<Bf16>(rows * text_gdn_qkv_width)),
++      gdn_z(allocations.allocate<Bf16>(rows * text_gdn_value_width)),
++      gdn_b(allocations.allocate<Bf16>(rows * text_gdn_value_heads)),
++      gdn_a(allocations.allocate<Bf16>(rows * text_gdn_value_heads)),
++      gdn_scratch(allocations.allocate<Bf16>(text_gdn_workspace_bytes(rows) / sizeof(Bf16))),
++      activation{allocations.allocate<std::uint8_t>(rows * intermediate_size),
++                 allocations.allocate<float>(rows * text_fp8_group_count(intermediate_size))} {
++    static_assert(text_gqa_q_width == text_gdn_value_width);
++}
++
+ Workspace::Workspace(Allocations& allocations)
+-    : hidden(allocations.allocate<Bf16>(hidden_size)),
+-      normalized(allocations.allocate<Bf16>(hidden_size)),
+-      residual(allocations.allocate<Bf16>(hidden_size)),
+-      projected_attention(allocations.allocate<Bf16>(hidden_size)),
+-      attention(allocations.allocate<Bf16>(text_gqa_q_width)),
+-      mlp_gate(allocations.allocate<Bf16>(intermediate_size)),
+-      mlp_up(allocations.allocate<Bf16>(intermediate_size)),
+-      q_gate(allocations.allocate<Bf16>(text_gqa_q_gate_width)),
+-      keys(allocations.allocate<Bf16>(text_gqa_kv_width)),
+-      values(allocations.allocate<Bf16>(text_gqa_kv_width)),
+-      rope_queries(allocations.allocate<Bf16>(text_gqa_q_width)),
+-      rope_keys(allocations.allocate<Bf16>(text_gqa_kv_width)),
+-      gdn_qkv(allocations.allocate<Bf16>(text_gdn_qkv_width)),
+-      gdn_z(allocations.allocate<Bf16>(text_gdn_value_width)),
+-      gdn_b(allocations.allocate<Bf16>(text_gdn_value_heads)),
+-      gdn_a(allocations.allocate<Bf16>(text_gdn_value_heads)),
+-      gdn_scratch(allocations.allocate<Bf16>(text_gdn_workspace_bytes(1) / sizeof(Bf16))),
++    : LayerWorkspace(allocations, 1),
+       logits(allocations.allocate<Bf16>(vocab_size)),
+-      activation{allocations.allocate<std::uint8_t>(intermediate_size),
+-                 allocations.allocate<float>(text_fp8_group_count(intermediate_size))},
+       argmax_scratch(
+           allocations.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
+-      argmax(allocations.allocate<TextLogitCandidate>(1)) {
+-    static_assert(text_gqa_q_width == text_gdn_value_width);
+-}
++      argmax(allocations.allocate<TextLogitCandidate>(1)) {}
++
++PrefillWorkspace::PrefillWorkspace(Allocations& allocations, int prompt_count)
++    : LayerWorkspace(allocations, std::min(prompt_count, prefill_chunk_rows)),
++      row_capacity(std::min(prompt_count, prefill_chunk_rows)), prompt_count(prompt_count),
++      tokens(allocations.allocate<int>(prompt_count)) {}
+ 
+ Request::Request(int device, int capacity, std::shared_ptr<const Allocations> weights)
+     : memory(device), work(memory) {
+diff --git a/src/text_prefill_ops.cu b/src/text_prefill_ops.cu
+new file mode 100644
+index 0000000..f06224c
+--- /dev/null
++++ b/src/text_prefill_ops.cu
+@@ -0,0 +1,305 @@
++#include "sglang/text_prefill_ops.h"
++
++#include <cstddef>
++#include <limits>
++
++#include <cuda_fp8.h>
++#include <cuda_runtime.h>
++#include <mma.h>
++
++namespace sglang {
++
++cudaError_t text_fp8_gemm_sm100(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                               TextFp8ActivationView input, int rows, int out_width, int in_width,
++                               __nv_bfloat16* output, cudaStream_t stream);
++
++namespace {
++
++constexpr int warp_size = 32;
++constexpr unsigned warp_mask = 0xffffffffu;
++constexpr int group_size = text_fp8_group_size;
++constexpr int fp8_tile = 64;
++constexpr int bf16_tile = 16;
++constexpr int bf16_partitions = 8;
++
++__host__ __device__ constexpr int ceil_div(int value, int divisor) {
++    return value / divisor + (value % divisor != 0);
++}
++
++bool valid_matrix(int rows, int cols, std::size_t element_size) {
++    return rows > 0 && cols > 0 &&
++           static_cast<std::size_t>(rows) <=
++               std::numeric_limits<std::ptrdiff_t>::max() / element_size / cols;
++}
++
++template <bool Packed>
++__global__ void quantize_batch(const __nv_bfloat16* input, int rows, int width, int groups,
++                               TextFp8Activation output) {
++    const int lane = threadIdx.x % warp_size;
++    const auto group_index = static_cast<std::size_t>(blockIdx.x) * 4 + threadIdx.x / warp_size;
++    if (group_index >= static_cast<std::size_t>(rows) * groups) {
++        return;
++    }
++    const auto row = group_index / groups;
++    const int col = static_cast<int>(group_index % groups) * group_size + lane * 4;
++    const auto offset = row * width + col;
++    float values[4];
++    if constexpr (Packed) {
++        const uint2 bits = *reinterpret_cast<const uint2*>(input + offset);
++        const float2 low = make_float2(__uint_as_float(bits.x << 16),
++                                      __uint_as_float(bits.x & 0xffff0000u));
++        const float2 high = make_float2(__uint_as_float(bits.y << 16),
++                                       __uint_as_float(bits.y & 0xffff0000u));
++        values[0] = low.x;
++        values[1] = low.y;
++        values[2] = high.x;
++        values[3] = high.y;
++    } else {
++        #pragma unroll
++        for (int elem = 0; elem < 4; ++elem) {
++            values[elem] = col + elem < width ? __bfloat162float(input[offset + elem]) : 0.0f;
++        }
++    }
++    float maximum = fmaxf(fmaxf(fabsf(values[0]), fabsf(values[1])),
++                          fmaxf(fabsf(values[2]), fabsf(values[3])));
++    maximum = __uint_as_float(__reduce_max_sync(warp_mask, __float_as_uint(maximum)));
++    float reciprocal = 0.0f;
++    if (lane == 0) {
++        const float scale = __fdiv_rn(fmaxf(maximum, 1e-10f), 448.0f);
++        output.scales[group_index] = scale;
++        reciprocal = __fdiv_rn(1.0f, scale);
++    }
++    reciprocal = __shfl_sync(warp_mask, reciprocal, 0);
++    if constexpr (Packed) {
++        const unsigned low = __nv_cvt_float2_to_fp8x2(
++            make_float2(values[0] * reciprocal, values[1] * reciprocal), __NV_SATFINITE, __NV_E4M3);
++        const unsigned high = __nv_cvt_float2_to_fp8x2(
++            make_float2(values[2] * reciprocal, values[3] * reciprocal), __NV_SATFINITE, __NV_E4M3);
++        *reinterpret_cast<unsigned*>(output.values + offset) = low | (high << 16);
++    } else {
++        #pragma unroll
++        for (int elem = 0; elem < 4; ++elem) {
++            if (col + elem < width) {
++                output.values[offset + elem] =
++                    __nv_cvt_float_to_fp8(values[elem] * reciprocal, __NV_SATFINITE, __NV_E4M3);
++            }
++        }
++    }
++}
++
++__device__ int swizzled_word(int row, int word) {
++    return word ^ ((row % 8) * 4);
++}
++
++__device__ uint4 load_fp8_sector(const std::uint8_t* base, int row, int rows, int col, int width) {
++    if (row >= rows || col >= width) {
++        return {};
++    }
++    const auto* source = base + static_cast<std::size_t>(row) * width + col;
++    if ((reinterpret_cast<std::uintptr_t>(source) % 16) == 0 && width - col >= 16) {
++        return *reinterpret_cast<const uint4*>(source);
++    }
++    alignas(16) std::uint8_t bytes[16];
++    #pragma unroll
++    for (int elem = 0; elem < 16; ++elem) {
++        bytes[elem] = elem < width - col ? source[elem] : 0;
++    }
++    uint4 result;
++    __builtin_memcpy(&result, bytes, sizeof(result));
++    return result;
++}
++
++__device__ void mma_fp8(float (&sum)[4], const unsigned* first, const unsigned* second,
++                        const unsigned* weight, int row, int out, int word) {
++    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
++        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++        : "+f"(sum[0]), "+f"(sum[1]), "+f"(sum[2]), "+f"(sum[3])
++        : "r"(first[swizzled_word(row, word)]), "r"(second[swizzled_word(row + 8, word)]),
++          "r"(first[swizzled_word(row, word + 4)]), "r"(second[swizzled_word(row + 8, word + 4)]),
++          "r"(weight[swizzled_word(out, word)]), "r"(weight[swizzled_word(out, word + 4)]));
++}
++
++__global__ void fp8_mma_sync(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                             TextFp8ActivationView input, int rows, int out_width, int in_width,
++                             int groups, __nv_bfloat16* output) {
++    __shared__ alignas(16) unsigned tile_input[fp8_tile][group_size / 4];
++    __shared__ alignas(16) unsigned tile_weight[fp8_tile][group_size / 4];
++    const int token_base = blockIdx.x * fp8_tile;
++    const int out_base = blockIdx.y * fp8_tile;
++    const int warp = threadIdx.x / warp_size;
++    const int lane = threadIdx.x % warp_size;
++    const int token_row = (warp / 2) * 16 + lane / 4;
++    const int out_row = (warp % 2) * 32 + lane / 4;
++    const int out_col = (warp % 2) * 32 + (lane % 4) * 2;
++    const int token0 = token_base + token_row;
++    const int token1 = token0 + 8;
++    float result[4][4] = {};
++    for (int group = 0; group < groups; ++group) {
++        for (int vec = threadIdx.x; vec < fp8_tile * 8; vec += blockDim.x) {
++            const int row = vec / 8;
++            const int word = (vec % 8) * 4;
++            const int col = group * group_size + word * 4;
++            const int dest = swizzled_word(row, word);
++            *reinterpret_cast<uint4*>(tile_input[row] + dest) =
++                load_fp8_sector(input.values, token_base + row, rows, col, in_width);
++            *reinterpret_cast<uint4*>(tile_weight[row] + dest) =
++                load_fp8_sector(weight, out_base + row, out_width, col, in_width);
++        }
++        __syncthreads();
++        float partial[4][4] = {};
++        #pragma unroll
++        for (int chunk = 0; chunk < 4; ++chunk) {
++            const int word = chunk * 8 + lane % 4;
++            #pragma unroll
++            for (int frag = 0; frag < 4; ++frag) {
++                const int out = out_row + frag * 8;
++                mma_fp8(partial[frag], tile_input[token_row], tile_input[token_row + 8],
++                        tile_weight[out], token_row, out, word);
++            }
++        }
++        const float weight_scale = __bfloat162float(
++            weight_scales[static_cast<std::size_t>(out_base / group_size) * groups + group]);
++        const float scale0 = token0 < rows ? input.scales[std::size_t(token0) * groups + group] : 0;
++        const float scale1 = token1 < rows ? input.scales[std::size_t(token1) * groups + group] : 0;
++        #pragma unroll
++        for (int frag = 0; frag < 4; ++frag) {
++            #pragma unroll
++            for (int reg = 0; reg < 4; ++reg) {
++                const float scale = (reg < 2 ? scale0 : scale1) * weight_scale;
++                result[frag][reg] = fmaf(partial[frag][reg], scale, result[frag][reg]);
++            }
++        }
++        __syncthreads();
++    }
++    #pragma unroll
++    for (int frag = 0; frag < 4; ++frag) {
++        #pragma unroll
++        for (int reg = 0; reg < 4; ++reg) {
++            const int token = reg < 2 ? token0 : token1;
++            const int out = out_base + out_col + frag * 8 + reg % 2;
++            if (token < rows && out < out_width) {
++                output[std::size_t(token) * out_width + out] =
++                    __float2bfloat16_rn(result[frag][reg]);
++            }
++        }
++    }
++}
++
++template <bool Direct>
++__global__ void bf16_wmma(const __nv_bfloat16* weight, const __nv_bfloat16* input, int rows,
++                          int out_width, int in_width, __nv_bfloat16* output) {
++    namespace wmma = nvcuda::wmma;
++    __shared__ alignas(32) __nv_bfloat16 lhs[bf16_partitions][bf16_tile * bf16_tile];
++    __shared__ alignas(32) __nv_bfloat16 rhs[bf16_partitions][bf16_tile * bf16_tile];
++    __shared__ alignas(32) float partial[bf16_partitions][bf16_tile * bf16_tile];
++    const int warp = threadIdx.x / warp_size;
++    const int lane = threadIdx.x % warp_size;
++    const int row_base = blockIdx.x * bf16_tile;
++    const int col_base = blockIdx.y * bf16_tile;
++    wmma::fragment<wmma::accumulator, bf16_tile, bf16_tile, bf16_tile, float> accum;
++    wmma::fill_fragment(accum, 0.0f);
++    const int blocks = ceil_div(in_width, bf16_tile);
++    for (int block = warp; block < blocks; block += bf16_partitions) {
++        const int start = block * bf16_tile;
++        wmma::fragment<wmma::matrix_a, bf16_tile, bf16_tile, bf16_tile, __nv_bfloat16,
++                       wmma::row_major> input_tile;
++        wmma::fragment<wmma::matrix_b, bf16_tile, bf16_tile, bf16_tile, __nv_bfloat16,
++                       wmma::col_major> weight_tile;
++        if constexpr (Direct) {
++            wmma::load_matrix_sync(input_tile, input + std::size_t(row_base) * in_width + start,
++                                   in_width);
++            wmma::load_matrix_sync(weight_tile, weight + std::size_t(col_base) * in_width + start,
++                                   in_width);
++        } else {
++            for (int elem = lane; elem < bf16_tile * bf16_tile; elem += warp_size) {
++                const int tile_row = elem / bf16_tile;
++                const int pos = start + elem % bf16_tile;
++                const int row = row_base + tile_row;
++                const int col = col_base + tile_row;
++                lhs[warp][elem] = row < rows && pos < in_width
++                    ? input[std::size_t(row) * in_width + pos] : __nv_bfloat16{};
++                rhs[warp][elem] = col < out_width && pos < in_width
++                    ? weight[std::size_t(col) * in_width + pos] : __nv_bfloat16{};
++            }
++            __syncwarp();
++            wmma::load_matrix_sync(input_tile, lhs[warp], bf16_tile);
++            wmma::load_matrix_sync(weight_tile, rhs[warp], bf16_tile);
++            __syncwarp();
++        }
++        wmma::mma_sync(accum, input_tile, weight_tile, accum);
++    }
++    wmma::store_matrix_sync(partial[warp], accum, bf16_tile, wmma::mem_row_major);
++    __syncthreads();
++    const int elem = threadIdx.x;
++    const int row = row_base + elem / bf16_tile;
++    const int col = col_base + elem % bf16_tile;
++    if (row < rows && col < out_width) {
++        float sum = 0.0f;
++        #pragma unroll
++        for (int part = 0; part < bf16_partitions; ++part) {
++            sum += partial[part][elem];
++        }
++        output[std::size_t(row) * out_width + col] = __float2bfloat16_rn(sum);
++    }
++}
++
++}
++
++cudaError_t text_quantize_fp8_batch(const __nv_bfloat16* input, int rows, int width,
++                                   TextFp8Activation output, cudaStream_t stream) {
++    if (!input || !output.values || !output.scales ||
++        !valid_matrix(rows, width, sizeof(*input))) {
++        return cudaErrorInvalidValue;
++    }
++    int groups = text_fp8_group_count(width);
++    const auto blocks = (static_cast<std::size_t>(rows) * groups + 3) / 4;
++    if (blocks > std::numeric_limits<int>::max()) {
++        return cudaErrorInvalidValue;
++    }
++    const bool packed = width % group_size == 0 &&
++                        reinterpret_cast<std::uintptr_t>(input) % 8 == 0 &&
++                        reinterpret_cast<std::uintptr_t>(output.values) % 4 == 0;
++    void* args[] = {&input, &rows, &width, &groups, &output};
++    return cudaLaunchKernel(packed ? quantize_batch<true> : quantize_batch<false>,
++                            static_cast<unsigned>(blocks), 4 * warp_size, args, 0, stream);
++}
++
++cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                         TextFp8ActivationView input, int rows, int out_width, int in_width,
++                         __nv_bfloat16* output, cudaStream_t stream) {
++    if (!weight || !weight_scales || !input.values || !input.scales || !output ||
++        !valid_matrix(rows, in_width, 1) || !valid_matrix(out_width, in_width, 1) ||
++        !valid_matrix(rows, out_width, sizeof(*output)) || ceil_div(out_width, fp8_tile) > 65535) {
++        return cudaErrorInvalidValue;
++    }
++    const cudaError_t fast_status = text_fp8_gemm_sm100(weight, weight_scales, input, rows,
++                                                       out_width, in_width, output, stream);
++    if (fast_status != cudaErrorNotSupported) {
++        return fast_status;
++    }
++    int groups = text_fp8_group_count(in_width);
++    void* args[] = {&weight, &weight_scales, &input, &rows, &out_width,
++                    &in_width, &groups, &output};
++    const dim3 grid(ceil_div(rows, fp8_tile), ceil_div(out_width, fp8_tile));
++    return cudaLaunchKernel(fp8_mma_sync, grid, 256, args, 0, stream);
++}
++
++cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, const __nv_bfloat16* input,
++                          int rows, int out_width, int in_width, __nv_bfloat16* output,
++                          cudaStream_t stream) {
++    if (!weight || !input || !output || !valid_matrix(rows, in_width, sizeof(*input)) ||
++        !valid_matrix(out_width, in_width, sizeof(*weight)) ||
++        !valid_matrix(rows, out_width, sizeof(*output)) || ceil_div(out_width, bf16_tile) > 65535) {
++        return cudaErrorInvalidValue;
++    }
++    void* args[] = {&weight, &input, &rows, &out_width, &in_width, &output};
++    const dim3 grid(ceil_div(rows, bf16_tile), ceil_div(out_width, bf16_tile));
++    const bool direct = rows % bf16_tile == 0 && out_width % bf16_tile == 0 &&
++                        in_width % bf16_tile == 0 &&
++                        reinterpret_cast<std::uintptr_t>(input) % 32 == 0 &&
++                        reinterpret_cast<std::uintptr_t>(weight) % 32 == 0;
++    return cudaLaunchKernel(direct ? bf16_wmma<true> : bf16_wmma<false>, grid,
++                            bf16_partitions * warp_size, args, 0, stream);
++}
++
++}
+diff --git a/src/text_prefill_ops_sm100.cu b/src/text_prefill_ops_sm100.cu
+new file mode 100644
+index 0000000..ad8f6bf
+--- /dev/null
++++ b/src/text_prefill_ops_sm100.cu
+@@ -0,0 +1,331 @@
++#include "sglang/text_prefill_ops.h"
++
++#include <cstddef>
++
++#include <cuda.h>
++#include <cuda_runtime.h>
++#include <cudaTypedefs.h>
++
++namespace sglang {
++namespace {
++
++constexpr int tile_rows = 128;
++constexpr int group_size = text_fp8_group_size;
++constexpr int copy_stages = 4;
++constexpr int accum_stages = 2;
++constexpr int warp_size = 32;
++constexpr int consumer_warps = tile_rows / warp_size;
++constexpr int thread_count = (consumer_warps + 2) * warp_size;
++
++struct Pipeline {
++    unsigned long long copy_ready[copy_stages];
++    unsigned long long copy_empty[copy_stages];
++    unsigned long long accum_ready[accum_stages];
++    unsigned long long accum_empty[accum_stages];
++    unsigned tmem;
++};
++
++__device__ unsigned shared_address(const void* pointer) {
++    return static_cast<unsigned>(__cvta_generic_to_shared(pointer));
++}
++
++__device__ void init_barrier(unsigned long long* barrier, int arrivals) {
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
++                 :: "r"(shared_address(barrier)), "r"(arrivals) : "memory");
++}
++
++__device__ void wait_barrier(const unsigned long long* barrier, unsigned phase) {
++    asm volatile("{ .reg .pred ready;\n"
++                 "WAIT: mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ready, [%0], %1;\n"
++                 "@!ready bra.uni WAIT; }"
++                 :: "r"(shared_address(barrier)), "r"(phase) : "memory");
++}
++
++__device__ void arrive_barrier(unsigned long long* barrier) {
++    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
++                 :: "r"(shared_address(barrier)) : "memory");
++}
++
++__device__ void commit_mma(unsigned long long* barrier) {
++    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
++                 :: "r"(shared_address(barrier)) : "memory");
++}
++
++__device__ void copy_tile(const CUtensorMap* map, unsigned shared, unsigned barrier,
++                          int col, int row) {
++    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes "
++                 "[%0], [%1, {%2, %3}], [%4];"
++                 :: "r"(shared), "l"(map), "r"(col), "r"(row), "r"(barrier) : "memory");
++}
++
++template <int TileCols>
++__device__ void produce_tiles(Pipeline& pipe, unsigned shared, const CUtensorMap* input,
++                              const CUtensorMap* weight, int row_base, int col_base, int groups) {
++    constexpr int stage_bytes = (tile_rows + TileCols) * group_size;
++    for (int group = 0; group < groups; ++group) {
++        const int slot = group % copy_stages;
++        if (group >= copy_stages) {
++            wait_barrier(&pipe.copy_empty[slot], (group / copy_stages - 1) % 2);
++        }
++        const unsigned barrier = shared_address(&pipe.copy_ready[slot]);
++        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
++                     :: "r"(barrier), "r"(stage_bytes) : "memory");
++        const unsigned start = shared + slot * stage_bytes;
++        copy_tile(input, start, barrier, group * group_size, row_base);
++        copy_tile(weight, start + tile_rows * group_size, barrier, group * group_size, col_base);
++    }
++}
++
++__device__ std::uint64_t matrix_desc(unsigned start) {
++    constexpr std::uint64_t stride = 8 * group_size / 16;
++    constexpr std::uint64_t swizzle_128b = std::uint64_t{2} << 61;
++    constexpr std::uint64_t descriptor_version = std::uint64_t{1} << 46;
++    constexpr std::uint64_t leading_offset = std::uint64_t{1} << 16;
++    return swizzle_128b | descriptor_version | (stride << 32) | leading_offset |
++           ((start & 0x3ffffu) >> 4);
++}
++
++template <int TileCols>
++__device__ void multiply_tiles(Pipeline& pipe, unsigned shared, int groups) {
++    constexpr int stage_bytes = (tile_rows + TileCols) * group_size;
++    constexpr unsigned accumulator_f32 = 1 << 4;
++    constexpr unsigned instruction = ((tile_rows / 16) << 24) | ((TileCols / 8) << 17) |
++                                     accumulator_f32;
++    for (int group = 0; group < groups; ++group) {
++        const int stage = group % copy_stages;
++        const int accum = group % accum_stages;
++        if (group >= accum_stages) {
++            wait_barrier(&pipe.accum_empty[accum], (group / accum_stages - 1) % 2);
++        }
++        wait_barrier(&pipe.copy_ready[stage], (group / copy_stages) % 2);
++        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
++        const unsigned start = shared + stage * stage_bytes;
++        #pragma unroll
++        for (int chunk = 0; chunk < group_size; chunk += 32) {
++            const auto input_desc = matrix_desc(start + chunk);
++            const auto weight_desc = matrix_desc(start + tile_rows * group_size + chunk);
++            asm volatile("{ .reg .pred accumulate;\n"
++                         "setp.ne.u32 accumulate, %4, 0;\n"
++                         "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, accumulate; }"
++                         :: "r"(pipe.tmem + accum * TileCols), "l"(input_desc), "l"(weight_desc),
++                            "r"(instruction), "r"(chunk) : "memory");
++        }
++        commit_mma(&pipe.copy_empty[stage]);
++        commit_mma(&pipe.accum_ready[accum]);
++    }
++}
++
++__device__ void load_partial(unsigned source, float (&value)[32]) {
++    asm volatile("{ .reg .b32 v<32>;\n"
++                 "tcgen05.ld.sync.aligned.32x32b.x32.b32 "
++                 "{v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15,"
++                 "v16,v17,v18,v19,v20,v21,v22,v23,v24,v25,v26,v27,v28,v29,v30,v31}, [%32];\n"
++                 "tcgen05.wait::ld.sync.aligned;\n"
++                 "mov.b32 %0,v0; mov.b32 %1,v1; mov.b32 %2,v2; mov.b32 %3,v3;\n"
++                 "mov.b32 %4,v4; mov.b32 %5,v5; mov.b32 %6,v6; mov.b32 %7,v7;\n"
++                 "mov.b32 %8,v8; mov.b32 %9,v9; mov.b32 %10,v10; mov.b32 %11,v11;\n"
++                 "mov.b32 %12,v12; mov.b32 %13,v13; mov.b32 %14,v14; mov.b32 %15,v15;\n"
++                 "mov.b32 %16,v16; mov.b32 %17,v17; mov.b32 %18,v18; mov.b32 %19,v19;\n"
++                 "mov.b32 %20,v20; mov.b32 %21,v21; mov.b32 %22,v22; mov.b32 %23,v23;\n"
++                 "mov.b32 %24,v24; mov.b32 %25,v25; mov.b32 %26,v26; mov.b32 %27,v27;\n"
++                 "mov.b32 %28,v28; mov.b32 %29,v29; mov.b32 %30,v30; mov.b32 %31,v31; }"
++                 : "=f"(value[0]), "=f"(value[1]), "=f"(value[2]), "=f"(value[3]),
++                   "=f"(value[4]), "=f"(value[5]), "=f"(value[6]), "=f"(value[7]),
++                   "=f"(value[8]), "=f"(value[9]), "=f"(value[10]), "=f"(value[11]),
++                   "=f"(value[12]), "=f"(value[13]), "=f"(value[14]), "=f"(value[15]),
++                   "=f"(value[16]), "=f"(value[17]), "=f"(value[18]), "=f"(value[19]),
++                   "=f"(value[20]), "=f"(value[21]), "=f"(value[22]), "=f"(value[23]),
++                   "=f"(value[24]), "=f"(value[25]), "=f"(value[26]), "=f"(value[27]),
++                   "=f"(value[28]), "=f"(value[29]), "=f"(value[30]), "=f"(value[31])
++                 : "r"(source) : "memory");
++}
++
++__device__ void scale_pair(float& result0, float& result1, float value0, float value1,
++                           float activation, float weight) {
++    asm("{ .reg .b64 values, ascales, wscales, sums;\n"
++                 "mov.b64 values, {%2,%3};\n"
++                 "mov.b64 ascales, {%4,%4};\n"
++                 "mov.b64 wscales, {%5,%5};\n"
++                 "mov.b64 sums, {%0,%1};\n"
++                 "mul.rn.f32x2 wscales, wscales, ascales;\n"
++                 "fma.rn.f32x2 sums, values, wscales, sums;\n"
++                 "mov.b64 {%0,%1}, sums; }"
++                 : "+f"(result0), "+f"(result1)
++                 : "f"(value0), "f"(value1), "f"(activation), "f"(weight));
++}
++
++template <int TileCols>
++__device__ void accumulate(Pipeline& pipe, const float* activation, const __nv_bfloat16* weight,
++                           int groups, float (&result)[TileCols]) {
++    const int warp = threadIdx.x / warp_size;
++    const int lane = threadIdx.x % warp_size;
++    const unsigned tmem = pipe.tmem + (warp * warp_size << 16);
++    for (int group = 0; group < groups; ++group) {
++        const int slot = group % accum_stages;
++        const float activation_scale = activation ? activation[group] : 0.0f;
++        const float weight_scale = __bfloat162float(weight[group]);
++        wait_barrier(&pipe.accum_ready[slot], (group / accum_stages) % 2);
++        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
++        #pragma unroll
++        for (int col = 0; col < TileCols; col += 32) {
++            float partial[32];
++            load_partial(tmem + slot * TileCols + col, partial);
++            #pragma unroll
++            for (int elem = 0; elem < 32; elem += 2) {
++                scale_pair(result[col + elem], result[col + elem + 1],
++                           partial[elem], partial[elem + 1], activation_scale, weight_scale);
++            }
++        }
++        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
++        __syncwarp();
++        if (lane == 0) {
++            arrive_barrier(&pipe.accum_empty[slot]);
++        }
++    }
++}
++
++template <int TileCols>
++__global__ __launch_bounds__(thread_count, 2)
++void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
++              const __grid_constant__ CUtensorMap weight_map, const float* activation_scales,
++              const __nv_bfloat16* weight_scales, int rows, int cols, int groups,
++              int row_tile_group, __nv_bfloat16* output) {
++    alignas(1024) extern __shared__ unsigned char tiles[];
++    __shared__ Pipeline pipe;
++    auto* epilogue = reinterpret_cast<__nv_bfloat16 (*)[TileCols + 2]>(tiles);
++    const int warp = threadIdx.x / warp_size;
++    const int lane = threadIdx.x % warp_size;
++    const int row_base = (blockIdx.y * row_tile_group + blockIdx.x % row_tile_group) * tile_rows;
++    const int col_base = (blockIdx.x / row_tile_group) * TileCols;
++    if (row_base >= rows) {
++        return;
++    }
++    const unsigned shared = shared_address(tiles);
++    if (threadIdx.x == 0) {
++        for (int slot = 0; slot < copy_stages; ++slot) {
++            init_barrier(&pipe.copy_ready[slot], 1);
++            init_barrier(&pipe.copy_empty[slot], 1);
++        }
++        for (int slot = 0; slot < accum_stages; ++slot) {
++            init_barrier(&pipe.accum_ready[slot], 1);
++            init_barrier(&pipe.accum_empty[slot], consumer_warps);
++        }
++        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
++    }
++    if (warp == consumer_warps) {
++        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
++                     :: "r"(shared_address(&pipe.tmem)), "r"(accum_stages * TileCols) : "memory");
++        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
++    }
++    __syncthreads();
++
++    float result[TileCols] = {};
++    if (warp < consumer_warps) {
++        const int row = row_base + threadIdx.x;
++        const auto* activation = row < rows ? activation_scales + std::size_t(row) * groups
++                                            : nullptr;
++        const auto* weight = weight_scales + std::size_t(col_base / group_size) * groups;
++        accumulate(pipe, activation, weight, groups, result);
++    } else if (warp == consumer_warps && lane == 0) {
++        multiply_tiles<TileCols>(pipe, shared, groups);
++    } else if (warp == consumer_warps + 1 && lane == 0) {
++        produce_tiles<TileCols>(pipe, shared, &activation_map, &weight_map, row_base, col_base,
++                                groups);
++    }
++    __syncthreads();
++
++    if (warp < consumer_warps) {
++        #pragma unroll
++        for (int col = 0; col < TileCols; col += 2) {
++            const auto packed = __floats2bfloat162_rn(result[col], result[col + 1]);
++            *reinterpret_cast<__nv_bfloat162*>(&epilogue[threadIdx.x][col]) = packed;
++        }
++    }
++    if (warp == consumer_warps) {
++        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
++                     :: "r"(pipe.tmem), "r"(accum_stages * TileCols) : "memory");
++    }
++    __syncthreads();
++    for (int index = threadIdx.x; index < tile_rows * TileCols; index += thread_count) {
++        const int row = index / TileCols;
++        const int col = index % TileCols;
++        if (row_base + row < rows && col_base + col < cols) {
++            output[std::size_t(row_base + row) * cols + col_base + col] = epilogue[row][col];
++        }
++    }
++}
++
++CUresult encode_map(PFN_cuTensorMapEncodeTiled_v12000 encode, CUtensorMap& map,
++                    const std::uint8_t* data, int rows, int width, int tile) {
++    const cuuint64_t dimensions[] = {static_cast<cuuint64_t>(width), static_cast<cuuint64_t>(rows)};
++    const cuuint64_t stride[] = {static_cast<cuuint64_t>(width)};
++    const cuuint32_t box[] = {group_size, static_cast<cuuint32_t>(tile)};
++    const cuuint32_t element_stride[] = {1, 1};
++    return encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<std::uint8_t*>(data),
++                  dimensions, stride, box, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
++                  CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
++                  CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
++}
++
++PFN_cuTensorMapEncodeTiled_v12000 tensor_map_encoder() {
++    static const auto encode = [] {
++        void* entry = nullptr;
++        cudaDriverEntryPointQueryResult result;
++        const auto status = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &entry,
++                                                           12000, cudaEnableDefault, &result);
++        return status == cudaSuccess && result == cudaDriverEntryPointSuccess
++            ? reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(entry) : nullptr;
++    }();
++    return encode;
++}
++
++template <int TileCols>
++cudaError_t launch_tma(PFN_cuTensorMapEncodeTiled_v12000 encode, const std::uint8_t* weight,
++                       const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
++                       int rows, int out_width, int in_width, __nv_bfloat16* output,
++                       cudaStream_t stream, int row_tile_group) {
++    constexpr int shared_bytes = copy_stages * (tile_rows + TileCols) * group_size;
++    CUtensorMap activation_map, weight_map;
++    if (encode_map(encode, activation_map, input.values, rows, in_width, tile_rows) !=
++            CUDA_SUCCESS ||
++        encode_map(encode, weight_map, weight, out_width, in_width, TileCols) != CUDA_SUCCESS) {
++        return cudaErrorNotSupported;
++    }
++    const auto kernel = fp8_tma<TileCols>;
++    const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            shared_bytes);
++    if (status != cudaSuccess) {
++        return status;
++    }
++    int groups = in_width / group_size;
++    void* args[] = {&activation_map, &weight_map, &input.scales, &weight_scales,
++                    &rows, &out_width, &groups, &row_tile_group, &output};
++    const dim3 grid((1 + (out_width - 1) / TileCols) * row_tile_group,
++                    1 + (rows - 1) / (tile_rows * row_tile_group));
++    return cudaLaunchKernel(kernel, grid, thread_count, args, shared_bytes, stream);
++}
++
++}
++
++cudaError_t text_fp8_gemm_sm100(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                               TextFp8ActivationView input, int rows, int out_width, int in_width,
++                               __nv_bfloat16* output, cudaStream_t stream) {
++    if (in_width % group_size != 0 || reinterpret_cast<std::uintptr_t>(weight) % 16 != 0 ||
++        reinterpret_cast<std::uintptr_t>(input.values) % 16 != 0 ||
++        (rows - 1) / tile_rows >= 65535) {
++        return cudaErrorNotSupported;
++    }
++    const auto encode = tensor_map_encoder();
++    if (!encode) {
++        return cudaErrorNotSupported;
++    }
++    if (rows <= tile_rows && out_width <= 8192) {
++        return launch_tma<32>(encode, weight, weight_scales, input, rows, out_width,
++                              in_width, output, stream, 1);
++    }
++    const int row_tile_group = rows >= 2048 ? 16 : rows >= 512 ? 4 : 1;
++    return launch_tma<64>(encode, weight, weight_scales, input, rows, out_width,
++                          in_width, output, stream, row_tile_group);
++}
++
++}
+diff --git a/xmake.lua b/xmake.lua
+index 0dbaee0..faee457 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -43,6 +43,16 @@ target("nvrtc-probe")
+     add_syslinks("nvrtc", "cuda")
+     add_files("tools/nvrtc-probe.cpp")
+ 
++target("sglang_prefill_sm100")
++    set_kind("static")
++    set_toolchains("host-pixi")
++    set_targetdir("$(builddir)/lib")
++    set_values("cuda.rdc", false)
++    add_cugencodes("sm_100a")
++    add_cuflags("--dependency-target-name=", {force = true})
++    add_includedirs("include", path.join(toolkit, "include"))
++    add_files("src/text_prefill_ops_sm100.cu")
++
+ target("sglang_cuda")
+     set_kind("static")
+     set_toolchains("host-pixi")
+@@ -56,6 +66,8 @@ target("sglang_cuda")
+     add_syslinks("cudart", {public = true})
+     add_files("src/mxfp8_gqa.cu")
+     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
++    add_files("src/decoder_batch_ops.cu", "src/text_prefill_ops.cu")
++    add_deps("sglang_prefill_sm100")
+ 
+ target("sglang_checkpoint")
+     set_kind("static")
+@@ -74,8 +86,8 @@ target("sglang_decoder")
+     set_targetdir("$(builddir)/lib")
+     add_includedirs("include", {public = true})
+     add_deps("sglang_checkpoint", "sglang_cuda")
+-    add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
+-              "src/decoder_weights.cpp")
++    add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_prefill.cpp",
++              "src/decoder_resources.cpp", "src/decoder_weights.cpp")
+ 
+ target("sglang-generate")
+     set_kind("binary")

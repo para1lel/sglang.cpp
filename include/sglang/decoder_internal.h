@@ -5,7 +5,9 @@
 #include "sglang/text_ops.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -53,7 +55,7 @@ private:
 struct TransferBuffers {
     std::unique_ptr<Checkpoint> checkpoint;
     std::vector<std::int32_t> logical_pages;
-    TextLogitCandidate winner{};
+    int winner = -1;
     std::vector<Bf16> logits;
 };
 
@@ -75,6 +77,9 @@ public:
     std::size_t bytes() const;
     TransferBuffers& transfers();
     cudaStream_t stream() const;
+    cudaGraphExec_t graph() const;
+    void capture_graph(const std::function<void()>& enqueue);
+    void reclaim_deferred();
     void open_stream(std::shared_ptr<const Allocations> weights = nullptr);
     void close_stream();
     void close();
@@ -154,10 +159,14 @@ struct Workspace {
 };
 
 struct Request {
-    Request(int device, int capacity, std::shared_ptr<const Allocations> weights);
+    Request(int device, int capacity, std::shared_ptr<const Allocations> weights,
+            bool reusable = false);
+
+    void reset();
 
     Allocations memory;
     Workspace work;
+    int* decode_position;
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
     std::array<TextGdnState, gdn_layers> states;
@@ -171,7 +180,11 @@ struct Decoder::Model {
     Model(const std::filesystem::path& checkpoint, int cuda_device);
 
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
+    void decode_graph(decoder::Request& request) const;
     void compute_logits(decoder::Request& request) const;
+
+    template <typename Position>
+    void forward_layers(decoder::Request& request, Position position, TextGdnMode mode) const;
 
     int device;
     std::shared_ptr<decoder::Allocations> memory;
@@ -179,6 +192,8 @@ struct Decoder::Model {
     const decoder::Bf16* embedding = nullptr;
     const decoder::Bf16* final_norm = nullptr;
     decoder::Bf16Weight lm_head{};
+    mutable std::atomic_flag request_in_use = ATOMIC_FLAG_INIT;
+    mutable std::unique_ptr<decoder::Request> decode_request;
 };
 
 }

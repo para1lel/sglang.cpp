@@ -1,16 +1,17 @@
 # sglang.cpp
 
 A C++ and CUDA C++ inference engine in development for **Qwen3.8-27B-FP8 on one NVIDIA B200**.
-The native decoder loads the official text weights and runs all 64 layers for one eager
-greedy token-ID request. It uses paged MXFP8 KV storage in the 16 full-attention layers
-and carries Gated DeltaNet state through the other 48 layers.
+The native decoder loads the official text weights and runs all 64 layers for greedy
+token-ID generation. It uses paged MXFP8 KV storage in the 16 full-attention layers
+and carries Gated DeltaNet state through the other 48 layers. Prefill and the first
+greedy selection run eagerly. Subsequent serial decode steps use a CUDA graph.
 
 The reusable runtime API is in
 [`include/sglang/decoder.h`](include/sglang/decoder.h#L41)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
-[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L32)<!-- prefix: "__device__ i" -->.
+[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L34)<!-- prefix: "__device__ i" -->.
 
 ## Build on the project host
 
@@ -67,11 +68,16 @@ Set `GENERATOR` to that executable path before running the command. The default 
 raw logits per generated token.
 
 The JSON report includes token IDs, finish reason, model load time, completed request times,
-and output tokens per second. Each request starts with fresh attention state and includes
-prompt processing and generation. The timing samples exclude warmups and model loading.
-Peak device allocation bytes count the decoder's requested CUDA allocations for the model
-and one request. C++ callers link the `sglang_decoder` target and reuse `sglang::Decoder`
-across requests.
+and output tokens per second. Each request resets its inference state and includes prompt
+processing and generation. The timing samples exclude warmups and model loading. The
+reported peak device allocation bytes count the decoder's CUDA allocations for the model
+and the buffers used by that request.
+
+C++ callers link the `sglang_decoder` target and reuse `sglang::Decoder` across requests.
+The model retains one set of request buffers for serial reuse. The first subsequent
+decode step captures the graph on demand, and later steps and requests replay it while
+capacity suffices. Overlapping calls that cannot acquire the serial slot use private
+request buffers and eager decode.
 
 ## Serve token IDs over HTTP
 
@@ -104,7 +110,8 @@ artifacts outside version control. Use SGLang as the architecture reference and 
 vLLM installation as the independent performance comparator.
 
 - [Isolated vLLM setup and single-B200 baseline](benchmarks/vllm/README.md) reproduces
-  the reference token IDs for the first candidate decoder. Baseline vLLM `81a8cb063e62` reached
+  the historical cross-engine token ID diagnostic. Graph token parity uses the published
+  native eager decoder as its reference. Baseline vLLM `81a8cb063e62` reached
   **25.89 output tokens/s** and **309.06 ms** median request latency on this serial fixture
   (five prompt tokens, eight generated tokens, two warmups, seven measured requests).
   The W1–W6 serving comparison remains open.

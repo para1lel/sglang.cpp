@@ -1,0 +1,1604 @@
+diff --git a/README.md b/README.md
+index 100f7e6903ca4e7ede991c0dd4fe5fe3c7d344d8..e3a9e738d6183dcd1dc0498916c88698642fa305 100644
+--- a/README.md
++++ b/README.md
+@@ -88,10 +88,12 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
+ 
+ The server loads one model and binds to `127.0.0.1`. `GET /health` returns HTTP 200 after
+ model loading. `POST /v1/completions` implements the frozen streaming benchmark contract
+-for model `benchmark` with token ID input. The server processes one request at a time.
+-Each selected token produces one SSE event. The first choice carries the prompt IDs.
+-A length finish, usage, and `[DONE]` end a completed request. A disconnect cancels
+-generation at the next decoder cancellation check.
++for model `benchmark` with token ID input. By default one request can run at a time.
++Pass `--max-active 2` or `--max-active 4` to run concurrent requests on the resident model.
++Each selected token produces one SSE event, and the first choice carries the prompt IDs.
++An optional `stop_token_ids` array can contain one ID. The server includes a matching
++generated ID and sends a `stop` finish. Exhausting the budget sends a `length` finish.
++Usage and `[DONE]` follow the finish. A detected disconnect cancels the affected request.
+ 
+ `Decoder::generate` accepts optional callbacks. `on_token` receives each selected ID
+ synchronously after host readback. Returning `false` cancels the request with that ID
+diff --git a/apps/server/batch_service.cpp b/apps/server/batch_service.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1587a80190601e19545c57f12170daab7c5e5ca0
+--- /dev/null
++++ b/apps/server/batch_service.cpp
+@@ -0,0 +1,248 @@
++#include "sglang/server/batch_service.h"
++
++#include "sglang/decoder_batch.h"
++
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <exception>
++#include <iostream>
++#include <mutex>
++#include <stdexcept>
++#include <thread>
++#include <utility>
++
++namespace sglang::server {
++namespace {
++
++struct Job {
++    std::vector<int> prompt;
++    DecoderOptions options;
++    std::optional<int> token;
++    std::optional<DecoderFinishReason> finish;
++    std::exception_ptr error;
++    bool admitted = false;
++    bool cancelled = false;
++
++    bool ready() const { return cancelled || !token; }
++};
++
++using Jobs = std::array<std::shared_ptr<Job>, decoder_batch_max_lanes>;
++using Selection = std::array<bool, decoder_batch_max_lanes>;
++constexpr auto disconnect_poll = std::chrono::milliseconds(10);
++constexpr auto mailbox_grace = std::chrono::milliseconds(1);
++
++}
++
++struct BatchService::State {
++    State(const Decoder& decoder, bool trace) : batch(decoder), trace(trace) {
++        worker = std::thread([this] { run(); });
++    }
++
++    ~State() {
++        {
++            const std::lock_guard lock(mutex);
++            closing = true;
++        }
++        changed.notify_all();
++        worker.join();
++    }
++
++    void run();
++    bool prepare(int slot, const std::shared_ptr<Job>& job);
++    void publish_locked(int slot, Job& job, DecoderBatchStep step);
++    void trace_step(const Selection& selected,
++                    const std::array<DecoderBatchStep, decoder_batch_max_lanes>& steps);
++    void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);
++
++    DecoderBatch batch;
++    bool trace;
++    std::size_t traced_bytes = 0;
++    std::mutex mutex;
++    std::condition_variable changed;
++    Jobs jobs;
++    std::exception_ptr failure;
++    bool closing = false;
++    std::thread worker;
++};
++
++bool BatchService::State::prepare(int slot, const std::shared_ptr<Job>& job) {
++    bool cancelled = false;
++    {
++        const std::lock_guard lock(mutex);
++        if (!job || !job->ready()) {
++            return false;
++        }
++        cancelled = job->cancelled;
++    }
++    if (cancelled) {
++        if (job->admitted) {
++            batch.cancel(slot);
++        }
++        const std::lock_guard lock(mutex);
++        publish_locked(slot, *job, {std::nullopt, DecoderFinishReason::cancelled});
++        changed.notify_all();
++        return false;
++    }
++    if (!job->admitted) {
++        try {
++            batch.admit(slot, std::move(job->prompt), job->options);
++            job->admitted = true;
++        } catch (const std::invalid_argument&) {
++            const std::lock_guard lock(mutex);
++            job->error = std::current_exception();
++            jobs[slot].reset();
++            changed.notify_all();
++            return false;
++        }
++    }
++    return true;
++}
++
++void BatchService::State::publish_locked(int slot, Job& job, DecoderBatchStep step) {
++    if (step.token && !job.cancelled) {
++        job.token = step.token;
++    }
++    if (step.finish_reason) {
++        job.finish = step.finish_reason;
++        jobs[slot].reset();
++    }
++}
++
++void BatchService::State::trace_step(
++    const Selection& selected, const std::array<DecoderBatchStep, decoder_batch_max_lanes>& steps) {
++    if (!trace) {
++        return;
++    }
++    const auto bytes = batch.request_device_allocation_bytes();
++    const auto decode = std::count_if(steps.begin(), steps.end(),
++                                      [](const DecoderBatchStep& step) { return step.decode; });
++    const auto width = std::count(selected.begin(), selected.end(), true);
++    if (width || bytes != traced_bytes) {
++        std::cerr << "batch width=" << width << " decode=" << decode
++                  << " request_bytes=" << bytes << '\n';
++        traced_bytes = bytes;
++    }
++}
++
++void BatchService::State::run() {
++    try {
++        for (;;) {
++            Jobs snapshot;
++            {
++                std::unique_lock lock(mutex);
++                changed.wait(lock, [&] {
++                    return closing || std::any_of(jobs.begin(), jobs.end(),
++                                                  [](const auto& job) {
++                                                      return job && job->ready();
++                                                  });
++                });
++                changed.wait_for(lock, mailbox_grace, [&] {
++                    return closing || std::all_of(jobs.begin(), jobs.end(), [](const auto& job) {
++                        return !job || job->ready();
++                    });
++                });
++                if (closing) {
++                    return;
++                }
++                snapshot = jobs;
++            }
++            Selection selected{};
++            for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++                selected[slot] = prepare(slot, snapshot[slot]);
++            }
++            const auto steps = batch.advance(selected);
++            trace_step(selected, steps);
++            {
++                const std::lock_guard lock(mutex);
++                for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++                    if (selected[slot] && (steps[slot].token || steps[slot].finish_reason)) {
++                        publish_locked(slot, *snapshot[slot], steps[slot]);
++                    }
++                }
++            }
++            changed.notify_all();
++        }
++    } catch (...) {
++        const std::lock_guard lock(mutex);
++        failure = std::current_exception();
++        for (auto& job : jobs) {
++            if (job) {
++                job->error = failure;
++                job.reset();
++            }
++        }
++        changed.notify_all();
++    }
++}
++
++void BatchService::State::cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job) {
++    job.cancelled = true;
++    changed.notify_all();
++    changed.wait(lock, [&] { return jobs[slot].get() != &job; });
++}
++
++BatchService::BatchService(const Decoder& decoder, bool trace)
++    : state_(std::make_unique<State>(decoder, trace)) {}
++
++BatchService::~BatchService() = default;
++
++DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
++                                     const DecoderOptions& options,
++                                     const DecoderCallbacks& callbacks) {
++    auto job = std::make_shared<Job>();
++    job->prompt = prompt;
++    job->options = options;
++    DecoderResult result;
++    std::unique_lock lock(state_->mutex);
++    if (state_->failure) {
++        std::rethrow_exception(state_->failure);
++    }
++    auto& queue = state_->jobs.at(slot);
++    if (queue) {
++        throw std::logic_error("Connection already has an active decoder job");
++    }
++    queue = job;
++    state_->changed.notify_all();
++    try {
++        for (;;) {
++            lock.unlock();
++            const bool disconnected = callbacks.is_cancelled && callbacks.is_cancelled();
++            lock.lock();
++            if (disconnected) {
++                state_->cancel(lock, slot, *job);
++                result.finish_reason = DecoderFinishReason::cancelled;
++                return result;
++            }
++            if (job->error) {
++                std::rethrow_exception(job->error);
++            }
++            if (job->token) {
++                const int token = *std::exchange(job->token, std::nullopt);
++                state_->changed.notify_all();
++                lock.unlock();
++                result.output_token_ids.push_back(token);
++                const bool accepted = !callbacks.on_token || callbacks.on_token(token);
++                lock.lock();
++                if (!accepted) {
++                    state_->cancel(lock, slot, *job);
++                    result.finish_reason = DecoderFinishReason::cancelled;
++                    return result;
++                }
++            } else if (job->finish) {
++                result.finish_reason = *job->finish;
++                return result;
++            } else {
++                state_->changed.wait_for(lock, disconnect_poll);
++            }
++        }
++    } catch (...) {
++        if (!lock.owns_lock()) {
++            lock.lock();
++        }
++        state_->cancel(lock, slot, *job);
++        throw;
++    }
++}
++
++}
+diff --git a/apps/server/completions.cpp b/apps/server/completions.cpp
+index d7582945498d43971f52f2ccce637e584e328fe2..0a36e76920a88150f07cfea0fd4e6d56f0278553 100644
+--- a/apps/server/completions.cpp
++++ b/apps/server/completions.cpp
+@@ -1,6 +1,6 @@
+ #include "sglang/server/completions.h"
+ 
+-#include "sglang/decoder.h"
++#include "sglang/server/batch_service.h"
+ #include "sglang/server/http.h"
+ 
+ #include <llvm/Support/Error.h>
+@@ -33,7 +33,9 @@ CompletionRequest parse_completion(std::string_view body) {
+         throw HttpError("400 Bad Request", "Invalid JSON request body");
+     }
+     const auto* object = parsed->getAsObject();
+-    if (!object || object->size() != 11 || object->getString("model") != "benchmark" ||
++    const auto* stops = object ? object->get("stop_token_ids") : nullptr;
++    if (!object || object->size() != (stops ? 12 : 11) ||
++        object->getString("model") != "benchmark" ||
+         object->getNumber("temperature") != 0.0 || unsigned_integer(*object, "seed") != 0 ||
+         object->getBoolean("ignore_eos") != true || object->getBoolean("stream") != true ||
+         object->getBoolean("return_token_ids") != true ||
+@@ -56,6 +58,15 @@ CompletionRequest parse_completion(std::string_view body) {
+     }
+     CompletionRequest request;
+     request.options.max_new_tokens = static_cast<int>(*output_budget);
++    if (stops) {
++        const auto* tokens = stops->getAsArray();
++        const auto id = tokens && tokens->size() == 1
++            ? tokens->front().getAsUINT64() : std::nullopt;
++        if (!id || *id > std::numeric_limits<int>::max()) {
++            throw HttpError("400 Bad Request", "Expected a single integer stop token ID");
++        }
++        request.options.stop_token_id = static_cast<int>(*id);
++    }
+     request.prompt.reserve(prompt->size());
+     for (const auto& value : *prompt) {
+         const auto id = value.getAsUINT64();
+@@ -76,7 +87,8 @@ std::string encode_json(Encode encode) {
+     return output;
+ }
+ 
+-std::string choice_event(std::optional<int> token, const std::vector<int>* prompt, bool finished) {
++std::string choice_event(std::optional<int> token, const std::vector<int>* prompt,
++                         const char* finish_reason) {
+     return encode_json([&](json::OStream& writer) {
+         writer.attributeArray("choices", [&] {
+             writer.object([&] {
+@@ -93,7 +105,8 @@ std::string choice_event(std::optional<int> token, const std::vector<int>* promp
+                         }
+                     });
+                 }
+-                writer.attribute("finish_reason", finished ? json::Value("length") : nullptr);
++                writer.attribute("finish_reason", finish_reason
++                                                       ? json::Value(finish_reason) : nullptr);
+             });
+         });
+     });
+@@ -128,13 +141,16 @@ bool begin_stream(const Socket& connection, bool& streaming) {
+ void finish_stream(const Socket& connection, const CompletionRequest& request,
+                    const DecoderResult& result, bool& streaming) {
+     const auto output_count = result.output_token_ids.size();
+-    if (result.finish_reason != DecoderFinishReason::length ||
+-        output_count != static_cast<std::size_t>(request.options.max_new_tokens)) {
+-        throw std::logic_error("Decoder did not complete the requested output budget");
++    const auto budget = static_cast<std::size_t>(request.options.max_new_tokens);
++    const bool stopped = result.finish_reason == DecoderFinishReason::stop;
++    if (stopped ? (output_count == 0 || output_count > budget ||
++                   result.output_token_ids.back() != request.options.stop_token_id)
++                : (result.finish_reason != DecoderFinishReason::length || output_count != budget)) {
++        throw std::logic_error("Decoder did not complete the requested output");
+     }
+     const auto* prompt = streaming ? nullptr : &request.prompt;
+     if (begin_stream(connection, streaming) &&
+-        write_event(connection, choice_event(std::nullopt, prompt, true)) &&
++        write_event(connection, choice_event(std::nullopt, prompt, stopped ? "stop" : "length")) &&
+         write_event(connection, usage_event(request.prompt.size(), output_count)) &&
+         write_event(connection, "[DONE]")) {
+         end_events(connection);
+@@ -147,20 +163,20 @@ void write_error(const Socket& connection, std::string_view status, const char*
+     write_json(connection, status, error_body(message));
+ }
+ 
+-void complete(const Socket& connection, const Decoder& decoder, std::string_view body) {
++void complete(const Socket& connection, BatchService& service, int slot, std::string_view body) {
+     const auto request = parse_completion(body);
+     bool streaming = false;
+     const DecoderCallbacks callbacks{
+         [&](int token) {
+             const auto* prompt = streaming ? nullptr : &request.prompt;
+             return begin_stream(connection, streaming) &&
+-                   write_event(connection, choice_event(token, prompt, false));
++                   write_event(connection, choice_event(token, prompt, nullptr));
+         },
+         [&] { return disconnected(connection); },
+     };
+ 
+     try {
+-        const auto result = decoder.generate(request.prompt, request.options, callbacks);
++        const auto result = service.generate(slot, request.prompt, request.options, callbacks);
+         if (result.finish_reason != DecoderFinishReason::cancelled) {
+             finish_stream(connection, request, result, streaming);
+         }
+diff --git a/apps/server/http.cpp b/apps/server/http.cpp
+index b9ae63c10de2e06083ef0bb4851f7d40f0803297..f5802587b23b821f17f9bfa2dd24a0bd8526f836 100644
+--- a/apps/server/http.cpp
++++ b/apps/server/http.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <arpa/inet.h>
++#include <atomic>
+ #include <cerrno>
+ #include <charconv>
+ #include <chrono>
+@@ -24,10 +25,11 @@ constexpr std::size_t max_body_bytes = 2 * 1024 * 1024;
+ constexpr auto io_timeout = std::chrono::seconds(5);
+ constexpr short terminal_events = POLLHUP | POLLERR | POLLNVAL;
+ 
+-volatile std::sig_atomic_t stop_requested = 0;
++std::atomic<bool> stop_requested{false};
++static_assert(std::atomic<bool>::is_always_lock_free);
+ 
+ void request_shutdown(int) {
+-    stop_requested = 1;
++    stop_serving();
+ }
+ 
+ [[noreturn]] void socket_error(const char* operation) {
+@@ -216,9 +218,9 @@ void install_shutdown_handlers() {
+     }
+ }
+ 
+-bool stopping() {
+-    return stop_requested != 0;
+-}
++void stop_serving() { stop_requested.store(true, std::memory_order_relaxed); }
++
++bool stopping() { return stop_requested.load(std::memory_order_relaxed); }
+ 
+ Socket listen_loopback(int port) {
+     Socket listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+diff --git a/apps/sglang-server.cpp b/apps/sglang-server.cpp
+index ccf20cfdd5cc6955bfe930eba514a1238b73a885..1e66abe765eca64496d4c271b452a9ea949d949a 100644
+--- a/apps/sglang-server.cpp
++++ b/apps/sglang-server.cpp
+@@ -1,11 +1,14 @@
+-#include "sglang/decoder.h"
++#include "sglang/decoder_batch.h"
++#include "sglang/server/batch_service.h"
+ #include "sglang/server/completions.h"
+ #include "sglang/server/http.h"
+ 
+ #include <charconv>
+ #include <exception>
+ #include <iostream>
++#include <mutex>
+ #include <string_view>
++#include <thread>
+ 
+ namespace {
+ 
+@@ -15,6 +18,8 @@ struct Arguments {
+     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
+     int device = 0;
+     int port = 17384;
++    int max_active = 1;
++    bool trace_batches = false;
+ };
+ 
+ int parse_integer(std::string_view value, const char* error) {
+@@ -30,6 +35,10 @@ Arguments parse_arguments(int argc, char** argv) {
+     Arguments arguments;
+     for (int index = 1; index < argc; ++index) {
+         const std::string_view option = argv[index];
++        if (option == "--trace-batches") {
++            arguments.trace_batches = true;
++            continue;
++        }
+         if (++index == argc) {
+             throw std::invalid_argument("Missing value for " + std::string(option));
+         }
+@@ -43,6 +52,11 @@ Arguments parse_arguments(int argc, char** argv) {
+             if (arguments.port == 0 || arguments.port > 65535) {
+                 throw std::invalid_argument("Expected a TCP port in [1, 65535]");
+             }
++        } else if (option == "--max-active") {
++            arguments.max_active = parse_integer(value, "Expected --max-active in [1, 4]");
++            if (!arguments.max_active || arguments.max_active > sglang::decoder_batch_max_lanes) {
++                throw std::invalid_argument("Expected --max-active in [1, 4]");
++            }
+         } else {
+             throw std::invalid_argument("Invalid argument " + std::string(option));
+         }
+@@ -50,7 +64,7 @@ Arguments parse_arguments(int argc, char** argv) {
+     return arguments;
+ }
+ 
+-void serve_connection(const Socket& connection, const sglang::Decoder& decoder) {
++void serve_connection(const Socket& connection, BatchService& service, int slot) {
+     try {
+         const auto request = read_request(connection);
+         if (!request) {
+@@ -59,7 +73,7 @@ void serve_connection(const Socket& connection, const sglang::Decoder& decoder)
+         if (request->path == "/health" && request->method == "GET" && request->body.empty()) {
+             write_json(connection, "200 OK", "{}");
+         } else if (request->path == "/v1/completions" && request->method == "POST") {
+-            complete(connection, decoder, request->body);
++            complete(connection, service, slot, request->body);
+         } else {
+             write_error(connection, "404 Not Found",
+                         "Expected GET /health or POST /v1/completions");
+@@ -74,11 +88,47 @@ void serve_connection(const Socket& connection, const sglang::Decoder& decoder)
+     }
+ }
+ 
++void serve(const Socket& listener, BatchService& service, int max_active) {
++    std::vector<std::thread> workers;
++    std::mutex error_mutex;
++    std::exception_ptr failure;
++    try {
++        for (int slot = 0; slot < max_active; ++slot) {
++            workers.emplace_back([&, slot] {
++                try {
++                    while (!stopping()) {
++                        const auto connection = accept_connection(listener);
++                        if (connection.get() >= 0) {
++                            serve_connection(connection, service, slot);
++                        }
++                    }
++                } catch (...) {
++                    const std::lock_guard lock(error_mutex);
++                    failure = std::current_exception();
++                    stop_serving();
++                }
++            });
++        }
++    } catch (...) {
++        const std::lock_guard lock(error_mutex);
++        failure = std::current_exception();
++        stop_serving();
++    }
++    for (auto& worker : workers) {
++        worker.join();
++    }
++    if (failure) {
++        std::rethrow_exception(failure);
++    }
++}
++
+ }
+ 
+ int main(int argc, char** argv) {
+     if (argc == 2 && std::string_view(argv[1]) == "--help") {
+-        std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]\n"
++        std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
++                     " [--max-active N] [--trace-batches]\n"
++                     "Default active requests: 1. Maximum: 4.\n"
+                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
+         return 0;
+     }
+@@ -90,13 +140,9 @@ int main(int argc, char** argv) {
+             return 0;
+         }
+         const auto listener = listen_loopback(arguments.port);
++        BatchService service(decoder, arguments.trace_batches);
+         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
+-        while (!stopping()) {
+-            const auto connection = accept_connection(listener);
+-            if (connection.get() >= 0) {
+-                serve_connection(connection, decoder);
+-            }
+-        }
++        serve(listener, service, arguments.max_active);
+     } catch (const std::exception& error) {
+         std::cerr << "sglang-server: " << error.what() << '\n';
+         return 1;
+diff --git a/docs/development.md b/docs/development.md
+index df932e07140e209143760eac9c72cd5b15d75018..8236dbae6091bfbf2183f40ddbf55912e13fc351 100644
+--- a/docs/development.md
++++ b/docs/development.md
+@@ -92,7 +92,7 @@ Keep the invocation, device UUID, binary identity, and full check output. Record
+ | --- | --- | --- |
+ | `sglang-generate` | Parse one token-ID prompt, run requests serially, and write one JSON result. | [CLI entry](../apps/sglang-generate.cpp#L216)<!-- prefix: "int main(int" --> |
+ | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
+-| `sglang_decoder` | Own device weights and run each request using operators from `sglang_cuda`. | [Decoder API](../include/sglang/decoder.h#L41)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L71)<!-- prefix: "void Decoder" --> |
++| `sglang_decoder` | Own device weights and run requests using `sglang_cuda`. | [Decoder API](../include/sglang/decoder.h#L41)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L109)<!-- prefix: "void Decoder" --> |
+ 
+ The loader uses LLVM Support 23.1.5 from Pixi (`llvmdev` and `libllvm23`, Apache-2.0 WITH LLVM-exception) only to parse checkpoint JSON. The loader owns the safetensors validation and mapping. [JSON parser](../src/checkpoint.cpp#L170)<!-- prefix: "json::Object" --> · [Link configuration](../xmake.lua#L60)<!-- prefix: "target(\"sgla" -->
+ 
+@@ -100,15 +100,15 @@ The loader uses LLVM Support 23.1.5 from Pixi (`llvmdev` and `libllvm23`, Apache
+ 
+ The decoder checks the name, dtype, and shape of each required text tensor before upload. The upload state retains the checkpoint mappings and device allocations until CUDA confirms stream completion. The decoder shares its device weights across requests. Each request stream holds a weight reference until CUDA confirms completion, including during deferred cleanup. FP8 projections use the checkpoint's E4M3 weights and BF16 inverse scales. They dynamically quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L97)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L168)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L100)<!-- prefix: "__global__ v" -->
+ 
+-Each request has its own stream, workspace, and state. The 48 GDN layers start with zeroed BF16 convolution history and FP32 recurrent state. The 16 GQA layers append to private [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Prefill processes the prompt one token at a time and scores its last position. Each subsequent decode step processes the preceding emitted token. The host waits for the stream before reading each selection. [Request allocation](../src/decoder_resources.cpp#L339)<!-- prefix: "Request::Req" --> · [Generation loop](../src/decoder.cpp#L80)<!-- prefix: "DecoderResul" -->
++Each standalone request has its own stream, workspace, and state. The 48 GDN layers start with zeroed BF16 convolution history and FP32 recurrent state. The 16 GQA layers append to private [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Prefill processes the prompt one token at a time and scores its last position. Each subsequent decode step processes the preceding emitted token. The host waits for the stream before reading each selection. [Request allocation](../src/decoder_resources.cpp#L346)<!-- prefix: "void Request" --> · [Generation loop](../src/decoder.cpp#L84)<!-- prefix: "DecoderResul" -->
+ 
+ #### Constraints and failure behavior
+ 
+-Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Use decimal token IDs separated by commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus `--max-new-tokens` must fit 262,144 tokens. The output budget defaults to one. A zero budget returns no tokens with finish reason `length` after model load and request validation. [CLI options](../apps/sglang-generate.cpp#L31)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L15)<!-- prefix: "void validat" -->
++Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Use decimal token IDs separated by commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus `--max-new-tokens` must fit 262,144 tokens. The output budget defaults to one. A zero budget returns no tokens with finish reason `length` after model load and request validation. [CLI options](../apps/sglang-generate.cpp#L31)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L13)<!-- prefix: "void validat" -->
+ 
+-The decoder chooses the highest BF16 logit and breaks ties by lowest token ID. Stopping is optional. A generated `--stop-token` match is included in the output and returns `stop`, even on the last allowed step. Otherwise the request returns `length`. The CLI applies no implicit EOS rule. Input, load, execution, or explicit request cleanup errors produce a diagnostic on stderr and exit status 1. The CLI covers token-ID text generation only. [Selection](../src/text_ops.cu#L286)<!-- prefix: "__device__ T" --> · [Generation loop](../src/decoder.cpp#L80)<!-- prefix: "DecoderResul" -->
++The decoder chooses the highest BF16 logit and breaks ties by lowest token ID. Stopping is optional. A generated `--stop-token` match is included in the output and returns `stop`, even on the last allowed step. Otherwise the request returns `length`. The CLI applies no implicit EOS rule. Input, load, execution, or explicit request cleanup errors produce a diagnostic on stderr and exit status 1. The CLI covers token-ID text generation only. [Selection](../src/text_ops.cu#L319)<!-- prefix: "__device__ T" --> · [Generation loop](../src/decoder.cpp#L84)<!-- prefix: "DecoderResul" -->
+ 
+-If cleanup cannot confirm stream completion, the decoder retains the pending stream, device storage, and host transfer buffers. Before a model load or generation with a positive output budget, it retries recoverable cleanup on the same device. Terminal errors and ambiguous stream destruction or memory frees keep the affected resources quarantined until process exit. A persistent cleanup error prevents further model loads and requests that require allocation on that device. [Deferred cleanup](../src/decoder_resources.cpp#L105)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L266)<!-- prefix: "Allocations:" -->
++If cleanup cannot confirm stream completion, the decoder retains the pending stream, device storage, and host transfer buffers. Before a model load or generation with a positive output budget, it retries recoverable cleanup on the same device. Terminal errors and ambiguous stream destruction or memory frees keep the affected resources quarantined until process exit. A persistent cleanup error prevents further model loads and requests that require allocation on that device. [Deferred cleanup](../src/decoder_resources.cpp#L105)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L265)<!-- prefix: "Allocations:" -->
+ 
+ Use `--top-logits N` to report up to `N` raw scores per emitted token, ranked by score and then by ascending token ID. This option accepts values from 0 to 248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L187)<!-- prefix: "void write_r" -->
+ 
+@@ -144,11 +144,13 @@ For offline timing, omit `--top-logits` to avoid the host logit copy and ranking
+ 
+ ### Native streaming server
+ 
+-Follow the [README launch procedure](../README.md#serve-token-ids-over-http). The loopback server loads one decoder and handles one connection at a time. Each completion uses the eager decoder with private request state. After each token readback, a synchronous callback writes one SSE token event. A client can call `shutdown(SHUT_WR)` after sending the complete request and still read the full response. The decoder checks for terminal socket events before allocation, each prompt token, and each generation step. A failed token write also cancels generation. An orderly full close may first become visible during a response write. Request cleanup drains submitted CUDA work before the server handles the next connection. [Server loop](../apps/sglang-server.cpp#L79)<!-- prefix: "int main(int" --> · [Completion handler](../apps/server/completions.cpp#L150)<!-- prefix: "void complet" -->
++Follow the [README launch procedure](../README.md#serve-token-ids-over-http). One decoder serves up to `--max-active` loopback connections. One CUDA stream advances ready slots, sharing packed FP8 weight loads in eligible projections. Each slot owns its MXFP8 page table and cache, GDN history and recurrence, and workspace. The scheduler gives socket workers up to one millisecond to take pending tokens before advancing other ready slots. [Server loop](../apps/sglang-server.cpp#L127)<!-- prefix: "int main(int" --> · [Completion handler](../apps/server/completions.cpp#L166)<!-- prefix: "void complet" -->
++
++Clients can call `shutdown(SHUT_WR)` after completing a request and still read the full response. Terminal socket events or failed writes cancel the request. The scheduler waits for submitted CUDA work before releasing state and reusing the slot.
+ 
+ For a functional smoke test, expect HTTP 200 from `GET /health`. Send the short FP8 prompt above using the [streaming wire contract](../benchmarks/streaming/README.md#wire-contract). Check eight IDs, one per event, and the prompt echo on the first choice. Check the `length` finish, usage, and `[DONE]`. Repeat with `shutdown(SHUT_WR)` after sending the request. Expect the same complete response. To test cancellation, queue a second request during a long stream. Confirm that it waits. Reset the active connection with an abortive TCP close. Check the queued response and a fresh request.
+ 
+-Use the [frozen streaming client and reference](../benchmarks/streaming/README.md#run) for W1 and W2. The client measures from submission to observed token events and `[DONE]`. Both workloads remain open at the exact-output gate on the eager path. [Client timing](../benchmarks/streaming/client.py#L148)<!-- prefix: "def measure(" -->
++Use the [frozen streaming client](../benchmarks/streaming/README.md#run) for W1 and W2. The client measures from submission to observed token events and `[DONE]`. Verify native request semantics and native serial parity before timing. [Client timing](../benchmarks/streaming/client.py#L148)<!-- prefix: "def measure(" -->
+ 
+ ## Runtime and state ownership
+ 
+diff --git a/include/sglang/decoder.h b/include/sglang/decoder.h
+index 2bd99a945e4e9d3a765435eeb266b431a70b7a31..6195cf80c7ee6ca38aeaa9ec364138fa17456f62 100644
+--- a/include/sglang/decoder.h
++++ b/include/sglang/decoder.h
+@@ -52,6 +52,7 @@ public:
+     std::size_t model_device_allocation_bytes() const;
+ 
+ private:
++    friend class DecoderBatch;
+     struct Model;
+     std::unique_ptr<Model> model_;
+ };
+diff --git a/include/sglang/decoder_batch.h b/include/sglang/decoder_batch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb8544adc346397a3a431cbd88ce81ffe0ba0c6e
+--- /dev/null
++++ b/include/sglang/decoder_batch.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include "sglang/decoder.h"
++
++#include <array>
++
++namespace sglang {
++
++inline constexpr int decoder_batch_max_lanes = 4;
++
++struct DecoderBatchStep {
++    std::optional<int> token;
++    std::optional<DecoderFinishReason> finish_reason;
++    bool decode = false;
++};
++
++/// The Decoder must outlive the batch. Use one host thread to operate a batch.
++/// Each slot owns its request state until cancel() or a finishing step.
++class DecoderBatch {
++public:
++    explicit DecoderBatch(const Decoder& decoder);
++    ~DecoderBatch();
++
++    void admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
++    void cancel(int slot);
++
++    /// Advance each selected slot by one model position. A zero-budget slot
++    /// finishes without a model position. A CUDA failure disables the batch.
++    std::array<DecoderBatchStep, decoder_batch_max_lanes>
++    advance(const std::array<bool, decoder_batch_max_lanes>& selected);
++
++    std::size_t request_device_allocation_bytes() const;
++
++private:
++    struct State;
++    std::unique_ptr<State> state_;
++};
++
++}
+diff --git a/include/sglang/decoder_internal.h b/include/sglang/decoder_internal.h
+index 08ea875163cfc3d5dfc81ace80df4facdcbb9475..2d327c9cc0804b3f0c747eb11c14b2ac6885927c 100644
+--- a/include/sglang/decoder_internal.h
++++ b/include/sglang/decoder_internal.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "sglang/decoder.h"
++#include "sglang/decoder_batch.h"
+ #include "sglang/text_attention.h"
+ #include "sglang/text_ops.h"
+ 
+@@ -35,6 +36,8 @@ constexpr bool is_full_attention(int layer_index) {
+ }
+ 
+ void check(cudaError_t status, const char* operation);
++bool valid_token(int id);
++void validate_request(const std::vector<int>& prompt, const DecoderOptions& options);
+ 
+ class DeviceScope {
+ public:
+@@ -75,7 +78,7 @@ public:
+     std::size_t bytes() const;
+     TransferBuffers& transfers();
+     cudaStream_t stream() const;
+-    void open_stream(std::shared_ptr<const Allocations> weights = nullptr);
++    void open_stream(std::shared_ptr<const void> owners = nullptr);
+     void close_stream();
+     void close();
+ 
+@@ -154,8 +157,11 @@ struct Workspace {
+ };
+ 
+ struct Request {
++    explicit Request(int device);
+     Request(int device, int capacity, std::shared_ptr<const Allocations> weights);
+ 
++    void initialize(int capacity, cudaStream_t stream);
++
+     Allocations memory;
+     Workspace work;
+     Mxfp8PageTable pages;
+@@ -163,6 +169,13 @@ struct Request {
+     std::array<TextGdnState, gdn_layers> states;
+ };
+ 
++struct ForwardLane {
++    Request* request;
++    int token_id;
++    int position;
++    TextGdnMode mode;
++};
++
+ }
+ 
+ namespace sglang {
+@@ -171,7 +184,9 @@ struct Decoder::Model {
+     Model(const std::filesystem::path& checkpoint, int cuda_device);
+ 
+     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
++    void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
+     void compute_logits(decoder::Request& request) const;
++    void compute_logits(decoder::Workspace& work, cudaStream_t stream) const;
+ 
+     int device;
+     std::shared_ptr<decoder::Allocations> memory;
+diff --git a/include/sglang/server/batch_service.h b/include/sglang/server/batch_service.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f89e501224dd63e2d6933519cf65773789cb0bf
+--- /dev/null
++++ b/include/sglang/server/batch_service.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "sglang/decoder.h"
++
++namespace sglang::server {
++
++class BatchService {
++public:
++    BatchService(const Decoder& decoder, bool trace);
++    ~BatchService();
++
++    DecoderResult generate(int slot, const std::vector<int>& prompt,
++                           const DecoderOptions& options, const DecoderCallbacks& callbacks);
++
++private:
++    struct State;
++    std::unique_ptr<State> state_;
++};
++
++}
+diff --git a/include/sglang/server/completions.h b/include/sglang/server/completions.h
+index fc14b75ee5dbeb22a2b270c4d5ce299018bab432..dc606fa77e7f975770faf793038c4457c105a438 100644
+--- a/include/sglang/server/completions.h
++++ b/include/sglang/server/completions.h
+@@ -2,16 +2,12 @@
+ 
+ #include <string_view>
+ 
+-namespace sglang {
+-
+-class Decoder;
+-
+-namespace server {
++namespace sglang::server {
+ 
++class BatchService;
+ class Socket;
+ 
+-void complete(const Socket& connection, const Decoder& decoder, std::string_view body);
++void complete(const Socket& connection, BatchService& service, int slot, std::string_view body);
+ void write_error(const Socket& connection, std::string_view status, const char* message);
+ 
+ }
+-}
+diff --git a/include/sglang/server/http.h b/include/sglang/server/http.h
+index 2efacf7649e23f1beeea80327a974bf1f7f3afa2..4b722b486650bd16c2cb0c0f1ab2f5b3f735994a 100644
+--- a/include/sglang/server/http.h
++++ b/include/sglang/server/http.h
+@@ -35,6 +35,7 @@ struct HttpError : std::runtime_error {
+ };
+ 
+ void install_shutdown_handlers();
++void stop_serving();
+ bool stopping();
+ Socket listen_loopback(int port);
+ Socket accept_connection(const Socket& listener);
+diff --git a/include/sglang/text_ops.h b/include/sglang/text_ops.h
+index 51c40b23520a213a2c66dbd045c7811075a9de5a..a187a467323c6ee2a9930b4f71ad8110574fa0e1 100644
+--- a/include/sglang/text_ops.h
++++ b/include/sglang/text_ops.h
+@@ -8,6 +8,7 @@
+ namespace sglang {
+ 
+ inline constexpr int text_fp8_group_size = 128;
++inline constexpr int text_fp8_max_batch = 4;
+ 
+ constexpr int text_fp8_group_count(int width) {
+     return width / text_fp8_group_size + (width % text_fp8_group_size != 0);
+@@ -23,6 +24,11 @@ struct TextFp8ActivationView {
+     const float* scales;
+ };
+ 
++struct TextFp8Projection {
++    TextFp8ActivationView input;
++    __nv_bfloat16* output;
++};
++
+ struct TextLogitCandidate {
+     float score;
+     int token_id;
+@@ -63,6 +69,12 @@ cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weigh
+                           TextFp8ActivationView input, int out_width, int in_width,
+                           __nv_bfloat16* output, cudaStream_t stream);
+ 
++/// Apply the same weight to count independent activation vectors with the
++/// same arithmetic as text_fp8_gemv. Projections is a host array.
++cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                          int out_width, int in_width, const TextFp8Projection* projections,
++                          int count, cudaStream_t stream);
++
+ /// Computes RMSNorm with eps 1e-6 and FP32 (1 + weight). A null residual
+ /// selects standalone normalization. A nonnull residual_output receives the
+ /// BF16-rounded sum, while normalization uses the FP32 sum. Output may alias
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index 69a45b82b0153a964bb3944ee61da6f5cdc0b43e..ebcdc60f57b6d6b907a9ece6ef796d41f555be22 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -4,9 +4,7 @@
+ #include <cmath>
+ 
+ namespace sglang {
+-namespace {
+-
+-using namespace decoder;
++namespace decoder {
+ 
+ bool valid_token(int id) {
+     return id >= 0 && id < vocab_size;
+@@ -28,6 +26,12 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
+     }
+ }
+ 
++}
++
++namespace {
++
++using namespace decoder;
++
+ std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_t count,
+                                     std::vector<DecoderLogit>& ranking) {
+     ranking.clear();
+diff --git a/src/decoder_batch.cpp b/src/decoder_batch.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..67d15844af16800a13a1040d16b5491bf329e40d
+--- /dev/null
++++ b/src/decoder_batch.cpp
+@@ -0,0 +1,193 @@
++#include "sglang/decoder_internal.h"
++
++#include <utility>
++
++namespace sglang {
++namespace {
++
++using namespace decoder;
++
++struct Lane {
++    std::unique_ptr<Request> request;
++    std::vector<int> prompt;
++    DecoderOptions options;
++    int position = 0;
++    int generated = 0;
++    int last_token = 0;
++
++    ForwardLane input() const {
++        if (static_cast<std::size_t>(position) < prompt.size()) {
++            return {request.get(), prompt[position], position, TextGdnMode::prefill};
++        }
++        return {request.get(), last_token, position, TextGdnMode::decode};
++    }
++
++    bool produces_token() const { return static_cast<std::size_t>(position) + 1 >= prompt.size(); }
++
++    void select_token(int token, DecoderBatchStep& result) {
++        if (!valid_token(token)) {
++            throw std::runtime_error("Greedy selection did not produce a valid token ID");
++        }
++        result.token = last_token = token;
++        ++generated;
++        if (options.stop_token_id == token) {
++            result.finish_reason = DecoderFinishReason::stop;
++        } else if (options.max_new_tokens == generated) {
++            result.finish_reason = DecoderFinishReason::length;
++        }
++    }
++};
++
++struct BatchStorage {
++    std::shared_ptr<const Allocations> weights;
++    std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
++};
++
++void retire(std::optional<Lane>& lane) {
++    if (lane && lane->request) {
++        lane->request->memory.close();
++    }
++    lane.reset();
++}
++
++using Selection = std::array<bool, decoder_batch_max_lanes>;
++using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
++
++}
++
++struct DecoderBatch::State {
++    explicit State(const Decoder::Model& owner)
++        : model(owner), storage(std::make_shared<BatchStorage>()), execution(model.device) {
++        DeviceScope device(model.device);
++        storage->weights = model.memory;
++        execution.open_stream(storage);
++        device.restore();
++    }
++
++    Steps advance(const Selection& selected);
++
++    const Decoder::Model& model;
++    std::shared_ptr<BatchStorage> storage;
++    Allocations execution;
++    bool failed = false;
++};
++
++DecoderBatch::DecoderBatch(const Decoder& decoder)
++    : state_(std::make_unique<State>(*decoder.model_)) {}
++
++DecoderBatch::~DecoderBatch() = default;
++
++void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
++    if (state_->failed) {
++        throw std::runtime_error("Decoder batch is unavailable");
++    }
++    auto& lane = state_->storage->slots.at(slot);
++    if (lane || options.top_logits != 0) {
++        throw std::invalid_argument("Decoder batch requires an empty slot and no top logits");
++    }
++    validate_request(prompt, options);
++    if (options.max_new_tokens == 0) {
++        lane.emplace(Lane{nullptr, std::move(prompt), options});
++        return;
++    }
++    DeviceScope device(state_->model.device);
++    const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
++    auto request = std::make_unique<Request>(state_->model.device);
++    lane.emplace(Lane{std::move(request), std::move(prompt), options});
++    const auto stream = state_->execution.stream();
++    try {
++        lane->request->initialize(capacity, stream);
++        check(cudaStreamSynchronize(stream), "Initialize decoder batch slot");
++        device.restore();
++    } catch (...) {
++        state_->failed = true;
++        throw;
++    }
++}
++
++void DecoderBatch::cancel(int slot) {
++    if (state_->failed) {
++        throw std::runtime_error("Decoder batch is unavailable");
++    }
++    auto& lane = state_->storage->slots.at(slot);
++    try {
++        retire(lane);
++    } catch (...) {
++        state_->failed = true;
++        throw;
++    }
++}
++
++std::size_t DecoderBatch::request_device_allocation_bytes() const {
++    std::size_t bytes = 0;
++    for (const auto& lane : state_->storage->slots) {
++        if (lane && lane->request) {
++            bytes += lane->request->memory.bytes();
++        }
++    }
++    return bytes;
++}
++
++Steps DecoderBatch::State::advance(const Selection& selected) {
++    DeviceScope device(model.device);
++    const auto stream = execution.stream();
++    auto& slots = storage->slots;
++    Steps results{};
++    std::array<ForwardLane, decoder_batch_max_lanes> work;
++    int count = 0;
++    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++        if (selected[slot] && slots[slot] && slots[slot]->request) {
++            work[count] = slots[slot]->input();
++            results[slot].decode = work[count].mode == TextGdnMode::decode;
++            ++count;
++        }
++    }
++    if (count) {
++        model.forward(work.data(), count, stream);
++        for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++            if (selected[slot] && slots[slot] && slots[slot]->request &&
++                slots[slot]->produces_token()) {
++                auto& request = *slots[slot]->request;
++                auto& winner = request.memory.transfers().winner;
++                model.compute_logits(request.work, stream);
++                check(cudaMemcpyAsync(&winner, request.work.argmax, sizeof(winner),
++                                      cudaMemcpyDeviceToHost, stream), "Read batch greedy token");
++            }
++        }
++        check(cudaStreamSynchronize(stream), "Complete decoder batch step");
++    }
++    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
++        auto& lane = slots[slot];
++        auto& result = results[slot];
++        if (!selected[slot] || !lane) {
++            continue;
++        }
++        if (!lane->request) {
++            result.finish_reason = DecoderFinishReason::length;
++        } else {
++            if (lane->produces_token()) {
++                lane->select_token(lane->request->memory.transfers().winner.token_id, result);
++            }
++            ++lane->position;
++        }
++        if (result.finish_reason) {
++            retire(lane);
++        }
++    }
++    device.restore();
++    return results;
++}
++
++Steps DecoderBatch::advance(const Selection& selected) {
++    if (state_->failed) {
++        throw std::runtime_error("Decoder batch is unavailable");
++    }
++    try {
++        return state_->advance(selected);
++    } catch (...) {
++        state_->failed = true;
++        throw;
++    }
++}
++
++}
+diff --git a/src/decoder_forward.cpp b/src/decoder_forward.cpp
+index 19205ab1e28390bcc40d67ab20a27de315010d6a..6a36e982693d1e57f0820c5025dd00b3a36ca766 100644
+--- a/src/decoder_forward.cpp
++++ b/src/decoder_forward.cpp
+@@ -5,44 +5,65 @@ namespace {
+ 
+ using namespace decoder;
+ 
+-TextFp8ActivationView quantize(const Bf16* source, int width, TextFp8Activation scratch,
+-                               cudaStream_t stream) {
+-    check(text_quantize_fp8(source, width, scratch, stream), "Quantize projection input");
+-    return {scratch.values, scratch.scales};
+-}
+-
+-void project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output, cudaStream_t stream) {
+-    check(text_fp8_gemv(weight.values, weight.scales, input, weight.rows, weight.columns,
+-                        output, stream), "Run FP8 projection");
+-}
+-
+ void project(Bf16Weight weight, const Bf16* input, Bf16* output, cudaStream_t stream) {
+     check(text_bf16_gemv(weight.values, input, weight.rows, weight.columns, output, stream),
+           "Run BF16 projection");
+ }
+ 
+-void run_gdn(const GdnLayer& layer, Request& request, TextGdnState state, TextGdnMode mode) {
+-    auto& work = request.work;
+-    const auto stream = request.memory.stream();
+-    const auto input = quantize(work.normalized, hidden_size, work.activation, stream);
+-    project(layer.qkv, input, work.gdn_qkv, stream);
+-    project(layer.z, input, work.gdn_z, stream);
+-    project(layer.b, work.normalized, work.gdn_b, stream);
+-    project(layer.a, work.normalized, work.gdn_a, stream);
+-    check(text_gdn_forward(1, mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+-                           layer.recurrent, state, work.gdn_scratch, text_gdn_workspace_bytes(1),
+-                           work.attention, stream), "Advance Gated DeltaNet state");
+-    const auto attention = quantize(work.attention, text_gdn_value_width, work.activation, stream);
+-    project(layer.output, attention, work.projected_attention, stream);
++struct LayerBatch {
++    const ForwardLane* lanes;
++    int count;
++    cudaStream_t stream;
++
++    template <typename Function>
++    void each(Function function) const {
++        for (int index = 0; index < count; ++index) {
++            function(lanes[index], lanes[index].request->work);
++        }
++    }
++
++    void quantize(Bf16* Workspace::*source, int width) const {
++        each([&](const ForwardLane&, Workspace& work) {
++            check(text_quantize_fp8(work.*source, width, work.activation, stream),
++                  "Quantize projection input");
++        });
++    }
++
++    void project(Fp8Weight weight, Bf16* Workspace::*output) const {
++        static_assert(decoder_batch_max_lanes <= text_fp8_max_batch);
++        std::array<TextFp8Projection, decoder_batch_max_lanes> projections;
++        for (int index = 0; index < count; ++index) {
++            auto& work = lanes[index].request->work;
++            projections[index] = {{work.activation.values, work.activation.scales}, work.*output};
++        }
++        check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
++                            projections.data(), count, stream), "Run FP8 projection");
++    }
++};
++
++void run_gdn(const GdnLayer& layer, const LayerBatch& batch, int state_index) {
++    batch.quantize(&Workspace::normalized, hidden_size);
++    batch.project(layer.qkv, &Workspace::gdn_qkv);
++    batch.project(layer.z, &Workspace::gdn_z);
++    batch.each([&](const ForwardLane& lane, Workspace& work) {
++        const auto stream = batch.stream;
++        project(layer.b, work.normalized, work.gdn_b, stream);
++        project(layer.a, work.normalized, work.gdn_a, stream);
++        check(text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
++                               layer.recurrent, lane.request->states[state_index],
++                               work.gdn_scratch, text_gdn_workspace_bytes(1), work.attention,
++                               stream), "Advance Gated DeltaNet state");
++    });
++    batch.quantize(&Workspace::attention, text_gdn_value_width);
++    batch.project(layer.output, &Workspace::projected_attention);
+ }
+ 
+-void run_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache, int position) {
++void attend_gqa(const GqaLayer& layer, const ForwardLane& lane, int cache_index,
++                cudaStream_t stream) {
++    auto& request = *lane.request;
+     auto& work = request.work;
+-    const auto stream = request.memory.stream();
+-    const auto input = quantize(work.normalized, hidden_size, work.activation, stream);
+-    project(layer.q_gate, input, work.q_gate, stream);
+-    project(layer.key, input, work.keys, stream);
+-    project(layer.value, input, work.values, stream);
++    const auto cache = request.caches[cache_index];
++    const int position = lane.position;
+     check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm, layer.key_norm,
+                               work.rope_queries, work.rope_keys, stream),
+           "Normalize and rotate Q/K");
+@@ -52,50 +73,77 @@ void run_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache, int po
+                              work.attention, stream), "Read causal MXFP8 attention");
+     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
+           "Gate grouped-query attention");
+-    const auto attention = quantize(work.attention, text_gqa_q_width, work.activation, stream);
+-    project(layer.output, attention, work.projected_attention, stream);
+ }
+ 
+-void run_mlp(const Layer& layer, Workspace& work, cudaStream_t stream) {
+-    const auto input = quantize(work.normalized, hidden_size, work.activation, stream);
+-    project(layer.mlp_gate, input, work.mlp_gate, stream);
+-    project(layer.mlp_up, input, work.mlp_up, stream);
+-    check(text_swiglu(work.mlp_gate, work.mlp_up, intermediate_size, work.mlp_gate, stream),
+-          "Apply SwiGLU");
+-    const auto activated = quantize(work.mlp_gate, intermediate_size, work.activation, stream);
+-    project(layer.mlp_down, activated, work.hidden, stream);
++void run_gqa(const GqaLayer& layer, const LayerBatch& batch, int cache_index) {
++    batch.quantize(&Workspace::normalized, hidden_size);
++    batch.project(layer.q_gate, &Workspace::q_gate);
++    batch.project(layer.key, &Workspace::keys);
++    batch.project(layer.value, &Workspace::values);
++    batch.each([&](const ForwardLane& lane, Workspace&) {
++        attend_gqa(layer, lane, cache_index, batch.stream);
++    });
++    batch.quantize(&Workspace::attention, text_gqa_q_width);
++    batch.project(layer.output, &Workspace::projected_attention);
++}
++
++void run_mlp(const Layer& layer, const LayerBatch& batch) {
++    batch.quantize(&Workspace::normalized, hidden_size);
++    batch.project(layer.mlp_gate, &Workspace::mlp_gate);
++    batch.project(layer.mlp_up, &Workspace::mlp_up);
++    batch.each([&](const ForwardLane&, Workspace& work) {
++        check(text_swiglu(work.mlp_gate, work.mlp_up, intermediate_size, work.mlp_gate,
++                          batch.stream), "Apply SwiGLU");
++    });
++    batch.quantize(&Workspace::mlp_gate, intermediate_size);
++    batch.project(layer.mlp_down, &Workspace::hidden);
+ }
+ 
+ }
+ 
+ void Decoder::Model::forward(Request& request, int token_id, int position, TextGdnMode mode) const {
+-    auto& work = request.work;
+-    const auto stream = request.memory.stream();
+-    check(text_embedding(embedding, vocab_size, hidden_size, token_id, work.residual, stream),
+-          "Look up token embedding");
++    const ForwardLane lane{&request, token_id, position, mode};
++    forward(&lane, 1, request.memory.stream());
++}
++
++void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t stream) const {
++    if (!lanes || count <= 0 || count > decoder_batch_max_lanes) {
++        throw std::invalid_argument("Invalid decoder batch size");
++    }
++    const LayerBatch batch{lanes, count, stream};
++    batch.each([&](const ForwardLane& lane, Workspace& work) {
++        check(text_embedding(embedding, vocab_size, hidden_size, lane.token_id, work.residual,
++                             stream), "Look up token embedding");
++    });
+     int gdn_index = 0;
+     int gqa_index = 0;
+     for (int index = 0; index < layer_count; ++index) {
+         const auto& layer = layers[index];
+-        const auto* input = index == 0 ? work.residual : work.hidden;
+-        auto* residual = index == 0 ? nullptr : work.residual;
+-        check(text_rms_norm(input, residual, layer.input_norm, hidden_size,
+-                            work.normalized, residual, stream), "Normalize layer input");
++        batch.each([&](const ForwardLane&, Workspace& work) {
++            const auto* input = index == 0 ? work.residual : work.hidden;
++            auto* residual = index == 0 ? nullptr : work.residual;
++            check(text_rms_norm(input, residual, layer.input_norm, hidden_size,
++                                work.normalized, residual, stream), "Normalize layer input");
++        });
+         if (is_full_attention(index)) {
+-            run_gqa(layer.gqa, request, request.caches[gqa_index++], position);
++            run_gqa(layer.gqa, batch, gqa_index++);
+         } else {
+-            run_gdn(layer.gdn, request, request.states[gdn_index++], mode);
++            run_gdn(layer.gdn, batch, gdn_index++);
+         }
+-        check(text_rms_norm(work.projected_attention, work.residual, layer.attention_norm,
+-                            hidden_size, work.normalized, work.residual, stream),
+-              "Normalize post-attention residual");
+-        run_mlp(layer, work, stream);
++        batch.each([&](const ForwardLane&, Workspace& work) {
++            check(text_rms_norm(work.projected_attention, work.residual, layer.attention_norm,
++                                hidden_size, work.normalized, work.residual, stream),
++                  "Normalize post-attention residual");
++        });
++        run_mlp(layer, batch);
+     }
+ }
+ 
+ void Decoder::Model::compute_logits(Request& request) const {
+-    auto& work = request.work;
+-    const auto stream = request.memory.stream();
++    compute_logits(request.work, request.memory.stream());
++}
++
++void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream) const {
+     check(text_rms_norm(work.hidden, work.residual, final_norm, hidden_size,
+                         work.normalized, nullptr, stream), "Normalize final residual");
+     project(lm_head, work.normalized, work.logits, stream);
+diff --git a/src/decoder_resources.cpp b/src/decoder_resources.cpp
+index acf736f66e9c9d8aaa534b68afc9c2b674e262e7..4e6c7645556ae077f13c26f59f7421986f7558b4 100644
+--- a/src/decoder_resources.cpp
++++ b/src/decoder_resources.cpp
+@@ -50,7 +50,7 @@ void zero(Element* buffer, std::size_t count, cudaStream_t stream) {
+     check(cudaMemsetAsync(buffer, 0, count * sizeof(Element), stream), "Reset request state");
+ }
+ 
+-void allocate_gdn(Request& request) {
++void allocate_gdn(Request& request, cudaStream_t stream) {
+     const std::size_t history_count = gdn_layers * gdn_history_elements;
+     const std::size_t recurrent_count = gdn_layers * gdn_state_elements;
+     auto* history = request.memory.allocate<Bf16>(history_count);
+@@ -59,11 +59,11 @@ void allocate_gdn(Request& request) {
+         request.states[index] = {history + index * gdn_history_elements,
+                                  recurrent + index * gdn_state_elements};
+     }
+-    zero(history, history_count, request.memory.stream());
+-    zero(recurrent, recurrent_count, request.memory.stream());
++    zero(history, history_count, stream);
++    zero(recurrent, recurrent_count, stream);
+ }
+ 
+-void allocate_kv(Request& request, int capacity) {
++void allocate_kv(Request& request, int capacity, cudaStream_t stream) {
+     const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
+     auto* table = request.memory.allocate<std::int32_t>(page_count);
+     const auto payload_per_layer = page_count * mxfp8_payload_bytes_per_page;
+@@ -84,7 +84,7 @@ void allocate_kv(Request& request, int capacity) {
+     logical_pages.resize(page_count);
+     std::iota(logical_pages.begin(), logical_pages.end(), 0);
+     check(cudaMemcpyAsync(table, logical_pages.data(), logical_pages.size() * sizeof(std::int32_t),
+-                          cudaMemcpyHostToDevice, request.memory.stream()),
++                          cudaMemcpyHostToDevice, stream),
+           "Upload MXFP8 page table");
+     request.pages = {table, page_count};
+ }
+@@ -105,7 +105,7 @@ struct Allocations::State {
+     static void reclaim(int device) {
+         auto& queue = deferred();
+         for (;;) {
+-            std::shared_ptr<const Allocations> drained_weights;
++            std::shared_ptr<const void> drained_owners;
+             std::unique_ptr<State> finished;
+             CleanupError error;
+             {
+@@ -118,13 +118,13 @@ struct Allocations::State {
+                     return;
+                 }
+                 auto& entry = **pending;
+-                error = entry.release(drained_weights);
++                error = entry.release(drained_owners);
+                 if (!entry.owns_cuda()) {
+                     finished = std::move(*pending);
+                     *pending = std::move(finished->next);
+                 }
+             }
+-            drained_weights.reset();
++            drained_owners.reset();
+             error.raise();
+         }
+     }
+@@ -140,9 +140,9 @@ struct Allocations::State {
+ 
+     bool owns_cuda() const { return stream != nullptr || !blocks.empty(); }
+ 
+-    CleanupError close_stream(std::shared_ptr<const Allocations>& drained_weights);
+-    CleanupError release_selected(std::shared_ptr<const Allocations>& drained_weights);
+-    CleanupError release(std::shared_ptr<const Allocations>& drained_weights);
++    CleanupError close_stream(std::shared_ptr<const void>& drained_owners);
++    CleanupError release_selected(std::shared_ptr<const void>& drained_owners);
++    CleanupError release(std::shared_ptr<const void>& drained_owners);
+     CleanupError failure(CleanupError error);
+ 
+     int device;
+@@ -154,7 +154,7 @@ struct Allocations::State {
+     CleanupError uncertain;
+     CleanupError terminal;
+     TransferBuffers transfers;
+-    std::shared_ptr<const Allocations> weights;
++    std::shared_ptr<const void> owners;
+     std::unique_ptr<State> next;
+ };
+ 
+@@ -165,7 +165,7 @@ CleanupError Allocations::State::failure(CleanupError error) {
+     return error;
+ }
+ 
+-CleanupError Allocations::State::close_stream(std::shared_ptr<const Allocations>& drained_weights) {
++CleanupError Allocations::State::close_stream(std::shared_ptr<const void>& drained_owners) {
+     if (terminal || uncertain_stream || stream == nullptr) {
+         return terminal ? terminal : uncertain;
+     }
+@@ -174,7 +174,7 @@ CleanupError Allocations::State::close_stream(std::shared_ptr<const Allocations>
+         return failure(sync);
+     }
+     transfers = {};
+-    drained_weights = std::move(weights);
++    drained_owners = std::move(owners);
+     const CleanupError destroy{cudaStreamDestroy(stream), "Destroy decoder stream"};
+     if (destroy) {
+         uncertain_stream = true;
+@@ -185,9 +185,8 @@ CleanupError Allocations::State::close_stream(std::shared_ptr<const Allocations>
+     return {};
+ }
+ 
+-CleanupError Allocations::State::release_selected(
+-    std::shared_ptr<const Allocations>& drained_weights) {
+-    const auto error = close_stream(drained_weights);
++CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& drained_owners) {
++    const auto error = close_stream(drained_owners);
+     if (terminal || (stream && !uncertain_stream)) {
+         return error;
+     }
+@@ -209,7 +208,7 @@ CleanupError Allocations::State::release_selected(
+     return uncertain;
+ }
+ 
+-CleanupError Allocations::State::release(std::shared_ptr<const Allocations>& drained_weights) {
++CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_owners) {
+     if (terminal || !owns_cuda()) {
+         return terminal;
+     }
+@@ -219,13 +218,13 @@ CleanupError Allocations::State::release(std::shared_ptr<const Allocations>& dra
+         return failure(current);
+     }
+     if (previous == device) {
+-        return release_selected(drained_weights);
++        return release_selected(drained_owners);
+     }
+     const CleanupError select{cudaSetDevice(device), "Select CUDA device for decoder cleanup"};
+     if (select) {
+         return failure(select);
+     }
+-    const auto error = release_selected(drained_weights);
++    const auto error = release_selected(drained_owners);
+     const CleanupError restore{cudaSetDevice(previous), "Restore CUDA device after cleanup"};
+     if (error) {
+         report_cleanup(restore.status, restore.operation);
+@@ -264,8 +263,8 @@ void DeviceScope::restore() {
+ Allocations::Allocations(int device) : state_(std::make_unique<State>(device)) {}
+ 
+ Allocations::~Allocations() {
+-    std::shared_ptr<const Allocations> drained_weights;
+-    const auto error = state_->release(drained_weights);
++    std::shared_ptr<const void> drained_owners;
++    const auto error = state_->release(drained_owners);
+     report_cleanup(error.status, error.operation);
+     if (state_->owns_cuda()) {
+         State::retain(std::move(state_));
+@@ -278,20 +277,20 @@ TransferBuffers& Allocations::transfers() { return state_->transfers; }
+ 
+ cudaStream_t Allocations::stream() const { return state_->stream; }
+ 
+-void Allocations::open_stream(std::shared_ptr<const Allocations> weights) {
++void Allocations::open_stream(std::shared_ptr<const void> owners) {
+     check(cudaStreamCreateWithFlags(&state_->stream, cudaStreamNonBlocking),
+           "Create decoder stream");
+-    state_->weights = std::move(weights);
++    state_->owners = std::move(owners);
+ }
+ 
+ void Allocations::close_stream() {
+-    std::shared_ptr<const Allocations> drained_weights;
+-    state_->close_stream(drained_weights).raise();
++    std::shared_ptr<const void> drained_owners;
++    state_->close_stream(drained_owners).raise();
+ }
+ 
+ void Allocations::close() {
+-    std::shared_ptr<const Allocations> drained_weights;
+-    state_->release(drained_weights).raise();
++    std::shared_ptr<const void> drained_owners;
++    state_->release(drained_owners).raise();
+ }
+ 
+ void* Allocations::allocate_bytes(std::size_t bytes) {
+@@ -336,11 +335,17 @@ Workspace::Workspace(Allocations& allocations)
+     static_assert(text_gqa_q_width == text_gdn_value_width);
+ }
+ 
++Request::Request(int device) : memory(device), work(memory) {}
++
+ Request::Request(int device, int capacity, std::shared_ptr<const Allocations> weights)
+-    : memory(device), work(memory) {
++    : Request(device) {
+     memory.open_stream(std::move(weights));
+-    allocate_kv(*this, capacity);
+-    allocate_gdn(*this);
++    initialize(capacity, memory.stream());
++}
++
++void Request::initialize(int capacity, cudaStream_t stream) {
++    allocate_kv(*this, capacity, stream);
++    allocate_gdn(*this, stream);
+ }
+ 
+ }
+diff --git a/src/text_ops.cu b/src/text_ops.cu
+index 2eb729bc30c1f7bb0bbb0e05ad61c5b76dac5af8..98d5bc6e677e9d549187fd0bfa632cc512ee3107 100644
+--- a/src/text_ops.cu
++++ b/src/text_ops.cu
+@@ -200,10 +200,21 @@ __device__ float fp8x4_dot(unsigned int lhs_bits, unsigned int rhs_bits, float s
+ constexpr int fp8_pack_bytes = 16;
+ constexpr int fp8_groups_per_warp = warp_width * fp8_pack_bytes / text_fp8_group_size;
+ 
++bool wide_fp8(const std::uint8_t* weight, TextFp8ActivationView input, int in_width) {
++    return in_width % (fp8_groups_per_warp * text_fp8_group_size) == 0 &&
++           aligned(weight, fp8_pack_bytes) && aligned(input.values, fp8_pack_bytes);
++}
++
++template <int Count>
++struct Fp8Projections {
++    TextFp8Projection entries[Count];
++};
++
++template <int Count>
+ __global__ void fp8_gemv_packed_kernel(const std::uint8_t* weight,
+                                        const __nv_bfloat16* weight_scales,
+-                                       TextFp8ActivationView input, int out_width, int in_width,
+-                                       int groups, __nv_bfloat16* output) {
++                                       int out_width, int in_width, int groups,
++                                       Fp8Projections<Count> projections) {
+     const int lane = threadIdx.x % warp_width;
+     const int row = blockIdx.x * block_warps + threadIdx.x / warp_width;
+     if (row >= out_width) {
+@@ -215,21 +226,43 @@ __global__ void fp8_gemv_packed_kernel(const std::uint8_t* weight,
+     constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
+     const int lane_group = lane / lanes_per_group;
+     const int lane_col = lane * fp8_pack_bytes;
+-    float sum = 0.0f;
++    float sums[Count]{};
+     for (int group = 0; group < groups; group += fp8_groups_per_warp) {
+         const auto col = static_cast<std::size_t>(group) * text_fp8_group_size + lane_col;
+-        const uint4 rhs = load_128(input.values + col);
+         const uint4 lhs = load_128(row_weight + col);
+-        const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
+-        const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
+         const int scale_index = group + lane_group;
+-        const float scaled = (low + high) * input.scales[scale_index];
+-        sum = fmaf(scaled, __bfloat162float(row_scales[scale_index]), sum);
++        const float scale = __bfloat162float(row_scales[scale_index]);
++#pragma unroll
++        for (int index = 0; index < Count; ++index) {
++            const auto input = projections.entries[index].input;
++            const uint4 rhs = load_128(input.values + col);
++            const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
++            const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
++            const float scaled = (low + high) * input.scales[scale_index];
++            sums[index] = fmaf(scaled, scale, sums[index]);
++        }
+     }
+-    sum = warp_sum(sum);
+-    if (lane == 0) {
+-        output[row] = __float2bfloat16_rn(sum);
++#pragma unroll
++    for (int index = 0; index < Count; ++index) {
++        const float sum = warp_sum(sums[index]);
++        if (lane == 0) {
++            projections.entries[index].output[row] = __float2bfloat16_rn(sum);
++        }
++    }
++}
++
++template <int Count>
++cudaError_t launch_wide_fp8(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                            int out_width, int in_width, const TextFp8Projection* projections,
++                            cudaStream_t stream) {
++    Fp8Projections<Count> batch;
++    for (int index = 0; index < Count; ++index) {
++        batch.entries[index] = projections[index];
+     }
++    int groups = text_fp8_group_count(in_width);
++    void* args[] = {&weight, &weight_scales, &out_width, &in_width, &groups, &batch};
++    return cudaLaunchKernel(fp8_gemv_packed_kernel<Count>, divide_up(out_width, block_warps),
++                            block_threads, args, 0, stream);
+ }
+ 
+ __device__ float residual_sum(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+@@ -391,16 +424,52 @@ cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weigh
+         return cudaErrorInvalidValue;
+     }
+     int groups = text_fp8_group_count(in_width);
+-    const bool wide = in_width % (fp8_groups_per_warp * text_fp8_group_size) == 0 &&
+-                      aligned(weight, fp8_pack_bytes) && aligned(input.values, fp8_pack_bytes);
++    if (wide_fp8(weight, input, in_width)) {
++        const TextFp8Projection projection{input, output};
++        return launch_wide_fp8<1>(weight, weight_scales, out_width, in_width, &projection, stream);
++    }
+     const bool packed = in_width % 4 == 0 && aligned(weight, 4) && aligned(input.values, 4);
+     void* args[] = {&weight, &weight_scales, &input, &out_width, &in_width, &groups, &output};
+-    const auto kernel = wide ? fp8_gemv_packed_kernel
+-                             : (packed ? fp8_gemv_kernel<true> : fp8_gemv_kernel<false>);
++    const auto kernel = packed ? fp8_gemv_kernel<true> : fp8_gemv_kernel<false>;
+     return cudaLaunchKernel(kernel,
+                             divide_up(out_width, block_warps), block_threads, args, 0, stream);
+ }
+ 
++cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
++                          int out_width, int in_width, const TextFp8Projection* projections,
++                          int count, cudaStream_t stream) {
++    if (!weight || !weight_scales || !projections || out_width <= 0 || in_width <= 0 ||
++        count <= 0 || count > text_fp8_max_batch) {
++        return cudaErrorInvalidValue;
++    }
++    bool wide = true;
++    for (int index = 0; index < count; ++index) {
++        const auto& entry = projections[index];
++        if (!entry.input.values || !entry.input.scales || !entry.output) {
++            return cudaErrorInvalidValue;
++        }
++        wide = wide && wide_fp8(weight, entry.input, in_width);
++    }
++    if (wide && count == 4) {
++        return launch_wide_fp8<4>(weight, weight_scales, out_width, in_width, projections, stream);
++    }
++    if (wide && count == 3) {
++        return launch_wide_fp8<3>(weight, weight_scales, out_width, in_width, projections, stream);
++    }
++    if (wide && count == 2) {
++        return launch_wide_fp8<2>(weight, weight_scales, out_width, in_width, projections, stream);
++    }
++    for (int index = 0; index < count; ++index) {
++        const auto& entry = projections[index];
++        const auto status = text_fp8_gemv(weight, weight_scales, entry.input, out_width, in_width,
++                                           entry.output, stream);
++        if (status != cudaSuccess) {
++            return status;
++        }
++    }
++    return cudaSuccess;
++}
++
+ cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                          const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
+                          __nv_bfloat16* residual_output, cudaStream_t stream) {
+diff --git a/xmake.lua b/xmake.lua
+index 0dbaee0084518d78e1447140cc9724d8e23f95e9..9bd6b642c2bed529ca93986edc15eb30ca76bc0e 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -75,7 +75,7 @@ target("sglang_decoder")
+     add_includedirs("include", {public = true})
+     add_deps("sglang_checkpoint", "sglang_cuda")
+     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
+-              "src/decoder_weights.cpp")
++              "src/decoder_weights.cpp", "src/decoder_batch.cpp")
+ 
+ target("sglang-generate")
+     set_kind("binary")

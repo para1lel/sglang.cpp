@@ -1,5 +1,7 @@
 #include "sglang/text_attention.h"
 
+#include "sglang/decoder_cuda.cuh"
+
 #include <cuda_runtime.h>
 
 namespace sglang {
@@ -18,7 +20,8 @@ __device__ float gemma_norm(float value, float inverse_rms, __nv_bfloat16 weight
                                             * (1.0f + __bfloat162float(weight))));
 }
 
-__global__ void gqa_preprocess(int first_position, const __nv_bfloat16* q_gate,
+template <typename Position>
+__global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_gate,
                                const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
                                const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries,
                                __nv_bfloat16* rope_keys) {
@@ -58,7 +61,8 @@ __global__ void gqa_preprocess(int first_position, const __nv_bfloat16* q_gate,
         const float paired = gemma_norm(__bfloat162float(input[other]), inverse_rms, norm[other]);
         const float power = static_cast<float>(channel) / rotary_half;
         const float inverse_frequency = 1.0f / powf(rope_theta, power);
-        const float position = static_cast<float>(first_position + static_cast<int>(row));
+        const float position =
+            static_cast<float>(decoder::position_value(first_position) + static_cast<int>(row));
         float sine;
         float cosine;
         sincosf(position * inverse_frequency, &sine, &cosine);
@@ -101,7 +105,20 @@ cudaError_t text_gqa_preprocess(int first_position, int token_count,
     const int blocks = token_count * (mxfp8_query_heads + mxfp8_kv_heads);
     void* arguments[] = {
         &first_position, &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
-    return cudaLaunchKernel(gqa_preprocess, dim3(blocks), dim3(mxfp8_head_dim),
+    return cudaLaunchKernel(gqa_preprocess<int>, dim3(blocks), dim3(mxfp8_head_dim),
+                            arguments, 0, stream);
+}
+
+cudaError_t decoder::decode_gqa_preprocess(const int* position, const __nv_bfloat16* q_gate,
+                                           const __nv_bfloat16* keys,
+                                           const __nv_bfloat16* q_norm,
+                                           const __nv_bfloat16* k_norm,
+                                           __nv_bfloat16* rope_queries,
+                                           __nv_bfloat16* rope_keys, cudaStream_t stream) {
+    constexpr int blocks = mxfp8_query_heads + mxfp8_kv_heads;
+    void* arguments[] = {
+        &position, &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<const int*>, dim3(blocks), dim3(mxfp8_head_dim),
                             arguments, 0, stream);
 }
 

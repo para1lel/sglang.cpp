@@ -1,5 +1,9 @@
 #include "sglang/decoder_internal.h"
 
+#include "sglang/decoder_cuda.cuh"
+
+#include <type_traits>
+
 namespace sglang {
 namespace {
 
@@ -36,20 +40,32 @@ void run_gdn(const GdnLayer& layer, Request& request, TextGdnState state, TextGd
     project(layer.output, attention, work.projected_attention, stream);
 }
 
-void run_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache, int position) {
+template <typename Position>
+void run_gqa(const GqaLayer& layer, Request& request, Mxfp8KvCache cache, Position position) {
     auto& work = request.work;
     const auto stream = request.memory.stream();
     const auto input = quantize(work.normalized, hidden_size, work.activation, stream);
     project(layer.q_gate, input, work.q_gate, stream);
     project(layer.key, input, work.keys, stream);
     project(layer.value, input, work.values, stream);
-    check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm, layer.key_norm,
-                              work.rope_queries, work.rope_keys, stream),
-          "Normalize and rotate Q/K");
-    check(mxfp8_kv_append(cache, request.pages, position, 1, work.rope_keys, work.values, stream),
-          "Append MXFP8 KV");
-    check(mxfp8_gqa_attention(cache, request.pages, position + 1, position, 1, work.rope_queries,
-                             work.attention, stream), "Read causal MXFP8 attention");
+    if constexpr (std::is_same_v<Position, int>) {
+        check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm,
+                                  layer.key_norm, work.rope_queries, work.rope_keys, stream),
+              "Normalize and rotate Q/K");
+        check(mxfp8_kv_append(cache, request.pages, position, 1, work.rope_keys, work.values,
+                              stream), "Append MXFP8 KV");
+        check(mxfp8_gqa_attention(cache, request.pages, position + 1, position, 1,
+                                  work.rope_queries, work.attention, stream),
+              "Read causal MXFP8 attention");
+    } else {
+        check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
+                                    layer.key_norm, work.rope_queries, work.rope_keys, stream),
+              "Normalize and rotate decode Q/K");
+        check(decode_kv_append(cache, request.pages, position, work.rope_keys, work.values, stream),
+              "Append decode MXFP8 KV");
+        check(decode_gqa_attention(cache, request.pages, position, work.rope_queries,
+                                   work.attention, stream), "Read causal decode MXFP8 attention");
+    }
     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
           "Gate grouped-query attention");
     const auto attention = quantize(work.attention, text_gqa_q_width, work.activation, stream);
@@ -69,10 +85,32 @@ void run_mlp(const Layer& layer, Workspace& work, cudaStream_t stream) {
 }
 
 void Decoder::Model::forward(Request& request, int token_id, int position, TextGdnMode mode) const {
+    check(text_embedding(embedding, vocab_size, hidden_size, token_id, request.work.residual,
+                         request.memory.stream()), "Look up token embedding");
+    forward_layers(request, position, mode);
+}
+
+void Decoder::Model::decode_graph(Request& request) const {
+    const auto stream = request.memory.stream();
+    if (!request.memory.graph()) {
+        request.memory.capture_graph([&] {
+            check(decode_embedding(embedding, vocab_size, hidden_size, request.work.argmax,
+                                   request.work.residual, stream),
+                  "Look up decode token embedding");
+            forward_layers(request, static_cast<const int*>(request.decode_position),
+                           TextGdnMode::decode);
+            compute_logits(request);
+            check(advance_decode_position(request.decode_position, stream),
+                  "Advance decode position");
+        });
+    }
+    check(cudaGraphLaunch(request.memory.graph(), stream), "Replay decode graph");
+}
+
+template <typename Position>
+void Decoder::Model::forward_layers(Request& request, Position position, TextGdnMode mode) const {
     auto& work = request.work;
     const auto stream = request.memory.stream();
-    check(text_embedding(embedding, vocab_size, hidden_size, token_id, work.residual, stream),
-          "Look up token embedding");
     int gdn_index = 0;
     int gqa_index = 0;
     for (int index = 0; index < layer_count; ++index) {

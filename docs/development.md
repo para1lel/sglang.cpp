@@ -21,17 +21,39 @@ The first executable check compiled a native `sm_100` cubin with XMake, GCC 15.3
 
 ## First task and next evidence
 
-From the repository root on the managed host, run `bash tools/build.sh` for a build-only probe. For a device run, set `GPU_INDEX` to the physical index of the reserved B200.
+From the repository root on the managed host, run `bash tools/build.sh` to build both probes. For a device run, set `GPU_INDEX` to the physical index of the reserved B200.
 
 ```bash
 bash tools/build.sh --gpu "${GPU_INDEX:?set the reserved B200 index}"
 ```
 
-The build checks the `sm_100` image and the loaded CUDA runtime. The device run must print `GPU returned 42 (expected 42)` and exit successfully. Keep the command, device UUID, toolchain identities, and binary hash. This probe exercises an ahead-of-time kernel. P1 also requires a timed NVRTC launch.
+The build checks the `sm_100` image and the resolved CUDA runtime. The device run must print `GPU returned 42 (expected 42)` and exit successfully. Keep the command, device UUID, toolchain identities, and binary hash. This probe exercises an ahead-of-time kernel.
 
 For P0, inspect the official configuration, weight index, tensor metadata, tokenizer, chat template, processor, and model implementation together. Record layer order, dimensions, weight formats and scales, state updates, position encoding, MTP weights, and media inputs. Map the applicable behavior to files at the pinned SGLang revision. Propose the API version, endpoints, parameters, streaming events, and constraint semantics for review. If the checkpoint conflicts with a proposed feature, record the evidence and request a scope decision.
 
 The [baseline smoke procedure](performance.md#first-baseline-run) completed on physical B200 1. The seven measured requests produced the same eight greedy IDs with BF16 KV and MTP disabled. Give the first candidate decoder this five-token prompt and compare all eight IDs on that same UUID. Then schedule the longer streaming workloads separately.
+
+### P1 runtime probe
+
+Use the managed default Pixi toolchain and reserve one B200. From the repository root, set `GPU_INDEX` to its physical index and run:
+
+```bash
+bash tools/build.sh --build-dir build --nvrtc --gpu "${GPU_INDEX:?set the reserved B200 index}"
+```
+
+The script checks that NVRTC resolves inside Pixi and that `libcuda.so.1` resolves outside Pixi. It exposes only the selected GPU by UUID. Check that the probe reports that UUID, `compute_capability=10.0`, `architecture=sm_100`, and the device allocation size.
+
+The [probe](../tools/nvrtc-probe.cpp#L265)<!-- prefix: "void run_pro" --> uses one CUDA context for both launches. The cold lookup compiles a native cubin and loads its function. The warm lookup reuses that function in the same context. The probe disables NVRTC's persistent cache.
+
+Expect these results in order:
+
+- `phase=cold cache=miss compiled=1` with `compile_ms` for the NVRTC compilation call.
+- `phase=warm cache=hit compiled=0` with `compile_ms=0.000000`.
+- `NVRTC probe passed` followed by exit status zero.
+
+Both phase lines must report `verified_elements=257 first=42 last=298`. The probe checks every element after each launch. The `kernel_ms` field measures each completed launch with CUDA events, after buffer reset and before the host copy.
+
+Keep the command and full output, including device properties, library and binary identities, allocation size, and both phase lines. A missing phase, incorrect result, or nonzero exit fails this check. The runtime check covers one fixed kernel and a function cache scoped to its CUDA context. Model execution and performance acceptance use later milestones.
 
 ## Runtime and state ownership
 
@@ -48,7 +70,7 @@ The discussion proposes these stages after adoption. Each row gives a test and t
 | Stage | Run | Accept when |
 | --- | --- | --- |
 | P0 · Model and baseline | Inspect the pinned tensors and configuration. Run one fixed greedy text request through isolated vLLM on the B200. | The manifest resolves the model identity. The request reproduces. Record the single-card memory budget, reference map, dependency decisions, and smallest experiment for each open risk. |
-| P1 · Runtime | Allocate device memory. Compile, load, and dispatch a project kernel with NVRTC. Repeat with the JIT cache populated and time execution with CUDA events. | Both runs return the expected value. Record device properties, allocation size, cache miss and hit, compile time, and completed kernel time. |
+| P1 · Runtime | Run the [P1 runtime probe](#p1-runtime-probe) on one B200. | The cold miss and warm hit each complete and verify the full output. Retain the device, build, cache, allocation, and timing evidence. |
 | P2 · Operators and one layer | Run FP8 GEMM, normalization, RoPE, GQA, GDN, FFN, and sampling on verified model shapes. Exercise each applicable layer type. | Operator and layer outputs meet prespecified independent reference tolerances. Capture state updates and per-shape timings. |
 | P3 · Text generation | Load the official weights. Prefill a fixed prompt and decode to a fixed limit. Repeat with a stop condition. | Compare logits and greedy token IDs with the reference. Verify the finish reason and sampling behavior. Record output tokens/s, latency, and peak memory. |
 | P4 · Cache and MTP | Compare fresh execution with prefix hits, restore and replay, and native MTP on and off. Exercise zero, partial, and full acceptance, cancellation, eviction, and reuse. | Committed state and continuation agree with fresh target execution. Sampling preserves the target distribution. Rejected tokens never enter a shared prefix. Released storage is safe to reuse. |

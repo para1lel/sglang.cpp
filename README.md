@@ -20,6 +20,17 @@ Choose an available B200 index in the last command. The build verifies the nativ
 resolved CUDA runtime. The device probe launches one kernel and checks its return value.
 Without `--build-dir`, the script uses a temporary build directory.
 
+To run the P1 NVRTC probe, use the physical index of a reserved B200.
+
+```bash
+bash tools/build.sh --build-dir build --nvrtc --gpu "${GPU_INDEX:?set the reserved B200 index}"
+```
+
+The probe compiles a native `sm_100` kernel and caches the loaded function in its CUDA
+context for the second launch. Both launches verify all 257 integers. The output records
+the device UUID and properties, allocation size, cold and warm cache results,
+NVRTC compilation time, and completed kernel time from CUDA events.
+
 ## Continue development
 
 The checkpoint lives at `/data0/shared/Qwen3.8-27B-FP8`. Keep its weights and generated

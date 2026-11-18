@@ -57,7 +57,28 @@ fi
 echo "CUDA runtime: $runtime"
 sha256sum "$probe"
 
+"$xmake" build -v nvrtc-probe
+nvrtc_probe="$work/build/bin/nvrtc-probe"
+nvrtc_links=$(ldd "$nvrtc_probe")
+nvrtc=$(awk '$1 ~ /^libnvrtc\.so/ {print $3}' <<< "$nvrtc_links")
+if [[ "$(realpath -e -- "$nvrtc")" != "$prefix/"* ]]; then
+    echo "Expected the NVRTC probe to load Pixi NVRTC, found $nvrtc" >&2
+    exit 1
+fi
+echo "NVRTC library: $nvrtc"
+sha256sum "$nvrtc_probe" "$nvrtc"
+
 if [[ -n "$SGLANG_GPU_INDEX" ]]; then
+    if [[ ${SGLANG_GPU_PROBE:-} == nvrtc-probe ]]; then
+        driver=$(awk '$1 == "libcuda.so.1" {print $3}' <<< "$nvrtc_links")
+        if ! driver=$(realpath -e -- "$driver") || [[ "$driver" == "$prefix/"* ]]; then
+            echo "Expected the NVRTC probe to load the CUDA driver outside Pixi." >&2
+            exit 1
+        fi
+        echo "CUDA driver: $driver"
+        sha256sum "$driver"
+        probe=$nvrtc_probe
+    fi
     gpu=$(nvidia-smi -i "$SGLANG_GPU_INDEX" --query-gpu=name,uuid --format=csv,noheader)
     echo "Running on physical GPU $SGLANG_GPU_INDEX: $gpu"
     CUDA_VISIBLE_DEVICES="${gpu#*, }" "$probe"

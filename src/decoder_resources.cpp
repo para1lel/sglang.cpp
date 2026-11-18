@@ -61,7 +61,7 @@ void allocate_gdn(Request& request) {
     }
 }
 
-void allocate_kv(Request& request, int capacity) {
+void allocate_kv(Request& request, int capacity, cudaStream_t stream) {
     const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     auto* table = request.memory.allocate<std::int32_t>(page_count);
     const auto payload_per_layer = page_count * mxfp8_payload_bytes_per_page;
@@ -82,7 +82,7 @@ void allocate_kv(Request& request, int capacity) {
     logical_pages.resize(page_count);
     std::iota(logical_pages.begin(), logical_pages.end(), 0);
     check(cudaMemcpyAsync(table, logical_pages.data(), logical_pages.size() * sizeof(std::int32_t),
-                          cudaMemcpyHostToDevice, request.memory.stream()),
+                          cudaMemcpyHostToDevice, stream),
           "Upload MXFP8 page table");
     request.pages = {table, page_count};
 }
@@ -103,7 +103,7 @@ struct Allocations::State {
     static void reclaim(int device) {
         auto& queue = deferred();
         for (;;) {
-            std::shared_ptr<const Allocations> drained_weights;
+            std::shared_ptr<const void> drained_owners;
             std::unique_ptr<State> finished;
             CleanupError error;
             {
@@ -116,13 +116,13 @@ struct Allocations::State {
                     return;
                 }
                 auto& entry = **pending;
-                error = entry.release(drained_weights);
+                error = entry.release(drained_owners);
                 if (!entry.owns_cuda()) {
                     finished = std::move(*pending);
                     *pending = std::move(finished->next);
                 }
             }
-            drained_weights.reset();
+            drained_owners.reset();
             error.raise();
         }
     }
@@ -138,9 +138,9 @@ struct Allocations::State {
 
     bool owns_cuda() const { return stream != nullptr || !blocks.empty(); }
 
-    CleanupError close_stream(std::shared_ptr<const Allocations>& drained_weights);
-    CleanupError release_selected(std::shared_ptr<const Allocations>& drained_weights);
-    CleanupError release(std::shared_ptr<const Allocations>& drained_weights);
+    CleanupError close_stream(std::shared_ptr<const void>& drained_owners);
+    CleanupError release_selected(std::shared_ptr<const void>& drained_owners);
+    CleanupError release(std::shared_ptr<const void>& drained_owners);
     CleanupError failure(CleanupError error);
 
     int device;
@@ -155,7 +155,7 @@ struct Allocations::State {
     CleanupError uncertain;
     CleanupError terminal;
     TransferBuffers transfers;
-    std::shared_ptr<const Allocations> weights;
+    std::shared_ptr<const void> owners;
     std::unique_ptr<State> next;
 };
 
@@ -166,7 +166,7 @@ CleanupError Allocations::State::failure(CleanupError error) {
     return error;
 }
 
-CleanupError Allocations::State::close_stream(std::shared_ptr<const Allocations>& drained_weights) {
+CleanupError Allocations::State::close_stream(std::shared_ptr<const void>& drained_owners) {
     if (terminal || uncertain_stream || uncertain_graph || stream == nullptr) {
         return terminal ? terminal : uncertain;
     }
@@ -193,7 +193,7 @@ CleanupError Allocations::State::close_stream(std::shared_ptr<const Allocations>
         capture = nullptr;
     }
     transfers = {};
-    drained_weights = std::move(weights);
+    drained_owners = std::move(owners);
     const CleanupError destroy{cudaStreamDestroy(stream), "Destroy decoder stream"};
     if (destroy) {
         uncertain_stream = true;
@@ -204,9 +204,8 @@ CleanupError Allocations::State::close_stream(std::shared_ptr<const Allocations>
     return {};
 }
 
-CleanupError Allocations::State::release_selected(
-    std::shared_ptr<const Allocations>& drained_weights) {
-    const auto error = close_stream(drained_weights);
+CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& drained_owners) {
+    const auto error = close_stream(drained_owners);
     if (terminal || (stream && !uncertain_stream)) {
         return error;
     }
@@ -228,7 +227,7 @@ CleanupError Allocations::State::release_selected(
     return uncertain;
 }
 
-CleanupError Allocations::State::release(std::shared_ptr<const Allocations>& drained_weights) {
+CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_owners) {
     if (terminal || !owns_cuda()) {
         return terminal;
     }
@@ -238,13 +237,13 @@ CleanupError Allocations::State::release(std::shared_ptr<const Allocations>& dra
         return failure(current);
     }
     if (previous == device) {
-        return release_selected(drained_weights);
+        return release_selected(drained_owners);
     }
     const CleanupError select{cudaSetDevice(device), "Select CUDA device for decoder cleanup"};
     if (select) {
         return failure(select);
     }
-    const auto error = release_selected(drained_weights);
+    const auto error = release_selected(drained_owners);
     const CleanupError restore{cudaSetDevice(previous), "Restore CUDA device after cleanup"};
     if (error) {
         report_cleanup(restore.status, restore.operation);
@@ -283,8 +282,8 @@ void DeviceScope::restore() {
 Allocations::Allocations(int device) : state_(std::make_unique<State>(device)) {}
 
 Allocations::~Allocations() {
-    std::shared_ptr<const Allocations> drained_weights;
-    const auto error = state_->release(drained_weights);
+    std::shared_ptr<const void> drained_owners;
+    const auto error = state_->release(drained_owners);
     report_cleanup(error.status, error.operation);
     if (state_->owns_cuda()) {
         State::retain(std::move(state_));
@@ -319,20 +318,20 @@ void Allocations::reclaim_deferred() {
     State::reclaim(state_->device);
 }
 
-void Allocations::open_stream(std::shared_ptr<const Allocations> weights) {
+void Allocations::open_stream(std::shared_ptr<const void> owners) {
     check(cudaStreamCreateWithFlags(&state_->stream, cudaStreamNonBlocking),
           "Create decoder stream");
-    state_->weights = std::move(weights);
+    state_->owners = std::move(owners);
 }
 
 void Allocations::close_stream() {
-    std::shared_ptr<const Allocations> drained_weights;
-    state_->close_stream(drained_weights).raise();
+    std::shared_ptr<const void> drained_owners;
+    state_->close_stream(drained_owners).raise();
 }
 
 void Allocations::close() {
-    std::shared_ptr<const Allocations> drained_weights;
-    state_->release(drained_weights).raise();
+    std::shared_ptr<const void> drained_owners;
+    state_->release(drained_owners).raise();
 }
 
 void* Allocations::allocate_bytes(std::size_t bytes) {
@@ -377,17 +376,28 @@ Workspace::Workspace(Allocations& allocations)
     static_assert(text_gqa_q_width == text_gdn_value_width);
 }
 
+Request::Request(int device, bool reusable)
+    : memory(device), work(memory), decode_position(reusable ? memory.allocate<int>(1) : nullptr) {}
+
 Request::Request(int device, int capacity, std::shared_ptr<const Allocations> weights,
                  bool reusable)
-    : memory(device), work(memory), decode_position(reusable ? memory.allocate<int>(1) : nullptr) {
+    : Request(device, reusable) {
     memory.open_stream(std::move(weights));
-    allocate_kv(*this, capacity);
+    initialize(capacity, memory.stream());
+}
+
+void Request::initialize(int capacity, cudaStream_t stream) {
+    allocate_kv(*this, capacity, stream);
     allocate_gdn(*this);
 }
 
+void Request::reset(cudaStream_t stream) {
+    zero(states.front().history, gdn_layers * gdn_history_elements, stream);
+    zero(states.front().recurrent, gdn_layers * gdn_state_elements, stream);
+}
+
 void Request::reset() {
-    zero(states.front().history, gdn_layers * gdn_history_elements, memory.stream());
-    zero(states.front().recurrent, gdn_layers * gdn_state_elements, memory.stream());
+    reset(memory.stream());
 }
 
 }

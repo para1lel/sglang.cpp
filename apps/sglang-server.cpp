@@ -1,11 +1,14 @@
-#include "sglang/decoder.h"
+#include "sglang/decoder_batch.h"
+#include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
 
 #include <charconv>
 #include <exception>
 #include <iostream>
+#include <mutex>
 #include <string_view>
+#include <thread>
 
 namespace {
 
@@ -15,6 +18,8 @@ struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
     int device = 0;
     int port = 17384;
+    int max_active = 1;
+    bool trace_batches = false;
 };
 
 int parse_integer(std::string_view value, const char* error) {
@@ -30,6 +35,10 @@ Arguments parse_arguments(int argc, char** argv) {
     Arguments arguments;
     for (int index = 1; index < argc; ++index) {
         const std::string_view option = argv[index];
+        if (option == "--trace-batches") {
+            arguments.trace_batches = true;
+            continue;
+        }
         if (++index == argc) {
             throw std::invalid_argument("Missing value for " + std::string(option));
         }
@@ -43,6 +52,13 @@ Arguments parse_arguments(int argc, char** argv) {
             if (arguments.port == 0 || arguments.port > 65535) {
                 throw std::invalid_argument("Expected a TCP port in [1, 65535]");
             }
+        } else if (option == "--max-active") {
+            const auto error = "Expected --max-active in [1, 4]";
+            arguments.max_active = parse_integer(value, error);
+            if (arguments.max_active == 0 ||
+                arguments.max_active > sglang::decoder_batch_max_lanes) {
+                throw std::invalid_argument(error);
+            }
         } else {
             throw std::invalid_argument("Invalid argument " + std::string(option));
         }
@@ -50,7 +66,8 @@ Arguments parse_arguments(int argc, char** argv) {
     return arguments;
 }
 
-void serve_connection(const Socket& connection, const sglang::Decoder& decoder) {
+template <typename Complete>
+void serve_connection(const Socket& connection, const Complete& complete_request) {
     try {
         const auto request = read_request(connection);
         if (!request) {
@@ -59,7 +76,7 @@ void serve_connection(const Socket& connection, const sglang::Decoder& decoder) 
         if (request->path == "/health" && request->method == "GET" && request->body.empty()) {
             write_json(connection, "200 OK", "{}");
         } else if (request->path == "/v1/completions" && request->method == "POST") {
-            complete(connection, decoder, request->body);
+            complete_request(connection, request->body);
         } else {
             write_error(connection, "404 Not Found",
                         "Expected GET /health or POST /v1/completions");
@@ -74,11 +91,59 @@ void serve_connection(const Socket& connection, const sglang::Decoder& decoder) 
     }
 }
 
+template <typename Complete>
+void serve_connections(const Socket& listener, const Complete& complete_request) {
+    while (!stopping()) {
+        const auto connection = accept_connection(listener);
+        if (connection.get() >= 0) {
+            serve_connection(connection, complete_request);
+        }
+    }
+}
+
+void serve_batch(const Socket& listener, BatchService& service, int max_active) {
+    std::vector<std::thread> workers;
+    workers.reserve(max_active);
+    std::mutex failure_mutex;
+    std::exception_ptr failure;
+    const auto stop_on_error = [&] {
+        const std::lock_guard lock(failure_mutex);
+        if (!failure) {
+            failure = std::current_exception();
+        }
+        stop_serving();
+    };
+    try {
+        for (int slot = 0; slot < max_active; ++slot) {
+            workers.emplace_back([&, slot] {
+                try {
+                    serve_connections(listener, [&](const Socket& connection,
+                                                    std::string_view body) {
+                        complete(connection, service, slot, body);
+                    });
+                } catch (...) {
+                    stop_on_error();
+                }
+            });
+        }
+    } catch (...) {
+        stop_on_error();
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
+}
+
 }
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]\n"
+        std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
+                     " [--max-active N] [--trace-batches]\n"
+                     "Active requests: 1 by default, up to 4.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
         return 0;
     }
@@ -91,11 +156,13 @@ int main(int argc, char** argv) {
         }
         const auto listener = listen_loopback(arguments.port);
         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
-        while (!stopping()) {
-            const auto connection = accept_connection(listener);
-            if (connection.get() >= 0) {
-                serve_connection(connection, decoder);
-            }
+        if (arguments.max_active == 1) {
+            serve_connections(listener, [&](const Socket& connection, std::string_view body) {
+                complete(connection, decoder, body, arguments.trace_batches);
+            });
+        } else {
+            BatchService service(decoder, arguments.trace_batches);
+            serve_batch(listener, service, arguments.max_active);
         }
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';

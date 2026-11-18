@@ -223,6 +223,11 @@ constexpr int fp8_pack_bytes = 16;
 constexpr int fp8_packed_warps = 4;
 constexpr int fp8_groups_per_warp = warp_width * fp8_pack_bytes / text_fp8_group_size;
 
+bool supports_wide_fp8(const std::uint8_t* weight, TextFp8ActivationView input, int in_width) {
+    return in_width % (fp8_groups_per_warp * text_fp8_group_size) == 0 &&
+           aligned(weight, fp8_pack_bytes) && aligned(input.values, fp8_pack_bytes);
+}
+
 __device__ uint4 load_fp8_weight(const void* address) {
     uint4 bits;
     const auto global = __cvta_generic_to_global(address);
@@ -262,6 +267,67 @@ __global__ void fp8_gemv_packed_kernel(const std::uint8_t* weight,
     if (lane == 0) {
         output[row] = __float2bfloat16_rn(sum);
     }
+}
+
+template <int Count>
+struct Fp8Projections {
+    TextFp8Projection entries[Count];
+};
+
+template <int Count>
+__global__ void fp8_batch_packed_kernel(const std::uint8_t* weight,
+                                        const __nv_bfloat16* weight_scales,
+                                        int out_width, int in_width, int groups,
+                                        Fp8Projections<Count> projections) {
+    const int lane = threadIdx.x % warp_width;
+    const int row = blockIdx.x * fp8_packed_warps + threadIdx.x / warp_width;
+    if (row >= out_width) {
+        return;
+    }
+    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
+    const auto* row_scales =
+        weight_scales + static_cast<std::size_t>(row / text_fp8_group_size) * groups;
+    constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
+    const int lane_group = lane / lanes_per_group;
+    const int lane_col = lane * fp8_pack_bytes;
+    float sums[Count]{};
+    for (int group = 0; group < groups; group += fp8_groups_per_warp) {
+        const auto col = static_cast<std::size_t>(group) * text_fp8_group_size + lane_col;
+        const uint4 lhs = load_fp8_weight(row_weight + col);
+        const int scale_index = group + lane_group;
+        const float scale = __bfloat162float(row_scales[scale_index]);
+#pragma unroll
+        for (int index = 0; index < Count; ++index) {
+            const auto input = projections.entries[index].input;
+            const uint4 rhs = load_128(input.values + col);
+            const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
+            const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
+            const float scaled = (low + high) * input.scales[scale_index];
+            sums[index] = fmaf(scaled, scale, sums[index]);
+        }
+    }
+#pragma unroll
+    for (int index = 0; index < Count; ++index) {
+        const float sum = warp_sum(sums[index]);
+        if (lane == 0) {
+            projections.entries[index].output[row] = __float2bfloat16_rn(sum);
+        }
+    }
+}
+
+template <int Count>
+cudaError_t launch_fp8_batch(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+                             int out_width, int in_width, const TextFp8Projection* projections,
+                             cudaStream_t stream) {
+    Fp8Projections<Count> batch;
+    for (int index = 0; index < Count; ++index) {
+        batch.entries[index] = projections[index];
+    }
+    int groups = text_fp8_group_count(in_width);
+    void* args[] = {&weight, &weight_scales, &out_width, &in_width, &groups, &batch};
+    return cudaLaunchKernel(fp8_batch_packed_kernel<Count>,
+                            divide_up(out_width, fp8_packed_warps),
+                            fp8_packed_warps * warp_width, args, 0, stream);
 }
 
 __device__ float residual_sum(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
@@ -441,8 +507,7 @@ cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weigh
         return cudaErrorInvalidValue;
     }
     int groups = text_fp8_group_count(in_width);
-    const bool wide = in_width % (fp8_groups_per_warp * text_fp8_group_size) == 0 &&
-                      aligned(weight, fp8_pack_bytes) && aligned(input.values, fp8_pack_bytes);
+    const bool wide = supports_wide_fp8(weight, input, in_width);
     const bool packed = in_width % 4 == 0 && aligned(weight, 4) && aligned(input.values, 4);
     void* args[] = {&weight, &weight_scales, &input, &out_width, &in_width, &groups, &output};
     const auto kernel = wide ? fp8_gemv_packed_kernel
@@ -450,6 +515,41 @@ cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weigh
     const int rows_per_block = wide ? fp8_packed_warps : block_warps;
     return cudaLaunchKernel(kernel, divide_up(out_width, rows_per_block),
                             rows_per_block * warp_width, args, 0, stream);
+}
+
+cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+                          int out_width, int in_width, const TextFp8Projection* projections,
+                          int count, cudaStream_t stream) {
+    if (!weight || !weight_scales || !projections || out_width <= 0 || in_width <= 0 ||
+        count < 1 || count > text_fp8_max_batch) {
+        return cudaErrorInvalidValue;
+    }
+    bool wide = true;
+    for (int index = 0; index < count; ++index) {
+        const auto& entry = projections[index];
+        if (!entry.input.values || !entry.input.scales || !entry.output) {
+            return cudaErrorInvalidValue;
+        }
+        wide = wide && supports_wide_fp8(weight, entry.input, in_width);
+    }
+    if (wide && count == 4) {
+        return launch_fp8_batch<4>(weight, weight_scales, out_width, in_width, projections, stream);
+    }
+    if (wide && count == 3) {
+        return launch_fp8_batch<3>(weight, weight_scales, out_width, in_width, projections, stream);
+    }
+    if (wide && count == 2) {
+        return launch_fp8_batch<2>(weight, weight_scales, out_width, in_width, projections, stream);
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& entry = projections[index];
+        const auto status = text_fp8_gemv(weight, weight_scales, entry.input, out_width, in_width,
+                                           entry.output, stream);
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
 }
 
 cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* residual,

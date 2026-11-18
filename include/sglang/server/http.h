@@ -35,6 +35,7 @@ struct HttpError : std::runtime_error {
 };
 
 void install_shutdown_handlers();
+void stop_serving();
 bool stopping();
 Socket listen_loopback(int port);
 Socket accept_connection(const Socket& listener);

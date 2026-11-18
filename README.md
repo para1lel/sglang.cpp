@@ -94,10 +94,20 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
 
 The server loads one model and binds to `127.0.0.1`. `GET /health` returns HTTP 200 after
 model loading. `POST /v1/completions` implements the frozen streaming benchmark contract
-for model `benchmark` with token ID input. The server processes one request at a time.
+for model `benchmark` with token ID input. By default and with `--max-active 1`,
+requests run serially and reuse the decode graph. Set `--max-active 2`, `3`, or `4`
+to batch concurrent requests on the resident model. Extra connections wait in the
+listener backlog until a socket worker is available.
+
 Each selected token produces one SSE event. The first choice carries the prompt IDs.
-A length finish, usage, and `[DONE]` end a completed request. A disconnect cancels
-generation at the next decoder cancellation check.
+To stop on a specific output ID, include a single ID in `stop_token_ids`.
+The server emits the matching token and reports `stop`, even at the output limit.
+Otherwise, reaching the output limit reports `length`. Usage and `[DONE]` follow the
+finish. A detected connection reset cancels the associated request and releases its slot.
+
+Add `--trace-batches` to log `batch width=… decode=… request_bytes=…` on standard error.
+In serial mode the trace describes token-producing steps and reports zero batch request
+bytes. In batch mode `request_bytes` counts live allocations owned by the batch executor.
 
 `Decoder::generate` accepts optional callbacks. `on_token` receives each selected ID
 synchronously after host readback. Returning `false` cancels the request with that ID

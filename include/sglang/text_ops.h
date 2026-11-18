@@ -8,6 +8,7 @@
 namespace sglang {
 
 inline constexpr int text_fp8_group_size = 128;
+inline constexpr int text_fp8_max_batch = 4;
 
 constexpr int text_fp8_group_count(int width) {
     return width / text_fp8_group_size + (width % text_fp8_group_size != 0);
@@ -21,6 +22,11 @@ struct TextFp8Activation {
 struct TextFp8ActivationView {
     const std::uint8_t* values;
     const float* scales;
+};
+
+struct TextFp8Projection {
+    TextFp8ActivationView input;
+    __nv_bfloat16* output;
 };
 
 struct TextLogitCandidate {
@@ -62,6 +68,12 @@ cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Acti
 cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
                           TextFp8ActivationView input, int out_width, int in_width,
                           __nv_bfloat16* output, cudaStream_t stream);
+
+/// Apply shared FP8 weights to independent vectors using GEMV arithmetic.
+/// Projections is a host array. Its output spans must be disjoint.
+cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+                          int out_width, int in_width, const TextFp8Projection* projections,
+                          int count, cudaStream_t stream);
 
 /// Computes RMSNorm with eps 1e-6 and FP32 (1 + weight). A null residual
 /// selects standalone normalization. A nonnull residual_output receives the

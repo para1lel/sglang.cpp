@@ -37,6 +37,7 @@ constexpr bool is_full_attention(int layer_index) {
 }
 
 void check(cudaError_t status, const char* operation);
+void validate_request(const std::vector<int>& prompt, const DecoderOptions& options);
 
 class DeviceScope {
 public:
@@ -80,7 +81,7 @@ public:
     cudaGraphExec_t graph() const;
     void capture_graph(const std::function<void()>& enqueue);
     void reclaim_deferred();
-    void open_stream(std::shared_ptr<const Allocations> weights = nullptr);
+    void open_stream(std::shared_ptr<const void> owners = nullptr);
     void close_stream();
     void close();
 
@@ -159,9 +160,12 @@ struct Workspace {
 };
 
 struct Request {
+    explicit Request(int device, bool reusable = false);
     Request(int device, int capacity, std::shared_ptr<const Allocations> weights,
             bool reusable = false);
 
+    void initialize(int capacity, cudaStream_t stream);
+    void reset(cudaStream_t stream);
     void reset();
 
     Allocations memory;
@@ -172,6 +176,16 @@ struct Request {
     std::array<TextGdnState, gdn_layers> states;
 };
 
+void copy_greedy_token(Request& request, cudaStream_t stream);
+int read_greedy_token(Request& request);
+
+struct ForwardLane {
+    Request* request;
+    int token_id;
+    int position;
+    TextGdnMode mode;
+};
+
 }
 
 namespace sglang {
@@ -180,11 +194,13 @@ struct Decoder::Model {
     Model(const std::filesystem::path& checkpoint, int cuda_device);
 
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
+    void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     void decode_graph(decoder::Request& request) const;
     void compute_logits(decoder::Request& request) const;
+    void compute_logits(decoder::Workspace& work, cudaStream_t stream) const;
 
-    template <typename Position>
-    void forward_layers(decoder::Request& request, Position position, TextGdnMode mode) const;
+    template <typename Lane>
+    void forward_layers(const Lane* lanes, int count, cudaStream_t stream) const;
 
     int device;
     std::shared_ptr<decoder::Allocations> memory;

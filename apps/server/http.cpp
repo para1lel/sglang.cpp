@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -22,12 +23,14 @@ using Clock = std::chrono::steady_clock;
 constexpr std::size_t max_header_bytes = 8192;
 constexpr std::size_t max_body_bytes = 2 * 1024 * 1024;
 constexpr auto io_timeout = std::chrono::seconds(5);
+constexpr auto shutdown_poll = std::chrono::milliseconds(250);
 constexpr short terminal_events = POLLHUP | POLLERR | POLLNVAL;
 
-volatile std::sig_atomic_t stop_requested = 0;
+std::atomic<bool> stop_requested{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
 
 void request_shutdown(int) {
-    stop_requested = 1;
+    stop_serving();
 }
 
 [[noreturn]] void socket_error(const char* operation) {
@@ -42,11 +45,12 @@ bool wait_ready(const Socket& socket, short events, Clock::time_point deadline) 
             break;
         }
         pollfd ready{socket.get(), events, 0};
-        const int count = poll(&ready, 1, static_cast<int>(time_left.count()));
+        const auto interval = std::min(time_left, shutdown_poll);
+        const int count = poll(&ready, 1, static_cast<int>(interval.count()));
         if (count > 0) {
             return (ready.revents & events) && !(ready.revents & terminal_events);
         }
-        if (count == 0 || errno != EINTR) {
+        if (count < 0 && errno != EINTR) {
             break;
         }
     }
@@ -216,9 +220,9 @@ void install_shutdown_handlers() {
     }
 }
 
-bool stopping() {
-    return stop_requested != 0;
-}
+void stop_serving() { stop_requested.store(true, std::memory_order_relaxed); }
+
+bool stopping() { return stop_requested.load(std::memory_order_relaxed); }
 
 Socket listen_loopback(int port) {
     Socket listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
@@ -239,7 +243,7 @@ Socket listen_loopback(int port) {
 }
 
 Socket accept_connection(const Socket& listener) {
-    if (!wait_ready(listener, POLLIN, Clock::now() + std::chrono::milliseconds(250))) {
+    if (!wait_ready(listener, POLLIN, Clock::now() + shutdown_poll)) {
         return Socket(-1);
     }
     Socket client(accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));

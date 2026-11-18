@@ -1,6 +1,6 @@
 #include "sglang/server/completions.h"
 
-#include "sglang/decoder.h"
+#include "sglang/server/batch_service.h"
 #include "sglang/server/http.h"
 
 #include <llvm/Support/Error.h>
@@ -33,7 +33,9 @@ CompletionRequest parse_completion(std::string_view body) {
         throw HttpError("400 Bad Request", "Invalid JSON request body");
     }
     const auto* object = parsed->getAsObject();
-    if (!object || object->size() != 11 || object->getString("model") != "benchmark" ||
+    const auto* stops = object ? object->get("stop_token_ids") : nullptr;
+    if (!object || object->size() != (stops ? 12 : 11) ||
+        object->getString("model") != "benchmark" ||
         object->getNumber("temperature") != 0.0 || unsigned_integer(*object, "seed") != 0 ||
         object->getBoolean("ignore_eos") != true || object->getBoolean("stream") != true ||
         object->getBoolean("return_token_ids") != true ||
@@ -56,6 +58,15 @@ CompletionRequest parse_completion(std::string_view body) {
     }
     CompletionRequest request;
     request.options.max_new_tokens = static_cast<int>(*output_budget);
+    if (stops) {
+        const auto* tokens = stops->getAsArray();
+        const auto id = tokens && tokens->size() == 1
+            ? tokens->front().getAsUINT64() : std::nullopt;
+        if (!id || *id > std::numeric_limits<int>::max()) {
+            throw HttpError("400 Bad Request", "Expected a single nonnegative integer stop ID");
+        }
+        request.options.stop_token_id = static_cast<int>(*id);
+    }
     request.prompt.reserve(prompt->size());
     for (const auto& value : *prompt) {
         const auto id = value.getAsUINT64();
@@ -76,7 +87,8 @@ std::string encode_json(Encode encode) {
     return output;
 }
 
-std::string choice_event(std::optional<int> token, const std::vector<int>* prompt, bool finished) {
+std::string choice_event(std::optional<int> token, const std::vector<int>* prompt,
+                         const char* finish_reason) {
     return encode_json([&](json::OStream& writer) {
         writer.attributeArray("choices", [&] {
             writer.object([&] {
@@ -93,7 +105,8 @@ std::string choice_event(std::optional<int> token, const std::vector<int>* promp
                         }
                     });
                 }
-                writer.attribute("finish_reason", finished ? json::Value("length") : nullptr);
+                writer.attribute("finish_reason", finish_reason ? json::Value(finish_reason)
+                                                                : nullptr);
             });
         });
     });
@@ -128,41 +141,49 @@ bool begin_stream(const Socket& connection, bool& streaming) {
 void finish_stream(const Socket& connection, const CompletionRequest& request,
                    const DecoderResult& result, bool& streaming) {
     const auto output_count = result.output_token_ids.size();
-    if (result.finish_reason != DecoderFinishReason::length ||
-        output_count != static_cast<std::size_t>(request.options.max_new_tokens)) {
-        throw std::logic_error("Decoder did not complete the requested output budget");
+    const auto budget = static_cast<std::size_t>(request.options.max_new_tokens);
+    const auto stop_id = request.options.stop_token_id;
+    const bool stop_matched = output_count && result.output_token_ids.back() == stop_id;
+    const bool stopped = result.finish_reason == DecoderFinishReason::stop;
+    if (stopped ? (!stop_matched || output_count > budget)
+                : (result.finish_reason != DecoderFinishReason::length ||
+                   stop_matched || output_count != budget)) {
+        throw std::logic_error("Decoder returned an inconsistent completion");
     }
     const auto* prompt = streaming ? nullptr : &request.prompt;
     if (begin_stream(connection, streaming) &&
-        write_event(connection, choice_event(std::nullopt, prompt, true)) &&
+        write_event(connection, choice_event(std::nullopt, prompt, stopped ? "stop" : "length")) &&
         write_event(connection, usage_event(request.prompt.size(), output_count)) &&
         write_event(connection, "[DONE]")) {
         end_events(connection);
     }
 }
 
-}
-
-void write_error(const Socket& connection, std::string_view status, const char* message) {
-    write_json(connection, status, error_body(message));
-}
-
-void complete(const Socket& connection, const Decoder& decoder, std::string_view body) {
+template <typename Generate>
+void stream_completion(const Socket& connection, std::string_view body, Generate generate,
+                       bool trace_serial = false) {
     const auto request = parse_completion(body);
     bool streaming = false;
+    bool first_token = true;
     const DecoderCallbacks callbacks{
         [&](int token) {
+            if (trace_serial) {
+                trace_batch_step(1, first_token ? 0 : 1, 0);
+                first_token = false;
+            }
             const auto* prompt = streaming ? nullptr : &request.prompt;
             return begin_stream(connection, streaming) &&
-                   write_event(connection, choice_event(token, prompt, false));
+                   write_event(connection, choice_event(token, prompt, nullptr));
         },
         [&] { return disconnected(connection); },
     };
 
     try {
-        const auto result = decoder.generate(request.prompt, request.options, callbacks);
+        const auto result = generate(request, callbacks);
         if (result.finish_reason != DecoderFinishReason::cancelled) {
             finish_stream(connection, request, result, streaming);
+        } else if (trace_serial) {
+            trace_batch_step(0, 0, 0);
         }
     } catch (const std::exception& error) {
         if (!streaming) {
@@ -173,6 +194,26 @@ void complete(const Socket& connection, const Decoder& decoder, std::string_view
             end_events(connection);
         }
     }
+}
+
+}
+
+void write_error(const Socket& connection, std::string_view status, const char* message) {
+    write_json(connection, status, error_body(message));
+}
+
+void complete(const Socket& connection, const Decoder& decoder, std::string_view body, bool trace) {
+    stream_completion(connection, body,
+                      [&](const CompletionRequest& request, const DecoderCallbacks& callbacks) {
+        return decoder.generate(request.prompt, request.options, callbacks);
+    }, trace);
+}
+
+void complete(const Socket& connection, BatchService& service, int slot, std::string_view body) {
+    stream_completion(connection, body,
+                      [&](const CompletionRequest& request, const DecoderCallbacks& callbacks) {
+        return service.generate(slot, request.prompt, request.options, callbacks);
+    });
 }
 
 }

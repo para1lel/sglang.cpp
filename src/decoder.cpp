@@ -6,13 +6,50 @@
 #include <cmath>
 
 namespace sglang {
+namespace decoder {
 namespace {
-
-using namespace decoder;
 
 bool valid_token(int id) {
     return id >= 0 && id < vocab_size;
 }
+
+}
+
+void validate_request(const std::vector<int>& prompt, const DecoderOptions& options) {
+    if (prompt.empty() || !std::all_of(prompt.begin(), prompt.end(), valid_token)) {
+        throw std::invalid_argument("Prompt must contain token IDs in [0, 248320)");
+    }
+    if (options.stop_token_id && !valid_token(*options.stop_token_id)) {
+        throw std::invalid_argument("Stop token ID falls outside the vocabulary");
+    }
+    if (options.top_logits < 0 || options.top_logits > vocab_size) {
+        throw std::invalid_argument("Top-logit count falls outside the vocabulary");
+    }
+    if (options.max_new_tokens < 0 || options.max_new_tokens > text_attention_max_tokens ||
+        prompt.size() > std::size_t(text_attention_max_tokens - options.max_new_tokens)) {
+        throw std::invalid_argument("Prompt and output budget must fit the 262144-token context");
+    }
+}
+
+void copy_greedy_token(Request& request, cudaStream_t stream) {
+    auto& winner = request.memory.transfers().winner;
+    check(cudaMemcpyAsync(&winner, &request.work.argmax->token_id, sizeof(winner),
+                          cudaMemcpyDeviceToHost, stream), "Read greedy token");
+}
+
+int read_greedy_token(Request& request) {
+    const int winner = request.memory.transfers().winner;
+    if (!valid_token(winner)) {
+        throw std::runtime_error("Greedy selection did not produce a valid token ID");
+    }
+    return winner;
+}
+
+}
+
+namespace {
+
+using namespace decoder;
 
 class RequestLease {
 public:
@@ -35,22 +72,6 @@ private:
     bool owns_slot_;
 };
 
-void validate_request(const std::vector<int>& prompt, const DecoderOptions& options) {
-    if (prompt.empty() || !std::all_of(prompt.begin(), prompt.end(), valid_token)) {
-        throw std::invalid_argument("Prompt must contain token IDs in [0, 248320)");
-    }
-    if (options.stop_token_id && !valid_token(*options.stop_token_id)) {
-        throw std::invalid_argument("Stop token ID falls outside the vocabulary");
-    }
-    if (options.top_logits < 0 || options.top_logits > vocab_size) {
-        throw std::invalid_argument("Top-logit count falls outside the vocabulary");
-    }
-    if (options.max_new_tokens < 0 || options.max_new_tokens > text_attention_max_tokens ||
-        prompt.size() > std::size_t(text_attention_max_tokens - options.max_new_tokens)) {
-        throw std::invalid_argument("Prompt and output budget must fit the 262144-token context");
-    }
-}
-
 std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_t count,
                                     std::vector<DecoderLogit>& ranking) {
     ranking.clear();
@@ -72,22 +93,16 @@ std::vector<DecoderLogit> top_logits(const std::vector<Bf16>& scores, std::size_
 }
 
 int read_step(Request& request) {
-    auto& transfers = request.memory.transfers();
     const auto stream = request.memory.stream();
-    auto& winner = transfers.winner;
-    auto& host_logits = transfers.logits;
-    check(cudaMemcpyAsync(&winner, &request.work.argmax->token_id, sizeof(winner),
-                          cudaMemcpyDeviceToHost, stream), "Read greedy token");
+    auto& host_logits = request.memory.transfers().logits;
+    copy_greedy_token(request, stream);
     if (!host_logits.empty()) {
         check(cudaMemcpyAsync(host_logits.data(), request.work.logits,
                               host_logits.size() * sizeof(Bf16), cudaMemcpyDeviceToHost, stream),
               "Read step logits");
     }
     check(cudaStreamSynchronize(stream), "Complete decoder step");
-    if (!valid_token(winner)) {
-        throw std::runtime_error("Greedy selection did not produce a valid token ID");
-    }
-    return winner;
+    return read_greedy_token(request);
 }
 
 }

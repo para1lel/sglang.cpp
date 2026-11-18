@@ -52,6 +52,7 @@ public:
     std::size_t model_device_allocation_bytes() const;
 
 private:
+    friend class DecoderBatch;
     struct Model;
     std::unique_ptr<Model> model_;
 };

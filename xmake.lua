@@ -75,7 +75,7 @@ target("sglang_decoder")
     add_includedirs("include", {public = true})
     add_deps("sglang_checkpoint", "sglang_cuda")
     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
-              "src/decoder_weights.cpp")
+              "src/decoder_weights.cpp", "src/decoder_batch.cpp")
 
 target("sglang-generate")
     set_kind("binary")
@@ -92,7 +92,8 @@ target("sglang-server")
     add_deps("sglang_decoder")
     add_sysincludedirs(path.join(prefix, "include"))
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
-    add_files("apps/sglang-server.cpp", "apps/server/*.cpp")
+    add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
+              "apps/server/completions.cpp", "apps/server/http.cpp")
 
 option("mxfp8-gqa-check")
     set_default(false)

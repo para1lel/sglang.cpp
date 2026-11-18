@@ -6,7 +6,7 @@ greedy token-ID request. It uses paged MXFP8 KV storage in the 16 full-attention
 and carries Gated DeltaNet state through the other 48 layers.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L34)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L41)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
@@ -72,6 +72,30 @@ prompt processing and generation. The timing samples exclude warmups and model l
 Peak device allocation bytes count the decoder's requested CUDA allocations for the model
 and one request. C++ callers link the `sglang_decoder` target and reuse `sglang::Decoder`
 across requests.
+
+## Serve token IDs over HTTP
+
+From the project root, enter the default Pixi environment and build `sglang-server`.
+Set `GPU_UUID` to the UUID of a reserved B200 before starting the server.
+
+```bash
+pixi shell --manifest-path /data1/shared/dongwu.chen/pixi.toml --environment default
+xmake f -P . -o build -p linux -a x86_64 -m release
+xmake build -P . sglang-server
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
+    ./build/bin/sglang-server --device 0 --port 17384
+```
+
+The server loads one model and binds to `127.0.0.1`. `GET /health` returns HTTP 200 after
+model loading. `POST /v1/completions` implements the frozen streaming benchmark contract
+for model `benchmark` with token ID input. The server processes one request at a time.
+Each selected token produces one SSE event. The first choice carries the prompt IDs.
+A length finish, usage, and `[DONE]` end a completed request. A disconnect cancels
+generation at the next decoder cancellation check.
+
+`Decoder::generate` accepts optional callbacks. `on_token` receives each selected ID
+synchronously after host readback. Returning `false` cancels the request with that ID
+in the result. `is_cancelled` is checked before request work and between model steps.
 
 ## Continue development
 

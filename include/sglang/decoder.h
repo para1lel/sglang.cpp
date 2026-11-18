@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -17,6 +18,12 @@ struct DecoderOptions {
 enum class DecoderFinishReason {
     length,
     stop,
+    cancelled,
+};
+
+struct DecoderCallbacks {
+    std::function<bool(int)> on_token;
+    std::function<bool()> is_cancelled;
 };
 
 struct DecoderLogit {
@@ -40,7 +47,8 @@ public:
     Decoder& operator=(const Decoder&) = delete;
 
     DecoderResult generate(const std::vector<int>& prompt_token_ids,
-                           const DecoderOptions& options = DecoderOptions{}) const;
+                           const DecoderOptions& options = DecoderOptions{},
+                           const DecoderCallbacks& callbacks = DecoderCallbacks{}) const;
     std::size_t model_device_allocation_bytes() const;
 
 private:

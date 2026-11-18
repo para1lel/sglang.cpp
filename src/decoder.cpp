@@ -78,10 +78,16 @@ std::size_t Decoder::model_device_allocation_bytes() const {
 }
 
 DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
-                                const DecoderOptions& options) const {
+                                const DecoderOptions& options,
+                                const DecoderCallbacks& callbacks) const {
     validate_request(prompt_token_ids, options);
     DecoderResult result;
     result.peak_device_allocation_bytes = model_device_allocation_bytes();
+    const auto cancelled = [&] { return callbacks.is_cancelled && callbacks.is_cancelled(); };
+    if (cancelled()) {
+        result.finish_reason = DecoderFinishReason::cancelled;
+        return result;
+    }
     if (options.max_new_tokens == 0) {
         return result;
     }
@@ -98,25 +104,39 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     auto& winner = transfers.winner;
     result.peak_device_allocation_bytes += request.memory.bytes();
     result.output_token_ids.reserve(options.max_new_tokens);
-    for (int position = 0; position < prompt_count; ++position) {
-        model_->forward(request, prompt_token_ids[position], position, TextGdnMode::prefill);
-    }
-    for (int step = 0; step < options.max_new_tokens; ++step) {
-        if (step != 0) {
-            model_->forward(request, winner.token_id, prompt_count + step - 1, TextGdnMode::decode);
+    const auto run_request = [&] {
+        for (int position = 0; position < prompt_count; ++position) {
+            if (cancelled()) {
+                return DecoderFinishReason::cancelled;
+            }
+            model_->forward(request, prompt_token_ids[position], position, TextGdnMode::prefill);
         }
-        model_->compute_logits(request);
-        read_step(request);
-        result.output_token_ids.push_back(winner.token_id);
-        if (options.top_logits > 0) {
-            result.step_top_logits.push_back(
-                top_logits(transfers.logits, options.top_logits, ranking));
+        for (int step = 0; step < options.max_new_tokens; ++step) {
+            if (cancelled()) {
+                return DecoderFinishReason::cancelled;
+            }
+            if (step != 0) {
+                const int position = prompt_count + step - 1;
+                model_->forward(request, winner.token_id, position, TextGdnMode::decode);
+            }
+            model_->compute_logits(request);
+            read_step(request);
+            result.output_token_ids.push_back(winner.token_id);
+            const bool keep_running = !callbacks.on_token || callbacks.on_token(winner.token_id);
+            if (options.top_logits > 0) {
+                result.step_top_logits.push_back(
+                    top_logits(transfers.logits, options.top_logits, ranking));
+            }
+            if (!keep_running) {
+                return DecoderFinishReason::cancelled;
+            }
+            if (options.stop_token_id == winner.token_id) {
+                return DecoderFinishReason::stop;
+            }
         }
-        if (options.stop_token_id == winner.token_id) {
-            result.finish_reason = DecoderFinishReason::stop;
-            break;
-        }
-    }
+        return DecoderFinishReason::length;
+    };
+    result.finish_reason = run_request();
     request.memory.close();
     selected_device.restore();
     return result;

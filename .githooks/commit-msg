@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+runner=$(git --no-replace-objects show :.githooks/run)
+exec /bin/sh -eu -c "$runner" run commit-msg "$1"

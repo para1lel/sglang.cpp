@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "baseline": {
+    "revision": null,
+    "tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "maxima": {
+      "directory_entries": 0,
+      "code_file_lines": 0,
+      "function_lines": 0
+    }
+  },
+  "limits": {
+    "directory_entries": 30,
+    "code_file_lines": 1000,
+    "function_lines": 100
+  },
+  "function_adapters": {
+    ".sh": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".bash": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".lua": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".cc": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".cpp": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".cxx": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".h": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".hpp": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".cu": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".cuh": ["{python}", ".agents/checks/function_spans.py", "{file}"]
+  },
+  "code_suffixes": [],
+  "code_paths": [],
+  "checks": [
+    {
+      "name": "maintenance contract",
+      "kind": "test",
+      "paths": [".agents/*", ".githooks/*", "tests/*"],
+      "command": [
+        "{python}", "-IB", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "tests/test_gate_contract.py", "--junitxml=.gate-results/contracts.xml"
+      ],
+      "report": ".gate-results/contracts.xml",
+      "timeout": 90
+    }
+  ],
+  "shared_paths": ["tests/conftest.py"]
+}

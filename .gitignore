@@ -1,0 +1,12 @@
+/.xmake/
+/build/
+/artifacts/
+/.gate-results/
+/.pytest_cache/
+/.pixi/
+/.venv/
+__pycache__/
+*.pyc
+*.safetensors
+*.ncu-rep
+*.nsys-rep

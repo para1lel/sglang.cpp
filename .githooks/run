@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+root=$(git rev-parse --show-toplevel)
+selected=$(git rev-parse --path-format=absolute --git-path index)
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+cd "$root"
+cp "$selected" "$temporary/index"
+export GIT_INDEX_FILE="$temporary/index" GIT_NO_REPLACE_OBJECTS=1
+for helper in gate_config.py staged_check.py check_rules.py
+do
+    git --no-replace-objects show ":.agents/checks/$helper" > "$temporary/$helper"
+done
+case "$1" in
+    pre-commit) python -IB "$temporary/staged_check.py" "$root" ;;
+    commit-msg) python -IB "$temporary/check_rules.py" commit-message "$2" ;;
+    *) exit 2 ;;
+esac
+cmp "$selected" "$temporary/index"

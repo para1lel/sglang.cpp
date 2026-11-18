@@ -111,6 +111,11 @@ cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16*
                               __nv_bfloat16* output, __nv_bfloat16* residual_output,
                               cudaStream_t stream);
 
+cudaError_t text_rms_norm_pair_rows(const __nv_bfloat16* first, const __nv_bfloat16* second,
+                                   const __nv_bfloat16* first_weight,
+                                   const __nv_bfloat16* second_weight, int width, int rows,
+                                   __nv_bfloat16* output, cudaStream_t stream);
+
 /// Stores BF16(BF16(SiLU(gate)) * up). Output may alias gate or up exactly.
 cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,
                         __nv_bfloat16* output, cudaStream_t stream);

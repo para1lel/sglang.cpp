@@ -20,9 +20,12 @@ from batch.run_native import (
     wait_until_ready,
     write_json,
 )
+from prefill.run_native import load_cases as load_prefill_cases
 
 COUNTERS = ("mtp_drafted_tokens", "mtp_accepted_tokens", "mtp_rounds")
 STEPS = (1, 2, 3, 4)
+SEED_COUNTERS = {129: {1: (4, 4, 4), 4: (11, 6, 3)},
+                 257: {1: (5, 4, 5), 4: (10, 5, 4)}}
 
 
 class CompletionStream(Stream):
@@ -146,6 +149,39 @@ def trim_control(target, budget, stop):
             "step_top_logits": target["step_top_logits"][:len(ids)]}
 
 
+def compare_reference(candidate, reference, steps, name):
+    fields = ("output_token_ids", "finish_reason", "step_top_logits")
+    for key in (*fields, *(COUNTERS if steps else ())):
+        require(candidate[key] == reference[key],
+                f"{name}: steps={steps}: changed {key} from the reference generator")
+    if not steps:
+        require(all(key not in reference for key in COUNTERS), f"{name}: reference draft counters")
+
+
+def check_seed_carry(args):
+    prefill_cases = load_prefill_cases()
+    for length, expected_counters in SEED_COUNTERS.items():
+        name = f"seed-carry-{length}"
+        prompt = prefill_cases[length]["prompt"]
+        case = (prompt, 9, None)
+        control = generate(args, name, case, 0)
+        require(all(key not in control for key in COUNTERS), f"{name}: target-only draft counters")
+        if args.reference_generate:
+            reference = generate(args, name, case, 0, reference=True)
+            compare_reference(control, reference, 0, name)
+        for steps, expected in expected_counters.items():
+            candidate = generate(args, name, case, steps)
+            compare(control, candidate, steps, name)
+            counters = tuple(candidate[key] for key in COUNTERS)
+            require(counters == expected,
+                    f"{name}: steps={steps}: row-wise draft counters {expected} "
+                    f"changed to {counters}")
+            if args.reference_generate:
+                reference = generate(args, name, case, steps, reference=True)
+                compare_reference(candidate, reference, steps, name)
+    return prompt, control
+
+
 @contextmanager
 def serial_server(args, steps):
     evidence = args.evidence / f"http-{steps}"
@@ -180,11 +216,10 @@ def await_serial_retirement(log_path, offset):
     raise AssertionError(f"Canceled serial request did not retire. See {log_path}")
 
 
-def check_recovery(port, evidence, prompt, target):
+def check_recovery(port, evidence, log_path, prompt, target):
     output = target["output_token_ids"]
     cancelled = {"name": "cancel-after-verification", "prompt": prompt,
                  "max_tokens": len(output), "output": output, "finish_reason": "length"}
-    log_path = evidence / "server.log"
     offset = log_path.stat().st_size
     with CompletionStream(port, cancelled, budget=128) as stream:
         stream.post()
@@ -205,7 +240,7 @@ def check_recovery(port, evidence, prompt, target):
         write_json(evidence / "resume.json", stream.evidence())
 
 
-def check_http(args, cases, controls):
+def check_http(args, cases, controls, seed_recovery):
     invalid = [str(args.server), "--max-active", "2", "--mtp-steps", "1"]
     result = subprocess.run(invalid, capture_output=True, text=True, timeout=5)
     require(result.returncode != 0 and "--mtp-steps requires --max-active 1" in result.stderr,
@@ -224,7 +259,12 @@ def check_http(args, cases, controls):
                     stream.complete()
                     write_json(evidence / f"{name}.json", stream.evidence())
             if steps == max(STEPS):
-                check_recovery(port, evidence, cases["silver-key"][0], controls["silver-key"])
+                log_path = evidence / "server.log"
+                check_recovery(
+                    port, evidence, log_path, cases["silver-key"][0], controls["silver-key"])
+                seed_evidence = evidence / "seed-carry"
+                seed_evidence.mkdir()
+                check_recovery(port, seed_evidence, log_path, *seed_recovery)
         print(f"HTTP steps={steps}: exact serial SSE tokens, finish, and usage")
 
 
@@ -232,7 +272,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generate", type=Path, required=True)
     parser.add_argument("--reference-generate", type=Path,
-                        help="Previous native generator with per-token target verification")
+                        help="Previous native generator with row-wise MTP prefill seeds")
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=Path("/data0/shared/Qwen3.8-27B-FP8"))
     parser.add_argument("--device", type=int, default=0)
@@ -271,14 +311,13 @@ def main():
             compare(controls[name], candidate, steps, name)
             if args.reference_generate and name == "silver-key":
                 reference = generate(args, name, case, steps, reference=True)
-                for key in (*COUNTERS, "output_token_ids", "finish_reason", "step_top_logits"):
-                    require(candidate[key] == reference[key],
-                            f"{name}: steps={steps}: changed {key} from per-token verifier")
+                compare_reference(candidate, reference, steps, name)
     for name, (parent, budget, stop, steps) in edges.items():
         cases[name] = (cases[parent][0], budget, stop)
         controls[name] = trim_control(controls[parent], budget, stop)
         compare(controls[name], generate(args, name, cases[name], steps), steps, name)
-    check_http(args, cases, controls)
+    seed_recovery = check_seed_carry(args)
+    check_http(args, cases, controls, seed_recovery)
 
 
 if __name__ == "__main__":

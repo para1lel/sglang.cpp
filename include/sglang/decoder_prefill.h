@@ -10,6 +10,17 @@ struct PrefillPool;
 
 void reclaim_prefill_workspaces(int device);
 
+struct PrefillProjections {
+    TextFp8Activation activation;
+    int rows;
+    cudaStream_t stream;
+    bool tensor_core_fp8 = false;
+
+    TextFp8ActivationView quantize(const Bf16* input, int width) const;
+    void project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output) const;
+    void project(Bf16Weight weight, const Bf16* input, Bf16* output) const;
+};
+
 class PrefillWorkspace {
 public:
     PrefillWorkspace(cudaStream_t stream, int capacity);

@@ -1,4 +1,5 @@
 #include "sglang/decoder_prefill.h"
+#include "sglang/decoder_mtp.h"
 #include "sglang/prefill_fp8.h"
 
 #include <algorithm>
@@ -206,36 +207,21 @@ struct TileBuffers {
     TextFp8Activation activation;
 };
 
-struct Chunk {
+struct Chunk : PrefillProjections {
     TileBuffers work;
     int position;
-    int rows;
-    cudaStream_t stream;
-    bool tensor_core_fp8;
 
-    TextFp8ActivationView quantize(const Bf16* input, int width) const {
-        check(text_quantize_fp8_rows(input, width, rows, work.activation, stream),
-              "Quantize prefill projection input");
-        return {work.activation.values, work.activation.scales};
-    }
-
-    void project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output) const {
-        if (tensor_core_fp8) {
-            const auto status = try_text_fp8_gemm_sm100(
-                weight.values, weight.scales, input, rows, weight.rows, weight.columns,
-                output, stream);
-            if (status) {
-                check(*status, "Run tensor-core prefill FP8 projection");
-                return;
-            }
-        }
-        check(text_fp8_gemv_rows(weight.values, weight.scales, input, weight.rows, weight.columns,
-                                 rows, output, stream), "Run exact prefill FP8 projection");
-    }
-
-    void project(Bf16Weight weight, const Bf16* input, Bf16* output) const {
-        check(text_bf16_gemv_rows(weight.values, input, weight.rows, weight.columns,
-                                  rows, output, stream), "Run exact prefill BF16 projection");
+    void seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
+                    const Bf16* final_norm) const {
+        static_assert(intermediate_size >= 2 * hidden_size);
+        static_assert(std::max(text_gdn_value_width, text_gqa_q_width) >= hidden_size);
+        check(text_rms_norm_rows(work.hidden, work.residual, final_norm, hidden_size, seed_rows,
+                                 work.normalized, nullptr, stream),
+              "Normalize target prompt rows for MTP");
+        const PrefillProjections projections{activation, seed_rows, stream};
+        draft.seed_prefill(position, shifted_tokens, work.normalized, projections,
+                           {work.projected_attention, work.mlp_gate, work.attention,
+                            work.keys, work.values, work.rope_keys});
     }
 
     void gdn(const GdnLayer& layer, TextGdnState state) const {
@@ -279,6 +265,32 @@ struct Chunk {
     }
 };
 
+}
+
+TextFp8ActivationView PrefillProjections::quantize(const Bf16* input, int width) const {
+    check(text_quantize_fp8_rows(input, width, rows, activation, stream),
+          "Quantize prefill projection input");
+    return {activation.values, activation.scales};
+}
+
+void PrefillProjections::project(Fp8Weight weight, TextFp8ActivationView input,
+                                 Bf16* output) const {
+    if (tensor_core_fp8) {
+        const auto status = try_text_fp8_gemm_sm100(
+            weight.values, weight.scales, input, rows, weight.rows, weight.columns,
+            output, stream);
+        if (status) {
+            check(*status, "Run tensor-core prefill FP8 projection");
+            return;
+        }
+    }
+    check(text_fp8_gemv_rows(weight.values, weight.scales, input, weight.rows, weight.columns,
+                             rows, output, stream), "Run exact prefill FP8 projection");
+}
+
+void PrefillProjections::project(Bf16Weight weight, const Bf16* input, Bf16* output) const {
+    check(text_bf16_gemv_rows(weight.values, input, weight.rows, weight.columns, rows, output,
+                              stream), "Run exact prefill BF16 projection");
 }
 
 void decoder::reclaim_prefill_workspaces(int device) {
@@ -365,11 +377,13 @@ void PrefillWorkspace::close() {
 }
 
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
-                                   PrefillWorkspace& workspace) const {
+                                   PrefillWorkspace& workspace, MtpDraftRequest* draft,
+                                   int prompt_remaining) const {
     const auto stream = workspace.stream();
     if (!stream || !tokens || rows < 1 || rows > workspace.capacity() || position < 0 ||
         position > text_attention_max_tokens - rows ||
-        (position + rows - 1) / mxfp8_page_size >= request.pages.page_count) {
+        (position + rows - 1) / mxfp8_page_size >= request.pages.page_count ||
+        (draft && prompt_remaining < rows)) {
         throw std::invalid_argument("Invalid decoder prefill tile");
     }
     if (rows == 1 || !workspace.data()) {
@@ -380,12 +394,18 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         for (int row = 0; row < rows; ++row) {
             const ForwardLane lane{&request, tokens[row], position + row, TextGdnMode::prefill};
             forward(&lane, 1, stream);
+            if (draft && row + 1 < prompt_remaining) {
+                normalize_final(request.work, stream);
+                draft->enqueue(position + row, tokens[row + 1], request.work.normalized, false,
+                               stream);
+            }
         }
         return;
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
-    const Chunk chunk{TileBuffers(layout, workspace.capacity()), position, rows, stream,
-                      fp8_prefill() == Fp8PrefillPolicy::tensor_core};
+    const TileBuffers buffers(layout, workspace.capacity());
+    const bool tensor_core = !draft && fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+    const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position};
     const auto& work = chunk.work;
     check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens, rows,
                                work.residual, stream), "Gather prefill embeddings");
@@ -407,6 +427,9 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                                  hidden_size, rows, work.normalized, work.residual, stream),
               "Normalize prefill post-attention residual");
         chunk.mlp(layer);
+    }
+    if (draft && prompt_remaining > 1) {
+        chunk.seed_draft(*draft, tokens + 1, std::min(rows, prompt_remaining - 1), final_norm);
     }
     const int last = (rows - 1) * hidden_size;
     const auto bytes = hidden_size * sizeof(Bf16);

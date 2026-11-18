@@ -479,21 +479,11 @@ __device__ float residual_sum(const __nv_bfloat16* branch, const __nv_bfloat16* 
     return residual == nullptr ? value : value + __bfloat162float(residual[col]);
 }
 
-template <bool Batched>
-__global__ void rms_norm_kernel(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
-                                const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
-                                __nv_bfloat16* residual_output) {
-    if constexpr (Batched) {
-        const auto offset = static_cast<std::size_t>(blockIdx.x) * width;
-        branch += offset;
-        output += offset;
-        if (residual != nullptr) {
-            residual += offset;
-        }
-        if (residual_output != nullptr) {
-            residual_output += offset;
-        }
-    }
+__device__ __forceinline__ void rms_norm_row(const __nv_bfloat16* branch,
+                                             const __nv_bfloat16* residual,
+                                             const __nv_bfloat16* weight, int width,
+                                             __nv_bfloat16* output,
+                                             __nv_bfloat16* residual_output) {
     __shared__ float warp_squares[block_warps];
     __shared__ float inverse_rms;
     const int lane = threadIdx.x % warp_width;
@@ -524,6 +514,26 @@ __global__ void rms_norm_kernel(const __nv_bfloat16* branch, const __nv_bfloat16
         }
         output[col] = __float2bfloat16_rn((value * inverse_rms) * gain);
     }
+}
+
+template <bool Batched>
+__global__ void rms_norm_kernel(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                                const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
+                                __nv_bfloat16* residual_output) {
+    const auto offset = Batched ? static_cast<std::size_t>(blockIdx.x) * width : 0;
+    rms_norm_row(branch + offset, residual ? residual + offset : nullptr, weight, width,
+                 output + offset, residual_output ? residual_output + offset : nullptr);
+}
+
+__global__ void rms_norm_pair_rows_kernel(const __nv_bfloat16* first, const __nv_bfloat16* second,
+                                          const __nv_bfloat16* first_weight,
+                                          const __nv_bfloat16* second_weight, int width,
+                                          __nv_bfloat16* output) {
+    const auto offset = static_cast<std::size_t>(blockIdx.x) * width;
+    const bool second_half = blockIdx.y != 0;
+    rms_norm_row((second_half ? second : first) + offset, nullptr,
+                 second_half ? second_weight : first_weight, width,
+                 output + 2 * offset + blockIdx.y * static_cast<std::size_t>(width), nullptr);
 }
 
 __global__ void swiglu_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,
@@ -937,6 +947,19 @@ cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16*
     }
     void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
     return cudaLaunchKernel(rms_norm_kernel<true>, rows, block_threads, args, 0, stream);
+}
+
+cudaError_t text_rms_norm_pair_rows(const __nv_bfloat16* first, const __nv_bfloat16* second,
+                                   const __nv_bfloat16* first_weight,
+                                   const __nv_bfloat16* second_weight, int width, int rows,
+                                   __nv_bfloat16* output, cudaStream_t stream) {
+    if (!first || !second || !first_weight || !second_weight || !output ||
+        width <= 0 || rows <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    void* args[] = {&first, &second, &first_weight, &second_weight, &width, &output};
+    return cudaLaunchKernel(rms_norm_pair_rows_kernel, dim3(rows, 2), block_threads, args, 0,
+                            stream);
 }
 
 cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,

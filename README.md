@@ -4,7 +4,7 @@ A C++ and CUDA C++ inference engine in development for **Qwen3.8-27B-FP8 on one 
 The native decoder loads the official text weights and runs all 64 layers for greedy
 token-ID generation. It uses paged MXFP8 KV storage in the 16 full-attention layers
 and carries Gated DeltaNet state through the other 48 layers. Prefill and the first
-greedy selection run eagerly. Subsequent serial decode steps use a CUDA graph.
+greedy selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
 
 The reusable runtime API is in
 [`include/sglang/decoder.h`](include/sglang/decoder.h#L59)<!-- prefix: "class Decode" -->.
@@ -74,17 +74,17 @@ reported peak device allocation bytes count the decoder's CUDA allocations for t
 and the buffers used by that request.
 
 C++ callers link the `sglang_decoder` target and reuse `sglang::Decoder` across requests.
-The model retains one set of request buffers for serial reuse. The first subsequent
-decode step captures the graph on demand, and later steps and requests replay it while
-capacity suffices. Overlapping calls that cannot acquire the serial slot use private
-request buffers and eager decode.
+The model retains one set of target-only request buffers for serial reuse. The first
+subsequent decode step captures the graph on demand, and later steps and requests replay
+it while capacity suffices. Overlapping calls that cannot acquire the serial slot use
+private request buffers and eager decode.
 
 The generator and HTTP server accept `--fp8-prefill exact|tensor-core`. The default
-`exact` uses the exact FP8 projection path. `tensor-core` uses SM100 Tensor Cores for
-eligible FP8 projections in chunks of 3 to 128 prompt positions. Smaller chunks and
-ineligible projections use the exact path. Tensor Core prefill accumulates FP32 sums in
-a different order. Model scores and generated token IDs can differ, including when
-the highest scores are far apart.
+`exact` uses the exact FP8 projection path. For target-only requests, `tensor-core`
+uses SM100 Tensor Cores for eligible FP8 projections in chunks of 3 to 128 prompt
+positions. Smaller chunks and ineligible projections use the exact path. Tensor Core
+prefill accumulates FP32 sums in a different order. Model scores and generated token
+IDs can differ, including when the highest scores are far apart.
 
 The selection applies to the model for its lifetime. For C++, pass
 `sglang::Fp8PrefillPolicy::tensor_core` as the fourth argument to
@@ -96,12 +96,15 @@ Pass `--mtp-steps 1` through `--mtp-steps 4` to enable greedy multi-token predic
 that match the target. Corrections, bonus tokens, and the first greedy token are
 excluded from that count. Zero steps selects the default decoder.
 
-MTP prompt seeding uses row-wise target forwards with either prefill policy.
-The draft uses final-normalized target rows and shifted token IDs. Each target
-layer processes up to five positions per round, with one synchronization to read
-the winners and any requested logits. The verifier accepts matches in order and
-emits the target correction at the first mismatch. If all proposals match, it
-can emit a bonus token within the stop rule and budget.
+MTP prefill processes up to 128 prompt positions per layer using exact FP8 projections
+with either prefill policy. Each final-normalized target row with a following prompt
+token seeds the draft KV cache with that token ID, including across chunk boundaries.
+A one-token prompt or an unavailable prefill workspace uses the one-row path.
+
+During verification, each target layer processes up to five positions per round,
+with one synchronization to read the winners and any requested logits. The verifier
+accepts matches in order and emits the target correction at the first mismatch.
+If all proposals match, it can emit a bonus token within the stop rule and budget.
 
 Target KV follows the committed prefix. The verifier retains one additional
 recurrent state bank and replays the consumed rows after a partial commit.
@@ -125,11 +128,11 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
 ```
 
 The server loads one model and binds to `127.0.0.1`. `GET /health` returns HTTP 200 after
-model loading. By default and with `--max-active 1`,
-requests run serially and reuse the decode graph. Set `--max-active 2`, `3`, or `4`
+model loading. By default and with `--max-active 1`, requests run serially. Serial
+target-only requests reuse the decode graph by default. Set `--max-active 2`, `3`, or `4`
 to batch concurrent requests on the resident model. Extra connections wait in the
-listener backlog until a socket worker is available.
-The FP8 prefill policy applies to both serial and batched requests.
+listener backlog until a socket worker is available. Both serial and batched target-only
+requests use the selected FP8 prefill policy.
 
 Add `--mtp-steps 1` through `--mtp-steps 4` to enable the parallel target verifier
 for serial HTTP requests with `--max-active 1`. The SSE events and usage fields

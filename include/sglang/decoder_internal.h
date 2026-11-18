@@ -19,6 +19,7 @@ class Checkpoint;
 namespace sglang::decoder {
 
 class MtpDraftWeights;
+class MtpDraftRequest;
 class PrefillWorkspace;
 class TargetVerification;
 
@@ -212,7 +213,8 @@ struct Decoder::Model {
     void forward_verify(decoder::TargetVerification& verification, int position,
                         const int* tokens, int count, cudaStream_t stream) const;
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
-                       decoder::PrefillWorkspace& workspace) const;
+                       decoder::PrefillWorkspace& workspace,
+                       decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0) const;
     void decode_graph(decoder::Request& request) const;
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request) const;

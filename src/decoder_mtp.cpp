@@ -1,6 +1,7 @@
 #include "sglang/decoder_mtp.h"
 
 #include "sglang/checkpoint.h"
+#include "sglang/decoder_prefill.h"
 
 #include <numeric>
 #include <string>
@@ -303,6 +304,45 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
     }
     ++request.prefix;
     return request.work.normalized;
+}
+
+void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
+                                   const PrefillProjections& projections,
+                                   MtpPrefillBuffers buffers) {
+    auto& request = *state_;
+    if (request.failed) {
+        throw std::logic_error("MTP draft request failed");
+    }
+    const int rows = projections.rows;
+    if (position != request.prefix || rows <= 0 || rows > request.capacity - position ||
+        !shifted_tokens || !hidden) {
+        throw std::invalid_argument("Invalid MTP draft prefill input");
+    }
+    const auto& model = *request.weights->state_;
+    const auto stream = projections.stream;
+    try {
+        check(text_embedding_rows(model.embedding, vocab_size, hidden_size, shifted_tokens, rows,
+                                   buffers.embedding, stream), "Gather shifted MTP tokens");
+        check(text_rms_norm_pair_rows(buffers.embedding, hidden, model.embedding_norm,
+                                      model.hidden_norm, hidden_size, rows, buffers.concatenated,
+                                      stream), "Normalize and concatenate MTP prefill inputs");
+        projections.project(model.fc, buffers.concatenated, buffers.embedding);
+        check(text_rms_norm_rows(buffers.embedding, nullptr, model.input_norm, hidden_size, rows,
+                                 buffers.layer_input, nullptr, stream),
+              "Normalize MTP prefill layer input");
+        const auto input = projections.quantize(buffers.layer_input, hidden_size);
+        projections.project(model.gqa.key, input, buffers.keys);
+        projections.project(model.gqa.value, input, buffers.values);
+        check(text_gqa_preprocess_keys(position, rows, buffers.keys, model.gqa.key_norm,
+                                        buffers.rope_keys, stream), "Rotate MTP prefill keys");
+        check(mxfp8_kv_append(request.cache, request.pages, position, rows, buffers.rope_keys,
+                              buffers.values, stream), "Append MTP prefill MXFP8 KV");
+    } catch (...) {
+        request.failed = true;
+        throw;
+    }
+    request.prefix += rows;
+    request.scored = false;
 }
 
 int MtpDraftRequest::read_token() const {

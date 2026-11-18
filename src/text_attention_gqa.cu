@@ -20,17 +20,18 @@ __device__ float gemma_norm(float value, float inverse_rms, __nv_bfloat16 weight
                                             * (1.0f + __bfloat162float(weight))));
 }
 
-template <typename Position>
+template <typename Position, bool IncludeQueries = true>
 __global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_gate,
                                const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
                                const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries,
                                __nv_bfloat16* rope_keys) {
-    constexpr int head_count = mxfp8_query_heads + mxfp8_kv_heads;
+    constexpr int query_heads = IncludeQueries ? mxfp8_query_heads : 0;
+    constexpr int head_count = query_heads + mxfp8_kv_heads;
     const std::size_t row = blockIdx.x / head_count;
     const int head = blockIdx.x % head_count;
     const int channel = threadIdx.x;
-    const bool is_query = head < mxfp8_query_heads;
-    const int kv_head = head - mxfp8_query_heads;
+    const bool is_query = head < query_heads;
+    const int kv_head = head - query_heads;
     const __nv_bfloat16* const input = is_query
         ? q_gate + row * text_gqa_q_gate_width + head * 2 * mxfp8_head_dim
         : keys + row * text_gqa_kv_width + kv_head * mxfp8_head_dim;
@@ -107,6 +108,22 @@ cudaError_t text_gqa_preprocess(int first_position, int token_count,
         &first_position, &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
     return cudaLaunchKernel(gqa_preprocess<int>, dim3(blocks), dim3(mxfp8_head_dim),
                             arguments, 0, stream);
+}
+
+cudaError_t text_gqa_preprocess_keys(int first_position, int token_count,
+                                    const __nv_bfloat16* keys, const __nv_bfloat16* k_norm,
+                                    __nv_bfloat16* rope_keys, cudaStream_t stream) {
+    if (token_count <= 0 || token_count > text_attention_max_tokens || first_position < 0 ||
+        first_position > text_attention_max_tokens - token_count ||
+        !keys || !k_norm || !rope_keys) {
+        return cudaErrorInvalidValue;
+    }
+    const __nv_bfloat16* unused_input = nullptr;
+    __nv_bfloat16* unused_output = nullptr;
+    void* args[] = {&first_position, &unused_input, &keys, &unused_input, &k_norm,
+                    &unused_output, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<int, false>, token_count * mxfp8_kv_heads,
+                            mxfp8_head_dim, args, 0, stream);
 }
 
 cudaError_t decoder::decode_gqa_preprocess(const int* position, const __nv_bfloat16* q_gate,

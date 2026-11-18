@@ -4,6 +4,17 @@
 
 namespace sglang::decoder {
 
+struct PrefillProjections;
+
+struct MtpPrefillBuffers {
+    Bf16* embedding;
+    Bf16* concatenated;
+    Bf16* layer_input;
+    Bf16* keys;
+    Bf16* values;
+    Bf16* rope_keys;
+};
+
 class MtpDraftWeights {
 public:
     MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
@@ -31,6 +42,9 @@ public:
     /// enqueue writes it. The row can also be passed as that enqueue's input.
     const Bf16* enqueue(int position, int shifted_token, const Bf16* hidden, bool score,
                         cudaStream_t stream);
+
+    void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
+                      const PrefillProjections& projections, MtpPrefillBuffers buffers);
 
     /// Read the most recent scored enqueue after its stream has completed.
     int read_token() const;

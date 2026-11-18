@@ -91,6 +91,10 @@ cudaError_t text_gqa_preprocess(int first_position, int token_count,
                                 __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
                                 cudaStream_t stream);
 
+cudaError_t text_gqa_preprocess_keys(int first_position, int token_count,
+                                    const __nv_bfloat16* keys, const __nv_bfloat16* k_norm,
+                                    __nv_bfloat16* rope_keys, cudaStream_t stream);
+
 /// Multiplies BF16 attention by sigmoid of the original q_gate gate in FP32.
 /// attention and output are [tokens,24,256]. output may equal attention.
 /// output is BF16 and ready for o_proj. No scratch required.

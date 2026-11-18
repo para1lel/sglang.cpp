@@ -225,20 +225,39 @@ struct Decoder::Model::MtpGeneration {
         return finish;
     }
 
-    DecoderFinishReason run(const std::vector<int>& prompt) {
+    bool prefill(const std::vector<int>& prompt, std::size_t& prefill_bytes) {
+        if (cancelled()) {
+            return false;
+        }
         const auto stream = target.memory.stream();
         const int prompt_count = static_cast<int>(prompt.size());
-        for (; next_target_position < prompt_count; ++next_target_position) {
+        PrefillWorkspace workspace(stream, std::min(prompt_count, prefill_chunk_rows));
+        prefill_bytes = workspace.bytes();
+        result.peak_device_allocation_bytes += prefill_bytes;
+        const int tile_rows = prefill_bytes ? workspace.capacity() : 1;
+        while (next_target_position < prompt_count) {
             if (cancelled()) {
-                return DecoderFinishReason::cancelled;
+                workspace.close();
+                return false;
             }
             const int position = next_target_position;
-            model.forward(target, prompt[position], position, TextGdnMode::prefill);
-            if (position + 1 < prompt_count) {
-                model.normalize_final(target.work, stream);
-                draft.enqueue(position, prompt[position + 1], target.work.normalized, false,
-                              stream);
+            const int remaining = prompt_count - position;
+            const int rows = std::min(tile_rows, remaining);
+            model.prefill_chunk(target, prompt.data() + position, rows, position, workspace,
+                                &draft, remaining);
+            if (callbacks.is_cancelled) {
+                check(cudaStreamSynchronize(stream), "Complete cancellable MTP prefill tile");
             }
+            next_target_position += rows;
+        }
+        workspace.close();
+        return !cancelled();
+    }
+
+    DecoderFinishReason run(const std::vector<int>& prompt) {
+        std::size_t prefill_bytes = 0;
+        if (!prefill(prompt, prefill_bytes)) {
+            return DecoderFinishReason::cancelled;
         }
         model.compute_logits(target);
         const int token = read_step(target);
@@ -247,9 +266,12 @@ struct Decoder::Model::MtpGeneration {
         }
         const auto before = target.memory.bytes();
         const int rows = std::min(options.max_new_tokens - 1, options.mtp_steps + 1);
+        const int prompt_count = static_cast<int>(prompt.size());
         TargetVerification verification(target, prompt_count + options.max_new_tokens - 1,
                                         next_target_position, rows, options.top_logits > 0);
-        result.peak_device_allocation_bytes += target.memory.bytes() - before;
+        const auto verify_bytes = target.memory.bytes() - before;
+        result.peak_device_allocation_bytes +=
+            std::max(prefill_bytes, verify_bytes) - prefill_bytes;
         while (!cancelled()) {
             const int remaining = options.max_new_tokens -
                                   static_cast<int>(result.output_token_ids.size());

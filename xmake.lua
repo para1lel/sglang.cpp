@@ -120,8 +120,9 @@ target("sglang-server")
     add_sysincludedirs(path.join(prefix, "include"))
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
-              "apps/server/completions.cpp", "apps/server/http.cpp",
-              "apps/server/text_request.cpp", "apps/server/text_completion.cpp")
+              "apps/server/chat_template.cpp", "apps/server/completions.cpp",
+              "apps/server/http.cpp", "apps/server/text_request.cpp",
+              "apps/server/text_completion.cpp")
 
 option("text-tokenizer-check")
     set_default(false)

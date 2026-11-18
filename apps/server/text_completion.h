@@ -11,14 +11,16 @@ struct TextRequest {
     bool stream = false;
     bool include_usage = false;
     bool return_token_ids = false;
+    bool chat = false;
 };
 
 using TextGenerator = std::function<DecoderResult(const std::vector<int>&, const DecoderOptions&,
                                                    const DecoderCallbacks&)>;
 
 TextRequest parse_text_request(std::string_view body, const CompletionTokenizer& tokenizer);
+TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer);
 void complete_text(const Socket& connection, std::string_view body,
                    const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                   bool trace_serial = false);
+                   bool trace_serial = false, bool chat = false);
 
 }

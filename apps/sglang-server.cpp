@@ -108,7 +108,9 @@ void serve_connection(const Socket& connection, const Complete& complete_request
         if (request->path == "/health" && request->method == "GET" && request->body.empty()) {
             write_json(connection, "200 OK", "{}");
         } else if (request->path == "/v1/completions" && request->method == "POST") {
-            complete_request(connection, request->body);
+            complete_request(connection, request->body, false);
+        } else if (request->path == "/v1/chat/completions" && request->method == "POST") {
+            complete_request(connection, request->body, true);
         } else {
             write_error(connection, "404 Not Found",
                         "Expected GET /health or POST /v1/completions");
@@ -151,8 +153,12 @@ void serve_batch(const Socket& listener, BatchService& service,
             workers.emplace_back([&, slot] {
                 try {
                     serve_connections(listener, [&](const Socket& connection,
-                                                    std::string_view body) {
-                        complete(connection, service, slot, tokenizer, body);
+                                                    std::string_view body, bool chat) {
+                        if (chat) {
+                            complete_chat(connection, service, slot, tokenizer, body);
+                        } else {
+                            complete(connection, service, slot, tokenizer, body);
+                        }
                     });
                 } catch (...) {
                     stop_on_error();
@@ -196,9 +202,15 @@ int main(int argc, char** argv) {
         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
         const CompletionTokenizer tokenizer(arguments.checkpoint);
         if (arguments.max_active == 1) {
-            serve_connections(listener, [&](const Socket& connection, std::string_view body) {
-                complete(connection, decoder, tokenizer, body, arguments.trace_batches,
-                         arguments.mtp_steps, arguments.eager);
+            serve_connections(listener, [&](const Socket& connection,
+                                            std::string_view body, bool chat) {
+                if (chat) {
+                    complete_chat(connection, decoder, tokenizer, body, arguments.trace_batches,
+                                  arguments.mtp_steps, arguments.eager);
+                } else {
+                    complete(connection, decoder, tokenizer, body, arguments.trace_batches,
+                             arguments.mtp_steps, arguments.eager);
+                }
             });
         } else {
             BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs);

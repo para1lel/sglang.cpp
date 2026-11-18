@@ -193,7 +193,11 @@ void stream_completion(const Socket& connection, const CompletionRequest& reques
 
 void dispatch_completion(const Socket& connection, std::string_view body,
                          const CompletionTokenizer* tokenizer, const TextGenerator& generate,
-                         bool trace = false) {
+                         bool trace, bool chat) {
+    if (chat && tokenizer) {
+        complete_text(connection, body, *tokenizer, generate, trace, true);
+        return;
+    }
     auto parsed = json::parse(llvm::StringRef(body.data(), body.size()));
     if (!parsed) {
         llvm::consumeError(parsed.takeError());
@@ -211,21 +215,22 @@ void dispatch_completion(const Socket& connection, std::string_view body,
 
 void complete_serial(const Socket& connection, const Decoder& decoder,
                      const CompletionTokenizer* tokenizer, std::string_view body,
-                     bool trace, int mtp_steps, bool eager) {
+                     bool trace, int mtp_steps, bool eager, bool chat = false) {
     dispatch_completion(connection, body, tokenizer,
                         [&](const auto& prompt, auto options, const auto& callbacks) {
         options.mtp_steps = mtp_steps;
         options.eager = eager;
         return decoder.generate(prompt, options, callbacks);
-    }, trace);
+    }, trace, chat);
 }
 
 void complete_batch(const Socket& connection, BatchService& service, int slot,
-                    const CompletionTokenizer* tokenizer, std::string_view body) {
+                    const CompletionTokenizer* tokenizer, std::string_view body,
+                    bool chat = false) {
     dispatch_completion(connection, body, tokenizer,
                         [&](const auto& prompt, const auto& options, const auto& callbacks) {
         return service.generate(slot, prompt, options, callbacks);
-    });
+    }, false, chat);
 }
 
 }
@@ -252,6 +257,17 @@ void complete(const Socket& connection, const Decoder& decoder,
 void complete(const Socket& connection, BatchService& service, int slot,
               const CompletionTokenizer& tokenizer, std::string_view body) {
     complete_batch(connection, service, slot, &tokenizer, body);
+}
+
+void complete_chat(const Socket& connection, const Decoder& decoder,
+                   const CompletionTokenizer& tokenizer, std::string_view body,
+                   bool trace, int mtp_steps, bool eager) {
+    complete_serial(connection, decoder, &tokenizer, body, trace, mtp_steps, eager, true);
+}
+
+void complete_chat(const Socket& connection, BatchService& service, int slot,
+                   const CompletionTokenizer& tokenizer, std::string_view body) {
+    complete_batch(connection, service, slot, &tokenizer, body, true);
 }
 
 }

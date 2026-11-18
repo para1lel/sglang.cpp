@@ -1,6 +1,6 @@
 # Native text completions
 
-Send `POST /v1/completions` with `model` set to `Qwen3.8-27B-FP8` and `prompt` set to a UTF-8 string. The same endpoint serves the frozen `benchmark` model with a [prompt ID array and token-ID SSE](../benchmarks/streaming/README.md#wire-contract).
+Send `POST /v1/completions` with `model` set to `Qwen3.8-27B-FP8` and `prompt` set to a UTF-8 string. The same endpoint serves the frozen `benchmark` model with a [prompt ID array and token-ID SSE](../benchmarks/streaming/README.md#wire-contract). Use [native chat](chat-serving.md) to render conversation history.
 
 ## Send a request
 
@@ -12,7 +12,7 @@ curl --fail-with-body http://127.0.0.1:17384/v1/completions \
   --data-binary '{"model":"Qwen3.8-27B-FP8","prompt":"一、北京\n二、上海\n三、","max_tokens":8}'
 ```
 
-The server generates one greedy completion. The prompt must contain 1 to 1,048,576 UTF-8 bytes. The encoded prompt length plus the output budget must fit 262,144 tokens. HTTP accepts up to 8 KiB of headers and 2 MiB of body. Invalid request options, malformed UTF-8, and invalid token limits return HTTP 400. Oversize headers return HTTP 431. Oversize bodies return HTTP 413. [Request parser](../apps/server/text_request.cpp#L59)<!-- prefix: "TextRequest " -->
+The server generates one greedy completion. The prompt must contain 1 to 1,048,576 UTF-8 bytes. The encoded prompt length plus the output budget must fit 262,144 tokens. HTTP accepts up to 8 KiB of headers and 2 MiB of body. Invalid request options, malformed UTF-8, and invalid token limits return HTTP 400. Oversize headers return HTTP 431. Oversize bodies return HTTP 413. [Request parser](../apps/server/text_request.cpp#L99)<!-- prefix: "TextRequest " -->
 
 | Field | Behavior |
 | --- | --- |
@@ -23,13 +23,13 @@ The server generates one greedy completion. The prompt must contain 1 to 1,048,5
 | `stop_token_ids` | Array of explicit stop IDs in `[0, 248320)`. These stops also apply with `ignore_eos: true`. |
 | `return_token_ids` | Boolean, default `false`. Set it to `true` to include diagnostic output IDs. Nonstreaming responses also include the encoded prompt IDs. |
 
-Tokenizer load occurs on the first valid text request. The server reads `tokenizer.json` from the selected checkpoint directory and verifies its size and SHA-256. A missing, unreadable, or mismatched asset returns HTTP 500 before output starts. A subsequent text request retries a failed load. Successful loads share an immutable tokenizer across requests. The benchmark ID route uses the IDs supplied by the client.
+Tokenizer load occurs on the first text or chat request that reaches encoding. The server reads `tokenizer.json` from the selected checkpoint directory and verifies its size and SHA-256. A missing, unreadable, or mismatched asset returns HTTP 500 before output starts. A subsequent request retries a failed load. Successful loads share an immutable tokenizer across text and chat requests. The benchmark ID route uses the IDs supplied by the client.
 
 ## Read the response
 
 Nonstreaming responses return `choices[0].text`, `finish_reason`, and usage. SSE sends `choices[0].text` deltas, a terminal choice, optional usage, and `[DONE]`. Join the text deltas in order. Usage counts encoded prompt IDs and committed output IDs. A matching stop ID counts as output and appears in diagnostic IDs. The writer omits its text and reports `stop`, including when it matches on the last allowed token. The writer reports `length` when the output budget is exhausted without a stop.
 
-The response decodes generated IDs into bytes. It skips special and unmapped IDs. The UTF-8 state belongs to the request and holds incomplete characters across tokens. Malformed output bytes produce U+FFFD. Normal completion flushes an incomplete tail as U+FFFD. Diagnostic SSE can carry an ID and empty text, or final UTF-8 text with zero IDs. A connection reset or failed write cancels that request and discards pending bytes. [Response writer](../apps/server/text_completion.cpp#L96)<!-- prefix: "bool TextRes" -->
+The response decodes generated IDs into bytes. It skips special and unmapped IDs. The UTF-8 state belongs to the request and holds incomplete characters across tokens. Malformed output bytes produce U+FFFD. Normal completion flushes an incomplete tail as U+FFFD. Diagnostic SSE can carry an ID and empty text, or final UTF-8 text with zero IDs. A connection reset or failed write cancels that request and discards pending bytes. [Response writer](../apps/server/text_completion.cpp#L142)<!-- prefix: "bool TextRes" -->
 
 ## Tokenizer assets
 

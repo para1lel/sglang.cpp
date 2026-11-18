@@ -1,0 +1,910 @@
+{
+  "checkpoint": {
+    "repository": "Qwen/Qwen3.8-27B-FP8",
+    "revision": "c3a462cc3d38cf351f3b26cbd763469eeb74ef81",
+    "license": "Apache-2.0"
+  },
+  "assets_sha256": {
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "207c03c41a06a9c3b0cc527d8a56115159c1eac6b59a4ffae85b646e773d074e",
+    "chat_template.jinja": "af16f654968d47d09a6c604e00370b12dbc21f76456f59c9e98b82e84d9f6375"
+  },
+  "transformers": "5.23.0",
+  "tokenizers": "0.23.3",
+  "jinja2": "3.1.6",
+  "cases": [
+    {
+      "name": "plain",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with Paris only."
+          }
+        ],
+        "enable_thinking": false
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "Reply with Paris only.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n"
+      ],
+      "ids": [
+        248045, 846, 198, 20206, 440, 11751, 1132, 13, 248046, 198, 248045, 74455, 198, 248068, 271,
+        248069, 271
+      ]
+    },
+    {
+      "name": "valid-unicode-escapes",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "\u001c A\u0000 \\\"\\ \n é É 𐐷 👩🏽‍💻"
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "A\u0000 \\\"\\ \n",
+        " é É 𐐷 👩🏽‍💻<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 32, 188, 7018, 59, 695, 3825, 27118, 220, 172, 238, 238, 115, 59720, 102,
+        9008, 237, 121, 373, 235, 88995, 119, 248046, 198, 248045, 74455, 198, 248068, 198
+      ]
+    },
+    {
+      "name": "thinking-default",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " Preserve casing and punctuation. "
+          },
+          {
+            "role": "user",
+            "content": "Reply with Paris only."
+          },
+          {
+            "role": "assistant",
+            "content": "Answer: Café.",
+            "reasoning_content": " echo | 念頭　"
+          },
+          {
+            "role": "user",
+            "content": "\tRepeat that answer. \n"
+          }
+        ]
+      },
+      "rendered": [
+        "<|im_start|>system\n",
+        "Reasoning effort is set to xhigh. Please think carefully through the",
+        " task, validate key assumptions, consider plausible alternatives, an",
+        "d prioritize correctness, consistency, and clarity in the final answ",
+        "er.\n",
+        "\n",
+        "Preserve casing and punctuation.<|im_end|>\n",
+        "<|im_start|>user\n",
+        "Reply with Paris only.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "echo | 念頭\n",
+        "</think>\n",
+        "\n",
+        "Answer: Café.<|im_end|>\n",
+        "<|im_start|>user\n",
+        "Repeat that answer.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n"
+      ],
+      "ids": [
+        248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 830, 11553, 13, 5044, 1683, 15060, 1472,
+        279, 3274, 11, 9307, 1328, 30800, 11, 2814, 47675, 25605, 11, 321, 60445, 55404, 11, 27224,
+        11, 321, 30246, 303, 279, 1534, 4087, 13, 271, 13955, 5671, 70848, 321, 59429, 13, 248046,
+        198, 248045, 846, 198, 20206, 440, 11751, 1132, 13, 248046, 198, 248045, 74455, 198, 248068,
+        198, 2949, 735, 220, 96599, 97670, 198, 248069, 271, 15666, 25, 63457, 13, 248046, 198,
+        248045, 846, 198, 37436, 421, 4087, 13, 248046, 198, 248045, 74455, 198, 248068, 198
+      ]
+    },
+    {
+      "name": "old-thinking-hidden",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " Preserve casing and punctuation. "
+          },
+          {
+            "role": "user",
+            "content": "Reply with Paris only."
+          },
+          {
+            "role": "assistant",
+            "content": "Answer: Café.",
+            "reasoning_content": " echo | 念頭　"
+          },
+          {
+            "role": "user",
+            "content": "\tRepeat that answer. \n"
+          }
+        ],
+        "preserve_thinking": false,
+        "reasoning_effort": "low"
+      },
+      "rendered": [
+        "<|im_start|>system\n",
+        "Reasoning effort is set to low. Keep your thinking brief and focused",
+        ", moving directly to the conclusion without unnecessary elaboration.",
+        "\n",
+        "\n",
+        "Preserve casing and punctuation.<|im_end|>\n",
+        "<|im_start|>user\n",
+        "Reply with Paris only.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "Answer: Café.<|im_end|>\n",
+        "<|im_start|>user\n",
+        "Repeat that answer.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n"
+      ],
+      "ids": [
+        248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 3238, 13, 13262, 678, 7047, 9522, 321,
+        10419, 11, 6992, 5774, 310, 279, 16198, 1973, 24366, 24150, 362, 13, 271, 13955, 5671,
+        70848, 321, 59429, 13, 248046, 198, 248045, 846, 198, 20206, 440, 11751, 1132, 13, 248046,
+        198, 248045, 74455, 198, 15666, 25, 63457, 13, 248046, 198, 248045, 846, 198, 37436, 421,
+        4087, 13, 248046, 198, 248045, 74455, 198, 248068, 198
+      ]
+    },
+    {
+      "name": "assistant-after-last-query",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with Paris only."
+          },
+          {
+            "role": "assistant",
+            "content": "Answer: Café.",
+            "reasoning_content": " echo | 念頭　"
+          },
+          {
+            "role": "user",
+            "content": "  <tool_response>data</tool_response> \t"
+          },
+          {
+            "role": "assistant",
+            "content": "Answer: Café.",
+            "reasoning_content": " echo | 念頭　"
+          }
+        ],
+        "preserve_thinking": false,
+        "add_generation_prompt": false,
+        "reasoning_effort": "medium"
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "Reply with Paris only.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "echo | 念頭\n",
+        "</think>\n",
+        "\n",
+        "Answer: Café.<|im_end|>\n",
+        "<|im_start|>user\n",
+        "<tool_response>data</tool_response><|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "echo | 念頭\n",
+        "</think>\n",
+        "\n",
+        "Answer: Café.<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 20206, 440, 11751, 1132, 13, 248046, 198, 248045, 74455, 198, 248068, 198,
+        2949, 735, 220, 96599, 97670, 198, 248069, 271, 15666, 25, 63457, 13, 248046, 198, 248045,
+        846, 198, 248066, 673, 248067, 248046, 198, 248045, 74455, 198, 248068, 198, 2949, 735, 220,
+        96599, 97670, 198, 248069, 271, 15666, 25, 63457, 13, 248046, 198
+      ]
+    },
+    {
+      "name": "text-parts-concatenation",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": " A "
+              },
+              {
+                "type": "text",
+                "text": "B "
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "C"
+              },
+              {
+                "type": "text",
+                "text": "afé 雲"
+              }
+            ]
+          }
+        ],
+        "enable_thinking": false
+      },
+      "rendered": [
+        "<|im_start|>system\n",
+        "A B<|im_end|>\n",
+        "<|im_start|>user\n",
+        "Café 雲<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n"
+      ],
+      "ids": [
+        248045, 8678, 198, 32, 373, 225, 33, 248046, 198, 248045, 846, 198, 34, 2492, 933, 220,
+        101158, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271
+      ]
+    },
+    {
+      "name": "case-and-order-tools",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " Preserve casing and punctuation. "
+          },
+          {
+            "role": "user",
+            "content": "Reply with Paris only."
+          },
+          {
+            "role": "assistant",
+            "content": "Calling.",
+            "tool_calls": [
+              {
+                "id": "Lookup_1",
+                "type": "function",
+                "function": {
+                  "name": "LookUp",
+                  "arguments": [
+                    "{\"Zulu\": [\"𝄞\", -0.0, 1e-05, 1e+16, true, null, 92233720368547758",
+                    "09], \"alpha\": {\"quote\": \"\\\"\\\\\\r\\n\\t\\b\\f",
+                    "\", \"case\": \"LoW\"}}"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "Result\\one \"A\" 雨",
+            "tool_call_id": "Lookup_1"
+          },
+          {
+            "role": "tool",
+            "content": "Result two",
+            "tool_call_id": "Lookup_2"
+          },
+          {
+            "role": "user",
+            "content": "\tRepeat that answer. \n"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "LookUp",
+              "description": "Café & <tag> \"x\"",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "Zulu": {
+                    "type": "array"
+                  },
+                  "alpha": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "Zulu",
+                  "alpha"
+                ]
+              }
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "reasoning_effort": "low"
+      },
+      "rendered": [
+        "<|im_start|>system\n",
+        "Reasoning effort is set to low. Keep your thinking brief and focused",
+        ", moving directly to the conclusion without unnecessary elaboration.",
+        "\n",
+        "\n",
+        "# Tools\n",
+        "\n",
+        "You have access to the following functions:\n",
+        "\n",
+        "<tools>\n",
+        "{\"type\": \"function\", \"function\": {\"name\": \"LookUp\", \"desc",
+        "ription\": \"Café & <tag> \\\"x\\\"\", \"parameters\": {\"type\": \"",
+        "object\", \"properties\": {\"Zulu\": {\"type\": \"array\"}, \"alpha",
+        "\": {\"type\": \"object\"}}, \"required\": [\"Zulu\", \"alpha\"]}}}",
+        "\n",
+        "</tools>\n",
+        "\n",
+        "If you choose to call a function ONLY reply in the following format ",
+        "with NO suffix:\n",
+        "\n",
+        "<tool_call>\n",
+        "<function=example_function_name>\n",
+        "<parameter=example_parameter_1>\n",
+        "value_1\n",
+        "</parameter>\n",
+        "<parameter=example_parameter_2>\n",
+        "This is the value for the second parameter\n",
+        "that can span\n",
+        "multiple lines\n",
+        "</parameter>\n",
+        "</function>\n",
+        "</tool_call>\n",
+        "\n",
+        "<IMPORTANT>\n",
+        "Reminder:\n",
+        "- Function calls MUST follow the specified format: an inner <functio",
+        "n=...></function> block must be nested within <tool_call></tool_call",
+        "> XML tags\n",
+        "- Required parameters MUST be specified\n",
+        "- You may provide optional reasoning for your function call in natur",
+        "al language BEFORE the function call, but NOT after\n",
+        "- If there is no function call available, answer the question like n",
+        "ormal with your current knowledge and do not tell the user about fun",
+        "ction calls\n",
+        "</IMPORTANT>\n",
+        "\n",
+        "Preserve casing and punctuation.<|im_end|>\n",
+        "<|im_start|>user\n",
+        "Reply with Paris only.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n",
+        "Calling.\n",
+        "\n",
+        "<tool_call>\n",
+        "<function=LookUp>\n",
+        "<parameter=Zulu>\n",
+        "[\"𝄞\", -0.0, 1e-05, 1e+16, true, null, 9223372036854775809]\n",
+        "</parameter>\n",
+        "<parameter=alpha>\n",
+        "{\"quote\": \"\\\"\\\\\\r\\n\\t\\b\\f",
+        "\", \"case\": \"LoW\"}\n",
+        "</parameter>\n",
+        "</function>\n",
+        "</tool_call><|im_end|>\n",
+        "<|im_start|>user\n",
+        "<tool_response>\n",
+        "Result\\one \"A\" 雨\n",
+        "</tool_response>\n",
+        "<tool_response>\n",
+        "Result two\n",
+        "</tool_response><|im_end|>\n",
+        "<|im_start|>user\n",
+        "Repeat that answer.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n"
+      ],
+      "ids": [
+        248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 3238, 13, 13262, 678, 7047, 9522, 321,
+        10419, 11, 6992, 5774, 310, 279, 16198, 1973, 24366, 24150, 362, 13, 271, 2, 13455, 271,
+        2523, 599, 2528, 310, 279, 2614, 5568, 25, 271, 27, 15449, 29, 198, 4754, 1267, 763, 328,
+        1628, 487, 328, 1628, 763, 5046, 591, 763, 328, 10071, 2248, 487, 328, 4532, 763, 328, 34,
+        2492, 933, 594, 361, 4429, 29, 7018, 87, 53980, 328, 13390, 763, 5046, 1267, 763, 328, 1640,
+        487, 328, 12811, 763, 5046, 57, 23639, 763, 5046, 1267, 763, 328, 1595, 13933, 328, 6918,
+        763, 5046, 1267, 763, 328, 1640, 8934, 2069, 328, 6081, 763, 4241, 57, 23639, 487, 328,
+        6918, 1293, 72964, 198, 510, 15449, 29, 271, 2592, 488, 4992, 310, 1562, 264, 709, 25835,
+        9559, 303, 279, 2614, 3443, 440, 5486, 19900, 25, 271, 248058, 198, 27, 1628, 28, 8422,
+        8901, 1224, 29, 198, 27, 15704, 28, 8422, 24109, 62, 16, 29, 198, 927, 62, 16, 198, 510,
+        15704, 29, 198, 27, 15704, 28, 8422, 24109, 62, 17, 29, 198, 1919, 369, 279, 869, 364, 279,
+        2018, 5555, 198, 8761, 628, 9111, 198, 34493, 4965, 198, 510, 15704, 29, 198, 510, 1628, 29,
+        198, 248059, 271, 27, 95328, 29, 198, 92065, 25, 198, 12, 5534, 6526, 26834, 1732, 279,
+        5024, 3443, 25, 449, 8906, 361, 1628, 28, 1076, 1419, 1628, 29, 2424, 1902, 381, 23283,
+        2785, 220, 248058, 248059, 11535, 9212, 198, 12, 12296, 4868, 26834, 381, 5024, 198, 12,
+        1394, 1189, 3300, 9801, 31626, 364, 678, 709, 1562, 303, 5629, 3992, 54588, 279, 709, 1562,
+        11, 694, 4045, 1238, 198, 12, 1368, 1017, 369, 874, 709, 1562, 2420, 11, 4087, 279, 3296,
+        1040, 4472, 440, 678, 1428, 6337, 321, 635, 524, 3184, 279, 1156, 883, 709, 6526, 198, 510,
+        95328, 29, 271, 13955, 5671, 70848, 321, 59429, 13, 248046, 198, 248045, 846, 198, 20206,
+        440, 11751, 1132, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271, 47218, 13,
+        271, 248058, 198, 27, 1628, 28, 10071, 2248, 29, 198, 27, 15704, 28, 57, 23639, 29, 198,
+        1143, 54362, 226, 252, 487, 471, 15, 13, 15, 11, 220, 16, 68, 12, 15, 20, 11, 220, 16, 68,
+        10, 16, 21, 11, 804, 11, 819, 11, 220, 24, 17, 17, 18, 18, 22, 17, 15, 18, 21, 23, 20, 19,
+        22, 22, 20, 23, 15, 24, 60, 198, 510, 15704, 29, 198, 27, 15704, 28, 6918, 29, 198, 4754,
+        2855, 763, 15430, 78547, 81, 1639, 4795, 42020, 62345, 126, 227, 487, 328, 5461, 763, 328,
+        4122, 54, 8934, 198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 248046, 198, 248045,
+        846, 198, 248066, 198, 2009, 59, 588, 328, 32, 1, 220, 96948, 198, 248067, 198, 248066, 198,
+        2009, 1330, 198, 248067, 248046, 198, 248045, 846, 198, 37436, 421, 4087, 13, 248046, 198,
+        248045, 74455, 198, 248068, 198
+      ]
+    },
+    {
+      "name": "tool-reply-at-end",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with Paris only."
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "Lookup_1",
+                "type": "function",
+                "function": {
+                  "name": "LookUp",
+                  "arguments": [
+                    "{\"Zulu\": [\"𝄞\", -0.0, 1e-05, 1e+16, true, null, 92233720368547758",
+                    "09], \"alpha\": {\"quote\": \"\\\"\\\\\\r\\n\\t\\b\\f",
+                    "\", \"case\": \"LoW\"}}"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "done",
+            "tool_call_id": "Lookup_1"
+          }
+        ],
+        "enable_thinking": false
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "Reply with Paris only.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n",
+        "<tool_call>\n",
+        "<function=LookUp>\n",
+        "<parameter=Zulu>\n",
+        "[\"𝄞\", -0.0, 1e-05, 1e+16, true, null, 9223372036854775809]\n",
+        "</parameter>\n",
+        "<parameter=alpha>\n",
+        "{\"quote\": \"\\\"\\\\\\r\\n\\t\\b\\f",
+        "\", \"case\": \"LoW\"}\n",
+        "</parameter>\n",
+        "</function>\n",
+        "</tool_call><|im_end|>\n",
+        "<|im_start|>user\n",
+        "<tool_response>\n",
+        "done\n",
+        "</tool_response><|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n"
+      ],
+      "ids": [
+        248045, 846, 198, 20206, 440, 11751, 1132, 13, 248046, 198, 248045, 74455, 198, 248068, 271,
+        248069, 271, 248058, 198, 27, 1628, 28, 10071, 2248, 29, 198, 27, 15704, 28, 57, 23639, 29,
+        198, 1143, 54362, 226, 252, 487, 471, 15, 13, 15, 11, 220, 16, 68, 12, 15, 20, 11, 220, 16,
+        68, 10, 16, 21, 11, 804, 11, 819, 11, 220, 24, 17, 17, 18, 18, 22, 17, 15, 18, 21, 23, 20,
+        19, 22, 22, 20, 23, 15, 24, 60, 198, 510, 15704, 29, 198, 27, 15704, 28, 6918, 29, 198,
+        4754, 2855, 763, 15430, 78547, 81, 1639, 4795, 42020, 62345, 126, 227, 487, 328, 5461, 763,
+        328, 4122, 54, 8934, 198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 248046, 198,
+        248045, 846, 198, 248066, 198, 10128, 198, 248067, 248046, 198, 248045, 74455, 198, 248068,
+        271, 248069, 271
+      ]
+    },
+    {
+      "name": "wide-history-integer",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with Paris only."
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "LookUp",
+                  "arguments": "{\"number\": 1208925819614629174706176}"
+                }
+              }
+            ]
+          }
+        ],
+        "enable_thinking": false
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "Reply with Paris only.<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n",
+        "<tool_call>\n",
+        "<function=LookUp>\n",
+        "<parameter=number>\n",
+        "1208925819614629174706176\n",
+        "</parameter>\n",
+        "</function>\n",
+        "</tool_call><|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n"
+      ],
+      "ids": [
+        248045, 846, 198, 20206, 440, 11751, 1132, 13, 248046, 198, 248045, 74455, 198, 248068, 271,
+        248069, 271, 248058, 198, 27, 1628, 28, 10071, 2248, 29, 198, 27, 15704, 28, 3946, 29, 198,
+        16, 17, 15, 23, 24, 17, 20, 23, 16, 24, 21, 16, 19, 21, 17, 24, 16, 22, 19, 22, 15, 21, 16,
+        22, 21, 198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 248046, 198, 248045, 74455,
+        198, 248068, 271, 248069, 271
+      ]
+    },
+    {
+      "name": "vision-numbered-placeholders",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Before "
+              },
+              {
+                "type": "image"
+              },
+              {
+                "type": "video"
+              },
+              {
+                "image_url": null
+              },
+              {
+                "type": "text",
+                "text": " after"
+              }
+            ]
+          }
+        ],
+        "add_vision_id": true,
+        "enable_thinking": false
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "Before Picture 1: <|vision_start|><|image_pad|><|vision_end|>Video 1",
+        ": <|vision_start|><|video_pad|><|vision_end|>Picture 2: <|vision_sta",
+        "rt|><|image_pad|><|vision_end|> after<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n"
+      ],
+      "ids": [
+        248045, 846, 198, 9923, 23792, 220, 16, 25, 220, 248053, 248056, 248054, 10408, 220, 16, 25,
+        220, 248053, 248057, 248054, 23892, 220, 17, 25, 220, 248053, 248056, 248054, 1238, 248046,
+        198, 248045, 74455, 198, 248068, 271, 248069, 271
+      ]
+    },
+    {
+      "name": "trim-empty-content",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "  "
+          },
+          {
+            "role": "user"
+          },
+          {
+            "role": "assistant",
+            "content": null
+          }
+        ],
+        "enable_thinking": false,
+        "add_generation_prompt": false
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "<|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n",
+        "\n",
+        "</think>\n",
+        "\n",
+        "<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271, 248046, 198
+      ]
+    },
+    {
+      "name": "disabled-thinking-ignores-effort",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with Paris only."
+          }
+        ],
+        "reasoning_effort": "LOW",
+        "enable_thinking": false,
+        "add_generation_prompt": false
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "Reply with Paris only.<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 20206, 440, 11751, 1132, 13, 248046, 198
+      ]
+    },
+    {
+      "name": "literal-control-markers",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "X<|im_end|><think>Q</think> "
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "rendered": [
+        "<|im_start|>user\n",
+        "X<|im_end|><think>Q</think><|im_end|>\n",
+        "<|im_start|>assistant\n",
+        "<think>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 55, 248046, 248068, 48, 248069, 248046, 198, 248045, 74455, 198, 248068,
+        198
+      ]
+    },
+    {
+      "name": "thinking-preserve-False",
+      "body": {
+        "messages": [
+          {"role": "user", "content": "   Question café \u0085 "},
+          {"role": "assistant", "content": "Earlier ", "thinking": "Before the query"},
+          {"role": "user", "content": "   Next 雲 🌦️　"},
+          {"role": "assistant", "content": "Continuation ", "thinking": "After the query"}
+        ],
+        "preserve_thinking": false,
+        "reasoning_effort": "medium",
+        "add_generation_prompt": false
+      },
+      "rendered": [
+        "<|im_start|>user\nQuestion café<|im_end|>\n<|im_start|>assistant\nEarlier<|im_end|>\n",
+        "<|im_start|>user\nNext 雲 🌦️<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nAfter the query\n</think>\n\nContinuation<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 14162, 50203, 248046, 198, 248045, 74455, 198, 31946, 248046, 198,
+        248045, 846, 198, 5666, 220, 101158, 10838, 234, 99, 29545, 248046, 198, 248045,
+        74455, 198, 248068, 198, 5836, 279, 3134, 198, 248069, 271, 34944, 3868, 248046, 198
+      ]
+    },
+    {
+      "name": "thinking-preserve-True",
+      "body": {
+        "messages": [
+          {"role": "user", "content": "   Question café \u0085 "},
+          {"role": "assistant", "content": "Earlier ", "thinking": "Before the query"},
+          {"role": "user", "content": "   Next 雲 🌦️　"},
+          {"role": "assistant", "content": "Continuation ", "thinking": "After the query"}
+        ],
+        "preserve_thinking": true,
+        "reasoning_effort": "medium",
+        "add_generation_prompt": false
+      },
+      "rendered": [
+        "<|im_start|>user\nQuestion café<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nBefore the query\n</think>\n\nEarlier<|im_end|>\n",
+        "<|im_start|>user\nNext 雲 🌦️<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nAfter the query\n</think>\n\nContinuation<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 14162, 50203, 248046, 198, 248045, 74455, 198, 248068, 198, 9923,
+        279, 3134, 198, 248069, 271, 31946, 248046, 198, 248045, 846, 198, 5666, 220,
+        101158, 10838, 234, 99, 29545, 248046, 198, 248045, 74455, 198, 248068, 198, 5836,
+        279, 3134, 198, 248069, 271, 34944, 3868, 248046, 198
+      ]
+    },
+    {
+      "name": "reasoning-preserve-False",
+      "body": {
+        "messages": [
+          {"role": "user", "content": "   Question café \u0085 "},
+          {"role": "assistant", "content": "Earlier ", "reasoning": "Before the query"},
+          {"role": "user", "content": "   Next 雲 🌦️　"},
+          {"role": "assistant", "content": "Continuation ", "reasoning": "After the query"}
+        ],
+        "preserve_thinking": false,
+        "reasoning_effort": "medium",
+        "add_generation_prompt": false
+      },
+      "rendered": [
+        "<|im_start|>user\nQuestion café<|im_end|>\n<|im_start|>assistant\nEarlier<|im_end|>\n",
+        "<|im_start|>user\nNext 雲 🌦️<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nAfter the query\n</think>\n\nContinuation<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 14162, 50203, 248046, 198, 248045, 74455, 198, 31946, 248046, 198,
+        248045, 846, 198, 5666, 220, 101158, 10838, 234, 99, 29545, 248046, 198, 248045,
+        74455, 198, 248068, 198, 5836, 279, 3134, 198, 248069, 271, 34944, 3868, 248046, 198
+      ]
+    },
+    {
+      "name": "reasoning-preserve-True",
+      "body": {
+        "messages": [
+          {"role": "user", "content": "   Question café \u0085 "},
+          {"role": "assistant", "content": "Earlier ", "reasoning": "Before the query"},
+          {"role": "user", "content": "   Next 雲 🌦️　"},
+          {"role": "assistant", "content": "Continuation ", "reasoning": "After the query"}
+        ],
+        "preserve_thinking": true,
+        "reasoning_effort": "medium",
+        "add_generation_prompt": false
+      },
+      "rendered": [
+        "<|im_start|>user\nQuestion café<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nBefore the query\n</think>\n\nEarlier<|im_end|>\n",
+        "<|im_start|>user\nNext 雲 🌦️<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nAfter the query\n</think>\n\nContinuation<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 14162, 50203, 248046, 198, 248045, 74455, 198, 248068, 198, 9923,
+        279, 3134, 198, 248069, 271, 31946, 248046, 198, 248045, 846, 198, 5666, 220,
+        101158, 10838, 234, 99, 29545, 248046, 198, 248045, 74455, 198, 248068, 198, 5836,
+        279, 3134, 198, 248069, 271, 34944, 3868, 248046, 198
+      ]
+    },
+    {
+      "name": "reasoning_content-preserve-False",
+      "body": {
+        "messages": [
+          {"role": "user", "content": "   Question café \u0085 "},
+          {"role": "assistant", "content": "Earlier ", "reasoning_content": "Before the query"},
+          {"role": "user", "content": "   Next 雲 🌦️　"},
+          {"role": "assistant", "content": "Continuation ", "reasoning_content": "After the query"}
+        ],
+        "preserve_thinking": false,
+        "reasoning_effort": "medium",
+        "add_generation_prompt": false
+      },
+      "rendered": [
+        "<|im_start|>user\nQuestion café<|im_end|>\n<|im_start|>assistant\nEarlier<|im_end|>\n",
+        "<|im_start|>user\nNext 雲 🌦️<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nAfter the query\n</think>\n\nContinuation<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 14162, 50203, 248046, 198, 248045, 74455, 198, 31946, 248046, 198,
+        248045, 846, 198, 5666, 220, 101158, 10838, 234, 99, 29545, 248046, 198, 248045,
+        74455, 198, 248068, 198, 5836, 279, 3134, 198, 248069, 271, 34944, 3868, 248046, 198
+      ]
+    },
+    {
+      "name": "reasoning_content-preserve-True",
+      "body": {
+        "messages": [
+          {"role": "user", "content": "   Question café \u0085 "},
+          {"role": "assistant", "content": "Earlier ", "reasoning_content": "Before the query"},
+          {"role": "user", "content": "   Next 雲 🌦️　"},
+          {"role": "assistant", "content": "Continuation ", "reasoning_content": "After the query"}
+        ],
+        "preserve_thinking": true,
+        "reasoning_effort": "medium",
+        "add_generation_prompt": false
+      },
+      "rendered": [
+        "<|im_start|>user\nQuestion café<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nBefore the query\n</think>\n\nEarlier<|im_end|>\n",
+        "<|im_start|>user\nNext 雲 🌦️<|im_end|>\n<|im_start|>assistant\n",
+        "<think>\nAfter the query\n</think>\n\nContinuation<|im_end|>\n"
+      ],
+      "ids": [
+        248045, 846, 198, 14162, 50203, 248046, 198, 248045, 74455, 198, 248068, 198, 9923,
+        279, 3134, 198, 248069, 271, 31946, 248046, 198, 248045, 846, 198, 5666, 220,
+        101158, 10838, 234, 99, 29545, 248046, 198, 248045, 74455, 198, 248068, 198, 5836,
+        279, 3134, 198, 248069, 271, 34944, 3868, 248046, 198
+      ]
+    },
+    {
+      "name": "aliases-null-and-precedence",
+      "body": {
+        "messages": [
+          {"role": "user", "content": "Prompt"},
+          {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": null,
+            "thinking": "Use this",
+            "reasoning": "Discard this"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "",
+            "thinking": "Discard this too"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Canonical value",
+            "thinking": "Hidden alias",
+            "reasoning": "Hidden fallback"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": null,
+            "thinking": null,
+            "reasoning": "Last fallback"
+          }
+        ]
+      },
+      "rendered": [
+        "<|im_start|>system\n",
+        "Reasoning effort is set to xhigh. Please think carefully through the task, ",
+        "validate key assumptions, consider plausible alternatives, and prioritize ",
+        "correctness, consistency, and clarity in the final answer.<|im_end|>\n",
+        "<|im_start|>user\nPrompt<|im_end|>\n",
+        "<|im_start|>assistant\n<think>\nUse this\n</think>\n\n<|im_end|>\n",
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>\n",
+        "<|im_start|>assistant\n<think>\nCanonical value\n</think>\n\n<|im_end|>\n",
+        "<|im_start|>assistant\n<think>\nLast fallback\n</think>\n\n<|im_end|>\n",
+        "<|im_start|>assistant\n<think>\n"
+      ],
+      "ids": [
+        248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 830, 11553, 13, 5044,
+        1683, 15060, 1472, 279, 3274, 11, 9307, 1328, 30800, 11, 2814, 47675, 25605,
+        11, 321, 60445, 55404, 11, 27224, 11, 321, 30246, 303, 279, 1534, 4087,
+        13, 248046, 198, 248045, 846, 198, 52782, 248046, 198, 248045, 74455, 198, 248068,
+        198, 9947, 411, 198, 248069, 271, 248046, 198, 248045, 74455, 198, 248068, 271,
+        248069, 271, 248046, 198, 248045, 74455, 198, 248068, 198, 68509, 869, 198, 248069,
+        271, 248046, 198, 248045, 74455, 198, 248068, 198, 5661, 31686, 198, 248069, 271,
+        248046, 198, 248045, 74455, 198, 248068, 198
+      ]
+    }
+  ]
+}

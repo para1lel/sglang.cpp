@@ -185,6 +185,18 @@ Omit `stream` to receive one JSON response with complete text and usage.
 The default `max_tokens` is 16.
 See [text completion options and verification](docs/text-serving.md) for the full contract.
 
+### Submit a chat conversation
+
+Send `messages` with model `Qwen3.8-27B-FP8` to `POST /v1/chat/completions`.
+The server renders the pinned checkpoint template and sends its prompt through the
+same serial or batched decoder as raw text and token-ID requests.
+
+```bash
+curl -N http://127.0.0.1:17384/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.8-27B-FP8","messages":[{"role":"user","content":"Explain why the sky is blue."}],"stream":true}'
+```
+
 ## Continue development
 
 The checkpoint lives at `/data0/shared/Qwen3.8-27B-FP8`. Keep its weights and generated

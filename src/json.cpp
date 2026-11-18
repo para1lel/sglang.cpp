@@ -4,6 +4,7 @@
 
 #include <charconv>
 #include <cmath>
+#include <set>
 
 namespace sglang::json {
 namespace {
@@ -14,7 +15,7 @@ bool digit(char character) {
 
 class Parser {
 public:
-    explicit Parser(std::string_view input) : input_(input) {}
+    Parser(std::string_view input, Syntax syntax) : input_(input), syntax_(syntax) {}
 
     Value document();
 
@@ -26,7 +27,7 @@ private:
     [[noreturn]] void fail(const char* message) const { throw ParseError(message); }
     Value value(std::size_t depth);
     Array array(std::size_t depth);
-    Object object(std::size_t depth);
+    Value object(std::size_t depth);
     Value number();
     bool digits();
     void strict_number();
@@ -35,6 +36,7 @@ private:
     void unicode(std::string& output);
 
     std::string_view input_;
+    Syntax syntax_;
 };
 
 bool Parser::accept(char character) {
@@ -78,7 +80,7 @@ Value Parser::value(std::size_t depth) {
             if (depth == 32) {
                 fail("JSON nesting exceeds the limit");
             }
-            return accept('{') ? Value(object(depth + 1)) : Value(array(depth + 1));
+            return accept('{') ? object(depth + 1) : Value(array(depth + 1));
         default: return number();
     }
 }
@@ -99,9 +101,11 @@ Array Parser::array(std::size_t depth) {
     return result;
 }
 
-Object Parser::object(std::size_t depth) {
+Value Parser::object(std::size_t depth) {
     whitespace();
     Object result;
+    OrderedObject ordered;
+    std::set<std::string> keys;
     if (!accept('}')) {
         do {
             whitespace();
@@ -111,7 +115,12 @@ Object Parser::object(std::size_t depth) {
                 fail("Expected a JSON object colon");
             }
             auto entry = value(depth);
-            if (!result.emplace(std::move(key), std::move(entry)).second) {
+            if (syntax_ == Syntax::ordered) {
+                if (!keys.insert(key).second) {
+                    fail("Duplicate JSON object key");
+                }
+                ordered.emplace_back(std::move(key), std::move(entry));
+            } else if (!result.emplace(std::move(key), std::move(entry)).second) {
                 fail("Duplicate JSON object key");
             }
             whitespace();
@@ -120,7 +129,7 @@ Object Parser::object(std::size_t depth) {
             fail("Expected a JSON object delimiter");
         }
     }
-    return result;
+    return syntax_ == Syntax::ordered ? Value(std::move(ordered)) : Value(std::move(result));
 }
 
 bool Parser::digits() {
@@ -166,6 +175,12 @@ Value Parser::number() {
         if (parsed.ec == std::errc{} && parsed.ptr == end) {
             return integer;
         }
+    }
+    if (syntax_ == Syntax::ordered && text.find_first_of(".eE") == std::string_view::npos) {
+        if (text.size() > 4300 + static_cast<std::size_t>(text.front() == '-')) {
+            fail("JSON integer exceeds the digit limit");
+        }
+        return WideInteger{std::string(text)};
     }
     double result = 0;
     const auto parsed = std::from_chars(text.data(), end, result);
@@ -254,6 +269,11 @@ std::optional<std::string_view> Value::string() const {
     return value ? std::optional<std::string_view>(*value) : std::nullopt;
 }
 
+std::optional<std::int64_t> Value::signed_integer() const {
+    const auto* value = std::get_if<std::int64_t>(&data_);
+    return value ? std::optional(*value) : std::nullopt;
+}
+
 std::optional<std::uint64_t> Value::unsigned_integer() const {
     if (const auto* value = std::get_if<std::uint64_t>(&data_)) {
         return *value;
@@ -269,16 +289,42 @@ std::optional<bool> Value::boolean() const {
     return value ? std::optional<bool>(*value) : std::nullopt;
 }
 
+std::optional<double> Value::number() const {
+    if (const auto* value = std::get_if<double>(&data_)) {
+        return *value;
+    }
+    if (const auto value = signed_integer()) {
+        return static_cast<double>(*value);
+    }
+    if (const auto value = unsigned_integer()) {
+        return static_cast<double>(*value);
+    }
+    return std::nullopt;
+}
+
 Value parse(std::string_view input) {
+    return parse(input, Syntax::strict);
+}
+
+Value parse(std::string_view input, Syntax syntax) {
     if (!valid_utf8(input)) {
         throw ParseError("Invalid UTF-8 in JSON document");
     }
-    return Parser(input).document();
+    return Parser(input, syntax).document();
 }
 
 const Value* get(const Object& object, std::string_view key) {
     const auto entry = object.find(key);
     return entry == object.end() ? nullptr : &entry->second;
+}
+
+const Value* get(const OrderedObject& object, std::string_view key) {
+    for (const auto& [name, value] : object) {
+        if (name == key) {
+            return &value;
+        }
+    }
+    return nullptr;
 }
 
 std::optional<std::string_view> get_string(const Object& object, std::string_view key) {
@@ -292,6 +338,10 @@ std::optional<bool> get_boolean(const Object& object, std::string_view key) {
 }
 
 void append_quoted(std::string& output, std::string_view value) {
+    append_quoted(output, value, false);
+}
+
+void append_quoted(std::string& output, std::string_view value, bool short_control_escapes) {
     constexpr std::string_view hex = "0123456789abcdef";
     output += '"';
     for (const unsigned char character : value) {
@@ -302,6 +352,10 @@ void append_quoted(std::string& output, std::string_view value) {
             case '\n': output += "\\n"; break;
             case '\r': output += "\\r"; break;
             default:
+                if (short_control_escapes && (character == '\b' || character == '\f')) {
+                    output += character == '\b' ? "\\b" : "\\f";
+                    break;
+                }
                 if (character < 0x20) {
                     output += "\\u00";
                     output += hex[character >> 4];

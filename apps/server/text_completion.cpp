@@ -5,6 +5,8 @@
 #include "sglang/server/http.h"
 #include "sglang/utf8.h"
 
+#include <atomic>
+#include <ctime>
 #include <iostream>
 
 namespace sglang::server {
@@ -28,6 +30,22 @@ void append_usage(std::string& output, std::size_t prompt, std::size_t completio
     output += R"(,"prompt_tokens_details":{"cached_tokens":0}})";
 }
 
+std::string response_prefix(const TextRequest& request) {
+    if (!request.chat) {
+        return "{";
+    }
+    static std::atomic<std::uint64_t> next_id{1};
+    std::string output = R"({"id":"chatcmpl-)";
+    output += std::to_string(next_id.fetch_add(1, std::memory_order_relaxed));
+    output += R"(","object":)";
+    output += request.stream ? R"("chat.completion.chunk")" : R"("chat.completion")";
+    output += R"(,"created":)" + std::to_string(std::time(nullptr));
+    output += R"(,"model":)";
+    json::append_quoted(output, model_name);
+    output += ',';
+    return output;
+}
+
 const char* finish_reason(const TextRequest& request, const DecoderResult& result) {
     const auto count = result.output_token_ids.size();
     const auto budget = static_cast<std::size_t>(request.options.max_new_tokens);
@@ -44,13 +62,15 @@ const char* finish_reason(const TextRequest& request, const DecoderResult& resul
 class TextResponse {
 public:
     TextResponse(const Socket& connection, const Tokenizer& tokenizer, const TextRequest& request)
-        : connection_(connection), tokenizer_(tokenizer), request_(request) {}
+        : connection_(connection), tokenizer_(tokenizer), request_(request),
+          prefix_(response_prefix(request)) {}
 
     bool token(int id);
     void finish(const DecoderResult& result);
     bool started() const { return streaming_; }
 
 private:
+    void append_text(std::string& output, std::string_view text, bool finished) const;
     std::string choice(std::string_view text, const int* ids, std::size_t count,
                        const char* reason = nullptr) const;
     bool event(std::string_view data);
@@ -59,15 +79,34 @@ private:
     const Socket& connection_;
     const Tokenizer& tokenizer_;
     const TextRequest& request_;
+    const std::string prefix_;
     Utf8Stream utf8_;
     std::string text_;
     bool streaming_ = false;
 };
 
+void TextResponse::append_text(std::string& output, std::string_view text, bool finished) const {
+    if (!request_.chat) {
+        output += R"(,"text":)";
+        json::append_quoted(output, text);
+    } else if (!request_.stream) {
+        output += R"(,"message":{"role":"assistant","content":)";
+        json::append_quoted(output, text);
+        output += '}';
+    } else {
+        output += R"(,"delta":{)";
+        if (!finished) {
+            output += R"("content":)";
+            json::append_quoted(output, text);
+        }
+        output += '}';
+    }
+}
+
 std::string TextResponse::choice(std::string_view text, const int* ids, std::size_t count,
                                  const char* reason) const {
-    std::string output = R"({"choices":[{"index":0,"text":)";
-    json::append_quoted(output, text);
+    auto output = prefix_ + R"("choices":[{"index":0)";
+    append_text(output, text, reason != nullptr);
     if (request_.return_token_ids) {
         output += R"(,"token_ids":)";
         append_ids(output, ids, count);
@@ -89,6 +128,13 @@ std::string TextResponse::choice(std::string_view text, const int* ids, std::siz
 bool TextResponse::event(std::string_view data) {
     if (!streaming_) {
         streaming_ = start_events(connection_);
+        if (streaming_ && request_.chat) {
+            const auto role = R"("choices":[{"index":0,"delta":{"role":"assistant"},)"
+                              R"("finish_reason":null}]})";
+            if (!write_event(connection_, prefix_ + role)) {
+                return false;
+            }
+        }
     }
     return streaming_ && write_event(connection_, data);
 }
@@ -116,7 +162,7 @@ void TextResponse::finish_stream(const char* reason, std::size_t count, std::str
         return;
     }
     if (request_.include_usage) {
-        std::string usage = R"({"choices":[])";
+        auto usage = prefix_ + R"("choices":[])";
         append_usage(usage, request_.prompt.size(), count);
         if (!event(usage + '}')) {
             return;
@@ -145,8 +191,9 @@ void TextResponse::finish(const DecoderResult& result) {
 
 void complete_text(const Socket& connection, std::string_view body,
                    const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                   bool trace_serial) {
-    const auto request = parse_text_request(body, tokenizer);
+                   bool trace_serial, bool chat) {
+    const auto request = chat ? parse_chat_request(body, tokenizer)
+                              : parse_text_request(body, tokenizer);
     if (disconnected(connection)) {
         return;
     }

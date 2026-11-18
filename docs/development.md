@@ -170,9 +170,9 @@ The [native MTP guide](mtp.md) defines exact tiled seeding, the target verifier,
 
 ### Native streaming server
 
-Follow the [server launch procedure](../README.md#serve-token-ids-over-http). See [native text completions](text-serving.md) for string prompts, tokenizer assets, and verification.
+Follow the [server launch procedure](../README.md#serve-token-ids-over-http). See [native text completions](text-serving.md) for string prompts and [native chat](chat-serving.md) for conversation requests.
 
-By default, `--max-active 1` uses the serial graph path. `--eager` requires one active request and MTP off. Set `--max-active 2`, `3`, or `4` for eager batching. See [batch CUDA graphs](batch-graphs.md) for opt-in dispatch and verification. Extra connections wait in the listener backlog. [Serving modes](../apps/sglang-server.cpp#L198)<!-- prefix: "if (argument" --> · [Socket workers](../apps/sglang-server.cpp#L136)<!-- prefix: "void serve_b" -->
+By default, `--max-active 1` uses the serial graph path. `--eager` requires one active request and MTP off. Set `--max-active 2`, `3`, or `4` for eager batching. See [batch CUDA graphs](batch-graphs.md) for opt-in dispatch and verification. Extra connections wait in the listener backlog. [Serving modes](../apps/sglang-server.cpp#L204)<!-- prefix: "if (argument" --> · [Socket workers](../apps/sglang-server.cpp#L138)<!-- prefix: "void serve_b" -->
 
 Lanes share weights and own KV, GDN state, and output buffers. Positive budgets reserve KV for prompt length plus budget minus one. HTTP steps assign one position per ready lane, then distribute remaining positions round-robin to prefill lanes, up to 128 total. Decode and single-row prefill run together first. Larger chunks share scratch in slot order. Readback and retirement follow stream completion. C++ `advance` uses one position per selected lane. [Admission](../src/decoder_batch.cpp#L150)<!-- prefix: "void Decoder" --> · [Plan](../src/decoder_batch.cpp#L73)<!-- prefix: "PrefillRows " --> · [Submission](../src/decoder_batch.cpp#L229)<!-- prefix: "void Decoder" -->
 

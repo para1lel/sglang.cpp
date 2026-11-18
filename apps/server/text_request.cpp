@@ -1,5 +1,6 @@
 #include "text_completion.h"
 
+#include "chat_template.h"
 #include "sglang/json.h"
 #include "sglang/server/http.h"
 
@@ -56,22 +57,7 @@ void set_stops(const json::Object& object, DecoderOptions& options) {
     }
 }
 
-TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {
-    for (const auto& entry : object) {
-        const auto& key = entry.first;
-        if (key != "model" && key != "prompt" && key != "max_tokens" && key != "stream" &&
-            key != "stream_options" && key != "ignore_eos" && key != "stop_token_ids" &&
-            key != "return_token_ids") {
-            throw std::invalid_argument("Unsupported text completion option: " + key);
-        }
-    }
-    if (json::get_string(object, "model") != model_name) {
-        bad_request("Expected model Qwen3.8-27B-FP8 for a string prompt");
-    }
-    const auto prompt = json::get_string(object, "prompt");
-    if (!prompt || prompt->empty() || prompt->size() > 1024 * 1024) {
-        bad_request("Expected a nonempty prompt string of up to 1048576 bytes");
-    }
+TextRequest text_options(const json::Object& object) {
     TextRequest request;
     request.stream = read_bool(object, "stream");
     request.return_token_ids = read_bool(object, "return_token_ids");
@@ -85,38 +71,131 @@ TextRequest parse_text(const json::Object& object, const CompletionTokenizer& to
         request.include_usage = read_bool(*options, "include_usage");
     }
     set_stops(object, request.options);
+    return request;
+}
+
+void validate_prompt(std::string_view prompt) {
+    if (prompt.empty() || prompt.size() > 1024 * 1024) {
+        bad_request("Expected a nonempty prompt string of up to 1048576 bytes");
+    }
+}
+
+void encode_prompt(TextRequest& request, std::string_view prompt,
+                   const CompletionTokenizer& tokenizer) {
     try {
-        const auto ids = tokenizer.get().encode(*prompt,
+        const auto ids = tokenizer.get().encode(prompt,
             checkpoint_context - request.options.max_new_tokens);
         request.prompt.assign(ids.begin(), ids.end());
     } catch (const std::length_error&) {
         bad_request("Prompt and output budget must fit the 262144-token context");
     }
+}
+
+bool is_text_option(std::string_view key) {
+    return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
+        key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids";
+}
+
+TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {
+    for (const auto& [key, value] : object) {
+        if (key != "prompt" && !is_text_option(key)) {
+            throw std::invalid_argument("Unsupported text completion option: " + key);
+        }
+    }
+    if (json::get_string(object, "model") != model_name) {
+        bad_request("Expected model Qwen3.8-27B-FP8 for a string prompt");
+    }
+    const auto prompt = json::get_string(object, "prompt").value_or("");
+    validate_prompt(prompt);
+    auto request = text_options(object);
+    encode_prompt(request, prompt, tokenizer);
     return request;
+}
+
+json::Object chat_text_options(const json::OrderedObject& chat) {
+    json::Object options;
+    for (const auto& [key, value] : chat) {
+        if (key == "stream_options" && value.ordered_object()) {
+            const auto& fields = *value.ordered_object();
+            options.emplace(key, json::Object(fields.begin(), fields.end()));
+        } else if (is_text_option(key)) {
+            options.emplace(key, value);
+        } else if (key == "max_completion_tokens") {
+            if (json::get(chat, "max_tokens")) {
+                bad_request("Use one of max_tokens and max_completion_tokens");
+            }
+            options.emplace("max_tokens", value);
+        } else if (key == "temperature") {
+            if (value.number() != 0.0) {
+                bad_request("Only temperature 0 is supported");
+            }
+        } else if (key == "n") {
+            if (value.unsigned_integer() != 1) {
+                bad_request("Only n=1 is supported");
+            }
+        } else if (key != "messages" && key != "tools" && key != "tool_choice" &&
+                   key != "add_generation_prompt" && key != "add_vision_id" &&
+                   key != "enable_thinking" && key != "preserve_thinking" &&
+                   key != "reasoning_effort") {
+            throw std::invalid_argument("Unsupported chat completion option: " + key);
+        }
+    }
+    if (json::get_string(options, "model") != model_name) {
+        bad_request("Expected model Qwen3.8-27B-FP8 for a chat request");
+    }
+    return options;
+}
+
+json::Value parse_body(std::string_view body, json::Syntax syntax) {
+    try {
+        return json::parse(body, syntax);
+    } catch (const json::ParseError&) {
+        bad_request("Invalid JSON request body");
+    }
 }
 
 }
 
 CompletionTokenizer::CompletionTokenizer(const std::filesystem::path& checkpoint)
-    : path_(checkpoint / "tokenizer.json") {}
+    : checkpoint_(checkpoint) {}
+
+CompletionTokenizer::~CompletionTokenizer() = default;
 
 const Tokenizer& CompletionTokenizer::get() const {
-    std::call_once(loaded_, [this] { tokenizer_ = std::make_unique<const Tokenizer>(path_); });
+    std::call_once(loaded_, [this] {
+        tokenizer_ = std::make_unique<const Tokenizer>(checkpoint_ / "tokenizer.json");
+    });
     return *tokenizer_;
 }
 
+const ChatTemplate& CompletionTokenizer::chat_template() const {
+    std::call_once(chat_loaded_, [this] {
+        chat_template_ = std::make_unique<const ChatTemplate>(checkpoint_);
+    });
+    return *chat_template_;
+}
+
 TextRequest parse_text_request(std::string_view body, const CompletionTokenizer& tokenizer) {
-    json::Value parsed;
-    try {
-        parsed = json::parse(body);
-    } catch (const json::ParseError&) {
-        bad_request("Invalid JSON request body");
-    }
+    const auto parsed = parse_body(body, json::Syntax::strict);
     const auto* object = parsed.object();
     if (!object) {
         bad_request("Expected a JSON object");
     }
     return parse_text(*object, tokenizer);
+}
+
+TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer) {
+    const auto parsed = parse_body(body, json::Syntax::ordered);
+    const auto* chat = parsed.ordered_object();
+    if (!chat) {
+        bad_request("Expected a JSON object for a chat request");
+    }
+    auto request = text_options(chat_text_options(*chat));
+    request.chat = true;
+    const auto prompt = tokenizer.chat_template().render(*chat, ChatInput::http);
+    validate_prompt(prompt);
+    encode_prompt(request, prompt, tokenizer);
+    return request;
 }
 
 }

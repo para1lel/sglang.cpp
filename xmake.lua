@@ -55,6 +55,7 @@ target("sglang_cuda")
     add_rpathdirs(path.join(toolkit, "lib"), {interface = true})
     add_syslinks("cudart", {public = true})
     add_files("src/mxfp8_gqa.cu", "src/text_decode_fp8.cu")
+    add_files("src/mxfp8_gqa_prefill.cu")
     add_files("src/text_decode_bandwidth.cu")
     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
     add_files("src/text_normalization.cu")
@@ -185,7 +186,7 @@ if has_config("mxfp8-gqa-check") then
         add_cuflags("--dependency-target-name=", {force = true})
         add_deps("sglang_cuda")
         add_syslinks("cudart")
-        add_files("tests/mxfp8_gqa_check.cu")
+        add_files("tests/mxfp8_gqa_check.cu", "tests/mxfp8_gqa_prefill_check.cu")
     target_end()
 end
 

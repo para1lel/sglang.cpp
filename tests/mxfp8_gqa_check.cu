@@ -13,6 +13,20 @@
 #include <utility>
 #include <vector>
 
+namespace gqa_test {
+
+std::vector<__nv_bfloat16> make_queries(int start_token, int count);
+double decode_value(std::uint8_t code, std::uint8_t scale);
+void check_bound_gdn(cudaStream_t stream);
+void check_tiled_prefill_scales(cudaStream_t stream);
+void check_raw_multirow_prefill(cudaStream_t stream);
+void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
+                            sglang::Mxfp8PageTable pages, int first, int rows,
+                            const __nv_bfloat16* queries, const std::vector<__nv_bfloat16>& actual,
+                            cudaStream_t stream);
+
+}
+
 namespace {
 
 constexpr int head_width = 256;
@@ -34,6 +48,8 @@ constexpr std::size_t scale_bytes = physical_pages * kv_heads * page_tokens * gr
 
 using BFloat = __nv_bfloat16;
 using Byte = std::uint8_t;
+using gqa_test::decode_value;
+using gqa_test::make_queries;
 
 enum class KvKind { key, value };
 
@@ -89,11 +105,15 @@ Byte encode_e8m0(double amax) {
     return static_cast<Byte>(lower);
 }
 
-double decode_value(Byte code, Byte scale) {
+}
+
+double gqa_test::decode_value(Byte code, Byte scale) {
     const double magnitude = positive_e4m3(code & 0x7f);
     const double value = (code & 0x80) != 0 ? -magnitude : magnitude;
     return std::ldexp(value, static_cast<int>(scale) - 127);
 }
+
+namespace {
 
 struct Encoded {
     std::vector<Byte> data;
@@ -163,7 +183,9 @@ std::vector<BFloat> make_kv(KvKind kind, int tokens, int generation) {
     return result;
 }
 
-std::vector<BFloat> make_queries(int start_token, int count) {
+}
+
+std::vector<BFloat> gqa_test::make_queries(int start_token, int count) {
     std::vector<BFloat> result(static_cast<std::size_t>(count) * query_heads * head_width);
     for (int token = 0; token < count; ++token) {
         for (int head = 0; head < query_heads; ++head) {
@@ -177,6 +199,8 @@ std::vector<BFloat> make_queries(int start_token, int count) {
     }
     return result;
 }
+
+namespace {
 
 std::vector<double> reference_attention(const std::vector<BFloat>& queries,
                                         const Encoded& keys, const Encoded& values,
@@ -342,10 +366,10 @@ struct Pages {
 
 struct KvSequence {
     KvSequence(int tokens, int generation)
-        : keys(make_kv(KvKind::key, tokens, generation)),
-          values(make_kv(KvKind::value, tokens, generation)),
-          encoded_keys(encode_rows(keys)),
-          encoded_values(encode_rows(values)) {}
+        : KvSequence(make_kv(KvKind::key, tokens, generation),
+                     make_kv(KvKind::value, tokens, generation)) {}
+
+    KvSequence(std::vector<BFloat> input_keys, std::vector<BFloat> input_values);
 
     const std::vector<BFloat> keys;
     const std::vector<BFloat> values;
@@ -704,22 +728,6 @@ void check_bound_cache(cudaStream_t stream) {
     std::puts("Rebound cache, page table and position on four device graph replays");
 }
 
-struct GdnBuffers {
-    DeviceBuffer<BFloat> history{sglang::text_gdn_qkv_width * sglang::text_gdn_history_taps};
-    DeviceBuffer<float> recurrent{sglang::text_gdn_value_width * sglang::text_gdn_head_dim};
-    DeviceBuffer<BFloat> output{sglang::text_gdn_value_width};
-
-    sglang::TextGdnState state() const {
-        return {history.get(), recurrent.get()};
-    }
-
-    void initialize(cudaStream_t stream) {
-        history.fill(0, stream);
-        recurrent.fill(0, stream);
-        output.fill(attention_sentinel, stream);
-    }
-};
-
 template <class Element>
 void require_same(const std::vector<Element>& actual, const std::vector<Element>& expected,
                   const char* message) {
@@ -727,107 +735,6 @@ void require_same(const std::vector<Element>& actual, const std::vector<Element>
         std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(Element)) != 0) {
         throw std::runtime_error(message);
     }
-}
-
-void check_bound_gdn(cudaStream_t stream) {
-    using namespace sglang;
-    const DeviceBuffer<BFloat> convolution(text_gdn_qkv_width * (text_gdn_history_taps + 1));
-    const DeviceBuffer<BFloat> head_weights(text_gdn_value_heads), norm(text_gdn_head_dim);
-    const DeviceBuffer<BFloat> qkv(text_gdn_qkv_width), z(text_gdn_value_width);
-    const DeviceBuffer<BFloat> gate(text_gdn_value_heads);
-    const DeviceBuffer<BFloat> scratch(text_gdn_workspace_bytes(1) / sizeof(BFloat));
-    const DeviceBuffer<BFloat> output(text_gdn_value_width);
-    const DeviceBuffer<TextGdnState> binding(1);
-    const std::vector<BFloat> convolution_values(
-        text_gdn_qkv_width * (text_gdn_history_taps + 1), __float2bfloat16_rn(0.25f));
-    const std::vector<BFloat> norm_values(text_gdn_head_dim, __float2bfloat16_rn(1.0f));
-    const std::vector<BFloat> z_values(text_gdn_value_width, __float2bfloat16_rn(0.5f));
-    convolution.upload(convolution_values.data(), stream);
-    head_weights.fill(0, stream);
-    gate.fill(0, stream);
-    norm.upload(norm_values.data(), stream);
-    z.upload(z_values.data(), stream);
-    const TextGdnWeights weights{convolution.get(), head_weights.get(), head_weights.get(),
-                                 norm.get()};
-    GdnBuffers actual[2], eager[2];
-    for (int lane = 0; lane < 2; ++lane) {
-        actual[lane].initialize(stream);
-        eager[lane].initialize(stream);
-    }
-    Graph graph;
-    graph.capture(stream, [&] {
-        return decoder::decode_gdn(qkv.get(), z.get(), gate.get(), gate.get(), weights,
-                                   binding.get(), scratch.get(), output.get(), stream);
-    });
-    for (int trial = 0; trial < 6; ++trial) {
-        const int lane = trial % 2;
-        std::vector<BFloat> input(text_gdn_qkv_width);
-        for (int index = 0; index < text_gdn_qkv_width; ++index) {
-            input[index] = __float2bfloat16_rn(((index * 7 + trial * 13) % 31 - 15) / 16.0f);
-        }
-        const auto state = actual[lane].state();
-        qkv.upload(input.data(), stream);
-        binding.upload(&state, stream);
-        graph.replay(stream);
-        check_cuda(text_gdn_forward(1, TextGdnMode::decode, qkv.get(), z.get(), gate.get(),
-                   gate.get(), weights, eager[lane].state(), scratch.get(),
-                   text_gdn_workspace_bytes(1), eager[lane].output.get(), stream),
-                   "Launch eager GDN oracle");
-        require_same(output.download(stream), eager[lane].output.download(stream),
-                     "Rebound GDN output differs from eager");
-        for (int bank = 0; bank < 2; ++bank) {
-            require_same(actual[bank].history.download(stream),
-                         eager[bank].history.download(stream), "Wrong GDN history bank");
-            require_same(actual[bank].recurrent.download(stream),
-                         eager[bank].recurrent.download(stream), "Wrong GDN recurrent bank");
-        }
-        const auto emitted = output.download(stream);
-        if (std::none_of(emitted.begin(), emitted.end(),
-                         [](BFloat value) { return __bfloat162float(value) != 0.0f; })) {
-            throw std::runtime_error("Degenerate GDN output");
-        }
-    }
-    std::puts("Rebound GDN history and recurrent banks on six device graph replays");
-}
-
-void check_tiled_prefill_scales(cudaStream_t stream) {
-    constexpr int rows = 2;
-    constexpr int first = page_tokens - 1;
-    constexpr auto page_payload = page_tokens * kv_elements_per_token;
-    constexpr auto page_scales = scale_bytes / physical_pages;
-    const Pages pages{{1, 0}};
-    pages.device.upload(pages.mapping.data(), stream);
-    const TestCache cache;
-    const auto view = cache.view();
-    const auto table = pages.view();
-    const DeviceBuffer<BFloat> queries(rows * query_elements);
-    const DeviceBuffer<BFloat> direct(rows * query_elements);
-    const DeviceBuffer<BFloat> tiled(rows * query_elements);
-    const auto host_queries = make_queries(first, rows);
-    queries.upload(host_queries.data(), stream);
-    check_cuda(cudaMemsetAsync(view.key_payload, 0, 2 * page_payload, stream), "Clear keys");
-    check_cuda(cudaMemsetAsync(view.key_scales, 127, 2 * page_scales, stream), "Set key scales");
-    for (const auto [exponent, payload] : {std::pair{0, 0x38}, std::pair{255, 0x01}}) {
-        check_cuda(cudaMemsetAsync(view.value_payload, payload | 0x80, page_payload, stream),
-                   "Set negative FP8 values");
-        check_cuda(cudaMemsetAsync(view.value_payload + page_payload, payload, page_payload,
-                                   stream), "Set positive FP8 values");
-        check_cuda(cudaMemsetAsync(view.value_scales, exponent, 2 * page_scales, stream),
-                   "Set value scales");
-        check_cuda(sglang::mxfp8_gqa_attention(view, table, first + rows, first, rows,
-                   queries.get(), direct.get(), stream), "Launch direct prefill oracle");
-        check_cuda(sglang::decoder::tensor_core_prefill_gqa(view, table, first, rows,
-                   queries.get(), tiled.get(), stream), "Launch tiled prefill");
-        const auto expected = direct.download(stream);
-        const auto actual = tiled.download(stream);
-        const float first_value = __bfloat162float(expected.front());
-        if (!std::isfinite(first_value) || first_value <= 0.0f ||
-            std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(BFloat)) != 0) {
-            throw std::runtime_error("Tiled prefill scale mismatch at exponent " +
-                                     std::to_string(exponent));
-        }
-    }
-    std::puts("Tiled prefill scales match across a remapped page boundary");
 }
 
 constexpr int finite_range_tokens = 1536;
@@ -944,6 +851,133 @@ void check_finite_range_decode(cudaStream_t stream) {
     }
 }
 
+KvSequence::KvSequence(std::vector<BFloat> input_keys, std::vector<BFloat> input_values)
+    : keys(std::move(input_keys)),
+      values(std::move(input_values)),
+      encoded_keys(encode_rows(keys)),
+      encoded_values(encode_rows(values)) {}
+
+constexpr int prefill_guard = 8;
+std::vector<BFloat> download_prefill(const DeviceBuffer<BFloat>& output, cudaStream_t stream) {
+    const auto actual = output.download(stream);
+    for (const auto* guard : {actual.data(), actual.data() + actual.size() - prefill_guard}) {
+        const auto* bytes = reinterpret_cast<const Byte*>(guard);
+        if (!std::all_of(bytes, bytes + prefill_guard * sizeof(BFloat),
+                         [](Byte byte) { return byte == attention_sentinel; })) {
+            throw std::runtime_error("Multirow prefill overwrote an output guard");
+        }
+    }
+    return {actual.begin() + prefill_guard, actual.end() - prefill_guard};
+}
+
+void check_ordered_multirow_prefill(cudaStream_t stream) {
+    constexpr int first = group_width - 1;
+    constexpr int rows = page_tokens + 1;
+    constexpr int tokens = first + rows;
+    constexpr int changed_token = page_tokens;
+    constexpr int changed_head = 1;
+    constexpr int changed_group = 2;
+    constexpr int causal_rows = changed_token - first;
+    constexpr auto changed_offset = (changed_token * kv_heads + changed_head) * head_width
+                                    + changed_group * group_width;
+    const Pages pages{{7, 2}};
+    pages.device.upload(pages.mapping.data(), stream);
+    TestCache cache;
+    cache.keys.initialize(stream);
+    cache.values.initialize(stream);
+    const KvSequence original_kv(tokens, 0);
+    auto values = original_kv.values;
+    const auto host_queries = make_queries(first, rows);
+    const DeviceBuffer<BFloat> queries(host_queries.size());
+    const DeviceBuffer<BFloat> output(host_queries.size() + 2 * prefill_guard);
+    queries.upload(host_queries.data(), stream);
+    const auto submit = [&] {
+        return sglang::decoder::tensor_core_multirow_prefill_gqa(
+            cache.view(), pages.view(), first, rows, queries.get(), output.get() + prefill_guard,
+            stream);
+    };
+    const auto verify = [&](const char* phase, const KvSequence& input) {
+        const auto reference = reference_attention(host_queries, input.encoded_keys,
+                                                   input.encoded_values, first, rows);
+        const auto actual = download_prefill(output, stream);
+        verify_attention(phase, actual, reference);
+        gqa_test::verify_ordered_prefill(phase, cache.view(), pages.view(), first, rows,
+                                         queries.get(), actual, stream);
+        cache.keys.verify(phase, stream);
+        cache.values.verify(phase, stream);
+        require_same(queries.download(stream), host_queries, "Multirow prefill modified queries");
+        require_same(pages.device.download(stream), pages.mapping,
+                     "Multirow prefill modified page mapping");
+        return actual;
+    };
+
+    check_append("ordered multirow KV", cache, pages, original_kv, 0, tokens, stream);
+    output.fill(attention_sentinel, stream);
+    check_cuda(submit(), "Launch ordered multirow prefill");
+    const auto original = verify("ordered multirow prefill", original_kv);
+
+    Graph graph;
+    graph.capture(stream, submit);
+    std::fill_n(values.begin() + changed_offset, group_width, __float2bfloat16_rn(8.0f));
+    const KvSequence future(original_kv.keys, std::move(values));
+    check_append("ordered future KV", cache, pages, future, changed_token, 1, stream);
+    output.fill(attention_sentinel, stream);
+    graph.replay(stream);
+    const auto perturbed = verify("ordered multirow prefill graph", future);
+    const auto causal_bytes = causal_rows * query_elements * sizeof(BFloat);
+    if (std::memcmp(original.data(), perturbed.data(), causal_bytes) != 0 ||
+        std::memcmp(original.data() + causal_rows * query_elements,
+                    perturbed.data() + causal_rows * query_elements,
+                    (rows - causal_rows) * query_elements * sizeof(BFloat)) == 0) {
+        throw std::runtime_error("Future KV perturbation failed the prefill causal boundary");
+    }
+}
+
+void check_ordered_prefill_masked_score_overflow(cudaStream_t stream) {
+    constexpr int rows = 65;
+    const Pages pages{{5}};
+    pages.device.upload(pages.mapping.data(), stream);
+    TestCache cache;
+    cache.keys.initialize(stream);
+    cache.values.initialize(stream);
+    std::vector<BFloat> keys(rows * kv_elements_per_token, __float2bfloat16_rn(0.0f));
+    std::vector<BFloat> values(keys.size(), __float2bfloat16_rn(1.0f));
+    const auto second_key = keys.begin() + kv_elements_per_token;
+    std::fill_n(second_key, group_width, __float2bfloat16_rn(-16.0f));
+    std::fill_n(second_key + group_width, 4 * group_width, __float2bfloat16_rn(4.0f));
+    std::fill_n(values.begin() + kv_elements_per_token, head_width, __float2bfloat16_rn(3.0f));
+    const KvSequence input(std::move(keys), std::move(values));
+    check_append("masked score overflow KV", cache, pages, input, 0, rows, stream);
+
+    const std::vector<BFloat> host_queries(rows * query_elements, __float2bfloat16_rn(0x1p120f));
+    const DeviceBuffer<BFloat> queries(host_queries.size());
+    const DeviceBuffer<BFloat> output(host_queries.size() + 2 * prefill_guard);
+    queries.upload(host_queries.data(), stream);
+    output.fill(attention_sentinel, stream);
+    check_cuda(sglang::decoder::tensor_core_multirow_prefill_gqa(
+                   cache.view(), pages.view(), 0, rows, queries.get(),
+                   output.get() + prefill_guard, stream), "Launch masked score overflow prefill");
+    const auto actual = download_prefill(output, stream);
+    bool passed = true;
+    for (const int row : {1, rows - 1}) {
+        const auto begin = actual.begin() + row * query_elements;
+        const float expected = __bfloat162float(__double2bfloat16(1.0 + 2.0 / (row + 1)));
+        const auto different = std::find_if(begin, begin + head_width, [expected](BFloat value) {
+            return __bfloat162float(value) != expected;
+        });
+        if (different != begin + head_width) {
+            std::fprintf(stderr, "Masked score overflow row=%d head=0 channel=%td "
+                         "got %.9g expected %.9g\n", row, different - begin,
+                         __bfloat162float(*different), expected);
+            passed = false;
+        }
+    }
+    if (!passed) {
+        throw std::runtime_error("Masked score overflow recovery mismatch");
+    }
+    std::puts("Masked score overflow recovers in paired rows and odd tail");
+}
+
 }
 
 int main() {
@@ -951,9 +985,12 @@ int main() {
         const Stream stream;
         run_check(stream);
         check_bound_cache(stream.get());
-        check_bound_gdn(stream.get());
-        check_tiled_prefill_scales(stream.get());
+        gqa_test::check_bound_gdn(stream.get());
+        gqa_test::check_tiled_prefill_scales(stream.get());
+        check_ordered_multirow_prefill(stream.get());
+        gqa_test::check_raw_multirow_prefill(stream.get());
         check_finite_range_decode(stream.get());
+        check_ordered_prefill_masked_score_overflow(stream.get());
         std::puts("MXFP8 GQA check passed");
         return 0;
     } catch (const std::exception& error) {

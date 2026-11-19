@@ -263,8 +263,8 @@ struct Chunk : PrefillProjections {
         check(mxfp8_kv_append(cache, pages, position, rows, work.rope_keys, work.values, stream),
               "Append prefill MXFP8 KV");
         const auto status = tensor_core_fp8
-            ? tensor_core_prefill_gqa(cache, pages, position, rows, work.rope_queries,
-                                      work.attention, stream)
+            ? tensor_core_multirow_prefill_gqa(cache, pages, position, rows, work.rope_queries,
+                                               work.attention, stream)
             : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
                                    work.attention, stream);
         check(status, "Read causal prefill MXFP8 attention");

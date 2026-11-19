@@ -178,117 +178,6 @@ __device__ float decode_e8m0(std::uint8_t payload, std::uint8_t exponent) {
     return __fmul_rn(static_cast<float>(value), __uint_as_float(scale_bits));
 }
 
-constexpr int prefill_heads_per_block = 2;
-static_assert(queries_per_kv_head % prefill_heads_per_block == 0);
-
-__device__ __forceinline__ float prefill_prefix_maximum(float prefix, int lane) {
-    #pragma unroll
-    for (int offset = 1; offset < replay_tile; offset *= 2) {
-        const float earlier = __shfl_up_sync(warp_mask, prefix, offset);
-        if (lane >= offset) {
-            prefix = fmaxf(earlier, prefix);
-        }
-    }
-    return prefix;
-}
-
-__global__ void tiled_prefill_attention(Mxfp8KvCache cache, const std::int32_t* pages,
-                                         int first_query_position, const __nv_bfloat16* queries,
-                                         __nv_bfloat16* output) {
-    __shared__ float scores[prefill_heads_per_block][replay_tile];
-    __shared__ float history_weight[prefill_heads_per_block][replay_tile];
-    __shared__ float token_weight[prefill_heads_per_block][replay_tile];
-    __shared__ float denominator[prefill_heads_per_block];
-    const int query_head = blockIdx.y * prefill_heads_per_block;
-    const int kv_head = query_head / queries_per_kv_head;
-    const int channel = threadIdx.x;
-    const int warp = channel / mxfp8_group_size;
-    const int lane = channel % mxfp8_group_size;
-    const auto row = row_offset(blockIdx.x, mxfp8_query_heads, query_head);
-    const int last = first_query_position + static_cast<int>(blockIdx.x);
-    float query[prefill_heads_per_block][mxfp8_groups];
-    #pragma unroll
-    for (int head = 0; head < prefill_heads_per_block; ++head) {
-        #pragma unroll
-        for (int group = 0; group < mxfp8_groups; ++group) {
-            const auto offset = row + head * mxfp8_head_dim + group * mxfp8_group_size + lane;
-            query[head][group] = __bfloat162float(queries[offset]);
-        }
-    }
-    float maximum = -CUDART_INF_F;
-    float mass = 0.0f;
-    float weighted_value[prefill_heads_per_block]{};
-    for (int first = 0; first <= last; first += replay_tile) {
-        const int count = min(replay_tile, last - first + 1);
-        const int physical_page = pages[first / mxfp8_page_size];
-        const int token = first % mxfp8_page_size;
-        const auto payload = payload_offset(physical_page, token, kv_head);
-        const auto scale = scale_offset(physical_page, token, kv_head, 0);
-        constexpr int payload_stride = mxfp8_kv_heads * mxfp8_head_dim;
-        constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
-        for (int index = warp; index < count; index += score_warps) {
-            float dot[prefill_heads_per_block]{};
-            #pragma unroll
-            for (int group = 0; group < mxfp8_groups; ++group) {
-                const auto key_index =
-                    payload + index * payload_stride + group * mxfp8_group_size;
-                const auto key_exponent = cache.key_scales[scale + index * scale_stride + group];
-                const float key = decode_e8m0(cache.key_payload[key_index + lane], key_exponent);
-                #pragma unroll
-                for (int head = 0; head < prefill_heads_per_block; ++head) {
-                    const float product = warp_sum(query[head][group] * key);
-                    if (lane == 0) {
-                        dot[head] += product;
-                    }
-                }
-            }
-            if (lane == 0) {
-                #pragma unroll
-                for (int head = 0; head < prefill_heads_per_block; ++head) {
-                    scores[head][index] = dot[head] * softmax_scale;
-                }
-            }
-        }
-        __syncthreads();
-        if (warp < prefill_heads_per_block) {
-            const float prior_maximum = maximum;
-            const float score = lane < count ? scores[warp][lane] : -CUDART_INF_F;
-            const float prefix = prefill_prefix_maximum(fmaxf(prior_maximum, score), lane);
-            const float previous = __shfl_up_sync(warp_mask, prefix, 1);
-            maximum = __shfl_sync(warp_mask, prefix, count - 1);
-            if (lane < count) {
-                history_weight[warp][lane] = expf((lane == 0 ? prior_maximum : previous) - prefix);
-                token_weight[warp][lane] = expf(score - prefix);
-            }
-        }
-        __syncthreads();
-        #pragma unroll 4
-        for (int index = 0; index < count; ++index) {
-            const float value = decode_e8m0(
-                cache.value_payload[payload + index * payload_stride + channel],
-                cache.value_scales[scale + index * scale_stride + warp]);
-            #pragma unroll
-            for (int head = 0; head < prefill_heads_per_block; ++head) {
-                weighted_value[head] =
-                    fmaf(token_weight[head][index], value,
-                         history_weight[head][index] * weighted_value[head]);
-            }
-        }
-        if (warp < prefill_heads_per_block && lane == 0) {
-            for (int index = 0; index < count; ++index) {
-                mass = fmaf(history_weight[warp][index], mass, token_weight[warp][index]);
-            }
-            denominator[warp] = mass;
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (int head = 0; head < prefill_heads_per_block; ++head) {
-        output[row + head * mxfp8_head_dim + channel] =
-            __float2bfloat16_rn(weighted_value[head] / denominator[head]);
-    }
-}
-
 __device__ decoder::ExactGqaWorkspace score_workspace(decoder::ExactGqaWorkspace workspace) {
     return workspace;
 }
@@ -692,14 +581,6 @@ cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int va
     void* arguments[] = {&cache, &pages.device_pages, &first_query_position, &queries, &output};
     return cudaLaunchKernel(attention_kernel<int>, dim3(query_count, mxfp8_query_heads),
                             dim3(mxfp8_head_dim), arguments, 0, stream);
-}
-
-cudaError_t decoder::tensor_core_prefill_gqa(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream) {
-    void* args[] = {&cache, &pages.device_pages, &position, &queries, &output};
-    const dim3 blocks(rows, mxfp8_query_heads / prefill_heads_per_block);
-    return cudaLaunchKernel(tiled_prefill_attention, blocks, mxfp8_head_dim, args, 0, stream);
 }
 
 cudaError_t decoder::decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages,

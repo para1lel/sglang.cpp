@@ -59,38 +59,48 @@ Keep the command, full output, allocation size, and device, library, and binary 
 
 ### P2 GQA cache contract
 
-K and V use E4M3 for four 256-channel heads, with one E8M0 scale per 32 contiguous channels. E4M3 weights use BF16 inverse scales per 128×128 block. [Checkpoint investigation](research/checkpoint.md)
+K and V use four 256-channel E4M3 heads and one E8M0 scale per 32 contiguous channels. E4M3 weights use BF16 inverse scales per 128×128 block. [Checkpoint investigation](research/checkpoint.md)
 
-Separate K and V buffers use 131,072 payload bytes and 4,096 scale bytes per tensor per 128-token page. The device table maps logical pages to distinct physical pages. [Cache layout](../include/sglang/mxfp8_gqa.h#L22)<!-- prefix: "/// Separate" --> · [Page table](../include/sglang/mxfp8_gqa.h#L34)<!-- prefix: "struct Mxfp8" -->
+Each 128-token page holds 131,072 payload bytes and 4,096 scale bytes per tensor. The device table maps logical pages to distinct physical pages. [Cache layout](../include/sglang/mxfp8_gqa.h#L22)<!-- prefix: "/// Separate" --> · [Page table](../include/sglang/mxfp8_gqa.h#L34)<!-- prefix: "struct Mxfp8" -->
 
-Link `sglang_cuda`. Apply RoPE to K before appending contiguous BF16 `[tokens, 4, 256]` K and V. Apply RoPE to Q. Pass the ready KV prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Keep storage live through stream completion. [Library](../xmake.lua#L46)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L55)<!-- prefix: "cudaError_t " -->
+Link `sglang_cuda`. Apply RoPE to Q and K. Append contiguous BF16 K and V `[tokens, 4, 256]`. Pass the ready prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Retain storage through stream completion. [Library](../xmake.lua#L46)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L55)<!-- prefix: "cudaError_t " -->
 
-For each K or V group's maximum magnitude `amax`, store `ceil(log2(max(amax, 1e-30) / 448)) + 127`, clamped to `[0, 254]`. Attention decodes K and V and converts BF16 Q to FP32. [Scale calculation](../src/mxfp8_gqa.cu#L35)<!-- prefix: "__device__ i" --> · [Direct attention](../src/mxfp8_gqa.cu#L98)<!-- prefix: "__global__ v" -->
+For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. Direct attention decodes K and V and converts Q to FP32. [Scale calculation](../src/mxfp8_gqa.cu#L35)<!-- prefix: "__device__ i" --> · [Direct attention](../src/mxfp8_gqa.cu#L98)<!-- prefix: "__global__ v" -->
 
-Exact scoring preserves FP32 group reductions, the ordered eight-group sum, and `1/16` scaling. Ordered replay stages V per tile, computes prefix maxima and weights, and folds denominator and value FMAs in token order. FP32 division precedes BF16 rounding. [Score](../src/mxfp8_gqa.cu#L472)<!-- prefix: "__global__ v" --> · [Replay](../src/mxfp8_gqa.cu#L509)<!-- prefix: "__device__ _" -->
+Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L361)<!-- prefix: "__global__ v" --> · [Replay](../src/mxfp8_gqa.cu#L398)<!-- prefix: "__device__ _" -->
 
 Eligible [singleton decode](batch-graphs.md#page-parallel-gqa-decode) groups softmax and value reductions by logical KV page.
 
+#### Ordered multirow GQA prefill
+
+The tensor-core projection policy pairs at least 64 rows within 8,192 visible tokens. [Dispatch](../src/mxfp8_gqa_prefill.cu#L441)<!-- prefix: "cudaError_t " -->
+
+Each block shares decoded K/V across two rows and two heads. Its 32-token tiles preserve ordered FP32 arithmetic and per-row causality. [Tile loop](../src/mxfp8_gqa_prefill.cu#L371)<!-- prefix: "for (int fir" -->
+
+Other valid shapes and odd tails use one-row attention. Both paths replay nonfinite visible scores by head and nonfinite quotients by channel in FP64. They keep finite FP64 replacements. [Recovery](../include/sglang/mxfp8_gqa.h#L63)<!-- prefix: "/// Both pai" -->
+
+Zero rows succeed. Otherwise, negative positions, negative rows, and position-plus-row overflow return `cudaErrorInvalidValue`.
+
 #### P2 GQA verification
 
-Build the verifier from the repository root with the managed Pixi toolchain.
+Build from the repository root with Pixi.
 
 ```bash
 bash tools/build.sh --build-dir build --mxfp8-check
 ```
 
-Set `BUILD_WORK_DIR` to the printed build directory and `GPU_UUID` to the reserved B200 UUID.
+Set `BUILD_WORK_DIR` to the printed directory and `GPU_UUID` to the reserved B200 UUID.
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     "${BUILD_WORK_DIR:?set the printed build directory}/build/bin/mxfp8-gqa-check"
 ```
 
-Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The [verifier](../tests/mxfp8_gqa_check.cu#L616)<!-- prefix: "void run_che" --> compares append, prefill, decode, and page reuse against independent packed KV and BF16 references.
+Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The [verifier](../tests/mxfp8_gqa_check.cu#L640)<!-- prefix: "void run_che" --> checks append, prefill, decode, and page reuse against packed KV and BF16 references.
 
-The [ordered decode check](../tests/mxfp8_gqa_check.cu#L518)<!-- prefix: "void check_e" --> matches direct BF16 outputs across tile and page boundaries in eager and graph execution. It checks input preservation, score bounds, and argument validation.
+The [ordered decode check](../tests/mxfp8_gqa_check.cu#L542)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, eager and graph execution, input preservation, bounds, and arguments.
 
-The [tiled scale check](../tests/mxfp8_gqa_check.cu#L793)<!-- prefix: "void check_t" --> matches direct BF16 bits across a remapped page boundary with raw MXFP8 value scale exponents 0 and 255.
+The [tiled scale check](../tests/mxfp8_gqa_prefill_check.cu#L394)<!-- prefix: "void check_t" --> covers exponents 0 and 255. Prefill tests cover [remapping and graphs](../tests/mxfp8_gqa_check.cu#L873)<!-- prefix: "void check_o" -->, [dispatch edges](../tests/mxfp8_gqa_prefill_check.cu#L186)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L228)<!-- prefix: "void check_o" -->, and [score recovery](../tests/mxfp8_gqa_check.cu#L936)<!-- prefix: "void check_o" -->.
 
 ### P3 native text decoder
 
@@ -102,7 +112,7 @@ The [tiled scale check](../tests/mxfp8_gqa_check.cu#L793)<!-- prefix: "void chec
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
 | `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L92)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L401)<!-- prefix: "void Decoder" --> |
 
-Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L88)<!-- prefix: "target(\"sgla" -->
+Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L89)<!-- prefix: "target(\"sgla" -->
 
 #### Runtime path
 
@@ -110,23 +120,23 @@ The decoder validates tensor names, dtypes, and shapes before upload. Upload ret
 
 Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L506)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L561)<!-- prefix: "void Request" -->
 
-Prefill processes tiles in token order and takes initial logits from the last row. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 decode defaults to graph replay. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L417)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L370)<!-- prefix: "void Decoder" -->
+Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L417)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L370)<!-- prefix: "void Decoder" -->
 
-Both binaries accept `--fp8-prefill exact|tensor-core`. `Fp8PrefillPolicy` is the fourth `Decoder` constructor argument. Default `exact` preserves SIMT row arithmetic. Tensor-core arithmetic can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L87)<!-- prefix: "enum class F" -->
+Both binaries accept `--fp8-prefill exact|tensor-core`. Pass `Fp8PrefillPolicy` as the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L87)<!-- prefix: "enum class F" -->
 
-Tensor-core projections require K0, three or more rows, 128-divisible input width, and contiguous, 16-byte-aligned E4M3 payloads. The `sm_100a` build uses TMA, TMEM, and `tcgen05` PTX. Dispatch requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor-map support. SIMT handles ineligible calls. Errors propagate. [Projection](../src/decoder_prefill.cpp#L313)<!-- prefix: "void Prefill" --> · [Eligibility](../src/prefill_fp8_sm100.cu#L467)<!-- prefix: "const int ma" --> · [Build](../xmake.lua#L63)<!-- prefix: "target(\"sgla" -->
+Tensor-core projections require K0, at least three rows, widths divisible by 128, and contiguous, 16-byte-aligned E4M3 payloads. The `sm_100a` build uses TMA, TMEM, and `tcgen05`. It requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Ineligible calls use SIMT. Errors propagate. [Projection](../src/decoder_prefill.cpp#L313)<!-- prefix: "void Prefill" --> · [Eligibility](../src/prefill_fp8_sm100.cu#L467)<!-- prefix: "const int ma" --> · [Build](../xmake.lua#L64)<!-- prefix: "target(\"sgla" -->
 
-For input widths ≥8192, eligible projections use 64×128 tiles below 1024 rows and 128×128 tiles otherwise. [Projection tiles](../src/prefill_fp8_sm100.cu#L489)<!-- prefix: "const bool n" -->
+At input widths ≥8192, eligible projections use 64×128 tiles below 1024 rows and 128×128 otherwise. [Projection tiles](../src/prefill_fp8_sm100.cu#L489)<!-- prefix: "const bool n" -->
 
-Scratch-backed multirow K0 prefill retains these operators during SIMT projection fallback. Both policies share decode.
+Multirow K0 tensor-core prefill keeps these operators during projection fallback.
 
-- [GDN prefill](gdn-prefill.md) fuses convolution, Q/K unit normalization, and gate preparation. Recurrence retains token order. [Preparation](../src/text_attention_gdn.cu#L75)<!-- prefix: "__global__ v" -->
-- After KV append, each GQA block handles one row. Two adjacent query heads reuse decoded K and V from one KV head. Each head keeps ordered FP32 group sums and independent, token-ordered softmax and value updates over 32-token tiles. [Tiled GQA](../src/mxfp8_gqa.cu#L195)<!-- prefix: "__global__ v" --> · [Launch](../src/mxfp8_gqa.cu#L697)<!-- prefix: "cudaError_t " -->
-- Residual RMSNorm and SwiGLU fuse with FP8 quantization. Both round to BF16 before quantization. [RMSNorm](../src/text_normalization.cu#L236)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L665)<!-- prefix: "cudaError_t " -->
+- [GDN prefill](gdn-prefill.md) fuses convolution, Q/K normalization, and gate preparation. Recurrence keeps token order. [Preparation](../src/text_attention_gdn.cu#L75)<!-- prefix: "__global__ v" -->
+- [Ordered multirow GQA](#ordered-multirow-gqa-prefill) follows KV append. [Call](../src/decoder_prefill.cpp#L265)<!-- prefix: "const auto s" -->
+- Fused residual RMSNorm and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L236)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L665)<!-- prefix: "cudaError_t " -->
 
-Other target prefill and draft decode use direct attention. Eager target decode, including MTP verification, uses exact attention below inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Both use direct attention beyond those limits. [Multirow prefill](../src/decoder_prefill.cpp#L265)<!-- prefix: "const auto s" --> · [Row dispatch](../src/decoder_forward.cpp#L178)<!-- prefix: "cudaError_t " -->
+Other target prefill and draft decode use direct attention. Both prefill policies share target decode. Eager decode, including MTP verification, uses exact attention within inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Beyond those limits, both use direct attention. [Row dispatch](../src/decoder_forward.cpp#L178)<!-- prefix: "cudaError_t " -->
 
-The lane stream orders KV append, scoring, replay, and gating. The logits allocation holds 24 FP32 scores per inline position, up to 5,120 slots. Eligible [batch graphs](batch-graphs.md) bind request-owned scores at later positions. Exact graphs read device positions. [Workspace](../src/decoder_resources.cpp#L504)<!-- prefix: "ExactGqaWork" -->
+The lane stream orders append, scoring, replay, and gating. Logits storage holds 24 FP32 scores per position for 5,120 positions. Eligible [batch graphs](batch-graphs.md) bind request-owned scores beyond that limit. Exact graphs read device positions. [Workspace](../src/decoder_resources.cpp#L504)<!-- prefix: "ExactGqaWork" -->
 
 Tuned FP8 projections require one target decode row in the forward group. This includes serial graphs, lone ordinary eager decode, and single-row verification. GQA combines Q/gate, K, and V. The MLP fusion rounds gate and up to BF16 before SwiGLU. GDN QKV and Z stay separate. [Lane selection](../src/decoder_forward.cpp#L50)<!-- prefix: "bool single_" --> · [Batch packing](../src/decoder_batch.cpp#L507)<!-- prefix: "if (rows[slo" -->
 

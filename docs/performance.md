@@ -74,9 +74,11 @@ For a raw text experiment, freeze UTF-8 request bytes, checkpoint and tokenizer 
 
 ### Frozen W1 and W2 timing
 
-Follow the [frozen streaming protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) and GPU3 reference. Use default or explicit `--max-active 1`. Preserve the device, requests, warmups, repeats, and timing definitions. Verify client, fixture, and request hashes. Use `--url` and a new `--output` directory. Omit `--reference` for native timing. The client checks streams and greedy IDs across native repetitions.
+Follow the [frozen streaming protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) on GPU3 with `--max-active 1`. Verify input hashes. Set `--url` and a fresh `--output`. Omit `--reference` for native timing. Check repeat streams and IDs.
 
 Require every warmup and measured stream to pass validation. The native-to-baseline median throughput ratio must exceed `strict_throughput_ratio_gt`. Native p95 TTFT, TPOT, and end-to-end latency must meet `p95_latency_ceilings_ms`. Retain frozen vLLM IDs for diagnosis.
+
+On November 19, 2026, the repaired candidate matched `60677ec` IDs. Both passed W1. W2 missed only p95 TTFT at 395.348 ms base and 366.781 ms candidate against 80.305 ms.
 
 ### Fused FP8 decode
 
@@ -112,21 +114,21 @@ The historical GPU6 prototype reduced W1 and W2 CUDA prefill time against the ro
 
 ### FP8 tensor-core prefill
 
-Compare `--fp8-prefill tensor-core` with explicit `--fp8-prefill exact` on one binary with MTP off. Positive MTP depth uses exact projections under either flag. Match measurement controls and KV and GDN policies. Record commands, flags, source and binary hashes, toolchain, and driver. Trace projection shapes, grid dimensions, dynamic shared memory, and fallbacks separately from timing.
+Compare both `--fp8-prefill` policies on one binary with MTP off. Match measurement controls and KV and GDN policies. Record commands, source and binary hashes, toolchain, and driver. Trace projection shapes, grids, shared memory, and fallback separately.
 
-Run the [exact prefill checks](development.md#chunked-prefill-verification) with default and explicit `exact` in both binaries. Compare tensor-core projections with an independent reference using predefined tolerances. Match fallback and exact projections bitwise on identical inputs. Exercise full chunks, tails, mixed steps, and unsupported dispatch. Check tokens and finish reasons across repetitions within each policy.
+Run [exact prefill checks](development.md#chunked-prefill-verification) with default and explicit `exact` in both binaries. Compare tensor-core projections with an independent reference under predefined tolerances. Match fallback and exact projections bitwise. Cover full chunks, tails, mixed steps, and unsupported dispatch. Check repeated tokens and finish reasons.
 
-For the [prefill fusions](development.md#runtime-path), match full BF16 logits and committed KV and GDN state bitwise against the pre-fusion implementation with the same policy and tile schedule. Match staged operator results for BF16 outputs, FP8 payloads and scales, including raw MXFP8 exponents 0 and 255. Check one-row fallback, two-row tiles, page crossings, positive MTP depth under both flags, and graph and eager decode.
+For arithmetic-preserving [prefill fusions](development.md#runtime-path), match full BF16 logits, committed KV and GDN state, and staged BF16 and FP8 values bitwise. Hold the policy and tile schedule fixed. Include raw MXFP8 exponents 0 and 255. Cover one-row fallback, two-row tiles, page crossings, positive MTP depth under both policies, and graph and eager decode.
 
-Compare full BF16 logits within predefined tolerances on identical histories and prefill boundaries. Use shared teacher-forced tokens after greedy divergence. Report logit errors, ranks, top-two margins, free-running IDs, and first divergence. Reduction differences can change the greedy winner even when the lead is large.
+Match [paired GQA](development.md#ordered-multirow-gqa-prefill) and its one-row fallback bitwise against ordered FP32 for finite scores and quotients. Check FP64 recovery independently. Trace paired, one-row, and recovery cases separately.
+
+For cross-policy comparisons, check full BF16 logits within predefined tolerances on identical histories and prefill boundaries. Use shared teacher-forced tokens after greedy divergence. Report logit errors, ranks, top-two margins, free-running IDs, and first divergence.
 
 Check parity against pinned vLLM on identical histories. Record its execution mode and KV and GDN policies. Record how diagnostic rows were selected. Use frozen fixtures for workload-level results.
 
-Use [chunked prefill measurements](#chunked-prefill) and the [frozen timing protocol](#frozen-w1-and-w2-timing). Report each precision policy separately.
+Run [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 across projection tiles on identical inputs. Follow the [prefill](#chunked-prefill) and [frozen timing](#frozen-w1-and-w2-timing) protocols. Report native deltas and frozen gates per policy.
 
-Run the [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 outputs across projection tiles on identical inputs. Report native deltas and frozen gates separately.
-
-The post-chat GPU3 run used tensor-core prefill, serial CUDA graphs, and MTP off. Each arm and workload used three warmups and nine measured requests. The chat control and fusion build returned identical IDs on the frozen token-ID requests.
+The post-chat GPU3 run used tensor-core prefill, serial graphs, and MTP off. Each workload and arm used three warmups and nine measurements. Both arms returned identical IDs.
 
 | Workload and arm | Median output tok/s | P95 TTFT (ms) | P95 TPOT (ms/token) | P95 E2E (ms) | Gates met |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -137,13 +139,15 @@ The post-chat GPU3 run used tensor-core prefill, serial CUDA graphs, and MTP off
 | W2 fusion | 61.250 | 753.935 | 14.890 | 8361.881 | 0/4 |
 | W2 frozen limits | >115.815 | ≤80.305 | ≤8.671 | ≤4510.901 | |
 
-The verifier used unrounded limits. W2 still misses all four. See `artifacts/tc-prefill-fusion-after-chat/results/performance/comparison.json`.
+The verifier used unrounded limits. Both W2 arms missed all four gates in this run. See `artifacts/tc-prefill-fusion-after-chat/results/performance/comparison.json`.
 
 ### Native concurrent workloads
 
 After [streaming verification](development.md#streaming-verification), set `--max-active` to the row's lane count and use K0. W4 uses 16 lanes and W5 uses 32. Wait for [HTTP readiness](development.md#native-streaming-server). In a separate traced run, verify full-width decode and record effective [graph dispatch](batch-graphs.md#timing).
 
 Follow the [frozen protocol](../benchmarks/concurrent/README.md#conditions-and-gates) for acceptance. The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets and instrumentation. W4 and W5 acceptance remains pending.
+
+The November 19, 2026 GPU2 `60677ec` control missed all four strict W3 gates. All 28,672 IDs matched frozen vLLM across seven cohorts.
 
 A pre-loader GPU6 comparison ran one cold full W3 cohort per arm with tensor-core prefill, batch graphs, and MTP off. Unit16 used eager long decode. The candidate replayed it. All 4,096 IDs, finish reasons, and usage matched. Throughput rose from 5.69 to 14.91 IDs/s. P95 TPOT fell from 624.40 to 189.36 ms. See `artifacts/long-batch-graph-release/report.md`.
 

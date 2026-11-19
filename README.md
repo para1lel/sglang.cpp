@@ -11,7 +11,9 @@ The reusable runtime API is in
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA cache and public attention implementation is in
-[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L35)<!-- prefix: "__device__ i" -->.
+[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L866)<!-- prefix: "cudaError_t " -->.
+The internal page-parallel path for batched decode is in
+[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L978)<!-- prefix: "cudaError_t " -->.
 The internal grouped-query attention prefill path is in
 [`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L441)<!-- prefix: "cudaError_t " -->.
 

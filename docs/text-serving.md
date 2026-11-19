@@ -61,7 +61,7 @@ The decoder validates options even on the greedy path. CUDA ranks BF16 logits by
 
 Unconstrained requests can use configured [sampled MTP](mtp.md#sampled-mtp). The frozen benchmark ID route stays greedy. K0 sampling runs on the decoder stream after eager scoring or [eligible graph replay](batch-graphs.md#runtime-path). [Serial dispatch](../apps/server/completions.cpp#L240)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/batch_service.cpp#L539)<!-- prefix: "if (!job-\u003eop" -->
 
-Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L122)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L687)<!-- prefix: "if (result.s" -->
+Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L122)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L689)<!-- prefix: "if (result.s" -->
 
 ## Finite-choice constraints
 

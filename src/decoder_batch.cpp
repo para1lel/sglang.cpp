@@ -434,7 +434,9 @@ bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
             const auto& lane = lanes[index];
             auto& request = *lane.request;
             auto scores = scratch.work[index]->gqa_scores(text_attention_max_tokens);
-            if (lane.position >= scores.capacity) {
+            if (paged_decode_position(lane.position)) {
+                scores = {};
+            } else if (lane.position >= scores.capacity) {
                 scores = request.batch_graph_scores();
                 if (lane.position >= scores.capacity) {
                     return false;

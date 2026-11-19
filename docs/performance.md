@@ -143,15 +143,15 @@ The verifier used unrounded limits. Both W2 arms missed all four gates in this r
 
 ### Native concurrent workloads
 
-After [streaming verification](development.md#streaming-verification), set `--max-active` to the row's lane count and use K0. W4 uses 16 lanes and W5 uses 32. Wait for [HTTP readiness](development.md#native-streaming-server). In a separate traced run, verify full-width decode and record effective [graph dispatch](batch-graphs.md#timing).
+After [streaming verification](development.md#streaming-verification), use K0 and set `--max-active` to the lane count (16 for W4, 32 for W5). [Trace](batch-graphs.md#timing) full-width decode and replay after [HTTP readiness](development.md#native-streaming-server).
 
-Follow the [frozen protocol](../benchmarks/concurrent/README.md#conditions-and-gates) for acceptance. The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets and instrumentation. W4 and W5 acceptance remains pending.
+Use the [frozen protocol](../benchmarks/concurrent/README.md#conditions-and-gates) for acceptance. The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets. W4 and W5 acceptance remains pending.
 
-The November 19, 2026 GPU2 `60677ec` control missed all four strict W3 gates. All 28,672 IDs matched frozen vLLM across seven cohorts.
+On November 19, 2026, [packed paged decode](batch-graphs.md#packed-paged-gqa-decode) reached 63.779 IDs/s in strict GPU2 W3. P95 TTFT, TPOT, and E2E were 33,923.407, 29.738, and 64,340.177 ms. All four gates failed. All 28,672 IDs matched frozen vLLM and the older `60677ec` control, which ran under different timing conditions.
 
-A pre-loader GPU6 comparison ran one cold full W3 cohort per arm with tensor-core prefill, batch graphs, and MTP off. Unit16 used eager long decode. The candidate replayed it. All 4,096 IDs, finish reasons, and usage matched. Throughput rose from 5.69 to 14.91 IDs/s. P95 TPOT fell from 624.40 to 189.36 ms. See `artifacts/long-batch-graph-release/report.md`.
+A pre-loader GPU6 W3 comparison used one cold cohort per arm, tensor-core prefill, batch graphs, and K0. The candidate replayed Unit16's eager long decode. All 4,096 IDs, finish reasons, and usage matched. Throughput rose 5.69 to 14.91 IDs/s. P95 TPOT fell 624.40 to 189.36 ms. See `artifacts/long-batch-graph-release/report.md`.
 
-The historical `w3-fused` experiment used additional attention and projection fusions. It reached 144.84 output IDs/s and missed all four [frozen W3 gates](../benchmarks/concurrent/README.md#conditions-and-gates).
+The historical `w3-fused` attention and projection fusions reached 144.84 IDs/s and missed all four W3 gates.
 
 ### Native MTP
 
@@ -167,7 +167,7 @@ Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rou
 
 Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L52)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L379)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L678)<!-- prefix: "current.peak" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L379)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L680)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

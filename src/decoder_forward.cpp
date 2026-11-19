@@ -195,9 +195,9 @@ cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
 }
 
 template <typename Position>
-void attend_gqa(const GqaLayer& layer, Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
-                Position position, TextGdnMode mode, bool narrow_gqa, cudaStream_t stream,
-                const MropePosition* mrope, int rotary_position) {
+void append_gqa(const GqaLayer& layer, Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
+                Position position, cudaStream_t stream, const MropePosition* mrope,
+                int rotary_position) {
     if constexpr (std::is_same_v<Position, int>) {
         const auto status = mrope
             ? mrope_gqa_preprocess(mrope, 1, work.q_gate, work.keys, layer.query_norm,
@@ -215,10 +215,78 @@ void attend_gqa(const GqaLayer& layer, Workspace& work, Mxfp8PageTable pages, Mx
         check(decode_kv_append(cache, pages, position, work.rope_keys, work.values, stream),
               "Append decode MXFP8 KV");
     }
-    check(read_gqa(work, pages, cache, position, mode, narrow_gqa, stream),
-          "Read causal MXFP8 attention");
+}
+
+void gate_gqa(Workspace& work, cudaStream_t stream) {
     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
           "Gate grouped-query attention");
+}
+
+PagedDecodeBuffers paged_gqa_buffers(Workspace& work) {
+    static_assert(vocab_size * sizeof(Bf16) >= paged_decode_scratch_bytes);
+    return {work.rope_queries, work.attention, work.logits};
+}
+
+void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& batch,
+                      int cache_index) {
+    static_assert(paged_decode_lanes == decoder_batch_max_graph_lanes);
+    std::array<BoundPagedDecodeLane, paged_decode_lanes> reads;
+    for (int index = 0; index < batch.count; ++index) {
+        const auto& lane = batch.lanes[index];
+        const auto* binding = lane.binding;
+        const auto* position = &binding->position;
+        auto& work = workspace(lane);
+        check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
+                                    layer.key_norm, work.rope_queries, work.rope_keys,
+                                    batch.stream), "Normalize and rotate bound decode Q/K");
+        check(decode_kv_append(&binding->caches[cache_index], &binding->pages, position,
+                               work.rope_keys, work.values, batch.stream), "Append bound MXFP8 KV");
+        reads[index] = {&binding->caches[cache_index], &binding->pages, position,
+                         &binding->scores, paged_gqa_buffers(work)};
+    }
+    check(paged_decode_gqa(reads.data(), batch.count, batch.stream),
+          "Read bound causal MXFP8 attention");
+    batch.each([&](const BatchGraphLane&, Workspace& work) { gate_gqa(work, batch.stream); });
+}
+
+template <typename Lane>
+void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
+    std::array<PagedDecodeLane, paged_decode_lanes> reads;
+    std::array<Workspace*, paged_decode_lanes> pending;
+    int count = 0;
+    batch.each([&](const Lane& lane, Workspace& work) {
+        auto& request = *lane.request;
+        const auto cache = request.caches[cache_index];
+        bool narrow_gqa = false;
+        const MropePosition* mrope = nullptr;
+        int rotary_position = -1;
+        if constexpr (!std::is_same_v<Lane, VerificationRow>) {
+            narrow_gqa = lane.narrow_gqa;
+        }
+        if constexpr (std::is_same_v<Lane, ForwardLane>) {
+            mrope = lane.mrope;
+            rotary_position = lane.rotary_position;
+        }
+        append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
+                   rotary_position);
+        if constexpr (std::is_same_v<Lane, ForwardLane>) {
+            if (batch.count > 1 && batch.count <= paged_decode_lanes &&
+                lane.mode == TextGdnMode::decode && paged_decode_position(lane.position)) {
+                reads[count] = {cache, request.pages, lane.position, paged_gqa_buffers(work)};
+                pending[count++] = &work;
+                return;
+            }
+        }
+        check(read_gqa(work, request.pages, cache, lane.position, lane.mode, narrow_gqa,
+                       batch.stream), "Read causal MXFP8 attention");
+        gate_gqa(work, batch.stream);
+    });
+    if (count > 0) {
+        check(paged_decode_gqa(reads.data(), count, batch.stream), "Read paged MXFP8 attention");
+        for (int index = 0; index < count; ++index) {
+            gate_gqa(*pending[index], batch.stream);
+        }
+    }
 }
 
 template <typename Lane>
@@ -237,38 +305,11 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
         batch.project(layer.key, &Workspace::keys);
         batch.project(layer.value, &Workspace::values);
     }
-    batch.each([&](const Lane& lane, Workspace& work) {
-        if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
-            const auto* binding = lane.binding;
-            const auto stream = batch.stream;
-            const auto* position = &binding->position;
-            check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
-                                        layer.key_norm, work.rope_queries, work.rope_keys, stream),
-                  "Normalize and rotate bound decode Q/K");
-            check(decode_kv_append(&binding->caches[cache_index], &binding->pages, position,
-                                   work.rope_keys, work.values, stream), "Append bound MXFP8 KV");
-            check(exact_decode_gqa_attention(&binding->caches[cache_index], &binding->pages,
-                                             position, work.rope_queries, work.attention,
-                                             &binding->scores, stream),
-                  "Read bound causal MXFP8 attention");
-            check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
-                  "Gate grouped-query attention");
-        } else {
-            auto& request = *lane.request;
-            bool narrow_gqa = false;
-            const MropePosition* mrope = nullptr;
-            int rotary_position = -1;
-            if constexpr (!std::is_same_v<Lane, VerificationRow>) {
-                narrow_gqa = lane.narrow_gqa;
-            }
-            if constexpr (std::is_same_v<Lane, ForwardLane>) {
-                mrope = lane.mrope;
-                rotary_position = lane.rotary_position;
-            }
-            attend_gqa(layer, work, request.pages, request.caches[cache_index], lane.position,
-                       lane.mode, narrow_gqa, batch.stream, mrope, rotary_position);
-        }
-    });
+    if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
+        attend_bound_gqa(layer, batch, cache_index);
+    } else {
+        attend_eager_gqa(layer, batch, cache_index);
+    }
     batch.quantize(&Workspace::attention, text_gqa_q_width);
     batch.project(layer.output, &Workspace::projected_attention);
 }

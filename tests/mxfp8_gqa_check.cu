@@ -19,7 +19,7 @@ std::vector<__nv_bfloat16> make_queries(int start_token, int count);
 double decode_value(std::uint8_t code, std::uint8_t scale);
 void check_bound_gdn(cudaStream_t stream);
 void check_tiled_prefill_scales(cudaStream_t stream);
-void check_raw_multirow_prefill(cudaStream_t stream);
+void check_raw_attention(cudaStream_t stream);
 void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
                             sglang::Mxfp8PageTable pages, int first, int rows,
                             const __nv_bfloat16* queries, const std::vector<__nv_bfloat16>& actual,
@@ -988,7 +988,7 @@ int main() {
         gqa_test::check_bound_gdn(stream.get());
         gqa_test::check_tiled_prefill_scales(stream.get());
         check_ordered_multirow_prefill(stream.get());
-        gqa_test::check_raw_multirow_prefill(stream.get());
+        gqa_test::check_raw_attention(stream.get());
         check_finite_range_decode(stream.get());
         check_ordered_prefill_masked_score_overflow(stream.get());
         std::puts("MXFP8 GQA check passed");

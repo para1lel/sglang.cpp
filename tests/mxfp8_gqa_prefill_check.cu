@@ -2,11 +2,13 @@
 #include "sglang/mxfp8_gqa.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -144,6 +146,156 @@ struct RawCache {
     }
 };
 
+using sglang::decoder::BoundPagedDecodeLane;
+using sglang::decoder::ExactGqaWorkspace;
+using sglang::decoder::PagedDecodeLane;
+using sglang::decoder::paged_decode_gqa;
+
+constexpr int paged_lanes = 4;
+constexpr int paged_layers = 2;
+constexpr int paged_pages = 131;
+constexpr int paged_groups = 8;
+constexpr int score_stride = paged_pages * page_tokens;
+constexpr int split_guard = 16;
+constexpr auto split_bytes = sglang::decoder::paged_decode_scratch_bytes;
+
+bool paged_position(int position) {
+    return position >= 8191 && position < 16384;
+}
+
+bool aliased_scores(int position) {
+    return position == 127 || position == 128;
+}
+
+struct PagedBinding {
+    sglang::Mxfp8KvCache cache;
+    sglang::Mxfp8PageTable pages;
+    int position;
+    ExactGqaWorkspace scores;
+};
+
+struct PackedRows {
+    DeviceBuffer<Byte> payload{paged_pages * sglang::mxfp8_payload_bytes_per_page};
+    DeviceBuffer<Byte> scales{paged_pages * sglang::mxfp8_scale_bytes_per_page};
+    std::vector<Byte> expected_payload = std::vector<Byte>(
+        paged_pages * sglang::mxfp8_payload_bytes_per_page, attention_sentinel);
+    std::vector<Byte> expected_scales = std::vector<Byte>(
+        paged_pages * sglang::mxfp8_scale_bytes_per_page, attention_sentinel);
+    std::vector<float> logical;
+
+    void load(const std::vector<std::int32_t>& pages, int position, int seed, bool values,
+              cudaStream_t stream) {
+        std::fill(expected_payload.begin(), expected_payload.end(), attention_sentinel);
+        std::fill(expected_scales.begin(), expected_scales.end(), attention_sentinel);
+        logical.resize((position + 1) * kv_elements_per_token);
+        for (int token = 0; token <= position; ++token) {
+            const int page = pages[token / page_tokens];
+            const int slot = token % page_tokens;
+            const bool appended = token == position;
+            for (int head = 0; head < kv_heads; ++head) {
+                const auto logical_row = row_index(token, head, kv_heads) * head_width;
+                const auto payload_row = row_index(page * page_tokens + slot, head, kv_heads)
+                                         * head_width;
+                for (int group = 0; group < paged_groups; ++group) {
+                    const auto exponent = static_cast<Byte>(appended ? (values ? 123 : 121) :
+                        124 + (token * 7 + head * 3 + group + seed) % 4);
+                    const auto scale = ((((page * kv_heads + head) * 32 + slot % 32) * 4
+                                        + slot / 32) * paged_groups + group);
+                    expected_scales[scale] = exponent;
+                    for (int index = 0; index < 32; ++index) {
+                        const int channel = group * 32 + index;
+                        const int sample = (token * 13 + head * 31 + channel * 5
+                                            + seed * (index + 1)) % 23;
+                        const auto code = static_cast<Byte>(appended ? 0x78 :
+                            (0x30 + sample % 8) | (sample % 2 ? 0x80 : 0));
+                        expected_payload[payload_row + channel] = code;
+                        logical[logical_row + channel] =
+                            static_cast<float>(decode_value(code, exponent));
+                    }
+                }
+            }
+        }
+        const auto last_page = pages[position / page_tokens];
+        const auto last_slot = position % page_tokens;
+        const auto last_payload = (last_page * page_tokens + last_slot) * kv_elements_per_token;
+        auto initial_payload = expected_payload;
+        auto initial_scales = expected_scales;
+        std::fill_n(initial_payload.begin() + last_payload, kv_elements_per_token,
+                    attention_sentinel);
+        for (int head = 0; head < kv_heads; ++head) {
+            const auto scale = (((last_page * kv_heads + head) * 32 + last_slot % 32) * 4
+                                + last_slot / 32) * paged_groups;
+            std::fill_n(initial_scales.begin() + scale, paged_groups, attention_sentinel);
+        }
+        payload.upload(initial_payload.data(), stream);
+        scales.upload(initial_scales.data(), stream);
+        check_cuda(cudaStreamSynchronize(stream), "Complete paged prefix upload");
+    }
+};
+
+struct PagedBank {
+    PackedRows keys, values;
+    DeviceBuffer<std::int32_t> page_table{paged_pages};
+    DeviceBuffer<float> scores{query_heads * score_stride + 2};
+    std::vector<std::int32_t> mapping = std::vector<std::int32_t>(paged_pages);
+    std::vector<BFloat> queries;
+
+    PagedBinding binding(int position) const {
+        const int padding = aliased_scores(position) ? 0 : paged_pages % (1 + position % 29);
+        return {{keys.payload.get(), values.payload.get(), keys.scales.get(),
+                 values.scales.get(), paged_pages}, {page_table.get(), paged_pages}, position,
+                {scores.get() + 1, position + 1 + padding}};
+    }
+
+    void prepare(int position, int seed, cudaStream_t stream) {
+        std::fill(mapping.begin(), mapping.end(), std::numeric_limits<int>::max());
+        for (int page = 0; page <= position / page_tokens; ++page) {
+            mapping[page] = (page * (3 + 2 * (seed % 9)) + seed) % paged_pages;
+        }
+        page_table.upload(mapping.data(), stream);
+        keys.load(mapping, position, seed, false, stream);
+        values.load(mapping, position, seed + 17, true, stream);
+        queries = make_queries(position + seed * 5, 1);
+        scores.fill(attention_sentinel, stream);
+    }
+};
+
+struct PagedSlot {
+    DeviceBuffer<PagedBinding> device_binding{1};
+    DeviceBuffer<BFloat> keys{kv_elements_per_token}, values{kv_elements_per_token};
+    DeviceBuffer<BFloat> queries{query_elements}, output{query_elements + 2};
+    DeviceBuffer<Byte> split{split_bytes + 2 * split_guard};
+
+    BoundPagedDecodeLane lane() const {
+        const auto* binding = device_binding.get();
+        return {&binding->cache, &binding->pages, &binding->position, &binding->scores,
+                {queries.get(), output.get() + 1, split.get() + split_guard}};
+    }
+
+    cudaError_t append(cudaStream_t stream) const {
+        const auto binding = lane();
+        return sglang::decoder::decode_kv_append(
+            binding.cache, binding.pages, binding.position, keys.get(), values.get(), stream);
+    }
+
+    void prepare(const PagedBank& bank, PagedBinding& binding, cudaStream_t stream) {
+        if (paged_position(binding.position)) {
+            binding.scores = {};
+        } else if (aliased_scores(binding.position)) {
+            binding.scores.scores = reinterpret_cast<float*>(split.get() + split_guard);
+        }
+        const std::vector<BFloat> append_keys(kv_elements_per_token, __float2bfloat16_rn(4.0f));
+        const std::vector<BFloat> append_values(kv_elements_per_token, __float2bfloat16_rn(16.0f));
+        keys.upload(append_keys.data(), stream);
+        values.upload(append_values.data(), stream);
+        queries.upload(bank.queries.data(), stream);
+        device_binding.upload(&binding, stream);
+        output.fill(attention_sentinel, stream);
+        split.fill(attention_sentinel, stream);
+        check_cuda(cudaStreamSynchronize(stream), "Complete paged lane binding");
+    }
+};
+
 struct GdnBuffers {
     DeviceBuffer<BFloat> history{sglang::text_gdn_qkv_width * sglang::text_gdn_history_taps};
     DeviceBuffer<float> recurrent{sglang::text_gdn_value_width * sglang::text_gdn_head_dim};
@@ -167,6 +319,307 @@ void require_same(const std::vector<Element>& actual, const std::vector<Element>
         std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(Element)) != 0) {
         throw std::runtime_error(message);
     }
+}
+
+template <class Element>
+bool poisoned(const std::vector<Element>& data, std::size_t first, std::size_t end) {
+    const auto* bytes = reinterpret_cast<const Byte*>(data.data());
+    return std::all_of(bytes + first * sizeof(Element), bytes + end * sizeof(Element),
+                       [](Byte byte) { return byte == attention_sentinel; });
+}
+
+std::vector<double> paged_reference(const PagedBank& bank, int position) {
+    std::vector<double> expected(query_elements), scores(position + 1);
+    for (int head = 0; head < query_heads; ++head) {
+        const int kv_head = head / (query_heads / kv_heads);
+        const auto query = bank.queries.data() + head * head_width;
+        for (int token = 0; token <= position; ++token) {
+            const auto key = bank.keys.logical.data()
+                             + row_index(token, kv_head, kv_heads) * head_width;
+            double dot = 0;
+            for (int channel = 0; channel < head_width; ++channel) {
+                dot += __bfloat162float(query[channel]) * static_cast<double>(key[channel]);
+            }
+            scores[token] = dot / 16.0;
+        }
+        const double maximum = *std::max_element(scores.begin(), scores.end());
+        double denominator = 0;
+        for (int token = 0; token <= position; ++token) {
+            const auto value = bank.values.logical.data()
+                               + row_index(token, kv_head, kv_heads) * head_width;
+            const double weight = std::exp(scores[token] - maximum);
+            denominator += weight;
+            for (int channel = 0; channel < head_width; ++channel) {
+                expected[head * head_width + channel] += weight * value[channel];
+            }
+        }
+        for (int channel = 0; channel < head_width; ++channel) {
+            expected[head * head_width + channel] /= denominator;
+        }
+    }
+    return expected;
+}
+
+void verify_paged_fp64(const PagedBank& bank, int position, const std::vector<BFloat>& actual) {
+    const auto expected = paged_reference(bank, position);
+    for (int index = 0; index < query_elements; ++index) {
+        const double magnitude = std::abs(expected[index]);
+        const int exponent = magnitude < std::numeric_limits<float>::min()
+                                 ? -126 : std::ilogb(magnitude);
+        const double tolerance = std::ldexp(1.0, exponent - 8) + 2e-5 * std::max(1.0, magnitude);
+        const double output = __bfloat162float(actual[index]);
+        if (!std::isfinite(output) || std::abs(output - expected[index]) > tolerance) {
+            std::fprintf(stderr, "Paged FP64 position=%d head=%d channel=%d got %.9g "
+                                 "expected %.9g tolerance %.9g\n", position, index / head_width,
+                         index % head_width, output, expected[index], tolerance);
+            throw std::runtime_error("Paged decode differs from independent causal reference");
+        }
+    }
+}
+
+std::vector<BFloat> paged_output(const PagedSlot& slot, cudaStream_t stream) {
+    const auto result = slot.output.download(stream);
+    if (!poisoned(result, 0, 1) || !poisoned(result, result.size() - 1, result.size())) {
+        throw std::runtime_error("Paged decode overwrote an output guard");
+    }
+    return {result.begin() + 1, result.end() - 1};
+}
+
+template <class Element>
+void check_ordered_score_tail(const std::vector<Element>& storage, std::size_t first,
+                              int position, int stride) {
+    constexpr auto factor = sizeof(float) / sizeof(Element);
+    for (int head = 0; head < query_heads; ++head) {
+        const auto row = first + head * stride * factor;
+        if (!poisoned(storage, row + (position + 1) * factor, row + stride * factor)) {
+            throw std::runtime_error("Ordered decode overwrote an inactive score tail");
+        }
+    }
+    if (!poisoned(storage, first + query_heads * stride * factor, storage.size())) {
+        throw std::runtime_error("Ordered decode overwrote inactive scratch");
+    }
+}
+
+void check_paged_scratch(const PagedSlot& slot, const PagedBank& bank, int position,
+                         cudaStream_t stream) {
+    const auto split = slot.split.download(stream);
+    const auto scores = bank.scores.download(stream);
+    const bool paged = paged_position(position);
+    const bool alias = aliased_scores(position);
+    const int stride = bank.binding(position).scores.capacity;
+    if (!poisoned(split, 0, split_guard) ||
+        !poisoned(split, split_guard + split_bytes, split.size()) ||
+        (paged || alias) == poisoned(split, split_guard, split_guard + split_bytes)) {
+        throw std::runtime_error("Paged split scratch writes disagree with position or guards");
+    }
+    if (paged || alias) {
+        if (!poisoned(scores, 0, scores.size())) {
+            throw std::runtime_error("Paged lane wrote inactive ordered scratch");
+        }
+    } else {
+        if (!poisoned(scores, 0, 1) || poisoned(scores, 1, position + 2)) {
+            throw std::runtime_error("Ordered lane failed to write only active scratch");
+        }
+        check_ordered_score_tail(scores, 1, position, stride);
+    }
+    if (alias) {
+        check_ordered_score_tail(split, split_guard, position, stride);
+    }
+}
+
+void check_paged_eager(const PagedSlot& slot, PagedBinding binding,
+                       const std::vector<BFloat>& expected, cudaStream_t stream) {
+    const DeviceBuffer<BFloat> output(query_elements);
+    if (paged_position(binding.position)) {
+        const DeviceBuffer<Byte> scratch(split_bytes + 2 * split_guard);
+        scratch.fill(attention_sentinel, stream);
+        const PagedDecodeLane lane{
+            binding.cache, binding.pages, binding.position,
+            {slot.queries.get(), output.get(), scratch.get() + split_guard}};
+        auto invalid = lane;
+        invalid.buffers.scratch = scratch.get() + split_guard + 1;
+        if (paged_decode_gqa(&invalid, 1, stream) != cudaErrorInvalidValue) {
+            throw std::runtime_error("Paged decode accepted misaligned scratch");
+        }
+        invalid.buffers.scratch = nullptr;
+        if (paged_decode_gqa(&invalid, 1, stream) != cudaErrorInvalidValue) {
+            throw std::runtime_error("Paged decode accepted missing scratch");
+        }
+        invalid = lane;
+        invalid.pages.page_count = binding.position / page_tokens;
+        if (paged_decode_gqa(&invalid, 1, stream) != cudaErrorInvalidValue) {
+            throw std::runtime_error("Paged decode accepted insufficient page capacity");
+        }
+        check_cuda(paged_decode_gqa(&lane, 1, stream), "Launch paged eager");
+        const auto bytes = scratch.download(stream);
+        if (!poisoned(bytes, 0, split_guard) ||
+            !poisoned(bytes, split_guard + split_bytes, bytes.size())) {
+            throw std::runtime_error("Paged eager overwrote a scratch guard");
+        }
+    } else {
+        check_cuda(sglang::decoder::exact_decode_gqa_attention(
+            binding.cache, binding.pages, binding.position, slot.queries.get(), output.get(),
+            binding.scores, stream), "Launch ordered eager fallback");
+    }
+    require_same(output.download(stream), expected, "Bound and eager decode differ bitwise");
+}
+
+void check_paged_replay(cudaStream_t stream) {
+    std::array<PagedSlot, paged_lanes * paged_layers> slots;
+    std::array<PagedBank, paged_lanes * paged_layers> banks;
+    Graph graph;
+    graph.capture(stream, [&] {
+        for (int layer = 0; layer < paged_layers; ++layer) {
+            std::array<BoundPagedDecodeLane, paged_lanes> lanes{};
+            for (int lane = 0; lane < paged_lanes; ++lane) {
+                const auto& slot = slots[layer * paged_lanes + lane];
+                const auto status = slot.append(stream);
+                if (status != cudaSuccess) {
+                    return status;
+                }
+                lanes[lane] = slot.lane();
+            }
+            const auto status = paged_decode_gqa(lanes.data(), paged_lanes, stream);
+            if (status != cudaSuccess) {
+                return status;
+            }
+        }
+        return cudaSuccess;
+    });
+    constexpr int positions[][paged_lanes] = {
+        {8190, 8191, 16383, 16384}, {8192, 8190, 16384, 16383}, {8319, 8320, 127, 128},
+    };
+    for (int trial = 0; trial < 3; ++trial) {
+        const auto bank_index = [trial](int index) {
+            return (index + trial * 3) % (paged_lanes * paged_layers);
+        };
+        std::array<PagedBinding, paged_lanes * paged_layers> bindings{};
+        for (int index = 0; index < paged_lanes * paged_layers; ++index) {
+            const int position = positions[trial][index % paged_lanes];
+            auto& bank = banks[bank_index(index)];
+            bank.prepare(position, 9 + index + trial * 19, stream);
+            bindings[index] = bank.binding(position);
+            slots[index].prepare(bank, bindings[index], stream);
+        }
+        graph.replay(stream);
+        for (int index = 0; index < paged_lanes * paged_layers; ++index) {
+            const int position = positions[trial][index % paged_lanes];
+            const auto& bank = banks[bank_index(index)];
+            const auto& slot = slots[index];
+            const auto result = paged_output(slot, stream);
+            check_paged_scratch(slot, bank, position, stream);
+            verify_paged_fp64(bank, position, result);
+            check_paged_eager(slot, bank.binding(position), result, stream);
+            for (const auto* plane : {&bank.keys, &bank.values}) {
+                require_same(plane->payload.download(stream), plane->expected_payload,
+                             "Bound decode changed a packed payload outside its append");
+                require_same(plane->scales.download(stream), plane->expected_scales,
+                             "Bound decode changed packed scales outside its append");
+            }
+            require_same(bank.page_table.download(stream), bank.mapping,
+                         "Bound decode changed the page table");
+            require_same(slot.queries.download(stream), bank.queries,
+                         "Bound decode changed a query");
+        }
+    }
+    std::puts("Paged decode matched FP64 and eager across 24 rebound layer-lanes");
+}
+
+void check_paged_escape_markers(const PagedSlot& slot, int first_head, int escaped_heads,
+                                cudaStream_t stream) {
+    const auto scratch = slot.split.download(stream);
+    const auto head_bytes = split_bytes / sglang::mxfp8_query_heads;
+    for (int head = 0; head < sglang::mxfp8_query_heads; ++head) {
+        float maximum;
+        const auto offset =
+            split_guard + head * head_bytes + sglang::mxfp8_head_dim * sizeof(float);
+        std::memcpy(&maximum, scratch.data() + offset, sizeof(maximum));
+        const bool escaped = head >= first_head && head < first_head + escaped_heads;
+        if ((escaped && !std::isnan(maximum)) || (!escaped && !std::isfinite(maximum))) {
+            throw std::runtime_error("Paged escape did not stay within the affected query heads");
+        }
+    }
+}
+
+void check_paged_finite_range(cudaStream_t stream) {
+    constexpr int position = 8191;
+    constexpr auto elements = (position + 1) * kv_elements_per_token;
+    constexpr int hostile_kv_head = 1;
+    constexpr int heads_per_kv = sglang::mxfp8_query_heads / sglang::mxfp8_kv_heads;
+    const PagedBank bank;
+    const PagedSlot slot;
+    std::vector<std::int32_t> mapping(paged_pages, std::numeric_limits<int>::max());
+    for (int page = 0; page <= position / page_tokens; ++page) {
+        mapping[page] = paged_pages - 1 - page;
+    }
+    bank.page_table.upload(mapping.data(), stream);
+    const auto binding = bank.binding(position);
+    auto active = binding;
+    active.scores = {};
+    slot.device_binding.upload(&active, stream);
+    Graph graph;
+    graph.capture(stream, [&] {
+        const auto lane = slot.lane();
+        return paged_decode_gqa(&lane, 1, stream);
+    });
+    const DeviceBuffer<BFloat> input_keys(elements), input_values(elements);
+    const DeviceBuffer<BFloat> ordered(query_elements);
+    const auto bf16 = [](float value) { return __float2bfloat16_rn(value); };
+    std::vector<BFloat> expected(query_elements, bf16(2.0f));
+    std::fill_n(expected.begin() + hostile_kv_head * heads_per_kv * sglang::mxfp8_head_dim,
+                heads_per_kv * sglang::mxfp8_head_dim, bf16(1.0f));
+    struct FiniteCase {
+        const char* name;
+        float query, key, value;
+        bool cancellation;
+    };
+    for (const auto& test : {
+             FiniteCase{"Paged score overflow recovery mismatch", -0x1p120f, 0x1p20f, 16.0f,
+                        false},
+             FiniteCase{"Paged numerator overflow recovery mismatch", 1.0f, -8.0f, 0x1p125f,
+                        false},
+             FiniteCase{"Paged value cancellation mismatch", 1.0f, 0.0f, 0x1p125f, true},
+         }) {
+        std::vector<BFloat> host_keys(elements, bf16(0.0f)), host_values(elements, bf16(2.0f));
+        const auto head_offset = [](int token) {
+            return token * kv_elements_per_token + hostile_kv_head * sglang::mxfp8_head_dim;
+        };
+        for (int token = 0; token <= position; ++token) {
+            std::fill_n(host_values.begin() + head_offset(token), sglang::mxfp8_head_dim,
+                        bf16(1.0f));
+        }
+        if (test.cancellation) {
+            std::fill_n(host_values.begin() + head_offset(0), sglang::mxfp8_head_dim,
+                        bf16(test.value));
+            std::fill_n(host_values.begin() + head_offset(1), sglang::mxfp8_head_dim,
+                        bf16(-test.value));
+        } else {
+            for (int token = 1024; token < 1536; ++token) {
+                std::fill_n(host_keys.begin() + head_offset(token), sglang::mxfp8_head_dim,
+                            bf16(test.key));
+                std::fill_n(host_values.begin() + head_offset(token), sglang::mxfp8_head_dim,
+                            bf16(test.value));
+            }
+        }
+        const std::vector<BFloat> queries(query_elements, bf16(test.query));
+        input_keys.upload(host_keys.data(), stream);
+        input_values.upload(host_values.data(), stream);
+        slot.queries.upload(queries.data(), stream);
+        slot.output.fill(attention_sentinel, stream);
+        slot.split.fill(attention_sentinel, stream);
+        check_cuda(sglang::mxfp8_kv_append(binding.cache, binding.pages, 0, position + 1,
+            input_keys.get(), input_values.get(), stream), "Append paged finite-range fixture");
+        graph.replay(stream);
+        const auto actual = paged_output(slot, stream);
+        require_same(actual, expected, test.name);
+        check_paged_escape_markers(slot, hostile_kv_head * heads_per_kv, heads_per_kv, stream);
+        check_cuda(sglang::decoder::exact_decode_gqa_attention(
+            binding.cache, binding.pages, position, slot.queries.get(), ordered.get(),
+            binding.scores, stream), "Launch ordered finite-range control");
+        require_same(ordered.download(stream), expected, "Ordered finite-range control mismatch");
+        check_paged_eager(slot, binding, actual, stream);
+    }
+    std::puts("Paged decode recovered from finite-input overflow and value cancellation");
 }
 
 constexpr int prefill_guard = 8;
@@ -451,10 +904,12 @@ void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
     }
 }
 
-void check_raw_multirow_prefill(cudaStream_t stream) {
+void check_raw_attention(cudaStream_t stream) {
     check_ordered_prefill_extent(stream);
     check_ordered_prefill_precision(stream);
     check_ordered_prefill_score_overflow(stream);
+    check_paged_replay(stream);
+    check_paged_finite_range(stream);
 }
 
 }

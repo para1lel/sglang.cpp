@@ -104,11 +104,9 @@ Arguments parse_arguments(int argc, char** argv) {
     if (arguments.mtp_steps > 0 && arguments.max_active > sglang::decoder_batch_max_mtp_lanes) {
         throw std::invalid_argument("--max-active above 4 requires --mtp-steps 0");
     }
-    if (arguments.prefix_cache_entries != 0 &&
-        (arguments.eager || arguments.mtp_steps != 0 ||
-         arguments.fp8_prefill != sglang::Fp8PrefillPolicy::exact)) {
+    if (arguments.prefix_cache_entries != 0 && (arguments.eager || arguments.mtp_steps != 0)) {
         throw std::invalid_argument(
-            "--prefix-cache-entries requires exact prefill and --mtp-steps 0. Omit --eager.");
+            "--prefix-cache-entries requires --mtp-steps 0. Omit --eager.");
     }
     return arguments;
 }
@@ -203,7 +201,7 @@ int main(int argc, char** argv) {
                      "MTP steps: 0 by default, up to 4 with at most 4 active requests.\n"
                      "Batch graphs: ordinary decode steps at widths 2-4. Other steps use eager.\n"
                      "Eager decode: one active request with MTP off.\n"
-                     "Prefix cache: disabled by default. Requires exact prefill and MTP off.\n"
+                     "Prefix cache: disabled by default. Requires MTP off. Omit --eager.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n"
                   << sglang::cli::fp8_prefill_usage;
         return 0;

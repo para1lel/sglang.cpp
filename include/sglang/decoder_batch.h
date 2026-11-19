@@ -70,6 +70,7 @@ public:
     void cancel(int slot);
 
     /// Advance each selected slot by one position or one speculative round.
+    /// Tensor-core prefill with an enabled cache uses the same tiles as advance_chunked().
     /// Consume token and the first extra_token_count entries of extra_tokens in order.
     /// extra_token mirrors the first extra token for callers using depth one.
     /// A zero-budget slot finishes without work. A failed selection retires only its slot.
@@ -80,6 +81,7 @@ public:
 
     /// Share one bounded prompt position budget across selected slots. Each ready
     /// decode slot advances by one position or speculative round.
+    /// Tensor-core prefill with an enabled cache keeps prompt tiles aligned to KV pages.
     std::array<DecoderBatchStep, decoder_batch_max_lanes>
     advance_chunked(const std::array<bool, decoder_batch_max_lanes>& selected,
                     DecoderBatchStepStats* stats = nullptr);

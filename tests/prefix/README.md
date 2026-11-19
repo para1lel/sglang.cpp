@@ -106,3 +106,19 @@ hit, an unaligned suffix, a changed seed, a changed grammar, UTF-8 chat streamin
 invalid grammar followed by a successful hit. It repeats the choices across concurrent
 warm and cold lanes. The test compares output IDs, decoded choices, finish reasons, and
 reported cache hits.
+
+For tensor-core cache parity, prepare the frozen W3 variant fixtures described in
+[the variant benchmark](../../benchmarks/variants/README.md) and run the following
+with the same release build, checkpoint, and reserved B200.
+
+```bash
+GPU_UUID="$GPU_UUID" bash tests/prefix/run_tensor_state.sh \
+    "$out" "$checkpoint" "$fixtures" "$out/tensor-prefix-state"
+```
+
+The probe compares a cache-disabled width-one `DecoderBatch` oracle with a restore
+alongside a decoding peer. It runs page boundaries and the frozen 6,400-token checkpoint
+with an 8,192-token request, remaps source and destination pages independently, and
+cancels before an incomplete prefix can publish. It compares active KV payloads and
+scales, GDN history and recurrence, hidden and residual vectors, the seeded first ID,
+and every BF16 logit.

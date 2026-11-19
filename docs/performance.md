@@ -44,7 +44,7 @@ The offline smoke case requests eight output tokens using checkpoint FP8 weights
 | W5 | 32,768 | 4,096 | 32 |
 | W6 | 131,072 | 1,024 | 4 |
 
-Start W1–W6 with disjoint prefixes and MTP off. Follow the [W3-prefix protocol](prefix-cache.md#w3-prefix) for native prefix reuse. For `W3-MTP`, repeat W3 with native speculation enabled. For proposed `W1-image` and `W1-video`, freeze media bytes, dimensions, sampled frames, timestamps, preprocessing, effective input positions, and output budget. Report each variant separately. Preserve OOM, timeout, early stop, and unsupported outcomes under the original workload name.
+Start W1–W6 with disjoint prefixes and MTP off. The [W3-prefix protocol](prefix-cache.md#w3-prefix) defines the exact-prefill gate and the separate tensor-core comparison. For `W3-MTP`, repeat W3 with native speculation enabled. For proposed `W1-image` and `W1-video`, freeze media bytes, dimensions, sampled frames, timestamps, preprocessing, effective input positions, and output budget. Report each variant separately. Preserve OOM, timeout, early stop, and unsupported outcomes under the original workload name.
 
 ## Measurement
 
@@ -163,7 +163,7 @@ Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rou
 
 Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L52)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L379)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L643)<!-- prefix: "current.peak" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L379)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L678)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

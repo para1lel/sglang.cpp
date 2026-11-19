@@ -149,6 +149,7 @@ using Selection = std::array<bool, decoder_batch_max_lanes>;
 using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
 using PrefillRows = std::array<int, decoder_batch_max_lanes>;
 static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
+static_assert(prefill_chunk_rows == mxfp8_page_size);
 
 struct DraftRound {
     Lane* lane;
@@ -209,19 +210,40 @@ PrefillRows plan_wide_prefill(const BatchStorage& storage, const Selection& sele
     return rows;
 }
 
+PrefillRows plan_tensor_cache_prefill(const BatchStorage& storage, const Selection& selected,
+                                      int lanes, int& cursor) {
+    PrefillRows rows{};
+    int unused = prefill_chunk_rows;
+    const int start = cursor;
+    for (int offset = 0; offset < lanes && unused > 0; ++offset) {
+        const int slot = (start + offset) % lanes;
+        const auto& lane = storage.slots[slot];
+        if (selected[slot] && lane && lane->request) {
+            const int tile = std::min(prefill_chunk_rows, lane->prefill_limit());
+            if (tile > 0 && tile <= unused) {
+                rows[slot] = tile;
+                unused -= tile;
+                cursor = (slot + 1) % lanes;
+            }
+        }
+    }
+    return rows;
+}
+
 }
 
 struct DecoderBatch::State {
     State(const Decoder::Model& owner, DecoderBatchOptions options)
         : model(owner), options(options), storage(std::make_shared<BatchStorage>()),
+          tensor_cache(options.prefix_cache_entries > 0 &&
+                       model.fp8_prefill() == Fp8PrefillPolicy::tensor_core),
           execution(model.device) {
         if (options.max_lanes < 1 || options.max_lanes > decoder_batch_max_lanes) {
             throw std::invalid_argument("Invalid decoder batch capacity");
         }
         if (options.prefix_cache_entries < 0 ||
-            options.prefix_cache_entries > decoder_batch_prefix_max_entries ||
-            (options.prefix_cache_entries != 0 && model.fp8_prefill() != Fp8PrefillPolicy::exact)) {
-            throw std::invalid_argument("Prefix cache requires exact prefill and 1 to 4 entries");
+            options.prefix_cache_entries > decoder_batch_prefix_max_entries) {
+            throw std::invalid_argument("Invalid prefix cache capacity");
         }
         DeviceScope device(model.device);
         storage->weights = model.memory;
@@ -280,6 +302,7 @@ struct DecoderBatch::State {
     const Decoder::Model& model;
     const DecoderBatchOptions options;
     std::shared_ptr<BatchStorage> storage;
+    const bool tensor_cache;
     Allocations execution;
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;
@@ -305,6 +328,9 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     validate_request(prompt, options, true);
     if (options.prefix_cache_salt.size() > decoder_prefix_max_salt_bytes) {
         throw std::invalid_argument("Prefix cache salt exceeds 256 bytes");
+    }
+    if (state_->tensor_cache && options.mtp_steps != 0) {
+        throw std::invalid_argument("Tensor-core prefix cache requires MTP off");
     }
     if (options.mtp_steps != 0 && state_->options.max_lanes > decoder_batch_max_mtp_lanes) {
         throw std::invalid_argument("Decoder batch capacity above 4 requires MTP off");
@@ -502,6 +528,9 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
     }
     if (max_rows > 1) {
         PrefillWorkspace workspace(stream, max_rows);
+        if (tensor_cache && !workspace.data()) {
+            throw std::runtime_error("Tensor-core prefix cache requires a prefill workspace");
+        }
         stats.prefill_workspace_bytes = workspace.bytes();
         for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
             if (rows[slot] > 1) {
@@ -634,9 +663,15 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         auto& slots = storage->slots;
         Steps results{};
         DecoderBatchStepStats current;
-        current.prefill_rows = chunked && options.max_lanes > decoder_batch_max_mtp_lanes
-            ? plan_wide_prefill(*storage, selected, options.max_lanes, prefill_cursor)
-            : plan_prefill(*storage, selected, chunked);
+        if (tensor_cache) {
+            current.prefill_rows =
+                plan_tensor_cache_prefill(*storage, selected, options.max_lanes, prefill_cursor);
+        } else if (chunked && options.max_lanes > decoder_batch_max_mtp_lanes) {
+            current.prefill_rows =
+                plan_wide_prefill(*storage, selected, options.max_lanes, prefill_cursor);
+        } else {
+            current.prefill_rows = plan_prefill(*storage, selected, chunked);
+        }
         const auto live_before = stats ? request_bytes(*storage) : 0;
         submit(selected, results, current, contains_mtp);
         if (stats) {

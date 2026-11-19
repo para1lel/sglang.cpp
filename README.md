@@ -171,7 +171,8 @@ This option requires `--max-active 1` and `--mtp-steps 0`.
 
 Set `--prefix-cache-entries` from `1` through `4` to enable
 [prefix reuse](docs/prefix-cache.md). The default is `0`.
-Use `--fp8-prefill exact` and `--mtp-steps 0`. Omit `--eager`.
+Keep `--mtp-steps 0` and omit `--eager`. Exact prefill remains the default.
+Use `--fp8-prefill tensor-core` to opt in to [page-aligned prefill](docs/prefix-cache.md#tensor-core-scheduling).
 Prefix reuse selects the batch route even at `--max-active 1`.
 
 For model `benchmark`, send a token ID array to `POST /v1/completions` using the

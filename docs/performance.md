@@ -79,15 +79,19 @@ For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the
 
 Reuse frozen W1–W6 `benchmark` requests, token-ID SSE clients, and timing definitions under the [new launch policy](#scheduler-and-reporting-policy). Check repeat IDs within each engine. Compare cross-engine output IDs only for diagnosis. Run [text verification](text-serving.md#verification) separately.
 
-For a raw text experiment, freeze UTF-8 request bytes, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Require both engines to encode the same prompt IDs for a paired comparison. Record cold tokenizer load separately from steady tokenization. Declare streaming, usage, and diagnostic ID settings. The first visible text can arrive after the first output ID. A text event can contain bytes from several IDs, and an ID can produce no text. Get output-token counts from usage or diagnostic IDs. Use diagnostic ID timestamps for TTFT and TPOT. Mark those metrics unavailable if the client cannot observe the corresponding IDs. Report time to first visible text separately. Keep raw text measurements in separate result rows.
+For raw text, freeze UTF-8 request bytes, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Declare streaming, usage, and diagnostic ID settings. Visible text can follow the first output ID. A text event can span several IDs, and an ID can produce no text. Count output tokens from usage or diagnostic IDs. Use diagnostic ID timestamps for TTFT and TPOT. Mark both metrics unavailable when the corresponding timestamps are missing. Report time to first visible text separately. Keep raw text measurements in separate result rows.
 
 ### Frozen W1 and W2 timing
 
-The [historical GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) used native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. For native timing, set `--url` and a fresh `--output`. Omit `--reference` for all native W1/W2 runs.
+The [GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) used native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. For native runs, set `--url` and a fresh `--output`. Omit `--reference`.
 
-Validate every warmup and measured stream and check repeat IDs within each engine. Require a native-to-vLLM median throughput ratio above `strict_throughput_ratio_gt`. Require native p95 TTFT, TPOT, and end-to-end latency at or below `p95_latency_ceilings_ms`.
+Validate every stream and match repeat IDs within each engine. Require the native-to-vLLM median throughput ratio to exceed `strict_throughput_ratio_gt`. Keep native p95 TTFT, TPOT, and end-to-end latency within `p95_latency_ceilings_ms`.
 
-On November 19, 2026, the repaired candidate matched `60677ec` IDs. Both passed W1. W2 missed only p95 TTFT at 395.348 ms base and 366.781 ms candidate against 80.305 ms.
+On November 19, 2026, the candidate matched `60677ec` IDs. Both passed W1. W2 missed only p95 TTFT (base 395.348 ms, candidate 366.781 ms, limit 80.305 ms).
+
+On November 20, 2026, `9d047fe` passed all four W1 gates on repeat after a TTFT miss. W2 missed only p95 TTFT (368.736 ms against 80.258 ms).
+
+On B200 GPU 6, the four-row W2 candidate matched the base's 512 full BF16 score rows and greedy IDs. In clean native-only serving, p95 TTFT fell from 367.158 to 277.963 ms and median throughput rose 2.16%.
 
 ### Fused FP8 decode
 
@@ -127,9 +131,9 @@ Compare both `--fp8-prefill` policies on one binary with MTP off. Match measurem
 
 Run [exact prefill checks](development.md#chunked-prefill-verification) with default and explicit `exact` in both binaries. Compare tensor-core projections with an independent reference under predefined tolerances. Match fallback and exact projections bitwise. Cover full chunks, tails, mixed steps, and unsupported dispatch. Check repeated tokens and finish reasons.
 
-For arithmetic-preserving [prefill fusions](development.md#runtime-path), match full BF16 logits, committed KV and GDN state, and staged BF16 and FP8 values bitwise. Hold the policy and tile schedule fixed. Include raw MXFP8 exponents 0 and 255. Cover one-row fallback, two-row tiles, page crossings, positive MTP depth under both policies, and graph and eager decode.
+For arithmetic-preserving [prefill fusions](development.md#runtime-path), match full BF16 logits, committed KV and GDN state, and staged BF16 and FP8 values bitwise. Hold the policy and tile schedule fixed. Include raw MXFP8 exponents 0 and 255. Cover single rows, two- and four-row tiles, page crossings, positive MTP depth under both policies, and graph and eager decode.
 
-Match [paired GQA](development.md#ordered-multirow-gqa-prefill) and its one-row fallback bitwise against ordered FP32 for finite scores and quotients. Check FP64 recovery independently. Trace paired, one-row, and recovery cases separately.
+Match [two- and four-row GQA](development.md#ordered-multirow-gqa-prefill) and protected single rows bitwise against ordered FP32 for finite scores and quotients. Check FP64 recovery independently. Trace each dispatch and recovery separately.
 
 For cross-policy comparisons, check full BF16 logits within predefined tolerances on identical histories and prefill boundaries. Use shared teacher-forced tokens after greedy divergence. Report logit errors, ranks, top-two margins, free-running IDs, and first divergence.
 

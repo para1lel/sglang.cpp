@@ -871,16 +871,16 @@ std::vector<BFloat> download_prefill(const DeviceBuffer<BFloat>& output, cudaStr
 }
 
 void check_ordered_multirow_prefill(cudaStream_t stream) {
-    constexpr int first = group_width - 1;
-    constexpr int rows = page_tokens + 1;
+    constexpr int first = page_tokens - 1;
+    constexpr int rows = page_tokens + 7;
     constexpr int tokens = first + rows;
-    constexpr int changed_token = page_tokens;
+    constexpr int changed_token = 2 * page_tokens;
     constexpr int changed_head = 1;
     constexpr int changed_group = 2;
     constexpr int causal_rows = changed_token - first;
     constexpr auto changed_offset = (changed_token * kv_heads + changed_head) * head_width
                                     + changed_group * group_width;
-    const Pages pages{{7, 2}};
+    const Pages pages{{11, 3, 16, 1}};
     pages.device.upload(pages.mapping.data(), stream);
     TestCache cache;
     cache.keys.initialize(stream);

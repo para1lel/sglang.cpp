@@ -17,7 +17,7 @@ The CUDA cache and public attention implementation is in
 The internal page-parallel path for batched decode is in
 [`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L980)<!-- prefix: "cudaError_t " -->.
 The internal grouped-query attention prefill path is in
-[`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L441)<!-- prefix: "cudaError_t " -->.
+[`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L466)<!-- prefix: "cudaError_t " -->.
 
 ## Build on the project host
 
@@ -109,6 +109,13 @@ With `SGLANG_SERIAL_PREFILL_ROWS` unset, serial K0 text requests on an NVIDIA B2
 and workspace fallback. Tensor Core prefill accumulates FP32 sums in a different
 order. Model scores and generated token IDs can differ, including when the highest
 scores are far apart.
+
+Paged MXFP8 attention in this mode shares decoded K and V across two query heads.
+Chunks with 64–127 rows use two-row tiles if they end within 8,192 visible tokens.
+Chunks with at least 128 rows use four-row tiles under the same 8,192-token bound.
+Leftover rows and ineligible chunks use the protected single-row path.
+The shared path keeps the 32-channel score reduction order, causal token order,
+BF16 output rounding, and selective FP64 recovery.
 
 The selection applies to the model for its lifetime. For C++, pass
 `sglang::Fp8PrefillPolicy::tensor_core` as the fourth argument to

@@ -624,16 +624,42 @@ void check_paged_finite_range(cudaStream_t stream) {
 
 constexpr int prefill_guard = 8;
 
-std::vector<BFloat> download_prefill(const DeviceBuffer<BFloat>& output, cudaStream_t stream) {
+std::vector<BFloat> download_prefill(const DeviceBuffer<BFloat>& output, cudaStream_t stream,
+                                     int guard_elements = prefill_guard) {
     const auto actual = output.download(stream);
-    for (const auto* guard : {actual.data(), actual.data() + actual.size() - prefill_guard}) {
+    for (const auto* guard : {actual.data(), actual.data() + actual.size() - guard_elements}) {
         const auto* bytes = reinterpret_cast<const Byte*>(guard);
-        if (!std::all_of(bytes, bytes + prefill_guard * sizeof(BFloat),
+        if (!std::all_of(bytes, bytes + guard_elements * sizeof(BFloat),
                          [](Byte byte) { return byte == attention_sentinel; })) {
             throw std::runtime_error("Multirow prefill overwrote an output guard");
         }
     }
-    return {actual.begin() + prefill_guard, actual.end() - prefill_guard};
+    return {actual.begin() + guard_elements, actual.end() - guard_elements};
+}
+
+void check_ordered_prefill_geometry(cudaStream_t stream) {
+    using sglang::decoder::tensor_core_multirow_prefill_gqa;
+    check_cuda(tensor_core_multirow_prefill_gqa({}, {}, 0, 0, nullptr, nullptr, stream),
+               "Launch empty multirow prefill");
+    constexpr int last = std::numeric_limits<int>::max();
+    for (const auto [first, rows] : {std::pair{-1, 1}, {0, -1}, {last, 1}}) {
+        if (tensor_core_multirow_prefill_gqa({}, {}, first, rows, nullptr, nullptr, stream)
+            != cudaErrorInvalidValue) {
+            throw std::runtime_error("Multirow prefill accepted invalid row geometry");
+        }
+    }
+}
+
+void poison_unused_values(Byte* values, int page_count, int used_tokens, cudaStream_t stream) {
+    constexpr auto bytes_per_page = sglang::mxfp8_payload_bytes_per_page;
+    constexpr auto bytes_per_token = bytes_per_page / page_tokens;
+    const int last_physical = page_count - 1 - (used_tokens - 1) / page_tokens;
+    const int used_in_page = (used_tokens - 1) % page_tokens + 1;
+    check_cuda(cudaMemsetAsync(values, 0x50, last_physical * bytes_per_page, stream),
+               "Poison unused reverse-mapped pages");
+    auto* tail = values + last_physical * bytes_per_page + used_in_page * bytes_per_token;
+    check_cuda(cudaMemsetAsync(tail, 0x50, (page_tokens - used_in_page) * bytes_per_token,
+                               stream), "Poison unused final page tokens");
 }
 
 void check_ordered_prefill_extent(cudaStream_t stream) {
@@ -656,17 +682,23 @@ void check_ordered_prefill_extent(cudaStream_t stream) {
     value_scales.fill(127, stream);
     const sglang::Mxfp8KvCache cache{keys.get(), values.get(), key_scales.get(), value_scales.get(),
                                    page_count};
-    const DeviceBuffer<BFloat> queries(rows * query_elements);
-    for (const auto [first, count] : {std::pair{31, 63}, {31, 64}, {limit - rows, rows},
-                                     {limit - rows + 1, rows}}) {
+    constexpr int masked_rows = 135;
+    for (const auto [first, count] : {
+             std::pair{128, 1}, {31, 63}, {31, 64}, {31, 66}, {31, 127}, {31, 128},
+             {31, 129}, {31, 130}, {limit - rows, rows}, {limit - rows + 1, rows},
+             {page_tokens - 1, masked_rows}}) {
+        if (count == masked_rows) {
+            poison_unused_values(values.get(), page_count, first + count, stream);
+        }
         const auto host_queries = make_queries(first, count);
-        const DeviceBuffer<BFloat> output(count * query_elements + 2 * prefill_guard);
+        const DeviceBuffer<BFloat> queries(host_queries.size());
+        const DeviceBuffer<BFloat> output(count * query_elements + 2 * query_elements);
         queries.upload(host_queries.data(), stream);
         output.fill(attention_sentinel, stream);
         check_cuda(sglang::decoder::tensor_core_multirow_prefill_gqa(
                        cache, pages.view(), first, count, queries.get(),
-                       output.get() + prefill_guard, stream), "Launch prefill at dispatch edge");
-        const auto actual = download_prefill(output, stream);
+                       output.get() + query_elements, stream), "Launch prefill at dispatch edge");
+        const auto actual = download_prefill(output, stream, query_elements);
         if (!std::all_of(actual.begin(), actual.end(), [](BFloat value) {
             return __bfloat162float(value) == 1.0f;
         })) {
@@ -905,6 +937,7 @@ void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
 }
 
 void check_raw_attention(cudaStream_t stream) {
+    check_ordered_prefill_geometry(stream);
     check_ordered_prefill_extent(stream);
     check_ordered_prefill_precision(stream);
     check_ordered_prefill_score_overflow(stream);

@@ -15,10 +15,13 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT.parent))
-from batch.run_native import Stream, await_retirement, burst, request, require, server, write_json
+from batch.run_native import (
+    TRACE, Stream, await_retirement, burst, request, require, server, write_json,
+)
 
-BOUNDARIES = (1, 2, 127, 128, 129, 257)
+BOUNDARIES = (1, 2, 127, 128, 129, 257, 511)
 PROMPT_SHA256 = "314fb913d558ac717a0a0a2ac86c7d310ea06dd0b4558ce160a141dd18564c43"
+BATCH_TOKEN_BUDGET = 128
 PREFILL = re.compile(
     rb"^batch width=(\d+) decode=(\d+) request_bytes=\d+\n"
     rb"batch prefill_rows=(\d+(?:,\d+){3}) workspace_bytes=(\d+)$", re.M
@@ -114,6 +117,26 @@ def prefill_rows(log_path, offset):
     ]
 
 
+def await_request_retirement(log_path, offset, capacity, name):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with log_path.open("rb") as log:
+            log.seek(offset)
+            data = log.read()
+        rows = [(offset + match.start(), *map(int, match.groups()))
+                for match in TRACE.finditer(data) if match.end() < len(data)]
+        allocation = next((row for row in rows if row[3] > 0), None)
+        if allocation is not None and rows[-1][3] == 0:
+            require(all(0 <= decode <= width <= capacity for _, width, decode, _ in rows),
+                    f"Scheduler exceeded width {capacity}: {rows!r}")
+            return {
+                "trace_offset": offset, "allocation_offset": allocation[0],
+                "allocation_bytes": allocation[3], "retirement_offset": rows[-1][0],
+            }
+        time.sleep(0.01)
+    raise AssertionError(f"No fresh allocation-to-zero transition for {name}. See {log_path}")
+
+
 def check_reset(port, log_path, evidence, width, cases):
     offset = log_path.stat().st_size
     with Stream(port, cases[257]) as cancelled:
@@ -124,19 +147,35 @@ def check_reset(port, log_path, evidence, width, cases):
             time.sleep(0.005)
         require(not select.select([cancelled.sock], [], [], 0)[0], "Reset must precede output")
         cancelled.reset()
-    await_retirement(log_path, offset, width)
+    cancelled_retirement = await_request_retirement(log_path, offset, width, "cancelled request")
+    offset = log_path.stat().st_size
     replacement = request(port, cases[129])
-    await_retirement(log_path, offset, width)
-    write_json(evidence, {"cancelled": cancelled.evidence(), "replacement": replacement.evidence()})
+    replacement_retirement = await_request_retirement(log_path, offset, width, "replacement")
+    write_json(evidence, {
+        "cancelled": cancelled.evidence(), "replacement": replacement.evidence(),
+        "cancelled_retirement": cancelled_retirement,
+        "replacement_retirement": replacement_retirement,
+    })
+
+
+def check_http_baseline(args, cases, name, width, flags, limits):
+    evidence = args.evidence / name
+    with server(args, evidence, width, flags=flags, expected_health=limits) as (port, _):
+        streams = [request(port, case).evidence() for case in cases.values()]
+        write_json(evidence / "streams.json", streams)
 
 
 def check_http(args, cases):
-    with server(args, args.evidence / "http-1", "default") as (port, _):
-        streams = [request(port, case).evidence() for case in cases.values()]
-        write_json(args.evidence / "serial.json", streams)
+    check_http_baseline(args, cases, "http-default", None, (),
+                        {"max_active": 32, "max_num_batched_tokens": 32768})
+    check_http_baseline(args, cases, "http-1", "1", ("--eager", "--fp8-prefill", "exact"),
+                        {"max_active": 1, "max_num_batched_tokens": 32768})
     for width, lengths in ((2, (129, 257)), (4, (2, 127, 129, 257))):
         evidence = args.evidence / f"http-{width}"
-        with server(args, evidence, str(width)) as (port, log_path):
+        flags = ("--max-num-batched-tokens", str(BATCH_TOKEN_BUDGET))
+        limits = {"max_active": width, "max_num_batched_tokens": BATCH_TOKEN_BUDGET}
+        with server(args, evidence, str(width), flags=flags,
+                    expected_health=limits) as (port, log_path):
             offset = log_path.stat().st_size
             burst(port, log_path, evidence / "cohort.json", [cases[size] for size in lengths],
                   full_decode=False)
@@ -144,7 +183,8 @@ def check_http(args, cases):
             rows = prefill_rows(log_path, offset)
             write_json(evidence / "prefill.json", rows)
             require(rows and all(
-                sum(positions) + decodes <= 128 and (max(positions) > 1) == (scratch > 0)
+                sum(positions) + decodes <= BATCH_TOKEN_BUDGET
+                and (max(positions) > 1) == (scratch > 0)
                 for _, decodes, positions, scratch in rows
             ), "Invalid per-step position or scratch accounting")
             require(any(sum(count > 1 for count in positions) >= 2
@@ -173,7 +213,7 @@ def main():
         return
     cases = load_cases()
     if args.check_fixtures and not (args.generate or args.server):
-        print("Six prefill boundary fixtures passed")
+        print(f"{len(cases)} prefill fixtures passed")
         return
     if not args.evidence or not (args.generate or args.server):
         parser.error("Provide --evidence and at least one release executable")

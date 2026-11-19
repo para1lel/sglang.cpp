@@ -186,7 +186,7 @@ Historical diagnostics use the [FP8 prompt](../benchmarks/vllm/small-fp8.json#L2
 
 #### Chunked prefill verification
 
-Run the [CPU and B200 prefill checks](../tests/prefill/README.md) in exact mode. Match the row-wise oracle and check chunk boundaries, mixed steps, reset, and slot reuse. Use the [tensor-core comparison](performance.md#fp8-tensor-core-prefill) for the opt-in mode.
+Run the [exact prefill checks](../tests/prefill/README.md). Match the frozen oracle. Check the default FP8 prefill policy with the 511-token probe. Check chunk boundaries, mixed steps, reset, and slot reuse. Use the [tensor-core comparison](performance.md#fp8-tensor-core-prefill) for the opt-in mode.
 
 #### Native MTP
 

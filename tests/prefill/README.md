@@ -14,16 +14,26 @@ python -B tests/prefill/run_native.py \
 ```
 
 Pass either executable to run only its checks. The CLI compares five greedy tokens and the
-ordered top 64 scores at prompt lengths 1, 2, 127, 128, 129, and 257. The oracle uses prefixes of
-the fixed W2 prompt and the native row-wise decoder at
-`dc087912a794372485e78c0a6de5140ac43746e7`. Each score digest covers the little-endian
-32-bit token ID and IEEE 754 binary32 logit for each ranked score, in output step and rank order.
+ordered top 64 scores. The oracle uses prefixes of the fixed W2 prompt and the native row-wise
+decoder at `dc087912a794372485e78c0a6de5140ac43746e7` for lengths 1, 2, 127, 128, 129, and 257.
+The 511-token policy probe uses explicit `exact` at `5c5281f11a5ba5a25950f84cbf8d110d46401138`.
+Each score digest covers the little-endian 32-bit token ID and IEEE 754 binary32 logit for
+each ranked score, in output step and rank order.
 
-The HTTP check compares complete streams at width one and overlapping cohorts at widths two
-and four. The batch trace must show multiple chunked lanes, decode alongside prefill, and
-at most 128 positions per step. The width-four check resets a connection after a chunk is traced
-and before any completion arrives, waits for request allocations to return to zero, then
-checks a replacement stream. Require `passed` in the resulting `status.json`.
+The HTTP check starts one server with its default capacity, token budget, and FP8 prefill policy.
+It verifies the advertised capacity of 32 and budget of 32,768, then checks complete streams
+against the frozen oracle. The 511-token probe distinguishes `exact` from `tensor-core` by the
+first generated token. A separate server runs the same prompts and generation budgets with
+`--max-active 1 --eager --fp8-prefill exact` to exercise the serial route.
+
+The width-two cohort uses 129- and 257-token prompts. The width-four cohort uses 2-, 127-,
+129-, and 257-token prompts. Both use the same five-token generation budget and an explicit
+scheduler budget of 128 positions per step. The trace must show multiple chunked lanes
+and decode alongside prefill within that budget. The width-four check resets a
+connection after a chunk is traced and before any completion arrives, waits for request
+allocations to return to zero, then checks a replacement stream and its own allocation-to-zero
+transition. The reset evidence records the trace offsets for both transitions. Each launch
+records its command and `/health` response. Require `passed` in the resulting `status.json`.
 
 For the FP8 prefill policy options, run the CPU-only check against the release binaries.
 It hides all CUDA devices and verifies help and argument rejection before model load.

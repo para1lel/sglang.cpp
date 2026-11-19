@@ -207,14 +207,16 @@ def stop_server(process, pid_file):
 
 
 @contextmanager
-def server(args, evidence, width, profile=False):
+def server(args, evidence, width, profile=False, *, flags=(), expected_health=None):
     evidence.mkdir()
     port = choose_port()
     command = [str(args.binary), "--checkpoint", str(args.checkpoint), "--device",
                str(args.device), "--port", str(port)]
-    command += ["--max-active", width]
+    if width is not None:
+        command += ["--max-active", width]
     if width in ("2", "4"):
         command.append("--trace-batches")
+    command.extend(flags)
     pid_file = None
     if profile:
         pid_file = evidence / "server.pid"
@@ -230,7 +232,11 @@ def server(args, evidence, width, profile=False):
         process = subprocess.Popen(command, cwd=evidence, stdout=log, stderr=log,
                                    start_new_session=True)
         try:
-            wait_until_ready(process, port, log_path)
+            health = wait_until_ready(process, port, log_path)
+            if expected_health is not None:
+                write_json(evidence / "health.json", health)
+                require(all(health.get(key) == value for key, value in expected_health.items()),
+                        f"Expected server limits {expected_health!r}, got {health!r}")
             yield port, log_path
         finally:
             stop_server(process, pid_file)

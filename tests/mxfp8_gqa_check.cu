@@ -830,6 +830,120 @@ void check_tiled_prefill_scales(cudaStream_t stream) {
     std::puts("Tiled prefill scales match across a remapped page boundary");
 }
 
+constexpr int finite_range_tokens = 1536;
+constexpr int finite_range_page = 1;
+
+struct FiniteRangeCase {
+    const char* name;
+    float query;
+    float key;
+    float value;
+};
+
+std::vector<double> append_finite_range_kv(const FiniteRangeCase& test, TestCache& cache,
+                                           const Pages& pages,
+                                           const std::vector<BFloat>& queries,
+                                           cudaStream_t stream) {
+    const auto elements = finite_range_tokens * kv_elements_per_token;
+    const auto page_elements = page_tokens * kv_elements_per_token;
+    std::vector<BFloat> keys(elements, __float2bfloat16_rn(0.0f));
+    std::vector<BFloat> values(elements, __float2bfloat16_rn(1.0f));
+    std::fill_n(keys.begin() + finite_range_page * page_elements, page_elements,
+                __float2bfloat16_rn(test.key));
+    std::fill_n(values.begin() + finite_range_page * page_elements, page_elements,
+                __float2bfloat16_rn(test.value));
+    const auto encoded_keys = encode_rows(keys);
+    const auto encoded_values = encode_rows(values);
+    const DeviceBuffer<BFloat> device_keys(elements);
+    const DeviceBuffer<BFloat> device_values(elements);
+    device_keys.upload(keys.data(), stream);
+    device_values.upload(values.data(), stream);
+    check_cuda(sglang::mxfp8_kv_append(cache.view(), pages.view(), 0, finite_range_tokens,
+                                      device_keys.get(), device_values.get(), stream), test.name);
+    cache.keys.record_append(encoded_keys, pages, 0, finite_range_tokens);
+    cache.values.record_append(encoded_values, pages, 0, finite_range_tokens);
+    cache.keys.verify(test.name, stream);
+    cache.values.verify(test.name, stream);
+    return reference_attention(queries, encoded_keys, encoded_values, finite_range_tokens - 1, 1);
+}
+
+bool check_finite_output(const char* name, const char* route, const DeviceBuffer<BFloat>& output,
+                         cudaStream_t stream) {
+    const auto actual = output.download(stream);
+    const auto incorrect = std::count_if(actual.begin(), actual.end(), [](BFloat value) {
+        return __bfloat162float(value) != 1.0f;
+    });
+    const auto nonfinite = std::count_if(actual.begin(), actual.end(), [](BFloat value) {
+        return !std::isfinite(__bfloat162float(value));
+    });
+    std::printf("%s %s incorrect=%td/%d nonfinite=%td\n",
+                name, route, incorrect, query_elements, nonfinite);
+    return incorrect == 0;
+}
+
+void check_finite_range_decode(cudaStream_t stream) {
+    constexpr std::size_t workspace_bytes = 496640;
+    const FiniteRangeCase cases[] = {
+        {"finite QK score overflow", -0x1p120f, 0x1p20f, 16.0f},
+        {"finite local value overflow", 1.0f, -8.0f, 0x1p125f},
+    };
+    TestCache cache;
+    cache.keys.initialize(stream);
+    cache.values.initialize(stream);
+    const Pages pages{{11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0}};
+    pages.device.upload(pages.mapping.data(), stream);
+    const DeviceBuffer<BFloat> queries(query_elements);
+    const DeviceBuffer<BFloat> output(query_elements);
+    const DeviceBuffer<float> scores(workspace_bytes / sizeof(float));
+    const DeviceBuffer<int> position(1);
+    const sglang::decoder::ExactGqaWorkspace workspace{scores.get(), finite_range_tokens};
+    const auto submit = [&](auto last, std::size_t bytes) {
+        return sglang::decoder::exact_decode_gqa_attention(cache.view(), pages.view(), last,
+            queries.get(), output.get(), workspace, stream, bytes);
+    };
+    const auto require_page_partial = [&] {
+        if (scores.download(stream).front() != static_cast<float>(page_tokens)) {
+            throw std::runtime_error("Finite-range fixture did not produce a split page partial");
+        }
+    };
+    Graph ordered, split;
+    ordered.capture(stream, [&] { return submit(position.get(), 0); });
+    split.capture(stream, [&] { return submit(position.get(), workspace_bytes); });
+    constexpr int last = finite_range_tokens - 1;
+    check_cuda(sglang::decoder::set_decode_position(position.get(), last, stream),
+               "Set finite-range position");
+    bool passed = true;
+    for (const auto& test : cases) {
+        const std::vector<BFloat> host_queries(query_elements, __float2bfloat16_rn(test.query));
+        const auto expected = append_finite_range_kv(test, cache, pages, host_queries, stream);
+        if (!std::all_of(expected.begin(), expected.end(), [](double value) {
+            return __bfloat162float(__float2bfloat16_rn(static_cast<float>(value))) == 1.0f;
+        })) {
+            throw std::runtime_error("Finite-range FP64 reference did not round to BF16 one");
+        }
+        queries.upload(host_queries.data(), stream);
+        output.fill(attention_sentinel, stream);
+        check_cuda(submit(last, 0), "Launch ordered finite-range attention");
+        passed &= check_finite_output(test.name, "ordered eager", output, stream);
+        output.fill(attention_sentinel, stream);
+        ordered.replay(stream);
+        passed &= check_finite_output(test.name, "ordered graph", output, stream);
+        output.fill(attention_sentinel, stream);
+        scores.fill(attention_sentinel, stream);
+        check_cuda(submit(last, workspace_bytes), "Launch split finite-range attention");
+        require_page_partial();
+        passed &= check_finite_output(test.name, "split eager", output, stream);
+        output.fill(attention_sentinel, stream);
+        scores.fill(attention_sentinel, stream);
+        split.replay(stream);
+        require_page_partial();
+        passed &= check_finite_output(test.name, "split graph", output, stream);
+    }
+    if (!passed) {
+        throw std::runtime_error("Finite-range attention differs from its FP64 reference");
+    }
+}
+
 }
 
 int main() {
@@ -839,6 +953,7 @@ int main() {
         check_bound_cache(stream.get());
         check_bound_gdn(stream.get());
         check_tiled_prefill_scales(stream.get());
+        check_finite_range_decode(stream.get());
         std::puts("MXFP8 GQA check passed");
         return 0;
     } catch (const std::exception& error) {

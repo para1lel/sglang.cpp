@@ -470,6 +470,7 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
     const bool graph = graph_eligible && !contains_mtp &&
         count >= 2 && count <= decoder_batch_max_graph_lanes && replay(work.data(), count);
     if (count != 0 && !graph) {
+        work[0].narrow_gqa = count == 1 && !contains_mtp && max_rows == 0;
         model.forward(work.data(), count, stream);
     }
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {

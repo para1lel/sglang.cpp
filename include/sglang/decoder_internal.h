@@ -218,6 +218,7 @@ struct ForwardLane {
     int token_id;
     int position;
     TextGdnMode mode;
+    bool narrow_gqa = false;
 };
 
 struct BatchDecodeBinding {

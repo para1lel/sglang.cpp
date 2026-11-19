@@ -23,3 +23,9 @@ Run `prefix-state --remapped` and `prefix-state --guards` after changes to KV co
 **Corrected.** The first prefix candidate left 53 stale or blank code anchors. The prefix docs also needed rebasing after finite EBNF changed their source preimage. Earlier checks covered a different file layout.
 
 Record the exact base, ordered patch hashes, and resulting tree in the handoff. Replay patches on that base and compare the result with the selected tree. Check incoming code links again after overlapping source edits. The selected prefix tree passed the staged maintenance checks after anchor repair.
+
+## L004 · Finite-input NaNs in page-parallel GQA
+
+**Correction verified on the isolated W2 candidate.** At 1,536 visible tokens, finite inputs overflowed FP32 QK scores or page-local value sums. Both cases returned NaNs in eager and graph modes while ordered replay and the FP64 oracle returned finite outputs.
+
+The [merge guard](batch-graphs.md#page-parallel-gqa-decode) sends an affected head and channel tile through ordered replay. The correction matched the ordered and FP64 outputs on both cases. Keep both cases in the GQA regression and run them with eager execution and graph replay.

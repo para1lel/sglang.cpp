@@ -80,7 +80,7 @@ Require every warmup and measured stream to pass validation. The native-to-basel
 
 ### Fused FP8 decode
 
-Match the published native control's greedy IDs and full-vocabulary BF16 logit bits on W1 and W2 under the same checkpoint and precision. Check eager decode and fresh and reused graphs. Exercise exact GQA and direct fallback at their [dispatch bounds](development.md#runtime-path). Run the [prefill](development.md#chunked-prefill-verification), [streaming](development.md#streaming-verification), and [MTP](mtp.md#verification) checks before timing.
+Match native control IDs and full BF16 logits on W1 and W2 with the same checkpoint, precision, and [GQA path](batch-graphs.md#page-parallel-gqa-decode). Check eager decode and fresh and reused graphs. Exercise exact and direct GQA at their [dispatch bounds](development.md#runtime-path). Run the [prefill](development.md#chunked-prefill-verification), [streaming](development.md#streaming-verification), and [MTP](mtp.md#verification) checks.
 
 Trace actual forward group sizes and row modes. Confirm fused launches for an eligible single target decode row. Check packed projections for eligible groups of two through five rows. Include a group containing decode and single-row prefill. Compare shape and alignment fallbacks with the separate native operations. For steady decode timing, match execution mode, context length, and KV capacity. Record graph captures and replays.
 
@@ -93,6 +93,8 @@ The studies in `artifacts/fp8-decode-next/report.md` and `artifacts/decode-combi
 Match the published native control's BF16 projections, E4M3 payloads, and FP32 scales byte for byte. Include nonfinite inputs and shape and alignment fallbacks. Trace fresh and reused graphs. Compare full BF16 logits and greedy IDs on shared W1/W2 histories within each policy. Run the [MTP checks](mtp.md#verification).
 
 Time serial HTTP with `--max-active 1 --mtp-steps 0`. Compare within each prefill policy. Apply the [frozen GPU3 criteria](#frozen-w1-and-w2-timing) separately for pinned vLLM.
+
+Record visible lengths and KV capacity. Report ordered fallback timing separately if measured.
 
 An earlier GPU1 run compared the unsplit build with the Unit13 runtime. Each arm used three warmups and nine measured requests per workload. W1/W2 median output tokens/s rose from 91.88/35.16 to 95.59/35.70 for exact and from 122.84/57.27 to 129.51/58.70 for tensor-core. All four passed native timing checks. P95 TPOT and end-to-end latency fell throughout. P95 TTFT rose up to 1.00 ms. See `artifacts/exact-decode-after-seed/runs/http.6acmFcnP/`.
 
@@ -159,7 +161,7 @@ Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rou
 
 Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L49)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L347)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L609)<!-- prefix: "current.peak" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L347)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L610)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

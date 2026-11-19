@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L80)<!-- prefix: "} else if (o" --> · [Salt parser](../apps/server/text_request.cpp#L255)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L27)<!-- prefix: "void append_" --> |
-| Batch | Restore request state, schedule remaining prompt rows, and publish completed checkpoints. | [Admission](../src/decoder_batch.cpp#L292)<!-- prefix: "int DecoderB" --> · [Checkpoint publication](../src/decoder_batch.cpp#L634)<!-- prefix: "cache-\u003estore" --> |
+| Batch | Restore request state, schedule remaining prompt rows, and publish completed checkpoints. | [Admission](../src/decoder_batch.cpp#L292)<!-- prefix: "int DecoderB" --> · [Checkpoint publication](../src/decoder_batch.cpp#L635)<!-- prefix: "cache-\u003estore" --> |
 | Cache | Match checkpoint keys and own the copies until eviction or batch teardown. | [Lookup](../src/decoder_prefix_cache.cpp#L119)<!-- prefix: "int PrefixCa" --> · [Restore](../src/decoder_prefix_cache.cpp#L138)<!-- prefix: "int PrefixCa" --> · [Store](../src/decoder_prefix_cache.cpp#L161)<!-- prefix: "void PrefixC" --> |
 
 ## Runtime path
@@ -28,7 +28,7 @@ An entry stores four MXFP8 K/V payload and scale planes for each of 16 attention
 
 Store gathers the four KV planes into logical page order. Restore scatters them into the destination request's physical pages. The copy validates the covered pages and rejects aliases into the suffix. A lane owns its restored copy and can continue after eviction. A store publishes the checkpoint after its copies complete on the batch stream. A hit or repeated key refreshes recency. A new key evicts the least recently used entry when all entries are occupied. Cancellation can leave an already published checkpoint available. Zero-budget requests and positive-depth C++ MTP lanes skip reuse and publication. [Page mapping](../src/decoder_prefix_cache.cpp#L17)<!-- prefix: "PageMapping " --> · [Completed copy](../src/decoder_prefix_cache.cpp#L183)<!-- prefix: "check(cudaSt" -->
 
-An error while restoring a K0 lane disables the batch. A publication error disables the batch on a K0-only step. An invalid sampled or constrained selection retires only its lane. [Admission recovery](../src/decoder_batch.cpp#L338)<!-- prefix: "} catch (..." --> · [Step recovery](../src/decoder_batch.cpp#L653)<!-- prefix: "if (!contain" -->
+An error while restoring a K0 lane disables the batch. A publication error disables the batch on a K0-only step. An invalid sampled or constrained selection retires only its lane. [Admission recovery](../src/decoder_batch.cpp#L338)<!-- prefix: "} catch (..." --> · [Step recovery](../src/decoder_batch.cpp#L654)<!-- prefix: "if (!contain" -->
 
 With `--trace-batches`, `entries` and `pages` count published state, and `device_bytes` counts the reservation. `hits`, `cached_tokens`, `prefill_tokens`, `stores`, and `evictions` are cumulative for the batch. `prefill_tokens` counts cache-eligible prompt rows processed on the batch path. Request memory and batch scratch have separate counters. [Trace](../apps/server/batch_service.cpp#L258)<!-- prefix: "void trace_p" --> · [Counters](../src/decoder_prefix_cache.cpp#L196)<!-- prefix: "DecoderPrefi" -->
 

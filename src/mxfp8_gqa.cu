@@ -297,7 +297,178 @@ __device__ decoder::ExactGqaWorkspace score_workspace(const decoder::ExactGqaWor
     return *workspace;
 }
 
-template <typename Position, typename Cache, typename Pages, typename Scores>
+constexpr int narrow_min_tokens = 1536;
+constexpr int narrow_max_tokens = 2560;
+constexpr int partial_stride = mxfp8_head_dim + 2;
+constexpr int max_partitions = narrow_max_tokens / mxfp8_page_size;
+constexpr std::size_t narrow_workspace_bytes =
+    mxfp8_query_heads * max_partitions * partial_stride * sizeof(float);
+static_assert(max_partitions <= mxfp8_group_size);
+static_assert(score_warps * mxfp8_group_size == mxfp8_head_dim);
+static_assert(replay_channels >= mxfp8_group_size);
+
+__host__ __device__ bool narrow_position(int position) {
+    return position >= narrow_min_tokens - 1 && position < narrow_max_tokens;
+}
+
+__device__ float warp_max(float value) {
+    for (int delta = mxfp8_group_size / 2; delta > 0; delta /= 2) {
+        value = fmaxf(value, __shfl_down_sync(warp_mask, value, delta));
+    }
+    return value;
+}
+
+__device__ void load_query(const __nv_bfloat16* queries, int head, int lane,
+                           float (&query)[mxfp8_groups]) {
+    #pragma unroll
+    for (int group = 0; group < mxfp8_groups; ++group) {
+        const int channel = group * mxfp8_group_size + lane;
+        query[group] = __bfloat162float(queries[row_offset(0, mxfp8_query_heads, head) + channel]);
+    }
+}
+
+__device__ float attention_score(Mxfp8KvCache cache, int physical_page, int token, int kv_head,
+                                 int lane, const float (&query)[mxfp8_groups]) {
+    const auto payload = payload_offset(physical_page, token, kv_head) + lane;
+    const auto scale = scale_offset(physical_page, token, kv_head, 0);
+    float dot = 0.0f;
+    #pragma unroll
+    for (int group = 0; group < mxfp8_groups; ++group) {
+        const float key = decode_e8m0(cache.key_payload[payload + group * mxfp8_group_size],
+                                      cache.key_scales[scale + group]);
+        const float product = warp_sum(query[group] * key);
+        if (lane == 0) {
+            dot += product;
+        }
+    }
+    return dot * softmax_scale;
+}
+
+__device__ void partition_attention(Mxfp8KvCache cache, const std::int32_t* pages, int last,
+                                   const __nv_bfloat16* queries, float* workspace) {
+    __shared__ float weights[mxfp8_page_size];
+    __shared__ float warp_stats[score_warps];
+    __shared__ float maximum;
+    __shared__ float numerators[mxfp8_head_dim];
+    const int partition = blockIdx.x;
+    const int partitions = last / mxfp8_page_size + 1;
+    if (partition >= partitions) {
+        return;
+    }
+    const int head = blockIdx.y;
+    const int kv_head = head / queries_per_kv_head;
+    const int thread = threadIdx.x;
+    const int warp = thread / mxfp8_group_size;
+    const int lane = thread % mxfp8_group_size;
+    const int count = min(mxfp8_page_size, last - partition * mxfp8_page_size + 1);
+    const int page = pages[partition];
+    auto* partial = workspace + (head * partitions + partition) * partial_stride;
+    float query[mxfp8_groups];
+    load_query(queries, head, lane, query);
+    for (int token = warp; token < count; token += score_warps) {
+        const float score = attention_score(cache, page, token, kv_head, lane, query);
+        if (lane == 0) {
+            weights[token] = score;
+        }
+    }
+    __syncthreads();
+
+    const float score = thread < count ? weights[thread] : -CUDART_INF_F;
+    const float local_max =
+        warp_max(thread < count && !isfinite(score) ? CUDART_INF_F : score);
+    if (lane == 0) {
+        warp_stats[warp] = local_max;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const float page_max = warp_max(lane < score_warps ? warp_stats[lane] : -CUDART_INF_F);
+        if (lane == 0) {
+            maximum = page_max;
+            partial[mxfp8_head_dim] = page_max;
+        }
+    }
+    __syncthreads();
+    const float weight = thread < count ? expf(score - maximum) : 0.0f;
+    if (thread < count) {
+        weights[thread] = weight;
+    }
+    const float local_sum = warp_sum(weight);
+    if (lane == 0) {
+        warp_stats[warp] = local_sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const float denominator = warp_sum(lane < score_warps ? warp_stats[lane] : 0.0f);
+        if (lane == 0) {
+            partial[mxfp8_head_dim + 1] = denominator;
+        }
+    }
+
+    constexpr int half_page = mxfp8_page_size / 2;
+    const int channel = (thread % (mxfp8_head_dim / 2)) * 2;
+    const int first = (thread / (mxfp8_head_dim / 2)) * half_page;
+    float even = 0.0f;
+    float odd = 0.0f;
+    for (int token = first; token < min(count, first + half_page); ++token) {
+        const auto payload = payload_offset(page, token, kv_head) + channel;
+        const auto scale = scale_offset(page, token, kv_head, channel / mxfp8_group_size);
+        const auto exponent = cache.value_scales[scale];
+        even = fmaf(weights[token], decode_e8m0(cache.value_payload[payload], exponent), even);
+        odd = fmaf(weights[token], decode_e8m0(cache.value_payload[payload + 1], exponent), odd);
+    }
+    if (first == 0) {
+        numerators[channel] = even;
+        numerators[channel + 1] = odd;
+    }
+    __syncthreads();
+    if (first != 0) {
+        partial[channel] = numerators[channel] + even;
+        partial[channel + 1] = numerators[channel + 1] + odd;
+    }
+}
+
+__device__ bool merge_attention(const float* workspace, int last, __nv_bfloat16* output) {
+    __shared__ float rescale[max_partitions];
+    __shared__ float denominator;
+    const int partitions = last / mxfp8_page_size + 1;
+    const int head = blockIdx.x;
+    const int thread = threadIdx.x;
+    const auto* head_partials = workspace + head * partitions * partial_stride;
+    if (thread < mxfp8_group_size) {
+        const auto* partial = head_partials + min(thread, partitions - 1) * partial_stride;
+        const float maximum = thread < partitions ? partial[mxfp8_head_dim] : -CUDART_INF_F;
+        const float global_max = __shfl_sync(warp_mask, warp_max(maximum), 0);
+        const float weight = thread < partitions ? expf(maximum - global_max) : 0.0f;
+        if (thread < partitions) {
+            rescale[thread] = weight;
+        }
+        const float sum = warp_sum(thread < partitions ? weight * partial[mxfp8_head_dim + 1]
+                                                        : 0.0f);
+        if (thread == 0) {
+            denominator = sum;
+        }
+    }
+    __syncthreads();
+    float numerator = 0.0f;
+    if (thread < replay_channels) {
+        const int channel = blockIdx.y * replay_channels + thread;
+        for (int partition = 0; partition < partitions; ++partition) {
+            numerator = fmaf(rescale[partition],
+                             head_partials[partition * partial_stride + channel], numerator);
+        }
+    }
+    if (__syncthreads_or(!isfinite(numerator) || !isfinite(denominator) || denominator <= 0.0f)) {
+        return false;
+    }
+    if (thread < replay_channels) {
+        const int channel = blockIdx.y * replay_channels + thread;
+        output[row_offset(0, mxfp8_query_heads, head) + channel] =
+            __float2bfloat16_rn(numerator / denominator);
+    }
+    return true;
+}
+
+template <bool Narrow, typename Position, typename Cache, typename Pages, typename Scores>
 __global__ void exact_scores_kernel(
     Cache cache_binding, Pages page_binding, Position position,
     const __nv_bfloat16* queries, Scores score_binding) {
@@ -306,6 +477,13 @@ __global__ void exact_scores_kernel(
     const int query_head = blockIdx.y;
     const int kv_head = query_head / queries_per_kv_head;
     const int last = decoder::position_value(position);
+    if constexpr (Narrow) {
+        if (narrow_position(last)) {
+            partition_attention(cache_value(cache_binding), page_values(page_binding), last,
+                                queries, score_workspace(score_binding).scores);
+            return;
+        }
+    }
     const int first = blockIdx.x * score_warps + warp;
     if (first > last) {
         return;
@@ -313,44 +491,29 @@ __global__ void exact_scores_kernel(
     const auto cache = cache_value(cache_binding);
     const auto* pages = page_values(page_binding);
     float query[mxfp8_groups];
-    #pragma unroll
-    for (int group = 0; group < mxfp8_groups; ++group) {
-        const int channel = group * mxfp8_group_size + lane;
-        query[group] =
-            __bfloat162float(queries[row_offset(0, mxfp8_query_heads, query_head) + channel]);
-    }
+    load_query(queries, query_head, lane, query);
     const auto workspace = score_workspace(score_binding);
     auto* scores = workspace.scores + query_head * workspace.capacity;
     const int stride = gridDim.x * score_warps;
     for (int index = first; index <= last; index += stride) {
         const int physical_page = pages[index / mxfp8_page_size];
         const int token = index % mxfp8_page_size;
-        const auto payload = payload_offset(physical_page, token, kv_head) + lane;
-        const auto scale = scale_offset(physical_page, token, kv_head, 0);
-        float dot = 0.0f;
-        #pragma unroll
-        for (int group = 0; group < mxfp8_groups; ++group) {
-            const float key = decode_e8m0(cache.key_payload[payload + group * mxfp8_group_size],
-                                          cache.key_scales[scale + group]);
-            const float product = warp_sum(query[group] * key);
-            if (lane == 0) {
-                dot += product;
-            }
-        }
+        const float score = attention_score(cache, physical_page, token, kv_head, lane, query);
         if (lane == 0) {
-            scores[index] = dot * softmax_scale;
+            scores[index] = score;
         }
     }
 }
 
-template <typename Position, typename Cache, typename Pages, typename Scores>
-__global__ void exact_replay_kernel(
-    Cache cache_binding, Pages page_binding, Position position,
-    Scores score_binding, __nv_bfloat16* output) {
+template <bool RecomputeScores>
+__device__ __noinline__ void ordered_replay(
+    Mxfp8KvCache cache, const std::int32_t* pages, int last, const float* scores,
+    const __nv_bfloat16* queries, __nv_bfloat16* output) {
     __shared__ float history_weight[replay_tile];
     __shared__ float token_weight[replay_tile];
     __shared__ float denominator;
     __shared__ float values[replay_tile][replay_channels];
+    __shared__ float tile_scores[RecomputeScores ? replay_tile : 1];
 
     const int query_head = blockIdx.x;
     const int kv_head = query_head / queries_per_kv_head;
@@ -358,11 +521,12 @@ __global__ void exact_replay_kernel(
     const int column = thread % replay_channels;
     const int channel = blockIdx.y * replay_channels + column;
     const int group = channel / mxfp8_group_size;
-    const int last = decoder::position_value(position);
-    const auto cache = cache_value(cache_binding);
-    const auto* pages = page_values(page_binding);
-    const auto workspace = score_workspace(score_binding);
-    const auto* scores = workspace.scores + query_head * workspace.capacity;
+    const int warp = thread / mxfp8_group_size;
+    const int lane = thread % mxfp8_group_size;
+    float query[mxfp8_groups];
+    if constexpr (RecomputeScores) {
+        load_query(queries, query_head, lane, query);
+    }
     float maximum = -CUDART_INF_F;
     float weight_sum = 0.0f;
     float weighted_value = 0.0f;
@@ -376,6 +540,16 @@ __global__ void exact_replay_kernel(
         const int token = first % mxfp8_page_size;
         const auto payload = payload_offset(physical_page, token, kv_head) + channel;
         const auto scale = scale_offset(physical_page, token, kv_head, group);
+        if constexpr (RecomputeScores) {
+            for (int index = warp; index < count; index += score_warps) {
+                const float score =
+                    attention_score(cache, physical_page, token + index, kv_head, lane, query);
+                if (lane == 0) {
+                    tile_scores[index] = score;
+                }
+            }
+            __syncthreads();
+        }
         #pragma unroll
         for (int index = thread / replay_channels; index < replay_tile; index += tokens_per_load) {
             if (index < count) {
@@ -385,7 +559,14 @@ __global__ void exact_replay_kernel(
             }
         }
         if (thread < mxfp8_group_size) {
-            const float score = thread < count ? scores[first + thread] : -CUDART_INF_F;
+            float score = -CUDART_INF_F;
+            if (thread < count) {
+                if constexpr (RecomputeScores) {
+                    score = tile_scores[thread];
+                } else {
+                    score = scores[first + thread];
+                }
+            }
             float prefix = fmaxf(maximum, score);
             #pragma unroll
             for (int offset = 1; offset < replay_tile; offset *= 2) {
@@ -424,6 +605,26 @@ __global__ void exact_replay_kernel(
     }
 }
 
+template <bool Narrow, typename Position, typename Cache, typename Pages, typename Scores>
+__global__ void exact_replay_kernel(
+    Cache cache_binding, Pages page_binding, Position position,
+    Scores score_binding, const __nv_bfloat16* queries, __nv_bfloat16* output) {
+    const int last = decoder::position_value(position);
+    const auto workspace = score_workspace(score_binding);
+    if constexpr (Narrow) {
+        if (narrow_position(last)) {
+            if (!merge_attention(workspace.scores, last, output)) {
+                ordered_replay<true>(cache_value(cache_binding), page_values(page_binding), last,
+                                     nullptr, queries, output);
+            }
+            return;
+        }
+    }
+    const auto* scores = workspace.scores + blockIdx.x * workspace.capacity;
+    ordered_replay<false>(cache_value(cache_binding), page_values(page_binding), last,
+                          scores, nullptr, output);
+}
+
 int score_grid_capacity(decoder::ExactGqaWorkspace workspace) {
     return workspace.scores ? workspace.capacity : 0;
 }
@@ -432,7 +633,7 @@ int score_grid_capacity(const decoder::ExactGqaWorkspace* workspace) {
     return workspace ? text_attention_max_tokens : 0;
 }
 
-template <typename Position, typename Cache, typename Pages, typename Scores>
+template <bool Narrow = false, typename Position, typename Cache, typename Pages, typename Scores>
 cudaError_t launch_exact_attention(
     Cache cache, Pages pages, Position position, const __nv_bfloat16* queries,
     __nv_bfloat16* output, Scores workspace, cudaStream_t stream) {
@@ -443,15 +644,15 @@ cudaError_t launch_exact_attention(
     constexpr int max_score_blocks = 32;
     const int blocks = std::min(max_score_blocks, (capacity + score_warps - 1) / score_warps);
     void* score_arguments[] = {&cache, &pages, &position, &queries, &workspace};
-    const auto status = cudaLaunchKernel(exact_scores_kernel<Position, Cache, Pages, Scores>,
-                                         dim3(blocks, mxfp8_query_heads),
-                                         score_warps * mxfp8_group_size, score_arguments,
-                                         0, stream);
+    const auto status = cudaLaunchKernel(
+        exact_scores_kernel<Narrow, Position, Cache, Pages, Scores>,
+        dim3(blocks, mxfp8_query_heads), score_warps * mxfp8_group_size, score_arguments,
+        0, stream);
     if (status != cudaSuccess) {
         return status;
     }
-    void* replay_arguments[] = {&cache, &pages, &position, &workspace, &output};
-    return cudaLaunchKernel(exact_replay_kernel<Position, Cache, Pages, Scores>,
+    void* replay_arguments[] = {&cache, &pages, &position, &workspace, &queries, &output};
+    return cudaLaunchKernel(exact_replay_kernel<Narrow, Position, Cache, Pages, Scores>,
                             dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
                             replay_threads,
                             replay_arguments, 0, stream);
@@ -520,12 +721,17 @@ cudaError_t decoder::decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pag
 
 cudaError_t decoder::exact_decode_gqa_attention(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,
-    __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream) {
+    __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream,
+    std::size_t workspace_bytes) {
     if (position < 0 || position >= workspace.capacity) {
         return cudaErrorInvalidValue;
     }
     if (!cache_covers(cache, pages, workspace.capacity)) {
         return cudaErrorInvalidValue;
+    }
+    if (workspace_bytes >= narrow_workspace_bytes && narrow_position(position)) {
+        return launch_exact_attention<true>(cache, pages.device_pages, position, queries, output,
+                                            workspace, stream);
     }
     return launch_exact_attention(cache, pages.device_pages, position, queries, output,
                                   workspace, stream);
@@ -533,12 +739,17 @@ cudaError_t decoder::exact_decode_gqa_attention(
 
 cudaError_t decoder::exact_decode_gqa_attention(
     Mxfp8KvCache cache, Mxfp8PageTable pages, const int* position, const __nv_bfloat16* queries,
-    __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream) {
+    __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream,
+    std::size_t workspace_bytes) {
     if (!position) {
         return cudaErrorInvalidValue;
     }
     if (!cache_covers(cache, pages, workspace.capacity)) {
         return cudaErrorInvalidValue;
+    }
+    if (workspace_bytes >= narrow_workspace_bytes && workspace.capacity >= narrow_min_tokens) {
+        return launch_exact_attention<true>(cache, pages.device_pages, position, queries, output,
+                                            workspace, stream);
     }
     return launch_exact_attention(cache, pages.device_pages, position, queries, output,
                                   workspace, stream);

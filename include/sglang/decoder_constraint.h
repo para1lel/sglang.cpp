@@ -10,6 +10,8 @@
 
 namespace sglang {
 
+namespace json { class Value; }
+
 inline constexpr int constraint_max_candidates = 4096;
 inline constexpr int constraint_mask_words = (model_vocab_size + 31) / 32;
 
@@ -21,12 +23,24 @@ public:
                                                           std::string_view ebnf);
     static std::shared_ptr<const TokenConstraint> compile_regex(const Tokenizer& tokenizer,
                                                                 std::string_view pattern);
+    static std::shared_ptr<const TokenConstraint> compile_json_schema(
+        const Tokenizer& tokenizer, const json::Value& schema);
     int minimum_tokens() const { return nodes_.front().minimum; }
     bool uses_wide_mask() const { return uses_wide_mask_; }
-    bool is_regex() const { return regex_; }
+    bool is_regex() const { return kind_ == Kind::regex; }
+    const char* budget_error() const {
+        switch (kind_) {
+            case Kind::regex: return "max_tokens is too small to complete the regex";
+            case Kind::json_schema: return "max_tokens is too small to complete the JSON Schema";
+            case Kind::ebnf: return "max_tokens is too small to complete an ebnf choice";
+        }
+        throw std::logic_error("Unknown output constraint");
+    }
 
 private:
     friend class ConstraintCursor;
+
+    enum class Kind { ebnf, regex, json_schema };
 
     struct Edge {
         TokenId token;
@@ -39,9 +53,11 @@ private:
     };
 
     TokenConstraint() = default;
+    static std::shared_ptr<const TokenConstraint> compile_regular(
+        const Tokenizer& tokenizer, std::string_view pattern, Kind kind);
     std::vector<Node> nodes_{1};
     bool uses_wide_mask_ = false;
-    bool regex_ = false;
+    Kind kind_ = Kind::ebnf;
 };
 
 inline bool constraint_eos(int token) {

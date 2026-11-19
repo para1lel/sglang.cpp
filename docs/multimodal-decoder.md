@@ -38,13 +38,13 @@ The planner preserves the outer template wrappers. It expands an image pad into 
 
 Physical token indices advance by one for every expanded ID. KV writes and causal attention use these indices. Text and wrapper tokens assign the same scalar to all three rotary axes. Within a visual plane, merged row `r` and column `c` use `(base, base + r, base + c)`. The next scalar advances by the larger merged spatial dimension. The language model rotates Q and K with interleaved temporal, height, and width sections of `[11, 11, 10]`. [Plane positions](../src/media/multimodal_prompt.cpp#L38)<!-- prefix: "void append_" --> · [Rotary axis selection](../src/text_attention_gqa.cu#L28)<!-- prefix: "__device__ i" -->
 
-Prefill scores the first output. When the next forward pass consumes the output token at zero-based index `k`, its KV index is `expanded_prompt_length + k`. All three rotary axes then use `next_position + k`, where `next_position` is one above the largest prompt coordinate. The CPU planner returns `next_position`. [Continuation](../src/decoder.cpp#L496)<!-- prefix: "const int po" -->
+Prefill scores the first output. When the next forward pass consumes the output token at zero-based index `k`, its KV index is `expanded_prompt_length + k`. All three rotary axes then use `next_position + k`, where `next_position` is one above the largest prompt coordinate. The CPU planner returns `next_position`. [Continuation](../src/decoder.cpp#L494)<!-- prefix: "const int po" -->
 
 ## Constraints and failure behavior
 
-Use `mtp_steps = 0`. Media prefill and decode run eager with private KV and GDN state. Media bypasses serial graph capture and replay, continuous batching, and prefix reuse. The request retains the feature owners through normal or deferred CUDA cleanup. Use the existing text entry point for requests without media. [Request allocation](../src/decoder.cpp#L519)<!-- prefix: "const Reques" -->
+Use `mtp_steps = 0`. Media prefill and decode run eager with private KV and GDN state. Media bypasses serial graph capture and replay, continuous batching, and prefix reuse. The request retains the feature owners through normal or deferred CUDA cleanup. Use the existing text entry point for requests without media. [Request allocation](../src/decoder.cpp#L517)<!-- prefix: "const Reques" -->
 
-Media prefill uses tiles of up to 128 positions, including with the tensor-core policy. It uses single-row prefill if workspace allocation is unavailable. [Media prefill](../src/decoder.cpp#L453)<!-- prefix: "const MediaP" -->
+Media prefill uses tiles of up to 128 positions, including with the tensor-core policy. It uses single-row prefill if workspace allocation is unavailable. [Media prefill](../src/decoder.cpp#L451)<!-- prefix: "const MediaP" -->
 
 The decoder accepts the normal greedy, [sampling](text-serving.md#sampling), and [finite-choice](text-serving.md#finite-choice-constraints) options for K0. The usual token and cancellation callbacks apply. The decoder accepts salts of up to 256 bytes. The salt has no effect on media generation. `cached_prompt_tokens` stays zero. [Request validation](../src/media/decoder_media.cpp#L103)<!-- prefix: "DecoderResul" -->
 

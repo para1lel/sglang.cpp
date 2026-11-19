@@ -66,10 +66,17 @@ std::vector<int> shortest(const std::vector<regex::State>& states,
 
 std::shared_ptr<const TokenConstraint> TokenConstraint::compile_regex(
     const Tokenizer& tokenizer, std::string_view pattern) {
-    const auto states = regex::determinize(regex::parse(pattern));
+    return compile_regular(tokenizer, pattern, Kind::regex);
+}
+
+std::shared_ptr<const TokenConstraint> TokenConstraint::compile_regular(
+    const Tokenizer& tokenizer, std::string_view pattern, Kind kind) {
+    const auto states = kind == Kind::regex
+        ? regex::determinize(regex::parse(pattern))
+        : regex::determinize_schema(regex::parse_generated(pattern));
     const auto pieces = output_pieces(tokenizer);
     auto result = std::shared_ptr<TokenConstraint>(new TokenConstraint);
-    result->regex_ = true;
+    result->kind_ = kind;
     result->nodes_.resize(states.size());
     std::vector<StateSet> previous(states.size());
     StateSet visited;

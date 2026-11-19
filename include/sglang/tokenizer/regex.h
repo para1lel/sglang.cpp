@@ -30,6 +30,8 @@ struct State {
 };
 
 Expression parse(std::string_view pattern);
+Expression parse_generated(std::string_view pattern);
 std::vector<State> determinize(const Expression& expression);
+std::vector<State> determinize_schema(const Expression& expression);
 
 }

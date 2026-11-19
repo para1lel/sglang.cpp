@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L82)<!-- prefix: "} else if (o" --> · [Salt parser](../apps/server/text_request.cpp#L298)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L27)<!-- prefix: "void append_" --> |
+| Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L82)<!-- prefix: "} else if (o" --> · [Salt parser](../apps/server/text_request.cpp#L347)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L27)<!-- prefix: "void append_" --> |
 | HTTP controls | Dispatch cache reset, metrics, and bounded scheduler profiling. | [Control routes](../apps/server/prefix_controls.cpp#L157)<!-- prefix: "void Connect" --> |
 | Batch | Restore request state, schedule remaining prompt rows, and publish completed checkpoints. | [Admission](../src/decoder_batch.cpp#L322)<!-- prefix: "int DecoderB" --> · [Checkpoint publication](../src/decoder_batch.cpp#L703)<!-- prefix: "cache-\u003estore" --> |
 | Cache | Match checkpoint keys and own the copies until eviction or batch teardown. | [Lookup](../src/decoder_prefix_cache.cpp#L119)<!-- prefix: "int PrefixCa" --> · [Restore](../src/decoder_prefix_cache.cpp#L138)<!-- prefix: "int PrefixCa" --> · [Store](../src/decoder_prefix_cache.cpp#L161)<!-- prefix: "void PrefixC" --> |

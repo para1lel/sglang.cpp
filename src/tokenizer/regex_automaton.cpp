@@ -11,6 +11,7 @@ namespace sglang::tokenizer::regex {
 namespace {
 
 constexpr int max_nfa_states = 4096;
+constexpr int max_schema_subsets = 1024;
 using Kind = Expression::Kind;
 using Utf8Bytes = std::array<unsigned, 4>;
 
@@ -40,7 +41,7 @@ class Nfa {
 public:
     Nfa() { add_node(); add_node(); }
     void emit(const Expression& expression, int start, int finish);
-    std::vector<State> determinize() const;
+    std::vector<State> determinize(int limit) const;
 
 private:
     int add_node();
@@ -199,7 +200,7 @@ std::vector<int> Nfa::advance(const std::vector<int>& states, unsigned byte) con
     return closure(std::move(next));
 }
 
-std::vector<State> Nfa::determinize() const {
+std::vector<State> Nfa::determinize(int limit) const {
     std::array<bool, 257> split{};
     split.front() = split.back() = true;
     for (const auto& node : nodes_) {
@@ -227,8 +228,9 @@ std::vector<State> Nfa::determinize() const {
                     indices.try_emplace(next, static_cast<int>(subsets.size()));
                 target = entry->second;
                 if (inserted) {
-                    if (subsets.size() == max_dfa_states) {
-                        throw std::invalid_argument("regex exceeds the 256-state DFA limit");
+                    if (subsets.size() == static_cast<std::size_t>(limit)) {
+                        throw std::invalid_argument(
+                            "regex exceeds the " + std::to_string(limit) + "-state DFA limit");
                     }
                     subsets.push_back(std::move(next));
                 }
@@ -240,12 +242,54 @@ std::vector<State> Nfa::determinize() const {
     return states;
 }
 
+std::array<int, 257> signature(const State& state, const std::vector<int>& classes) {
+    std::array<int, 257> result;
+    result.front() = state.accepting;
+    std::transform(state.next.begin(), state.next.end(), result.begin() + 1,
+                   [&](int target) { return target == dead_state ? dead_state : classes[target]; });
+    return result;
+}
+
+std::vector<State> minimize(const std::vector<State>& states) {
+    std::vector<int> classes(states.size(), 0);
+    while (true) {
+        std::map<std::array<int, 257>, int> groups;
+        std::vector<int> next;
+        next.reserve(states.size());
+        for (const auto& state : states) {
+            const int number = static_cast<int>(groups.size());
+            const auto [entry, inserted] = groups.try_emplace(signature(state, classes), number);
+            next.push_back(entry->second);
+        }
+        if (groups.size() > max_dfa_states) {
+            throw std::invalid_argument("schema exceeds the 256-state minimized DFA limit");
+        }
+        if (classes == next) {
+            std::vector<State> result(groups.size());
+            for (std::size_t index = 0; index < states.size(); ++index) {
+                const auto key = signature(states[index], classes);
+                auto& state = result[classes[index]];
+                state.accepting = key.front() != 0;
+                std::copy(key.begin() + 1, key.end(), state.next.begin());
+            }
+            return result;
+        }
+        classes = std::move(next);
+    }
+}
+
 }
 
 std::vector<State> determinize(const Expression& expression) {
     Nfa automaton;
     automaton.emit(expression, 0, 1);
-    return automaton.determinize();
+    return automaton.determinize(max_dfa_states);
+}
+
+std::vector<State> determinize_schema(const Expression& expression) {
+    Nfa automaton;
+    automaton.emit(expression, 0, 1);
+    return minimize(automaton.determinize(max_schema_subsets));
 }
 
 }

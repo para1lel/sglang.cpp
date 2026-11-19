@@ -28,9 +28,9 @@ private:
     void whitespace();
     void literal(std::string_view word);
     [[noreturn]] void fail(const char* message) const { throw ParseError(message); }
-    Value value(std::size_t depth);
-    Array array(std::size_t depth);
-    Value object(std::size_t depth);
+    Value value(std::size_t depth, bool ordered);
+    Array array(std::size_t depth, bool ordered);
+    Value object(std::size_t depth, bool ordered);
     Value number();
     bool digits();
     void strict_number();
@@ -63,7 +63,7 @@ void Parser::literal(std::string_view word) {
 }
 
 Value Parser::document() {
-    auto result = value(0);
+    auto result = value(0, syntax_ == Syntax::ordered);
     whitespace();
     if (!input_.empty()) {
         fail("Unexpected data after JSON document");
@@ -71,7 +71,7 @@ Value Parser::document() {
     return result;
 }
 
-Value Parser::value(std::size_t depth) {
+Value Parser::value(std::size_t depth, bool ordered) {
     whitespace();
     switch (peek()) {
         case 'n': literal("null"); return {};
@@ -83,18 +83,18 @@ Value Parser::value(std::size_t depth) {
             if (depth == 32) {
                 fail("JSON nesting exceeds the limit");
             }
-            return accept('{') ? object(depth + 1) : Value(array(depth + 1));
+            return accept('{') ? object(depth + 1, ordered) : Value(array(depth + 1, ordered));
         default: return number();
     }
 }
 
-Array Parser::array(std::size_t depth) {
+Array Parser::array(std::size_t depth, bool ordered) {
     accept('[');
     whitespace();
     Array result;
     if (!accept(']')) {
         do {
-            result.push_back(value(depth));
+            result.push_back(value(depth, ordered));
             whitespace();
         } while (accept(','));
         if (!accept(']')) {
@@ -104,10 +104,10 @@ Array Parser::array(std::size_t depth) {
     return result;
 }
 
-Value Parser::object(std::size_t depth) {
+Value Parser::object(std::size_t depth, bool ordered) {
     whitespace();
     Object result;
-    OrderedObject ordered;
+    OrderedObject entries;
     std::set<std::string> keys;
     if (!accept('}')) {
         do {
@@ -117,12 +117,14 @@ Value Parser::object(std::size_t depth) {
             if (!accept(':')) {
                 fail("Expected a JSON object colon");
             }
-            auto entry = value(depth);
-            if (syntax_ == Syntax::ordered) {
+            const bool schema = syntax_ == Syntax::completion && depth == 1 &&
+                key == "response_format";
+            auto entry = value(depth, ordered || schema);
+            if (ordered) {
                 if (!keys.insert(key).second) {
                     fail("duplicate JSON object key");
                 }
-                ordered.emplace_back(std::move(key), std::move(entry));
+                entries.emplace_back(std::move(key), std::move(entry));
             } else if (!result.emplace(std::move(key), std::move(entry)).second) {
                 fail("duplicate JSON object key");
             }
@@ -132,7 +134,7 @@ Value Parser::object(std::size_t depth) {
             fail("Expected a JSON object delimiter");
         }
     }
-    return syntax_ == Syntax::ordered ? Value(std::move(ordered)) : Value(std::move(result));
+    return ordered ? Value(std::move(entries)) : Value(std::move(result));
 }
 
 bool Parser::digits() {

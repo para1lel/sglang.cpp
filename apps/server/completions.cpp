@@ -186,8 +186,10 @@ json::Value parse_completion_body(std::string_view body, bool allow_text) {
         auto parsed = json::parse(body);
         if (allow_text && parsed.object()) {
             const auto* top_k = json::get(*parsed.object(), "top_k");
-            if (top_k && top_k->number() && !top_k->unsigned_integer() &&
-                !top_k->signed_integer() && native_text_body(parsed)) {
+            const bool wide_top_k = top_k && top_k->number() && !top_k->unsigned_integer() &&
+                !top_k->signed_integer();
+            if ((wide_top_k || json::get(*parsed.object(), "response_format")) &&
+                native_text_body(parsed)) {
                 return json::parse(body, json::Syntax::completion);
             }
         }

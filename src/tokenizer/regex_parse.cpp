@@ -277,6 +277,10 @@ Expression parse(std::string_view pattern) {
     if (pattern.empty() || pattern.size() > max_pattern_bytes) {
         throw std::invalid_argument("regex must contain 1 to 1024 UTF-8 bytes");
     }
+    return parse_generated(pattern);
+}
+
+Expression parse_generated(std::string_view pattern) {
     const auto scalars = read_utf8(pattern);
     return Parser(scalars).pattern();
 }

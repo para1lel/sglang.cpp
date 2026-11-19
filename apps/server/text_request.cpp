@@ -118,29 +118,75 @@ void set_sampling(const json::Object& object, DecoderOptions& options) {
     }
 }
 
+const json::Value& response_schema(const json::Value& value) {
+    const auto* format = value.ordered_object();
+    const auto* type = format ? json::get(*format, "type") : nullptr;
+    if (!type || type->string() != "json_schema") {
+        bad_request("Unsupported response_format: expected type json_schema");
+    }
+    const auto* config = json::get(*format, "json_schema");
+    const auto* descriptor = config ? config->ordered_object() : nullptr;
+    if (!descriptor || format->size() != 2) {
+        bad_request("Expected response_format.json_schema object");
+    }
+    for (const auto& [key, field] : *descriptor) {
+        if (key == "schema") {
+            continue;
+        }
+        if (key == "strict" && field.boolean() == true) {
+            continue;
+        }
+        if (key == "name" && field.string() && !field.string()->empty() &&
+            field.string()->size() <= 64) {
+            continue;
+        }
+        if (key == "description" && field.string() && field.string()->size() <= 256) {
+            continue;
+        }
+        bad_request("Unsupported JSON Schema response format descriptor");
+    }
+    const auto* schema = json::get(*descriptor, "schema");
+    if (!schema) {
+        bad_request("Expected response_format.json_schema.schema");
+    }
+    return *schema;
+}
+
 void set_constraint(const json::Object& object, const CompletionTokenizer& tokenizer,
                     DecoderOptions& options) {
     const auto* regex = json::get(object, "regex");
     const auto* ebnf = json::get(object, "ebnf");
+    const auto* schema = json::get(object, "response_format");
+    if (schema && (regex || ebnf)) {
+        bad_request("Use one of response_format, regex and ebnf");
+    }
     if (regex && ebnf) {
         bad_request("Use one of regex and ebnf");
     }
     const auto* value = regex ? regex : ebnf;
-    if (!value) {
+    if (!value && !schema) {
         return;
     }
-    if (!value->string()) {
+    if (value && !value->string()) {
         bad_request(regex ? "regex must be a string" : "ebnf must be a string");
     }
     if (read_bool(object, "ignore_eos") || json::get(object, "stop_token_ids")) {
+        if (schema) {
+            bad_request("JSON Schema requires model EOS stops without stop_token_ids overrides");
+        }
         bad_request(regex ? "regex requires model EOS stops without stop_token_ids overrides"
                           : "ebnf requires model EOS stops without stop_token_ids overrides");
     }
-    options.constraint = regex ? TokenConstraint::compile_regex(tokenizer.get(), *value->string())
-                               : TokenConstraint::compile(tokenizer.get(), *value->string());
+    if (schema) {
+        const auto& descriptor = response_schema(*schema);
+        options.constraint = TokenConstraint::compile_json_schema(tokenizer.get(), descriptor);
+    } else {
+        options.constraint = regex
+            ? TokenConstraint::compile_regex(tokenizer.get(), *value->string())
+            : TokenConstraint::compile(tokenizer.get(), *value->string());
+    }
     if (options.max_new_tokens < options.constraint->minimum_tokens()) {
-        bad_request(regex ? "max_tokens is too small to complete the regex"
-                          : "max_tokens is too small to complete an ebnf choice");
+        bad_request(options.constraint->budget_error());
     }
 }
 
@@ -185,7 +231,8 @@ bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
         key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
-        key == "min_p" || key == "ebnf" || key == "regex" || key == "cache_salt";
+        key == "min_p" || key == "ebnf" || key == "regex" || key == "response_format" ||
+        key == "cache_salt";
 }
 
 TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {
@@ -214,6 +261,8 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
             bad_request("Decoded media chat does not support EBNF constraints");
         } else if (media && key == "regex") {
             bad_request("Decoded media chat does not support regex constraints");
+        } else if (media && key == "response_format") {
+            bad_request("Decoded media chat does not support JSON Schema constraints");
         } else if (media && key == "cache_salt") {
             bad_request("Decoded media chat does not support cache_salt");
         } else if (is_text_option(key)) {

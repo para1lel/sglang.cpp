@@ -12,7 +12,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L125)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L308)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L125)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L357)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
 | Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L339)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L28)<!-- prefix: "DecoderResul" --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L162)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L177)<!-- prefix: "void TextRes" --> |
@@ -21,13 +21,13 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 The server parses chat once as ordered JSON and returns HTTP 400 for floating-point range errors. It preserves oversized integer `top_k` values for validation and clamping. The native renderer uses the pinned checkpoint's template rules and literals. The [shared tokenizer](text-serving.md#tokenizer-assets) encodes the rendered prompt without adding special tokens.
 
-Serial text chat calls `Decoder::generate`. Batch chat submits the IDs to `BatchService::generate` with the connection's worker slot. Rendering, tokenization, and response writing run outside CUDA graphs. Eligible decode cohorts can mix text chat, [raw strings](text-serving.md), and [benchmark ID requests](../benchmarks/streaming/README.md#wire-contract). [Serial dispatch](../apps/server/completions.cpp#L238)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/completions.cpp#L259)<!-- prefix: "void complet" -->
+Serial text chat calls `Decoder::generate`. Batch chat submits the IDs to `BatchService::generate` with the connection's worker slot. Rendering, tokenization, and response writing run outside CUDA graphs. Eligible decode cohorts can mix text chat, [raw strings](text-serving.md), and [benchmark ID requests](../benchmarks/streaming/README.md#wire-contract). [Serial dispatch](../apps/server/completions.cpp#L240)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/completions.cpp#L261)<!-- prefix: "void complet" -->
 
 For media chat, the parser substitutes template placeholders in attachment order. The CPU prepares patches and expands the rendered IDs before generation. The server loads the vision encoder on the first media generation that proceeds. It encodes the patches and passes owned BF16 features to the [multimodal decoder](multimodal-decoder.md). Zero-budget or already cancelled requests skip vision encoding.
 
 ### Read JSON and SSE
 
-The JSON response has one assistant choice at `choices[0].message`. Its `content` holds the generated text. Input tools and reasoning history affect the rendered prompt. Generated reasoning and tool-call markup stay in `content`. Structured output parsing is a separate feature.
+The JSON response has one assistant choice at `choices[0].message`. Its `content` holds the generated text. Input tools and reasoning history affect the rendered prompt. Generated reasoning and tool-call markup stay in `content`. With [JSON Schema](output-constraints.md#json-schema), `content` holds JSON text that the client can parse.
 
 JSON uses `object: "chat.completion"`. SSE uses `object: "chat.completion.chunk"`. Both carry `id`, `model`, and `created` in Unix seconds. All chunks in a stream share these values. The response ID starts with `chatcmpl-`.
 
@@ -56,6 +56,7 @@ With `return_token_ids: true`, each committed ID appears once in `token_ids`, ev
 | `temperature`, `top_p`, `top_k`, `min_p`, `seed` | Use the [shared sampling controls](text-serving.md#sampling). |
 | `ebnf` | Use a [finite-choice constraint](text-serving.md#finite-choice-constraints) for the generated content. |
 | `regex` | Use a [whole-output regular expression](output-constraints.md#regular-expressions) for the generated content. |
+| `response_format` | Use a [bounded JSON Schema](output-constraints.md#json-schema) for the generated content. |
 | `cache_salt` | Optional [prefix cache key](prefix-cache.md#runtime-path) component. |
 | `stream`, `return_token_ids`, `ignore_eos`, `stop_token_ids` | Use the [shared text options](text-serving.md#send-a-request). |
 | `stream_options` | With streaming enabled, accepts one boolean member, `include_usage`. The default omits the usage event. |
@@ -73,7 +74,7 @@ A reset or failed write cancels the request and discards its pending UTF-8 bytes
 
 ### Image and video inputs
 
-Start the server with `--max-active 1 --prefix-cache-entries 0`. Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Generation uses private eager K0 state. The route rejects `ebnf`, `regex`, and `cache_salt`. Sampling and stop options follow the text contract. A continuous server or a positive prefix-cache capacity returns HTTP 400 for attachments. [Serial route](../apps/sglang-server.cpp#L220)<!-- prefix: "if (argument" -->
+Start the server with `--max-active 1 --prefix-cache-entries 0`. Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Generation uses private eager K0 state. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Sampling and stop options follow the text contract. A continuous server or a positive prefix-cache capacity returns HTTP 400 for attachments. [Serial route](../apps/sglang-server.cpp#L220)<!-- prefix: "if (argument" -->
 
 Omit `add_special_tokens` or set it to `false`. Set `enable_thinking` at the top level or as the only member of `chat_template_kwargs`.
 

@@ -260,6 +260,29 @@ request. Constrained requests use target-only decoding (K0).
 - `{"regex":"[A-Z]{2}-[0-9]{3}"}` matches a whole output such as `AB-123`.
   A pattern takes 1–1,024 UTF-8 bytes, with explicit repeat bounds up to 64.
   See the [regular expression contract](docs/output-constraints.md#regular-expressions).
+- `response_format` with `type: "json_schema"` generates JSON in the response text.
+  The supported subset allows up to eight properties per object and eight items per array.
+
+For example, add this field to require a JSON object with a `status` drawn from two values.
+
+```json
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "schema": {
+        "type": "object",
+        "properties": {"status": {"enum": ["open", "closed"]}},
+        "required": ["status"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+See the [JSON Schema contract](docs/output-constraints.md#json-schema) for supported keywords,
+token budgets, and finish rules.
 
 ## Continue development
 

@@ -102,11 +102,11 @@ An earlier GPU1 run compared the unsplit build with the Unit13 runtime. Each arm
 
 Run the [prefill acceptance checks](development.md#chunked-prefill-verification) before timing. For exact prefill, match full BF16 logits and committed KV and GDN state with the row-wise control. Time device prompt processing with CUDA events through the operation before the first LM head. Measure HTTP TTFT from submission to the first token. Record tile sizes, tails, active lanes, and decode token gaps during mixed steps.
 
-The 128-row tile requests 31,944,704 scratch bytes. One row requires zero. Generator `peak_device_allocation_bytes` counts logical model, request, and scratch bytes. Batch `workspace_bytes` sizes scratch for the largest lane tile. `request_bytes` counts live request storage after the step. These counters exclude idle pool backing. The [32 MiB release threshold](development.md#constraints-and-failure-behavior) applies after synchronization. Live work can reserve more.
+Scratch uses 31,944,704 bytes at 128 rows and zero at one row. Generator `peak_device_allocation_bytes` counts logical model, request, and scratch bytes. Batch `workspace_bytes` tracks the largest lane tile's scratch. `request_bytes` counts live request storage after each step. These counters exclude idle backing. Live reservations can exceed [pool thresholds](development.md#constraints-and-failure-behavior).
 
 Record pool used and reserved bytes after synchronization. Require zero live scratch after retirement, including recovered free-enqueue failures. Report peak HBM, headroom, lane mix, and KV capacity.
 
-Use a fresh process for cold allocator timing. For warm timing, complete a multirow request first. Record its tile sizes, lane count, and order. Record model load, tokenizer warmup, graph state, and prefix-cache state separately. Report cold and warm rows.
+Use a fresh process for cold allocator timing. Warm pools with a multirow request. Record tiles, lanes, and order. Report model load, tokenizer warmup, graph state, and prefix state separately.
 
 The historical GPU6 prototype reduced W1 and W2 CUDA prefill time against the row-wise native control. It missed all four paired vLLM targets on both workloads. Qualify each production configuration under its applicable protocol.
 
@@ -123,6 +123,8 @@ Compare full BF16 logits within predefined tolerances on identical histories and
 Check parity against pinned vLLM on identical histories. Record its execution mode and KV and GDN policies. Record how diagnostic rows were selected. Use frozen fixtures for workload-level results.
 
 Use [chunked prefill measurements](#chunked-prefill) and the [frozen timing protocol](#frozen-w1-and-w2-timing). Report each precision policy separately.
+
+Run the [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Report native deltas and frozen gate results separately.
 
 The post-chat GPU3 run used tensor-core prefill, serial CUDA graphs, and MTP off. Each arm and workload used three warmups and nine measured requests. The chat control and fusion build returned identical IDs on the frozen token-ID requests.
 
@@ -155,13 +157,13 @@ To isolate layer-major verification, compare with row-wise MTP at the same depth
 
 Alternate paired arms on the same reserved B200. Match warmups and repeats. Report individual samples, medians, ranges, and paired ratios. The [frozen W3-MTP variant](../benchmarks/variants/README.md) requires four active requests and K1. Keep that workload separate from the [historical eager bursts](mtp.md#measured-continuous-mtp-trade-offs).
 
-Positive depth adds counters for the generator's first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds started. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L200)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder.cpp#L235)<!-- prefix: "bool propose" --> · [Output commit](../src/decoder.cpp#L209)<!-- prefix: "std::optiona" -->
+Positive depth adds counters for the generator's first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds started. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L200)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder.cpp#L259)<!-- prefix: "bool propose" --> · [Output commit](../src/decoder.cpp#L233)<!-- prefix: "std::optiona" -->
 
-Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder.cpp#L256)<!-- prefix: "std::optiona" -->
+Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder.cpp#L280)<!-- prefix: "std::optiona" -->
 
 Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L52)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L347)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L622)<!-- prefix: "current.peak" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L371)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L622)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

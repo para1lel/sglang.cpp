@@ -12,7 +12,7 @@
 namespace sglang::decoder {
 
 struct PrefillPool {
-    explicit PrefillPool(int ordinal) : device(ordinal) {}
+    PrefillPool(int ordinal, bool large) : device(ordinal), large(large) {}
 
     ~PrefillPool() {
         if (handle) {
@@ -21,6 +21,7 @@ struct PrefillPool {
     }
 
     const int device;
+    const bool large;
     cudaMemPool_t handle = nullptr;
     void* pending = nullptr;
     bool retains_backing = false;
@@ -41,7 +42,7 @@ public:
         {
             const std::lock_guard<std::mutex> lock(mutex_);
             for (auto* owner = retained_; owner; owner = owner->next_retained) {
-                if (owner->device == pool.device) {
+                if (owner->device == pool.device && owner->large == pool.large) {
                     return;
                 }
             }
@@ -49,7 +50,7 @@ public:
             retained_ = &pool;
         }
 
-        std::uint64_t threshold = 32 * 1024 * 1024;
+        std::uint64_t threshold = (pool.large ? 512 : 32) * 1024 * 1024;
         const auto status =
             cudaMemPoolSetAttribute(pool.handle, cudaMemPoolAttrReleaseThreshold, &threshold);
         if (status == cudaSuccess) {
@@ -71,12 +72,12 @@ public:
         }
     }
 
-    std::unique_ptr<PrefillPool> take_idle(int device) {
+    std::unique_ptr<PrefillPool> take_idle(int device, bool large) {
         const std::lock_guard<std::mutex> lock(mutex_);
-        if (auto pool = take(idle_, device, true)) {
+        if (auto pool = take(idle_, device, large, true)) {
             return pool;
         }
-        return take(idle_, device);
+        return take(idle_, device, large);
     }
 
     std::unique_ptr<PrefillPool> take_pending(int device) {
@@ -105,9 +106,11 @@ public:
 
 private:
     static std::unique_ptr<PrefillPool> take(std::unique_ptr<PrefillPool>& list, int device,
+                                             std::optional<bool> large = std::nullopt,
                                              bool must_retain_backing = false) {
         auto* link = &list;
         while (*link && ((*link)->device != device ||
+                        (large && (*link)->large != *large) ||
                         (must_retain_backing && !(*link)->retains_backing))) {
             link = &(*link)->next;
         }
@@ -306,7 +309,7 @@ void PrefillProjections::project(Fp8Weight weight, TextFp8ActivationView input,
     if (tensor_core_fp8) {
         const auto status = try_text_fp8_gemm_sm100(
             weight.values, weight.scales, input, rows, weight.rows, weight.columns,
-            output, stream);
+            output, stream, rows > prefill_chunk_rows);
         if (status) {
             check(*status, "Run tensor-core prefill FP8 projection");
             return;
@@ -334,7 +337,7 @@ void decoder::reclaim_prefill_workspaces(int device) {
 
 PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
     : stream_(stream), capacity_(capacity) {
-    if (!stream || capacity < 1 || capacity > prefill_chunk_rows) {
+    if (!stream || capacity < 1 || capacity > serial_prefill_max_rows) {
         throw std::invalid_argument("Invalid decoder prefill workspace");
     }
     if (capacity == 1) {
@@ -343,10 +346,11 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
     int device = 0;
     check(cudaGetDevice(&device), "Get CUDA device for prefill workspace");
     reclaim_prefill_workspaces(device);
+    const bool large = capacity > prefill_chunk_rows;
     auto& pools = prefill_pools();
-    auto pool = pools.take_idle(device);
+    auto pool = pools.take_idle(device, large);
     if (!pool) {
-        pool = std::make_unique<PrefillPool>(device);
+        pool = std::make_unique<PrefillPool>(device, large);
         cudaMemPoolProps props{};
         props.allocType = cudaMemAllocationTypePinned;
         props.location.type = cudaMemLocationTypeDevice;
@@ -435,8 +439,12 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     const bool tensor_core = !draft && fp8_prefill() == Fp8PrefillPolicy::tensor_core;
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position};
     const auto& work = chunk.work;
-    check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens, rows,
-                               work.residual, stream), "Gather prefill embeddings");
+    for (int offset = 0; offset < rows; offset += text_embedding_max_rows) {
+        const int count = std::min(text_embedding_max_rows, rows - offset);
+        check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens + offset, count,
+                                  work.residual + offset * hidden_size, stream),
+              "Gather prefill embeddings");
+    }
     int gqa_index = 0;
     int gdn_index = 0;
     for (int index = 0; index < layer_count; ++index) {

@@ -90,10 +90,14 @@ Graph and eager decode use the same arithmetic for these operations.
 
 The generator and HTTP server accept `--fp8-prefill exact|tensor-core`. The default
 `exact` uses the exact FP8 projection path. For target-only requests, `tensor-core`
-uses SM100 Tensor Cores for eligible FP8 projections in chunks of 3 to 128 prompt
-positions. Smaller chunks and ineligible projections use the exact path. Tensor Core
-prefill accumulates FP32 sums in a different order. Model scores and generated token
-IDs can differ, including when the highest scores are far apart.
+uses SM100 Tensor Cores for eligible FP8 projections in chunks of at least three rows.
+Smaller chunks and ineligible projections use the exact path.
+With `SGLANG_SERIAL_PREFILL_ROWS` unset, serial K0 requests on an NVIDIA B200 use a
+1,024-row cap for prompts of at least 512 encoded tokens. Other requests use a
+128-row cap. See [serial prefill](docs/text-serving.md#serial-prefill) for overrides
+and workspace fallback. Tensor Core prefill accumulates FP32 sums in a different
+order. Model scores and generated token IDs can differ, including when the highest
+scores are far apart.
 
 The selection applies to the model for its lifetime. For C++, pass
 `sglang::Fp8PrefillPolicy::tensor_core` as the fourth argument to

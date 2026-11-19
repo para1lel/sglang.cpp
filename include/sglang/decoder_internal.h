@@ -286,6 +286,7 @@ private:
     Model(const std::filesystem::path& checkpoint, int cuda_device);
 
     Fp8PrefillPolicy fp8_prefill_ = Fp8PrefillPolicy::exact;
+    bool b200_ = false;
 };
 
 }

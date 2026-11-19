@@ -4,10 +4,13 @@
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/prefill_fp8.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <random>
+#include <string_view>
 
 namespace sglang {
 namespace decoder {
@@ -15,6 +18,27 @@ namespace {
 
 bool valid_token(int id) {
     return id >= 0 && id < vocab_size;
+}
+
+int serial_prefill_rows(bool b200, int prompt_rows) {
+    const auto* setting = std::getenv("SGLANG_SERIAL_PREFILL_ROWS");
+    if (!setting) {
+        return b200 && prompt_rows >= 512 ? 1024 : prefill_chunk_rows;
+    }
+    const std::string_view value(setting);
+    if (value == "256") {
+        return 256;
+    }
+    if (value == "512") {
+        return 512;
+    }
+    if (value == "1024") {
+        return 1024;
+    }
+    if (value == "2048") {
+        return serial_prefill_max_rows;
+    }
+    return prefill_chunk_rows;
 }
 
 void validate_constraint(const DecoderOptions& options) {
@@ -416,12 +440,26 @@ DecoderFinishReason Decoder::Model::generate_mtp(const std::vector<int>& prompt,
 bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& prompt,
                                    const DecoderCallbacks& callbacks, DecoderResult& result) const {
     const int count = static_cast<int>(prompt.size());
-    PrefillWorkspace workspace(request.memory.stream(), std::min(count, prefill_chunk_rows));
+    const auto stream = request.memory.stream();
+    const int aligned = count / prefill_chunk_rows * prefill_chunk_rows;
+    std::optional<PrefillWorkspace> tiled;
+    if (fp8_prefill() == Fp8PrefillPolicy::tensor_core) {
+        const int larger = std::min(aligned, serial_prefill_rows(b200_, count));
+        if (larger > prefill_chunk_rows) {
+            tiled.emplace(stream, larger);
+        }
+    }
+    if (!tiled || !tiled->bytes()) {
+        tiled.emplace(stream, std::min(count, prefill_chunk_rows));
+    }
+    auto& workspace = *tiled;
     result.peak_device_allocation_bytes += workspace.bytes();
     const int tile_rows = workspace.bytes() ? workspace.capacity() : 1;
-    for (int position = 0; position < count; position += tile_rows) {
-        const int rows = std::min(tile_rows, count - position);
+    for (int position = 0; position < count;) {
+        const int end = position < aligned ? aligned : count;
+        const int rows = std::min(tile_rows, end - position);
         prefill_chunk(request, prompt.data() + position, rows, position, workspace);
+        position += rows;
         if (callbacks.is_cancelled && callbacks.is_cancelled()) {
             workspace.close();
             return false;

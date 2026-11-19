@@ -452,11 +452,20 @@ std::optional<cudaError_t> launch_tma(
 std::optional<cudaError_t> try_text_fp8_gemm_sm100(
     const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
     int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream) {
+    return try_text_fp8_gemm_sm100(weight, weight_scales, input, rows, out_width, in_width,
+                                   output, stream, false);
+}
+
+std::optional<cudaError_t> try_text_fp8_gemm_sm100(
+    const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
+    int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream,
+    bool allow_large_rows) {
     if (rows <= 0 || out_width <= 0 || in_width <= 0 ||
         !valid_buffers(weight, weight_scales, input, rows, out_width, in_width, output)) {
         return cudaErrorInvalidValue;
     }
-    if (rows < 3 || rows > text_embedding_max_rows || in_width % group_size != 0 ||
+    const int max_rows = allow_large_rows ? serial_prefill_max_rows : text_embedding_max_rows;
+    if (rows < 3 || rows > max_rows || in_width % group_size != 0 ||
         reinterpret_cast<std::uintptr_t>(weight) % 16 != 0 ||
         reinterpret_cast<std::uintptr_t>(input.values) % 16 != 0) {
         return std::nullopt;

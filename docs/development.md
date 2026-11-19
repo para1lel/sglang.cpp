@@ -65,7 +65,7 @@ Link `sglang_cuda`. Apply RoPE to K before appending contiguous BF16 `[tokens, 4
 
 For each K or V group's maximum magnitude `amax`, store `ceil(log2(max(amax, 1e-30) / 448)) + 127`, clamped to `[0, 254]`. Attention decodes K and V and converts BF16 Q to FP32. [Scale calculation](../src/mxfp8_gqa.cu#L35)<!-- prefix: "__device__ i" --> · [Direct attention](../src/mxfp8_gqa.cu#L98)<!-- prefix: "__global__ v" -->
 
-Exact scoring preserves FP32 group reductions, the ordered eight-group sum, and `1/16` scaling. Per 32-token tile, replay decodes V into shared memory in parallel. A warp computes prefix maxima and `expf` weights. Denominator and value FMAs follow token order. FP32 division precedes one BF16 rounding. [Score](../src/mxfp8_gqa.cu#L281)<!-- prefix: "__global__ v" --> · [Replay](../src/mxfp8_gqa.cu#L327)<!-- prefix: "__global__ v" -->
+Exact scoring preserves FP32 group reductions, the ordered eight-group sum, and `1/16` scaling. Per 32-token tile, replay decodes V into shared memory in parallel. A warp computes prefix maxima and `expf` weights. Denominator and value FMAs follow token order. FP32 division precedes one BF16 rounding. [Score](../src/mxfp8_gqa.cu#L301)<!-- prefix: "__global__ v" --> · [Replay](../src/mxfp8_gqa.cu#L347)<!-- prefix: "__global__ v" -->
 
 #### P2 GQA verification
 
@@ -112,10 +112,10 @@ Both binaries accept `--fp8-prefill exact|tensor-core`. C++ callers pass `Fp8Pre
 
 Tensor-core projections require MTP off, 3–128 rows, 128-divisible input width, and contiguous, 16-byte-aligned E4M3 payloads. The `sm_100a` build uses TMA, TMEM, and `tcgen05` PTX. Dispatch requires capability 10.0, a matching image, enough opt-in shared memory, and `cuTensorMapEncodeTiled` support. Ineligible calls use SIMT. Invalid arguments and execution errors propagate. [Projection](../src/decoder_prefill.cpp#L304)<!-- prefix: "void Prefill" --> · [Eligibility](../src/prefill_fp8_sm100.cu#L452)<!-- prefix: "std::optiona" --> · [Build](../xmake.lua#L62)<!-- prefix: "target(\"sgla" -->
 
-Tensor-core mode uses these operators on scratch-backed 2–128 row tiles with MTP off, including during SIMT projection fallback. Exact, MTP, and row-wise prefill use the existing operators. Both policies share decode. [Tile dispatch](../src/decoder_prefill.cpp#L407)<!-- prefix: "void Decoder" -->
+Tensor-core mode uses these operators on scratch-backed 2–128-row K0 tiles, including during SIMT projection fallback. Both policies share decode. [Tile dispatch](../src/decoder_prefill.cpp#L407)<!-- prefix: "void Decoder" -->
 
 - GDN fuses convolution, Q/K unit normalization, and gate preparation. Recurrent updates retain token order. Gates reuse key scratch. [GDN preparation](../src/text_attention_gdn.cu#L75)<!-- prefix: "__global__ v" -->
-- After KV append, causal GQA scores and weights 32 tokens per tile. FP32 group sums, denominator updates, and value accumulation retain their order. The MXFP8 format stays the same. [Tiled GQA](../src/mxfp8_gqa.cu#L181)<!-- prefix: "__global__ v" -->
+- After KV append, each GQA block handles one row. Two adjacent query heads reuse decoded K and V from one KV head. Each head keeps ordered FP32 group sums and independent, token-ordered softmax and value updates over 32-token tiles. [Tiled GQA](../src/mxfp8_gqa.cu#L195)<!-- prefix: "__global__ v" --> · [Launch](../src/mxfp8_gqa.cu#L496)<!-- prefix: "cudaError_t " -->
 - Residual RMSNorm and SwiGLU fuse with FP8 quantization. Both round to BF16 before quantization. [RMSNorm](../src/text_normalization.cu#L236)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L665)<!-- prefix: "cudaError_t " -->
 
 Other target prefill and draft decode use direct attention. Eager target decode, including MTP verification, uses exact attention below inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Both use direct attention beyond those limits. [Multirow prefill](../src/decoder_prefill.cpp#L256)<!-- prefix: "const auto s" --> · [Row dispatch](../src/decoder_forward.cpp#L177)<!-- prefix: "cudaError_t " -->

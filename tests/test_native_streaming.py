@@ -119,6 +119,16 @@ class NativeStreamingTest(unittest.TestCase):
     def test_zero_budget(self):
         self.check_completion(self.prompt, [])
 
+    def test_compatible_zero_temperature_spellings(self):
+        request = json.dumps(completion_request(self.prompt, 0)).encode()
+        for temperature in (b"0e0", b"1e-400", b"-1e-400"):
+            with self.subTest(temperature=temperature), closing(self.connect()) as connection:
+                body = request.replace(b'"temperature": 0.0', b'"temperature": ' + temperature)
+                self.assertNotEqual(body, request)
+                self.post(connection, body)
+                with connection.getresponse() as response:
+                    self.check_stream(response, self.prompt, [])
+
     def test_client_write_half_close(self):
         for after_headers in (False, True):
             with (
@@ -146,6 +156,9 @@ class NativeStreamingTest(unittest.TestCase):
             "negative budget": valid | {"max_tokens": -1},
             "context overflow": valid | {"max_tokens": 262144},
             "unsupported stream option": valid | {"stream_interval": 2},
+            "nonzero temperature": valid | {"temperature": 1e-300},
+            "negative nonzero temperature": valid | {"temperature": -1e-300},
+            "string temperature": valid | {"temperature": "0"},
         }
         for label, body in cases.items():
             with self.subTest(case=label), closing(self.connect()) as connection:
@@ -155,6 +168,31 @@ class NativeStreamingTest(unittest.TestCase):
                     self.assertEqual(response.headers.get_content_type(), "application/json")
                     self.assertTrue(json.load(response)["error"]["message"])
         self.check_completion(self.prompt, self.expected[:1])
+
+    def test_strict_json_requests(self):
+        valid = json.dumps(completion_request(self.prompt, 0)).encode()
+        cases = {
+            "duplicate key": b'{"seed":0,' + valid[1:],
+            "escaped duplicate key": rb'{"s\u0065ed":0,' + valid[1:],
+            "leading zero": valid.replace(b'"seed": 0', b'"seed": 00'),
+            "leading plus": valid.replace(b'"seed": 0', b'"seed": +0'),
+            "missing exponent": valid.replace(b'"temperature": 0.0', b'"temperature": 0e'),
+            "invalid UTF-8": valid.replace(b'"benchmark"', b'"ben\xc0\xafchmark"'),
+            "unpaired surrogate": valid.replace(b'"benchmark"', rb'"ben\ud800chmark"'),
+            "invalid escape": valid.replace(b'"benchmark"', rb'"ben\qchmark"'),
+            "unescaped control": valid.replace(b'"benchmark"', b'"ben\x01chmark"'),
+            "depth": valid.replace(b'"seed": 0', b'"seed": ' + b"[" * 32 + b"0" + b"]" * 32),
+            "trailing data": valid + b"null",
+        }
+        for label, body in cases.items():
+            with self.subTest(case=label), closing(self.connect()) as connection:
+                self.assertNotEqual(body, valid)
+                self.post(connection, body)
+                with connection.getresponse() as response:
+                    self.assertEqual(response.status, 400)
+                    self.assertEqual(response.headers.get_content_type(), "application/json")
+                    self.assertEqual(json.load(response),
+                                     {"error": {"message": "Invalid JSON request body"}})
 
     def test_single_active_request_and_disconnect(self):
         with closing(self.connect()) as queued, closing(self.connect()) as active:

@@ -1,5 +1,7 @@
 #include "sglang/checkpoint.h"
 
+#include "sglang/json.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <limits>
@@ -16,16 +18,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <llvm/Support/JSON.h>
-
 namespace sglang {
 namespace {
 
-namespace json = llvm::json;
 using Path = std::filesystem::path;
 
 constexpr std::size_t max_metadata_bytes = 8 * 1024 * 1024;
-constexpr std::size_t max_json_depth = 32;
 constexpr std::size_t max_mapping_bytes = std::numeric_limits<std::ptrdiff_t>::max();
 constexpr std::size_t shard_prefix_bytes = 8;
 
@@ -78,110 +76,17 @@ public:
     std::size_t size;
 };
 
-bool is_decimal_digit(char character) {
-    return character >= '0' && character <= '9';
-}
-
-bool consume_digits(llvm::StringRef& input) {
-    const auto size = input.size();
-    while (!input.empty() && is_decimal_digit(input.front())) {
-        input = input.drop_front();
-    }
-    return input.size() != size;
-}
-
-bool consume_json_number(llvm::StringRef& input) {
-    input.consume_front("-");
-    if (!input.consume_front("0") && !consume_digits(input)) {
-        return false;
-    }
-    if (input.consume_front(".") && !consume_digits(input)) {
-        return false;
-    }
-    if (input.consume_front("e") || input.consume_front("E")) {
-        if (!input.consume_front("+")) {
-            input.consume_front("-");
-        }
-        if (!consume_digits(input)) {
-            return false;
-        }
-    }
-    return input.empty() || llvm::StringRef(",]} \t\r\n").contains(input.front());
-}
-
-std::size_t count_json_keys(llvm::StringRef source, const Path& path) {
-    std::size_t depth = 0;
-    std::size_t keys = 0;
-    bool in_string = false;
-    bool escaped = false;
-    while (!source.empty()) {
-        const char character = source.front();
-        if (!in_string && (is_decimal_digit(character) || character == '-' ||
-                           character == '+' || character == '.')) {
-            if (!consume_json_number(source)) {
-                invalid(path, "invalid JSON number");
-            }
-            continue;
-        }
-        source = source.drop_front();
-        if (in_string) {
-            if (escaped) {
-                escaped = false;
-            } else if (character == '\\') {
-                escaped = true;
-            } else if (character == '"') {
-                in_string = false;
-            }
-        } else if (character == '"') {
-            in_string = true;
-        } else if (character == '{' || character == '[') {
-            if (++depth > max_json_depth) {
-                invalid(path, "JSON nesting exceeds the checkpoint metadata limit");
-            }
-        } else if (character == '}' || character == ']') {
-            if (depth == 0) {
-                invalid(path, "unbalanced JSON delimiters");
-            }
-            --depth;
-        } else if (character == ':') {
-            ++keys;
-        }
-    }
-    return keys;
-}
-
-std::size_t count_object_keys(const json::Value& value) {
-    if (const auto* object = value.getAsObject()) {
-        std::size_t keys = object->size();
-        for (const auto& field : *object) {
-            keys += count_object_keys(field.second);
-        }
-        return keys;
-    }
-    std::size_t keys = 0;
-    if (const auto* array = value.getAsArray()) {
-        for (const auto& entry : *array) {
-            keys += count_object_keys(entry);
-        }
-    }
-    return keys;
-}
-
 json::Object parse_object(const Path& path, const std::byte* data, std::size_t size) {
-    const llvm::StringRef source(reinterpret_cast<const char*>(data), size);
-    const std::size_t keys = count_json_keys(source, path);
-    auto value = json::parse(source);
-    if (!value) {
-        invalid(path, llvm::toString(value.takeError()));
+    try {
+        auto value = json::parse(
+            {reinterpret_cast<const char*>(data), size}, json::Syntax::checkpoint);
+        if (auto* object = value.object()) {
+            return std::move(*object);
+        }
+    } catch (const json::ParseError& error) {
+        invalid(path, error.what());
     }
-    auto* object = value->getAsObject();
-    if (!object) {
-        invalid(path, "expected a JSON object");
-    }
-    if (count_object_keys(*value) != keys) {
-        invalid(path, "duplicate JSON object key");
-    }
-    return std::move(*object);
+    invalid(path, "expected a JSON object");
 }
 
 json::Object read_json_file(const Path& path) {
@@ -190,19 +95,38 @@ json::Object read_json_file(const Path& path) {
 }
 
 const json::Object& require_object(const json::Object& parent, const char* name, const Path& path) {
-    const auto* object = parent.getObject(name);
+    const auto* value = json::get(parent, name);
+    const auto* object = value ? value->object() : nullptr;
     if (!object) {
         invalid(path, std::string("expected a JSON object at ") + name);
     }
     return *object;
 }
 
-void check_fields(const json::Object& actual, std::initializer_list<json::Object::KV> expected,
+bool matches_config(const json::Value& actual, const json::Value& expected) {
+    if (const auto* expected_array = expected.array()) {
+        const auto* actual_array = actual.array();
+        return actual_array && std::equal(actual_array->begin(), actual_array->end(),
+                                         expected_array->begin(), expected_array->end(),
+                                         matches_config);
+    }
+    if (const auto text = expected.string()) {
+        return actual.string() == text;
+    }
+    if (const auto flag = expected.boolean()) {
+        return actual.boolean() == flag;
+    }
+    const auto number = expected.number();
+    return number && actual.number() == number;
+}
+
+void check_fields(const json::Object& actual,
+                  std::initializer_list<std::pair<const char*, json::Value>> expected,
                   const Path& path, const std::string& prefix) {
-    for (const auto& field : expected) {
-        const auto* value = actual.get(field.K);
-        if (!value || *value != field.V) {
-            invalid(path, prefix + field.K.str() + " differs from the pinned text model");
+    for (const auto& [name, expected_value] : expected) {
+        const auto* value = json::get(actual, name);
+        if (!value || !matches_config(*value, expected_value)) {
+            invalid(path, prefix + name + " differs from the pinned text model");
         }
     }
 }
@@ -271,11 +195,13 @@ using TensorNames = std::set<std::string, std::less<>>;
 using ShardIndex = std::map<std::string, TensorNames>;
 using TensorMap = std::map<std::string, HostTensorView, std::less<>>;
 
-bool valid_shard_name(llvm::StringRef name) {
-    return name.ends_with(".safetensors") && name.size() > sizeof(".safetensors") - 1 &&
+bool valid_shard_name(std::string_view name) {
+    constexpr std::string_view extension = ".safetensors";
+    return name.size() > extension.size() &&
+           name.substr(name.size() - extension.size()) == extension &&
            name.find_first_not_of(
                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") ==
-               llvm::StringRef::npos;
+               std::string_view::npos;
 }
 
 ShardIndex read_index(const Path& path) {
@@ -285,14 +211,13 @@ ShardIndex read_index(const Path& path) {
         invalid(path, "empty weight_map");
     }
     ShardIndex shards;
-    for (const auto& entry : weights) {
-        const llvm::StringRef name = entry.first;
-        const auto shard = entry.second.getAsString();
-        if (name.empty() || name.contains('\0') || name == "__metadata__" ||
+    for (const auto& [name, value] : weights) {
+        const auto shard = value.string();
+        if (name.empty() || name.find('\0') != std::string::npos || name == "__metadata__" ||
             !shard || !valid_shard_name(*shard)) {
-            invalid(path, "invalid weight_map entry for " + name.str());
+            invalid(path, "invalid weight_map entry for " + name);
         }
-        shards[shard->str()].insert(name.str());
+        shards[std::string(*shard)].insert(name);
     }
     return shards;
 }
@@ -302,29 +227,30 @@ struct TensorType {
     std::uint64_t width;
 };
 
-TensorType tensor_type(const json::Object& spec, const Path& path, llvm::StringRef name) {
-    const auto dtype = spec.getString("dtype");
+TensorType tensor_type(const json::Object& spec, const Path& path, const std::string& name) {
+    const auto dtype = json::get_string(spec, "dtype");
     if (dtype == "BF16") {
         return {TensorDtype::BF16, 2};
     }
     if (dtype == "F8_E4M3") {
         return {TensorDtype::F8_E4M3, 1};
     }
-    invalid(path, "unsupported dtype for " + name.str());
+    invalid(path, "unsupported dtype for " + name);
 }
 
 std::vector<std::uint64_t> tensor_shape(const json::Object& spec, const Path& path,
-                                       llvm::StringRef name) {
-    const auto* dimensions = spec.getArray("shape");
+                                       const std::string& name) {
+    const auto* field = json::get(spec, "shape");
+    const auto* dimensions = field ? field->array() : nullptr;
     if (!dimensions) {
-        invalid(path, "missing or invalid shape for " + name.str());
+        invalid(path, "missing or invalid shape for " + name);
     }
     std::vector<std::uint64_t> shape;
     shape.reserve(dimensions->size());
     for (const auto& entry : *dimensions) {
-        const auto dimension = entry.getAsUINT64();
+        const auto dimension = entry.unsigned_integer();
         if (!dimension) {
-            invalid(path, "invalid dimension for " + name.str());
+            invalid(path, "invalid dimension for " + name);
         }
         shape.push_back(*dimension);
     }
@@ -337,33 +263,34 @@ struct ByteRange {
 };
 
 ByteRange tensor_range(const json::Object& spec, std::uint64_t payload_size,
-                       const Path& path, llvm::StringRef name) {
-    const auto* offsets = spec.getArray("data_offsets");
+                       const Path& path, const std::string& name) {
+    const auto* field = json::get(spec, "data_offsets");
+    const auto* offsets = field ? field->array() : nullptr;
     if (!offsets || offsets->size() != 2) {
-        invalid(path, "invalid data_offsets for " + name.str());
+        invalid(path, "invalid data_offsets for " + name);
     }
-    const auto begin = (*offsets)[0].getAsUINT64();
-    const auto end = (*offsets)[1].getAsUINT64();
+    const auto begin = (*offsets)[0].unsigned_integer();
+    const auto end = (*offsets)[1].unsigned_integer();
     if (!begin || !end || *end < *begin || *end > payload_size) {
-        invalid(path, "data_offsets out of bounds for " + name.str());
+        invalid(path, "data_offsets out of bounds for " + name);
     }
     return {*begin, *end};
 }
 
 void check_tensor_size(const std::vector<std::uint64_t>& shape, std::uint64_t width,
-                       std::uint64_t available, const Path& path, llvm::StringRef name) {
+                       std::uint64_t available, const Path& path, const std::string& name) {
     std::uint64_t bytes = 0;
     if (std::find(shape.begin(), shape.end(), 0) == shape.end()) {
         bytes = width;
         for (const auto dimension : shape) {
             if (dimension > available / bytes) {
-                invalid(path, "shape and dtype exceed the byte range for " + name.str());
+                invalid(path, "shape and dtype exceed the byte range for " + name);
             }
             bytes *= dimension;
         }
     }
     if (bytes != available) {
-        invalid(path, "shape and dtype do not match the byte range for " + name.str());
+        invalid(path, "shape and dtype do not match the byte range for " + name);
     }
 }
 
@@ -383,12 +310,12 @@ std::size_t shard_header_size(const Mapping& file, const Path& path) {
 }
 
 void validate_shard_metadata(const json::Value& value, const Path& path) {
-    const auto* metadata = value.getAsObject();
+    const auto* metadata = value.object();
     if (!metadata) {
         invalid(path, "invalid __metadata__ object");
     }
     for (const auto& entry : *metadata) {
-        if (!entry.second.getAsString()) {
+        if (!entry.second.string()) {
             invalid(path, "non-string value in __metadata__");
         }
     }
@@ -419,19 +346,18 @@ void load_shard(const Path& path, const Mapping& file, TensorNames& missing, Ten
     std::vector<ByteRange> ranges;
     ranges.reserve(missing.size());
 
-    for (const auto& entry : header) {
-        const llvm::StringRef name = entry.first;
+    for (const auto& [name, value] : header) {
         if (name == "__metadata__") {
-            validate_shard_metadata(entry.second, path);
+            validate_shard_metadata(value, path);
             continue;
         }
-        const auto expected = missing.find(std::string_view(name.data(), name.size()));
+        const auto expected = missing.find(name);
         if (expected == missing.end()) {
-            invalid(path, "tensor is not indexed to this shard: " + name.str());
+            invalid(path, "tensor is not indexed to this shard: " + name);
         }
-        const auto* spec = entry.second.getAsObject();
+        const auto* spec = value.object();
         if (!spec) {
-            invalid(path, "invalid tensor metadata for " + name.str());
+            invalid(path, "invalid tensor metadata for " + name);
         }
         const auto type = tensor_type(*spec, path, name);
         auto shape = tensor_shape(*spec, path, name);
@@ -443,7 +369,7 @@ void load_shard(const Path& path, const Mapping& file, TensorNames& missing, Ten
         if (!tensors.emplace(*expected, HostTensorView{
                 type.dtype, std::move(shape), data, static_cast<std::size_t>(bytes)
             }).second) {
-            invalid(path, "duplicate tensor name: " + name.str());
+            invalid(path, "duplicate tensor name: " + name);
         }
         missing.erase(expected);
     }

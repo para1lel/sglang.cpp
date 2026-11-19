@@ -10,7 +10,6 @@
 #include <iostream>
 
 namespace sglang::server {
-namespace {
 
 void append_ids(std::string& output, const int* ids, std::size_t count) {
     output += '[';
@@ -22,6 +21,8 @@ void append_ids(std::string& output, const int* ids, std::size_t count) {
     }
     output += ']';
 }
+
+namespace {
 
 void append_usage(std::string& output, std::size_t prompt, std::size_t completion) {
     output += R"(,"usage":{"prompt_tokens":)" + std::to_string(prompt);
@@ -189,11 +190,9 @@ void TextResponse::finish(const DecoderResult& result) {
 
 }
 
-void complete_text(const Socket& connection, std::string_view body,
+void complete_text(const Socket& connection, const TextRequest& request,
                    const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                   bool trace_serial, bool chat) {
-    const auto request = chat ? parse_chat_request(body, tokenizer)
-                              : parse_text_request(body, tokenizer);
+                   bool trace_serial) {
     if (disconnected(connection)) {
         return;
     }

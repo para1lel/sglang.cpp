@@ -12,15 +12,15 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and pass validated prompt IDs to the decoder. | [Route](../apps/sglang-server.cpp#L112)<!-- prefix: "} else if (r" --> · [Request parser](../apps/server/text_request.cpp#L187)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and pass validated prompt IDs to the decoder. | [Route](../apps/sglang-server.cpp#L112)<!-- prefix: "} else if (r" --> · [Request parser](../apps/server/text_request.cpp#L182)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
-| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L142)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L157)<!-- prefix: "void TextRes" --> |
+| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L143)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L158)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
 
-The server parses chat as ordered JSON. The native renderer uses the pinned checkpoint's template rules and literals. The [shared tokenizer](text-serving.md#tokenizer-assets) encodes the rendered prompt without adding special tokens.
+The server parses chat once as ordered JSON and returns HTTP 400 for floating-point range errors. The native renderer uses the pinned checkpoint's template rules and literals. The [shared tokenizer](text-serving.md#tokenizer-assets) encodes the rendered prompt without adding special tokens.
 
-The serial route calls `Decoder::generate`. The batch route submits the IDs to `BatchService::generate` with the connection's worker slot. Rendering, tokenization, and response writing run outside CUDA graphs. Eligible decode cohorts can mix chat, [raw strings](text-serving.md), and [benchmark ID requests](../benchmarks/streaming/README.md#wire-contract). [Serial dispatch](../apps/server/completions.cpp#L216)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/completions.cpp#L227)<!-- prefix: "void complet" -->
+The serial route calls `Decoder::generate`. The batch route submits the IDs to `BatchService::generate` with the connection's worker slot. Rendering, tokenization, and response writing run outside CUDA graphs. Eligible decode cohorts can mix chat, [raw strings](text-serving.md), and [benchmark ID requests](../benchmarks/streaming/README.md#wire-contract). [Serial dispatch](../apps/server/completions.cpp#L209)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/completions.cpp#L220)<!-- prefix: "void complet" -->
 
 ### Read JSON and SSE
 
@@ -32,7 +32,7 @@ The first SSE chunk carries `delta.role: "assistant"` and a null finish reason. 
 
 JSON responses always include usage. `prompt_tokens` counts rendered prompt IDs. `completion_tokens` counts committed output IDs. `total_tokens` sums both counts. `prompt_tokens_details.cached_tokens` is zero. A matched stop ID counts as output, even at the budget. The writer omits its text and reports `stop`. Budget exhaustion without a match reports `length`, including a zero budget.
 
-With `return_token_ids: true`, JSON includes `prompt_token_ids` and `token_ids` in its choice. In SSE, the first diagnostic choice after the role carries `prompt_token_ids`. Each committed ID appears once in `token_ids`, even when it produces empty text. A UTF-8 tail flush can carry text with zero IDs. [Diagnostic choice](../apps/server/text_completion.cpp#L106)<!-- prefix: "std::string " --> · [Role delta](../apps/server/text_completion.cpp#L128)<!-- prefix: "bool TextRes" -->
+With `return_token_ids: true`, JSON includes `prompt_token_ids` and `token_ids` in its choice. In SSE, the first diagnostic choice after the role carries `prompt_token_ids`. Each committed ID appears once in `token_ids`, even when it produces empty text. A UTF-8 tail flush can carry text with zero IDs. [Diagnostic choice](../apps/server/text_completion.cpp#L107)<!-- prefix: "std::string " --> · [Role delta](../apps/server/text_completion.cpp#L129)<!-- prefix: "bool TextRes" -->
 
 ## Constraints and failure behavior
 
@@ -62,7 +62,7 @@ The first request that reaches rendering loads the pinned `tokenizer_config.json
 
 Positive MTP depth, including K4 (`--mtp-steps 4`), requires `--max-active 1`. Follow the [native MTP guide](mtp.md) for serial verification. [Batch CUDA graphs](batch-graphs.md) require `--batch-cuda-graphs`, `--max-active 2`, `3`, or `4`, MTP off, and omission of `--eager`.
 
-A reset or failed write cancels the request and discards its pending UTF-8 bytes. In batch mode, the server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream. [Request lifecycle](../apps/server/text_completion.cpp#L192)<!-- prefix: "void complet" -->
+A reset or failed write cancels the request and discards its pending UTF-8 bytes. In batch mode, the server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream. [Request lifecycle](../apps/server/text_completion.cpp#L193)<!-- prefix: "void complet" -->
 
 ## Verification
 

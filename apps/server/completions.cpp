@@ -1,13 +1,10 @@
 #include "sglang/server/completions.h"
 
+#include "sglang/json.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/http.h"
 
 #include "text_completion.h"
-
-#include <llvm/Support/Error.h>
-#include <llvm/Support/JSON.h>
-#include <llvm/Support/raw_ostream.h>
 
 #include <cstdint>
 #include <iostream>
@@ -16,48 +13,50 @@
 namespace sglang::server {
 namespace {
 
-namespace json = llvm::json;
-
 struct CompletionRequest {
     std::vector<int> prompt;
     DecoderOptions options;
 };
 
-std::optional<std::uint64_t> unsigned_integer(const json::Object& object, llvm::StringRef key) {
-    const auto* value = object.get(key);
-    return value ? value->getAsUINT64() : std::nullopt;
+std::optional<std::uint64_t> unsigned_integer(const json::Object& object, std::string_view key) {
+    const auto* value = json::get(object, key);
+    return value ? value->unsigned_integer() : std::nullopt;
 }
 
 CompletionRequest parse_benchmark(const json::Object* object) {
-    const auto* stops = object ? object->get("stop_token_ids") : nullptr;
+    const auto* stops = object ? json::get(*object, "stop_token_ids") : nullptr;
+    const auto* temperature = object ? json::get(*object, "temperature") : nullptr;
     if (!object || object->size() != (stops ? 12 : 11) ||
-        object->getString("model") != "benchmark" ||
-        object->getNumber("temperature") != 0.0 || unsigned_integer(*object, "seed") != 0 ||
-        object->getBoolean("ignore_eos") != true || object->getBoolean("stream") != true ||
-        object->getBoolean("return_token_ids") != true ||
+        json::get_string(*object, "model") != "benchmark" ||
+        !temperature || temperature->number() != 0.0 || unsigned_integer(*object, "seed") != 0 ||
+        json::get_boolean(*object, "ignore_eos") != true ||
+        json::get_boolean(*object, "stream") != true ||
+        json::get_boolean(*object, "return_token_ids") != true ||
         unsigned_integer(*object, "stream_interval") != 1 ||
-        object->getBoolean("add_special_tokens") != false) {
+        json::get_boolean(*object, "add_special_tokens") != false) {
         throw HttpError("400 Bad Request", "Expected the frozen benchmark streaming options");
     }
-    const auto* stream_options = object->getObject("stream_options");
+    const auto* stream_field = json::get(*object, "stream_options");
+    const auto* stream_options = stream_field ? stream_field->object() : nullptr;
     if (!stream_options || stream_options->size() != 1 ||
-        stream_options->getBoolean("include_usage") != true) {
+        json::get_boolean(*stream_options, "include_usage") != true) {
         throw HttpError("400 Bad Request", "Expected stream_options.include_usage=true");
     }
     const auto output_budget = unsigned_integer(*object, "max_tokens");
     if (!output_budget || *output_budget > std::numeric_limits<int>::max()) {
         throw HttpError("400 Bad Request", "Expected a nonnegative integer max_tokens");
     }
-    const auto* prompt = object->getArray("prompt");
+    const auto* prompt_field = json::get(*object, "prompt");
+    const auto* prompt = prompt_field ? prompt_field->array() : nullptr;
     if (!prompt || prompt->empty()) {
         throw HttpError("400 Bad Request", "Expected a nonempty prompt token ID array");
     }
     CompletionRequest request;
     request.options.max_new_tokens = static_cast<int>(*output_budget);
     if (stops) {
-        const auto* tokens = stops->getAsArray();
+        const auto* tokens = stops->array();
         const auto id = tokens && tokens->size() == 1
-            ? tokens->front().getAsUINT64() : std::nullopt;
+            ? tokens->front().unsigned_integer() : std::nullopt;
         if (!id || *id > std::numeric_limits<int>::max()) {
             throw HttpError("400 Bad Request", "Expected a single nonnegative integer stop ID");
         }
@@ -65,7 +64,7 @@ CompletionRequest parse_benchmark(const json::Object* object) {
     }
     request.prompt.reserve(prompt->size());
     for (const auto& value : *prompt) {
-        const auto id = value.getAsUINT64();
+        const auto id = value.unsigned_integer();
         if (!id || *id > std::numeric_limits<int>::max()) {
             throw HttpError("400 Bad Request", "Expected nonnegative integer prompt token IDs");
         }
@@ -74,57 +73,35 @@ CompletionRequest parse_benchmark(const json::Object* object) {
     return request;
 }
 
-template <typename Encode>
-std::string encode_json(Encode encode) {
-    std::string output;
-    llvm::raw_string_ostream stream(output);
-    json::OStream writer(stream);
-    writer.object([&] { encode(writer); });
-    return output;
-}
-
 std::string choice_event(std::optional<int> token, const std::vector<int>* prompt,
                          const char* finish_reason) {
-    return encode_json([&](json::OStream& writer) {
-        writer.attributeArray("choices", [&] {
-            writer.object([&] {
-                writer.attribute("index", 0);
-                writer.attributeArray("token_ids", [&] {
-                    if (token) {
-                        writer.value(*token);
-                    }
-                });
-                if (prompt) {
-                    writer.attributeArray("prompt_token_ids", [&] {
-                        for (const int id : *prompt) {
-                            writer.value(id);
-                        }
-                    });
-                }
-                writer.attribute("finish_reason", finish_reason ? json::Value(finish_reason)
-                                                                : nullptr);
-            });
-        });
-    });
+    std::string output = R"({"choices":[{"index":0,"token_ids":)";
+    append_ids(output, token ? &*token : nullptr, token ? 1 : 0);
+    if (prompt) {
+        output += R"(,"prompt_token_ids":)";
+        append_ids(output, prompt->data(), prompt->size());
+    }
+    output += R"(,"finish_reason":)";
+    if (finish_reason) {
+        json::append_quoted(output, finish_reason);
+    } else {
+        output += "null";
+    }
+    return output + "}]}";
 }
 
 std::string usage_event(std::size_t prompt_tokens, std::size_t completion_tokens) {
-    return encode_json([&](json::OStream& writer) {
-        writer.attribute("choices", json::Array{});
-        writer.attributeObject("usage", [&] {
-            writer.attribute("prompt_tokens", static_cast<std::int64_t>(prompt_tokens));
-            writer.attribute("completion_tokens", static_cast<std::int64_t>(completion_tokens));
-            writer.attributeObject("prompt_tokens_details", [&] {
-                writer.attribute("cached_tokens", 0);
-            });
-        });
-    });
+    std::string output = R"({"choices":[],"usage":{"prompt_tokens":)";
+    output += std::to_string(prompt_tokens);
+    output += R"(,"completion_tokens":)" + std::to_string(completion_tokens);
+    output += R"(,"prompt_tokens_details":{"cached_tokens":0}}})";
+    return output;
 }
 
 std::string error_body(const char* message) {
-    return encode_json([&](json::OStream& writer) {
-        writer.attributeObject("error", [&] { writer.attribute("message", message); });
-    });
+    std::string output = R"({"error":{"message":)";
+    json::append_quoted(output, message);
+    return output + "}}";
 }
 
 bool begin_stream(const Socket& connection, bool& streaming) {
@@ -191,23 +168,39 @@ void stream_completion(const Socket& connection, const CompletionRequest& reques
     }
 }
 
+json::Value parse_completion_body(std::string_view body) {
+    try {
+        return json::parse(body);
+    } catch (const json::NumberRangeError&) {
+        auto parsed = json::parse(body, json::Syntax::benchmark);
+        const auto* object = parsed.object();
+        if (object && json::get_string(*object, "model") == "benchmark") {
+            return parsed;
+        }
+        throw;
+    }
+}
+
 void dispatch_completion(const Socket& connection, std::string_view body,
                          const CompletionTokenizer* tokenizer, const TextGenerator& generate,
                          bool trace, bool chat) {
     if (chat && tokenizer) {
-        complete_text(connection, body, *tokenizer, generate, trace, true);
+        complete_text(connection, parse_chat_request(body, *tokenizer), *tokenizer,
+                      generate, trace);
         return;
     }
-    auto parsed = json::parse(llvm::StringRef(body.data(), body.size()));
-    if (!parsed) {
-        llvm::consumeError(parsed.takeError());
+    json::Value parsed;
+    try {
+        parsed = parse_completion_body(body);
+    } catch (const json::ParseError&) {
         throw HttpError("400 Bad Request", "Invalid JSON request body");
     }
-    const auto* object = parsed->getAsObject();
-    const llvm::StringRef text_model(model_name.data(), model_name.size());
-    if (tokenizer && object && object->getString("model") != "benchmark" &&
-        (object->getString("prompt") || object->getString("model") == text_model)) {
-        complete_text(connection, body, *tokenizer, generate, trace);
+    const auto* object = parsed.object();
+    const auto model = object ? json::get_string(*object, "model") : std::nullopt;
+    if (tokenizer && object && model != "benchmark" &&
+        (json::get_string(*object, "prompt") || model == model_name)) {
+        complete_text(connection, parse_text_request(*object, *tokenizer), *tokenizer,
+                      generate, trace);
         return;
     }
     stream_completion(connection, parse_benchmark(object), generate, trace);

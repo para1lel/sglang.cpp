@@ -32,10 +32,10 @@ checkpoint=/data0/shared/Qwen3.8-27B-FP8
     -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaLaunchKernel -lsglang_cuda -lcudart \
     -o "$out/decode-bandwidth-check"
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
-    tests/decoder/decode_graph_check.cpp -L"$out/lib" -L"$toolkit/lib" -L"$CONDA_PREFIX/lib" \
-    -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" \
+    tests/decoder/decode_graph_check.cpp -L"$out/lib" -L"$toolkit/lib" \
+    -Wl,-rpath,"$toolkit/lib" \
     -Wl,--wrap=cudaGraphLaunch -Wl,--wrap=cudaStreamBeginCapture \
-    -lsglang_decoder -lsglang_checkpoint -lsglang_cuda -lsglang_prefill_fp8_sm100 -lLLVM-23 \
+    -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
     -lcudart -o "$out/decode-graph-check"
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" "$out/decode-bandwidth-check"
 for policy in exact tensor-core; do
@@ -51,3 +51,25 @@ The checkpoint check expects one capture on the first request, three graph launc
 two default requests, and no capture or launch on the eager request. The second default request
 must reuse the first graph. All three requests must return identical greedy IDs and full score
 bits within each prefill policy.
+
+## Checkpoint metadata
+
+Build the checkpoint library in the managed Pixi environment. Both checks run
+on the host. The metadata probe compares file offsets derived from Linux
+`/proc/self/maps` with an independent read of the index and shard headers.
+The fixture suite covers sparse offsets above 4 GiB, historical JSON number
+spellings, and invalid or truncated metadata.
+
+```bash
+out="$PWD/build/checkpoint-metadata"
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release
+xmake build -P "$PWD" sglang_checkpoint
+for check in checkpoint_check checkpoint_metadata_probe; do
+    "$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude \
+        "tests/decoder/$check.cpp" -L"$out/lib" -lsglang_checkpoint -lsglang_json -o "$out/$check"
+done
+"$out/checkpoint_check" "$checkpoint/config.json" "$out/checkpoint-fixtures"
+python3 -B tests/decoder/test_checkpoint_metadata.py \
+    "$out/checkpoint_metadata_probe" "$checkpoint" --fixtures "$out"
+```

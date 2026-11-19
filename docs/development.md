@@ -13,7 +13,7 @@ The first `sm_100` cubin built with XMake, GCC 15.3.0, and CUDA 13.4.92. It retu
 | Performance | Reproduce a run independently and compare the candidate on each agreed workload. | The [benchmark agreement](performance.md) owns the vLLM pin, controls, and metrics. |
 | Candidate | Build the C++ runtime and CUDA C++ operators in `src/` with XMake and default Pixi. Keep all headers under `include/sglang/`, with server headers in `include/sglang/server/`. Use `sglang/...` includes from `include/`. | [Build options](../tools/build.sh#L5)<!-- prefix: "echo \"Usage:" --> and [XMake project](../xmake.lua#L2)<!-- prefix: "set_project(" -->. |
 
-**Adopted scope.** Target one B200 with the local checkpoint and project-owned model and CUDA operators. The [native decoder](#p3-native-text-decoder) documents its parser dependency.
+**Adopted scope.** Target one B200 with the local checkpoint and project-owned model and CUDA operators.
 
 **Operator policy.** Exclude cuBLAS, cuBLASLt, cuDNN, CUTLASS, FlashInfer, and equivalent operator libraries or generators from production execution. Justify HTTP, JSON, tokenizer, media decoder, and system libraries. Record purpose, license, version, and execution path. Reference engines may use their own operators.
 
@@ -98,7 +98,7 @@ The [tiled scale check](../tests/mxfp8_gqa_check.cu#L793)<!-- prefix: "void chec
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
 | `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L59)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L330)<!-- prefix: "void Decoder" --> |
 
-The checkpoint loader uses Pixi's LLVM Support 23.1.5 (`llvmdev` and `libllvm23`, Apache-2.0 WITH LLVM-exception) for JSON. [JSON parser](../src/checkpoint.cpp#L170)<!-- prefix: "json::Object" --> · [Link configuration](../xmake.lua#L87)<!-- prefix: "target(\"sgla" -->
+Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L87)<!-- prefix: "target(\"sgla" -->
 
 #### Runtime path
 
@@ -150,7 +150,7 @@ Single rows, scratch OOM, and unsupported pool allocation use row-wise prefill. 
 
 #### Verification
 
-Freeze independent inputs and precision-aware tolerances. Compare layer outputs and state on model shapes. Require exact tensor names, shapes, dtypes, scales, and specified packed bytes.
+Compare layer outputs and state on model shapes with frozen independent inputs and precision-aware tolerances. Require exact tensor names, shapes, dtypes, scales, and packed bytes. Run the [checkpoint metadata checks](../tests/decoder/README.md#checkpoint-metadata).
 
 Use the [P2 verifier](#p2-gqa-verification) for MXFP8 encoding, causal attention, and page reuse. Check KV positions and ownership through append and decode. Check BF16 convolution history and FP32 recurrent state. Compare supported cache restores and continuations with fresh native execution under the same precision policy. [Independent GDN check](../tests/decoder/gdn_check.cu#L239)<!-- prefix: "void verify_" -->
 
@@ -174,25 +174,25 @@ Run the [CPU and B200 prefill checks](../tests/prefill/README.md) in exact mode.
 
 #### Serial greedy MTP
 
-The [native MTP guide](mtp.md) defines exact tiled seeding, the target verifier, and serial request limits. Follow its [verification procedure](mtp.md#verification) before measuring MTP.
+See [MTP](mtp.md) for exact tiled seeding, target verification, and serial limits. [Verify MTP](mtp.md#verification) before timing.
 
 ### Native streaming server
 
-Follow the [server launch procedure](../README.md#serve-token-ids-over-http). See [native text completions](text-serving.md) for string prompts and [native chat](chat-serving.md) for conversation requests.
+Follow the [server launch procedure](../README.md#serve-token-ids-over-http) for [string prompts](text-serving.md) and [chat](chat-serving.md).
 
-By default, `--max-active 1` uses the serial graph path. `--eager` requires one active request and MTP off. Set `--max-active 2`, `3`, or `4` for eager batching. See [batch CUDA graphs](batch-graphs.md) for opt-in dispatch and verification. Extra connections wait in the listener backlog. [Serving modes](../apps/sglang-server.cpp#L204)<!-- prefix: "if (argument" --> · [Socket workers](../apps/sglang-server.cpp#L138)<!-- prefix: "void serve_b" -->
+Serial graph execution is the default (`--max-active 1`). `--eager` requires one active request and MTP off. Set `--max-active 2`, `3`, or `4` for eager batching. [Batch CUDA graphs](batch-graphs.md) are opt-in. Extra connections wait in the listener backlog. [Serving modes](../apps/sglang-server.cpp#L204)<!-- prefix: "if (argument" --> · [Socket workers](../apps/sglang-server.cpp#L138)<!-- prefix: "void serve_b" -->
 
 Lanes share weights and own KV, GDN state, and output buffers. Positive budgets reserve KV for prompt length plus budget minus one. HTTP steps assign one position per ready lane, then distribute remaining positions round-robin to prefill lanes, up to 128 total. Decode and single-row prefill run together first. Larger chunks share scratch in slot order. Readback and retirement follow stream completion. C++ `advance` uses one position per selected lane. [Admission](../src/decoder_batch.cpp#L150)<!-- prefix: "void Decoder" --> · [Plan](../src/decoder_batch.cpp#L73)<!-- prefix: "PrefillRows " --> · [Submission](../src/decoder_batch.cpp#L229)<!-- prefix: "void Decoder" -->
 
 In batch mode, `--trace-batches` reports selected `width`, actual `decode` width, and live post-step `request_bytes`. The second line gives `prefill_rows` by slot and transient `workspace_bytes`. [Trace](../apps/server/batch_service.cpp#L181)<!-- prefix: "void BatchSe" -->
 
-Follow the [benchmark token-ID wire contract](../benchmarks/streaming/README.md#wire-contract). Optional `stop_token_ids` takes one ID. A match emits that ID and finishes with `stop`, including at the budget. Zero budget finishes with `length` without a model step. The [decoder limits](#constraints-and-failure-behavior) apply. [Request parser](../apps/server/completions.cpp#L31)<!-- prefix: "CompletionRe" -->
+Follow the [benchmark token-ID wire contract](../benchmarks/streaming/README.md#wire-contract) and [decoder limits](#constraints-and-failure-behavior). Optional `stop_token_ids` takes one ID. A match emits it and reports `stop`, including at the budget. Zero budget reports `length` without a model step. Benchmark temperature accepts values that underflow to signed zero. [Request parser](../apps/server/completions.cpp#L26)<!-- prefix: "CompletionRe" --> · [Numeric retry](../apps/server/completions.cpp#L171)<!-- prefix: "json::Value " -->
 
 A reset or failed token write cancels the affected request. The batch retires its storage before slot reuse. A write-blocked lane waits while ready peers can advance. Clients can use `shutdown(SHUT_WR)` after sending a complete request. [Cancellation](../apps/server/batch_service.cpp#L132)<!-- prefix: "bool BatchSe" --> · [Disconnect check](../apps/server/http.cpp#L263)<!-- prefix: "bool disconn" -->
 
 #### Streaming verification
 
-Build the release server with the README procedure. Set `GPU_UUID` to the reserved B200 UUID. Put `nsys` on `PATH` for graph checks. Use a new evidence directory.
+Build the release server. Set `GPU_UUID` to the reserved B200 UUID. Put `nsys` on `PATH`. Use a new evidence directory.
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
@@ -200,7 +200,7 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     --binary build/bin/sglang-server --evidence artifacts/native-batch-check
 ```
 
-Require `passed` in `status.json` for each mode. Check serial oracle streams and one graph launch per output after the first. At 2 and 4, check exact streams, full decode width on mixed-stop, and full scheduler width on page crossing. Confirm extra connections wait. After HTTP reset, verify readable peer streams, exact replacements, and zero request bytes. The independent core probe checks post-cancellation GPU advancement of retained lanes. Keep [runner](../tests/batch/run_native.py#L1)<!-- prefix: "\"\"\"Opt-in li" --> identity and raw results. Run the serial [streaming smoke](../tests/test_native_streaming.py#L178)<!-- prefix: "def main():" --> with `--port PORT` for zero budget and half-close.
+Require `passed` in `status.json` for each mode. Check serial oracle streams and one graph launch per output after the first. At 2 and 4, check exact streams, full decode width on mixed-stop, and full scheduler width on page crossing. Confirm extra connections wait. After reset, check readable peers, exact replacements, and zero request bytes. The core probe checks GPU advancement of retained lanes after cancellation. Keep [runner](../tests/batch/run_native.py#L1)<!-- prefix: "\"\"\"Opt-in li" --> identity and raw results. Run the [streaming smoke](../tests/test_native_streaming.py#L1)<!-- prefix: "\"\"\"Loopback " --> with `--port PORT` for zero budget, half-close, zero temperature forms, and strict JSON.
 
 ## Runtime and state ownership
 

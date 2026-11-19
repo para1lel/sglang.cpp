@@ -4,7 +4,10 @@
 
 #include <charconv>
 #include <cmath>
+#include <limits>
+#include <locale>
 #include <set>
+#include <sstream>
 
 namespace sglang::json {
 namespace {
@@ -117,11 +120,11 @@ Value Parser::object(std::size_t depth) {
             auto entry = value(depth);
             if (syntax_ == Syntax::ordered) {
                 if (!keys.insert(key).second) {
-                    fail("Duplicate JSON object key");
+                    fail("duplicate JSON object key");
                 }
                 ordered.emplace_back(std::move(key), std::move(entry));
             } else if (!result.emplace(std::move(key), std::move(entry)).second) {
-                fail("Duplicate JSON object key");
+                fail("duplicate JSON object key");
             }
             whitespace();
         } while (accept(','));
@@ -158,6 +161,23 @@ void Parser::strict_number() {
     }
 }
 
+std::optional<double> ranged_number(std::string_view text) {
+    std::istringstream fallback{std::string(text)};
+    fallback.imbue(std::locale::classic());
+    double result = 0;
+    fallback >> result;
+    if (!fallback.eof()) {
+        return std::nullopt;
+    }
+    if (!fallback.fail()) {
+        return result;
+    }
+    if (std::abs(result) == std::numeric_limits<double>::max()) {
+        return std::copysign(std::numeric_limits<double>::infinity(), result);
+    }
+    return std::nullopt;
+}
+
 Value Parser::number() {
     const auto before = input_;
     strict_number();
@@ -186,6 +206,15 @@ Value Parser::number() {
     const auto parsed = std::from_chars(text.data(), end, result);
     if (parsed.ec == std::errc{} && parsed.ptr == end && std::isfinite(result)) {
         return result;
+    }
+    if (parsed.ec == std::errc::result_out_of_range && parsed.ptr == end) {
+        if (syntax_ == Syntax::benchmark || syntax_ == Syntax::checkpoint) {
+            const auto ranged = ranged_number(text);
+            if (ranged && (syntax_ == Syntax::checkpoint || *ranged == 0.0)) {
+                return *ranged;
+            }
+        }
+        throw NumberRangeError("Invalid JSON number");
     }
     fail("Invalid JSON number");
 }

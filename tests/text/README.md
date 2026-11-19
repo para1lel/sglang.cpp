@@ -35,18 +35,31 @@ UTF-8 scalar at both short budgets and requires U+FFFD on both public routes.
 
 ## Normal server entrypoint
 
-The integration runner starts the candidate and the graph parent on loopback.
-Build both Release trees with the managed Pixi environment. Set `candidate`
-and `parent` to their absolute source paths. Set `candidate_build` and
-`parent_build` to the corresponding directories containing `bin/` and `lib/`.
-Use Python 3.11 or newer and choose a fresh evidence directory for each run.
+The integration runner starts the candidate and the Unit 18 reference on
+loopback. Use commit `7a3b85164588173c0b9ba3aa97acf887b360c862` for the
+reference. Its tree is `d4c12ddb4f2f04d4ef0dd32cabedff486ff73502`, and it
+contains the LLVM-linked CPU helper used by the control.
+
+Run from the candidate source root in the managed Pixi `default` environment
+with Python 3.11 or newer. Point `parent` to an existing checkout of the
+reference commit. Build both Release servers and choose a fresh evidence
+directory for each run.
 
 ```bash
+candidate="$PWD"
+parent="${UNIT18_SOURCE:?Set UNIT18_SOURCE to the absolute Unit 18 source path}"
+test "$(git -C "$parent" rev-parse HEAD)" = 7a3b85164588173c0b9ba3aa97acf887b360c862
+candidate_build="$candidate/build/chat-release"
+parent_build="$parent/build/chat-release"
+xmake f -P "$candidate" -o "$candidate_build" -p linux -a x86_64 -m release
+xmake build -P "$candidate" sglang-server
+xmake f -P "$parent" -o "$parent_build" -p linux -a x86_64 -m release
+xmake build -P "$parent" sglang-server
 checkpoint=/data0/shared/Qwen3.8-27B-FP8
 out="$candidate_build/chat-evidence"
 mkdir -p "$out"
 bash tests/text/build_chat_cpu.sh "$candidate" "$candidate_build" "$out/candidate-cpu"
-bash tests/text/build_chat_cpu.sh "$parent" "$parent_build" "$out/parent-cpu"
+bash "$parent/tests/text/build_chat_cpu.sh" "$parent" "$parent_build" "$out/parent-cpu"
 CUDA_VISIBLE_DEVICES='' python3 -B tests/text/run_chat_layer1.py --mode cpu \
     --binary "$out/candidate-cpu" --control "$out/parent-cpu" \
     --checkpoint "$checkpoint" --output "$out/cpu"
@@ -54,9 +67,10 @@ CUDA_VISIBLE_DEVICES='' python3 -B tests/text/run_chat_layer1.py --mode cpu \
 
 The CPU link uses the production HTTP entrypoint, scheduler, JSON, and
 tokenizer. It replaces the decoder with deterministic token pieces and emits
-a link map. The reset case checks an incomplete UTF-8 scalar, cancellation
-before reuse of the same slot, and three peers that finish without changes
-to their streams.
+a link map. Build each control with its own checkout's helper so it uses the
+JSON dependency of that revision. The reset case checks an incomplete UTF-8
+scalar, cancellation before reuse of the same slot, and three peers that
+finish without changes to their streams.
 
 For the GPU run, hold the shared UUID lock on an idle B200. Build the graph
 observer from `tests/batch/graph_activity.cpp` with the CUDA toolkit and
@@ -72,8 +86,8 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved GPU UUID}" \
 ```
 
 Both runs check full prompt IDs, zero-token and nonempty responses, and raw
-and legacy response bodies before and after slot reuse and against the graph
-parent. The GPU run compares mixed widths two through four against isolated
+and legacy response bodies before and after slot reuse and against Unit 18.
+The GPU run compares mixed widths two through four against isolated
 requests and requires CUPTI device graph replays at each width. It checks
 continued replay when a cancelled chat is replaced while three legacy streams
 stay active. The same candidate binary serves serial MTP at depth four for

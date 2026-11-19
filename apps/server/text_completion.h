@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/decoder.h"
+#include "sglang/json.h"
 #include "sglang/server/completions.h"
 
 namespace sglang::server {
@@ -17,10 +18,11 @@ struct TextRequest {
 using TextGenerator = std::function<DecoderResult(const std::vector<int>&, const DecoderOptions&,
                                                    const DecoderCallbacks&)>;
 
-TextRequest parse_text_request(std::string_view body, const CompletionTokenizer& tokenizer);
+TextRequest parse_text_request(const json::Object& body, const CompletionTokenizer& tokenizer);
 TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer);
-void complete_text(const Socket& connection, std::string_view body,
+void append_ids(std::string& output, const int* ids, std::size_t count);
+void complete_text(const Socket& connection, const TextRequest& request,
                    const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                   bool trace_serial = false, bool chat = false);
+                   bool trace_serial);
 
 }

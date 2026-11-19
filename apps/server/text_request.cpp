@@ -175,13 +175,8 @@ const ChatTemplate& CompletionTokenizer::chat_template() const {
     return *chat_template_;
 }
 
-TextRequest parse_text_request(std::string_view body, const CompletionTokenizer& tokenizer) {
-    const auto parsed = parse_body(body, json::Syntax::strict);
-    const auto* object = parsed.object();
-    if (!object) {
-        bad_request("Expected a JSON object");
-    }
-    return parse_text(*object, tokenizer);
+TextRequest parse_text_request(const json::Object& body, const CompletionTokenizer& tokenizer) {
+    return parse_text(body, tokenizer);
 }
 
 TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer) {

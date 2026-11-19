@@ -14,6 +14,8 @@ curl --fail-with-body http://127.0.0.1:17384/v1/completions \
 
 The server generates one greedy completion. The prompt must contain 1 to 1,048,576 UTF-8 bytes. The encoded prompt length plus the output budget must fit 262,144 tokens. HTTP accepts up to 8 KiB of headers and 2 MiB of body. Invalid request options, malformed UTF-8, and invalid token limits return HTTP 400. Oversize headers return HTTP 431. Oversize bodies return HTTP 413. [Request parser](../apps/server/text_request.cpp#L99)<!-- prefix: "TextRequest " -->
 
+The server parses `/v1/completions` as strict JSON. It passes the parsed object to the selected route without parsing it again. After a numeric range error, it retries with signed-zero underflow enabled and accepts the result only for model `benchmark`. Raw prompts return HTTP 400 for malformed JSON, duplicate decoded keys, floating-point range errors, or nesting beyond 32 containers. [Dispatch](../apps/server/completions.cpp#L184)<!-- prefix: "void dispatc" -->
+
 | Field | Behavior |
 | --- | --- |
 | `max_tokens` | Nonnegative integer output budget, default 16. Zero loads the tokenizer and encodes the prompt without running generation. |
@@ -29,7 +31,25 @@ Tokenizer load occurs on the first text or chat request that reaches encoding. T
 
 Nonstreaming responses return `choices[0].text`, `finish_reason`, and usage. SSE sends `choices[0].text` deltas, a terminal choice, optional usage, and `[DONE]`. Join the text deltas in order. Usage counts encoded prompt IDs and committed output IDs. A matching stop ID counts as output and appears in diagnostic IDs. The writer omits its text and reports `stop`, including when it matches on the last allowed token. The writer reports `length` when the output budget is exhausted without a stop.
 
-The response decodes generated IDs into bytes. It skips special and unmapped IDs. The UTF-8 state belongs to the request and holds incomplete characters across tokens. Malformed output bytes produce U+FFFD. Normal completion flushes an incomplete tail as U+FFFD. Diagnostic SSE can carry an ID and empty text, or final UTF-8 text with zero IDs. A connection reset or failed write cancels that request and discards pending bytes. [Response writer](../apps/server/text_completion.cpp#L142)<!-- prefix: "bool TextRes" -->
+The response decodes generated IDs into bytes. It skips special and unmapped IDs. The UTF-8 state belongs to the request and holds incomplete characters across tokens. Malformed output bytes produce U+FFFD. Normal completion flushes an incomplete tail as U+FFFD. Diagnostic SSE can carry an ID and empty text, or final UTF-8 text with zero IDs. A connection reset or failed write cancels that request and discards pending bytes. [Response writer](../apps/server/text_completion.cpp#L143)<!-- prefix: "bool TextRes" -->
+
+## Run with bundled libraries
+
+Build the Linux Release server and generator with XMake and the managed Pixi toolchain. The tested x86-64 runtime uses bundled `libcudart.so.13`, `libstdc++.so.6`, and `libgcc_s.so.1`. The host provides glibc and compatible NVIDIA driver libraries. Provide the checkpoint separately.
+
+Set `BUNDLE` to the directory with the executables in `bin/` and libraries in `lib/`. Set `CUDA_COMPAT` to the compatibility library directory if the host requires it. The binaries retain build `DT_RPATH`. Use the host loader to bypass it for the isolation check.
+
+```bash
+loader=/lib64/ld-linux-x86-64.so.2
+libraries="${BUNDLE:?set the bundle directory}/lib${CUDA_COMPAT:+:$CUDA_COMPAT}"
+for program in sglang-server sglang-generate; do
+    readelf -d "$BUNDLE/bin/$program"
+    "$loader" --inhibit-rpath '' --library-path "$libraries" --list "$BUNDLE/bin/$program"
+    "$loader" --inhibit-rpath '' --library-path "$libraries" "$BUNDLE/bin/$program" --help
+done
+```
+
+Check that both programs resolve without LLVM or Pixi paths. Use the same loader options with the usual server or generator arguments.
 
 ## Tokenizer assets
 

@@ -21,7 +21,7 @@ struct WideInteger {
     std::string digits;
 };
 
-enum class Syntax { strict, ordered };
+enum class Syntax { strict, ordered, benchmark, checkpoint };
 
 class Value {
 public:
@@ -38,6 +38,7 @@ public:
     Value(OrderedObject value) : data_(std::move(value)) {}
     Value(WideInteger value) : data_(std::move(value)) {}
 
+    Object* object() { return std::get_if<Object>(&data_); }
     const Object* object() const { return std::get_if<Object>(&data_); }
     const OrderedObject* ordered_object() const { return std::get_if<OrderedObject>(&data_); }
     const Array* array() const { return std::get_if<Array>(&data_); }
@@ -57,6 +58,11 @@ private:
 class ParseError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
+};
+
+class NumberRangeError : public ParseError {
+public:
+    using ParseError::ParseError;
 };
 
 Value parse(std::string_view input);

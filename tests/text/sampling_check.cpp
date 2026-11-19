@@ -72,7 +72,8 @@ Law probabilities(const std::vector<__nv_bfloat16>& encoded, SamplingParameters 
     long double retained = 0;
     auto last = ranked.begin();
     for (; last != ranked.end() && last - ranked.begin() < options.top_k; ++last) {
-        if (options.top_p < 1 && retained > total * options.top_p) {
+        if ((options.top_p < 1 && retained > total * options.top_p) ||
+            last->second < options.min_p) {
             break;
         }
         retained += last->second;
@@ -132,6 +133,10 @@ void check_kernel() {
     check_law("warm", {0, 2, -1, 1, -inf, 0}, {2.5, 0.9, 5, 93});
     check_law("equal prefix cutoff", {-0.0f, -inf, 0, 0, 0}, {1, 0.5, 3, 178});
     check_law("below equal prefix cutoff", {-0.0f, -inf, 0, 0, 0}, {1, 0.499, 3, 178});
+    check_law("minimum mass", {0, 1, -2, 0, -inf}, {1, 0.99, 4, 840, 0.3});
+    check_law("minimum mass and nucleus", {0, 2, 1, 0, -inf}, {2, 0.6, 3, 841, 0.5});
+    check_law("minimum mass tied peak", {0, 1, 1, 0}, {1, 1, 4, 842, 1});
+    check_law("negative BF16 score keys", {-300, -299, -298, -298}, {1, 1, 4, 843, 0.5});
     std::vector<float> stripes(248320, -inf);
     for (const int token : {31, 32, 2047, 2048, 248319}) {
         stripes[token] = 1;
@@ -167,7 +172,7 @@ void validation(const Decoder& decoder, DecoderOptions options) {
         throw std::runtime_error("invalid direct request accepted");
     };
     auto rejected = options;
-    rejected.mtp_steps = 1;
+    rejected.mtp_steps = sglang::decoder_max_mtp_steps + 1;
     invalid(rejected);
     rejected = options;
     rejected.temperature = std::numeric_limits<double>::quiet_NaN();
@@ -180,12 +185,19 @@ void validation(const Decoder& decoder, DecoderOptions options) {
     rejected = options;
     rejected.top_k = 0;
     invalid(rejected);
+    rejected = options;
+    rejected.min_p = std::numeric_limits<double>::quiet_NaN();
+    invalid(rejected);
 }
 
 struct Lane {
     int slot;
     DecoderOptions options;
     std::vector<int> tokens{};
+    int accepted = 0;
+    int drafted = 0;
+    int replayed = 0;
+    int boundaries = 0;
 };
 
 std::pair<std::uint32_t, int> drain(DecoderBatch& batch, std::vector<Lane>& lanes) {
@@ -213,6 +225,10 @@ std::pair<std::uint32_t, int> drain(DecoderBatch& batch, std::vector<Lane>& lane
             }
             lane.tokens.insert(lane.tokens.end(), step.extra_tokens.begin(),
                                step.extra_tokens.begin() + step.extra_token_count);
+            lane.accepted += step.mtp_accepted_tokens;
+            lane.drafted += step.mtp_drafted_tokens;
+            lane.replayed += step.mtp_replayed_rows;
+            lane.boundaries += step.mtp_boundary;
             if (step.finish_reason) {
                 require(*step.finish_reason == DecoderFinishReason::length,
                         "unexpected batch finish reason");
@@ -223,6 +239,84 @@ std::pair<std::uint32_t, int> drain(DecoderBatch& batch, std::vector<Lane>& lane
     require(batch.available() && batch.request_device_allocation_bytes() == 0,
             "batch retained a retired request");
     return {graph_slots, verification};
+}
+
+void check_sampled_mtp(const Decoder& decoder, DecoderOptions sampled) {
+    std::vector<Lane> lanes;
+    std::vector<std::vector<int>> expected;
+    sampled.top_logits = 8;
+    for (int depth = 1; depth <= 4; ++depth) {
+        sampled.seed = -100 + depth;
+        sampled.max_new_tokens = 6 + depth * 3;
+        sampled.min_p = depth % 2 ? 0.04 : 0.0;
+        const auto control = decoder.generate(prompt, sampled);
+        auto options = sampled;
+        options.mtp_steps = depth;
+        const auto candidate = decoder.generate(prompt, options);
+        require(candidate.output_token_ids == control.output_token_ids &&
+                    candidate.finish_reason == control.finish_reason,
+                "serial sampled MTP changed the K0 trace");
+        require(candidate.step_top_logits.size() == control.step_top_logits.size(),
+                "serial sampled MTP changed the logit row count");
+        for (std::size_t row = 0; row < control.step_top_logits.size(); ++row) {
+            const auto& reference = control.step_top_logits[row];
+            const auto& verified = candidate.step_top_logits[row];
+            require(std::equal(reference.begin(), reference.end(), verified.begin(), verified.end(),
+                               [](const auto& first, const auto& second) {
+                                   return first.token_id == second.token_id &&
+                                          first.logit == second.logit;
+                               }), "serial sampled MTP changed ordered BF16 top logits");
+        }
+        require(candidate.mtp_drafted_tokens > 0, "serial sampled MTP did not draft");
+        options.top_logits = 0;
+        lanes.push_back({depth - 1, options});
+        expected.push_back(control.output_token_ids);
+    }
+    DecoderBatch batch(decoder, {true, 4});
+    const auto mixed = drain(batch, lanes);
+    require(mixed.second > 0, "heterogeneous sampled MTP batch did not verify");
+    int replayed = 0;
+    for (std::size_t index = 0; index < lanes.size(); ++index) {
+        const auto& lane = lanes[index];
+        require(lane.tokens == expected[index] && lane.drafted > 0,
+                "heterogeneous sampled MTP changed a K0 trace");
+        replayed += lane.replayed;
+        std::cout << "sampled K" << lane.options.mtp_steps << " drafted=" << lane.drafted
+                  << " accepted=" << lane.accepted << " replayed=" << lane.replayed
+                  << " boundary=" << lane.boundaries << '\n';
+    }
+    require(replayed > 0, "heterogeneous fixture did not exercise target rollback");
+
+    auto stopped = lanes.back().options;
+    stopped.stop_token_id = expected.back()[2];
+    const auto candidate_stop = decoder.generate(prompt, stopped);
+    stopped.mtp_steps = 0;
+    const auto control_stop = decoder.generate(prompt, stopped);
+    require(candidate_stop.finish_reason == DecoderFinishReason::stop &&
+                candidate_stop.output_token_ids == control_stop.output_token_ids,
+            "sampled MTP changed stop behavior");
+
+    auto cancelled = lanes.back().options;
+    int emitted = 0;
+    sglang::DecoderCallbacks callbacks;
+    callbacks.on_token = [&](int) { return ++emitted < 3; };
+    const auto partial = decoder.generate(prompt, cancelled, callbacks);
+    require(partial.finish_reason == DecoderFinishReason::cancelled &&
+                partial.output_token_ids.size() == 3 &&
+                std::equal(partial.output_token_ids.begin(), partial.output_token_ids.end(),
+                           expected.back().begin()), "sampled MTP changed cancellation prefix");
+    batch.admit(3, prompt, cancelled);
+    std::array<bool, sglang::decoder_batch_max_lanes> active{};
+    active[3] = true;
+    const auto first = batch.advance_chunked(active);
+    require(first[3].token == expected.back().front(), "sampled MTP prefill stream changed");
+    const auto draft = batch.advance_chunked(active);
+    require(draft[3].mtp_drafted_tokens > 0, "cancel fixture did not verify");
+    batch.cancel(3);
+    require(batch.request_device_allocation_bytes() == 0, "cancel retained sampled MTP state");
+    lanes = {{3, cancelled}};
+    drain(batch, lanes);
+    require(lanes[0].tokens == expected.back(), "re-admission changed the sample stream");
 }
 
 void check_decoder(const char* checkpoint) {
@@ -289,6 +383,7 @@ void check_decoder(const char* checkpoint) {
             "serial cancellation changed the first sample");
     require(generate(decoder, sampled) == wanted, "serial seed leaked across cancellation");
     std::cout << "decoder: eager, graph, mixed MTP, slot reassignment, and cleanup passed\n";
+    check_sampled_mtp(decoder, sampled);
 }
 
 }

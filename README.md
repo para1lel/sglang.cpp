@@ -7,7 +7,7 @@ and carries Gated DeltaNet state through the other 48 layers. Prefill and the fi
 token selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L91)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L92)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
@@ -108,10 +108,10 @@ The selection applies to the model for its lifetime. For C++, pass
 `sglang::Fp8PrefillPolicy::tensor_core` as the fourth argument to
 `Decoder(checkpoint, device, enable_mtp, policy)`.
 
-Pass `--mtp-steps 1` through `--mtp-steps 4` to enable greedy multi-token prediction
-(MTP). The generator reports `mtp_drafted_tokens`, `mtp_accepted_tokens`, and
+Pass `--mtp-steps 1` through `--mtp-steps 4` to enable multi-token prediction
+(MTP) for text generation. The generator reports `mtp_drafted_tokens`, `mtp_accepted_tokens`, and
 `mtp_rounds` for the first measured request. Accepted tokens count emitted proposals
-that match the target. Corrections, bonus tokens, and the first greedy token are
+that match the target. Corrections, bonus tokens, and the first token are
 excluded from that count. Zero steps selects the default decoder.
 
 MTP prefill processes up to 128 prompt positions per layer using exact FP8 projections
@@ -119,9 +119,9 @@ with either prefill policy. Each final-normalized target row with a following pr
 token seeds the draft KV cache with that token ID, including across chunk boundaries.
 A one-token prompt or an unavailable prefill workspace uses the one-row path.
 
-During verification, each target layer processes up to five positions per round,
-with one synchronization to read the winners and any requested logits. The verifier
-accepts matches in order and emits the target correction at the first mismatch.
+During verification, each target layer processes up to five positions per round.
+The verifier compares proposals with the target's greedy selections or seeded draws,
+accepts matches in order, and emits the target correction at the first mismatch.
 If all proposals match, it can emit a bonus token within the stop rule and budget.
 
 Target KV follows the committed prefix. The verifier retains one additional
@@ -159,7 +159,8 @@ allocation runs out of memory, steps that need it use eager decode. Other decode
 widths and mixed decode and prefill steps run eagerly.
 
 The default `--mtp-steps 0` selects target-only decoding. Set `--mtp-steps 1` through
-`--mtp-steps 4` at any `--max-active` value from `1` through `4` to enable MTP for unconstrained greedy requests.
+`--mtp-steps 4` at any `--max-active` value from `1` through `4` to enable MTP for
+unconstrained greedy and sampled text requests.
 Batched requests share target projections and commit their outputs independently.
 Steps that contain an MTP lane run eagerly, including when `--batch-cuda-graphs` is set.
 Values of `--max-active` above `4` require `--mtp-steps 0`. SSE events and usage
@@ -235,15 +236,17 @@ Set `top_p` in `(0, 1]` to limit the nucleus. The default is `1`.
 Set `top_k` to a positive integer to limit the number of candidates.
 The server caps positive values at the vocabulary size.
 The default `-1` lets top-p act on the full vocabulary.
+Set `min_p` in `[0, 1]` to retain candidates with at least that fraction of the
+largest probability. The default `0` disables this cutoff.
 
 Pass a signed 64-bit integer `seed` to repeat the draws for the same logits.
 When you omit `seed`, the decoder selects one seed for the request.
-Sampled requests use target-only decoding. Unconstrained greedy requests can still use MTP in the same batch.
-The generator command and the token-ID benchmark use greedy selection.
+Unconstrained sampled text requests use the configured MTP depth.
+The generator accepts `--temperature`, `--top-p`, `--top-k`, `--min-p`, and `--seed`.
+The token-ID benchmark uses greedy selection.
 
 C++ callers set the same fields in
 [`DecoderOptions`](include/sglang/decoder.h#L24)<!-- prefix: "struct Decod" -->.
-Set `mtp_steps` to `0` for sampled C++ requests.
 See the [sampling contract](docs/text-serving.md#sampling) for dispatch and seed behavior.
 
 ### Choose from fixed outputs

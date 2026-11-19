@@ -251,12 +251,16 @@ def check_cli_policy(args):
     cases = {}
     for name, binary, flags in (("generate", args.generate, ["--prompt-ids", "17"]),
                                 ("server", args.server, ["--max-active", "2"])):
-        unknown = "Unknown option" if name == "generate" else "Invalid argument"
+        sampling = (
+            (("seed", ["--seed", "9223372036854775808"], "Invalid number for --seed"),
+             ("temperature", ["--temperature", "-1"], "Expected finite --temperature >= 0"))
+            if name == "generate" else
+            (("seed", ["--seed", "1"], "Invalid argument --seed"),
+             ("temperature", ["--temperature", "1"], "Invalid argument --temperature"))
+        )
         validations = (
             ("depth", ["--mtp-steps", "5"], "Expected --mtp-steps in [0, 4]"),
-            ("seed", ["--mtp-steps", "4", "--seed", "1"], f"{unknown} --seed"),
-            ("temperature", ["--mtp-steps", "4", "--temperature", "1"],
-             f"{unknown} --temperature"),
+            *sampling,
         )
         for label, options, diagnostic in validations:
             command = [str(binary), *flags, *options]

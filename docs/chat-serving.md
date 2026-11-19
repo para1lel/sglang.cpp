@@ -12,7 +12,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L127)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L291)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L127)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L298)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
 | Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L339)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L28)<!-- prefix: "DecoderResul" --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L162)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L177)<!-- prefix: "void TextRes" --> |
@@ -53,7 +53,7 @@ With `return_token_ids: true`, each committed ID appears once in `token_ids`, ev
 | --- | --- |
 | `max_tokens`, `max_completion_tokens` | Use at most one. Each sets a nonnegative integer budget. The default is 16. |
 | `n` | Omit or set to `1`. |
-| `temperature`, `top_p`, `top_k`, `seed` | Use the [shared sampling controls](text-serving.md#sampling). |
+| `temperature`, `top_p`, `top_k`, `min_p`, `seed` | Use the [shared sampling controls](text-serving.md#sampling). |
 | `ebnf` | Use a [finite-choice constraint](text-serving.md#finite-choice-constraints) for the generated content. |
 | `cache_salt` | Optional [prefix cache key](prefix-cache.md#runtime-path) component. |
 | `stream`, `return_token_ids`, `ignore_eos`, `stop_token_ids` | Use the [shared text options](text-serving.md#send-a-request). |
@@ -66,7 +66,7 @@ The rendered prompt and its output budget share the 262,144-token context. The r
 
 The first request that reaches rendering loads the pinned `tokenizer_config.json` and `chat_template.jinja` from the checkpoint directory. A missing, unreadable, or mismatched chat asset returns HTTP 500 before output starts. Later chat requests retry a failed load. Raw text can still load `tokenizer.json` independently. The benchmark ID route requires neither tokenizer nor chat assets.
 
-Chat and completion routes share the [serving limits](development.md#native-streaming-server) and [batch graph eligibility](batch-graphs.md). Unconstrained greedy chat can use the configured [MTP depth](mtp.md). Sampled and constrained chat use K0.
+Chat and completion routes share the [serving limits](development.md#native-streaming-server) and [batch graph eligibility](batch-graphs.md). Unconstrained text-only chat can use the configured [MTP depth](mtp.md). Constrained and media chat use K0.
 
 A reset or failed write cancels the request and discards its pending UTF-8 bytes. In batch mode, the server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream. [Request lifecycle](../apps/server/text_completion.cpp#L213)<!-- prefix: "void complet" -->
 

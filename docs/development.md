@@ -98,9 +98,9 @@ The [tiled scale check](../tests/mxfp8_gqa_check.cu#L793)<!-- prefix: "void chec
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L234)<!-- prefix: "int main(int" --> |
+| `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L281)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L91)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L401)<!-- prefix: "void Decoder" --> |
+| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L92)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L401)<!-- prefix: "void Decoder" --> |
 
 Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L88)<!-- prefix: "target(\"sgla" -->
 
@@ -108,11 +108,11 @@ Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves histo
 
 The decoder validates tensor names, dtypes, and shapes before upload. Upload retains mappings and allocations until completion. Deferred cleanup retains shared weights. FP8 projections quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L98)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L210)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L165)<!-- prefix: "__global__ v" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L498)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L561)<!-- prefix: "void Request" -->
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L506)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L561)<!-- prefix: "void Request" -->
 
 Prefill processes tiles in token order. The last row supplies initial logits. [Serial tile selection](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 decode defaults to graph replay. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L417)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L370)<!-- prefix: "void Decoder" -->
 
-Both binaries accept `--fp8-prefill exact|tensor-core`. C++ callers pass `Fp8PrefillPolicy` as the fourth `Decoder` constructor argument. Default `exact` preserves SIMT row arithmetic. Tensor-core arithmetic can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L86)<!-- prefix: "enum class F" -->
+Both binaries accept `--fp8-prefill exact|tensor-core`. C++ callers pass `Fp8PrefillPolicy` as the fourth `Decoder` constructor argument. Default `exact` preserves SIMT row arithmetic. Tensor-core arithmetic can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L87)<!-- prefix: "enum class F" -->
 
 Tensor-core projections require K0, at least three rows, 128-divisible input width, and contiguous, 16-byte-aligned E4M3 payloads. The `sm_100a` build uses TMA, TMEM, and `tcgen05` PTX. Dispatch requires capability 10.0, a matching image, enough opt-in shared memory, and tensor-map support. Ineligible calls use SIMT. Invalid arguments and execution errors propagate. [Projection](../src/decoder_prefill.cpp#L313)<!-- prefix: "void Prefill" --> · [Eligibility](../src/prefill_fp8_sm100.cu#L467)<!-- prefix: "const int ma" --> · [Build](../xmake.lua#L63)<!-- prefix: "target(\"sgla" -->
 
@@ -126,7 +126,7 @@ Other target prefill and draft decode use direct attention. Eager target decode,
 
 The lane stream orders KV append, scoring, replay, and gating. The logits allocation holds 24 FP32 scores per inline position, up to 5,120 slots. Eligible [batch graphs](batch-graphs.md) bind request-owned scores at later positions. Exact graphs read device positions. [Workspace](../src/decoder_resources.cpp#L504)<!-- prefix: "ExactGqaWork" -->
 
-Tuned FP8 projections require one target decode row in the forward group. This includes serial graphs, lone ordinary eager decode, and single-row verification. GQA combines Q/gate, K, and V. The MLP fusion rounds gate and up to BF16 before SwiGLU. GDN QKV and Z stay separate. [Lane selection](../src/decoder_forward.cpp#L50)<!-- prefix: "bool single_" --> · [Batch packing](../src/decoder_batch.cpp#L474)<!-- prefix: "if (rows[slo" -->
+Tuned FP8 projections require one target decode row in the forward group. This includes serial graphs, lone ordinary eager decode, and single-row verification. GQA combines Q/gate, K, and V. The MLP fusion rounds gate and up to BF16 before SwiGLU. GDN QKV and Z stay separate. [Lane selection](../src/decoder_forward.cpp#L50)<!-- prefix: "bool single_" --> · [Batch packing](../src/decoder_batch.cpp#L481)<!-- prefix: "if (rows[slo" -->
 
 Tuned GEMV requires 16-byte-aligned FP8 weights and activations and input widths of 5,120, 6,144, or 17,408. Both fusions require the same alignment and width 5,120. Q/gate, K, and V require 12,288, 1,024, and 1,024 output rows. Gate and up require 17,408 each. Other valid inputs use separate operations. Output spans must be disjoint from inputs and each other. Fused SwiGLU permits identical gate and up spans. [Tuned GEMV](../src/text_decode_fp8.cu#L276)<!-- prefix: "cudaError_t " --> · [Fused QKV](../src/text_decode_fp8.cu#L298)<!-- prefix: "cudaError_t " --> · [Fused SwiGLU](../src/text_decode_fp8.cu#L321)<!-- prefix: "cudaError_t " --> · [Buffers](../include/sglang/decoder_cuda.cuh#L98)<!-- prefix: "// Read-only" -->
 
@@ -142,15 +142,15 @@ Combined GDN gates need matching 48-by-5,120 shapes. After the initial score, se
 
 Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decimal IDs with commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus budget must fit 262,144 tokens. The default budget is one. Zero budget returns no tokens and `length`. [CLI options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L64)<!-- prefix: "void validat" -->
 
-The CLI selects the highest BF16 logit and breaks ties by lowest ID. `--stop-token` emits a match and returns `stop`, even at the budget. Exhaustion returns `length`. The CLI applies no implicit EOS. Failures print to stderr and exit 1. C++ and HTTP support [sampling](text-serving.md#sampling) and [constraints](text-serving.md#finite-choice-constraints). [Greedy selection](../src/text_ops.cu#L467)<!-- prefix: "__device__ T" -->
+The CLI defaults to greedy selection, with ties going to the lowest ID. `--stop-token` emits a match and returns `stop`, even at the budget. Exhaustion returns `length`. There is no implicit EOS. Failures print to stderr and exit 1. See [sampling](text-serving.md#sampling) and [C++ and HTTP constraints](text-serving.md#finite-choice-constraints). [Greedy selection](../src/text_ops.cu#L467)<!-- prefix: "__device__ T" -->
 
 The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/decoder_resources.cpp#L115)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L321)<!-- prefix: "Allocations:" -->
 
 Private CUDA pools separate workspaces at or below 128 rows from larger ones. One pool per device and class can set a release threshold. The thresholds are 32 MiB and 512 MiB respectively. Other pools use CUDA defaults. [Retention](../src/decoder_prefill.cpp#L43)<!-- prefix: "void configu" -->
 
-Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L604)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L316)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L344)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L399)<!-- prefix: "cudaError_t " -->
+Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L612)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L323)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L344)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L399)<!-- prefix: "cudaError_t " -->
 
-`--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L200)<!-- prefix: "void write_r" -->
+`--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" -->
 
 #### Verification
 
@@ -176,7 +176,7 @@ Historical diagnostics use the [FP8 prompt](../benchmarks/vllm/small-fp8.json#L2
 
 Run the [CPU and B200 prefill checks](../tests/prefill/README.md) in exact mode. Match the row-wise oracle and check chunk boundaries, mixed steps, reset, and slot reuse. Use the [tensor-core comparison](performance.md#fp8-tensor-core-prefill) for the opt-in mode.
 
-#### Greedy MTP
+#### Native MTP
 
 See [MTP](mtp.md) for exact tiled seeding, serial and joint target verification, and per-lane rollback. [Verify MTP](mtp.md#verification) before timing.
 
@@ -186,7 +186,7 @@ Follow the [server launch procedure](../README.md#serve-token-ids-over-http). Th
 
 Serial K0 defaults to graph replay. `--eager` requires width one and K0. Batch with `--max-active 2` through `32`, or enable prefix reuse at width one. Above four, use K0. Batch replay is [opt-in](batch-graphs.md). With reuse off, extra connections wait in the listener backlog. Reuse enables a [completion queue and control routes](prefix-cache.md#native-http-controls). `DecoderBatchOptions::max_lanes` defaults to four. [CLI limits](../apps/sglang-server.cpp#L75)<!-- prefix: "} else if (o" --> · [Socket workers](../apps/sglang-server.cpp#L153)<!-- prefix: "void serve_b" --> · [Batch options](../include/sglang/decoder_batch.h#L43)<!-- prefix: "struct Decod" -->
 
-Lanes share weights and own KV, GDN state, and outputs. Positive budgets reserve KV for prompt length plus budget minus one. Prefill and one row per ready decode lane share 128 positions. MTP computes verification rows separately. Through capacity four, prefill starts with one row per ready lane. Above four, decode goes first and prefill priority rotates. Deferred lanes retain position. Decode and single-row prefill share a packed forward. Larger chunks share scratch. `advance` allows one prefill row per lane. [Admission](../src/decoder_batch.cpp#L292)<!-- prefix: "int DecoderB" --> · [Plan selection](../src/decoder_batch.cpp#L616)<!-- prefix: "current.pref" --> · [Submission](../src/decoder_batch.cpp#L442)<!-- prefix: "void Decoder" -->
+Lanes share weights and own KV, GDN state, and outputs. Positive budgets reserve KV for prompt length plus budget minus one. Prefill and one row per ready decode lane share 128 positions. MTP computes verification rows separately. Through capacity four, prefill starts with one row per ready lane. Above four, decode goes first and prefill priority rotates. Deferred lanes retain position. Decode and single-row prefill share a packed forward. Larger chunks share scratch. `advance` allows one prefill row per lane. [Admission](../src/decoder_batch.cpp#L299)<!-- prefix: "int DecoderB" --> · [Plan selection](../src/decoder_batch.cpp#L637)<!-- prefix: "current.pref" --> · [Submission](../src/decoder_batch.cpp#L449)<!-- prefix: "void Decoder" -->
 
 `--trace-batches` reports selected `width`, `decode` lanes, and post-step `request_bytes`. `prefill_rows` lists configured slots in order with at least four entries. K0 servers report `peak_request_bytes` on active steps. [Trace](../apps/server/batch_service.cpp#L361)<!-- prefix: "if (trace) {" --> · [Batch scratch](batch-graphs.md#runtime-path) · [MTP counters](performance.md#native-mtp)
 

@@ -80,6 +80,9 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     if (!(options.top_p > 0 && options.top_p <= 1)) {
         throw std::invalid_argument("top_p must be in (0, 1]");
     }
+    if (!(options.min_p >= 0 && options.min_p <= 1)) {
+        throw std::invalid_argument("min_p must be in [0, 1]");
+    }
     if (options.top_k != -1 && options.top_k < 1) {
         throw std::invalid_argument("top_k must be -1 or at least 1");
     }
@@ -87,9 +90,6 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
         throw std::invalid_argument("MTP proposal count must be in [0, 4]");
     }
     validate_constraint(options);
-    if (options.samples() && options.mtp_steps != 0) {
-        throw std::invalid_argument("Sampling requires mtp_steps=0");
-    }
     if (!allow_mtp && options.mtp_steps != 0) {
         throw std::invalid_argument("MTP requires serial generation");
     }
@@ -110,7 +110,7 @@ SamplingParameters request_sampling(const DecoderOptions& options) {
     }
     const int top_k = options.top_k == -1 ? vocab_size
         : static_cast<int>(std::min<std::int64_t>(options.top_k, vocab_size));
-    return {options.temperature, options.top_p, top_k, seed};
+    return {options.temperature, options.top_p, top_k, seed, options.min_p};
 }
 
 void copy_token(Request& request, const Workspace& work, cudaStream_t stream) {
@@ -225,6 +225,7 @@ struct Decoder::Model::MtpGeneration {
     const DecoderOptions& options;
     const DecoderCallbacks& callbacks;
     DecoderResult& result;
+    std::optional<SamplingParameters> sampling;
     std::vector<DecoderLogit> ranking{};
     int next_target_position = 0;
     int seed = -1;
@@ -263,7 +264,7 @@ struct Decoder::Model::MtpGeneration {
         const Bf16* hidden = target.work.normalized;
         int shifted_token = seed;
         tokens.front() = seed;
-        ++result.mtp_rounds;
+        result.mtp_rounds += count > 0;
         for (int index = 0; index < count; ++index) {
             if (cancelled()) {
                 return false;
@@ -286,7 +287,7 @@ struct Decoder::Model::MtpGeneration {
                 return DecoderFinishReason::cancelled;
             }
             ++processed;
-            const int token = verification.winner(index);
+            const int token = verification.winner(index, sampling.has_value());
             const bool accepted = index < count && token == tokens[index + 1];
             if (const auto finish = emit(token, verification.logits(index), accepted)) {
                 return finish;
@@ -303,13 +304,19 @@ struct Decoder::Model::MtpGeneration {
     std::optional<DecoderFinishReason> verify(TargetVerification& verification,
                                               const VerificationTokens& tokens, int count,
                                               int remaining) {
-        draft.rewind(next_target_position);
+        if (count > 0) {
+            draft.rewind(next_target_position);
+        }
         if (cancelled()) {
             return DecoderFinishReason::cancelled;
         }
         const auto stream = target.memory.stream();
         const int rows = std::min(remaining, count + 1);
         model.forward_verify(verification, next_target_position, tokens.data(), rows, stream);
+        if (sampling) {
+            verification.sample(*sampling, static_cast<int>(result.output_token_ids.size()),
+                                target.sampling_workspace);
+        }
         verification.read();
         int processed = 0;
         const auto finish = consume(verification, tokens, rows, count, processed);
@@ -359,7 +366,7 @@ struct Decoder::Model::MtpGeneration {
             return DecoderFinishReason::cancelled;
         }
         model.compute_logits(target);
-        const int token = read_step(target);
+        const int token = read_step(target, sampling);
         if (const auto finish = emit(token, target.memory.transfers().logits.data())) {
             return *finish;
         }
@@ -374,7 +381,7 @@ struct Decoder::Model::MtpGeneration {
         while (!cancelled()) {
             const int remaining = options.max_new_tokens -
                                   static_cast<int>(result.output_token_ids.size());
-            const int count = std::min(remaining, options.mtp_steps);
+            const int count = std::min(remaining - (sampling ? 1 : 0), options.mtp_steps);
             VerificationTokens tokens{};
             if (!propose(tokens, count)) {
                 break;
@@ -425,11 +432,12 @@ DecoderFinishReason Decoder::Model::generate_mtp(const std::vector<int>& prompt,
     const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
     const auto draft = std::make_shared<MtpDraftRequest>(mtp_weights, capacity);
     Request target(device, capacity, draft);
-    target.reset();
-    target.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
+    prepare_serial_request(target, options);
     result.peak_device_allocation_bytes +=
         target.memory.bytes() + draft->device_allocation_bytes();
-    MtpGeneration generation{*this, target, *draft, options, callbacks, result};
+    const auto sampling = options.samples() ? std::optional{request_sampling(options)}
+                                            : std::nullopt;
+    MtpGeneration generation{*this, target, *draft, options, callbacks, result, sampling};
     if (options.top_logits > 0) {
         generation.ranking.reserve(vocab_size);
     }

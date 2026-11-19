@@ -12,6 +12,7 @@ struct SamplingParameters {
     double top_p;
     int top_k;
     std::uint64_t seed;
+    double min_p = 0.0;
 };
 
 SamplingParameters request_sampling(const DecoderOptions& options);

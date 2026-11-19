@@ -35,6 +35,8 @@ void usage(std::ostream& output) {
     output << "Usage: sglang-generate (--prompt-ids ID,ID,... | --prompt-file FILE)\n"
            << "                       [--max-new-tokens N] [--stop-token ID] [--top-logits N]\n"
            << "                       [--mtp-steps N] (0–4, default 0)\n"
+           << "                       [--temperature T] [--top-p P] [--top-k K]\n"
+           << "                       [--min-p P] [--seed INTEGER]\n"
            << "                       [--fp8-prefill exact|tensor-core]\n"
            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
@@ -50,6 +52,47 @@ int positive_or_zero(std::string_view input, std::string_view option) {
         throw std::invalid_argument("Expected a nonnegative integer for " + std::string(option));
     }
     return value;
+}
+
+template <typename Number>
+Number number(std::string_view input, std::string_view option) {
+    Number value{};
+    const auto* end = input.data() + input.size();
+    const auto result = std::from_chars(input.data(), end, value);
+    if (result.ec != std::errc{} || result.ptr != end) {
+        throw std::invalid_argument("Invalid number for " + std::string(option));
+    }
+    return value;
+}
+
+bool parse_sampling(std::string_view option, std::string_view value,
+                    sglang::DecoderOptions& options) {
+    if (option == "--temperature") {
+        options.temperature = number<double>(value, option);
+        if (!std::isfinite(options.temperature) || options.temperature < 0) {
+            throw std::invalid_argument("Expected finite --temperature >= 0");
+        }
+    } else if (option == "--top-p") {
+        options.top_p = number<double>(value, option);
+        if (!(options.top_p > 0 && options.top_p <= 1)) {
+            throw std::invalid_argument("Expected --top-p in (0, 1]");
+        }
+    } else if (option == "--top-k") {
+        options.top_k = number<std::int64_t>(value, option);
+        if (options.top_k != -1 && options.top_k < 1) {
+            throw std::invalid_argument("Expected --top-k of -1 or at least 1");
+        }
+    } else if (option == "--min-p") {
+        options.min_p = number<double>(value, option);
+        if (!(options.min_p >= 0 && options.min_p <= 1)) {
+            throw std::invalid_argument("Expected --min-p in [0, 1]");
+        }
+    } else if (option == "--seed") {
+        options.seed = number<std::int64_t>(value, option);
+    } else {
+        return false;
+    }
+    return true;
 }
 
 std::vector<int> parse_ids(std::string_view input) {
@@ -120,7 +163,7 @@ Arguments parse_arguments(int argc, char** argv) {
             arguments.repeats = positive_or_zero(value, option);
         } else if (option == "--device") {
             arguments.device = positive_or_zero(value, option);
-        } else {
+        } else if (!parse_sampling(option, value, arguments.options)) {
             throw std::invalid_argument("Unknown option " + std::string(option));
         }
     }
@@ -171,11 +214,13 @@ struct Measurements {
     sglang::DecoderResult result;
     std::vector<double> samples;
     std::size_t peak_bytes = 0;
+    std::size_t output_tokens = 0;
     double elapsed_ms = 0;
 };
 
 Measurements measure(const sglang::Decoder& decoder, const Arguments& arguments) {
     Measurements measured;
+    const bool repeatable = !arguments.options.samples() || arguments.options.seed.has_value();
     for (int index = 0; index < arguments.warmup; ++index) {
         const auto result = decoder.generate(arguments.prompt, arguments.options);
         measured.peak_bytes = std::max(measured.peak_bytes, result.peak_device_allocation_bytes);
@@ -186,12 +231,14 @@ Measurements measure(const sglang::Decoder& decoder, const Arguments& arguments)
         const double elapsed = milliseconds(Clock::now() - start);
         measured.samples.push_back(elapsed);
         measured.elapsed_ms += elapsed;
+        measured.output_tokens += result.output_token_ids.size();
         measured.peak_bytes = std::max(measured.peak_bytes, result.peak_device_allocation_bytes);
         if (index == 0) {
             measured.result = std::move(result);
-        } else if (result.output_token_ids != measured.result.output_token_ids ||
-                   result.finish_reason != measured.result.finish_reason) {
-            throw std::runtime_error("Greedy output changed between measured requests");
+        } else if (repeatable &&
+                   (result.output_token_ids != measured.result.output_token_ids ||
+                    result.finish_reason != measured.result.finish_reason)) {
+            throw std::runtime_error("Output changed between identical seeded or greedy requests");
         }
     }
     return measured;
@@ -202,7 +249,7 @@ void write_result(const Arguments& arguments, const Measurements& measured,
     const auto& result = measured.result;
     const bool stopped = result.finish_reason == sglang::DecoderFinishReason::stop;
     const double rate = measured.elapsed_ms == 0 ? 0 :
-        result.output_token_ids.size() * (1000.0 * arguments.repeats / measured.elapsed_ms);
+        measured.output_tokens * (1000.0 / measured.elapsed_ms);
     auto& output = std::cout;
     output.imbue(std::locale::classic());
     output << std::setprecision(12);

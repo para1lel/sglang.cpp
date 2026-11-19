@@ -67,7 +67,13 @@ struct Lane {
         draft->rewind(position);
         int consumed = 0;
         for (int index = 0; index < rows; ++index) {
-            const int token = verification->winner(index);
+            int token;
+            try {
+                token = verification->winner(index, sampling.has_value());
+            } catch (const DecoderSamplingError&) {
+                result.sampling_failed = true;
+                break;
+            }
             if (index == 0) {
                 result.token = token;
             } else {
@@ -86,7 +92,7 @@ struct Lane {
         if (result.extra_token_count != 0) {
             result.extra_token = result.extra_tokens.front();
         }
-        if (!result.finish_reason) {
+        if (!result.finish_reason && !result.sampling_failed) {
             const auto* hidden = verification->row(consumed - 1).work->normalized;
             check(cudaMemcpyAsync(request->work.normalized, hidden, hidden_size * sizeof(Bf16),
                                   cudaMemcpyDeviceToDevice, stream),
@@ -232,6 +238,7 @@ struct DecoderBatch::State {
                 bool& contains_mtp);
     void score(Lane& lane, Request& request, Workspace& work, bool graph);
     void speculate(const Selection& selected, Steps& results, DecoderBatchStepStats& stats);
+    void draft_proposals(DraftRound* rounds, int count, int longest);
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring, Steps&);
     std::optional<Lane>& slot_at(int slot) {
         if (slot < 0 || slot >= options.max_lanes) {
@@ -520,11 +527,11 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
             }
         }
     }
-    stats.sampling_workspace_bytes = sampling_workspace ? sampling_workspace_bytes() : 0;
     stats.constraint_workspace_bytes = constraint_workspace.bytes();
     if (contains_mtp) {
         speculate(speculative, results, stats);
     }
+    stats.sampling_workspace_bytes = sampling_workspace ? sampling_workspace_bytes() : 0;
     if (stats.verification_lanes == 0 && submitted) {
         check(cudaStreamSynchronize(stream), "Complete decoder batch step");
     }
@@ -578,6 +585,28 @@ void DecoderBatch::State::speculate(const Selection& selected, Steps& results,
     if (count == 0) {
         return;
     }
+    draft_proposals(rounds.data(), count, longest);
+    model.forward_verify(sequences.data(), count, stream);
+    for (int index = 0; index < count; ++index) {
+        auto& lane = *rounds[index].lane;
+        if (lane.sampling) {
+            if (!sampling_workspace) {
+                sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
+            }
+            lane.verification->sample(*lane.sampling, lane.generated, sampling_workspace);
+        }
+    }
+    TargetVerification::read_all(verifiers.data(), count, stream);
+    for (int index = 0; index < count; ++index) {
+        const auto& round = rounds[index];
+        round.lane->finish_round(round.tokens, round.count + 1, results[round.slot], stream);
+    }
+    check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
+    stats.verification_lanes = count;
+}
+
+void DecoderBatch::State::draft_proposals(DraftRound* rounds, int count, int longest) {
+    const auto stream = execution.stream();
     for (int wave = 0; wave < longest; ++wave) {
         for (int index = 0; index < count; ++index) {
             auto& round = rounds[index];
@@ -594,14 +623,6 @@ void DecoderBatch::State::speculate(const Selection& selected, Steps& results,
             }
         }
     }
-    model.forward_verify(sequences.data(), count, stream);
-    TargetVerification::read_all(verifiers.data(), count, stream);
-    for (int index = 0; index < count; ++index) {
-        const auto& round = rounds[index];
-        round.lane->finish_round(round.tokens, round.count + 1, results[round.slot], stream);
-    }
-    check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
-    stats.verification_lanes = count;
 }
 
 Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,

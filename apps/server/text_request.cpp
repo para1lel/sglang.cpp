@@ -86,6 +86,13 @@ void set_sampling(const json::Object& object, DecoderOptions& options) {
         }
         options.top_p = *top_p;
     }
+    if (const auto* value = json::get(object, "min_p")) {
+        const auto min_p = value->number();
+        if (!min_p || !(*min_p >= 0 && *min_p <= 1)) {
+            bad_request("min_p must be in [0, 1]");
+        }
+        options.min_p = *min_p;
+    }
     if (const auto* value = json::get(object, "top_k")) {
         const auto positive = value->unsigned_integer();
         const auto* wide = value->wide_integer();
@@ -170,7 +177,7 @@ bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
         key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
-        key == "ebnf" || key == "cache_salt";
+        key == "min_p" || key == "ebnf" || key == "cache_salt";
 }
 
 TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {

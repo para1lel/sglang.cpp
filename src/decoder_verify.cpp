@@ -1,5 +1,7 @@
 #include "sglang/decoder_verify.h"
 
+#include "sglang/decoder_sampling.h"
+
 #include <cstdio>
 
 namespace sglang::decoder {
@@ -92,6 +94,16 @@ void TargetVerification::advance_gdn(int layer, TextGdnWeights weights) {
           "Advance target GDN and retain its tail");
 }
 
+void TargetVerification::sample(const SamplingParameters& parameters, int first_output,
+                                void* scratch) {
+    for (int index = 0; index < pending_rows_; ++index) {
+        const auto& work = work_[index];
+        check(sample_logits(work.logits, vocab_size, &work.argmax->token_id, parameters,
+                            first_output + index, scratch, stream_),
+              "Sample target verification logits");
+    }
+}
+
 void TargetVerification::read() {
     auto* verifier = this;
     read_all(&verifier, 1, stream_);
@@ -149,8 +161,11 @@ void TargetVerification::commit(int count) {
     pending_rows_ = 0;
 }
 
-int TargetVerification::winner(int index) const {
+int TargetVerification::winner(int index, bool sampled) const {
     const int token = host_winners_[index].token_id;
+    if (sampled && token == -1) {
+        throw DecoderSamplingError();
+    }
     if (token < 0 || token >= vocab_size) {
         throw std::runtime_error("Target verification winner falls outside vocabulary");
     }

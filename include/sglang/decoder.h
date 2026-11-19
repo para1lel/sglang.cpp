@@ -34,9 +34,10 @@ struct DecoderOptions {
     std::optional<std::int64_t> seed = std::nullopt;
     std::shared_ptr<const TokenConstraint> constraint = nullptr;
     std::string prefix_cache_salt;
+    double min_p = 0.0;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
-    bool requires_target_only() const { return samples() || constraint != nullptr; }
+    bool requires_target_only() const { return constraint != nullptr; }
 
     bool stops_at(int token) const {
         return stop_token_id == token || additional_stop_token_ids.count(token) != 0;

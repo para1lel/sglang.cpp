@@ -15,10 +15,12 @@ using namespace media_test;
 using Bf16 = __nv_bfloat16;
 
 template <class Function>
-void rejects(Function request) {
+void rejects(Function request, std::string_view diagnostic = "") {
     try {
         request();
-    } catch (const std::invalid_argument&) {
+    } catch (const std::invalid_argument& error) {
+        require(std::string_view(error.what()).find(diagnostic) != std::string_view::npos,
+                error.what());
         return;
     }
     throw std::runtime_error("Malformed media request was accepted");
@@ -152,9 +154,18 @@ void check_public_guards(const Decoder& engine, const std::vector<DecoderMedia>&
     invalid[125] = 19;
     rejects([&] { engine.generate_multimodal(invalid, media); });
     DecoderOptions options;
-    options.mtp_steps = 1;
-    rejects([&] { engine.generate_multimodal(template_tokens, media, options); });
-    options = {};
+    bool entered = false;
+    const DecoderCallbacks callbacks{{}, [&] {
+        entered = true;
+        return true;
+    }};
+    for (int depth : {1, 4}) {
+        options.mtp_steps = depth;
+        rejects([&] { engine.generate_multimodal(template_tokens, media, options, callbacks); },
+                "MTP");
+    }
+    require(!entered, "Media speculation reached the generation cancellation callback");
+    options.mtp_steps = 0;
     options.max_new_tokens = 262145 - physical;
     rejects([&] { engine.generate_multimodal(template_tokens, media, options); });
     const auto cancelled = engine.generate_multimodal(template_tokens, media, {},

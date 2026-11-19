@@ -254,12 +254,6 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
 }
 
 void BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& step) {
-    if (step.sampling_failed || step.constraint_failed) {
-        job.error = step.constraint_failed ? std::make_exception_ptr(DecoderConstraintError())
-                                           : std::make_exception_ptr(DecoderSamplingError());
-        jobs[slot].reset();
-        return;
-    }
     if (step.token && !job.cancelled) {
         if (counters.cache_capacity != 0) {
             if (!job.prefill_completed) {
@@ -270,6 +264,12 @@ void BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& st
             counters.generation_tokens += 1 + step.extra_token_count;
         }
         job.pending = step;
+    }
+    if (step.sampling_failed || step.constraint_failed) {
+        job.error = step.constraint_failed ? std::make_exception_ptr(DecoderConstraintError())
+                                           : std::make_exception_ptr(DecoderSamplingError());
+        jobs[slot].reset();
+        return;
     }
     if (step.finish_reason) {
         job.finish = step.finish_reason;
@@ -436,9 +436,6 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
             result.finish_reason = DecoderFinishReason::cancelled;
             return result;
         }
-        if (job.error) {
-            std::rethrow_exception(job.error);
-        }
         if (job.pending) {
             const auto step = *job.pending;
             lock.unlock();
@@ -451,6 +448,8 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
             }
             job.pending.reset();
             changed.notify_all();
+        } else if (job.error) {
+            std::rethrow_exception(job.error);
         } else if (job.finish) {
             result.finish_reason = *job.finish;
             result.cached_prompt_tokens = job.cached_tokens;

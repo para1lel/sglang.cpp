@@ -4,6 +4,8 @@
 
 namespace sglang::decoder {
 
+struct SamplingParameters;
+
 inline constexpr int target_verify_max_rows = decoder_max_mtp_steps + 1;
 static_assert(target_verify_max_rows <= text_fp8_max_batch);
 static_assert(target_verify_max_rows <= text_gdn_max_verify_rows);
@@ -33,11 +35,12 @@ public:
     VerificationRow row(int index);
     void bind_gdn(int layer);
     void advance_gdn(int layer, TextGdnWeights weights);
+    void sample(const SamplingParameters& parameters, int first_output, void* scratch);
     void read();
     static void read_all(TargetVerification* const* verifiers, int count, cudaStream_t stream);
     void commit(int count);
 
-    int winner(int index) const;
+    int winner(int index, bool sampled = false) const;
     const Bf16* logits(int index) const;
 
 private:

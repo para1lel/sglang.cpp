@@ -137,17 +137,37 @@ __device__ int crossing(double prefix, double weight, double limit, int count) {
     return first;
 }
 
-__device__ MassGroup retain(const Scratch& scratch, int top_k, double cutoff) {
+__device__ int minimum_key(int highest, double temperature, double min_p) {
+    if (min_p == 0.0) {
+        return 0;
+    }
+    int first = 0x0080;
+    int last = highest;
+    const double peak = key_score(highest);
+    while (first < last) {
+        const int middle = first + (last - first) / 2;
+        if (exp((key_score(middle) - peak) / temperature) >= min_p) {
+            last = middle;
+        } else {
+            first = middle + 1;
+        }
+    }
+    return first;
+}
+
+__device__ MassGroup retain(const Scratch& scratch, int top_k, double cutoff, int lowest) {
     MassGroup kept{};
-    for (int group = scratch.histogram.highest / group_size; group >= 0; --group) {
+    for (int group = scratch.histogram.highest / group_size; group >= lowest / group_size;
+         --group) {
         const auto current = scratch.groups[group];
-        if (kept.count + current.count <= top_k && kept.mass + current.mass <= cutoff) {
+        const int start = group * group_size;
+        if (start >= lowest && kept.count + current.count <= top_k &&
+            kept.mass + current.mass <= cutoff) {
             kept.mass += current.mass;
             kept.count += current.count;
             continue;
         }
-        const int start = group * group_size;
-        for (int key = start + group_size - 1; key >= start; --key) {
+        for (int key = start + group_size - 1; key >= max(start, lowest); --key) {
             if (kept.count == top_k || kept.mass > cutoff) {
                 return kept;
             }
@@ -178,7 +198,8 @@ __global__ void choose_score(Scratch* scratch, SamplingParameters parameters, in
         }
         cutoff = parameters.top_p * full_mass;
     }
-    const auto kept = retain(*scratch, parameters.top_k, cutoff);
+    const int lowest = minimum_key(highest, parameters.temperature, parameters.min_p);
+    const auto kept = retain(*scratch, parameters.top_k, cutoff, lowest);
     const double draw = min(uniform(parameters.seed, position) * kept.mass,
                             nextafter(kept.mass, 0.0));
     double mass = 0;

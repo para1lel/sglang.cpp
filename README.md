@@ -53,6 +53,7 @@ to check cache bytes and attention outputs. This build command only compiles and
 
 For decoded RGB8 images and video, see the [CPU media preprocessing API](docs/media-preprocessing.md).
 The guide covers the standalone C++ library, patch layout, and CPU verification.
+To turn those patches into BF16 features on a B200, see the [standalone vision encoder](docs/vision-encoder.md).
 
 ## Generate text token IDs
 

@@ -122,11 +122,11 @@ bool matches_config(const json::Value& actual, const json::Value& expected) {
 
 void check_fields(const json::Object& actual,
                   std::initializer_list<std::pair<const char*, json::Value>> expected,
-                  const Path& path, const std::string& prefix) {
+                  const Path& path, const std::string& prefix, const char* model = "text") {
     for (const auto& [name, expected_value] : expected) {
         const auto* value = json::get(actual, name);
         if (!value || !matches_config(*value, expected_value)) {
-            invalid(path, prefix + name + " differs from the pinned text model");
+            invalid(path, prefix + name + " differs from the pinned " + model + " model");
         }
     }
 }
@@ -382,6 +382,7 @@ void load_shard(const Path& path, const Mapping& file, TensorNames& missing, Ten
 }
 
 struct Checkpoint::Storage {
+    Path config;
     std::list<Mapping> shards;
     TensorMap tensors;
 };
@@ -390,6 +391,7 @@ Checkpoint::Checkpoint(const std::filesystem::path& directory) {
     validate_text_config(directory / "config.json");
     auto index = read_index(directory / "model.safetensors.index.json");
     auto storage = std::make_unique<Storage>();
+    storage->config = std::filesystem::absolute(directory / "config.json");
     for (auto& [shard, missing] : index) {
         const auto path = directory / shard;
         const auto& file = storage->shards.emplace_back(path);
@@ -417,6 +419,37 @@ const HostTensorView& Checkpoint::tensor(std::string_view name, TensorDtype dtyp
                                  std::string(name));
     }
     return view;
+}
+
+void Checkpoint::validate_vision() const {
+    const auto& path = storage_->config;
+    const auto config = read_json_file(path);
+    const auto& vision = require_object(config, "vision_config", path);
+    check_fields(vision, {
+        {"model_type", "qwen3_5"},
+        {"depth", 27},
+        {"hidden_size", 1152},
+        {"intermediate_size", 4304},
+        {"out_hidden_size", 5120},
+        {"num_heads", 16},
+        {"num_position_embeddings", 2304},
+        {"in_channels", 3},
+        {"patch_size", 16},
+        {"temporal_patch_size", 2},
+        {"spatial_merge_size", 2},
+        {"hidden_act", "gelu_pytorch_tanh"},
+        {"deepstack_visual_indexes", json::Array{}},
+    }, path, "vision_config.", "vision");
+    constexpr std::string_view prefix = "model.visual.";
+    auto tensor = storage_->tensors.lower_bound(prefix);
+    int count = 0;
+    for (; tensor != storage_->tensors.end() &&
+           std::string_view(tensor->first).substr(0, prefix.size()) == prefix; ++tensor) {
+        ++count;
+    }
+    if (count != 333) {
+        invalid(path, "expected 333 indexed vision tensors");
+    }
 }
 
 }

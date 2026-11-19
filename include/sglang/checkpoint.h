@@ -36,6 +36,9 @@ public:
     const HostTensorView& tensor(std::string_view name, TensorDtype dtype,
                                  std::initializer_list<std::uint64_t> shape) const;
 
+    /// Checks the pinned vision configuration and indexed vision tensor count.
+    void validate_vision() const;
+
 private:
     struct Storage;
     std::unique_ptr<Storage> storage_;

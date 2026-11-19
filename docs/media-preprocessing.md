@@ -3,14 +3,14 @@
 Link the C++17 static target `sglang_media_preprocess` and include `sglang/media_preprocess.h`.
 The library converts decoded RGB8 frames into normalized patches for the Qwen3.8-27B-FP8 vision encoder.
 It uses the standard C++ runtime and runs on the CPU without loading checkpoint assets.
-Codec decoding, vision encoding, model integration, and HTTP media support remain separate work.
+Pass the patches to the [standalone vision encoder](vision-encoder.md) to produce BF16 features.
 
 ## Responsibilities and sources of truth
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Caller | Decode media to RGB8 and provide displayed dimensions and source video metadata. | [Input view](../include/sglang/media_preprocess.h#L10)<!-- prefix: "struct Decod" --> · [Video metadata](../include/sglang/media_preprocess.h#L20)<!-- prefix: "struct Video" --> |
-| Preprocessor | Select frames, resize, normalize, and pack patches. | [Public functions](../include/sglang/media_preprocess.h#L35)<!-- prefix: "std::vector\u003c" --> · [Library target](../xmake.lua#L203)<!-- prefix: "target(\"sgla" --> |
+| Preprocessor | Select frames, resize, normalize, and pack patches. | [Public functions](../include/sglang/media_preprocess.h#L35)<!-- prefix: "std::vector\u003c" --> · [Library target](../xmake.lua#L217)<!-- prefix: "target(\"sgla" --> |
 | Consumer | Read the owned patch buffer, grid, and video metadata. | [Result](../include/sglang/media_preprocess.h#L26)<!-- prefix: "struct Media" --> |
 
 ## Runtime path
@@ -103,7 +103,7 @@ build_dir="$PWD/build/media-preprocess"
 
 Expect sample indices `0 2 4 7`. To build only the library, select the target `sglang_media_preprocess`.
 The CPU targets link the C++ runtime. The project uses the provisioned Pixi environment for XMake configuration.
-[Check target](../xmake.lua#L217)<!-- prefix: "target(\"medi" --> · [Check driver](../tests/media/preprocess_check.cpp#L98)<!-- prefix: "void check(i" -->
+[Check target](../xmake.lua#L231)<!-- prefix: "target(\"medi" --> · [Check driver](../tests/media/preprocess_check.cpp#L98)<!-- prefix: "void check(i" -->
 
 For the numerical oracle, set `ORACLE_PYTHON` to an absolute interpreter path.
 Use a reference environment with CPU-capable PyTorch, torchvision, NumPy, and Transformers 5.19.0.

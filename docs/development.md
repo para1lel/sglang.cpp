@@ -65,7 +65,7 @@ Link `sglang_cuda`. Apply RoPE to K before appending contiguous BF16 `[tokens, 4
 
 For each K or V group's maximum magnitude `amax`, store `ceil(log2(max(amax, 1e-30) / 448)) + 127`, clamped to `[0, 254]`. Attention decodes K and V and converts BF16 Q to FP32. [Scale calculation](../src/mxfp8_gqa.cu#L35)<!-- prefix: "__device__ i" --> · [Direct attention](../src/mxfp8_gqa.cu#L98)<!-- prefix: "__global__ v" -->
 
-Exact scoring preserves the direct FP32 group reductions, ordered sum of eight groups, and `1/16` scale. Replay computes `expf` weights in parallel in 32-token tiles. Running maxima, denominator FMAs, and value FMAs follow token order. FP32 division precedes one BF16 rounding. [Score](../src/mxfp8_gqa.cu#L278)<!-- prefix: "__global__ v" --> · [Replay](../src/mxfp8_gqa.cu#L324)<!-- prefix: "__global__ v" -->
+Exact scoring preserves FP32 group reductions, the ordered eight-group sum, and `1/16` scaling. Per 32-token tile, replay decodes V into shared memory in parallel. A warp computes prefix maxima and `expf` weights. Denominator and value FMAs follow token order. FP32 division precedes one BF16 rounding. [Score](../src/mxfp8_gqa.cu#L281)<!-- prefix: "__global__ v" --> · [Replay](../src/mxfp8_gqa.cu#L327)<!-- prefix: "__global__ v" -->
 
 #### P2 GQA verification
 
@@ -115,7 +115,7 @@ Tensor-core projections require MTP off, 3–128 rows, 128-divisible input width
 Tensor-core mode uses these operators on scratch-backed 2–128 row tiles with MTP off, including during SIMT projection fallback. Exact, MTP, and row-wise prefill use the existing operators. Both policies share decode. [Tile dispatch](../src/decoder_prefill.cpp#L407)<!-- prefix: "void Decoder" -->
 
 - GDN fuses convolution, Q/K unit normalization, and gate preparation. Recurrent updates retain token order. Gates reuse key scratch. [GDN preparation](../src/text_attention_gdn.cu#L75)<!-- prefix: "__global__ v" -->
-- After KV append, causal GQA scores and weights 32 tokens per tile. FP32 group sums, denominator updates, and value accumulation retain their order. The MXFP8 format stays the same. [Tiled GQA](../src/mxfp8_gqa.cu#L178)<!-- prefix: "__global__ v" -->
+- After KV append, causal GQA scores and weights 32 tokens per tile. FP32 group sums, denominator updates, and value accumulation retain their order. The MXFP8 format stays the same. [Tiled GQA](../src/mxfp8_gqa.cu#L181)<!-- prefix: "__global__ v" -->
 - Residual RMSNorm and SwiGLU fuse with FP8 quantization. Both round to BF16 before quantization. [RMSNorm](../src/text_normalization.cu#L236)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L665)<!-- prefix: "cudaError_t " -->
 
 Other target prefill and draft decode use direct attention. Eager target decode, including MTP verification, uses exact attention below inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Both use direct attention beyond those limits. [Multirow prefill](../src/decoder_prefill.cpp#L256)<!-- prefix: "const auto s" --> · [Row dispatch](../src/decoder_forward.cpp#L178)<!-- prefix: "cudaError_t " -->

@@ -112,7 +112,7 @@ The historical GPU6 prototype reduced W1 and W2 CUDA prefill time against the ro
 
 ### FP8 tensor-core prefill
 
-Compare `--fp8-prefill tensor-core` with explicit `--fp8-prefill exact` on one binary with MTP off. Positive MTP depth uses exact projections under either flag. Match measurement controls and KV and GDN policies. Record commands, flags, source and binary hashes, toolchain, and driver in the immutable manifest. Trace effective dispatch, shapes, and fallbacks separately from timing.
+Compare `--fp8-prefill tensor-core` with explicit `--fp8-prefill exact` on one binary with MTP off. Positive MTP depth uses exact projections under either flag. Match measurement controls and KV and GDN policies. Record commands, flags, source and binary hashes, toolchain, and driver. Trace projection shapes, grid dimensions, dynamic shared memory, and fallbacks separately from timing.
 
 Run the [exact prefill checks](development.md#chunked-prefill-verification) with default and explicit `exact` in both binaries. Compare tensor-core projections with an independent reference using predefined tolerances. Match fallback and exact projections bitwise on identical inputs. Exercise full chunks, tails, mixed steps, and unsupported dispatch. Check tokens and finish reasons across repetitions within each policy.
 
@@ -124,7 +124,7 @@ Check parity against pinned vLLM on identical histories. Record its execution mo
 
 Use [chunked prefill measurements](#chunked-prefill) and the [frozen timing protocol](#frozen-w1-and-w2-timing). Report each precision policy separately.
 
-Run the [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Report native deltas and frozen gate results separately.
+Run the [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 outputs across projection tiles on identical inputs. Report native deltas and frozen gates separately.
 
 The post-chat GPU3 run used tensor-core prefill, serial CUDA graphs, and MTP off. Each arm and workload used three warmups and nine measured requests. The chat control and fusion build returned identical IDs on the frozen token-ID requests.
 

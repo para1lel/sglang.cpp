@@ -486,7 +486,8 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
     if (major != 10 || minor != 0) {
         return std::nullopt;
     }
-    if ((rows <= 64 && out_width >= 4096) || in_width >= 8192) {
+    const bool narrow_high_k = in_width >= 8192 && rows < 1024;
+    if ((rows <= 64 && out_width >= 4096) || narrow_high_k) {
         return launch_tma<Tile<64, 128, 6, 2, 1>>(weight, weight_scales, input, rows,
                                                  out_width, in_width, output, stream, device);
     }

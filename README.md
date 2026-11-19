@@ -111,9 +111,9 @@ order. Model scores and generated token IDs can differ, including when the highe
 scores are far apart.
 
 Paged MXFP8 attention in this mode shares decoded K and V across two query heads.
-Chunks with 64–127 rows use two-row tiles if they end within 8,192 visible tokens.
-Chunks with at least 128 rows use four-row tiles under the same 8,192-token bound.
-Leftover rows and ineligible chunks use the protected single-row path.
+Chunks with 64–127 rows use two-row tiles when the last row sees at most 32,768 tokens.
+Chunks with at least 128 rows use four-row tiles under the same bound.
+Leftover rows, shorter chunks, and chunks beyond the bound use the protected single-row path.
 The shared path keeps the 32-channel score reduction order, causal token order,
 BF16 output rounding, and selective FP64 recovery.
 

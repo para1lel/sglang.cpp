@@ -121,6 +121,21 @@ public:
         check_cuda(cudaGraphLaunch(executable_, stream), "Replay attention graph");
     }
 
+    void check_grid(unsigned width) const {
+        std::size_t count = 0;
+        check_cuda(cudaGraphGetNodes(graph_, nullptr, &count), "Count attention graph nodes");
+        if (count != 1) {
+            throw std::runtime_error("Expected one attention graph kernel");
+        }
+        cudaGraphNode_t node = nullptr;
+        check_cuda(cudaGraphGetNodes(graph_, &node, &count), "Get attention graph node");
+        cudaKernelNodeParams kernel{};
+        check_cuda(cudaGraphKernelNodeGetParams(node, &kernel), "Get attention graph grid");
+        if (kernel.gridDim.x != width || kernel.gridDim.y != query_heads / 2) {
+            throw std::runtime_error("Unexpected prefill dispatch grid at the 32768-token cutoff");
+        }
+    }
+
 private:
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t executable_ = nullptr;
@@ -764,20 +779,27 @@ void check_ordered_prefill_precision(cudaStream_t stream) {
 
 void check_ordered_prefill_score_overflow(cudaStream_t stream) {
     constexpr int rows = 65;
-    const Pages pages{{5}};
+    constexpr int limit = 32768;
+    constexpr int page_count = limit / page_tokens + 1;
+    constexpr auto payload = page_count * sglang::mxfp8_payload_bytes_per_page;
+    constexpr auto scales = page_count * sglang::mxfp8_scale_bytes_per_page;
+    std::vector<std::int32_t> mapping(page_count);
+    for (int page = 0; page < page_count; ++page) {
+        mapping[page] = page_count - 1 - page;
+    }
+    const Pages pages{std::move(mapping)};
     pages.device.upload(pages.mapping.data(), stream);
-    const RawCache cache;
-    const auto view = cache.view();
-    const auto offset = pages.mapping.front() * page_tokens * kv_elements_per_token;
-    check_cuda(cudaMemsetAsync(view.key_payload, 0, payload_bytes, stream), "Clear overflow keys");
-    check_cuda(cudaMemsetAsync(view.key_scales, 127, scale_bytes, stream),
-               "Set overflow key scales");
+    const DeviceBuffer<Byte> keys(payload), values(payload);
+    const DeviceBuffer<Byte> key_scales(scales), value_scales(scales);
+    const sglang::Mxfp8KvCache view{keys.get(), values.get(), key_scales.get(), value_scales.get(),
+                                  page_count};
+    const auto offset = pages.mapping.front() * sglang::mxfp8_payload_bytes_per_page;
+    keys.fill(0, stream);
+    key_scales.fill(127, stream);
+    values.fill(0x38, stream);
+    value_scales.fill(127, stream);
     check_cuda(cudaMemsetAsync(view.key_payload + offset, 0x58, head_width, stream),
                "Set leading overflow key");
-    check_cuda(cudaMemsetAsync(view.value_payload, 0x38, payload_bytes, stream),
-               "Set overflow values");
-    check_cuda(cudaMemsetAsync(view.value_scales, 127, scale_bytes, stream),
-               "Set overflow value scales");
     check_cuda(cudaMemsetAsync(view.value_payload + offset, 0x40, head_width, stream),
                "Set leading overflow value");
     std::vector<BFloat> input(rows * query_elements, __float2bfloat16_rn(0.0f));
@@ -788,27 +810,38 @@ void check_ordered_prefill_score_overflow(cudaStream_t stream) {
     const DeviceBuffer<BFloat> queries(input.size());
     queries.upload(input.data(), stream);
     const DeviceBuffer<BFloat> output(rows * query_elements + 2 * prefill_guard);
-    output.fill(attention_sentinel, stream);
-    check_cuda(sglang::decoder::tensor_core_multirow_prefill_gqa(
-                   view, pages.view(), 0, rows, queries.get(), output.get() + prefill_guard,
-                   stream), "Launch score-overflow prefill");
-    const auto actual = download_prefill(output, stream);
-    for (int row = 0; row < rows; ++row) {
-        const float mean = __bfloat162float(__double2bfloat16(1.0 + 1.0 / (row + 1)));
-        for (int head = 0; head < query_heads; ++head) {
-            const float ordinary = head < query_heads / kv_heads ? mean : 1.0f;
-            const float expected = head == 0 ? 2.0f : ordinary;
-            const auto begin = actual.begin() + row_index(row, head, query_heads) * head_width;
-            if (!std::all_of(begin, begin + head_width, [expected](BFloat value) {
-                return __bfloat162float(value) == expected;
-            })) {
-                throw std::runtime_error("Score overflow recovery mismatch at row "
-                                         + std::to_string(row) + ", head "
-                                         + std::to_string(head));
+    for (const int first : {0, limit - rows, limit - rows + 1}) {
+        const auto launch = [&](int row, int count) {
+            return sglang::decoder::tensor_core_multirow_prefill_gqa(
+                view, pages.view(), first + row, count, queries.get() + row * query_elements,
+                output.get() + prefill_guard + row * query_elements, stream);
+        };
+        Graph graph;
+        graph.capture(stream, [&] { return launch(0, rows); });
+        graph.check_grid(first + rows <= limit ? rows / 2 + rows % 2 : rows);
+        output.fill(attention_sentinel, stream);
+        graph.replay(stream);
+        const auto actual = download_prefill(output, stream);
+        output.fill(attention_sentinel, stream);
+        check_cuda(launch(0, 32), "Launch first protected overflow tile");
+        check_cuda(launch(32, rows - 32), "Launch second protected overflow tile");
+        require_same(actual, download_prefill(output, stream), "Protected overflow parity");
+        for (int row = 0; row < rows; ++row) {
+            const float mean = __bfloat162float(__double2bfloat16(1.0 + 1.0 / (first + row + 1)));
+            for (int head = 0; head < query_heads; ++head) {
+                const float ordinary = head < query_heads / kv_heads ? mean : 1.0f;
+                const float expected = head == 0 ? 2.0f : ordinary;
+                const auto begin = actual.begin() + row_index(row, head, query_heads) * head_width;
+                if (!std::all_of(begin, begin + head_width, [expected](BFloat value) {
+                    return __bfloat162float(value) == expected;
+                })) {
+                    throw std::runtime_error("Score overflow at first=" + std::to_string(first)
+                        + ", row=" + std::to_string(row) + ", head=" + std::to_string(head));
+                }
             }
         }
     }
-    std::puts("Score overflow recovers in paired rows and odd tail");
+    std::puts("Score overflow matches protected tiles at 32768 and 32769 visible tokens");
 }
 
 }

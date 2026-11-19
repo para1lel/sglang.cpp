@@ -73,9 +73,9 @@ Exact scoring reduces eight groups in FP32, sums in group order, and scales by `
 
 #### Ordered multirow GQA prefill
 
-Tensor-core prefill uses two-row tiles at 64–127 rows and four-row tiles from 128 rows. Both require at most 8,192 visible tokens. [Dispatch](../src/mxfp8_gqa_prefill.cu#L466)<!-- prefix: "cudaError_t " -->
+Tensor-core prefill uses two-row tiles at 64–127 rows and four-row tiles from 128 rows. The final row must see at most 32,768 tokens. [Dispatch](../src/mxfp8_gqa_prefill.cu#L466)<!-- prefix: "cudaError_t " -->
 
-Blocks share decoded K/V across two query heads and all tile rows. Each processes 32 KV tokens at a time with per-row causality. Tiles preserve the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L272)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L395)<!-- prefix: "for (int fir" -->
+Blocks share decoded K/V across two query heads and tile rows. Each processes 32 KV tokens at a time with per-row causality. Tiles preserve the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L272)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L395)<!-- prefix: "for (int fir" -->
 
 Other chunks and leftover rows use protected single-row attention. Both paths replay nonfinite visible scores by head and nonfinite quotients by channel in FP64. They keep finite FP64 replacements. [Recovery](../include/sglang/mxfp8_gqa.h#L63)<!-- prefix: "/// Shared a" -->
 
@@ -100,7 +100,7 @@ Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The [
 
 The [ordered decode check](../tests/mxfp8_gqa_check.cu#L542)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 
-Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L879)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L873)<!-- prefix: "void check_o" -->, [dispatch bounds and tails](../tests/mxfp8_gqa_prefill_check.cu#L665)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L713)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L936)<!-- prefix: "void check_o" -->.
+Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L912)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L873)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L680)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L728)<!-- prefix: "void check_o" -->, [32,768-token recovery](../tests/mxfp8_gqa_prefill_check.cu#L780)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L936)<!-- prefix: "void check_o" -->.
 
 ### P3 native text decoder
 

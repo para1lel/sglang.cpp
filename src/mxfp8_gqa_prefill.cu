@@ -16,7 +16,7 @@ constexpr int channels = mxfp8_head_dim;
 constexpr int ratio = mxfp8_query_heads / mxfp8_kv_heads;
 constexpr int ordered_heads = 2;
 constexpr int keys_per_tile = 32;
-constexpr int max_tokens = 8192;
+constexpr int max_multirow_visible_tokens = 32768;
 constexpr Word warp_mask = 0xffffffffu;
 constexpr float softmax_scale = 1.0f / 16.0f;
 
@@ -475,7 +475,7 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     Attention request{cache, pages.device_pages, position, queries, output};
     void* args[] = {&request, &rows};
     constexpr int min_paired_rows = 64;
-    if (rows < min_paired_rows || rows > max_tokens || position > max_tokens - rows) {
+    if (rows < min_paired_rows || position + rows > max_multirow_visible_tokens) {
         const dim3 blocks(rows, mxfp8_query_heads / ordered_heads);
         return cudaLaunchKernel(protected_prefill_attention, blocks, channels, args, 0, stream);
     }

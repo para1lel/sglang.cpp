@@ -156,15 +156,21 @@ The verifier used unrounded limits. Both W2 arms missed all four gates in this r
 
 ### Native concurrent workloads
 
-After [streaming verification](development.md#streaming-verification), use K0 and the [scheduler policy](#scheduler-and-reporting-policy). Offer the workload's client lane count. [Trace](batch-graphs.md#timing) decode width and replay.
+Verify [streaming](development.md#streaming-verification). Use K0 and the [scheduler policy](#scheduler-and-reporting-policy). Preserve offered concurrency. [Trace](batch-graphs.md#timing) decode width and replay.
 
-The [historical concurrent protocol](../benchmarks/concurrent/README.md#conditions-and-gates) used vLLM `--max-num-batched-tokens 8192 --max-num-seqs 32`. The strict GPU2 W3 native run used `--max-active 4 --mtp-steps 0 --fp8-prefill tensor-core --prefix-cache-entries 0 --batch-cuda-graphs`. The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets. New acceptance remains pending.
+Historical GPU2 W3 reached 63.779 IDs/s, matched 28,672 IDs, and missed all four gates. [Historical protocol](../benchmarks/concurrent/README.md#conditions-and-gates)
 
-On November 19, 2026, [packed paged decode](batch-graphs.md#packed-paged-gqa-decode) reached 63.779 IDs/s in strict GPU2 W3. P95 TTFT, TPOT, and E2E were 33,923.407, 29.738, and 64,340.177 ms. All four gates failed. All 28,672 IDs matched frozen vLLM and the older `60677ec` control, which ran under different timing conditions.
+GPU6 W3 replay raised throughput from 5.69 to 14.91 IDs/s and matched 4,096 IDs. See `artifacts/long-batch-graph-release/report.md`. Historical `w3-fused` reached 144.84 IDs/s and missed all four gates.
 
-A pre-loader GPU6 W3 comparison used one cold cohort per arm, tensor-core prefill, batch graphs, and K0. The candidate replayed Unit16's eager long decode. All 4,096 IDs, finish reasons, and usage matched. Throughput rose 5.69 to 14.91 IDs/s. P95 TPOT fell 624.40 to 189.36 ms. See `artifacts/long-batch-graph-release/report.md`.
+GPU3 W3 on `9d047fe` reached 90.519 IDs/s versus vLLM’s 373.931. All 4,096 IDs matched. Native missed all four gates. See `artifacts/takeover-w3/report.md`.
 
-The historical `w3-fused` attention and projection fusions reached 144.84 IDs/s and missed all four W3 gates.
+The prior W4 singleton spent 54.245 of 58.657 s TTFT in protected single-row GQA. See `artifacts/takeover-w4-diagnostic/report.md`.
+
+GPU3 singleton median W4 TTFT fell from 58.701 to 29.214 s across three fresh-process pairs. First ID `760` matched.
+
+vLLM completed GPU3 W4. Both 16-lane native runs timed out at 90 s with zero output. Completed prefill rose from 163,840 to 196,608 of 524,288 rows. Native gates stayed unscored. See `artifacts/takeover-w4-long-tiled/report.md`.
+
+GPU5 operator median GQA fell from 222.465 to 101.679 ms for 1,024 rows at 32,768 visible tokens. See `artifacts/takeover-long-prefill-code/handoff.md`.
 
 ### Native MTP
 

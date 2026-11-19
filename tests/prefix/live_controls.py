@@ -225,7 +225,7 @@ def run(controls):
     prefix_output = fixture["output"]["128"]
     suffix = fixture["prompt"][:129]
     suffix_output = fixture["output"]["129"]
-    assert json.loads(controls.control("health", "/health")) == {}
+    check_health(controls)
     for index, body in enumerate((b"[]", b"{", b'{"unexpected":true}')):
         controls.control(f"bad-reset-{index}", "/reset_prefix_cache", body, 400)
     controls.control("reset-with-get", "/reset_prefix_cache", status=404)
@@ -237,6 +237,19 @@ def run(controls):
     check_profile_controls(controls, prefix, prefix_output)
     check_wrong_prefix_and_eviction(controls, prefix, prefix_output)
     live_reset(controls, prefix, prefix_output)
+
+
+def check_health(controls):
+    health = json.loads(controls.control("health", "/health"))
+    assert isinstance(health, dict), health
+    if health == {}:
+        controls.control("legacy-ready", "/ready", status=404)
+        return
+    active = health.get("max_active")
+    tokens = health.get("max_num_batched_tokens")
+    assert type(active) is int and active == 2, health
+    assert type(tokens) is int and 1 <= tokens <= 32768, health
+    assert json.loads(controls.control("ready", "/ready")) == {"ready": True}
 
 
 def main():

@@ -3,10 +3,12 @@
 #include "sglang/decoder_batch.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -20,6 +22,7 @@ struct Job {
     std::vector<int> prompt;
     std::size_t prompt_tokens = 0;
     DecoderOptions options;
+    std::vector<DecoderMedia> media;
     std::optional<DecoderBatchStep> pending;
     std::optional<DecoderFinishReason> finish;
     std::exception_ptr error;
@@ -53,14 +56,13 @@ void trace_verification(const Steps& steps, const DecoderBatchStepStats& stats) 
     std::cerr << ("batch verify lanes=" + std::to_string(stats.verification_lanes) +
                   " rows=" + std::to_string(stats.verification_rows) +
                   " peak_request_bytes=" + std::to_string(stats.peak_request_bytes) + '\n');
-    for (int slot = 0; slot < decoder_batch_max_mtp_lanes; ++slot) {
+    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         const auto& step = steps[slot];
-        if (step.mtp_drafted_tokens || step.mtp_boundary) {
+        if (step.mtp_verified_rows || step.mtp_boundary) {
             std::cerr << ("batch mtp slot=" + std::to_string(slot) +
                           " drafted=" + std::to_string(step.mtp_drafted_tokens) +
                           " accepted=" + std::to_string(step.mtp_accepted_tokens) +
-                          " verified=" + std::to_string(step.mtp_drafted_tokens ?
-                              step.mtp_drafted_tokens + 1 : 0) +
+                          " verified=" + std::to_string(step.mtp_verified_rows) +
                           " replayed=" + std::to_string(step.mtp_replayed_rows) +
                           " boundary=" + std::to_string(step.mtp_boundary) + '\n');
         }
@@ -93,7 +95,7 @@ bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& callbacks,
 
 struct BatchService::State {
     State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps, int max_active,
-          int prefix_cache_entries);
+          int prefix_cache_entries, int max_num_batched_tokens);
     ~State();
 
     void run(const Decoder& decoder, std::promise<void> started);
@@ -114,6 +116,7 @@ struct BatchService::State {
     const int mtp_steps;
     const int max_active;
     const int prefix_cache_entries;
+    const int max_num_batched_tokens;
     std::mutex mutex;
     std::condition_variable changed;
     Jobs jobs;
@@ -124,20 +127,18 @@ struct BatchService::State {
     std::uint64_t profile_epoch = 0;
     std::size_t profile_limit = 0;
     std::exception_ptr failure;
+    std::atomic_bool failed{false};
     bool reset_pending = false;
     bool closing = false;
     std::thread worker;
 };
 
 BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
-                           int max_active, int prefix_cache_entries)
+                           int max_active, int prefix_cache_entries, int max_num_batched_tokens)
     : trace(trace), cuda_graphs(cuda_graphs), mtp_steps(mtp_steps), max_active(max_active),
-      prefix_cache_entries(prefix_cache_entries) {
+      prefix_cache_entries(prefix_cache_entries), max_num_batched_tokens(max_num_batched_tokens) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch service capacity");
-    }
-    if (mtp_steps != 0 && max_active > decoder_batch_max_mtp_lanes) {
-        throw std::invalid_argument("Decoder batch service capacity above 4 requires MTP off");
     }
     counters.cache_capacity = prefix_cache_entries;
     std::promise<void> started;
@@ -164,7 +165,8 @@ void BatchService::State::run(const Decoder& decoder, std::promise<void> started
     std::unique_ptr<DecoderBatch> batch;
     try {
         batch = std::make_unique<DecoderBatch>(decoder,
-            DecoderBatchOptions{cuda_graphs, max_active, prefix_cache_entries});
+            DecoderBatchOptions{cuda_graphs, max_active, prefix_cache_entries,
+                                max_num_batched_tokens, std::numeric_limits<std::size_t>::max()});
         counters.cache = batch->prefix_cache_stats();
     } catch (...) {
         started.set_exception(std::current_exception());
@@ -182,6 +184,7 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
     const std::lock_guard lock(mutex);
     if (permanent) {
         failure = error;
+        failed.store(true);
         reset_pending = false;
     }
     for (auto& job : jobs) {
@@ -237,7 +240,12 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
     }
     if (!job->admitted) {
         try {
-            job->cached_tokens = batch.admit(slot, std::move(job->prompt), job->options);
+            if (job->media.empty()) {
+                job->cached_tokens = batch.admit(slot, std::move(job->prompt), job->options);
+            } else {
+                batch.admit_multimodal(slot, std::move(job->prompt), job->options, job->media);
+                job->media.clear();
+            }
             job->admitted = true;
         } catch (...) {
             if (!batch.available()) {
@@ -366,6 +374,8 @@ void BatchService::State::process(DecoderBatch& batch) {
                 trace_batch_step(width, decode, bytes);
                 if (width) {
                     trace_prefill_rows(stats, max_active);
+                    std::cerr << ("batch target_rows=" + std::to_string(stats.target_rows) +
+                                  " step_budget=" + std::to_string(max_num_batched_tokens) + '\n');
                     if (stats.graph_slots) {
                         std::cerr << ("batch graph_slots=" +
                                      std::to_string(stats.graph_slots) + '\n');
@@ -461,9 +471,9 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
 }
 
 BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
-                           int max_active, int prefix_cache_entries)
+                           int max_active, int prefix_cache_entries, int max_num_batched_tokens)
     : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps, max_active,
-                                     prefix_cache_entries)) {}
+                                     prefix_cache_entries, max_num_batched_tokens)) {}
 
 BatchService::~BatchService() = default;
 
@@ -475,6 +485,17 @@ void BatchService::claim_connection(int slot) {
 void BatchService::release_connection(int slot) {
     const std::lock_guard lock(state_->mutex);
     state_->connections.at(slot) = false;
+}
+
+bool BatchService::ready() const {
+    return !state_->failed.load();
+}
+
+void BatchService::rethrow_failure() const {
+    if (!ready()) {
+        const std::lock_guard lock(state_->mutex);
+        std::rethrow_exception(state_->failure);
+    }
 }
 
 BatchMetrics BatchService::metrics() const {
@@ -528,17 +549,19 @@ std::optional<BatchProfile> BatchService::stop_profile() {
 
 DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
                                      const DecoderOptions& options,
-                                     const DecoderCallbacks& callbacks) {
+                                     const DecoderCallbacks& callbacks,
+                                     std::vector<DecoderMedia> media, std::size_t expanded_tokens) {
     if (slot < 0 || slot >= state_->max_active) {
         throw std::out_of_range("Invalid decoder batch service slot");
     }
     auto job = std::make_shared<Job>();
     job->prompt = prompt;
-    job->prompt_tokens = prompt.size();
+    job->prompt_tokens = media.empty() ? prompt.size() : expanded_tokens;
     job->options = options;
-    if (!job->options.requires_target_only()) {
+    if (media.empty() && !job->options.requires_target_only()) {
         job->options.mtp_steps = state_->mtp_steps;
     }
+    job->media = std::move(media);
     std::unique_lock lock(state_->mutex);
     state_->changed.wait(lock, [&] { return !state_->reset_pending; });
     if (state_->failure) {

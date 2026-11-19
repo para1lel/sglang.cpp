@@ -51,9 +51,11 @@ sampling filters, EOS, stop at the output limit, and replay after a TCP reset.
 Server traces verify graph replay at depth 0, joint verification at positive
 depths, and replay of discarded verifier state.
 
-Serial decoded RGB8 chat uses depth 0 even when the server is configured for
-text speculation. The check verifies media output and rejection of a per-request
-depth, then checks the rejection of media on the batch route. The width-two
+Serial and batched decoded RGB8 chat use depth 0 even when the server is
+configured for text speculation. The check compares media output with the
+depth-0 control and verifies rejection of a per-request depth. The width-two
 sampled depth-0 case checks active and queued cancellation, rejection of a busy
 prefix-cache reset, and unchanged seeded output after an idle reset. The runner
-saves requests, transcripts, startup errors, and server traces.
+saves requests, transcripts, effective caps, startup results, and server traces.
+The startup matrix checks positive-depth admission through width 32 and
+preserves the prefix-cache, eager, and graph restrictions.

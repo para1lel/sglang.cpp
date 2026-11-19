@@ -7,7 +7,9 @@ and carries Gated DeltaNet state through the other 48 layers. Prefill and the fi
 token selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L92)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L101)<!-- prefix: "class Decode" -->.
+The batch scheduler options are in
+[`DecoderBatchOptions`](include/sglang/decoder_batch.h#L46)<!-- prefix: "struct Decod" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA cache and public attention implementation is in
@@ -149,11 +151,29 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     ./build/bin/sglang-server --device 0 --port 17384
 ```
 
-The server loads one model and binds to `127.0.0.1`. `GET /health` returns HTTP 200 after
-model loading. With the default settings, requests run serially and reuse the decode graph.
-Set `--max-active` from `2` through `32` to batch concurrent requests on the resident model.
+The server loads one model and binds to `127.0.0.1`. `GET /health` returns the effective
+`max_active` and `max_num_batched_tokens` after model loading. The defaults are 32 active
+requests and 32,768 target rows per scheduler step. Set `--max-active 1` to use the serial
+decode graph with prefix caching disabled.
+Use `GET /ready` to check whether the inference worker can serve requests.
+It returns HTTP 200 with `{"ready":true}` while the worker is available. After a terminal
+worker failure, it returns HTTP 503 with `{"ready":false,"reason":"worker_failed"}`.
+`GET /health` continues to report liveness and the configured limits.
 Extra connections wait in the listener backlog until a socket worker is available.
 Both serial and batched target-only requests use the selected FP8 prefill policy.
+Set `--max-num-batched-tokens` from `1` through `32768` to lower the step budget. It covers
+prompt rows, ordinary decode rows, and MTP target verification rows across all scheduled requests.
+One step can contain several backend tiles per request and reuses a single tile workspace.
+Ordinary text uses tiles of up to 1,024 rows. Media, MTP, and tensor-core prefix caching
+use tiles of up to 128 rows.
+
+The batch service reserves KV cache space for the full accepted output limit before it sends tokens.
+A request beyond total resident capacity gets HTTP 413. Temporary memory pressure returns HTTP 503.
+If the CUDA stream can be drained after an admission allocation fails, the worker retires that
+request and continues serving its peers.
+A failed drain ends the affected requests. New completions return HTTP 500 until the server restarts.
+[`DecoderCapacityError`](include/sglang/decoder.h#L60)<!-- prefix: "class Decode" -->
+reports whether the caller can retry.
 
 Add `--batch-cuda-graphs` to opt in to graph replay for eligible decode-only
 groups of two through four requests. The server warms each actual decode width
@@ -162,13 +182,14 @@ with its own exact attention score workspace sized to its KV capacity. If that
 allocation runs out of memory, steps that need it use eager decode. Other decode
 widths and mixed decode and prefill steps run eagerly.
 
-The default `--mtp-steps 0` selects target-only decoding. Set `--mtp-steps 1` through
-`--mtp-steps 4` at any `--max-active` value from `1` through `4` to enable MTP for
-unconstrained greedy and sampled text requests.
-Batched requests share target projections and commit their outputs independently.
-Steps that contain an MTP lane run eagerly, including when `--batch-cuda-graphs` is set.
-Values of `--max-active` above `4` require `--mtp-steps 0`. SSE events and usage
-fields follow the same contract at every depth.
+The default `--mtp-steps 0` selects target-only decoding.
+Use `--mtp-steps 1` through `--mtp-steps 4` for unconstrained greedy and sampled text requests.
+MTP supports `--max-active` values from `1` through `32`.
+`--mtp-k` is an alias for `--mtp-steps`. Batched requests share target projections
+within groups of up to four requests and commit their outputs independently.
+Steps that execute MTP work run eagerly, including when `--batch-cuda-graphs` is set.
+All groups in a step share the same target-row budget. SSE events and usage fields
+follow the same contract at every depth.
 
 Set `--eager` to run serial requests without graph capture or replay.
 This option requires `--max-active 1` and `--mtp-steps 0`.
@@ -178,6 +199,8 @@ Set `--prefix-cache-entries` from `1` through `4` to enable
 Keep `--mtp-steps 0` and omit `--eager`. Exact prefill remains the default.
 Use `--fp8-prefill tensor-core` to opt in to [page-aligned prefill](docs/prefix-cache.md#tensor-core-scheduling).
 Prefix reuse selects the batch route even at `--max-active 1`.
+Tensor-core cache requests keep fixed prompt tile boundaries across scheduler turns.
+Their full tiles use 128 rows, or the largest power of two within a smaller step budget.
 
 For model `benchmark`, send a token ID array to `POST /v1/completions` using the
 [frozen streaming benchmark contract](benchmarks/streaming/README.md#wire-contract).
@@ -190,6 +213,7 @@ finish. A detected connection reset cancels the associated request and releases 
 Add `--trace-batches` to log `batch width=… decode=… request_bytes=…` on standard error.
 In serial mode the trace describes token-producing steps and reports zero batch request
 bytes. In batch mode `request_bytes` counts live allocations owned by the batch executor.
+The `batch target_rows=… step_budget=…` line records the charged work for the batch step.
 When a batch graph replays, `batch graph_slots=…` gives the bit mask of replayed slots.
 When the batch allocates sampling scratch, `sampling_workspace_bytes=…` reports its size.
 
@@ -227,7 +251,8 @@ curl -N http://127.0.0.1:17384/v1/chat/completions \
   -d '{"model":"Qwen3.8-27B-FP8","messages":[{"role":"user","content":"Explain why the sky is blue."}],"stream":true}'
 ```
 
-The serial, cache-off chat route accepts inline decoded RGB8 images and video.
+Chat accepts inline decoded RGB8 images and video. Media requests use eager target execution
+and bypass prefix reuse.
 See [image and video inputs](docs/chat-serving.md#image-and-video-inputs) for the attachment format.
 An opt-in build with libpng and FFmpeg also accepts inline PNG images and MP4 video.
 See [codec build and verification](docs/chat-serving.md#codec-checks) for setup and checks.

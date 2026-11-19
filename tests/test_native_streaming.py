@@ -104,12 +104,31 @@ class NativeStreamingTest(unittest.TestCase):
             with connection.getresponse() as response:
                 self.check_stream(response, prompt, expected)
 
-    def test_health(self):
+    def health_caps(self):
         with closing(self.connect()) as connection:
             connection.request("GET", "/health")
             with connection.getresponse() as response:
                 self.assertEqual(response.status, 200)
-                self.assertEqual(json.load(response), {})
+                self.assertEqual(response.headers.get_content_type(), "application/json")
+                health = json.load(response)
+        with closing(self.connect()) as connection:
+            connection.request("GET", "/ready")
+            with connection.getresponse() as response:
+                if response.status == 404:
+                    self.assertEqual(health, {})
+                    return health
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get_content_type(), "application/json")
+                self.assertEqual(json.load(response), {"ready": True})
+        self.assertIsInstance(health, dict)
+        for name, maximum in (("max_active", 32), ("max_num_batched_tokens", 32768)):
+            value = health.get(name)
+            self.assertIs(type(value), int, health)
+            self.assertTrue(1 <= value <= maximum, health)
+        return health
+
+    def test_health(self):
+        self.health_caps()
 
     def test_exact_tokens_and_request_reset(self):
         self.check_completion(self.prompt, self.expected)
@@ -195,6 +214,8 @@ class NativeStreamingTest(unittest.TestCase):
                                      {"error": {"message": "Invalid JSON request body"}})
 
     def test_single_active_request_and_disconnect(self):
+        if self.health_caps().get("max_active", 1) != 1:
+            self.skipTest("Run with --max-active 1 to check single-slot queueing and disconnect")
         with closing(self.connect()) as queued, closing(self.connect()) as active:
             self.post(active, completion_request(self.prompt, 1024))
             active_socket = active.sock

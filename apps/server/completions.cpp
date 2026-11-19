@@ -1,6 +1,7 @@
 #include "sglang/server/completions.h"
 
 #include "sglang/json.h"
+#include "sglang/decoder_internal.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/http.h"
 
@@ -237,15 +238,34 @@ void dispatch_completion(const Socket& connection, std::string_view body,
     stream_completion(connection, parse_benchmark(parsed.object()), generate, trace);
 }
 
+template <typename Generate>
+DecoderResult generate_serial(std::exception_ptr* failure, const Generate& generate) {
+    try {
+        return generate();
+    } catch (const decoder::CudaError& error) {
+        if (failure && decoder::CudaError::terminal(error.status)) {
+            *failure = std::current_exception();
+        }
+        throw;
+    }
+}
+
 void complete_serial(const Socket& connection, const Decoder& decoder,
                      const CompletionTokenizer* tokenizer, std::string_view body,
                      bool trace, int mtp_steps, bool eager, bool chat = false,
-                     VisionCompletion* vision = nullptr) {
+                     VisionCompletion* vision = nullptr, int target_rows = 0,
+                     std::exception_ptr* failure = nullptr) {
+    if (failure && *failure) {
+        std::rethrow_exception(*failure);
+    }
     MediaGenerator generate_media;
     if (vision) {
         generate_media = [&](const auto& prompt, auto options, const auto& callbacks) {
             options.eager = eager;
-            return vision->generate(decoder, prompt, options, callbacks);
+            options.max_num_batched_tokens = target_rows;
+            return generate_serial(failure, [&] {
+                return vision->generate(decoder, prompt, options, callbacks);
+            });
         };
     }
     dispatch_completion(connection, body, tokenizer,
@@ -254,17 +274,27 @@ void complete_serial(const Socket& connection, const Decoder& decoder,
             options.mtp_steps = mtp_steps;
         }
         options.eager = eager;
-        return decoder.generate(prompt, options, callbacks);
+        options.max_num_batched_tokens = target_rows;
+        return generate_serial(failure, [&] {
+            return decoder.generate(prompt, options, callbacks);
+        });
     }, trace, chat, generate_media);
 }
 
 void complete_batch(const Socket& connection, BatchService& service, int slot,
                     const CompletionTokenizer* tokenizer, std::string_view body,
-                    bool chat = false) {
+                    bool chat = false, VisionCompletion* vision = nullptr) {
+    service.rethrow_failure();
+    MediaGenerator generate_media;
+    if (vision) {
+        generate_media = [&](const auto& prompt, const auto& options, const auto& callbacks) {
+            return vision->generate(service, slot, prompt, options, callbacks);
+        };
+    }
     dispatch_completion(connection, body, tokenizer,
                         [&](const auto& prompt, const auto& options, const auto& callbacks) {
         return service.generate(slot, prompt, options, callbacks);
-    }, false, chat);
+    }, false, chat, generate_media);
 }
 
 }
@@ -284,8 +314,9 @@ void complete(const Socket& connection, BatchService& service, int slot, std::st
 
 void complete(const Socket& connection, const Decoder& decoder,
               const CompletionTokenizer& tokenizer, std::string_view body,
-              bool trace, int mtp_steps, bool eager) {
-    complete_serial(connection, decoder, &tokenizer, body, trace, mtp_steps, eager);
+              bool trace, int mtp_steps, bool eager, int target_rows, std::exception_ptr* failure) {
+    complete_serial(connection, decoder, &tokenizer, body, trace, mtp_steps, eager,
+                    false, nullptr, target_rows, failure);
 }
 
 void complete(const Socket& connection, BatchService& service, int slot,
@@ -295,13 +326,16 @@ void complete(const Socket& connection, BatchService& service, int slot,
 
 void complete_chat(const Socket& connection, const Decoder& decoder,
                    const CompletionTokenizer& tokenizer, std::string_view body,
-                   bool trace, int mtp_steps, bool eager, VisionCompletion* vision) {
-    complete_serial(connection, decoder, &tokenizer, body, trace, mtp_steps, eager, true, vision);
+                   bool trace, int mtp_steps, bool eager, VisionCompletion* vision,
+                   int target_rows, std::exception_ptr* failure) {
+    complete_serial(connection, decoder, &tokenizer, body, trace, mtp_steps, eager,
+                    true, vision, target_rows, failure);
 }
 
 void complete_chat(const Socket& connection, BatchService& service, int slot,
-                   const CompletionTokenizer& tokenizer, std::string_view body) {
-    complete_batch(connection, service, slot, &tokenizer, body, true);
+                   const CompletionTokenizer& tokenizer, std::string_view body,
+                   VisionCompletion* vision) {
+    complete_batch(connection, service, slot, &tokenizer, body, true, vision);
 }
 
 }

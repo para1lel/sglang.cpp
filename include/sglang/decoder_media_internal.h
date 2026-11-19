@@ -21,6 +21,11 @@ struct MediaPrefill {
     void substitute(Bf16* embeddings, int position, int rows, cudaStream_t stream) const;
 };
 
-MediaPrefill upload_media_positions(Request& request, const MultimodalInput& input);
+std::shared_ptr<MultimodalInput> prepare_input(const std::vector<int>& template_ids,
+                                               const std::vector<DecoderMedia>& media,
+                                               std::shared_ptr<const Allocations> model);
+void validate_feature_device(const MultimodalInput& input, int device);
+MediaPrefill upload_media_positions(Request& request, const MultimodalInput& input,
+                                     cudaStream_t stream);
 
 }

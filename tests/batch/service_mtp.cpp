@@ -47,7 +47,7 @@ bool check(const Scenario& scenario) {
     sglang::DecoderResult result;
     try {
         const sglang::Decoder decoder("unused");
-        Service service(decoder, true, false, 4);
+        Service service(decoder, true, false, 4, 4, 0, 32768);
         result = service.generate(3, {7}, options, callbacks);
     } catch (...) {
         std::cerr.rdbuf(original);
@@ -95,17 +95,27 @@ struct DecoderBatch::State {
     bool seeded = false;
 };
 
-DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions)
-    : state_(std::make_unique<State>()) {}
+DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
+    : state_(std::make_unique<State>()) {
+    require(!options.cuda_graphs && options.max_lanes == 4 &&
+                options.prefix_cache_entries == 0 && options.max_num_batched_tokens == 32768,
+            "Unexpected service scheduler configuration");
+}
 DecoderBatch::~DecoderBatch() = default;
 
-void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
+int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
     require(slot == 3 && prompt == std::vector<int>{7} && options.mtp_steps == 4 &&
                 (options.max_new_tokens == 1 || options.max_new_tokens == 6),
             "Unexpected admission");
     require(state_->budget == 0, "Overlapping admission");
     state_->budget = options.max_new_tokens;
     state_->seeded = false;
+    return 0;
+}
+
+int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
+                                  const std::vector<DecoderMedia>&) {
+    throw std::logic_error("Unexpected media admission");
 }
 
 void DecoderBatch::cancel(int slot) {
@@ -123,6 +133,7 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
     if (!std::exchange(state_->seeded, true)) {
         step.token = 100;
         stats->prefill_rows[3] = 1;
+        stats->target_rows = 1;
         if (state_->budget == 1) {
             step.finish_reason = Finish::length;
             state_->budget = 0;
@@ -138,12 +149,18 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
     step.extra_token_count = 4;
     step.mtp_accepted_tokens = 4;
     step.mtp_drafted_tokens = 4;
+    step.mtp_verified_rows = 5;
     stats->verification_lanes = 1;
     stats->verification_rows = 5;
+    stats->target_rows = 5;
     return steps;
 }
 
 std::size_t DecoderBatch::request_device_allocation_bytes() const { return 0; }
+DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const { return {}; }
+void DecoderBatch::reset_prefix_cache() {
+    throw std::logic_error("Unexpected prefix cache reset");
+}
 bool DecoderBatch::available() const { return true; }
 
 }

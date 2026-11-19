@@ -32,6 +32,7 @@ struct PreparedMedia {
 struct MediaPrompt {
     std::vector<int> template_ids;
     std::vector<PreparedMedia> parts;
+    std::size_t expanded_tokens = 0;
 };
 
 std::optional<ChatMedia> parse_chat_media(const json::OrderedObject& chat, bool enabled);

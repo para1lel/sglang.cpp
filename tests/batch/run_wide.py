@@ -23,15 +23,12 @@ def check_cli(args):
     valid = [([], NO_DEVICE)]
     valid.extend((["--max-active", str(width)], NO_DEVICE) for width in (1, 2, 3, 4, *WIDTHS))
     valid.extend((["--max-active", str(width), "--mtp-steps", str(depth)], NO_DEVICE)
-                 for width in range(1, 5) for depth in (1, 4))
+                 for width in (1, 2, 3, 4, 5, *WIDTHS) for depth in (1, 4))
     valid.extend((["--max-active", str(width), "--batch-cuda-graphs"], NO_DEVICE)
                  for width in WIDTHS)
     invalid = [(["--max-active", value], "--max-active in [1,")
                for value in ("0", "-1", "33", "wide", "2147483648")]
     invalid.extend([
-        (["--max-active", "5", "--mtp-steps", "1"], "above 4 requires --mtp-steps 0"),
-        (["--max-active", "16", "--mtp-steps", "1"], "above 4 requires --mtp-steps 0"),
-        (["--max-active", "32", "--mtp-steps", "4"], "above 4 requires --mtp-steps 0"),
         (["--max-active", "4", "--mtp-steps", "5"], "--mtp-steps in [0, 4]"),
         (["--max-active", "1", "--batch-cuda-graphs"], "--batch-cuda-graphs requires"),
         (["--max-active", "16", "--eager"], "--eager requires --max-active 1"),
@@ -79,7 +76,8 @@ def check_native(args, width):
 def check_http(args, width):
     out = args.evidence / f"http-{width}"
     spec = argparse.Namespace(output=out, binary=args.binary, checkpoint=args.checkpoint,
-                              width=width, route="graph", policy="exact", activity=args.activity)
+                              width=width, route="graph", policy="exact", activity=args.activity,
+                              max_num_batched_tokens=PREFILL_ROW_BUDGET)
     with http.server(spec) as port:
         log = out / "server.log"
         offset = log.stat().st_size

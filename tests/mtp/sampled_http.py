@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, contextmanager
 import http.client
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -22,6 +23,8 @@ from live_controls import ENTRIES, Controls
 
 
 CHECKPOINT = Path("/data0/shared/Qwen3.8-27B-FP8")
+TOKEN_BUDGET = 32768
+NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
 TEXT = "/v1/completions"
 CHAT = "/v1/chat/completions"
 COMMON = {"model": "Qwen3.8-27B-FP8", "return_token_ids": True}
@@ -52,13 +55,17 @@ def server(args, output, width, depth, prefill="exact", flags=()):
     port = choose_port()
     command = [str(args.server), "--checkpoint", str(args.checkpoint), "--device", "0",
                "--port", str(port), "--max-active", str(width), "--mtp-steps", str(depth),
-               "--fp8-prefill", prefill, "--trace-batches", *flags]
+               "--max-num-batched-tokens", str(TOKEN_BUDGET), "--fp8-prefill", prefill,
+               "--trace-batches", *flags]
     write_json(output / "command.json", command)
     log = output / "server.log"
     with log.open("wb") as stream:
         process = subprocess.Popen(command, stdout=stream, stderr=stream, start_new_session=True)
         try:
-            wait_until_ready(process, port, log)
+            health = wait_until_ready(process, port, log)
+            write_json(output / "health.json", health)
+            require(health.get("max_active") == width and
+                    health.get("max_num_batched_tokens") == TOKEN_BUDGET, health)
             yield port, log
         finally:
             stop_server(process, None)
@@ -138,17 +145,11 @@ def media_body():
                   "max_tokens": 4, "ignore_eos": True}
 
 
-def check_media(port, log, width):
+def check_media(port, log):
     body = media_body()
     offset = log.stat().st_size
     error = post(port, CHAT, body | {"mtp_steps": 1}, stream=False, status=400)
-    expected = ("Unsupported chat completion option: mtp_steps" if width == 1
-                else "Decoded media requires serial chat")
-    require(expected in error["error"]["message"], error)
-    if width != 1:
-        batch_error = post(port, CHAT, body, stream=False, status=400)
-        require(batch_error == error, batch_error)
-        return {"with_depth": error, "without_depth": batch_error}
+    require("Unsupported chat completion option: mtp_steps" in error["error"]["message"], error)
     require(log.stat().st_size == offset, "Rejected media request produced generation traces")
     frames = post(port, CHAT, body)
     row = transcript(frames)
@@ -210,6 +211,7 @@ def run_cases(port, log, width, depth, prefill):
         "ignore-natural-eos": post(port, CHAT, EOS | {"ignore_eos": True, "max_tokens": 4}),
         "one-token": post(port, TEXT, MAIN | {"max_tokens": 1}),
         "argmax-filter": post(port, TEXT, MAIN | {"top_p": 1, "top_k": 1, "min_p": 1}),
+        "greedy": post(port, TEXT, MAIN | {"temperature": 0}),
     }
     if width == 4:
         cases["long"] = post(port, TEXT, LONG)
@@ -229,6 +231,7 @@ def run_cases(port, log, width, depth, prefill):
             rows["ignore-natural-eos"]["tokens"][:2] == rows["natural-eos"]["tokens"],
             rows["ignore-natural-eos"])
     require(rows["one-token"]["tokens"] == wanted["tokens"][:1], rows["one-token"])
+    require(rows["argmax-filter"] == rows["greedy"], "Top-1 sampling changed greedy output")
     require(rows["mask"]["text"] in ("yes", "no") and rows["mask"]["finish"] == "stop",
             rows["mask"])
     if width == 4:
@@ -247,7 +250,7 @@ def run_cases(port, log, width, depth, prefill):
     require(all("min_p" in error["error"]["message"] for error in errors), errors)
     return {
         "wire": cases, "transcripts": rows, "errors": errors, "stop_request": stop,
-        "media": check_media(port, log, width),
+        "media": check_media(port, log),
         "cancellation": check_cancellation(port, log, width, depth, wanted),
     }
 
@@ -259,14 +262,20 @@ def check_against_control(rows, control, context):
 
 def check_configuration(args, width, prefill, mode, depths, flags=(), exact=None):
     observed = {}
+    media_control = None
     for depth in depths:
         output = args.evidence / f"w{width}-{prefill}-{mode}-k{depth}"
         with server(args, output, width, depth, prefill, flags) as (port, log):
             evidence = run_cases(port, log, width, depth, prefill)
         write_json(output / "wire.json", evidence)
         rows = evidence["transcripts"]
+        media = evidence["media"]["transcript"]
+        if depth:
+            require(media == media_control, f"W{width} {prefill} {mode} K{depth}: changed media")
+        else:
+            media_control = media
         if width == 1:
-            rows = rows | {"media": evidence["media"]["transcript"]}
+            rows = rows | {"media": media}
         if depth:
             control = observed[0]
             if exact is not None:
@@ -297,21 +306,31 @@ def check_configuration(args, width, prefill, mode, depths, flags=(), exact=None
     return observed
 
 
-def check_invalid_startup(args):
+def check_startup(args):
     cases = [
-        (["--max-active", "5", "--mtp-steps", "1"], "--max-active above 4"),
+        (["--mtp-steps", "1"], NO_DEVICE),
+        (["--max-active", "5", "--mtp-steps", "1"], NO_DEVICE),
+        (["--max-active", "32", "--mtp-k", "4"], NO_DEVICE),
+        (["--max-active", "32", "--prefix-cache-entries", "2"], NO_DEVICE),
+        (["--max-active", "33", "--mtp-steps", "1"], "--max-active in [1, 32]"),
+        (["--max-active", "32", "--mtp-steps", "5"], "--mtp-steps in [0, 4]"),
         (["--max-active", "4", "--mtp-steps", "4", "--prefix-cache-entries", "2"],
-         "--prefix-cache-entries requires exact prefill and --mtp-steps 0"),
+         "--prefix-cache-entries requires --mtp-steps 0. Omit --eager."),
+        (["--max-active", "32", "--mtp-steps", "1", "--prefix-cache-entries", "2"],
+         "--prefix-cache-entries requires --mtp-steps 0. Omit --eager."),
         (["--max-active", "1", "--mtp-steps", "1", "--eager"], "--eager requires"),
         (["--max-active", "1", "--batch-cuda-graphs"], "--batch-cuda-graphs requires"),
     ]
     records = []
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     for flags, diagnostic in cases:
-        command = [str(args.server), "--checkpoint", str(args.evidence / "absent"), *flags]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+        command = [str(args.server), "--checkpoint", str(args.evidence / "absent"),
+                   "--max-num-batched-tokens", str(TOKEN_BUDGET), *flags]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                timeout=10, check=False)
         records.append({"command": command, "status": result.returncode,
-                        "stdout": result.stdout, "stderr": result.stderr})
-        write_json(args.evidence / "invalid-startup.json", records)
+                        "expected": diagnostic, "stdout": result.stdout, "stderr": result.stderr})
+        write_json(args.evidence / "startup.json", records)
         require(result.returncode != 0 and diagnostic in result.stderr, records[-1])
 
 
@@ -369,7 +388,7 @@ def main():
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
     args.evidence.mkdir(parents=True)
-    check_invalid_startup(args)
+    check_startup(args)
     serial = check_configuration(args, 1, "exact", "default", range(5))
     eager = check_configuration(args, 1, "exact", "eager", (0,), ("--eager",))
     require(serial[0] == eager[0], "Serial eager changed seeded output")

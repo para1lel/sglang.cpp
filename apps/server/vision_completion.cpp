@@ -3,6 +3,7 @@
 #include "sglang/checkpoint.h"
 #include "sglang/decoder_internal.h"
 #include "sglang/decoder_media.h"
+#include "sglang/server/batch_service.h"
 #include "sglang/vision.h"
 
 namespace sglang::server {
@@ -25,25 +26,21 @@ VisionCompletion::VisionCompletion(const std::filesystem::path& checkpoint, int 
 
 VisionCompletion::~VisionCompletion() = default;
 
-DecoderResult VisionCompletion::generate(const Decoder& decoder, const MediaPrompt& prompt,
-                                        const DecoderOptions& options,
-                                        const DecoderCallbacks& callbacks) {
+std::optional<std::vector<DecoderMedia>> VisionCompletion::encode(
+    const MediaPrompt& prompt, const DecoderCallbacks& callbacks) {
     if (callbacks.is_cancelled && callbacks.is_cancelled()) {
-        return cancelled();
-    }
-    if (options.max_new_tokens == 0) {
-        return {};
+        return std::nullopt;
     }
     const DeviceScope device(device_);
-    if (!encoder_) {
+    std::call_once(loaded_, [&] {
         encoder_ = std::make_unique<VisionEncoder>(Checkpoint(checkpoint_));
-    }
+    });
     const auto storage = std::make_shared<Allocations>(device_);
     std::vector<DecoderMedia> media;
     media.reserve(prompt.parts.size());
     for (const auto& part : prompt.parts) {
         if (callbacks.is_cancelled && callbacks.is_cancelled()) {
-            return cancelled();
+            return std::nullopt;
         }
         const VisionGrid grid{part.layout.temporal_pairs, part.layout.patch_height,
                               part.layout.patch_width};
@@ -58,7 +55,29 @@ DecoderResult VisionCompletion::generate(const Decoder& decoder, const MediaProm
         encoder_->encode(grid, pixels, part.patches.size(), features, elements, work.stream());
         media.push_back({part.layout, {storage, features}, elements});
     }
-    return decoder.generate_multimodal(prompt.template_ids, media, options, callbacks);
+    return media;
+}
+
+DecoderResult VisionCompletion::generate(const Decoder& decoder, const MediaPrompt& prompt,
+                                        const DecoderOptions& options,
+                                        const DecoderCallbacks& callbacks) {
+    if (options.max_new_tokens == 0) {
+        return callbacks.is_cancelled && callbacks.is_cancelled() ? cancelled() : DecoderResult{};
+    }
+    auto media = encode(prompt, callbacks);
+    return media ? decoder.generate_multimodal(prompt.template_ids, *media, options, callbacks)
+                 : cancelled();
+}
+
+DecoderResult VisionCompletion::generate(BatchService& service, int slot, const MediaPrompt& prompt,
+                                        const DecoderOptions& options,
+                                        const DecoderCallbacks& callbacks) {
+    if (options.max_new_tokens == 0) {
+        return callbacks.is_cancelled && callbacks.is_cancelled() ? cancelled() : DecoderResult{};
+    }
+    auto media = encode(prompt, callbacks);
+    return media ? service.generate(slot, prompt.template_ids, options, callbacks,
+                                    std::move(*media), prompt.expanded_tokens) : cancelled();
 }
 
 }

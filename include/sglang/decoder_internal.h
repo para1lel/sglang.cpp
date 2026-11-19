@@ -47,6 +47,33 @@ constexpr bool is_full_attention(int layer_index) {
 }
 
 void check(cudaError_t status, const char* operation);
+struct CudaError : std::runtime_error {
+    CudaError(cudaError_t status, const char* operation);
+    static bool terminal(cudaError_t error) {
+        switch (error) {
+            case cudaErrorECCUncorrectable:
+            case cudaErrorIllegalAddress:
+            case cudaErrorLaunchTimeout:
+            case cudaErrorContextIsDestroyed:
+            case cudaErrorAssert:
+            case cudaErrorHardwareStackError:
+            case cudaErrorIllegalInstruction:
+            case cudaErrorMisalignedAddress:
+            case cudaErrorInvalidAddressSpace:
+            case cudaErrorInvalidPc:
+            case cudaErrorLaunchFailure:
+                return true;
+            default:
+                return false;
+        }
+    }
+    cudaError_t status;
+};
+
+std::size_t available_device_bytes();
+int reserved_verification_rows(int output, int mtp_steps);
+std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft);
+void check_resident_capacity(std::size_t requested, std::size_t total, std::size_t free);
 void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
                       bool allow_mtp = false);
 
@@ -270,7 +297,7 @@ struct Decoder::Model {
     void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;
     bool prefill_serial(decoder::Request& request, const std::vector<int>& prompt,
                         const DecoderCallbacks& callbacks, DecoderResult& result,
-                        const decoder::MediaPrefill* media = nullptr) const;
+                        const decoder::MediaPrefill* media = nullptr, int step_budget = 0) const;
     void advance_serial(decoder::Request& request, int step, int prompt_count, int input,
                         bool media, int rotary_delta) const;
     void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,

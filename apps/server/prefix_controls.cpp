@@ -34,6 +34,9 @@ void handle_errors(const Socket& connection, const Handle& handle) {
         handle();
     } catch (const HttpError& error) {
         write_error(connection, error.status, error.what());
+    } catch (const DecoderCapacityError& error) {
+        const char* status = error.retryable ? "503 Service Unavailable" : "413 Content Too Large";
+        write_error(connection, status, error.what());
     } catch (const std::invalid_argument& error) {
         write_error(connection, "400 Bad Request", error.what());
     } catch (const std::exception& error) {
@@ -128,8 +131,9 @@ void stop_profile(const Socket& connection, BatchService& service, const HttpReq
 
 class ConnectionQueue {
 public:
-    ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete)
-        : service_(service), capacity_(capacity), complete_(complete) {}
+    ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete,
+                    std::string_view health)
+        : service_(service), capacity_(capacity), complete_(complete), health_(health) {}
 
     void read_connections(const Socket& listener);
     void run(int slot);
@@ -144,6 +148,7 @@ private:
     BatchService& service_;
     const int capacity_;
     const BatchCompletion& complete_;
+    const std::string_view health_;
     std::mutex mutex_;
     std::condition_variable changed_;
     std::list<Completion> pending_;
@@ -157,7 +162,11 @@ void ConnectionQueue::discard_disconnected() {
 void ConnectionQueue::serve_control(const Socket& connection, const HttpRequest& request) {
     if (request.method == "GET" && request.body.empty()) {
         if (request.path == "/health") {
-            write_json(connection, "200 OK", "{}");
+            write_json(connection, "200 OK", health_);
+            return;
+        }
+        if (request.path == "/ready") {
+            write_readiness(connection, service_.ready());
             return;
         }
         if (request.path == "/metrics") {
@@ -202,6 +211,7 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         serve_control(connection, request);
         return;
     }
+    service_.rethrow_failure();
     {
         const std::lock_guard lock(mutex_);
         if (closing_) {
@@ -272,11 +282,11 @@ void ConnectionQueue::stop() {
 }
 
 void serve_prefix_connections(const Socket& listener, BatchService& service, int max_active,
-                              const BatchCompletion& complete) {
+                              const BatchCompletion& complete, std::string_view health) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid prefix listener capacity");
     }
-    ConnectionQueue queue(service, max_active, complete);
+    ConnectionQueue queue(service, max_active, complete, health);
     std::vector<std::thread> workers;
     workers.reserve(2 * max_active);
     std::mutex failure_mutex;

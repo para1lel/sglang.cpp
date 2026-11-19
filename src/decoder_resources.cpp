@@ -22,14 +22,6 @@ struct CleanupError {
     void raise() const { check(status, operation); }
 };
 
-struct CudaError : std::runtime_error {
-    CudaError(cudaError_t status, const char* operation)
-        : std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status)),
-          status(status) {}
-
-    cudaError_t status;
-};
-
 bool capture_rejected(cudaError_t status) {
     return status == cudaErrorNotSupported || status == cudaErrorMemoryAllocation ||
         status == cudaErrorStreamCaptureUnsupported ||
@@ -292,6 +284,46 @@ CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_ow
 void check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
         throw CudaError(status, operation);
+    }
+}
+
+CudaError::CudaError(cudaError_t status, const char* operation)
+    : std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status)),
+      status(status) {}
+
+std::size_t available_device_bytes() {
+    std::size_t free = 0;
+    std::size_t total = 0;
+    check(cudaMemGetInfo(&free, &total), "Measure available CUDA memory");
+    return free;
+}
+
+int reserved_verification_rows(int output, int mtp_steps) {
+    return mtp_steps && output > 1 ? std::min(mtp_steps + 1, output - 1) : 0;
+}
+
+std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft) {
+    constexpr std::size_t gdn_bytes = gdn_layers *
+        (gdn_history_elements * sizeof(Bf16) + gdn_state_elements * sizeof(float));
+    constexpr std::size_t workspace_allowance = 16 * 1024 * 1024;
+    const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
+    const auto kv_per_layer = 2 * pages *
+        (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
+    const auto table = pages * sizeof(std::int32_t);
+    const auto target = full_attention_layers * kv_per_layer + table + gdn_bytes;
+    const auto draft_kv = kv_per_layer + table;
+    const auto verifier = verification_rows ? gdn_bytes + verification_rows * workspace_allowance
+                                            : 0;
+    return target + workspace_allowance + (draft ? draft_kv + workspace_allowance : 0) + verifier;
+}
+
+void check_resident_capacity(std::size_t requested, std::size_t total, std::size_t free) {
+    if (requested > total) {
+        throw DecoderCapacityError("Prompt and output budget exceed resident decoder capacity",
+                                   false);
+    }
+    if (requested > free) {
+        throw DecoderCapacityError("Insufficient free resident decoder memory. Retry later.", true);
     }
 }
 

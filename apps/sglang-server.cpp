@@ -24,7 +24,8 @@ struct Arguments {
     sglang::Fp8PrefillPolicy fp8_prefill = sglang::Fp8PrefillPolicy::exact;
     int device = 0;
     int port = 17384;
-    int max_active = 1;
+    int max_active = sglang::decoder_batch_max_lanes;
+    int max_num_batched_tokens = sglang::decoder_batch_max_step_tokens;
     int mtp_steps = 0;
     int prefix_cache_entries = 0;
     bool eager = false;
@@ -39,6 +40,15 @@ int parse_integer(std::string_view value, const char* error) {
         throw std::invalid_argument(error);
     }
     return number;
+}
+
+int parse_target_rows(std::string_view value) {
+    const auto error = "Expected --max-num-batched-tokens in [1, 32768]";
+    const int rows = parse_integer(value, error);
+    if (rows == 0 || rows > sglang::decoder_batch_max_step_tokens) {
+        throw std::invalid_argument(error);
+    }
+    return rows;
 }
 
 Arguments parse_arguments(int argc, char** argv) {
@@ -79,13 +89,15 @@ Arguments parse_arguments(int argc, char** argv) {
                 arguments.max_active > sglang::decoder_batch_max_lanes) {
                 throw std::invalid_argument(error);
             }
+        } else if (option == "--max-num-batched-tokens") {
+            arguments.max_num_batched_tokens = parse_target_rows(value);
         } else if (option == "--prefix-cache-entries") {
             const auto error = "Expected --prefix-cache-entries in [0, 4]";
             arguments.prefix_cache_entries = parse_integer(value, error);
             if (arguments.prefix_cache_entries > sglang::decoder_batch_prefix_max_entries) {
                 throw std::invalid_argument(error);
             }
-        } else if (option == "--mtp-steps") {
+        } else if (option == "--mtp-steps" || option == "--mtp-k") {
             const auto error = "Expected --mtp-steps in [0, 4]";
             arguments.mtp_steps = parse_integer(value, error);
             if (arguments.mtp_steps > sglang::decoder_max_mtp_steps) {
@@ -101,9 +113,6 @@ Arguments parse_arguments(int argc, char** argv) {
     if (arguments.batch_cuda_graphs && arguments.max_active == 1) {
         throw std::invalid_argument("--batch-cuda-graphs requires --max-active at least 2");
     }
-    if (arguments.mtp_steps > 0 && arguments.max_active > sglang::decoder_batch_max_mtp_lanes) {
-        throw std::invalid_argument("--max-active above 4 requires --mtp-steps 0");
-    }
     if (arguments.prefix_cache_entries != 0 && (arguments.eager || arguments.mtp_steps != 0)) {
         throw std::invalid_argument(
             "--prefix-cache-entries requires --mtp-steps 0. Omit --eager.");
@@ -111,25 +120,42 @@ Arguments parse_arguments(int argc, char** argv) {
     return arguments;
 }
 
-template <typename Complete>
-void serve_connection(const Socket& connection, const Complete& complete_request) {
+std::string health_json(const Arguments& arguments) {
+    return "{\"max_active\":" + std::to_string(arguments.max_active) +
+        ",\"max_num_batched_tokens\":" + std::to_string(arguments.max_num_batched_tokens) + "}";
+}
+
+Socket listen(const Arguments& arguments) {
+    auto listener = listen_loopback(arguments.port);
+    std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
+    return listener;
+}
+
+template <typename Ready, typename Complete>
+void serve_connection(const Socket& connection, std::string_view health,
+                      const Ready& ready, const Complete& complete_request) {
     try {
         const auto request = read_request(connection);
         if (!request) {
             return;
         }
         if (request->path == "/health" && request->method == "GET" && request->body.empty()) {
-            write_json(connection, "200 OK", "{}");
+            write_json(connection, "200 OK", health);
+        } else if (request->path == "/ready" && request->method == "GET" && request->body.empty()) {
+            write_readiness(connection, ready());
         } else if (request->path == "/v1/completions" && request->method == "POST") {
             complete_request(connection, request->body, false);
         } else if (request->path == "/v1/chat/completions" && request->method == "POST") {
             complete_request(connection, request->body, true);
         } else {
             write_error(connection, "404 Not Found",
-                        "Expected GET /health or POST /v1/completions");
+                        "Expected GET /health, GET /ready, or POST /v1/completions");
         }
     } catch (const HttpError& error) {
         write_error(connection, error.status, error.what());
+    } catch (const sglang::DecoderCapacityError& error) {
+        const char* status = error.retryable ? "503 Service Unavailable" : "413 Content Too Large";
+        write_error(connection, status, error.what());
     } catch (const std::invalid_argument& error) {
         write_error(connection, "400 Bad Request", error.what());
     } catch (const std::exception& error) {
@@ -138,18 +164,20 @@ void serve_connection(const Socket& connection, const Complete& complete_request
     }
 }
 
-template <typename Complete>
-void serve_connections(const Socket& listener, const Complete& complete_request) {
+template <typename Ready, typename Complete>
+void serve_connections(const Socket& listener, std::string_view health,
+                       const Ready& ready, const Complete& complete_request) {
     while (!stopping()) {
         const auto connection = accept_connection(listener);
         if (connection.get() >= 0) {
-            serve_connection(connection, complete_request);
+            serve_connection(connection, health, ready, complete_request);
         }
     }
 }
 
 void serve_batch(const Socket& listener, BatchService& service,
-                 const CompletionTokenizer& tokenizer, int max_active) {
+                 const CompletionTokenizer& tokenizer, VisionCompletion& vision,
+                 int max_active, std::string_view health) {
     std::vector<std::thread> workers;
     workers.reserve(max_active);
     std::mutex failure_mutex;
@@ -165,10 +193,11 @@ void serve_batch(const Socket& listener, BatchService& service,
         for (int slot = 0; slot < max_active; ++slot) {
             workers.emplace_back([&, slot] {
                 try {
-                    serve_connections(listener, [&](const Socket& connection,
+                    serve_connections(listener, health, [&] { return service.ready(); },
+                                               [&](const Socket& connection,
                                                     std::string_view body, bool chat) {
                         if (chat) {
-                            complete_chat(connection, service, slot, tokenizer, body);
+                            complete_chat(connection, service, slot, tokenizer, body, &vision);
                         } else {
                             complete(connection, service, slot, tokenizer, body);
                         }
@@ -195,10 +224,12 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
                      " [--max-active N] [--mtp-steps N] [--eager] [--batch-cuda-graphs]\n"
-                     "                     [--fp8-prefill exact|tensor-core] [--trace-batches]\n"
+                     "                     [--max-num-batched-tokens N] [--trace-batches]\n"
+                     "                     [--fp8-prefill exact|tensor-core]\n"
                      "                     [--prefix-cache-entries 0..4]\n"
-                     "Active requests: 1 by default, up to 32.\n"
-                     "MTP steps: 0 by default, up to 4 with at most 4 active requests.\n"
+                     "Active requests: 32 by default, range 1-32.\n"
+                     "Target rows per step: 32768 by default, range 1-32768.\n"
+                     "MTP steps: 0 by default, up to 4. --mtp-k is an alias.\n"
                      "Batch graphs: ordinary decode steps at widths 2-4. Other steps use eager.\n"
                      "Eager decode: one active request with MTP off.\n"
                      "Prefix cache: disabled by default. Requires MTP off. Omit --eager.\n"
@@ -214,36 +245,44 @@ int main(int argc, char** argv) {
         if (stopping()) {
             return 0;
         }
-        const auto listener = listen_loopback(arguments.port);
-        std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
         const CompletionTokenizer tokenizer(arguments.checkpoint);
+        const auto health = health_json(arguments);
+        VisionCompletion vision(arguments.checkpoint, arguments.device);
         if (arguments.max_active == 1 && arguments.prefix_cache_entries == 0) {
-            VisionCompletion vision(arguments.checkpoint, arguments.device);
-            serve_connections(listener, [&](const Socket& connection,
+            std::exception_ptr failure;
+            const auto listener = listen(arguments);
+            serve_connections(listener, health, [&] { return !failure; },
+                                       [&](const Socket& connection,
                                             std::string_view body, bool chat) {
                 if (chat) {
                     complete_chat(connection, decoder, tokenizer, body, arguments.trace_batches,
-                                  arguments.mtp_steps, arguments.eager, &vision);
+                                  arguments.mtp_steps, arguments.eager, &vision,
+                                  arguments.max_num_batched_tokens, &failure);
                 } else {
                     complete(connection, decoder, tokenizer, body, arguments.trace_batches,
-                             arguments.mtp_steps, arguments.eager);
+                             arguments.mtp_steps, arguments.eager,
+                             arguments.max_num_batched_tokens, &failure);
                 }
             });
         } else {
             BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs,
                                  arguments.mtp_steps, arguments.max_active,
-                                 arguments.prefix_cache_entries);
+                                 arguments.prefix_cache_entries, arguments.max_num_batched_tokens);
+            if (stopping()) {
+                return 0;
+            }
+            const auto listener = listen(arguments);
             if (arguments.prefix_cache_entries != 0) {
                 serve_prefix_connections(listener, service, arguments.max_active,
                     [&](const Socket& connection, int slot, std::string_view body, bool chat) {
                         if (chat) {
-                            complete_chat(connection, service, slot, tokenizer, body);
+                            complete_chat(connection, service, slot, tokenizer, body, &vision);
                         } else {
                             complete(connection, service, slot, tokenizer, body);
                         }
-                    });
+                    }, health);
             } else {
-                serve_batch(listener, service, tokenizer, arguments.max_active);
+                serve_batch(listener, service, tokenizer, vision, arguments.max_active, health);
             }
         }
     } catch (const std::exception& error) {

@@ -89,6 +89,9 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     if (options.mtp_steps < 0 || options.mtp_steps > decoder_max_mtp_steps) {
         throw std::invalid_argument("MTP proposal count must be in [0, 4]");
     }
+    if (options.max_num_batched_tokens < 0) {
+        throw std::invalid_argument("Target step budget must be nonnegative");
+    }
     validate_constraint(options);
     if (!allow_mtp && options.mtp_steps != 0) {
         throw std::invalid_argument("MTP requires serial generation");
@@ -337,7 +340,9 @@ struct Decoder::Model::MtpGeneration {
         }
         const auto stream = target.memory.stream();
         const int prompt_count = static_cast<int>(prompt.size());
-        PrefillWorkspace workspace(stream, std::min(prompt_count, prefill_chunk_rows));
+        const int limit = options.max_num_batched_tokens
+            ? std::min(prefill_chunk_rows, options.max_num_batched_tokens) : prefill_chunk_rows;
+        PrefillWorkspace workspace(stream, std::min(prompt_count, limit));
         prefill_bytes = workspace.bytes();
         result.peak_device_allocation_bytes += prefill_bytes;
         const int tile_rows = prefill_bytes ? workspace.capacity() : 1;
@@ -371,7 +376,9 @@ struct Decoder::Model::MtpGeneration {
             return *finish;
         }
         const auto before = target.memory.bytes();
-        const int rows = std::min(options.max_new_tokens - 1, options.mtp_steps + 1);
+        const int proposals = options.max_num_batched_tokens
+            ? std::min(options.mtp_steps, options.max_num_batched_tokens - 1) : options.mtp_steps;
+        const int rows = std::min(options.max_new_tokens - 1, proposals + 1);
         const int prompt_count = static_cast<int>(prompt.size());
         TargetVerification verification(target, prompt_count + options.max_new_tokens - 1,
                                         next_target_position, rows, options.top_logits > 0);
@@ -381,7 +388,7 @@ struct Decoder::Model::MtpGeneration {
         while (!cancelled()) {
             const int remaining = options.max_new_tokens -
                                   static_cast<int>(result.output_token_ids.size());
-            const int count = std::min(remaining - (sampling ? 1 : 0), options.mtp_steps);
+            const int count = std::min(remaining - (sampling ? 1 : 0), proposals);
             VerificationTokens tokens{};
             if (!propose(tokens, count)) {
                 break;
@@ -448,19 +455,24 @@ DecoderFinishReason Decoder::Model::generate_mtp(const std::vector<int>& prompt,
 
 bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& prompt,
                                    const DecoderCallbacks& callbacks, DecoderResult& result,
-                                   const MediaPrefill* media) const {
+                                   const MediaPrefill* media, int step_budget) const {
     const int count = static_cast<int>(prompt.size());
     const auto stream = request.memory.stream();
     const int aligned = count / prefill_chunk_rows * prefill_chunk_rows;
     std::optional<PrefillWorkspace> tiled;
     if (!media && fp8_prefill() == Fp8PrefillPolicy::tensor_core) {
-        const int larger = std::min(aligned, serial_prefill_rows(b200_, count));
+        const int configured = serial_prefill_rows(b200_, count);
+        const int limit = step_budget ? step_budget / prefill_chunk_rows * prefill_chunk_rows
+                                      : configured;
+        const int larger = std::min({aligned, configured, limit});
         if (larger > prefill_chunk_rows) {
             tiled.emplace(stream, larger);
         }
     }
     if (!tiled || !tiled->bytes()) {
-        tiled.emplace(stream, std::min(count, prefill_chunk_rows));
+        const int limit = step_budget ? std::min(step_budget, prefill_chunk_rows)
+                                      : prefill_chunk_rows;
+        tiled.emplace(stream, std::min(count, limit));
     }
     auto& workspace = *tiled;
     result.peak_device_allocation_bytes += workspace.bytes();
@@ -534,7 +546,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         }
         auto& request = *storage;
         prepare_serial_request(request, options);
-        const auto prefill = media ? upload_media_positions(request, *media) : MediaPrefill{};
+        const auto prefill = media
+            ? upload_media_positions(request, *media, request.memory.stream()) : MediaPrefill{};
         const int rotary_delta = media ? media->prompt.next_position - prompt_count : 0;
         auto& transfers = request.memory.transfers();
         std::vector<DecoderLogit> ranking;
@@ -544,7 +557,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         result.peak_device_allocation_bytes += request.memory.bytes();
         const auto run_request = [&] {
             if (cancelled() ||
-                !prefill_serial(request, prompt, callbacks, result, media ? &prefill : nullptr)) {
+                !prefill_serial(request, prompt, callbacks, result, media ? &prefill : nullptr,
+                                options.max_num_batched_tokens)) {
                 return DecoderFinishReason::cancelled;
             }
             int winner = -1;

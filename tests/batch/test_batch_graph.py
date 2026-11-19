@@ -155,6 +155,27 @@ def scheduler(path, offset):
             rows[-1]["workspace_bytes"] = int(prefill[2])
         elif graph := re.fullmatch(rb"batch graph_slots=(\d+)", line):
             rows[-1]["graph_slots"] = int(graph[1])
+        elif target := re.fullmatch(rb"batch target_rows=(\d+) step_budget=(\d+)", line):
+            assert rows and rows[-1]["width"] and "target_rows" not in rows[-1], line
+            rows[-1]["target_rows"], rows[-1]["step_budget"] = map(int, target.groups())
+        elif verify := re.fullmatch(
+            rb"batch verify lanes=(\d+) rows=(\d+) peak_request_bytes=(\d+)", line
+        ):
+            assert rows and rows[-1]["width"] and "verification_rows" not in rows[-1], line
+            rows[-1]["verification_lanes"], rows[-1]["verification_rows"] = map(
+                int, verify.groups()[:2])
+            assert int(verify[3]) >= rows[-1]["request_bytes"], line
+        elif mtp := re.fullmatch(
+            rb"batch mtp slot=(\d+) drafted=(\d+) accepted=(\d+) verified=(\d+) "
+            rb"replayed=(\d+) boundary=([01])",
+            line,
+        ):
+            assert rows and "verification_rows" in rows[-1], line
+            slots = rows[-1].setdefault("mtp_slots", {})
+            slot, drafted, accepted, verified, replayed, boundary = map(int, mtp.groups())
+            assert slot not in slots, line
+            slots[slot] = {"drafted": drafted, "accepted": accepted, "verified": verified,
+                           "replayed": replayed, "boundary": boundary}
         elif peak := re.fullmatch(rb"batch peak_request_bytes=(\d+)", line):
             assert rows and rows[-1]["width"] and "peak_request_bytes" not in rows[-1], line
             peak_bytes = int(peak[1])
@@ -199,6 +220,8 @@ def server(args):
     command = [str(args.binary.resolve()), "--checkpoint", str(args.checkpoint.resolve()),
                "--device", "0", "--port", str(port), "--max-active", str(args.width),
                "--fp8-prefill", args.policy, "--trace-batches"]
+    if getattr(args, "max_num_batched_tokens", None) is not None:
+        command += ["--max-num-batched-tokens", str(args.max_num_batched_tokens)]
     if args.route == "graph":
         command.append("--batch-cuda-graphs")
     environment = dict(os.environ, LD_PRELOAD=str(args.activity.resolve()),

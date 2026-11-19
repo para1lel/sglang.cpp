@@ -19,7 +19,7 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 Launch both engines with **32,768 aggregate scheduled tokens per step** and **32 maximum in-service requests** for every new performance run, including diagnostics.
 
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-seqs 32`. Leave `--max-num-scheduled-tokens` unset or set it to `32768`. Verify the effective limits.
-- **Native server.** Set `--max-active 32` and require an effective aggregate step budget of `32768`. Both values are required native defaults. The fixed base supports `--max-active 32`. The aggregate setting and new defaults await implementation and verification.
+- **Native server.** Set `--max-active 32 --max-num-batched-tokens 32768`. Verify both defaults in [`GET /health`](development.md#native-streaming-server). Record admission failures separately from timing under the [resident memory limit](batch-graphs.md#resident-memory-admission).
 
 In every chat report, enumerate all nondefault launch, environment, client, and request settings for each engine, including diagnostics. Report effective server maxima separately from offered and observed client concurrency. Record each request's input length, context limit, and output budget. Preserve the original settings, identities, and gates of frozen runs. Only new matched runs under this policy qualify for acceptance. An unavailable required mode leaves its comparison open.
 
@@ -83,9 +83,9 @@ For a raw text experiment, freeze UTF-8 request bytes, checkpoint and tokenizer 
 
 ### Frozen W1 and W2 timing
 
-The [historical GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) used native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. Run the native client with `--url` and a fresh `--output`. Omit `--reference`.
+The [historical GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) used native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. For native timing, set `--url` and a fresh `--output`. Omit `--reference` for all native W1/W2 runs.
 
-Validate every warmup and measured stream and check repeat IDs within each engine. Apply the frozen limits separately to the native summary. Require a native-to-vLLM median throughput ratio above `strict_throughput_ratio_gt` and p95 TTFT, TPOT, and end-to-end latency at or below `p95_latency_ceilings_ms`.
+Validate every warmup and measured stream and check repeat IDs within each engine. Require a native-to-vLLM median throughput ratio above `strict_throughput_ratio_gt`. Require native p95 TTFT, TPOT, and end-to-end latency at or below `p95_latency_ceilings_ms`.
 
 On November 19, 2026, the repaired candidate matched `60677ec` IDs. Both passed W1. W2 missed only p95 TTFT at 395.348 ms base and 366.781 ms candidate against 80.305 ms.
 
@@ -168,15 +168,15 @@ Run the [MTP checks](mtp.md#verification) before timing. Use same-width eager K0
 
 To isolate layer-major verification, compare with row-wise MTP at the same depth. To isolate tiled seeding, keep the verifier, exact precision, and depth fixed. Time target prefill and draft KV seeding through workspace release, before the first LM head. Record HTTP TTFT and request latency separately. Include short, tile-boundary, and long prompts. Record tile sizes, pool state, and output length.
 
-Alternate paired arms on the same reserved B200. Match warmups and repeats. Report individual samples, medians, ranges, and paired ratios. The [frozen W3-MTP variant](../benchmarks/variants/README.md) requires four active requests and K1. Keep that workload separate from the [historical eager bursts](mtp.md#measured-continuous-mtp-trade-offs).
+Alternate paired arms on the same reserved B200. Match warmups and repeats. Report individual samples, medians, ranges, and paired ratios. The [frozen W3-MTP variant](../benchmarks/variants/README.md) offers four requests. Run K1 with `--max-active 32 --max-num-batched-tokens 32768`. The full matched run is pending. The [earlier eager bursts](mtp.md#measured-continuous-mtp-trade-offs) used 64 output IDs per request.
 
-Positive depth adds counters for the generator's first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds started. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder.cpp#L261)<!-- prefix: "bool propose" --> · [Output commit](../src/decoder.cpp#L235)<!-- prefix: "std::optiona" -->
+Positive depth adds counters for the generator's first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds started. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder.cpp#L264)<!-- prefix: "bool propose" --> · [Output commit](../src/decoder.cpp#L238)<!-- prefix: "std::optiona" -->
 
-Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder.cpp#L282)<!-- prefix: "std::optiona" -->
+Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder.cpp#L285)<!-- prefix: "std::optiona" -->
 
-Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L52)<!-- prefix: "void trace_v" -->
+Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L55)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L379)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L680)<!-- prefix: "current.peak" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L386)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L918)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

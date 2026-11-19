@@ -8,6 +8,7 @@
 namespace sglang {
 
 inline constexpr int decoder_batch_max_lanes = 32;
+inline constexpr int decoder_batch_max_step_tokens = 32768;
 inline constexpr int decoder_batch_max_graph_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_steps = decoder_max_mtp_steps;
@@ -27,6 +28,7 @@ struct DecoderBatchStep {
     int extra_token_count = 0;
     bool sampling_failed = false;
     bool constraint_failed = false;
+    int mtp_verified_rows = 0;
 };
 
 struct DecoderBatchStepStats {
@@ -38,12 +40,15 @@ struct DecoderBatchStepStats {
     int verification_rows = 0;
     std::size_t sampling_workspace_bytes = 0;
     std::size_t constraint_workspace_bytes = 0;
+    int target_rows = 0;
 };
 
 struct DecoderBatchOptions {
     bool cuda_graphs = false;
     int max_lanes = decoder_batch_max_mtp_lanes;
     int prefix_cache_entries = 0;
+    int max_num_batched_tokens = 0;
+    std::optional<std::size_t> resident_memory_limit = std::nullopt;
 };
 
 struct DecoderPrefixCacheStats {
@@ -67,6 +72,8 @@ public:
 
     /// Return the number of prompt positions restored from a completed checkpoint.
     int admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
+    int admit_multimodal(int slot, std::vector<int> prompt, const DecoderOptions& options,
+                         const std::vector<DecoderMedia>& media);
     void cancel(int slot);
 
     /// Advance each selected slot by one position or one speculative round.
@@ -92,6 +99,8 @@ public:
     bool available() const;
 
 private:
+    int admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& options,
+                   const std::vector<DecoderMedia>* media);
     struct State;
     std::unique_ptr<State> state_;
 };

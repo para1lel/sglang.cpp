@@ -86,8 +86,8 @@ def request_body(case, budget=None):
 
 
 class Stream:
-    def __init__(self, port, case, budget=None):
-        self.connection = http.client.HTTPConnection(LOOPBACK, port, timeout=30)
+    def __init__(self, port, case, budget=None, timeout=30):
+        self.connection = http.client.HTTPConnection(LOOPBACK, port, timeout=timeout)
         self.case = case
         self.request = request_body(case, budget)
         self.events = []
@@ -179,8 +179,10 @@ def wait_until_ready(process, port, log_path):
                 with closing(http.client.HTTPConnection(LOOPBACK, port, timeout=2)) as connection:
                     connection.request("GET", "/health")
                     with connection.getresponse() as response:
-                        require(response.status == 200 and json.load(response) == {}, "Unhealthy")
-                        return
+                        require(response.status == 200, f"Unhealthy: HTTP {response.status}")
+                        health = json.load(response)
+                        require(isinstance(health, dict), f"Invalid health response: {health!r}")
+                        return health
             except (ConnectionRefusedError, TimeoutError, http.client.RemoteDisconnected):
                 pass
         time.sleep(0.1)
@@ -210,8 +212,7 @@ def server(args, evidence, width, profile=False):
     port = choose_port()
     command = [str(args.binary), "--checkpoint", str(args.checkpoint), "--device",
                str(args.device), "--port", str(port)]
-    if width != "default":
-        command += ["--max-active", width]
+    command += ["--max-active", width]
     if width in ("2", "4"):
         command.append("--trace-batches")
     pid_file = None
@@ -315,11 +316,11 @@ def check_admission(port, log_path, evidence, cases, capacity):
                 f"An extra stream responded with {capacity} active decoders")
         for blocker in blockers:
             blocker.choice(active["output"][2:3])
+        retirement_offset = log_path.stat().st_size
         blockers[0].reset()
         queued.complete()
         for blocker in blockers[1:]:
             blocker.choice(active["output"][3:4])
-            retirement_offset = log_path.stat().st_size
             blocker.reset()
     retired = await_retirement(log_path, retirement_offset, capacity)
     replacement = request(port, active)
@@ -367,18 +368,18 @@ def main():
     parser.add_argument("--device", type=int, default=0, help="CUDA ordinal within visible GPUs")
     parser.add_argument("--evidence", type=Path, required=True,
                         help="new directory for raw results")
-    parser.add_argument("--width", action="append", choices=("default", "1", "2", "4"),
-                        help="repeat to select modes, defaults to all four")
+    parser.add_argument("--width", action="append", choices=("1", "2", "4"),
+                        help="repeat to select modes, defaults to all three")
     parser.add_argument("--nsys", default="nsys", help="Nsight Systems CLI for serial graph checks")
     args = parser.parse_args()
     args.binary = args.binary.resolve()
     args.checkpoint = args.checkpoint.resolve()
     args.evidence = args.evidence.resolve()
-    widths = tuple(dict.fromkeys(args.width or ("default", "1", "2", "4")))
-    if any(width in ("default", "1") for width in widths):
+    widths = tuple(dict.fromkeys(args.width or ("1", "2", "4")))
+    if "1" in widths:
         nsys = shutil.which(args.nsys)
         if not nsys:
-            parser.error("Nsight Systems is required for default and explicit width-1 graph checks")
+            parser.error("Nsight Systems is required for explicit width-1 graph checks")
         args.nsys = str(Path(nsys).absolute())
     cases = load_fixtures()
     args.evidence.mkdir(parents=True)
@@ -392,7 +393,7 @@ def main():
     for width in widths:
         print(f"Checking native serving width {width}", flush=True)
         evidence = args.evidence / f"width-{width}"
-        if width in ("default", "1"):
+        if width == "1":
             check_serial(args, evidence, width, cases)
         else:
             check_parallel(args, evidence, width, cases)

@@ -66,8 +66,8 @@ python3 -IB tests/batch/check_graph_evidence.py --check-slot-mask
 ## Wide K0 serving
 
 Use the Release `sglang-server` and a fresh evidence directory for the CLI checks.
-CUDA remains hidden while the runner checks valid limits, invalid inputs, and the MTP
-limit of four active requests.
+CUDA remains hidden while the runner checks valid limits, invalid inputs, and
+positive MTP depths at narrow and wide active limits.
 
 ```bash
 python3 -IB tests/batch/run_wide.py --binary "$out/bin/sglang-server" \
@@ -103,10 +103,10 @@ reuse. Request bytes must return to zero after retirement.
 
 The HTTP trace must show a full-width scheduler step and eager decode above
 the four-lane graph limit. Each step can contain at most 128 prompt and decode
-rows. The native probe requires one full-width eager decode call. A sparse pair
-that includes the highest slot must replay at graph width two. The mask must
-include the highest slot bit, and CUPTI must record the replay. The existing
-graph and MTP runners cover the narrow serving paths.
+rows with the explicit test budget. The native probe requires one full-width
+eager decode call. A sparse pair that includes the highest slot must replay at
+graph width two. The mask must include the highest slot bit, and CUPTI must
+record the replay. The existing graph and MTP runners cover the narrow serving paths.
 
 ## CPU score slab check
 
@@ -128,3 +128,63 @@ CUDA_VISIBLE_DEVICES= "$score_check"
 
 Expect a rejection at each of the four packed lanes followed by
 `Score bounds, bounded ownership and executable reuse passed`.
+
+## Scheduler admission
+
+The full batch runner checks scheduler admission. To run only admission with a
+Release server and the pinned checkpoint, select `admission` on the reserved GPU.
+
+```bash
+GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
+    bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/admission" admission
+```
+
+The check records `/health` for omitted limits and explicit widths one and four.
+It verifies low-concurrency progress and a waiting request at full occupancy.
+After resetting an active stream, surviving streams advance, the waiter finishes,
+and request bytes return to zero. The small-budget arm checks prompt boundaries
+and counts prompt, decode, and MTP verification rows in scheduler traces. Media
+requests exercise the serial route and share a scheduler step with a text
+request at the default width. The CLI accepts K1 through K4 with up to 32
+active requests. The scheduler shares one row budget across all active slots
+and verifies drafts in groups of up to four lanes. The wide K1 arm fills the
+default 32 slots and checks a waiting request and slot reuse. The trace must
+account for every ready decoder, show verification in every slot, and show
+more than four verifier lanes in one iteration. HTTP stream workers can make
+slots ready on different iterations. The full batch runner also selects all
+32 ready lanes directly in one `DecoderBatch` step. It requires 64 verifier
+rows, compares each lane's IDs with target-only decoding, and checks that
+cancellation releases all request bytes.
+
+Run `run_admission.py --case pressure` separately for 32 requests with
+32,769 prompt IDs in total. The trace records actual work per iteration, which
+can also be limited by arrival order and per-request tiles.
+
+### KV admission fault
+
+Run this opt-in check with the Release server's build directory and matching
+source tree. Keep the GPU reservation for all three cases.
+
+```bash
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    python3 -IB tests/batch/run_admission.py --source "$PWD" --binary "$out/bin/sglang-server" \
+    --case kv-capacity --case kv-context --case kv-drain \
+    --checkpoint "$checkpoint" --evidence "$out/kv-admission-fault"
+```
+
+The runner replays the recorded XMake link and verifies the unmodified
+executable byte for byte. A second link wraps CUDA allocation, release and
+stream synchronization.
+The server runs with its default limits. A four-token prompt and a 1,021-token
+output budget allocate eight KV pages. The probe allows the key payload
+allocation and injects a failure on the value payload allocation while a
+peer is decoding.
+
+A capacity failure must return HTTP 503, release the partial allocation,
+and let the peer decode and a fresh request complete. The peer is then
+cancelled, and the runner checks that request bytes return to zero and a new
+stream succeeds. One terminal control injects the CUDA illegal-address
+status at the same allocation. The other injects a memory allocation
+failure there, then reports an illegal address during stream synchronization.
+Both require HTTP 500 for the triggering and fresh requests and an SSE
+error for the active peer.

@@ -35,6 +35,7 @@ struct DecoderOptions {
     std::shared_ptr<const TokenConstraint> constraint = nullptr;
     std::string prefix_cache_salt;
     double min_p = 0.0;
+    int max_num_batched_tokens = 0;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
     bool requires_target_only() const { return constraint != nullptr; }
@@ -54,6 +55,14 @@ class DecoderConstraintError : public std::runtime_error {
 public:
     DecoderConstraintError()
         : std::runtime_error("Constrained selection did not produce a valid token") {}
+};
+
+class DecoderCapacityError : public std::runtime_error {
+public:
+    DecoderCapacityError(const char* message, bool retryable)
+        : std::runtime_error(message), retryable(retryable) {}
+
+    const bool retryable;
 };
 
 enum class DecoderFinishReason {

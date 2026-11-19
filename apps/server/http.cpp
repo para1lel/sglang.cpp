@@ -311,6 +311,15 @@ bool write_json(const Socket& connection, std::string_view status, std::string_v
     return write_response(connection, status, "application/json", json);
 }
 
+void write_readiness(const Socket& connection, bool ready) {
+    if (ready) {
+        write_json(connection, "200 OK", R"({"ready":true})");
+    } else {
+        write_json(connection, "503 Service Unavailable",
+                   R"({"ready":false,"reason":"worker_failed"})");
+    }
+}
+
 bool write_metrics(const Socket& connection, std::string_view body) {
     return write_response(connection, "200 OK", "text/plain; version=0.0.4", body);
 }

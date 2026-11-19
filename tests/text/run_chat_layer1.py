@@ -42,6 +42,19 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def ready(port):
+    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=1)) as conn:
+        conn.request("GET", "/ready")
+        with conn.getresponse() as reply:
+            status = reply.status
+            reply.read()
+        if status != 404:
+            return status == 200
+        conn.request("GET", "/health")
+        with conn.getresponse() as reply:
+            return reply.status == 200
+
+
 @contextmanager
 def server(binary, checkpoint, out, width, *, graph=False, mtp=False, observer=None):
     with closing(socket.socket()) as reservation:
@@ -67,11 +80,8 @@ def server(binary, checkpoint, out, width, *, graph=False, mtp=False, observer=N
             while True:
                 assert process.poll() is None, (process.returncode, out)
                 try:
-                    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=1)) as conn:
-                        conn.request("GET", "/health")
-                        with conn.getresponse() as reply:
-                            if (reply.status, reply.read()) == (200, b"{}"):
-                                break
+                    if ready(port):
+                        break
                 except (OSError, http.client.HTTPException):
                     pass
                 assert time.monotonic() < deadline, out

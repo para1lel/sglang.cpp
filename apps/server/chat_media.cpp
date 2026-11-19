@@ -270,9 +270,11 @@ std::optional<Value> normalize_turn(const OrderedObject& turn, std::vector<Media
             normalized.push_back(value);
             continue;
         }
-        if (!enabled || string(turn, "role") != "user" || media.size() == max_media) {
-            throw std::invalid_argument(
-                "Decoded media requires serial chat, user content and at most four attachments");
+        if (!enabled) {
+            throw std::invalid_argument("Decoded media is unavailable on this chat route");
+        }
+        if (string(turn, "role") != "user" || media.size() == max_media) {
+            throw std::invalid_argument("Decoded media requires user content and up to four parts");
         }
         media.push_back(parse_part(*part, *type, chat));
         normalized.emplace_back(OrderedObject{{"type", *type == "image_url" ? "image" : "video"}});
@@ -384,7 +386,9 @@ std::vector<int> expand_chat_media(MediaPrompt& prompt, const std::vector<MediaP
         layouts.push_back(prepared.layout);
         prompt.parts.push_back(std::move(prepared));
     }
-    return prepare_multimodal_prompt(prompt.template_ids, layouts).token_ids;
+    auto expanded = prepare_multimodal_prompt(prompt.template_ids, layouts);
+    prompt.expanded_tokens = expanded.token_ids.size();
+    return std::move(expanded.token_ids);
 }
 
 }

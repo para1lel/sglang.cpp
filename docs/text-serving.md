@@ -12,13 +12,13 @@ curl --fail-with-body http://127.0.0.1:17384/v1/completions \
   --data-binary '{"model":"Qwen3.8-27B-FP8","prompt":"一、北京\n二、上海\n三、","max_tokens":8}'
 ```
 
-The server generates one completion with greedy decoding by default. The prompt must contain 1 to 1,048,576 UTF-8 bytes. The encoded prompt length plus the output budget must fit 262,144 tokens. HTTP accepts up to 8 KiB of headers and 2 MiB of body. Invalid request options, malformed UTF-8, and invalid token limits return HTTP 400. Oversize headers return HTTP 431. Oversize bodies return HTTP 413. [Request parser](../apps/server/text_request.cpp#L238)<!-- prefix: "TextRequest " -->
+The server generates one completion with greedy decoding by default. The prompt must contain 1 to 1,048,576 UTF-8 bytes. The encoded prompt length plus the output budget must fit 262,144 tokens. HTTP accepts up to 8 KiB of headers and 2 MiB of body. Invalid request options, malformed UTF-8, and invalid token limits return HTTP 400. Oversize headers return HTTP 431. Oversize bodies return HTTP 413. The batch route also applies [resident memory admission](batch-graphs.md#resident-memory-admission). [Request parser](../apps/server/text_request.cpp#L238)<!-- prefix: "TextRequest " -->
 
-The server rejects malformed JSON, duplicate decoded keys, and nesting beyond 32 containers. Native text rejects floating-point range errors. The parser preserves oversized integer `top_k` values for validation and clamping. The frozen `benchmark` parser retains its signed-zero underflow handling and fixed request fields. [Numeric dispatch](../apps/server/completions.cpp#L184)<!-- prefix: "json::Value " --> · [Benchmark parser](../apps/server/completions.cpp#L27)<!-- prefix: "CompletionRe" -->
+The server rejects malformed JSON, duplicate decoded keys, and nesting beyond 32 containers. Native text rejects floating-point range errors. The parser preserves oversized integer `top_k` values for validation and clamping. The frozen `benchmark` parser retains its signed-zero underflow handling and fixed request fields. [Numeric dispatch](../apps/server/completions.cpp#L185)<!-- prefix: "json::Value " --> · [Benchmark parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" -->
 
 | Field | Behavior |
 | --- | --- |
-| `max_tokens` | Nonnegative integer output budget, default 16. For an unconstrained request, zero encodes the prompt without generation. |
+| `max_tokens` | Nonnegative integer output budget. Omit it to use 16. For an unconstrained request, zero encodes the prompt without generation. |
 | `stream` | Boolean, default `false`. Set it to `true` for SSE. |
 | `stream_options` | For SSE, set `{"include_usage":true}` to receive a separate usage event. |
 | `ignore_eos` | Boolean, default `false`. Set it to `true` to disable the implicit stops `248044` and `248046`. |
@@ -33,13 +33,13 @@ Tokenizer load occurs on the first text or chat request that reaches encoding. T
 
 ## Serial prefill
 
-The generator, `Decoder::generate`, and HTTP with `--max-active 1` and prefix reuse off use the serial route. Larger prefill tiles require a K0 request and `--fp8-prefill tensor-core` or the equivalent C++ policy. The default FP8 policy is `exact`. Default, eager, and overlapping serial K0 calls share the prefill selector. CUDA graphs cover later decode steps. [HTTP route](../apps/sglang-server.cpp#L220)<!-- prefix: "if (argument" --> · [K0 dispatch](../src/decoder.cpp#L614)<!-- prefix: "if (options." --> · [Prefill and decode](../src/decoder.cpp#L545)<!-- prefix: "const auto r" -->
+The generator, `Decoder::generate`, and HTTP with `--max-active 1` and prefix reuse off use the serial route. Larger prefill tiles require a K0 request and `--fp8-prefill tensor-core` or the equivalent C++ policy. The default FP8 policy is `exact`. Default, eager, and overlapping serial K0 calls share the prefill selector. CUDA graphs cover later decode steps. [HTTP route](../apps/sglang-server.cpp#L251)<!-- prefix: "if (argument" --> · [K0 dispatch](../src/decoder.cpp#L628)<!-- prefix: "if (options." --> · [Prefill and decode](../src/decoder.cpp#L558)<!-- prefix: "const auto r" -->
 
 The binaries and default C++ constructor use visible CUDA ordinal 0. Use `--device` or the constructor's device argument to select another ordinal. With `SGLANG_SERIAL_PREFILL_ROWS` unset, the selected device must report `NVIDIA B200` and the encoded prompt must have at least 512 tokens. The automatic cap is then 1,024 rows. Other device names and shorter prompts use the 128-row cap. [Device check](../src/decoder_weights.cpp#L106)<!-- prefix: "b200_ = std:" --> · [Row selector](../src/decoder.cpp#L24)<!-- prefix: "int serial_p" -->
 
 Set `SGLANG_SERIAL_PREFILL_ROWS=128` to opt out. Values `256`, `512`, `1024`, and `2048` override the cap for serial tensor-core K0 on supported devices. An empty or unrecognized value uses the 128-row cap. Exact prefill, positive-depth MTP, and the batch scheduler ignore this setting.
 
-Prefill caps large scratch at the greatest multiple of 128 within the prompt. It processes the aligned prefix and any shorter tail in order. If large scratch allocation runs out of memory or the pool is unsupported, prefill retries with at most 128 rows. If normal scratch is unavailable for either reason, prefill processes one row at a time. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L449)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L344)<!-- prefix: "PrefillWorks" -->
+Prefill processes the aligned prefix and any shorter tail in order. The larger tile fits the prompt and the step cap, both rounded down to multiples of 128. If large scratch is unavailable, prefill retries with a tile bounded by 128 and the step cap. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L456)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L344)<!-- prefix: "PrefillWorks" -->
 
 ### Serial prefill verification
 
@@ -57,15 +57,15 @@ Native text, native chat, and C++ `DecoderOptions` share these controls. They ap
 | `min_p` | Finite number in `[0, 1]`, default `0`. The minimum weight is `min_p` times the maximum weight in the selection row. |
 | `seed` | Signed 64-bit integer. With active sampling and no seed, generation resolves one from system entropy. |
 
-The decoder validates options even on the greedy path. CUDA ranks BF16 logits by descending score, then ascending token ID. It divides score differences by temperature before exponentiation. For `top_p < 1`, the nucleus includes the token where cumulative weight first exceeds `top_p` times the selection row's total weight. The unconstrained row covers the vocabulary. Selection draws from the nucleus intersected with top-k and weights at or above the `min_p` threshold. Each draw depends on the resolved seed and zero-based output index. Identical rows and options preserve draws across slot changes. [Seed resolution](../src/decoder.cpp#L102)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L187)<!-- prefix: "__global__ v" -->
+The decoder validates options even on the greedy path. CUDA ranks BF16 logits by descending score, then ascending token ID. It divides score differences by temperature before exponentiation. For `top_p < 1`, the nucleus includes the token where cumulative weight first exceeds `top_p` times the selection row's total weight. The unconstrained row covers the vocabulary. Selection draws from the nucleus intersected with top-k and weights at or above the `min_p` threshold. Each draw depends on the resolved seed and zero-based output index. Identical rows and options preserve draws across slot changes. [Seed resolution](../src/decoder.cpp#L105)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L187)<!-- prefix: "__global__ v" -->
 
-Unconstrained requests can use configured [sampled MTP](mtp.md#sampled-mtp). The frozen benchmark ID route stays greedy. K0 sampling runs on the decoder stream after eager scoring or [eligible graph replay](batch-graphs.md#runtime-path). [Serial dispatch](../apps/server/completions.cpp#L240)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/batch_service.cpp#L539)<!-- prefix: "if (!job-\u003eop" -->
+Unconstrained requests can use configured [sampled MTP](mtp.md#sampled-mtp). The frozen benchmark ID route stays greedy. K0 sampling runs on the decoder stream after eager scoring or [eligible graph replay](batch-graphs.md#runtime-path). [Serial dispatch](../apps/server/completions.cpp#L253)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/batch_service.cpp#L561)<!-- prefix: "if (media.em" -->
 
-Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L122)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L689)<!-- prefix: "if (result.s" -->
+Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L125)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L927)<!-- prefix: "if (result.s" -->
 
-### Pinned service sampling acceptance
+### Pinned reference behavior
 
-Match each HTTP route against SGLang `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. Implementation and verification are pending. The fixed base exposes the two OpenAI routes in the table and has no `/generate` route.
+The table describes SGLang `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8` and records the contract for future parity checks. The native text and chat routes use the greedy and budget defaults documented here. [Native budget parser](../apps/server/text_request.cpp#L32)<!-- prefix: "int text_bud" --> · [Native chat alias](../apps/server/text_request.cpp#L270)<!-- prefix: "} else if (k" -->
 
 | Reference route | Omitted controls on the pinned checkpoint |
 | --- | --- |
@@ -73,7 +73,7 @@ Match each HTTP route against SGLang `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`.
 | `/v1/completions` | Temperature `1`, full top-k, top-p `1`, and 16 output tokens. The adapter supplies these defaults. These fields reject null. |
 | `/v1/chat/completions` | `--sampling-defaults model` uses temperature `1`, top-k `20`, and top-p `0.95`. `--sampling-defaults openai` uses temperature `1`, full top-k, and top-p `1`. Non-null request controls override the selected defaults. |
 
-For chat, non-null `max_completion_tokens` takes priority over `max_tokens`. If both are absent or null, the scheduler supplies the available request capacity. Verify omitted, explicit, and null fields per route. Check validation, greedy selection at temperature below `1e-6` or top-k `1`, stop and EOS handling, seeded repeatability, and mixed greedy and sampled requests. Preserve the explicit greedy benchmark fixture.
+In the pinned reference chat route, non-null `max_completion_tokens` takes priority over `max_tokens`. If both are absent or null, the reference scheduler supplies the available request capacity. Verify omitted, explicit, and null fields per route. Check validation, greedy selection at temperature below `1e-6` or top-k `1`, stop and EOS handling, seeded repeatability, and mixed greedy and sampled requests. Preserve the explicit greedy benchmark fixture.
 
 ## Finite-choice constraints
 

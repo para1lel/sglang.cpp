@@ -42,22 +42,15 @@ void MediaPrefill::substitute(Bf16* embeddings, int position, int rows, cudaStre
     }
 }
 
-MediaPrefill upload_media_positions(Request& request, const MultimodalInput& input) {
+MediaPrefill upload_media_positions(Request& request, const MultimodalInput& input,
+                                     cudaStream_t stream) {
     const auto& positions = input.prompt.positions;
     auto* device_positions = request.memory.allocate<MropePosition>(positions.size());
     const auto bytes = positions.size() * sizeof(MropePosition);
-    check(cudaMemcpyAsync(device_positions, positions.data(), bytes, cudaMemcpyHostToDevice,
-                          request.memory.stream()),
-          "Upload multimodal rotary positions");
+    check(cudaMemcpyAsync(device_positions, positions.data(), bytes,
+                          cudaMemcpyHostToDevice, stream), "Upload multimodal rotary positions");
     return {&input, device_positions};
 }
-
-}
-
-namespace sglang {
-namespace {
-
-using namespace decoder;
 
 std::shared_ptr<MultimodalInput> prepare_input(
     const std::vector<int>& template_ids, const std::vector<DecoderMedia>& media,
@@ -92,6 +85,10 @@ void validate_feature_device(const MultimodalInput& input, int device) {
 }
 
 }
+
+namespace sglang {
+
+using namespace decoder;
 
 DecoderResult Decoder::generate_multimodal(const std::vector<int>& template_token_ids,
                                             const std::vector<DecoderMedia>& media,

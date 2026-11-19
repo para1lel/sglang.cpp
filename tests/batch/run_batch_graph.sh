@@ -17,16 +17,33 @@ case "$mode" in
         test -x "$build/bin/sglang-server"
         test -x "$build/bin/mxfp8-gqa-check"
         ;;
+    admission) test -x "$build/bin/sglang-server" ;;
     boundary) ;;
     *) exit 2 ;;
 esac
-test -x "$build/bin/batch-graph-lanes"
+if [[ "$mode" != admission ]]; then
+    test -x "$build/bin/batch-graph-lanes"
+fi
 test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
 mkdir "$out"
 python3 -IB "$tests/check_graph_evidence.py" --check-slot-mask >"$out/slot-mask.log"
 export CUDA_VISIBLE_DEVICES="$gpu" CUDA_DEVICE_ORDER=PCI_BUS_ID
 nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=csv \
     >"$out/device-before.csv"
+
+if [[ "$mode" == all ]]; then
+    "$build/bin/batch-graph-lanes" "$checkpoint" verify-wide exact >"$out/wide-verify.log" 2>&1
+fi
+if [[ "$mode" != boundary ]]; then
+    python3 -IB "$tests/run_admission.py" --binary "$build/bin/sglang-server" \
+        --checkpoint "$checkpoint" --evidence "$out/admission"
+fi
+if [[ "$mode" == admission ]]; then
+    test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
+    nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=csv \
+        >"$out/device-after.csv"
+    exit
+fi
 
 compile_observer() {
     local source=$1

@@ -218,6 +218,68 @@ void score_boundary(const Decoder& decoder, std::string_view role) {
     run.check_step(15, 0);
 }
 
+void verify_wide(const Decoder& decoder) {
+    constexpr int width = decoder_batch_max_lanes;
+    constexpr int budget = decoder_batch_max_step_tokens;
+    std::array<std::array<int, 3>, width> target_ids{};
+    Mask ready;
+    ready.fill(true);
+    for (const int depth : {0, 1}) {
+        DecoderBatch batch(decoder, {false, width, 0, budget});
+        DecoderOptions options;
+        options.max_new_tokens = 4;
+        options.mtp_steps = depth;
+        for (int slot = 0; slot < width; ++slot) {
+            batch.admit(slot, {13, 198, 279, 826 + slot}, options);
+        }
+        DecoderBatchStepStats prefill;
+        const auto seeds = batch.advance_chunked(ready, &prefill);
+        require(prefill.target_rows == width * 4 && prefill.verification_lanes == 0,
+                "Unexpected target charge while seeding wide verification");
+        for (int slot = 0; slot < width; ++slot) {
+            require(prefill.prefill_rows[slot] == 4 && seeds[slot].token && !seeds[slot].decode,
+                    "Wide verification lane was not ready after prefill");
+            if (depth == 0) {
+                target_ids[slot][0] = *seeds[slot].token;
+            } else {
+                require(seeds[slot].token == target_ids[slot][0], "K1 changed a prefill seed");
+            }
+        }
+        const int rounds = depth == 0 ? 2 : 1;
+        for (int round = 0; round < rounds; ++round) {
+            DecoderBatchStepStats stats;
+            const auto decoded = batch.advance_chunked(ready, &stats);
+            require(stats.target_rows == width * (depth + 1) && stats.graph_slots == 0,
+                    "Unexpected target charge while decoding wide verification");
+            require(stats.verification_lanes == width * depth &&
+                    stats.verification_rows == width * depth * (depth + 1),
+                    "Ready wide cohort did not verify together");
+            for (int slot = 0; slot < width; ++slot) {
+                const auto& step = decoded[slot];
+                require(step.decode && step.token && !step.finish_reason && !step.mtp_boundary,
+                        "Ready wide lane did not decode");
+                if (depth == 0) {
+                    target_ids[slot][round + 1] = *step.token;
+                    continue;
+                }
+                require(step.mtp_drafted_tokens == 1 && step.mtp_verified_rows == 2 &&
+                        step.extra_token_count >= 0 && step.extra_token_count <= 1,
+                        "Wide K1 lane did not verify its draft and target rows");
+                const bool bonus_matches = step.extra_token_count == 0 ||
+                    step.extra_tokens[0] == target_ids[slot][2];
+                require(step.token == target_ids[slot][1] && bonus_matches,
+                        "Wide K1 lane changed its target-only tokens");
+            }
+            std::cout << "K" << depth << " ready " << width << " verified "
+                      << stats.verification_lanes << " rows " << stats.verification_rows << '\n';
+        }
+        for (int slot = 0; slot < width; ++slot) {
+            batch.cancel(slot);
+        }
+        require(batch.request_device_allocation_bytes() == 0, "Wide requests retained buffers");
+    }
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -227,12 +289,16 @@ int main(int argc, char** argv) {
         const bool boundary = argc == 5;
         const std::string_view role = argv[2];
         const std::string_view policy = argv[3];
-        require(role == "eager" || role == "graph" || role == (boundary ? "score-oom" : "hard"),
+        const bool wide = !boundary && role == "verify-wide" && policy == "exact";
+        require(wide || role == "eager" || role == "graph" ||
+                role == (boundary ? "score-oom" : "hard"),
                 "Unexpected graph test role");
         require(policy == "exact" || policy == "tensor-core", "Expected exact or tensor-core");
-        const Decoder decoder(argv[1], 0, false, policy == "exact" ?
+        const Decoder decoder(argv[1], 0, wide, policy == "exact" ?
             Fp8PrefillPolicy::exact : Fp8PrefillPolicy::tensor_core);
-        if (boundary) {
+        if (wide) {
+            verify_wide(decoder);
+        } else if (boundary) {
             score_boundary(decoder, role);
         } else {
             scenario(decoder, role != "eager", role == "hard");

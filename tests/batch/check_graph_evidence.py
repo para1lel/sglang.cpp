@@ -221,10 +221,13 @@ def verify_operators(evidence):
     output = (evidence / "operators.log").read_text()
     assert "Rebound cache, page table and position on four device graph replays" in output
     assert "Rebound GDN history and recurrent banks on six device graph replays" in output
+    assert "Paged decode matched FP64 and eager across 24 rebound layer-lanes" in output
+    assert "Paged decode recovered from finite-input overflow and value cancellation" in output
     assert "MXFP8 GQA check passed" in output
     device, runtime = trace(evidence / "operators.cupti.tsv")
-    assert sorted(Counter(device).values()) == [4, 6, 8]
-    assert all(count(runtime, api) == 3 for api in LIFECYCLE)
+    replays = [8, 4, 6, 1, 3, 3, 2, 2]
+    assert list(Counter(device).values()) == replays
+    assert all(count(runtime, api) == len(replays) for api in LIFECYCLE)
 
 
 def check_slot_mask():

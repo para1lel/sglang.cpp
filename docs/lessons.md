@@ -29,3 +29,9 @@ Record the exact base, ordered patch hashes, and resulting tree in the handoff. 
 **Correction verified on the isolated W2 candidate.** At 1,536 visible tokens, finite inputs overflowed FP32 QK scores or page-local value sums. Both cases returned NaNs in eager and graph modes while ordered replay and the FP64 oracle returned finite outputs.
 
 The [merge guard](batch-graphs.md#page-parallel-gqa-decode) sends an affected head and channel tile through ordered replay. The correction matched the ordered and FP64 outputs on both cases. Keep both cases in the GQA regression and run them with eager execution and graph replay.
+
+## L005 · HTTP request parsing on the accept thread
+
+**Corrected.** The cache-enabled listener accepted and parsed requests on one thread. A stalled body held that thread until the read deadline and delayed unrelated controls and completions.
+
+The [bounded reader pool](prefix-cache.md#native-http-controls) lets another reader accept and dispatch a request. At width one, a CPU loopback regression paused one reader after parsing a complete request. Separate complete health and completion requests returned HTTP 200. Shutdown joined a held reader and discarded its request. The normal loopback suite also passed queue overflow, busy reset, cancellation, and cache accounting.

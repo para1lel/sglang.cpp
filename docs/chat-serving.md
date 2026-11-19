@@ -12,7 +12,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and pass validated prompt IDs to the decoder. | [Route](../apps/sglang-server.cpp#L125)<!-- prefix: "} else if (r" --> · [Request parser](../apps/server/text_request.cpp#L265)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and pass validated prompt IDs to the decoder. | [Route](../apps/sglang-server.cpp#L126)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L265)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L150)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L165)<!-- prefix: "void TextRes" --> |
 

@@ -365,6 +365,18 @@ DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {
     return cache ? cache->stats() : DecoderPrefixCacheStats{};
 }
 
+void DecoderBatch::reset_prefix_cache() {
+    state_->require_ready();
+    auto& storage = *state_->storage;
+    if (std::any_of(storage.slots.begin(), storage.slots.end(),
+                    [](const auto& slot) { return slot.has_value(); })) {
+        throw std::logic_error("Cannot reset prefix cache with active decoder slots");
+    }
+    if (storage.prefix_cache) {
+        storage.prefix_cache->reset();
+    }
+}
+
 bool DecoderBatch::available() const { return !state_->failed; }
 
 bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {

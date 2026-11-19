@@ -86,6 +86,7 @@ public:
 
     std::size_t request_device_allocation_bytes() const;
     DecoderPrefixCacheStats prefix_cache_stats() const;
+    void reset_prefix_cache();
     bool available() const;
 
 private:

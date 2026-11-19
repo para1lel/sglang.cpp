@@ -5,6 +5,7 @@
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
+#include "sglang/server/prefix_controls.h"
 
 #include <charconv>
 #include <exception>
@@ -232,7 +233,18 @@ int main(int argc, char** argv) {
             BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs,
                                  arguments.mtp_steps, arguments.max_active,
                                  arguments.prefix_cache_entries);
-            serve_batch(listener, service, tokenizer, arguments.max_active);
+            if (arguments.prefix_cache_entries != 0) {
+                serve_prefix_connections(listener, service, arguments.max_active,
+                    [&](const Socket& connection, int slot, std::string_view body, bool chat) {
+                        if (chat) {
+                            complete_chat(connection, service, slot, tokenizer, body);
+                        } else {
+                            complete(connection, service, slot, tokenizer, body);
+                        }
+                    });
+            } else {
+                serve_batch(listener, service, tokenizer, arguments.max_active);
+            }
         }
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';

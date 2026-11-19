@@ -1,4 +1,31 @@
-# Prefix cache CUDA and route checks
+# Prefix cache checks
+
+## CPU reader queue
+
+Run from the repository root in the managed Pixi default environment. The test uses the
+production HTTP parser and prefix listener with in-process socket pairs, a decoder-service
+stand-in, and explicit reader and completion barriers. No GPU or model weights are required.
+
+```bash
+out="$PWD/build/prefix-readers"
+mkdir -p "$out"
+toolkit="$CONDA_PREFIX/targets/x86_64-linux"
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+    -Iinclude -I"$toolkit/include" tests/prefix/reader_queue.cpp \
+    apps/server/{prefix_controls,http,completions}.cpp src/{json,utf8}.cpp -Wl,--gc-sections \
+    -Wl,--wrap=_ZN6sglang6server17accept_connectionERKNS0_6SocketE \
+    -Wl,--wrap=_ZN6sglang6server12read_requestERKNS0_6SocketE -o "$out/reader-queue"
+timeout 20s "$out/reader-queue"
+timeout 20s "$out/reader-queue" --reader-failure
+```
+
+Expect `prefix reader queue passed` for each run. The test checks control progress while
+two readers wait at a dispatch barrier, concurrent admission to the last pending position,
+FIFO dispatch by admission order, response ownership, and shutdown with a pending request,
+active completions, and a reader still in flight. The second run checks that a reader
+failure triggers the same cleanup and reaches the caller after joining.
+
+## CUDA state and routes
 
 Run from the repository root in the managed Pixi default environment. Reserve a B200 and set
 `GPU_UUID` to its UUID. The state check runs without model weights.

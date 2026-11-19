@@ -294,14 +294,25 @@ std::optional<HttpRequest> read_request(const Socket& connection) {
     return request;
 }
 
-bool write_json(const Socket& connection, std::string_view status, std::string_view json) {
+static bool write_response(const Socket& connection, std::string_view status,
+                           std::string_view content_type, std::string_view body) {
     std::string response = "HTTP/1.1 ";
     response += status;
-    response += "\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ";
-    response += std::to_string(json.size());
+    response += "\r\nConnection: close\r\nContent-Type: ";
+    response += content_type;
+    response += "\r\nContent-Length: ";
+    response += std::to_string(body.size());
     response += "\r\n\r\n";
-    response += json;
+    response += body;
     return send_all(connection, response);
+}
+
+bool write_json(const Socket& connection, std::string_view status, std::string_view json) {
+    return write_response(connection, status, "application/json", json);
+}
+
+bool write_metrics(const Socket& connection, std::string_view body) {
+    return write_response(connection, "200 OK", "text/plain; version=0.0.4", body);
 }
 
 bool start_events(const Socket& connection) {

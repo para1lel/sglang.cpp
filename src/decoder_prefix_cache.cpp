@@ -193,6 +193,12 @@ void PrefixCache::count_prefill(int tokens) {
     counters_.prefill_tokens += tokens;
 }
 
+void PrefixCache::reset() {
+    for (auto& entry : entries_) {
+        entry->tokens = 0;
+    }
+}
+
 DecoderPrefixCacheStats PrefixCache::stats() const {
     auto stats = counters_;
     for (const auto& entry : entries_) {

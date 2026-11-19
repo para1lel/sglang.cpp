@@ -18,6 +18,7 @@ public:
                int tokens, cudaStream_t stream);
     void count_prefill(int tokens);
     DecoderPrefixCacheStats stats() const;
+    void reset();
 
 private:
     struct Entry {

@@ -42,6 +42,7 @@ Socket accept_connection(const Socket& listener);
 bool disconnected(const Socket& connection);
 std::optional<HttpRequest> read_request(const Socket& connection);
 bool write_json(const Socket& connection, std::string_view status, std::string_view json);
+bool write_metrics(const Socket& connection, std::string_view body);
 bool start_events(const Socket& connection);
 bool write_event(const Socket& connection, std::string_view data);
 bool end_events(const Socket& connection);

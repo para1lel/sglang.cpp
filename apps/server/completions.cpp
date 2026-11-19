@@ -234,7 +234,7 @@ void complete_serial(const Socket& connection, const Decoder& decoder,
                      bool trace, int mtp_steps, bool eager, bool chat = false) {
     dispatch_completion(connection, body, tokenizer,
                         [&](const auto& prompt, auto options, const auto& callbacks) {
-        if (!options.samples()) {
+        if (!options.requires_target_only()) {
             options.mtp_steps = mtp_steps;
         }
         options.eager = eager;

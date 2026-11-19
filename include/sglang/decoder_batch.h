@@ -24,6 +24,7 @@ struct DecoderBatchStep {
     std::array<int, decoder_batch_max_mtp_steps> extra_tokens{};
     int extra_token_count = 0;
     bool sampling_failed = false;
+    bool constraint_failed = false;
 };
 
 struct DecoderBatchStepStats {
@@ -34,6 +35,7 @@ struct DecoderBatchStepStats {
     int verification_lanes = 0;
     int verification_rows = 0;
     std::size_t sampling_workspace_bytes = 0;
+    std::size_t constraint_workspace_bytes = 0;
 };
 
 struct DecoderBatchOptions {
@@ -55,7 +57,7 @@ public:
     /// Advance each selected slot by one position or one speculative round.
     /// Consume token and the first extra_token_count entries of extra_tokens in order.
     /// extra_token mirrors the first extra token for callers using depth one.
-    /// A zero-budget slot finishes without work. A sampling_failed step retires its slot.
+    /// A zero-budget slot finishes without work. A failed selection retires only its slot.
     /// On a failed advance, all slots are retired
     /// if the stream can be drained. A stream that cannot be drained disables the batch.
     std::array<DecoderBatchStep, decoder_batch_max_lanes>

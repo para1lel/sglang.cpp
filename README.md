@@ -7,7 +7,7 @@ and carries Gated DeltaNet state through the other 48 layers. Prefill and the fi
 token selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L73)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L84)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
@@ -147,7 +147,7 @@ allocation runs out of memory, steps that need it use eager decode. Other decode
 widths and mixed decode and prefill steps run eagerly.
 
 The default `--mtp-steps 0` selects target-only decoding. Set `--mtp-steps 1` through
-`--mtp-steps 4` at any `--max-active` value from `1` through `4` to enable MTP for greedy requests.
+`--mtp-steps 4` at any `--max-active` value from `1` through `4` to enable MTP for unconstrained greedy requests.
 Batched requests share target projections and commit their outputs independently.
 Steps that contain an MTP lane run eagerly, including when `--batch-cuda-graphs` is set.
 Values of `--max-active` above `4` require `--mtp-steps 0`. SSE events and usage
@@ -216,13 +216,20 @@ The default `-1` lets top-p act on the full vocabulary.
 
 Pass a signed 64-bit integer `seed` to repeat the draws for the same logits.
 When you omit `seed`, the decoder selects one seed for the request.
-Sampled requests use target-only decoding. Greedy requests can still use MTP in the same batch.
+Sampled requests use target-only decoding. Unconstrained greedy requests can still use MTP in the same batch.
 The generator command and the token-ID benchmark use greedy selection.
 
 C++ callers set the same fields in
-[`DecoderOptions`](include/sglang/decoder.h#L17)<!-- prefix: "struct Decod" -->.
+[`DecoderOptions`](include/sglang/decoder.h#L19)<!-- prefix: "struct Decod" -->.
 Set `mtp_steps` to `0` for sampled C++ requests.
 See the [sampling contract](docs/text-serving.md#sampling) for dispatch and seed behavior.
+
+### Choose from fixed outputs
+
+Set `ebnf` on a native text or chat request to restrict output to one literal.
+For example, send `{"ebnf":"root ::= \"yes\" | \"no\""}` with the other request fields.
+These requests use target-only decoding and report `stop` when a choice completes.
+See the [finite-choice contract](docs/text-serving.md#finite-choice-constraints) for limits and stop rules.
 
 ## Continue development
 

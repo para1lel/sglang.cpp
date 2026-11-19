@@ -17,6 +17,23 @@ bool valid_token(int id) {
     return id >= 0 && id < vocab_size;
 }
 
+void validate_constraint(const DecoderOptions& options) {
+    if (!options.constraint) {
+        return;
+    }
+    if (options.mtp_steps != 0) {
+        throw std::invalid_argument("Constrained decoding requires mtp_steps=0");
+    }
+    if ((options.stop_token_id && !constraint_eos(*options.stop_token_id)) ||
+        !std::all_of(options.additional_stop_token_ids.begin(),
+                     options.additional_stop_token_ids.end(), constraint_eos)) {
+        throw std::invalid_argument("Constrained decoding requires the model EOS stop tokens");
+    }
+    if (options.max_new_tokens < options.constraint->minimum_tokens()) {
+        throw std::invalid_argument("max_tokens is too small to complete an ebnf choice");
+    }
+}
+
 }
 
 void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
@@ -44,6 +61,7 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     if (options.mtp_steps < 0 || options.mtp_steps > decoder_max_mtp_steps) {
         throw std::invalid_argument("MTP proposal count must be in [0, 4]");
     }
+    validate_constraint(options);
     if (options.samples() && options.mtp_steps != 0) {
         throw std::invalid_argument("Sampling requires mtp_steps=0");
     }
@@ -76,9 +94,12 @@ void copy_token(Request& request, const Workspace& work, cudaStream_t stream) {
                           cudaMemcpyDeviceToHost, stream), "Read selected token");
 }
 
-int read_token(Request& request, bool sampled) {
+int read_token(Request& request, bool sampled, bool constrained) {
     const int winner = request.memory.transfers().winner;
     if (!valid_token(winner)) {
+        if (constrained && winner == -1) {
+            throw DecoderConstraintError();
+        }
         if (sampled && winner == -1) {
             throw DecoderSamplingError();
         }
@@ -141,14 +162,21 @@ void prepare_serial_request(Request& request, const DecoderOptions& options) {
         request.sampling_workspace =
             request.memory.allocate<std::byte>(sampling_workspace_bytes());
     }
+    if (options.constraint) {
+        request.constraint_workspace.allocate(request.memory);
+    }
     request.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
 }
 
 int read_step(Request& request, const std::optional<SamplingParameters>& sampling = std::nullopt,
-              int position = 0) {
+              const ConstraintCursor* constraint = nullptr, int position = 0) {
     const auto stream = request.memory.stream();
     auto& host_logits = request.memory.transfers().logits;
-    if (sampling) {
+    if (constraint) {
+        select_constrained(request.work, request.constraint_workspace, *constraint,
+                            sampling ? &*sampling : nullptr, position,
+                            request.sampling_workspace, stream);
+    } else if (sampling) {
         check(sample_logits(request.work.logits, vocab_size, &request.work.argmax->token_id,
                             *sampling, position, request.sampling_workspace, stream),
               "Sample decoder logits");
@@ -160,7 +188,7 @@ int read_step(Request& request, const std::optional<SamplingParameters>& samplin
               "Read step logits");
     }
     check(cudaStreamSynchronize(stream), "Complete decoder step");
-    return read_token(request, sampling.has_value());
+    return read_token(request, sampling.has_value(), constraint != nullptr);
 }
 
 }
@@ -385,6 +413,24 @@ DecoderFinishReason Decoder::Model::generate_mtp(const std::vector<int>& prompt,
     return finish;
 }
 
+bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& prompt,
+                                   const DecoderCallbacks& callbacks, DecoderResult& result) const {
+    const int count = static_cast<int>(prompt.size());
+    PrefillWorkspace workspace(request.memory.stream(), std::min(count, prefill_chunk_rows));
+    result.peak_device_allocation_bytes += workspace.bytes();
+    const int tile_rows = workspace.bytes() ? workspace.capacity() : 1;
+    for (int position = 0; position < count; position += tile_rows) {
+        const int rows = std::min(tile_rows, count - position);
+        prefill_chunk(request, prompt.data() + position, rows, position, workspace);
+        if (callbacks.is_cancelled && callbacks.is_cancelled()) {
+            workspace.close();
+            return false;
+        }
+    }
+    workspace.close();
+    return true;
+}
+
 void Decoder::Model::generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
                                      const DecoderCallbacks& callbacks,
                                      DecoderResult& result) const {
@@ -419,25 +465,11 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         }
         result.peak_device_allocation_bytes += request.memory.bytes();
         const auto run_request = [&] {
-            if (cancelled()) {
+            if (cancelled() || !prefill_serial(request, prompt, callbacks, result)) {
                 return DecoderFinishReason::cancelled;
             }
-            {
-                PrefillWorkspace workspace(request.memory.stream(),
-                                           std::min(prompt_count, prefill_chunk_rows));
-                result.peak_device_allocation_bytes += workspace.bytes();
-                const int tile_rows = workspace.bytes() ? workspace.capacity() : 1;
-                for (int position = 0; position < prompt_count; position += tile_rows) {
-                    const int rows = std::min(tile_rows, prompt_count - position);
-                    prefill_chunk(request, prompt.data() + position, rows, position, workspace);
-                    if (cancelled()) {
-                        workspace.close();
-                        return DecoderFinishReason::cancelled;
-                    }
-                }
-                workspace.close();
-            }
             int winner = -1;
+            ConstraintCursor constraint;
             for (int step = 0; step < options.max_new_tokens; ++step) {
                 if (cancelled()) {
                     return DecoderFinishReason::cancelled;
@@ -454,7 +486,12 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                     }
                     compute_logits(request, step != 0);
                 }
-                winner = read_step(request, sampling, step);
+                const int remaining = options.max_new_tokens - step;
+                if (options.constraint) {
+                    constraint.candidates(*options.constraint, remaining);
+                }
+                winner = read_step(request, sampling,
+                                   options.constraint ? &constraint : nullptr, step);
                 result.output_token_ids.push_back(winner);
                 const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
                 if (options.top_logits > 0) {
@@ -464,7 +501,11 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 if (!keep_running) {
                     return DecoderFinishReason::cancelled;
                 }
-                if (options.stops_at(winner)) {
+                if (options.constraint &&
+                    constraint.commit(*options.constraint, winner, remaining - 1)) {
+                    return DecoderFinishReason::constraint;
+                }
+                if (!options.constraint && options.stops_at(winner)) {
                     return DecoderFinishReason::stop;
                 }
             }

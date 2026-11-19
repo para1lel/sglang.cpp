@@ -14,6 +14,8 @@ namespace sglang {
 
 inline constexpr int decoder_max_mtp_steps = 4;
 
+class TokenConstraint;
+
 struct DecoderOptions {
     int max_new_tokens = 1;
     std::optional<int> stop_token_id;
@@ -25,8 +27,10 @@ struct DecoderOptions {
     double top_p = 1.0;
     std::int64_t top_k = -1;
     std::optional<std::int64_t> seed = std::nullopt;
+    std::shared_ptr<const TokenConstraint> constraint = nullptr;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
+    bool requires_target_only() const { return samples() || constraint != nullptr; }
 
     bool stops_at(int token) const {
         return stop_token_id == token || additional_stop_token_ids.count(token) != 0;
@@ -39,10 +43,17 @@ public:
         : std::runtime_error("Sampled logits must contain a finite score and no NaN or +inf") {}
 };
 
+class DecoderConstraintError : public std::runtime_error {
+public:
+    DecoderConstraintError()
+        : std::runtime_error("Constrained selection did not produce a valid token") {}
+};
+
 enum class DecoderFinishReason {
     length,
     stop,
     cancelled,
+    constraint,
 };
 
 struct DecoderCallbacks {

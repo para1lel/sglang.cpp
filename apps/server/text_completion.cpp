@@ -50,6 +50,10 @@ std::string response_prefix(const TextRequest& request) {
 const char* finish_reason(const TextRequest& request, const DecoderResult& result) {
     const auto count = result.output_token_ids.size();
     const auto budget = static_cast<std::size_t>(request.options.max_new_tokens);
+    if (result.finish_reason == DecoderFinishReason::constraint &&
+        request.options.constraint && count && count <= budget) {
+        return "stop";
+    }
     const bool stop_matched = count && request.options.stops_at(result.output_token_ids.back());
     if (result.finish_reason == DecoderFinishReason::stop && stop_matched && count <= budget) {
         return "stop";

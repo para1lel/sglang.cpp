@@ -58,7 +58,7 @@ target("sglang_cuda")
     add_files("src/text_decode_bandwidth.cu")
     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
     add_files("src/text_normalization.cu")
-    add_files("src/decoder_sampling.cu")
+    add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu")
 
 target("sglang_prefill_fp8_sm100")
     set_kind("static")
@@ -101,7 +101,7 @@ target("sglang_decoder")
     add_deps("sglang_checkpoint", "sglang_cuda", "sglang_prefill_fp8_sm100")
     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
               "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_mtp.cpp",
-              "src/decoder_prefill.cpp", "src/decoder_verify.cpp")
+              "src/decoder_prefill.cpp", "src/decoder_verify.cpp", "src/decoder_constraint.cpp")
 
 target("sglang-generate")
     set_kind("binary")
@@ -180,5 +180,22 @@ if has_config("batch-graph-lanes") then
         add_deps("sglang_decoder")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_files("tests/batch/batch_graph_lanes.cpp")
+    target_end()
+end
+
+option("constraint-check")
+    set_default(false)
+option_end()
+
+if has_config("constraint-check") then
+    target("constraint-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_decoder", "sglang_tokenizer")
+        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_files("tests/text/constraint_check.cpp")
+        add_ldflags("-Wl,--wrap=_ZN6sglang7decoder25gather_constrained_logits" ..
+                    "EPK13__nv_bfloat16PKiPS1_iP11CUstream_st", {force = true})
     target_end()
 end

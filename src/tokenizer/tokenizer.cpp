@@ -7,6 +7,7 @@
 
 #include <array>
 #include <fstream>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <string>
@@ -63,6 +64,8 @@ struct Tokenizer::Model {
     std::array<TokenId, 256> byte_ids{};
     std::vector<TokenId> added;
     std::unordered_map<std::uint64_t, Merge> merges;
+    mutable std::once_flag piece_index_ready;
+    mutable std::unordered_multimap<std::string_view, TokenId> piece_index;
 };
 
 Tokenizer::Model::Model(const json::Object& root) {
@@ -213,6 +216,24 @@ std::string_view Tokenizer::piece(TokenId id, bool skip_special) const {
         return {};
     }
     return model_->pieces[id];
+}
+
+void Tokenizer::matching_pieces(std::string_view bytes, std::vector<TokenId>& ids) const {
+    std::call_once(model_->piece_index_ready, [this] {
+        decltype(model_->piece_index) index;
+        index.reserve(mapped_vocab_size);
+        for (TokenId token = 0; token < mapped_vocab_size; ++token) {
+            const auto bytes = piece(token, true);
+            if (!bytes.empty() && token != end_of_text && token != end_of_message) {
+                index.emplace(bytes, token);
+            }
+        }
+        model_->piece_index = std::move(index);
+    });
+    const auto [first, last] = model_->piece_index.equal_range(bytes);
+    for (auto entry = first; entry != last; ++entry) {
+        ids.push_back(entry->second);
+    }
 }
 
 }

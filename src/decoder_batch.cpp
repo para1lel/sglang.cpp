@@ -27,6 +27,7 @@ struct Lane {
     std::unique_ptr<MtpDraftRequest> draft = nullptr;
     std::unique_ptr<TargetVerification> verification = nullptr;
     std::optional<SamplingParameters> sampling = std::nullopt;
+    ConstraintCursor constraint{};
 
     int remaining_prompt() const { return std::max(0, static_cast<int>(prompt.size()) - position); }
     int remaining_output() const { return options.max_new_tokens - generated; }
@@ -42,7 +43,11 @@ struct Lane {
     void select_token(int token, DecoderBatchStep& result) {
         last_token = token;
         ++generated;
-        if (options.stops_at(token)) {
+        if (options.constraint) {
+            if (constraint.commit(*options.constraint, token, remaining_output())) {
+                result.finish_reason = DecoderFinishReason::constraint;
+            }
+        } else if (options.stops_at(token)) {
             result.finish_reason = DecoderFinishReason::stop;
         } else if (options.max_new_tokens == generated) {
             result.finish_reason = DecoderFinishReason::length;
@@ -208,7 +213,7 @@ struct DecoderBatch::State {
     bool replay(const ForwardLane* lanes, int count);
     void submit(const Selection& selected, Steps& results, DecoderBatchStepStats& stats,
                 bool& contains_mtp);
-    void score(const Lane& lane, Request& request, Workspace& work, bool graph);
+    void score(Lane& lane, Request& request, Workspace& work, bool graph);
     void speculate(const Selection& selected, Steps& results, DecoderBatchStepStats& stats);
 
     std::optional<Lane>& slot_at(int slot) {
@@ -252,6 +257,7 @@ struct DecoderBatch::State {
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;
     std::byte* sampling_workspace = nullptr;
+    ConstraintWorkspace constraint_workspace;
     std::array<bool, decoder_batch_max_graph_lanes - 1> graph_warmed{};
     int prefill_cursor = 0;
     bool failed = false;
@@ -364,15 +370,21 @@ bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
     });
 }
 
-void DecoderBatch::State::score(const Lane& lane, Request& request, Workspace& work, bool graph) {
+void DecoderBatch::State::score(Lane& lane, Request& request, Workspace& work, bool graph) {
     const auto stream = execution.stream();
     if (!graph) {
         model.compute_logits(work, stream);
     }
-    if (lane.sampling) {
-        if (!sampling_workspace) {
-            sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
-        }
+    if (lane.sampling && !sampling_workspace) {
+        sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
+    }
+    if (lane.options.constraint) {
+        constraint_workspace.allocate(execution);
+        lane.constraint.candidates(*lane.options.constraint, lane.remaining_output());
+        select_constrained(work, constraint_workspace, lane.constraint,
+                            lane.sampling ? &*lane.sampling : nullptr, lane.generated,
+                            sampling_workspace, stream);
+    } else if (lane.sampling) {
         check(sample_logits(work.logits, vocab_size, &work.argmax->token_id,
                             *lane.sampling, lane.generated, sampling_workspace, stream),
               "Sample batched decoder logits");
@@ -452,6 +464,7 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
         }
     }
     stats.sampling_workspace_bytes = sampling_workspace ? sampling_workspace_bytes() : 0;
+    stats.constraint_workspace_bytes = constraint_workspace.bytes();
     if (contains_mtp) {
         speculate(speculative, results, stats);
     }
@@ -460,11 +473,14 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
     }
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (scoring[slot]) {
-            const bool sampled = slots[slot]->sampling.has_value();
+            const auto& lane = *slots[slot];
             try {
-                results[slot].token = read_token(*scoring[slot], sampled);
+                results[slot].token = read_token(*scoring[slot], lane.sampling.has_value(),
+                                                  lane.options.constraint != nullptr);
             } catch (const DecoderSamplingError&) {
                 results[slot].sampling_failed = true;
+            } catch (const DecoderConstraintError&) {
+                results[slot].constraint_failed = true;
             }
         }
     }
@@ -549,7 +565,7 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             if (!selected[slot] || !lane) {
                 continue;
             }
-            if (result.sampling_failed) {
+            if (result.sampling_failed || result.constraint_failed) {
                 retire(lane);
                 continue;
             }

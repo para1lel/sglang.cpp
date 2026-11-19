@@ -25,6 +25,7 @@ public:
         std::size_t limit = std::numeric_limits<std::size_t>::max(),
         bool split_special = false) const;
     std::string_view piece(TokenId id, bool skip_special = false) const;
+    void matching_pieces(std::string_view bytes, std::vector<TokenId>& ids) const;
 
 private:
     struct Model;

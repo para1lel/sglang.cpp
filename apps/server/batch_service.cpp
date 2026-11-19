@@ -231,8 +231,9 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
 }
 
 void BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& step) {
-    if (step.sampling_failed) {
-        job.error = std::make_exception_ptr(DecoderSamplingError());
+    if (step.sampling_failed || step.constraint_failed) {
+        job.error = step.constraint_failed ? std::make_exception_ptr(DecoderConstraintError())
+                                           : std::make_exception_ptr(DecoderSamplingError());
         jobs[slot].reset();
         return;
     }
@@ -291,6 +292,10 @@ void BatchService::State::process(DecoderBatch& batch) {
                         std::cerr << ("batch sampling_workspace_bytes=" +
                                       std::to_string(stats.sampling_workspace_bytes) + '\n');
                     }
+                    if (stats.constraint_workspace_bytes) {
+                        std::cerr << ("batch constraint_workspace_bytes=" +
+                                      std::to_string(stats.constraint_workspace_bytes) + '\n');
+                    }
                     if (mtp_steps != 0) {
                         trace_verification(steps, stats);
                     } else {
@@ -334,7 +339,7 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
     auto job = std::make_shared<Job>();
     job->prompt = prompt;
     job->options = options;
-    if (!job->options.samples()) {
+    if (!job->options.requires_target_only()) {
         job->options.mtp_steps = state_->mtp_steps;
     }
     DecoderResult result;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/decoder.h"
+#include "sglang/decoder_constraint.h"
 #include "sglang/decoder_cuda.cuh"
 
 #include <array>
@@ -23,6 +24,7 @@ class MtpDraftRequest;
 class PrefillWorkspace;
 class TargetVerification;
 struct VerificationSequence;
+struct SamplingParameters;
 
 using Bf16 = __nv_bfloat16;
 
@@ -176,6 +178,18 @@ struct Workspace {
 using GdnBank = std::array<TextGdnState, gdn_layers>;
 void allocate_gdn(Allocations& memory, GdnBank& states);
 
+struct ConstraintWorkspace {
+    int* ids = nullptr;
+    Bf16* logits = nullptr;
+
+    void allocate(Allocations& memory);
+    std::size_t bytes() const;
+};
+
+void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
+                        const ConstraintCursor& cursor, const SamplingParameters* sampling,
+                        int position, void* sampling_workspace, cudaStream_t stream);
+
 struct Request {
     explicit Request(int device, bool reusable = false);
     Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false);
@@ -193,10 +207,11 @@ struct Request {
     GdnBank states;
     std::optional<ExactGqaWorkspace> long_graph_scores;
     std::byte* sampling_workspace = nullptr;
+    ConstraintWorkspace constraint_workspace;
 };
 
 void copy_token(Request& request, const Workspace& work, cudaStream_t stream);
-int read_token(Request& request, bool sampled);
+int read_token(Request& request, bool sampled, bool constrained = false);
 
 struct ForwardLane {
     Request* request;
@@ -244,6 +259,8 @@ struct Decoder::Model {
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request, bool decode = false) const;
     void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;
+    bool prefill_serial(decoder::Request& request, const std::vector<int>& prompt,
+                        const DecoderCallbacks& callbacks, DecoderResult& result) const;
     void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
                          const DecoderCallbacks& callbacks, DecoderResult& result) const;
     DecoderFinishReason generate_mtp(const std::vector<int>& prompt,

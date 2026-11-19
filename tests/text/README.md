@@ -17,6 +17,37 @@ checkpoint run also checks the direct decoder with serial and packed graphs,
 eager fallback, mixed MTP, and slot reuse. The text and chat HTTP tests below
 exercise the sampled JSON and event-stream routes.
 
+## Finite-choice constraints
+
+From the project source directory in the managed Pixi environment, build
+the optional direct decoder check and the native server.
+
+```bash
+xmake f -m release --constraint-check=y
+xmake build constraint-check
+xmake build sglang-server
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+xmake run constraint-check "$checkpoint"
+python3 -B tests/text/test_native_constraint.py \
+  --server "$PWD/build/bin/sglang-server" \
+  --control "${UNCONSTRAINED_SERVER:?Set this to a pre-constraint Release server with sampling}" \
+  --checkpoint "$checkpoint" \
+  --evidence "$PWD/artifacts/constraint-http"
+```
+
+Reserve a B200 and select it with `CUDA_VISIBLE_DEVICES`. The direct test
+compares allowed tokens to a checkpoint-byte oracle, forces greedy and
+sampled selection at an accepting prefix, and injects a bad allowed row
+through the real selector. Batch checks cover eager and graph replay,
+peer completion, cancellation, and slot reuse. Pass `--cursor-only` after
+the checkpoint path to run the byte oracle and cursor checks without a GPU.
+
+The HTTP runner starts serial and continuous servers with MTP disabled
+and at depth four. It checks both native routes for complete literal
+outputs, split UTF-8, usage and finish reasons, invalid grammar handling,
+and unchanged unconstrained greedy and sampled output. Use a fresh
+evidence directory for each run.
+
 ## Chat Layer 1
 
 With the native server running against the pinned Qwen3.8-27B-FP8 checkpoint

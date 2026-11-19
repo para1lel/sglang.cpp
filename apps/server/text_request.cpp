@@ -1,6 +1,7 @@
 #include "text_completion.h"
 
 #include "chat_template.h"
+#include "sglang/decoder_constraint.h"
 #include "sglang/json.h"
 #include "sglang/server/http.h"
 
@@ -110,7 +111,25 @@ void set_sampling(const json::Object& object, DecoderOptions& options) {
     }
 }
 
-TextRequest text_options(const json::Object& object) {
+void set_constraint(const json::Object& object, const CompletionTokenizer& tokenizer,
+                    DecoderOptions& options) {
+    const auto* value = json::get(object, "ebnf");
+    if (!value) {
+        return;
+    }
+    if (!value->string()) {
+        bad_request("ebnf must be a string");
+    }
+    if (read_bool(object, "ignore_eos") || json::get(object, "stop_token_ids")) {
+        bad_request("ebnf requires model EOS stops without stop_token_ids overrides");
+    }
+    options.constraint = TokenConstraint::compile(tokenizer.get(), *value->string());
+    if (options.max_new_tokens < options.constraint->minimum_tokens()) {
+        bad_request("max_tokens is too small to complete an ebnf choice");
+    }
+}
+
+TextRequest text_options(const json::Object& object, const CompletionTokenizer& tokenizer) {
     TextRequest request;
     request.stream = read_bool(object, "stream");
     request.return_token_ids = read_bool(object, "return_token_ids");
@@ -125,6 +144,7 @@ TextRequest text_options(const json::Object& object) {
     }
     set_stops(object, request.options);
     set_sampling(object, request.options);
+    set_constraint(object, tokenizer, request.options);
     return request;
 }
 
@@ -148,7 +168,8 @@ void encode_prompt(TextRequest& request, std::string_view prompt,
 bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
         key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids" ||
-        key == "temperature" || key == "top_p" || key == "top_k" || key == "seed";
+        key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
+        key == "ebnf";
 }
 
 TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {
@@ -162,7 +183,7 @@ TextRequest parse_text(const json::Object& object, const CompletionTokenizer& to
     }
     const auto prompt = json::get_string(object, "prompt").value_or("");
     validate_prompt(prompt);
-    auto request = text_options(object);
+    auto request = text_options(object, tokenizer);
     encode_prompt(request, prompt, tokenizer);
     return request;
 }
@@ -236,7 +257,7 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
     if (!chat) {
         bad_request("Expected a JSON object for a chat request");
     }
-    auto request = text_options(chat_text_options(*chat));
+    auto request = text_options(chat_text_options(*chat), tokenizer);
     request.chat = true;
     const auto prompt = tokenizer.chat_template().render(*chat, ChatInput::http);
     validate_prompt(prompt);

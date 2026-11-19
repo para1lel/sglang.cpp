@@ -968,11 +968,13 @@ cudaError_t decoder::exact_decode_gqa_attention(
 cudaError_t decoder::exact_decode_gqa_attention(
     const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
     const __nv_bfloat16* queries, __nv_bfloat16* output, const ExactGqaWorkspace* workspace,
-    cudaStream_t stream) {
+    cudaStream_t stream, std::size_t workspace_bytes) {
     if (!cache || !pages || !position) {
         return cudaErrorInvalidValue;
     }
-    return launch_exact_attention(cache, pages, position, queries, output, workspace, stream);
+    return workspace_bytes >= narrow_workspace_bytes
+        ? launch_exact_attention<true>(cache, pages, position, queries, output, workspace, stream)
+        : launch_exact_attention(cache, pages, position, queries, output, workspace, stream);
 }
 
 cudaError_t decoder::paged_decode_gqa(const PagedDecodeLane* lanes, int count,

@@ -433,7 +433,7 @@ struct DecoderBatch::State {
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;
     std::size_t resident_capacity = 0;
-    std::array<bool, decoder_batch_max_graph_lanes - 1> graph_warmed{};
+    std::array<bool, decoder_batch_max_graph_lanes> graph_warmed{};
     int prefill_cursor = 0;
     bool failed = false;
 };
@@ -610,7 +610,11 @@ void DecoderBatch::reset_prefix_cache() {
 bool DecoderBatch::available() const { return !state_->failed; }
 
 bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
-    auto& warmed = graph_warmed[count - 2];
+    if (count == 1 && lanes[0].position >=
+        lanes[0].request->work.gqa_scores(text_attention_max_tokens).capacity) {
+        return false;
+    }
+    auto& warmed = graph_warmed[count - 1];
     if (!std::exchange(warmed, true)) {
         return false;
     }
@@ -718,8 +722,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             scoring[slot] = lane.request.get();
         }
     }
-    const bool graph = graph_eligible && !contains_mtp &&
-        count >= 2 && count <= decoder_batch_max_graph_lanes && replay(work.data(), count);
+    const bool graph = graph_eligible && !contains_mtp && count > 0 &&
+        count <= decoder_batch_max_graph_lanes && replay(work.data(), count);
     if (count != 0 && !graph) {
         work[0].narrow_gqa = count == 1 && !contains_mtp && max_rows == 0 &&
             work[0].rotary_position == -1;

@@ -14,7 +14,7 @@ import test_batch_graph as http
 
 WIDTHS = (16, 32)
 PREFILL_ROW_BUDGET = 128
-BATCH_GRAPH_WIDTHS = (2, 3, 4)
+BATCH_GRAPH_WIDTHS = check_graph_evidence.BATCH_GRAPH_WIDTHS
 NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
 NATIVE_STEP = re.compile(r"^step decode=(\d+) graph=(\d+) bytes=(\d+)$", re.M)
 

@@ -48,10 +48,11 @@ struct LayerBatch {
     cudaStream_t stream;
 
     bool single_decode() const {
-        if constexpr (!std::is_same_v<Lane, BatchGraphLane>) {
+        if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
+            return count == 1;
+        } else {
             return count == 1 && lanes[0].mode == TextGdnMode::decode;
         }
-        return false;
     }
 
     int projection_rows(int group) const {
@@ -244,8 +245,16 @@ void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& b
         reads[index] = {&binding->caches[cache_index], &binding->pages, position,
                          &binding->scores, paged_gqa_buffers(work)};
     }
-    check(paged_decode_gqa(reads.data(), batch.count, batch.stream),
-          "Read bound causal MXFP8 attention");
+    if (batch.single_decode()) {
+        const auto& read = reads[0];
+        check(exact_decode_gqa_attention(read.cache, read.pages, read.position,
+                                          read.buffers.queries, read.buffers.output, read.scores,
+                                          batch.stream, vocab_size * sizeof(Bf16)),
+              "Read bound singleton MXFP8 attention");
+    } else {
+        check(paged_decode_gqa(reads.data(), batch.count, batch.stream),
+              "Read bound causal MXFP8 attention");
+    }
     batch.each([&](const BatchGraphLane&, Workspace& work) { gate_gqa(work, batch.stream); });
 }
 

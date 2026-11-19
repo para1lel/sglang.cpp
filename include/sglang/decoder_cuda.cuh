@@ -82,7 +82,7 @@ cudaError_t exact_decode_gqa_attention(
 cudaError_t exact_decode_gqa_attention(
     const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
     const __nv_bfloat16* queries, __nv_bfloat16* output, const ExactGqaWorkspace* workspace,
-    cudaStream_t stream);
+    cudaStream_t stream, std::size_t workspace_bytes = 0);
 
 inline constexpr int paged_decode_lanes = 4;
 inline constexpr int paged_decode_partitions = 16;

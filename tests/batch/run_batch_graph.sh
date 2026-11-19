@@ -18,7 +18,7 @@ case "$mode" in
         test -x "$build/bin/mxfp8-gqa-check"
         ;;
     admission) test -x "$build/bin/sglang-server" ;;
-    boundary) ;;
+    boundary|singleton) ;;
     *) exit 2 ;;
 esac
 if [[ "$mode" != admission ]]; then
@@ -34,7 +34,7 @@ nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=c
 if [[ "$mode" == all ]]; then
     "$build/bin/batch-graph-lanes" "$checkpoint" verify-wide exact >"$out/wide-verify.log" 2>&1
 fi
-if [[ "$mode" != boundary ]]; then
+if [[ "$mode" == all || "$mode" == admission ]]; then
     python3 -IB "$tests/run_admission.py" --binary "$build/bin/sglang-server" \
         --checkpoint "$checkpoint" --evidence "$out/admission"
 fi
@@ -54,7 +54,6 @@ compile_observer() {
 
 compile_observer activity -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcupti
 compile_observer scores -ldl
-compile_observer oom -ldl
 
 run_lanes() {
     local name=$1 role=$2 policy=$3 fault=${4:-} addon=${5:-} scenario=${6:-}
@@ -74,11 +73,30 @@ run_boundary() {
     run_lanes boundary-score-oom score-oom tensor-core score-oom oom boundary
 }
 
-if [[ "$mode" == boundary ]]; then
-    run_boundary
+run_singleton() {
+    run_lanes singleton-eager eager tensor-core '' '' singleton
+    run_lanes singleton-graph graph tensor-core '' '' singleton
+    run_lanes singleton-launch launch tensor-core launch failure singleton
+}
+
+finish_device() {
     test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
     nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=csv \
         >"$out/device-after.csv"
+}
+
+if [[ "$mode" == singleton ]]; then
+    compile_observer failure -ldl
+    run_singleton
+    finish_device
+    python3 -IB "$tests/check_graph_evidence.py" "$out" --singleton-only
+    exit
+fi
+
+compile_observer oom -ldl
+if [[ "$mode" == boundary ]]; then
+    run_boundary
+    finish_device
     python3 -IB "$tests/check_graph_evidence.py" "$out" --boundary-only
     exit
 fi
@@ -111,7 +129,6 @@ for policy in exact tensor-core; do
 done
 
 run_boundary
-test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
-nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=csv \
-    >"$out/device-after.csv"
+run_singleton
+finish_device
 python3 -IB "$tests/check_graph_evidence.py" "$out"

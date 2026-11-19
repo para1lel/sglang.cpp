@@ -162,7 +162,7 @@ struct Allocations::State {
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
-    std::array<BatchGraph, decoder_batch_max_graph_lanes - 1> batch_graphs{};
+    std::array<BatchGraph, decoder_batch_max_graph_lanes> batch_graphs{};
     bool uncertain_stream = false;
     bool uncertain_graph = false;
     std::vector<void*> blocks;
@@ -412,7 +412,7 @@ void Allocations::capture_graph(const std::function<void()>& enqueue) {
 bool Allocations::replay_batch_graph(int width, const std::function<void()>& prepare,
                                      const std::function<void()>& capture_nodes,
                                      const std::function<bool()>& bind) {
-    auto& batch = state_->batch_graphs.at(width - 2);
+    auto& batch = state_->batch_graphs.at(width - 1);
     if (batch.disabled) {
         return false;
     }

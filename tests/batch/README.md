@@ -26,7 +26,7 @@ and CUPTI runtime/device records in the evidence directory.
   crosses positions 127 and 128, and checks KV bytes, inactive storage, and BF16
   attention. It rebinds separate GDN history and recurrence banks and compares
   output, BF16 history, and FP32 state against ordinary decode.
-- The model probe changes sparse active sets at widths two, three, and four.
+- The model probe changes sparse active sets at widths two through four.
   It checks cancellation, zero-budget retirement, positive slot reuse, greedy IDs,
   and complete BF16 scores against eager. Each graph mask must equal the slots
   with a decode result. Within this short scenario, once a width has replayed,
@@ -36,14 +36,21 @@ and CUPTI runtime/device records in the evidence directory.
   scratch and instantiation allocation failures, and an uncertain post-launch
   synchronization. They check eager fallback, graph cleanup, continued replay at
   other widths, and fail-closed behavior after uncertain completion.
+- The singleton probe uses slot 31 in a 32-slot batch. It checks eager warmup,
+  replay across request replacement, mixed prefill, zero-budget retirement,
+  the inline score limit, and width-local launch rejection. CUPTI pairs each
+  reported mask with a device launch. The full BF16 score comparison includes
+  both ends of the 1,536–2,560 visible-token page-parallel attention window.
 - The long-score probe crosses positions 5,119–5,121 with tensor-core prefill.
   It checks lazy allocation, changing score strides, mixed steps, score
   allocation failure, cancellation, and slot reuse. It matches greedy IDs and
   complete BF16 rows to eager, correlates masks with CUPTI launches, and
   requires zero request bytes at cleanup.
-- The public HTTP probe sends distinct prompts with all three widths and checks
-  independent EOS and explicit stop, cancellation, overlapping replacement, and
-  recovery. Both server routes must return identical SSE and release request state.
+- The public HTTP probe sends distinct prompts across decode widths one through
+  four and checks independent EOS and explicit stop, cancellation, overlapping
+  replacement, and recovery. It also runs a seeded sampled request alongside a
+  greedy request and checks replay during their shared decode. Both server
+  routes must return identical SSE and release request state.
 
 Expect `Batch CUDA Graph operator, lane, fault and HTTP checks passed`. The
 [evidence checker](check_graph_evidence.py#L1)<!-- prefix: "\"\"\"Check rea" -->
@@ -55,6 +62,14 @@ Run the long-score boundary with a fresh evidence destination.
 GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
     bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/boundary" boundary
 python3 -IB tests/batch/check_graph_evidence.py "$out/boundary" --boundary-only
+```
+
+Run the singleton regression with a fresh evidence destination.
+
+```bash
+GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
+    bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/singleton" singleton
+python3 -IB tests/batch/check_graph_evidence.py "$out/singleton" --singleton-only
 ```
 
 Run the slot-mask regression without a checkpoint or GPU.

@@ -15,7 +15,7 @@ The paged KV-cache and causal grouped-query attention API is in
 The CUDA cache and public attention implementation is in
 [`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L866)<!-- prefix: "cudaError_t " -->.
 The internal page-parallel path for batched decode is in
-[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L978)<!-- prefix: "cudaError_t " -->.
+[`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L980)<!-- prefix: "cudaError_t " -->.
 The internal grouped-query attention prefill path is in
 [`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L441)<!-- prefix: "cudaError_t " -->.
 
@@ -176,11 +176,15 @@ A failed drain ends the affected requests. New completions return HTTP 500 until
 reports whether the caller can retry.
 
 Add `--batch-cuda-graphs` to opt in to graph replay for eligible decode-only
-groups of two through four requests. The server warms each actual decode width
-before capturing it. At decode position 5,120 or later, a request can replay
-with its own exact attention score workspace sized to its KV capacity. If that
-allocation runs out of memory, steps that need it use eager decode. Other decode
-widths and mixed decode and prefill steps run eagerly.
+groups of one through four requests. The server warms each actual decode width
+before capturing it. A singleton in a graph-enabled batch can replay through
+5,120 visible tokens and uses eager decode at longer contexts. In groups of two
+through four, graph replay for ordered attention at zero-based decode position
+5,120 or later uses a request-owned score workspace sized to the request's KV
+capacity. Packed paged attention at 8,192–16,384 visible tokens skips that
+workspace. If allocating the ordered workspace runs out of memory, steps
+that need it use eager decode. Other decode widths and mixed decode and
+prefill steps run eagerly.
 
 The default `--mtp-steps 0` selects target-only decoding.
 Use `--mtp-steps 1` through `--mtp-steps 4` for unconstrained greedy and sampled text requests.

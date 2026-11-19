@@ -65,7 +65,7 @@ def consume(stream, exact, preposted=False):
             usage = event["usage"]
     assert stream.response.read(1) == b""
     prompt = stream.request["prompt"]
-    expected_prompt = TEXT["ids"] if isinstance(prompt, str) else prompt
+    expected_prompt = stream.case["prompt"] if isinstance(prompt, str) else prompt
     assert stream.events[0]["choices"][0]["prompt_token_ids"] == expected_prompt
     assert usage["completion_tokens"] == len(tokens)
     assert usage["prompt_tokens"] == len(expected_prompt)
@@ -75,15 +75,15 @@ def consume(stream, exact, preposted=False):
     else:
         assert set(usage) == {"prompt_tokens", "completion_tokens", "prompt_tokens_details"}
     stop = stream.request.get("stop_token_ids", [])
-    if isinstance(prompt, str):
+    if stream.case.get("raw"):
         stop = [248044, 248046]
         assert tokens == [248046] and finish == "stop"
         assert stream.events[len(tokens) - 1]["choices"][0]["text"] == ""
     elif exact and "stop_token_id" in stream.case:
         assert tokens == stream.case["output"] and finish == "stop"
     else:
-        expected = stream.case["output"]
-        if exact:
+        if exact and not stream.case.get("sampling"):
+            expected = stream.case["output"]
             assert tokens[:len(expected)] == expected[:len(tokens)]
         assert finish == "stop" or len(tokens) == stream.request["max_tokens"]
     assert (tokens[-1] in stop) == (finish == "stop")
@@ -95,6 +95,8 @@ def start(port, case, barrier, exact):
     with native.Stream(port, case) as stream:
         if case.get("raw"):
             stream.request = raw_body()
+        elif sampling := case.get("sampling"):
+            stream.request = sampling
         barrier.wait(timeout=15)
         return consume(stream, exact)
 
@@ -155,6 +157,9 @@ def scheduler(path, offset):
             rows[-1]["workspace_bytes"] = int(prefill[2])
         elif graph := re.fullmatch(rb"batch graph_slots=(\d+)", line):
             rows[-1]["graph_slots"] = int(graph[1])
+        elif sampling := re.fullmatch(rb"batch sampling_workspace_bytes=([1-9]\d*)", line):
+            assert rows and rows[-1]["width"] and "sampling_workspace_bytes" not in rows[-1], line
+            rows[-1]["sampling_workspace_bytes"] = int(sampling[1])
         elif target := re.fullmatch(rb"batch target_rows=(\d+) step_budget=(\d+)", line):
             assert rows and rows[-1]["width"] and "target_rows" not in rows[-1], line
             rows[-1]["target_rows"], rows[-1]["step_budget"] = map(int, target.groups())
@@ -190,7 +195,7 @@ def scheduler(path, offset):
 def check(port, out, maximum_width, graph_enabled, exact):
     log = out / "server.log"
     result = {}
-    for width in range(2, maximum_width + 1):
+    for width in range(1, maximum_width + 1):
         cases = [FIXTURES[name] for name in DIRECT[:width]]
         offset = log.stat().st_size
         streams = parallel(port, cases, exact)
@@ -205,6 +210,21 @@ def check(port, out, maximum_width, graph_enabled, exact):
              FIXTURES["held-out"], FIXTURES["page-boundary"]][:maximum_width]
     streams = parallel(port, mixed, exact)
     result["independent-stops"] = {"streams": streams, "rows": scheduler(log, offset)}
+    save(out / "http.json", result)
+    greedy = {**FIXTURES["held-out"], "max_tokens": 32}
+    sampled = {"name": "seeded-sampling", "prompt": TEXT["ids"], "max_tokens": 32, "sampling": {
+        **raw_body(), "max_tokens": 32, "ignore_eos": True,
+        "temperature": 0.8, "top_k": 20, "seed": 42,
+    }}
+    offset = log.stat().st_size
+    streams = parallel(port, [greedy, sampled], exact)
+    assert all(stream["finish"] == "length" and len(stream["tokens"]) == 32 for stream in streams)
+    rows = scheduler(log, offset)
+    joint_decode = [row for row in rows
+                    if row["decode"] == 2 and row.get("sampling_workspace_bytes")]
+    assert joint_decode and any(row["graph_slots"].bit_count() == 2
+                                for row in joint_decode) == graph_enabled, rows
+    result["sampling-and-replay"] = {"streams": streams, "rows": rows}
     save(out / "http.json", result)
     offset = log.stat().st_size
     result["cancel-and-replace"] = cancel_and_replace(port, maximum_width, exact)

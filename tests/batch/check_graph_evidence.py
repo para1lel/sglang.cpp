@@ -14,6 +14,8 @@ LIFECYCLE = (
     "cudaGraphExecDestroy", "cudaGraphDestroy",
 )
 RECOVERABLE = ("begin", "instantiate", "launch", "scratch-oom", "instantiate-oom")
+BATCH_GRAPH_WIDTHS = (1, 2, 3, 4)
+BATCH_MAX_SLOTS = 32
 
 
 def trace(path):
@@ -74,7 +76,8 @@ def lane_trace(path, require_replays=False, compare_request_bytes=True):
             lanes, decoded, prefill = 0, 0, 0
         elif kind == "lane":
             slot, _, rows, decode, token, _ = map(int, values)
-            assert step is not None and 0 <= slot < 4 and decode in (0, 1), (path, row)
+            assert step is not None and 0 <= slot < BATCH_MAX_SLOTS and decode in (0, 1), (
+                path, row)
             slot_bit = 1 << slot
             assert selected & slot_bit and not lanes & slot_bit, (path, row)
             lanes |= slot_bit
@@ -185,6 +188,32 @@ def verify_boundary(evidence):
     print(f"Long batch graph boundary, score OOM and recycling checks passed ({len(tokens)} rows)")
 
 
+def verify_singleton(evidence):
+    eager = evidence / "singleton-eager"
+    baseline, masks, tokens = lane_trace(eager.with_suffix(".lanes"))
+    assert not masks and trace(eager.with_suffix(".cupti.tsv")) == ([], [])
+    scores = eager.with_suffix(".scores").read_bytes()
+    far_mask = 1 << (BATCH_MAX_SLOTS - 1)
+    pair = far_mask | 1
+    expected = {"graph": [far_mask] * 5 + [pair, far_mask], "launch": [far_mask, pair]}
+    for role, expected_masks in expected.items():
+        stem = evidence / f"singleton-{role}"
+        steps, masks, observed = lane_trace(stem.with_suffix(".lanes"))
+        assert steps == baseline and observed == tokens and tokens
+        assert masks == expected_masks, (stem, masks)
+        verify_scores(stem.with_suffix(".scores"), tokens)
+        assert stem.with_suffix(".scores").read_bytes() == scores
+        device, runtime = trace(stem.with_suffix(".cupti.tsv"))
+        singleton_ids = {graph_id for graph_id, mask in zip(device, masks, strict=True)
+                         if mask == far_mask}
+        assert len(singleton_ids) == 1 and device[masks.index(pair)] not in singleton_ids
+        assert all(count(runtime, api) == 2 for api in LIFECYCLE)
+        output = stem.with_suffix(".log").read_text()
+        assert output.count("inject: launch") == (role == "launch")
+        assert ("at width 1:" in output) == (role == "launch"), output
+    print(f"Singleton warmup, sparse replay, recycling and fallback passed ({len(tokens)} rows)")
+
+
 def payloads(data):
     return [
         [stream["events"], stream["tokens"], stream["finish"], stream["usage"]]
@@ -206,9 +235,10 @@ def verify_http(evidence, policy):
     grouped = defaultdict(set)
     for graph_id, mask in zip(device, masks, strict=True):
         grouped[mask.bit_count()].add(graph_id)
-    assert set(grouped) == {2, 3, 4} and all(len(ids) == 1 for ids in grouped.values())
-    assert len(set.union(*grouped.values())) == 3
-    assert all(count(runtime, api) == 3 for api in LIFECYCLE)
+    assert set(grouped) == set(BATCH_GRAPH_WIDTHS)
+    assert all(len(ids) == 1 for ids in grouped.values())
+    assert len(set.union(*grouped.values())) == len(BATCH_GRAPH_WIDTHS)
+    assert all(count(runtime, api) == len(BATCH_GRAPH_WIDTHS) for api in LIFECYCLE)
 
 
 def churn_responses(data):
@@ -259,17 +289,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evidence", type=Path, nargs="?")
     parser.add_argument("--check-slot-mask", action="store_true")
-    parser.add_argument("--boundary-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--boundary-only", action="store_true")
+    mode.add_argument("--singleton-only", action="store_true")
     args = parser.parse_args()
     if args.check_slot_mask:
         check_slot_mask()
     output = args.evidence
     if output is None:
-        if not args.check_slot_mask or args.boundary_only:
+        if not args.check_slot_mask or args.boundary_only or args.singleton_only:
             parser.error("Pass an evidence directory or --check-slot-mask")
         return
     if args.boundary_only:
         verify_boundary(output)
+        return
+    if args.singleton_only:
+        verify_singleton(output)
         return
     verify_operators(output)
     for policy in ("exact", "tensor-core"):
@@ -278,6 +313,7 @@ def main():
             verify_faults(output, *evidence)
         verify_http(output, policy)
     verify_boundary(output)
+    verify_singleton(output)
     print("Batch CUDA Graph operator, lane, fault and HTTP checks passed")
 
 

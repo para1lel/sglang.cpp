@@ -17,7 +17,11 @@ void require(bool condition, const char* failure) {
 }
 
 Mask mask(unsigned value) {
-    return {bool(value & 1), bool(value & 2), bool(value & 4), bool(value & 8)};
+    Mask selected{};
+    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+        selected[slot] = (value & (1u << slot)) != 0;
+    }
+    return selected;
 }
 
 struct Instance {
@@ -27,7 +31,8 @@ struct Instance {
     int steps = 0;
     unsigned graph_slots = 0;
 
-    Instance(const Decoder& decoder, bool graphs) : batch(decoder, {graphs}) {}
+    Instance(const Decoder& decoder, bool graphs, int width = 4) :
+        batch(decoder, {graphs, width}) {}
 
     void admit(int slot, int length, int budget, std::optional<int> stop = std::nullopt) {
         constexpr std::array pool{13, 198, 279, 826, 760, 6511, 314, 9338, 369, 1570,
@@ -218,6 +223,57 @@ void score_boundary(const Decoder& decoder, std::string_view role) {
     run.check_step(15, 0);
 }
 
+void singleton(const Decoder& decoder, std::string_view role) {
+    constexpr int far_slot = decoder_batch_max_lanes - 1;
+    constexpr unsigned far_mask = 1u << far_slot;
+    constexpr unsigned pair = far_mask | 1u;
+    const bool graphs = role != "eager";
+    const bool rejected = role == "launch";
+    const auto singleton_mask = graphs && !rejected ? far_mask : 0u;
+    Instance run(decoder, graphs, decoder_batch_max_lanes);
+
+    run.admit(far_slot, 1534, 6);
+    run.prefill(far_mask, far_slot);
+    run.step(far_mask);
+    require(run.graph_slots == 0, "First singleton decode did not warm eagerly");
+    run.step(far_mask);
+    require(run.graph_slots == (graphs ? far_mask : 0u),
+            "Expected singleton replay at 1536 visible tokens");
+    run.admit(0, 1, 6);
+    const auto mixed = run.step(pair);
+    require(run.graph_slots == 0 && mixed[far_slot].decode &&
+            mixed[0].token && !mixed[0].decode, "Mixed prefill and singleton decode used a graph");
+    run.admit(2, 1, 0);
+    const auto zero = run.step(far_mask | 4u);
+    require(run.graph_slots == singleton_mask && zero[far_slot].decode &&
+            !zero[2].token && zero[2].finish_reason == DecoderFinishReason::length,
+            "Unexpected singleton mask or zero-budget retirement");
+    run.cancel(far_slot);
+
+    run.admit(far_slot, 2558, 6);
+    run.prefill(far_mask, far_slot);
+    for (int index = 0; index < 3; ++index) {
+        run.step(far_mask);
+        require(run.graph_slots == singleton_mask, "Unexpected replay mask on recycled slot");
+    }
+    run.step(pair);
+    require(run.graph_slots == 0, "First pair decode did not warm eagerly");
+    run.step(pair);
+    require(run.graph_slots == (graphs ? pair : 0u),
+            "Singleton graph state prevented pair replay");
+    require(!run.jobs[far_slot], "Recycled slot did not finish");
+    run.cancel(0);
+
+    run.admit(far_slot, 5119, 3);
+    run.prefill(far_mask, far_slot);
+    run.step(far_mask);
+    require(run.graph_slots == singleton_mask, "Last inline score position did not replay");
+    run.step(far_mask);
+    require(run.graph_slots == 0, "Singleton beyond inline score capacity used a graph");
+    run.drain();
+    run.check_step(pair, 0);
+}
+
 void verify_wide(const Decoder& decoder) {
     constexpr int width = decoder_batch_max_lanes;
     constexpr int budget = decoder_batch_max_step_tokens;
@@ -284,22 +340,27 @@ void verify_wide(const Decoder& decoder) {
 
 int main(int argc, char** argv) {
     try {
-        require(argc == 4 || (argc == 5 && std::string_view(argv[4]) == "boundary"),
-                "Expected CHECKPOINT ROLE FP8_PREFILL [boundary]");
-        const bool boundary = argc == 5;
+        require(argc == 4 || argc == 5,
+                "Expected CHECKPOINT ROLE FP8_PREFILL [boundary|singleton]");
+        const std::string_view test = argc == 5 ? argv[4] : "";
+        require(test.empty() || test == "boundary" || test == "singleton",
+                "Unexpected graph test scenario");
         const std::string_view role = argv[2];
         const std::string_view policy = argv[3];
-        const bool wide = !boundary && role == "verify-wide" && policy == "exact";
+        const bool wide = test.empty() && role == "verify-wide" && policy == "exact";
         require(wide || role == "eager" || role == "graph" ||
-                role == (boundary ? "score-oom" : "hard"),
+                role == (test == "boundary" ? "score-oom" :
+                         test == "singleton" ? "launch" : "hard"),
                 "Unexpected graph test role");
         require(policy == "exact" || policy == "tensor-core", "Expected exact or tensor-core");
         const Decoder decoder(argv[1], 0, wide, policy == "exact" ?
             Fp8PrefillPolicy::exact : Fp8PrefillPolicy::tensor_core);
         if (wide) {
             verify_wide(decoder);
-        } else if (boundary) {
+        } else if (test == "boundary") {
             score_boundary(decoder, role);
+        } else if (test == "singleton") {
+            singleton(decoder, role);
         } else {
             scenario(decoder, role != "eager", role == "hard");
         }

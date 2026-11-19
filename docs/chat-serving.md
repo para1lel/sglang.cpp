@@ -12,7 +12,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and pass validated prompt IDs to the decoder. | [Route](../apps/sglang-server.cpp#L112)<!-- prefix: "} else if (r" --> · [Request parser](../apps/server/text_request.cpp#L182)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and pass validated prompt IDs to the decoder. | [Route](../apps/sglang-server.cpp#L109)<!-- prefix: "} else if (r" --> · [Request parser](../apps/server/text_request.cpp#L182)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L143)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L158)<!-- prefix: "void TextRes" --> |
 
@@ -60,7 +60,7 @@ The rendered prompt and its output budget share the 262,144-token context. The r
 
 The first request that reaches rendering loads the pinned `tokenizer_config.json` and `chat_template.jinja` from the checkpoint directory. A missing, unreadable, or mismatched chat asset returns HTTP 500 before output starts. Later chat requests retry a failed load. Raw text can still load `tokenizer.json` independently. The benchmark ID route requires neither tokenizer nor chat assets.
 
-Positive MTP depth, including K4 (`--mtp-steps 4`), requires `--max-active 1`. Follow the [native MTP guide](mtp.md) for serial verification. [Batch CUDA graphs](batch-graphs.md) require `--batch-cuda-graphs`, `--max-active 2`, `3`, or `4`, MTP off, and omission of `--eager`.
+Set `--mtp-steps` to `1`–`4` for eager speculation at any supported width. The server applies the same depth to chat and completion routes. [Batch CUDA graphs](batch-graphs.md) require `--batch-cuda-graphs`, `--max-active 2`, `3`, or `4`, and MTP off for replay. Follow the [native MTP guide](mtp.md) for speculative verification and cancellation.
 
 A reset or failed write cancels the request and discards its pending UTF-8 bytes. In batch mode, the server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream. [Request lifecycle](../apps/server/text_completion.cpp#L193)<!-- prefix: "void complet" -->
 
@@ -74,6 +74,6 @@ python3 -B tests/text/test_native_chat.py --port 17384 -v
 
 Require exact rendered prompt IDs and usage against the frozen template fixtures. Check JSON and SSE parity, matched stop IDs without stop text, malformed requests, and replay after a reset. Compare raw requests with the equivalent rendered prompts. Run the [raw text checks](text-serving.md#verification) and the [benchmark streaming checks](development.md#streaming-verification) separately.
 
-For a K4 check, use the same chat fixture and request limits with MTP off and with `--mtp-steps 4`. Compare prompt IDs, committed IDs, finish reasons, and usage. For batch graphs, run overlapping chat, raw text, and benchmark ID requests. Compare each response with a same-policy control. Correlate a multi-lane decode mask with an actual CUDA graph launch. Reset a chat stream while a peer is active. Check the peer and replacement request against their controls.
+For a K4 check, match prompt IDs, committed IDs, finish reasons, and usage against MTP off. Use the same chat fixtures and limits at width one and with overlapping requests. For batch graphs, overlap chat, raw text, and benchmark ID requests. Compare each response with a same-policy control. Correlate a multi-lane decode mask with an actual CUDA graph launch. Reset a chat stream while a peer is active. Check the peer and replacement request against their controls.
 
 For serving performance, record template and tokenizer assets, request bytes, rendered prompt IDs, stops, and active decoder options. Use the [performance contract](performance.md) for frozen comparisons and timing definitions. Keep chat checks separate from W1–W6.

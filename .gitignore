@@ -1,6 +1,7 @@
 /.xmake/
 /build/
 /artifacts/
+/checkpoints/
 /.gate-results/
 /.pytest_cache/
 /.pixi/

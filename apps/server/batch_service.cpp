@@ -18,17 +18,18 @@ namespace {
 struct Job {
     std::vector<int> prompt;
     DecoderOptions options;
-    std::optional<int> token;
+    std::optional<DecoderBatchStep> pending;
     std::optional<DecoderFinishReason> finish;
     std::exception_ptr error;
     bool admitted = false;
     bool cancelled = false;
 
-    bool ready() const { return cancelled || !token; }
+    bool ready() const { return cancelled || !pending; }
 };
 
 using Jobs = std::array<std::shared_ptr<Job>, decoder_batch_max_lanes>;
 using Selection = std::array<bool, decoder_batch_max_lanes>;
+using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
 constexpr auto disconnect_poll = std::chrono::milliseconds(10);
 constexpr auto mailbox_grace = std::chrono::milliseconds(1);
 
@@ -39,10 +40,50 @@ void trace_prefill_rows(const DecoderBatchStepStats& stats) {
                   " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) + '\n');
 }
 
+void trace_verification(const Steps& steps, const DecoderBatchStepStats& stats) {
+    std::cerr << ("batch verify lanes=" + std::to_string(stats.verification_lanes) +
+                  " rows=" + std::to_string(stats.verification_rows) +
+                  " peak_request_bytes=" + std::to_string(stats.peak_request_bytes) + '\n');
+    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+        const auto& step = steps[slot];
+        if (step.mtp_drafted_tokens || step.mtp_boundary) {
+            std::cerr << ("batch mtp slot=" + std::to_string(slot) +
+                          " drafted=" + std::to_string(step.mtp_drafted_tokens) +
+                          " accepted=" + std::to_string(step.mtp_accepted_tokens) +
+                          " verified=" + std::to_string(step.mtp_drafted_tokens ?
+                              step.mtp_drafted_tokens + 1 : 0) +
+                          " replayed=" + std::to_string(step.mtp_replayed_rows) +
+                          " boundary=" + std::to_string(step.mtp_boundary) + '\n');
+        }
+    }
+}
+
+bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& callbacks,
+               DecoderResult& result) {
+    result.mtp_rounds += step.mtp_drafted_tokens != 0;
+    result.mtp_drafted_tokens += step.mtp_drafted_tokens;
+    result.output_token_ids.push_back(*step.token);
+    result.mtp_accepted_tokens += step.mtp_accepted_tokens > 0;
+    if (callbacks.on_token && !callbacks.on_token(*step.token)) {
+        return false;
+    }
+    for (int index = 0; index < step.extra_token_count; ++index) {
+        if (callbacks.is_cancelled && callbacks.is_cancelled()) {
+            return false;
+        }
+        result.output_token_ids.push_back(step.extra_tokens[index]);
+        result.mtp_accepted_tokens += index + 1 < step.mtp_accepted_tokens;
+        if (callbacks.on_token && !callbacks.on_token(step.extra_tokens[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }
 
 struct BatchService::State {
-    State(const Decoder& decoder, bool trace, bool cuda_graphs);
+    State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps);
     ~State();
 
     void run(const Decoder& decoder, std::promise<void> started);
@@ -50,10 +91,12 @@ struct BatchService::State {
     std::optional<Jobs> wait_for_jobs();
     bool prepare(DecoderBatch& batch, int slot, const std::shared_ptr<Job>& job);
     void publish(int slot, Job& job, const DecoderBatchStep& step);
+    void fail_jobs(std::exception_ptr error, bool permanent);
     void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);
 
     const bool trace;
     const bool cuda_graphs;
+    const int mtp_steps;
     std::mutex mutex;
     std::condition_variable changed;
     Jobs jobs;
@@ -62,8 +105,8 @@ struct BatchService::State {
     std::thread worker;
 };
 
-BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs)
-    : trace(trace), cuda_graphs(cuda_graphs) {
+BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps)
+    : trace(trace), cuda_graphs(cuda_graphs), mtp_steps(mtp_steps) {
     std::promise<void> started;
     auto ready = started.get_future();
     worker = std::thread(&State::run, this, std::cref(decoder), std::move(started));
@@ -96,16 +139,22 @@ void BatchService::State::run(const Decoder& decoder, std::promise<void> started
     try {
         process(*batch);
     } catch (...) {
-        const std::lock_guard lock(mutex);
-        failure = std::current_exception();
-        for (auto& job : jobs) {
-            if (job) {
-                job->error = failure;
-                job.reset();
-            }
-        }
-        changed.notify_all();
+        fail_jobs(std::current_exception(), true);
     }
+}
+
+void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
+    const std::lock_guard lock(mutex);
+    if (permanent) {
+        failure = error;
+    }
+    for (auto& job : jobs) {
+        if (job) {
+            job->error = error;
+            job.reset();
+        }
+    }
+    changed.notify_all();
 }
 
 std::optional<Jobs> BatchService::State::wait_for_jobs() {
@@ -152,7 +201,10 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
         try {
             batch.admit(slot, std::move(job->prompt), job->options);
             job->admitted = true;
-        } catch (const std::invalid_argument&) {
+        } catch (...) {
+            if (!batch.available()) {
+                throw;
+            }
             const std::lock_guard lock(mutex);
             job->error = std::current_exception();
             jobs[slot].reset();
@@ -165,7 +217,7 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
 
 void BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& step) {
     if (step.token && !job.cancelled) {
-        job.token = step.token;
+        job.pending = step;
     }
     if (step.finish_reason) {
         job.finish = step.finish_reason;
@@ -186,10 +238,22 @@ void BatchService::State::process(DecoderBatch& batch) {
             selected[slot] = prepare(batch, slot, (*snapshot)[slot]);
         }
         const int width = std::count(selected.begin(), selected.end(), true);
-        std::array<DecoderBatchStep, decoder_batch_max_lanes> steps{};
+        Steps steps{};
         DecoderBatchStepStats stats;
         if (width) {
-            steps = batch.advance_chunked(selected, trace ? &stats : nullptr);
+            try {
+                steps = batch.advance_chunked(selected, trace ? &stats : nullptr);
+            } catch (...) {
+                if (!batch.available()) {
+                    throw;
+                }
+                fail_jobs(std::current_exception(), false);
+                if (trace) {
+                    trace_batch_step(0, 0, batch.request_device_allocation_bytes());
+                    traced_bytes = 0;
+                }
+                continue;
+            }
         }
         if (trace) {
             const auto bytes = batch.request_device_allocation_bytes();
@@ -202,6 +266,12 @@ void BatchService::State::process(DecoderBatch& batch) {
                     if (stats.graph_slots) {
                         std::cerr << ("batch graph_slots=" +
                                      std::to_string(stats.graph_slots) + '\n');
+                    }
+                    if (mtp_steps != 0) {
+                        trace_verification(steps, stats);
+                    } else {
+                        std::cerr << ("batch peak_request_bytes=" +
+                                      std::to_string(stats.peak_request_bytes) + '\n');
                     }
                 }
                 traced_bytes = bytes;
@@ -225,8 +295,8 @@ void BatchService::State::cancel(std::unique_lock<std::mutex>& lock, int slot, J
     changed.wait(lock, [&] { return jobs[slot].get() != &job; });
 }
 
-BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs)
-    : state_(std::make_unique<State>(decoder, trace, cuda_graphs)) {}
+BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps)
+    : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps)) {}
 
 BatchService::~BatchService() = default;
 
@@ -236,6 +306,7 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
     auto job = std::make_shared<Job>();
     job->prompt = prompt;
     job->options = options;
+    job->options.mtp_steps = state_->mtp_steps;
     DecoderResult result;
     std::unique_lock lock(state_->mutex);
     if (state_->failure) {
@@ -260,18 +331,17 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
             if (job->error) {
                 std::rethrow_exception(job->error);
             }
-            if (job->token) {
-                const int token = *job->token;
+            if (job->pending) {
+                const auto step = *job->pending;
                 lock.unlock();
-                result.output_token_ids.push_back(token);
-                const bool accepted = !callbacks.on_token || callbacks.on_token(token);
+                const bool accepted = emit_step(step, callbacks, result);
                 lock.lock();
                 if (!accepted) {
                     state_->cancel(lock, slot, *job);
                     result.finish_reason = DecoderFinishReason::cancelled;
                     return result;
                 }
-                job->token.reset();
+                job->pending.reset();
                 state_->changed.notify_all();
             } else if (job->finish) {
                 result.finish_reason = *job->finish;

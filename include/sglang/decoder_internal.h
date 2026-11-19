@@ -22,6 +22,7 @@ class MtpDraftWeights;
 class MtpDraftRequest;
 class PrefillWorkspace;
 class TargetVerification;
+struct VerificationSequence;
 
 using Bf16 = __nv_bfloat16;
 
@@ -231,6 +232,8 @@ struct Decoder::Model {
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     void forward_verify(decoder::TargetVerification& verification, int position,
                         const int* tokens, int count, cudaStream_t stream) const;
+    void forward_verify(const decoder::VerificationSequence* sequences, int count,
+                        cudaStream_t stream) const;
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
                        decoder::PrefillWorkspace& workspace,
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0) const;

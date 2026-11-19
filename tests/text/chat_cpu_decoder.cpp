@@ -122,4 +122,8 @@ std::size_t DecoderBatch::request_device_allocation_bytes() const {
                          [](const auto& lane) { return lane.has_value(); });
 }
 
+bool DecoderBatch::available() const {
+    return true;
+}
+
 }

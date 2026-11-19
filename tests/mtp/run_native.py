@@ -1,9 +1,11 @@
-"""Opt-in real-checkpoint acceptance for native serial MTP."""
+"""Opt-in real-checkpoint acceptance for native greedy MTP."""
 
 import argparse
 from contextlib import contextmanager
+import http.client
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -14,7 +16,9 @@ BATCH = ROOT.parent / "batch"
 sys.path.insert(0, str(ROOT.parent))
 from batch.run_native import (
     Stream,
+    burst,
     choose_port,
+    request_body,
     require,
     stop_server,
     wait_until_ready,
@@ -24,6 +28,8 @@ from prefill.run_native import load_cases as load_prefill_cases
 
 COUNTERS = ("mtp_drafted_tokens", "mtp_accepted_tokens", "mtp_rounds")
 STEPS = (1, 2, 3, 4)
+BATCH_SPOT = [(2, steps) for steps in STEPS] + [(4, max(STEPS))]
+VERIFY_ROWS = re.compile(rb"^batch verify lanes=(\d+) rows=(\d+) ", re.M)
 SEED_COUNTERS = {129: {1: (4, 4, 4), 4: (11, 6, 3)},
                  257: {1: (5, 4, 5), 4: (10, 5, 4)}}
 
@@ -183,15 +189,16 @@ def check_seed_carry(args):
 
 
 @contextmanager
-def serial_server(args, steps):
-    evidence = args.evidence / f"http-{steps}"
+def mtp_server(args, steps, width=1):
+    suffix = f"{steps}" if width == 1 else f"w{width}-k{steps}"
+    evidence = args.evidence / f"http-{suffix}"
     evidence.mkdir()
     port = choose_port()
     command = [str(args.server), "--checkpoint", str(args.checkpoint), "--device",
                str(args.device), "--port", str(port)]
     if steps != "default":
-        command += ["--max-active", "1", "--mtp-steps", str(steps)]
-    if steps == max(STEPS):
+        command += ["--max-active", str(width), "--mtp-steps", str(steps)]
+    if width > 1 or steps == max(STEPS):
         command.append("--trace-batches")
     write_json(evidence / "command.json", command)
     log_path = evidence / "server.log"
@@ -240,13 +247,91 @@ def check_recovery(port, evidence, log_path, prompt, target):
         write_json(evidence / "resume.json", stream.evidence())
 
 
+def check_cli_policy(args):
+    cases = {}
+    for name, binary, flags in (("generate", args.generate, ["--prompt-ids", "17"]),
+                                ("server", args.server, ["--max-active", "2"])):
+        unknown = "Unknown option" if name == "generate" else "Invalid argument"
+        validations = (
+            ("depth", ["--mtp-steps", "5"], "Expected --mtp-steps in [0, 4]"),
+            ("seed", ["--mtp-steps", "4", "--seed", "1"], f"{unknown} --seed"),
+            ("temperature", ["--mtp-steps", "4", "--temperature", "1"],
+             f"{unknown} --temperature"),
+        )
+        for label, options, diagnostic in validations:
+            command = [str(binary), *flags, *options]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            require(result.returncode != 0 and not result.stdout and diagnostic in result.stderr,
+                    f"{name} {label}: {result.stderr}")
+            cases[f"{name}-{label}"] = {
+                "command": command, "status": result.returncode, "stderr": result.stderr,
+            }
+    write_json(args.evidence / "cli-policy.json", cases)
+
+
+def check_rng_policy(port, evidence):
+    completions = "/v1/completions"
+    chat = "/v1/chat/completions"
+    model = "Qwen3.8-27B-FP8"
+    ids = request_body({"prompt": [17], "max_tokens": 0})
+    text = {"model": model, "prompt": "Spain", "max_tokens": 0}
+    messages = {"model": model, "messages": [{"role": "user", "content": "Spain"}],
+                "max_tokens": 0, "temperature": 0}
+    cases = (
+        ("ids-greedy", completions, ids, None),
+        ("ids-temperature", completions, ids | {"temperature": 1},
+         "Expected the frozen benchmark streaming options"),
+        ("ids-seed", completions, ids | {"seed": 1},
+         "Expected the frozen benchmark streaming options"),
+        ("ids-top-p", completions, ids | {"top_p": 0.5},
+         "Expected the frozen benchmark streaming options"),
+        ("text-greedy", completions, text, None),
+        ("text-seed", completions, text | {"seed": 0},
+         "Unsupported text completion option: seed"),
+        ("text-temperature", completions, text | {"temperature": 1},
+         "Unsupported text completion option: temperature"),
+        ("chat-greedy", chat, messages, None),
+        ("chat-temperature", chat, messages | {"temperature": 1},
+         "Only temperature 0 is supported"),
+        ("chat-seed", chat, messages | {"seed": 0},
+         "Unsupported chat completion option: seed"),
+        ("chat-top-p", chat, messages | {"top_p": 0.5},
+         "Unsupported chat completion option: top_p"),
+    )
+    results = {}
+    for name, route, body, diagnostic in cases:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        try:
+            connection.request("POST", route, json.dumps(body),
+                               {"Content-Type": "application/json", "Connection": "close"})
+            with connection.getresponse() as response:
+                received = response.read().decode("utf-8")
+                status = response.status
+                expect = 400 if diagnostic else 200
+                require(status == expect, f"{name}: HTTP {status}: {received}")
+                if diagnostic:
+                    require(response.headers.get_content_type() == "application/json" and
+                            json.loads(received)["error"]["message"] == diagnostic,
+                            f"{name}: {received}")
+                elif name == "ids-greedy":
+                    require(response.headers.get_content_type() == "text/event-stream" and
+                            received.endswith("data: [DONE]\n\n"), f"{name}: {received}")
+                else:
+                    require(json.loads(received)["choices"][0]["finish_reason"] == "length",
+                            f"{name}: {received}")
+                results[name] = {
+                    "route": route, "request": body, "status": status, "body": received,
+                }
+        finally:
+            connection.close()
+    write_json(evidence / "rng-policy.json", results)
+
+
 def check_http(args, cases, controls, seed_recovery):
-    invalid = [str(args.server), "--max-active", "2", "--mtp-steps", "1"]
-    result = subprocess.run(invalid, capture_output=True, text=True, timeout=5)
-    require(result.returncode != 0 and "--mtp-steps requires --max-active 1" in result.stderr,
-            f"Expected rejection of batched MTP: {result.stderr}")
     for steps in ("default", *STEPS):
-        with serial_server(args, steps) as (port, evidence):
+        with mtp_server(args, steps) as (port, evidence):
+            if steps in ("default", max(STEPS)):
+                check_rng_policy(port, evidence)
             for name, (prompt, budget, stop) in cases.items():
                 target = controls[name]
                 expected = {"name": name, "prompt": prompt, "max_tokens": budget,
@@ -268,6 +353,37 @@ def check_http(args, cases, controls, seed_recovery):
         print(f"HTTP steps={steps}: exact serial SSE tokens, finish, and usage")
 
 
+def check_batch_http(args, prompt, target, settings):
+    tokens = target["output_token_ids"]
+    for width, steps in settings:
+        with mtp_server(args, steps, width) as (port, evidence):
+            cases = [
+                {"name": f"lane-{lane}", "prompt": prompt, "max_tokens": len(tokens),
+                 "finish_reason": target["finish_reason"], "output": tokens}
+                for lane in range(width)
+            ]
+            log_path = evidence / "server.log"
+            with log_path.open("rb") as log:
+                log.seek(0, 2)
+                burst(port, log_path, evidence / "burst.json", cases, full_decode=True)
+                rows = [tuple(map(int, group)) for group in VERIFY_ROWS.findall(log.read())]
+            if width == 4 and steps == max(STEPS):
+                check_rng_policy(port, evidence)
+        require((width, width * (steps + 1)) in rows,
+                f"Missing joint verifier at width {width}, steps {steps}: {log_path}")
+        print(f"HTTP width={width} steps={steps}: exact SSE and joint target verification")
+
+
+def check_batch_spot(args, page):
+    name = "page-127"
+    case = (page, 10, None)
+    target = generate(args, name, case, 0)
+    require(all(key not in target for key in COUNTERS), f"{name}: target-only draft counters")
+    for steps in STEPS:
+        compare(target, generate(args, name, case, steps), steps, name)
+    check_batch_http(args, page, target, BATCH_SPOT)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generate", type=Path, required=True)
@@ -277,13 +393,19 @@ def main():
     parser.add_argument("--checkpoint", type=Path, default=Path("/data0/shared/Qwen3.8-27B-FP8"))
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--batch-spot-check", action="store_true",
+                        help="Check generation at depths 0–4 and five joint HTTP batch shapes")
     args = parser.parse_args()
     args.generate = args.generate.resolve()
     if args.reference_generate:
         args.reference_generate = args.reference_generate.resolve()
     args.server = args.server.resolve()
     args.evidence.mkdir(parents=True)
+    check_cli_policy(args)
     capital, silver, page = load_cases()
+    if args.batch_spot_check:
+        check_batch_spot(args, page)
+        return
     cases = {
         "capital": (capital, 12, None),
         "silver-key": (silver, 24, None),
@@ -318,6 +440,8 @@ def main():
         compare(controls[name], generate(args, name, cases[name], steps), steps, name)
     seed_recovery = check_seed_carry(args)
     check_http(args, cases, controls, seed_recovery)
+    check_batch_http(args, page, controls["page-127"],
+                     [(width, steps) for width in (2, 3, 4) for steps in STEPS])
 
 
 if __name__ == "__main__":

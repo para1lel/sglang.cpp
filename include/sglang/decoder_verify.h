@@ -13,30 +13,43 @@ struct VerificationRow {
     Workspace* work;
     int position;
     TargetVerification* verification;
+    bool first;
     static constexpr auto mode = TextGdnMode::decode;
+};
+
+struct VerificationSequence {
+    TargetVerification* verification;
+    int position;
+    const int* tokens;
+    int count;
 };
 
 class TargetVerification {
 public:
-    TargetVerification(Request& request, int capacity, int prefix, int rows, bool logits);
+    TargetVerification(Request& request, int capacity, int prefix, int rows, bool logits,
+                       cudaStream_t stream = nullptr);
 
     void begin(int position, int count, cudaStream_t stream);
     VerificationRow row(int index);
     void bind_gdn(int layer);
     void advance_gdn(int layer, TextGdnWeights weights);
     void read();
+    static void read_all(TargetVerification* const* verifiers, int count, cudaStream_t stream);
     void commit(int count);
 
     int winner(int index) const;
     const Bf16* logits(int index) const;
 
 private:
+    void enqueue_results();
+
     struct ReplayLayer {
         TextGdnReplayRows inputs;
         TextGdnWeights weights;
     };
 
     Request& request_;
+    cudaStream_t stream_;
     int capacity_;
     int valid_prefix_;
     int pending_rows_ = 0;

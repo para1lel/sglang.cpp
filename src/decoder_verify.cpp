@@ -22,11 +22,13 @@ void free_results(void* results) {
 }
 
 TargetVerification::TargetVerification(Request& request, int capacity, int prefix, int rows,
-                                       bool logits)
-    : request_(request), capacity_(capacity), valid_prefix_(prefix) {
+                                       bool logits, cudaStream_t stream)
+    : request_(request), stream_(stream ? stream : request.memory.stream()),
+      capacity_(capacity), valid_prefix_(prefix) {
     auto& memory = request.memory;
     auto& host_owner = memory.transfers().verification_results;
-    if (!memory.stream() || memory.graph() || host_owner || rows < 1 ||
+    if (!stream_ || (memory.stream() && memory.stream() != stream_) ||
+        memory.graph() || host_owner || rows < 1 ||
         rows > target_verify_max_rows || prefix < 0 || prefix > capacity ||
         capacity > request.pages.page_count * mxfp8_page_size) {
         throw std::invalid_argument("Invalid target verification storage");
@@ -59,7 +61,7 @@ TargetVerification::TargetVerification(Request& request, int capacity, int prefi
 }
 
 void TargetVerification::begin(int position, int count, cudaStream_t stream) {
-    if (stream != request_.memory.stream() || pending_rows_ != 0 ||
+    if (stream != stream_ || pending_rows_ != 0 ||
         position != valid_prefix_ || count < 1 ||
         count > static_cast<int>(work_.size()) || count > capacity_ - position) {
         throw std::invalid_argument("Invalid target verification interval");
@@ -68,7 +70,7 @@ void TargetVerification::begin(int position, int count, cudaStream_t stream) {
 }
 
 VerificationRow TargetVerification::row(int index) {
-    return {&request_, &work_.at(index), valid_prefix_ + index, this};
+    return {&request_, &work_.at(index), valid_prefix_ + index, this, index == 0};
 }
 
 void TargetVerification::bind_gdn(int layer) {
@@ -86,27 +88,44 @@ void TargetVerification::advance_gdn(int layer, TextGdnWeights weights) {
     const auto& work = work_.front();
     check(text_gdn_verify_tail(pending_rows_, saved.inputs, work.gdn_z, weights,
                                request_.states[layer], tail_[layer], observable_,
-                               work.attention, request_.memory.stream()),
+                               work.attention, stream_),
           "Advance target GDN and retain its tail");
 }
 
 void TargetVerification::read() {
-    if (pending_rows_ == 0 || ready_) {
-        throw std::logic_error("No target verification results pending");
+    auto* verifier = this;
+    read_all(&verifier, 1, stream_);
+}
+
+void TargetVerification::read_all(TargetVerification* const* verifiers, int count,
+                                   cudaStream_t stream) {
+    for (int index = 0; index < count; ++index) {
+        const auto* verifier = verifiers[index];
+        if (!verifier || verifier->stream_ != stream ||
+            verifier->pending_rows_ == 0 || verifier->ready_) {
+            throw std::logic_error("No target verification results pending on this stream");
+        }
     }
-    const auto stream = request_.memory.stream();
+    for (int index = 0; index < count; ++index) {
+        verifiers[index]->enqueue_results();
+    }
+    check(cudaStreamSynchronize(stream), "Complete target verification round");
+    for (int index = 0; index < count; ++index) {
+        verifiers[index]->ready_ = true;
+    }
+}
+
+void TargetVerification::enqueue_results() {
     check(cudaMemcpyAsync(host_winners_, device_winners_,
                           pending_rows_ * sizeof(TextLogitCandidate), cudaMemcpyDeviceToHost,
-                          stream), "Read target verification winners");
+                          stream_), "Read target verification winners");
     if (host_logits_) {
         for (int index = 0; index < pending_rows_; ++index) {
             check(cudaMemcpyAsync(host_logits_ + index * vocab_size, work_[index].logits,
-                                  vocab_size * sizeof(Bf16), cudaMemcpyDeviceToHost, stream),
+                                  vocab_size * sizeof(Bf16), cudaMemcpyDeviceToHost, stream_),
                   "Read target verification logits");
         }
     }
-    check(cudaStreamSynchronize(stream), "Complete target verification round");
-    ready_ = true;
 }
 
 void TargetVerification::commit(int count) {
@@ -118,7 +137,7 @@ void TargetVerification::commit(int count) {
             const auto& saved = replay_[layer];
             check(text_gdn_replay_prefix(count, saved.inputs, saved.weights,
                                          request_.states[layer], tail_[layer],
-                                         request_.memory.stream()),
+                                         stream_),
                   "Replay committed target GDN prefix");
         }
     }

@@ -4,6 +4,7 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_verify.h"
 
+#include <algorithm>
 #include <type_traits>
 
 namespace sglang {
@@ -52,6 +53,11 @@ struct LayerBatch {
         return false;
     }
 
+    int projection_rows(int group) const {
+        const int groups = (count + text_fp8_max_batch - 1) / text_fp8_max_batch;
+        return count / groups + (group < count % groups);
+    }
+
     template <typename Function>
     void each(Function function) const {
         for (int index = 0; index < count; ++index) {
@@ -88,24 +94,33 @@ struct LayerBatch {
         }
         static_assert(decoder_batch_max_lanes <= text_fp8_max_batch);
         std::array<TextFp8Projection, text_fp8_max_batch> projections;
-        for (int index = 0; index < count; ++index) {
-            const auto& work = workspace(lanes[index]);
-            projections[index] = {{work.activation.values, work.activation.scales}, work.*output};
+        for (int first = 0, group = 0; first < count; ++group) {
+            const int rows = projection_rows(group);
+            for (int index = 0; index < rows; ++index) {
+                const auto& work = workspace(lanes[first + index]);
+                projections[index] = {{work.activation.values, work.activation.scales},
+                                      work.*output};
+            }
+            check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
+                                projections.data(), rows, stream), "Run batched FP8 projection");
+            first += rows;
         }
-        check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
-                            projections.data(), count, stream), "Run batched FP8 projection");
     }
 };
 
 void project(Bf16Weight weight, const LayerBatch<VerificationRow>& batch,
              Bf16* Workspace::*output) {
-    std::array<TextBf16Projection, target_verify_max_rows> projections;
-    for (int index = 0; index < batch.count; ++index) {
-        const auto& work = workspace(batch.lanes[index]);
-        projections[index] = {work.normalized, work.*output};
+    std::array<TextBf16Projection, text_fp8_max_batch> projections;
+    for (int first = 0, group = 0; first < batch.count; ++group) {
+        const int rows = batch.projection_rows(group);
+        for (int index = 0; index < rows; ++index) {
+            const auto& work = workspace(batch.lanes[first + index]);
+            projections[index] = {work.normalized, work.*output};
+        }
+        check(text_bf16_gemm(weight.values, weight.rows, weight.columns, projections.data(),
+                             rows, batch.stream), "Run batched BF16 projection");
+        first += rows;
     }
-    check(text_bf16_gemm(weight.values, weight.rows, weight.columns, projections.data(),
-                         batch.count, batch.stream), "Run batched BF16 projection");
 }
 
 template <typename Lane>
@@ -140,14 +155,21 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
 }
 
 void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, int state_index) {
-    auto& verification = *batch.lanes[0].verification;
-    verification.bind_gdn(state_index);
+    batch.each([&](const VerificationRow& row, Workspace&) {
+        if (row.first) {
+            row.verification->bind_gdn(state_index);
+        }
+    });
     batch.quantize(&Workspace::normalized, hidden_size);
     batch.project(layer.qkv, &Workspace::gdn_qkv);
     batch.project(layer.z, &Workspace::gdn_z);
     project(layer.b, batch, &Workspace::gdn_b);
     project(layer.a, batch, &Workspace::gdn_a);
-    verification.advance_gdn(state_index, layer.recurrent);
+    batch.each([&](const VerificationRow& row, Workspace&) {
+        if (row.first) {
+            row.verification->advance_gdn(state_index, layer.recurrent);
+        }
+    });
     batch.quantize(&Workspace::attention, text_gdn_value_width);
     batch.project(layer.output, &Workspace::projected_attention);
 }
@@ -278,16 +300,43 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
 
 void Decoder::Model::forward_verify(TargetVerification& verification, int position,
                                     const int* tokens, int count, cudaStream_t stream) const {
-    verification.begin(position, count, stream);
-    std::array<VerificationRow, target_verify_max_rows> rows;
-    for (int index = 0; index < count; ++index) {
-        auto& row = rows[index];
-        row = verification.row(index);
-        check(text_embedding(embedding, vocab_size, hidden_size, tokens[index],
-                             row.work->residual, stream), "Look up verification input");
+    const VerificationSequence sequence{&verification, position, tokens, count};
+    forward_verify(&sequence, 1, stream);
+}
+
+void Decoder::Model::forward_verify(const VerificationSequence* sequences, int count,
+                                    cudaStream_t stream) const {
+    if (!sequences || count < 1 || count > decoder_batch_max_lanes) {
+        throw std::invalid_argument("Invalid number of verification sequences");
     }
-    forward_layers(rows.data(), count, stream);
-    const LayerBatch<VerificationRow> batch{rows.data(), count, stream};
+    constexpr int max_rows = target_verify_max_rows * decoder_batch_max_lanes;
+    int total = 0;
+    int longest = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& sequence = sequences[index];
+        if (!sequence.verification || !sequence.tokens ||
+            sequence.count < 1 || sequence.count > target_verify_max_rows) {
+            throw std::invalid_argument("Invalid number of verification rows");
+        }
+        total += sequence.count;
+        longest = std::max(longest, sequence.count);
+        sequence.verification->begin(sequence.position, sequence.count, stream);
+    }
+    std::array<VerificationRow, max_rows> rows;
+    int next = 0;
+    for (int index = 0; index < longest; ++index) {
+        for (int lane = 0; lane < count; ++lane) {
+            const auto& sequence = sequences[lane];
+            if (index < sequence.count) {
+                const auto row = sequence.verification->row(index);
+                rows[next++] = row;
+                check(text_embedding(embedding, vocab_size, hidden_size, sequence.tokens[index],
+                                     row.work->residual, stream), "Look up verification input");
+            }
+        }
+    }
+    forward_layers(rows.data(), total, stream);
+    const LayerBatch<VerificationRow> batch{rows.data(), total, stream};
     batch.each([&](const VerificationRow&, Workspace& work) { normalize_final(work, stream); });
     project(lm_head, batch, &Workspace::logits);
     batch.each([&](const VerificationRow&, Workspace& work) {

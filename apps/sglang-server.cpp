@@ -86,9 +86,6 @@ Arguments parse_arguments(int argc, char** argv) {
             throw std::invalid_argument("Invalid argument " + std::string(option));
         }
     }
-    if (arguments.mtp_steps != 0 && arguments.max_active != 1) {
-        throw std::invalid_argument("--mtp-steps requires --max-active 1");
-    }
     if (arguments.eager && (arguments.max_active != 1 || arguments.mtp_steps != 0)) {
         throw std::invalid_argument("--eager requires --max-active 1 and --mtp-steps 0");
     }
@@ -184,7 +181,8 @@ int main(int argc, char** argv) {
                      " [--max-active N] [--mtp-steps N] [--eager] [--batch-cuda-graphs]\n"
                      "                     [--fp8-prefill exact|tensor-core] [--trace-batches]\n"
                      "Active requests: 1 by default, up to 4.\n"
-                     "MTP steps: 0 by default, up to 4 with one active request.\n"
+                     "MTP steps: 0 by default, up to 4 for any active request limit.\n"
+                     "Batch graphs: ordinary decode at widths 2-4. MTP rounds use eager decode.\n"
                      "Eager decode: one active request with MTP off.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n"
                   << sglang::cli::fp8_prefill_usage;
@@ -213,7 +211,8 @@ int main(int argc, char** argv) {
                 }
             });
         } else {
-            BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs);
+            BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs,
+                                 arguments.mtp_steps);
             serve_batch(listener, service, tokenizer, arguments.max_active);
         }
     } catch (const std::exception& error) {

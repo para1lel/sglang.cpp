@@ -69,8 +69,8 @@ def check_policy(args):
         cases.append((["--fp8-prefill"], 1, f"Missing {missing} for --fp8-prefill"))
         if serving:
             cases.append((
-                ["--fp8-prefill", "tensor-core", "--max-active", "2", "--mtp-steps", "1"],
-                1, "--mtp-steps requires --max-active 1",
+                ["--fp8-prefill", "tensor-core", "--max-active", "2", "--mtp-steps", "5"],
+                1, "Expected --mtp-steps in [0, 4]",
             ))
         for flags, status, message in cases:
             result = subprocess.run([str(executable), *flags], env=environment, text=True,

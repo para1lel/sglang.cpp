@@ -15,12 +15,28 @@ __global__ void gather_logits(const __nv_bfloat16* source, const int* ids,
     }
 }
 
+__global__ void mask_logits(const __nv_bfloat16* source, const std::uint32_t* mask,
+                            __nv_bfloat16* logits, int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const bool allowed = (mask[index / 32] >> (index % 32)) & 1U;
+        logits[index] = allowed ? source[index] : __ushort_as_bfloat16(0xff80);
+    }
+}
+
 __global__ void remap_token(const __nv_bfloat16* logits, const int* ids, int count, int* token) {
     const int index = *token;
     *token = index >= 0 && index < count && isfinite(__bfloat162float(logits[index]))
-        ? ids[index] : -1;
+        ? (ids ? ids[index] : index) : -1;
 }
 
+}
+
+cudaError_t mask_constrained_logits(const __nv_bfloat16* source, const std::uint32_t* mask,
+                                   __nv_bfloat16* logits, int count, cudaStream_t stream) {
+    mask_logits<<<(count + block_size - 1) / block_size, block_size, 0, stream>>>(
+        source, mask, logits, count);
+    return cudaGetLastError();
 }
 
 cudaError_t gather_constrained_logits(const __nv_bfloat16* source, const int* ids,

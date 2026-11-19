@@ -250,12 +250,16 @@ C++ callers set the same fields in
 [`DecoderOptions`](include/sglang/decoder.h#L24)<!-- prefix: "struct Decod" -->.
 See the [sampling contract](docs/text-serving.md#sampling) for dispatch and seed behavior.
 
-### Choose from fixed outputs
+### Constrain generated output
 
-Set `ebnf` on a native text or chat request to restrict output to one literal.
-For example, send `{"ebnf":"root ::= \"yes\" | \"no\""}` with the other request fields.
-These requests use target-only decoding and report `stop` when a choice completes.
-See the [finite-choice contract](docs/text-serving.md#finite-choice-constraints) for limits and stop rules.
+Add one of these fields to a native `/v1/completions` or text-only `/v1/chat/completions`
+request. Constrained requests use target-only decoding (K0).
+
+- `{"ebnf":"root ::= \"yes\" | \"no\""}` restricts output to one listed literal.
+  See the [finite-choice contract](docs/text-serving.md#finite-choice-constraints).
+- `{"regex":"[A-Z]{2}-[0-9]{3}"}` matches a whole output such as `AB-123`.
+  A pattern takes 1–1,024 UTF-8 bytes, with explicit repeat bounds up to 64.
+  See the [regular expression contract](docs/output-constraints.md#regular-expressions).
 
 ## Continue development
 

@@ -3,12 +3,15 @@
 #include "sglang/tokenizer/tokenizer.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 
 namespace sglang {
 
 inline constexpr int constraint_max_candidates = 4096;
+inline constexpr int constraint_mask_words = (model_vocab_size + 31) / 32;
 
 class ConstraintCursor;
 
@@ -16,7 +19,11 @@ class TokenConstraint {
 public:
     static std::shared_ptr<const TokenConstraint> compile(const Tokenizer& tokenizer,
                                                           std::string_view ebnf);
+    static std::shared_ptr<const TokenConstraint> compile_regex(const Tokenizer& tokenizer,
+                                                                std::string_view pattern);
     int minimum_tokens() const { return nodes_.front().minimum; }
+    bool uses_wide_mask() const { return uses_wide_mask_; }
+    bool is_regex() const { return regex_; }
 
 private:
     friend class ConstraintCursor;
@@ -33,6 +40,8 @@ private:
 
     TokenConstraint() = default;
     std::vector<Node> nodes_{1};
+    bool uses_wide_mask_ = false;
+    bool regex_ = false;
 };
 
 inline bool constraint_eos(int token) {
@@ -55,9 +64,17 @@ public:
             candidates_.insert(std::lower_bound(candidates_.begin(), candidates_.end(),
                                                 end_of_message), end_of_message);
         }
+        mask_.clear();
+        if (candidates_.size() > constraint_max_candidates) {
+            mask_.assign(constraint_mask_words, 0);
+            for (const int id : candidates_) {
+                mask_[id / 32] |= std::uint32_t{1} << (id % 32);
+            }
+        }
     }
 
     const std::vector<int>& ids() const { return candidates_; }
+    const std::vector<std::uint32_t>& mask() const { return mask_; }
 
     bool commit(const TokenConstraint& constraint, int token, int remaining) {
         const auto& node = constraint.nodes_[node_];
@@ -77,6 +94,7 @@ public:
 
 private:
     std::vector<int> candidates_;
+    std::vector<std::uint32_t> mask_;
     int node_ = 0;
 };
 

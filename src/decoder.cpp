@@ -55,7 +55,9 @@ void validate_constraint(const DecoderOptions& options) {
         throw std::invalid_argument("Constrained decoding requires the model EOS stop tokens");
     }
     if (options.max_new_tokens < options.constraint->minimum_tokens()) {
-        throw std::invalid_argument("max_tokens is too small to complete an ebnf choice");
+        throw std::invalid_argument(options.constraint->is_regex()
+            ? "max_tokens is too small to complete the regex"
+            : "max_tokens is too small to complete an ebnf choice");
     }
 }
 
@@ -188,7 +190,7 @@ void prepare_serial_request(Request& request, const DecoderOptions& options) {
             request.memory.allocate<std::byte>(sampling_workspace_bytes());
     }
     if (options.constraint) {
-        request.constraint_workspace.allocate(request.memory);
+        request.constraint_workspace.allocate(request.memory, options.constraint->uses_wide_mask());
     }
     request.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
 }

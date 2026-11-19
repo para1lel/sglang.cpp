@@ -183,8 +183,10 @@ void allocate_gdn(Allocations& memory, GdnBank& states);
 struct ConstraintWorkspace {
     int* ids = nullptr;
     Bf16* logits = nullptr;
+    std::uint32_t* mask = nullptr;
+    Bf16* masked_logits = nullptr;
 
-    void allocate(Allocations& memory);
+    void allocate(Allocations& memory, bool wide);
     std::size_t bytes() const;
 };
 

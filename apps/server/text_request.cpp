@@ -120,19 +120,27 @@ void set_sampling(const json::Object& object, DecoderOptions& options) {
 
 void set_constraint(const json::Object& object, const CompletionTokenizer& tokenizer,
                     DecoderOptions& options) {
-    const auto* value = json::get(object, "ebnf");
+    const auto* regex = json::get(object, "regex");
+    const auto* ebnf = json::get(object, "ebnf");
+    if (regex && ebnf) {
+        bad_request("Use one of regex and ebnf");
+    }
+    const auto* value = regex ? regex : ebnf;
     if (!value) {
         return;
     }
     if (!value->string()) {
-        bad_request("ebnf must be a string");
+        bad_request(regex ? "regex must be a string" : "ebnf must be a string");
     }
     if (read_bool(object, "ignore_eos") || json::get(object, "stop_token_ids")) {
-        bad_request("ebnf requires model EOS stops without stop_token_ids overrides");
+        bad_request(regex ? "regex requires model EOS stops without stop_token_ids overrides"
+                          : "ebnf requires model EOS stops without stop_token_ids overrides");
     }
-    options.constraint = TokenConstraint::compile(tokenizer.get(), *value->string());
+    options.constraint = regex ? TokenConstraint::compile_regex(tokenizer.get(), *value->string())
+                               : TokenConstraint::compile(tokenizer.get(), *value->string());
     if (options.max_new_tokens < options.constraint->minimum_tokens()) {
-        bad_request("max_tokens is too small to complete an ebnf choice");
+        bad_request(regex ? "max_tokens is too small to complete the regex"
+                          : "max_tokens is too small to complete an ebnf choice");
     }
 }
 
@@ -177,7 +185,7 @@ bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
         key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
-        key == "min_p" || key == "ebnf" || key == "cache_salt";
+        key == "min_p" || key == "ebnf" || key == "regex" || key == "cache_salt";
 }
 
 TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {
@@ -204,6 +212,8 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
             options.emplace(key, json::Object(fields.begin(), fields.end()));
         } else if (media && key == "ebnf") {
             bad_request("Decoded media chat does not support EBNF constraints");
+        } else if (media && key == "regex") {
+            bad_request("Decoded media chat does not support regex constraints");
         } else if (media && key == "cache_salt") {
             bad_request("Decoded media chat does not support cache_salt");
         } else if (is_text_option(key)) {

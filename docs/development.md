@@ -108,7 +108,7 @@ Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves histo
 
 The decoder validates tensor names, dtypes, and shapes before upload. Upload retains mappings and allocations until completion. Deferred cleanup retains shared weights. FP8 projections quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L98)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L210)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L165)<!-- prefix: "__global__ v" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L506)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L561)<!-- prefix: "void Request" -->
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L508)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L561)<!-- prefix: "void Request" -->
 
 Prefill processes tiles in token order. The last row supplies initial logits. [Serial tile selection](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 decode defaults to graph replay. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L417)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L370)<!-- prefix: "void Decoder" -->
 
@@ -140,7 +140,7 @@ Combined GDN gates need matching 48-by-5,120 shapes. After the initial score, se
 
 #### Constraints and failure behavior
 
-Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decimal IDs with commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus budget must fit 262,144 tokens. The default budget is one. Zero budget returns no tokens and `length`. [CLI options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L64)<!-- prefix: "void validat" -->
+Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decimal IDs with commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus budget must fit 262,144 tokens. The default budget is one. Zero budget returns no tokens and `length`. [CLI options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L66)<!-- prefix: "void validat" -->
 
 The CLI defaults to greedy selection, with ties going to the lowest ID. `--stop-token` emits a match and returns `stop`, even at the budget. Exhaustion returns `length`. There is no implicit EOS. Failures print to stderr and exit 1. See [sampling](text-serving.md#sampling) and [C++ and HTTP constraints](text-serving.md#finite-choice-constraints). [Greedy selection](../src/text_ops.cu#L467)<!-- prefix: "__device__ T" -->
 
@@ -148,7 +148,7 @@ The decoder retains CUDA resources and transfer buffers while completion is unce
 
 Private CUDA pools separate workspaces at or below 128 rows from larger ones. One pool per device and class can set a release threshold. The thresholds are 32 MiB and 512 MiB respectively. Other pools use CUDA defaults. [Retention](../src/decoder_prefill.cpp#L43)<!-- prefix: "void configu" -->
 
-Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L612)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L349)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L344)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L399)<!-- prefix: "cudaError_t " -->
+Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L614)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L349)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L344)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L399)<!-- prefix: "cudaError_t " -->
 
 `--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" -->
 

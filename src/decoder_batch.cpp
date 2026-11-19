@@ -459,7 +459,7 @@ void DecoderBatch::State::score(Lane& lane, Request& request, Workspace& work, b
         sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
     }
     if (lane.options.constraint) {
-        constraint_workspace.allocate(execution);
+        constraint_workspace.allocate(execution, lane.options.constraint->uses_wide_mask());
         lane.constraint.candidates(*lane.options.constraint, lane.remaining_output());
         select_constrained(work, constraint_workspace, lane.constraint,
                             lane.sampling ? &*lane.sampling : nullptr, lane.generated,

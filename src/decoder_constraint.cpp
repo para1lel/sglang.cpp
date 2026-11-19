@@ -5,40 +5,60 @@
 
 namespace sglang::decoder {
 
-void ConstraintWorkspace::allocate(Allocations& memory) {
+void ConstraintWorkspace::allocate(Allocations& memory, bool wide) {
     if (!ids) {
         logits = memory.allocate<Bf16>(constraint_max_candidates);
         ids = memory.allocate<int>(constraint_max_candidates);
     }
+    if (wide && !masked_logits) {
+        masked_logits = memory.allocate<Bf16>(vocab_size);
+    }
+    if (wide && !mask) {
+        mask = memory.allocate<std::uint32_t>(constraint_mask_words);
+    }
 }
 
 std::size_t ConstraintWorkspace::bytes() const {
-    return ids ? constraint_max_candidates * (sizeof(int) + sizeof(Bf16)) : 0;
+    const auto sparse = ids ? constraint_max_candidates * (sizeof(int) + sizeof(Bf16)) : 0;
+    const auto mask_bytes = mask ? constraint_mask_words * sizeof(std::uint32_t) : 0;
+    const auto masked_bytes = masked_logits ? vocab_size * sizeof(Bf16) : 0;
+    return sparse + mask_bytes + masked_bytes;
 }
 
 void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
                         const ConstraintCursor& cursor, const SamplingParameters* sampling,
                         int position, void* sampling_workspace, cudaStream_t stream) {
     const auto& allowed = cursor.ids();
-    const int count = static_cast<int>(allowed.size());
-    if (count == 0) {
+    if (allowed.empty()) {
         throw std::logic_error("Output constraint has no remaining continuation");
     }
-    check(cudaMemcpyAsync(scratch.ids, allowed.data(), count * sizeof(int),
-                          cudaMemcpyHostToDevice, stream), "Upload allowed token IDs");
-    check(gather_constrained_logits(work.logits, scratch.ids, scratch.logits, count, stream),
-          "Gather allowed logits");
+    const auto& mask = cursor.mask();
+    const bool wide = !mask.empty();
+    const int count = wide ? vocab_size : static_cast<int>(allowed.size());
+    const auto* logits = wide ? scratch.masked_logits : scratch.logits;
+    if (wide) {
+        check(cudaMemcpyAsync(scratch.mask, mask.data(), mask.size() * sizeof(std::uint32_t),
+                              cudaMemcpyHostToDevice, stream), "Upload allowed token mask");
+        check(mask_constrained_logits(work.logits, scratch.mask, scratch.masked_logits,
+                                      count, stream), "Mask disallowed logits");
+    } else {
+        check(cudaMemcpyAsync(scratch.ids, allowed.data(), count * sizeof(int),
+                              cudaMemcpyHostToDevice, stream), "Upload allowed token IDs");
+        check(gather_constrained_logits(work.logits, scratch.ids, scratch.logits, count, stream),
+              "Gather allowed logits");
+    }
     if (sampling) {
         auto parameters = *sampling;
-        parameters.top_k = std::min(parameters.top_k, count);
-        check(sample_logits(scratch.logits, count, &work.argmax->token_id, parameters,
+        parameters.top_k = std::min(parameters.top_k, static_cast<int>(allowed.size()));
+        check(sample_logits(logits, count, &work.argmax->token_id, parameters,
                             position, sampling_workspace, stream), "Sample allowed logits");
     } else {
-        check(text_argmax(scratch.logits, count, work.argmax_scratch, work.argmax, stream),
+        check(text_argmax(logits, count, work.argmax_scratch, work.argmax, stream),
               "Choose highest allowed logit");
     }
-    check(remap_constrained_token(scratch.logits, scratch.ids, count, &work.argmax->token_id,
-                                  stream), "Resolve allowed token ID");
+    const auto* ids = wide ? nullptr : scratch.ids;
+    check(remap_constrained_token(logits, ids, count, &work.argmax->token_id, stream),
+          "Resolve allowed token ID");
 }
 
 }

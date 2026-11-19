@@ -22,6 +22,8 @@ namespace sglang::decoder {
 class MtpDraftWeights;
 class MtpDraftRequest;
 class PrefillWorkspace;
+struct MediaPrefill;
+struct MultimodalInput;
 class TargetVerification;
 struct VerificationSequence;
 struct SamplingParameters;
@@ -219,6 +221,9 @@ struct ForwardLane {
     int position;
     TextGdnMode mode;
     bool narrow_gqa = false;
+    const Bf16* feature = nullptr;
+    const MropePosition* mrope = nullptr;
+    int rotary_position = -1;
 };
 
 struct BatchDecodeBinding {
@@ -253,7 +258,8 @@ struct Decoder::Model {
                         cudaStream_t stream) const;
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
                        decoder::PrefillWorkspace& workspace,
-                       decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0) const;
+                       decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
+                       const decoder::MediaPrefill* media = nullptr) const;
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;
@@ -261,9 +267,14 @@ struct Decoder::Model {
     void compute_logits(decoder::Request& request, bool decode = false) const;
     void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;
     bool prefill_serial(decoder::Request& request, const std::vector<int>& prompt,
-                        const DecoderCallbacks& callbacks, DecoderResult& result) const;
+                        const DecoderCallbacks& callbacks, DecoderResult& result,
+                        const decoder::MediaPrefill* media = nullptr) const;
+    void advance_serial(decoder::Request& request, int step, int prompt_count, int input,
+                        bool media, int rotary_delta) const;
     void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
-                         const DecoderCallbacks& callbacks, DecoderResult& result) const;
+                         const DecoderCallbacks& callbacks, DecoderResult& result,
+                         std::shared_ptr<const decoder::MultimodalInput> media = nullptr,
+                         const std::vector<int>* teacher = nullptr) const;
     DecoderFinishReason generate_mtp(const std::vector<int>& prompt,
                                      const DecoderOptions& options,
                                      const DecoderCallbacks& callbacks,

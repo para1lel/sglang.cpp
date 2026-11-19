@@ -13,6 +13,9 @@
 
 namespace sglang {
 
+struct DecoderMedia;
+class MediaDecoderCheck;
+
 inline constexpr int decoder_max_mtp_steps = 4;
 inline constexpr std::size_t decoder_prefix_max_salt_bytes = 256;
 
@@ -99,10 +102,21 @@ public:
     DecoderResult generate(const std::vector<int>& prompt_token_ids,
                            const DecoderOptions& options = DecoderOptions{},
                            const DecoderCallbacks& callbacks = DecoderCallbacks{}) const;
+    /// Supply feature views in the same order as wrapped media pads in the prompt.
+    DecoderResult generate_multimodal(const std::vector<int>& template_token_ids,
+                                      const std::vector<DecoderMedia>& media,
+                                      const DecoderOptions& options = DecoderOptions{},
+                                      const DecoderCallbacks& callbacks = DecoderCallbacks{}) const;
     std::size_t model_device_allocation_bytes() const;
 
 private:
     friend class DecoderBatch;
+    friend class MediaDecoderCheck;
+    DecoderResult generate_multimodal_impl(const std::vector<int>& template_token_ids,
+                                           const std::vector<DecoderMedia>& media,
+                                           const DecoderOptions& options,
+                                           const DecoderCallbacks& callbacks,
+                                           const std::vector<int>* teacher) const;
     struct Model;
     std::unique_ptr<Model> model_;
 };

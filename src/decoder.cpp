@@ -1,6 +1,7 @@
 #include "sglang/decoder_prefill.h"
 
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
@@ -438,12 +439,13 @@ DecoderFinishReason Decoder::Model::generate_mtp(const std::vector<int>& prompt,
 }
 
 bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& prompt,
-                                   const DecoderCallbacks& callbacks, DecoderResult& result) const {
+                                   const DecoderCallbacks& callbacks, DecoderResult& result,
+                                   const MediaPrefill* media) const {
     const int count = static_cast<int>(prompt.size());
     const auto stream = request.memory.stream();
     const int aligned = count / prefill_chunk_rows * prefill_chunk_rows;
     std::optional<PrefillWorkspace> tiled;
-    if (fp8_prefill() == Fp8PrefillPolicy::tensor_core) {
+    if (!media && fp8_prefill() == Fp8PrefillPolicy::tensor_core) {
         const int larger = std::min(aligned, serial_prefill_rows(b200_, count));
         if (larger > prefill_chunk_rows) {
             tiled.emplace(stream, larger);
@@ -458,7 +460,8 @@ bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& pr
     for (int position = 0; position < count;) {
         const int end = position < aligned ? aligned : count;
         const int rows = std::min(tile_rows, end - position);
-        prefill_chunk(request, prompt.data() + position, rows, position, workspace);
+        prefill_chunk(request, prompt.data() + position, rows, position, workspace,
+                      nullptr, 0, media);
         position += rows;
         if (callbacks.is_cancelled && callbacks.is_cancelled()) {
             workspace.close();
@@ -469,16 +472,41 @@ bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& pr
     return true;
 }
 
+void Decoder::Model::advance_serial(Request& request, int step, int prompt_count, int input,
+                                    bool media, int rotary_delta) const {
+    if (step != 0 && request.decode_position) {
+        if (step == 1) {
+            check(set_decode_position(request.decode_position, prompt_count,
+                                      request.memory.stream()), "Set decode position");
+        }
+        decode_graph(request);
+        return;
+    }
+    if (step != 0) {
+        const int position = prompt_count + step - 1;
+        if (media) {
+            const ForwardLane lane{&request, input, position, TextGdnMode::decode, false,
+                                   nullptr, nullptr, position + rotary_delta};
+            forward(&lane, 1, request.memory.stream());
+        } else {
+            forward(request, input, position, TextGdnMode::decode);
+        }
+    }
+    compute_logits(request, step != 0);
+}
+
 void Decoder::Model::generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
                                      const DecoderCallbacks& callbacks,
-                                     DecoderResult& result) const {
+                                     DecoderResult& result,
+                                     std::shared_ptr<const MultimodalInput> media,
+                                     const std::vector<int>* teacher) const {
     const auto cancelled = [&] { return callbacks.is_cancelled && callbacks.is_cancelled(); };
     const int prompt_count = static_cast<int>(prompt.size());
     int capacity = prompt_count + options.max_new_tokens - 1;
     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     const auto sampling = options.samples() ? std::optional{request_sampling(options)}
                                             : std::nullopt;
-    const RequestLease lease(request_in_use, !options.eager);
+    const RequestLease lease(request_in_use, !options.eager && !media);
     std::unique_ptr<Request> eager_request;
     auto& storage = lease.owns_slot() ? decode_request : eager_request;
     try {
@@ -492,10 +520,14 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         if (storage) {
             storage->memory.reclaim_deferred();
         } else {
-            storage = std::make_unique<Request>(device, capacity, memory, lease.owns_slot());
+            const std::shared_ptr<const void> owners = media
+                ? std::shared_ptr<const void>(media) : memory;
+            storage = std::make_unique<Request>(device, capacity, owners, lease.owns_slot());
         }
         auto& request = *storage;
         prepare_serial_request(request, options);
+        const auto prefill = media ? upload_media_positions(request, *media) : MediaPrefill{};
+        const int rotary_delta = media ? media->prompt.next_position - prompt_count : 0;
         auto& transfers = request.memory.transfers();
         std::vector<DecoderLogit> ranking;
         if (options.top_logits > 0) {
@@ -503,7 +535,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         }
         result.peak_device_allocation_bytes += request.memory.bytes();
         const auto run_request = [&] {
-            if (cancelled() || !prefill_serial(request, prompt, callbacks, result)) {
+            if (cancelled() ||
+                !prefill_serial(request, prompt, callbacks, result, media ? &prefill : nullptr)) {
                 return DecoderFinishReason::cancelled;
             }
             int winner = -1;
@@ -512,18 +545,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 if (cancelled()) {
                     return DecoderFinishReason::cancelled;
                 }
-                if (step != 0 && request.decode_position) {
-                    if (step == 1) {
-                        check(set_decode_position(request.decode_position, prompt_count,
-                                                  request.memory.stream()), "Set decode position");
-                    }
-                    decode_graph(request);
-                } else {
-                    if (step != 0) {
-                        forward(request, winner, prompt_count + step - 1, TextGdnMode::decode);
-                    }
-                    compute_logits(request, step != 0);
-                }
+                const int input = step != 0 && teacher ? (*teacher)[step - 1] : winner;
+                advance_serial(request, step, prompt_count, input, bool(media), rotary_delta);
                 const int remaining = options.max_new_tokens - step;
                 if (options.constraint) {
                     constraint.candidates(*options.constraint, remaining);

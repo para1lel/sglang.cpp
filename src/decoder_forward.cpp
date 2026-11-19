@@ -196,11 +196,16 @@ cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
 
 template <typename Position>
 void attend_gqa(const GqaLayer& layer, Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
-                Position position, TextGdnMode mode, bool narrow_gqa, cudaStream_t stream) {
+                Position position, TextGdnMode mode, bool narrow_gqa, cudaStream_t stream,
+                const MropePosition* mrope, int rotary_position) {
     if constexpr (std::is_same_v<Position, int>) {
-        check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, layer.query_norm,
-                                  layer.key_norm, work.rope_queries, work.rope_keys, stream),
-              "Normalize and rotate Q/K");
+        const auto status = mrope
+            ? mrope_gqa_preprocess(mrope, 1, work.q_gate, work.keys, layer.query_norm,
+                                    layer.key_norm, work.rope_queries, work.rope_keys, stream)
+            : text_gqa_preprocess(rotary_position < 0 ? position : rotary_position, 1, work.q_gate,
+                                   work.keys, layer.query_norm, layer.key_norm, work.rope_queries,
+                                   work.rope_keys, stream);
+        check(status, "Normalize and rotate Q/K");
         check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values,
                               stream), "Append MXFP8 KV");
     } else {
@@ -251,11 +256,17 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
         } else {
             auto& request = *lane.request;
             bool narrow_gqa = false;
+            const MropePosition* mrope = nullptr;
+            int rotary_position = -1;
             if constexpr (!std::is_same_v<Lane, VerificationRow>) {
                 narrow_gqa = lane.narrow_gqa;
             }
+            if constexpr (std::is_same_v<Lane, ForwardLane>) {
+                mrope = lane.mrope;
+                rotary_position = lane.rotary_position;
+            }
             attend_gqa(layer, work, request.pages, request.caches[cache_index], lane.position,
-                       lane.mode, narrow_gqa, batch.stream);
+                       lane.mode, narrow_gqa, batch.stream, mrope, rotary_position);
         }
     });
     batch.quantize(&Workspace::attention, text_gqa_q_width);
@@ -297,8 +308,14 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
     }
     for (int index = 0; index < count; ++index) {
         const auto& lane = lanes[index];
-        check(text_embedding(embedding, vocab_size, hidden_size, lane.token_id,
-                             lane.request->work.residual, stream), "Look up token embedding");
+        auto* residual = lane.request->work.residual;
+        if (lane.feature) {
+            check(cudaMemcpyAsync(residual, lane.feature, hidden_size * sizeof(Bf16),
+                                  cudaMemcpyDeviceToDevice, stream), "Substitute visual embedding");
+        } else {
+            check(text_embedding(embedding, vocab_size, hidden_size, lane.token_id, residual,
+                                 stream), "Look up token embedding");
+        }
     }
     forward_layers(lanes, count, stream);
 }

@@ -7,7 +7,7 @@ and carries Gated DeltaNet state through the other 48 layers. Prefill and the fi
 token selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L88)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L91)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
@@ -78,10 +78,14 @@ reported peak device allocation bytes count the decoder's CUDA allocations for t
 and the buffers used by that request.
 
 C++ callers link the `sglang_decoder` target and reuse `sglang::Decoder` across requests.
-The model retains one set of target-only request buffers for serial reuse. The first
+The model retains one set of target-only text request buffers for serial reuse. The first
 subsequent decode step captures the graph on demand, and later steps and requests replay
 it while capacity suffices. Overlapping calls that cannot acquire the serial slot use
 private request buffers and eager decode.
+
+For image or video inputs, C++ callers pass template token IDs and completed BF16 device
+features to `Decoder::generate_multimodal`. It runs eager with private state and `mtp_steps = 0`.
+See the [multimodal decoder contract](docs/multimodal-decoder.md) for layout and ownership.
 
 Serial single-row target decode uses packed FP8 activation quantization, fused BF16
 Gated DeltaNet gate projections, and a paired-row BF16 LM head for eligible shapes.
@@ -92,7 +96,7 @@ The generator and HTTP server accept `--fp8-prefill exact|tensor-core`. The defa
 `exact` uses the exact FP8 projection path. For target-only requests, `tensor-core`
 uses SM100 Tensor Cores for eligible FP8 projections in chunks of at least three rows.
 Smaller chunks and ineligible projections use the exact path.
-With `SGLANG_SERIAL_PREFILL_ROWS` unset, serial K0 requests on an NVIDIA B200 use a
+With `SGLANG_SERIAL_PREFILL_ROWS` unset, serial K0 text requests on an NVIDIA B200 use a
 1,024-row cap for prompts of at least 512 encoded tokens. Other requests use a
 128-row cap. See [serial prefill](docs/text-serving.md#serial-prefill) for overrides
 and workspace fallback. Tensor Core prefill accumulates FP32 sums in a different
@@ -232,7 +236,7 @@ Sampled requests use target-only decoding. Unconstrained greedy requests can sti
 The generator command and the token-ID benchmark use greedy selection.
 
 C++ callers set the same fields in
-[`DecoderOptions`](include/sglang/decoder.h#L21)<!-- prefix: "struct Decod" -->.
+[`DecoderOptions`](include/sglang/decoder.h#L24)<!-- prefix: "struct Decod" -->.
 Set `mtp_steps` to `0` for sampled C++ requests.
 See the [sampling contract](docs/text-serving.md#sampling) for dispatch and seed behavior.
 

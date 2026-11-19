@@ -3,7 +3,7 @@
 Link `sglang_vision` and include `sglang/vision.h` to encode one preprocessed image or video on a B200.
 The encoder produces BF16 features for the pinned Qwen3.8-27B-FP8 checkpoint.
 Use [CPU media preprocessing](media-preprocessing.md) to prepare decoded RGB8 input.
-Media decoding, language model embedding insertion, generation from media, and HTTP media support are separate integration work.
+Pass features to the [multimodal decoder](multimodal-decoder.md) for native generation.
 [Public API](../include/sglang/vision.h#L29)<!-- prefix: "class Vision" -->
 
 ## Load the encoder

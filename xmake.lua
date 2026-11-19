@@ -116,7 +116,8 @@ target("sglang_decoder")
     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
               "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_prefix_cache.cpp",
               "src/decoder_mtp.cpp", "src/decoder_prefill.cpp", "src/decoder_verify.cpp",
-              "src/decoder_constraint.cpp")
+              "src/decoder_constraint.cpp", "src/media/decoder_media.cpp",
+              "src/media/multimodal_prompt.cpp")
 
 target("sglang-generate")
     set_kind("binary")

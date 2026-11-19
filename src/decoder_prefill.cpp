@@ -1,4 +1,6 @@
 #include "sglang/decoder_prefill.h"
+
+#include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/prefill_fp8.h"
 
@@ -213,6 +215,7 @@ struct TileBuffers {
 struct Chunk : PrefillProjections {
     TileBuffers work;
     int position;
+    const MropePosition* mrope;
 
     void seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
                     const Bf16* final_norm) const {
@@ -251,9 +254,12 @@ struct Chunk : PrefillProjections {
         project(layer.q_gate, input, work.q_gate);
         project(layer.key, input, work.keys);
         project(layer.value, input, work.values);
-        check(text_gqa_preprocess(position, rows, work.q_gate, work.keys, layer.query_norm,
-                                  layer.key_norm, work.rope_queries, work.rope_keys, stream),
-              "Normalize and rotate prefill Q/K");
+        const auto rotation = mrope
+            ? mrope_gqa_preprocess(mrope, rows, work.q_gate, work.keys, layer.query_norm,
+                                    layer.key_norm, work.rope_queries, work.rope_keys, stream)
+            : text_gqa_preprocess(position, rows, work.q_gate, work.keys, layer.query_norm,
+                                   layer.key_norm, work.rope_queries, work.rope_keys, stream);
+        check(rotation, "Normalize and rotate prefill Q/K");
         check(mxfp8_kv_append(cache, pages, position, rows, work.rope_keys, work.values, stream),
               "Append prefill MXFP8 KV");
         const auto status = tensor_core_fp8
@@ -410,12 +416,12 @@ void PrefillWorkspace::close() {
 
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
                                    PrefillWorkspace& workspace, MtpDraftRequest* draft,
-                                   int prompt_remaining) const {
+                                   int prompt_remaining, const MediaPrefill* media) const {
     const auto stream = workspace.stream();
     if (!stream || !tokens || rows < 1 || rows > workspace.capacity() || position < 0 ||
         position > text_attention_max_tokens - rows ||
         (position + rows - 1) / mxfp8_page_size >= request.pages.page_count ||
-        (draft && prompt_remaining < rows)) {
+        (draft && (prompt_remaining < rows || media))) {
         throw std::invalid_argument("Invalid decoder prefill tile");
     }
     if (rows == 1 || !workspace.data()) {
@@ -424,7 +430,11 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
             throw std::invalid_argument("Invalid decoder prefill token");
         }
         for (int row = 0; row < rows; ++row) {
-            const ForwardLane lane{&request, tokens[row], position + row, TextGdnMode::prefill};
+            const int token_position = position + row;
+            const ForwardLane lane{
+                &request, tokens[row], token_position, TextGdnMode::prefill, false,
+                media ? media->feature(token_position) : nullptr,
+                media ? media->positions + token_position : nullptr};
             forward(&lane, 1, stream);
             if (draft && row + 1 < prompt_remaining) {
                 normalize_final(request.work, stream);
@@ -437,13 +447,17 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
     const TileBuffers buffers(layout, workspace.capacity());
     const bool tensor_core = !draft && fp8_prefill() == Fp8PrefillPolicy::tensor_core;
-    const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position};
+    const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
+                      media ? media->positions + position : nullptr};
     const auto& work = chunk.work;
     for (int offset = 0; offset < rows; offset += text_embedding_max_rows) {
         const int count = std::min(text_embedding_max_rows, rows - offset);
         check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens + offset, count,
                                   work.residual + offset * hidden_size, stream),
               "Gather prefill embeddings");
+    }
+    if (media) {
+        media->substitute(work.residual, position, rows, stream);
     }
     int gqa_index = 0;
     int gdn_index = 0;

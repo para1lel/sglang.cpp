@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sglang/multimodal_prompt.h"
 #include "sglang/text_attention.h"
 #include "sglang/text_ops.h"
 
@@ -46,6 +47,11 @@ cudaError_t decode_gqa_preprocess(const int* position, const __nv_bfloat16* q_ga
                                   const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
                                   const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries,
                                   __nv_bfloat16* rope_keys, cudaStream_t stream);
+cudaError_t mrope_gqa_preprocess(const MropePosition* positions, int rows,
+                                const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,
+                                const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+                                __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
+                                cudaStream_t stream);
 cudaError_t decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, const int* position,
                              const __nv_bfloat16* keys, const __nv_bfloat16* values,
                              cudaStream_t stream);

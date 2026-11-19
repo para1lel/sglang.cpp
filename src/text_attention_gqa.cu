@@ -20,6 +20,22 @@ __device__ float gemma_norm(float value, float inverse_rms, __nv_bfloat16 weight
                                             * (1.0f + __bfloat162float(weight))));
 }
 
+template <typename Position>
+__device__ int rotary_position(Position first_position, std::size_t row, int) {
+    return decoder::position_value(first_position) + static_cast<int>(row);
+}
+
+__device__ int rotary_position(const MropePosition* positions, std::size_t row, int channel) {
+    const auto& position = positions[row];
+    if (channel % 3 == 1) {
+        return position.height;
+    }
+    if (channel % 3 == 2 && channel < 30) {
+        return position.width;
+    }
+    return position.temporal;
+}
+
 template <typename Position, bool IncludeQueries = true>
 __global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_gate,
                                const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
@@ -62,8 +78,7 @@ __global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_g
         const float paired = gemma_norm(__bfloat162float(input[other]), inverse_rms, norm[other]);
         const float power = static_cast<float>(channel) / rotary_half;
         const float inverse_frequency = 1.0f / powf(rope_theta, power);
-        const float position =
-            static_cast<float>(decoder::position_value(first_position) + static_cast<int>(row));
+        const float position = static_cast<float>(rotary_position(first_position, row, channel));
         float sine;
         float cosine;
         sincosf(position * inverse_frequency, &sine, &cosine);
@@ -136,6 +151,21 @@ cudaError_t decoder::decode_gqa_preprocess(const int* position, const __nv_bfloa
     void* arguments[] = {
         &position, &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
     return cudaLaunchKernel(gqa_preprocess<const int*>, dim3(blocks), dim3(mxfp8_head_dim),
+                            arguments, 0, stream);
+}
+
+cudaError_t decoder::mrope_gqa_preprocess(
+    const MropePosition* positions, int rows, const __nv_bfloat16* q_gate,
+    const __nv_bfloat16* keys, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+    __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys, cudaStream_t stream) {
+    if (rows <= 0 || rows > text_attention_max_tokens || !positions || !q_gate || !keys ||
+        !q_norm || !k_norm || !rope_queries || !rope_keys) {
+        return cudaErrorInvalidValue;
+    }
+    const int blocks = rows * (mxfp8_query_heads + mxfp8_kv_heads);
+    void* arguments[] = {
+        &positions, &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<const MropePosition*>, blocks, mxfp8_head_dim,
                             arguments, 0, stream);
 }
 

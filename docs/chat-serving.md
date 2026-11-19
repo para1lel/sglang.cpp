@@ -14,7 +14,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 | --- | --- | --- |
 | HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L127)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L291)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
-| Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L273)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L28)<!-- prefix: "DecoderResul" --> |
+| Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L339)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L28)<!-- prefix: "DecoderResul" --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L162)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L177)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
@@ -82,10 +82,16 @@ Each attachment has two members. Set `type` to `"image_url"` or `"video_url"` an
 | --- | --- |
 | Decoded RGB8 image | `url` starts with `data:application/x-sglang-rgb8;base64,`. Supply `height` and `width`. |
 | Decoded RGB8 video | Use the same URL prefix and dimensions. Also supply `source_frame_count`, `source_fps`, and `frame_indices`. |
+| PNG | With codecs enabled, supply only `url` with `data:image/png;base64,`. |
+| MP4 | With codecs enabled, supply only `url` with `data:video/mp4;base64,`. |
 
-Each dimension is 16–1024 pixels. RGB8 bytes are tightly packed in frame, row, column, channel order. An image carries one frame. A decoded video carries 2–32 frames in the order of `frame_indices`. Supply nondecreasing zero-based indices within `source_frame_count`, which can be 2–1,000,000,000. Use finite `source_fps` from 0.001 through 1,000,000. [Decoded video metadata](../apps/server/chat_media.cpp#L57)<!-- prefix: "VideoMetadat" -->
+Each dimension is 16–1024 pixels. RGB8 bytes are tightly packed in frame, row, column, channel order. An image carries one frame. A decoded video carries 2–32 frames in the order of `frame_indices`. Supply nondecreasing zero-based indices within `source_frame_count`, which can be 2–1,000,000,000. Use finite `source_fps` from 0.001 through 1,000,000. [Decoded video metadata](../apps/server/chat_media.cpp#L55)<!-- prefix: "VideoMetadat" -->
 
-Requests must fit the 2 MiB HTTP body limit and the context and vision limits. The server bounds the patch grid at 4,096 patches per frame and 16,384 per request. Oversized HTTP bodies return 413. Malformed media, compressed inputs, or exceeded media limits return 400. [Grid bounds](../apps/server/chat_media.cpp#L90)<!-- prefix: "int bound_gr" -->
+PNG decoding preserves RGB and drops alpha. MP4 requires one unrotated MPEG-4 Part 2 `mp4v` video track. Use constant frame spacing, fixed dimensions, and YUV420P or YUVJ420P frames. MP4 limits include 2–256 source frames, 0.001–1,000 FPS, 4,096 packets, and 16 MiB of selected RGB8.
+
+MP4 selects up to four evenly spaced source ordinals by default. The selection includes both endpoints and rounds fractional ordinals down. To change the count, set `media_io_kwargs` to an object with just `video`. In `video`, set `video_backend` and `backend` to `"opencv"` and `num_frames` to an integer from 2 through 32. The selection cannot exceed the source frame count. The only accepted `mm_processor_kwargs` is `{"do_sample_frames":false}`. FFmpeg handles decoding. [MP4 limits](../apps/server/media_mp4.cpp#L21)<!-- prefix: "constexpr in" --> · [Frame options](../apps/server/chat_media.cpp#L184)<!-- prefix: "int selected" -->
+
+Requests must fit the 2 MiB HTTP body limit and the context and vision limits. The server bounds the patch grid at 4,096 patches per frame and 16,384 per request. Oversized HTTP bodies return 413. Malformed media, disabled codecs, or exceeded media limits return 400. [Grid bounds](../apps/server/chat_media.cpp#L88)<!-- prefix: "int bound_gr" -->
 
 ## Verification
 
@@ -123,3 +129,27 @@ Decode the frozen PNG to RGB8. Decode MP4 frames `[0,2,4,7]` to RGB8. Check the 
 Match all 128 expanded prompt IDs to the case file. Require 128 generated IDs, `length`, usage of `128/128/256`, and zero cached prompt tokens. Compare all generated IDs between native JSON and SSE. Repeat with `--eager` and compare the outputs. Require `[DONE]` on SSE.
 
 Verify HTTP rejection before SSE for malformed media. Cancel a live stream and check recovery with a valid request. On cache-enabled routes, verify identical cache metrics before and after media rejection. Compare the next text request with the warm text control.
+
+### Codec checks
+
+For compressed media, configure an absolute `codec_prefix` containing libpng and FFmpeg headers and libraries. The server links `png16`, `avformat`, `avcodec`, `swscale`, and `avutil`. The default build accepts decoded RGB8. [Build option](../xmake.lua#L130)<!-- prefix: "option(\"medi" --> · [Codec setup](../xmake.lua#L136)<!-- prefix: "local functi" -->
+
+```bash
+xmake f -P . -m release --media-codec-prefix="$codec_prefix" -o build/media-server
+xmake build -P . sglang-server
+```
+
+Start the codec-enabled server on the reserved B200 using the serial cache-off route. Verify the [pinned media corpus](../benchmarks/media/README.md), then send its image and video bodies unchanged.
+
+```bash
+python3 -B -m benchmarks.media.collect verify
+for kind in image video; do
+  curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    --data-binary "@benchmarks/media/W1-${kind}.http-body"
+done
+```
+
+Require the same expanded prompt IDs, output IDs, usage, and finish in all four native configurations. Compare decoded RGB8 on the HTTP-only and default codec builds. Compare the two compressed inputs on the codec-enabled build with default and explicit eager options. Check JSON and SSE in each configuration. Test disabled codecs and malformed or over-limit inputs before SSE.
+
+Use the archived vLLM output IDs for cross-engine diagnostics. Functional replay checks the native model and response contract. Accepted cross-engine performance requires a separate run under the [frozen media timing protocol](../benchmarks/media/README.md#reproduce-the-measurement).

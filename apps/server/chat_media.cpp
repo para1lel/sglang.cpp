@@ -1,5 +1,6 @@
 #include "sglang/server/chat_media.h"
 
+#include "sglang/server/media_codec.h"
 #include "sglang/tokenizer/tokenizer.h"
 
 #include <algorithm>
@@ -15,10 +16,7 @@ using json::OrderedObject;
 using json::Value;
 
 constexpr std::string_view rgb_url = "data:application/x-sglang-rgb8;base64,";
-constexpr int max_dimension = 1024;
-constexpr int min_dimension = 16;
 constexpr std::size_t max_media = 4;
-constexpr std::size_t max_frames = 32;
 constexpr int max_source_frames = 1'000'000'000;
 constexpr int max_grid_patches = 16384;
 constexpr int max_frame_patches = 4096;
@@ -64,7 +62,7 @@ VideoMetadata parse_video(const OrderedObject& payload) {
         throw std::invalid_argument("source_fps must be finite and in [0.001, 1000000]");
     }
     const auto* indices = array(payload, "frame_indices");
-    if (!indices || indices->size() < 2 || indices->size() > max_frames) {
+    if (!indices || indices->size() < 2 || indices->size() > max_selected_frames) {
         throw std::invalid_argument("Expected 2 to 32 selected video frame indices");
     }
     for (const auto& index : *indices) {
@@ -149,21 +147,88 @@ std::vector<std::uint8_t> decode_rgb(const MediaPart& part) {
     return rgb;
 }
 
-MediaPart parse_part(const OrderedObject& part, std::string_view type) {
+#ifdef SGLANG_MEDIA_CODECS
+constexpr std::string_view png_url = "data:image/png;base64,";
+constexpr std::string_view mp4_url = "data:video/mp4;base64,";
+constexpr std::size_t max_base64_bytes = 2 * 1024 * 1024;
+
+std::vector<std::uint8_t> decode_compressed_base64(std::string_view encoded) {
+    if (encoded.empty() || encoded.size() > max_base64_bytes || encoded.size() % 4) {
+        throw std::invalid_argument("Invalid compressed media base64 length");
+    }
+    const auto padding = encoded.back() == '=' ? 1 + (encoded[encoded.size() - 2] == '=') : 0;
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(encoded.size() / 4 * 3 - padding);
+    for (std::size_t offset = 0; offset < encoded.size(); offset += 4) {
+        const auto group = encoded.substr(offset, 4);
+        const auto final = offset + 4 == encoded.size();
+        const auto first = base64_digit(group[0]);
+        const auto second = base64_digit(group[1]);
+        const auto third = final && padding == 2 ? 0 : base64_digit(group[2]);
+        const auto fourth = final && padding ? 0 : base64_digit(group[3]);
+        if (first < 0 || second < 0 || third < 0 || fourth < 0 ||
+            (final && ((padding == 2 && (second & 15)) || (padding == 1 && (third & 3))))) {
+            throw std::invalid_argument("Expected canonical base64 compressed media");
+        }
+        bytes.push_back(static_cast<std::uint8_t>((first << 2) | (second >> 4)));
+        if (!final || padding < 2) {
+            bytes.push_back(static_cast<std::uint8_t>((second << 4) | (third >> 2)));
+        }
+        if (!final || padding == 0) {
+            bytes.push_back(static_cast<std::uint8_t>((third << 6) | fourth));
+        }
+    }
+    return bytes;
+}
+
+int selected_video_frames(const OrderedObject& chat) {
+    if (const auto* processor = get(chat, "mm_processor_kwargs")) {
+        const auto* fields = processor->ordered_object();
+        const auto* sample = fields ? get(*fields, "do_sample_frames") : nullptr;
+        if (!sample || fields->size() != 1 || sample->boolean() != false) {
+            throw std::invalid_argument("Inline MP4 supports only do_sample_frames=false");
+        }
+    }
+    if (const auto* io = get(chat, "media_io_kwargs")) {
+        const auto* fields = io->ordered_object();
+        const auto* video = fields ? object(*fields, "video") : nullptr;
+        if (!video || fields->size() != 1 || video->size() != 3 ||
+            string(*video, "video_backend") != "opencv" || string(*video, "backend") != "opencv") {
+            throw std::invalid_argument("Unsupported inline MP4 sampling options");
+        }
+        return integer(*video, "num_frames", 2, max_selected_frames);
+    }
+    return 4;
+}
+#endif
+
+MediaPart parse_part(const OrderedObject& part, std::string_view type,
+                     [[maybe_unused]] const OrderedObject& chat) {
     const bool image = type == "image_url";
+    const auto kind = image ? DecoderMediaKind::image : DecoderMediaKind::video;
     const auto* payload = object(part, type);
-    if (part.size() != 2 || !payload || payload->size() != (image ? 3 : 6)) {
-        throw std::invalid_argument("Expected a decoded image_url or video_url object");
+    if (part.size() != 2 || !payload) {
+        throw std::invalid_argument("Expected an image_url or video_url object");
     }
     const auto url = string(*payload, "url").value_or("");
-    if (url.substr(0, rgb_url.size()) != rgb_url) {
-        throw std::invalid_argument(
-            "Media URL must be an inline application/x-sglang-rgb8 data URL");
+#ifdef SGLANG_MEDIA_CODECS
+    const auto compressed_url = image ? png_url : mp4_url;
+    if (url.substr(0, compressed_url.size()) == compressed_url && payload->size() == 1) {
+        const auto bytes = decode_compressed_base64(url.substr(compressed_url.size()));
+        auto decoded = image ? decode_png(bytes) : decode_mp4(bytes, selected_video_frames(chat));
+        return {kind, {}, decoded.height, decoded.width, std::move(decoded.video),
+                std::move(decoded.rgb)};
     }
-    MediaPart result{image ? DecoderMediaKind::image : DecoderMediaKind::video,
-                     url.substr(rgb_url.size()),
-                     integer(*payload, "height", min_dimension, max_dimension),
-                     integer(*payload, "width", min_dimension, max_dimension), {}};
+#endif
+    if (url.substr(0, rgb_url.size()) != rgb_url) {
+        throw std::invalid_argument("Expected an enabled inline media data URL with matching MIME");
+    }
+    if (payload->size() != (image ? 3 : 6)) {
+        throw std::invalid_argument("Unexpected fields in decoded RGB8 media object");
+    }
+    MediaPart result{kind, url.substr(rgb_url.size()),
+                     integer(*payload, "height", min_media_dimension, max_media_dimension),
+                     integer(*payload, "width", min_media_dimension, max_media_dimension), {}, {}};
     if (!image) {
         result.video = parse_video(*payload);
     }
@@ -192,7 +257,7 @@ bool has_media(const Value& value) {
 }
 
 std::optional<Value> normalize_turn(const OrderedObject& turn, std::vector<MediaPart>& media,
-                                    bool enabled) {
+                                    bool enabled, const OrderedObject& chat) {
     const auto* parts = array(turn, "content");
     if (!parts) {
         return std::nullopt;
@@ -209,7 +274,7 @@ std::optional<Value> normalize_turn(const OrderedObject& turn, std::vector<Media
             throw std::invalid_argument(
                 "Decoded media requires serial chat, user content and at most four attachments");
         }
-        media.push_back(parse_part(*part, *type));
+        media.push_back(parse_part(*part, *type, chat));
         normalized.emplace_back(OrderedObject{{"type", *type == "image_url" ? "image" : "video"}});
     }
     OrderedObject result;
@@ -230,7 +295,8 @@ std::string timestamp_text(double seconds) {
 }
 
 PreparedMedia prepare(const MediaPart& part, const Tokenizer& tokenizer, int& remaining_patches) {
-    const auto rgb = decode_rgb(part);
+    const auto compatibility_rgb = part.rgb.empty() ? decode_rgb(part) : std::vector<uint8_t>{};
+    const auto& rgb = part.rgb.empty() ? compatibility_rgb : part.rgb;
     const DecodedRgb input{rgb.data(), rgb.size(), part.height, part.width,
                            static_cast<int>(frame_count(part))};
     auto patches = part.kind == DecoderMediaKind::image
@@ -279,7 +345,7 @@ std::optional<ChatMedia> parse_chat_media(const OrderedObject& chat, bool enable
     json::Array normalized;
     for (const auto& value : *messages) {
         const auto* turn = value.ordered_object();
-        auto replacement = turn ? normalize_turn(*turn, result.parts, enabled) : std::nullopt;
+        auto replacement = turn ? normalize_turn(*turn, result.parts, enabled, chat) : std::nullopt;
         normalized.push_back(replacement ? std::move(*replacement) : value);
     }
     int remaining = max_grid_patches;
@@ -289,8 +355,21 @@ std::optional<ChatMedia> parse_chat_media(const OrderedObject& chat, bool enable
             throw std::invalid_argument("Decoded media exceeds the total vision patch budget");
         }
     }
+    const bool inline_video = std::any_of(result.parts.begin(), result.parts.end(),
+        [](const MediaPart& part) {
+            return part.kind == DecoderMediaKind::video && !part.rgb.empty();
+        });
+    const bool inline_media = std::all_of(result.parts.begin(), result.parts.end(),
+        [](const MediaPart& part) { return !part.rgb.empty(); });
     for (const auto& [key, value] : chat) {
-        result.chat.emplace_back(key, key == "messages" ? Value(std::move(normalized)) : value);
+        if (inline_video && (key == "media_io_kwargs" || key == "mm_processor_kwargs")) {
+            continue;
+        }
+        if (inline_media && key == "model" && value.string() == "benchmark") {
+            result.chat.emplace_back(key, std::string(model_name));
+        } else {
+            result.chat.emplace_back(key, key == "messages" ? Value(std::move(normalized)) : value);
+        }
     }
     return result;
 }

@@ -223,6 +223,8 @@ curl -N http://127.0.0.1:17384/v1/chat/completions \
 
 The serial, cache-off chat route accepts inline decoded RGB8 images and video.
 See [image and video inputs](docs/chat-serving.md#image-and-video-inputs) for the attachment format.
+An opt-in build with libpng and FFmpeg also accepts inline PNG images and MP4 video.
+See [codec build and verification](docs/chat-serving.md#codec-checks) for setup and checks.
 
 ### Sample output tokens
 

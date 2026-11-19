@@ -16,6 +16,7 @@ struct MediaPart {
     int height;
     int width;
     VideoMetadata video;
+    std::vector<std::uint8_t> rgb;
 };
 
 struct ChatMedia {

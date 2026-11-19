@@ -127,6 +127,24 @@ target("sglang-generate")
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
     add_files("apps/sglang-generate.cpp")
 
+option("media-codec-prefix")
+    set_default("")
+    set_showmenu(true)
+    set_description("Prefix with libpng and FFmpeg development libraries for inline chat media")
+option_end()
+
+local function add_media_codecs()
+    local codecs = get_config("media-codec-prefix")
+    if codecs and #codecs > 0 then
+        add_defines("SGLANG_MEDIA_CODECS")
+        add_files("apps/server/media_png.cpp", "apps/server/media_mp4.cpp")
+        add_sysincludedirs(path.join(codecs, "include"))
+        add_linkdirs(path.join(codecs, "lib"))
+        add_rpathdirs(path.join(codecs, "lib"))
+        add_links("png16", "avformat", "avcodec", "swscale", "avutil")
+    end
+end
+
 target("sglang-server")
     set_kind("binary")
     set_toolchains("host-pixi")
@@ -138,6 +156,7 @@ target("sglang-server")
               "apps/server/http.cpp", "apps/server/prefix_controls.cpp",
               "apps/server/text_request.cpp", "apps/server/text_completion.cpp",
               "apps/server/chat_media.cpp", "apps/server/vision_completion.cpp")
+    add_media_codecs()
 
 option("text-tokenizer-check")
     set_default(false)

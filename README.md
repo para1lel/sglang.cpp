@@ -51,6 +51,9 @@ bash tools/build.sh --build-dir build --mxfp8-check
 `mxfp8-gqa-check` links `sglang_cuda`. Run the reported executable on a reserved B200
 to check cache bytes and attention outputs. This build command only compiles and links the check.
 
+For decoded RGB8 images and video, see the [CPU media preprocessing API](docs/media-preprocessing.md).
+The guide covers the standalone C++ library, patch layout, and CPU verification.
+
 ## Generate text token IDs
 
 Use the absolute executable path printed by the build as `Native generator`. Select the

@@ -199,3 +199,27 @@ if has_config("constraint-check") then
                     "EPK13__nv_bfloat16PKiPS1_iP11CUstream_st", {force = true})
     target_end()
 end
+
+target("sglang_media_preprocess")
+    set_kind("static")
+    set_default(false)
+    set_toolchains("host-pixi")
+    set_targetdir("$(builddir)/lib")
+    add_includedirs("include", {public = true})
+    add_cxxflags("-ffp-contract=off")
+    add_files("src/media_preprocess.cpp", "src/media_resize.cpp")
+
+option("media-preprocess-check")
+    set_default(false)
+option_end()
+
+if has_config("media-preprocess-check") then
+    target("media-preprocess-check")
+        set_kind("binary")
+        set_default(false)
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_media_preprocess")
+        add_files("tests/media/preprocess_check.cpp")
+    target_end()
+end

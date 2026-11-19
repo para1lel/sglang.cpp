@@ -382,9 +382,11 @@ def run_checks(port, out, pieces, *, require_partial):
         import unittest
 
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeChatTest)
+        expected = suite.countTestCases()
         result = unittest.TextTestRunner(stream=log, verbosity=2).run(suite)
     save(out / "maintained.json", evidence)
-    assert result.testsRun == 5 and result.wasSuccessful() and not result.skipped, out
+    assert expected > 0 and result.testsRun == expected and result.wasSuccessful(), out
+    assert not result.skipped, out
 
 
 def main():

@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <unordered_set>
 #include <vector>
 
@@ -19,10 +21,22 @@ struct DecoderOptions {
     int mtp_steps = 0;
     std::unordered_set<int> additional_stop_token_ids;
     bool eager = false;
+    double temperature = 0.0;
+    double top_p = 1.0;
+    std::int64_t top_k = -1;
+    std::optional<std::int64_t> seed = std::nullopt;
+
+    bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 
     bool stops_at(int token) const {
         return stop_token_id == token || additional_stop_token_ids.count(token) != 0;
     }
+};
+
+class DecoderSamplingError : public std::runtime_error {
+public:
+    DecoderSamplingError()
+        : std::runtime_error("Sampled logits must contain a finite score and no NaN or +inf") {}
 };
 
 enum class DecoderFinishReason {

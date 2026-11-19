@@ -3,6 +3,7 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_prefill.h"
+#include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
 
 #include <algorithm>
@@ -25,6 +26,7 @@ struct Lane {
     int last_token = 0;
     std::unique_ptr<MtpDraftRequest> draft = nullptr;
     std::unique_ptr<TargetVerification> verification = nullptr;
+    std::optional<SamplingParameters> sampling = std::nullopt;
 
     int remaining_prompt() const { return std::max(0, static_cast<int>(prompt.size()) - position); }
     int remaining_output() const { return options.max_new_tokens - generated; }
@@ -206,6 +208,7 @@ struct DecoderBatch::State {
     bool replay(const ForwardLane* lanes, int count);
     void submit(const Selection& selected, Steps& results, DecoderBatchStepStats& stats,
                 bool& contains_mtp);
+    void score(const Lane& lane, Request& request, Workspace& work, bool graph);
     void speculate(const Selection& selected, Steps& results, DecoderBatchStepStats& stats);
 
     std::optional<Lane>& slot_at(int slot) {
@@ -248,6 +251,7 @@ struct DecoderBatch::State {
     const DecoderBatchOptions options;
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;
+    std::byte* sampling_workspace = nullptr;
     std::array<bool, decoder_batch_max_graph_lanes - 1> graph_warmed{};
     int prefill_cursor = 0;
     bool failed = false;
@@ -278,12 +282,15 @@ void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions
         lane.emplace(Lane{nullptr, std::move(prompt), options});
         return;
     }
+    const auto sampling = options.samples() ? std::optional{request_sampling(options)}
+                                            : std::nullopt;
     try {
         DeviceScope device(state_->model.device);
         reclaim_prefill_workspaces(state_->model.device);
         const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
         auto request = std::make_unique<Request>(state_->model.device);
         lane.emplace(Lane{std::move(request), std::move(prompt), options});
+        lane->sampling = sampling;
         const auto stream = state_->execution.stream();
         if (options.mtp_steps != 0) {
             lane->draft = std::make_unique<MtpDraftRequest>(state_->model.mtp_weights, capacity);
@@ -357,6 +364,22 @@ bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
     });
 }
 
+void DecoderBatch::State::score(const Lane& lane, Request& request, Workspace& work, bool graph) {
+    const auto stream = execution.stream();
+    if (!graph) {
+        model.compute_logits(work, stream);
+    }
+    if (lane.sampling) {
+        if (!sampling_workspace) {
+            sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
+        }
+        check(sample_logits(work.logits, vocab_size, &work.argmax->token_id,
+                            *lane.sampling, lane.generated, sampling_workspace, stream),
+              "Sample batched decoder logits");
+    }
+    copy_token(request, work, stream);
+}
+
 void DecoderBatch::State::submit(const Selection& selected, Steps& results,
                                  DecoderBatchStepStats& stats, bool& contains_mtp) {
     const auto stream = execution.stream();
@@ -421,19 +444,14 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
     }
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = scoring[slot]) {
+            auto& work = graph ? *storage->graph_scratch->work[packed_slots[slot]] : request->work;
+            score(*slots[slot], *request, work, graph);
             if (graph) {
-                auto& scratch = *storage->graph_scratch;
-                auto& winner = request->memory.transfers().winner;
-                const auto* output = &scratch.work[packed_slots[slot]]->argmax->token_id;
-                check(cudaMemcpyAsync(&winner, output, sizeof(winner), cudaMemcpyDeviceToHost,
-                                      stream), "Read batch graph greedy token");
                 stats.graph_slots |= std::uint32_t{1} << slot;
-                continue;
             }
-            model.compute_logits(request->work, stream);
-            copy_greedy_token(*request, stream);
         }
     }
+    stats.sampling_workspace_bytes = sampling_workspace ? sampling_workspace_bytes() : 0;
     if (contains_mtp) {
         speculate(speculative, results, stats);
     }
@@ -442,7 +460,12 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
     }
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (scoring[slot]) {
-            results[slot].token = read_greedy_token(*scoring[slot]);
+            const bool sampled = slots[slot]->sampling.has_value();
+            try {
+                results[slot].token = read_token(*scoring[slot], sampled);
+            } catch (const DecoderSamplingError&) {
+                results[slot].sampling_failed = true;
+            }
         }
     }
 }
@@ -524,6 +547,10 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             auto& lane = slots[slot];
             auto& result = results[slot];
             if (!selected[slot] || !lane) {
+                continue;
+            }
+            if (result.sampling_failed) {
+                retire(lane);
                 continue;
             }
             if (!lane->request) {

@@ -196,7 +196,8 @@ Value Parser::number() {
             return integer;
         }
     }
-    if (syntax_ == Syntax::ordered && text.find_first_of(".eE") == std::string_view::npos) {
+    if ((syntax_ == Syntax::ordered || syntax_ == Syntax::completion) &&
+        text.find_first_of(".eE") == std::string_view::npos) {
         if (text.size() > 4300 + static_cast<std::size_t>(text.front() == '-')) {
             fail("JSON integer exceeds the digit limit");
         }

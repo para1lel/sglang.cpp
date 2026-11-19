@@ -12,15 +12,15 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and pass validated prompt IDs to the decoder. | [Route](../apps/sglang-server.cpp#L112)<!-- prefix: "} else if (r" --> · [Request parser](../apps/server/text_request.cpp#L182)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and pass validated prompt IDs to the decoder. | [Route](../apps/sglang-server.cpp#L112)<!-- prefix: "} else if (r" --> · [Request parser](../apps/server/text_request.cpp#L233)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L143)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L158)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
 
-The server parses chat once as ordered JSON and returns HTTP 400 for floating-point range errors. The native renderer uses the pinned checkpoint's template rules and literals. The [shared tokenizer](text-serving.md#tokenizer-assets) encodes the rendered prompt without adding special tokens.
+The server parses chat once as ordered JSON and returns HTTP 400 for floating-point range errors. It preserves oversized integer `top_k` values for validation and clamping. The native renderer uses the pinned checkpoint's template rules and literals. The [shared tokenizer](text-serving.md#tokenizer-assets) encodes the rendered prompt without adding special tokens.
 
-The serial route calls `Decoder::generate`. The batch route submits the IDs to `BatchService::generate` with the connection's worker slot. Rendering, tokenization, and response writing run outside CUDA graphs. Eligible decode cohorts can mix chat, [raw strings](text-serving.md), and [benchmark ID requests](../benchmarks/streaming/README.md#wire-contract). [Serial dispatch](../apps/server/completions.cpp#L209)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/completions.cpp#L220)<!-- prefix: "void complet" -->
+The serial route calls `Decoder::generate`. The batch route submits the IDs to `BatchService::generate` with the connection's worker slot. Rendering, tokenization, and response writing run outside CUDA graphs. Eligible decode cohorts can mix chat, [raw strings](text-serving.md), and [benchmark ID requests](../benchmarks/streaming/README.md#wire-contract). [Serial dispatch](../apps/server/completions.cpp#L232)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/completions.cpp#L245)<!-- prefix: "void complet" -->
 
 ### Read JSON and SSE
 
@@ -40,7 +40,7 @@ With `return_token_ids: true`, JSON includes `prompt_token_ids` and `token_ids` 
 
 - Use `system`, `user`, `assistant`, or `tool` roles. A system message must be first. Include a user query distinct from tool responses.
 - Use a string or text parts for `content`. The renderer also accepts null or omitted content. Empty image and video placeholders can render template tokens outside the system message. Media payloads return HTTP 400.
-- Supply tool schemas as an array of objects. Omit `tool_choice` or set it to `"auto"`. The renderer inserts schemas into the prompt. Greedy decoding provides no forced function selection or schema constraint.
+- Supply tool schemas as an array of objects. Omit `tool_choice` or set it to `"auto"`. The renderer inserts schemas into the prompt. Tool schemas guide generation through the prompt alone.
 - Supply earlier assistant `tool_calls` as an array. Put the `name` and `arguments` in a `function` object or directly in the call. If supplied, `type` must be `"function"`. Arguments can be objects or strings that encode JSON objects. A `tool` message supplies a tool response through its `content`.
 - Use `reasoning_content`, `thinking`, or `reasoning` for earlier assistant reasoning. The renderer uses the first non-null field in that order.
 
@@ -49,7 +49,8 @@ With `return_token_ids: true`, JSON includes `prompt_token_ids` and `token_ids` 
 | Field | Accepted values and effect |
 | --- | --- |
 | `max_tokens`, `max_completion_tokens` | Use at most one. Each sets a nonnegative integer budget. The default is 16. |
-| `temperature`, `n` | When supplied, use `0` and `1`, respectively. |
+| `n` | Omit or set to `1`. |
+| `temperature`, `top_p`, `top_k`, `seed` | Use the [shared sampling controls](text-serving.md#sampling). |
 | `stream`, `return_token_ids`, `ignore_eos`, `stop_token_ids` | Use the [shared text options](text-serving.md#send-a-request). |
 | `stream_options` | With streaming enabled, accepts one boolean member, `include_usage`. The default omits the usage event. |
 | `add_generation_prompt`, `add_vision_id` | Booleans. HTTP defaults are `true` and `false`, respectively. |
@@ -60,7 +61,7 @@ The rendered prompt and its output budget share the 262,144-token context. The r
 
 The first request that reaches rendering loads the pinned `tokenizer_config.json` and `chat_template.jinja` from the checkpoint directory. A missing, unreadable, or mismatched chat asset returns HTTP 500 before output starts. Later chat requests retry a failed load. Raw text can still load `tokenizer.json` independently. The benchmark ID route requires neither tokenizer nor chat assets.
 
-Chat and completion routes share the [serving limits](development.md#native-streaming-server), configured [MTP depth](mtp.md), and [batch graph eligibility](batch-graphs.md).
+Chat and completion routes share the [serving limits](development.md#native-streaming-server) and [batch graph eligibility](batch-graphs.md). Greedy chat can use the configured [MTP depth](mtp.md). Sampled chat uses K0.
 
 A reset or failed write cancels the request and discards its pending UTF-8 bytes. In batch mode, the server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream. [Request lifecycle](../apps/server/text_completion.cpp#L193)<!-- prefix: "void complet" -->
 

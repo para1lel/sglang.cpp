@@ -4,6 +4,11 @@
 #include "sglang/json.h"
 #include "sglang/server/http.h"
 
+#include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <limits>
+
 namespace sglang::server {
 namespace {
 
@@ -57,6 +62,54 @@ void set_stops(const json::Object& object, DecoderOptions& options) {
     }
 }
 
+void set_sampling(const json::Object& object, DecoderOptions& options) {
+    if (const auto* value = json::get(object, "temperature")) {
+        auto temperature = value->number();
+        if (const auto* wide = value->wide_integer()) {
+            double parsed = 0;
+            const auto* end = wide->digits.data() + wide->digits.size();
+            const auto conversion = std::from_chars(wide->digits.data(), end, parsed);
+            if (conversion.ec == std::errc{} && conversion.ptr == end) {
+                temperature = parsed;
+            }
+        }
+        if (!temperature || !std::isfinite(*temperature) || *temperature < 0) {
+            bad_request("temperature must be finite and nonnegative");
+        }
+        options.temperature = *temperature;
+    }
+    if (const auto* value = json::get(object, "top_p")) {
+        const auto top_p = value->number();
+        if (!top_p || !(*top_p > 0 && *top_p <= 1)) {
+            bad_request("top_p must be in (0, 1]");
+        }
+        options.top_p = *top_p;
+    }
+    if (const auto* value = json::get(object, "top_k")) {
+        const auto positive = value->unsigned_integer();
+        const auto* wide = value->wide_integer();
+        if (value->signed_integer() == -1) {
+            options.top_k = -1;
+        } else if (positive && *positive > 0) {
+            options.top_k = std::min<std::uint64_t>(*positive, model_vocab_size);
+        } else if (wide && wide->digits.front() != '-') {
+            options.top_k = model_vocab_size;
+        } else {
+            bad_request("top_k must be -1 or a positive integer");
+        }
+    }
+    if (const auto* value = json::get(object, "seed")) {
+        const auto positive = value->unsigned_integer();
+        options.seed = value->signed_integer();
+        if (positive && *positive <= std::numeric_limits<std::int64_t>::max()) {
+            options.seed = static_cast<std::int64_t>(*positive);
+        }
+        if (!options.seed) {
+            bad_request("seed must be a signed 64-bit integer");
+        }
+    }
+}
+
 TextRequest text_options(const json::Object& object) {
     TextRequest request;
     request.stream = read_bool(object, "stream");
@@ -71,6 +124,7 @@ TextRequest text_options(const json::Object& object) {
         request.include_usage = read_bool(*options, "include_usage");
     }
     set_stops(object, request.options);
+    set_sampling(object, request.options);
     return request;
 }
 
@@ -93,7 +147,8 @@ void encode_prompt(TextRequest& request, std::string_view prompt,
 
 bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
-        key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids";
+        key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids" ||
+        key == "temperature" || key == "top_p" || key == "top_k" || key == "seed";
 }
 
 TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {
@@ -125,10 +180,6 @@ json::Object chat_text_options(const json::OrderedObject& chat) {
                 bad_request("Use one of max_tokens and max_completion_tokens");
             }
             options.emplace("max_tokens", value);
-        } else if (key == "temperature") {
-            if (value.number() != 0.0) {
-                bad_request("Only temperature 0 is supported");
-            }
         } else if (key == "n") {
             if (value.unsigned_integer() != 1) {
                 bad_request("Only n=1 is supported");

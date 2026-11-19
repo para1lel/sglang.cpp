@@ -2,10 +2,12 @@
 
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_mtp.h"
+#include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
 
 #include <algorithm>
 #include <cmath>
+#include <random>
 
 namespace sglang {
 namespace decoder {
@@ -30,8 +32,20 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     if (options.top_logits < 0 || options.top_logits > vocab_size) {
         throw std::invalid_argument("Top-logit count falls outside the vocabulary");
     }
+    if (!std::isfinite(options.temperature) || options.temperature < 0) {
+        throw std::invalid_argument("temperature must be finite and nonnegative");
+    }
+    if (!(options.top_p > 0 && options.top_p <= 1)) {
+        throw std::invalid_argument("top_p must be in (0, 1]");
+    }
+    if (options.top_k != -1 && options.top_k < 1) {
+        throw std::invalid_argument("top_k must be -1 or at least 1");
+    }
     if (options.mtp_steps < 0 || options.mtp_steps > decoder_max_mtp_steps) {
         throw std::invalid_argument("MTP proposal count must be in [0, 4]");
+    }
+    if (options.samples() && options.mtp_steps != 0) {
+        throw std::invalid_argument("Sampling requires mtp_steps=0");
     }
     if (!allow_mtp && options.mtp_steps != 0) {
         throw std::invalid_argument("MTP requires serial generation");
@@ -42,15 +56,32 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     }
 }
 
-void copy_greedy_token(Request& request, cudaStream_t stream) {
-    auto& winner = request.memory.transfers().winner;
-    check(cudaMemcpyAsync(&winner, &request.work.argmax->token_id, sizeof(winner),
-                          cudaMemcpyDeviceToHost, stream), "Read greedy token");
+SamplingParameters request_sampling(const DecoderOptions& options) {
+    std::uint64_t seed;
+    if (options.seed) {
+        seed = static_cast<std::uint64_t>(*options.seed);
+    } else {
+        std::random_device entropy;
+        const auto high = static_cast<std::uint64_t>(entropy());
+        seed = (high << 32) | entropy();
+    }
+    const int top_k = options.top_k == -1 ? vocab_size
+        : static_cast<int>(std::min<std::int64_t>(options.top_k, vocab_size));
+    return {options.temperature, options.top_p, top_k, seed};
 }
 
-int read_greedy_token(Request& request) {
+void copy_token(Request& request, const Workspace& work, cudaStream_t stream) {
+    auto& winner = request.memory.transfers().winner;
+    check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner),
+                          cudaMemcpyDeviceToHost, stream), "Read selected token");
+}
+
+int read_token(Request& request, bool sampled) {
     const int winner = request.memory.transfers().winner;
     if (!valid_token(winner)) {
+        if (sampled && winner == -1) {
+            throw DecoderSamplingError();
+        }
         throw std::runtime_error("Greedy selection did not produce a valid token ID");
     }
     return winner;
@@ -104,17 +135,32 @@ std::vector<DecoderLogit> top_logits(const Bf16* scores, std::size_t count,
     return {ranking.begin(), end};
 }
 
-int read_step(Request& request) {
+void prepare_serial_request(Request& request, const DecoderOptions& options) {
+    request.reset();
+    if (options.samples() && !request.sampling_workspace) {
+        request.sampling_workspace =
+            request.memory.allocate<std::byte>(sampling_workspace_bytes());
+    }
+    request.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
+}
+
+int read_step(Request& request, const std::optional<SamplingParameters>& sampling = std::nullopt,
+              int position = 0) {
     const auto stream = request.memory.stream();
     auto& host_logits = request.memory.transfers().logits;
-    copy_greedy_token(request, stream);
+    if (sampling) {
+        check(sample_logits(request.work.logits, vocab_size, &request.work.argmax->token_id,
+                            *sampling, position, request.sampling_workspace, stream),
+              "Sample decoder logits");
+    }
+    copy_token(request, request.work, stream);
     if (!host_logits.empty()) {
         check(cudaMemcpyAsync(host_logits.data(), request.work.logits,
                               host_logits.size() * sizeof(Bf16), cudaMemcpyDeviceToHost, stream),
               "Read step logits");
     }
     check(cudaStreamSynchronize(stream), "Complete decoder step");
-    return read_greedy_token(request);
+    return read_token(request, sampling.has_value());
 }
 
 }
@@ -346,6 +392,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
     const int prompt_count = static_cast<int>(prompt.size());
     int capacity = prompt_count + options.max_new_tokens - 1;
     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
+    const auto sampling = options.samples() ? std::optional{request_sampling(options)}
+                                            : std::nullopt;
     const RequestLease lease(request_in_use, !options.eager);
     std::unique_ptr<Request> eager_request;
     auto& storage = lease.owns_slot() ? decode_request : eager_request;
@@ -363,9 +411,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
             storage = std::make_unique<Request>(device, capacity, memory, lease.owns_slot());
         }
         auto& request = *storage;
-        request.reset();
+        prepare_serial_request(request, options);
         auto& transfers = request.memory.transfers();
-        transfers.logits.resize(options.top_logits > 0 ? vocab_size : 0);
         std::vector<DecoderLogit> ranking;
         if (options.top_logits > 0) {
             ranking.reserve(vocab_size);
@@ -407,7 +454,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                     }
                     compute_logits(request, step != 0);
                 }
-                winner = read_step(request);
+                winner = read_step(request, sampling, step);
                 result.output_token_ids.push_back(winner);
                 const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
                 if (options.top_logits > 0) {

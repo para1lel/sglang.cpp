@@ -168,14 +168,40 @@ void stream_completion(const Socket& connection, const CompletionRequest& reques
     }
 }
 
-json::Value parse_completion_body(std::string_view body) {
+const json::Object* native_text_body(const json::Value& parsed) {
+    const auto* object = parsed.object();
+    const auto model = object ? json::get_string(*object, "model") : std::nullopt;
+    return object && model != "benchmark" &&
+        (json::get_string(*object, "prompt") || model == model_name) ? object : nullptr;
+}
+
+json::Value parse_completion_body(std::string_view body, bool allow_text) {
     try {
-        return json::parse(body);
+        auto parsed = json::parse(body);
+        if (allow_text && parsed.object()) {
+            const auto* top_k = json::get(*parsed.object(), "top_k");
+            if (top_k && top_k->number() && !top_k->unsigned_integer() &&
+                !top_k->signed_integer() && native_text_body(parsed)) {
+                return json::parse(body, json::Syntax::completion);
+            }
+        }
+        return parsed;
     } catch (const json::NumberRangeError&) {
-        auto parsed = json::parse(body, json::Syntax::benchmark);
-        const auto* object = parsed.object();
-        if (object && json::get_string(*object, "model") == "benchmark") {
-            return parsed;
+        try {
+            auto parsed = json::parse(body, json::Syntax::benchmark);
+            if (parsed.object() && json::get_string(*parsed.object(), "model") == "benchmark") {
+                return parsed;
+            }
+        } catch (const json::NumberRangeError&) {
+            if (!allow_text) {
+                throw;
+            }
+        }
+        if (allow_text) {
+            auto parsed = json::parse(body, json::Syntax::completion);
+            if (native_text_body(parsed)) {
+                return parsed;
+            }
         }
         throw;
     }
@@ -191,19 +217,16 @@ void dispatch_completion(const Socket& connection, std::string_view body,
     }
     json::Value parsed;
     try {
-        parsed = parse_completion_body(body);
+        parsed = parse_completion_body(body, tokenizer != nullptr);
     } catch (const json::ParseError&) {
         throw HttpError("400 Bad Request", "Invalid JSON request body");
     }
-    const auto* object = parsed.object();
-    const auto model = object ? json::get_string(*object, "model") : std::nullopt;
-    if (tokenizer && object && model != "benchmark" &&
-        (json::get_string(*object, "prompt") || model == model_name)) {
-        complete_text(connection, parse_text_request(*object, *tokenizer), *tokenizer,
+    if (const auto* text = tokenizer ? native_text_body(parsed) : nullptr) {
+        complete_text(connection, parse_text_request(*text, *tokenizer), *tokenizer,
                       generate, trace);
         return;
     }
-    stream_completion(connection, parse_benchmark(object), generate, trace);
+    stream_completion(connection, parse_benchmark(parsed.object()), generate, trace);
 }
 
 void complete_serial(const Socket& connection, const Decoder& decoder,
@@ -211,7 +234,9 @@ void complete_serial(const Socket& connection, const Decoder& decoder,
                      bool trace, int mtp_steps, bool eager, bool chat = false) {
     dispatch_completion(connection, body, tokenizer,
                         [&](const auto& prompt, auto options, const auto& callbacks) {
-        options.mtp_steps = mtp_steps;
+        if (!options.samples()) {
+            options.mtp_steps = mtp_steps;
+        }
         options.eager = eager;
         return decoder.generate(prompt, options, callbacks);
     }, trace, chat);

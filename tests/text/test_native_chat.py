@@ -303,6 +303,21 @@ class NativeChatTest(unittest.TestCase):
         self.assertNotEqual(replay[0], role["id"])
         self.assertEqual(replay[1:], first[1:])
 
+    def test_sampling_json_sse_and_raw(self):
+        case = fixtures()[0]
+        body = chat_body(case, 5)
+        options = {"temperature": 1.25, "top_p": 0.87, "top_k": 13, "seed": -(1 << 63)}
+        request = body | options
+        _, ids, text, reason = chat_json(self.port, request, case["ids"], completion_count=5)
+        self.assertEqual(reason, "length")
+        _, streamed_ids, streamed_text, stream_reason = chat_sse(
+            self.port, request | {"stream_options": {"include_usage": True}},
+            case["ids"], completion_count=5)
+        self.assertEqual((streamed_ids, streamed_text, stream_reason), (ids, text, reason))
+        raw = one_choice(json_response(self.port, RAW, raw_body(case, 5) | options))
+        self.assertEqual((raw["token_ids"], raw["text"], raw["finish_reason"]),
+                         (ids, text, reason))
+
     def test_request_errors(self):
         user = {"role": "user", "content": "question"}
         valid = {"model": MODEL, "messages": [user], "max_tokens": 0}
@@ -333,7 +348,10 @@ class NativeChatTest(unittest.TestCase):
             (valid | {"max_tokens": 262144}, "262144-token context"),
             (valid | {"reasoning_effort": "LOW"}, "Unexpected reasoning effort"),
             (valid | {"tool_choice": "AUTO"}, "Unsupported tool_choice"),
-            (valid | {"temperature": 1}, "temperature 0"),
+            (valid | {"temperature": -1}, "finite and nonnegative"),
+            (valid | {"top_p": 1.1}, "top_p must be in"),
+            (valid | {"top_k": -2}, "top_k must be -1"),
+            (valid | {"seed": 1 << 63}, "signed 64-bit integer"),
             (valid | {"n": 2}, "n=1"),
             (valid | {"stop": ["x"]}, "Unsupported chat completion option"),
             (valid | {"stream_options": {"include_usage": True}}, "for a stream"),

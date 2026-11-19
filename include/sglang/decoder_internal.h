@@ -192,10 +192,11 @@ struct Request {
     std::array<Mxfp8KvCache, full_attention_layers> caches;
     GdnBank states;
     std::optional<ExactGqaWorkspace> long_graph_scores;
+    std::byte* sampling_workspace = nullptr;
 };
 
-void copy_greedy_token(Request& request, cudaStream_t stream);
-int read_greedy_token(Request& request);
+void copy_token(Request& request, const Workspace& work, cudaStream_t stream);
+int read_token(Request& request, bool sampled);
 
 struct ForwardLane {
     Request* request;

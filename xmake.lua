@@ -58,6 +58,7 @@ target("sglang_cuda")
     add_files("src/text_decode_bandwidth.cu")
     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
     add_files("src/text_normalization.cu")
+    add_files("src/decoder_sampling.cu")
 
 target("sglang_prefill_fp8_sm100")
     set_kind("static")
@@ -149,6 +150,21 @@ if has_config("mxfp8-gqa-check") then
         add_deps("sglang_cuda")
         add_syslinks("cudart")
         add_files("tests/mxfp8_gqa_check.cu")
+    target_end()
+end
+
+option("sampling-check")
+    set_default(false)
+option_end()
+
+if has_config("sampling-check") then
+    target("sampling-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_decoder")
+        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_files("tests/text/sampling_check.cpp")
     target_end()
 end
 

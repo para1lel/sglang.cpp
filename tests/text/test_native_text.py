@@ -161,7 +161,7 @@ def verify_errors(port, tokenizer_ids):
         raw("", 0), raw([220], 0), raw("x", -1), raw("a", 0, stop_token_ids=[-1]),
         raw("a", 0, stop_token_ids=[248320]), legacy([-1], 0), legacy([248320], 0),
         legacy([220], 0, stop_token_ids=[248320]), raw("x y z", 262143),
-        raw("é" * 524289, 0), raw("x", 0, temperature=0),
+        raw("é" * 524289, 0), raw("x", 0, temperature=-1),
         raw("x", 0, stream_options={"include_usage": True}),
         b'{"model":"Qwen3.8-27B-FP8","prompt":"\xc0\xaf"}',
         b'{"model":"Qwen3.8-27B-FP8","prompt":"\\ud800"}',
@@ -176,6 +176,34 @@ def verify_errors(port, tokenizer_ids):
     check(media_type == "application/json" and "error" in json.loads(data), "oversize HTTP body")
     generated_ids(port, [248319], 0)
     verify_raw(port, {"text": "248320 -1", "ids": tokenizer_ids, "budget": 0}, [], [])
+
+
+def verify_sampling(port, sample, greedy_ids, pieces):
+    for options in ({"temperature": 0}, {"temperature": 0.0000009, "seed": -1},
+                    {"temperature": 3, "top_k": 1, "top_p": 0.1}):
+        _, data = exchange(port, raw(sample["text"], sample["budget"], **options))
+        selected = json.loads(data)["choices"][0]["token_ids"]
+        check(selected == greedy_ids, f"greedy IDs changed with {options!r}")
+
+    sampling = {"temperature": 1.1, "top_p": 0.91, "top_k": 24}
+    for seed in (-(1 << 63), 0, (1 << 63) - 1):
+        body = raw(sample["text"], sample["budget"], **sampling, seed=seed)
+        _, data = exchange(port, body)
+        packet = json.loads(data)
+        selected = packet["choices"][0]["token_ids"]
+        check(len(selected) == sample["budget"], f"sampled length for seed {seed}")
+        token_pieces = [pieces.get(token, b"") for token in selected]
+        expected = expected_choices(sample["ids"], selected, token_pieces, "length")
+        streamed = events(port, body | stream_options())
+        check(streamed == expected + [{"choices": [], "usage": usage(sample["ids"], selected)}],
+              f"sampled JSON/SSE IDs differ for seed {seed}")
+        check(packet["choices"][0]["text"] ==
+              "".join(frame["choices"][0]["text"] for frame in expected),
+              f"sampled UTF-8 text differs for seed {seed}")
+
+    for options in ({"seed": (1 << 63)}, {"seed": -(1 << 63) - 1}, {"seed": 4.0},
+                    {"top_k": 1.5}, {"top_p": 0}, {"temperature": "1"}):
+        exchange(port, raw(sample["text"], 0, **options), 400)
 
 
 def pending_start(ids, pieces):
@@ -288,6 +316,7 @@ def main():
         generated[name] = ids
     verify_terminal(args.port, cases, generated, pieces)
     verify_errors(args.port, fixture["numeric_text_ids"])
+    verify_sampling(args.port, cases["cjk"], generated["cjk"], pieces)
     cancellation = verify_concurrent(args.port, args.width, cases, generated, pieces)
     if args.evidence:
         result = {"width": args.width, "generated_ids": generated, "cancellation": cancellation}

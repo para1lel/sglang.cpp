@@ -1,13 +1,13 @@
 # sglang.cpp
 
 A C++ and CUDA C++ inference engine in development for **Qwen3.8-27B-FP8 on one NVIDIA B200**.
-The native decoder loads the official text weights and runs all 64 layers for greedy
+The native decoder loads the official text weights and runs all 64 layers for
 token-ID generation. It uses paged MXFP8 KV storage in the 16 full-attention layers
 and carries Gated DeltaNet state through the other 48 layers. Prefill and the first
-greedy selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
+token selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L59)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L73)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
@@ -147,9 +147,9 @@ allocation runs out of memory, steps that need it use eager decode. Other decode
 widths and mixed decode and prefill steps run eagerly.
 
 The default `--mtp-steps 0` selects target-only decoding. Set `--mtp-steps 1` through
-`--mtp-steps 4` at any `--max-active` value from `1` through `4` to enable MTP.
+`--mtp-steps 4` at any `--max-active` value from `1` through `4` to enable MTP for greedy requests.
 Batched requests share target projections and commit their outputs independently.
-Positive MTP depths run eagerly, including when `--batch-cuda-graphs` is set.
+Steps that contain an MTP lane run eagerly, including when `--batch-cuda-graphs` is set.
 Values of `--max-active` above `4` require `--mtp-steps 0`. SSE events and usage
 fields follow the same contract at every depth.
 
@@ -168,6 +168,7 @@ Add `--trace-batches` to log `batch width=… decode=… request_bytes=…` on s
 In serial mode the trace describes token-producing steps and reports zero batch request
 bytes. In batch mode `request_bytes` counts live allocations owned by the batch executor.
 When a batch graph replays, `batch graph_slots=…` gives the bit mask of replayed slots.
+When the batch allocates sampling scratch, `sampling_workspace_bytes=…` reports its size.
 
 `Decoder::generate` accepts optional callbacks. `on_token` receives each selected ID
 synchronously after host readback. Returning `false` cancels the request with that ID
@@ -189,7 +190,7 @@ curl -N http://127.0.0.1:17384/v1/completions \
 With `stream: true`, append the valid UTF-8 `choices[0].text` deltas in order until `[DONE]`.
 Omit `stream` to receive one JSON response with complete text and usage.
 The default `max_tokens` is 16.
-See [text completion options and verification](docs/text-serving.md) for the full contract.
+See [text completion options and verification](docs/text-serving.md) for prompt and response details.
 
 ### Submit a chat conversation
 
@@ -202,6 +203,26 @@ curl -N http://127.0.0.1:17384/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"Qwen3.8-27B-FP8","messages":[{"role":"user","content":"Explain why the sky is blue."}],"stream":true}'
 ```
+
+### Sample output tokens
+
+Native text and chat requests default to greedy selection with `temperature: 0`.
+Temperature must be finite and nonnegative.
+A temperature below `1e-6` or `top_k: 1` selects the greedy path.
+Set `top_p` in `(0, 1]` to limit the nucleus. The default is `1`.
+Set `top_k` to a positive integer to limit the number of candidates.
+The server caps positive values at the vocabulary size.
+The default `-1` lets top-p act on the full vocabulary.
+
+Pass a signed 64-bit integer `seed` to repeat the draws for the same logits.
+When you omit `seed`, the decoder selects one seed for the request.
+Sampled requests use target-only decoding. Greedy requests can still use MTP in the same batch.
+The generator command and the token-ID benchmark use greedy selection.
+
+C++ callers set the same fields in
+[`DecoderOptions`](include/sglang/decoder.h#L17)<!-- prefix: "struct Decod" -->.
+Set `mtp_steps` to `0` for sampled C++ requests.
+See the [sampling contract](docs/text-serving.md#sampling) for dispatch and seed behavior.
 
 ## Continue development
 

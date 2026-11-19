@@ -12,9 +12,9 @@ curl --fail-with-body http://127.0.0.1:17384/v1/completions \
   --data-binary '{"model":"Qwen3.8-27B-FP8","prompt":"一、北京\n二、上海\n三、","max_tokens":8}'
 ```
 
-The server generates one greedy completion. The prompt must contain 1 to 1,048,576 UTF-8 bytes. The encoded prompt length plus the output budget must fit 262,144 tokens. HTTP accepts up to 8 KiB of headers and 2 MiB of body. Invalid request options, malformed UTF-8, and invalid token limits return HTTP 400. Oversize headers return HTTP 431. Oversize bodies return HTTP 413. [Request parser](../apps/server/text_request.cpp#L99)<!-- prefix: "TextRequest " -->
+The server generates one completion with greedy decoding by default. The prompt must contain 1 to 1,048,576 UTF-8 bytes. The encoded prompt length plus the output budget must fit 262,144 tokens. HTTP accepts up to 8 KiB of headers and 2 MiB of body. Invalid request options, malformed UTF-8, and invalid token limits return HTTP 400. Oversize headers return HTTP 431. Oversize bodies return HTTP 413. [Request parser](../apps/server/text_request.cpp#L154)<!-- prefix: "TextRequest " -->
 
-The server parses `/v1/completions` as strict JSON. It passes the parsed object to the selected route without parsing it again. After a numeric range error, it retries with signed-zero underflow enabled and accepts the result only for model `benchmark`. Raw prompts return HTTP 400 for malformed JSON, duplicate decoded keys, floating-point range errors, or nesting beyond 32 containers. [Dispatch](../apps/server/completions.cpp#L184)<!-- prefix: "void dispatc" -->
+The server rejects malformed JSON, duplicate decoded keys, and nesting beyond 32 containers. Native text rejects floating-point range errors. The parser preserves oversized integer `top_k` values for validation and clamping. The frozen `benchmark` parser retains its signed-zero underflow handling and fixed request fields. [Numeric dispatch](../apps/server/completions.cpp#L178)<!-- prefix: "json::Value " --> · [Benchmark parser](../apps/server/completions.cpp#L26)<!-- prefix: "CompletionRe" -->
 
 | Field | Behavior |
 | --- | --- |
@@ -26,6 +26,23 @@ The server parses `/v1/completions` as strict JSON. It passes the parsed object 
 | `return_token_ids` | Boolean, default `false`. Set it to `true` to include diagnostic output IDs. Nonstreaming responses also include the encoded prompt IDs. |
 
 Tokenizer load occurs on the first text or chat request that reaches encoding. The server reads `tokenizer.json` from the selected checkpoint directory and verifies its size and SHA-256. A missing, unreadable, or mismatched asset returns HTTP 500 before output starts. A subsequent request retries a failed load. Successful loads share an immutable tokenizer across text and chat requests. The benchmark ID route uses the IDs supplied by the client.
+
+## Sampling
+
+Native text, native chat, and C++ `DecoderOptions` use the same sampling controls. These fields apply to both JSON and SSE responses. [HTTP validation](../apps/server/text_request.cpp#L65)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L17)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L22)<!-- prefix: "void validat" -->
+
+| Field | Valid values and default |
+| --- | --- |
+| `temperature` | Finite nonnegative number, default `0`. Values below `1e-6` use greedy selection. |
+| `top_p` | Number in `(0, 1]`, default `1`. A value of `1` disables the nucleus cutoff. |
+| `top_k` | Integer `-1` or positive, default `-1` for the full vocabulary. Values above 248,320 clamp to 248,320. A value of `1` uses greedy selection. |
+| `seed` | Signed 64-bit integer. With active sampling and no seed, generation resolves one from system entropy. |
+
+The decoder validates options even on the greedy path. CUDA ranks BF16 logits by descending score, then ascending token ID. It divides score differences by temperature before exponentiation. For `top_p < 1`, the nucleus ends at the first token that raises cumulative weight strictly above `top_p` times full vocabulary weight. Top-k caps the retained prefix. The decoder draws from the retained weights. Each draw depends on the resolved seed and zero-based output index. With identical logits and options, moving a request to another slot preserves its draws. [Seed resolution](../src/decoder.cpp#L59)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L167)<!-- prefix: "__global__ v" -->
+
+Native HTTP uses K0 for sampled requests. Greedy requests on the same server can still use configured MTP. Set `mtp_steps = 0` explicitly for sampled C++ requests. Graph eligibility follows the [usual dispatch rules](batch-graphs.md#runtime-path). The sampler runs on the decoder stream after model replay or eager scoring. [Serial dispatch](../apps/server/completions.cpp#L232)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/batch_service.cpp#L337)<!-- prefix: "if (!job->op" -->
+
+Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. C++ serial generation throws `DecoderSamplingError`. The C++ batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L79)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L552)<!-- prefix: "if (result.s" -->
 
 ## Read the response
 
@@ -88,6 +105,10 @@ Start the release server on a reserved B200 with `--max-active 1`. Run the HTTP 
 ```
 
 Repeat with a server at `--max-active 2` and `4`. Match `--width` to the server. Require exit status zero at each width. The [HTTP check](../tests/text/test_native_text.py#L1)<!-- prefix: "\"\"\"Run again" --> compares diagnostic output IDs, finish reasons, and usage with token-ID requests. It checks SSE and JSON text against an independent UTF-8 decoder. It exercises empty deltas, split characters, terminal flush, stops, zero budget, and cancellation with pending bytes. The concurrent cases check peer and replacement responses.
+
+Run both native routes with `return_token_ids: true`, a fixed seed, and active sampling. Match output IDs, finish reasons, and usage across JSON and SSE. Use the same checkpoint, prefill policy, prompts, and budgets. Compare eager, replay, and reassigned slots with identical logits. Include a mixed batch with a sampled K0 lane and a greedy MTP lane. Check that a temperature below `1e-6` or `top_k: 1` takes the greedy path. Check both signed seed limits, omitted seed, and top-k clamping. Require HTTP 400 for invalid values, including zero top-p, zero top-k, and out-of-range seeds. Run the frozen benchmark check separately.
+
+At the operator boundary, compare CUDA winners with a CPU oracle. Cover ties, the exact nucleus cutoff, combined top-k and top-p, masked logits, and invalid rows. Inject an invalid sampled row in a batch and check peer output and slot reuse. With diagnostics disabled, verify one four-byte selected ID transfer per sampled row.
 
 Verify asset errors with a separate checkpoint directory that shares the immutable weights. Restart the server with that `--checkpoint` and with `tokenizer.json` missing or altered.
 

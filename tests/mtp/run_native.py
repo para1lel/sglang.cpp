@@ -277,6 +277,7 @@ def check_rng_policy(port, evidence):
     text = {"model": model, "prompt": "Spain", "max_tokens": 0}
     messages = {"model": model, "messages": [{"role": "user", "content": "Spain"}],
                 "max_tokens": 0, "temperature": 0}
+    sampled = {"temperature": 1, "top_p": 0.9, "top_k": 32, "seed": -1, "max_tokens": 3}
     cases = (
         ("ids-greedy", completions, ids, None),
         ("ids-temperature", completions, ids | {"temperature": 1},
@@ -286,17 +287,12 @@ def check_rng_policy(port, evidence):
         ("ids-top-p", completions, ids | {"top_p": 0.5},
          "Expected the frozen benchmark streaming options"),
         ("text-greedy", completions, text, None),
-        ("text-seed", completions, text | {"seed": 0},
-         "Unsupported text completion option: seed"),
-        ("text-temperature", completions, text | {"temperature": 1},
-         "Unsupported text completion option: temperature"),
+        ("text-seed", completions, text | {"seed": 0}, None),
+        ("text-sampled", completions, text | sampled, None),
         ("chat-greedy", chat, messages, None),
-        ("chat-temperature", chat, messages | {"temperature": 1},
-         "Only temperature 0 is supported"),
-        ("chat-seed", chat, messages | {"seed": 0},
-         "Unsupported chat completion option: seed"),
-        ("chat-top-p", chat, messages | {"top_p": 0.5},
-         "Unsupported chat completion option: top_p"),
+        ("chat-sampled", chat, messages | sampled, None),
+        ("chat-seed", chat, messages | {"seed": 0}, None),
+        ("chat-top-p", chat, messages | {"top_p": 0.5}, None),
     )
     results = {}
     for name, route, body, diagnostic in cases:

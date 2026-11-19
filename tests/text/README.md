@@ -1,4 +1,23 @@
-# Native chat Layer 1 checks
+# Native text serving checks
+
+## Sampling
+
+In the project Pixi environment, configure the optional check and build it
+with the native CUDA targets.
+
+```bash
+xmake f -m release --sampling-check=y
+xmake build sampling-check
+xmake run sampling-check /data0/shared/Qwen3.8-27B-FP8
+```
+
+Reserve a B200 and select it with `CUDA_VISIBLE_DEVICES` before running.
+Omit the checkpoint path to run only the synthetic BF16 logit cases. The
+checkpoint run also checks the direct decoder with serial and packed graphs,
+eager fallback, mixed MTP, and slot reuse. The text and chat HTTP tests below
+exercise the sampled JSON and event-stream routes.
+
+## Chat Layer 1
 
 With the native server running against the pinned Qwen3.8-27B-FP8 checkpoint
 at `--max-active 1`, run the chat tests through its HTTP listener.

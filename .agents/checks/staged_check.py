@@ -170,12 +170,23 @@ def snapshot_repository(root, snapshot, entries, environment, head):
         git(snapshot, ["update-ref", "HEAD", head.strip().decode("ascii")], clean)
 
 
+def check_header_layout(entries):
+    suffixes = {".h", ".hh", ".hpp", ".hxx", ".h++", ".cuh"}
+    for name in entries:
+        if (
+            PurePosixPath(name).suffix.lower() in suffixes
+            and not name.startswith("include/sglang/")
+        ):
+            raise ValueError(f"Move project header {name!r} under include/sglang/.")
+
+
 def run(root):
     with tempfile.TemporaryDirectory(prefix="meta-harness-staged-") as directory:
         temporary = Path(directory).resolve()
         if not temporary.is_relative_to(Path(tempfile.gettempdir()).resolve()):
             raise ValueError("The temporary snapshot leaves its selected directory.")
         entries, changed, environment, index, original = freeze(root, temporary)
+        check_header_layout(entries)
         if not changed:
             print("Passed: the selected index has no changed files.")
             return 0

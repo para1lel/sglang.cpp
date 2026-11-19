@@ -15,6 +15,8 @@ The first `sm_100` cubin built with XMake, GCC 15.3.0, and CUDA 13.4.92. It retu
 
 **Adopted scope.** Target one B200 with the local checkpoint and project-owned model and CUDA operators.
 
+Record verified failures and preventive checks in [development lessons](lessons.md).
+
 **Operator policy.** Exclude cuBLAS, cuBLASLt, cuDNN, CUTLASS, FlashInfer, and equivalent operator libraries or generators from production execution. Justify HTTP, JSON, tokenizer, media decoder, and system libraries. Record purpose, license, version, and execution path. Reference engines may use their own operators.
 
 **Proposed scope.** Cover text generation, sampling, stopping, image and video inputs, MTP4, and concurrent scheduling. Use MXFP8 KV for grouped-query attention (GQA). Investigate GDN state and Radix prefix reuse. Verify checkpoint and service semantics before accepting OpenAI-compatible endpoints, streaming, cancellation, and JSON Schema, regex, and grammar constraints.

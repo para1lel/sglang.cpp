@@ -1,4 +1,4 @@
-#include "chat_template.h"
+#include "sglang/server/chat_template.h"
 
 #include "sglang/tokenizer/digest.h"
 #include "sglang/utf8.h"

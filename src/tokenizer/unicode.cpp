@@ -28,10 +28,10 @@ struct Mapping {
     char32_t third;
 };
 
-#include "unicode/character_properties_16.h"
-#include "unicode/combining_classes_9.h"
-#include "unicode/canonical_decompositions_9.h"
-#include "unicode/canonical_compositions_9.h"
+#include "sglang/tokenizer/unicode/character_properties_16.h"
+#include "sglang/tokenizer/unicode/combining_classes_9.h"
+#include "sglang/tokenizer/unicode/canonical_decompositions_9.h"
+#include "sglang/tokenizer/unicode/canonical_compositions_9.h"
 
 constexpr unsigned letter = 1;
 constexpr unsigned mark = 2;

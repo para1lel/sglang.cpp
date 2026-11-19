@@ -6,7 +6,7 @@
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
 
-#include "decoder_prefix_cache.h"
+#include "sglang/decoder_prefix_cache.h"
 
 #include <algorithm>
 #include <utility>

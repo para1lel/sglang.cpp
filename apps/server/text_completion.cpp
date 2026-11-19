@@ -1,4 +1,4 @@
-#include "text_completion.h"
+#include "sglang/server/text_completion.h"
 
 #include "sglang/json.h"
 #include "sglang/server/batch_service.h"

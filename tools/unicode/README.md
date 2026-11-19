@@ -27,7 +27,7 @@ From the project root, regenerate the checked-in tables with the Python
 standard library.
 
 ```sh
-python -B tools/unicode/generate.py /path/to/ucd src/tokenizer/unicode
+python -B tools/unicode/generate.py /path/to/ucd include/sglang/tokenizer/unicode
 ```
 
 The C++ build compiles the checked-in tables directly. The source archives and

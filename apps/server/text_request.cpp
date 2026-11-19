@@ -1,6 +1,6 @@
-#include "text_completion.h"
+#include "sglang/server/text_completion.h"
 
-#include "chat_template.h"
+#include "sglang/server/chat_template.h"
 #include "sglang/decoder_constraint.h"
 #include "sglang/json.h"
 #include "sglang/server/http.h"

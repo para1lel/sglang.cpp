@@ -8,7 +8,7 @@ out="$PWD/build/prefix-checks"
 xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release
 xmake build -P "$PWD" sglang-server
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
-"$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -Isrc -I"$toolkit/include" \
+"$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
     tests/prefix/cache_state.cpp -L"$out/lib" -L"$toolkit/lib" \
     -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaMemcpy2DAsync \
     -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \

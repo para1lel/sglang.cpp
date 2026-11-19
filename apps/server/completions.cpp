@@ -4,7 +4,7 @@
 #include "sglang/server/batch_service.h"
 #include "sglang/server/http.h"
 
-#include "text_completion.h"
+#include "sglang/server/text_completion.h"
 
 #include <cstdint>
 #include <iostream>

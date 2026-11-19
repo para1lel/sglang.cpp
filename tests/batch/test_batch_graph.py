@@ -155,6 +155,11 @@ def scheduler(path, offset):
             rows[-1]["workspace_bytes"] = int(prefill[2])
         elif graph := re.fullmatch(rb"batch graph_slots=(\d+)", line):
             rows[-1]["graph_slots"] = int(graph[1])
+        elif peak := re.fullmatch(rb"batch peak_request_bytes=(\d+)", line):
+            assert rows and rows[-1]["width"] and "peak_request_bytes" not in rows[-1], line
+            peak_bytes = int(peak[1])
+            assert peak_bytes >= rows[-1]["request_bytes"], line
+            rows[-1]["peak_request_bytes"] = peak_bytes
         else:
             assert not line.startswith(b"batch "), line
     assert rows and rows[-1]["request_bytes"] == 0

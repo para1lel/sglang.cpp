@@ -7,7 +7,7 @@ and carries Gated DeltaNet state through the other 48 layers. Prefill and the fi
 token selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L101)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L102)<!-- prefix: "class Decode" -->.
 The batch scheduler options are in
 [`DecoderBatchOptions`](include/sglang/decoder_batch.h#L46)<!-- prefix: "struct Decod" -->.
 The paged KV-cache and causal grouped-query attention API is in
@@ -172,7 +172,7 @@ A request beyond total resident capacity gets HTTP 413. Temporary memory pressur
 If the CUDA stream can be drained after an admission allocation fails, the worker retires that
 request and continues serving its peers.
 A failed drain ends the affected requests. New completions return HTTP 500 until the server restarts.
-[`DecoderCapacityError`](include/sglang/decoder.h#L60)<!-- prefix: "class Decode" -->
+[`DecoderCapacityError`](include/sglang/decoder.h#L61)<!-- prefix: "class Decode" -->
 reports whether the caller can retry.
 
 Add `--batch-cuda-graphs` to opt in to graph replay for eligible decode-only
@@ -259,21 +259,33 @@ See [codec build and verification](docs/chat-serving.md#codec-checks) for setup 
 
 ### Sample output tokens
 
-Native text and chat requests default to greedy selection with `temperature: 0`.
-Temperature must be finite and nonnegative.
+Raw string completions default to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`.
+Chat defaults to `--sampling-defaults model` and reads the checkpoint's `generation_config.json`.
+This checkpoint uses `temperature: 1`, `top_p: 0.95`, `top_k: 20`, and `min_p: 0`.
+Use `--sampling-defaults openai` to give chat the raw-text sampling defaults.
+Explicit sampling controls override the route defaults.
+If a chat request omits its output limit, the server uses the final prompt length to set the budget.
+Batch admission can lower that implicit budget to fit the worker's resident capacity.
+See [chat sampling and output limits](docs/chat-serving.md#sampling-defaults-and-output-budget).
+The [chat defaults loader](apps/server/text_request.cpp#L408)<!-- prefix: "const Decode" -->
+and [output limit calculation](apps/server/text_request.cpp#L246)<!-- prefix: "void finish_" -->
+implement these defaults.
+
+Set a finite, nonnegative temperature.
 A temperature below `1e-6` or `top_k: 1` selects the greedy path.
-Set `top_p` in `(0, 1]` to limit the nucleus. The default is `1`.
+Set `top_p` in `(0, 1]` to limit the nucleus.
 Set `top_k` to a positive integer to limit the number of candidates.
 The server caps positive values at the vocabulary size.
-The default `-1` lets top-p act on the full vocabulary.
+Use `-1` to let top-p act on the full vocabulary.
 Set `min_p` in `[0, 1]` to retain candidates with at least that fraction of the
-largest probability. The default `0` disables this cutoff.
+largest probability. A value of `0` disables this cutoff.
 
 Pass a signed 64-bit integer `seed` to repeat the draws for the same logits.
 When you omit `seed`, the decoder selects one seed for the request.
 Unconstrained sampled text requests use the configured MTP depth.
-The generator accepts `--temperature`, `--top-p`, `--top-k`, `--min-p`, and `--seed`.
-The token-ID benchmark uses greedy selection.
+The generator defaults to greedy selection. Use `--temperature 0` to request it explicitly.
+The generator also accepts `--top-p`, `--top-k`, `--min-p`, and `--seed`.
+The token-ID benchmark client explicitly requests greedy selection.
 
 C++ callers set the same fields in
 [`DecoderOptions`](include/sglang/decoder.h#L24)<!-- prefix: "struct Decod" -->.

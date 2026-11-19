@@ -12,10 +12,10 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L148)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L357)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L153)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L448)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
 | Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L61)<!-- prefix: "DecoderResul" --> |
-| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L162)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L177)<!-- prefix: "void TextRes" --> |
+| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L199)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L217)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
 
@@ -33,9 +33,9 @@ JSON uses `object: "chat.completion"`. SSE uses `object: "chat.completion.chunk"
 
 The first SSE chunk carries `delta.role: "assistant"` and a null finish reason. Join later `delta.content` strings in order. The terminal choice has `delta: {}` and `finish_reason: "stop"` or `"length"`. When requested, a usage event with `choices: []` follows the terminal choice. The stream ends with `[DONE]`.
 
-JSON responses always include usage. `prompt_tokens` counts rendered prompt IDs. `completion_tokens` counts committed output IDs. `total_tokens` sums both counts. `prompt_tokens_details.cached_tokens` counts [restored prompt IDs](prefix-cache.md#runtime-path). A matched stop ID counts as output, even at the budget. The writer omits its text and reports `stop`. For unconstrained requests, exhaustion without a stop reports `length`, including a zero budget. See [constrained finishes](text-serving.md#finite-choice-constraints).
+JSON responses always include usage. `prompt_tokens` counts rendered prompt IDs. `completion_tokens` counts committed output IDs. `total_tokens` sums both counts. `prompt_tokens_details.cached_tokens` counts [restored prompt IDs](prefix-cache.md#runtime-path). Chat uses the [same stop and finish rules as raw text](text-serving.md#read-the-response).
 
-With `return_token_ids: true`, each committed ID appears once in `token_ids`, even when it produces empty text. A UTF-8 tail flush can carry text with zero IDs. In text chat, `prompt_token_ids` appears in the JSON choice or the first diagnostic SSE choice after the role. Media chat puts the expanded `prompt_token_ids` at the top level of the JSON response or the initial assistant SSE chunk. Media usage counts expanded prompt IDs. [Diagnostic choice](../apps/server/text_completion.cpp#L122)<!-- prefix: "std::string " --> · [Role delta](../apps/server/text_completion.cpp#L147)<!-- prefix: "bool TextRes" -->
+With `return_token_ids: true`, each committed ID appears once in `token_ids`, even when it produces empty text. A UTF-8 tail flush can carry text with zero IDs. In text chat, `prompt_token_ids` appears in the JSON choice or the first diagnostic SSE choice after the role. Media chat puts the expanded `prompt_token_ids` at the top level of the JSON response or the initial assistant SSE chunk. Media usage counts expanded prompt IDs. [Diagnostic choice](../apps/server/text_completion.cpp#L129)<!-- prefix: "std::string " --> · [Role delta](../apps/server/text_completion.cpp#L154)<!-- prefix: "bool TextRes" -->
 
 ## Constraints and failure behavior
 
@@ -51,14 +51,14 @@ With `return_token_ids: true`, each committed ID appears once in `token_ids`, ev
 
 | Field | Accepted values and effect |
 | --- | --- |
-| `max_tokens`, `max_completion_tokens` | Use at most one. Each requires a nonnegative integer. Omit both to use 16. |
+| `max_tokens`, `max_completion_tokens` | Nonnegative integer or null. A non-null `max_completion_tokens` takes priority in either field order. |
 | `n` | Omit or set to `1`. |
-| `temperature`, `top_p`, `top_k`, `min_p`, `seed` | Use the [shared sampling controls](text-serving.md#sampling). |
+| `temperature`, `top_p`, `top_k`, `min_p`, `seed` | Use the [shared sampling controls](text-serving.md#sampling). A non-null value overrides its default. |
 | `ebnf` | Use a [finite-choice constraint](text-serving.md#finite-choice-constraints) for the generated content. |
 | `regex` | Use a [whole-output regular expression](output-constraints.md#regular-expressions) for the generated content. |
 | `response_format` | Use a [bounded JSON Schema](output-constraints.md#json-schema) for the generated content. |
 | `cache_salt` | Optional [prefix cache key](prefix-cache.md#runtime-path) component. |
-| `stream`, `return_token_ids`, `ignore_eos`, `stop_token_ids` | Use the [shared text options](text-serving.md#send-a-request). |
+| `stream`, `return_token_ids`, `ignore_eos`, `stop_token_ids`, `stop` | Use the [shared text options](text-serving.md#send-a-request). |
 | `stream_options` | With streaming enabled, accepts one boolean member, `include_usage`. The default omits the usage event. |
 | `add_generation_prompt`, `add_vision_id` | Booleans. HTTP defaults are `true` and `false`, respectively. |
 | `enable_thinking`, `preserve_thinking` | Booleans that default to `true`. They control rendering of the generation prompt and assistant history. |
@@ -70,11 +70,19 @@ The first request that reaches rendering loads the pinned `tokenizer_config.json
 
 Chat and completion routes share [resident memory admission](batch-graphs.md#resident-memory-admission) and [batch graph eligibility](batch-graphs.md). Unconstrained text-only chat can use the configured [MTP depth](mtp.md). Constrained and media chat use K0.
 
-A reset or failed write cancels the request and discards its pending UTF-8 bytes. In batch mode, the server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream. [Request lifecycle](../apps/server/text_completion.cpp#L213)<!-- prefix: "void complet" -->
+A reset or failed write cancels the request and discards its pending UTF-8 bytes. In batch mode, the server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream without `[DONE]`. [Request lifecycle](../apps/server/text_completion.cpp#L253)<!-- prefix: "void complet" -->
+
+### Sampling defaults and output budget
+
+`--sampling-defaults model` is the server default. Chat reads sampling values from the selected checkpoint's `generation_config.json` on first use. For Qwen3.8-27B-FP8, the values are `temperature: 1`, `top_p: 0.95`, `top_k: 20`, and `min_p: 0`.
+
+Use `--sampling-defaults openai` for `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Model mode uses the same fallback for a missing file or omitted sampling fields. A missing or null request control inherits its default. The checkpoint does not supply the request seed. Raw text defaults are independent of this option. [Server option](../apps/sglang-server.cpp#L25)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L408)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L320)<!-- prefix: "} else if ((" -->
+
+If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L246)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L463)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L326)<!-- prefix: "int limit_re" -->
 
 ### Image and video inputs
 
-Media chat accepts up to four attachments in `user` content and preserves their order among text parts. It uses private eager K0 state in both serial and batch serving. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Sampling and stop options follow the text contract. [Routes](../apps/sglang-server.cpp#L251)<!-- prefix: "if (argument" -->
+Media chat accepts up to four attachments in `user` content and preserves their order among text parts. It uses private eager K0 state in both serial and batch serving. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Routes](../apps/sglang-server.cpp#L256)<!-- prefix: "if (argument" -->
 
 Omit `add_special_tokens` or set it to `false`. Set `enable_thinking` at the top level or as the only member of `chat_template_kwargs`.
 
@@ -104,6 +112,8 @@ python3 -B tests/text/test_native_chat.py --port 17384 -v
 ```
 
 Require exact rendered prompt IDs and usage against the frozen template fixtures. Check JSON and SSE parity, matched stop IDs without stop text, malformed requests, and replay after a reset. Compare raw requests with the equivalent rendered prompts. Run the [raw text checks](text-serving.md#verification) and the [benchmark streaming checks](development.md#streaming-verification) separately.
+
+Check both sampling default modes with omitted, null, and explicit controls. Check budget alias priority in both field orders. Check the omitted-budget boundary after tokenization and media expansion. Fix the seed and score history. Compare output IDs and usage across JSON and SSE. Include a text stop that spans tokens.
 
 For a K4 check, match prompt IDs, committed IDs, finish reasons, and usage against MTP off. Use the same chat fixtures and limits at width one and with overlapping requests. For batch graphs, overlap chat, raw text, and benchmark ID requests. Compare each response with a same-policy control. Correlate a multi-lane decode mask with an actual CUDA graph launch. Reset a chat stream while a peer is active. Check the peer and replacement request against their controls.
 

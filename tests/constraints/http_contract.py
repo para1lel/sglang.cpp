@@ -24,7 +24,8 @@ CONSTRAINT_FIELDS = {"ebnf", "regex", "response_format"}
 
 def body(route, budget, **options):
     prompt = "Complete the requested output."
-    base = {"model": MODEL, "max_tokens": budget, "return_token_ids": True}
+    base = {"model": MODEL, "max_tokens": budget, "return_token_ids": True,
+            "temperature": 0.0, "seed": 0}
     if route == "text":
         base["prompt"] = prompt
     else:

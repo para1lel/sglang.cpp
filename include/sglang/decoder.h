@@ -36,6 +36,7 @@ struct DecoderOptions {
     std::string prefix_cache_salt;
     double min_p = 0.0;
     int max_num_batched_tokens = 0;
+    bool incremental_kv = false;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
     bool requires_target_only() const { return constraint != nullptr; }

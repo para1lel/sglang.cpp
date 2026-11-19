@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_sampling.h"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace sglang::decoder {
@@ -29,10 +30,11 @@ TargetVerification::TargetVerification(Request& request, int capacity, int prefi
       capacity_(capacity), valid_prefix_(prefix) {
     auto& memory = request.memory;
     auto& host_owner = memory.transfers().verification_results;
+    const int reserved = std::max(request.kv_limit, request.pages.page_count * mxfp8_page_size);
     if (!stream_ || (memory.stream() && memory.stream() != stream_) ||
         memory.graph() || host_owner || rows < 1 ||
         rows > target_verify_max_rows || prefix < 0 || prefix > capacity ||
-        capacity > request.pages.page_count * mxfp8_page_size) {
+        capacity > reserved) {
         throw std::invalid_argument("Invalid target verification storage");
     }
     allocate_gdn(memory, tail_);
@@ -65,7 +67,8 @@ TargetVerification::TargetVerification(Request& request, int capacity, int prefi
 void TargetVerification::begin(int position, int count, cudaStream_t stream) {
     if (stream != stream_ || pending_rows_ != 0 ||
         position != valid_prefix_ || count < 1 ||
-        count > static_cast<int>(work_.size()) || count > capacity_ - position) {
+        count > static_cast<int>(work_.size()) || count > capacity_ - position ||
+        count > request_.pages.page_count * mxfp8_page_size - position) {
         throw std::invalid_argument("Invalid target verification interval");
     }
     pending_rows_ = count;

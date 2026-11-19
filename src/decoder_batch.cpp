@@ -387,7 +387,7 @@ struct DecoderBatch::State {
                          DecoderBatchStepStats& stats);
     void draft_proposals(DraftRound* rounds, int count, int longest);
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring, Steps&);
-    std::size_t reserve(const DecoderOptions& request, int prompt, std::size_t media_bytes) const;
+    std::size_t reserve(DecoderOptions& request, int prompt, std::size_t media_bytes) const;
     void initialize(Lane& lane);
     void drain(const char* operation, std::optional<Lane>* lane = nullptr) {
         try {
@@ -455,7 +455,7 @@ int DecoderBatch::admit_multimodal(int slot, std::vector<int> prompt, const Deco
     return admit_impl(slot, std::move(prompt), options, &media);
 }
 
-std::size_t DecoderBatch::State::reserve(const DecoderOptions& request, int prompt,
+std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
                                          std::size_t media_bytes) const {
     if (!options.resident_memory_limit) {
         return 0;
@@ -466,12 +466,13 @@ std::size_t DecoderBatch::State::reserve(const DecoderOptions& request, int prom
     }
     const auto free = available_device_bytes();
     const auto unreserved = free - std::min(free, decoder_shared_reserve);
-    const auto needed = media_bytes + request_resident_bytes(prompt + request.max_new_tokens - 1,
+    request.max_new_tokens = limit_resident_output(
+        prompt, request, resident_capacity, std::min(unreserved, resident_capacity - charged),
+        media_bytes);
+    request.incremental_kv = false;
+    return media_bytes + request_resident_bytes(prompt + request.max_new_tokens - 1,
         reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
         request.mtp_steps != 0);
-    check_resident_capacity(needed, resident_capacity,
-                            std::min(unreserved, resident_capacity - charged));
-    return needed;
 }
 
 void DecoderBatch::State::initialize(Lane& lane) {
@@ -481,7 +482,8 @@ void DecoderBatch::State::initialize(Lane& lane) {
     if (opts.mtp_steps != 0) {
         lane.draft = std::make_unique<MtpDraftRequest>(model.mtp_weights, lane.capacity());
     }
-    lane.request->initialize(lane.capacity(), stream);
+    lane.request->initialize(opts.incremental_kv ? prompt : lane.capacity(), stream,
+                             opts.incremental_kv ? lane.capacity() : 0);
     if (lane.media) {
         lane.media_prefill = upload_media_positions(*lane.request, *lane.media, stream);
     } else if (auto& cache = storage->prefix_cache; cache && !lane.draft) {
@@ -507,10 +509,11 @@ void DecoderBatch::State::initialize(Lane& lane) {
     check(cudaStreamSynchronize(stream), "Initialize decoder batch slot");
 }
 
-int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& options,
+int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& requested,
                              const std::vector<DecoderMedia>* media) {
     state_->require_ready();
     auto& lane = state_->slot_at(slot);
+    auto options = requested;
     if (lane || options.top_logits != 0) {
         throw std::invalid_argument("Decoder batch requires an empty slot and no top logits");
     }
@@ -540,6 +543,9 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         reclaim_prefill_workspaces(state_->model.device);
         const auto resident = state_->reserve(options, static_cast<int>(prompt.size()),
             input ? input->prompt.positions.size() * sizeof(MropePosition) : 0);
+        if (options.max_new_tokens != requested.max_new_tokens) {
+            validate_request(prompt, options, !media);
+        }
         auto request = std::make_unique<Request>(state_->model.device);
         lane.emplace(Lane{std::move(request), std::move(prompt), options});
         if (options.samples()) lane->sampling = request_sampling(options);
@@ -691,6 +697,10 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             ? decode[slot] : lane.proposals() + 1;
         if (rows[slot] == 0 && decode_rows == 0) {
             continue;
+        }
+        if (lane.options.incremental_kv) {
+            lane.request->grow_kv(lane.position + std::max(rows[slot], decode_rows),
+                                  lane.position, stream);
         }
         results[slot].decode = remaining == 0;
         contains_mtp = contains_mtp || lane.draft != nullptr;

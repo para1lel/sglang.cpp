@@ -6,7 +6,7 @@ Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finit
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP request | Validate the constraint fields and compile with the checkpoint tokenizer. | [Request validation](../apps/server/text_request.cpp#L155)<!-- prefix: "void set_con" --> |
+| HTTP request | Validate the constraint fields and compile with the checkpoint tokenizer. | [Request validation](../apps/server/text_request.cpp#L179)<!-- prefix: "void set_con" --> |
 | Regular expression compiler | Build the token transition table and compute the minimum budget. | [Tokenizer compiler](../src/tokenizer/regex_constraint.cpp#L67)<!-- prefix: "std::shared_" --> |
 | Schema compiler | Convert the supported schema to a token constraint. | [Schema compiler](../src/tokenizer/json_schema.cpp#L267)<!-- prefix: "std::shared_" --> |
 | Decoder | Apply the request cursor to target scores and commit the selected ID. | [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [Cursor update](../include/sglang/decoder_constraint.h#L95)<!-- prefix: "bool commit(" --> |
@@ -76,7 +76,7 @@ Send `response_format` with `POST /v1/chat/completions`. For `POST /v1/completio
 }
 ```
 
-`response_format` contains exactly `type` and `json_schema`. The descriptor requires `schema`. It accepts optional `strict: true`, a nonempty `name` of at most 64 bytes, and `description` of at most 256 bytes. A supplied `strict: false` is invalid. HTTP rejects `json_object`, `text`, and other format types. [Envelope validation](../apps/server/text_request.cpp#L121)<!-- prefix: "const json::" -->
+`response_format` contains exactly `type` and `json_schema`. The descriptor requires `schema`. It accepts optional `strict: true`, a nonempty `name` of at most 64 bytes, and `description` of at most 256 bytes. A supplied `strict: false` is invalid. HTTP rejects `json_object`, `text`, and other format types. [Envelope validation](../apps/server/text_request.cpp#L145)<!-- prefix: "const json::" -->
 
 | Schema | Supported output |
 | --- | --- |
@@ -98,7 +98,7 @@ Each request owns its cursor. The cursor excludes tokens that cannot lead to a m
 
 A match with no continuation stops immediately. Acceptance at the last allowed token also stops. Neither case adds EOS. With budget left at a match that can continue, either model EOS ID can compete with valid continuations. A selected EOS counts in usage and diagnostic IDs. Its text is omitted. A nullable regex with `max_tokens: 0` returns no IDs and `finish_reason: "length"`. A completed match during decoding returns `stop`.
 
-HTTP 400 covers conflicting constraints, invalid input, compiler limits, and an impossible token budget. Omit `stop_token_ids` entirely. Leave `ignore_eos` false. Constraints use K0 even when the server has positive MTP depth. The benchmark model and HTTP media chat reject `regex` and `response_format`. A full prefix hit uses the new request's constraint and seed for its first eager selection. [Prefix reuse](prefix-cache.md#runtime-path)
+HTTP 400 covers conflicting constraints, invalid input, compiler limits, and an impossible token budget. Omit `stop_token_ids` entirely. Leave `ignore_eos` false. Omit nonempty text stops. Constraints use K0 even when the server has positive MTP depth. The benchmark model and HTTP media chat reject `regex` and `response_format`. A full prefix hit uses the new request's constraint and seed for its first eager selection. [Prefix reuse](prefix-cache.md#runtime-path)
 
 C++ callers can use `TokenConstraint::compile_regex(tokenizer, pattern)` with the checkpoint tokenizer. Use the [shared C++ constraint options](text-serving.md#finite-choice-constraints) and set `mtp_steps = 0`.
 

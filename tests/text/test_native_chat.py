@@ -18,6 +18,7 @@ RAW = "/v1/completions"
 FIXTURE = Path(__file__).with_name("chat-layer1.json")
 CHECKPOINT = Path("/data0/shared") / MODEL
 HEADERS = {"Content-Type": "application/json", "Connection": "close"}
+GREEDY = {"temperature": 0.0, "seed": 0}
 
 
 def request(port, route, body):
@@ -192,14 +193,15 @@ def tokenizer_pieces(checkpoint):
 
 def chat_body(case, count):
     return case["body"] | {
-        "model": MODEL, "max_tokens": count, "return_token_ids": True, "ignore_eos": True
+        "model": MODEL, "max_tokens": count, "return_token_ids": True, "ignore_eos": True,
+        **GREEDY,
     }
 
 
 def raw_body(case, count):
     return {
         "model": MODEL, "prompt": case["rendered"], "max_tokens": count,
-        "ignore_eos": True, "return_token_ids": True,
+        "ignore_eos": True, "return_token_ids": True, **GREEDY,
     }
 
 
@@ -277,10 +279,18 @@ class NativeChatTest(unittest.TestCase):
         self.assertEqual(raw_choice["token_ids"], tokens)
         self.assertEqual(raw_choice["text"], text)
         usage(raw, len(ids), len(tokens))
-        stopped = body | {"stop_token_ids": [tokens[0]]}
+        stopped = body | {"ignore_eos": False, "stop_token_ids": [tokens[0]]}
         self.assertEqual(chat_json(self.port, stopped, ids)[1:], ([tokens[0]], "", "stop"))
         stopped_stream = stopped | {"stream_options": {"include_usage": True}}
         self.assertEqual(chat_sse(self.port, stopped_stream, ids)[1:], ([tokens[0]], "", "stop"))
+        text_stop = body | {"stop": [text[0]]}
+        _, text_stop_ids, stopped_text, stopped_reason = chat_json(self.port, text_stop, ids)
+        self.assertEqual((stopped_text, stopped_reason), ("", "stop"))
+        self.assertTrue(text_stop_ids)
+        self.assertEqual(text_stop_ids, tokens[:len(text_stop_ids)])
+        self.assertEqual(chat_sse(self.port, text_stop | {
+            "stream_options": {"include_usage": True}
+        }, ids)[1:], (text_stop_ids, stopped_text, stopped_reason))
         empty = chat_body(case, 0)
         del empty["max_tokens"]
         empty.update(max_completion_tokens=0, stream_options={"include_usage": False})
@@ -344,7 +354,6 @@ class NativeChatTest(unittest.TestCase):
             (valid | {"messages": [user, {"role": "assistant", "tool_calls": [
                 {"function": {"name": "lookup", "arguments": "[0]"}}
             ]}]}, "arguments must be an object"),
-            (valid | {"max_completion_tokens": 1}, "Use one of"),
             (valid | {"max_tokens": 262144}, "262144-token context"),
             (valid | {"reasoning_effort": "LOW"}, "Unexpected reasoning effort"),
             (valid | {"tool_choice": "AUTO"}, "Unsupported tool_choice"),
@@ -353,7 +362,8 @@ class NativeChatTest(unittest.TestCase):
             (valid | {"top_k": -2}, "top_k must be -1"),
             (valid | {"seed": 1 << 63}, "signed 64-bit integer"),
             (valid | {"n": 2}, "n=1"),
-            (valid | {"stop": ["x"]}, "Unsupported chat completion option"),
+            (valid | {"stop": [1]}, "Expected a nonempty stop string"),
+            (valid | {"stop": [""]}, "Expected a nonempty stop string"),
             (valid | {"stream_options": {"include_usage": True}}, "for a stream"),
             (valid | {"stop_token_ids": [248320]}, "outside the vocabulary"),
         ]

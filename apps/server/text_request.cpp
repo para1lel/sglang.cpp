@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <fstream>
+#include <iterator>
 #include <limits>
 
 namespace sglang::server {
@@ -29,12 +31,8 @@ bool read_bool(const json::Object& object, std::string_view key) {
     return *result;
 }
 
-int text_budget(const json::Object& object) {
-    const auto* value = json::get(object, "max_tokens");
-    if (!value) {
-        return 16;
-    }
-    const auto budget = value->unsigned_integer();
+int text_budget(const json::Value& value) {
+    const auto budget = value.unsigned_integer();
     if (!budget) {
         bad_request("Expected a nonnegative integer max_tokens");
     }
@@ -45,7 +43,8 @@ int text_budget(const json::Object& object) {
 }
 
 void set_stops(const json::Object& object, DecoderOptions& options) {
-    if (!read_bool(object, "ignore_eos")) {
+    const bool ignore_eos = read_bool(object, "ignore_eos");
+    if (!ignore_eos) {
         options.additional_stop_token_ids = {end_of_text, end_of_message};
     }
     if (const auto* value = json::get(object, "stop_token_ids")) {
@@ -58,9 +57,34 @@ void set_stops(const json::Object& object, DecoderOptions& options) {
             if (!id || *id >= model_vocab_size) {
                 bad_request("Stop token ID falls outside the vocabulary");
             }
-            options.additional_stop_token_ids.insert(static_cast<int>(*id));
+            if (!ignore_eos) {
+                options.additional_stop_token_ids.insert(static_cast<int>(*id));
+            }
         }
     }
+}
+
+std::vector<std::string> stop_text(const json::Object& object) {
+    const auto* value = json::get(object, "stop");
+    if (!value || value->is_null()) {
+        return {};
+    }
+    std::vector<std::string> stops;
+    const auto append = [&](const json::Value& item) {
+        const auto text = item.string();
+        if (!text || text->empty()) {
+            bad_request("Expected a nonempty stop string");
+        }
+        stops.emplace_back(*text);
+    };
+    if (const auto* array = value->array()) {
+        for (const auto& item : *array) {
+            append(item);
+        }
+    } else {
+        append(*value);
+    }
+    return stops;
 }
 
 void set_sampling(const json::Object& object, DecoderOptions& options) {
@@ -106,7 +130,7 @@ void set_sampling(const json::Object& object, DecoderOptions& options) {
             bad_request("top_k must be -1 or a positive integer");
         }
     }
-    if (const auto* value = json::get(object, "seed")) {
+    if (const auto* value = json::get(object, "seed"); value && !value->is_null()) {
         const auto positive = value->unsigned_integer();
         options.seed = value->signed_integer();
         if (positive && *positive <= std::numeric_limits<std::int64_t>::max()) {
@@ -190,11 +214,20 @@ void set_constraint(const json::Object& object, const CompletionTokenizer& token
     }
 }
 
-TextRequest text_options(const json::Object& object, const CompletionTokenizer& tokenizer) {
+TextRequest text_options(const json::Object& object, const CompletionTokenizer& tokenizer,
+                         bool chat) {
     TextRequest request;
+    request.chat = chat;
     request.stream = read_bool(object, "stream");
     request.return_token_ids = read_bool(object, "return_token_ids");
-    request.options.max_new_tokens = text_budget(object);
+    request.options.temperature = 1.0;
+    if (chat) {
+        request.options = tokenizer.chat_sampling_defaults();
+    }
+    const auto* budget = json::get(object, "max_tokens");
+    request.options.incremental_kv = chat && (!budget || budget->is_null());
+    request.options.max_new_tokens = request.options.incremental_kv ? 0 :
+        (budget ? text_budget(*budget) : 16);
     if (const auto* value = json::get(object, "stream_options")) {
         const auto* options = value->object();
         if (!request.stream || !options || options->size() != 1 ||
@@ -204,10 +237,27 @@ TextRequest text_options(const json::Object& object, const CompletionTokenizer& 
         request.include_usage = read_bool(*options, "include_usage");
     }
     set_stops(object, request.options);
+    request.stop_text = stop_text(object);
     set_sampling(object, request.options);
-    set_constraint(object, tokenizer, request.options);
     set_cache_salt(object, request.options);
     return request;
+}
+
+void finish_options(TextRequest& request, const json::Object& object,
+                    const CompletionTokenizer& tokenizer) {
+    if (request.options.incremental_kv) {
+        constexpr int chat_token_limit = checkpoint_context - 2;
+        constexpr int chat_prompt_limit = checkpoint_context - 6;
+        if (request.prompt.size() >= chat_prompt_limit) {
+            bad_request("Prompt must fit within the 262144-token context");
+        }
+        request.options.max_new_tokens =
+            chat_token_limit - static_cast<int>(request.prompt.size());
+    }
+    set_constraint(object, tokenizer, request.options);
+    if (request.options.constraint && !request.stop_text.empty()) {
+        bad_request("Text stops cannot be combined with a response constraint");
+    }
 }
 
 void validate_prompt(std::string_view prompt) {
@@ -229,7 +279,8 @@ void encode_prompt(TextRequest& request, std::string_view prompt,
 
 bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
-        key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids" ||
+        key == "ignore_eos" || key == "stop_token_ids" || key == "stop" ||
+        key == "return_token_ids" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
         key == "min_p" || key == "ebnf" || key == "regex" || key == "response_format" ||
         key == "cache_salt";
@@ -246,8 +297,9 @@ TextRequest parse_text(const json::Object& object, const CompletionTokenizer& to
     }
     const auto prompt = json::get_string(object, "prompt").value_or("");
     validate_prompt(prompt);
-    auto request = text_options(object, tokenizer);
+    auto request = text_options(object, tokenizer, false);
     encode_prompt(request, prompt, tokenizer);
+    finish_options(request, object, tokenizer);
     return request;
 }
 
@@ -265,13 +317,15 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
             bad_request("Decoded media chat does not support JSON Schema constraints");
         } else if (media && key == "cache_salt") {
             bad_request("Decoded media chat does not support cache_salt");
+        } else if ((key == "temperature" || key == "top_p" || key == "top_k" ||
+                    key == "min_p" || key == "seed") && value.is_null()) {
+            continue;
         } else if (is_text_option(key)) {
             options.emplace(key, value);
         } else if (key == "max_completion_tokens") {
-            if (json::get(chat, "max_tokens")) {
-                bad_request("Use one of max_tokens and max_completion_tokens");
+            if (!value.is_null()) {
+                options.insert_or_assign("max_tokens", value);
             }
-            options.emplace("max_tokens", value);
         } else if (key == "n") {
             if (value.unsigned_integer() != 1) {
                 bad_request("Only n=1 is supported");
@@ -293,22 +347,32 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
     return options;
 }
 
-void normalize_media_options(json::OrderedObject& chat) {
+void normalize_template_options(json::OrderedObject& chat) {
     const auto kwargs = std::find_if(chat.begin(), chat.end(), [](const auto& field) {
         return field.first == "chat_template_kwargs";
     });
     if (kwargs == chat.end()) {
         return;
     }
-    const auto* object = kwargs->second.ordered_object();
-    const auto* thinking = object ? json::get(*object, "enable_thinking") : nullptr;
-    if (!thinking || object->size() != 1 || !thinking->boolean() ||
-        json::get(chat, "enable_thinking")) {
-        bad_request("Use one boolean enable_thinking setting for decoded media chat");
+    if (kwargs->second.is_null()) {
+        chat.erase(kwargs);
+        return;
     }
-    const auto setting = *thinking->boolean();
-    kwargs->first = "enable_thinking";
-    kwargs->second = setting;
+    const auto* object = kwargs->second.ordered_object();
+    if (!object) {
+        bad_request("Expected a chat_template_kwargs object");
+    }
+    auto settings = *object;
+    chat.erase(kwargs);
+    for (auto& [key, value] : settings) {
+        if (key != "enable_thinking" && key != "preserve_thinking" &&
+            key != "reasoning_effort" && key != "add_vision_id") {
+            bad_request("Unsupported chat_template_kwargs option");
+        }
+        if (!json::get(chat, key)) {
+            chat.emplace_back(std::move(key), std::move(value));
+        }
+    }
 }
 
 json::Value parse_body(std::string_view body, json::Syntax syntax) {
@@ -321,8 +385,9 @@ json::Value parse_body(std::string_view body, json::Syntax syntax) {
 
 }
 
-CompletionTokenizer::CompletionTokenizer(const std::filesystem::path& checkpoint)
-    : checkpoint_(checkpoint) {}
+CompletionTokenizer::CompletionTokenizer(const std::filesystem::path& checkpoint,
+                                         SamplingDefaults sampling)
+    : checkpoint_(checkpoint), sampling_mode_(sampling) {}
 
 CompletionTokenizer::~CompletionTokenizer() = default;
 
@@ -338,6 +403,32 @@ const ChatTemplate& CompletionTokenizer::chat_template() const {
         chat_template_ = std::make_unique<const ChatTemplate>(checkpoint_);
     });
     return *chat_template_;
+}
+
+const DecoderOptions& CompletionTokenizer::chat_sampling_defaults() const {
+    std::call_once(sampling_loaded_, [this] {
+        const auto path = checkpoint_ / "generation_config.json";
+        auto defaults = std::make_unique<DecoderOptions>();
+        defaults->temperature = 1.0;
+        if (sampling_mode_ == SamplingDefaults::openai || !std::filesystem::exists(path)) {
+            sampling_defaults_ = std::move(defaults);
+            return;
+        }
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) {
+            throw std::runtime_error("Cannot open checkpoint generation config: " + path.string());
+        }
+        const std::string contents{std::istreambuf_iterator<char>(stream), {}};
+        const auto config = json::parse(contents);
+        const auto* object = config.object();
+        if (!object) {
+            throw std::runtime_error("Expected a checkpoint generation config object");
+        }
+        set_sampling(*object, *defaults);
+        defaults->seed.reset();
+        sampling_defaults_ = std::move(defaults);
+    });
+    return *sampling_defaults_;
 }
 
 TextRequest parse_text_request(const json::Object& body, const CompletionTokenizer& tokenizer) {
@@ -362,13 +453,11 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
         bad_request("Expected a JSON object for a chat request");
     }
     auto media = parse_chat_media(*chat, media_enabled);
-    if (media) {
-        normalize_media_options(media->chat);
-        chat = &media->chat;
-    }
-    auto request = text_options(chat_text_options(*chat, media.has_value()), tokenizer);
-    request.chat = true;
-    const auto prompt = tokenizer.chat_template().render(*chat, ChatInput::http);
+    auto normalized = media ? std::move(media->chat) : *chat;
+    normalize_template_options(normalized);
+    const auto options = chat_text_options(normalized, media.has_value());
+    auto request = text_options(options, tokenizer, true);
+    const auto prompt = tokenizer.chat_template().render(normalized, ChatInput::http);
     validate_prompt(prompt);
     encode_prompt(request, prompt, tokenizer);
     if (media) {
@@ -383,6 +472,7 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
             bad_request("Expanded prompt and output budget must fit the 262144-token context");
         }
     }
+    finish_options(request, options, tokenizer);
     return request;
 }
 

@@ -29,7 +29,8 @@ def check(condition, message):
 
 def raw(prompt, budget, **options):
     return {"model": MODEL, "prompt": prompt, "max_tokens": budget,
-            "return_token_ids": True, "ignore_eos": True, **options}
+            "return_token_ids": True, "ignore_eos": True, "temperature": 0.0, "seed": 0,
+            **options}
 
 
 def legacy(prompt, budget, **options):
@@ -225,7 +226,7 @@ def verify_terminal(port, cases, generated, pieces):
     verify_raw(port, {**han, "budget": 0}, [], [])
     verify_raw(port, {**han, "budget": split + 1}, ids, chunks)
     verify_raw(port, {**han, "budget": split + 1}, ids, [*chunks[:-1], b""], reason="stop",
-               overrides={"stop_token_ids": [ids[-1]]})
+               overrides={"ignore_eos": False, "stop_token_ids": [ids[-1]]})
 
     chat_ids = generated["chatml"]
     eos = next(index for index, token in enumerate(chat_ids) if token in EOS)

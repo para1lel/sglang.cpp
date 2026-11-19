@@ -73,7 +73,8 @@ struct CudaError : std::runtime_error {
 std::size_t available_device_bytes();
 int reserved_verification_rows(int output, int mtp_steps);
 std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft);
-void check_resident_capacity(std::size_t requested, std::size_t total, std::size_t free);
+int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t total_bytes,
+                          std::size_t free_bytes, std::size_t extra_bytes);
 void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
                       bool allow_mtp = false);
 
@@ -119,6 +120,8 @@ public:
     cudaStream_t stream() const;
     cudaGraphExec_t graph() const;
     void capture_graph(const std::function<void()>& enqueue);
+    void discard_graph();
+    void free_block(void* pointer, std::size_t bytes);
     bool replay_batch_graph(int width, const std::function<void()>& prepare,
                             const std::function<void()>& capture,
                             const std::function<bool()>& bind);
@@ -223,9 +226,11 @@ void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
 
 struct Request {
     explicit Request(int device, bool reusable = false);
-    Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false);
+    Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false,
+            int kv_limit = 0);
 
-    void initialize(int capacity, cudaStream_t stream);
+    void initialize(int capacity, cudaStream_t stream, int kv_limit = 0);
+    void grow_kv(int positions, int written, cudaStream_t stream);
     void reset(cudaStream_t stream);
     void reset();
     ExactGqaWorkspace batch_graph_scores();
@@ -235,6 +240,7 @@ struct Request {
     int* decode_position;
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
+    int kv_limit = 0;
     GdnBank states;
     std::optional<ExactGqaWorkspace> long_graph_scores;
     std::byte* sampling_workspace = nullptr;

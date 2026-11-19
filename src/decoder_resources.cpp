@@ -59,30 +59,39 @@ void zero(Element* buffer, std::size_t count, cudaStream_t stream) {
     check(cudaMemsetAsync(buffer, 0, count * sizeof(Element), stream), "Reset request state");
 }
 
-void allocate_kv(Request& request, int capacity, cudaStream_t stream) {
-    const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
-    auto* table = request.memory.allocate<std::int32_t>(page_count);
+int pages_for(int capacity) {
+    return (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
+}
+
+std::size_t kv_bytes(int pages) {
+    return 2 * full_attention_layers * pages *
+        (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
+}
+
+std::array<Mxfp8KvCache, full_attention_layers> allocate_kv(Allocations& memory, int page_count) {
     const auto payload_per_layer = page_count * mxfp8_payload_bytes_per_page;
     const auto scales_per_layer = page_count * mxfp8_scale_bytes_per_page;
     const auto scale_bytes = full_attention_layers * scales_per_layer;
-    auto* keys = request.memory.allocate<std::uint8_t>(full_attention_layers * payload_per_layer);
-    auto* values = request.memory.allocate<std::uint8_t>(full_attention_layers * payload_per_layer);
-    auto* key_scales = request.memory.allocate<std::uint8_t>(scale_bytes);
-    auto* val_scales = request.memory.allocate<std::uint8_t>(scale_bytes);
+    const auto payload_bytes = full_attention_layers * payload_per_layer;
+    auto* keys = memory.allocate<std::uint8_t>(kv_bytes(page_count));
+    auto* values = keys + payload_bytes;
+    auto* key_scales = values + payload_bytes;
+    auto* val_scales = key_scales + scale_bytes;
+    std::array<Mxfp8KvCache, full_attention_layers> caches;
     for (int index = 0; index < full_attention_layers; ++index) {
-        request.caches[index] = {
+        caches[index] = {
             keys + index * payload_per_layer, values + index * payload_per_layer,
             key_scales + index * scales_per_layer, val_scales + index * scales_per_layer,
             page_count,
         };
     }
-    auto& logical_pages = request.memory.transfers().logical_pages;
-    logical_pages.resize(page_count);
-    std::iota(logical_pages.begin(), logical_pages.end(), 0);
-    check(cudaMemcpyAsync(table, logical_pages.data(), logical_pages.size() * sizeof(std::int32_t),
-                          cudaMemcpyHostToDevice, stream),
-          "Upload MXFP8 page table");
-    request.pages = {table, page_count};
+    return caches;
+}
+
+void copy_kv_plane(std::uint8_t* destination, const std::uint8_t* source, std::size_t bytes,
+                   cudaStream_t stream) {
+    check(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, stream),
+          "Copy MXFP8 cache during growth");
 }
 
 }
@@ -306,25 +315,42 @@ std::size_t request_resident_bytes(int capacity, int verification_rows, bool dra
     constexpr std::size_t gdn_bytes = gdn_layers *
         (gdn_history_elements * sizeof(Bf16) + gdn_state_elements * sizeof(float));
     constexpr std::size_t workspace_allowance = 16 * 1024 * 1024;
-    const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
-    const auto kv_per_layer = 2 * pages *
-        (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
-    const auto table = pages * sizeof(std::int32_t);
-    const auto target = full_attention_layers * kv_per_layer + table + gdn_bytes;
-    const auto draft_kv = kv_per_layer + table;
+    const int pages = pages_for(capacity);
+    const auto target = kv_bytes(pages) + pages * sizeof(std::int32_t) + gdn_bytes;
+    const auto draft_kv = kv_bytes(pages) / full_attention_layers + pages * sizeof(std::int32_t);
     const auto verifier = verification_rows ? gdn_bytes + verification_rows * workspace_allowance
                                             : 0;
     return target + workspace_allowance + (draft ? draft_kv + workspace_allowance : 0) + verifier;
 }
 
-void check_resident_capacity(std::size_t requested, std::size_t total, std::size_t free) {
-    if (requested > total) {
+int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t total_bytes,
+                          std::size_t free_bytes, std::size_t extra_bytes) {
+    const auto fits = [&](int output, std::size_t bytes) {
+        const auto resident = request_resident_bytes(
+            prompt + output - 1, reserved_verification_rows(output, options.mtp_steps),
+            options.mtp_steps != 0);
+        return resident + extra_bytes <= bytes;
+    };
+    int output = options.max_new_tokens;
+    if (options.incremental_kv) {
+        int low = 0;
+        while (low < output) {
+            const int middle = low + (output - low + 1) / 2;
+            if (fits(middle, total_bytes)) {
+                low = middle;
+            } else {
+                output = middle - 1;
+            }
+        }
+    }
+    if (output == 0 || !fits(output, total_bytes)) {
         throw DecoderCapacityError("Prompt and output budget exceed resident decoder capacity",
                                    false);
     }
-    if (requested > free) {
+    if (!fits(output, free_bytes)) {
         throw DecoderCapacityError("Insufficient free resident decoder memory. Retry later.", true);
     }
+    return output;
 }
 
 DeviceScope::DeviceScope(int device) {
@@ -487,6 +513,27 @@ void Allocations::close() {
     state_->release(drained_owners).raise();
 }
 
+void Allocations::discard_graph() {
+    state_->destroy_executable(state_->graph).raise();
+    state_->destroy_capture(state_->capture).raise();
+}
+
+void Allocations::free_block(void* pointer, std::size_t bytes) {
+    auto& blocks = state_->blocks;
+    const auto block = std::find(blocks.begin() + state_->uncertain_blocks, blocks.end(), pointer);
+    if (block == blocks.end()) {
+        throw std::logic_error("Unknown decoder allocation");
+    }
+    const CleanupError freed{cudaFree(pointer), "Free replaced decoder allocation"};
+    if (freed) {
+        state_->uncertain = freed;
+        std::iter_swap(blocks.begin() + state_->uncertain_blocks++, block);
+        state_->failure(freed).raise();
+    }
+    blocks.erase(block);
+    state_->bytes -= bytes;
+}
+
 void* Allocations::allocate_bytes(std::size_t bytes) {
     if (bytes > std::numeric_limits<std::size_t>::max() - state_->bytes) {
         throw std::overflow_error("CUDA allocation total overflow");
@@ -579,15 +626,61 @@ void allocate_gdn(Allocations& memory, GdnBank& states) {
 Request::Request(int device, bool reusable)
     : memory(device), work(memory), decode_position(reusable ? memory.allocate<int>(1) : nullptr) {}
 
-Request::Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable)
+Request::Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable,
+                 int maximum_kv)
     : Request(device, reusable) {
     memory.open_stream(std::move(owners));
-    initialize(capacity, memory.stream());
+    initialize(capacity, memory.stream(), maximum_kv);
 }
 
-void Request::initialize(int capacity, cudaStream_t stream) {
-    allocate_kv(*this, capacity, stream);
+void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv) {
+    kv_limit = maximum_kv;
+    const int page_count = pages_for(capacity);
+    const int table_pages = std::max(page_count, pages_for(maximum_kv));
+    auto* table = memory.allocate<std::int32_t>(table_pages);
+    auto& logical_pages = memory.transfers().logical_pages;
+    logical_pages.resize(table_pages);
+    std::iota(logical_pages.begin(), logical_pages.end(), 0);
+    check(cudaMemcpyAsync(table, logical_pages.data(), table_pages * sizeof(std::int32_t),
+                          cudaMemcpyHostToDevice, stream), "Upload MXFP8 page table");
+    pages = {table, page_count};
+    caches = allocate_kv(memory, page_count);
     allocate_gdn(memory, states);
+}
+
+void Request::grow_kv(int positions, int written, cudaStream_t stream) {
+    const int needed = pages_for(positions);
+    const int previous = pages.page_count;
+    if (needed <= previous) {
+        return;
+    }
+    if (positions > kv_limit || written > previous * mxfp8_page_size) {
+        throw std::logic_error("Invalid decoder KV cache growth");
+    }
+    const int next = std::min(pages_for(kv_limit), std::max(needed, 2 * previous));
+    const auto replacement = allocate_kv(memory, next);
+    if (written) {
+        const auto payload = pages_for(written) * mxfp8_payload_bytes_per_page;
+        const auto scales = pages_for(written) * mxfp8_scale_bytes_per_page;
+        for (int layer = 0; layer < full_attention_layers; ++layer) {
+            const auto& old = caches[layer];
+            const auto& fresh = replacement[layer];
+            copy_kv_plane(fresh.key_payload, old.key_payload, payload, stream);
+            copy_kv_plane(fresh.value_payload, old.value_payload, payload, stream);
+            copy_kv_plane(fresh.key_scales, old.key_scales, scales, stream);
+            copy_kv_plane(fresh.value_scales, old.value_scales, scales, stream);
+        }
+    }
+    check(cudaStreamSynchronize(stream), "Complete MXFP8 cache growth");
+    memory.discard_graph();
+    memory.free_block(caches.front().key_payload, kv_bytes(previous));
+    if (long_graph_scores && long_graph_scores->scores) {
+        memory.free_block(long_graph_scores->scores,
+                          long_graph_scores->capacity * mxfp8_query_heads * sizeof(float));
+    }
+    long_graph_scores.reset();
+    caches = replacement;
+    pages.page_count = next;
 }
 
 void Request::reset(cudaStream_t stream) {

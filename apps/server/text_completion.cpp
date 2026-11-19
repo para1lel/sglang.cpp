@@ -5,6 +5,7 @@
 #include "sglang/server/http.h"
 #include "sglang/utf8.h"
 
+#include <algorithm>
 #include <atomic>
 #include <ctime>
 #include <iostream>
@@ -60,7 +61,9 @@ const char* finish_reason(const TextRequest& request, const DecoderResult& resul
     if (result.finish_reason == DecoderFinishReason::stop && stop_matched && count <= budget) {
         return "stop";
     }
-    if (result.finish_reason == DecoderFinishReason::length && !stop_matched && count == budget) {
+    const bool reached_limit = count == budget ||
+        (request.options.incremental_kv && count > 0 && count < budget);
+    if (result.finish_reason == DecoderFinishReason::length && !stop_matched && reached_limit) {
         return "length";
     }
     throw std::logic_error("Decoder returned an inconsistent completion");
@@ -75,8 +78,10 @@ public:
     bool token(int id);
     void finish(const DecoderResult& result);
     bool started() const { return streaming_; }
+    bool stopped() const { return text_stopped_; }
 
 private:
+    std::string filter_stop(std::string_view delta, bool final = false);
     void append_media_prompt_ids(std::string& output) const;
     void append_text(std::string& output, std::string_view text, bool finished) const;
     std::string choice(std::string_view text, const int* ids, std::size_t count,
@@ -91,6 +96,8 @@ private:
     const std::string prefix_;
     Utf8Stream utf8_;
     std::string text_;
+    std::string pending_stop_;
+    bool text_stopped_ = false;
     bool streaming_ = false;
 };
 
@@ -159,19 +166,52 @@ bool TextResponse::event(std::string_view data) {
     return streaming_ && write_event(connection_, data);
 }
 
+std::string TextResponse::filter_stop(std::string_view delta, bool final) {
+    if (request_.stop_text.empty()) {
+        return std::string(delta);
+    }
+    if (text_stopped_) {
+        return {};
+    }
+    pending_stop_ += delta;
+    std::size_t stop_position = std::string::npos;
+    std::size_t held = 0;
+    for (const auto& stop : request_.stop_text) {
+        stop_position = std::min(stop_position, pending_stop_.find(stop));
+        if (!final && stop_position == std::string::npos) {
+            const std::string_view pending = pending_stop_;
+            for (auto size = std::min(stop.size() - 1, pending.size()); size > held; --size) {
+                if (pending.substr(pending.size() - size) ==
+                    std::string_view(stop).substr(0, size)) {
+                    held = size;
+                    break;
+                }
+            }
+        }
+    }
+    text_stopped_ = stop_position != std::string::npos;
+    const auto ready = text_stopped_ ? stop_position : pending_stop_.size() - held;
+    auto output = pending_stop_.substr(0, ready);
+    pending_stop_.erase(0, ready);
+    return output;
+}
+
 bool TextResponse::token(int id) {
     std::string delta;
     if (!request_.options.stops_at(id)) {
         delta = utf8_.push(tokenizer_.piece(id, true));
     }
+    if (!request_.stop_text.empty()) {
+        delta = filter_stop(delta);
+    }
     if (!request_.stream) {
         text_ += delta;
-        return !disconnected(connection_);
+        return !text_stopped_ && !disconnected(connection_);
     }
     if (!delta.empty() || request_.return_token_ids) {
-        return event(choice(delta, &id, 1) + '}');
+        return event(choice(delta, &id, 1) + '}') && !text_stopped_;
     }
-    return !disconnected(connection_);
+    return !text_stopped_ && !disconnected(connection_);
 }
 
 void TextResponse::finish_stream(const char* reason, std::size_t count, std::string_view tail,
@@ -195,9 +235,9 @@ void TextResponse::finish_stream(const char* reason, std::size_t count, std::str
 }
 
 void TextResponse::finish(const DecoderResult& result) {
-    const auto reason = finish_reason(request_, result);
+    const auto tail = filter_stop(utf8_.finish(), true);
+    const auto reason = text_stopped_ ? "stop" : finish_reason(request_, result);
     const auto count = result.output_token_ids.size();
-    const auto tail = utf8_.finish();
     if (request_.stream) {
         finish_stream(reason, count, tail, result.cached_prompt_tokens);
         return;
@@ -230,7 +270,7 @@ void complete_text(const Socket& connection, const TextRequest& request,
     };
     try {
         const auto result = generate(request.prompt, request.options, callbacks);
-        if (result.finish_reason == DecoderFinishReason::cancelled) {
+        if (result.finish_reason == DecoderFinishReason::cancelled && !response.stopped()) {
             if (trace_serial) {
                 trace_batch_step(0, 0, 0);
             }

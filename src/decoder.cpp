@@ -315,6 +315,9 @@ struct Decoder::Model::MtpGeneration {
         }
         const auto stream = target.memory.stream();
         const int rows = std::min(remaining, count + 1);
+        if (options.incremental_kv) {
+            target.grow_kv(next_target_position + rows, next_target_position, stream);
+        }
         model.forward_verify(verification, next_target_position, tokens.data(), rows, stream);
         if (sampling) {
             verification.sample(*sampling, static_cast<int>(result.output_token_ids.size()),
@@ -438,7 +441,8 @@ DecoderFinishReason Decoder::Model::generate_mtp(const std::vector<int>& prompt,
                                                 DecoderResult& result) const {
     const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
     const auto draft = std::make_shared<MtpDraftRequest>(mtp_weights, capacity);
-    Request target(device, capacity, draft);
+    const int initial_kv = options.incremental_kv ? static_cast<int>(prompt.size()) : capacity;
+    Request target(device, initial_kv, draft, false, options.incremental_kv ? capacity : 0);
     prepare_serial_request(target, options);
     result.peak_device_allocation_bytes +=
         target.memory.bytes() + draft->device_allocation_bytes();
@@ -494,6 +498,10 @@ bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& pr
 
 void Decoder::Model::advance_serial(Request& request, int step, int prompt_count, int input,
                                     bool media, int rotary_delta) const {
+    const int position = prompt_count + step - 1;
+    if (step != 0 && request.kv_limit) {
+        request.grow_kv(position + 1, position, request.memory.stream());
+    }
     if (step != 0 && request.decode_position) {
         if (step == 1) {
             check(set_decode_position(request.decode_position, prompt_count,
@@ -503,7 +511,6 @@ void Decoder::Model::advance_serial(Request& request, int step, int prompt_count
         return;
     }
     if (step != 0) {
-        const int position = prompt_count + step - 1;
         if (media) {
             const ForwardLane lane{&request, input, position, TextGdnMode::decode, false,
                                    nullptr, nullptr, position + rotary_delta};
@@ -522,7 +529,9 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                                      const std::vector<int>* teacher) const {
     const auto cancelled = [&] { return callbacks.is_cancelled && callbacks.is_cancelled(); };
     const int prompt_count = static_cast<int>(prompt.size());
-    int capacity = prompt_count + options.max_new_tokens - 1;
+    const int limit = prompt_count + options.max_new_tokens - 1;
+    const int kv_limit = options.incremental_kv ? limit : 0;
+    int capacity = kv_limit ? prompt_count : limit;
     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     const auto sampling = options.samples() ? std::optional{request_sampling(options)}
                                             : std::nullopt;
@@ -530,6 +539,10 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
     std::unique_ptr<Request> eager_request;
     auto& storage = lease.owns_slot() ? decode_request : eager_request;
     try {
+        if (storage && storage->kv_limit != kv_limit) {
+            storage->memory.close();
+            storage.reset();
+        }
         if (storage && storage->pages.page_count < pages) {
             const int previous_capacity = storage->pages.page_count * mxfp8_page_size;
             capacity = std::max(capacity, std::min(2 * previous_capacity,
@@ -542,7 +555,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         } else {
             const std::shared_ptr<const void> owners = media
                 ? std::shared_ptr<const void>(media) : memory;
-            storage = std::make_unique<Request>(device, capacity, owners, lease.owns_slot());
+            storage = std::make_unique<Request>(device, capacity, owners, lease.owns_slot(),
+                                                kv_limit);
         }
         auto& request = *storage;
         prepare_serial_request(request, options);

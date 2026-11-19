@@ -152,7 +152,8 @@ def main():
     pieces = tokenizer_pieces(args.checkpoint)
     assert "\U0010fffd".encode() not in pieces.values()
     case = fixtures()[0]
-    normal = (("greedy", {}), ("sample", {"temperature": 1.1, "seed": -19, "top_k": 8}))
+    sampled = {"temperature": 1.1, "seed": -19, "top_k": 8, "top_p": 1.0, "min_p": 0.0}
+    normal = (("greedy", {}), ("sample", sampled))
     with server(args.control, args.checkpoint, args.evidence / "control", 1) as port:
         expected = {
             name: result(port, RAW, case, raw_body(case, 12) | options)

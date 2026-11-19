@@ -4,8 +4,13 @@
 #include "sglang/vision.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -14,6 +19,8 @@ namespace sglang {
 namespace {
 
 constexpr std::array<int, 7> sequence{172, 253, 239, 102, 32, 248046, 33};
+constexpr std::array<int, 7> sampling_sequence{32, 248046, 33, 248044, 34, 35, 36};
+constexpr std::size_t han_partial_prompt_tokens = 41;
 
 void validate_token_ids(const std::vector<int>& prompt, const DecoderOptions& options) {
     const auto valid = [](int token) {
@@ -27,6 +34,44 @@ void validate_token_ids(const std::vector<int>& prompt, const DecoderOptions& op
     }
 }
 
+bool sampling_probe() {
+    return std::getenv("SGLANG_TEST_SAMPLING_RECEIPTS") != nullptr;
+}
+
+void record_sampling(const DecoderOptions& options, std::size_t prompt_size) {
+    if (!sampling_probe()) {
+        return;
+    }
+    std::ostringstream output;
+    output << std::setprecision(std::numeric_limits<double>::max_digits10)
+           << "cpu sampling {\"temperature\":" << options.temperature
+           << ",\"top_k\":" << options.top_k << ",\"top_p\":" << options.top_p
+           << ",\"min_p\":" << options.min_p
+           << ",\"budget\":" << options.max_new_tokens << ",\"seed\":";
+    if (options.seed) {
+        output << *options.seed;
+    } else {
+        output << "null";
+    }
+    output << ",\"sampled\":" << (options.samples() ? "true" : "false")
+           << ",\"prompt_tokens\":" << prompt_size << ",\"stops\":[";
+    std::vector<int> stops(options.additional_stop_token_ids.begin(),
+                           options.additional_stop_token_ids.end());
+    if (options.stop_token_id) {
+        stops.push_back(*options.stop_token_id);
+    }
+    std::sort(stops.begin(), stops.end());
+    stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
+    stops.erase(std::remove_if(stops.begin(), stops.end(),
+                               [&](const auto token) { return !options.stops_at(token); }),
+                stops.end());
+    for (std::size_t index = 0; index < stops.size(); ++index) {
+        output << (index == 0 ? "" : ",") << stops[index];
+    }
+    output << "]}\n";
+    std::cerr << output.str();
+}
+
 struct Lane {
     DecoderOptions options;
     std::size_t prompt_size;
@@ -36,9 +81,12 @@ struct Lane {
         if (tokens == options.max_new_tokens) {
             return {std::nullopt, DecoderFinishReason::length, false};
         }
-        const auto index = (static_cast<std::size_t>(tokens) + prompt_size % sequence.size() +
-                            sequence.size() - 17 % sequence.size()) % sequence.size();
-        const auto token = sequence[index];
+        const auto offset = prompt_size == han_partial_prompt_tokens
+            ? 0 : (prompt_size % sequence.size() + sequence.size() - 17 % sequence.size());
+        const auto index = (static_cast<std::size_t>(tokens) + offset) % sequence.size();
+        const auto token = sampling_probe()
+            ? sampling_sequence[static_cast<std::size_t>(tokens) % sampling_sequence.size()]
+            : sequence[index];
         ++tokens;
         if (options.stops_at(token)) {
             return {token, DecoderFinishReason::stop, true};
@@ -58,17 +106,21 @@ Decoder::~Decoder() = default;
 DecoderResult Decoder::generate(const std::vector<int>& prompt, const DecoderOptions& options,
                                 const DecoderCallbacks& callbacks) const {
     validate_token_ids(prompt, options);
+    record_sampling(options, prompt.size());
     Lane lane{options, prompt.size()};
     DecoderResult result;
     while (true) {
-        const auto step = lane.step();
-        if ((callbacks.is_cancelled && callbacks.is_cancelled()) ||
-            (step.token && callbacks.on_token && !callbacks.on_token(*step.token))) {
+        if (callbacks.is_cancelled && callbacks.is_cancelled()) {
             result.finish_reason = DecoderFinishReason::cancelled;
             return result;
         }
+        const auto step = lane.step();
         if (step.token) {
             result.output_token_ids.push_back(*step.token);
+            if (callbacks.on_token && !callbacks.on_token(*step.token)) {
+                result.finish_reason = DecoderFinishReason::cancelled;
+                return result;
+            }
         }
         if (step.finish_reason) {
             result.finish_reason = *step.finish_reason;
@@ -97,16 +149,19 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
         throw std::logic_error("Invalid CPU lane admission");
     }
     lane.emplace(Lane{options, prompt.size()});
+    record_sampling(options, prompt.size());
     std::cerr << ("cpu admit slot=" + std::to_string(slot) +
                   " prompt=" + std::to_string(prompt.size()) +
                   " budget=" + std::to_string(options.max_new_tokens) + '\n');
     return 0;
 }
 
+#ifdef SGLANG_TEST_BATCH_MEDIA
 int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
                                   const std::vector<DecoderMedia>&) {
     throw std::logic_error("The CPU decoder does not accept media");
 }
+#endif
 
 void DecoderBatch::cancel(int slot) {
     auto& lane = state_->lanes.at(slot);
@@ -124,6 +179,8 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
                               DecoderBatchStepStats*) {
     std::this_thread::sleep_for(std::chrono::milliseconds(3));
     std::array<DecoderBatchStep, decoder_batch_max_lanes> result{};
+    bool has_greedy = false;
+    bool has_sampled = false;
     for (std::size_t slot = 0; slot < selected.size(); ++slot) {
         if (!selected[slot]) {
             continue;
@@ -132,10 +189,15 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
         if (!lane) {
             throw std::logic_error("Selected an empty CPU lane");
         }
+        has_greedy |= !lane->options.samples();
+        has_sampled |= lane->options.samples();
         result[slot] = lane->step();
         if (result[slot].finish_reason) {
             lane.reset();
         }
+    }
+    if (sampling_probe() && has_greedy && has_sampled) {
+        std::cerr << "cpu sampling mixed step\n";
     }
     return result;
 }
@@ -171,10 +233,12 @@ DecoderResult VisionCompletion::generate(const Decoder&, const MediaPrompt&,
     throw std::logic_error("The CPU decoder does not accept media");
 }
 
+#ifdef SGLANG_TEST_BATCH_MEDIA
 DecoderResult VisionCompletion::generate(BatchService&, int, const MediaPrompt&,
-                                         const DecoderOptions&, const DecoderCallbacks&) {
+                                        const DecoderOptions&, const DecoderCallbacks&) {
     throw std::logic_error("The CPU decoder does not accept media");
 }
+#endif
 
 }
 

@@ -22,6 +22,7 @@ using namespace sglang::server;
 struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
     sglang::Fp8PrefillPolicy fp8_prefill = sglang::Fp8PrefillPolicy::exact;
+    SamplingDefaults sampling = SamplingDefaults::model;
     int device = 0;
     int port = 17384;
     int max_active = sglang::decoder_batch_max_lanes;
@@ -73,6 +74,10 @@ Arguments parse_arguments(int argc, char** argv) {
         const std::string_view value = argv[index];
         if (option == "--checkpoint" && !value.empty()) {
             arguments.checkpoint = value;
+        } else if (option == "--sampling-defaults" && value == "model") {
+            arguments.sampling = SamplingDefaults::model;
+        } else if (option == "--sampling-defaults" && value == "openai") {
+            arguments.sampling = SamplingDefaults::openai;
         } else if (option == "--fp8-prefill") {
             arguments.fp8_prefill = sglang::cli::parse_fp8_prefill(value);
         } else if (option == "--device") {
@@ -245,7 +250,7 @@ int main(int argc, char** argv) {
         if (stopping()) {
             return 0;
         }
-        const CompletionTokenizer tokenizer(arguments.checkpoint);
+        const CompletionTokenizer tokenizer(arguments.checkpoint, arguments.sampling);
         const auto health = health_json(arguments);
         VisionCompletion vision(arguments.checkpoint, arguments.device);
         if (arguments.max_active == 1 && arguments.prefix_cache_entries == 0) {

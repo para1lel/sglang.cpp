@@ -24,11 +24,13 @@ void append_ids(std::string& output, const int* ids, std::size_t count) {
 
 namespace {
 
-void append_usage(std::string& output, std::size_t prompt, std::size_t completion) {
+void append_usage(std::string& output, std::size_t prompt, std::size_t completion,
+                  int cached_tokens) {
     output += R"(,"usage":{"prompt_tokens":)" + std::to_string(prompt);
     output += R"(,"completion_tokens":)" + std::to_string(completion);
     output += R"(,"total_tokens":)" + std::to_string(prompt + completion);
-    output += R"(,"prompt_tokens_details":{"cached_tokens":0}})";
+    output += R"(,"prompt_tokens_details":{"cached_tokens":)" +
+              std::to_string(cached_tokens) + "}}";
 }
 
 std::string response_prefix(const TextRequest& request) {
@@ -79,7 +81,8 @@ private:
     std::string choice(std::string_view text, const int* ids, std::size_t count,
                        const char* reason = nullptr) const;
     bool event(std::string_view data);
-    void finish_stream(const char* reason, std::size_t count, std::string_view tail);
+    void finish_stream(const char* reason, std::size_t count, std::string_view tail,
+                       int cached_tokens);
 
     const Socket& connection_;
     const Tokenizer& tokenizer_;
@@ -159,7 +162,8 @@ bool TextResponse::token(int id) {
     return !disconnected(connection_);
 }
 
-void TextResponse::finish_stream(const char* reason, std::size_t count, std::string_view tail) {
+void TextResponse::finish_stream(const char* reason, std::size_t count, std::string_view tail,
+                                 int cached_tokens) {
     if (!tail.empty() && !event(choice(tail, nullptr, 0) + '}')) {
         return;
     }
@@ -168,7 +172,7 @@ void TextResponse::finish_stream(const char* reason, std::size_t count, std::str
     }
     if (request_.include_usage) {
         auto usage = prefix_ + R"("choices":[])";
-        append_usage(usage, request_.prompt.size(), count);
+        append_usage(usage, request_.prompt.size(), count, cached_tokens);
         if (!event(usage + '}')) {
             return;
         }
@@ -183,12 +187,12 @@ void TextResponse::finish(const DecoderResult& result) {
     const auto count = result.output_token_ids.size();
     const auto tail = utf8_.finish();
     if (request_.stream) {
-        finish_stream(reason, count, tail);
+        finish_stream(reason, count, tail, result.cached_prompt_tokens);
         return;
     }
     text_ += tail;
     auto output = choice(text_, result.output_token_ids.data(), count, reason);
-    append_usage(output, request_.prompt.size(), count);
+    append_usage(output, request_.prompt.size(), count, result.cached_prompt_tokens);
     write_json(connection_, "200 OK", output + '}');
 }
 

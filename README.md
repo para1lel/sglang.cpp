@@ -7,7 +7,7 @@ and carries Gated DeltaNet state through the other 48 layers. Prefill and the fi
 token selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L84)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L88)<!-- prefix: "class Decode" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA implementation is in
@@ -137,11 +137,10 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
 ```
 
 The server loads one model and binds to `127.0.0.1`. `GET /health` returns HTTP 200 after
-model loading. By default and with `--max-active 1`, requests run serially. Serial
-target-only requests reuse the decode graph by default. Set `--max-active` from `2`
-through `32` to batch concurrent requests on the resident model. Extra connections
-wait in the listener backlog until a socket worker is available. Both serial and
-batched target-only requests use the selected FP8 prefill policy.
+model loading. With the default settings, requests run serially and reuse the decode graph.
+Set `--max-active` from `2` through `32` to batch concurrent requests on the resident model.
+Extra connections wait in the listener backlog until a socket worker is available.
+Both serial and batched target-only requests use the selected FP8 prefill policy.
 
 Add `--batch-cuda-graphs` to opt in to graph replay for eligible decode-only
 groups of two through four requests. The server warms each actual decode width
@@ -159,6 +158,11 @@ fields follow the same contract at every depth.
 
 Set `--eager` to run serial requests without graph capture or replay.
 This option requires `--max-active 1` and `--mtp-steps 0`.
+
+Set `--prefix-cache-entries` from `1` through `4` to enable
+[prefix reuse](docs/prefix-cache.md). The default is `0`.
+Use `--fp8-prefill exact` and `--mtp-steps 0`. Omit `--eager`.
+Prefix reuse selects the batch route even at `--max-active 1`.
 
 For model `benchmark`, send a token ID array to `POST /v1/completions` using the
 [frozen streaming benchmark contract](benchmarks/streaming/README.md#wire-contract).
@@ -224,7 +228,7 @@ Sampled requests use target-only decoding. Unconstrained greedy requests can sti
 The generator command and the token-ID benchmark use greedy selection.
 
 C++ callers set the same fields in
-[`DecoderOptions`](include/sglang/decoder.h#L19)<!-- prefix: "struct Decod" -->.
+[`DecoderOptions`](include/sglang/decoder.h#L21)<!-- prefix: "struct Decod" -->.
 Set `mtp_steps` to `0` for sampled C++ requests.
 See the [sampling contract](docs/text-serving.md#sampling) for dispatch and seed behavior.
 

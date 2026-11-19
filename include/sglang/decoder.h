@@ -7,12 +7,14 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
 namespace sglang {
 
 inline constexpr int decoder_max_mtp_steps = 4;
+inline constexpr std::size_t decoder_prefix_max_salt_bytes = 256;
 
 class TokenConstraint;
 
@@ -28,6 +30,7 @@ struct DecoderOptions {
     std::int64_t top_k = -1;
     std::optional<std::int64_t> seed = std::nullopt;
     std::shared_ptr<const TokenConstraint> constraint = nullptr;
+    std::string prefix_cache_salt;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
     bool requires_target_only() const { return samples() || constraint != nullptr; }
@@ -74,6 +77,7 @@ struct DecoderResult {
     std::size_t mtp_drafted_tokens = 0;
     std::size_t mtp_accepted_tokens = 0;
     std::size_t mtp_rounds = 0;
+    std::size_t cached_prompt_tokens = 0;
 };
 
 enum class Fp8PrefillPolicy {

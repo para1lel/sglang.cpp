@@ -145,6 +145,7 @@ TextRequest text_options(const json::Object& object, const CompletionTokenizer& 
     set_stops(object, request.options);
     set_sampling(object, request.options);
     set_constraint(object, tokenizer, request.options);
+    set_cache_salt(object, request.options);
     return request;
 }
 
@@ -169,7 +170,7 @@ bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
         key == "ignore_eos" || key == "stop_token_ids" || key == "return_token_ids" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
-        key == "ebnf";
+        key == "ebnf" || key == "cache_salt";
 }
 
 TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {
@@ -249,6 +250,16 @@ const ChatTemplate& CompletionTokenizer::chat_template() const {
 
 TextRequest parse_text_request(const json::Object& body, const CompletionTokenizer& tokenizer) {
     return parse_text(body, tokenizer);
+}
+
+void set_cache_salt(const json::Object& object, DecoderOptions& options) {
+    if (json::get(object, "cache_salt")) {
+        const auto salt = json::get_string(object, "cache_salt");
+        if (!salt || salt->size() > decoder_prefix_max_salt_bytes) {
+            bad_request("Expected a cache_salt string of up to 256 bytes");
+        }
+        options.prefix_cache_salt = *salt;
+    }
 }
 
 TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer) {

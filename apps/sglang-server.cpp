@@ -24,6 +24,7 @@ struct Arguments {
     int port = 17384;
     int max_active = 1;
     int mtp_steps = 0;
+    int prefix_cache_entries = 0;
     bool eager = false;
     bool trace_batches = false;
     bool batch_cuda_graphs = false;
@@ -76,6 +77,12 @@ Arguments parse_arguments(int argc, char** argv) {
                 arguments.max_active > sglang::decoder_batch_max_lanes) {
                 throw std::invalid_argument(error);
             }
+        } else if (option == "--prefix-cache-entries") {
+            const auto error = "Expected --prefix-cache-entries in [0, 4]";
+            arguments.prefix_cache_entries = parse_integer(value, error);
+            if (arguments.prefix_cache_entries > sglang::decoder_batch_prefix_max_entries) {
+                throw std::invalid_argument(error);
+            }
         } else if (option == "--mtp-steps") {
             const auto error = "Expected --mtp-steps in [0, 4]";
             arguments.mtp_steps = parse_integer(value, error);
@@ -94,6 +101,12 @@ Arguments parse_arguments(int argc, char** argv) {
     }
     if (arguments.mtp_steps > 0 && arguments.max_active > sglang::decoder_batch_max_mtp_lanes) {
         throw std::invalid_argument("--max-active above 4 requires --mtp-steps 0");
+    }
+    if (arguments.prefix_cache_entries != 0 &&
+        (arguments.eager || arguments.mtp_steps != 0 ||
+         arguments.fp8_prefill != sglang::Fp8PrefillPolicy::exact)) {
+        throw std::invalid_argument(
+            "--prefix-cache-entries requires exact prefill and --mtp-steps 0. Omit --eager.");
     }
     return arguments;
 }
@@ -183,10 +196,12 @@ int main(int argc, char** argv) {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
                      " [--max-active N] [--mtp-steps N] [--eager] [--batch-cuda-graphs]\n"
                      "                     [--fp8-prefill exact|tensor-core] [--trace-batches]\n"
+                     "                     [--prefix-cache-entries 0..4]\n"
                      "Active requests: 1 by default, up to 32.\n"
                      "MTP steps: 0 by default, up to 4 with at most 4 active requests.\n"
                      "Batch graphs: ordinary decode steps at widths 2-4. Other steps use eager.\n"
                      "Eager decode: one active request with MTP off.\n"
+                     "Prefix cache: disabled by default. Requires exact prefill and MTP off.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n"
                   << sglang::cli::fp8_prefill_usage;
         return 0;
@@ -202,7 +217,7 @@ int main(int argc, char** argv) {
         const auto listener = listen_loopback(arguments.port);
         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
         const CompletionTokenizer tokenizer(arguments.checkpoint);
-        if (arguments.max_active == 1) {
+        if (arguments.max_active == 1 && arguments.prefix_cache_entries == 0) {
             serve_connections(listener, [&](const Socket& connection,
                                             std::string_view body, bool chat) {
                 if (chat) {
@@ -215,7 +230,8 @@ int main(int argc, char** argv) {
             });
         } else {
             BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs,
-                                 arguments.mtp_steps, arguments.max_active);
+                                 arguments.mtp_steps, arguments.max_active,
+                                 arguments.prefix_cache_entries);
             serve_batch(listener, service, tokenizer, arguments.max_active);
         }
     } catch (const std::exception& error) {

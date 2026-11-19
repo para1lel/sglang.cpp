@@ -44,7 +44,7 @@ The offline smoke case requests eight output tokens using checkpoint FP8 weights
 | W5 | 32,768 | 4,096 | 32 |
 | W6 | 131,072 | 1,024 | 4 |
 
-**Proposed variants.** Start W1–W6 with disjoint prefixes and MTP off. For `W3-prefix`, prime a recorded shared prefix before timing. For `W3-MTP`, repeat W3 with native speculation enabled. For `W1-image` and `W1-video`, freeze media bytes, dimensions, sampled frames, timestamps, preprocessing, effective input positions, and output budget. Report each variant separately. Select actual fixtures and confirm supported lengths against the checkpoint in P0. Preserve OOM, timeout, early stop, and unsupported outcomes under the original workload name.
+Start W1–W6 with disjoint prefixes and MTP off. Follow the [W3-prefix protocol](prefix-cache.md#w3-prefix) for native prefix reuse. For `W3-MTP`, repeat W3 with native speculation enabled. For proposed `W1-image` and `W1-video`, freeze media bytes, dimensions, sampled frames, timestamps, preprocessing, effective input positions, and output budget. Report each variant separately. Preserve OOM, timeout, early stop, and unsupported outcomes under the original workload name.
 
 ## Measurement
 
@@ -157,9 +157,9 @@ Positive depth adds counters for the generator's first measured request. `mtp_dr
 
 Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder.cpp#L256)<!-- prefix: "std::optiona" -->
 
-Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L48)<!-- prefix: "void trace_v" -->
+Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L49)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L347)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L559)<!-- prefix: "current.peak" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L347)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L609)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

@@ -21,6 +21,7 @@ struct Job {
     std::optional<DecoderBatchStep> pending;
     std::optional<DecoderFinishReason> finish;
     std::exception_ptr error;
+    int cached_tokens = 0;
     bool admitted = false;
     bool cancelled = false;
 
@@ -88,7 +89,8 @@ bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& callbacks,
 }
 
 struct BatchService::State {
-    State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps, int max_active);
+    State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps, int max_active,
+          int prefix_cache_entries);
     ~State();
 
     void run(const Decoder& decoder, std::promise<void> started);
@@ -103,6 +105,7 @@ struct BatchService::State {
     const bool cuda_graphs;
     const int mtp_steps;
     const int max_active;
+    const int prefix_cache_entries;
     std::mutex mutex;
     std::condition_variable changed;
     Jobs jobs;
@@ -112,8 +115,9 @@ struct BatchService::State {
 };
 
 BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
-                           int max_active)
-    : trace(trace), cuda_graphs(cuda_graphs), mtp_steps(mtp_steps), max_active(max_active) {
+                           int max_active, int prefix_cache_entries)
+    : trace(trace), cuda_graphs(cuda_graphs), mtp_steps(mtp_steps), max_active(max_active),
+      prefix_cache_entries(prefix_cache_entries) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch service capacity");
     }
@@ -144,7 +148,7 @@ void BatchService::State::run(const Decoder& decoder, std::promise<void> started
     std::unique_ptr<DecoderBatch> batch;
     try {
         batch = std::make_unique<DecoderBatch>(decoder,
-                                               DecoderBatchOptions{cuda_graphs, max_active});
+            DecoderBatchOptions{cuda_graphs, max_active, prefix_cache_entries});
     } catch (...) {
         started.set_exception(std::current_exception());
         return;
@@ -214,7 +218,7 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
     }
     if (!job->admitted) {
         try {
-            batch.admit(slot, std::move(job->prompt), job->options);
+            job->cached_tokens = batch.admit(slot, std::move(job->prompt), job->options);
             job->admitted = true;
         } catch (...) {
             if (!batch.available()) {
@@ -251,8 +255,24 @@ void trace_batch_step(int width, int decode, std::size_t request_bytes) {
                   " request_bytes=" + std::to_string(request_bytes) + '\n');
 }
 
+void trace_prefix_cache(const DecoderPrefixCacheStats& stats) {
+    std::cerr << ("prefix cache entries=" + std::to_string(stats.entries) +
+                  " pages=" + std::to_string(stats.pages) +
+                  " device_bytes=" + std::to_string(stats.device_bytes) +
+                  " hits=" + std::to_string(stats.hits) +
+                  " cached_tokens=" + std::to_string(stats.cached_tokens) +
+                  " prefill_tokens=" + std::to_string(stats.prefill_tokens) +
+                  " stores=" + std::to_string(stats.stores) +
+                  " evictions=" + std::to_string(stats.evictions) + '\n');
+}
+
 void BatchService::State::process(DecoderBatch& batch) {
     std::size_t traced_bytes = 0;
+    const bool trace_cache = trace && prefix_cache_entries != 0;
+    auto traced_cache = batch.prefix_cache_stats();
+    if (trace_cache) {
+        trace_prefix_cache(traced_cache);
+    }
     while (const auto snapshot = wait_for_jobs()) {
         Selection selected{};
         for (int slot = 0; slot < max_active; ++slot) {
@@ -306,6 +326,16 @@ void BatchService::State::process(DecoderBatch& batch) {
                 traced_bytes = bytes;
             }
         }
+        if (trace_cache) {
+            const auto current = batch.prefix_cache_stats();
+            const bool finished = std::any_of(steps.begin(), steps.end(),
+                [](const auto& step) { return step.finish_reason.has_value(); });
+            if (finished || current.hits != traced_cache.hits ||
+                current.stores != traced_cache.stores) {
+                trace_prefix_cache(current);
+                traced_cache = current;
+            }
+        }
         {
             const std::lock_guard lock(mutex);
             for (int slot = 0; slot < max_active; ++slot) {
@@ -325,8 +355,9 @@ void BatchService::State::cancel(std::unique_lock<std::mutex>& lock, int slot, J
 }
 
 BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
-                           int max_active)
-    : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps, max_active)) {}
+                           int max_active, int prefix_cache_entries)
+    : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps, max_active,
+                                     prefix_cache_entries)) {}
 
 BatchService::~BatchService() = default;
 
@@ -380,6 +411,7 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
                 state_->changed.notify_all();
             } else if (job->finish) {
                 result.finish_reason = *job->finish;
+                result.cached_prompt_tokens = job->cached_tokens;
                 return result;
             } else {
                 state_->changed.wait_for(lock, disconnect_poll);

@@ -11,6 +11,8 @@ inline constexpr int decoder_batch_max_lanes = 32;
 inline constexpr int decoder_batch_max_graph_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_steps = decoder_max_mtp_steps;
+inline constexpr int decoder_batch_prefix_max_entries = 4;
+inline constexpr int decoder_batch_prefix_max_tokens = 6400;
 
 struct DecoderBatchStep {
     std::optional<int> token;
@@ -41,6 +43,18 @@ struct DecoderBatchStepStats {
 struct DecoderBatchOptions {
     bool cuda_graphs = false;
     int max_lanes = decoder_batch_max_mtp_lanes;
+    int prefix_cache_entries = 0;
+};
+
+struct DecoderPrefixCacheStats {
+    std::size_t device_bytes = 0;
+    int entries = 0;
+    int pages = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t cached_tokens = 0;
+    std::uint64_t prefill_tokens = 0;
+    std::uint64_t stores = 0;
+    std::uint64_t evictions = 0;
 };
 
 /// The Decoder must outlive the batch. Use one host thread to operate a batch.
@@ -51,7 +65,8 @@ public:
     DecoderBatch(const Decoder& decoder, DecoderBatchOptions options);
     ~DecoderBatch();
 
-    void admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
+    /// Return the number of prompt positions restored from a completed checkpoint.
+    int admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
     void cancel(int slot);
 
     /// Advance each selected slot by one position or one speculative round.
@@ -70,6 +85,7 @@ public:
                     DecoderBatchStepStats* stats = nullptr);
 
     std::size_t request_device_allocation_bytes() const;
+    DecoderPrefixCacheStats prefix_cache_stats() const;
     bool available() const;
 
 private:

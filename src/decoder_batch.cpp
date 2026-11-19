@@ -6,6 +6,8 @@
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
 
+#include "decoder_prefix_cache.h"
+
 #include <algorithm>
 #include <utility>
 
@@ -28,8 +30,13 @@ struct Lane {
     std::unique_ptr<TargetVerification> verification = nullptr;
     std::optional<SamplingParameters> sampling = std::nullopt;
     ConstraintCursor constraint{};
+    int checkpoint = 0;
+    bool restored_prompt = false;
 
     int remaining_prompt() const { return std::max(0, static_cast<int>(prompt.size()) - position); }
+    int prefill_limit() const {
+        return checkpoint > position ? checkpoint - position : remaining_prompt();
+    }
     int remaining_output() const { return options.max_new_tokens - generated; }
     int capacity() const { return static_cast<int>(prompt.size()) + options.max_new_tokens - 1; }
 
@@ -109,6 +116,7 @@ struct BatchStorage {
     std::shared_ptr<const Allocations> weights;
     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
     std::unique_ptr<BatchGraphScratch> graph_scratch;
+    std::optional<PrefixCache> prefix_cache;
 };
 
 void retire(std::optional<Lane>& lane) {
@@ -150,9 +158,9 @@ PrefillRows plan_prefill(const BatchStorage& storage, const Selection& selected,
     int unused = prefill_chunk_rows;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         const auto& lane = storage.slots[slot];
-        if (selected[slot] && lane && lane->request) {
+        if (selected[slot] && lane && lane->request && !lane->restored_prompt) {
             --unused;
-            remaining[slot] = lane->remaining_prompt();
+            remaining[slot] = lane->prefill_limit();
             rows[slot] = std::min(1, remaining[slot]);
         }
     }
@@ -177,7 +185,8 @@ PrefillRows plan_wide_prefill(const BatchStorage& storage, const Selection& sele
     int unused = prefill_chunk_rows;
     for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
-        if (selected[slot] && lane && lane->request && lane->remaining_prompt() == 0) {
+        if (selected[slot] && lane && lane->request && !lane->restored_prompt &&
+            lane->remaining_prompt() == 0) {
             --unused;
         }
     }
@@ -186,7 +195,7 @@ PrefillRows plan_wide_prefill(const BatchStorage& storage, const Selection& sele
         const int slot = (start + offset) % lanes;
         const auto& lane = storage.slots[slot];
         if (selected[slot] && lane && lane->request && lane->remaining_prompt() > 0) {
-            rows[slot] = std::min(unused, lane->remaining_prompt());
+            rows[slot] = std::min(unused, lane->prefill_limit());
             unused -= rows[slot];
             cursor = (slot + 1) % lanes;
         }
@@ -203,8 +212,16 @@ struct DecoderBatch::State {
         if (options.max_lanes < 1 || options.max_lanes > decoder_batch_max_lanes) {
             throw std::invalid_argument("Invalid decoder batch capacity");
         }
+        if (options.prefix_cache_entries < 0 ||
+            options.prefix_cache_entries > decoder_batch_prefix_max_entries ||
+            (options.prefix_cache_entries != 0 && model.fp8_prefill() != Fp8PrefillPolicy::exact)) {
+            throw std::invalid_argument("Prefix cache requires exact prefill and 1 to 4 entries");
+        }
         DeviceScope device(model.device);
         storage->weights = model.memory;
+        if (options.prefix_cache_entries != 0) {
+            storage->prefix_cache.emplace(model.device, options.prefix_cache_entries);
+        }
         execution.open_stream(storage);
         device.restore();
     }
@@ -215,7 +232,7 @@ struct DecoderBatch::State {
                 bool& contains_mtp);
     void score(Lane& lane, Request& request, Workspace& work, bool graph);
     void speculate(const Selection& selected, Steps& results, DecoderBatchStepStats& stats);
-
+    void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring, Steps&);
     std::optional<Lane>& slot_at(int slot) {
         if (slot < 0 || slot >= options.max_lanes) {
             throw std::out_of_range("Invalid decoder batch slot");
@@ -239,6 +256,7 @@ struct DecoderBatch::State {
         }
         storage->slots = {};
         storage->graph_scratch.reset();
+        storage->prefix_cache.reset();
     }
 
     bool drain_after_error() noexcept {
@@ -271,13 +289,16 @@ DecoderBatch::DecoderBatch(const Decoder& decoder, DecoderBatchOptions options)
 
 DecoderBatch::~DecoderBatch() = default;
 
-void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
+int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
     state_->require_ready();
     auto& lane = state_->slot_at(slot);
     if (lane || options.top_logits != 0) {
         throw std::invalid_argument("Decoder batch requires an empty slot and no top logits");
     }
     validate_request(prompt, options, true);
+    if (options.prefix_cache_salt.size() > decoder_prefix_max_salt_bytes) {
+        throw std::invalid_argument("Prefix cache salt exceeds 256 bytes");
+    }
     if (options.mtp_steps != 0 && state_->options.max_lanes > decoder_batch_max_mtp_lanes) {
         throw std::invalid_argument("Decoder batch capacity above 4 requires MTP off");
     }
@@ -286,7 +307,7 @@ void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions
     }
     if (options.max_new_tokens == 0) {
         lane.emplace(Lane{nullptr, std::move(prompt), options});
-        return;
+        return 0;
     }
     const auto sampling = options.samples() ? std::optional{request_sampling(options)}
                                             : std::nullopt;
@@ -302,9 +323,18 @@ void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions
             lane->draft = std::make_unique<MtpDraftRequest>(state_->model.mtp_weights, capacity);
         }
         lane->request->initialize(capacity, stream);
-        lane->request->reset(stream);
+        if (auto& cache = state_->storage->prefix_cache; cache && options.mtp_steps == 0) {
+            lane->checkpoint = PrefixCache::checkpoint(static_cast<int>(lane->prompt.size()));
+            lane->position = cache->restore(*lane->request, lane->prompt, options.prefix_cache_salt,
+                                            stream);
+        }
+        if (lane->position == 0) {
+            lane->request->reset(stream);
+        }
+        lane->restored_prompt = lane->remaining_prompt() == 0;
         check(cudaStreamSynchronize(stream), "Initialize decoder batch slot");
         device.restore();
+        return lane->position;
     } catch (...) {
         if (options.mtp_steps == 0) {
             state_->disable();
@@ -328,6 +358,11 @@ void DecoderBatch::cancel(int slot) {
 
 std::size_t DecoderBatch::request_device_allocation_bytes() const {
     return request_bytes(*state_->storage);
+}
+
+DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {
+    const auto& cache = state_->storage->prefix_cache;
+    return cache ? cache->stats() : DecoderPrefixCacheStats{};
 }
 
 bool DecoderBatch::available() const { return !state_->failed; }
@@ -409,6 +444,10 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
             continue;
         }
         auto& lane = *slots[slot];
+        if (lane.restored_prompt) {
+            scoring[slot] = lane.request.get();
+            continue;
+        }
         const int remaining = lane.remaining_prompt();
         if (rows[slot] == 0 && remaining > 0) {
             continue;
@@ -454,11 +493,16 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
         }
         workspace.close();
     }
+    bool submitted = count != 0 || max_rows > 1;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = scoring[slot]) {
-            auto& work = graph ? *storage->graph_scratch->work[packed_slots[slot]] : request->work;
-            score(*slots[slot], *request, work, graph);
-            if (graph) {
+            auto& lane = *slots[slot];
+            const bool packed = graph && !lane.restored_prompt;
+            auto& workspace = packed ? *storage->graph_scratch->work[packed_slots[slot]]
+                                     : request->work;
+            score(lane, *request, workspace, packed);
+            submitted = true;
+            if (packed) {
                 stats.graph_slots |= std::uint32_t{1} << slot;
             }
         }
@@ -468,9 +512,15 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
     if (contains_mtp) {
         speculate(speculative, results, stats);
     }
-    if (stats.verification_lanes == 0 && (count != 0 || max_rows > 1)) {
+    if (stats.verification_lanes == 0 && submitted) {
         check(cudaStreamSynchronize(stream), "Complete decoder batch step");
     }
+    collect_scores(scoring, results);
+}
+
+void DecoderBatch::State::collect_scores(
+    const std::array<Request*, decoder_batch_max_lanes>& scoring, Steps& results) {
+    const auto& slots = storage->slots;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (scoring[slot]) {
             const auto& lane = *slots[slot];
@@ -571,12 +621,24 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             }
             if (!lane->request) {
                 result.finish_reason = DecoderFinishReason::length;
+            } else if (lane->restored_prompt) {
+                lane->select_token(*result.token, result);
+                lane->restored_prompt = false;
             } else if (result.mtp_drafted_tokens == 0 &&
                        (result.decode || current.prefill_rows[slot] != 0)) {
+                const int rows = current.prefill_rows[slot];
+                if (auto& cache = storage->prefix_cache; cache && rows != 0 &&
+                    lane->options.mtp_steps == 0) {
+                    cache->count_prefill(rows);
+                    if (lane->position + rows == lane->checkpoint) {
+                        cache->store(*lane->request, lane->prompt, lane->options.prefix_cache_salt,
+                                     lane->checkpoint, execution.stream());
+                    }
+                }
                 if (result.token) {
                     lane->select_token(*result.token, result);
                 }
-                lane->position += std::max(1, current.prefill_rows[slot]);
+                lane->position += std::max(1, rows);
             }
             if (result.finish_reason) {
                 retire(lane);

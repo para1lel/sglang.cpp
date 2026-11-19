@@ -25,8 +25,9 @@ std::optional<std::uint64_t> unsigned_integer(const json::Object& object, std::s
 
 CompletionRequest parse_benchmark(const json::Object* object) {
     const auto* stops = object ? json::get(*object, "stop_token_ids") : nullptr;
+    const bool has_salt = object && json::get(*object, "cache_salt");
     const auto* temperature = object ? json::get(*object, "temperature") : nullptr;
-    if (!object || object->size() != (stops ? 12 : 11) ||
+    if (!object || object->size() != 11u + (stops != nullptr) + has_salt ||
         json::get_string(*object, "model") != "benchmark" ||
         !temperature || temperature->number() != 0.0 || unsigned_integer(*object, "seed") != 0 ||
         json::get_boolean(*object, "ignore_eos") != true ||
@@ -53,6 +54,7 @@ CompletionRequest parse_benchmark(const json::Object* object) {
     }
     CompletionRequest request;
     request.options.max_new_tokens = static_cast<int>(*output_budget);
+    set_cache_salt(*object, request.options);
     if (stops) {
         const auto* tokens = stops->array();
         const auto id = tokens && tokens->size() == 1
@@ -90,11 +92,13 @@ std::string choice_event(std::optional<int> token, const std::vector<int>* promp
     return output + "}]}";
 }
 
-std::string usage_event(std::size_t prompt_tokens, std::size_t completion_tokens) {
+std::string usage_event(std::size_t prompt_tokens, std::size_t completion_tokens,
+                        int cached_tokens) {
     std::string output = R"({"choices":[],"usage":{"prompt_tokens":)";
     output += std::to_string(prompt_tokens);
     output += R"(,"completion_tokens":)" + std::to_string(completion_tokens);
-    output += R"(,"prompt_tokens_details":{"cached_tokens":0}}})";
+    output += R"(,"prompt_tokens_details":{"cached_tokens":)" +
+              std::to_string(cached_tokens) + "}}}";
     return output;
 }
 
@@ -126,7 +130,8 @@ void finish_stream(const Socket& connection, const CompletionRequest& request,
     const auto* prompt = streaming ? nullptr : &request.prompt;
     if (begin_stream(connection, streaming) &&
         write_event(connection, choice_event(std::nullopt, prompt, stopped ? "stop" : "length")) &&
-        write_event(connection, usage_event(request.prompt.size(), output_count)) &&
+        write_event(connection, usage_event(request.prompt.size(), output_count,
+                                            result.cached_prompt_tokens)) &&
         write_event(connection, "[DONE]")) {
         end_events(connection);
     }

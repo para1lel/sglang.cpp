@@ -20,6 +20,7 @@ using TextGenerator = std::function<DecoderResult(const std::vector<int>&, const
 
 TextRequest parse_text_request(const json::Object& body, const CompletionTokenizer& tokenizer);
 TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer);
+void set_cache_salt(const json::Object& object, DecoderOptions& options);
 void append_ids(std::string& output, const int* ids, std::size_t count);
 void complete_text(const Socket& connection, const TextRequest& request,
                    const CompletionTokenizer& tokenizer, const TextGenerator& generate,

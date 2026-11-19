@@ -7,7 +7,7 @@ namespace sglang::server {
 class BatchService {
 public:
     BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false, int mtp_steps = 0,
-                 int max_active = decoder_batch_max_mtp_lanes);
+                 int max_active = decoder_batch_max_mtp_lanes, int prefix_cache_entries = 0);
     ~BatchService();
 
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,

@@ -14,6 +14,7 @@ namespace server {
 class BatchService;
 class ChatTemplate;
 class Socket;
+class VisionCompletion;
 
 class CompletionTokenizer {
 public:
@@ -40,7 +41,7 @@ void complete(const Socket& connection, BatchService& service, int slot,
               const CompletionTokenizer& tokenizer, std::string_view body);
 void complete_chat(const Socket& connection, const Decoder& decoder,
                    const CompletionTokenizer& tokenizer, std::string_view body,
-                   bool trace, int mtp_steps, bool eager);
+                   bool trace, int mtp_steps, bool eager, VisionCompletion* vision = nullptr);
 void complete_chat(const Socket& connection, BatchService& service, int slot,
                    const CompletionTokenizer& tokenizer, std::string_view body);
 void write_error(const Socket& connection, std::string_view status, const char* message);

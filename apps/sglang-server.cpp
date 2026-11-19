@@ -6,6 +6,7 @@
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
 #include "sglang/server/prefix_controls.h"
+#include "sglang/server/vision_completion.h"
 
 #include <charconv>
 #include <exception>
@@ -219,11 +220,12 @@ int main(int argc, char** argv) {
         std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
         const CompletionTokenizer tokenizer(arguments.checkpoint);
         if (arguments.max_active == 1 && arguments.prefix_cache_entries == 0) {
+            VisionCompletion vision(arguments.checkpoint, arguments.device);
             serve_connections(listener, [&](const Socket& connection,
                                             std::string_view body, bool chat) {
                 if (chat) {
                     complete_chat(connection, decoder, tokenizer, body, arguments.trace_batches,
-                                  arguments.mtp_steps, arguments.eager);
+                                  arguments.mtp_steps, arguments.eager, &vision);
                 } else {
                     complete(connection, decoder, tokenizer, body, arguments.trace_batches,
                              arguments.mtp_steps, arguments.eager);

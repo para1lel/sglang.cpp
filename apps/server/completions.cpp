@@ -5,6 +5,7 @@
 #include "sglang/server/http.h"
 
 #include "sglang/server/text_completion.h"
+#include "sglang/server/vision_completion.h"
 
 #include <cstdint>
 #include <iostream>
@@ -214,10 +215,10 @@ json::Value parse_completion_body(std::string_view body, bool allow_text) {
 
 void dispatch_completion(const Socket& connection, std::string_view body,
                          const CompletionTokenizer* tokenizer, const TextGenerator& generate,
-                         bool trace, bool chat) {
+                         bool trace, bool chat,
+                         const MediaGenerator& generate_media = MediaGenerator{}) {
     if (chat && tokenizer) {
-        complete_text(connection, parse_chat_request(body, *tokenizer), *tokenizer,
-                      generate, trace);
+        complete_chat_request(connection, body, *tokenizer, generate, generate_media, trace);
         return;
     }
     json::Value parsed;
@@ -236,7 +237,15 @@ void dispatch_completion(const Socket& connection, std::string_view body,
 
 void complete_serial(const Socket& connection, const Decoder& decoder,
                      const CompletionTokenizer* tokenizer, std::string_view body,
-                     bool trace, int mtp_steps, bool eager, bool chat = false) {
+                     bool trace, int mtp_steps, bool eager, bool chat = false,
+                     VisionCompletion* vision = nullptr) {
+    MediaGenerator generate_media;
+    if (vision) {
+        generate_media = [&](const auto& prompt, auto options, const auto& callbacks) {
+            options.eager = eager;
+            return vision->generate(decoder, prompt, options, callbacks);
+        };
+    }
     dispatch_completion(connection, body, tokenizer,
                         [&](const auto& prompt, auto options, const auto& callbacks) {
         if (!options.requires_target_only()) {
@@ -244,7 +253,7 @@ void complete_serial(const Socket& connection, const Decoder& decoder,
         }
         options.eager = eager;
         return decoder.generate(prompt, options, callbacks);
-    }, trace, chat);
+    }, trace, chat, generate_media);
 }
 
 void complete_batch(const Socket& connection, BatchService& service, int slot,
@@ -284,8 +293,8 @@ void complete(const Socket& connection, BatchService& service, int slot,
 
 void complete_chat(const Socket& connection, const Decoder& decoder,
                    const CompletionTokenizer& tokenizer, std::string_view body,
-                   bool trace, int mtp_steps, bool eager) {
-    complete_serial(connection, decoder, &tokenizer, body, trace, mtp_steps, eager, true);
+                   bool trace, int mtp_steps, bool eager, VisionCompletion* vision) {
+    complete_serial(connection, decoder, &tokenizer, body, trace, mtp_steps, eager, true, vision);
 }
 
 void complete_chat(const Socket& connection, BatchService& service, int slot,

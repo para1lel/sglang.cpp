@@ -1,6 +1,6 @@
 # Native multimodal decoder
 
-Link `sglang_decoder` and call `Decoder::generate_multimodal` to generate from text and completed visual features.
+Link `sglang_decoder` and call `Decoder::generate_multimodal` to generate from text and completed visual features. For server requests, see [image and video inputs](chat-serving.md#image-and-video-inputs).
 
 ## Responsibilities and sources of truth
 

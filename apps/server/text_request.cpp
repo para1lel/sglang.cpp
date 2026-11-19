@@ -189,12 +189,16 @@ TextRequest parse_text(const json::Object& object, const CompletionTokenizer& to
     return request;
 }
 
-json::Object chat_text_options(const json::OrderedObject& chat) {
+json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
     json::Object options;
     for (const auto& [key, value] : chat) {
         if (key == "stream_options" && value.ordered_object()) {
             const auto& fields = *value.ordered_object();
             options.emplace(key, json::Object(fields.begin(), fields.end()));
+        } else if (media && key == "ebnf") {
+            bad_request("Decoded media chat does not support EBNF constraints");
+        } else if (media && key == "cache_salt") {
+            bad_request("Decoded media chat does not support cache_salt");
         } else if (is_text_option(key)) {
             options.emplace(key, value);
         } else if (key == "max_completion_tokens") {
@@ -205,6 +209,10 @@ json::Object chat_text_options(const json::OrderedObject& chat) {
         } else if (key == "n") {
             if (value.unsigned_integer() != 1) {
                 bad_request("Only n=1 is supported");
+            }
+        } else if (media && key == "add_special_tokens") {
+            if (value.boolean() != false) {
+                bad_request("Decoded media chat requires add_special_tokens=false");
             }
         } else if (key != "messages" && key != "tools" && key != "tool_choice" &&
                    key != "add_generation_prompt" && key != "add_vision_id" &&
@@ -217,6 +225,24 @@ json::Object chat_text_options(const json::OrderedObject& chat) {
         bad_request("Expected model Qwen3.8-27B-FP8 for a chat request");
     }
     return options;
+}
+
+void normalize_media_options(json::OrderedObject& chat) {
+    const auto kwargs = std::find_if(chat.begin(), chat.end(), [](const auto& field) {
+        return field.first == "chat_template_kwargs";
+    });
+    if (kwargs == chat.end()) {
+        return;
+    }
+    const auto* object = kwargs->second.ordered_object();
+    const auto* thinking = object ? json::get(*object, "enable_thinking") : nullptr;
+    if (!thinking || object->size() != 1 || !thinking->boolean() ||
+        json::get(chat, "enable_thinking")) {
+        bad_request("Use one boolean enable_thinking setting for decoded media chat");
+    }
+    const auto setting = *thinking->boolean();
+    kwargs->first = "enable_thinking";
+    kwargs->second = setting;
 }
 
 json::Value parse_body(std::string_view body, json::Syntax syntax) {
@@ -262,17 +288,35 @@ void set_cache_salt(const json::Object& object, DecoderOptions& options) {
     }
 }
 
-TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer) {
+TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer,
+                               bool media_enabled) {
     const auto parsed = parse_body(body, json::Syntax::ordered);
     const auto* chat = parsed.ordered_object();
     if (!chat) {
         bad_request("Expected a JSON object for a chat request");
     }
-    auto request = text_options(chat_text_options(*chat), tokenizer);
+    auto media = parse_chat_media(*chat, media_enabled);
+    if (media) {
+        normalize_media_options(media->chat);
+        chat = &media->chat;
+    }
+    auto request = text_options(chat_text_options(*chat, media.has_value()), tokenizer);
     request.chat = true;
     const auto prompt = tokenizer.chat_template().render(*chat, ChatInput::http);
     validate_prompt(prompt);
     encode_prompt(request, prompt, tokenizer);
+    if (media) {
+        auto& prepared = request.media.emplace();
+        prepared.template_ids = std::move(request.prompt);
+        try {
+            request.prompt = expand_chat_media(prepared, media->parts, tokenizer.get());
+        } catch (const std::length_error& error) {
+            throw HttpError("400 Bad Request", error.what());
+        }
+        if (request.prompt.size() > checkpoint_context - request.options.max_new_tokens) {
+            bad_request("Expanded prompt and output budget must fit the 262144-token context");
+        }
+    }
     return request;
 }
 

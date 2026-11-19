@@ -77,6 +77,7 @@ public:
     bool started() const { return streaming_; }
 
 private:
+    void append_media_prompt_ids(std::string& output) const;
     void append_text(std::string& output, std::string_view text, bool finished) const;
     std::string choice(std::string_view text, const int* ids, std::size_t count,
                        const char* reason = nullptr) const;
@@ -92,6 +93,13 @@ private:
     std::string text_;
     bool streaming_ = false;
 };
+
+void TextResponse::append_media_prompt_ids(std::string& output) const {
+    if (request_.media && request_.return_token_ids) {
+        output += R"(,"prompt_token_ids":)";
+        append_ids(output, request_.prompt.data(), request_.prompt.size());
+    }
+}
 
 void TextResponse::append_text(std::string& output, std::string_view text, bool finished) const {
     if (!request_.chat) {
@@ -118,7 +126,7 @@ std::string TextResponse::choice(std::string_view text, const int* ids, std::siz
     if (request_.return_token_ids) {
         output += R"(,"token_ids":)";
         append_ids(output, ids, count);
-        if (!streaming_) {
+        if (!streaming_ && !request_.media) {
             output += R"(,"prompt_token_ids":)";
             append_ids(output, request_.prompt.data(), request_.prompt.size());
         }
@@ -130,6 +138,9 @@ std::string TextResponse::choice(std::string_view text, const int* ids, std::siz
         output += "null";
     }
     output += "}]";
+    if (!request_.stream) {
+        append_media_prompt_ids(output);
+    }
     return output;
 }
 
@@ -137,9 +148,10 @@ bool TextResponse::event(std::string_view data) {
     if (!streaming_) {
         streaming_ = start_events(connection_);
         if (streaming_ && request_.chat) {
-            const auto role = R"("choices":[{"index":0,"delta":{"role":"assistant"},)"
-                              R"("finish_reason":null}]})";
-            if (!write_event(connection_, prefix_ + role)) {
+            auto role = prefix_ + R"("choices":[{"index":0,"delta":{"role":"assistant"},)"
+                                  R"("finish_reason":null}])";
+            append_media_prompt_ids(role);
+            if (!write_event(connection_, role + '}')) {
                 return false;
             }
         }
@@ -234,6 +246,23 @@ void complete_text(const Socket& connection, const TextRequest& request,
             end_events(connection);
         }
     }
+}
+
+void complete_chat_request(const Socket& connection, std::string_view body,
+                           const CompletionTokenizer& tokenizer, const TextGenerator& generate,
+                           const MediaGenerator& generate_media, bool trace_serial) {
+    if (disconnected(connection)) {
+        return;
+    }
+    const auto request = parse_chat_request(body, tokenizer, bool(generate_media));
+    if (!request.media) {
+        complete_text(connection, request, tokenizer, generate, trace_serial);
+        return;
+    }
+    complete_text(connection, request, tokenizer,
+                  [&](const auto&, const auto& options, const auto& callbacks) {
+                      return generate_media(*request.media, options, callbacks);
+                  }, trace_serial);
 }
 
 }

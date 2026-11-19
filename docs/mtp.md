@@ -6,13 +6,13 @@ Multi-token prediction (MTP) drafts candidates and uses the target model to veri
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Generator and server | Set the proposal limit and select serial or batch execution. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L221)<!-- prefix: "if (argument" --> |
+| Generator and server | Set the proposal limit and select serial or batch execution. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L222)<!-- prefix: "if (argument" --> |
 | MTP controllers | Seed draft KV, collect proposals, and publish greedy target outputs. | [Serial controller](../src/decoder.cpp#L327)<!-- prefix: "bool prefill" --> · [Batch rounds](../src/decoder_batch.cpp#L552)<!-- prefix: "void Decoder" --> |
 | Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_forward.cpp#L329)<!-- prefix: "void Decoder" --> · [State commit](../src/decoder_verify.cpp#L131)<!-- prefix: "void TargetV" --> |
 
 ## Runtime path
 
-Set `--mtp-steps` to `1`–`4` to cap draft proposals per round. Positive depths require a configured capacity of at most four, even when fewer lanes are active. The server applies that depth to unconstrained greedy requests. [Sampled](text-serving.md#sampling) and [constrained](text-serving.md#finite-choice-constraints) requests use K0 beside greedy MTP lanes. The generator and width-one server use the serial MTP controller. A batch step with an active MTP lane runs eager. [Server validation](../apps/sglang-server.cpp#L103)<!-- prefix: "if (argument" -->
+Set `--mtp-steps` to `1`–`4` to cap draft proposals per round. Positive depths require a configured capacity of at most four, even when fewer lanes are active. The server applies that depth to unconstrained greedy requests. [Sampled](text-serving.md#sampling) and [constrained](text-serving.md#finite-choice-constraints) requests use K0 beside greedy MTP lanes. The generator and width-one server use the serial MTP controller. A batch step with an active MTP lane runs eager. [Server validation](../apps/sglang-server.cpp#L104)<!-- prefix: "if (argument" -->
 
 MTP loads its draft weights once and shares the target embedding and LM head. Each positive-budget MTP request owns target state, draft MXFP8 KV, and any verifier storage it allocates. C++ batch callers can set different proposal limits per lane within the same capacity limit. Positive-depth lanes skip [prefix reuse](prefix-cache.md), and HTTP prefix reuse requires K0. [Weights](../src/decoder.cpp#L402)<!-- prefix: "Decoder::Dec" --> · [Admission](../src/decoder_batch.cpp#L292)<!-- prefix: "int DecoderB" -->
 

@@ -54,6 +54,7 @@ to check cache bytes and attention outputs. This build command only compiles and
 For decoded RGB8 images and video, see the [CPU media preprocessing API](docs/media-preprocessing.md).
 The guide covers the standalone C++ library, patch layout, and CPU verification.
 To turn those patches into BF16 features on a B200, see the [standalone vision encoder](docs/vision-encoder.md).
+See the [native multimodal decoder](docs/multimodal-decoder.md) to generate from those features in C++.
 
 ## Generate text token IDs
 
@@ -219,6 +220,9 @@ curl -N http://127.0.0.1:17384/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"Qwen3.8-27B-FP8","messages":[{"role":"user","content":"Explain why the sky is blue."}],"stream":true}'
 ```
+
+The serial, cache-off chat route accepts inline decoded RGB8 images and video.
+See [image and video inputs](docs/chat-serving.md#image-and-video-inputs) for the attachment format.
 
 ### Sample output tokens
 

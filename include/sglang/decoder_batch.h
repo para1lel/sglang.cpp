@@ -3,10 +3,13 @@
 #include "sglang/decoder.h"
 
 #include <array>
+#include <cstdint>
 
 namespace sglang {
 
-inline constexpr int decoder_batch_max_lanes = 4;
+inline constexpr int decoder_batch_max_lanes = 32;
+inline constexpr int decoder_batch_max_graph_lanes = 4;
+inline constexpr int decoder_batch_max_mtp_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_steps = decoder_max_mtp_steps;
 
 struct DecoderBatchStep {
@@ -25,7 +28,7 @@ struct DecoderBatchStep {
 struct DecoderBatchStepStats {
     std::array<int, decoder_batch_max_lanes> prefill_rows{};
     std::size_t prefill_workspace_bytes = 0;
-    unsigned graph_slots = 0;
+    std::uint32_t graph_slots = 0;
     std::size_t peak_request_bytes = 0;
     int verification_lanes = 0;
     int verification_rows = 0;
@@ -33,6 +36,7 @@ struct DecoderBatchStepStats {
 
 struct DecoderBatchOptions {
     bool cuda_graphs = false;
+    int max_lanes = decoder_batch_max_mtp_lanes;
 };
 
 /// The Decoder must outlive the batch. Use one host thread to operate a batch.

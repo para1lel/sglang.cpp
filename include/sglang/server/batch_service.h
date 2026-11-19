@@ -1,12 +1,13 @@
 #pragma once
 
-#include "sglang/decoder.h"
+#include "sglang/decoder_batch.h"
 
 namespace sglang::server {
 
 class BatchService {
 public:
-    BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false, int mtp_steps = 0);
+    BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false, int mtp_steps = 0,
+                 int max_active = decoder_batch_max_mtp_lanes);
     ~BatchService();
 
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,

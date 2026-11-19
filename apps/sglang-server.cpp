@@ -70,7 +70,7 @@ Arguments parse_arguments(int argc, char** argv) {
                 throw std::invalid_argument("Expected a TCP port in [1, 65535]");
             }
         } else if (option == "--max-active") {
-            const auto error = "Expected --max-active in [1, 4]";
+            const auto error = "Expected --max-active in [1, 32]";
             arguments.max_active = parse_integer(value, error);
             if (arguments.max_active == 0 ||
                 arguments.max_active > sglang::decoder_batch_max_lanes) {
@@ -90,7 +90,10 @@ Arguments parse_arguments(int argc, char** argv) {
         throw std::invalid_argument("--eager requires --max-active 1 and --mtp-steps 0");
     }
     if (arguments.batch_cuda_graphs && arguments.max_active == 1) {
-        throw std::invalid_argument("--batch-cuda-graphs requires --max-active 2, 3, or 4");
+        throw std::invalid_argument("--batch-cuda-graphs requires --max-active at least 2");
+    }
+    if (arguments.mtp_steps > 0 && arguments.max_active > sglang::decoder_batch_max_mtp_lanes) {
+        throw std::invalid_argument("--max-active above 4 requires --mtp-steps 0");
     }
     return arguments;
 }
@@ -180,9 +183,9 @@ int main(int argc, char** argv) {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
                      " [--max-active N] [--mtp-steps N] [--eager] [--batch-cuda-graphs]\n"
                      "                     [--fp8-prefill exact|tensor-core] [--trace-batches]\n"
-                     "Active requests: 1 by default, up to 4.\n"
-                     "MTP steps: 0 by default, up to 4 for any active request limit.\n"
-                     "Batch graphs: ordinary decode at widths 2-4. MTP rounds use eager decode.\n"
+                     "Active requests: 1 by default, up to 32.\n"
+                     "MTP steps: 0 by default, up to 4 with at most 4 active requests.\n"
+                     "Batch graphs: ordinary decode steps at widths 2-4. Other steps use eager.\n"
                      "Eager decode: one active request with MTP off.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n"
                   << sglang::cli::fp8_prefill_usage;
@@ -212,7 +215,7 @@ int main(int argc, char** argv) {
             });
         } else {
             BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs,
-                                 arguments.mtp_steps);
+                                 arguments.mtp_steps, arguments.max_active);
             serve_batch(listener, service, tokenizer, arguments.max_active);
         }
     } catch (const std::exception& error) {

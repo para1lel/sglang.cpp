@@ -115,7 +115,8 @@ void DecoderBatch::cancel(int slot) {
 std::array<DecoderBatchStep, decoder_batch_max_lanes>
 DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& selected,
                               DecoderBatchStepStats* stats) {
-    require(selected == std::array{false, false, false, true} && state_->budget != 0 && stats,
+    constexpr std::array<bool, decoder_batch_max_lanes> expected{false, false, false, true};
+    require(selected == expected && state_->budget != 0 && stats,
             "Unexpected scheduler selection");
     std::array<DecoderBatchStep, decoder_batch_max_lanes> steps{};
     auto& step = steps[3];

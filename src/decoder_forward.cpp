@@ -92,7 +92,6 @@ struct LayerBatch {
             check(status, "Run FP8 projection");
             return;
         }
-        static_assert(decoder_batch_max_lanes <= text_fp8_max_batch);
         std::array<TextFp8Projection, text_fp8_max_batch> projections;
         for (int first = 0, group = 0; first < count; ++group) {
             const int rows = projection_rows(group);
@@ -306,10 +305,10 @@ void Decoder::Model::forward_verify(TargetVerification& verification, int positi
 
 void Decoder::Model::forward_verify(const VerificationSequence* sequences, int count,
                                     cudaStream_t stream) const {
-    if (!sequences || count < 1 || count > decoder_batch_max_lanes) {
+    if (!sequences || count < 1 || count > decoder_batch_max_mtp_lanes) {
         throw std::invalid_argument("Invalid number of verification sequences");
     }
-    constexpr int max_rows = target_verify_max_rows * decoder_batch_max_lanes;
+    constexpr int max_rows = target_verify_max_rows * decoder_batch_max_mtp_lanes;
     int total = 0;
     int longest = 0;
     for (int index = 0; index < count; ++index) {

@@ -33,18 +33,23 @@ using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
 constexpr auto disconnect_poll = std::chrono::milliseconds(10);
 constexpr auto mailbox_grace = std::chrono::milliseconds(1);
 
-void trace_prefill_rows(const DecoderBatchStepStats& stats) {
-    const auto& rows = stats.prefill_rows;
-    std::cerr << ("batch prefill_rows=" + std::to_string(rows[0]) + ',' + std::to_string(rows[1]) +
-                  ',' + std::to_string(rows[2]) + ',' + std::to_string(rows[3]) +
-                  " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) + '\n');
+void trace_prefill_rows(const DecoderBatchStepStats& stats, int max_active) {
+    std::string line = "batch prefill_rows=";
+    for (int slot = 0; slot < std::max(max_active, decoder_batch_max_mtp_lanes); ++slot) {
+        if (slot != 0) {
+            line += ',';
+        }
+        line += std::to_string(stats.prefill_rows[slot]);
+    }
+    std::cerr << (line + " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) +
+                  '\n');
 }
 
 void trace_verification(const Steps& steps, const DecoderBatchStepStats& stats) {
     std::cerr << ("batch verify lanes=" + std::to_string(stats.verification_lanes) +
                   " rows=" + std::to_string(stats.verification_rows) +
                   " peak_request_bytes=" + std::to_string(stats.peak_request_bytes) + '\n');
-    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+    for (int slot = 0; slot < decoder_batch_max_mtp_lanes; ++slot) {
         const auto& step = steps[slot];
         if (step.mtp_drafted_tokens || step.mtp_boundary) {
             std::cerr << ("batch mtp slot=" + std::to_string(slot) +
@@ -83,7 +88,7 @@ bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& callbacks,
 }
 
 struct BatchService::State {
-    State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps);
+    State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps, int max_active);
     ~State();
 
     void run(const Decoder& decoder, std::promise<void> started);
@@ -97,6 +102,7 @@ struct BatchService::State {
     const bool trace;
     const bool cuda_graphs;
     const int mtp_steps;
+    const int max_active;
     std::mutex mutex;
     std::condition_variable changed;
     Jobs jobs;
@@ -105,8 +111,15 @@ struct BatchService::State {
     std::thread worker;
 };
 
-BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps)
-    : trace(trace), cuda_graphs(cuda_graphs), mtp_steps(mtp_steps) {
+BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
+                           int max_active)
+    : trace(trace), cuda_graphs(cuda_graphs), mtp_steps(mtp_steps), max_active(max_active) {
+    if (max_active < 1 || max_active > decoder_batch_max_lanes) {
+        throw std::invalid_argument("Invalid decoder batch service capacity");
+    }
+    if (mtp_steps != 0 && max_active > decoder_batch_max_mtp_lanes) {
+        throw std::invalid_argument("Decoder batch service capacity above 4 requires MTP off");
+    }
     std::promise<void> started;
     auto ready = started.get_future();
     worker = std::thread(&State::run, this, std::cref(decoder), std::move(started));
@@ -130,7 +143,8 @@ BatchService::State::~State() {
 void BatchService::State::run(const Decoder& decoder, std::promise<void> started) {
     std::unique_ptr<DecoderBatch> batch;
     try {
-        batch = std::make_unique<DecoderBatch>(decoder, DecoderBatchOptions{cuda_graphs});
+        batch = std::make_unique<DecoderBatch>(decoder,
+                                               DecoderBatchOptions{cuda_graphs, max_active});
     } catch (...) {
         started.set_exception(std::current_exception());
         return;
@@ -159,16 +173,17 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
 
 std::optional<Jobs> BatchService::State::wait_for_jobs() {
     std::unique_lock lock(mutex);
+    const auto end = jobs.begin() + max_active;
     changed.wait(lock, [&] {
-        return closing || std::any_of(jobs.begin(), jobs.end(), [](const auto& job) {
+        return closing || std::any_of(jobs.begin(), end, [](const auto& job) {
             return job && job->ready();
         });
     });
-    const bool admitting = std::any_of(jobs.begin(), jobs.end(), [](const auto& job) {
+    const bool admitting = std::any_of(jobs.begin(), end, [](const auto& job) {
         return job && !job->admitted && !job->cancelled;
     });
     changed.wait_for(lock, mailbox_grace, [&] {
-        return closing || std::all_of(jobs.begin(), jobs.end(), [admitting](const auto& job) {
+        return closing || std::all_of(jobs.begin(), end, [admitting](const auto& job) {
             return job ? job->ready() : !admitting;
         });
     });
@@ -234,7 +249,7 @@ void BatchService::State::process(DecoderBatch& batch) {
     std::size_t traced_bytes = 0;
     while (const auto snapshot = wait_for_jobs()) {
         Selection selected{};
-        for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+        for (int slot = 0; slot < max_active; ++slot) {
             selected[slot] = prepare(batch, slot, (*snapshot)[slot]);
         }
         const int width = std::count(selected.begin(), selected.end(), true);
@@ -262,7 +277,7 @@ void BatchService::State::process(DecoderBatch& batch) {
             if (width || bytes != traced_bytes) {
                 trace_batch_step(width, decode, bytes);
                 if (width) {
-                    trace_prefill_rows(stats);
+                    trace_prefill_rows(stats, max_active);
                     if (stats.graph_slots) {
                         std::cerr << ("batch graph_slots=" +
                                      std::to_string(stats.graph_slots) + '\n');
@@ -279,7 +294,7 @@ void BatchService::State::process(DecoderBatch& batch) {
         }
         {
             const std::lock_guard lock(mutex);
-            for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+            for (int slot = 0; slot < max_active; ++slot) {
                 if (selected[slot]) {
                     publish(slot, *(*snapshot)[slot], steps[slot]);
                 }
@@ -295,14 +310,18 @@ void BatchService::State::cancel(std::unique_lock<std::mutex>& lock, int slot, J
     changed.wait(lock, [&] { return jobs[slot].get() != &job; });
 }
 
-BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps)
-    : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps)) {}
+BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
+                           int max_active)
+    : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps, max_active)) {}
 
 BatchService::~BatchService() = default;
 
 DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
                                      const DecoderOptions& options,
                                      const DecoderCallbacks& callbacks) {
+    if (slot < 0 || slot >= state_->max_active) {
+        throw std::out_of_range("Invalid decoder batch service slot");
+    }
     auto job = std::make_shared<Job>();
     job->prompt = prompt;
     job->options = options;

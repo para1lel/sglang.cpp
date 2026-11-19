@@ -63,6 +63,51 @@ Run the slot-mask regression without a checkpoint or GPU.
 python3 -IB tests/batch/check_graph_evidence.py --check-slot-mask
 ```
 
+## Wide K0 serving
+
+Use the Release `sglang-server` and a fresh evidence directory for the CLI checks.
+CUDA remains hidden while the runner checks valid limits, invalid inputs, and the MTP
+limit of four active requests.
+
+```bash
+python3 -IB tests/batch/run_wide.py --binary "$out/bin/sglang-server" \
+    --cpu-only --evidence "$out/wide-cli"
+```
+
+From the same source and build, compile the native lane probe and CUPTI observer.
+The probe wraps two native entry points to check one full-width model call and
+packed FP8 projection fan-out.
+
+```bash
+toolkit="${CONDA_PREFIX:?Activate the managed Pixi default environment}/targets/x86_64-linux"
+forward=_ZNK6sglang7Decoder5Model7forwardEPKNS_7decoder11ForwardLaneEiP11CUstream_st
+gemm=_ZN6sglang13text_fp8_gemmEPKhPK13__nv_bfloat16iiPKNS_17TextFp8ProjectionEiP11CUstream_st
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
+    tests/batch/check_wide_lanes.cpp -L"$out/lib" -L"$toolkit/lib" \
+    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap="$forward" -Wl,--wrap="$gemm" \
+    -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
+    -lcudart -o "$out/bin/check-wide-lanes"
+"$CXX" -std=c++17 -O2 -fPIC -shared -I"$toolkit/include" \
+    tests/batch/graph_activity.cpp -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" \
+    -lcupti -o "$out/bin/wide-activity.so"
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    python3 -IB tests/batch/run_wide.py --binary "$out/bin/sglang-server" \
+    --checkpoint "$checkpoint" --lanes "$out/bin/check-wide-lanes" \
+    --activity "$out/bin/wide-activity.so" --evidence "$out/wide"
+```
+
+The GPU runner checks both 16 and 32 lanes by default. It compares native and
+HTTP token IDs with serial exact-prefill results. All clients must emit a token
+before the first `[DONE]`. The runner checks queueing, cancellation, and slot
+reuse. Request bytes must return to zero after retirement.
+
+The HTTP trace must show a full-width scheduler step and eager decode above
+the four-lane graph limit. Each step can contain at most 128 prompt and decode
+rows. The native probe requires one full-width eager decode call. A sparse pair
+that includes the highest slot must replay at graph width two. The mask must
+include the highest slot bit, and CUPTI must record the replay. The existing
+graph and MTP runners cover the narrow serving paths.
+
 ## CPU score slab check
 
 From the repository root in the managed Pixi `default` environment, build and

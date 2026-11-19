@@ -93,9 +93,9 @@ struct BatchGraphScratch {
     }
 
     Allocations memory;
-    std::array<std::optional<Workspace>, decoder_batch_max_lanes> work;
+    std::array<std::optional<Workspace>, decoder_batch_max_graph_lanes> work;
     BatchDecodeBinding* device_bindings;
-    std::array<BatchDecodeBinding, decoder_batch_max_lanes> bindings{};
+    std::array<BatchDecodeBinding, decoder_batch_max_graph_lanes> bindings{};
 };
 
 struct BatchStorage {
@@ -127,6 +127,7 @@ std::size_t request_bytes(const BatchStorage& storage) {
 using Selection = std::array<bool, decoder_batch_max_lanes>;
 using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
 using PrefillRows = std::array<int, decoder_batch_max_lanes>;
+static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
 
 struct DraftRound {
     Lane* lane;
@@ -163,12 +164,38 @@ PrefillRows plan_prefill(const BatchStorage& storage, const Selection& selected,
     return rows;
 }
 
+PrefillRows plan_wide_prefill(const BatchStorage& storage, const Selection& selected,
+                              int lanes, int& cursor) {
+    PrefillRows rows{};
+    int unused = prefill_chunk_rows;
+    for (int slot = 0; slot < lanes; ++slot) {
+        const auto& lane = storage.slots[slot];
+        if (selected[slot] && lane && lane->request && lane->remaining_prompt() == 0) {
+            --unused;
+        }
+    }
+    const int start = cursor;
+    for (int offset = 0; offset < lanes && unused > 0; ++offset) {
+        const int slot = (start + offset) % lanes;
+        const auto& lane = storage.slots[slot];
+        if (selected[slot] && lane && lane->request && lane->remaining_prompt() > 0) {
+            rows[slot] = std::min(unused, lane->remaining_prompt());
+            unused -= rows[slot];
+            cursor = (slot + 1) % lanes;
+        }
+    }
+    return rows;
+}
+
 }
 
 struct DecoderBatch::State {
     State(const Decoder::Model& owner, DecoderBatchOptions options)
         : model(owner), options(options), storage(std::make_shared<BatchStorage>()),
           execution(model.device) {
+        if (options.max_lanes < 1 || options.max_lanes > decoder_batch_max_lanes) {
+            throw std::invalid_argument("Invalid decoder batch capacity");
+        }
         DeviceScope device(model.device);
         storage->weights = model.memory;
         execution.open_stream(storage);
@@ -180,6 +207,13 @@ struct DecoderBatch::State {
     void submit(const Selection& selected, Steps& results, DecoderBatchStepStats& stats,
                 bool& contains_mtp);
     void speculate(const Selection& selected, Steps& results, DecoderBatchStepStats& stats);
+
+    std::optional<Lane>& slot_at(int slot) {
+        if (slot < 0 || slot >= options.max_lanes) {
+            throw std::out_of_range("Invalid decoder batch slot");
+        }
+        return storage->slots[slot];
+    }
 
     void require_ready() const {
         if (failed) {
@@ -214,7 +248,8 @@ struct DecoderBatch::State {
     const DecoderBatchOptions options;
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;
-    std::array<bool, decoder_batch_max_lanes - 1> graph_warmed{};
+    std::array<bool, decoder_batch_max_graph_lanes - 1> graph_warmed{};
+    int prefill_cursor = 0;
     bool failed = false;
 };
 
@@ -228,11 +263,14 @@ DecoderBatch::~DecoderBatch() = default;
 
 void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
     state_->require_ready();
-    auto& lane = state_->storage->slots.at(slot);
+    auto& lane = state_->slot_at(slot);
     if (lane || options.top_logits != 0) {
         throw std::invalid_argument("Decoder batch requires an empty slot and no top logits");
     }
     validate_request(prompt, options, true);
+    if (options.mtp_steps != 0 && state_->options.max_lanes > decoder_batch_max_mtp_lanes) {
+        throw std::invalid_argument("Decoder batch capacity above 4 requires MTP off");
+    }
     if (options.mtp_steps != 0 && !state_->model.mtp_weights) {
         throw std::invalid_argument("Decoder batch requires draft weights for MTP");
     }
@@ -266,7 +304,7 @@ void DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions
 
 void DecoderBatch::cancel(int slot) {
     state_->require_ready();
-    auto& lane = state_->storage->slots.at(slot);
+    auto& lane = state_->slot_at(slot);
     try {
         retire(lane);
     } catch (...) {
@@ -292,7 +330,7 @@ bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
         }
     }, [&] {
         auto& scratch = *storage->graph_scratch;
-        std::array<BatchGraphLane, decoder_batch_max_lanes> capture;
+        std::array<BatchGraphLane, decoder_batch_max_graph_lanes> capture;
         for (int index = 0; index < count; ++index) {
             capture[index] = {&*scratch.work[index], scratch.device_bindings + index};
         }
@@ -331,27 +369,32 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
     const int max_rows = *std::max_element(rows.begin(), rows.end());
     const bool graph_eligible = options.cuda_graphs && max_rows == 0;
     int count = 0;
-    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
-        if (selected[slot] && slots[slot] && slots[slot]->request) {
-            auto& lane = *slots[slot];
-            results[slot].decode = rows[slot] == 0;
-            contains_mtp = contains_mtp || lane.draft != nullptr;
-            if (results[slot].decode && lane.draft && lane.remaining_output() > 1) {
-                speculative[slot] = true;
-                continue;
-            }
-            results[slot].mtp_boundary = results[slot].decode && lane.draft != nullptr;
-            if (rows[slot] <= 1) {
-                packed_slots[slot] = count;
-                work[count++] = lane.input();
-            }
-            if (rows[slot] == lane.remaining_prompt()) {
-                scoring[slot] = lane.request.get();
-            }
+    for (int slot = 0; slot < options.max_lanes; ++slot) {
+        if (!selected[slot] || !slots[slot] || !slots[slot]->request) {
+            continue;
+        }
+        auto& lane = *slots[slot];
+        const int remaining = lane.remaining_prompt();
+        if (rows[slot] == 0 && remaining > 0) {
+            continue;
+        }
+        results[slot].decode = remaining == 0;
+        contains_mtp = contains_mtp || lane.draft != nullptr;
+        if (results[slot].decode && lane.draft && lane.remaining_output() > 1) {
+            speculative[slot] = true;
+            continue;
+        }
+        results[slot].mtp_boundary = results[slot].decode && lane.draft != nullptr;
+        if (rows[slot] <= 1) {
+            packed_slots[slot] = count;
+            work[count++] = lane.input();
+        }
+        if (rows[slot] == remaining) {
+            scoring[slot] = lane.request.get();
         }
     }
-    const bool graph = graph_eligible && !contains_mtp && count >= 2 &&
-        replay(work.data(), count);
+    const bool graph = graph_eligible && !contains_mtp &&
+        count >= 2 && count <= decoder_batch_max_graph_lanes && replay(work.data(), count);
     if (count != 0 && !graph) {
         model.forward(work.data(), count, stream);
     }
@@ -384,14 +427,16 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
                 const auto* output = &scratch.work[packed_slots[slot]]->argmax->token_id;
                 check(cudaMemcpyAsync(&winner, output, sizeof(winner), cudaMemcpyDeviceToHost,
                                       stream), "Read batch graph greedy token");
-                stats.graph_slots |= 1u << slot;
+                stats.graph_slots |= std::uint32_t{1} << slot;
                 continue;
             }
             model.compute_logits(request->work, stream);
             copy_greedy_token(*request, stream);
         }
     }
-    speculate(speculative, results, stats);
+    if (contains_mtp) {
+        speculate(speculative, results, stats);
+    }
     if (stats.verification_lanes == 0 && (count != 0 || max_rows > 1)) {
         check(cudaStreamSynchronize(stream), "Complete decoder batch step");
     }
@@ -405,12 +450,12 @@ void DecoderBatch::State::submit(const Selection& selected, Steps& results,
 void DecoderBatch::State::speculate(const Selection& selected, Steps& results,
                                     DecoderBatchStepStats& stats) {
     const auto stream = execution.stream();
-    std::array<DraftRound, decoder_batch_max_lanes> rounds;
-    std::array<VerificationSequence, decoder_batch_max_lanes> sequences;
-    std::array<TargetVerification*, decoder_batch_max_lanes> verifiers;
+    std::array<DraftRound, decoder_batch_max_mtp_lanes> rounds;
+    std::array<VerificationSequence, decoder_batch_max_mtp_lanes> sequences;
+    std::array<TargetVerification*, decoder_batch_max_mtp_lanes> verifiers;
     int count = 0;
     int longest = 0;
-    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+    for (int slot = 0; slot < options.max_lanes; ++slot) {
         if (selected[slot]) {
             auto& lane = *storage->slots[slot];
             const int proposals = std::min(lane.options.mtp_steps, lane.remaining_output() - 1);
@@ -466,7 +511,9 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         auto& slots = storage->slots;
         Steps results{};
         DecoderBatchStepStats current;
-        current.prefill_rows = plan_prefill(*storage, selected, chunked);
+        current.prefill_rows = chunked && options.max_lanes > decoder_batch_max_mtp_lanes
+            ? plan_wide_prefill(*storage, selected, options.max_lanes, prefill_cursor)
+            : plan_prefill(*storage, selected, chunked);
         const auto live_before = stats ? request_bytes(*storage) : 0;
         submit(selected, results, current, contains_mtp);
         if (stats) {
@@ -481,7 +528,8 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             }
             if (!lane->request) {
                 result.finish_reason = DecoderFinishReason::length;
-            } else if (result.mtp_drafted_tokens == 0) {
+            } else if (result.mtp_drafted_tokens == 0 &&
+                       (result.decode || current.prefill_rows[slot] != 0)) {
                 if (result.token) {
                     lane->select_token(*result.token, result);
                 }

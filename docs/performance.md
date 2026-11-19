@@ -82,7 +82,7 @@ Require every warmup and measured stream to pass validation. The native-to-basel
 
 Match the published native control's greedy IDs and full-vocabulary BF16 logit bits on W1 and W2 under the same checkpoint and precision. Check eager decode and fresh and reused graphs. Exercise exact GQA and direct fallback at their [dispatch bounds](development.md#runtime-path). Run the [prefill](development.md#chunked-prefill-verification), [streaming](development.md#streaming-verification), and [MTP](mtp.md#verification) checks before timing.
 
-Trace actual forward group sizes and row modes. Confirm fused launches for an eligible single target decode row and packed projections for eligible groups of two to four rows. Include a group containing decode and single-row prefill. Compare shape and alignment fallbacks with the separate native operations. For steady decode timing, match execution mode, context length, and KV capacity. Record graph captures and replays.
+Trace actual forward group sizes and row modes. Confirm fused launches for an eligible single target decode row. Check packed projections for eligible groups of two through five rows. Include a group containing decode and single-row prefill. Compare shape and alignment fallbacks with the separate native operations. For steady decode timing, match execution mode, context length, and KV capacity. Record graph captures and replays.
 
 Compare fused SwiGLU BF16 results with identical and disjoint gate and up output spans. Require `cudaErrorInvalidValue` before launch for identical gate and up spans in fallback, partial output overlaps, and output overlaps with inputs.
 
@@ -137,9 +137,9 @@ The verifier used unrounded limits. W2 still misses all four. See `artifacts/tc-
 
 ### Native concurrent workloads
 
-After [streaming verification](development.md#streaming-verification), run W3 and W6 with `--max-active 4`. Verify full-width decode and capacity. Account for [score allocation and capture](batch-graphs.md#timing). W4 and W5 exceed four lanes.
+After [streaming verification](development.md#streaming-verification), set `--max-active` to the row's lane count and use K0. W4 uses 16 lanes and W5 uses 32. Wait for [HTTP readiness](development.md#native-streaming-server). In a separate traced run, verify full-width decode and record effective [graph dispatch](batch-graphs.md#timing).
 
-The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets and instrumentation. Follow the [frozen protocol](../benchmarks/concurrent/README.md#conditions-and-gates) for acceptance timing.
+Follow the [frozen protocol](../benchmarks/concurrent/README.md#conditions-and-gates) for acceptance. The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets and instrumentation. W4 and W5 acceptance remains pending.
 
 A pre-loader GPU6 comparison ran one cold full W3 cohort per arm with tensor-core prefill, batch graphs, and MTP off. Unit16 used eager long decode. The candidate replayed it. All 4,096 IDs, finish reasons, and usage matched. Throughput rose from 5.69 to 14.91 IDs/s. P95 TPOT fell from 624.40 to 189.36 ms. See `artifacts/long-batch-graph-release/report.md`.
 
@@ -157,9 +157,9 @@ Positive depth adds counters for the generator's first measured request. `mtp_dr
 
 Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder.cpp#L182)<!-- prefix: "std::optiona" -->
 
-Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L43)<!-- prefix: "void trace_v" -->
+Batch traces report joint verifier lanes and computed rows. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L48)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L273)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L460)<!-- prefix: "Steps Decode" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L273)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L520)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

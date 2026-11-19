@@ -10,7 +10,7 @@
 namespace {
 
 constexpr std::size_t binding_bytes =
-    sizeof(sglang::decoder::BatchDecodeBinding) * sglang::decoder_batch_max_lanes;
+    sizeof(sglang::decoder::BatchDecodeBinding) * sglang::decoder_batch_max_graph_lanes;
 constexpr std::size_t first_workspace_bytes =
     sizeof(sglang::decoder::Bf16) * sglang::decoder::hidden_size;
 constexpr std::size_t long_score_bytes = 5248 * sglang::mxfp8_query_heads * sizeof(float);

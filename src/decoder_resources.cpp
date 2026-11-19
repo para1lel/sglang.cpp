@@ -161,7 +161,7 @@ struct Allocations::State {
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
-    std::array<BatchGraph, decoder_batch_max_lanes - 1> batch_graphs{};
+    std::array<BatchGraph, decoder_batch_max_graph_lanes - 1> batch_graphs{};
     bool uncertain_stream = false;
     bool uncertain_graph = false;
     std::vector<void*> blocks;

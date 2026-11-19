@@ -1,0 +1,1335 @@
+diff --git a/tests/model_reference/README.md b/tests/model_reference/README.md
+new file mode 100644
+index 0000000..1007d30
+--- /dev/null
++++ b/tests/model_reference/README.md
+@@ -0,0 +1,70 @@
++# Pinned SGLang model reference
++
++This test compares the native text generator with SGLang `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`, using the Qwen3.8-27B-FP8 snapshot `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`. It uses greedy target-only generation on one B200. The fixture manifests pin the prompts, teacher histories, full vocabulary logits and acceptance criteria. The test tools are outside the deployed binaries.
++
++`archive-manifest.json` binds five existing SGLang captures. It includes a 128-token page edge, 897- and 2017-token content prompts, and 2047- and 2048-token prompts. The full capture recipe adds one input token, the 127- and 129-token page edges, new prose, Python, Japanese and mixed Unicode, and checkpoint EOS. The full run uses a separately verified and pinned `manifest.json`. Logit row 0 predicts the token after the prompt. Row `i` predicts the token after the prompt and the first `i` teacher tokens.
++
++## Run with frozen evidence
++
++Set `bundle` to the unpacked reference bundle, `build` to the native XMake build directory, `checkpoint` to the pinned model directory, and `out` to a new evidence location. Use the project Pixi C++/CUDA environment for the interposer, and Python with NumPy for the checker. Pass an already leased B200 as the sole device in `CUDA_VISIBLE_DEVICES`.
++
++```sh
++suite=$PWD/tests/model_reference
++toolkit="$CONDA_PREFIX/targets/x86_64-linux"
++mkdir -p "$out"
++"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -shared -fPIC \
++  -I"$toolkit/include" "$suite/teacher.cpp" -ldl -o "$out/teacher.so"
++OPENBLAS_NUM_THREADS=1 python -B "$suite/compare.py" "$bundle" --self-test
++OPENBLAS_NUM_THREADS=1 python -B "$suite/compare.py" "$bundle" \
++  --generate "$build/bin/sglang-generate" --checkpoint "$checkpoint" \
++  --teacher "$out/teacher.so" --output "$out/generate" --prefill exact
++```
++
++The self-test verifies the frozen bundle and rejects the real W1 next-position row substituted for row 0 and the W1 score vector with token IDs rotated. `--case W1 --case H2047` selects a bounded smoke test. `--prefill tensor-core` covers that policy separately. A gate failure exits with status 1 and keeps the measurements.
++
++The regular CLI returns all 248,320 logits via `--top-logits` and emits the native greedy selection. The test interposer identifies the winner readback followed by the full BF16 score readback on the same stream. It saves the original greedy ID and changes the host and device winner after the score copy, allowing normal native decode to consume the external teacher token. The checker restores vocabulary order from the JSON IDs and verifies the recorded original winner. A pass-through control must preserve every observed score. A changed teacher token must preserve the score before selection and change the following row. Neither control supplies expected model logits.
++
++## Run the HTTP widths
++
++The test exercises normal streaming completion at widths 1, 2 and 4 on the published binary and adds width 3 with graph scheduling on the staged binary. Run each binary against the same external fixture. With a full bundle the width-4 burst uses three distinct prompts and repeats the prose prompt once. Pass `--archive-smoke` with the archive bundle to run the width checks on copies of W1. It checks tokens against all available SGLang score rows while the prefixes agree. An archived position without scores requires the recorded SGLang token so that it cannot silently skip later checks. The batch logs must show overlapping decode twice at the requested width. The existing batch graph release tests provide separate replay instrumentation.
++
++```sh
++PYTHONPATH="$PWD/tests/batch" OPENBLAS_NUM_THREADS=1 python -B "$suite/serve.py" \
++  "$published_build/bin/sglang-server" "$checkpoint" "$bundle" "$out/published-http" \
++  --widths 1 2 4
++PYTHONPATH="$PWD/tests/batch" OPENBLAS_NUM_THREADS=1 python -B "$suite/serve.py" \
++  "$graph_build/bin/sglang-server" "$checkpoint" "$bundle" "$out/graph-http" \
++  --widths 1 2 3 4 --graph
++```
++
++HTTP token checks use the SGLang score row for the shared prefix. A close alternate requires a top-16 position and at most 1.0 logit of regret. Later tokens after a divergence have a different history and are omitted from numerical checks. The checker reports where comparison ended. Native HTTP accepts `ignore_eos=true` and explicit `stop_token_ids`. The EOS case configures the observed checkpoint EOS as that stop token and requires the SGLang token sequence and stop reason.
++
++## Recreate or audit the fixture
++
++`archive` is the original `fp8-projection-parity/evidence/sglang-v1` evidence directory. It has `fixtures/*.prompt`, `fixtures/*.teacher`, `*.f32` and `*.json`. `fixtures.py` derives the edge inputs from W1 and tokenizes the fixed holdout texts with the pinned checkpoint tokenizer.
++
++```sh
++python -B "$suite/fixtures.py" "$checkpoint" "$archive" "$out/inputs.json"
++python -B "$suite/bundle.py" "$out/inputs.json" "$archive" "$out/archive-bundle"
++```
++
++For an optional heavyweight independent replay, use the existing isolated SGLang-compatible environment and dependency overlay from the projection study. The input `source_archive` is the pinned `vision-parity/upstream/sglang.tar.gz`. Extract its `*/python/*` members into a fresh directory and set `sglang_python` to that extracted `python` directory. `checkpoint_manifest` is the authenticated `checkpoint.sha256` from the pinned reference environment. Use offline mode, a leased device and a writable evidence cache for CUDA, Triton and FlashInfer. Use a short writable `TMPDIR` so the generated ZeroMQ Unix socket paths fit in 107 bytes. The capture verifies the pinned source directory, the checkpoint manifest and checkpoint files before launch.
++
++```sh
++export MODEL_REFERENCE_SGLANG_PYTHON="$sglang_python"
++export PYTHONPATH="$reference_overlay:$sglang_python"
++export PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
++"$reference_python" -B "$suite/reference.py" \
++  "$checkpoint" "$checkpoint_manifest" "$source_archive" \
++  "$out/inputs.json" "$out/capture"
++python -B "$suite/bundle.py" "$out/inputs.json" "$archive" "$out/full-bundle" \
++  --capture "$out/capture"
++```
++
++The optional capture makes two runs of each new request within one independent engine session and records raw FP32 rows before teacher selection. `--all` also recaptures the five archived cases for drift investigation. Bundle resynthesis retains the original archived vectors and compares expected digests byte for byte. A replay that changes a digest remains separate evidence. If the suite has no pinned full manifest yet, the bundler writes a candidate manifest and exits with an error. Review the independent capture receipts and reproducibility, then pin the verified manifest alongside `archive-manifest.json` before running native against the new cases.
++
++## Numerical criteria
++
++Every aligned row reports raw relative L2, cosine similarity, top-16 intersection, both winning IDs and margins, and reference regret. Compute norms in FP64. The row limits are 0.15 relative L2, 0.985 cosine and at least eight common top-16 IDs. A reference margin of at least 1.0 requires the same greedy winner. Where a second reference capture exists, both must agree on the winner and clear that minimum before applying the winner gate. Archive margins are single-capture observations. These are release-suite test criteria for the mixed FP8 model on this hardware.
++
++The prior fixed-model projection study observed 0.1252 relative L2 for W2 row 0 and 0.1132 for H2047 row 0. A 0.15 ceiling allows modest headroom above that calibration while rejecting larger drift. One logit is well above the observed BF16 rounding increments near the top of those rows. The published H2047 disagreement was 2.875 logits by SGLang's margin and is expected to remain visible. SGLang uses BF16 KV and a FlashInfer groupwise FP8 projection backend, while native uses MXFP8 KV and its own activation quantization and accumulation. The model combines 48 recurrent GDN and 16 GQA blocks. Cross-engine score and token deviations alone cannot isolate a native implementation defect. A regression claim requires a controlled comparison with the same history and the relevant arithmetic or execution path held fixed.
+diff --git a/tests/model_reference/archive-manifest.json b/tests/model_reference/archive-manifest.json
+new file mode 100644
+index 0000000..285e7bb
+--- /dev/null
++++ b/tests/model_reference/archive-manifest.json
+@@ -0,0 +1,105 @@
++{
++  "cases": {
++    "C2017": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "a8a662e2ad462c8dae8e57e1a7bf6384b9bb4b218560b894c08ea1d32fb64530",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        561,
++        5721,
++        11222,
++        264,
++        16097
++      ]
++    },
++    "C897": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "28df2c23b6cf11190f4f7742201b6a77ea47f8e410173d039f846d583f61d4fc",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        561,
++        5721,
++        11222,
++        264,
++        16097
++      ]
++    },
++    "H2047": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "824a4d23193c423387edb7f16d8999166dadb53282274f7a101bd3849be457c2",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        2981,
++        5157,
++        11,
++        271,
++        248068
++      ]
++    },
++    "W1": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "b9b7478fa45d927c623ea8ad4c2a9a473615d0ed3335c94a9117783e2eb6c986",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        279,
++        1500,
++        557,
++        4860,
++        11
++      ]
++    },
++    "W2": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "e8cedead6f1b5652047254d7b00b4be165e414dae5bef0230bf21e5d238e7cb1",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        2981,
++        5157,
++        11,
++        271,
++        248068
++      ]
++    }
++  },
++  "checkpoint_revision": "c3a462cc3d38cf351f3b26cbd763469eeb74ef81",
++  "criteria_sha256": "68e3a6259ba754c7b4a9b58b5b864e35a4e413ee73758ca87d2c1e5911bd452c",
++  "files": {
++    "C2017.0.f32": "c84023bede26aa9d809d30c28db6d9bea30babe98da0ee4bb7c04099baff755c",
++    "C897.0.f32": "c1f5cc2439b3197dbc9581de81f32ab71a2af8a1a8f7bf9017d15194c1ab451c",
++    "H2047.0.f32": "d5682148c8231d565fcca8e3f3dd72aeca8a706980af17053ba43846960964c8",
++    "W1.0.f32": "60ad6dfc28365d87258bbf6ce1d63be43b3a1e0b0bcb7524369bd386b6916263",
++    "W2.0.f32": "bc131c3ffb29cfbaf7c4766a4ff31d1a2de04d6d3fdd2f3c5dfd960681c88f11",
++    "inputs.json": "1521579b38ac181b6e46b4a8994ca64eaaada1261410109928ff4537c72f4ee3"
++  },
++  "sglang_revision": "f04d886bf79aa3d6237cbb12a3311838eb9f9bd8"
++}
+diff --git a/tests/model_reference/bundle.py b/tests/model_reference/bundle.py
+new file mode 100644
+index 0000000..af0046d
+--- /dev/null
++++ b/tests/model_reference/bundle.py
+@@ -0,0 +1,92 @@
++import argparse
++import json
++import shutil
++from pathlib import Path
++
++from fixtures import (ARCHIVE_CASES, CHECKPOINT, CHECKPOINT_MANIFEST_SHA, HERE, SGLANG, SOURCE_SHA,
++                      VOCAB, digest, require, write_json)
++
++
++ARCHIVE_STEPS = (0, 1, 3, 4)
++
++
++def archive_case(inputs, archive, output, name):
++    case = inputs[name]
++    original = archive / f"{name}.f32"
++    receipt = json.loads((archive / f"{name}.json").read_text())
++    require(receipt["output_ids"] == case["teacher"] and
++            receipt["meta_info"]["prompt_tokens"] == len(case["prompt"]),
++            f"Archived teacher history mismatch for {name}")
++    stride = 4 * VOCAB
++    require(original.stat().st_size == stride * len(case["teacher"]),
++            f"Archived vocabulary size mismatch for {name}")
++    with original.open("rb") as source, (output / f"{name}.0.f32").open("xb") as saved:
++        for step in ARCHIVE_STEPS:
++            source.seek(stride * step)
++            saved.write(source.read(stride))
++    return {"steps": ARCHIVE_STEPS, "tokens": case["teacher"][:max(ARCHIVE_STEPS) + 1],
++            "finish": "length", "repeats": 1, "source_sha256": digest(original)}
++
++
++def captured_case(inputs, capture, output, name):
++    primary = json.loads((capture / f"{name}.0.json").read_text())
++    repeat = json.loads((capture / f"{name}.1.json").read_text())
++    require(primary == repeat, f"SGLang repeat changed emitted history for {name}")
++    tokens = primary["tokens"]
++    require(primary["prompt"] == inputs[name]["prompt"] and tokens and
++            ("teacher" not in inputs[name] or tokens == inputs[name]["teacher"]),
++            f"Invalid captured history for {name}")
++    for index in range(2):
++        filename = f"{name}.{index}.f32"
++        source = capture / filename
++        require(source.stat().st_size == len(tokens) * VOCAB * 4,
++                f"Invalid vocabulary size for {filename}")
++        shutil.copyfile(source, output / filename)
++    return {"tokens": tokens, "finish": primary["finish"],
++            "steps": list(range(len(tokens))), "repeats": 2}
++
++
++def materialize(inputs_path, archive, capture, output):
++    inputs = json.loads(inputs_path.read_text())
++    output.mkdir()
++    shutil.copyfile(inputs_path, output / "inputs.json")
++    if capture is not None:
++        receipt_path = capture / "capture.json"
++        receipt = json.loads(receipt_path.read_text())
++        expected = {"sglang_revision": SGLANG, "checkpoint_revision": CHECKPOINT,
++                    "source_sha256": SOURCE_SHA, "checkpoint_manifest_sha256": CHECKPOINT_MANIFEST_SHA,
++                    "inputs_sha256": digest(inputs_path), "repeats": 2}
++        require(all(receipt[key] == value for key, value in expected.items()),
++                "Unexpected SGLang capture provenance")
++        shutil.copyfile(receipt_path, output / "capture.json")
++    cases = {}
++    for name in inputs:
++        if name not in ARCHIVE_CASES and capture is None:
++            continue
++        function, source = ((archive_case, archive) if name in ARCHIVE_CASES
++                            else (captured_case, capture))
++        cases[name] = function(inputs, source, output, name)
++    return {"sglang_revision": SGLANG, "checkpoint_revision": CHECKPOINT,
++            "criteria_sha256": digest(HERE / "criteria.json"), "cases": cases,
++            "files": {file.name: digest(file) for file in sorted(output.iterdir())}}
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("inputs", type=Path)
++    parser.add_argument("archive", type=Path)
++    parser.add_argument("output", type=Path)
++    parser.add_argument("--capture", type=Path)
++    args = parser.parse_args()
++    manifest = materialize(args.inputs, args.archive, args.capture, args.output)
++    name = "manifest.json" if args.capture is not None else "archive-manifest.json"
++    path = args.output / name
++    write_json(path, manifest)
++    frozen = HERE / name
++    require(frozen.exists(), f"Unfrozen candidate manifest written at {path}")
++    require(path.read_bytes() == frozen.read_bytes(),
++            f"Resynthesized bundle differs from {name}. Compare the two manifests.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/model_reference/compare.py b/tests/model_reference/compare.py
+new file mode 100644
+index 0000000..047637a
+--- /dev/null
++++ b/tests/model_reference/compare.py
+@@ -0,0 +1,216 @@
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++from pathlib import Path
++
++import numpy as np
++
++from fixtures import CHECKPOINT, HERE, SGLANG, VOCAB, digest, require, verify_checkpoint, write_json
++
++
++def read_bundle(bundle):
++    name = "manifest.json" if (bundle / "manifest.json").exists() else "archive-manifest.json"
++    frozen_path = HERE / name
++    require(frozen_path.exists(), f"Missing pinned fixture manifest {frozen_path}")
++    frozen = frozen_path.read_bytes()
++    require((bundle / name).read_bytes() == frozen, f"Bundle differs from frozen {name}")
++    manifest = json.loads(frozen)
++    require(manifest["checkpoint_revision"] == CHECKPOINT and manifest["sglang_revision"] == SGLANG,
++            "Unexpected fixture provenance")
++    require(digest(HERE / "criteria.json") == manifest["criteria_sha256"], "Criteria digest changed")
++    for filename, expected in manifest["files"].items():
++        require(digest(bundle / filename) == expected, f"Fixture digest changed: {filename}")
++    inputs = json.loads((bundle / "inputs.json").read_text())
++    require(manifest["cases"].keys() <= inputs.keys(), "Fixture list differs from manifest")
++    return inputs, manifest["cases"]
++
++
++def rankings(scores, count):
++    threshold = np.partition(scores, scores.size - count)[-count]
++    candidates = np.flatnonzero(scores >= threshold)
++    return candidates[np.lexsort((candidates, -scores[candidates]))[:count]]
++
++
++def measure(reference, candidate, thresholds, repeat=None):
++    reference = np.asarray(reference, dtype=np.float64)
++    candidate = np.asarray(candidate, dtype=np.float64)
++    require(reference.shape == candidate.shape == (VOCAB,), "Wrong vocabulary shape")
++    require(np.isfinite(reference).all() and np.isfinite(candidate).all(), "Nonfinite logits")
++    count = thresholds["top_k"]
++    ref_order = rankings(reference, count)
++    got_order = rankings(candidate, count)
++    reference_winner, candidate_winner = int(ref_order[0]), int(got_order[0])
++    reference_margin = float(reference[ref_order[0]] - reference[ref_order[1]])
++    high_margin = reference_margin >= thresholds["reference_margin_min"]
++    repeat_delta = None
++    if repeat is not None:
++        repeat_order = rankings(repeat, 2)
++        repeat_margin = float(repeat[repeat_order[0]] - repeat[repeat_order[1]])
++        high_margin &= (int(repeat_order[0]) == reference_winner and
++                        repeat_margin >= thresholds["reference_margin_min"])
++        repeat_delta = float(np.max(np.abs(reference - repeat)))
++    ref_norm = np.linalg.norm(reference)
++    candidate_norm = np.linalg.norm(candidate)
++    require(ref_norm > 0 and candidate_norm > 0, "Zero logit norm")
++    relative_l2 = float(np.linalg.norm(candidate - reference) / ref_norm)
++    cosine = float(np.dot(candidate, reference) / (candidate_norm * ref_norm))
++    overlap = int(np.intersect1d(ref_order, got_order).size)
++    failures = []
++    if relative_l2 > thresholds["relative_l2_max"]:
++        failures.append("relative_l2")
++    if cosine < thresholds["cosine_min"]:
++        failures.append("cosine")
++    if overlap < thresholds["top_k_overlap_min"]:
++        failures.append("top_k_overlap")
++    if high_margin and candidate_winner != reference_winner:
++        failures.append("clear_margin_winner")
++    return {"relative_l2": relative_l2, "cosine": cosine, "top_k_overlap": overlap,
++            "reference_top_ids": ref_order.tolist(), "reference_winner": reference_winner,
++            "candidate_winner": candidate_winner, "reference_margin": reference_margin,
++            "candidate_margin": float(candidate[got_order[0]] - candidate[got_order[1]]),
++            "reference_regret": float(reference[reference_winner] - reference[candidate_winner]),
++            "clear_margin": bool(high_margin), "reference_repeat_max_abs": repeat_delta,
++            "failures": failures}
++
++
++def load_rows(bundle, name, case, repeat=0):
++    path = bundle / f"{name}.{repeat}.f32"
++    rows = np.fromfile(path, dtype="<f4")
++    require(rows.size == len(case["steps"]) * VOCAB and np.isfinite(rows).all(),
++            f"Invalid SGLang logits in {path}")
++    return dict(zip(case["steps"], rows.reshape(-1, VOCAB), strict=True))
++
++
++def native_rows(payload):
++    for row in payload["step_top_logits"]:
++        require(len(row) == VOCAB, "Native JSON omitted logits")
++        ids = np.asarray([item["token_id"] for item in row])
++        require(np.issubdtype(ids.dtype, np.integer) and
++                np.array_equal(np.sort(ids), np.arange(VOCAB)), "Native vocabulary ID mismatch")
++        dense = np.empty(VOCAB, dtype=np.float32)
++        dense[ids] = [item["logit"] for item in row]
++        require(np.isfinite(dense).all(), "Nonfinite native logits")
++        yield dense
++
++
++def invoke(args, output, tokens, budget, forced=None):
++    output.mkdir()
++    prompt_file = output / "prompt.txt"
++    prompt_file.write_text(",".join(map(str, tokens)) + "\n")
++    command = [str(args.generate), "--checkpoint", str(args.checkpoint), "--device", "0",
++               "--prompt-file", str(prompt_file), "--max-new-tokens", str(budget),
++               "--fp8-prefill", args.prefill, "--top-logits", str(VOCAB)]
++    env = os.environ.copy()
++    if forced is not None:
++        teacher = output / "teacher.txt"
++        teacher.write_text(" ".join(map(str, forced)) + "\n")
++        env["MODEL_REFERENCE_TEACHER"] = str(teacher)
++        env["MODEL_REFERENCE_TEACHER_TRACE"] = str(output / "trace.txt")
++        env["LD_PRELOAD"] = str(args.teacher)
++    write_json(output / "command.json", command)
++    with (output / "stdout.json").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
++        subprocess.run(command, env=env, cwd=output, stdout=stdout, stderr=stderr, check=True,
++                       timeout=45)
++    result = json.loads((output / "stdout.json").read_text())
++    require(result["prompt_token_ids"] == tokens, "Native prompt identity changed")
++    return result
++
++
++def case_rows(args, inputs, cases, name, thresholds):
++    case = cases[name]
++    prompt = inputs[name]["prompt"]
++    tokens = case["tokens"]
++    output = args.output / name
++    payload = invoke(args, output, prompt, len(tokens), forced=tokens)
++    require(payload["output_token_ids"] == tokens and payload["finish_reason"] == "length",
++            f"Native teacher history changed for {name}")
++    trace = [tuple(map(int, line.split())) for line in (output / "trace.txt").read_text().splitlines()]
++    require([(row[0], row[2]) for row in trace] == list(enumerate(tokens)),
++            f"Teacher observer missed native readback for {name}")
++    ref = load_rows(args.bundle, name, case)
++    repeat = load_rows(args.bundle, name, case, 1) if case["repeats"] == 2 else {}
++    rows = []
++    for step, native in enumerate(native_rows(payload)):
++        require(int(np.argmax(native)) == trace[step][1],
++                f"Native raw argmax/readback mismatch at {name}/{step}")
++        if step not in ref:
++            continue
++        history = np.asarray(prompt + tokens[:step], dtype="<u4")
++        metrics = measure(ref[step], native, thresholds, repeat.get(step))
++        rows.append({"step": step, "input_tokens": len(history),
++                     "last_input_id": int(history[-1]),
++                     "history_sha256": hashlib.sha256(history.tobytes()).hexdigest(), **metrics})
++    require(len(payload["step_top_logits"]) == len(tokens) and len(rows) == len(case["steps"]),
++            f"Missing native rows for {name}")
++    return rows
++
++
++def check_hook(args, name, inputs):
++    prompt = inputs[name]["prompt"]
++    natural = invoke(args, args.output / "hook-natural", prompt, 3)
++    tokens = natural["output_token_ids"]
++    forced = invoke(args, args.output / "hook-identity", prompt, 3, forced=tokens)
++    require(len(tokens) == 3 and forced["output_token_ids"] == tokens and
++            all(np.array_equal(left, right) for left, right in
++                zip(native_rows(natural), native_rows(forced), strict=True)),
++            "Inert teacher hook changed same-history logits")
++    alternate_tokens = [(tokens[0] + 1031) % VOCAB, tokens[1]]
++    alternate = invoke(args, args.output / "hook-alternate", prompt, 2, forced=alternate_tokens)
++    natural_rows = native_rows(natural)
++    alternate_rows = native_rows(alternate)
++    require(alternate["output_token_ids"] == alternate_tokens and
++            np.array_equal(next(natural_rows), next(alternate_rows)) and
++            not np.array_equal(next(natural_rows), next(alternate_rows)),
++            "Changed teacher token did not take effect exclusively after its selection")
++    return {"case": name, "steps": len(tokens), "tokens": tokens,
++            "alternate_first_token": alternate_tokens[0]}
++
++
++def mutation_test(bundle, cases, thresholds):
++    rows = load_rows(bundle, "W1", cases["W1"])
++    reference = rows[0]
++    control = measure(reference, reference, thresholds)
++    require(not control["failures"], "Identity scores failed")
++    changed = {"next_position": measure(reference, rows[1], thresholds),
++               "permuted_vocab": measure(reference, np.roll(reference, 1031), thresholds)}
++    require(all(row["failures"] for row in changed.values()), "Score mutation escaped detection")
++    return {name: details["failures"] for name, details in changed.items()}
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("bundle", type=Path)
++    parser.add_argument("--self-test", action="store_true")
++    for name in ("generate", "checkpoint", "teacher", "output"):
++        parser.add_argument(f"--{name}", type=lambda value: Path(value).resolve())
++    parser.add_argument("--prefill", choices=("exact", "tensor-core"), default="exact")
++    parser.add_argument("--case", action="append")
++    args = parser.parse_args()
++    inputs, cases = read_bundle(args.bundle)
++    thresholds = json.loads((HERE / "criteria.json").read_text())
++    mutations = mutation_test(args.bundle, cases, thresholds)
++    if args.self_test:
++        print(json.dumps(mutations, indent=2))
++        return
++    require(all((args.generate, args.checkpoint, args.teacher, args.output)),
++            "Native comparison requires --generate, --checkpoint, --teacher, and --output")
++    verify_checkpoint(args.checkpoint)
++    args.output.mkdir()
++    names = args.case or list(cases)
++    require(set(names) <= cases.keys() and len(set(names)) == len(names), "Unknown or repeated case")
++    evidence = {"native_sha256": digest(args.generate), "teacher_sha256": digest(args.teacher),
++                "prefill": args.prefill, "mutations": mutations,
++                "hook_identity": check_hook(args, "W1", inputs), "cases": {}}
++    report = args.output / "report.json"
++    for name in names:
++        evidence["cases"][name] = case_rows(args, inputs, cases, name, thresholds)
++        write_json(report, evidence)
++    passed = not any(row["failures"] for rows in evidence["cases"].values() for row in rows)
++    print(f"{len(names)} cases, {sum(map(len, evidence['cases'].values()))} rows, pass={passed}")
++    raise SystemExit(0 if passed else 1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/model_reference/criteria.json b/tests/model_reference/criteria.json
+new file mode 100644
+index 0000000..f8b764b
+--- /dev/null
++++ b/tests/model_reference/criteria.json
+@@ -0,0 +1,7 @@
++{
++  "relative_l2_max": 0.15,
++  "cosine_min": 0.985,
++  "top_k": 16,
++  "top_k_overlap_min": 8,
++  "reference_margin_min": 1.0
++}
+diff --git a/tests/model_reference/fixtures.py b/tests/model_reference/fixtures.py
+new file mode 100644
+index 0000000..a769064
+--- /dev/null
++++ b/tests/model_reference/fixtures.py
+@@ -0,0 +1,88 @@
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++
++HERE = Path(__file__).resolve().parent
++VOCAB = 248320
++EOS = (248046, 248044)
++SGLANG = "f04d886bf79aa3d6237cbb12a3311838eb9f9bd8"
++CHECKPOINT = "c3a462cc3d38cf351f3b26cbd763469eeb74ef81"
++TOKENIZER_SHA = "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
++CONFIG_SHA = "74227dd615bf1ea975aa676bdf355a0379858c12f394b5365cd9dfa5fc2c70bc"
++GENERATION_SHA = "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
++SOURCE_SHA = "56f58b8682457261ee3aa8deb9eeabbaee2fbea71c90af4387d28badc58e3aa4"
++CHECKPOINT_MANIFEST_SHA = "b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303"
++ARCHIVE_CASES = ("W1", "W2", "H2047", "C897", "C2017")
++HOLDOUTS = {
++    "prose": "The ferry paused beside the pier. Someone had left a paper bag on the bench. Inside",
++    "python": "def rotate_left(items, count):\n    if not items:\n        return []\n    count %= len(items)\n    return",
++    "unicode": "札幌の古本屋で「銀河鉄道の夜」を開いた。余白には café と書いてあり、その下に",
++    "eos": "<|im_start|>user\nReply with just OK.<|im_end|>\n"
++           "<|im_start|>assistant\n<think>\n\n</think>\n\nOK",
++}
++
++
++def require(condition, message):
++    if not condition:
++        raise ValueError(message)
++
++
++def digest(path):
++    with path.open("rb") as source:
++        return hashlib.file_digest(source, "sha256").hexdigest()
++
++
++def write_json(path, value):
++    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
++                    encoding="utf-8")
++
++
++def verify_checkpoint(checkpoint):
++    for name, sha in (("tokenizer.json", TOKENIZER_SHA), ("config.json", CONFIG_SHA),
++                      ("generation_config.json", GENERATION_SHA)):
++        require(digest(checkpoint / name) == sha, f"Unexpected checkpoint {name}")
++
++
++def read_ids(path):
++    return list(map(int, path.read_text().split()))
++
++
++def synthesize(checkpoint, archive):
++    from tokenizers import Tokenizer
++
++    verify_checkpoint(checkpoint)
++    tokenizer = Tokenizer.from_file(str(checkpoint / "tokenizer.json"))
++    cases = {}
++    for name in ARCHIVE_CASES:
++        base = archive / "fixtures" / name
++        prompt = read_ids(base.with_suffix(".prompt"))
++        teacher = read_ids(base.with_suffix(".teacher"))
++        cases[name] = {"prompt": prompt, "teacher": teacher}
++    w1 = cases["W1"]
++    for name, prompt, teacher in (
++        ("single", w1["prompt"][:1], w1["teacher"]),
++        ("edge127", w1["prompt"][:127], w1["prompt"][127:] + w1["teacher"]),
++        ("edge129", w1["prompt"] + w1["teacher"][:1], w1["teacher"][1:]),
++    ):
++        cases[name] = {"prompt": prompt, "teacher": teacher[:5]}
++    for name, text in HOLDOUTS.items():
++        cases[name] = {
++            "prompt": tokenizer.encode(text, add_special_tokens=False).ids,
++            "natural": 12 if name != "eos" else 8,
++        }
++    return cases
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("checkpoint", type=Path)
++    parser.add_argument("archive", type=Path)
++    parser.add_argument("output", type=Path)
++    args = parser.parse_args()
++    write_json(args.output, synthesize(args.checkpoint, args.archive))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/model_reference/manifest.json b/tests/model_reference/manifest.json
+new file mode 100644
+index 0000000..5ebb804
+--- /dev/null
++++ b/tests/model_reference/manifest.json
+@@ -0,0 +1,280 @@
++{
++  "cases": {
++    "C2017": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "a8a662e2ad462c8dae8e57e1a7bf6384b9bb4b218560b894c08ea1d32fb64530",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        561,
++        5721,
++        11222,
++        264,
++        16097
++      ]
++    },
++    "C897": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "28df2c23b6cf11190f4f7742201b6a77ea47f8e410173d039f846d583f61d4fc",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        561,
++        5721,
++        11222,
++        264,
++        16097
++      ]
++    },
++    "H2047": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "824a4d23193c423387edb7f16d8999166dadb53282274f7a101bd3849be457c2",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        2981,
++        5157,
++        11,
++        271,
++        248068
++      ]
++    },
++    "W1": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "b9b7478fa45d927c623ea8ad4c2a9a473615d0ed3335c94a9117783e2eb6c986",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        279,
++        1500,
++        557,
++        4860,
++        11
++      ]
++    },
++    "W2": {
++      "finish": "length",
++      "repeats": 1,
++      "source_sha256": "e8cedead6f1b5652047254d7b00b4be165e414dae5bef0230bf21e5d238e7cb1",
++      "steps": [
++        0,
++        1,
++        3,
++        4
++      ],
++      "tokens": [
++        2981,
++        5157,
++        11,
++        271,
++        248068
++      ]
++    },
++    "edge127": {
++      "finish": "length",
++      "repeats": 2,
++      "steps": [
++        0,
++        1,
++        2,
++        3,
++        4
++      ],
++      "tokens": [
++        11,
++        279,
++        1500,
++        557,
++        4860
++      ]
++    },
++    "edge129": {
++      "finish": "length",
++      "repeats": 2,
++      "steps": [
++        0,
++        1,
++        2,
++        3,
++        4
++      ],
++      "tokens": [
++        1500,
++        557,
++        4860,
++        11,
++        321
++      ]
++    },
++    "eos": {
++      "finish": "stop",
++      "repeats": 2,
++      "steps": [
++        0
++      ],
++      "tokens": [
++        248046
++      ]
++    },
++    "prose": {
++      "finish": "length",
++      "repeats": 2,
++      "steps": [
++        0,
++        1,
++        2,
++        3,
++        4,
++        5,
++        6,
++        7,
++        8,
++        9,
++        10,
++        11
++      ],
++      "tokens": [
++        25,
++        264,
++        3074,
++        9994,
++        11,
++        1819,
++        1422,
++        506,
++        279,
++        8858,
++        11,
++        8755
++      ]
++    },
++    "python": {
++      "finish": "length",
++      "repeats": 2,
++      "steps": [
++        0,
++        1,
++        2,
++        3,
++        4,
++        5,
++        6,
++        7,
++        8,
++        9,
++        10,
++        11
++      ],
++      "tokens": [
++        3470,
++        26645,
++        27365,
++        478,
++        3470,
++        3337,
++        1767,
++        60,
++        271,
++        2,
++        12996,
++        10121
++      ]
++    },
++    "single": {
++      "finish": "length",
++      "repeats": 2,
++      "steps": [
++        0,
++        1,
++        2,
++        3,
++        4
++      ],
++      "tokens": [
++        279,
++        1500,
++        557,
++        4860,
++        11
++      ]
++    },
++    "unicode": {
++      "finish": "length",
++      "repeats": 2,
++      "steps": [
++        0,
++        1,
++        2,
++        3,
++        4,
++        5,
++        6,
++        7,
++        8,
++        9,
++        10,
++        11
++      ],
++      "tokens": [
++        12512,
++        16,
++        24,
++        24,
++        20,
++        13,
++        16,
++        15,
++        13,
++        16,
++        15,
++        63078
++      ]
++    }
++  },
++  "checkpoint_revision": "c3a462cc3d38cf351f3b26cbd763469eeb74ef81",
++  "criteria_sha256": "68e3a6259ba754c7b4a9b58b5b864e35a4e413ee73758ca87d2c1e5911bd452c",
++  "files": {
++    "C2017.0.f32": "c84023bede26aa9d809d30c28db6d9bea30babe98da0ee4bb7c04099baff755c",
++    "C897.0.f32": "c1f5cc2439b3197dbc9581de81f32ab71a2af8a1a8f7bf9017d15194c1ab451c",
++    "H2047.0.f32": "d5682148c8231d565fcca8e3f3dd72aeca8a706980af17053ba43846960964c8",
++    "W1.0.f32": "60ad6dfc28365d87258bbf6ce1d63be43b3a1e0b0bcb7524369bd386b6916263",
++    "W2.0.f32": "bc131c3ffb29cfbaf7c4766a4ff31d1a2de04d6d3fdd2f3c5dfd960681c88f11",
++    "capture.json": "1d34cf56c24f04eba05acc779c136e14436c8ada47ec4c0c85ea070e70914ada",
++    "edge127.0.f32": "26556c9dfa99e51cbcfa3d8cab27398d6573186cb62847b0b0bf717f1a8bc9d8",
++    "edge127.1.f32": "26556c9dfa99e51cbcfa3d8cab27398d6573186cb62847b0b0bf717f1a8bc9d8",
++    "edge129.0.f32": "200341637746139c5bae87ddd84d136d2927bddd7c4d4b5a63a6204c98a13d25",
++    "edge129.1.f32": "200341637746139c5bae87ddd84d136d2927bddd7c4d4b5a63a6204c98a13d25",
++    "eos.0.f32": "41027fb1986b46021d3857803fd8f66d8f2c1d81f2e69393a1a53a8fd08d76b7",
++    "eos.1.f32": "41027fb1986b46021d3857803fd8f66d8f2c1d81f2e69393a1a53a8fd08d76b7",
++    "inputs.json": "1521579b38ac181b6e46b4a8994ca64eaaada1261410109928ff4537c72f4ee3",
++    "prose.0.f32": "a1617e7ea8eed5c0bc23ae115db59680ac9ebde2a6b36663a90c7c6e135fa085",
++    "prose.1.f32": "a1617e7ea8eed5c0bc23ae115db59680ac9ebde2a6b36663a90c7c6e135fa085",
++    "python.0.f32": "d684aa252830c7e95220c7ae151e541eb01c11278419b676eaa5a09a39b22d99",
++    "python.1.f32": "d684aa252830c7e95220c7ae151e541eb01c11278419b676eaa5a09a39b22d99",
++    "single.0.f32": "72ac82574d1d7536ad5808294db68515518a3617a6015cf89c4153214e3b64b5",
++    "single.1.f32": "72ac82574d1d7536ad5808294db68515518a3617a6015cf89c4153214e3b64b5",
++    "unicode.0.f32": "58e3ae123f757f16f668c356672ce5d2d733c7ec0dbc2bb4089231c2fe153d60",
++    "unicode.1.f32": "58e3ae123f757f16f668c356672ce5d2d733c7ec0dbc2bb4089231c2fe153d60"
++  },
++  "sglang_revision": "f04d886bf79aa3d6237cbb12a3311838eb9f9bd8"
++}
+diff --git a/tests/model_reference/reference.py b/tests/model_reference/reference.py
+new file mode 100644
+index 0000000..dc10400
+--- /dev/null
++++ b/tests/model_reference/reference.py
+@@ -0,0 +1,138 @@
++import argparse
++import json
++import os
++import tarfile
++from pathlib import Path
++
++from fixtures import (ARCHIVE_CASES, CHECKPOINT, CHECKPOINT_MANIFEST_SHA, EOS, SGLANG,
++                      SOURCE_SHA, VOCAB, digest, require, verify_checkpoint, write_json)
++
++
++def score_processor(base):
++    class Scores(base):
++        def __call__(self, logits, params):
++            from pathlib import Path
++
++            settings = params[0]
++            request = settings["__req__"]
++            step = len(request.output_ids)
++            assert list(request.origin_input_ids) == settings["prompt"]
++            if step == 0 and request.extend_end < len(request.origin_input_ids):
++                return logits
++            assert logits.shape == (1, 248320)
++            teacher = settings.get("teacher")
++            if teacher is not None:
++                assert list(request.output_ids) == teacher[:step] and step < len(teacher)
++            with Path(settings["output"]).open("ab") as output:
++                assert output.tell() == step * 248320 * 4
++                logits.float().cpu().contiguous().numpy().tofile(output)
++            if teacher is not None:
++                logits.fill_(-float("inf"))
++                logits[0, teacher[step]] = 0.0
++            return logits
++
++    return Scores.to_str()
++
++
++def verify_source(archive):
++    require(digest(archive) == SOURCE_SHA, "Unexpected SGLang source archive")
++    root = f"sglang-{SGLANG}/python/"
++    package = Path(os.environ["MODEL_REFERENCE_SGLANG_PYTHON"]).resolve()
++    with tarfile.open(archive, "r:gz") as source:
++        members = [member for member in source if (member.isfile() or member.issym())
++                   and member.name.startswith(root)]
++        expected = {member.name.removeprefix(root) for member in members}
++        actual = {str(path.relative_to(package)) for path in package.rglob("*")
++                  if (path.is_file() or path.is_symlink()) and "__pycache__" not in path.parts}
++        require(expected == actual, "SGLang Python tree members differ from pinned source")
++        for member in members:
++            path = package / member.name.removeprefix(root)
++            matches = (os.readlink(path) == member.linkname if member.issym()
++                       else path.read_bytes() == source.extractfile(member).read())
++            require(matches, f"SGLang source differs at {path}")
++    return package
++
++
++def verify_weights(checkpoint, manifest):
++    require(digest(manifest) == CHECKPOINT_MANIFEST_SHA, "Unexpected checkpoint manifest")
++    for line in manifest.read_text().splitlines():
++        sha, name = line.split(maxsplit=1)
++        require(digest(checkpoint / name) == sha, f"Unexpected checkpoint file {name}")
++
++
++def capture(engine, case, processor, destination):
++    settings = {"prompt": case["prompt"], "output": str(destination)}
++    teacher = case.get("teacher")
++    if teacher is not None:
++        settings["teacher"] = teacher
++    count = len(teacher) if teacher is not None else case["natural"]
++    stop_at_eos = case.get("stop_at_eos", False)
++    sampling = {"temperature": 0.0, "max_new_tokens": count,
++                "ignore_eos": not stop_at_eos, "custom_params": settings}
++    if stop_at_eos:
++        sampling["stop_token_ids"] = list(EOS)
++    response = engine.generate(
++        input_ids=case["prompt"], custom_logit_processor=processor,
++        sampling_params=sampling,
++    )
++    tokens = response["output_ids"]
++    finish = response["meta_info"]["finish_reason"]["type"]
++    require(teacher is None or teacher == tokens, "SGLang did not follow teacher")
++    require(destination.stat().st_size == len(tokens) * VOCAB * 4, "Bad SGLang row count")
++    require(response["meta_info"]["prompt_tokens"] == len(case["prompt"]),
++            "SGLang prompt length mismatch")
++    if stop_at_eos:
++        require(finish == "stop" and tokens[-1] in EOS, "SGLang did not observe checkpoint EOS")
++    return {"tokens": tokens, "finish": finish, "prompt": case["prompt"]}
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("checkpoint", type=Path)
++    parser.add_argument("checkpoint_manifest", type=Path)
++    parser.add_argument("source_archive", type=Path)
++    parser.add_argument("inputs", type=Path)
++    parser.add_argument("output", type=lambda value: Path(value).resolve())
++    parser.add_argument("--all", action="store_true", help="also recapture archived cases")
++    parser.add_argument("--repeat", type=int, choices=(1, 2), default=2)
++    args = parser.parse_args()
++    verify_checkpoint(args.checkpoint)
++    verify_weights(args.checkpoint, args.checkpoint_manifest)
++    package = verify_source(args.source_archive)
++    import sglang
++    from sglang.srt.entrypoints.engine import Engine
++    from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
++
++    require(Path(sglang.__file__).resolve().is_relative_to(package),
++            f"Wrong SGLang import: {sglang.__file__}")
++    args.output.mkdir()
++    cases = json.loads(args.inputs.read_text())
++    options = {"language_only": True, "skip_tokenizer_init": True,
++               "dtype": "bfloat16", "mamba_ssm_dtype": "float32", "kv_cache_dtype": "bfloat16",
++               "disable_radix_cache": True, "enable_custom_logit_processor": True,
++               "disable_decode_cuda_graph": True, "disable_prefill_cuda_graph": True,
++               "disable_overlap_schedule": True, "chunked_prefill_size": 128,
++               "max_running_requests": 1, "context_length": 4096, "mem_fraction_static": 0.45}
++    engine = Engine(model_path=str(args.checkpoint), **options)
++    try:
++        processor = score_processor(CustomLogitProcessor)
++        for name, case in cases.items():
++            if name in ARCHIVE_CASES and not args.all:
++                continue
++            if name == "eos":
++                case["stop_at_eos"] = True
++            for repeat in range(args.repeat):
++                base = args.output / f"{name}.{repeat}"
++                result = capture(engine, case, processor, Path(f"{base}.f32"))
++                write_json(Path(f"{base}.json"), result)
++    finally:
++        engine.shutdown()
++    write_json(args.output / "capture.json", {
++        "sglang_revision": SGLANG, "checkpoint_revision": CHECKPOINT,
++        "source_sha256": SOURCE_SHA, "checkpoint_manifest_sha256": CHECKPOINT_MANIFEST_SHA,
++        "inputs_sha256": digest(args.inputs), "engine_options": options, "repeats": args.repeat,
++    })
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/model_reference/serve.py b/tests/model_reference/serve.py
+new file mode 100644
+index 0000000..bd369f1
+--- /dev/null
++++ b/tests/model_reference/serve.py
+@@ -0,0 +1,179 @@
++import argparse
++from concurrent.futures import ThreadPoolExecutor
++import json
++from pathlib import Path
++import signal
++import subprocess
++import threading
++
++from compare import load_rows, rankings, read_bundle
++from fixtures import EOS, HERE, digest, require, verify_checkpoint, write_json
++from run_native import Stream, choose_port, stop_server, trace_rows, wait_until_ready
++
++
++def cancel_run(_signal, _frame):
++    raise KeyboardInterrupt
++
++
++def served_request(port, name, case, barrier=None):
++    with Stream(port, case) as stream:
++        if barrier is not None:
++            barrier.wait(timeout=10)
++        stream.post()
++        stream.open()
++        tokens = []
++        prompt = case["prompt"]
++        for _ in range(case["max_tokens"] + 1):
++            event = stream.event()
++            require(isinstance(event, dict) and len(event["choices"]) == 1,
++                    f"{name}: missing SSE choice")
++            choice = event["choices"][0]
++            if not tokens:
++                require(choice["prompt_token_ids"] == prompt, f"{name}: prompt ID mismatch")
++            finish = choice["finish_reason"]
++            if finish is not None:
++                require(choice["token_ids"] == [] and finish in ("length", "stop"),
++                        f"{name}: malformed completion")
++                break
++            ids = choice["token_ids"]
++            require(len(ids) == 1, f"{name}: expected one streamed token")
++            tokens.extend(ids)
++        else:
++            raise ValueError(f"{name}: missing finish event")
++        usage = stream.event()
++        require(usage["choices"] == [] and usage["usage"]["prompt_tokens"] == len(prompt)
++                and usage["usage"]["completion_tokens"] == len(tokens),
++                f"{name}: inconsistent usage")
++        require(stream.event() == "[DONE]" and stream.response.read(1) == b"",
++                f"{name}: invalid SSE termination")
++        return {"name": name, "tokens": tokens, "finish": finish,
++                "request": stream.request, "events": stream.events}
++
++
++def check_reference(args, response, oracle, criteria):
++    name, generated = response["name"], response["tokens"]
++    expected = oracle["tokens"]
++    failures = []
++    steps = []
++    if name == "eos" and (generated != expected or response["finish"] != "stop"):
++        failures.append("eos_history_or_finish")
++    if name != "eos" and (len(generated) != len(expected) or response["finish"] != "length"):
++        failures.append("length_or_finish")
++    rows = load_rows(args.bundle, name, oracle)
++    repeats = load_rows(args.bundle, name, oracle, 1) if oracle["repeats"] == 2 else {}
++    same_prefix = 0
++    for step, (candidate, teacher) in enumerate(zip(generated, expected)):
++        if candidate == teacher:
++            same_prefix += 1
++        if step not in rows:
++            if candidate != teacher:
++                failures.append(f"unscored_history_at_{step}")
++                break
++            continue
++        ref, repeat = rows[step], repeats.get(step)
++        order = rankings(ref, criteria["top_k"])
++        winner = int(order[0])
++        require(winner == teacher or ref[teacher] == ref[winner],
++                f"{name}/{step}: SGLang recorded token is not a greedy winner")
++        require(0 <= candidate < len(ref), f"{name}/{step}: invalid native token ID")
++        margin = float(ref[winner] - ref[order[1]])
++        repeat_margin = None
++        clear = margin >= criteria["reference_margin_min"]
++        if repeat is not None:
++            other = rankings(repeat, 2)
++            repeat_margin = float(repeat[other[0]] - repeat[other[1]])
++            clear &= winner == other[0] and repeat_margin >= criteria["reference_margin_min"]
++        regret = float(ref[winner] - ref[candidate])
++        if (clear and candidate != winner) or (
++            not clear and (candidate not in order or regret > criteria["reference_margin_min"])
++        ):
++            failures.append(f"reference_winner_at_{step}")
++        steps.append({"step": step, "reference": teacher, "native": candidate,
++                      "reference_margin": margin, "repeat_margin": repeat_margin,
++                      "clear_margin": bool(clear), "reference_regret": regret})
++        if candidate != teacher:
++            break
++    return {"same_prefix": same_prefix, "steps": steps, "failures": failures}
++
++
++def run_width(args, inputs, oracle, thresholds, width):
++    output = args.output / f"width-{width}"
++    output.mkdir()
++    port = choose_port()
++    command = [str(args.server), "--checkpoint", str(args.checkpoint), "--device", "0",
++               "--port", str(port), "--max-active", str(width), "--trace-batches",
++               "--fp8-prefill", args.prefill]
++    if args.graph and width > 1:
++        command.append("--batch-cuda-graphs")
++    write_json(output / "command.json", command)
++    log_path = output / "server.log"
++    names = ["W1"] * width if args.archive_smoke else ["prose", "python", "unicode", "prose"][:width]
++    request_names = set(names)
++    if not args.archive_smoke:
++        request_names.add("eos")
++    requests = {name: {"prompt": inputs[name]["prompt"],
++                       "max_tokens": inputs[name].get("natural", len(oracle[name]["tokens"]))}
++                for name in request_names}
++    if "eos" in requests:
++        require(oracle["eos"]["finish"] == "stop" and oracle["eos"]["tokens"][-1] in EOS,
++                "Frozen EOS fixture did not reach checkpoint EOS")
++        requests["eos"]["stop_token_id"] = oracle["eos"]["tokens"][-1]
++    with log_path.open("wb") as log:
++        process = subprocess.Popen(command, cwd=output, stdout=log, stderr=log,
++                                   start_new_session=True)
++        try:
++            wait_until_ready(process, port, log_path)
++            offset = log_path.stat().st_size
++            barrier = threading.Barrier(width)
++            with ThreadPoolExecutor(max_workers=width) as pool:
++                futures = [pool.submit(served_request, port, name, requests[name], barrier)
++                           for name in names]
++                burst = [future.result() for future in futures]
++            scheduler = trace_rows(log_path, offset, width)
++            if "eos" in requests:
++                burst.append(served_request(port, "eos", requests["eos"]))
++        finally:
++            stop_server(process, None)
++    require(process.returncode == 0, f"Server exit {process.returncode}: {log_path}")
++    result = {"graph_requested": args.graph and width > 1, "scheduler": scheduler,
++              "full_width_decode_steps": sum(decode == width for _, decode, _ in scheduler),
++              "responses": [{**item, **check_reference(args, item, oracle[item["name"]], thresholds)}
++                            for item in burst]}
++    result["failures"] = [failure for response in result["responses"]
++                          for failure in response["failures"]]
++    if width > 1 and result["full_width_decode_steps"] < 2:
++        result["failures"].append("full_width_decode_not_observed_twice")
++    write_json(output / "report.json", result)
++    return result["failures"]
++
++
++def main():
++    signal.signal(signal.SIGTERM, cancel_run)
++    parser = argparse.ArgumentParser()
++    for name in ("server", "checkpoint", "bundle", "output"):
++        parser.add_argument(name, type=lambda value: Path(value).resolve())
++    parser.add_argument("--graph", action="store_true")
++    parser.add_argument("--archive-smoke", action="store_true")
++    parser.add_argument("--prefill", choices=("exact", "tensor-core"), default="exact")
++    parser.add_argument("--widths", nargs="+", type=int, choices=(1, 2, 3, 4),
++                        default=[1, 2, 3, 4])
++    args = parser.parse_args()
++    inputs, oracle = read_bundle(args.bundle)
++    verify_checkpoint(args.checkpoint)
++    if not args.archive_smoke:
++        require({"prose", "python", "unicode", "eos"} <= oracle.keys(),
++                "The HTTP holdout tests require a full independently captured fixture")
++    thresholds = json.loads((HERE / "criteria.json").read_text())
++    args.output.mkdir()
++    failures = {}
++    for width in args.widths:
++        failures[str(width)] = run_width(args, inputs, oracle, thresholds, width)
++        write_json(args.output / "report.json",
++                   {"server_sha256": digest(args.server), "prefill": args.prefill,
++                    "archive_smoke": args.archive_smoke,
++                    "width_failures": failures})
++    raise SystemExit(1 if any(failures.values()) else 0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/model_reference/teacher.cpp b/tests/model_reference/teacher.cpp
+new file mode 100644
+index 0000000..588b0eb
+--- /dev/null
++++ b/tests/model_reference/teacher.cpp
+@@ -0,0 +1,100 @@
++#include <cuda_runtime_api.h>
++#include <dlfcn.h>
++
++#include <cstdio>
++#include <cstdint>
++#include <cstdlib>
++#include <fstream>
++#include <vector>
++
++namespace {
++
++constexpr std::size_t vocabulary = 248320;
++
++template <class Function>
++Function next_symbol(const char* name) {
++    auto symbol = reinterpret_cast<Function>(dlsym(RTLD_NEXT, name));
++    if (!symbol) {
++        std::fprintf(stderr, "model reference: cannot interpose %s\n", name);
++        std::abort();
++    }
++    return symbol;
++}
++
++auto copy = next_symbol<decltype(&cudaMemcpyAsync)>("cudaMemcpyAsync");
++auto sync = next_symbol<decltype(&cudaStreamSynchronize)>("cudaStreamSynchronize");
++
++struct Teacher {
++    Teacher() {
++        const char* path = std::getenv("MODEL_REFERENCE_TEACHER");
++        const char* trace = std::getenv("MODEL_REFERENCE_TEACHER_TRACE");
++        if (!path || !trace) {
++            std::abort();
++        }
++        std::ifstream input(path);
++        for (int token; input >> token;) {
++            if (token < 0 || token >= static_cast<int>(vocabulary)) {
++                std::abort();
++            }
++            tokens.push_back(token);
++        }
++        output.open(trace);
++        if (!input.eof() || tokens.empty() || !output) {
++            std::abort();
++        }
++    }
++
++    std::vector<int> tokens;
++    std::ofstream output;
++    std::size_t step = 0;
++};
++
++struct Readback {
++    int* host = nullptr;
++    void* device = nullptr;
++    cudaStream_t stream = nullptr;
++    bool scores = false;
++};
++
++thread_local Readback pending;
++
++}
++
++extern "C" cudaError_t cudaMemcpyAsync(void* destination, const void* source, std::size_t bytes,
++                                      cudaMemcpyKind kind, cudaStream_t stream) {
++    const auto status = copy(destination, source, bytes, kind, stream);
++    if (status != cudaSuccess) {
++        return status;
++    }
++    if (pending.host && pending.stream == stream && kind == cudaMemcpyDeviceToHost &&
++        bytes == vocabulary * sizeof(std::uint16_t)) {
++        pending.scores = true;
++    } else if (kind == cudaMemcpyDeviceToHost && bytes == sizeof(int)) {
++        pending = {static_cast<int*>(destination), const_cast<void*>(source), stream, false};
++    } else if (pending.stream == stream) {
++        pending = {};
++    }
++    return status;
++}
++
++extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
++    const auto status = sync(stream);
++    if (pending.stream != stream) {
++        return status;
++    }
++    const auto readback = pending;
++    pending = {};
++    if (status != cudaSuccess || !readback.scores) {
++        return status;
++    }
++    static Teacher teacher;
++    if (teacher.step >= teacher.tokens.size()) {
++        std::abort();
++    }
++    const int forced = teacher.tokens[teacher.step];
++    teacher.output << teacher.step++ << ' ' << *readback.host << ' ' << forced << std::endl;
++    *readback.host = forced;
++    const auto overwritten = copy(readback.device, readback.host, sizeof(int),
++                                  cudaMemcpyHostToDevice, stream);
++    return overwritten == cudaSuccess ? sync(stream) : overwritten;
++}

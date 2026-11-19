@@ -1,0 +1,950 @@
+diff --git a/mtp_probe.cpp b/mtp_probe.cpp
+new file mode 100644
+index 0000000..aa4e11b
+--- /dev/null
++++ b/mtp_probe.cpp
+@@ -0,0 +1,442 @@
++#include "candidate/src/decoder.cpp"
++#include "candidate/src/decoder_mtp.cpp"
++
++#include <cstring>
++#include <iostream>
++#include <string_view>
++
++using namespace sglang;
++using namespace sglang::decoder;
++
++bool inject_sync = false;
++cudaStream_t verifier_stream = nullptr;
++int injected = 0;
++int device_oom_after = 0;
++bool pinned_oom = false;
++int allocation_failures = 0;
++int graph_launches = 0;
++
++extern "C" cudaError_t __real_cudaMalloc(void**, std::size_t);
++extern "C" cudaError_t __real_cudaMallocHost(void**, std::size_t);
++extern "C" cudaError_t __real_cudaGraphLaunch(cudaGraphExec_t, cudaStream_t);
++extern "C" cudaError_t __real_cudaMemcpyAsync(void*, const void*, std::size_t,
++                                             cudaMemcpyKind, cudaStream_t);
++extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t);
++
++extern "C" cudaError_t __wrap_cudaMalloc(void** pointer, std::size_t bytes) {
++    if (device_oom_after > 0 && --device_oom_after == 0) {
++        ++allocation_failures;
++        return cudaErrorMemoryAllocation;
++    }
++    return __real_cudaMalloc(pointer, bytes);
++}
++
++extern "C" cudaError_t __wrap_cudaMallocHost(void** pointer, std::size_t bytes) {
++    if (pinned_oom) {
++        pinned_oom = false;
++        ++allocation_failures;
++        return cudaErrorMemoryAllocation;
++    }
++    return __real_cudaMallocHost(pointer, bytes);
++}
++
++extern "C" cudaError_t __wrap_cudaGraphLaunch(cudaGraphExec_t graph, cudaStream_t stream) {
++    ++graph_launches;
++    return __real_cudaGraphLaunch(graph, stream);
++}
++
++extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* to, const void* from, std::size_t bytes,
++                                             cudaMemcpyKind kind, cudaStream_t stream) {
++    if (inject_sync && kind == cudaMemcpyDeviceToHost &&
++        bytes == target_verify_max_rows * sizeof(TextLogitCandidate)) {
++        verifier_stream = stream;
++    }
++    return __real_cudaMemcpyAsync(to, from, bytes, kind, stream);
++}
++
++extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
++    if (inject_sync && verifier_stream && stream == verifier_stream) {
++        inject_sync = false;
++        verifier_stream = nullptr;
++        ++injected;
++        return cudaErrorUnknown;
++    }
++    return __real_cudaStreamSynchronize(stream);
++}
++
++namespace {
++
++constexpr int capacity = 8264;
++constexpr int vocab_sample = 198;
++constexpr int kv_stride = mxfp8_payload_bytes_per_page / mxfp8_page_size;
++
++template <auto Member>
++struct ModelAccess {
++    friend auto model_of(const Decoder& decoder) { return &*(decoder.*Member); }
++};
++auto model_of(const Decoder& decoder);
++template struct ModelAccess<&Decoder::model_>;
++
++template <auto Member>
++struct DraftAccess {
++    friend auto& state_of(const MtpDraftRequest& draft) { return *(draft.*Member); }
++};
++auto& state_of(const MtpDraftRequest& draft);
++template struct DraftAccess<&MtpDraftRequest::state_>;
++
++void require(bool condition, std::string_view label) {
++    if (!condition) {
++        throw std::runtime_error(std::string(label));
++    }
++}
++
++void sync(const Request& request) {
++    check(cudaStreamSynchronize(request.memory.stream()), "Complete probe stream");
++}
++
++template <typename Element>
++void copy(Element* to, const Element* from, std::size_t count, cudaStream_t stream) {
++    check(cudaMemcpyAsync(to, from, count * sizeof(Element), cudaMemcpyDeviceToDevice, stream),
++          "Copy probe snapshot");
++}
++
++template <typename Element>
++std::vector<Element> download(const Element* input, std::size_t count) {
++    std::vector<Element> output(count);
++    check(cudaMemcpy(output.data(), input, count * sizeof(Element), cudaMemcpyDeviceToHost),
++          "Read probe data");
++    return output;
++}
++
++template <typename Element>
++void equal_bytes(const Element* lhs, const Element* rhs, std::size_t count,
++                 std::string_view label) {
++    if (count == 0 || std::memcmp(lhs, rhs, count * sizeof(Element)) == 0) {
++        return;
++    }
++    for (std::size_t index = 0; index < count; ++index) {
++        if (std::memcmp(lhs + index, rhs + index, sizeof(Element)) != 0) {
++            throw std::runtime_error(std::string(label) + " differs at " + std::to_string(index));
++        }
++    }
++}
++
++template <typename Element>
++void equal_device(const Element* lhs, const Element* rhs, std::size_t count,
++                  std::string_view label) {
++    const auto expected = download(lhs, count);
++    const auto actual = download(rhs, count);
++    equal_bytes(expected.data(), actual.data(), count, label);
++}
++
++void compare_state(const Request& expected, const Request& actual) {
++    equal_device(expected.states.front().history, actual.states.front().history,
++                 gdn_layers * gdn_history_elements, "GDN history");
++    equal_device(expected.states.front().recurrent, actual.states.front().recurrent,
++                 gdn_layers * gdn_state_elements, "GDN recurrence");
++}
++
++void compare_scales(const std::uint8_t* lhs, const std::uint8_t* rhs, int count) {
++    constexpr int group_rows = mxfp8_page_size / mxfp8_group_size;
++    const int pages = count / mxfp8_page_size;
++    const int tail = count % mxfp8_page_size;
++    const auto offset = pages * mxfp8_scale_bytes_per_page;
++    equal_device(lhs, rhs, offset, "whole KV scale pages");
++    if (tail == 0) {
++        return;
++    }
++    const auto expected = download(lhs + offset, mxfp8_scale_bytes_per_page);
++    const auto actual = download(rhs + offset, mxfp8_scale_bytes_per_page);
++    for (int head = 0; head < mxfp8_kv_heads; ++head) {
++        for (int row = 0; row < tail; ++row) {
++            const int index = (head * mxfp8_page_size + row % mxfp8_group_size * group_rows +
++                               row / mxfp8_group_size) * mxfp8_groups;
++            equal_bytes(expected.data() + index, actual.data() + index, mxfp8_groups,
++                        "partial KV scale page");
++        }
++    }
++}
++
++void compare_cache(Mxfp8KvCache lhs, Mxfp8KvCache rhs, int count) {
++    equal_device(lhs.key_payload, rhs.key_payload, count * kv_stride, "K payload");
++    equal_device(lhs.value_payload, rhs.value_payload, count * kv_stride, "V payload");
++    compare_scales(lhs.key_scales, rhs.key_scales, count);
++    compare_scales(lhs.value_scales, rhs.value_scales, count);
++}
++
++void compare_target(const Request& expected, const Request& actual, int prefix) {
++    compare_state(expected, actual);
++    for (int layer = 0; layer < full_attention_layers; ++layer) {
++        compare_cache(expected.caches[layer], actual.caches[layer], prefix);
++    }
++}
++
++void restore_cache(Mxfp8KvCache src, Mxfp8KvCache dst, int prefix, cudaStream_t stream) {
++    const int pages = (prefix + mxfp8_page_size - 1) / mxfp8_page_size;
++    copy(dst.key_payload, src.key_payload, prefix * kv_stride, stream);
++    copy(dst.value_payload, src.value_payload, prefix * kv_stride, stream);
++    copy(dst.key_scales, src.key_scales, pages * mxfp8_scale_bytes_per_page, stream);
++    copy(dst.value_scales, src.value_scales, pages * mxfp8_scale_bytes_per_page, stream);
++}
++
++void restore_draft(const MtpDraftRequest& from, MtpDraftRequest& to, cudaStream_t stream) {
++    auto& src = state_of(from);
++    auto& dst = state_of(to);
++    restore_cache(src.cache, dst.cache, src.prefix, stream);
++    dst.prefix = src.prefix;
++}
++
++void restore(const Request& from, Request& to, int prefix) {
++    const auto stream = to.memory.stream();
++    copy(to.states.front().history, from.states.front().history,
++         gdn_layers * gdn_history_elements, stream);
++    copy(to.states.front().recurrent, from.states.front().recurrent,
++         gdn_layers * gdn_state_elements, stream);
++    for (int layer = 0; layer < full_attention_layers; ++layer) {
++        restore_cache(from.caches[layer], to.caches[layer], prefix, stream);
++    }
++    copy(to.work.normalized, from.work.normalized, hidden_size, stream);
++}
++
++template <typename Model>
++int eager(const Model& model, Request& request, int token, int position) {
++    model.forward(request, token, position, TextGdnMode::decode);
++    model.compute_logits(request);
++    copy_greedy_token(request, request.memory.stream());
++    sync(request);
++    return read_greedy_token(request);
++}
++
++template <typename Model>
++std::vector<int> golden(const Model& model, const Request& origin, int prefix, int count) {
++    Request request(0, capacity, model.memory);
++    restore(origin, request, prefix);
++    std::vector<int> ids{vocab_sample};
++    for (int index = 0; index < count; ++index) {
++        ids.push_back(eager(model, request, ids.back(), prefix + index));
++    }
++    return ids;
++}
++
++void equal_results(const DecoderResult& expected, const DecoderResult& actual) {
++    require(expected.output_token_ids == actual.output_token_ids &&
++                expected.mtp_accepted_tokens == actual.mtp_accepted_tokens &&
++                expected.mtp_rounds == actual.mtp_rounds &&
++                expected.mtp_drafted_tokens == actual.mtp_drafted_tokens &&
++                expected.step_top_logits.size() == actual.step_top_logits.size(),
++            "Decoder result");
++    for (std::size_t row = 0; row < expected.step_top_logits.size(); ++row) {
++        const auto& left = expected.step_top_logits[row];
++        const auto& right = actual.step_top_logits[row];
++        require(left.size() == right.size(), "Top-logit width");
++        for (std::size_t column = 0; column < left.size(); ++column) {
++            require(left[column].token_id == right[column].token_id &&
++                        left[column].logit == right[column].logit, "Top-logit value");
++        }
++    }
++}
++
++template <typename Generation>
++void provision(Generation& generation, const typename Generation::VerificationTokens& tokens,
++               int count) {
++    const auto stream = generation.target.memory.stream();
++    const auto* hidden = generation.target.work.normalized;
++    for (int index = 0; index < count; ++index) {
++        hidden = generation.draft.enqueue(generation.next_target_position - 1 + index,
++                                          tokens[index], hidden, false, stream);
++    }
++}
++
++enum class Control { transition, device_oom, pinned_oom, stop, cancellation, short_budget };
++
++template <typename Model>
++void compare_rounds(const Model& model, const Request& origin, const MtpDraftRequest& draft_origin,
++                    int prefix, const std::vector<int>& gold, int depth, Control control) {
++    using Generation = typename Model::MtpGeneration;
++    Request expected_request(0, capacity, model.memory);
++    Request request(0, capacity, model.memory);
++    MtpDraftRequest expected_draft(model.mtp_weights, capacity);
++    MtpDraftRequest draft(model.mtp_weights, capacity);
++    restore(origin, expected_request, prefix);
++    restore(origin, request, prefix);
++    restore_draft(draft_origin, expected_draft, expected_request.memory.stream());
++    restore_draft(draft_origin, draft, request.memory.stream());
++    DecoderOptions options;
++    options.max_new_tokens = capacity - prefix;
++    options.mtp_steps = depth;
++    options.top_logits = 64;
++    expected_request.memory.transfers().logits.resize(vocab_size);
++    request.memory.transfers().logits.resize(vocab_size);
++    int round_emitted = 0;
++    int control_round = 0;
++    DecoderCallbacks callbacks;
++    callbacks.on_token = [&](int) {
++        ++round_emitted;
++        return control != Control::cancellation || control_round != 2 || round_emitted < 2;
++    };
++    DecoderResult expected_result;
++    DecoderResult result;
++    Generation reference{model, expected_request, expected_draft, options, callbacks,
++                         expected_result};
++    Generation generation{model, request, draft, options, callbacks, result};
++    reference.allow_parallel = false;
++    reference.seed = generation.seed = gold.front();
++    reference.next_target_position = generation.next_target_position = prefix;
++    const auto original_bytes = request.memory.bytes();
++    const auto initial_failures = allocation_failures;
++    const std::array<int, 11> quality{100, 100, 100, 0, 0, 0, 100, 100, 100, 100, 50};
++    std::string modes;
++    for (int round = 0; round < static_cast<int>(quality.size()); ++round) {
++        control_round = round;
++        const int offset = generation.next_target_position - prefix;
++        const int accepted = depth * quality[round] / 100;
++        int remaining = options.max_new_tokens - offset;
++        int count = depth;
++        typename Generation::VerificationTokens tokens{};
++        std::copy_n(gold.begin() + offset, depth + 1, tokens.begin());
++        if (accepted < depth) {
++            tokens[accepted + 1] = (tokens[accepted + 1] + 1) % vocab_size;
++        }
++        if (round == 2 && control == Control::stop) {
++            options.stop_token_id = gold[offset + 1];
++        }
++        if (round == 2 && control == Control::short_budget) {
++            options.max_new_tokens = offset + 1;
++            remaining = count = 1;
++        }
++        provision(reference, tokens, count);
++        provision(generation, tokens, count);
++        round_emitted = 0;
++        const auto expected_finish = reference.verify_round(tokens, count, remaining);
++        round_emitted = 0;
++        if (round == 2 && control == Control::device_oom) {
++            device_oom_after = 3;
++        }
++        if (round == 2 && control == Control::pinned_oom) {
++            pinned_oom = true;
++        }
++        const bool parallel = generation.policy.parallel() && generation.allow_parallel &&
++                              remaining > 1;
++        const auto finish = generation.verify_round(tokens, count, remaining);
++        modes += parallel && generation.allow_parallel ? 'P' : 'O';
++        sync(request);
++        sync(expected_request);
++        require(finish == expected_finish, "Finish reason");
++        equal_results(expected_result, result);
++        const int position = generation.next_target_position;
++        require(reference.next_target_position == position, "Target cursor");
++        require(std::equal(result.output_token_ids.begin(), result.output_token_ids.end(),
++                           gold.begin() + 1), "Greedy K0 IDs");
++        compare_target(expected_request, request, position);
++        require(draft.valid_prefix() == expected_draft.valid_prefix(), "Committed draft cursor");
++        compare_cache(state_of(expected_draft).cache, state_of(draft).cache, draft.valid_prefix());
++        if (!finish) {
++            equal_device(expected_request.work.normalized, request.work.normalized, hidden_size,
++                         "Resumed target hidden");
++        }
++        if (finish) {
++            require(round == 2, "Unexpected early terminal");
++            break;
++        }
++    }
++    if (control == Control::transition) {
++        require(modes == "OOPPPOOOPPP" && generation.verification, "Policy transitions");
++    }
++    if (control == Control::device_oom || control == Control::pinned_oom) {
++        require(allocation_failures == initial_failures + 1 && !generation.allow_parallel &&
++                    !generation.verification && request.memory.bytes() == original_bytes,
++                "Rollback verifier OOM and retain ordered mode");
++    }
++    std::cout << "rounds," << depth << ',' << prefix << ',' << static_cast<int>(control)
++              << ',' << modes << ',' << request.memory.bytes() - original_bytes << ",exact\n";
++}
++
++void callback_and_device_fault(const Decoder& decoder) {
++    const std::vector<int> prompt{760, 6511, 314, 9338, 369};
++    DecoderOptions options;
++    options.max_new_tokens = 40;
++    options.mtp_steps = 4;
++    options.top_logits = 16;
++    const auto expected = decoder.generate(prompt, options);
++    require(expected.mtp_accepted_tokens > 0, "Exercise real draft on fault prompt");
++    auto graph_options = options;
++    graph_options.mtp_steps = 0;
++    const auto graph = decoder.generate(prompt, graph_options);
++    require(graph_launches > 0 && graph.output_token_ids == expected.output_token_ids,
++            "Graph and positive MTP IDs");
++    inject_sync = true;
++    bool stream_failed = false;
++    try {
++        decoder.generate(prompt, options);
++    } catch (const std::exception& error) {
++        stream_failed = std::string_view(error.what()).find("Complete target verification round") !=
++                        std::string_view::npos;
++    }
++    require(stream_failed && injected == 1 && !inject_sync, "Device fault ownership");
++    DecoderCallbacks callbacks;
++    int emitted = 0;
++    callbacks.on_token = [&](int) {
++        if (++emitted == 12) {
++            throw std::runtime_error("probe callback fault");
++        }
++        return true;
++    };
++    bool callback_failed = false;
++    try {
++        decoder.generate(prompt, options, callbacks);
++    } catch (const std::exception& error) {
++        callback_failed = std::string_view(error.what()) == "probe callback fault";
++    }
++    require(callback_failed, "CPU fault ownership");
++    equal_results(expected, decoder.generate(prompt, options));
++    const int graph_before = graph_launches;
++    equal_results(graph, decoder.generate(prompt, graph_options));
++    require(graph_launches > graph_before, "Graph path after faults");
++    std::cout << "real callback and verifier sync faults, exact MTP and graph recovery\n";
++}
++
++template <typename Model>
++void trials(const Model& model) {
++    constexpr int prefix = 8191;
++    Request snapshot(0, capacity, model.memory);
++    MtpDraftRequest draft(model.mtp_weights, capacity);
++    snapshot.reset();
++    std::vector<int> ids(prefix, vocab_sample);
++    const auto stream = snapshot.memory.stream();
++    PrefillWorkspace scratch(stream, prefill_chunk_rows);
++    require(scratch.bytes() > 0, "Allocate long prefill fixture");
++    for (int filled = 0; filled < prefix;) {
++        const int rows = std::min(prefill_chunk_rows, prefix - filled);
++        model.prefill_chunk(snapshot, ids.data() + filled, rows, filled, scratch);
++        filled += rows;
++    }
++    model.normalize_final(snapshot.work, stream);
++    for (int index = 0; index < prefix - 1; ++index) {
++        draft.enqueue(index, vocab_sample, snapshot.work.normalized, false, stream);
++    }
++    sync(snapshot);
++    const auto gold = golden(model, snapshot, prefix, capacity - prefix);
++    for (int depth = 1; depth <= decoder_max_mtp_steps; ++depth) {
++        compare_rounds(model, snapshot, draft, prefix, gold, depth, Control::transition);
++    }
++    for (const auto control : {Control::device_oom, Control::pinned_oom, Control::stop,
++                               Control::cancellation, Control::short_budget}) {
++        compare_rounds(model, snapshot, draft, prefix, gold, 4, control);
++    }
++    scratch.close();
++}
++
++}
++
++int main() {
++    try {
++        const Decoder decoder("/data0/shared/Qwen3.8-27B-FP8", 0, true,
++                              Fp8PrefillPolicy::tensor_core);
++        callback_and_device_fault(decoder);
++        trials(*model_of(decoder));
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/segmented_probe.cpp b/segmented_probe.cpp
+new file mode 100644
+index 0000000..913cfed
+--- /dev/null
++++ b/segmented_probe.cpp
+@@ -0,0 +1,439 @@
++#include "src/decoder_batch.cpp"
++
++#include <bitset>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <numeric>
++#include <string>
++
++namespace {
++
++using namespace sglang;
++using namespace sglang::decoder;
++using Clock = std::chrono::steady_clock;
++
++void require(bool condition, const std::string& reason) {
++    if (!condition) {
++        throw std::runtime_error(reason);
++    }
++}
++
++template <typename Element>
++std::vector<Element> read(const Element* source, std::size_t count) {
++    std::vector<Element> values(count);
++    if (count) {
++        check(cudaMemcpy(values.data(), source, values.size() * sizeof(Element),
++                         cudaMemcpyDeviceToHost), "Read runtime state");
++    }
++    return values;
++}
++
++struct StateCounts {
++    std::size_t kv = 0;
++    std::size_t history = 0;
++    std::size_t recurrent = 0;
++    std::size_t pages = 0;
++    std::size_t observations = 0;
++};
++
++template <typename Element>
++std::size_t compare_bytes(const Element* candidate, const Element* reference, std::size_t count,
++                          const std::string& label) {
++    require(candidate != reference, "Aliased reference: " + label);
++    const auto left = read(candidate, count);
++    const auto right = read(reference, count);
++    const auto* lhs = reinterpret_cast<const unsigned char*>(left.data());
++    const auto* rhs = reinterpret_cast<const unsigned char*>(right.data());
++    const auto mismatch = std::mismatch(lhs, lhs + left.size() * sizeof(Element), rhs);
++    require(mismatch.first == lhs + left.size() * sizeof(Element),
++            label + " first byte " + std::to_string(mismatch.first - lhs));
++    return count * sizeof(Element);
++}
++
++void compare_state(const Request& candidate, const Request& reference, int position,
++                   const std::string& label, StateCounts& counts) {
++    require(candidate.pages.page_count == reference.pages.page_count, label + " page count");
++    const auto pages = read(candidate.pages.device_pages, candidate.pages.page_count);
++    counts.pages += compare_bytes(candidate.pages.device_pages, reference.pages.device_pages,
++                                  pages.size(), label + " pages");
++    ++counts.observations;
++    for (int layer : {0, 1, gdn_layers / 2, gdn_layers - 1}) {
++        const auto suffix = label + " GDN layer " + std::to_string(layer);
++        const auto left = candidate.states[layer];
++        const auto right = reference.states[layer];
++        counts.history += compare_bytes(left.history, right.history, gdn_history_elements,
++                                        suffix + " history");
++        counts.recurrent += compare_bytes(left.recurrent, right.recurrent, gdn_state_elements,
++                                          suffix + " recurrent");
++    }
++    for (int layer = 0; layer < full_attention_layers; ++layer) {
++        const auto suffix = label + " KV layer " + std::to_string(layer);
++        const auto left = candidate.caches[layer];
++        const auto right = reference.caches[layer];
++        for (int first = 0; first < position; first += mxfp8_page_size) {
++            const auto page = pages.at(first / mxfp8_page_size);
++            const auto payload = page * mxfp8_payload_bytes_per_page;
++            const auto scales = page * mxfp8_scale_bytes_per_page;
++            const auto used = std::min(mxfp8_page_size, position - first);
++            const auto elements = used * mxfp8_kv_heads * mxfp8_head_dim;
++            counts.kv += compare_bytes(left.key_payload + payload, right.key_payload + payload,
++                                       elements, suffix + " key payload");
++            counts.kv += compare_bytes(left.value_payload + payload, right.value_payload + payload,
++                                       elements, suffix + " value payload");
++            const auto read_scales = [&](const std::uint8_t* lhs, const std::uint8_t* rhs,
++                                         const std::string& name) {
++                const auto a = read(lhs + scales, mxfp8_scale_bytes_per_page);
++                const auto b = read(rhs + scales, mxfp8_scale_bytes_per_page);
++                for (int token = 0; token < used; ++token) {
++                    for (int head = 0; head < mxfp8_kv_heads; ++head) {
++                        const auto offset = ((head * 32 + token % 32) * 4 + token / 32) * mxfp8_groups;
++                        require(std::equal(a.begin() + offset, a.begin() + offset + mxfp8_groups,
++                                           b.begin() + offset),
++                                suffix + name + " token " + std::to_string(first + token));
++                    }
++                }
++                return used * mxfp8_kv_heads * mxfp8_groups;
++            };
++            counts.kv += read_scales(left.key_scales, right.key_scales, " key scales");
++            counts.kv += read_scales(left.value_scales, right.value_scales, " value scales");
++        }
++    }
++}
++
++std::vector<int> prompt(int rows, int seed, int preserve = 0) {
++    std::vector<int> ids;
++    for (int row = 0; row < rows; ++row) {
++        const auto salt = row < preserve ? 17 : seed;
++        ids.push_back(100 + (((row + 1) * (271 + salt * 31)) ^ (salt * 997)) % 29811);
++    }
++    return ids;
++}
++
++struct Isolated {
++    std::vector<int> prompt;
++    DecoderOptions options;
++    std::unique_ptr<Request> request;
++    DecoderResult full;
++    int position = 0;
++    int emitted = 0;
++    int last = 0;
++    bool retired = false;
++};
++
++struct Case {
++    Case(const Decoder& owner, std::string id, int width, int budget)
++        : decoder(owner), name(std::move(id)), width(width), budget(budget),
++          candidate(owner, {budget, true}) {}
++
++    void admit(int slot, std::vector<int> ids, int output) {
++        require(!lanes[slot], "Admit occupied reference slot");
++        DecoderOptions options;
++        options.max_new_tokens = output;
++        candidate.admit(slot, ids, options);
++        Isolated lane{std::move(ids), options, nullptr, {}};
++        if (output) {
++            const auto& model = *decoder.model_;
++            lane.request = std::make_unique<Request>(
++                model.device, lane.prompt.size() + output - 1, model.memory);
++            lane.request->reset();
++            check(cudaStreamSynchronize(lane.request->memory.stream()), "Reset isolated request");
++            options.top_logits = 20;
++            lane.full = decoder.generate(lane.prompt, options);
++        }
++        lanes[slot].emplace(std::move(lane));
++    }
++
++    void cancel(int slot) {
++        const auto before = candidate.request_device_allocation_bytes();
++        const auto occupied = lanes[slot] && lanes[slot]->request;
++        candidate.cancel(slot);
++        lanes[slot].reset();
++        const auto after = candidate.request_device_allocation_bytes();
++        require(occupied ? after < before : after == before, "Incorrect cancel ownership");
++    }
++
++    void step(Selection selection, bool observe = false);
++
++    void drain() {
++        for (int step_number = 0; step_number < 120; ++step_number) {
++            Selection selection{};
++            for (int slot = 0; slot < width; ++slot) {
++                selection[slot] = lanes[slot].has_value();
++            }
++            if (std::none_of(selection.begin(), selection.end(), [](bool value) { return value; })) {
++                require(candidate.request_device_allocation_bytes() == 0, "Live allocations after drain");
++                require(packed_steps > 0, "No packed steps exercised");
++                std::cout << "case=" << name << " width=" << width << " budget=" << budget
++                          << " steps=" << steps << " packed_steps=" << packed_steps
++                          << " packed_rows=" << packed_rows << " mixed_steps=" << mixed_steps
++                          << " mixed_packed_steps=" << mixed_packed_steps
++                          << " prompt_rows=" << prompt_rows << " decoded_rows=" << decode_rows
++                          << " ids=" << ids << " dense_bf16=" << dense_values
++                          << " serial_top=" << serial_checked
++                          << " serial_top_nonexact=" << serial_different
++                          << " serial_max_abs=" << serial_max_abs
++                          << " serial_id_mismatches=" << serial_id_mismatches
++                          << " observations=" << state.observations << " kv_bytes=" << state.kv
++                          << " page_table_bytes=" << state.pages << " history_bytes=" << state.history
++                          << " recurrent_bytes=" << state.recurrent << std::endl;
++                return;
++            }
++            step(selection, step_number == 0 || step_number % 11 == 0);
++        }
++        throw std::runtime_error("Drain limit exceeded");
++    }
++
++    const Decoder& decoder;
++    const std::string name;
++    const int width;
++    const int budget;
++    DecoderBatch candidate;
++    std::array<std::optional<Isolated>, decoder_batch_max_lanes> lanes;
++    int steps = 0;
++    int packed_steps = 0;
++    int packed_rows = 0;
++    int mixed_steps = 0;
++    int mixed_packed_steps = 0;
++    int prompt_rows = 0;
++    int decode_rows = 0;
++    int ids = 0;
++    int serial_different = 0;
++    int serial_checked = 0;
++    int serial_id_mismatches = 0;
++    float serial_max_abs = 0;
++    std::size_t dense_values = 0;
++    StateCounts state;
++};
++
++void Case::step(Selection selection, bool observe) {
++    const auto& model = *decoder.model_;
++    DecoderBatchStepStats stats;
++    DecoderBatchLogits logits;
++    const auto started = Clock::now();
++    const auto actual = candidate.advance_chunked(selection, &stats, &logits);
++    const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
++    const auto rows = std::accumulate(stats.prefill_rows.begin(), stats.prefill_rows.end(), 0);
++    const auto decoded = std::count_if(actual.begin(), actual.end(), [](const auto& item) {
++        return item.decode;
++    });
++    const auto segments = std::count_if(stats.prefill_rows.begin(), stats.prefill_rows.end(),
++                                        [](int count) { return count > 1; });
++    int expected_packed = 0;
++    if (segments > 1) {
++        for (const auto count : stats.prefill_rows) {
++            expected_packed += count > 1 ? count : 0;
++        }
++    }
++    require(stats.packed_prefill_rows == expected_packed, name + " packed row count");
++    require(rows + decoded <= budget, name + " row budget exceeded");
++    packed_steps += stats.packed_prefill_rows > 0;
++    packed_rows += stats.packed_prefill_rows;
++    mixed_steps += rows > 0 && decoded > 0;
++    mixed_packed_steps += stats.packed_prefill_rows > 0 && decoded > 0;
++    prompt_rows += rows;
++    decode_rows += decoded;
++    std::cout << "step case=" << name << " index=" << steps << " prompt=" << rows
++              << " decode=" << decoded << " packed=" << stats.packed_prefill_rows
++              << " workspace=" << stats.prefill_workspace_bytes << " diagnostic_ms=" << elapsed
++              << std::endl;
++    for (int slot = 0; slot < width; ++slot) {
++        auto& lane = lanes[slot];
++        const auto& device_slot = candidate.state_->storage->slots[slot];
++        const auto label = name + " step=" + std::to_string(steps) + " lane=" + std::to_string(slot);
++        const auto count = stats.prefill_rows[slot];
++        const auto& result = actual[slot];
++        if (!selection[slot] || !lane || !lane->request) {
++            const bool ended = selection[slot] && lane.has_value();
++            require(!result.token && !result.decode && !count && logits[slot].empty(), label);
++            require(result.finish_reason.has_value() == ended, label + " empty completion");
++            require(device_slot.has_value() == (lane.has_value() && !ended), label + " slot retention");
++            if (ended) {
++                lane.reset();
++            } else if (observe && lane && lane->request) {
++                require(device_slot->position == lane->position, label + " untouched position");
++                compare_state(*device_slot->request, *lane->request, lane->position, label, state);
++            }
++            continue;
++        }
++        auto& independent = *lane->request;
++        const auto stream = independent.memory.stream();
++        const auto remaining = std::max(0, static_cast<int>(lane->prompt.size()) - lane->position);
++        require(result.decode == (remaining == 0) && count <= std::min(128, remaining) &&
++                    (remaining == 0 || count > 0),
++                label + " lane phase or consumed rows");
++        if (count > 1) {
++            PrefillWorkspace workspace(stream, count);
++            model.prefill_chunk(independent, lane->prompt.data() + lane->position, count,
++                                lane->position, workspace);
++            workspace.close();
++        } else {
++            model.forward(independent, remaining ? lane->prompt[lane->position] : lane->last,
++                          lane->position, remaining ? TextGdnMode::prefill : TextGdnMode::decode);
++        }
++        const int old_position = lane->position;
++        lane->position += std::max(1, count);
++        require(result.token.has_value() == (remaining == count), label + " score timing");
++        if (result.token) {
++            model.compute_logits(independent);
++            copy_greedy_token(independent, stream);
++        }
++        check(cudaStreamSynchronize(stream), "Complete isolated lane");
++        if (result.token) {
++            lane->last = read_greedy_token(independent);
++            require(result.token == lane->last, label + " isolated greedy ID");
++            const auto expected = read(reinterpret_cast<const std::uint16_t*>(independent.work.logits),
++                                       vocab_size);
++            require(logits[slot].size() == expected.size(), label + " dense BF16 size");
++            const auto mismatch = std::mismatch(expected.begin(), expected.end(), logits[slot].begin());
++            require(mismatch.first == expected.end(),
++                    label + " isolated BF16 mismatch token " +
++                    std::to_string(mismatch.first - expected.begin()));
++            dense_values += expected.size();
++            if (lane->full.output_token_ids.at(lane->emitted) != *result.token) {
++                ++serial_id_mismatches;
++                std::cerr << label << " public serial ID=" << lane->full.output_token_ids.at(lane->emitted)
++                          << " observed=" << *result.token << '\n';
++            }
++            for (const auto& ranked : lane->full.step_top_logits.at(lane->emitted)) {
++                const auto encoded = expected[ranked.token_id];
++                const std::uint32_t bits = static_cast<std::uint32_t>(encoded) << 16;
++                float observed;
++                std::memcpy(&observed, &bits, sizeof(observed));
++                require(std::isfinite(observed) && std::isfinite(ranked.logit), label + " nonfinite logit");
++                serial_max_abs = std::max(serial_max_abs, std::abs(observed - ranked.logit));
++                serial_different += observed != ranked.logit;
++                ++serial_checked;
++            }
++            ++lane->emitted;
++            ++ids;
++        } else {
++            require(logits[slot].empty(), label + " partial-prefill logits");
++        }
++        const bool finished = lane->emitted == lane->options.max_new_tokens;
++        require(result.finish_reason.has_value() == finished, label + " terminal event");
++        require(device_slot.has_value() != finished, label + " retirement");
++        if (finished) {
++            require(result.finish_reason == DecoderFinishReason::length, label + " finish reason");
++            lane.reset();
++        } else {
++            require(device_slot->position == lane->position, label + " absolute position");
++            if (observe || (old_position < 128 && lane->position >= 128)) {
++                compare_state(*device_slot->request, independent, lane->position, label, state);
++            }
++        }
++    }
++    ++steps;
++}
++
++void correctness(const Decoder& decoder) {
++    for (int budget : {7, 31, 256}) {
++        Case pair(decoder, "ragged_pair_" + std::to_string(budget), 2, budget);
++        pair.admit(0, prompt(11, 6), 4);
++        pair.admit(1, prompt(budget == 7 ? 39 : 139, 19), 3);
++        pair.step({true, true}, true);
++        pair.step({}, true);
++        pair.drain();
++    }
++    for (int seed : {51, 73}) {
++        Case mixed(decoder, "decode_prefill_" + std::to_string(seed), 4, 31);
++        mixed.admit(0, prompt(9, 4), 8);
++        mixed.admit(3, prompt(17, 61), 0);
++        mixed.step({true, false, false, true}, true);
++        mixed.admit(1, prompt(151, seed, 31), 3);
++        mixed.admit(2, prompt(139, seed + 6), 4);
++        mixed.admit(3, prompt(18, 7), 5);
++        mixed.step({true, true, true, true}, true);
++        mixed.step({}, true);
++        mixed.cancel(2);
++        mixed.cancel(2);
++        mixed.admit(2, prompt(129, seed + 14), 4);
++        mixed.step({true, true, false, true}, true);
++        mixed.drain();
++    }
++}
++
++void timed(const Decoder& decoder, bool pack, int width, int budget, int rows, int repeat) {
++    DecoderBatch batch(decoder, {budget, pack});
++    std::array<std::vector<int>, decoder_batch_max_lanes> tokens;
++    Selection active{};
++    const auto begin_admit = Clock::now();
++    for (int slot = 0; slot < width; ++slot) {
++        active[slot] = true;
++        DecoderOptions options;
++        options.max_new_tokens = 8;
++        batch.admit(slot, prompt(rows - slot * 11, 82 + slot), options);
++    }
++    const auto start = Clock::now();
++    const auto admit = std::chrono::duration<double, std::milli>(start - begin_admit).count();
++    int step = 0;
++    while (std::any_of(active.begin(), active.end(), [](bool value) { return value; })) {
++        require(step < 2000, "Timing failed to complete");
++        DecoderBatchStepStats stats;
++        const auto before = Clock::now();
++        const auto output = batch.advance_chunked(active, &stats);
++        const auto after = Clock::now();
++        const auto wall = std::chrono::duration<double, std::milli>(after - before).count();
++        int decoded = 0;
++        int emitted = 0;
++        for (int slot = 0; slot < width; ++slot) {
++            decoded += output[slot].decode;
++            if (output[slot].token) {
++                tokens[slot].push_back(*output[slot].token);
++                ++emitted;
++            }
++            if (output[slot].finish_reason) {
++                require(output[slot].finish_reason == DecoderFinishReason::length, "Timing finish");
++                active[slot] = false;
++            }
++        }
++        std::cout << "time_step," << width << ',' << budget << ',' << rows << ',' << repeat << ','
++                  << pack << ',' << step++ << ',' << wall << ',' << decoded << ',' << emitted
++                  << ',' << stats.packed_prefill_rows << ',' << stats.prefill_workspace_bytes;
++        for (int count : stats.prefill_rows) {
++            std::cout << ',' << count;
++        }
++        std::cout << '\n';
++    }
++    require(batch.request_device_allocation_bytes() == 0, "Timing has live allocations at end");
++    std::cout << "time_end," << width << ',' << budget << ',' << rows << ',' << repeat << ','
++              << pack << ',' << admit << ','
++              << std::chrono::duration<double, std::milli>(Clock::now() - start).count();
++    for (int slot = 0; slot < width; ++slot) {
++        require(tokens[slot].size() == 8, "Timing output count");
++        for (const auto token : tokens[slot]) {
++            std::cout << ',' << token;
++        }
++    }
++    std::cout << std::endl;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    if (argc < 3) {
++        return 2;
++    }
++    try {
++        const sglang::Decoder decoder(argv[1]);
++        if (std::string(argv[2]) == "correctness") {
++            correctness(decoder);
++        } else if (std::string(argv[2]) == "timing" && argc == 6) {
++            const int width = std::stoi(argv[3]);
++            const int budget = std::stoi(argv[4]);
++            const int rows = std::stoi(argv[5]);
++            require((width == 2 || width == 4) && rows >= width * 11, "Invalid timing shape");
++            for (int repeat = -2; repeat < 5; ++repeat) {
++                const bool packed_first = repeat % 2 != 0;
++                timed(decoder, packed_first, width, budget, rows, repeat);
++                timed(decoder, !packed_first, width, budget, rows, repeat);
++            }
++        } else {
++            return 2;
++        }
++    } catch (const std::exception& error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/reject_pair_kernel.cpp b/reject_pair_kernel.cpp
+new file mode 100644
+index 0000000..a6885b2
+--- /dev/null
++++ b/reject_pair_kernel.cpp
+@@ -0,0 +1,22 @@
++#include <cuda_runtime_api.h>
++
++#include <cstdio>
++#include <cstring>
++#include <dlfcn.h>
++
++extern "C" cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* attributes, const void* kernel) {
++    using Lookup = cudaError_t (*)(cudaFuncAttributes*, const void*);
++    using Name = cudaError_t (*)(const char**, const void*);
++    static const auto lookup = reinterpret_cast<Lookup>(dlsym(RTLD_NEXT, "cudaFuncGetAttributes"));
++    static const auto name = reinterpret_cast<Name>(dlsym(RTLD_NEXT, "cudaFuncGetName"));
++    if (!lookup || !name) {
++        return cudaErrorSharedObjectSymbolNotFound;
++    }
++    const char* raw_name = nullptr;
++    if (name(&raw_name, kernel) == cudaSuccess && raw_name &&
++        std::strstr(raw_name, "fp8_tma") && std::strstr(raw_name, "Li6ELi2ELi1ELi2E")) {
++        std::fputs("pair_fault: paired-staging kernel unavailable\n", stderr);
++        return cudaErrorInvalidDeviceFunction;
++    }
++    return lookup(attributes, kernel);
++}
+diff --git a/fail_wide_allocation.cpp b/fail_wide_allocation.cpp
+new file mode 100644
+index 0000000..8b6fc94
+--- /dev/null
++++ b/fail_wide_allocation.cpp
+@@ -0,0 +1,23 @@
++#include <cuda_runtime_api.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <dlfcn.h>
++
++extern "C" cudaError_t cudaMallocFromPoolAsync(void** pointer, std::size_t bytes,
++                                              cudaMemPool_t pool, cudaStream_t stream) {
++    using Allocate = decltype(&cudaMallocFromPoolAsync);
++    static const auto allocate = reinterpret_cast<Allocate>(
++        dlsym(RTLD_NEXT, "cudaMallocFromPoolAsync"));
++    if (!allocate) {
++        std::abort();
++    }
++    if (bytes >= 300 * 1024 * 1024) {
++        std::fprintf(stderr, "prefill_fault: rejected %zu bytes\n", bytes);
++        return cudaErrorMemoryAllocation;
++    }
++    const auto status = allocate(pointer, bytes, pool, stream);
++    std::fprintf(stderr, "prefill_fault: delegated %zu bytes status=%d\n",
++                 bytes, static_cast<int>(status));
++    return status;
++}

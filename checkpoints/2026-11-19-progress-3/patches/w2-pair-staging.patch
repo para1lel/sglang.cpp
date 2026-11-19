@@ -1,0 +1,164 @@
+--- a/src/prefill_fp8_sm100.cu
++++ b/src/prefill_fp8_sm100.cu
+@@ -14,11 +14,13 @@
+ constexpr int warp_size = 32;
+ constexpr int accum_stages = 2;
+
+-template <int Rows, int Cols, int Copies, int Batch, int Resident>
++template <int Rows, int Cols, int Copies, int Batch, int Resident, int CopyBatch = 1>
+ struct Tile {
+     static constexpr int rows = Rows;
+     static constexpr int cols = Cols;
+     static constexpr int copies = Copies;
++    static constexpr int copy_batch = CopyBatch;
++    static constexpr int copy_slots = Copies / CopyBatch;
+     static constexpr int batch = Batch;
+     static constexpr int resident = Resident;
+     static constexpr int warp_cols = Cols < 64 ? Cols : 64;
+@@ -32,12 +34,14 @@
+     static_assert(Rows == 128 || (Rows == 64 && Cols == 128));
+     static_assert(group_size % 32 == 0 && group_size % Cols == 0);
+     static_assert(tmem_cols >= 32 && tmem_cols <= 512 && (tmem_cols & (tmem_cols - 1)) == 0);
++    static_assert(Copies % CopyBatch == 0);
++    static_assert(CopyBatch == 1 || (CopyBatch == Batch && copy_slots >= accum_stages));
+ };
+
+ template <class Config>
+ struct Pipeline {
+-    unsigned long long copy_ready[Config::copies];
+-    unsigned long long copy_empty[Config::copies];
++    unsigned long long copy_ready[Config::copy_slots];
++    unsigned long long copy_empty[Config::copy_slots];
+     unsigned long long accum_ready[accum_stages];
+     unsigned long long accum_empty[accum_stages];
+     unsigned tmem;
+@@ -79,17 +83,22 @@
+ template <class Config>
+ __device__ void produce_tiles(Pipeline<Config>& pipe, unsigned shared, const CUtensorMap* input,
+                               const CUtensorMap* weight, int row_base, int col_base, int groups) {
+-    for (int group = 0; group < groups; ++group) {
+-        const int slot = group % Config::copies;
+-        if (group >= Config::copies) {
+-            wait_barrier(&pipe.copy_empty[slot], (group / Config::copies - 1) % 2);
++    for (int batch = 0; batch < groups / Config::copy_batch; ++batch) {
++        const int slot = batch % Config::copy_slots;
++        if (batch >= Config::copy_slots) {
++            wait_barrier(&pipe.copy_empty[slot], (batch / Config::copy_slots - 1) % 2);
+         }
+         const unsigned barrier = shared_address(&pipe.copy_ready[slot]);
++        constexpr int bytes = Config::stage_bytes * Config::copy_batch;
+         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+-                     :: "r"(barrier), "r"(Config::stage_bytes) : "memory");
+-        const unsigned start = shared + slot * Config::stage_bytes;
+-        copy_tile(input, start, barrier, group * group_size, row_base);
+-        copy_tile(weight, start + Config::rows * group_size, barrier, group * group_size, col_base);
++                     :: "r"(barrier), "r"(bytes) : "memory");
++        #pragma unroll
++        for (int offset = 0; offset < Config::copy_batch; ++offset) {
++            const unsigned start = shared + slot * bytes + offset * Config::stage_bytes;
++            const int depth = (batch * Config::copy_batch + offset) * group_size;
++            copy_tile(input, start, barrier, depth, row_base);
++            copy_tile(weight, start + Config::rows * group_size, barrier, depth, col_base);
++        }
+     }
+ }
+
+@@ -109,13 +118,17 @@
+                                      accumulator_f32;
+     for (int group = 0; group < groups; ++group) {
+         const int stage = group % Config::copies;
++        const int copy_batch = group / Config::copy_batch;
++        const int copy_slot = copy_batch % Config::copy_slots;
+         const int batch = group / Config::batch;
+         const int accum = group % (accum_stages * Config::batch);
+         if (batch >= accum_stages && group % Config::batch == 0) {
+             wait_barrier(&pipe.accum_empty[batch % accum_stages], (batch / accum_stages - 1) % 2);
+         }
+-        wait_barrier(&pipe.copy_ready[stage], (group / Config::copies) % 2);
+-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
++        if (group % Config::copy_batch == 0) {
++            wait_barrier(&pipe.copy_ready[copy_slot], (copy_batch / Config::copy_slots) % 2);
++            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
++        }
+         const unsigned start = shared + stage * Config::stage_bytes;
+         const unsigned destination = pipe.tmem + accum * Config::accum_cols;
+         #pragma unroll
+@@ -137,9 +150,13 @@
+                                 "r"(instruction), "r"(chunk) : "memory");
+             }
+         }
+-        commit_mma(&pipe.copy_empty[stage]);
+-        if (group % Config::batch == Config::batch - 1 || group == groups - 1) {
+-            commit_mma(&pipe.accum_ready[batch % accum_stages]);
++        if (group % Config::copy_batch == Config::copy_batch - 1) {
++            commit_mma(&pipe.copy_empty[copy_slot]);
++        }
++        if constexpr (Config::copy_batch == 1) {
++            if (group % Config::batch == Config::batch - 1 || group == groups - 1) {
++                commit_mma(&pipe.accum_ready[batch % accum_stages]);
++            }
+         }
+     }
+ }
+@@ -204,7 +221,13 @@
+         const float activation_scale = activation ? activation[group] : 0.0f;
+         const float scale = __fmul_rn(activation_scale, __bfloat162float(weight[group]));
+         if (group % Config::batch == 0) {
+-            wait_barrier(&pipe.accum_ready[batch % accum_stages], (batch / accum_stages) % 2);
++            if constexpr (Config::copy_batch == 1) {
++                wait_barrier(&pipe.accum_ready[batch % accum_stages],
++                             (batch / accum_stages) % 2);
++            } else {
++                wait_barrier(&pipe.copy_empty[batch % Config::copy_slots],
++                             (batch / Config::copy_slots) % 2);
++            }
+             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+         }
+         unsigned partial[Config::warp_cols];
+@@ -242,12 +265,14 @@
+     }
+     const unsigned shared = shared_address(tiles);
+     if (threadIdx.x == 0) {
+-        for (int slot = 0; slot < Config::copies; ++slot) {
++        for (int slot = 0; slot < Config::copy_slots; ++slot) {
+             init_barrier(&pipe.copy_ready[slot], 1);
+             init_barrier(&pipe.copy_empty[slot], 1);
+         }
+         for (int slot = 0; slot < accum_stages; ++slot) {
+-            init_barrier(&pipe.accum_ready[slot], 1);
++            if constexpr (Config::copy_batch == 1) {
++                init_barrier(&pipe.accum_ready[slot], 1);
++            }
+             init_barrier(&pipe.accum_empty[slot], Config::consumers);
+         }
+         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+@@ -440,10 +465,12 @@
+         return status;
+     }
+     int groups = in_width / group_size;
+-    int row_tile_group = 1;
++    const int row_tiles = 1 + (rows - 1) / Config::rows;
++    int row_tile_group = Config::copy_batch == 1 ? 1 : row_tiles;
+     void* args[] = {&activation_map, &weight_map, &input.scales, &weight_scales,
+                     &rows, &out_width, &groups, &row_tile_group, &output};
+-    const dim3 grid(1 + (out_width - 1) / Config::cols, 1 + (rows - 1) / Config::rows);
++    const dim3 grid((1 + (out_width - 1) / Config::cols) * row_tile_group,
++                    row_tiles / row_tile_group);
+     return cudaLaunchKernel(kernel, grid, Config::threads, args, shared_bytes, stream);
+ }
+
+@@ -477,6 +504,14 @@
+     if (major != 10 || minor != 0) {
+         return std::nullopt;
+     }
++    if (rows >= 1024 && (out_width >= 8192 || in_width >= 8192) &&
++        in_width % (2 * group_size) == 0) {
++        const auto wide = launch_tma<Tile<128, 128, 6, 2, 1, 2>>(
++            weight, weight_scales, input, rows, out_width, in_width, output, stream, device);
++        if (wide.has_value()) {
++            return wide;
++        }
++    }
+     if ((rows <= 64 && out_width >= 4096) || in_width >= 8192) {
+         return launch_tma<Tile<64, 128, 6, 2, 1>>(weight, weight_scales, input, rows,
+                                                  out_width, in_width, output, stream, device);

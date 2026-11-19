@@ -1,0 +1,62 @@
+--- a/src/decoder_prefill.cpp
++++ b/src/decoder_prefill.cpp
+@@ -24,6 +24,7 @@
+     const int device;
+     cudaMemPool_t handle = nullptr;
+     void* pending = nullptr;
++    std::uint64_t release_threshold = 0;
+     bool retains_backing = false;
+     PrefillPool* next_retained = nullptr;
+     std::unique_ptr<PrefillPool> next;
+@@ -50,11 +51,12 @@
+             retained_ = &pool;
+         }
+
+-        std::uint64_t threshold = 32 * 1024 * 1024;
++        std::uint64_t threshold = retention_granularity;
+         const auto status =
+             cudaMemPoolSetAttribute(pool.handle, cudaMemPoolAttrReleaseThreshold, &threshold);
+         if (status == cudaSuccess) {
+             pool.retains_backing = true;
++            pool.release_threshold = threshold;
+             return;
+         }
+
+@@ -72,6 +74,18 @@
+         }
+     }
+
++    void retain_wide_workspace(PrefillPool& pool, std::size_t bytes) {
++        if (!pool.retains_backing || bytes <= pool.release_threshold) {
++            return;
++        }
++        std::uint64_t threshold =
++            (bytes + retention_granularity - 1) / retention_granularity * retention_granularity;
++        if (cudaMemPoolSetAttribute(pool.handle, cudaMemPoolAttrReleaseThreshold, &threshold)
++            == cudaSuccess) {
++            pool.release_threshold = threshold;
++        }
++    }
++
+     std::unique_ptr<PrefillPool> take_idle(int device) {
+         const std::lock_guard<std::mutex> lock(mutex_);
+         if (auto pool = take(idle_, device, true)) {
+@@ -105,6 +119,8 @@
+     }
+
+ private:
++    static constexpr std::uint64_t retention_granularity = 32 * 1024 * 1024;
++
+     static std::unique_ptr<PrefillPool> take(std::unique_ptr<PrefillPool>& list, int device,
+                                              bool must_retain_backing = false) {
+         auto* link = &list;
+@@ -366,6 +382,9 @@
+     pool_ = std::move(pool);
+     data_ = data;
+     bytes_ = layout.bytes;
++    if (capacity_ > prefill_chunk_rows) {
++        pools.retain_wide_workspace(*pool_, bytes_);
++    }
+ }
+
+ PrefillWorkspace::~PrefillWorkspace() {

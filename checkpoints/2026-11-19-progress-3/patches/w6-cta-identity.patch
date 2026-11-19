@@ -1,0 +1,43 @@
+--- a/src/mxfp8_flash_tc.cu
++++ b/src/mxfp8_flash_tc.cu
+@@ -56,7 +56,7 @@
+ template <int Columns, bool TransposeB>
+ __device__ void mma(unsigned output, std::uint64_t left, std::uint64_t right, bool accumulate) {
+     constexpr unsigned instruction = (query_tile / 16 << 24) | (Columns / 8 << 17) |
+-        (static_cast<unsigned>(TransposeB) << 16) | (1 << 10) | (1 << 7) | (1 << 4);
++        (unsigned(TransposeB) << 16) | (1 << 10) | (1 << 7) | (1 << 4);
+     asm volatile("{ .reg .pred keep;\n"
+                  "setp.ne.u32 keep, %4, 0;\n"
+                  "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, keep; }"
+@@ -91,9 +91,10 @@
+                  :: "r"(barrier), "r"(phase) : "memory");
+ }
+
++#define TMEM_REGS "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}"
++
+ __device__ void tmem_load(unsigned address, float (&values)[values_per_lane]) {
+-    asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+-                 "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];\n"
++    asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 " TMEM_REGS ", [%16];\n"
+                  "tcgen05.wait::ld.sync.aligned;"
+                  : "=f"(values[0]), "=f"(values[1]), "=f"(values[2]), "=f"(values[3]),
+                    "=f"(values[4]), "=f"(values[5]), "=f"(values[6]), "=f"(values[7]),
+@@ -112,6 +113,8 @@
+                     "f"(values[11]), "f"(values[12]), "f"(values[13]), "f"(values[14]),
+                     "f"(values[15]) : "memory");
+ }
++
++#undef TMEM_REGS
+
+ __device__ int swizzled(int row, int column) {
+     return column ^ ((row & 7) * 8);
+@@ -292,8 +295,7 @@
+     finish_mma(tile, 1);
+ }
+
+-__device__ void save_partial(unsigned address,
+-                             float (&saved)[key_tile / values_per_lane][values_per_lane]) {
++__device__ void save_partial(unsigned address, float (&saved)[key_tile / values_per_lane][values_per_lane]) {
+     #pragma unroll
+     for (int index = 0; index < key_tile / values_per_lane; ++index) {
+         tmem_load(address + index * values_per_lane, saved[index]);

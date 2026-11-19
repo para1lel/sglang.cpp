@@ -1,0 +1,235 @@
+--- a/include/sglang/decoder.h
++++ b/include/sglang/decoder.h
+@@ -34,6 +34,7 @@
+ struct DecoderCallbacks {
+     std::function<bool(int)> on_token;
+     std::function<bool()> is_cancelled;
++    std::function<int(int, const std::byte*, std::size_t)> teacher_token;
+ };
+
+ struct DecoderLogit {
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -352,7 +352,7 @@
+         auto& request = *storage;
+         request.reset();
+         auto& transfers = request.memory.transfers();
+-        transfers.logits.resize(options.top_logits > 0 ? vocab_size : 0);
++        transfers.logits.resize(options.top_logits > 0 || callbacks.teacher_token ? vocab_size : 0);
+         std::vector<DecoderLogit> ranking;
+         if (options.top_logits > 0) {
+             ranking.reserve(vocab_size);
+@@ -398,6 +398,19 @@
+                     compute_logits(request);
+                 }
+                 winner = read_step(request);
++                if (callbacks.teacher_token) {
++                    const int teacher = callbacks.teacher_token(
++                        winner, reinterpret_cast<const std::byte*>(transfers.logits.data()),
++                        transfers.logits.size() * sizeof(Bf16));
++                    if (!valid_token(teacher)) {
++                        throw std::invalid_argument("Teacher token falls outside the vocabulary");
++                    }
++                    const auto stream = request.memory.stream();
++                    check(cudaMemcpyAsync(&request.work.argmax->token_id, &teacher, sizeof(teacher),
++                                          cudaMemcpyHostToDevice, stream), "Install teacher token");
++                    check(cudaStreamSynchronize(stream), "Complete teacher token copy");
++                    winner = teacher;
++                }
+                 result.output_token_ids.push_back(winner);
+                 const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
+                 if (options.top_logits > 0) {
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -141,6 +141,16 @@
+     set_default(false)
+ option_end()
+
++target("serial-score-probe")
++    set_kind("binary")
++    set_default(false)
++    set_toolchains("host-pixi")
++    set_targetdir("$(builddir)/bin")
++    add_deps("sglang_decoder")
++    add_includedirs("apps")
++    add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
++    add_files("tools/serial-score-probe.cpp")
++
+ if has_config("mxfp8-gqa-check") then
+     target("mxfp8-gqa-check")
+         set_kind("binary")
+--- /dev/null
++++ b/tools/serial-score-probe.cpp
+@@ -0,0 +1,172 @@
++#include "fp8_prefill_option.h"
++#include "sglang/decoder.h"
++
++#include <algorithm>
++#include <chrono>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++
++namespace {
++
++std::vector<int> read_ids(const std::filesystem::path& path) {
++    std::ifstream input(path);
++    std::vector<int> ids;
++    for (int token; input >> token;) {
++        ids.push_back(token);
++    }
++    if (!input.eof() || ids.empty()) {
++        throw std::runtime_error("Invalid token fixture " + path.string());
++    }
++    return ids;
++}
++
++void score(sglang::Decoder& decoder, const std::filesystem::path& directory,
++           const std::string& workload) {
++    const auto prompt = read_ids(directory / (workload + ".prompt"));
++    const auto teacher = read_ids(directory / (workload + ".teacher"));
++    std::ofstream raw(directory / (workload + ".bf16"), std::ios::binary);
++    std::ofstream outputs(directory / (workload + ".winners"));
++    raw.exceptions(std::ios::failbit | std::ios::badbit);
++    outputs.exceptions(std::ios::failbit | std::ios::badbit);
++    sglang::DecoderOptions options;
++    options.max_new_tokens = static_cast<int>(teacher.size());
++    std::size_t step = 0;
++    sglang::DecoderCallbacks callbacks;
++    callbacks.teacher_token = [&](int winner, const std::byte* data, std::size_t bytes) {
++        raw.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
++        outputs << winner << '\n';
++        return teacher.at(step++);
++    };
++    const auto report = decoder.generate(prompt, options, callbacks);
++    if (step != teacher.size() || report.finish_reason != sglang::DecoderFinishReason::length) {
++        throw std::runtime_error("Incomplete score run");
++    }
++    raw.close();
++    outputs.close();
++    std::cout << workload << " score rows " << step
++              << ", accounted CUDA bytes " << report.peak_device_allocation_bytes << std::endl;
++}
++
++void verify_reset(sglang::Decoder& decoder, const std::filesystem::path& directory) {
++    const auto short_prompt = read_ids(directory / "W1.prompt");
++    const auto long_prompt = read_ids(directory / "W2.prompt");
++    sglang::DecoderOptions options;
++    options.max_new_tokens = 8;
++    const auto fresh_short = decoder.generate(short_prompt, options).output_token_ids;
++    const auto fresh_long = decoder.generate(long_prompt, options).output_token_ids;
++    sglang::DecoderCallbacks callbacks;
++    int emitted = 0;
++    callbacks.on_token = [&](int) { return ++emitted < 4; };
++    const auto cancelled_decode = decoder.generate(long_prompt, options, callbacks);
++    const auto short_after_cancel = decoder.generate(short_prompt, options).output_token_ids;
++    if (cancelled_decode.finish_reason != sglang::DecoderFinishReason::cancelled ||
++        cancelled_decode.output_token_ids.size() != 4 ||
++        !std::equal(cancelled_decode.output_token_ids.begin(),
++                    cancelled_decode.output_token_ids.end(), fresh_long.begin()) ||
++        short_after_cancel != fresh_short) {
++        throw std::runtime_error("Decode cancellation or cross-prompt reuse changed IDs");
++    }
++    callbacks.on_token = {};
++    int cancellation_polls = 0;
++    callbacks.is_cancelled = [&] { return ++cancellation_polls == 3; };
++    const auto cancelled_prefill = decoder.generate(long_prompt, options, callbacks);
++    const auto long_after_cancel = decoder.generate(long_prompt, options).output_token_ids;
++    if (cancelled_prefill.finish_reason != sglang::DecoderFinishReason::cancelled ||
++        !cancelled_prefill.output_token_ids.empty() || long_after_cancel != fresh_long) {
++        throw std::runtime_error("Interrupted prefill changed reused K/V or GDN behavior");
++    }
++    struct ProbeFailure {};
++    callbacks.is_cancelled = {};
++    callbacks.on_token = [&](int) -> bool {
++        if (++emitted == 6) {
++            throw ProbeFailure{};
++        }
++        return true;
++    };
++    try {
++        decoder.generate(long_prompt, options, callbacks);
++        throw std::runtime_error("Injected decode failure did not propagate");
++    } catch (const ProbeFailure&) {
++        if (decoder.generate(long_prompt, options).output_token_ids != fresh_long) {
++            throw std::runtime_error("Failure cleanup changed regenerated IDs");
++        }
++    }
++    std::cout << "Decode cancellation, prefill interruption, failure cleanup and reuse passed"
++              << std::endl;
++}
++
++void measure(sglang::Decoder& decoder, const std::filesystem::path& directory) {
++    using Clock = std::chrono::steady_clock;
++    using Milliseconds = std::chrono::duration<double, std::milli>;
++    struct Fixture {
++        std::string name;
++        std::vector<int> prompt;
++        std::vector<int> expected;
++    };
++    std::vector<Fixture> fixtures;
++    for (const std::string name : {"W1", "W2"}) {
++        fixtures.push_back({name, read_ids(directory / (name + ".prompt")),
++                            read_ids(directory / (name + ".teacher"))});
++    }
++    std::cout << "workload\tphase\tindex\tttft_ms\ttpot_ms\te2e_ms\ttokens_per_second\n"
++              << std::setprecision(12);
++    for (int index = 0; index < 12; ++index) {
++        for (const auto& fixture : fixtures) {
++            sglang::DecoderOptions options;
++            options.max_new_tokens = static_cast<int>(fixture.expected.size());
++            auto first = Clock::time_point{};
++            auto last = Clock::time_point{};
++            sglang::DecoderCallbacks callbacks;
++            callbacks.on_token = [&](int) {
++                last = Clock::now();
++                if (first == Clock::time_point{}) {
++                    first = last;
++                }
++                return true;
++            };
++            const auto start = Clock::now();
++            const auto result = decoder.generate(fixture.prompt, options, callbacks);
++            const double elapsed = Milliseconds(Clock::now() - start).count();
++            if (result.output_token_ids != fixture.expected ||
++                result.finish_reason != sglang::DecoderFinishReason::length) {
++                throw std::runtime_error("Direct CUDA IDs differ from HTTP for " + fixture.name);
++            }
++            std::cout << fixture.name << '\t' << (index < 3 ? "warmup" : "measured")
++                      << '\t' << (index < 3 ? index + 1 : index - 2)
++                      << '\t' << Milliseconds(first - start).count() << '\t'
++                      << Milliseconds(last - first).count() / (fixture.expected.size() - 1)
++                      << '\t' << elapsed << '\t' << 1000 * fixture.expected.size() / elapsed
++                      << std::endl;
++        }
++    }
++}
++
++}
++
++int main(int argc, char** argv) {
++    try {
++        if (argc != 5) {
++            throw std::invalid_argument(
++                "Usage: serial-score-probe CHECKPOINT POLICY DIRECTORY score|reset|timing");
++        }
++        sglang::Decoder decoder(argv[1], 0, false, sglang::cli::parse_fp8_prefill(argv[2]));
++        const std::filesystem::path directory(argv[3]);
++        const std::string mode(argv[4]);
++        if (mode == "score") {
++            score(decoder, directory, "W1");
++            score(decoder, directory, "W2");
++        } else if (mode == "reset") {
++            verify_reset(decoder, directory);
++        } else if (mode == "timing") {
++            measure(decoder, directory);
++        } else {
++            throw std::invalid_argument("Unknown run mode " + mode);
++        }
++    } catch (const std::exception& error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}

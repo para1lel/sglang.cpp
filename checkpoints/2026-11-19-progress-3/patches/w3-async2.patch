@@ -1,0 +1,141 @@
+--- a/src/text_fp8_decode.cu
++++ b/src/text_fp8_decode.cu
+@@ -84,6 +84,123 @@
+     }
+ }
+
++template <int Pending>
++__device__ void fp8_wait_copy() {
++    asm volatile("cp.async.wait_group %0;" :: "n"(Pending) : "memory");
++}
++
++__device__ unsigned fp8_shared_address(const void* pointer) {
++    return static_cast<unsigned>(__cvta_generic_to_shared(pointer));
++}
++
++__device__ void fp8_copy_tile(std::uint8_t* destination, const std::uint8_t* weight,
++                              int first_row, int width, int group, int lane) {
++    const int segment = lane % 8;
++    const int row_in_quartet = lane / 8;
++#pragma unroll
++    for (int quartet = 0; quartet < 4; ++quartet) {
++        const int row = quartet * 4 + row_in_quartet;
++        const auto* source = weight + std::size_t(first_row + row) * width +
++                             group * text_fp8_group_size + segment * 16;
++        const auto shared = fp8_shared_address(
++            destination + row * text_fp8_group_size + (segment ^ (row % 8)) * 16);
++        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
++                     :: "r"(shared), "l"(source) : "memory");
++    }
++}
++
++__device__ void fp8_mma_from_shared(float (&accumulator)[4], const std::uint8_t* tile,
++                                   const std::uint8_t* input, int column, int lane) {
++    const int row = lane % fp8_mma_rows;
++    const int segment = (lane / fp8_mma_rows) + column / 16;
++    const unsigned address = fp8_shared_address(
++        tile + row * text_fp8_group_size + (segment ^ (row % 8)) * 16);
++    unsigned a0;
++    unsigned a1;
++    unsigned a2;
++    unsigned a3;
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
++                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(address) : "memory");
++    const unsigned b0 = input ? fp8_word(input + column) : 0;
++    const unsigned b1 = input ? fp8_word(input + column + 16) : 0;
++    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++                 : "+f"(accumulator[0]), "+f"(accumulator[1]), "+f"(accumulator[2]),
++                   "+f"(accumulator[3])
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++
++template <int Depth>
++__global__ void fp8_batch_mma_async_kernel(const std::uint8_t* weight,
++                                         const __nv_bfloat16* weight_scales, int in_width,
++                                         int groups, const __grid_constant__ Fp8Projections projections) {
++    static_assert(Depth >= 1 && Depth <= 4);
++    constexpr int tile_bytes = fp8_mma_rows * text_fp8_group_size;
++    __shared__ __align__(16) std::uint8_t tiles[fp8_mma_block_warps][Depth][tile_bytes];
++    __shared__ float partial[fp8_mma_block_warps][fp8_mma_rows * fp8_mma_lanes];
++    const int warp = threadIdx.x / warp_width;
++    const int lane = threadIdx.x % warp_width;
++    const int lane_group = lane / 4;
++    const int lane_offset = lane % 4;
++    const int first_row = blockIdx.x * fp8_mma_rows;
++    const auto* scales = weight_scales + std::size_t(first_row / text_fp8_group_size) * groups;
++    const auto* input = lane_group < fp8_mma_lanes
++        ? projections.entries[lane_group].input.values + lane_offset * 4 : nullptr;
++    const int out_first = 2 * lane_offset;
++    float totals[4]{};
++#pragma unroll
++    for (int slot = 0; slot < Depth - 1; ++slot) {
++        const int group = warp + slot * fp8_mma_block_warps;
++        if (group < groups) fp8_copy_tile(tiles[warp][slot], weight, first_row, in_width, group, lane);
++        asm volatile("cp.async.commit_group;" ::: "memory");
++    }
++    int slot = 0;
++    for (int group = warp; group < groups; group += fp8_mma_block_warps) {
++        const int future_group = group + (Depth - 1) * fp8_mma_block_warps;
++        const int future_slot = slot == 0 ? Depth - 1 : slot - 1;
++        if (future_group < groups) {
++            fp8_copy_tile(tiles[warp][future_slot], weight, first_row, in_width, future_group, lane);
++        }
++        asm volatile("cp.async.commit_group;" ::: "memory");
++        fp8_wait_copy<Depth - 1>();
++        __syncwarp();
++        float values[4]{};
++        const auto* input_group = input ? input + group * text_fp8_group_size : nullptr;
++#pragma unroll
++        for (int column = 0; column < text_fp8_group_size; column += 32) {
++            fp8_mma_from_shared(values, tiles[warp][slot], input_group, column, lane);
++        }
++        if (out_first < fp8_mma_lanes) {
++            const float weight_scale = __bfloat162float(scales[group]);
++            const float first_scale = projections.entries[out_first].input.scales[group];
++            const float second_scale = projections.entries[out_first + 1].input.scales[group];
++            totals[0] = fmaf(values[0] * first_scale, weight_scale, totals[0]);
++            totals[1] = fmaf(values[1] * second_scale, weight_scale, totals[1]);
++            totals[2] = fmaf(values[2] * first_scale, weight_scale, totals[2]);
++            totals[3] = fmaf(values[3] * second_scale, weight_scale, totals[3]);
++        }
++        __syncwarp();
++        slot = slot == Depth - 1 ? 0 : slot + 1;
++    }
++    fp8_wait_copy<0>();
++    if (out_first < fp8_mma_lanes) {
++#pragma unroll
++        for (int index = 0; index < 4; ++index) {
++            const int output_row = lane_group + (index / 2) * 8;
++            const int output_lane = out_first + index % 2;
++            partial[warp][output_row * fp8_mma_lanes + output_lane] = totals[index];
++        }
++    }
++    __syncthreads();
++    if (threadIdx.x < fp8_mma_rows * fp8_mma_lanes) {
++        const int output_lane = threadIdx.x % fp8_mma_lanes;
++        const int output_row = first_row + threadIdx.x / fp8_mma_lanes;
++        const float sum = (partial[0][threadIdx.x] + partial[1][threadIdx.x]) +
++                          (partial[2][threadIdx.x] + partial[3][threadIdx.x]);
++        projections.entries[output_lane].output[output_row] = __float2bfloat16_rn(sum);
++    }
++}
++
+ }
+
+ cudaError_t launch_fp8_batch_mma(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+@@ -95,6 +212,14 @@
+     }
+     int groups = text_fp8_group_count(in_width);
+     void* args[] = {&weight, &weight_scales, &in_width, &groups, &batch};
++    if (out_width == 17408 && in_width == 5120) {
++        return cudaLaunchKernel(fp8_batch_mma_async_kernel<2>, out_width / fp8_mma_rows,
++                                fp8_mma_block_warps * warp_width, args, 0, stream);
++    }
++    if (out_width == 5120 && in_width == 17408) {
++        return cudaLaunchKernel(fp8_batch_mma_async_kernel<2>, out_width / fp8_mma_rows,
++                                fp8_mma_block_warps * warp_width, args, 0, stream);
++    }
+     return cudaLaunchKernel(fp8_batch_mma_kernel, out_width / fp8_mma_rows,
+                             fp8_mma_block_warps * warp_width, args, 0, stream);
+ }

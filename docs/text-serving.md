@@ -63,6 +63,18 @@ Unconstrained requests can use configured [sampled MTP](mtp.md#sampled-mtp). The
 
 Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L122)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L689)<!-- prefix: "if (result.s" -->
 
+### Pinned service sampling acceptance
+
+Match each HTTP route against SGLang `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. Implementation and verification are pending. The fixed base exposes the two OpenAI routes in the table and has no `/generate` route.
+
+| Reference route | Omitted controls on the pinned checkpoint |
+| --- | --- |
+| `/generate` | Temperature `1`, full top-k, top-p `1`, and 128 new tokens. Server preferred keys override built-in defaults for absent request keys. |
+| `/v1/completions` | Temperature `1`, full top-k, top-p `1`, and 16 output tokens. The adapter supplies these defaults. These fields reject null. |
+| `/v1/chat/completions` | `--sampling-defaults model` uses temperature `1`, top-k `20`, and top-p `0.95`. `--sampling-defaults openai` uses temperature `1`, full top-k, and top-p `1`. Non-null request controls override the selected defaults. |
+
+For chat, non-null `max_completion_tokens` takes priority over `max_tokens`. If both are absent or null, the scheduler supplies the available request capacity. Verify omitted, explicit, and null fields per route. Check validation, greedy selection at temperature below `1e-6` or top-k `1`, stop and EOS handling, seeded repeatability, and mixed greedy and sampled requests. Preserve the explicit greedy benchmark fixture.
+
 ## Finite-choice constraints
 
 Set `ebnf` on a native text or chat request to restrict the generated text to one literal, in JSON or SSE. Use one rule of the form `root ::= "yes" | "no"`. Each alternative is a nonempty double-quoted string with JSON escapes. The decoded bytes must be valid UTF-8. A single literal is valid. [HTTP validation](../apps/server/text_request.cpp#L155)<!-- prefix: "void set_con" --> · [Compiler](../src/tokenizer/constraint.cpp#L82)<!-- prefix: "std::shared_" -->

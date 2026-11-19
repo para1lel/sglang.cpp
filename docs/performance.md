@@ -1,6 +1,6 @@
 # Single-B200 benchmark agreement
 
-The project goal is higher inference throughput than pinned vLLM on the **same physical B200 and the same immutable checkpoint**. A workload earns a speedup only after the candidate passes its correctness checks. The measured candidate/vLLM output-token throughput ratio must exceed the agreed threshold above 1.0. The candidate must also meet the agreed latency ceilings. Measure vLLM first. Freeze the workloads, repetition policy, noise margin, and latency ceilings before timing the candidate.
+Compare correct implementations on the **same physical B200 and immutable checkpoint**. Measure pinned vLLM first. Freeze workloads, repeats, throughput thresholds above 1.0, and latency ceilings before candidate timing.
 
 ## Implementations and controls
 
@@ -10,9 +10,18 @@ The project goal is higher inference throughput than pinned vLLM on the **same p
 | Candidate | Run the project binary built by XMake with the default Pixi toolchain. Record source, build options, and executable identity. | [Development contract](development.md). |
 | Architectural reference | Interpret service and cache behavior. Any separate SGLang timing needs its own result label. | `sgl-project/sglang` at `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. |
 
-Run each engine alone on the selected UUID. Record driver, CUDA runtimes, host and client configuration, clocks, power settings, and other GPU activity. Keep isolation between the baseline environment and the candidate build. Disclose required software differences and their effect on the comparison.
+Run each engine alone on the selected UUID in its own environment. Record drivers, runtimes, host and client settings, clocks, power, other GPU activity, and relevant software differences.
 
-Match model revision, weight shards and scales, tokenizer, chat template, processor, effective weight precision, and sampling policy. Use the precision policies in the [GQA cache comparison](#gqa-cache-comparison). Freeze request bytes, input token IDs, arrival order, concurrency, seeds, output limits, and stop rules. Match prefix-cache state, MTP mode, and media preprocessing. Check actual dispatch and token counts. If either engine lacks a required mode, mark that row unsupported and leave the comparison open.
+Match checkpoint, tokenizer, template, processor, weight precision, sampling, cache state, MTP, and media preprocessing. Freeze request bytes, input IDs, arrivals, seeds, and stops. Record dispatch and token counts. Mark missing modes unsupported.
+
+## Scheduler and reporting policy
+
+Launch both engines with **32,768 aggregate scheduled tokens per step** and **32 maximum in-service requests** for every new performance run, including diagnostics.
+
+- **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-seqs 32`. Leave `--max-num-scheduled-tokens` unset or set it to `32768`. Verify the effective limits.
+- **Native server.** Set `--max-active 32` and require an effective aggregate step budget of `32768`. Both values are required native defaults. The fixed base supports `--max-active 32`. The aggregate setting and new defaults await implementation and verification.
+
+In every chat report, enumerate all nondefault launch, environment, client, and request settings for each engine, including diagnostics. Report effective server maxima separately from offered and observed client concurrency. Record each request's input length, context limit, and output budget. Preserve the original settings, identities, and gates of frozen runs. Only new matched runs under this policy qualify for acceptance. An unavailable required mode leaves its comparison open.
 
 ## GQA cache comparison
 
@@ -20,22 +29,22 @@ Use the candidate's [native MXFP8 GQA path](development.md#p2-gqa-cache-contract
 
 The native path stores E4M3 values with E8M0 scales per 32 channels. The pinned comparator uses E4M3 values with per-tensor K and V scales. These precision policies can produce different logits and greedy IDs. Report cross-engine output and logit comparisons for diagnosis only. Require each engine to satisfy the workload's token counts, finish conditions, and stream contract. Record each engine's requested and effective KV format and the scale dtype, granularity, and source. Record the effective attention Q dtype, any Q scaling, and the attention backend and fallback status. Match and record the GDN state dtypes. The checkpoint FP8 weights and their scales remain a separate control.
 
-## First baseline run
+## Historical offline smoke
 
-From the repository root, prepare the isolated vLLM environment. Set `GPU_INDEX` to the reserved B200's physical index. Run the supplied token-ID fixture against `/data0/shared/Qwen3.8-27B-FP8` and record the resolved UUID.
+From the repository root, set `GPU_INDEX` to the reserved B200 index. These commands reproduce the archived offline diagnostic.
 
 ```bash
 bash benchmarks/vllm/setup.sh
 GPU="${GPU_INDEX:?set the reserved B200 index}" bash benchmarks/vllm/run.sh benchmarks/vllm/small.json
 ```
 
-The offline smoke case requests eight output tokens using checkpoint FP8 weights and BF16 KV. Inspect the reported run directory for the device UUID, effective configuration, output IDs, and individual request timings. Repeats of this vLLM run must finish at the requested length with identical greedy IDs. This historical diagnostic measures whole-request latency and output tokens/s. Paired acceptance requires a separate run under the GQA cache comparison. W1–W6 require separate runs with a streaming client to measure first-token latency.
+The fixture uses eight greedy output tokens and BF16 KV. Check repeat IDs, UUID, effective settings, request latency, and throughput. Use streaming for W1–W6 TTFT.
 
 ## Named workloads
 
-**Proposed starting matrix.** Lengths are exact tokens **per request**, after template expansion. Concurrency is the number of active requests. Approve the matrix, prompt corpus, request count, arrival schedule, and stop policy before timing. Use fixed-length text fixtures for these rows. Test normal EOS and stop behavior separately.
+**Proposed starting matrix.** Lengths are exact post-template tokens per request. Concurrency is client offered load. Approve prompts, request counts, arrivals, and stops before timing. Test normal EOS separately.
 
-| Workload | Input tokens per request | Output tokens per request | Concurrency |
+| Workload | Input tokens per request | Output tokens per request | Offered concurrency |
 | --- | ---: | ---: | ---: |
 | W1 | 128 | 128 | 1 |
 | W2 | 2,048 | 512 | 1 |
@@ -44,7 +53,7 @@ The offline smoke case requests eight output tokens using checkpoint FP8 weights
 | W5 | 32,768 | 4,096 | 32 |
 | W6 | 131,072 | 1,024 | 4 |
 
-Start W1–W6 with disjoint prefixes and MTP off. The [W3-prefix protocol](prefix-cache.md#w3-prefix) defines the exact-prefill gate and the separate tensor-core comparison. For `W3-MTP`, repeat W3 with native speculation enabled. For proposed `W1-image` and `W1-video`, freeze media bytes, dimensions, sampled frames, timestamps, preprocessing, effective input positions, and output budget. Report each variant separately. Preserve OOM, timeout, early stop, and unsupported outcomes under the original workload name.
+Start W1–W6 with disjoint prefixes and MTP off. Keep [W3-prefix](prefix-cache.md#w3-prefix), `W3-MTP`, and media variants separate. Freeze media bytes, dimensions, sampled frames, timestamps, preprocessing, positions, and output budget. Retain failed outcomes under the original workload name.
 
 ## Measurement
 
@@ -68,15 +77,15 @@ For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the
 
 ### Native text completions
 
-W1–W6 keep the frozen `benchmark` model name, prompt ID arrays, and token-ID SSE. Use those request bytes, clients, and timing definitions for acceptance. Run [text verification](text-serving.md#verification) separately.
+Reuse frozen W1–W6 `benchmark` requests, token-ID SSE clients, and timing definitions under the [new launch policy](#scheduler-and-reporting-policy). Check repeat IDs within each engine. Compare cross-engine output IDs only for diagnosis. Run [text verification](text-serving.md#verification) separately.
 
 For a raw text experiment, freeze UTF-8 request bytes, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Require both engines to encode the same prompt IDs for a paired comparison. Record cold tokenizer load separately from steady tokenization. Declare streaming, usage, and diagnostic ID settings. The first visible text can arrive after the first output ID. A text event can contain bytes from several IDs, and an ID can produce no text. Get output-token counts from usage or diagnostic IDs. Use diagnostic ID timestamps for TTFT and TPOT. Mark those metrics unavailable if the client cannot observe the corresponding IDs. Report time to first visible text separately. Keep raw text measurements in separate result rows.
 
 ### Frozen W1 and W2 timing
 
-Follow the [frozen streaming protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) on GPU3 with `--max-active 1`. Verify input hashes. Set `--url` and a fresh `--output`. Omit `--reference` for native timing. Check repeat streams and IDs.
+The [historical GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) used native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. Run the native client with `--url` and a fresh `--output`. Omit `--reference`.
 
-Require every warmup and measured stream to pass validation. The native-to-baseline median throughput ratio must exceed `strict_throughput_ratio_gt`. Native p95 TTFT, TPOT, and end-to-end latency must meet `p95_latency_ceilings_ms`. Retain frozen vLLM IDs for diagnosis.
+Validate every warmup and measured stream and check repeat IDs within each engine. Apply the frozen limits separately to the native summary. Require a native-to-vLLM median throughput ratio above `strict_throughput_ratio_gt` and p95 TTFT, TPOT, and end-to-end latency at or below `p95_latency_ceilings_ms`.
 
 On November 19, 2026, the repaired candidate matched `60677ec` IDs. Both passed W1. W2 missed only p95 TTFT at 395.348 ms base and 366.781 ms candidate against 80.305 ms.
 
@@ -88,13 +97,13 @@ Trace actual forward group sizes and row modes. Confirm fused launches for an el
 
 Compare fused SwiGLU BF16 results with identical and disjoint gate and up output spans. Require `cudaErrorInvalidValue` before launch for identical gate and up spans in fallback, partial output overlaps, and output overlaps with inputs.
 
-The studies in `artifacts/fp8-decode-next/report.md` and `artifacts/decode-combined/report.md` used earlier source. Qualify the promoted build under the frozen serial and concurrent protocols.
+The studies in `artifacts/fp8-decode-next/report.md` and `artifacts/decode-combined/report.md` used earlier source. Qualify the promoted build with the serial and concurrent fixtures under the new launch policy.
 
 ### Exact decode bandwidth
 
 Match the published native control's BF16 projections, E4M3 payloads, and FP32 scales byte for byte. Include nonfinite inputs and shape and alignment fallbacks. Trace fresh and reused graphs. Compare full BF16 logits and greedy IDs on shared W1/W2 histories within each policy. Run the [MTP checks](mtp.md#verification).
 
-Time serial HTTP with `--max-active 1 --mtp-steps 0`. Compare within each prefill policy. Apply the [frozen GPU3 criteria](#frozen-w1-and-w2-timing) separately for pinned vLLM.
+Historical serial HTTP used `--max-active 1 --mtp-steps 0` and compared within each prefill policy. Use the [frozen GPU3 criteria](#frozen-w1-and-w2-timing) to reproduce that comparison.
 
 Record visible lengths and KV capacity. Report ordered fallback timing separately if measured.
 
@@ -126,7 +135,7 @@ For cross-policy comparisons, check full BF16 logits within predefined tolerance
 
 Check parity against pinned vLLM on identical histories. Record its execution mode and KV and GDN policies. Record how diagnostic rows were selected. Use frozen fixtures for workload-level results.
 
-Run [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 across projection tiles on identical inputs. Follow the [prefill](#chunked-prefill) and [frozen timing](#frozen-w1-and-w2-timing) protocols. Report native deltas and frozen gates per policy.
+Run [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 across projection tiles on identical inputs. Follow the [prefill protocol](#chunked-prefill). Report native deltas and gates per policy. Keep [frozen timings](#frozen-w1-and-w2-timing) historical.
 
 The post-chat GPU3 run used tensor-core prefill, serial graphs, and MTP off. Each workload and arm used three warmups and nine measurements. Both arms returned identical IDs.
 
@@ -143,9 +152,9 @@ The verifier used unrounded limits. Both W2 arms missed all four gates in this r
 
 ### Native concurrent workloads
 
-After [streaming verification](development.md#streaming-verification), use K0 and set `--max-active` to the lane count (16 for W4, 32 for W5). [Trace](batch-graphs.md#timing) full-width decode and replay after [HTTP readiness](development.md#native-streaming-server).
+After [streaming verification](development.md#streaming-verification), use K0 and the [scheduler policy](#scheduler-and-reporting-policy). Offer the workload's client lane count. [Trace](batch-graphs.md#timing) decode width and replay.
 
-Use the [frozen protocol](../benchmarks/concurrent/README.md#conditions-and-gates) for acceptance. The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets. W4 and W5 acceptance remains pending.
+The [historical concurrent protocol](../benchmarks/concurrent/README.md#conditions-and-gates) used vLLM `--max-num-batched-tokens 8192 --max-num-seqs 32`. The strict GPU2 W3 native run used `--max-active 4 --mtp-steps 0 --fp8-prefill tensor-core --prefix-cache-entries 0 --batch-cuda-graphs`. The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets. New acceptance remains pending.
 
 On November 19, 2026, [packed paged decode](batch-graphs.md#packed-paged-gqa-decode) reached 63.779 IDs/s in strict GPU2 W3. P95 TTFT, TPOT, and E2E were 33,923.407, 29.738, and 64,340.177 ms. All four gates failed. All 28,672 IDs matched frozen vLLM and the older `60677ec` control, which ran under different timing conditions.
 

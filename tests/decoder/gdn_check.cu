@@ -283,8 +283,257 @@ void verify_transition(GpuCase& gpu, Reference& ref, const Weights& weights,
 
 }
 
-int main() {
+#ifdef SGLANG_TEST_GDN_TILED
+#include "sglang/decoder_cuda.cuh"
+
+#include <cstring>
+#include <fstream>
+#include <string_view>
+#include <utility>
+
+extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, std::size_t,
+                                              cudaStream_t);
+
+namespace {
+
+bool trace_launches = false;
+std::vector<std::pair<bool, unsigned int>> recurrent_launches;
+cudaEvent_t recurrence_start = nullptr;
+cudaEvent_t recurrence_stop = nullptr;
+
+struct PrefillCase {
+    Device<BFloat> qkv;
+    Device<BFloat> z;
+    Device<BFloat> beta;
+    Device<BFloat> decay;
+    Device<BFloat> history{qkv_width * history_width};
+    Device<float> recurrent{state_size};
+    Device<BFloat> scratch;
+    Device<float2> gates;
+    Device<BFloat> output;
+    Device<BFloat> convolution{qkv_width * 4};
+    Device<BFloat> a_log{value_heads};
+    Device<BFloat> dt_bias{value_heads};
+    Device<BFloat> norm{head_dim};
+    Stream stream;
+
+    PrefillCase(int rows, const Weights& weights, const Reference& reference)
+        : qkv(rows * qkv_width), z(rows * value_width), beta(rows * value_heads),
+          decay(rows * value_heads), scratch(rows * (qkv_width + value_width) + 1),
+          gates(rows * value_heads), output(rows * value_width) {
+        convolution.upload(weights.convolution);
+        a_log.upload(weights.a_log);
+        dt_bias.upload(weights.dt_bias);
+        norm.upload(weights.norm);
+        history.upload(reference.history);
+        recurrent.upload(std::vector<float>(reference.recurrent.begin(),
+                                            reference.recurrent.end()));
+    }
+
+    void upload(const Rows& rows) const {
+        qkv.upload(rows.qkv);
+        z.upload(rows.z);
+        beta.upload(rows.beta);
+        decay.upload(rows.decay);
+        check(cudaMemsetAsync(output.data(), 0xff, rows.count * value_width * sizeof(BFloat),
+                              stream.stream));
+    }
+
+    void launch(int rows, int offset) const {
+        const sglang::TextGdnWeights weights{convolution.data(), a_log.data(), dt_bias.data(),
+                                             norm.data()};
+        const sglang::TextGdnState state{history.data(), recurrent.data()};
+        check(sglang::decoder::tensor_core_prefill_gdn(
+            rows, qkv.data(), z.data(), beta.data(), decay.data(), weights, state,
+            scratch.data() + offset, gates.data(), output.data(), stream.stream));
+    }
+};
+
+template <typename Value>
+void verify_exact(const std::vector<Value>& left, const std::vector<Value>& right,
+                  const char* label, std::ofstream& capture) {
+    const auto bytes = left.size() * sizeof(Value);
+    if (left.size() != right.size() || std::memcmp(left.data(), right.data(), bytes) != 0) {
+        throw std::runtime_error(std::string(label) + " differs for the offset workspace");
+    }
+    capture.write(reinterpret_cast<const char*>(left.data()), bytes);
+    if (!capture) {
+        throw std::runtime_error("Write capture");
+    }
+}
+
+void check_launch(std::size_t index, bool paired) {
+    if (recurrent_launches.size() <= index ||
+        recurrent_launches[index] != std::pair{paired, paired ? 128U : 256U}) {
+        throw std::runtime_error("Unexpected recurrence kernel or block width");
+    }
+}
+
+void compare_prefill(PrefillCase& aligned, PrefillCase& offset, Reference& reference,
+                     const Weights& weights, const Rows& rows, bool paired,
+                     std::ofstream& capture) {
+    const auto expected = reference_forward(rows, true, weights, reference);
+    aligned.upload(rows);
+    offset.upload(rows);
+    recurrent_launches.clear();
+    trace_launches = true;
+    aligned.launch(rows.count, 0);
+    offset.launch(rows.count, 1);
+    trace_launches = false;
+    check_launch(0, paired && rows.count >= 32);
+    check_launch(1, false);
+    if (recurrent_launches.size() != 2) {
+        throw std::runtime_error("Unexpected recurrence launch count");
+    }
+    check(cudaStreamSynchronize(aligned.stream.stream));
+    check(cudaStreamSynchronize(offset.stream.stream));
+    const auto output = aligned.output.download(expected.size());
+    const auto state = aligned.recurrent.download(state_size);
+    const auto history = aligned.history.download(reference.history.size());
+    verify_exact(output, offset.output.download(expected.size()), "Gated output", capture);
+    verify_exact(state, offset.recurrent.download(state_size), "Recurrent carry", capture);
+    verify_exact(history, offset.history.download(history.size()), "Convolution carry", capture);
+    double output_delta = 0;
+    double state_delta = 0;
+    for (std::size_t index = 0; index < output.size(); ++index) {
+        const double target = number(expected[index]);
+        require_close("gated output", index, number(output[index]), target,
+                      2 * bf16_ulp(target) + 2e-4);
+        output_delta = std::max(output_delta, std::abs(number(output[index]) - target));
+    }
+    for (std::size_t index = 0; index < state.size(); ++index) {
+        const double target = reference.recurrent[index];
+        require_close("recurrent carry", index, state[index], target,
+                      3e-6 + 5e-5 * std::abs(target));
+        state_delta = std::max(state_delta, std::abs(state[index] - target));
+    }
+    for (std::size_t index = 0; index < history.size(); ++index) {
+        require_close("convolution carry", index, number(history[index]),
+                      number(reference.history[index]), 0);
+    }
+    std::cout << "rows=" << rows.count << " offset=2"
+              << " paired=" << recurrent_launches[0].first << " outputs=" << output.size()
+              << " fp64_state_delta=" << state_delta << " fp64_output_delta=" << output_delta
+              << std::endl;
+}
+
+void check_segmented(bool paired, bool short_run, const char* path) {
+    Reference reference;
+    reference.history = input(qkv_width * history_width, 17, 1.0 / 128);
+    for (std::size_t index = 0; index < reference.recurrent.size(); ++index) {
+        reference.recurrent[index] = (static_cast<int>(index % 127) - 63) * (1.0 / 8192);
+    }
+    const Weights weights;
+    const int capacity = short_run ? 129 : 2048;
+    PrefillCase aligned(capacity, weights, reference);
+    PrefillCase offset(capacity, weights, reference);
+    const auto sizes = short_run ? std::vector{31, 32, 33, 129} :
+                                   std::vector{31, 32, 33, 128, 512, 1024, 2048, 1};
+    std::ofstream capture(path, std::ios::binary);
+    int seed = 17;
+    for (const int rows : sizes) {
+        compare_prefill(aligned, offset, reference, weights, request_rows(rows, seed++),
+                        paired, capture);
+    }
+    capture.close();
+    if (!capture) {
+        throw std::runtime_error("Close capture");
+    }
+}
+
+class Event {
+public:
+    Event() { check(cudaEventCreate(&event)); }
+    ~Event() { cudaEventDestroy(event); }
+    Event(const Event&) = delete;
+    Event& operator=(const Event&) = delete;
+
+    cudaEvent_t event = nullptr;
+};
+
+float elapsed(const Event& start, const Event& stop) {
+    check(cudaEventSynchronize(stop.event));
+    float ms = 0;
+    check(cudaEventElapsedTime(&ms, start.event, stop.event));
+    return ms * 1000;
+}
+
+void time_prefill(int iterations) {
+    PrefillCase gpu(2048, Weights{}, Reference{});
+    const Event start, stop, kernel_start, kernel_stop;
+    for (const int rows : {32, 128, 512, 1024, 2048}) {
+        gpu.upload(request_rows(rows, 51));
+        for (int warmup = 0; warmup < 15; ++warmup) {
+            gpu.launch(rows, 0);
+        }
+        check(cudaStreamSynchronize(gpu.stream.stream));
+        for (int index = 0; index < iterations; ++index) {
+            check(cudaEventRecord(start.event, gpu.stream.stream));
+            gpu.launch(rows, 0);
+            check(cudaEventRecord(stop.event, gpu.stream.stream));
+            const auto total_us = elapsed(start, stop);
+            recurrence_start = kernel_start.event;
+            recurrence_stop = kernel_stop.event;
+            gpu.launch(rows, 0);
+            recurrence_start = nullptr;
+            recurrence_stop = nullptr;
+            const auto recurrence_us = elapsed(kernel_start, kernel_stop);
+            std::cout << rows << ',' << index << ',' << total_us << ',' << recurrence_us << '\n';
+        }
+        check(cudaStreamSynchronize(gpu.stream.stream));
+    }
+}
+
+}
+
+extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, dim3 block,
+                                               void** args, std::size_t shared,
+                                               cudaStream_t stream) {
+    if (trace_launches || recurrence_start) {
+        const char* name = nullptr;
+        check(cudaFuncGetName(&name, function));
+        const std::string_view kernel(name);
+        if (kernel.find("gdn_prefill_recur") != std::string_view::npos) {
+            if (trace_launches) {
+                recurrent_launches.emplace_back(
+                    kernel.find("gdn_prefill_recur_paired") != std::string_view::npos, block.x);
+            }
+            if (recurrence_start) {
+                check(cudaEventRecord(recurrence_start, stream));
+            }
+            const auto status = __real_cudaLaunchKernel(function, grid, block, args,
+                                                        shared, stream);
+            if (recurrence_stop) {
+                check(cudaEventRecord(recurrence_stop, stream));
+            }
+            return status;
+        }
+    }
+    return __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
+}
+#endif
+
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     try {
+#ifdef SGLANG_TEST_GDN_TILED
+        if (argc == 3 && std::string_view(argv[1]) == "timing") {
+            time_prefill(std::stoi(argv[2]));
+            return 0;
+        }
+        if (argc == 4) {
+            const std::string_view mode = argv[1];
+            const std::string_view expected = argv[2];
+            if ((mode == "segmented" || mode == "short") &&
+                (expected == "paired" || expected == "original")) {
+                check_segmented(expected == "paired", mode == "short", argv[3]);
+                return 0;
+            }
+        }
+        if (argc != 1) {
+            throw std::invalid_argument(
+                "Expected segmented|short paired|original CAPTURE or timing N");
+        }
+#endif
         GpuCase gpu;
         Reference reference;
         const Weights weights;

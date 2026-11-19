@@ -118,7 +118,7 @@ Tensor-core projections require K0, at least three rows, 128-divisible input wid
 
 Tensor-core mode uses these operators on scratch-backed multirow K0 tiles, including during SIMT projection fallback. Both policies share decode. [Tile dispatch](../src/decoder_prefill.cpp#L417)<!-- prefix: "void Decoder" -->
 
-- GDN fuses convolution, Q/K unit normalization, and gate preparation. Recurrent updates retain token order. Gates reuse key scratch. [GDN preparation](../src/text_attention_gdn.cu#L75)<!-- prefix: "__global__ v" -->
+- [GDN prefill](gdn-prefill.md) fuses convolution, Q/K unit normalization, and gate preparation. Recurrence retains token order. [Preparation](../src/text_attention_gdn.cu#L75)<!-- prefix: "__global__ v" -->
 - After KV append, each GQA block handles one row. Two adjacent query heads reuse decoded K and V from one KV head. Each head keeps ordered FP32 group sums and independent, token-ordered softmax and value updates over 32-token tiles. [Tiled GQA](../src/mxfp8_gqa.cu#L195)<!-- prefix: "__global__ v" --> · [Launch](../src/mxfp8_gqa.cu#L697)<!-- prefix: "cudaError_t " -->
 - Residual RMSNorm and SwiGLU fuse with FP8 quantization. Both round to BF16 before quantization. [RMSNorm](../src/text_normalization.cu#L236)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L665)<!-- prefix: "cudaError_t " -->
 

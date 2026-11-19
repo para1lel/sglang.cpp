@@ -162,6 +162,112 @@ __global__ void gdn_prefill_recur(int rows, const __nv_bfloat16* convolved, cons
     }
 }
 
+constexpr int paired_recurrent_threads = recurrent_threads / 2;
+constexpr int paired_recurrent_min_rows = 32;
+constexpr int recurrent_tile_rows = 8;
+constexpr int value_pairs_per_block = value_rows_per_block / 2;
+
+__global__ void gdn_prefill_recur_paired(int rows, const __nv_bfloat16* convolved,
+                                        const float2* gates, float* recurrent,
+                                        __nv_bfloat16* observable) {
+    constexpr int components_per_vector = sizeof(uint4) / sizeof(__nv_bfloat16);
+    constexpr int vectors_per_head = text_gdn_head_dim / components_per_vector;
+    __shared__ uint4 packed_qk[recurrent_tile_rows][2][vectors_per_head];
+    __shared__ float2 tile_gates[recurrent_tile_rows];
+    __shared__ __nv_bfloat162 tile_targets[recurrent_tile_rows][value_pairs_per_block];
+    const int head = blockIdx.x / value_blocks_per_head;
+    const int qk_head = head / value_heads_per_qk_head;
+    const int lane = threadIdx.x % warp_size;
+    const int warp = threadIdx.x / warp_size;
+    const int first_feature = head * text_gdn_head_dim +
+                              (blockIdx.x % value_blocks_per_head) * value_rows_per_block;
+    const int feature = first_feature + 2 * warp;
+    auto* first_state = recurrent + feature * text_gdn_head_dim + lane;
+    auto* second_state = first_state + text_gdn_head_dim;
+    float first_keys[keys_per_lane], second_keys[keys_per_lane];
+    #pragma unroll
+    for (int part = 0; part < keys_per_lane; ++part) {
+        first_keys[part] = first_state[part * warp_size];
+        second_keys[part] = second_state[part * warp_size];
+    }
+    for (int first = 0; first < rows; first += recurrent_tile_rows) {
+        const int count = min(recurrent_tile_rows, rows - first);
+        constexpr int vectors_per_row = 2 * vectors_per_head;
+        #pragma unroll
+        for (int index = threadIdx.x; index < recurrent_tile_rows * vectors_per_row;
+             index += paired_recurrent_threads) {
+            const int local_row = index / vectors_per_row;
+            const int plane = index / vectors_per_head % 2;
+            const int vector = index % vectors_per_head;
+            if (local_row < count) {
+                const auto* mixed =
+                    convolved + static_cast<std::size_t>(first + local_row) * text_gdn_qkv_width;
+                const auto* source = reinterpret_cast<const uint4*>(
+                    mixed + plane * text_gdn_qk_width + qk_head * text_gdn_head_dim);
+                packed_qk[local_row][plane][vector] = source[vector];
+            }
+        }
+        if (threadIdx.x < count * value_pairs_per_block) {
+            const int local_row = threadIdx.x / value_pairs_per_block;
+            const int pair = threadIdx.x % value_pairs_per_block;
+            const int row = first + local_row;
+            const auto* mixed = convolved + static_cast<std::size_t>(row) * text_gdn_qkv_width;
+            const auto* target = reinterpret_cast<const __nv_bfloat162*>(
+                mixed + 2 * text_gdn_qk_width + first_feature);
+            tile_targets[local_row][pair] = target[pair];
+            if (pair == 0) {
+                tile_gates[local_row] = gates[row * text_gdn_value_heads + head];
+            }
+        }
+        __syncthreads();
+        for (int local_row = 0; local_row < count; ++local_row) {
+            const auto* queries_bf16 =
+                reinterpret_cast<const __nv_bfloat16*>(packed_qk[local_row][0]);
+            const auto* keys_bf16 =
+                reinterpret_cast<const __nv_bfloat16*>(packed_qk[local_row][1]);
+            const auto gate = tile_gates[local_row];
+            const auto targets = __bfloat1622float2(tile_targets[local_row][warp]);
+            float keys[keys_per_lane], queries[keys_per_lane];
+            float first_prediction = 0.0f, second_prediction = 0.0f;
+            #pragma unroll
+            for (int part = 0; part < keys_per_lane; ++part) {
+                const int key = part * warp_size + lane;
+                constexpr float query_scale = 0.08838834764831845f;
+                keys[part] = __bfloat162float(keys_bf16[key]);
+                queries[part] = __bfloat162float(queries_bf16[key]) * query_scale;
+                first_keys[part] *= gate.x;
+                second_keys[part] *= gate.x;
+                first_prediction = fmaf(first_keys[part], keys[part], first_prediction);
+                second_prediction = fmaf(second_keys[part], keys[part], second_prediction);
+            }
+            const float first_correction = gate.y * (targets.x - warp_sum(first_prediction));
+            const float second_correction = gate.y * (targets.y - warp_sum(second_prediction));
+            float first_result = 0.0f, second_result = 0.0f;
+            #pragma unroll
+            for (int part = 0; part < keys_per_lane; ++part) {
+                first_keys[part] = fmaf(first_correction, keys[part], first_keys[part]);
+                second_keys[part] = fmaf(second_correction, keys[part], second_keys[part]);
+                first_result = fmaf(first_keys[part], queries[part], first_result);
+                second_result = fmaf(second_keys[part], queries[part], second_result);
+            }
+            const float first_sum = warp_sum(first_result);
+            const float second_sum = warp_sum(second_result);
+            if (lane == 0) {
+                auto* row_output =
+                    observable + static_cast<std::size_t>(first + local_row) * text_gdn_value_width;
+                reinterpret_cast<__nv_bfloat162*>(row_output)[feature / 2] =
+                    __floats2bfloat162_rn(first_sum, second_sum);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int part = 0; part < keys_per_lane; ++part) {
+        first_state[part * warp_size] = first_keys[part];
+        second_state[part * warp_size] = second_keys[part];
+    }
+}
+
 template <bool round_qk, bool observe, typename State>
 __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
                           const __nv_bfloat16* b, const __nv_bfloat16* a,
@@ -336,8 +442,12 @@ cudaError_t prefill_gdn(
     }
     auto* observable = workspace + static_cast<std::size_t>(rows) * text_gdn_qkv_width;
     void* recurrent_arguments[] = {&rows, &workspace, &gates, &state.recurrent, &observable};
-    status = cudaLaunchKernel(gdn_prefill_recur, dim3(text_gdn_value_heads * value_blocks_per_head),
-                              dim3(recurrent_threads), recurrent_arguments, 0, stream);
+    const bool paired = rows >= paired_recurrent_min_rows &&
+                        reinterpret_cast<std::uintptr_t>(workspace) % alignof(uint4) == 0;
+    const auto recur = paired ? gdn_prefill_recur_paired : gdn_prefill_recur;
+    const int threads = paired ? paired_recurrent_threads : recurrent_threads;
+    status = cudaLaunchKernel(recur, dim3(text_gdn_value_heads * value_blocks_per_head),
+                              dim3(threads), recurrent_arguments, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }

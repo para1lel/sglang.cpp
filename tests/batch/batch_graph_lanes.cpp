@@ -25,6 +25,7 @@ struct Instance {
     std::array<int, decoder_batch_max_lanes> jobs{};
     int next = 0;
     int steps = 0;
+    unsigned graph_slots = 0;
 
     Instance(const Decoder& decoder, bool graphs) : batch(decoder, {graphs}) {}
 
@@ -82,6 +83,7 @@ struct Instance {
         }
         require(stats.graph_slots == 0 || stats.graph_slots == decode_slots,
                 "Graph mask differs from the slots that decoded");
+        graph_slots = stats.graph_slots;
         std::cout << std::flush;
         return result;
     }
@@ -90,6 +92,23 @@ struct Instance {
         for (int index = 0; index < count; ++index) {
             step(bits);
         }
+    }
+
+    void prefill(unsigned bits, int slot) {
+        for (int index = 0; index < 100; ++index) {
+            if (step(bits)[slot].token) {
+                return;
+            }
+        }
+        throw std::runtime_error("Boundary prefill did not complete");
+    }
+
+    void check_step(unsigned bits, unsigned graph, std::size_t increase = 0) {
+        const auto before = batch.request_device_allocation_bytes();
+        step(bits);
+        require(graph_slots == graph, "Unexpected boundary replay mask");
+        require(batch.request_device_allocation_bytes() == before + increase,
+                "Unexpected boundary request bytes");
     }
 
     void drain() {
@@ -155,19 +174,69 @@ void scenario(const Decoder& decoder, bool graphs, bool hard) {
     require(run.steps > 20, "Insufficient replay steps");
 }
 
+void score_boundary(const Decoder& decoder, std::string_view role) {
+    const bool graph = role != "eager";
+    const bool oom = role == "score-oom";
+    constexpr std::size_t score_bytes = 24 * sizeof(float);
+    constexpr auto first_growth = 5248 * score_bytes;
+    constexpr auto replacement_growth = 5376 * score_bytes;
+    Instance run(decoder, graph);
+    run.admit(0, 5117, 16);
+    run.admit(2, 5117, 16);
+    const auto before_prefill = run.batch.request_device_allocation_bytes();
+    run.prefill(5, 0);
+    require(run.batch.request_device_allocation_bytes() == before_prefill,
+            "Prefill allocated long decode scores");
+    for (int position = 5117; position <= 5122; ++position) {
+        const bool replay = graph && position > 5117 && (position < 5120 || !oom);
+        run.check_step(5, replay ? 5u : 0u, replay && position == 5120 ? 2 * first_growth : 0);
+    }
+    run.cancel(0);
+    run.admit(1, 2, 5);
+    run.check_step(6, 0);
+    run.check_step(6, graph ? 6u : 0u, oom ? first_growth : 0);
+    run.cancel(1);
+    run.admit(0, 5121, 200);
+    run.admit(3, 9, 6);
+    run.prefill(1, 0);
+    run.prefill(8, 3);
+    run.check_step(13, 0);
+    run.check_step(13, graph ? 13u : 0u, graph ? replacement_growth : 0);
+    run.check_step(1, 0);
+    run.admit(1, 5, 0);
+    const auto zero = run.step(7);
+    require(run.graph_slots == (graph ? 5u : 0u) && !zero[1].token &&
+            zero[1].finish_reason == DecoderFinishReason::length,
+            "Zero-budget lane changed the replay mask");
+    while (run.jobs[2]) {
+        run.step(5);
+        require(run.graph_slots == (graph ? 5u : 0u), "Rebound width stopped replaying");
+    }
+    run.cancel(0);
+    run.cancel(3);
+    run.drain();
+    run.check_step(15, 0);
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        require(argc == 4, "Expected CHECKPOINT ROLE FP8_PREFILL");
+        require(argc == 4 || (argc == 5 && std::string_view(argv[4]) == "boundary"),
+                "Expected CHECKPOINT ROLE FP8_PREFILL [boundary]");
+        const bool boundary = argc == 5;
         const std::string_view role = argv[2];
         const std::string_view policy = argv[3];
-        require(role == "eager" || role == "graph" || role == "hard",
-                "Expected eager, graph or hard");
+        require(role == "eager" || role == "graph" || role == (boundary ? "score-oom" : "hard"),
+                "Unexpected graph test role");
         require(policy == "exact" || policy == "tensor-core", "Expected exact or tensor-core");
         const Decoder decoder(argv[1], 0, false, policy == "exact" ?
             Fp8PrefillPolicy::exact : Fp8PrefillPolicy::tensor_core);
-        scenario(decoder, role != "eager", role == "hard");
+        if (boundary) {
+            score_boundary(decoder, role);
+        } else {
+            scenario(decoder, role != "eager", role == "hard");
+        }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

@@ -10,9 +10,16 @@ out=$(realpath -m -- "${3:?Pass a fresh evidence directory}")
 gpu=${GPU_UUID:?Set GPU_UUID to the reserved B200 device UUID}
 toolkit="${CONDA_PREFIX:?Activate the managed Pixi default environment}/targets/x86_64-linux"
 cxx=${CXX:-g++}
+mode=${4:-all}
 
-test -x "$build/bin/sglang-server"
-test -x "$build/bin/mxfp8-gqa-check"
+case "$mode" in
+    all)
+        test -x "$build/bin/sglang-server"
+        test -x "$build/bin/mxfp8-gqa-check"
+        ;;
+    boundary) ;;
+    *) exit 2 ;;
+esac
 test -x "$build/bin/batch-graph-lanes"
 test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
 mkdir "$out"
@@ -30,23 +37,38 @@ compile_observer() {
 
 compile_observer activity -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcupti
 compile_observer scores -ldl
-compile_observer failure -ldl
 compile_observer oom -ldl
 
-LD_PRELOAD="$out/activity.so" BATCH_GRAPH_ACTIVITY="$out/operators.cupti.tsv" \
-    "$build/bin/mxfp8-gqa-check" >"$out/operators.log" 2>&1
-
 run_lanes() {
-    local name=$1 role=$2 policy=$3 fault=${4:-} addon=${5:-}
+    local name=$1 role=$2 policy=$3 fault=${4:-} addon=${5:-} scenario=${6:-}
     local preload="$out/activity.so:$out/scores.so"
     if [[ -n "$addon" ]]; then
         preload="$preload:$out/$addon.so"
     fi
     LD_PRELOAD="$preload" BATCH_SCORE_OUTPUT="$out/$name.scores" \
         BATCH_GRAPH_ACTIVITY="$out/$name.cupti.tsv" BATCH_GRAPH_FAILURE="$fault" \
-        "$build/bin/batch-graph-lanes" "$checkpoint" "$role" "$policy" \
+        "$build/bin/batch-graph-lanes" "$checkpoint" "$role" "$policy" ${scenario:+"$scenario"} \
         >"$out/$name.lanes" 2>"$out/$name.log"
 }
+
+run_boundary() {
+    run_lanes boundary-eager eager tensor-core '' '' boundary
+    run_lanes boundary-graph graph tensor-core '' '' boundary
+    run_lanes boundary-score-oom score-oom tensor-core score-oom oom boundary
+}
+
+if [[ "$mode" == boundary ]]; then
+    run_boundary
+    test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
+    nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=csv \
+        >"$out/device-after.csv"
+    python3 -IB "$tests/check_graph_evidence.py" "$out" --boundary-only
+    exit
+fi
+
+compile_observer failure -ldl
+LD_PRELOAD="$out/activity.so" BATCH_GRAPH_ACTIVITY="$out/operators.cupti.tsv" \
+    "$build/bin/mxfp8-gqa-check" >"$out/operators.log" 2>&1
 
 for policy in exact tensor-core; do
     for route in eager graph; do
@@ -71,6 +93,7 @@ for policy in exact tensor-core; do
     done
 done
 
+run_boundary
 test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
 nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=csv \
     >"$out/device-after.csv"

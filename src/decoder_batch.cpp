@@ -216,13 +216,21 @@ bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
         auto& scratch = *storage->graph_scratch;
         for (int index = 0; index < count; ++index) {
             const auto& lane = lanes[index];
-            const auto& request = *lane.request;
-            scratch.bindings[index] = {{0.0f, lane.token_id}, lane.position, request.pages,
-                                       request.caches, request.states};
+            auto& request = *lane.request;
+            auto scores = scratch.work[index]->gqa_scores(text_attention_max_tokens);
+            if (lane.position >= scores.capacity) {
+                scores = request.batch_graph_scores();
+                if (lane.position >= scores.capacity) {
+                    return false;
+                }
+            }
+            scratch.bindings[index] = {{0.0f, lane.token_id}, lane.position, scores,
+                                       request.pages, request.caches, request.states};
         }
         check(cudaMemcpyAsync(scratch.device_bindings, scratch.bindings.data(),
                               count * sizeof(BatchDecodeBinding), cudaMemcpyHostToDevice,
                               execution.stream()), "Upload batch decode bindings");
+        return true;
     });
 }
 
@@ -249,10 +257,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& r
         }
     }
     const bool graph = options.cuda_graphs && max_rows == 0 && count >= 2 &&
-        std::all_of(work.begin(), work.begin() + count, [](const auto& lane) {
-            const auto scores = lane.request->work.gqa_scores(text_attention_max_tokens);
-            return lane.position < scores.capacity;
-        }) && replay(work.data(), count);
+        replay(work.data(), count);
     if (count != 0 && !graph) {
         model.forward(work.data(), count, stream);
     }

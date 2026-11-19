@@ -137,7 +137,13 @@ The verifier used unrounded limits. W2 still misses all four. See `artifacts/tc-
 
 ### Native concurrent workloads
 
-Run W3 and W6 with `--max-active 4` after the [native streaming checks](development.md#streaming-verification). Verify full-width decode and memory capacity at workload lengths. Follow the [concurrent baseline procedure](../benchmarks/concurrent/README.md#conditions-and-gates) for paired timing and acceptance. W4 and W5 exceed the four-lane limit. See [batch graph timing](batch-graphs.md#timing) for replay eligibility and the historical width-four sample.
+After [streaming verification](development.md#streaming-verification), run W3 and W6 with `--max-active 4`. Verify full-width decode and capacity. Account for [score allocation and capture](batch-graphs.md#timing). W4 and W5 exceed four lanes.
+
+The post-loader [W3 smoke](batch-graphs.md#verification) used shortened budgets and instrumentation. Follow the [frozen protocol](../benchmarks/concurrent/README.md#conditions-and-gates) for acceptance timing.
+
+A pre-loader GPU6 comparison ran one cold full W3 cohort per arm with tensor-core prefill, batch graphs, and MTP off. Unit16 used eager long decode. The candidate replayed it. All 4,096 IDs, finish reasons, and usage matched. Throughput rose from 5.69 to 14.91 IDs/s. P95 TPOT fell from 624.40 to 189.36 ms. See `artifacts/long-batch-graph-release/report.md`.
+
+The [historical `w3-fused` server](../checkpoints/2026-11-19-performance/README.md#historical-measurements) used additional attention and projection fusions. It reached 144.84 output IDs/s and missed all four frozen W3 gates.
 
 ### Native serial MTP
 

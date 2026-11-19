@@ -266,10 +266,18 @@ __global__ void tiled_prefill_attention(Mxfp8KvCache cache, const std::int32_t* 
     output[row + channel] = __float2bfloat16_rn(weighted_value / denominator);
 }
 
-template <typename Position, typename Cache, typename Pages>
+__device__ decoder::ExactGqaWorkspace score_workspace(decoder::ExactGqaWorkspace workspace) {
+    return workspace;
+}
+
+__device__ decoder::ExactGqaWorkspace score_workspace(const decoder::ExactGqaWorkspace* workspace) {
+    return *workspace;
+}
+
+template <typename Position, typename Cache, typename Pages, typename Scores>
 __global__ void exact_scores_kernel(
     Cache cache_binding, Pages page_binding, Position position,
-    const __nv_bfloat16* queries, decoder::ExactGqaWorkspace workspace) {
+    const __nv_bfloat16* queries, Scores score_binding) {
     const int warp = threadIdx.x / mxfp8_group_size;
     const int lane = threadIdx.x % mxfp8_group_size;
     const int query_head = blockIdx.y;
@@ -288,6 +296,7 @@ __global__ void exact_scores_kernel(
         query[group] =
             __bfloat162float(queries[row_offset(0, mxfp8_query_heads, query_head) + channel]);
     }
+    const auto workspace = score_workspace(score_binding);
     auto* scores = workspace.scores + query_head * workspace.capacity;
     const int stride = gridDim.x * score_warps;
     for (int index = first; index <= last; index += stride) {
@@ -311,10 +320,10 @@ __global__ void exact_scores_kernel(
     }
 }
 
-template <typename Position, typename Cache, typename Pages>
+template <typename Position, typename Cache, typename Pages, typename Scores>
 __global__ void exact_replay_kernel(
     Cache cache_binding, Pages page_binding, Position position,
-    decoder::ExactGqaWorkspace workspace, __nv_bfloat16* output) {
+    Scores score_binding, __nv_bfloat16* output) {
     __shared__ float prefix_maximum[replay_tile + 1];
     __shared__ float history_weight[replay_tile];
     __shared__ float token_weight[replay_tile];
@@ -327,6 +336,7 @@ __global__ void exact_replay_kernel(
     const int last = decoder::position_value(position);
     const auto cache = cache_value(cache_binding);
     const auto* pages = page_values(page_binding);
+    const auto workspace = score_workspace(score_binding);
     const auto* scores = workspace.scores + query_head * workspace.capacity;
     float maximum = -CUDART_INF_F;
     float weight_sum = 0.0f;
@@ -376,19 +386,26 @@ __global__ void exact_replay_kernel(
         __float2bfloat16_rn(weighted_value / denominator);
 }
 
-template <typename Position, typename Cache, typename Pages>
+int score_grid_capacity(decoder::ExactGqaWorkspace workspace) {
+    return workspace.scores ? workspace.capacity : 0;
+}
+
+int score_grid_capacity(const decoder::ExactGqaWorkspace* workspace) {
+    return workspace ? text_attention_max_tokens : 0;
+}
+
+template <typename Position, typename Cache, typename Pages, typename Scores>
 cudaError_t launch_exact_attention(
     Cache cache, Pages pages, Position position, const __nv_bfloat16* queries,
-    __nv_bfloat16* output, decoder::ExactGqaWorkspace workspace, cudaStream_t stream) {
-    if (!queries || !output || !workspace.scores ||
-        workspace.capacity <= 0 || workspace.capacity > text_attention_max_tokens) {
+    __nv_bfloat16* output, Scores workspace, cudaStream_t stream) {
+    const int capacity = score_grid_capacity(workspace);
+    if (!queries || !output || capacity <= 0 || capacity > text_attention_max_tokens) {
         return cudaErrorInvalidValue;
     }
     constexpr int max_score_blocks = 32;
-    const int blocks =
-        std::min(max_score_blocks, (workspace.capacity + score_warps - 1) / score_warps);
+    const int blocks = std::min(max_score_blocks, (capacity + score_warps - 1) / score_warps);
     void* score_arguments[] = {&cache, &pages, &position, &queries, &workspace};
-    const auto status = cudaLaunchKernel(exact_scores_kernel<Position, Cache, Pages>,
+    const auto status = cudaLaunchKernel(exact_scores_kernel<Position, Cache, Pages, Scores>,
                                          dim3(blocks, mxfp8_query_heads),
                                          score_warps * mxfp8_group_size, score_arguments,
                                          0, stream);
@@ -396,7 +413,7 @@ cudaError_t launch_exact_attention(
         return status;
     }
     void* replay_arguments[] = {&cache, &pages, &position, &workspace, &output};
-    return cudaLaunchKernel(exact_replay_kernel<Position, Cache, Pages>,
+    return cudaLaunchKernel(exact_replay_kernel<Position, Cache, Pages, Scores>,
                             mxfp8_query_heads, mxfp8_head_dim,
                             replay_arguments, 0, stream);
 }
@@ -500,6 +517,16 @@ cudaError_t decoder::exact_decode_gqa_attention(
     const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
     const __nv_bfloat16* queries, __nv_bfloat16* output, ExactGqaWorkspace workspace,
     cudaStream_t stream) {
+    return launch_exact_attention(cache, pages, position, queries, output, workspace, stream);
+}
+
+cudaError_t decoder::exact_decode_gqa_attention(
+    const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, const ExactGqaWorkspace* workspace,
+    cudaStream_t stream) {
+    if (!cache || !pages || !position) {
+        return cudaErrorInvalidValue;
+    }
     return launch_exact_attention(cache, pages, position, queries, output, workspace, stream);
 }
 

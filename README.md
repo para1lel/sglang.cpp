@@ -141,7 +141,10 @@ requests use the selected FP8 prefill policy.
 
 Add `--batch-cuda-graphs` with `--max-active 2`, `3`, or `4` to opt in to graph
 replay for eligible decode-only groups. The server warms each actual decode
-width before capturing it. Mixed decode and prefill steps run eagerly.
+width before capturing it. At decode position 5,120 or later, a request can
+replay with its own exact attention score workspace sized to its KV capacity.
+If that allocation runs out of memory, steps that need it use eager decode.
+Mixed decode and prefill steps run eagerly.
 
 Add `--mtp-steps 1` through `--mtp-steps 4` to enable the parallel target verifier
 for serial HTTP requests with `--max-active 1`. The SSE events and usage fields

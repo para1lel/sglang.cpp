@@ -13,6 +13,7 @@ constexpr std::size_t binding_bytes =
     sizeof(sglang::decoder::BatchDecodeBinding) * sglang::decoder_batch_max_lanes;
 constexpr std::size_t first_workspace_bytes =
     sizeof(sglang::decoder::Bf16) * sglang::decoder::hidden_size;
+constexpr std::size_t long_score_bytes = 5248 * sglang::mxfp8_query_heads * sizeof(float);
 void* bindings = nullptr;
 bool injected = false;
 
@@ -26,6 +27,11 @@ bool enabled(std::string_view name) {
 extern "C" cudaError_t cudaMalloc(void** address, std::size_t bytes) {
     static const auto real =
         reinterpret_cast<decltype(&cudaMalloc)>(dlsym(RTLD_NEXT, "cudaMalloc"));
+    if (!injected && enabled("score-oom") && bytes == long_score_bytes) {
+        injected = true;
+        std::fprintf(stderr, "inject: score-oom\n");
+        return cudaErrorMemoryAllocation;
+    }
     if (!injected && enabled("scratch-oom") && bindings && bytes == first_workspace_bytes) {
         injected = true;
         std::fprintf(stderr, "inject: scratch-oom after allocating graph bindings\n");

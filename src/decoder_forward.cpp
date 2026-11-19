@@ -221,7 +221,7 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
                                    work.rope_keys, work.values, stream), "Append bound MXFP8 KV");
             check(exact_decode_gqa_attention(&binding->caches[cache_index], &binding->pages,
                                              position, work.rope_queries, work.attention,
-                                             work.gqa_scores(text_attention_max_tokens), stream),
+                                             &binding->scores, stream),
                   "Read bound causal MXFP8 attention");
             check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
                   "Gate grouped-query attention");

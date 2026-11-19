@@ -353,7 +353,7 @@ void Allocations::capture_graph(const std::function<void()>& enqueue) {
 
 bool Allocations::replay_batch_graph(int width, const std::function<void()>& prepare,
                                      const std::function<void()>& capture_nodes,
-                                     const std::function<void()>& bind) {
+                                     const std::function<bool()>& bind) {
     auto& batch = state_->batch_graphs.at(width - 2);
     if (batch.disabled) {
         return false;
@@ -422,7 +422,9 @@ bool Allocations::replay_batch_graph(int width, const std::function<void()>& pre
         check(built, "Instantiate batch decode graph");
         state_->destroy_capture(batch.capture).raise();
     }
-    bind();
+    if (!bind()) {
+        return false;
+    }
     check(cudaGetLastError(), "Check CUDA error before batch graph launch");
     const auto launched = cudaGraphLaunch(batch.executable, stream);
     if (launched == cudaErrorInvalidValue || launched == cudaErrorInvalidResourceHandle ||
@@ -503,6 +505,34 @@ ExactGqaWorkspace Workspace::gqa_scores(int capacity) const {
     constexpr int bytes_per_page = mxfp8_page_size * mxfp8_query_heads * sizeof(float);
     constexpr int score_pages = vocab_size * sizeof(Bf16) / bytes_per_page;
     return {reinterpret_cast<float*>(logits), std::min(capacity, score_pages * mxfp8_page_size)};
+}
+
+ExactGqaWorkspace Request::batch_graph_scores() {
+    if (long_graph_scores) {
+        return *long_graph_scores;
+    }
+    if (pages.page_count <= 0 ||
+        pages.page_count > text_attention_max_tokens / mxfp8_page_size) {
+        throw std::invalid_argument("Invalid batch graph score capacity");
+    }
+    const int capacity = pages.page_count * mxfp8_page_size;
+    const auto count = static_cast<std::size_t>(capacity) * mxfp8_query_heads;
+    try {
+        long_graph_scores = {memory.allocate<float>(count), capacity};
+    } catch (const CudaError& error) {
+        if (error.status != cudaErrorMemoryAllocation) {
+            throw;
+        }
+        const auto previous = cudaGetLastError();
+        if (previous != cudaErrorMemoryAllocation) {
+            check(previous, "Check CUDA error before eager batch score fallback");
+        }
+        std::fprintf(stderr, "sglang decoder: Allocate batch scores for %d positions: %s, "
+                     "using eager decode for long positions\n", capacity,
+                     cudaGetErrorString(error.status));
+        long_graph_scores = ExactGqaWorkspace{};
+    }
+    return *long_graph_scores;
 }
 
 void allocate_gdn(Allocations& memory, GdnBank& states) {

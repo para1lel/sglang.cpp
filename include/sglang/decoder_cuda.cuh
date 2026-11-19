@@ -71,6 +71,10 @@ cudaError_t exact_decode_gqa_attention(
     const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
     const __nv_bfloat16* queries, __nv_bfloat16* output, ExactGqaWorkspace workspace,
     cudaStream_t stream);
+cudaError_t exact_decode_gqa_attention(
+    const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, const ExactGqaWorkspace* workspace,
+    cudaStream_t stream);
 cudaError_t decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                        const __nv_bfloat16* b, const __nv_bfloat16* a,
                        TextGdnWeights weights, const TextGdnState* state,

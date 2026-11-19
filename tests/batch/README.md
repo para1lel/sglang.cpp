@@ -36,6 +36,11 @@ and CUPTI runtime/device records in the evidence directory.
   scratch and instantiation allocation failures, and an uncertain post-launch
   synchronization. They check eager fallback, graph cleanup, continued replay at
   other widths, and fail-closed behavior after uncertain completion.
+- The long-score probe crosses positions 5,119–5,121 with tensor-core prefill.
+  It checks lazy allocation, changing score strides, mixed steps, score
+  allocation failure, cancellation, and slot reuse. It matches greedy IDs and
+  complete BF16 rows to eager, correlates masks with CUPTI launches, and
+  requires zero request bytes at cleanup.
 - The public HTTP probe sends distinct prompts with all three widths and checks
   independent EOS and explicit stop, cancellation, overlapping replacement, and
   recovery. Both server routes must return identical SSE and release request state.
@@ -44,8 +49,37 @@ Expect `Batch CUDA Graph operator, lane, fault and HTTP checks passed`. The
 [evidence checker](check_graph_evidence.py#L1)<!-- prefix: "\"\"\"Check rea" -->
 can be run again against an existing evidence directory.
 
+Run the long-score boundary with a fresh evidence destination.
+
+```bash
+GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
+    bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/boundary" boundary
+python3 -IB tests/batch/check_graph_evidence.py "$out/boundary" --boundary-only
+```
+
 Run the slot-mask regression without a checkpoint or GPU.
 
 ```bash
 python3 -IB tests/batch/check_graph_evidence.py --check-slot-mask
 ```
+
+## CPU score slab check
+
+From the repository root in the managed Pixi `default` environment, build and
+run the score-slab check with CUDA hidden. It needs the CUDA headers and uses
+host stubs for allocation and graph APIs. It requires no checkpoint or GPU.
+
+```bash
+toolkit="${CONDA_PREFIX:?Activate the managed Pixi default environment}/targets/x86_64-linux"
+score_check=build/check-score-slab
+mkdir -p "$(dirname "$score_check")"
+"$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++" -std=c++17 -O2 -Wall -Wextra -Werror \
+    -ffunction-sections -fdata-sections -Wl,--gc-sections \
+    -Iinclude -I"$toolkit/include" \
+    tests/batch/check_score_slab.cpp src/decoder_resources.cpp \
+    src/checkpoint.cpp src/json.cpp src/utf8.cpp -o "$score_check"
+CUDA_VISIBLE_DEVICES= "$score_check"
+```
+
+Expect a rejection at each of the four packed lanes followed by
+`Score bounds, bounded ownership and executable reuse passed`.

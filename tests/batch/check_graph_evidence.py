@@ -43,7 +43,8 @@ def count(api, prefix):
     return sum(name.startswith(prefix) for name in api)
 
 
-def lane_trace(path, require_replays=False):
+def lane_trace(path, require_replays=False, compare_request_bytes=True):
+    request_bytes = {"step": slice(2, 3), "admit": slice(-1, None), "cancel": slice(2, None)}
     normalized, masks, tokens = [], [], []
     step = None
     selected, graph, lanes, decoded, prefill = 0, 0, 0, 0, 0
@@ -86,6 +87,8 @@ def lane_trace(path, require_replays=False):
         else:
             finish_step()
             assert kind in metadata_fields and len(values) == metadata_fields[kind], (path, row)
+        if not compare_request_bytes and kind in request_bytes:
+            del values[request_bytes[kind]]
         normalized.append((kind, *values))
     finish_step()
     return normalized, masks, tokens
@@ -154,6 +157,32 @@ def verify_faults(evidence, baseline, expected_tokens, expected_scores):
         assert len(device) == len(masks)
         if role == "scratch-oom":
             assert "released partial graph scratch bindings" in output
+
+
+def verify_boundary(evidence):
+    baseline, masks, tokens = lane_trace(evidence / "boundary-eager.lanes",
+                                         compare_request_bytes=False)
+    assert not masks and trace(evidence / "boundary-eager.cupti.tsv") == ([], [])
+    scores = (evidence / "boundary-eager.scores").read_bytes()
+    for role in ("graph", "score-oom"):
+        stem = evidence / f"boundary-{role}"
+        steps, masks, observed = lane_trace(stem.with_suffix(".lanes"),
+                                           compare_request_bytes=False)
+        assert steps == baseline and observed == tokens and tokens
+        assert steps[-1] == ("step", steps[-1][1], "15", "0")
+        verify_scores(stem.with_suffix(".scores"), tokens)
+        assert stem.with_suffix(".scores").read_bytes() == scores
+        device, runtime = trace(stem.with_suffix(".cupti.tsv"))
+        buckets = defaultdict(set)
+        for graph_id, mask in zip(device, masks, strict=True):
+            buckets[mask.bit_count()].add(graph_id)
+        assert set(buckets) == {2, 3} and all(len(ids) == 1 for ids in buckets.values())
+        assert len(set.union(*buckets.values())) == 2
+        assert all(count(runtime, api) == 2 for api in LIFECYCLE)
+        output = stem.with_suffix(".log").read_text()
+        assert output.count("inject: score-oom") == (role == "score-oom")
+        assert output.count("Allocate batch scores for 5248 positions") == (role == "score-oom")
+    print(f"Long batch graph boundary, score OOM and recycling checks passed ({len(tokens)} rows)")
 
 
 def payloads(data):
@@ -227,13 +256,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evidence", type=Path, nargs="?")
     parser.add_argument("--check-slot-mask", action="store_true")
+    parser.add_argument("--boundary-only", action="store_true")
     args = parser.parse_args()
     if args.check_slot_mask:
         check_slot_mask()
     output = args.evidence
     if output is None:
-        if not args.check_slot_mask:
+        if not args.check_slot_mask or args.boundary_only:
             parser.error("Pass an evidence directory or --check-slot-mask")
+        return
+    if args.boundary_only:
+        verify_boundary(output)
         return
     verify_operators(output)
     for policy in ("exact", "tensor-core"):
@@ -241,6 +274,7 @@ def main():
         if policy == "exact":
             verify_faults(output, *evidence)
         verify_http(output, policy)
+    verify_boundary(output)
     print("Batch CUDA Graph operator, lane, fault and HTTP checks passed")
 
 

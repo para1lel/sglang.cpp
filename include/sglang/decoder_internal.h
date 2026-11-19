@@ -89,7 +89,7 @@ public:
     void capture_graph(const std::function<void()>& enqueue);
     bool replay_batch_graph(int width, const std::function<void()>& prepare,
                             const std::function<void()>& capture,
-                            const std::function<void()>& bind);
+                            const std::function<bool()>& bind);
     void reclaim_deferred();
     void open_stream(std::shared_ptr<const void> owners = nullptr);
     void close_stream();
@@ -182,6 +182,7 @@ struct Request {
     void initialize(int capacity, cudaStream_t stream);
     void reset(cudaStream_t stream);
     void reset();
+    ExactGqaWorkspace batch_graph_scores();
 
     Allocations memory;
     Workspace work;
@@ -189,6 +190,7 @@ struct Request {
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
     GdnBank states;
+    std::optional<ExactGqaWorkspace> long_graph_scores;
 };
 
 void copy_greedy_token(Request& request, cudaStream_t stream);
@@ -204,6 +206,7 @@ struct ForwardLane {
 struct BatchDecodeBinding {
     TextLogitCandidate input;
     int position;
+    ExactGqaWorkspace scores;
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
     std::array<TextGdnState, gdn_layers> states;

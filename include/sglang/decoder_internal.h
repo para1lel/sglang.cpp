@@ -314,6 +314,10 @@ struct Decoder::Model {
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;
+    using DecodeHeadRows = std::array<decoder::Workspace*, 4>;
+    void compute_decode_logits(const DecodeHeadRows& rows, cudaStream_t stream) const;
+    bool compute_eager_decode_logits(const decoder::ForwardLane* lanes, int count,
+                                   cudaStream_t stream) const;
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request, bool decode = false) const;
     void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;

@@ -520,6 +520,14 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
                                work.residual, stream), "Look up bound token embedding");
     });
     forward_layers(lanes, count, stream);
+    DecodeHeadRows rows;
+    if (count == static_cast<int>(rows.size())) {
+        for (int index = 0; index < count; ++index) {
+            rows[index] = lanes[index].work;
+        }
+        compute_decode_logits(rows, stream);
+        return;
+    }
     batch.each([&](const BatchGraphLane&, Workspace& work) {
         compute_logits(work, stream);
     });
@@ -559,6 +567,35 @@ void Decoder::Model::compute_logits(Request& request, bool decode) const {
 void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream) const {
     check(text_rms_norm(work.hidden, work.residual, final_norm, hidden_size,
                         work.normalized, nullptr, stream), "Normalize final residual");
+}
+
+bool Decoder::Model::compute_eager_decode_logits(const ForwardLane* lanes, int count,
+                                                cudaStream_t stream) const {
+    DecodeHeadRows rows;
+    if (count != static_cast<int>(rows.size())) {
+        return false;
+    }
+    for (int index = 0; index < count; ++index) {
+        rows[index] = &lanes[index].request->work;
+    }
+    compute_decode_logits(rows, stream);
+    return true;
+}
+
+void Decoder::Model::compute_decode_logits(const DecodeHeadRows& rows, cudaStream_t stream) const {
+    DecodeHeadProjections projections;
+    static_assert(std::tuple_size_v<DecodeHeadRows> == std::tuple_size_v<DecodeHeadProjections>);
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        auto& work = *rows[index];
+        normalize_final(work, stream);
+        projections[index] = {work.normalized, work.logits};
+    }
+    check(decode_bf16_lm_head_batch(lm_head.values, lm_head.rows, lm_head.columns, projections,
+                                   stream), "Run grouped decode LM head");
+    for (auto* work : rows) {
+        check(text_argmax(work->logits, vocab_size, work->argmax_scratch, work->argmax, stream),
+              "Select greedy token");
+    }
 }
 
 void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode) const {

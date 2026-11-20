@@ -45,12 +45,42 @@ done
 
 The operator check compares output bits and guards with ordinary BF16 GEMV and FP8 quantization.
 It checks successful kernel launch counts and grid and block dimensions for optimized and fallback
-cases. Invalid arguments must submit no kernels.
+cases. For the four-lane head it exercises the first row pair, full and partial blocks, odd rows,
+unaligned inputs or weights, and a different hidden width. Invalid arguments must submit no kernels.
 
 The checkpoint check expects one capture on the first request, three graph launches on each of
 two default requests, and no capture or launch on the eager request. The second default request
 must reuse the first graph. All three requests must return identical greedy IDs and full score
 bits within each prefill policy.
+
+## Grouped decode LM head
+
+Use the same Release build, Pixi environment, checkpoint and reserved B200.
+The route check observes the width-four kernel, argmax, seeded sampler and host winner copies.
+It covers sparse slots with different positions, eager decode, graph capture and replay, capture
+rejection, width changes, a mixed prefill/decode step, and slot reuse.
+
+```bash
+sampler=_ZN6sglang7decoder13sample_logitsEPK13__nv_bfloat16iPiNS0_18SamplingParametersEiPvP11CUstream_st
+"$CXX" -std=c++20 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
+    tests/decoder/grouped_head_routes.cpp -L"$out/lib" -L"$toolkit/lib" \
+    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaLaunchKernel \
+    -Wl,--wrap=cudaStreamBeginCapture -Wl,--wrap=cudaStreamEndCapture \
+    -Wl,--wrap=cudaGraphInstantiate -Wl,--wrap=cudaGraphLaunch \
+    -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap="$sampler" \
+    -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
+    -lcudart -o "$out/grouped-head-routes"
+jq -r '.prompt[]' tests/prefix/route-cases.json >"$out/prompt.ids"
+export CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}"
+for mode in eager graph rejected; do
+    "$out/grouped-head-routes" "$checkpoint" "$out/prompt.ids" candidate "$mode" \
+        "$out/$mode.bf16" >"$out/$mode.log"
+done
+```
+
+For a matched comparison, link the same route check against the original decoder libraries and
+use `base` in place of `candidate`. Compare the `token` lines and each mode's binary files.
+Each file contains one full BF16 logit row per returned token in the order printed in the log.
 
 ## GDN prefill
 

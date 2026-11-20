@@ -4,6 +4,8 @@
 #include "sglang/text_attention.h"
 #include "sglang/text_ops.h"
 
+#include <array>
+
 namespace sglang::decoder {
 
 #ifdef __CUDACC__
@@ -22,6 +24,10 @@ cudaError_t decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
                                   __nv_bfloat16* output_a, cudaStream_t stream);
 cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                                int rows, int width, __nv_bfloat16* output, cudaStream_t stream);
+using DecodeHeadProjections = std::array<TextBf16Projection, 4>;
+cudaError_t decode_bf16_lm_head_batch(const __nv_bfloat16* weight, int rows, int width,
+                                     const DecodeHeadProjections& projections,
+                                     cudaStream_t stream);
 cudaError_t decode_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
                                 cudaStream_t stream);
 

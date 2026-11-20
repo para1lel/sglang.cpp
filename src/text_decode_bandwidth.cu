@@ -123,6 +123,46 @@ __global__ void bf16_lm_head_pair_kernel(const __nv_bfloat16* weight,
     }
 }
 
+constexpr int head_batch_warps = 4;
+constexpr int head_batch_lanes = std::tuple_size_v<decoder::DecodeHeadProjections>;
+
+struct HeadBatchArguments {
+    TextBf16Projection projections[head_batch_lanes];
+};
+
+__global__ void bf16_lm_head_batch_kernel(const __nv_bfloat16* weight, int rows,
+                                         const __grid_constant__ HeadBatchArguments arguments) {
+    const int lane = threadIdx.x % warp_width;
+    const int row = 2 * (blockIdx.x * head_batch_warps + threadIdx.x / warp_width);
+    if (row >= rows) {
+        return;
+    }
+    constexpr int width = decoder::hidden_size;
+    const auto* weights = weight + static_cast<std::size_t>(row) * width;
+    Bf16Dot dots[2][head_batch_lanes];
+#pragma unroll 2
+    for (int column = lane * 8; column < width; column += warp_width * 8) {
+        const auto first = load_streaming_128(weights + column);
+        const auto second = load_streaming_128(weights + width + column);
+#pragma unroll
+        for (int request = 0; request < head_batch_lanes; ++request) {
+            const auto input = load_128(arguments.projections[request].input + column);
+            dots[0][request].accumulate(first, input);
+            dots[1][request].accumulate(second, input);
+        }
+    }
+#pragma unroll
+    for (int offset = 0; offset < 2; ++offset) {
+#pragma unroll
+        for (int request = 0; request < head_batch_lanes; ++request) {
+            const auto value = warp_sum(dots[offset][request].sum());
+            if (lane == 0) {
+                arguments.projections[request].output[row + offset] = __float2bfloat16_rn(value);
+            }
+        }
+    }
+}
+
 __global__ void quantize_fp8_warp(const __nv_bfloat16* input, TextFp8Activation output) {
     static_assert(text_fp8_group_size == warp_width * 4);
     const int lane = threadIdx.x;
@@ -182,6 +222,26 @@ cudaError_t decoder::decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv
     void* args[] = {&weight, &input, &rows, &output};
     return cudaLaunchKernel(bf16_lm_head_pair_kernel, divide_up(rows, 2 * block_warps),
                             block_threads, args, 0, stream);
+}
+
+cudaError_t decoder::decode_bf16_lm_head_batch(const __nv_bfloat16* weight, int rows, int width,
+                                             const DecodeHeadProjections& projections,
+                                             cudaStream_t stream) {
+    if (!weight || rows <= 0 || rows % 2 != 0 || width != hidden_size || !aligned(weight, 16)) {
+        return text_bf16_gemm(weight, rows, width, projections.data(), projections.size(), stream);
+    }
+    HeadBatchArguments arguments;
+    for (int request = 0; request < head_batch_lanes; ++request) {
+        const auto& projection = projections[request];
+        if (!projection.input || !projection.output || !aligned(projection.input, 16)) {
+            return text_bf16_gemm(weight, rows, width, projections.data(), projections.size(),
+                                  stream);
+        }
+        arguments.projections[request] = projection;
+    }
+    void* args[] = {&weight, &rows, &arguments};
+    return cudaLaunchKernel(bf16_lm_head_batch_kernel, divide_up(rows, 2 * head_batch_warps),
+                            warp_width * head_batch_warps, args, 0, stream);
 }
 
 cudaError_t decoder::decode_quantize_fp8(const __nv_bfloat16* input, int width,

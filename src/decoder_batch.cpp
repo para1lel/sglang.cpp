@@ -372,7 +372,7 @@ struct DecoderBatch::State {
     void submit(const Selection& selected, const PrefillRows& decode, Steps& results,
                 DecoderBatchStepStats& stats, bool& contains_mtp);
     void prefill(const PrefillRows& rows, int max_rows, DecoderBatchStepStats& stats);
-    void score(Lane& lane, Request& request, Workspace& work, bool graph);
+    void score(Lane& lane, Request& request, Workspace& work, bool logits_ready);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats);
     void draft_proposals(DraftRound* rounds, int count, int longest);
@@ -644,9 +644,9 @@ bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
     });
 }
 
-void DecoderBatch::State::score(Lane& lane, Request& request, Workspace& work, bool graph) {
+void DecoderBatch::State::score(Lane& lane, Request& request, Workspace& work, bool logits_ready) {
     const auto stream = execution.stream();
-    if (!graph) {
+    if (!logits_ready) {
         model.compute_logits(work, stream);
     }
     if (lane.sampling && !sampling_workspace) {
@@ -676,7 +676,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     std::array<int, decoder_batch_max_lanes> packed_slots{};
     PrefillRows speculative{};
     const int max_rows = *std::max_element(rows.begin(), rows.end());
-    bool graph_eligible = options.cuda_graphs && max_rows == 0;
+    bool text_decode = max_rows == 0;
     int count = 0;
     for (int slot = 0; slot < options.max_lanes; ++slot) {
         if (!selected[slot] || !slots[slot] || !slots[slot]->request) {
@@ -699,7 +699,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         }
         results[slot].decode = remaining == 0;
         contains_mtp = contains_mtp || lane.draft != nullptr;
-        graph_eligible = graph_eligible && !lane.media;
+        text_decode = text_decode && !lane.media;
         if (results[slot].decode && lane.draft && lane.remaining_output() > 1) {
             speculative[slot] = decode_rows;
             continue;
@@ -715,7 +715,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             scoring[slot] = lane.request.get();
         }
     }
-    const bool graph = graph_eligible && !contains_mtp && count > 0 &&
+    const bool graph = options.cuda_graphs && text_decode && !contains_mtp && count > 0 &&
         count <= decoder_batch_max_graph_lanes && replay(work.data(), count);
     if (count != 0 && !graph) {
         work[0].narrow_gqa = count == 1 && !contains_mtp && max_rows == 0 &&
@@ -723,6 +723,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         model.forward(work.data(), count, stream);
     }
     prefill(rows, max_rows, stats);
+    const bool grouped_head = !graph && text_decode && !contains_mtp &&
+        model.compute_eager_decode_logits(work.data(), count, stream);
     bool submitted = count != 0 || max_rows > 1;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = scoring[slot]) {
@@ -730,7 +732,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             const bool packed = graph && !lane.restored_prompt;
             auto& workspace = packed ? *storage->graph_scratch->work[packed_slots[slot]]
                                      : request->work;
-            score(lane, *request, workspace, packed);
+            score(lane, *request, workspace, (graph || grouped_head) && !lane.restored_prompt);
             submitted = true;
             if (packed) {
                 stats.graph_slots |= std::uint32_t{1} << slot;

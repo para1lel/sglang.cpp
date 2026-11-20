@@ -11,8 +11,10 @@ namespace {
 
 using BFloat = __nv_bfloat16;
 using sglang::TextFp8Activation;
+using sglang::decoder::DecodeHeadProjections;
 using sglang::decoder::decode_bf16_gdn_gates;
 using sglang::decoder::decode_bf16_lm_head;
+using sglang::decoder::decode_bf16_lm_head_batch;
 using sglang::decoder::decode_quantize_fp8;
 
 constexpr int hidden = 5120;
@@ -29,9 +31,10 @@ struct ExpectedLaunches {
     unsigned threads;
 };
 
-std::array<Launch, 2> launches;
+std::array<Launch, 4> launches;
 unsigned successful_launches = 0;
 unsigned attempted_launches = 0;
+bool reject_launch = false;
 
 void check(cudaError_t status) {
     if (status != cudaSuccess) {
@@ -129,6 +132,72 @@ void projection(int width, int rows, int offset, bool gdn, ExpectedLaunches expe
                      gdn ? "GDN gate launch geometry differs" : "LM head launch geometry differs");
 }
 
+void grouped_head(int width, int rows, int weight_offset, int input_offset,
+                  ExpectedLaunches expected_launches) {
+    constexpr int lanes = std::tuple_size_v<DecodeHeadProjections>;
+    const int stride = 8 * ((width + 8) / 8);
+    const int output_stride = rows + 2;
+    Device<BFloat> inputs(lanes * stride);
+    Device<BFloat> weight(rows * width + 1);
+    Device<BFloat> expected(lanes * output_stride);
+    Device<BFloat> actual(lanes * output_stride);
+    fill(inputs, lanes * stride, 11);
+    fill(weight, rows * width + 1, 17);
+    expected.reset();
+    actual.reset();
+
+    DecodeHeadProjections projections;
+    for (int lane = 0; lane < lanes; ++lane) {
+        const auto* input = inputs.data + lane * stride + (lane == 2 ? input_offset : 0);
+        const int first = lane * output_stride + 1;
+        projections[lane] = {input, actual.data + first};
+        check(sglang::text_bf16_gemv(weight.data + weight_offset, input, rows, width,
+                                   expected.data + first, nullptr));
+    }
+    successful_launches = 0;
+    check(decode_bf16_lm_head_batch(weight.data + weight_offset, rows, width, projections,
+                                    nullptr));
+    check(cudaDeviceSynchronize());
+    require_launches(expected_launches, "Grouped LM head launch geometry differs");
+    actual.match(expected, "Grouped LM head bits or guards differ");
+}
+
+void grouped_head_errors() {
+    Device<BFloat> input(hidden);
+    Device<BFloat> weight(2 * hidden);
+    Device<BFloat> output(8);
+    DecodeHeadProjections projections;
+    for (std::size_t lane = 0; lane < projections.size(); ++lane) {
+        projections[lane] = {input.data, output.data + 2 * lane};
+    }
+    auto missing_input = projections;
+    missing_input.back().input = nullptr;
+    auto missing_output = projections;
+    missing_output.back().output = nullptr;
+    const auto before = attempted_launches;
+    const std::array statuses{
+        decode_bf16_lm_head_batch(nullptr, 2, hidden, projections, nullptr),
+        decode_bf16_lm_head_batch(weight.data, 0, hidden, projections, nullptr),
+        decode_bf16_lm_head_batch(weight.data, 2, 0, projections, nullptr),
+        decode_bf16_lm_head_batch(weight.data, 2, hidden, missing_input, nullptr),
+        decode_bf16_lm_head_batch(weight.data, 2, hidden, missing_output, nullptr),
+    };
+    for (const auto status : statuses) {
+        if (status != cudaErrorInvalidValue) {
+            throw std::runtime_error("Invalid grouped LM head input accepted");
+        }
+    }
+    if (attempted_launches != before) {
+        throw std::runtime_error("Invalid grouped LM head input submitted a kernel");
+    }
+    reject_launch = true;
+    const auto status = decode_bf16_lm_head_batch(weight.data, 2, hidden, projections, nullptr);
+    reject_launch = false;
+    if (status != cudaErrorInvalidConfiguration || attempted_launches != before + 1) {
+        throw std::runtime_error("Grouped LM head did not propagate the launch failure");
+    }
+}
+
 void quantization(int width, int input_offset, int output_offset,
                   ExpectedLaunches expected_launches) {
     const auto groups = sglang::text_fp8_group_count(width);
@@ -202,6 +271,7 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
                                                void** args, std::size_t shared,
                                                cudaStream_t stream) {
     ++attempted_launches;
+    if (reject_launch) return cudaErrorInvalidConfiguration;
     const auto status = __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
     if (status == cudaSuccess) {
         if (successful_launches < launches.size()) {
@@ -218,6 +288,15 @@ int main() try {
     projection(hidden, 17, 0, false, {1, 3, 256});
     projection(hidden, 18, 1, false, {1, 3, 256});
     projection(hidden - 1, 18, 0, false, {1, 3, 256});
+    grouped_head(hidden, 2, 0, 0, {1, 1, 128});
+    grouped_head(hidden, 8, 0, 0, {1, 1, 128});
+    grouped_head(hidden, 10, 0, 0, {1, 2, 128});
+    grouped_head(hidden, 1, 0, 0, {1, 1, 256});
+    grouped_head(hidden, 9, 0, 0, {1, 2, 256});
+    grouped_head(hidden, 10, 1, 0, {4, 2, 256});
+    grouped_head(hidden, 10, 0, 1, {4, 2, 256});
+    grouped_head(hidden - 8, 10, 0, 0, {1, 2, 256});
+    grouped_head_errors();
     projection(hidden, gates, 0, true, {1, 2 * gates, 32});
     projection(hidden, gates - 1, 0, true, {2, 6, 256});
     projection(hidden, gates, 1, true, {2, 6, 256});

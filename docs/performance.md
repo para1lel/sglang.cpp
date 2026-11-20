@@ -10,7 +10,7 @@ Compare correct implementations on the **same physical B200 and immutable checkp
 | Candidate | Run the project binary built by XMake with the default Pixi toolchain. Record source, build options, and executable identity. | [Development contract](development.md). |
 | Architectural reference | Interpret service and cache behavior. Any separate SGLang timing needs its own result label. | `sgl-project/sglang` at `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. |
 
-Run each engine alone on the selected UUID in its own environment. Record drivers, runtimes, host and client settings, clocks, power, other GPU activity, and relevant software differences.
+Run each engine alone on the selected UUID in its own environment. Record drivers, runtimes, host and client settings, clocks, power, other GPU activity, and software differences.
 
 Match checkpoint, tokenizer, template, processor, weight precision, sampling, cache state, MTP, and media preprocessing. Freeze request bytes, input IDs, arrivals, seeds, and stops. Record dispatch and token counts. Mark missing modes unsupported.
 
@@ -21,7 +21,7 @@ Launch both engines with **32,768 aggregate scheduled tokens per step** and **32
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-seqs 32`. Leave `--max-num-scheduled-tokens` unset or set it to `32768`. Verify the effective limits.
 - **Native server.** Set `--max-active 32 --max-num-batched-tokens 32768`. Verify both defaults in [`GET /health`](development.md#native-streaming-server). Record admission failures separately from timing under the [resident memory limit](batch-graphs.md#resident-memory-admission).
 
-In every chat report, enumerate all nondefault launch, environment, client, and request settings for each engine, including diagnostics. Report effective server maxima separately from offered and observed client concurrency. Record each request's input length, context limit, and output budget. Preserve the original settings, identities, and gates of frozen runs. Only new matched runs under this policy qualify for acceptance. An unavailable required mode leaves its comparison open.
+In every chat report, list each engine's nondefault launch, environment, client, and request settings, including diagnostics. Report effective server maxima, offered and observed concurrency, input lengths, context limits, and output budgets. Preserve frozen run settings, identities, and gates. Acceptance requires a new matched run under this policy with every required mode available.
 
 ## GQA cache comparison
 
@@ -57,9 +57,9 @@ Start W1–W6 with disjoint prefixes and MTP off. Keep [W3-prefix](prefix-cache.
 
 ## Measurement
 
-**Required reporting.** Give output tokens/s, first-token latency, per-output-token latency, and end-to-end latency for each named workload and engine. Retain actual input and output counts and all failed requests.
+**Required reporting.** For each workload and engine report output tokens/s, TTFT, TPOT, and end-to-end latency. Retain input and output counts and failed requests.
 
-**Proposed timing protocol.** Use the same streaming client and monotonic clock for both engines. Time a cohort from the first request submission to the last terminal response. Preserve per-request submission, first output token, subsequent token events when observable, final output token, and completion times. Exclude empty stream events from token counts. A fixed-length comparison requires all requests to complete at the specified lengths.
+**Proposed timing protocol.** Use one streaming client and monotonic clock for both engines. Time cohorts from first submission to last terminal response. Preserve submission, first and last token, intermediate token events when observable, and completion times per request. Exclude empty events from token counts. Require every request to finish at its specified length.
 
 | Metric | Definition for one measured cohort |
 | --- | --- |
@@ -156,13 +156,15 @@ The verifier used unrounded limits. Both W2 arms missed all four gates in this r
 
 ### Native concurrent workloads
 
-Verify [streaming](development.md#streaming-verification). Use [K0 scheduling](#scheduler-and-reporting-policy) and preserve offered concurrency. [Trace](batch-graphs.md#timing) decode width and replay.
+Verify [streaming](development.md#streaming-verification), [K0 scheduling](#scheduler-and-reporting-policy), offered concurrency, and [decode width and replay](batch-graphs.md#timing).
 
 Historical W3 missed all gates on GPU2 (63.779 IDs/s, 28,672 matching IDs), `w3-fused` (144.84), and GPU3 `9d047fe` (90.519 versus vLLM’s 373.931, 4,096 matching IDs). [Historical protocol](../benchmarks/concurrent/README.md#conditions-and-gates) · `artifacts/takeover-w3/report.md`
 
 GPU6 W3 replay rose from 5.69 to 14.91 IDs/s (4,096 matching IDs). `artifacts/long-batch-graph-release/report.md`
 
 GPU3 W3 pairing raised median IDs/s from 103.724 to 111.340 (+7.34%). Pinned vLLM reached 374.427. All 4,096 IDs matched. Both native arms missed all four frozen gates. `artifacts/takeover-w3-gqa-perf/report.md`
+
+On GPU4, the `dad987dd` W3 [grouped head](batch-graphs.md#runtime-path) raised median throughput by 3.39–3.63% to 138.843–138.849 IDs/s versus pinned vLLM's 374.187. All 143,360 IDs matched. Both candidate arms missed all four gates. `artifacts/takeover-w3-lmhead-code/flash-release/REPORT.md`
 
 The prior W4 singleton spent 54.245 of 58.657 s TTFT in protected single-row GQA. `artifacts/takeover-w4-diagnostic/report.md`
 
@@ -190,7 +192,7 @@ Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rou
 
 Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L55)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L389)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L930)<!-- prefix: "current.peak" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L389)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L932)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

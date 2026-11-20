@@ -1,25 +1,25 @@
 # Single-B200 development contract
 
-Build a C++ and CUDA C++ inference service for one NVIDIA B200. `/data0/shared/Qwen3.8-27B-FP8` matches revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`. The [checkpoint investigation](research/checkpoint.md) records hashes, tensors, and SGLang source paths.
+Build a C++ and CUDA C++ inference service for one B200. The [checkpoint investigation](research/checkpoint.md) records hashes, tensors, and SGLang sources for `/data0/shared/Qwen3.8-27B-FP8` at `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`.
 
 ## Scope at adoption
 
-The first `sm_100` cubin built with XMake, GCC 15.3.0, and CUDA 13.4.92. It returned 42 on B200 4 (`GPU-57c04c1a-9ae4-b231-f31a-5f4367e759a8`). Model, service, and throughput require separate evidence.
+The initial `sm_100` probe returned 42 on B200 4 (`GPU-57c04c1a-9ae4-b231-f31a-5f4367e759a8`) after an XMake build with GCC 15.3.0 and CUDA 13.4.92.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Model | Define weights, mathematics, tokenization, media processing, and native multi-token prediction (MTP). | Official checkpoint, configuration, processor, tokenizer, and model code pinned in P0. |
 | Service | Study scheduling, Radix prefix reuse, memory ownership, speculative verification, constraints, and streaming behavior. | Architectural and behavioral reference `sgl-project/sglang` at `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. |
 | Performance | Reproduce a run independently and compare the candidate on each agreed workload. | The [benchmark agreement](performance.md) owns the vLLM pin, controls, and metrics. |
-| Candidate | Build the C++ runtime and CUDA C++ operators in `src/` with XMake and default Pixi. Keep all headers under `include/sglang/`, with server headers in `include/sglang/server/`. Use `sglang/...` includes from `include/`. | [Build options](../tools/build.sh#L5)<!-- prefix: "echo \"Usage:" --> and [XMake project](../xmake.lua#L2)<!-- prefix: "set_project(" -->. |
+| Candidate | Build `src/` with XMake and default Pixi. Use `sglang/...` includes for headers under `include/sglang/`, with server headers in `include/sglang/server/`. | [Build options](../tools/build.sh#L5)<!-- prefix: "echo \"Usage:" --> and [XMake project](../xmake.lua#L2)<!-- prefix: "set_project(" -->. |
 
 **Adopted scope.** Target one B200 with the local checkpoint and project-owned model and CUDA operators.
 
 Record verified failures and preventive checks in [development lessons](lessons.md).
 
-**Operator policy.** Exclude cuBLAS, cuBLASLt, cuDNN, CUTLASS, FlashInfer, and equivalent operator libraries or generators from production execution. Justify HTTP, JSON, tokenizer, media decoder, and system libraries. Record purpose, license, version, and execution path. Reference engines may use their own operators.
+**Operator policy.** Production excludes cuBLAS, cuBLASLt, cuDNN, CUTLASS, FlashInfer, and equivalent operator libraries or generators. Record the justification, license, version, and execution path of HTTP, JSON, tokenizer, media, and system dependencies. Reference engines may use their own operators.
 
-**Proposed scope.** Cover text generation, sampling, stopping, image and video inputs, MTP4, and concurrent scheduling. Use MXFP8 KV for grouped-query attention (GQA). Investigate GDN state and Radix prefix reuse. Verify checkpoint and service semantics before accepting OpenAI-compatible endpoints, streaming, cancellation, and JSON Schema, regex, and grammar constraints.
+**Proposed scope.** Text generation, sampling, stopping, image and video input, MTP4, concurrent scheduling, and MXFP8 grouped-query attention (GQA) KV. Investigate GDN state and Radix prefix reuse. Verify checkpoint and service semantics before accepting OpenAI-compatible endpoints, streaming, cancellation, or JSON Schema, regex, and grammar constraints.
 
 ## First task and next evidence
 
@@ -29,23 +29,23 @@ From the repository root, set `GPU_INDEX` to the reserved B200's physical index.
 bash tools/build.sh --gpu "${GPU_INDEX:?set the reserved B200 index}"
 ```
 
-The build checks the `sm_100` image and CUDA runtime. The ahead-of-time probe must print `GPU returned 42 (expected 42)` and exit successfully. Keep the command, device UUID, toolchain identities, and binary hash.
+Check the `sm_100` image and runtime. Require `GPU returned 42 (expected 42)` and exit zero. Keep the command, UUID, toolchain identities, and binary hash.
 
-For P0, use the [checkpoint investigation](research/checkpoint.md) for model semantics and pinned SGLang source mappings. Propose endpoints, API version, parameters, streaming events, and constraint semantics. Record checkpoint conflicts for scope review.
+For P0, use the [checkpoint investigation](research/checkpoint.md) for semantics and pinned SGLang mappings. Propose endpoints, API version, parameters, streaming events, and constraints. Record checkpoint conflicts.
 
-The [baseline smoke procedure](performance.md#first-baseline-run) produced the same eight greedy IDs on seven vLLM requests with BF16 KV and MTP disabled. Keep that continuation as a historical diagnostic. Use the [GQA cache comparison](performance.md#gqa-cache-comparison) for paired runs.
+The [baseline smoke](performance.md#first-baseline-run) found identical eight-ID greedy continuations across seven vLLM requests with BF16 KV and MTP off. Use the [GQA cache comparison](performance.md#gqa-cache-comparison) for paired runs.
 
 ### P1 runtime probe
 
-Use the managed Pixi toolchain. Set `GPU_INDEX` to the reserved B200's physical index.
+Use managed Pixi. Set `GPU_INDEX` to the reserved B200's physical index.
 
 ```bash
 bash tools/build.sh --build-dir build --nvrtc --gpu "${GPU_INDEX:?set the reserved B200 index}"
 ```
 
-The script checks NVRTC inside Pixi and `libcuda.so.1` outside Pixi. It exposes only the selected GPU. Check its UUID, `compute_capability=10.0`, `architecture=sm_100`, and the allocation size.
+The script checks NVRTC inside Pixi and `libcuda.so.1` outside Pixi and exposes only the selected GPU. Check UUID, `compute_capability=10.0`, `architecture=sm_100`, and allocation size.
 
-The [probe](../tools/nvrtc-probe.cpp#L265)<!-- prefix: "void run_pro" --> disables NVRTC's persistent cache. The cold lookup compiles a native cubin and loads its function. The warm lookup reuses the function in the same CUDA context.
+The [probe](../tools/nvrtc-probe.cpp#L265)<!-- prefix: "void run_pro" --> disables NVRTC's persistent cache. The cold lookup compiles and loads a cubin. The warm lookup reuses its function in the same CUDA context.
 
 Expect these results in order:
 
@@ -55,7 +55,7 @@ Expect these results in order:
 
 Both phases verify all elements and report `verified_elements=257 first=42 last=298`. CUDA events measure `kernel_ms` after buffer reset and before the host copy.
 
-Keep the command, full output, allocation size, and device, library, and binary identities.
+Keep the command, output, allocation size, and device, library, and binary identities.
 
 ### P2 GQA cache contract
 
@@ -111,7 +111,7 @@ Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L930)<!-- prefix
 | --- | --- | --- |
 | `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L281)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L102)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L529)<!-- prefix: "void Decoder" --> |
+| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L102)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L537)<!-- prefix: "void Decoder" --> |
 
 Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L89)<!-- prefix: "target(\"sgla" -->
 
@@ -141,15 +141,17 @@ The lane stream orders append, attention, and gating. Logits storage holds score
 
 Tuned FP8 projections require one target decode row in the forward group. This includes serial graphs, single-lane batch graphs, lone ordinary eager decode, and single-row verification. GQA combines Q/gate, K, and V. The MLP fusion rounds gate and up to BF16 before SwiGLU. GDN QKV and Z stay separate. [Lane selection](../src/decoder_forward.cpp#L51)<!-- prefix: "bool single_" --> · [Batch packing](../src/decoder_batch.cpp#L708)<!-- prefix: "if (rows[slo" -->
 
-Tuned GEMV requires 16-byte-aligned FP8 weights and activations and input widths of 5,120, 6,144, or 17,408. Both fusions require the same alignment and width 5,120. Q/gate, K, and V require 12,288, 1,024, and 1,024 output rows. Gate and up require 17,408 each. Other valid inputs use separate operations. Output spans must be disjoint from inputs and each other. Fused SwiGLU permits identical gate and up spans. [Tuned GEMV](../src/text_decode_fp8.cu#L276)<!-- prefix: "cudaError_t " --> · [Fused QKV](../src/text_decode_fp8.cu#L298)<!-- prefix: "cudaError_t " --> · [Fused SwiGLU](../src/text_decode_fp8.cu#L321)<!-- prefix: "cudaError_t " --> · [Buffers](../include/sglang/decoder_cuda.cuh#L153)<!-- prefix: "// Read-only" -->
+Tuned GEMV requires 16-byte-aligned FP8 weights and activations and input widths of 5,120, 6,144, or 17,408. Both fusions require the same alignment and width 5,120. Q/gate, K, and V require 12,288, 1,024, and 1,024 output rows. Gate and up require 17,408 each. Other valid inputs use separate operations. Output spans must be disjoint from inputs and each other. Fused SwiGLU permits identical gate and up spans. [Tuned GEMV](../src/text_decode_fp8.cu#L276)<!-- prefix: "cudaError_t " --> · [Fused QKV](../src/text_decode_fp8.cu#L298)<!-- prefix: "cudaError_t " --> · [Fused SwiGLU](../src/text_decode_fp8.cu#L321)<!-- prefix: "cudaError_t " --> · [Buffers](../include/sglang/decoder_cuda.cuh#L159)<!-- prefix: "// Read-only" -->
 
 Row-wise prefill and MTP draft decode use GEMV. Each forward layer divides a multirow FP8 projection into balanced groups of at most five rows. Eligible groups of two to five use packed GEMM. Other groups use GEMV. Wide GEMV and packed GEMM require 512-divisible input widths and 16-byte-aligned FP8 payloads. [Grouping](../src/decoder_forward.cpp#L59)<!-- prefix: "int projecti" --> · [GEMV](../src/text_ops.cu#L674)<!-- prefix: "cudaError_t " --> · [GEMM](../src/text_ops.cu#L692)<!-- prefix: "cudaError_t " -->
 
 Single-row BF16 RMSNorm uses vector loads at width 5,120 with 16-byte-aligned branch, gains, and optional residual. Other calls use generic kernels. [RMSNorm dispatch](../src/text_normalization.cu#L253)<!-- prefix: "cudaError_t " -->
 
-Outside MTP verification, one target decode row can use warp quantization and combined GDN gates. Quantization needs whole 128-channel groups, 8-byte-aligned BF16 input, and 4-byte-aligned E4M3 values. It preserves FP32 round-to-nearest scale and reciprocal divisions and saturated E4M3 conversion. Other valid layouts use the generic quantizer. [Dispatch](../src/decoder_forward.cpp#L71)<!-- prefix: "void quantiz" --> · [Quantizer](../src/text_decode_bandwidth.cu#L187)<!-- prefix: "cudaError_t " -->
+Outside MTP verification, one target decode row can use warp quantization and combined GDN gates. Quantization needs whole 128-channel groups, 8-byte-aligned BF16 input, and 4-byte-aligned E4M3 values. It preserves FP32 round-to-nearest scale and reciprocal divisions and saturated E4M3 conversion. Other valid layouts use the generic quantizer. [Dispatch](../src/decoder_forward.cpp#L71)<!-- prefix: "void quantiz" --> · [Quantizer](../src/text_decode_bandwidth.cu#L247)<!-- prefix: "cudaError_t " -->
 
-Combined GDN gates need matching 48-by-5,120 shapes. After the initial score, serial eager and graph decode can pair two vocabulary rows per warp. The paired LM head shares input loads across each pair and uses streaming weight loads. It needs a positive even row count. Both BF16 kernels require width 5,120 and 16-byte-aligned weights and input. They preserve two ordered FP32 FMA chains, their sum, ordered warp reduction, and BF16 rounding. Other valid shapes or alignments use the existing GEMVs. [GDN gates](../src/text_decode_bandwidth.cu#L154)<!-- prefix: "cudaError_t " --> · [LM head](../src/text_decode_bandwidth.cu#L175)<!-- prefix: "cudaError_t " -->
+Combined GDN gates need matching 48-by-5,120 shapes. After the initial score, serial eager and graph decode can pair two vocabulary rows per warp. The paired LM head shares input loads across each pair and uses streaming weight loads. It needs a positive even row count. Both BF16 kernels require width 5,120 and 16-byte-aligned weights and input. They preserve two ordered FP32 FMA chains, their sum, ordered warp reduction, and BF16 rounding. Other valid shapes or alignments use the existing GEMVs. [GDN gates](../src/text_decode_bandwidth.cu#L194)<!-- prefix: "cudaError_t " --> · [Serial LM head](../src/text_decode_bandwidth.cu#L215)<!-- prefix: "cudaError_t " -->
+
+The [width-four batch route](batch-graphs.md#runtime-path) uses a paired BF16 LM head that shares weight reads across four inputs and preserves the same per-output accumulation and rounding. It requires a positive even vocabulary size, width 5,120, and 16-byte-aligned weights and inputs. Other shapes and alignments use the generic BF16 batch projection. [Grouped LM head](../src/text_decode_bandwidth.cu#L227)<!-- prefix: "cudaError_t " -->
 
 #### Constraints and failure behavior
 

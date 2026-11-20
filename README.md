@@ -97,7 +97,7 @@ See the [multimodal decoder contract](docs/multimodal-decoder.md) for layout and
 Serial single-row target decode uses packed FP8 activation quantization, fused BF16
 Gated DeltaNet gate projections, and a paired-row BF16 LM head for eligible shapes.
 Graph and eager decode use the same arithmetic for these operations.
-[Decode operators](src/text_decode_bandwidth.cu#L154)<!-- prefix: "cudaError_t " -->
+[Decode operators](src/text_decode_bandwidth.cu#L194)<!-- prefix: "cudaError_t " -->
 
 The generator and HTTP server accept `--fp8-prefill exact|tensor-core`. The default
 `exact` uses the exact FP8 projection path. For target-only requests, `tensor-core`

@@ -558,7 +558,7 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
     job->prompt = prompt;
     job->prompt_tokens = media.empty() ? prompt.size() : expanded_tokens;
     job->options = options;
-    if (media.empty() && !job->options.requires_target_only()) {
+    if (media.empty()) {
         job->options.mtp_steps = state_->mtp_steps;
     }
     job->media = std::move(media);

@@ -4,12 +4,12 @@ A C++ and CUDA C++ inference engine in development for **Qwen3.8-27B-FP8 on one 
 The native decoder loads the official text weights and runs all 64 layers for
 token-ID generation. It uses paged MXFP8 KV storage in the 16 full-attention layers
 and carries Gated DeltaNet state through the other 48 layers. Prefill and the first
-token selection run eagerly. Serial target-only decoding uses a CUDA graph by default.
+token selection run eagerly. The direct C++ target-only decoder uses a CUDA graph by default.
 
 The reusable runtime API is in
-[`include/sglang/decoder.h`](include/sglang/decoder.h#L102)<!-- prefix: "class Decode" -->.
+[`include/sglang/decoder.h`](include/sglang/decoder.h#L104)<!-- prefix: "class Decode" -->.
 The batch scheduler options are in
-[`DecoderBatchOptions`](include/sglang/decoder_batch.h#L47)<!-- prefix: "struct Decod" -->.
+[`DecoderBatchOptions`](include/sglang/decoder_batch.h#L49)<!-- prefix: "struct Decod" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA cache and public attention implementation is in
@@ -169,14 +169,14 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
 
 The server loads one model and binds to `127.0.0.1`. `GET /health` returns the effective
 `max_active` and `max_num_batched_tokens` after model loading. The defaults are 32 active
-requests and 32,768 target rows per scheduler step. Set `--max-active 1` to use the serial
-decode graph with prefix caching disabled.
+requests and 32,768 target rows per scheduler step. All supported capacities use the same
+batch scheduler.
 Use `GET /ready` to check whether the inference worker can serve requests.
 It returns HTTP 200 with `{"ready":true}` while the worker is available. After a terminal
 worker failure, it returns HTTP 503 with `{"ready":false,"reason":"worker_failed"}`.
 `GET /health` continues to report liveness and the configured limits.
 Extra connections wait in the listener backlog until a socket worker is available.
-Both serial and batched target-only requests use the selected FP8 prefill policy.
+Target-only requests use the selected FP8 prefill policy.
 Set `--max-num-batched-tokens` from `1` through `32768` to lower the step budget. It covers
 prompt rows, ordinary decode rows, and MTP target verification rows across all scheduled requests.
 One step can contain several backend tiles per request and reuses a single tile workspace.
@@ -188,7 +188,7 @@ A request beyond total resident capacity gets HTTP 413. Temporary memory pressur
 If the CUDA stream can be drained after an admission allocation fails, the worker retires that
 request and continues serving its peers.
 A failed drain ends the affected requests. New completions return HTTP 500 until the server restarts.
-[`DecoderCapacityError`](include/sglang/decoder.h#L61)<!-- prefix: "class Decode" -->
+[`DecoderCapacityError`](include/sglang/decoder.h#L63)<!-- prefix: "class Decode" -->
 reports whether the caller can retry.
 
 With `--batch-cuda-graphs`, the server warms each eligible decode-only width
@@ -205,25 +205,25 @@ eligible lanes and 16-byte-aligned K/V throughout, [Tensor Core blocks](include/
 share KV across six query heads. Other groups use the paired split.
 
 The default `--mtp-steps 0` selects target-only decoding.
-Use `--mtp-steps 1` through `--mtp-steps 4` for unconstrained greedy and sampled text requests.
+Use `--mtp-steps 1` through `--mtp-steps 4` for greedy and sampled text requests,
+including requests with output constraints.
 MTP supports `--max-active` values from `1` through `32`.
 `--mtp-k` is an alias for `--mtp-steps`. Batched requests share target projections
 within groups of up to four requests and commit their outputs independently.
-With `--batch-cuda-graphs`, a text-only K1 group of one request can replay
-two target verification rows when both positions are below 5,120. The first
+With `--batch-cuda-graphs`, an unconstrained group with one request and two
+target verification rows can replay when both zero-based positions are below 5,120. The first
 eligible round runs eagerly. Draft, acceptance, sampling, and commit still
 run outside the graph. Other MTP verification shapes run eagerly.
 All groups in a step share the same target-row budget. SSE events and usage fields
 follow the same contract at every depth.
 
-Set `--eager` to run serial requests without graph capture or replay.
-This option requires `--max-active 1` and `--mtp-steps 0`.
+Graph capture and replay are opt-in for HTTP. Set `--eager` to disable them
+when `--batch-cuda-graphs` is also set.
 
 Set `--prefix-cache-entries` from `1` through `4` to enable
 [prefix reuse](docs/prefix-cache.md). The default is `0`.
 Keep `--mtp-steps 0` and omit `--eager`. Exact prefill remains the default.
 Use `--fp8-prefill tensor-core` to opt in to [page-aligned prefill](docs/prefix-cache.md#tensor-core-scheduling).
-Prefix reuse selects the batch route even at `--max-active 1`.
 Tensor-core cache requests keep fixed prompt tile boundaries across scheduler turns.
 Their full tiles use 128 rows, or the largest power of two within a smaller step budget.
 
@@ -308,7 +308,7 @@ largest probability. A value of `0` disables this cutoff.
 
 Pass a signed 64-bit integer `seed` to repeat the draws for the same logits.
 When you omit `seed`, the decoder selects one seed for the request.
-Unconstrained sampled text requests use the configured MTP depth.
+Sampled text requests use the configured MTP depth.
 The generator defaults to greedy selection. Use `--temperature 0` to request it explicitly.
 The generator also accepts `--top-p`, `--top-k`, `--min-p`, and `--seed`.
 The token-ID benchmark client explicitly requests greedy selection.
@@ -320,7 +320,8 @@ See the [sampling contract](docs/text-serving.md#sampling) for dispatch and seed
 ### Constrain generated output
 
 Add one of these fields to a native `/v1/completions` or text-only `/v1/chat/completions`
-request. Constrained requests use target-only decoding (K0).
+request. With MTP enabled, the draft and target select from the tokens allowed by each row's
+prefix and remaining output budget.
 
 - `{"ebnf":"root ::= \"yes\" | \"no\""}` restricts output to one listed literal.
   See the [finite-choice contract](docs/text-serving.md#finite-choice-constraints).

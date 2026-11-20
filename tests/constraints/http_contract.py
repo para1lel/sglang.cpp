@@ -200,9 +200,10 @@ def trace_slice(path, offset=0):
 
 
 def verify_verifier(path, offset, expect_work):
-    rows = re.findall(r"batch verify lanes=(\d+) rows=(\d+)", trace_slice(path, offset))
-    assert rows, (path, offset, "no verifier trace")
-    assert any(int(lanes) > 0 and int(count) > 0 for lanes, count in rows) == expect_work
+    trace = trace_slice(path, offset)
+    rows = re.findall(r"batch mtp slot=\d+ drafted=(\d+) accepted=\d+ verified=(\d+)", trace)
+    assert any(int(drafted) > 0 and int(verified) > 0
+               for drafted, verified in rows) == expect_work, (path, trace)
 
 
 def media_guard(http, args, constraint, field, label="media"):
@@ -267,16 +268,16 @@ def validate_regex(pieces, label, request, result):
 def run(args, pieces, cases, validate, reject, media):
     with serve(args, pieces) as http:
         log = args.output / "server.log"
-        if args.mtp and args.width > 1 and not args.standin:
+        if args.mtp and not args.standin:
             request = body("text", 16, ignore_eos=True)
             offset = log.stat().st_size
             http.call("ordinary-mtp-control", "text", request)
             verify_verifier(log, offset, True)
         offset = log.stat().st_size
         http.pairs(cases, args.width, validate)
-        if args.mtp and args.width > 1 and not args.standin:
-            verify_verifier(log, offset, False)
-            if args.graph:
+        if not args.standin:
+            verify_verifier(log, offset, bool(args.mtp))
+            if args.graph and not args.mtp:
                 assert re.search(r"batch graph_slots=[1-9]\d*", trace_slice(log, offset))
         offset = log.stat().st_size
         reject(http, args)
@@ -292,7 +293,7 @@ def arguments():
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--width", type=int, choices=(1, 4), default=1)
-    parser.add_argument("--mtp", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--mtp", type=int, choices=range(5), default=0)
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--standin", action="store_true")

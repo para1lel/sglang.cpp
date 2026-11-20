@@ -7,6 +7,8 @@
 
 namespace sglang {
 
+namespace decoder { struct SerialMtpOutput; }
+
 inline constexpr int decoder_batch_max_lanes = 32;
 inline constexpr int decoder_batch_max_step_tokens = 32768;
 inline constexpr int decoder_batch_max_graph_lanes = 4;
@@ -100,6 +102,9 @@ public:
     bool available() const;
 
 private:
+    friend class Decoder;
+    void generate_mtp(const std::vector<int>& prompt, const DecoderOptions& options,
+                      const decoder::SerialMtpOutput& output, DecoderResult& result);
     int admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& options,
                    const std::vector<DecoderMedia>* media);
     struct State;

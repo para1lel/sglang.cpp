@@ -1,4 +1,4 @@
-# Native regex constraints
+# Native output constraints
 
 Build `sglang-server` in Release mode. Run the commands from the repository
 root inside the project's Pixi environment. Set `build` to the build output
@@ -16,6 +16,12 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
     -L"$CONDA_PREFIX/lib" -lcudart -pthread -ldl -lrt \
     -o "$build/bin/mtp-guard"
 "$build/bin/mtp-guard" "$checkpoint/tokenizer.json"
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
+    -I"$CONDA_PREFIX/targets/x86_64-linux/include" "$tests/mtp_native.cpp" \
+    -Wl,--start-group "$build/lib/"*.a -Wl,--end-group \
+    -L"$CONDA_PREFIX/lib" -lcudart -pthread -ldl -lrt \
+    -o "$build/bin/mtp-native"
+"$build/bin/mtp-native" "$checkpoint"
 python "$tests/token_oracle.py" "$build/bin/token-probe" \
     "$checkpoint/tokenizer.json" "$evidence/masks"
 ```
@@ -30,17 +36,32 @@ GPU before starting the server.
 
 ```bash
 server="$build/bin/sglang-server"
-python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/serial"
+python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/w1"
 python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/eager" --eager
 python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/graph" \
     --width 4 --graph --mtp 1
-python "$tests/integration.py" "$server" "$checkpoint" "$evidence/depth-serial" --mtp 1
-python "$tests/integration.py" "$server" "$checkpoint" "$evidence/depth-mixed" \
-    --width 4 --graph --mtp 1
+for width in 1 4; do
+    for depth in 1 2 3 4; do
+        python "$tests/schema_integration.py" "$server" "$checkpoint" \
+            "$evidence/w$width-k$depth" --width "$width" --graph --mtp "$depth"
+    done
+done
 python "$tests/integration.py" "$server" "$checkpoint" "$evidence/tensor-prefix" \
     --width 4 --graph --prefill tensor-core --cache-entries 4
 ```
 
-Append `--media-body "$media_request" --media-sha256 "$media_hash"` to a serial
-command to check a decoded image request before and after rejecting constraints
-on that route. The body must be a valid, unconstrained chat request.
+The native probe compares serial and batched token IDs with depth-zero controls.
+Its counters cover full, partial, and zero proposal acceptance, replay, terminal
+drafts, and a batch with both positive-depth and depth-zero lanes.
+
+The HTTP integration requires `jsonschema` 4.26.0. Each positive-depth run
+starts a matching depth-zero server with exact prefill and compares the full
+lists of token IDs and the finish reasons. The trace shows draft and verification
+activity for finite-choice EBNF, regular expressions, and JSON Schema on both
+routes. At capacity four, the integration check also verifies joint verification
+and retirement after mixed requests.
+
+Append `--media-body "$media_request" --media-sha256 "$media_hash"` to a
+capacity-one command. The check sends the valid image request before and after
+it verifies that media requests with constraints are rejected. The body must be
+a valid, unconstrained chat request.

@@ -92,6 +92,8 @@ public:
     const std::vector<int>& ids() const { return candidates_; }
     const std::vector<std::uint32_t>& mask() const { return mask_; }
 
+    void reset_to(const ConstraintCursor& other) { node_ = other.node_; }
+
     bool commit(const TokenConstraint& constraint, int token, int remaining) {
         const auto& node = constraint.nodes_[node_];
         if (constraint_eos(token) && node.accepting) {

@@ -1,4 +1,4 @@
-"""Exercise K1 target graph replay through the native HTTP batch scheduler."""
+"""Exercise two-row target graph replay through the native HTTP batch scheduler."""
 
 import argparse
 import ctypes
@@ -130,7 +130,8 @@ def check_rounds(wire, traces):
     http.require(all(any(row[0] == 1 and row[2] == 2 for row in rows[name])
                      for name in ("last-bound", "straddles", "outside", "sampled",
                                   "replacement")), rows)
-    http.require(not rows["selector"], rows["selector"])
+    http.require(any(drafted == 1 and verified > 0
+                     for drafted, _, verified, _, _ in rows["selector"]), rows["selector"])
     return rows
 
 
@@ -183,6 +184,32 @@ def observed_exercise(args, arm, graphs, clock):
     return wire, traces, intervals, activity
 
 
+def check_capped_depth(args):
+    records = {}
+    graph_launches = {}
+    for arm in ("eager", "graph"):
+        output = args.evidence / f"k4-two-rows-{arm}"
+        activity = output.with_suffix(".cupti.tsv")
+        flags = ("--batch-cuda-graphs",) if arm == "graph" else ("--eager",)
+        with patch.dict(os.environ, LD_PRELOAD=str(args.activity),
+                        BATCH_GRAPH_ACTIVITY=str(activity)):
+            with http.server(args, output, 1, 4, flags=flags, token_budget=2) as (port, log):
+                request(port, log, output, "warm", http.TEXT, benchmark(4, 8))
+                row, trace = request(port, log, output, "sampled", http.TEXT, http.MAIN)
+        rounds = [tuple(map(int, value[1:])) for value in ROUND.findall(trace)]
+        http.require(any(drafted == 1 and verified == 2
+                         for drafted, _, verified, _, _ in rounds), (arm, rounds))
+        http.require(all(verified <= 2 for _, _, verified, _, _ in rounds), (arm, rounds))
+        completions, _ = graph_trace(activity)
+        graph_launches[arm] = len(completions)
+        records[arm] = row, rounds
+    http.require(records["graph"] == records["eager"], records)
+    http.require(graph_launches["graph"] > 0 and graph_launches["eager"] == 0, graph_launches)
+    http.write_json(args.evidence / "k4-two-rows.json", {
+        "completion_counts": graph_launches, "transcript_and_rounds": records,
+    })
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
@@ -207,7 +234,8 @@ def main():
                  "K1 graph changed speculative round accounting")
     check_replays(*eager, False)
     http.write_json(args.evidence / "replays.json", check_replays(*graph, True))
-    print("K1 HTTP output, retirement and round accounting match", flush=True)
+    check_capped_depth(args)
+    print("K1 and capped K4 HTTP two-row graph checks passed", flush=True)
 
 
 if __name__ == "__main__":

@@ -12,16 +12,16 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L153)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L448)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and validate the request. | [Route](../apps/sglang-server.cpp#L147)<!-- prefix: "} else if (r" --> · [Cache-enabled route](../apps/server/prefix_controls.cpp#L24)<!-- prefix: "bool chat_ro" --> · [Request parser](../apps/server/text_request.cpp#L448)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L421)<!-- prefix: "std::string " --> |
 | Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L61)<!-- prefix: "DecoderResul" --> |
-| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L199)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L217)<!-- prefix: "void TextRes" --> |
+| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L198)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L216)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
 
 The server parses chat once as ordered JSON and returns HTTP 400 for floating-point range errors. It preserves oversized integer `top_k` values for validation and clamping. The native renderer uses the pinned checkpoint's template rules and literals. The [shared tokenizer](text-serving.md#tokenizer-assets) encodes the rendered prompt without adding special tokens.
 
-Serial text chat calls `Decoder::generate`. Batch chat submits the IDs to `BatchService::generate` with the connection's worker slot. Rendering, tokenization, and response writing run outside CUDA graphs. Eligible decode cohorts can mix text chat, [raw strings](text-serving.md), and [benchmark ID requests](../benchmarks/streaming/README.md#wire-contract). [Serial dispatch](../apps/server/completions.cpp#L253)<!-- prefix: "void complet" --> · [Batch dispatch](../apps/server/completions.cpp#L284)<!-- prefix: "void complet" -->
+Text chat submits the IDs to `BatchService::generate` with the connection's worker slot. Rendering, tokenization, and response writing run outside CUDA graphs. Eligible decode groups can mix text chat, [raw strings](text-serving.md), and [benchmark ID requests](../benchmarks/streaming/README.md#wire-contract). [Batch dispatch](../apps/server/completions.cpp#L232)<!-- prefix: "void complet" -->
 
 For media chat, the parser substitutes template placeholders in attachment order. The CPU prepares patches and expands the rendered IDs. The connection worker encodes vision features before it submits language generation to the [multimodal decoder](multimodal-decoder.md). Zero-budget or already cancelled requests skip vision encoding. Usage counts the expanded prompt IDs. Vision encoding stays outside the target step cap.
 
@@ -35,7 +35,7 @@ The first SSE chunk carries `delta.role: "assistant"` and a null finish reason. 
 
 JSON responses always include usage. `prompt_tokens` counts rendered prompt IDs. `completion_tokens` counts committed output IDs. `total_tokens` sums both counts. `prompt_tokens_details.cached_tokens` counts [restored prompt IDs](prefix-cache.md#runtime-path). Chat uses the [same stop and finish rules as raw text](text-serving.md#read-the-response).
 
-With `return_token_ids: true`, each committed ID appears once in `token_ids`, even when it produces empty text. A UTF-8 tail flush can carry text with zero IDs. In text chat, `prompt_token_ids` appears in the JSON choice or the first diagnostic SSE choice after the role. Media chat puts the expanded `prompt_token_ids` at the top level of the JSON response or the initial assistant SSE chunk. Media usage counts expanded prompt IDs. [Diagnostic choice](../apps/server/text_completion.cpp#L129)<!-- prefix: "std::string " --> · [Role delta](../apps/server/text_completion.cpp#L154)<!-- prefix: "bool TextRes" -->
+With `return_token_ids: true`, each committed ID appears once in `token_ids`, even when it produces empty text. A UTF-8 tail flush can carry text with zero IDs. In text chat, `prompt_token_ids` appears in the JSON choice or the first diagnostic SSE choice after the role. Media chat puts the expanded `prompt_token_ids` at the top level of the JSON response or the initial assistant SSE chunk. Media usage counts expanded prompt IDs. [Diagnostic choice](../apps/server/text_completion.cpp#L128)<!-- prefix: "std::string " --> · [Role delta](../apps/server/text_completion.cpp#L153)<!-- prefix: "bool TextRes" -->
 
 ## Constraints and failure behavior
 
@@ -68,9 +68,9 @@ The rendered prompt and its output budget share the 262,144-token context. The r
 
 The first request that reaches rendering loads the pinned `tokenizer_config.json` and `chat_template.jinja` from the checkpoint directory. A missing, unreadable, or mismatched chat asset returns HTTP 500 before output starts. Later chat requests retry a failed load. Raw text can still load `tokenizer.json` independently. The benchmark ID route requires neither tokenizer nor chat assets.
 
-Chat and completion routes share [resident memory admission](batch-graphs.md#resident-memory-admission) and [batch graph eligibility](batch-graphs.md). Unconstrained text-only chat can use the configured [MTP depth](mtp.md). Constrained and media chat use K0.
+Chat and completion routes share [resident memory admission](batch-graphs.md#resident-memory-admission) and [batch graph eligibility](batch-graphs.md). Text-only chat uses the configured [MTP depth](mtp.md#runtime-path), including requests with an output constraint. Media chat uses K0.
 
-A reset or failed write cancels the request and discards its pending UTF-8 bytes. In batch mode, the server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream without `[DONE]`. [Request lifecycle](../apps/server/text_completion.cpp#L253)<!-- prefix: "void complet" -->
+A reset or failed write cancels the request and discards its pending UTF-8 bytes. The server retires the lane before it reuses the slot. If generation fails after SSE starts, the server attempts an error event and closes the stream without `[DONE]`. [Request lifecycle](../apps/server/text_completion.cpp#L252)<!-- prefix: "void complet" -->
 
 ### Sampling defaults and output budget
 
@@ -82,7 +82,7 @@ If both budgets are absent or null, the output limit is 262,142 minus the final 
 
 ### Image and video inputs
 
-Media chat accepts up to four attachments in `user` content and preserves their order among text parts. It uses private eager K0 state in both serial and batch serving. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Routes](../apps/sglang-server.cpp#L256)<!-- prefix: "if (argument" -->
+Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Each media lane uses private eager K0 state. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Media depth selection](../apps/server/batch_service.cpp#L561)<!-- prefix: "if (media.em" -->
 
 Omit `add_special_tokens` or set it to `false`. Set `enable_thinking` at the top level or as the only member of `chat_template_kwargs`.
 
@@ -115,13 +115,13 @@ Require exact rendered prompt IDs and usage against the frozen template fixtures
 
 Check both sampling default modes with omitted, null, and explicit controls. Check budget alias priority in both field orders. Check the omitted-budget boundary after tokenization and media expansion. Fix the seed and score history. Compare output IDs and usage across JSON and SSE. Include a text stop that spans tokens.
 
-For a K4 check, match prompt IDs, committed IDs, finish reasons, and usage against MTP off. Use the same chat fixtures and limits at width one and with overlapping requests. For batch graphs, overlap chat, raw text, and benchmark ID requests. Compare each response with a same-policy control. Correlate a multi-lane decode mask with an actual CUDA graph launch. Reset a chat stream while a peer is active. Check the peer and replacement request against their controls.
+Compare prompt IDs, committed IDs, finish reasons, and usage for unconstrained K4 and K0 requests. Use the same chat fixtures and limits at width one and with overlapping requests. For constrained chat, follow the [constrained MTP checks](mtp.md#constrained-verification). For batch graphs, overlap chat, raw text, and benchmark ID requests. Compare each response with a same-policy control. Correlate a multi-lane decode mask with an actual CUDA graph launch. Reset a chat stream while a peer is active. Check the peer and replacement request against their controls.
 
 For serving performance, record template and tokenizer assets, request bytes, rendered prompt IDs, stops, and active decoder options. Use the [performance contract](performance.md) for frozen comparisons and timing definitions. Keep chat checks separate from W1–W6.
 
 ### Media checks
 
-Reserve a B200 and set `checkpoint` to the pinned checkpoint path. Build and start the release server with serial, cache-off, exact K0 options.
+Reserve a B200 and set `checkpoint` to the pinned checkpoint path. Build the release server. Start it at capacity one with prefix reuse off and exact K0.
 
 ```bash
 xmake f -P . -m release -o build/media-server
@@ -151,7 +151,7 @@ xmake f -P . -m release --media-codec-prefix="$codec_prefix" -o build/media-serv
 xmake build -P . sglang-server
 ```
 
-Start the codec-enabled server on the reserved B200 using the serial cache-off route. Verify the [pinned media corpus](../benchmarks/media/README.md), then send its image and video bodies unchanged.
+Start the codec-enabled server on the reserved B200 with prefix reuse off. Verify the [pinned media corpus](../benchmarks/media/README.md), then send its image and video bodies unchanged.
 
 ```bash
 python3 -B -m benchmarks.media.collect verify

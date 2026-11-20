@@ -58,17 +58,6 @@ std::optional<std::vector<DecoderMedia>> VisionCompletion::encode(
     return media;
 }
 
-DecoderResult VisionCompletion::generate(const Decoder& decoder, const MediaPrompt& prompt,
-                                        const DecoderOptions& options,
-                                        const DecoderCallbacks& callbacks) {
-    if (options.max_new_tokens == 0) {
-        return callbacks.is_cancelled && callbacks.is_cancelled() ? cancelled() : DecoderResult{};
-    }
-    auto media = encode(prompt, callbacks);
-    return media ? decoder.generate_multimodal(prompt.template_ids, *media, options, callbacks)
-                 : cancelled();
-}
-
 DecoderResult VisionCompletion::generate(BatchService& service, int slot, const MediaPrompt& prompt,
                                         const DecoderOptions& options,
                                         const DecoderCallbacks& callbacks) {

@@ -9,11 +9,11 @@ Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finit
 | HTTP request | Validate the constraint fields and compile with the checkpoint tokenizer. | [Request validation](../apps/server/text_request.cpp#L179)<!-- prefix: "void set_con" --> |
 | Regular expression compiler | Build the token transition table and compute the minimum budget. | [Tokenizer compiler](../src/tokenizer/regex_constraint.cpp#L67)<!-- prefix: "std::shared_" --> |
 | Schema compiler | Convert the supported schema to a token constraint. | [Schema compiler](../src/tokenizer/json_schema.cpp#L267)<!-- prefix: "std::shared_" --> |
-| Decoder | Apply the request cursor to target scores and commit the selected ID. | [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [Cursor update](../include/sglang/decoder_constraint.h#L95)<!-- prefix: "bool commit(" --> |
+| Decoder | Apply the request cursor to target scores and commit the selected ID. | [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [Cursor update](../include/sglang/decoder_constraint.h#L97)<!-- prefix: "bool commit(" --> |
 
 ## Runtime path
 
-The server compiles the constraint before it starts generation. The decoder scores the request, filters candidates by its cursor, and updates the cursor after selection.
+The server compiles the constraint before it starts generation. The decoder filters candidates by the request cursor and updates it for each committed token. The same selection and finish rules apply at [positive MTP depths](mtp.md#constrained-mtp).
 
 ## Constraints and failure behavior
 
@@ -94,13 +94,13 @@ C++ callers can pass an ordered schema object to `TokenConstraint::compile_json_
 
 ### Selection and finish
 
-Each request owns its cursor. The cursor excludes tokens that cannot lead to a match within the remaining budget. With up to 4,096 allowed IDs, CUDA gathers their BF16 scores. For larger sets it masks disallowed scores to negative infinity in a vocabulary-sized row. Both routes use the usual greedy tie rule or [sampling](text-serving.md#sampling) over the allowed scores. Selection runs after eager scoring or eligible graph replay.
+Each request owns its cursor. The cursor excludes tokens that cannot lead to a match within the remaining budget. With up to 4,096 allowed IDs, CUDA gathers their BF16 scores. For larger sets it masks disallowed scores to negative infinity in a vocabulary-sized row. Both routes use the usual greedy tie rule or [sampling](text-serving.md#sampling) over the allowed scores. Selection runs after eager scoring or eligible K0 graph replay. Positive-depth requests use [constrained MTP](mtp.md#constrained-mtp).
 
 A match with no continuation stops immediately. Acceptance at the last allowed token also stops. Neither case adds EOS. With budget left at a match that can continue, either model EOS ID can compete with valid continuations. A selected EOS counts in usage and diagnostic IDs. Its text is omitted. A nullable regex with `max_tokens: 0` returns no IDs and `finish_reason: "length"`. A completed match during decoding returns `stop`.
 
-HTTP 400 covers conflicting constraints, invalid input, compiler limits, and an impossible token budget. Omit `stop_token_ids` entirely. Leave `ignore_eos` false. Omit nonempty text stops. Constraints use K0 even when the server has positive MTP depth. The benchmark model and HTTP media chat reject `regex` and `response_format`. A full prefix hit uses the new request's constraint and seed for its first eager selection. [Prefix reuse](prefix-cache.md#runtime-path)
+HTTP 400 covers conflicting constraints, invalid input, compiler limits, and an impossible token budget. Omit `stop_token_ids` entirely. Leave `ignore_eos` false. Omit nonempty text stops. The benchmark model and HTTP media chat reject `regex` and `response_format`. At K0, a full prefix hit uses the new request's constraint and seed for its first eager selection. [Prefix reuse](prefix-cache.md#runtime-path)
 
-C++ callers can use `TokenConstraint::compile_regex(tokenizer, pattern)` with the checkpoint tokenizer. Use the [shared C++ constraint options](text-serving.md#finite-choice-constraints) and set `mtp_steps = 0`.
+C++ callers can use `TokenConstraint::compile_regex(tokenizer, pattern)` with the checkpoint tokenizer. Use the [shared C++ constraint options](text-serving.md#finite-choice-constraints).
 
 ## Verification
 
@@ -116,3 +116,9 @@ Repeat with `stream: true`, `return_token_ids: true`, and `stream_options: {"inc
 Use the pinned tokenizer for a CPU oracle of allowed continuations. Compare sparse and wide selection with a score oracle on identical BF16 rows. Include a fixed seed and ties. On a reserved B200, trace eager and graph routes with mixed K0 lanes. Change the constraint on a full prefix hit and compare with its cold control. Require HTTP 400 for invalid syntax, conflicts, and an impossible budget. Record compilation time separately from prefill and decode.
 
 For JSON Schema, run the example on both endpoints. Parse the joined response text and verify the property order, required keys, and scalar values. Include optional keys before and after required keys, bounded arrays, and escaped Unicode. Try an unsupported keyword, `strict: false`, a conflicting constraint, and a budget too small for valid JSON. Require HTTP 400 before SSE begins for each invalid request.
+
+### Positive-depth checks
+
+Use the release server and pinned checkpoint on a reserved B200. Follow the [constraint integration procedure](../tests/constraints/README.md) at capacities one and four. Compare K1 and K4 with exact-policy K0 on both native HTTP endpoints. Include finite-choice EBNF, regex, and JSON Schema. Check greedy and seeded selection, JSON and SSE, diagnostic IDs, finish reasons, and usage. Investigate differing IDs by comparing the scores on matching token histories.
+
+Check the trace for draft proposals and target verification. Enable graphs and check that constrained verification stays eager. At wider capacity, check mixed lanes, stream reset, and slot reuse. Run the C++ constraint probe at depths zero through four. Check acceptance, rollback, terminal proposals, EOS with budget left, and completion at the budget.

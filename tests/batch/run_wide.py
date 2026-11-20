@@ -25,14 +25,11 @@ def check_cli(args):
     valid.extend((["--max-active", str(width), "--mtp-steps", str(depth)], NO_DEVICE)
                  for width in (1, 2, 3, 4, 5, *WIDTHS) for depth in (1, 4))
     valid.extend((["--max-active", str(width), "--batch-cuda-graphs"], NO_DEVICE)
-                 for width in WIDTHS)
+                 for width in (1, *WIDTHS))
     invalid = [(["--max-active", value], "--max-active in [1,")
                for value in ("0", "-1", "33", "wide", "2147483648")]
-    invalid.extend([
-        (["--max-active", "4", "--mtp-steps", "5"], "--mtp-steps in [0, 4]"),
-        (["--max-active", "1", "--batch-cuda-graphs"], "--batch-cuda-graphs requires"),
-        (["--max-active", "16", "--eager"], "--eager requires --max-active 1"),
-    ])
+    valid.append((["--max-active", "16", "--eager"], NO_DEVICE))
+    invalid.append((["--max-active", "4", "--mtp-steps", "5"], "--mtp-steps in [0, 4]"))
     missing = args.evidence / "no-checkpoint"
     records = []
     for flags, diagnostic in valid + invalid:

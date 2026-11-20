@@ -29,10 +29,9 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
 void set_cache_salt(const json::Object& object, DecoderOptions& options);
 void append_ids(std::string& output, const int* ids, std::size_t count);
 void complete_text(const Socket& connection, const TextRequest& request,
-                   const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                   bool trace_serial);
+                   const CompletionTokenizer& tokenizer, const TextGenerator& generate);
 void complete_chat_request(const Socket& connection, std::string_view body,
                            const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                           const MediaGenerator& generate_media, bool trace_serial);
+                           const MediaGenerator& generate_media);
 
 }

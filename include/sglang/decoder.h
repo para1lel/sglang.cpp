@@ -39,7 +39,9 @@ struct DecoderOptions {
     bool incremental_kv = false;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
-    bool requires_target_only() const { return constraint != nullptr; }
+
+    /// No text option requires target-only decoding. Media and cache checks are separate.
+    bool requires_target_only() const { return false; }
 
     bool stops_at(int token) const {
         return stop_token_id == token || additional_stop_token_ids.count(token) != 0;

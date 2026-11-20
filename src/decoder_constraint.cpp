@@ -25,31 +25,30 @@ std::size_t ConstraintWorkspace::bytes() const {
     return sparse + mask_bytes + masked_bytes;
 }
 
-void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
-                        const ConstraintCursor& cursor, const SamplingParameters* sampling,
+void select_constrained(LogitSelection work, const ConstraintWorkspace& scratch,
+                        ConstraintCandidates allowed, const SamplingParameters* sampling,
                         int position, void* sampling_workspace, cudaStream_t stream) {
-    const auto& allowed = cursor.ids();
-    if (allowed.empty()) {
+    if (allowed.count == 0) {
         throw std::logic_error("Output constraint has no remaining continuation");
     }
-    const auto& mask = cursor.mask();
-    const bool wide = !mask.empty();
-    const int count = wide ? vocab_size : static_cast<int>(allowed.size());
+    const bool wide = allowed.mask != nullptr;
+    const int count = wide ? vocab_size : allowed.count;
     const auto* logits = wide ? scratch.masked_logits : scratch.logits;
     if (wide) {
-        check(cudaMemcpyAsync(scratch.mask, mask.data(), mask.size() * sizeof(std::uint32_t),
+        check(cudaMemcpyAsync(scratch.mask, allowed.mask,
+                              constraint_mask_words * sizeof(std::uint32_t),
                               cudaMemcpyHostToDevice, stream), "Upload allowed token mask");
         check(mask_constrained_logits(work.logits, scratch.mask, scratch.masked_logits,
                                       count, stream), "Mask disallowed logits");
     } else {
-        check(cudaMemcpyAsync(scratch.ids, allowed.data(), count * sizeof(int),
+        check(cudaMemcpyAsync(scratch.ids, allowed.ids, count * sizeof(int),
                               cudaMemcpyHostToDevice, stream), "Upload allowed token IDs");
         check(gather_constrained_logits(work.logits, scratch.ids, scratch.logits, count, stream),
               "Gather allowed logits");
     }
     if (sampling) {
         auto parameters = *sampling;
-        parameters.top_k = std::min(parameters.top_k, static_cast<int>(allowed.size()));
+        parameters.top_k = std::min(parameters.top_k, allowed.count);
         check(sample_logits(logits, count, &work.argmax->token_id, parameters,
                             position, sampling_workspace, stream), "Sample allowed logits");
     } else {
@@ -59,6 +58,15 @@ void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
     const auto* ids = wide ? nullptr : scratch.ids;
     check(remap_constrained_token(logits, ids, count, &work.argmax->token_id, stream),
           "Resolve allowed token ID");
+}
+
+void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
+                        const ConstraintCursor& cursor, const SamplingParameters* sampling,
+                        int position, void* sampling_workspace, cudaStream_t stream) {
+    const ConstraintCandidates allowed{static_cast<int>(cursor.ids().size()), cursor.ids().data(),
+                                       cursor.mask().empty() ? nullptr : cursor.mask().data()};
+    select_constrained({work.logits, work.argmax_scratch, work.argmax}, scratch, allowed, sampling,
+                       position, sampling_workspace, stream);
 }
 
 }

@@ -29,9 +29,15 @@ class TargetVerification;
 struct VerificationSequence;
 struct VerificationRow;
 struct VerificationGraph;
+struct MtpRound;
 struct SamplingParameters;
 
 using Bf16 = __nv_bfloat16;
+
+struct SerialMtpOutput {
+    const std::function<bool()>& is_cancelled;
+    std::function<bool(int, const Bf16*)> emit;
+};
 
 inline constexpr int hidden_size = 5120;
 inline constexpr int intermediate_size = 17408;
@@ -101,6 +107,7 @@ struct TransferBuffers {
     int winner = -1;
     std::vector<Bf16> logits;
     std::shared_ptr<void> verification_results;
+    std::shared_ptr<void> mtp_constraint_inputs;
 };
 
 class Allocations {
@@ -224,6 +231,22 @@ struct ConstraintWorkspace {
     std::size_t bytes() const;
 };
 
+struct ConstraintCandidates {
+    int count;
+    const int* ids;
+    const std::uint32_t* mask;
+};
+
+struct LogitSelection {
+    const Bf16* logits;
+    TextLogitCandidate* argmax_scratch;
+    TextLogitCandidate* argmax;
+};
+
+void select_constrained(LogitSelection work, const ConstraintWorkspace& scratch,
+                        ConstraintCandidates allowed, const SamplingParameters* sampling,
+                        int position, void* sampling_workspace, cudaStream_t stream);
+
 void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
                         const ConstraintCursor& cursor, const SamplingParameters* sampling,
                         int position, void* sampling_workspace, cudaStream_t stream);
@@ -252,6 +275,7 @@ struct Request {
 };
 
 void copy_token(Request& request, const Workspace& work, cudaStream_t stream);
+int validate_winner(int winner, bool sampled, bool constrained);
 int read_token(Request& request, bool sampled, bool constrained = false);
 
 struct ForwardLane {
@@ -294,15 +318,14 @@ struct BatchGraphScratch {
 namespace sglang {
 
 struct Decoder::Model {
-    struct MtpGeneration;
-
     Model(const std::filesystem::path& checkpoint, int cuda_device, Fp8PrefillPolicy fp8_prefill);
 
     Fp8PrefillPolicy fp8_prefill() const { return fp8_prefill_; }
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
-    void forward_verify(decoder::TargetVerification& verification, int position,
-                        const int* tokens, int count, cudaStream_t stream) const;
+    bool verify_mtp(decoder::MtpRound* rounds, int count,
+                    const decoder::ConstraintWorkspace& scratch, void* sampling_scratch,
+                    cudaStream_t stream, decoder::VerificationGraph* graph = nullptr) const;
     bool forward_verify(const decoder::VerificationSequence* sequences, int count,
                         cudaStream_t stream, decoder::VerificationGraph* graph = nullptr) const;
     void enqueue_verification(const decoder::VerificationRow* rows, int count,

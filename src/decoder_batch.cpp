@@ -16,7 +16,6 @@ namespace {
 
 using namespace decoder;
 
-using VerificationTokens = std::array<int, target_verify_max_rows>;
 static_assert(decoder_batch_max_mtp_steps + 1 == target_verify_max_rows);
 
 struct Lane {
@@ -30,6 +29,7 @@ struct Lane {
     std::unique_ptr<TargetVerification> verification = nullptr;
     std::optional<SamplingParameters> sampling = std::nullopt;
     ConstraintCursor constraint{};
+    std::optional<MtpConstraintRound> constraint_round{};
     int checkpoint = 0;
     bool restored_prompt = false;
     std::shared_ptr<const MultimodalInput> media = nullptr;
@@ -56,10 +56,13 @@ struct Lane {
                 rotary};
     }
 
-    void select_token(int token, DecoderBatchStep& result) {
+    void select_token(int token, DecoderBatchStep& result, const Bf16* logits = nullptr,
+                      const SerialMtpOutput* output = nullptr) {
         last_token = token;
         ++generated;
-        if (options.constraint) {
+        if (output && !output->emit(token, logits)) {
+            result.finish_reason = DecoderFinishReason::cancelled;
+        } else if (options.constraint) {
             if (constraint.commit(*options.constraint, token, remaining_output())) {
                 result.finish_reason = DecoderFinishReason::constraint;
             }
@@ -70,47 +73,36 @@ struct Lane {
         }
     }
 
-    void finish_round(const VerificationTokens& tokens, int rows, DecoderBatchStep& result,
-                      cudaStream_t stream) {
-        result.mtp_drafted_tokens = rows - 1;
-        result.mtp_verified_rows = rows;
-        draft->rewind(position);
-        int consumed = 0;
-        for (int index = 0; index < rows; ++index) {
-            int token;
-            try {
-                token = verification->winner(index, sampling.has_value());
-            } catch (const DecoderSamplingError&) {
-                result.sampling_failed = true;
-                break;
+    void finish_round(MtpRound& round, DecoderBatchStep& result, cudaStream_t stream,
+                      const SerialMtpOutput* output, const MtpRound::Cancel& cancel) {
+        result.mtp_drafted_tokens = round.drafted;
+        result.mtp_verified_rows = round.rows();
+        try {
+            const bool completed = round.commit([&](int token, const Bf16* logits, bool accepted) {
+                if (!result.token) {
+                    result.token = token;
+                } else {
+                    result.extra_tokens[result.extra_token_count++] = token;
+                }
+                result.mtp_accepted_tokens += accepted;
+                select_token(token, result, logits, output);
+                return !result.finish_reason;
+            }, stream, cancel);
+            if (!completed) {
+                result.finish_reason = DecoderFinishReason::cancelled;
             }
-            if (index == 0) {
-                result.token = token;
-            } else {
-                result.extra_tokens[result.extra_token_count++] = token;
-            }
-            ++consumed;
-            const bool accepted = index < rows - 1 && token == tokens[index + 1];
-            result.mtp_accepted_tokens += accepted;
-            select_token(token, result);
-            if (!accepted || result.finish_reason) {
-                break;
-            }
-            const auto row = verification->row(index);
-            draft->enqueue(row.position, token, row.work->normalized, false, stream);
+        } catch (const DecoderSamplingError&) {
+            result.sampling_failed = true;
+            return;
+        } catch (const DecoderConstraintError&) {
+            result.constraint_failed = true;
+            return;
         }
         if (result.extra_token_count != 0) {
             result.extra_token = result.extra_tokens.front();
         }
-        if (!result.finish_reason && !result.sampling_failed) {
-            const auto* hidden = verification->row(consumed - 1).work->normalized;
-            check(cudaMemcpyAsync(request->work.normalized, hidden, hidden_size * sizeof(Bf16),
-                                  cudaMemcpyDeviceToDevice, stream),
-                  "Carry batched target hidden state into next draft");
-        }
-        result.mtp_replayed_rows = consumed < rows ? consumed : 0;
-        verification->commit(consumed);
-        position += consumed;
+        result.mtp_replayed_rows = round.consumed < round.rows() ? round.consumed : 0;
+        position += round.consumed;
     }
 };
 
@@ -149,14 +141,6 @@ constexpr int batch_prefill_tile_rows = 1024;
 constexpr std::size_t decoder_shared_reserve = std::size_t{2} * 1024 * 1024 * 1024;
 static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
 static_assert(prefill_chunk_rows == mxfp8_page_size);
-
-struct DraftRound {
-    Lane* lane;
-    VerificationTokens tokens;
-    int count;
-    const Bf16* hidden;
-    int slot;
-};
 
 PrefillRows plan_prefill(const BatchStorage& storage, const Selection& selected, bool chunked) {
     PrefillRows rows{};
@@ -375,7 +359,6 @@ struct DecoderBatch::State {
     void score(Lane& lane, Request& request, Workspace& work, bool logits_ready);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats);
-    void draft_proposals(DraftRound* rounds, int count, int longest);
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring, Steps&);
     std::size_t reserve(DecoderOptions& request, int prompt, std::size_t media_bytes) const;
     void initialize(Lane& lane);
@@ -427,6 +410,10 @@ struct DecoderBatch::State {
     std::array<bool, decoder_batch_max_graph_lanes> graph_warmed{};
     int prefill_cursor = 0;
     bool failed = false;
+    const SerialMtpOutput* output = nullptr;
+    MtpRound::Cancel no_cancel;
+    const auto& cancel_probe() const { return output ? output->is_cancelled : no_cancel; }
+    bool cancelled() const { return output && output->is_cancelled && output->is_cancelled(); }
 };
 
 DecoderBatch::DecoderBatch(const Decoder& decoder)
@@ -505,7 +492,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     state_->require_ready();
     auto& lane = state_->slot_at(slot);
     auto options = requested;
-    if (lane || options.top_logits != 0) {
+    if (lane || (options.top_logits != 0 && !state_->output)) {
         throw std::invalid_argument("Decoder batch requires an empty slot and no top logits");
     }
     auto input = media ? prepare_input(prompt, *media, state_->model.memory) : nullptr;
@@ -539,6 +526,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         }
         auto request = std::make_unique<Request>(state_->model.device);
         lane.emplace(Lane{std::move(request), std::move(prompt), options});
+        if (options.top_logits > 0) lane->request->memory.transfers().logits.resize(vocab_size);
         if (options.samples()) lane->sampling = request_sampling(options);
         lane->media = std::move(input);
         lane->resident_bytes = resident;
@@ -664,6 +652,11 @@ void DecoderBatch::State::score(Lane& lane, Request& request, Workspace& work, b
               "Sample batched decoder logits");
     }
     copy_token(request, work, stream);
+    auto& logits = request.memory.transfers().logits;
+    if (!logits.empty()) {
+        check(cudaMemcpyAsync(logits.data(), work.logits, logits.size() * sizeof(Bf16),
+                              cudaMemcpyDeviceToHost, stream), "Read decoder step logits");
+    }
 }
 
 void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& decode,
@@ -822,82 +815,59 @@ void DecoderBatch::State::collect_scores(
 void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, int& next_slot,
                                           Steps& results, DecoderBatchStepStats& stats) {
     const auto stream = execution.stream();
-    std::array<DraftRound, decoder_batch_max_mtp_lanes> rounds;
-    std::array<VerificationSequence, decoder_batch_max_mtp_lanes> sequences;
-    std::array<TargetVerification*, decoder_batch_max_mtp_lanes> verifiers;
+    std::array<MtpRound, decoder_batch_max_mtp_lanes> rounds;
+    std::array<int, decoder_batch_max_mtp_lanes> slots;
     int count = 0;
-    int longest = 0;
     while (next_slot < options.max_lanes && count < decoder_batch_max_mtp_lanes) {
         const int slot = next_slot++;
         const int rows = verification_rows[slot];
-        if (rows) {
-            auto& lane = *storage->slots[slot];
-            const int proposals = rows - 1;
-            if (!lane.verification) {
-                lane.verification = std::make_unique<TargetVerification>(
-                    *lane.request, lane.capacity(), lane.position, lane.proposals() + 1,
-                    false, stream);
-            }
-            if (proposals == 0) {
-                lane.draft->enqueue(lane.position - 1, lane.last_token,
-                                    lane.request->work.normalized, false, stream);
-            }
-            rounds[count] = {&lane, {lane.last_token}, proposals,
-                             lane.request->work.normalized, slot};
-            verifiers[count] = lane.verification.get();
-            sequences[count] = {verifiers[count], lane.position, rounds[count].tokens.data(),
-                                proposals + 1};
-            longest = std::max(longest, proposals);
-            stats.verification_rows += proposals + 1;
-            ++count;
+        if (rows == 0) {
+            continue;
         }
+        auto& lane = *storage->slots[slot];
+        const int capacity = lane.proposals() + 1;
+        if (!lane.verification) {
+            lane.verification = std::make_unique<TargetVerification>(
+                *lane.request, lane.capacity(), lane.position, capacity,
+                lane.options.top_logits > 0, stream);
+        }
+        if (lane.options.constraint) {
+            if (!lane.constraint_round) {
+                lane.constraint_round.emplace(*lane.request, *lane.options.constraint, capacity);
+            }
+            lane.constraint_round->begin(lane.constraint, lane.remaining_output());
+        }
+        rounds[count] = {lane.draft.get(), lane.verification.get(), lane.request.get(),
+                         lane.constraint_round ? &*lane.constraint_round : nullptr,
+                         lane.sampling ? &*lane.sampling : nullptr, {lane.last_token},
+                         lane.position, lane.generated, lane.remaining_output(), rows - 1};
+        slots[count++] = slot;
     }
     if (count == 0) {
         return;
     }
-    draft_proposals(rounds.data(), count, longest);
-    const auto& lane = *rounds[0].lane;
-    auto* graph = storage->verification_graph && count == 1 && lane.options.mtp_steps == 1 &&
-        !lane.media && !lane.options.constraint ? &*storage->verification_graph : nullptr;
-    if (model.forward_verify(sequences.data(), count, stream, graph)) {
-        stats.verification_graph_slots |= std::uint32_t{1} << rounds[0].slot;
-    }
-    for (int index = 0; index < count; ++index) {
-        auto& lane = *rounds[index].lane;
-        if (lane.sampling) {
-            if (!sampling_workspace) {
-                sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
-            }
-            lane.verification->sample(*lane.sampling, lane.generated, sampling_workspace);
+    const auto& cancel = cancel_probe();
+    if (!MtpRound::propose_all(rounds.data(), count, constraint_workspace, stream, cancel)) {
+        check(cudaStreamSynchronize(stream), "Complete cancelled MTP draft wave");
+        for (int index = 0; index < count; ++index) {
+            auto& result = results[slots[index]];
+            result.mtp_drafted_tokens = rounds[index].drafted;
+            result.finish_reason = DecoderFinishReason::cancelled;
         }
+        return;
     }
-    TargetVerification::read_all(verifiers.data(), count, stream);
+    auto* graph = storage->verification_graph ? &*storage->verification_graph : nullptr;
+    if (model.verify_mtp(rounds.data(), count, constraint_workspace, sampling_workspace,
+                         stream, graph)) {
+        stats.verification_graph_slots |= std::uint32_t{1} << slots[0];
+    }
     for (int index = 0; index < count; ++index) {
-        const auto& round = rounds[index];
-        round.lane->finish_round(round.tokens, round.count + 1, results[round.slot], stream);
+        const auto slot = slots[index];
+        stats.verification_rows += rounds[index].rows();
+        storage->slots[slot]->finish_round(rounds[index], results[slot], stream, output, cancel);
     }
     check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
     stats.verification_lanes += count;
-}
-
-void DecoderBatch::State::draft_proposals(DraftRound* rounds, int count, int longest) {
-    const auto stream = execution.stream();
-    for (int wave = 0; wave < longest; ++wave) {
-        for (int index = 0; index < count; ++index) {
-            auto& round = rounds[index];
-            if (wave < round.count) {
-                round.hidden = round.lane->draft->enqueue(round.lane->position - 1 + wave,
-                    round.tokens[wave], round.hidden, true, stream);
-            }
-        }
-        check(cudaStreamSynchronize(stream), "Complete batch MTP draft wave");
-        for (int index = 0; index < count; ++index) {
-            auto& round = rounds[index];
-            if (wave < round.count) {
-                round.tokens[wave + 1] = round.lane->draft->read_token();
-            }
-        }
-    }
 }
 
 Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
@@ -959,7 +929,12 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
                     }
                 }
                 if (result.token) {
-                    lane->select_token(*result.token, result);
+                    if (cancelled()) {
+                        result.finish_reason = DecoderFinishReason::cancelled;
+                    } else {
+                        const auto& logits = lane->request->memory.transfers().logits;
+                        lane->select_token(*result.token, result, logits.data(), output);
+                    }
                 }
                 lane->position += std::max(1, rows);
             }
@@ -987,6 +962,31 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         }
         throw;
     }
+}
+
+void DecoderBatch::generate_mtp(const std::vector<int>& prompt, const DecoderOptions& options,
+                                const SerialMtpOutput& output, DecoderResult& result) {
+    state_->output = &output;
+    admit(0, prompt, options);
+    const auto model_bytes = result.peak_device_allocation_bytes;
+    while (!state_->cancelled()) {
+        DecoderBatchStepStats stats;
+        const auto step = advance_chunked({true}, &stats).front();
+        if (step.sampling_failed) throw DecoderSamplingError();
+        if (step.constraint_failed) throw DecoderConstraintError();
+        result.peak_device_allocation_bytes = std::max(result.peak_device_allocation_bytes,
+            model_bytes + stats.peak_request_bytes + stats.sampling_workspace_bytes +
+                stats.constraint_workspace_bytes);
+        result.mtp_rounds += step.mtp_drafted_tokens > 0;
+        result.mtp_accepted_tokens += step.mtp_accepted_tokens;
+        result.mtp_drafted_tokens += step.mtp_drafted_tokens;
+        if (step.finish_reason) {
+            result.finish_reason = *step.finish_reason;
+            return;
+        }
+    }
+    cancel(0);
+    result.finish_reason = DecoderFinishReason::cancelled;
 }
 
 Steps DecoderBatch::advance(const Selection& selected) {

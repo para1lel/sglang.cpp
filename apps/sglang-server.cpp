@@ -112,12 +112,6 @@ Arguments parse_arguments(int argc, char** argv) {
             throw std::invalid_argument("Invalid argument " + std::string(option));
         }
     }
-    if (arguments.eager && (arguments.max_active != 1 || arguments.mtp_steps != 0)) {
-        throw std::invalid_argument("--eager requires --max-active 1 and --mtp-steps 0");
-    }
-    if (arguments.batch_cuda_graphs && arguments.max_active == 1) {
-        throw std::invalid_argument("--batch-cuda-graphs requires --max-active at least 2");
-    }
     if (arguments.prefix_cache_entries != 0 && (arguments.eager || arguments.mtp_steps != 0)) {
         throw std::invalid_argument(
             "--prefix-cache-entries requires --mtp-steps 0. Omit --eager.");
@@ -235,8 +229,8 @@ int main(int argc, char** argv) {
                      "Active requests: 32 by default, range 1-32.\n"
                      "Target rows per step: 32768 by default, range 1-32768.\n"
                      "MTP steps: 0 by default, up to 4. --mtp-k is an alias.\n"
-                     "Batch graphs: ordinary decode steps at widths 2-4. Other steps use eager.\n"
-                     "Eager decode: one active request with MTP off.\n"
+                     "Batch graphs: enable graph replay for eligible decode steps.\n"
+                     "Eager decode: disable graph replay.\n"
                      "Prefix cache: disabled by default. Requires MTP off. Omit --eager.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n"
                   << sglang::cli::fp8_prefill_usage;
@@ -253,42 +247,25 @@ int main(int argc, char** argv) {
         const CompletionTokenizer tokenizer(arguments.checkpoint, arguments.sampling);
         const auto health = health_json(arguments);
         VisionCompletion vision(arguments.checkpoint, arguments.device);
-        if (arguments.max_active == 1 && arguments.prefix_cache_entries == 0) {
-            std::exception_ptr failure;
-            const auto listener = listen(arguments);
-            serve_connections(listener, health, [&] { return !failure; },
-                                       [&](const Socket& connection,
-                                            std::string_view body, bool chat) {
-                if (chat) {
-                    complete_chat(connection, decoder, tokenizer, body, arguments.trace_batches,
-                                  arguments.mtp_steps, arguments.eager, &vision,
-                                  arguments.max_num_batched_tokens, &failure);
-                } else {
-                    complete(connection, decoder, tokenizer, body, arguments.trace_batches,
-                             arguments.mtp_steps, arguments.eager,
-                             arguments.max_num_batched_tokens, &failure);
-                }
-            });
+        BatchService service(decoder, arguments.trace_batches,
+                             arguments.batch_cuda_graphs && !arguments.eager,
+                             arguments.mtp_steps, arguments.max_active,
+                             arguments.prefix_cache_entries, arguments.max_num_batched_tokens);
+        if (stopping()) {
+            return 0;
+        }
+        const auto listener = listen(arguments);
+        if (arguments.prefix_cache_entries != 0) {
+            serve_prefix_connections(listener, service, arguments.max_active,
+                [&](const Socket& connection, int slot, std::string_view body, bool chat) {
+                    if (chat) {
+                        complete_chat(connection, service, slot, tokenizer, body, &vision);
+                    } else {
+                        complete(connection, service, slot, tokenizer, body);
+                    }
+                }, health);
         } else {
-            BatchService service(decoder, arguments.trace_batches, arguments.batch_cuda_graphs,
-                                 arguments.mtp_steps, arguments.max_active,
-                                 arguments.prefix_cache_entries, arguments.max_num_batched_tokens);
-            if (stopping()) {
-                return 0;
-            }
-            const auto listener = listen(arguments);
-            if (arguments.prefix_cache_entries != 0) {
-                serve_prefix_connections(listener, service, arguments.max_active,
-                    [&](const Socket& connection, int slot, std::string_view body, bool chat) {
-                        if (chat) {
-                            complete_chat(connection, service, slot, tokenizer, body, &vision);
-                        } else {
-                            complete(connection, service, slot, tokenizer, body);
-                        }
-                    }, health);
-            } else {
-                serve_batch(listener, service, tokenizer, vision, arguments.max_active, health);
-            }
+            serve_batch(listener, service, tokenizer, vision, arguments.max_active, health);
         }
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';

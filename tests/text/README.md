@@ -140,5 +140,5 @@ and legacy response bodies before and after slot reuse and against Unit 18.
 The GPU run compares mixed widths two through four against isolated
 requests and requires CUPTI device graph replays at each width. It checks
 continued replay when a cancelled chat is replaced while three legacy streams
-stay active. The same candidate binary serves serial MTP at depth four for
-greedy parity, including the explicit legacy stop fixture.
+stay active. The same candidate binary runs depth-four MTP with one scheduler
+slot and checks greedy parity, including the explicit legacy stop fixture.

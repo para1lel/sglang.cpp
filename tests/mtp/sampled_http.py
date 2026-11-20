@@ -36,8 +36,10 @@ EOS = COMMON | {
     "messages": [{"role": "user", "content": "Reply with exactly the word yes."}],
     "enable_thinking": False, "max_tokens": 24, "temperature": 0.4, "top_k": 20, "seed": 14,
 }
+MASKED_CHOICES = ("Please reply with yes today.", "Please reply with no today.")
 MASKED = MAIN | {
-    "prompt": "Choose one word.", "max_tokens": 8, "ebnf": 'root ::= "yes" | "no"',
+    "prompt": "Choose one reply.", "max_tokens": 12,
+    "ebnf": "root ::= " + " | ".join(map(json.dumps, MASKED_CHOICES)),
     "top_p": 1, "min_p": 0, "ignore_eos": False,
 }
 LONG = MAIN | {
@@ -50,12 +52,12 @@ GRAPH = re.compile(rb"^batch graph_slots=\d+", re.M)
 
 
 @contextmanager
-def server(args, output, width, depth, prefill="exact", flags=()):
+def server(args, output, width, depth, prefill="exact", flags=(), token_budget=TOKEN_BUDGET):
     output.mkdir()
     port = choose_port()
     command = [str(args.server), "--checkpoint", str(args.checkpoint), "--device", "0",
                "--port", str(port), "--max-active", str(width), "--mtp-steps", str(depth),
-               "--max-num-batched-tokens", str(TOKEN_BUDGET), "--fp8-prefill", prefill,
+               "--max-num-batched-tokens", str(token_budget), "--fp8-prefill", prefill,
                "--trace-batches", *flags]
     write_json(output / "command.json", command)
     log = output / "server.log"
@@ -65,7 +67,7 @@ def server(args, output, width, depth, prefill="exact", flags=()):
             health = wait_until_ready(process, port, log)
             write_json(output / "health.json", health)
             require(health.get("max_active") == width and
-                    health.get("max_num_batched_tokens") == TOKEN_BUDGET, health)
+                    health.get("max_num_batched_tokens") == token_budget, health)
             yield port, log
         finally:
             stop_server(process, None)
@@ -186,14 +188,14 @@ def check_cancellation(port, log, width, depth, wanted):
         stream.reset()
         interrupted = stream.evidence()
     trace = log.read_bytes()[offset:]
-    if width == 4 and depth:
+    if depth:
         require(COUNTERS.search(trace), "Interrupted request had no verifier trace")
     if width == 1:
         deadline = time.monotonic() + 15
         while b"batch width=0 decode=0" not in trace and time.monotonic() < deadline:
             time.sleep(0.02)
             trace = log.read_bytes()[offset:]
-        require(b"batch width=0 decode=0" in trace, "Serial request did not retire after TCP reset")
+        require(b"batch width=0 decode=0" in trace, "Request did not retire after TCP reset")
     replay = post(port, TEXT, MAIN)
     require(transcript(replay) == wanted, "TCP reset changed the next seeded request")
     return {"interrupted": interrupted, "before_replay_trace": trace.decode(), "replay": replay}
@@ -213,11 +215,12 @@ def run_cases(port, log, width, depth, prefill):
         "argmax-filter": post(port, TEXT, MAIN | {"top_p": 1, "top_k": 1, "min_p": 1}),
         "greedy": post(port, TEXT, MAIN | {"temperature": 0}),
     }
-    if width == 4:
-        cases["long"] = post(port, TEXT, LONG)
+    cases["long"] = post(port, TEXT, LONG)
     offset = log.stat().st_size
     cases["mask"] = post(port, TEXT, MASKED)
-    require(not COUNTERS.search(log.read_bytes()[offset:]), "Constrained request used MTP")
+    mask_rounds = COUNTERS.findall(log.read_bytes()[offset:])
+    require(any(int(row[0]) > 0 and int(row[2]) > 0 for row in mask_rounds) == bool(depth),
+            "Unexpected constrained proposal and verification activity")
     rows = {name: transcript(frames) for name, frames in cases.items()}
     require(rows["main"] == rows["json"], "JSON and SSE differ")
     require(rows["main"]["finish"] == "length" and len(wanted["tokens"]) == MAIN["max_tokens"],
@@ -232,11 +235,11 @@ def run_cases(port, log, width, depth, prefill):
             rows["ignore-natural-eos"])
     require(rows["one-token"]["tokens"] == wanted["tokens"][:1], rows["one-token"])
     require(rows["argmax-filter"] == rows["greedy"], "Top-1 sampling changed greedy output")
-    require(rows["mask"]["text"] in ("yes", "no") and rows["mask"]["finish"] == "stop",
+    require(rows["mask"]["text"] in MASKED_CHOICES and rows["mask"]["finish"] == "stop",
             rows["mask"])
+    require(len(rows["long"]["prompt"]) >= 512 and
+            len(rows["long"]["tokens"]) == LONG["max_tokens"], (prefill, rows["long"]))
     if width == 4:
-        require(len(rows["long"]["prompt"]) >= 512 and
-                len(rows["long"]["tokens"]) == LONG["max_tokens"], (prefill, rows["long"]))
         other = MAIN | {"seed": 2**63 - 1}
         mixed = [(TEXT, other), (CHAT, EOS), (TEXT, MAIN), (TEXT, MASKED)]
         cases["mixed"] = cohort(port, mixed)
@@ -277,31 +280,26 @@ def check_configuration(args, width, prefill, mode, depths, flags=(), exact=None
         if width == 1:
             rows = rows | {"media": media}
         if depth:
-            control = observed[0]
-            if exact is not None:
-                mixed = [*exact[depth]["mixed"][:3], control["mixed"][3]]
-                control = exact[depth] | {"mask": control["mask"], "mixed": mixed}
+            control = observed[0] if exact is None else exact[depth]
             check_against_control(rows, control, f"W{width} {prefill} {mode} K{depth}")
         observed[depth] = rows
         summary = {"depth": depth, "width": width, "prefill": prefill, "mode": mode}
-        if width == 4:
-            trace = log.read_bytes()
-            graph_steps = len(GRAPH.findall(trace))
-            summary["graph_steps"] = graph_steps
-            counts = tuple(sum(map(int, values))
-                           for values in zip(*COUNTERS.findall(trace)))
-            summary["counters"] = dict(zip(("drafted", "accepted", "verified", "replayed"), counts))
-            if depth:
-                require(counts and counts[0] > counts[1] > 0 and counts[3] > 0, summary)
-                lanes = max((int(lane) for lane, _ in LANES.findall(trace)), default=0)
-                require(lanes >= 2, f"No concurrent verifier lanes at K{depth}")
-                for step in trace.split(b"\nbatch width=")[1:]:
-                    match = LANES.search(step)
-                    if match and int(match[1]):
-                        require(not GRAPH.search(step), "Active verifier step replayed a graph")
-                summary["concurrent_verifiers"] = lanes
-            if mode == "eager" or depth == 0:
-                require(bool(graph_steps) == (mode == "graph"), summary)
+        trace = log.read_bytes()
+        graph_steps = len(GRAPH.findall(trace))
+        summary["graph_steps"] = graph_steps
+        counts = tuple(sum(map(int, values)) for values in zip(*COUNTERS.findall(trace)))
+        summary["counters"] = dict(zip(("drafted", "accepted", "verified", "replayed"), counts))
+        if depth:
+            require(counts and counts[0] > counts[1] > 0 and counts[3] > 0, summary)
+            lanes = max((int(lane) for lane, _ in LANES.findall(trace)), default=0)
+            require(lanes >= min(width, 2), f"No expected verifier lanes at W{width} K{depth}")
+            for step in trace.split(b"\nbatch width=")[1:]:
+                match = LANES.search(step)
+                if match and int(match[1]) > 1:
+                    require(not GRAPH.search(step), "Multiple verifier lanes replayed a graph")
+            summary["concurrent_verifiers"] = lanes
+        if mode != "graph" or depth == 0:
+            require(bool(graph_steps) == (mode == "graph"), summary)
         print(json.dumps(summary), flush=True)
     return observed
 
@@ -318,8 +316,10 @@ def check_startup(args):
          "--prefix-cache-entries requires --mtp-steps 0. Omit --eager."),
         (["--max-active", "32", "--mtp-steps", "1", "--prefix-cache-entries", "2"],
          "--prefix-cache-entries requires --mtp-steps 0. Omit --eager."),
-        (["--max-active", "1", "--mtp-steps", "1", "--eager"], "--eager requires"),
-        (["--max-active", "1", "--batch-cuda-graphs"], "--batch-cuda-graphs requires"),
+        (["--max-active", "1", "--mtp-steps", "1", "--eager"], NO_DEVICE),
+        (["--max-active", "4", "--mtp-steps", "4", "--eager", "--batch-cuda-graphs"],
+         NO_DEVICE),
+        (["--max-active", "1", "--batch-cuda-graphs"], NO_DEVICE),
     ]
     records = []
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES="")
@@ -389,11 +389,12 @@ def main():
     args = parser.parse_args()
     args.evidence.mkdir(parents=True)
     check_startup(args)
-    serial = check_configuration(args, 1, "exact", "default", range(5))
-    eager = check_configuration(args, 1, "exact", "eager", (0,), ("--eager",))
-    require(serial[0] == eager[0], "Serial eager changed seeded output")
-    depths = (0, 1, 4)
     graph_flag = ("--batch-cuda-graphs",)
+    singleton = check_configuration(args, 1, "exact", "default", range(5))
+    eager = check_configuration(args, 1, "exact", "eager", (0, 4), (*graph_flag, "--eager"))
+    for depth in eager:
+        require(singleton[depth] == eager[depth], f"Explicit eager changed capacity-one K{depth}")
+    depths = (0, 1, 4)
     exact_graph = check_configuration(args, 4, "exact", "graph", range(5), graph_flag)
     exact_eager = check_configuration(args, 4, "exact", "eager", depths)
     tensor_graph = check_configuration(args, 4, "tensor-core", "graph", depths,

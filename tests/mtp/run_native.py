@@ -30,8 +30,9 @@ COUNTERS = ("mtp_drafted_tokens", "mtp_accepted_tokens", "mtp_rounds")
 STEPS = (1, 2, 3, 4)
 BATCH_SPOT = [(2, steps) for steps in STEPS] + [(4, max(STEPS))]
 VERIFY_ROWS = re.compile(rb"^batch verify lanes=(\d+) rows=(\d+) ", re.M)
-SEED_COUNTERS = {129: {1: (4, 4, 4), 4: (11, 6, 3)},
-                 257: {1: (5, 4, 5), 4: (10, 5, 4)}}
+MTP_ROUND = re.compile(rb"drafted=(\d+) accepted=(\d+) verified=(\d+) replayed=\d+ boundary=(\d+)")
+SEED_LENGTHS = (129, 257)
+SEED_STEPS = (1, max(STEPS))
 
 
 class CompletionStream(Stream):
@@ -135,14 +136,20 @@ def compare(target, candidate, steps, name):
         for key in ("model_device_allocation_bytes", "peak_device_allocation_bytes"):
             require(candidate[key] == target[key], f"{label}: changed {key}")
         return
-    drafted, accepted, rounds = (candidate[key] for key in COUNTERS)
-    output = len(candidate["output_token_ids"])
-    if output <= 1:
-        require((drafted, accepted, rounds) == (0, 0, 0), f"{label}: unnecessary draft work")
-    else:
-        require(0 < rounds <= output - 1 and rounds <= drafted <= rounds * steps, label)
-        require(0 <= accepted <= min(drafted, output - 1), label)
-        require(0 <= (output - 1) - accepted <= rounds, label)
+    check_draft_totals(candidate, steps, label)
+
+
+def check_draft_totals(result, steps, label, *, terminal_at_budget=False):
+    drafted, accepted, rounds = (result[key] for key in COUNTERS)
+    output = len(result["output_token_ids"])
+    decode_outputs = max(output - 1, 0)
+    require(0 <= rounds <= decode_outputs, label)
+    require(rounds <= drafted <= rounds * steps, label)
+    require(0 <= accepted <= min(drafted, decode_outputs), label)
+    # One terminal proposal can suppress the correction or bonus. One final
+    # output can use an ordinary target step without a draft round.
+    terminal_proposal = accepted > 0 and (terminal_at_budget or result["finish_reason"] == "stop")
+    require(rounds - terminal_proposal <= decode_outputs - accepted <= rounds + 1, label)
     print(f"{label}: {output} output, {drafted} drafted, {accepted} accepted, {rounds} rounds")
 
 
@@ -157,16 +164,21 @@ def trim_control(target, budget, stop):
 
 def compare_reference(candidate, reference, steps, name):
     fields = ("output_token_ids", "finish_reason", "step_top_logits")
-    for key in (*fields, *(COUNTERS if steps else ())):
+    for key in fields:
         require(candidate[key] == reference[key],
                 f"{name}: steps={steps}: changed {key} from the reference generator")
-    if not steps:
+    if steps:
+        label = f"{name}: reference steps={steps}"
+        check_draft_totals(reference, steps, label, terminal_at_budget=True)
+        require(reference["mtp_accepted_tokens"] > 0, f"{label}: no accepted proposals")
+    else:
         require(all(key not in reference for key in COUNTERS), f"{name}: reference draft counters")
 
 
 def check_seed_carry(args):
     prefill_cases = load_prefill_cases()
-    for length, expected_counters in SEED_COUNTERS.items():
+    seeds = {}
+    for length in SEED_LENGTHS:
         name = f"seed-carry-{length}"
         prompt = prefill_cases[length]["prompt"]
         case = (prompt, 9, None)
@@ -175,22 +187,24 @@ def check_seed_carry(args):
         if args.reference_generate:
             reference = generate(args, name, case, 0, reference=True)
             compare_reference(control, reference, 0, name)
-        for steps, expected in expected_counters.items():
+        candidates = {}
+        for steps in SEED_STEPS:
             candidate = generate(args, name, case, steps)
             compare(control, candidate, steps, name)
-            counters = tuple(candidate[key] for key in COUNTERS)
-            require(counters == expected,
-                    f"{name}: steps={steps}: row-wise draft counters {expected} "
-                    f"changed to {counters}")
+            require(candidate["mtp_accepted_tokens"] > 0, f"{name}: no accepted proposals")
+            candidates[steps] = candidate
             if args.reference_generate:
                 reference = generate(args, name, case, steps, reference=True)
                 compare_reference(candidate, reference, steps, name)
-    return prompt, control
+        seeds[name] = (prompt, control, candidates)
+    return seeds
 
 
 @contextmanager
-def mtp_server(args, steps, width=1):
+def mtp_server(args, steps, width=1, *, token_budget=None):
     suffix = f"{steps}" if width == 1 else f"w{width}-k{steps}"
+    if token_budget is not None:
+        suffix += f"-rows{token_budget}"
     evidence = args.evidence / f"http-{suffix}"
     evidence.mkdir()
     port = choose_port()
@@ -198,7 +212,9 @@ def mtp_server(args, steps, width=1):
                str(args.device), "--port", str(port)]
     if steps != "default":
         command += ["--max-active", str(width), "--mtp-steps", str(steps)]
-    if width > 1 or steps == max(STEPS):
+    if token_budget is not None:
+        command.extend(("--max-num-batched-tokens", str(token_budget)))
+    if width > 1 or steps in SEED_STEPS or token_budget is not None:
         command.append("--trace-batches")
     write_json(evidence / "command.json", command)
     log_path = evidence / "server.log"
@@ -211,7 +227,7 @@ def mtp_server(args, steps, width=1):
             stop_server(process, None)
 
 
-def await_serial_retirement(log_path, offset):
+def await_retirement(log_path, offset):
     marker = b"batch width=0 decode=0 request_bytes=0\n"
     deadline = time.monotonic() + 5
     with log_path.open("rb") as log:
@@ -220,7 +236,7 @@ def await_serial_retirement(log_path, offset):
             if marker in log:
                 return (0, 0, 0)
             time.sleep(0.01)
-    raise AssertionError(f"Canceled serial request did not retire. See {log_path}")
+    raise AssertionError(f"Canceled request did not retire. See {log_path}")
 
 
 def check_recovery(port, evidence, log_path, prompt, target):
@@ -234,7 +250,7 @@ def check_recovery(port, evidence, log_path, prompt, target):
         for token in output[:2]:
             stream.choice([token])
         stream.reset()
-    retirement = await_serial_retirement(log_path, offset)
+    retirement = await_retirement(log_path, offset)
     write_json(evidence / "cancel-after-verification.json",
                {**stream.evidence(), "retirement": retirement})
 
@@ -327,7 +343,25 @@ def check_rng_policy(port, evidence):
     write_json(evidence / "rng-policy.json", results)
 
 
-def check_http(args, cases, controls, seed_recovery):
+def check_seed_http(port, evidence, log_path, name, seed, steps):
+    prompt, target, candidates = seed
+    output = target["output_token_ids"]
+    case = {"name": name, "prompt": prompt, "max_tokens": len(output),
+            "finish_reason": target["finish_reason"], "output": output}
+    offset = log_path.stat().st_size
+    with CompletionStream(port, case) as stream:
+        stream.post()
+        stream.complete()
+    rows = read_rounds(log_path, offset, output, steps)
+    first_drafted, first_accepted, _, _ = rows[0]
+    require(first_drafted == steps and first_accepted > 0,
+            f"{name}: initial verifier must accept a proposal from the prefill seed: {rows}")
+    require(draft_totals(rows) == tuple(candidates[steps][key] for key in COUNTERS),
+            f"{name}: CLI and HTTP speculative totals differ: {rows}")
+    write_json(evidence / f"{name}.json", {**stream.evidence(), "mtp_rounds": rows})
+
+
+def check_http(args, cases, controls, seeds):
     for steps in ("default", *STEPS):
         with mtp_server(args, steps) as (port, evidence):
             if steps in ("default", max(STEPS)):
@@ -343,14 +377,19 @@ def check_http(args, cases, controls, seed_recovery):
                     stream.post()
                     stream.complete()
                     write_json(evidence / f"{name}.json", stream.evidence())
+            log_path = evidence / "server.log"
+            if steps in SEED_STEPS:
+                for name, seed in seeds.items():
+                    check_seed_http(port, evidence, log_path, name, seed, steps)
             if steps == max(STEPS):
-                log_path = evidence / "server.log"
                 check_recovery(
                     port, evidence, log_path, cases["silver-key"][0], controls["silver-key"])
-                seed_evidence = evidence / "seed-carry"
+                seed_name = f"seed-carry-{max(SEED_LENGTHS)}"
+                seed_evidence = evidence / seed_name
                 seed_evidence.mkdir()
-                check_recovery(port, seed_evidence, log_path, *seed_recovery)
-        print(f"HTTP steps={steps}: exact serial SSE tokens, finish, and usage")
+                prompt, control, _ = seeds[seed_name]
+                check_recovery(port, seed_evidence, log_path, prompt, control)
+        print(f"HTTP steps={steps}: exact single-request SSE tokens, finish, and usage")
 
 
 def check_batch_http(args, prompt, target, settings):
@@ -374,13 +413,61 @@ def check_batch_http(args, prompt, target, settings):
         print(f"HTTP width={width} steps={steps}: exact SSE and joint target verification")
 
 
+def check_round_accounting(args, prompt, target, candidate, token_budget):
+    output = target["output_token_ids"]
+    case = {"name": "round-accounting", "prompt": prompt, "max_tokens": len(output),
+            "finish_reason": "length", "output": output}
+    with mtp_server(args, 1, token_budget=token_budget) as (port, evidence):
+        with CompletionStream(port, case) as stream:
+            stream.post()
+            stream.complete()
+            write_json(evidence / "round-accounting.json", stream.evidence())
+    rows = read_rounds(evidence / "server.log", 0, output, 1)
+    drafted, accepted, positive = draft_totals(rows)
+    zero_proposal = sum(drafted == 0 and verified == 1 for drafted, _, verified, _ in rows)
+    require(rows[-1] == (0, 0, 0, 1), rows)
+    if token_budget == 1:
+        require(drafted == accepted == positive == 0 and zero_proposal > 0, rows)
+    else:
+        require((drafted, accepted, positive) == tuple(candidate[key] for key in COUNTERS)
+                and positive > 0 and zero_proposal == 0, rows)
+
+
+def read_rounds(log_path, offset, output, steps):
+    with log_path.open("rb") as log:
+        log.seek(offset)
+        rows = [tuple(map(int, row)) for row in MTP_ROUND.findall(log.read())]
+    require(rows and all(0 <= accepted <= drafted <= steps and
+                         verified == (0 if boundary else drafted + 1) and
+                         (not boundary or (drafted, accepted, verified, boundary) == (0, 0, 0, 1))
+                         for drafted, accepted, verified, boundary in rows), rows)
+    _, accepted, positive = draft_totals(rows)
+    zero_proposal = sum(drafted == 0 and verified == 1 for drafted, _, verified, _ in rows)
+    ordinary_tail = sum(boundary for _, _, _, boundary in rows)
+    # For these requests that reach the output limit, each verification round
+    # emits one target token in addition to its accepted proposals.
+    require(len(output) == 1 + accepted + positive + zero_proposal + ordinary_tail, rows)
+    require(ordinary_tail <= 1 and (not ordinary_tail or rows[-1] == (0, 0, 0, 1)), rows)
+    return rows
+
+
+def draft_totals(rows):
+    return (sum(drafted for drafted, _, _, _ in rows),
+            sum(accepted for _, accepted, _, _ in rows),
+            sum(drafted > 0 for drafted, _, _, _ in rows))
+
+
 def check_batch_spot(args, page):
     name = "page-127"
     case = (page, 10, None)
     target = generate(args, name, case, 0)
     require(all(key not in target for key in COUNTERS), f"{name}: target-only draft counters")
     for steps in STEPS:
-        compare(target, generate(args, name, case, steps), steps, name)
+        candidate = generate(args, name, case, steps)
+        compare(target, candidate, steps, name)
+        if steps == 1:
+            for token_budget in (32768, 1):
+                check_round_accounting(args, page, target, candidate, token_budget)
     check_batch_http(args, page, target, BATCH_SPOT)
 
 
@@ -438,8 +525,8 @@ def main():
         cases[name] = (cases[parent][0], budget, stop)
         controls[name] = trim_control(controls[parent], budget, stop)
         compare(controls[name], generate(args, name, cases[name], steps), steps, name)
-    seed_recovery = check_seed_carry(args)
-    check_http(args, cases, controls, seed_recovery)
+    seeds = check_seed_carry(args)
+    check_http(args, cases, controls, seeds)
     check_batch_http(args, page, controls["page-127"],
                      [(width, steps) for width in (2, 3, 4) for steps in STEPS])
 

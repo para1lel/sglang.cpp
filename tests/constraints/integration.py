@@ -1,5 +1,6 @@
 """Check constrained routing alongside positive MTP depth or tensor prefix reuse."""
 
+from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import json
@@ -12,8 +13,10 @@ from token_oracle import checkpoint_bytes
 
 
 def grammars():
-    return {"ebnf": ('root ::= "Café" | "Café!"', 'root ::= "other"', "other"),
-            "regex": ("^(?:Café|Café!){1,2}$", "^other$", "other")}
+    sentence = "The café serves tea and many kinds of coffee"
+    ebnf = f'root ::= "{sentence}." | "{sentence}!"'
+    return {"ebnf": (ebnf, 'root ::= "other"', "other"),
+            "regex": (r"^[A-Za-z ,.!]{23,36}$", "^other$", "other")}
 
 
 def field_pattern(field):
@@ -45,23 +48,24 @@ def reject_overrides(http, log, fields):
 def check_mtp(http, args, fields, validate):
     log = args.output / "server.log"
     reject_overrides(http, log, fields)
-    cases = [(f"{field}-{route}-{mode}", route,
-              body(route, 12, **{field: spec}, **options))
-             for field, (spec, _, _) in fields.items() for route in ("text", "chat")
-             for mode, options in (("greedy", {}), ("sampled", SAMPLED))]
-    offset = log.stat().st_size
-    http.pairs(cases, args.width, validate)
-    if args.width > 1:
-        verify_verifier(log, offset, False)
-        if args.graph:
-            assert re.search(r"^batch graph_slots=[1-9]\d*$", trace_slice(log, offset), re.M)
-    ordinary = body("text", 18, ignore_eos=True, **SAMPLED)
+    cases = []
+    for field, (spec, _, _) in fields.items():
+        for route in ("text", "chat"):
+            pair = [(f"{field}-{route}-{mode}", route,
+                     body(route, 32, **{field: spec}, **options))
+                    for mode, options in (("greedy", {}), ("sampled", SAMPLED))]
+            offset = log.stat().st_size
+            http.pairs(pair, args.width, validate)
+            verify_verifier(log, offset, bool(args.mtp))
+            cases.extend(pair)
+    ordinary = body("text", 24, ignore_eos=True, **SAMPLED)
     offset = log.stat().st_size
     control = http.call("ordinary-sampled-alone", "text", ordinary)
+    http.summary["ordinary-sampled-alone"] = control
+    verify_verifier(log, offset, bool(args.mtp))
     if args.width > 1:
-        verify_verifier(log, offset, True)
-        mixed(http, log, cases, ordinary, control)
-    else:
+        mixed(http, log, cases, ordinary, control, args.mtp)
+    elif args.mtp:
         for field, (spec, _, _) in fields.items():
             media_guard(http, args, {field: spec}, field_pattern(field), label=field)
 
@@ -79,7 +83,7 @@ def validate_constraint(pieces, schema_validator, label, request, row):
         schema_validator(schema, row["text"])
 
 
-def mixed(http, log, cases, ordinary, control):
+def mixed(http, log, cases, ordinary, control, depth):
     constrained = cases[::4]
     jobs = constrained + [("mixed-ordinary", "text", ordinary)]
     barrier = Barrier(len(jobs))
@@ -91,20 +95,22 @@ def mixed(http, log, cases, ordinary, control):
     assert rows[-1] == control
     for (label, _, _), row in zip(constrained, rows[:-1], strict=True):
         assert row == http.summary[label], (label, row)
-    verify_verifier(log, offset, True)
+    verify_verifier(log, offset, bool(depth))
     trace = trace_slice(log, offset)
     steps = re.split(r"(?=^batch width=)", trace, flags=re.M)
     assert any(re.search(r"^batch width=[2-4] decode=[2-4] ", step, re.M)
-               and re.search(r"^batch verify lanes=1 rows=[1-9]\d* ", step, re.M)
+               and (not depth or re.search(r"^batch verify lanes=[2-4] rows=[1-9]\d* ",
+                                          step, re.M))
                for step in steps), (log, trace)
-    assert not re.search(r"^batch verify lanes=[2-9]", trace, re.M), (log, trace)
+    allocations = re.findall(r"^batch width=\d+ decode=\d+ request_bytes=(\d+)$", trace, re.M)
+    assert allocations and allocations[-1] == "0", (log, allocations)
 
 
 def check_prefix(http, fields, validate):
     prompt = "Hello" + " hello" * 127
     for field, (spec, other, expected) in fields.items():
         def request(pattern, salt):
-            return body("text", 12, prompt=prompt, cache_salt=salt,
+            return body("text", 32, prompt=prompt, cache_salt=salt,
                         **{field: pattern}, **SAMPLED)
 
         cold = request(spec, field)
@@ -131,9 +137,17 @@ def run(args, fields, schema_validator=None):
             assert args.width > 1 and args.graph and args.prefill == "tensor-core"
             check_prefix(http, fields, validate)
         else:
-            assert args.mtp > 0
             check_mtp(http, args, fields, validate)
         (args.output / "summary.json").write_text(json.dumps(http.summary, ensure_ascii=True))
+        candidate = http.summary
+    if not args.cache_entries and args.mtp:
+        control = Namespace(**(vars(args) | {"mtp": 0, "prefill": "exact",
+                                             "output": args.output / "k0"}))
+        run(control, fields, schema_validator)
+        expected = json.loads((control.output / "summary.json").read_text())
+        assert candidate.keys() == expected.keys()
+        for label, row in candidate.items():
+            assert row == expected[label], (label, row, expected[label])
 
 
 def main():

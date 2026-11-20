@@ -14,8 +14,6 @@ public:
     VisionCompletion(const std::filesystem::path& checkpoint, int device);
     ~VisionCompletion();
 
-    DecoderResult generate(const Decoder& decoder, const MediaPrompt& prompt,
-                           const DecoderOptions& options, const DecoderCallbacks& callbacks);
     DecoderResult generate(BatchService& service, int slot, const MediaPrompt& prompt,
                            const DecoderOptions& options, const DecoderCallbacks& callbacks);
 

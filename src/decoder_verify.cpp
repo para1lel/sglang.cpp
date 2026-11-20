@@ -1,9 +1,11 @@
 #include "sglang/decoder_verify.h"
 
+#include "sglang/decoder_mtp.h"
 #include "sglang/decoder_sampling.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 namespace sglang::decoder {
 namespace {
@@ -73,6 +75,136 @@ void VerificationGraphScratch::upload(const VerificationSequence& sequence, cuda
     }
     check(cudaMemcpyAsync(device_binding, host_binding.get(), sizeof(binding),
                           cudaMemcpyHostToDevice, stream), "Upload K1 verifier graph bindings");
+}
+
+MtpConstraintRound::MtpConstraintRound(Request& request, const TokenConstraint& constraint,
+                                       int rows)
+    : constraint_(&constraint), stride_(constraint.uses_wide_mask()
+          ? constraint_mask_words * sizeof(std::uint32_t)
+          : constraint_max_candidates * sizeof(int)) {
+    auto& owner = request.memory.transfers().mtp_constraint_inputs;
+    if (owner || rows < 1 || rows > target_verify_max_rows) {
+        throw std::invalid_argument("Invalid MTP constraint storage");
+    }
+    void* pinned = nullptr;
+    check(cudaMallocHost(&pinned, stride_ * rows), "Allocate MTP constraint inputs");
+    owner = std::shared_ptr<void>(pinned, free_pinned);
+    staging_ = static_cast<std::byte*>(pinned);
+}
+
+void MtpConstraintRound::begin(const ConstraintCursor& committed, int remaining) {
+    cursor_.reset_to(committed);
+    remaining_ = remaining;
+    prepare(0, remaining);
+}
+
+bool MtpConstraintRound::advance(int row, int token) {
+    const int remaining = remaining_ - row - 1;
+    if (cursor_.commit(*constraint_, token, remaining)) {
+        return false;
+    }
+    prepare(row + 1, remaining);
+    return true;
+}
+
+void MtpConstraintRound::prepare(int row, int remaining) {
+    cursor_.candidates(*constraint_, remaining);
+    prepared_rows_ = row + 1;
+    auto* destination = staging_ + row * stride_;
+    const auto& ids = cursor_.ids();
+    const auto& mask = cursor_.mask();
+    rows_[row] = {static_cast<int>(ids.size()), nullptr, nullptr};
+    if (mask.empty()) {
+        std::memcpy(destination, ids.data(), ids.size() * sizeof(int));
+        rows_[row].ids = reinterpret_cast<const int*>(destination);
+    } else {
+        std::memcpy(destination, mask.data(), mask.size() * sizeof(std::uint32_t));
+        rows_[row].mask = reinterpret_cast<const std::uint32_t*>(destination);
+    }
+}
+
+int MtpRound::rows() const {
+    return constraint ? constraint->rows() : std::min(drafted + 1, remaining);
+}
+
+bool MtpRound::propose_all(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
+                           cudaStream_t stream, const Cancel& cancel) {
+    int longest = 0;
+    for (int index = 0; index < count; ++index) {
+        auto& round = rounds[index];
+        round.draft_hidden = round.request->work.normalized;
+        longest = std::max(longest, round.proposal_limit);
+        if (round.proposal_limit == 0) {
+            round.draft->enqueue(round.position - 1, round.tokens.front(), round.draft_hidden,
+                                 false, stream);
+        }
+    }
+    for (int wave = 0; wave < longest; ++wave) {
+        if (cancel && cancel()) {
+            return false;
+        }
+        bool submitted = false;
+        for (int index = 0; index < count; ++index) {
+            auto& round = rounds[index];
+            if (wave < round.proposal_limit) {
+                const auto* allowed = round.constraint ? &round.constraint->candidates(wave)
+                                                       : nullptr;
+                round.draft_hidden = round.draft->enqueue(round.position - 1 + wave,
+                    round.tokens[wave], round.draft_hidden, true, stream, &scratch, allowed);
+                submitted = true;
+            }
+        }
+        if (!submitted) {
+            break;
+        }
+        check(cudaStreamSynchronize(stream), "Complete MTP draft wave");
+        for (int index = 0; index < count; ++index) {
+            auto& round = rounds[index];
+            if (wave >= round.proposal_limit) {
+                continue;
+            }
+            const int token = round.draft->read_token();
+            if (token == -1) {
+                round.proposal_limit = wave;
+            } else {
+                round.tokens[++round.drafted] = token;
+                if (round.constraint && !round.constraint->advance(wave, token)) {
+                    round.proposal_limit = wave + 1;
+                }
+            }
+        }
+    }
+    return !cancel || !cancel();
+}
+
+bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel) {
+    if (draft->valid_prefix() > position) {
+        draft->rewind(position);
+    }
+    const int count = rows();
+    bool continuing = true;
+    for (int index = 0; index < count; ++index) {
+        if (cancel && cancel()) {
+            target->commit(consumed);
+            return false;
+        }
+        const int token = target->winner(index, sampling != nullptr, constraint != nullptr);
+        const bool accepted = index < drafted && token == tokens[index + 1];
+        ++consumed;
+        continuing = emit(token, target->logits(index), accepted);
+        if (!accepted || !continuing) {
+            break;
+        }
+        const auto row = target->row(index);
+        draft->enqueue(row.position, token, row.work->normalized, false, stream);
+    }
+    if (continuing) {
+        const auto* hidden = target->row(consumed - 1).work->normalized;
+        check(cudaMemcpyAsync(request->work.normalized, hidden, hidden_size * sizeof(Bf16),
+                              cudaMemcpyDeviceToDevice, stream), "Carry committed MTP hidden row");
+    }
+    target->commit(consumed);
+    return true;
 }
 
 TargetVerification::TargetVerification(Request& request, int capacity, int prefix, int rows,
@@ -160,6 +292,18 @@ void TargetVerification::sample(const SamplingParameters& parameters, int first_
     }
 }
 
+void TargetVerification::constrain(const MtpConstraintRound& constraint,
+                                  const ConstraintWorkspace& scratch,
+                                  const SamplingParameters* sampling, int first_output,
+                                  void* sampling_scratch) {
+    for (int index = 0; index < pending_rows_; ++index) {
+        const auto& work = workspace().work[index];
+        select_constrained({work.logits, work.argmax_scratch, work.argmax}, scratch,
+                           constraint.candidates(index), sampling, first_output + index,
+                           sampling_scratch, stream_);
+    }
+}
+
 void TargetVerification::read() {
     auto* verifier = this;
     read_all(&verifier, 1, stream_);
@@ -219,15 +363,8 @@ void TargetVerification::commit(int count) {
     active_workspace_ = nullptr;
 }
 
-int TargetVerification::winner(int index, bool sampled) const {
-    const int token = host_winners_[index].token_id;
-    if (sampled && token == -1) {
-        throw DecoderSamplingError();
-    }
-    if (token < 0 || token >= vocab_size) {
-        throw std::runtime_error("Target verification winner falls outside vocabulary");
-    }
-    return token;
+int TargetVerification::winner(int index, bool sampled, bool constrained) const {
+    return validate_winner(host_winners_[index].token_id, sampled, constrained);
 }
 
 const Bf16* TargetVerification::logits(int index) const {

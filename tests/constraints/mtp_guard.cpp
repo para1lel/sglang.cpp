@@ -14,23 +14,30 @@ namespace {
 void check_depth(const std::shared_ptr<const sglang::TokenConstraint>& constraint) {
     const std::vector<int> prompt{32};
     sglang::DecoderOptions options;
-    options.constraint = constraint;
-    options.max_new_tokens = 16;
-    sglang::decoder::validate_request(prompt, options, true);
-    for (int depth = 1; depth <= sglang::decoder_max_mtp_steps; ++depth) {
-        options.mtp_steps = depth;
-        try {
-            sglang::decoder::validate_request(prompt, options, true);
-        } catch (const std::invalid_argument& error) {
-            if (std::string_view(error.what()) == "Constrained decoding requires mtp_steps=0") {
-                continue;
-            }
-            throw;
-        }
-        throw std::runtime_error("A constrained decoder request accepted positive MTP depth");
+    if (options.requires_target_only()) {
+        throw std::runtime_error("Ordinary text unexpectedly requires target-only decode");
     }
-    options.constraint.reset();
-    sglang::decoder::validate_request(prompt, options, true);
+    options.constraint = constraint;
+    if (options.requires_target_only()) {
+        throw std::runtime_error("Constrained text unexpectedly requires target-only decode");
+    }
+    options.max_new_tokens = 16;
+    for (int depth = 0; depth <= sglang::decoder_max_mtp_steps; ++depth) {
+        options.mtp_steps = depth;
+        sglang::decoder::validate_request(prompt, options, true);
+    }
+    options.stop_token_id = 32;
+    try {
+        sglang::decoder::validate_request(prompt, options, true);
+    } catch (const std::invalid_argument& error) {
+        constexpr std::string_view eos_error =
+            "Constrained decoding requires the model EOS stop tokens";
+        if (error.what() == eos_error) {
+            return;
+        }
+        throw;
+    }
+    throw std::runtime_error("A constrained decoder request accepted a custom stop token");
 }
 
 }
@@ -43,12 +50,12 @@ int main(int argc, char** argv) {
         const sglang::Tokenizer tokenizer(argv[1]);
         check_depth(sglang::TokenConstraint::compile(tokenizer, R"(root ::= "abc")"));
         check_depth(sglang::TokenConstraint::compile_regex(tokenizer, "^(?:ab|abc)$"));
-        std::cout << "EBNF and regex accept K0 and reject every positive depth\n";
+        std::cout << "EBNF and regex accept K0 through K4 with model EOS\n";
 #ifdef SGLANG_CHECK_JSON_SCHEMA
         const auto schema =
             sglang::json::parse(R"({"type":"null"})", sglang::json::Syntax::ordered);
         check_depth(sglang::TokenConstraint::compile_json_schema(tokenizer, schema));
-        std::cout << "JSON Schema accepts K0 and rejects every positive depth\n";
+        std::cout << "JSON Schema accepts K0 through K4 with model EOS\n";
 #endif
         return 0;
     } catch (const std::exception& error) {

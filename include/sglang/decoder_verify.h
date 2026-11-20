@@ -21,6 +21,7 @@ struct VerificationRow {
     static constexpr auto mode = TextGdnMode::decode;
     const VerificationGraphBinding* binding = nullptr;
     VerificationWorkspace* graph_workspace = nullptr;
+    bool constrained = false;
 };
 
 struct VerificationSequence {
@@ -28,6 +29,7 @@ struct VerificationSequence {
     int position;
     const int* tokens;
     int count;
+    bool constrained = false;
 };
 
 inline constexpr int k1_verification_rows = 2;
@@ -75,6 +77,52 @@ struct VerificationGraph {
     bool warmed = false;
 };
 
+// Holds candidate uploads for draft and target scores on one speculative branch.
+class MtpConstraintRound {
+public:
+    MtpConstraintRound(Request& request, const TokenConstraint& constraint, int rows);
+
+    void begin(const ConstraintCursor& committed, int remaining);
+    bool advance(int row, int token);
+    const ConstraintCandidates& candidates(int row) const { return rows_[row]; }
+    int rows() const { return prepared_rows_; }
+
+private:
+    void prepare(int row, int remaining);
+
+    const TokenConstraint* constraint_;
+    ConstraintCursor cursor_;
+    std::byte* staging_;
+    std::size_t stride_;
+    int remaining_ = 0;
+    int prepared_rows_ = 0;
+    std::array<ConstraintCandidates, target_verify_max_rows> rows_{};
+};
+
+struct MtpRound {
+    MtpDraftRequest* draft;
+    TargetVerification* target;
+    Request* request;
+    MtpConstraintRound* constraint;
+    const SamplingParameters* sampling;
+    std::array<int, target_verify_max_rows> tokens;
+    int position;
+    int first_output;
+    int remaining;
+    int proposal_limit;
+    const Bf16* draft_hidden = nullptr;
+    int drafted = 0;
+    int consumed = 0;
+
+    using Emit = std::function<bool(int, const Bf16*, bool)>;
+    using Cancel = std::function<bool()>;
+
+    int rows() const;
+    static bool propose_all(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
+                            cudaStream_t stream, const Cancel& cancel);
+    bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel);
+};
+
 class TargetVerification {
 public:
     TargetVerification(Request& request, int capacity, int prefix, int rows, bool logits,
@@ -88,11 +136,13 @@ public:
     void bind_gdn(int layer);
     void advance_gdn(int layer, TextGdnWeights weights);
     void sample(const SamplingParameters& parameters, int first_output, void* scratch);
+    void constrain(const MtpConstraintRound& constraint, const ConstraintWorkspace& scratch,
+                   const SamplingParameters* sampling, int first_output, void* sampling_scratch);
     void read();
     static void read_all(TargetVerification* const* verifiers, int count, cudaStream_t stream);
     void commit(int count);
 
-    int winner(int index, bool sampled = false) const;
+    int winner(int index, bool sampled = false, bool constrained = false) const;
     const Bf16* logits(int index) const;
 
 private:

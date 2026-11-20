@@ -48,8 +48,8 @@ and CUPTI runtime/device records in the evidence directory.
   requires zero request bytes at cleanup.
 - The K1 target verification probe distinguishes two-row target launches from K0
   replay. It checks sparse slots, request replacement, mixed K0 and K1 decode,
-  and eager execution for verifier groups with multiple K1 lanes, K2–K4,
-  or a one-row budget.
+  and eager execution for verifier groups with multiple lanes, more than two
+  target rows, or a one-row budget.
   Preparation, capture, and instantiation rejection fall back to eager. The
   fixture checks same-slot replacement after a successful drain and batch
   disablement after launch-call errors, uncertain teardown, or a failed drain.
@@ -176,7 +176,7 @@ It verifies low-concurrency progress and a waiting request at full occupancy.
 After resetting an active stream, surviving streams advance, the waiter finishes,
 and request bytes return to zero. The small-budget arm checks prompt boundaries
 and counts prompt, decode, and MTP verification rows in scheduler traces. Media
-requests exercise the serial route and share a scheduler step with a text
+requests run at capacity one and share a scheduler step with a text
 request at the default width. The CLI accepts K1 through K4 with up to 32
 active requests. The scheduler shares one row budget across all active slots
 and verifies drafts in groups of up to four lanes. The wide K1 arm fills the

@@ -338,10 +338,12 @@ def check_admission(port, log_path, evidence, cases, capacity):
     })
 
 
-def check_serial(args, evidence, width, cases):
-    with server(args, evidence, width, profile=True) as (port, _):
+def check_singleton_graph(args, evidence, width, cases):
+    flags = ("--batch-cuda-graphs", "--trace-batches")
+    with server(args, evidence, width, profile=True, flags=flags) as (port, log):
         streams = [request(port, case).evidence() for case in cases.values()]
         write_json(evidence / "serial-oracle.json", streams)
+    traced = log.read_bytes().count(b"batch graph_slots=1\n")
     database = evidence / "graph.sqlite"
     with closing(sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)) as connection:
         launches, = connection.execute("""
@@ -350,10 +352,12 @@ def check_serial(args, evidence, width, cases):
             JOIN StringIds AS names ON api.nameId = names.id
             WHERE names.value LIKE 'cudaGraphLaunch%'
         """).fetchone()
-    expected = sum(len(case["output"]) - 1 for case in cases.values())
-    write_json(evidence / "graph-launches.json", {"expected": expected, "observed": launches})
-    require(launches == expected,
-            f"{width}: expected {expected} CUDA graph launches, got {launches}")
+    expected = sum(len(case["output"]) - 1 for case in cases.values()) - 1
+    write_json(evidence / "graph-launches.json", {
+        "expected": expected, "observed": launches, "traced": traced,
+    })
+    require(launches == traced == expected,
+            f"{width}: expected {expected} launches, got {launches} with {traced} traced")
 
 
 def check_parallel(args, evidence, width, cases):
@@ -376,7 +380,7 @@ def main():
                         help="new directory for raw results")
     parser.add_argument("--width", action="append", choices=("1", "2", "4"),
                         help="repeat to select modes, defaults to all three")
-    parser.add_argument("--nsys", default="nsys", help="Nsight Systems CLI for serial graph checks")
+    parser.add_argument("--nsys", default="nsys", help="Nsight Systems CLI for width-one graphs")
     args = parser.parse_args()
     args.binary = args.binary.resolve()
     args.checkpoint = args.checkpoint.resolve()
@@ -400,7 +404,7 @@ def main():
         print(f"Checking native serving width {width}", flush=True)
         evidence = args.evidence / f"width-{width}"
         if width == "1":
-            check_serial(args, evidence, width, cases)
+            check_singleton_graph(args, evidence, width, cases)
         else:
             check_parallel(args, evidence, width, cases)
     write_json(args.evidence / "status.json", {"result": "passed"})

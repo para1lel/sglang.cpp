@@ -24,7 +24,7 @@ The HTTP check starts one server with its default capacity, token budget, and FP
 It verifies the advertised capacity of 32 and budget of 32,768, then checks complete streams
 against the frozen oracle. The 511-token probe distinguishes `exact` from `tensor-core` by the
 first generated token. A separate server runs the same prompts and generation budgets with
-`--max-active 1 --eager --fp8-prefill exact` to exercise the serial route.
+`--max-active 1 --eager --fp8-prefill exact` to exercise the scheduler with one slot.
 
 The width-two cohort uses 129- and 257-token prompts. The width-four cohort uses 2-, 127-,
 129-, and 257-token prompts. Both use the same five-token generation budget and an explicit

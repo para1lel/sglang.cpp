@@ -165,7 +165,8 @@ struct MtpDraftRequest::State {
     void prepare(int shifted_token, const Bf16* hidden, cudaStream_t stream);
     void attend(int position, cudaStream_t stream);
     void run_mlp(cudaStream_t stream);
-    void score(cudaStream_t stream);
+    void score(cudaStream_t stream, const ConstraintWorkspace* scratch,
+               const ConstraintCandidates* allowed);
 
     std::shared_ptr<const MtpDraftWeights> weights;
     Allocations memory;
@@ -175,6 +176,7 @@ struct MtpDraftRequest::State {
     Mxfp8PageTable pages;
     int prefix = 0;
     bool scored = false;
+    bool constrained_score = false;
     bool failed = false;
 };
 
@@ -248,12 +250,19 @@ void MtpDraftRequest::State::run_mlp(cudaStream_t stream) {
                         nullptr, stream), "Normalize MTP output");
 }
 
-void MtpDraftRequest::State::score(cudaStream_t stream) {
+void MtpDraftRequest::State::score(cudaStream_t stream, const ConstraintWorkspace* scratch,
+                                  const ConstraintCandidates* allowed) {
     const auto& head = weights->state_->lm_head;
     check(text_bf16_gemv(head.values, work.normalized, head.rows, head.columns,
                          work.logits, stream), "Run shared LM head for MTP");
-    check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
-          "Select MTP token");
+    if (allowed) {
+        select_constrained({work.logits, work.argmax_scratch, work.argmax}, *scratch, *allowed,
+                           nullptr, 0, nullptr, stream);
+    } else {
+        check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+              "Select MTP token");
+    }
+    constrained_score = allowed != nullptr;
     auto& winner = memory.transfers().winner;
     check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner), cudaMemcpyDeviceToHost,
                           stream), "Copy MTP token");
@@ -282,7 +291,9 @@ MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights,
 MtpDraftRequest::~MtpDraftRequest() = default;
 
 const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16* hidden,
-                                    bool score, cudaStream_t stream) {
+                                    bool score, cudaStream_t stream,
+                                    const ConstraintWorkspace* scratch,
+                                    const ConstraintCandidates* allowed) {
     auto& request = *state_;
     if (request.failed) {
         throw std::logic_error("MTP draft request failed");
@@ -296,7 +307,7 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
         request.attend(position, stream);
         request.run_mlp(stream);
         if (score) {
-            request.score(stream);
+            request.score(stream, scratch, allowed);
         }
     } catch (...) {
         request.failed = true;
@@ -350,6 +361,9 @@ int MtpDraftRequest::read_token() const {
         throw std::logic_error("MTP draft has no completed score to read");
     }
     const int token = state_->memory.transfers().winner;
+    if (token == -1 && state_->constrained_score) {
+        return -1;
+    }
     if (token < 0 || token >= vocab_size) {
         throw std::runtime_error("MTP argmax did not return a valid token ID");
     }

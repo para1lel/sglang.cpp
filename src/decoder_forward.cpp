@@ -416,10 +416,33 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
     forward_layers(lanes, count, stream);
 }
 
-void Decoder::Model::forward_verify(TargetVerification& verification, int position,
-                                    const int* tokens, int count, cudaStream_t stream) const {
-    const VerificationSequence sequence{&verification, position, tokens, count};
-    forward_verify(&sequence, 1, stream);
+bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
+                                void* sampling_scratch, cudaStream_t stream,
+                                VerificationGraph* graph) const {
+    std::array<VerificationSequence, decoder_batch_max_mtp_lanes> sequences;
+    std::array<TargetVerification*, decoder_batch_max_mtp_lanes> verifiers;
+    if (count < 1 || count > decoder_batch_max_mtp_lanes) {
+        throw std::invalid_argument("Invalid number of MTP rounds");
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& round = rounds[index];
+        const int rows = round.rows();
+        verifiers[index] = round.target;
+        sequences[index] = {round.target, round.position, round.tokens.data(), rows,
+                            round.constraint != nullptr};
+    }
+    const bool replayed = forward_verify(sequences.data(), count, stream, graph);
+    for (int index = 0; index < count; ++index) {
+        const auto& round = rounds[index];
+        if (round.constraint) {
+            round.target->constrain(*round.constraint, scratch, round.sampling, round.first_output,
+                                    sampling_scratch);
+        } else if (round.sampling) {
+            round.target->sample(*round.sampling, round.first_output, sampling_scratch);
+        }
+    }
+    TargetVerification::read_all(verifiers.data(), count, stream);
+    return replayed;
 }
 
 bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int count,
@@ -441,7 +464,7 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
         sequence.verification->begin(sequence.position, sequence.count, stream);
     }
     const auto& first = sequences[0];
-    if (graph && count == 1 && first.verification->graph_eligible(first) &&
+    if (graph && count == 1 && !first.constrained && first.verification->graph_eligible(first) &&
         std::exchange(graph->warmed, true)) {
         const bool replayed = graph->execution.replay_batch_graph(1, [&] {
             graph->scratch = std::make_unique<VerificationGraphScratch>(device);
@@ -472,7 +495,8 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
         for (int lane = 0; lane < count; ++lane) {
             const auto& sequence = sequences[lane];
             if (index < sequence.count) {
-                const auto row = sequence.verification->row(index);
+                auto row = sequence.verification->row(index);
+                row.constrained = sequence.constrained;
                 rows[next++] = row;
                 check(text_embedding(embedding, vocab_size, hidden_size, sequence.tokens[index],
                                      row.work->residual, stream), "Look up verification input");
@@ -489,9 +513,11 @@ void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count
     const LayerBatch<VerificationRow> batch{rows, count, stream};
     batch.each([&](const VerificationRow&, Workspace& work) { normalize_final(work, stream); });
     project(lm_head, batch, &Workspace::logits);
-    batch.each([&](const VerificationRow&, Workspace& work) {
-        check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
-              "Select target verification winner");
+    batch.each([&](const VerificationRow& row, Workspace& work) {
+        if (!row.constrained) {
+            check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+                  "Select target verification winner");
+        }
     });
 }
 

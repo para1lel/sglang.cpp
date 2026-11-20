@@ -1,7 +1,6 @@
 #include "sglang/server/text_completion.h"
 
 #include "sglang/json.h"
-#include "sglang/server/batch_service.h"
 #include "sglang/server/http.h"
 #include "sglang/utf8.h"
 
@@ -251,30 +250,19 @@ void TextResponse::finish(const DecoderResult& result) {
 }
 
 void complete_text(const Socket& connection, const TextRequest& request,
-                   const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                   bool trace_serial) {
+                   const CompletionTokenizer& tokenizer, const TextGenerator& generate) {
     if (disconnected(connection)) {
         return;
     }
     TextResponse response(connection, tokenizer.get(), request);
-    bool first_token = true;
     const DecoderCallbacks callbacks{
-        [&](int token) {
-            if (trace_serial) {
-                trace_batch_step(1, first_token ? 0 : 1, 0);
-                first_token = false;
-            }
-            return response.token(token);
-        },
+        [&](int token) { return response.token(token); },
         [&] { return disconnected(connection); },
     };
     try {
         const auto result = generate(request.prompt, request.options, callbacks);
-        if (result.finish_reason == DecoderFinishReason::cancelled && !response.stopped()) {
-            if (trace_serial) {
-                trace_batch_step(0, 0, 0);
-            }
-        } else if (!disconnected(connection)) {
+        const bool complete = result.finish_reason != DecoderFinishReason::cancelled;
+        if ((complete || response.stopped()) && !disconnected(connection)) {
             response.finish(result);
         }
     } catch (const std::exception& error) {
@@ -290,19 +278,19 @@ void complete_text(const Socket& connection, const TextRequest& request,
 
 void complete_chat_request(const Socket& connection, std::string_view body,
                            const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                           const MediaGenerator& generate_media, bool trace_serial) {
+                           const MediaGenerator& generate_media) {
     if (disconnected(connection)) {
         return;
     }
     const auto request = parse_chat_request(body, tokenizer, bool(generate_media));
     if (!request.media) {
-        complete_text(connection, request, tokenizer, generate, trace_serial);
+        complete_text(connection, request, tokenizer, generate);
         return;
     }
     complete_text(connection, request, tokenizer,
                   [&](const auto&, const auto& options, const auto& callbacks) {
                       return generate_media(*request.media, options, callbacks);
-                  }, trace_serial);
+                  });
 }
 
 }

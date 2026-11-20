@@ -46,9 +46,6 @@ void validate_constraint(const DecoderOptions& options) {
     if (!options.constraint) {
         return;
     }
-    if (options.mtp_steps != 0) {
-        throw std::invalid_argument("Constrained decoding requires mtp_steps=0");
-    }
     if ((options.stop_token_id && !constraint_eos(*options.stop_token_id)) ||
         !std::all_of(options.additional_stop_token_ids.begin(),
                      options.additional_stop_token_ids.end(), constraint_eos)) {
@@ -122,8 +119,7 @@ void copy_token(Request& request, const Workspace& work, cudaStream_t stream) {
                           cudaMemcpyDeviceToHost, stream), "Read selected token");
 }
 
-int read_token(Request& request, bool sampled, bool constrained) {
-    const int winner = request.memory.transfers().winner;
+int validate_winner(int winner, bool sampled, bool constrained) {
     if (!valid_token(winner)) {
         if (constrained && winner == -1) {
             throw DecoderConstraintError();
@@ -134,6 +130,10 @@ int read_token(Request& request, bool sampled, bool constrained) {
         throw std::runtime_error("Greedy selection did not produce a valid token ID");
     }
     return winner;
+}
+
+int read_token(Request& request, bool sampled, bool constrained) {
+    return validate_winner(request.memory.transfers().winner, sampled, constrained);
 }
 
 }
@@ -221,189 +221,6 @@ int read_step(Request& request, const std::optional<SamplingParameters>& samplin
 
 }
 
-struct Decoder::Model::MtpGeneration {
-    const Model& model;
-    Request& target;
-    MtpDraftRequest& draft;
-    const DecoderOptions& options;
-    const DecoderCallbacks& callbacks;
-    DecoderResult& result;
-    std::optional<SamplingParameters> sampling;
-    std::vector<DecoderLogit> ranking{};
-    int next_target_position = 0;
-    int seed = -1;
-
-    bool cancelled() const { return callbacks.is_cancelled && callbacks.is_cancelled(); }
-
-    std::optional<DecoderFinishReason> emit(int token, const Bf16* logits, bool accepted = false) {
-        if (cancelled()) {
-            return DecoderFinishReason::cancelled;
-        }
-        seed = token;
-        result.output_token_ids.push_back(token);
-        result.mtp_accepted_tokens += accepted;
-        const bool keep_running = !callbacks.on_token || callbacks.on_token(token);
-        if (options.top_logits > 0) {
-            result.step_top_logits.push_back(
-                top_logits(logits, options.top_logits, ranking));
-        }
-        if (!keep_running) {
-            return DecoderFinishReason::cancelled;
-        }
-        if (options.stops_at(token)) {
-            return DecoderFinishReason::stop;
-        }
-        if (result.output_token_ids.size() == static_cast<std::size_t>(options.max_new_tokens)) {
-            return DecoderFinishReason::length;
-        }
-        return std::nullopt;
-    }
-
-    using VerificationTokens = std::array<int, target_verify_max_rows>;
-
-    bool propose(VerificationTokens& tokens, int count) {
-        const auto stream = target.memory.stream();
-        const int first_draft_position = next_target_position - 1;
-        const Bf16* hidden = target.work.normalized;
-        int shifted_token = seed;
-        tokens.front() = seed;
-        result.mtp_rounds += count > 0;
-        for (int index = 0; index < count; ++index) {
-            if (cancelled()) {
-                return false;
-            }
-            hidden = draft.enqueue(first_draft_position + index, shifted_token, hidden, true,
-                                   stream);
-            check(cudaStreamSynchronize(stream), "Complete MTP draft step");
-            shifted_token = draft.read_token();
-            tokens[index + 1] = shifted_token;
-            ++result.mtp_drafted_tokens;
-        }
-        return true;
-    }
-
-    std::optional<DecoderFinishReason> consume(TargetVerification& verification,
-                                               const VerificationTokens& tokens, int rows,
-                                               int count, int& processed) {
-        for (int index = 0; index < rows; ++index) {
-            if (index > 0 && cancelled()) {
-                return DecoderFinishReason::cancelled;
-            }
-            ++processed;
-            const int token = verification.winner(index, sampling.has_value());
-            const bool accepted = index < count && token == tokens[index + 1];
-            if (const auto finish = emit(token, verification.logits(index), accepted)) {
-                return finish;
-            }
-            if (!accepted) {
-                return std::nullopt;
-            }
-            const auto row = verification.row(index);
-            draft.enqueue(row.position, seed, row.work->normalized, false, target.memory.stream());
-        }
-        return std::nullopt;
-    }
-
-    std::optional<DecoderFinishReason> verify(TargetVerification& verification,
-                                              const VerificationTokens& tokens, int count,
-                                              int remaining) {
-        if (count > 0) {
-            draft.rewind(next_target_position);
-        }
-        if (cancelled()) {
-            return DecoderFinishReason::cancelled;
-        }
-        const auto stream = target.memory.stream();
-        const int rows = std::min(remaining, count + 1);
-        if (options.incremental_kv) {
-            target.grow_kv(next_target_position + rows, next_target_position, stream);
-        }
-        model.forward_verify(verification, next_target_position, tokens.data(), rows, stream);
-        if (sampling) {
-            verification.sample(*sampling, static_cast<int>(result.output_token_ids.size()),
-                                target.sampling_workspace);
-        }
-        verification.read();
-        int processed = 0;
-        const auto finish = consume(verification, tokens, rows, count, processed);
-        if (!finish) {
-            const auto* hidden = verification.row(processed - 1).work->normalized;
-            check(cudaMemcpyAsync(target.work.normalized, hidden, hidden_size * sizeof(Bf16),
-                                  cudaMemcpyDeviceToDevice, stream),
-                  "Carry committed target hidden state into next draft");
-        }
-        verification.commit(processed);
-        next_target_position += processed;
-        return finish;
-    }
-
-    bool prefill(const std::vector<int>& prompt, std::size_t& prefill_bytes) {
-        if (cancelled()) {
-            return false;
-        }
-        const auto stream = target.memory.stream();
-        const int prompt_count = static_cast<int>(prompt.size());
-        const int limit = options.max_num_batched_tokens
-            ? std::min(prefill_chunk_rows, options.max_num_batched_tokens) : prefill_chunk_rows;
-        PrefillWorkspace workspace(stream, std::min(prompt_count, limit));
-        prefill_bytes = workspace.bytes();
-        result.peak_device_allocation_bytes += prefill_bytes;
-        const int tile_rows = prefill_bytes ? workspace.capacity() : 1;
-        while (next_target_position < prompt_count) {
-            if (cancelled()) {
-                workspace.close();
-                return false;
-            }
-            const int position = next_target_position;
-            const int remaining = prompt_count - position;
-            const int rows = std::min(tile_rows, remaining);
-            model.prefill_chunk(target, prompt.data() + position, rows, position, workspace,
-                                &draft, remaining);
-            if (callbacks.is_cancelled) {
-                check(cudaStreamSynchronize(stream), "Complete cancellable MTP prefill tile");
-            }
-            next_target_position += rows;
-        }
-        workspace.close();
-        return !cancelled();
-    }
-
-    DecoderFinishReason run(const std::vector<int>& prompt) {
-        std::size_t prefill_bytes = 0;
-        if (!prefill(prompt, prefill_bytes)) {
-            return DecoderFinishReason::cancelled;
-        }
-        model.compute_logits(target);
-        const int token = read_step(target, sampling);
-        if (const auto finish = emit(token, target.memory.transfers().logits.data())) {
-            return *finish;
-        }
-        const auto before = target.memory.bytes();
-        const int proposals = options.max_num_batched_tokens
-            ? std::min(options.mtp_steps, options.max_num_batched_tokens - 1) : options.mtp_steps;
-        const int rows = std::min(options.max_new_tokens - 1, proposals + 1);
-        const int prompt_count = static_cast<int>(prompt.size());
-        TargetVerification verification(target, prompt_count + options.max_new_tokens - 1,
-                                        next_target_position, rows, options.top_logits > 0);
-        const auto verify_bytes = target.memory.bytes() - before;
-        result.peak_device_allocation_bytes +=
-            std::max(prefill_bytes, verify_bytes) - prefill_bytes;
-        while (!cancelled()) {
-            const int remaining = options.max_new_tokens -
-                                  static_cast<int>(result.output_token_ids.size());
-            const int count = std::min(remaining - (sampling ? 1 : 0), proposals);
-            VerificationTokens tokens{};
-            if (!propose(tokens, count)) {
-                break;
-            }
-            if (const auto finish = verify(verification, tokens, count, remaining)) {
-                return *finish;
-            }
-        }
-        return DecoderFinishReason::cancelled;
-    }
-};
-
 Decoder::Model::Model(const std::filesystem::path& checkpoint, int cuda_device,
                       Fp8PrefillPolicy fp8_prefill)
     : Model(checkpoint, cuda_device) {
@@ -433,28 +250,6 @@ Decoder::~Decoder() = default;
 std::size_t Decoder::model_device_allocation_bytes() const {
     return model_->memory->bytes() + (model_->mtp_weights ?
                                      model_->mtp_weights->device_allocation_bytes() : 0);
-}
-
-DecoderFinishReason Decoder::Model::generate_mtp(const std::vector<int>& prompt,
-                                                const DecoderOptions& options,
-                                                const DecoderCallbacks& callbacks,
-                                                DecoderResult& result) const {
-    const int capacity = static_cast<int>(prompt.size()) + options.max_new_tokens - 1;
-    const auto draft = std::make_shared<MtpDraftRequest>(mtp_weights, capacity);
-    const int initial_kv = options.incremental_kv ? static_cast<int>(prompt.size()) : capacity;
-    Request target(device, initial_kv, draft, false, options.incremental_kv ? capacity : 0);
-    prepare_serial_request(target, options);
-    result.peak_device_allocation_bytes +=
-        target.memory.bytes() + draft->device_allocation_bytes();
-    const auto sampling = options.samples() ? std::optional{request_sampling(options)}
-                                            : std::nullopt;
-    MtpGeneration generation{*this, target, *draft, options, callbacks, result, sampling};
-    if (options.top_logits > 0) {
-        generation.ranking.reserve(vocab_size);
-    }
-    const auto finish = generation.run(prompt);
-    target.memory.close();
-    return finish;
 }
 
 bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& prompt,
@@ -642,7 +437,22 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     if (options.mtp_steps == 0) {
         model_->generate_serial(prompt_token_ids, options, callbacks, result);
     } else {
-        result.finish_reason = model_->generate_mtp(prompt_token_ids, options, callbacks, result);
+        const int limit = options.max_num_batched_tokens
+            ? std::min(options.max_num_batched_tokens, prefill_chunk_rows) : prefill_chunk_rows;
+        DecoderBatch batch(*this, DecoderBatchOptions{false, 1, 0, limit});
+        std::vector<DecoderLogit> ranking;
+        if (options.top_logits > 0) {
+            ranking.reserve(vocab_size);
+        }
+        const SerialMtpOutput output{callbacks.is_cancelled, [&](int token, const Bf16* logits) {
+            result.output_token_ids.push_back(token);
+            const bool keep_running = !callbacks.on_token || callbacks.on_token(token);
+            if (options.top_logits > 0) {
+                result.step_top_logits.push_back(top_logits(logits, options.top_logits, ranking));
+            }
+            return keep_running;
+        }};
+        batch.generate_mtp(prompt_token_ids, options, output, result);
     }
     selected_device.restore();
     return result;

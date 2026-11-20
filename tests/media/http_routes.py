@@ -114,10 +114,10 @@ def malformed(args, port):
         negative(args, f"invalid-{index}", port, chat([image, changed], stream=True), message)
     for kind, mime in (("image_url", "image/png"), ("video_url", "video/mp4")):
         body = chat([{"type": kind, kind: {"url": f"data:{mime};base64,AAAA"}}])
-        negative(args, f"codec-disabled-{kind}", port, body, "decoded")
+        negative(args, f"codec-disabled-{kind}", port, body, "enabled inline media data URL")
     for field, value in (("cache_salt", "media"), ("ebnf", 'root ::= "Hello"')):
         negative(args, f"media-{field}", port, chat([image]) | {field: value}, field)
-    negative(args, "too-many-parts", port, chat([image] * 5), "at most four")
+    negative(args, "too-many-parts", port, chat([image] * 5), "up to four parts")
 
 
 def usage(body, budget):
@@ -203,7 +203,7 @@ def cancel_and_replace(args, port, log, content, expected):
 def main(args):
     args.evidence.mkdir()
     content = mixed_content()
-    with serve(args, "serial", "--max-active", "1", "--mtp-steps", "0") as (port, log):
+    with serve(args, "width-one", "--max-active", "1", "--mtp-steps", "0") as (port, log):
         malformed(args, port)
         response = capture(args, "zero-budget", port, CHAT, chat(content, 0))
         received(response, 0)
@@ -220,7 +220,7 @@ def main(args):
     for label, options in (("continuous", ["--max-active", "2"]),
                            ("cached", ["--max-active", "1", "--prefix-cache-entries", "1"])):
         with serve(args, label, *options) as (port, _):
-            negative(args, f"{label}-media", port, chat(content), "serial")
+            assert ordinary(args, port, f"{label}-media", content) == (expected, prompt)
             ordinary(args, port, f"{label}-plain", "Say hello.")
     print("Decoded media HTTP route contract passed.")
 

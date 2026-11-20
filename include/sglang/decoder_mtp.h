@@ -41,7 +41,8 @@ public:
     /// normalized hidden row. The returned device row survives until the next
     /// enqueue writes it. The row can also be passed as that enqueue's input.
     const Bf16* enqueue(int position, int shifted_token, const Bf16* hidden, bool score,
-                        cudaStream_t stream);
+                        cudaStream_t stream, const ConstraintWorkspace* scratch = nullptr,
+                        const ConstraintCandidates* allowed = nullptr);
 
     void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                       const PrefillProjections& projections, MtpPrefillBuffers buffers);

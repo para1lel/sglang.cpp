@@ -375,12 +375,15 @@ cudaError_t launch_paged_decode(const Lane* lanes, int count, cudaStream_t strea
     return cudaGetLastError();
 }
 
+#include "sglang/text/mxfp8_gqa_wide_tc.cuh"
+
 cudaError_t launch_long_paged_decode(const decoder::PagedDecodeLane* lanes, int count,
                                     cudaStream_t stream) {
     if (!lanes || count < 1 || count > decoder_batch_max_lanes) {
         return cudaErrorInvalidValue;
     }
     LongDecodeBatch batch{};
+    bool tensor = count > decoder::paged_decode_lanes;
     for (int index = 0; index < count; ++index) {
         const auto& lane = lanes[index];
         const auto& buffers = lane.buffers;
@@ -390,13 +393,16 @@ cudaError_t launch_long_paged_decode(const decoder::PagedDecodeLane* lanes, int 
             !buffers.queries || !buffers.output || !address || address % alignof(DecodePartial)) {
             return cudaErrorInvalidValue;
         }
+        const auto key = reinterpret_cast<std::uintptr_t>(lane.cache.key_payload);
+        const auto value = reinterpret_cast<std::uintptr_t>(lane.cache.value_payload);
+        tensor &= (key | value) % alignof(uint4) == 0;
         batch.lanes[index] = lane;
     }
     void* arguments[] = {&batch};
     auto status = cudaLaunchKernel(
-        split_long_decode_attention,
-        dim3(decode_splits, mxfp8_query_heads / split_query_heads, count),
-        mxfp8_head_dim, arguments, 0, stream);
+        tensor ? split_long_decode_tensor : split_long_decode_attention,
+        dim3(decode_splits, tensor ? mxfp8_kv_heads : mxfp8_query_heads / split_query_heads, count),
+        tensor ? wide_warps * 32 : mxfp8_head_dim, arguments, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }

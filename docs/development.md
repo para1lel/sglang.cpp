@@ -70,7 +70,7 @@ For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 
 Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L221)<!-- prefix: "__device__ f" --> · [Replay](../src/mxfp8_gqa.cu#L405)<!-- prefix: "__device__ _" -->
 
 [Singleton](batch-graphs.md#page-parallel-gqa-decode) and [packed decode](batch-graphs.md#packed-paged-gqa-decode) group softmax and value reductions by KV pages.
-[Wide long decode](long-paged-decode.md) covers wider eager forwards.
+[Wide eager decode](long-paged-decode.md) selects its split after compaction.
 
 #### Ordered multirow GQA prefill
 
@@ -135,7 +135,7 @@ Multirow K0 tensor-core prefill keeps these operators during projection fallback
 - [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L267)<!-- prefix: "const auto s" -->
 - Fused residual RMSNorm and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L236)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L665)<!-- prefix: "cudaError_t " -->
 
-Other target prefill and draft decode use direct attention. Both prefill policies share target decode. Outside packed paged decode, eager decode uses exact attention within inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Beyond these limits both use direct attention. [Row dispatch](../src/decoder_forward.cpp#L196)<!-- prefix: "cudaError_t " -->
+Other target prefill and draft decode use direct attention. Wide long decode requires the tensor-core policy. Outside packed paged decode, eager decode uses exact attention within inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Both use direct attention beyond these limits. [Row dispatch](../src/decoder_forward.cpp#L196)<!-- prefix: "cudaError_t " -->
 
 The lane stream orders append, attention, and gating. Logits storage holds scores for 5,120 positions. See the [batch graph attention routes](batch-graphs.md#page-parallel-gqa-decode) for singleton eager fallback and multi-lane score allocation. [Workspace](../src/decoder_resources.cpp#L601)<!-- prefix: "ExactGqaWork" -->
 

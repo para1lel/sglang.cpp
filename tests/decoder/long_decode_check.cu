@@ -30,7 +30,8 @@ constexpr int guard = 32;
 constexpr std::size_t scratch_stride = paged_decode_scratch_bytes + 2 * guard;
 constexpr unsigned char poison = 0xa5;
 
-enum class Kind { split, merge, replay, other };
+enum class Kind { paired, tensor, merge, replay, other };
+enum class Mode { full, paired, small, recovery, unaligned };
 struct Launch {
     Kind kind;
     dim3 grid;
@@ -82,9 +83,10 @@ __global__ void fill_cache(Mxfp8KvCache kv, int populated, int marker) {
     const int kv_head = (linear / dim) % mxfp8_kv_heads;
     const int channel = linear % dim;
     const bool recovery = page == marker && slot == page_size - 1 && kv_head == 0;
+    const bool value_overflow = page == marker && kv_head == 1;
     kv.key_payload[linear] = channel == 0
         ? (recovery || key_sign(page, slot, kv_head) > 0 ? 0x38 : 0xb8) : 0;
-    kv.value_payload[linear] = recovery && channel < 32
+    kv.value_payload[linear] = (recovery || value_overflow) && channel < 32
         ? (channel == 0 ? 0x38 : 0) : (value_sign(page, slot, kv_head, channel) > 0 ? 0x38 : 0xb8);
     if (channel % mxfp8_group_size == 0) {
         const auto scale =
@@ -92,7 +94,8 @@ __global__ void fill_cache(Mxfp8KvCache kv, int populated, int marker) {
             + channel / 32;
         const bool oversized = recovery && channel == 0;
         kv.key_scales[scale] = oversized ? 254 : 128 + (page + slot + kv_head) % 4;
-        kv.value_scales[scale] = oversized ? 254 : 124 + (page + slot + channel / 32) % 4;
+        kv.value_scales[scale] = oversized || (value_overflow && channel == 0)
+            ? 254 : 124 + (page + slot + channel / 32) % 4;
     }
 }
 
@@ -108,7 +111,8 @@ double reference(int lane, int tokens, int head, int channel, int marker, int ph
         const bool repair = page == marker && slot == page_size - 1 && kv_head == 0;
         const double key = repair ? std::ldexp(1.0, 127)
             : std::ldexp(double(key_sign(page, slot, kv_head)), 1 + (page + slot + kv_head) % 4);
-        const double value = repair && channel < 32 ? std::ldexp(double(channel == 0), 127)
+        const bool large_value = repair || (page == marker && kv_head == 1);
+        const double value = large_value && channel < 32 ? std::ldexp(double(channel == 0), 127)
             : std::ldexp(double(value_sign(page, slot, kv_head, channel)),
                          -3 + (page + slot + channel / 32) % 4);
         const double score = query * key / 16.0;
@@ -122,16 +126,21 @@ double reference(int lane, int tokens, int head, int channel, int marker, int ph
     return numerator / mass;
 }
 
-void expect_launches(int count) {
+void expect_launches(int count, Kind split) {
     check(observed == 3, "Expected split, merge and replay launches");
-    constexpr std::array kinds{Kind::split, Kind::merge, Kind::replay};
+    const std::array kinds{split, Kind::merge, Kind::replay};
     for (int index = 0; index < observed; ++index) {
         const auto launch = launches[index];
+        const bool tensor = kinds[index] == Kind::tensor;
         check(launch.kind == kinds[index] && launch.grid.x == (index == 0 ? 16 : 24)
-                  && launch.grid.y == (index == 0 ? 12 : 1) && launch.grid.z == count
-                  && launch.block.x == dim && launch.block.y == 1 && launch.block.z == 1,
+                  && launch.grid.y == (tensor ? 4 : index == 0 ? 12 : 1)
+                  && launch.grid.z == count && launch.block.x == (tensor ? 128 : dim)
+                  && launch.block.y == 1 && launch.block.z == 1,
               "Unexpected grouped kernel or geometry");
     }
+    std::cout << "split=" << (split == Kind::tensor ? "tensor" : "paired")
+              << " grid=16x" << launches[0].grid.y << 'x' << count
+              << " block=" << launches[0].block.x << '\n';
 }
 
 cudaError_t invoke(const PagedDecodeLane* inputs, int count, cudaStream_t stream,
@@ -185,12 +194,14 @@ void check_errors(std::vector<PagedDecodeLane> inputs, unsigned char* scratch,
     inputs[1].buffers.queries = nullptr;
     invalid(inputs.data(), 2, stream);
     inputs[1] = original;
-    for (int fault = 1; fault <= 3; ++fault) {
-        check(invoke(inputs.data(), 2, stream, fault) == cudaErrorLaunchFailure &&
-                  observed == fault, "Launch failure was swallowed or followed by another pass");
-        cuda_check(cudaStreamSynchronize(stream));
+    for (int count : {2, 5}) {
+        for (int fault = 1; fault <= 3; ++fault) {
+            check(invoke(inputs.data(), count, stream, fault) == cudaErrorLaunchFailure &&
+                      observed == fault, "Launch error changed or a later pass was submitted");
+            cuda_check(cudaStreamSynchronize(stream));
+        }
     }
-    std::cout << "invalid=10 injected_launch_failures=3\n";
+    std::cout << "invalid=10 injected_launch_failures=6\n";
 }
 
 constexpr std::size_t output_stride = row_size * sizeof(Bf16) + 2 * guard;
@@ -225,10 +236,14 @@ void check_outputs(const std::vector<PagedDecodeLane>& inputs,
     for (std::size_t lane = 0; lane < inputs.size(); ++lane) {
         std::memcpy(decoded.data(), output.data() + lane * output_stride + guard,
                     row_size * sizeof(Bf16));
-        for (const auto value : decoded) {
-            check(std::isfinite(__bfloat162float(value)), "Nonfinite attention output");
+        for (int index = 0; index < row_size; ++index) {
+            const auto value = __bfloat162float(decoded[index]);
+            const bool nan_head = marker >= 0 && lane == 1 && index / dim == 12;
+            check(nan_head ? std::isnan(value) : std::isfinite(value),
+                  "Unexpected nonfinite attention output");
         }
         for (const int head : {0, 5, 6, 11, 12, 17, 18, 23}) {
+            if (marker >= 0 && lane == 1 && head == 12) continue;
             for (const int channel : {0, 31, 32, 203, 255}) {
                 const auto expected = reference(lane, inputs[lane].position + 1, head,
                                                 channel, marker, physical_pages);
@@ -245,10 +260,50 @@ void check_outputs(const std::vector<PagedDecodeLane>& inputs,
               << samples << " max_scaled_error=" << worst << " guards=pass\n";
 }
 
-void run(bool small, bool recovery) {
-    const int count = small || recovery ? (recovery ? 2 : 1) : width;
-    const int physical_pages = small ? 32768 / page_size : pages;
-    const int marker = recovery ? page_map(0, pages - 1, physical_pages) : -1;
+void check_recovery(const std::vector<unsigned char>& scratch, int count, int marker,
+                    int physical_pages) {
+    int replayed = 0;
+    for (int lane = 0; lane < count; ++lane) {
+        bool has_marker = false;
+        for (int page = 0; page < 32768 / page_size; ++page) {
+            has_marker |= page_map(lane, page, physical_pages) == marker;
+        }
+        for (int head = 0; head < heads; ++head) {
+            const auto offset = lane * scratch_stride + guard +
+                head * paged_decode_scratch_bytes / heads + dim * sizeof(float);
+            float maximum;
+            std::memcpy(&maximum, scratch.data() + offset, sizeof(maximum));
+            const bool expected = (has_marker && head < 12) || (lane == 1 && head == 12);
+            check(expected ? std::isnan(maximum) : std::isfinite(maximum),
+                  "Unexpected ordered replay mask");
+            replayed += expected;
+        }
+    }
+    std::cout << "replayed_heads=" << replayed << " checked_heads=" << count * heads << '\n';
+}
+
+void check_unaligned(std::vector<PagedDecodeLane> inputs, std::size_t bytes,
+                     cudaStream_t stream) {
+    Buffer<std::uint8_t> shifted(bytes + 1);
+    auto& cache = inputs.back().cache;
+    for (auto payload : {&cache.key_payload, &cache.value_payload}) {
+        const auto original = *payload;
+        cuda_check(cudaMemcpyAsync(shifted.data + 1, original, bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+        *payload = shifted.data + 1;
+        cuda_check(invoke(inputs.data(), inputs.size(), stream));
+        expect_launches(inputs.size(), Kind::paired);
+        cuda_check(cudaStreamSynchronize(stream));
+        *payload = original;
+    }
+}
+
+void run(Mode mode) {
+    const bool full = mode == Mode::full || mode == Mode::paired;
+    const bool recovery = mode == Mode::recovery;
+    const int count = full ? width : mode == Mode::small ? 1 : 5;
+    const int physical_pages = full ? pages : 512;
+    const int marker = recovery ? page_map(0, 32768 / page_size - 1, physical_pages) : -1;
     Buffer<std::uint8_t> keys(physical_pages * mxfp8_payload_bytes_per_page);
     Buffer<std::uint8_t> values(physical_pages * mxfp8_payload_bytes_per_page);
     Buffer<std::uint8_t> ks(physical_pages * mxfp8_scale_bytes_per_page);
@@ -271,12 +326,16 @@ void run(bool small, bool recovery) {
         for (int head = 0; head < heads; ++head) {
             query_host[lane * row_size + head * dim] = __float2bfloat16(query_value(lane, head));
         }
-        const int length = recovery ? (lane == 0 ? max_tokens : 32768) : small ? 32768
-            : lane < int(lengths.size()) ? lengths[lane] : 32768 + lane;
+        const int length = full && lane < int(lengths.size()) ? lengths[lane]
+            : recovery ? 32769 : 32768 + lane;
         inputs.push_back({cache, {page_device.data + lane * pages, (length + 127) / 128},
                           length - 1, {queries.data + lane * row_size,
                           reinterpret_cast<Bf16*>(output.data + lane * output_stride + guard),
                           scratch.data + lane * scratch_stride + guard}});
+    }
+    if (recovery) {
+        query_host[row_size + 12 * dim] =
+            __float2bfloat16(std::numeric_limits<float>::quiet_NaN());
     }
     cuda_check(cudaMemcpyAsync(page_device.data, page_host.data(), page_host.size() * sizeof(int),
                                cudaMemcpyHostToDevice, stream));
@@ -287,9 +346,11 @@ void run(bool small, bool recovery) {
     cuda_check(cudaGetLastError());
     cuda_check(cudaMemsetAsync(output.data, poison, count * output_stride, stream));
     cuda_check(cudaMemsetAsync(scratch.data, poison, count * scratch_stride, stream));
-    if (!small && !recovery) check_errors(inputs, scratch.data, stream);
+    if (full) check_errors(inputs, scratch.data, stream);
+    if (mode == Mode::unaligned) check_unaligned(inputs, slots, stream);
     cuda_check(invoke(inputs.data(), count, stream));
-    expect_launches(count);
+    expect_launches(count, mode == Mode::full || recovery || mode == Mode::unaligned
+                              ? Kind::tensor : Kind::paired);
     std::vector<unsigned char> host_output(count * output_stride);
     std::vector<unsigned char> host_scratch(count * scratch_stride);
     cuda_check(cudaMemcpyAsync(host_output.data(), output.data, host_output.size(),
@@ -299,11 +360,12 @@ void run(bool small, bool recovery) {
     cuda_check(cudaStreamSynchronize(stream));
     check_guards(host_output, output_stride, count);
     check_guards(host_scratch, scratch_stride, count);
-    if (!small && !recovery) {
+    if (full) {
         constexpr int longest = 4;
         check_ordered(inputs[longest], host_output.data() + longest * output_stride + guard,
                       stream);
     }
+    if (recovery) check_recovery(host_scratch, count, marker, physical_pages);
     check_outputs(inputs, host_output, marker, physical_pages);
     cuda_check(cudaStreamDestroy(stream));
 }
@@ -319,7 +381,8 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
         const char* name = nullptr;
         cuda_check(cudaFuncGetName(&name, function));
         const std::string_view symbol(name);
-        const auto type = symbol.find("split_long_decode_attention") != symbol.npos ? Kind::split
+        const auto type = symbol.find("split_long_decode_attention") != symbol.npos ? Kind::paired
+            : symbol.find("split_long_decode_tensor") != symbol.npos ? Kind::tensor
             : symbol.find("merge_decode_attention") != symbol.npos ? Kind::merge
             : symbol.find("replay_long_paged_decode") != symbol.npos ? Kind::replay : Kind::other;
         check(observed < int(launches.size()), "Too many grouped launches");
@@ -330,10 +393,14 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
 }
 
 int main(int argc, char** argv) try {
-    check(argc <= 2, "Usage: long-decode-check [full|small|recovery]");
+    check(argc <= 2, "Usage: long-decode-check [full|paired|small|recovery|unaligned]");
     const std::string_view mode = argc == 2 ? argv[1] : "full";
-    check(mode == "full" || mode == "small" || mode == "recovery", "Invalid operator test mode");
-    run(mode == "small", mode == "recovery");
+    if (mode == "full") run(Mode::full);
+    else if (mode == "paired") run(Mode::paired);
+    else if (mode == "small") run(Mode::small);
+    else if (mode == "recovery") run(Mode::recovery);
+    else if (mode == "unaligned") run(Mode::unaligned);
+    else check(false, "Invalid operator test mode");
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

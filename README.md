@@ -201,10 +201,10 @@ attention at 8,192–16,384 visible tokens skips it. Longer singletons,
 workspace-dependent steps after allocation failure, other widths, and mixed
 prefill and decode steps run eagerly.
 
-With `--fp8-prefill tensor-core`, eager forwards wider than four rows use
-[split paged attention](src/mxfp8_gqa.cu#L967)<!-- prefix: "cudaError_t " -->
-for K0 text decode at 32,768–262,144 visible tokens, reordering softmax and
-weighted value reductions.
+`--fp8-prefill tensor-core` enables [eager split attention](src/mxfp8_gqa.cu#L967)<!-- prefix: "cudaError_t " -->
+for K0 text widths above four at 32,768–262,144 visible tokens. With five or more
+eligible lanes and 16-byte-aligned K/V throughout, [Tensor Core blocks](include/sglang/text/mxfp8_gqa_wide_tc.cuh#L178)<!-- prefix: "__global__ v" -->
+share KV across six query heads. Other groups use the paired split.
 
 The default `--mtp-steps 0` selects target-only decoding.
 Use `--mtp-steps 1` through `--mtp-steps 4` for unconstrained greedy and sampled text requests.

@@ -461,22 +461,18 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     if (media) {
         media->substitute(work.residual, position, rows, stream);
     }
-    int gqa_index = 0;
-    int gdn_index = 0;
-    for (int index = 0; index < layer_count; ++index) {
-        const auto& layer = layers[index];
-        const auto* input = index == 0 ? work.residual : work.hidden;
-        auto* residual = index == 0 ? nullptr : work.residual;
-        chunk.normalize(input, residual, layer.input_norm);
-        if (is_full_attention(index)) {
-            chunk.gqa(layer.gqa, request.caches[gqa_index++], request.pages);
-        } else {
-            chunk.gdn(layer.gdn, request.states[gdn_index], gdn_index);
-            ++gdn_index;
-        }
-        chunk.normalize(work.projected_attention, work.residual, layer.attention_norm);
-        chunk.mlp(layer);
-    }
+    const auto normalize = [&](const Bf16* weight, const char*, const auto& residuals) {
+        const auto [branch, residual] = residuals(work);
+        chunk.normalize(branch, residual, weight);
+    };
+    execute_layers(layers, normalize,
+                   [&](const GqaLayer& layer, int bank) {
+                       chunk.gqa(layer, request.caches[bank], request.pages);
+                   },
+                   [&](const GdnLayer& layer, int bank) {
+                       chunk.gdn(layer, request.states[bank], bank);
+                   },
+                   [&](const Layer& layer) { chunk.mlp(layer); });
     if (draft && prompt_remaining > 1) {
         chunk.seed_draft(*draft, tokens + 1, std::min(rows, prompt_remaining - 1), final_norm);
     }

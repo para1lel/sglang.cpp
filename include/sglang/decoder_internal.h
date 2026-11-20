@@ -189,6 +189,35 @@ struct Layer {
     GqaLayer gqa;
 };
 
+struct LayerResidual {
+    const Bf16* branch;
+    Bf16* residual;
+};
+
+template <typename Normalize, typename Gqa, typename Gdn, typename Mlp>
+void execute_layers(const std::array<Layer, layer_count>& layers, Normalize normalize,
+                    Gqa gqa, Gdn gdn, Mlp mlp) {
+    int gqa_index = 0;
+    int gdn_index = 0;
+    for (int index = 0; index < layer_count; ++index) {
+        const auto& layer = layers[index];
+        const auto input = [first = index == 0](const auto& work) {
+            return first ? LayerResidual{work.residual, nullptr}
+                         : LayerResidual{work.hidden, work.residual};
+        };
+        normalize(layer.input_norm, "Normalize layer input", input);
+        if (is_full_attention(index)) {
+            gqa(layer.gqa, gqa_index++);
+        } else {
+            gdn(layer.gdn, gdn_index++);
+        }
+        normalize(layer.attention_norm, "Normalize post-attention residual", [](const auto& work) {
+            return LayerResidual{work.projected_attention, work.residual};
+        });
+        mlp(layer);
+    }
+}
+
 struct Workspace {
     explicit Workspace(Allocations& allocations, Bf16* verification_attention = nullptr,
                        TextLogitCandidate* verification_winner = nullptr);

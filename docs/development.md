@@ -111,7 +111,7 @@ Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L930)<!-- prefix
 | --- | --- | --- |
 | `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L281)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L104)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L563)<!-- prefix: "void Decoder" --> |
+| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L104)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L198)<!-- prefix: "void execute" --> |
 
 Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L90)<!-- prefix: "target(\"sgla" -->
 
@@ -120,6 +120,8 @@ Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves histo
 The decoder validates tensor names, dtypes, and shapes before upload. Upload retains mappings and allocations until completion. Deferred cleanup retains shared weights. FP8 projections quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L98)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L212)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L165)<!-- prefix: "__global__ v" -->
 
 Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L320)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L711)<!-- prefix: "void Request" -->
+
+One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L468)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L563)<!-- prefix: "void Decoder" -->
 
 Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L419)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L524)<!-- prefix: "void Decoder" -->
 

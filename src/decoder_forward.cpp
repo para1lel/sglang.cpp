@@ -562,28 +562,17 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
 template <typename Lane>
 void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream) const {
     const LayerBatch<Lane> batch{lanes, count, stream};
-    int gdn_index = 0;
-    int gqa_index = 0;
-    for (int index = 0; index < layer_count; ++index) {
-        const auto& layer = layers[index];
+    const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
         batch.each([&](const Lane&, Workspace& work) {
-            const auto* input = index == 0 ? work.residual : work.hidden;
-            auto* residual = index == 0 ? nullptr : work.residual;
-            check(text_rms_norm(input, residual, layer.input_norm, hidden_size,
-                                work.normalized, residual, stream), "Normalize layer input");
+            const auto [branch, residual] = residuals(work);
+            check(text_rms_norm(branch, residual, weight, hidden_size, work.normalized,
+                                residual, stream), operation);
         });
-        if (is_full_attention(index)) {
-            run_gqa(layer.gqa, batch, gqa_index++);
-        } else {
-            run_gdn(layer.gdn, batch, gdn_index++);
-        }
-        batch.each([&](const Lane&, Workspace& work) {
-            check(text_rms_norm(work.projected_attention, work.residual, layer.attention_norm,
-                                hidden_size, work.normalized, work.residual, stream),
-                  "Normalize post-attention residual");
-        });
-        run_mlp(layer, batch);
-    }
+    };
+    execute_layers(layers, normalize,
+                   [&](const GqaLayer& layer, int bank) { run_gqa(layer, batch, bank); },
+                   [&](const GdnLayer& layer, int bank) { run_gdn(layer, batch, bank); },
+                   [&](const Layer& layer) { run_mlp(layer, batch); });
 }
 
 void Decoder::Model::compute_logits(Request& request, bool decode) const {

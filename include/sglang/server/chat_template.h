@@ -8,12 +8,27 @@ namespace sglang::server {
 
 enum class ChatInput { checkpoint_template, http };
 
-const json::Value* chat_tools(const json::OrderedObject& chat);
+enum class ChatToolChoice { none, automatic, required, named };
+
+struct ChatTools {
+    json::Array tools;
+    ChatToolChoice choice = ChatToolChoice::automatic;
+    bool parallel = true;
+    bool strict = false;
+
+    bool forced() const {
+        return choice == ChatToolChoice::required || choice == ChatToolChoice::named;
+    }
+};
+
+ChatTools chat_tools(const json::OrderedObject& chat);
 
 class ChatTemplate {
 public:
     explicit ChatTemplate(const std::filesystem::path& checkpoint);
     std::string render(const json::OrderedObject& chat, ChatInput input) const;
+    std::string render(const json::OrderedObject& chat, ChatInput input,
+                       const ChatTools& selection) const;
 
 private:
     std::string xhigh_;

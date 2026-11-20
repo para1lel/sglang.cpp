@@ -295,8 +295,8 @@ Explicit sampling controls override the route defaults.
 If a chat request omits its output limit, the server uses the final prompt length to set the budget.
 Batch admission can lower that implicit budget to fit the worker's resident capacity.
 See [chat sampling and output limits](docs/chat-serving.md#sampling-defaults-and-output-budget).
-The [chat defaults loader](apps/server/text_request.cpp#L441)<!-- prefix: "const Decode" -->
-and [output limit calculation](apps/server/text_request.cpp#L246)<!-- prefix: "void finish_" -->
+The [chat defaults loader](apps/server/text_request.cpp#L482)<!-- prefix: "const Decode" -->
+and [output limit calculation](apps/server/text_request.cpp#L247)<!-- prefix: "void finish_" -->
 implement these defaults.
 
 Set a finite, nonnegative temperature.

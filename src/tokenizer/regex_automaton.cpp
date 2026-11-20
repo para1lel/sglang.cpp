@@ -12,6 +12,7 @@ namespace {
 
 constexpr int max_nfa_states = 4096;
 constexpr int max_schema_subsets = 1024;
+constexpr int max_tool_subsets = 4096;
 using Kind = Expression::Kind;
 using Utf8Bytes = std::array<unsigned, 4>;
 
@@ -49,6 +50,7 @@ private:
     void byte_range(const Utf8Bytes& low, const Utf8Bytes& high, unsigned offset,
                     unsigned size, int start, int finish);
     void repeat(const Expression& expression, int start, int finish);
+    void xml_text(int start, int finish);
     std::vector<int> closure(std::vector<int> seeds) const;
     std::vector<int> advance(const std::vector<int>& states, unsigned byte) const;
 
@@ -142,6 +144,60 @@ void Nfa::repeat(const Expression& expression, int start, int finish) {
     nodes_[start].empty.push_back(finish);
 }
 
+using MarkerTransitions = std::array<int, 128>;
+
+std::vector<MarkerTransitions> xml_marker_trie() {
+    constexpr std::string_view markers[] = {"</parameter>", "<parameter=", "</function>",
+                                            "</tool_call>"};
+    std::vector<MarkerTransitions> trie(1);
+    for (const auto marker : markers) {
+        std::size_t parent = 0;
+        for (std::size_t index = 0; index < marker.size(); ++index) {
+            const auto byte = static_cast<unsigned char>(marker[index]);
+            int next = trie[parent][byte];
+            if (index + 1 == marker.size()) {
+                trie[parent][byte] = dead_state;
+                break;
+            }
+            if (next == 0) {
+                next = static_cast<int>(trie.size());
+                trie[parent][byte] = next;
+                trie.emplace_back();
+            }
+            parent = next;
+        }
+    }
+    return trie;
+}
+
+void Nfa::xml_text(int start, int finish) {
+    static const auto trie = xml_marker_trie();
+    const int root = add_node();
+    nodes_[start].empty.push_back(root);
+    for (std::size_t index = 1; index < trie.size(); ++index) {
+        add_node();
+    }
+    const int unicode = add_node();
+    character({{0x80, 0x10ffff}}, unicode, root);
+    for (std::size_t index = 0; index < trie.size(); ++index) {
+        auto& state = nodes_[root + index];
+        state.empty = {finish, unicode};
+        auto transitions = trie[index];
+        transitions['<'] = trie.front()['<'];
+        for (unsigned first = 0; first < transitions.size();) {
+            const int next = transitions[first];
+            unsigned end = first + 1;
+            while (end < transitions.size() && transitions[end] == next) {
+                ++end;
+            }
+            if (next != dead_state) {
+                state.bytes.push_back({first, end - 1, root + next});
+            }
+            first = end;
+        }
+    }
+}
+
 void Nfa::emit(const Expression& expression, int start, int finish) {
     const auto& children = expression.children;
     switch (expression.kind) {
@@ -164,6 +220,7 @@ void Nfa::emit(const Expression& expression, int start, int finish) {
             }
             break;
         case Kind::repeat: repeat(expression, start, finish); break;
+        case Kind::xml_text: xml_text(start, finish); break;
     }
 }
 
@@ -250,7 +307,7 @@ std::array<int, 257> signature(const State& state, const std::vector<int>& class
     return result;
 }
 
-std::vector<State> minimize(const std::vector<State>& states) {
+std::vector<State> minimize(const std::vector<State>& states, std::size_t limit) {
     std::vector<int> classes(states.size(), 0);
     while (true) {
         std::map<std::array<int, 257>, int> groups;
@@ -261,8 +318,9 @@ std::vector<State> minimize(const std::vector<State>& states) {
             const auto [entry, inserted] = groups.try_emplace(signature(state, classes), number);
             next.push_back(entry->second);
         }
-        if (groups.size() > max_dfa_states) {
-            throw std::invalid_argument("schema exceeds the 256-state minimized DFA limit");
+        if (groups.size() > limit) {
+            throw std::invalid_argument(
+                "schema exceeds the " + std::to_string(limit) + "-state minimized DFA limit");
         }
         if (classes == next) {
             std::vector<State> result(groups.size());
@@ -289,7 +347,13 @@ std::vector<State> determinize(const Expression& expression) {
 std::vector<State> determinize_schema(const Expression& expression) {
     Nfa automaton;
     automaton.emit(expression, 0, 1);
-    return minimize(automaton.determinize(max_schema_subsets));
+    return minimize(automaton.determinize(max_schema_subsets), max_dfa_states);
+}
+
+std::vector<State> determinize_tool(const Expression& expression) {
+    Nfa automaton;
+    automaton.emit(expression, 0, 1);
+    return minimize(automaton.determinize(max_tool_subsets), max_tool_dfa_states);
 }
 
 }

@@ -12,10 +12,10 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L25)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L481)<!-- prefix: "TextRequest " --> |
-| Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L410)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L436)<!-- prefix: "std::string " --> |
+| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L25)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L522)<!-- prefix: "TextRequest " --> |
+| Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L412)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L515)<!-- prefix: "std::string " --> |
 | Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L61)<!-- prefix: "DecoderResul" --> |
-| Chat output parsers | Apply the request options and parse reasoning and complete tool calls. | [Request options](../apps/server/text_request.cpp#L390)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/chat_output.cpp#L668)<!-- prefix: "bool ChatOut" --> |
+| Chat output parsers | Apply the request options and parse reasoning and tool calls. | [Request options](../apps/server/text_request.cpp#L427)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/chat_output.cpp#L773)<!-- prefix: "bool ChatOut" --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L322)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L333)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
@@ -49,13 +49,13 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
   --prefix-cache-entries 0 --reasoning-parser qwen3 --tool-call-parser qwen3_coder
 ```
 
-Output parsing applies to unconstrained text chat. Media chat and chat with [output constraints](output-constraints.md) keep generated text in `content`. Use the [text completion route](text-serving.md#send-a-request) for the native raw text response.
+Output parsing applies to text chat with free output or a [tool-call constraint](output-constraints.md#tool-call-constraints). Media chat and chat with `response_format`, `regex`, or `ebnf` keep generated text in `content`.
 
 With the reasoning parser active, `separate_reasoning: true` places reasoning in `reasoning_content`. Set it to `false` to keep reasoning in `content`. `enable_thinking` controls the rendered prompt. The parser starts in the reasoning section when the prompt leaves `<think>` open. It also recognizes `<think>` at the start of generated text. `</think>` ends the section. So does `<tool_call>` when tool parsing is active and the request advertises functions. Set `stream_reasoning: false` to buffer reasoning until the section ends or the request completes. Both output options are booleans and default to `true`.
 
-With the tool parser active, advertise functions in `tools`. Set `tool_choice` to `"auto"` or null, or omit it. The parser emits complete calls for advertised names. It preserves ordinary text before, between, and after calls. Unrecognized or invalid markup stays in `content`. The parser can resume at a later tool wrapper. Call-shaped text inside a complete string parameter stays part of the argument. [Tool frame scanner](../apps/server/chat_output.cpp#L588)<!-- prefix: "std::size_t " -->
+With the tool parser active, complete calls for advertised functions become `tool_calls`. In unconstrained output, ordinary text and invalid wrappers stay in `content`. The parser can recover at a later wrapper. Call-shaped text inside a complete string parameter stays part of the argument. [Tool frame scanner](../apps/server/chat_output.cpp#L682)<!-- prefix: "std::size_t " -->
 
-In JSON, read `message.reasoning_content` and `message.tool_calls`. With calls and empty content, `message.content` is `null`. In SSE, join the `delta.reasoning_content` strings. Group the `delta.tool_calls` entries by their zero-based `index`. The first delta for a call gives its `id`, `type: "function"`, `function.name`, and an empty argument string. Append the next delta's `function.arguments` for that index. In both formats, parse the final argument string as a JSON object. A stop with a complete call reports `tool_calls`. Reaching the token limit without a stop reports `length`, even with a complete call. Text stop strings match the generated text before either parser runs.
+In JSON, read `message.reasoning_content` and `message.tool_calls`. With calls and empty content, `message.content` is `null`. In SSE, join the `delta.reasoning_content` strings. Group the `delta.tool_calls` entries by zero-based `index`. The first delta gives the call's `id`, `type: "function"`, `function.name`, and empty arguments. Append the next delta's `function.arguments`. In both formats, parse the argument string as a JSON object. A stop with a complete call reports `tool_calls`. A token-limit cut without a stop reports `length` and can carry a call with incomplete arguments. Text stops match generated text before parsing.
 
 Send each request twice to get a JSON response and an SSE stream. Expect `391` as the first answer, separate from the reasoning. Expect a `get_weather` call with arguments `{"city":"Paris"}` from the second request.
 
@@ -84,14 +84,24 @@ done
 
 ### Messages and tools
 
-- Use `system`, `user`, `assistant`, or `tool` roles. A system message must be first. Include a user query distinct from tool responses.
+- Use `system`, `developer`, `root`, `user`, `assistant`, or `tool` roles. The renderer treats `developer` and `root` as `system`. A system message must be first. Include a user query distinct from tool responses.
 - Use a string or text parts for text content. The renderer also accepts null or omitted content. Empty image and video placeholders can render template tokens outside the system message. Follow the attachment contract for actual media.
-- Supply new tool schemas in the top-level `tools` array. With `tool_choice: "auto"`, null, or omission, the renderer advertises any supplied functions. Tool parsing stays off if `tools` is absent, null, or empty. The optional [tool parser](#qwen-reasoning-and-tool-calls) requires `type: "function"` and a unique `function.name`.
-- `tool_choice: "none"` disables tool advertisement and tool-call extraction for this request, even with `tools` present. Earlier assistant calls and tool responses stay in the prompt. Reasoning can still be separated. `"required"` and choices that name a specific function return HTTP 400. [Tool selection](../apps/server/chat_template.cpp#L421)<!-- prefix: "const json::" -->
-- For parsed tools, `function.parameters` accepts an object schema, null, or omission. The parser reads `properties`, `required`, and boolean `additionalProperties`. It converts strings, integers, finite numbers, booleans, and JSON objects and arrays. The parser removes up to one line feed from each end of a parameter value. A bare `null` in any letter case becomes JSON null. A spelling such as `+-1.5` fails numeric conversion. For a type union, the parser tries alternatives in declaration order. By default, the parser allows extra keys with string or null values. The parser checks top-level arguments. The application validates nested values and any other function requirements. When the parser compiles tool schemas, it rejects `function.strict: true` or a direct `$ref` in a parsed schema with HTTP 400. [Argument conversion](../apps/server/chat_output.cpp#L368)<!-- prefix: "void ToolFra" -->
-- `parallel_tool_calls` defaults to `true`. The server accepts an explicit `true` and rejects `false` with HTTP 400. The output parser can return more than one complete call.
+- Supply function schemas in `tools`. The renderer collects top-level tools first, then tools on `system`, `developer`, or `root` messages. Advertised tools need `type: "function"` and unique names of 1–64 UTF-8 bytes. Names exclude angle brackets, carriage return, and line feed. [Tool selection](../apps/server/chat_template.cpp#L473)<!-- prefix: "ChatTools ch" -->
 - Supply earlier assistant `tool_calls` as an array. Put the `name` and `arguments` in a `function` object or directly in the call. If supplied, `type` must be `"function"`. Arguments can be objects or strings that encode JSON objects. A `tool` message supplies a tool response through its `content`.
 - Use `reasoning_content`, `thinking`, or `reasoning` for earlier assistant reasoning. The renderer uses the first non-null field in that order.
+
+### Tool choice
+
+| `tool_choice` | Behavior |
+| --- | --- |
+| `"auto"`, null, or omitted | Advertise supplied functions. Allow prose and optional calls. An advertised `function.strict: true` activates the tool grammar when parsing is available. |
+| `"none"` | Disable tool advertisement and extraction. Keep earlier assistant calls and tool responses in the prompt. Reasoning separation can still run. |
+| `"required"` | Require a call frame for an advertised function. |
+| `{"type":"function","function":{"name":"get_weather"}}` | Advertise only the selected function and require a single call frame for it. |
+
+`parallel_tool_calls` is a boolean and defaults to `true`. With `false`, JSON and SSE expose at most one call. Auto with only non-strict tools leaves later wrappers in `content` after the first accepted call. Named choice always allows one call. Required and named choices need an eligible tool, text-only chat, and the `qwen3_coder` parser. They return HTTP 400 when a prerequisite is missing or `response_format`, `regex`, or `ebnf` is set. Active tool constraints require the model EOS stop set and reject nonempty text stops. [Tool admission](../apps/server/text_request.cpp#L398)<!-- prefix: "void check_t" --> · [Parser dispatch](../apps/server/chat_output.cpp#L773)<!-- prefix: "bool ChatOut" -->
+
+The parser accepts an object schema for `function.parameters`, null, or omission. It reads `properties`, `required`, and `additionalProperties`. It removes up to one line feed from each end of a value. It converts scalars and JSON collections. A strict string parameter with the XML value `null` produces the JSON string `"null"`. A strict null parameter produces JSON null. In a loose tool, bare `null` in any letter case produces JSON null, and declared type alternatives are tried in order for other values. Loose tools allow extra keys by default. Validate loose arguments in the application. [Argument conversion](../apps/server/chat_output.cpp#L406)<!-- prefix: "void ToolFra" --> · [Strict schema limits](output-constraints.md#tool-call-constraints)
 
 ### Request options
 
@@ -109,7 +119,7 @@ done
 | `add_generation_prompt`, `add_vision_id` | Booleans. HTTP defaults are `true` and `false`, respectively. |
 | `enable_thinking`, `preserve_thinking` | Booleans that default to `true`. They control rendering of the generation prompt and assistant history. |
 | `separate_reasoning`, `stream_reasoning` | Boolean [reasoning output controls](#qwen-reasoning-and-tool-calls) that default to `true`. |
-| `parallel_tool_calls` | Omit or set to `true`. |
+| `tool_choice`, `parallel_tool_calls` | Use the [tool selection controls](#tool-choice). |
 | `reasoning_effort` | With thinking enabled, use `"xhigh"` (default), `"medium"`, or `"low"`. |
 
 The rendered prompt and its output budget share the 262,144-token context. The rendered prompt must contain 1 to 1,048,576 UTF-8 bytes. The [shared HTTP size limits](text-serving.md#send-a-request) also apply. Invalid options, messages, or limits return HTTP 400.
@@ -124,9 +134,9 @@ A TCP reset or failed write cancels the request. The server discards pending UTF
 
 `--sampling-defaults model` is the server default. Chat reads sampling values from the selected checkpoint's `generation_config.json` on first use. For Qwen3.8-27B-FP8, the values are `temperature: 1`, `top_p: 0.95`, `top_k: 20`, and `min_p: 0`.
 
-Use `--sampling-defaults openai` for `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Model mode uses the same fallback for a missing file or omitted sampling fields. A missing or null request control inherits its default. The checkpoint does not supply the request seed. Raw text defaults are independent of this option. [Server option](../apps/sglang-server.cpp#L23)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L441)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L320)<!-- prefix: "} else if ((" -->
+Use `--sampling-defaults openai` for `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Model mode uses the same fallback for a missing file or omitted sampling fields. A missing or null request control inherits its default. The checkpoint does not supply the request seed. Raw text defaults are independent of this option. [Server option](../apps/sglang-server.cpp#L23)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L482)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L321)<!-- prefix: "} else if ((" -->
 
-If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L246)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L496)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L327)<!-- prefix: "int limit_re" -->
+If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L247)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L538)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L327)<!-- prefix: "int limit_re" -->
 
 ### Image and video inputs
 
@@ -169,7 +179,9 @@ For serving performance, record template and tokenizer assets, request bytes, re
 
 ### Qwen output checks
 
-Run the [Qwen chat output checks](../tests/text/README.md#qwen-chat-output) for parser boundaries, response fields, and finish reasons. Compare both public examples in JSON and SSE. Check the committed IDs against a control run with both parsers disabled. Keep media and constrained output raw. Compare isolated and overlapping requests.
+Run the [Qwen chat output checks](../tests/text/README.md#qwen-chat-output) for parser boundaries, response fields, and finish reasons. Compare both public examples in JSON and SSE. Check their committed IDs against a control with both parsers disabled. Check isolated and overlapping requests.
+
+Compare auto, none, required, and named choices in JSON and SSE. Include prose-only strict auto. Replay two calls with loose auto and `parallel_tool_calls: false`. Test a required strict string enum containing `"null"`. Check that serial responses expose at most one call. Verify the types of string and null arguments. Check that unsupported forced requests return 400 before SSE starts. Run the [tool constraint checks](output-constraints.md#tool-constraint-checks) for masked generation and length cuts.
 
 ### Media checks
 

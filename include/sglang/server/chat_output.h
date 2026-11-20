@@ -10,21 +10,33 @@ namespace sglang::server {
 
 enum class ChatArgumentType { string, integer, number, boolean, object, array, null };
 
+struct ChatToolProperty {
+    std::vector<ChatArgumentType> types;
+    std::map<std::string, std::string, std::less<>> enum_values;
+};
+
 struct ChatToolSchema {
-    std::map<std::string, std::vector<ChatArgumentType>, std::less<>> properties;
+    std::map<std::string, ChatToolProperty, std::less<>> properties;
     std::set<std::string, std::less<>> required;
     bool additional_properties = true;
+    bool strict = false;
 };
 
 struct ChatOutputOptions {
     bool separate_reasoning = false;
     bool stream_reasoning = true;
     bool prompt_has_open_think = false;
+    bool complete_truncated_calls = false;
+    bool parallel_tool_calls = true;
     std::map<std::string, ChatToolSchema, std::less<>> tools;
 
     bool enabled() const { return separate_reasoning || !tools.empty(); }
+    bool accepts_tool_calls(std::size_t calls) const {
+        return !tools.empty() && (parallel_tool_calls || calls == 0);
+    }
 };
 
+void read_chat_tools(ChatOutputOptions& options, const json::Array& tools);
 void read_chat_tools(ChatOutputOptions& options, const json::Value* tools);
 
 enum class ChatOutputKind { content, reasoning, tool_call };
@@ -62,6 +74,7 @@ private:
     std::string reasoning_;
     std::unique_ptr<ChatToolFrame> tool_;
     std::size_t calls_ = 0;
+    bool truncated_ = false;
 };
 
 }

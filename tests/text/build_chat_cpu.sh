@@ -8,7 +8,7 @@ output=$(realpath -m -- "${3:?Pass the output executable path}")
 
 sources=("$source/apps/sglang-server.cpp")
 for name in batch_service completions http text_request text_completion chat_template \
-    chat_media chat_output prefix_controls; do
+    chat_media chat_output chat_tool_constraints prefix_controls; do
     file="$source/apps/server/$name.cpp"
     if [[ -f "$file" ]]; then
         sources+=("$file")

@@ -90,8 +90,35 @@ std::string_view schema_name(const json::Value* value) {
     return name;
 }
 
-ChatToolSchema read_schema(const json::Value* value) {
+void read_enum_values(ChatToolProperty& property, const json::Value* choices) {
+    if (!choices || !choices->array()) {
+        return;
+    }
+    for (const auto& value : *choices->array()) {
+        std::string spelling;
+        if (const auto text = value.string()) {
+            json::append_quoted(spelling, *text);
+            property.enum_values.emplace(*text, std::move(spelling));
+            continue;
+        }
+        if (const auto integer = value.signed_integer()) {
+            spelling = std::to_string(*integer);
+        } else if (const auto integer = value.unsigned_integer()) {
+            spelling = std::to_string(*integer);
+        } else if (const auto flag = value.boolean()) {
+            spelling = *flag ? "true" : "false";
+        } else if (value.is_null()) {
+            spelling = "null";
+        } else {
+            continue;
+        }
+        property.enum_values.emplace(spelling, spelling);
+    }
+}
+
+ChatToolSchema read_schema(const json::Value* value, bool strict) {
     ChatToolSchema schema;
+    schema.strict = strict;
     if (!value || value->is_null()) {
         return schema;
     }
@@ -109,7 +136,11 @@ ChatToolSchema read_schema(const json::Value* value) {
             if (!valid_label(name)) {
                 throw std::invalid_argument("Expected a valid tool parameter name");
             }
-            read_types(property, schema.properties[name]);
+            auto& output = schema.properties[name];
+            read_types(property, output.types);
+            if (strict && !field(property, "type")) {
+                read_enum_values(output, field(property, "enum"));
+            }
         }
     }
     if (const auto* required = field(*value, "required")) {
@@ -227,11 +258,32 @@ bool append_argument(std::string& output, std::string_view raw, Type type) {
     case Type::array:
         return append_collection(output, text, type);
     case Type::null:
-        return false;
+        if (raw != "null") {
+            return false;
+        }
+        output += "null";
+        return true;
     }
     return false;
 }
 
+}
+
+void read_chat_tools(ChatOutputOptions& options, const json::Array& tools) {
+    for (const auto& tool : tools) {
+        const auto* type = field(tool, "type");
+        const auto* function = field(tool, "function");
+        if (!type || type->string() != "function" || !function) {
+            throw std::invalid_argument("Only function tools are supported");
+        }
+        const auto name = schema_name(field(*function, "name"));
+        const auto* strict = field(*function, "strict");
+        auto schema = read_schema(field(*function, "parameters"),
+                                  strict && strict->boolean().value_or(false));
+        if (!options.tools.emplace(name, std::move(schema)).second) {
+            throw std::invalid_argument("Duplicate tool name");
+        }
+    }
 }
 
 void read_chat_tools(ChatOutputOptions& options, const json::Value* tools) {
@@ -242,22 +294,7 @@ void read_chat_tools(ChatOutputOptions& options, const json::Value* tools) {
     if (!array) {
         throw std::invalid_argument("Expected an array of function tools");
     }
-    for (const auto& tool : *array) {
-        const auto* type = field(tool, "type");
-        const auto* function = field(tool, "function");
-        if (!type || type->string() != "function" || !function) {
-            throw std::invalid_argument("Only function tools are supported");
-        }
-        const auto* strict = field(*function, "strict");
-        if (strict && !strict->is_null() && strict->boolean() != false) {
-            throw std::invalid_argument("Strict tool generation is unsupported");
-        }
-        const auto name = schema_name(field(*function, "name"));
-        auto schema = read_schema(field(*function, "parameters"));
-        if (!options.tools.emplace(name, std::move(schema)).second) {
-            throw std::invalid_argument("Duplicate tool name");
-        }
-    }
+    read_chat_tools(options, *array);
 }
 
 namespace {
@@ -281,6 +318,7 @@ public:
 
     FrameScan scan(std::string_view input);
     void resume(FrameScan result, ToolFrame& child);
+    bool complete_truncated(std::string_view input);
     void release_recovery(std::list<FrameSpan>& spans) { spans.splice(spans.end(), provisional_); }
     std::string_view name() const {
         return schema_ && syntax_valid_ && arguments_valid_ ? name_ : std::string_view{};
@@ -296,7 +334,7 @@ private:
     bool label(std::string_view input, bool function);
     FrameScan value(std::string_view input);
     FrameScan recover(std::string_view input);
-    void convert(std::string_view raw);
+    void convert(std::string_view raw, bool partial = false);
     bool ignoring_marker(char ch);
 
     const ChatOutputOptions* options_;
@@ -365,8 +403,14 @@ bool ToolFrame::label(std::string_view input, bool function) {
     return true;
 }
 
-void ToolFrame::convert(std::string_view raw) {
+void ToolFrame::convert(std::string_view raw, bool partial) {
     if (!schema_ || !syntax_valid_ || !arguments_valid_) {
+        return;
+    }
+    const auto property = schema_->properties.find(key_);
+    const bool unknown = property == schema_->properties.end() &&
+                         !schema_->additional_properties;
+    if (partial && (unknown || seen_.count(key_))) {
         return;
     }
     if (!seen_.emplace(key_).second) {
@@ -379,8 +423,7 @@ void ToolFrame::convert(std::string_view raw) {
     if (!raw.empty() && raw.back() == '\n') {
         raw.remove_suffix(1);
     }
-    const auto property = schema_->properties.find(key_);
-    if (property == schema_->properties.end() && !schema_->additional_properties) {
+    if (unknown) {
         arguments_valid_ = false;
         return;
     }
@@ -389,13 +432,26 @@ void ToolFrame::convert(std::string_view raw) {
     }
     json::append_quoted(arguments_, key_);
     arguments_ += ':';
-    if (equals_folded(raw, "null")) {
+    if (!schema_->strict && equals_folded(raw, "null")) {
         arguments_ += "null";
     } else if (property == schema_->properties.end()) {
         json::append_quoted(arguments_, raw);
     } else {
-        const auto convert = [&](Type type) { return append_argument(arguments_, raw, type); };
-        arguments_valid_ = std::any_of(property->second.begin(), property->second.end(), convert);
+        const auto& [types, choices] = property->second;
+        if (choices.empty()) {
+            const auto convert = [&](Type type) { return append_argument(arguments_, raw, type); };
+            arguments_valid_ = std::any_of(types.begin(), types.end(), convert);
+        } else {
+            const auto choice = choices.find(raw);
+            arguments_valid_ = choice != choices.end();
+            if (arguments_valid_) {
+                arguments_ += choice->second;
+            }
+        }
+        if (partial && !arguments_valid_) {
+            json::append_quoted(arguments_, raw);
+            arguments_valid_ = true;
+        }
     }
 }
 
@@ -403,6 +459,16 @@ bool ToolFrame::ignoring_marker(char ch) {
     if (!value_started_ && whitespace.find(ch) == whitespace.npos) {
         value_started_ = true;
         json_value_ = ch == '{' || ch == '[';
+        if (json_value_ && schema_ && schema_->strict) {
+            const auto property = schema_->properties.find(key_);
+            if (property != schema_->properties.end()) {
+                const auto& types = property->second.types;
+                const auto structured = [](Type type) {
+                    return type == Type::object || type == Type::array;
+                };
+                json_value_ = std::any_of(types.begin(), types.end(), structured);
+            }
+        }
     }
     if (quoted_) {
         if (escaped_) {
@@ -564,13 +630,40 @@ void ToolFrame::resume(FrameScan result, ToolFrame& child) {
     state_ = State::value;
 }
 
+std::string_view without_partial_marker(std::string_view raw) {
+    const auto start = raw.rfind('<');
+    if (start == raw.npos) {
+        return raw;
+    }
+    const auto tail = raw.substr(start);
+    constexpr std::array markers{parameter_close, parameter_open, function_close, tool_close};
+    const auto partial = [&](std::string_view tag) {
+        return tail.size() < tag.size() && starts_with(tag, tail);
+    };
+    return std::any_of(markers.begin(), markers.end(), partial) ? raw.substr(0, start) : raw;
+}
+
+bool ToolFrame::complete_truncated(std::string_view input) {
+    if (!schema_ || !syntax_valid_ || !arguments_valid_) {
+        return false;
+    }
+    if (state_ == State::value || state_ == State::value_tool) {
+        convert(without_partial_marker(input.substr(field_start_)), true);
+    } else if (state_ != State::parameters && state_ != State::parameter_name &&
+               state_ != State::close) {
+        return false;
+    }
+    arguments_ += '}';
+    return arguments_valid_;
+}
+
 }
 
 class ChatToolFrame {
 public:
     explicit ChatToolFrame(const ChatOutputOptions& options) : frames_{ToolFrame(&options)} {}
 
-    std::size_t scan(std::string_view input, bool final);
+    std::size_t scan(std::string_view input, bool final, bool truncated = false);
     bool emit(std::string_view input, const ChatOutputOptions& options, std::size_t& calls,
               const ChatOutputSink& sink) const;
 
@@ -583,9 +676,10 @@ private:
     std::vector<ToolFrame> frames_;
     std::list<FrameSpan> recovery_;
     bool complete_ = false;
+    bool dropped_ = false;
 };
 
-std::size_t ChatToolFrame::scan(std::string_view input, bool final) {
+std::size_t ChatToolFrame::scan(std::string_view input, bool final, bool truncated) {
     // A closed parameter owns any call-shaped text that it contains.
     for (;;) {
         auto& frame = frames_.back();
@@ -595,6 +689,11 @@ std::size_t ChatToolFrame::scan(std::string_view input, bool final) {
         } else if (step.action == FrameAction::wait) {
             if (!final) {
                 return 0;
+            }
+            if (truncated) {
+                complete_ = frames_.front().complete_truncated(input);
+                dropped_ = !complete_;
+                return input.size();
             }
             for (auto& pending : frames_) {
                 pending.release_recovery(recovery_);
@@ -621,8 +720,14 @@ bool ChatToolFrame::emit(std::string_view input, const ChatOutputOptions& option
     if (!name().empty()) {
         return sink({ChatOutputKind::tool_call, arguments(), calls++, name()});
     }
+    if (dropped_) {
+        return true;
+    }
     std::size_t emitted = 0;
     for (const auto& span : recovery_) {
+        if (!options.accepts_tool_calls(calls)) {
+            break;
+        }
         if (!content(input.substr(emitted, span.start - emitted))) {
             return false;
         }
@@ -678,8 +783,9 @@ bool ChatOutputParser::drain(bool final, const ChatOutputSink& sink) {
         }
     }
     while (!input.empty()) {
+        const bool truncated = final && truncated_ && options_.complete_truncated_calls;
         if (tool_) {
-            const auto length = tool_->scan(input, final);
+            const auto length = tool_->scan(input, final, truncated);
             if (length == 0) {
                 break;
             }
@@ -699,7 +805,7 @@ bool ChatOutputParser::drain(bool final, const ChatOutputSink& sink) {
             break;
         }
         const bool reasoning = phase_ == Phase::reasoning;
-        const bool tools = !options_.tools.empty();
+        const bool tools = options_.accepts_tool_calls(calls_);
         if (reasoning && starts_with(input, think_close)) {
             if (!flush_reasoning(sink)) {
                 return false;
@@ -715,6 +821,8 @@ bool ChatOutputParser::drain(bool final, const ChatOutputSink& sink) {
         } else if (!final && ((reasoning && starts_with(think_close, input)) ||
                               (tools && starts_with(tool_open, input)))) {
             break;
+        } else if (truncated && tools && starts_with(tool_open, input)) {
+            input = {};
         } else {
             const auto next = input.find('<', 1);
             if (!emit_text(input.substr(0, next), sink)) {
@@ -742,6 +850,7 @@ bool ChatOutputParser::finish(ChatEnd end, const ChatOutputSink& sink) {
         tool_.reset();
         return true;
     }
+    truncated_ = end == ChatEnd::length;
     return drain(true, sink);
 }
 

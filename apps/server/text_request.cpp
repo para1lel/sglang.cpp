@@ -1,6 +1,7 @@
 #include "sglang/server/text_completion.h"
 
 #include "sglang/server/chat_template.h"
+#include "sglang/server/chat_tool_constraints.h"
 #include "sglang/decoder_constraint.h"
 #include "sglang/json.h"
 #include "sglang/server/http.h"
@@ -387,13 +388,49 @@ bool chat_flag(const json::OrderedObject& chat, std::string_view key) {
     throw std::invalid_argument("Expected a boolean for " + std::string(key));
 }
 
+bool model_eos_stops(const DecoderOptions& options) {
+    const auto& stops = options.additional_stop_token_ids;
+    return (!options.stop_token_id || constraint_eos(*options.stop_token_id)) &&
+        stops.count(end_of_text) && stops.count(end_of_message) &&
+        std::all_of(stops.begin(), stops.end(), constraint_eos);
+}
+
+void check_tool_constraint(const TextRequest& request, const ChatTools& tools,
+                           ChatParsers parsers) {
+    const bool forced = tools.forced();
+    if (!forced && (!tool_constraint_applies(tools) || request.media ||
+                    request.options.constraint || !parsers.qwen3_coder_tools)) {
+        return;
+    }
+    if (request.media) {
+        bad_request("Decoded media chat does not support tool_choice required or a named tool");
+    }
+    if (request.options.constraint) {
+        bad_request("tool_choice 'required' or a named tool cannot be combined with "
+                    "response_format, regex, or ebnf: the tool-call constraint and the output "
+                    "constraint cannot both be honored.");
+    }
+    if (!parsers.qwen3_coder_tools) {
+        bad_request("tool_choice 'required' or a named tool needs --tool-call-parser qwen3_coder");
+    }
+    const std::string subject = forced ? "tool_choice 'required' or a named tool" :
+                                         "A strict tool with tool_choice auto";
+    if (!model_eos_stops(request.options)) {
+        bad_request((subject + " requires model EOS stops without ignore_eos or stop_token_ids "
+                    "overrides").c_str());
+    }
+    if (!request.stop_text.empty()) {
+        bad_request((subject + " cannot be combined with text stops").c_str());
+    }
+}
+
 void set_chat_output(TextRequest& request, const json::OrderedObject& chat,
-                     std::string_view prompt, ChatParsers parsers) {
+                     std::string_view prompt, const CompletionTokenizer& tokenizer,
+                     const ChatTools& tools) {
+    const auto parsers = tokenizer.chat_parsers();
     const bool separate = chat_flag(chat, "separate_reasoning");
     const bool stream = chat_flag(chat, "stream_reasoning");
-    if (!chat_flag(chat, "parallel_tool_calls")) {
-        bad_request("parallel_tool_calls=false is unsupported");
-    }
+    check_tool_constraint(request, tools, parsers);
     if (request.media || request.options.constraint) {
         return;
     }
@@ -403,9 +440,13 @@ void set_chat_output(TextRequest& request, const json::OrderedObject& chat,
     output.stream_reasoning = stream;
     output.prompt_has_open_think = prompt.size() >= open_suffix.size() &&
         prompt.substr(prompt.size() - open_suffix.size()) == open_suffix;
-    if (parsers.qwen3_coder_tools) {
-        read_chat_tools(output, chat_tools(chat));
+    if (!parsers.qwen3_coder_tools) {
+        return;
     }
+    output.parallel_tool_calls = tools.parallel && tools.choice != ChatToolChoice::named;
+    read_chat_tools(output, tools.tools);
+    request.options.constraint = tokenizer.tool_constraint(tools, output.prompt_has_open_think);
+    output.complete_truncated_calls = request.options.constraint != nullptr;
 }
 
 json::Value parse_body(std::string_view body, json::Syntax syntax) {
@@ -490,7 +531,8 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
     normalize_template_options(normalized);
     const auto options = chat_text_options(normalized, media.has_value());
     auto request = text_options(options, tokenizer, true);
-    const auto prompt = tokenizer.chat_template().render(normalized, ChatInput::http);
+    const auto tools = chat_tools(normalized);
+    const auto prompt = tokenizer.chat_template().render(normalized, ChatInput::http, tools);
     validate_prompt(prompt);
     encode_prompt(request, prompt, tokenizer);
     if (media) {
@@ -506,7 +548,7 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
         }
     }
     finish_options(request, options, tokenizer);
-    set_chat_output(request, normalized, prompt, tokenizer.chat_parsers());
+    set_chat_output(request, normalized, prompt, tokenizer, tools);
     return request;
 }
 

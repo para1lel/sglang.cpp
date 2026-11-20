@@ -78,15 +78,14 @@ def check_cancel(port, out, body, name, held_text):
 
 
 def check_validation(port, out, body):
-    strict = {"type": "function", "function": PING["function"] | {"strict": True}}
     ref = {"type": "function", "function": {"name": "ping", "parameters": {"$ref": "#"}}}
     invalid = {
-        "strict": body | {"tools": [strict]},
         "ref": body | {"tools": [ref]},
         "duplicate-tool": body | {"tools": [PING, PING]},
-        "required": body | {"tool_choice": "required"},
-        "named": body | {"tool_choice": {"type": "function", "function": {"name": "ping"}}},
-        "parallel-policy": body | {"parallel_tool_calls": False},
+        "named-missing": body | {
+            "tool_choice": {"type": "function", "function": {"name": "absent"}}},
+        "choice-bad": body | {"tool_choice": "any"},
+        "parallel-type": body | {"parallel_tool_calls": "false"},
         "logprobs": body | {"logprobs": True},
         "top-logprobs": body | {"top_logprobs": 1},
         "stream-reasoning": body | {"stream_reasoning": "true"},
@@ -223,6 +222,57 @@ def check_independent(port, out, flags, sequences):
         expect(actual, "checking" + PING_CALL)
 
 
+def tool_policy_cases():
+    prose = "No tool needed."
+    ping = "<tool_call>\n<function=ping>\n\n</function>\n</tool_call>"
+    one_call = [("ping", {})]
+    loose_ping = PING | {"function": PING["function"] | {"strict": False}}
+    parallel = {"tools": [loose_ping], "tool_choice": "auto", "parallel_tool_calls": True}
+    serial = parallel | {"parallel_tool_calls": False}
+    cases = {
+        "loose-auto-serial-prose": (prose, serial, prose, []),
+        "loose-auto-serial-one": (ping, serial, "", one_call),
+        "loose-auto-parallel-two": (ping + ping, parallel, "", one_call * 2),
+        "loose-auto-serial-two": (ping + ping, serial, None, one_call),
+    }
+    for label, schema, value in (
+        ("strict-string-null-literal", {"type": "string", "enum": ["null"]}, "null"),
+        ("strict-json-null", {"type": "null"}, None),
+        ("strict-mixed-enum-string", {"enum": ["null", 7]}, "null"),
+        ("strict-mixed-enum-integer", {"enum": ["null", 7]}, 7),
+    ):
+        tool = {"type": "function", "function": {"name": "record", "strict": True, "parameters": {
+            "type": "object", "properties": {"value": schema}, "required": ["value"],
+            "additionalProperties": False,
+        }}}
+        raw = "null" if value is None else str(value)
+        output = (f"<tool_call>\n<function=record>\n<parameter=value>\n{raw}\n</parameter>\n"
+                  "</function>\n</tool_call>")
+        cases[label] = (output, {"tools": [tool], "tool_choice": "required"}, "",
+                        [("record", {"value": value})])
+    return cases
+
+
+def check_tool_policy(port, out, sequences, cases):
+    failures = []
+    for name, (_, options, content, calls) in cases.items():
+        seed, ids = sequences[name]
+        request = request_body(seed=seed, max_tokens=len(ids), **options)
+        try:
+            result = pair(port, out, name, request)
+            actual = [(tool, json.loads(args)) for tool, args in result["calls"]]
+            assert actual == calls, (calls, actual)
+            assert content is None or result["content"] == content, result
+            assert result["reasoning"] == "" and result["ids"] == ids, result
+            assert result["finish"] == ("tool_calls" if calls else "stop"), result
+        except AssertionError as error:
+            failures.append(name)
+            print(f"{name}: FAIL {error}")
+        else:
+            print(f"{name}: PASS")
+    assert not failures, failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
@@ -255,6 +305,8 @@ def main():
         "cancel-ambiguous": (TRUNCATED + PING_CALL + "x" * 512, False),
     }
     cases.update({name: (text, True) for name, (text, _, _) in recoveries().items()})
+    policy = tool_policy_cases()
+    cases.update({name: (text, True) for name, (text, _, _, _) in policy.items()})
     sequences = encode_inputs(args, cases)
     with server(args.server, args.checkpoint, args.evidence / "both", 1,
                 flags=COMMON + BOTH) as port:
@@ -263,6 +315,9 @@ def main():
         out = args.evidence / name
         with server(args.server, args.checkpoint, out, 1, flags=COMMON + flags) as port:
             check_independent(port, out, flags, sequences)
+    with server(args.server, args.checkpoint, args.evidence / "tool-policy", 1,
+                flags=COMMON + BOTH) as port:
+        check_tool_policy(port, args.evidence / "tool-policy", sequences, policy)
     print("Scripted chat HTTP output cases passed")
 
 

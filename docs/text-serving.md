@@ -30,7 +30,7 @@ The server rejects malformed JSON, duplicate decoded keys, and nesting beyond 32
 | `response_format` | Optional [bounded JSON Schema](output-constraints.md#json-schema). |
 | `cache_salt` | Optional [prefix cache key](prefix-cache.md#runtime-path) component. |
 
-Raw text accepts one string prompt and returns one choice. It rejects `n` and `max_completion_tokens`. Both routes reject unknown options, including `logprobs`, `logit_bias`, `frequency_penalty`, `presence_penalty`, and `repetition_penalty`. [Request options](../apps/server/text_request.cpp#L280)<!-- prefix: "bool is_text" -->
+Raw text accepts one string prompt and returns one choice. It rejects `n` and `max_completion_tokens`. Both routes reject unknown options, including `logprobs`, `logit_bias`, `frequency_penalty`, `presence_penalty`, and `repetition_penalty`. [Request options](../apps/server/text_request.cpp#L281)<!-- prefix: "bool is_text" -->
 
 Tokenizer load occurs on the first text or chat request that reaches encoding. The server reads `tokenizer.json` from the selected checkpoint directory and verifies its size and SHA-256. A missing, unreadable, or mismatched asset returns HTTP 500 before output starts. A subsequent request retries a failed load. Successful loads share an immutable tokenizer across text and chat requests. The benchmark ID route uses the IDs supplied by the client.
 
@@ -58,7 +58,7 @@ If `is_cancelled` returns true at entry, direct C++ generation finishes with `ca
 
 ## Sampling
 
-Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L90)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L24)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L61)<!-- prefix: "void validat" -->
+Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L91)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L24)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L61)<!-- prefix: "void validat" -->
 
 | Field | Valid values |
 | --- | --- |
@@ -68,7 +68,7 @@ Native HTTP uses these controls for JSON and SSE. C++ and the generator use the 
 | `min_p` | Number in `[0, 1]`. The minimum weight is `min_p` times the maximum weight in the selection row. |
 | `seed` | Signed 64-bit integer. Omission or null leaves the seed unset. |
 
-Raw text defaults to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Explicit values override them. Null numeric controls other than `seed` return HTTP 400. Chat uses its [server-selected defaults](chat-serving.md#sampling-defaults-and-output-budget). [Route defaults](../apps/server/text_request.cpp#L217)<!-- prefix: "TextRequest " -->
+Raw text defaults to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Explicit values override them. Null numeric controls other than `seed` return HTTP 400. Chat uses its [server-selected defaults](chat-serving.md#sampling-defaults-and-output-budget). [Route defaults](../apps/server/text_request.cpp#L218)<!-- prefix: "TextRequest " -->
 
 The decoder validates options even on the greedy path. CUDA ranks BF16 logits by descending score, then ascending token ID. It divides score differences by temperature before exponentiation. For `top_p < 1`, the nucleus includes the token where cumulative weight first exceeds `top_p` times the selection row's total weight. The unconstrained row covers the vocabulary. Selection draws from the nucleus intersected with top-k and weights at or above the `min_p` threshold. Each draw depends on the resolved seed and zero-based output index. Identical rows and options preserve draws across slot changes. [Seed resolution](../src/decoder.cpp#L102)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L187)<!-- prefix: "__global__ v" -->
 
@@ -80,7 +80,7 @@ An unseeded sampled request resolves one seed with `std::random_device`. The fro
 
 ## Finite-choice constraints
 
-Set `ebnf` on a native text or chat request to restrict the generated text to one literal, in JSON or SSE. Use one rule of the form `root ::= "yes" | "no"`. Each alternative is a nonempty double-quoted string with JSON escapes. The decoded bytes must be valid UTF-8. A single literal is valid. [HTTP validation](../apps/server/text_request.cpp#L179)<!-- prefix: "void set_con" --> · [Compiler](../src/tokenizer/constraint.cpp#L82)<!-- prefix: "std::shared_" -->
+Set `ebnf` on a native text or chat request to restrict the generated text to one literal, in JSON or SSE. Use one rule of the form `root ::= "yes" | "no"`. Each alternative is a nonempty double-quoted string with JSON escapes. The decoded bytes must be valid UTF-8. A single literal is valid. [HTTP validation](../apps/server/text_request.cpp#L180)<!-- prefix: "void set_con" --> · [Compiler](../src/tokenizer/constraint.cpp#L82)<!-- prefix: "std::shared_" -->
 
 ```bash
 curl --fail-with-body http://127.0.0.1:17384/v1/completions \
@@ -90,11 +90,11 @@ curl --fail-with-body http://127.0.0.1:17384/v1/completions \
 
 The grammar limit is 16,384 bytes after JSON request decoding. Supply up to 32 literals, with at most 256 decoded bytes per literal and 2,048 decoded bytes in total. Each state allows up to 4,094 ordinary token choices and reserves two EOS entries. HTTP returns 400 for an invalid grammar or a non-string `ebnf`. It also rejects additional EBNF rules, concatenation, repetition, and requests with no tokenizable choice within budget. Send only one of `ebnf`, [`regex`](output-constraints.md#regular-expressions), and [`response_format`](output-constraints.md#json-schema). The `benchmark` model accepts only its fixed fields. With `ebnf`, omit `stop_token_ids`, including an empty array. Leave `ignore_eos` false.
 
-The compiler matches checkpoint token bytes against literal prefixes. A token may span several prefix nodes or parts of UTF-8 characters. Alternate tokenizations can compete for the same literal. Each request owns its cursor. At each step it excludes paths that cannot complete within the remaining token budget. [Candidate filtering](../include/sglang/decoder_constraint.h#L69)<!-- prefix: "void candida" -->
+The compiler matches checkpoint token bytes against literal prefixes. A token may span several prefix nodes or parts of UTF-8 characters. Alternate tokenizations can compete for the same literal. Each request owns its cursor. At each step it excludes paths that cannot complete within the remaining token budget. [Candidate filtering](../include/sglang/decoder_constraint.h#L89)<!-- prefix: "void candida" -->
 
 CUDA gathers the allowed BF16 scores in ascending token ID order after eager scoring or K0 graph replay. Greedy selects the highest score and breaks ties by lowest token ID. With active sampling, the [sampling rules](#sampling) apply to the allowed row. Top-k clamps to its size, and top-p uses its total weight. The selector maps the winning index back to a vocabulary ID for the four-byte readback. C++ serial `top_logits` still reports the original model row. [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" -->
 
-A request stops when it reaches a leaf or completes a literal at the budget limit. This adds no EOS token. At a literal that prefixes a longer choice, the next step can select model EOS if budget remains. A selected EOS counts in usage and diagnostic IDs. The writer omits it from text. Every successful EBNF completion reports HTTP `finish_reason: "stop"`. [Cursor update](../include/sglang/decoder_constraint.h#L97)<!-- prefix: "bool commit(" --> · [HTTP finish](../apps/server/text_completion.cpp#L52)<!-- prefix: "const char* " -->
+A request stops when it reaches a leaf or completes a literal at the budget limit. This adds no EOS token. At a literal that prefixes a longer choice, the next step can select model EOS if budget remains. A selected EOS counts in usage and diagnostic IDs. The writer omits it from text. Every successful EBNF completion reports HTTP `finish_reason: "stop"`. [Cursor update](../include/sglang/decoder_constraint.h#L134)<!-- prefix: "bool commit(" --> · [HTTP finish](../apps/server/text_completion.cpp#L52)<!-- prefix: "const char* " -->
 
 Constrained text uses the configured [MTP depth](mtp.md#runtime-path) and can share a batch with other text requests. K0 constraint selection can follow [eligible graph replay](batch-graphs.md#runtime-path).
 

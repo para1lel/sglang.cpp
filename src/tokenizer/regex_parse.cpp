@@ -60,7 +60,7 @@ Expression children(Kind kind, std::vector<Expression> values) {
 
 class Parser {
 public:
-    explicit Parser(std::u32string_view input) : input_(input) {}
+    explicit Parser(std::u32string_view input, bool tool = false) : input_(input), tool_(tool) {}
     Expression pattern();
 
 private:
@@ -96,6 +96,7 @@ private:
     int count();
 
     std::u32string_view input_;
+    bool tool_;
 };
 
 Expression Parser::pattern() {
@@ -132,6 +133,10 @@ Expression Parser::atom(int depth) {
                 throw std::invalid_argument("regex group nesting exceeds 32");
             }
             if (take(U'?')) {
+                if (tool_ && take(U'x')) {
+                    require(U')');
+                    return {Kind::xml_text, {}, {}};
+                }
                 require(U':');
             }
             {
@@ -283,6 +288,11 @@ Expression parse(std::string_view pattern) {
 Expression parse_generated(std::string_view pattern) {
     const auto scalars = read_utf8(pattern);
     return Parser(scalars).pattern();
+}
+
+Expression parse_tool_pattern(std::string_view pattern) {
+    const auto scalars = read_utf8(pattern);
+    return Parser(scalars, true).pattern();
 }
 
 }

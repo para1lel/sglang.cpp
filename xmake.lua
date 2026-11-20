@@ -159,6 +159,7 @@ target("sglang-server")
               "apps/server/http.cpp", "apps/server/prefix_controls.cpp",
               "apps/server/text_request.cpp", "apps/server/text_completion.cpp",
               "apps/server/chat_media.cpp", "apps/server/vision_completion.cpp")
+    add_files("apps/server/chat_tool_constraints.cpp")
     add_media_codecs()
 
 option("text-tokenizer-check")

@@ -5,6 +5,7 @@
 
 #include <charconv>
 #include <fstream>
+#include <set>
 
 namespace sglang::server {
 namespace {
@@ -349,7 +350,8 @@ std::vector<Turn> read_turns(const OrderedObject& chat) {
         if (!role) {
             throw std::invalid_argument("Expected a message object with a string role");
         }
-        turns.push_back({*role, *message});
+        const bool instruction = *role == "root" || *role == "developer";
+        turns.push_back({instruction ? "system"sv : *role, *message});
     }
     return turns;
 }
@@ -418,22 +420,100 @@ ChatTemplate::ChatTemplate(const std::filesystem::path& checkpoint) {
     tools_instructions_ = checkpoint_literal(source, "'\\n\\nIf you choose to call");
 }
 
-const json::Value* chat_tools(const json::OrderedObject& chat) {
-    const auto* tools = get(chat, "tools");
-    if (tools && !tools->is_null() && !tools->array()) {
-        throw std::invalid_argument("Expected an array of tool schemas");
+namespace {
+
+const Value* field(const Value& value, std::string_view key) {
+    const auto* object = value.ordered_object();
+    return object ? get(*object, key) : nullptr;
+}
+
+void collect_tools(json::Array& output, const Value* value) {
+    if (!value || value->is_null()) return;
+    const auto* tools = value->array();
+    if (!tools) throw std::invalid_argument("Expected an array of tool schemas");
+    output.insert(output.end(), tools->begin(), tools->end());
+}
+
+void collect_message_tools(json::Array& output, const OrderedObject& chat) {
+    const auto* list = get(chat, "messages");
+    if (!list || !list->array()) return;
+    for (const auto& message : *list->array()) {
+        const auto* tools = field(message, "tools");
+        if (!tools || tools->is_null()) continue;
+        const auto* role = field(message, "role");
+        if (role && (role->string() == "system" || role->string() == "developer" ||
+                     role->string() == "root")) {
+            collect_tools(output, tools);
+        } else if (!tools->array() || !tools->array()->empty()) {
+            throw std::invalid_argument("Message tools require a privileged instruction role");
+        }
     }
-    const auto* choice = get(chat, "tool_choice");
-    if (!choice || choice->is_null() || choice->string() == "auto") {
-        return tools;
+}
+
+ChatToolChoice read_tool_choice(const Value* selector, std::string_view& selected) {
+    if (!selector || selector->is_null() || selector->string() == "auto") {
+        return ChatToolChoice::automatic;
     }
-    if (choice->string() == "none") {
-        return nullptr;
+    if (selector->string() == "none") return ChatToolChoice::none;
+    if (selector->string() == "required") return ChatToolChoice::required;
+    const auto* type = field(*selector, "type");
+    const auto* function = field(*selector, "function");
+    const auto* name = function ? field(*function, "name") : nullptr;
+    if (!type || type->string() != "function" || !name || !name->string() ||
+        name->string()->empty()) {
+        throw std::invalid_argument("Unsupported tool_choice. Expected auto, none, required, "
+                                    "or a named function.");
     }
-    throw std::invalid_argument("Unsupported tool_choice. Expected auto, none, or null.");
+    selected = *name->string();
+    return ChatToolChoice::named;
+}
+
+}
+
+ChatTools chat_tools(const OrderedObject& chat) {
+    ChatTools output;
+    std::string_view selected;
+    output.choice = read_tool_choice(get(chat, "tool_choice"), selected);
+    if (const auto* parallel = get(chat, "parallel_tool_calls")) {
+        if (!parallel->boolean()) {
+            throw std::invalid_argument("Expected boolean parallel_tool_calls");
+        }
+        output.parallel = *parallel->boolean();
+    }
+    json::Array effective;
+    collect_tools(effective, get(chat, "tools"));
+    collect_message_tools(effective, chat);
+    if (output.choice == ChatToolChoice::none) return output;
+    std::set<std::string> names;
+    for (auto& tool : effective) {
+        const auto* type = field(tool, "type");
+        const auto* function = field(tool, "function");
+        const auto* value = function ? field(*function, "name") : nullptr;
+        const auto name = value ? value->string().value_or("") : ""sv;
+        if (!type || type->string() != "function" || name.empty() || name.size() > 64 ||
+            name.find_first_of("<>\r\n") != name.npos || !names.emplace(name).second) {
+            throw std::invalid_argument("Expected unique function tools with valid names");
+        }
+        if (output.choice == ChatToolChoice::named && name != selected) continue;
+        const auto* strict = field(*function, "strict");
+        if (strict && !strict->is_null()) {
+            if (!strict->boolean()) throw std::invalid_argument("Expected boolean function.strict");
+            output.strict |= *strict->boolean();
+        }
+        output.tools.push_back(std::move(tool));
+    }
+    if (output.forced() && output.tools.empty()) {
+        throw std::invalid_argument("Required or named tool_choice needs an advertised function");
+    }
+    return output;
 }
 
 std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) const {
+    return render(chat, input, chat_tools(chat));
+}
+
+std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input,
+                                 const ChatTools& selection) const {
     auto turns = read_turns(chat);
     const bool thinking = boolean(chat, "enable_thinking", true);
     const bool preserve = boolean(chat, "preserve_thinking", true);
@@ -453,11 +533,10 @@ std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) con
                 "Unexpected reasoning effort. Expected xhigh, medium or low.");
         }
     }
-    const auto* value = chat_tools(chat);
-    const auto* tools = value ? value->array() : nullptr;
+    const auto& tools = selection.tools;
     const auto system = turns.front().role == "system"
         ? render_content(turns.front().message, vision, false, true, input) : std::string();
-    const bool has_tools = tools && !tools->empty();
+    const bool has_tools = !tools.empty();
     if (!instructions.empty() || has_tools || !system.empty()) {
         output += "<|im_start|>system\n";
         output += instructions;
@@ -466,7 +545,7 @@ std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) con
         }
         if (has_tools) {
             output += tools_intro_;
-            for (const auto& tool : *tools) {
+            for (const auto& tool : tools) {
                 if (!tool.ordered_object()) {
                     throw std::invalid_argument("Expected a tool schema object");
                 }

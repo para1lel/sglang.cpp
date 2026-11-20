@@ -194,6 +194,46 @@ void check_ranking(const sglang::Decoder& decoder) {
     }
 }
 
+void check_terminal_progress(const sglang::Decoder& decoder) {
+    using sglang::DecoderFinishReason;
+    sglang::DecoderOptions options;
+    options.max_new_tokens = 1;
+    options.top_logits = 1;
+    options.stop_token_id = two_ids.front();
+    const auto stopped = decoder.generate(prompt, options);
+    const std::vector<int> expected{two_ids.front()};
+    require(stopped.output_token_ids == expected &&
+                stopped.finish_reason == DecoderFinishReason::stop,
+            "A stop on the last permitted output did not take precedence over length");
+    require(stopped.step_top_logits.size() == 1 && stopped.step_top_logits.front().size() == 1,
+            "The stopped output is missing its requested top logit");
+
+    std::vector<int> emitted;
+    sglang::DecoderCallbacks callbacks;
+    callbacks.on_token = [&](int token) {
+        emitted.push_back(token);
+        return false;
+    };
+    const auto cancelled = decoder.generate(prompt, options, callbacks);
+    require(emitted == expected && cancelled.output_token_ids == expected &&
+                cancelled.finish_reason == DecoderFinishReason::cancelled,
+            "Callback cancellation did not retain the terminal output");
+    require(cancelled.step_top_logits.size() == 1 && cancelled.step_top_logits.front().size() == 1,
+            "Callback cancellation lost the requested top logit");
+    const auto& stopped_logit = stopped.step_top_logits.front().front();
+    const auto& cancelled_logit = cancelled.step_top_logits.front().front();
+    require(cancelled_logit.token_id == stopped_logit.token_id &&
+                cancelled_logit.logit == stopped_logit.logit,
+            "Callback cancellation changed the terminal output's top logit");
+
+    options.max_new_tokens = 0;
+    emitted.clear();
+    const auto empty = decoder.generate(prompt, options, callbacks);
+    require(emitted.empty() && empty.output_token_ids.empty() && empty.step_top_logits.empty() &&
+                empty.finish_reason == DecoderFinishReason::length,
+            "A zero output budget published a token or logit");
+}
+
 void check_live(std::size_t allocation_count, std::size_t stream_count = 0) {
     require(!calls.bad_handle, "CUDA release attempted on a non-live handle");
     require(calls.streams.size() == stream_count, "Unexpected number of live CUDA streams");
@@ -430,6 +470,7 @@ int main(int argc, const char** argv) {
             const sglang::Decoder decoder(argv[1]);
             if (mode == "ranking") {
                 check_ranking(decoder);
+                check_terminal_progress(decoder);
             } else if (mode == "cleanup") {
                 check_cleanup(decoder, Fault::none);
             } else if (mode == "growth") {

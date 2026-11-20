@@ -113,10 +113,48 @@ SamplingParameters request_sampling(const DecoderOptions& options) {
     return {options.temperature, options.top_p, top_k, seed, options.min_p};
 }
 
-void copy_token(Request& request, const Workspace& work, cudaStream_t stream) {
-    auto& winner = request.memory.transfers().winner;
+void RequestProgress::select(Request& request, Workspace& work, const DecoderOptions& options,
+                             const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
+                             void* sampling_workspace, cudaStream_t stream) {
+    if (options.constraint) {
+        constraint.candidates(*options.constraint, remaining_output(options));
+        select_constrained(work, scratch, constraint, sampling, generated, sampling_workspace,
+                            stream);
+    } else if (sampling) {
+        check(sample_logits(work.logits, vocab_size, &work.argmax->token_id, *sampling,
+                            generated, sampling_workspace, stream), "Sample decoder logits");
+    }
+    auto& transfers = request.memory.transfers();
+    auto& winner = transfers.winner;
     check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner),
                           cudaMemcpyDeviceToHost, stream), "Read selected token");
+    auto& logits = transfers.logits;
+    if (!logits.empty()) {
+        check(cudaMemcpyAsync(logits.data(), work.logits, logits.size() * sizeof(Bf16),
+                              cudaMemcpyDeviceToHost, stream), "Read decoder step logits");
+    }
+}
+
+std::optional<DecoderFinishReason> RequestProgress::commit(const DecoderOptions& options, int token,
+                                                           const Bf16* logits,
+                                                           SerialOutput* output) {
+    last_token = token;
+    ++generated;
+    if (output && !output->emit(token, logits)) {
+        return DecoderFinishReason::cancelled;
+    }
+    const int remaining = remaining_output(options);
+    if (options.constraint) {
+        if (constraint.commit(*options.constraint, token, remaining)) {
+            return DecoderFinishReason::constraint;
+        }
+    } else if (options.stops_at(token)) {
+        return DecoderFinishReason::stop;
+    }
+    if (remaining == 0) {
+        return DecoderFinishReason::length;
+    }
+    return std::nullopt;
 }
 
 int validate_winner(int winner, bool sampled, bool constrained) {
@@ -196,29 +234,22 @@ void prepare_serial_request(Request& request, const DecoderOptions& options) {
     request.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
 }
 
-int read_step(Request& request, const std::optional<SamplingParameters>& sampling = std::nullopt,
-              const ConstraintCursor* constraint = nullptr, int position = 0) {
-    const auto stream = request.memory.stream();
-    auto& host_logits = request.memory.transfers().logits;
-    if (constraint) {
-        select_constrained(request.work, request.constraint_workspace, *constraint,
-                            sampling ? &*sampling : nullptr, position,
-                            request.sampling_workspace, stream);
-    } else if (sampling) {
-        check(sample_logits(request.work.logits, vocab_size, &request.work.argmax->token_id,
-                            *sampling, position, request.sampling_workspace, stream),
-              "Sample decoder logits");
-    }
-    copy_token(request, request.work, stream);
-    if (!host_logits.empty()) {
-        check(cudaMemcpyAsync(host_logits.data(), request.work.logits,
-                              host_logits.size() * sizeof(Bf16), cudaMemcpyDeviceToHost, stream),
-              "Read step logits");
-    }
-    check(cudaStreamSynchronize(stream), "Complete decoder step");
-    return read_token(request, sampling.has_value(), constraint != nullptr);
 }
 
+SerialOutput::SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result)
+    : callbacks_(callbacks), top_count_(top_count), result_(result) {
+    if (top_count_ > 0) {
+        ranking_.reserve(vocab_size);
+    }
+}
+
+bool SerialOutput::emit(int token, const Bf16* logits) {
+    result_.output_token_ids.push_back(token);
+    const bool keep_running = !callbacks_.on_token || callbacks_.on_token(token);
+    if (top_count_ > 0) {
+        result_.step_top_logits.push_back(top_logits(logits, top_count_, ranking_));
+    }
+    return keep_running;
 }
 
 Decoder::Model::Model(const std::filesystem::path& checkpoint, int cuda_device,
@@ -252,9 +283,10 @@ std::size_t Decoder::model_device_allocation_bytes() const {
                                      model_->mtp_weights->device_allocation_bytes() : 0);
 }
 
-bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& prompt,
-                                   const DecoderCallbacks& callbacks, DecoderResult& result,
-                                   const MediaPrefill* media, int step_budget) const {
+bool Decoder::Model::prefill_serial(Request& request, RequestProgress& progress,
+                                    const std::vector<int>& prompt, const SerialOutput& output,
+                                    DecoderResult& result, const MediaPrefill* media,
+                                    int step_budget) const {
     const int count = static_cast<int>(prompt.size());
     const auto stream = request.memory.stream();
     const int aligned = count / prefill_chunk_rows * prefill_chunk_rows;
@@ -276,13 +308,14 @@ bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& pr
     auto& workspace = *tiled;
     result.peak_device_allocation_bytes += workspace.bytes();
     const int tile_rows = workspace.bytes() ? workspace.capacity() : 1;
-    for (int position = 0; position < count;) {
+    while (progress.remaining_prompt(count)) {
+        const int position = progress.position;
         const int end = position < aligned ? aligned : count;
         const int rows = std::min(tile_rows, end - position);
         prefill_chunk(request, prompt.data() + position, rows, position, workspace,
                       nullptr, 0, media);
-        position += rows;
-        if (callbacks.is_cancelled && callbacks.is_cancelled()) {
+        progress.advance(rows);
+        if (output.cancelled()) {
             workspace.close();
             return false;
         }
@@ -291,30 +324,34 @@ bool Decoder::Model::prefill_serial(Request& request, const std::vector<int>& pr
     return true;
 }
 
-void Decoder::Model::advance_serial(Request& request, int step, int prompt_count, int input,
-                                    bool media, int rotary_delta) const {
-    const int position = prompt_count + step - 1;
-    if (step != 0 && request.kv_limit) {
-        request.grow_kv(position + 1, position, request.memory.stream());
-    }
-    if (step != 0 && request.decode_position) {
-        if (step == 1) {
-            check(set_decode_position(request.decode_position, prompt_count,
-                                      request.memory.stream()), "Set decode position");
-        }
-        decode_graph(request);
+void Decoder::Model::advance_serial(Request& request, RequestProgress& progress,
+                                    int input, bool media, int rotary_delta) const {
+    if (progress.generated == 0) {
+        compute_logits(request);
         return;
     }
-    if (step != 0) {
+    const auto stream = request.memory.stream();
+    const int position = progress.position;
+    if (request.kv_limit) {
+        request.grow_kv(position + 1, position, stream);
+    }
+    if (request.decode_position) {
+        if (progress.generated == 1) {
+            check(set_decode_position(request.decode_position, position, stream),
+                  "Set decode position");
+        }
+        decode_graph(request);
+    } else {
         if (media) {
             const ForwardLane lane{&request, input, position, TextGdnMode::decode, false,
                                    nullptr, nullptr, position + rotary_delta};
-            forward(&lane, 1, request.memory.stream());
+            forward(&lane, 1, stream);
         } else {
             forward(request, input, position, TextGdnMode::decode);
         }
+        compute_logits(request, true);
     }
-    compute_logits(request, step != 0);
+    progress.advance(1);
 }
 
 void Decoder::Model::generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
@@ -322,9 +359,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                                      DecoderResult& result,
                                      std::shared_ptr<const MultimodalInput> media,
                                      const std::vector<int>* teacher) const {
-    const auto cancelled = [&] { return callbacks.is_cancelled && callbacks.is_cancelled(); };
     const int prompt_count = static_cast<int>(prompt.size());
-    const int limit = prompt_count + options.max_new_tokens - 1;
+    const int limit = RequestProgress::capacity(prompt_count, options);
     const int kv_limit = options.incremental_kv ? limit : 0;
     int capacity = kv_limit ? prompt_count : limit;
     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
@@ -358,47 +394,32 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         const auto prefill = media
             ? upload_media_positions(request, *media, request.memory.stream()) : MediaPrefill{};
         const int rotary_delta = media ? media->prompt.next_position - prompt_count : 0;
-        auto& transfers = request.memory.transfers();
-        std::vector<DecoderLogit> ranking;
-        if (options.top_logits > 0) {
-            ranking.reserve(vocab_size);
-        }
+        SerialOutput output(callbacks, options.top_logits, result);
         result.peak_device_allocation_bytes += request.memory.bytes();
         const auto run_request = [&] {
-            if (cancelled() ||
-                !prefill_serial(request, prompt, callbacks, result, media ? &prefill : nullptr,
-                                options.max_num_batched_tokens)) {
+            RequestProgress progress;
+            if (output.cancelled() ||
+                !prefill_serial(request, progress, prompt, output, result,
+                                media ? &prefill : nullptr, options.max_num_batched_tokens)) {
                 return DecoderFinishReason::cancelled;
             }
-            int winner = -1;
-            ConstraintCursor constraint;
-            for (int step = 0; step < options.max_new_tokens; ++step) {
-                if (cancelled()) {
+            const auto stream = request.memory.stream();
+            while (progress.remaining_output(options) > 0) {
+                if (output.cancelled()) {
                     return DecoderFinishReason::cancelled;
                 }
-                const int input = step != 0 && teacher ? (*teacher)[step - 1] : winner;
-                advance_serial(request, step, prompt_count, input, bool(media), rotary_delta);
-                const int remaining = options.max_new_tokens - step;
-                if (options.constraint) {
-                    constraint.candidates(*options.constraint, remaining);
-                }
-                winner = read_step(request, sampling,
-                                   options.constraint ? &constraint : nullptr, step);
-                result.output_token_ids.push_back(winner);
-                const bool keep_running = !callbacks.on_token || callbacks.on_token(winner);
-                if (options.top_logits > 0) {
-                    result.step_top_logits.push_back(
-                        top_logits(transfers.logits.data(), options.top_logits, ranking));
-                }
-                if (!keep_running) {
-                    return DecoderFinishReason::cancelled;
-                }
-                if (options.constraint &&
-                    constraint.commit(*options.constraint, winner, remaining - 1)) {
-                    return DecoderFinishReason::constraint;
-                }
-                if (!options.constraint && options.stops_at(winner)) {
-                    return DecoderFinishReason::stop;
+                const int input = progress.generated != 0 && teacher
+                    ? (*teacher)[progress.generated - 1] : progress.last_token;
+                advance_serial(request, progress, input, bool(media), rotary_delta);
+                progress.select(request, request.work, options, request.constraint_workspace,
+                                sampling ? &*sampling : nullptr, request.sampling_workspace,
+                                stream);
+                check(cudaStreamSynchronize(stream), "Complete decoder step");
+                const int token = read_token(request, sampling.has_value(),
+                                             options.constraint != nullptr);
+                const auto* logits = request.memory.transfers().logits.data();
+                if (const auto finish = progress.commit(options, token, logits, &output)) {
+                    return *finish;
                 }
             }
             return DecoderFinishReason::length;
@@ -440,18 +461,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
         const int limit = options.max_num_batched_tokens
             ? std::min(options.max_num_batched_tokens, prefill_chunk_rows) : prefill_chunk_rows;
         DecoderBatch batch(*this, DecoderBatchOptions{false, 1, 0, limit});
-        std::vector<DecoderLogit> ranking;
-        if (options.top_logits > 0) {
-            ranking.reserve(vocab_size);
-        }
-        const SerialMtpOutput output{callbacks.is_cancelled, [&](int token, const Bf16* logits) {
-            result.output_token_ids.push_back(token);
-            const bool keep_running = !callbacks.on_token || callbacks.on_token(token);
-            if (options.top_logits > 0) {
-                result.step_top_logits.push_back(top_logits(logits, options.top_logits, ranking));
-            }
-            return keep_running;
-        }};
+        SerialOutput output(callbacks, options.top_logits, result);
         batch.generate_mtp(prompt_token_ids, options, output, result);
     }
     selected_device.restore();

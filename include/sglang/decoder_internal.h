@@ -34,9 +34,18 @@ struct SamplingParameters;
 
 using Bf16 = __nv_bfloat16;
 
-struct SerialMtpOutput {
-    const std::function<bool()>& is_cancelled;
-    std::function<bool(int, const Bf16*)> emit;
+class SerialOutput {
+public:
+    SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result);
+    const std::function<bool()>& cancel_probe() const { return callbacks_.is_cancelled; }
+    bool cancelled() const { return cancel_probe() && cancel_probe()(); }
+    bool emit(int token, const Bf16* logits);
+
+private:
+    const DecoderCallbacks& callbacks_;
+    const int top_count_;
+    DecoderResult& result_;
+    std::vector<DecoderLogit> ranking_;
 };
 
 inline constexpr int hidden_size = 5120;
@@ -303,7 +312,29 @@ struct Request {
     ConstraintWorkspace constraint_workspace;
 };
 
-void copy_token(Request& request, const Workspace& work, cudaStream_t stream);
+struct RequestProgress {
+    // Target prefix length, excluding unconsumed verification rows.
+    int position = 0;
+    int generated = 0;
+    int last_token = -1;
+    ConstraintCursor constraint{};
+
+    static int capacity(int prompt, const DecoderOptions& options) {
+        return prompt + options.max_new_tokens - 1;
+    }
+    int remaining_prompt(int prompt) const { return position < prompt ? prompt - position : 0; }
+    int remaining_output(const DecoderOptions& options) const {
+        return options.max_new_tokens - generated;
+    }
+    void advance(int rows) { position += rows; }
+    void select(Request& request, Workspace& work, const DecoderOptions& options,
+                const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
+                void* sampling_workspace, cudaStream_t stream);
+    std::optional<DecoderFinishReason> commit(const DecoderOptions& options, int token,
+                                              const Bf16* logits = nullptr,
+                                              SerialOutput* output = nullptr);
+};
+
 int validate_winner(int winner, bool sampled, bool constrained);
 int read_token(Request& request, bool sampled, bool constrained = false);
 
@@ -373,11 +404,12 @@ struct Decoder::Model {
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request, bool decode = false) const;
     void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;
-    bool prefill_serial(decoder::Request& request, const std::vector<int>& prompt,
-                        const DecoderCallbacks& callbacks, DecoderResult& result,
-                        const decoder::MediaPrefill* media = nullptr, int step_budget = 0) const;
-    void advance_serial(decoder::Request& request, int step, int prompt_count, int input,
-                        bool media, int rotary_delta) const;
+    bool prefill_serial(decoder::Request& request, decoder::RequestProgress& progress,
+                        const std::vector<int>& prompt, const decoder::SerialOutput& output,
+                        DecoderResult& result, const decoder::MediaPrefill* media,
+                        int step_budget) const;
+    void advance_serial(decoder::Request& request, decoder::RequestProgress& progress,
+                        int input, bool media, int rotary_delta) const;
     void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
                          const DecoderCallbacks& callbacks, DecoderResult& result,
                          std::shared_ptr<const decoder::MultimodalInput> media = nullptr,

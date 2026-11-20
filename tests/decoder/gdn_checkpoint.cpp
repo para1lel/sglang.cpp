@@ -76,8 +76,10 @@ void teacher_force(const Decoder::Model& model, const std::vector<int>& prompt,
         ++chunks;
         return false;
     }};
-    if (!model.prefill_serial(request, prompt, callbacks, result) || chunks != 2 ||
-        result.peak_device_allocation_bytes != 255557632) {
+    RequestProgress progress;
+    const SerialOutput output(callbacks, 0, result);
+    if (!model.prefill_serial(request, progress, prompt, output, result, nullptr, 0) ||
+        chunks != 2 || result.peak_device_allocation_bytes != 255557632) {
         throw std::runtime_error("Expected the 1024-row automatic serial prefill route");
     }
     model.compute_logits(request);

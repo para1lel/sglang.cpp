@@ -74,30 +74,30 @@ Exact scoring reduces eight groups in FP32, sums in group order, and scales by `
 
 #### Ordered multirow GQA prefill
 
-The [flash route](flash-prefill.md#constraints-and-failure-behavior) handles eligible tensor-core chunks. Ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more, through 32,768 visible tokens. [Dispatch](../src/mxfp8_gqa_prefill.cu#L841)<!-- prefix: "cudaError_t " -->
+Eligible tensor-core chunks use [Flash](flash-prefill.md#constraints-and-failure-behavior). Through 32,768 visible tokens, ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more. [Dispatch](../src/mxfp8_gqa_prefill.cu#L540)<!-- prefix: "cudaError_t " -->
 
-Tiles share decoded K/V across rows and two query heads. Each 32-token block preserves per-row causality, the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L283)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L406)<!-- prefix: "for (int fir" -->
+Tiles share decoded K/V across rows and two query heads. Each 32-token block preserves causality, the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L37)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L160)<!-- prefix: "for (int fir" -->
 
-Other shapes and leftover rows use protected single-row attention. Both routes recompute nonfinite visible scores by head and nonfinite quotients by channel in FP64, retaining finite replacements. [Recovery](../include/sglang/mxfp8_gqa.h#L63)<!-- prefix: "/// Shared a" -->
+Other shapes and tails use protected single-row attention. Both routes retain finite FP64 replacements for nonfinite visible scores per head and quotients per channel. [Recovery](../include/sglang/mxfp8_gqa.h#L63)<!-- prefix: "/// Shared a" -->
 
-Zero rows succeed. Otherwise, negative positions, negative rows, and position-plus-row overflow return `cudaErrorInvalidValue`.
+Zero rows succeed. Negative positions or rows and position-plus-row overflow otherwise return `cudaErrorInvalidValue`.
 
 #### P2 GQA verification
-
-Build from the repository root with Pixi.
 
 ```bash
 bash tools/build.sh --build-dir build --mxfp8-check
 ```
 
-Set `BUILD_WORK_DIR` to the printed directory and `GPU_UUID` to the reserved B200 UUID.
+Run from the repository root. Use the printed build directory and reserved B200 UUID.
 
 ```bash
-CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
-    "${BUILD_WORK_DIR:?set the printed build directory}/build/bin/mxfp8-gqa-check"
+export CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}"
+checker="${BUILD_WORK_DIR:?set the printed build directory}/build/bin/mxfp8-gqa-check"
+env -u SGLANG_EXPERIMENTAL_TMEM_PREFILL "$checker"
+SGLANG_EXPERIMENTAL_TMEM_PREFILL=1 "$checker"
 ```
 
-Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The [verifier](../tests/mxfp8_gqa_check.cu#L639)<!-- prefix: "void run_che" --> checks append, attention, and page reuse against packed KV and BF16.
+Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero in both [dispatch modes](flash-prefill.md#verification). The [verifier](../tests/mxfp8_gqa_check.cu#L639)<!-- prefix: "void run_che" --> covers append, attention, and page reuse with packed KV and BF16.
 
 The [ordered decode check](../tests/mxfp8_gqa_check.cu#L541)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 
@@ -113,7 +113,7 @@ Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L930)<!-- prefix
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
 | `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L102)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L537)<!-- prefix: "void Decoder" --> |
 
-Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L89)<!-- prefix: "target(\"sgla" -->
+Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L90)<!-- prefix: "target(\"sgla" -->
 
 #### Runtime path
 
@@ -125,7 +125,7 @@ Prefill follows token order. The final prompt row gives initial logits. [Serial 
 
 Both binaries accept `--fp8-prefill exact|tensor-core`. Pass `Fp8PrefillPolicy` as the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L97)<!-- prefix: "enum class F" -->
 
-Tensor-core projections require K0, at least three rows, widths divisible by 128, and contiguous, 16-byte-aligned E4M3 payloads. The `sm_100a` build uses TMA, TMEM, and `tcgen05`. It requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Ineligible calls use SIMT. Errors propagate. [Projection](../src/decoder_prefill.cpp#L315)<!-- prefix: "void Prefill" --> · [Eligibility](../src/prefill_fp8_sm100.cu#L467)<!-- prefix: "const int ma" --> · [Build](../xmake.lua#L64)<!-- prefix: "target(\"sgla" -->
+Tensor-core projections require K0, at least three rows, widths divisible by 128, and contiguous, 16-byte-aligned E4M3 payloads. The `sm_100a` build uses TMA, TMEM, and `tcgen05`. It requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Ineligible calls use SIMT. Errors propagate. [Projection](../src/decoder_prefill.cpp#L315)<!-- prefix: "void Prefill" --> · [Eligibility](../src/prefill_fp8_sm100.cu#L467)<!-- prefix: "const int ma" --> · [Build](../xmake.lua#L65)<!-- prefix: "target(\"sgla" -->
 
 At input widths ≥8192, eligible projections use 64×128 tiles below 1024 rows and 128×128 otherwise. [Projection tiles](../src/prefill_fp8_sm100.cu#L489)<!-- prefix: "const bool n" -->
 

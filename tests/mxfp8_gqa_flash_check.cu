@@ -4,6 +4,8 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -221,9 +223,13 @@ struct Dispatch {
     const char* kernel;
     unsigned grid_width;
     unsigned grid_height = head_blocks;
+    unsigned grid_depth = 1;
+    unsigned block_width = 0;
 };
 
 constexpr Dispatch flash{"flash_prefill_attention", rows / 64};
+constexpr Dispatch tmem_split{"tmem_flash_attention", rows / 64, head_blocks, 3, 384};
+constexpr Dispatch tmem_merge{"tmem_merge", rows, head_blocks, 1, channels};
 constexpr Dispatch exact{"attention_kernel", rows, mxfp8_query_heads};
 constexpr Dispatch multirow{"multirow_prefill_attention", rows / 4};
 constexpr Dispatch protected_rows{"protected_prefill_attention", rows};
@@ -294,14 +300,7 @@ void check_dispatch_errors(cudaStream_t stream) {
     }
 }
 
-void check_dispatch(const char* label, cudaGraph_t graph, Dispatch expected) {
-    std::size_t count = 0;
-    check_cuda(cudaGraphGetNodes(graph, nullptr, &count), "Count Flash check launch nodes");
-    if (count != 1) {
-        throw std::runtime_error(std::string(label) + ": expected one prefill CUDA graph node");
-    }
-    cudaGraphNode_t node = nullptr;
-    check_cuda(cudaGraphGetNodes(graph, &node, &count), "Get Flash check launch node");
+void check_kernel(const char* label, cudaGraphNode_t node, Dispatch expected) {
     cudaKernelNodeParams params{};
     check_cuda(cudaGraphKernelNodeGetParams(node, &params), "Get Flash check kernel parameters");
     const char* name = nullptr;
@@ -311,10 +310,74 @@ void check_dispatch(const char* label, cudaGraph_t graph, Dispatch expected) {
                 params.blockDim.x, params.blockDim.y, params.blockDim.z, params.sharedMemBytes);
     if (std::string_view(name).find(expected.kernel) == std::string_view::npos ||
         params.gridDim.x != expected.grid_width || params.gridDim.y != expected.grid_height ||
-        params.gridDim.z != 1) {
+        params.gridDim.z != expected.grid_depth ||
+        (expected.block_width && (params.blockDim.x != expected.block_width ||
+                                  params.blockDim.y != 1 || params.blockDim.z != 1))) {
         throw std::runtime_error(std::string(label) + ": expected " + expected.kernel +
                                  " grid=" + std::to_string(expected.grid_width) + "x" +
-                                 std::to_string(expected.grid_height) + "x1");
+                                 std::to_string(expected.grid_height) + "x" +
+                                 std::to_string(expected.grid_depth));
+    }
+}
+
+cudaGraphNode_t predecessor(cudaGraphNode_t node) {
+    std::size_t count = 0;
+    check_cuda(cudaGraphNodeGetDependencies(node, nullptr, nullptr, &count),
+               "Count prefill graph predecessors");
+    if (count != 1) {
+        throw std::runtime_error("TMEM graph node must have one predecessor");
+    }
+    cudaGraphNode_t previous = nullptr;
+    check_cuda(cudaGraphNodeGetDependencies(node, &previous, nullptr, &count),
+               "Read prefill graph predecessor");
+    return previous;
+}
+
+void check_tmem_dispatch(const char* label, const std::array<cudaGraphNode_t, 4>& nodes) {
+    cudaGraphNode_t release = nullptr;
+    for (const auto node : nodes) {
+        cudaGraphNodeType type{};
+        check_cuda(cudaGraphNodeGetType(node, &type), "Inspect prefill graph node");
+        if (type == cudaGraphNodeTypeMemFree) {
+            release = node;
+        }
+    }
+    if (!release) {
+        throw std::runtime_error("TMEM graph is missing its scratch release");
+    }
+    const auto merge = predecessor(release);
+    const auto split = predecessor(merge);
+    const auto allocate = predecessor(split);
+    check_kernel(label, split, tmem_split);
+    check_kernel(label, merge, tmem_merge);
+    cudaMemAllocNodeParams allocation{};
+    void* freed = nullptr;
+    check_cuda(cudaGraphMemAllocNodeGetParams(allocate, &allocation), "Read TMEM scratch size");
+    check_cuda(cudaGraphMemFreeNodeGetParams(release, &freed), "Read released TMEM scratch");
+    constexpr auto scratch_bytes = std::size_t{3} * output_elements * sizeof(float)
+        + std::size_t{3} * rows * mxfp8_query_heads * sizeof(float2);
+    if (!allocation.dptr || allocation.dptr != freed || allocation.bytesize != scratch_bytes) {
+        throw std::runtime_error("TMEM graph scratch allocation and release do not match");
+    }
+    std::printf("MXFP8 prefill %s scratch_bytes=%zu graph=allocate,split,merge,free\n",
+                label, allocation.bytesize);
+}
+
+void check_dispatch(const char* label, cudaGraph_t graph, Dispatch expected) {
+    const bool split = expected.grid_depth > 1;
+    std::size_t count = 0;
+    check_cuda(cudaGraphGetNodes(graph, nullptr, &count), "Count Flash check launch nodes");
+    if (count != (split ? 4u : 1u)) {
+        throw std::runtime_error(std::string(label) +
+                                 (split ? ": expected four TMEM CUDA graph nodes" :
+                                          ": expected one prefill CUDA graph node"));
+    }
+    std::array<cudaGraphNode_t, 4> nodes{};
+    check_cuda(cudaGraphGetNodes(graph, nodes.data(), &count), "Get Flash check launch nodes");
+    if (split) {
+        check_tmem_dispatch(label, nodes);
+    } else {
+        check_kernel(label, nodes.front(), expected);
     }
 }
 
@@ -379,6 +442,7 @@ struct RunOptions {
     int key_offset = 0;
     int value_offset = 0;
     bool use_exact = false;
+    bool repeat_graph = false;
 };
 
 struct DeviceInput {
@@ -425,6 +489,17 @@ struct DeviceInput {
                    "Instantiate Flash check graph");
         check_cuda(cudaGraphLaunch(graph.executable, stream), "Replay Flash check graph");
         auto result = output.download(stream);
+        if (options.repeat_graph) {
+            check_cuda(cudaMemsetAsync(output.get(), 0xff, output_bytes, stream),
+                       "Poison output before second TMEM graph replay");
+            check_cuda(cudaGraphLaunch(graph.executable, stream), "Replay the TMEM graph again");
+            const auto repeated = output.download(stream);
+            if (std::memcmp(result.data(), repeated.data(), output_bytes) != 0) {
+                throw std::runtime_error("TMEM graph reuse changed its output");
+            }
+            std::printf("MXFP8 prefill %s repeated graph matched %zu output bytes\n",
+                        label, output_bytes);
+        }
         if (samples.empty()) {
             check_guards(label, result, options.count);
         } else {
@@ -435,7 +510,8 @@ struct DeviceInput {
 };
 
 void check_long_causality(Input& input, DeviceInput& device, int position,
-                          const std::vector<BFloat>& baseline, cudaStream_t stream) {
+                          const std::vector<BFloat>& baseline, Dispatch dispatch,
+                          cudaStream_t stream) {
     constexpr int first_changed_row = 65;
     for (int row = first_changed_row; row < first_changed_row + 64; ++row) {
         const auto payload = input.payload_offset(position + row, 0);
@@ -443,8 +519,8 @@ void check_long_causality(Input& input, DeviceInput& device, int position,
         std::fill_n(input.values.begin() + payload, channels, 0x48);
         std::fill_n(input.value_scales.begin() + scale, mxfp8_groups, 127);
     }
-    const auto changed = device.run("131072 future value perturbation", input, position, flash,
-                                    attention_samples(input, position), stream);
+    const auto changed = device.run("131072 future value perturbation", input, position,
+                                    dispatch, attention_samples(input, position), stream);
     constexpr std::size_t prefix = first_changed_row * row_width;
     std::size_t suffix_differences = 0;
     for (std::size_t index = 0; index < output_elements; ++index) {
@@ -464,14 +540,36 @@ void check_long_causality(Input& input, DeviceInput& device, int position,
                 prefix, suffix_differences);
 }
 
+void check_tmem_lower_edge(Input& input, DeviceInput& device, Dispatch eligible,
+                           cudaStream_t stream) {
+    constexpr int first = 32768;
+    constexpr int key_tile = 64;
+    device.run("TMEM aligned start below lower bound", input, first - key_tile, flash,
+               attention_samples(input, first - key_tile), stream);
+    device.run("TMEM lower edge predecessor", input, first - 1, flash,
+               attention_samples(input, first - 1), stream);
+    const auto samples = attention_samples(input, first);
+    device.run("TMEM first aligned start", input, first, eligible, samples, stream,
+               {.repeat_graph = eligible.grid_depth > 1});
+    device.run("TMEM nonaligned start", input, first + 1, flash,
+               attention_samples(input, first + 1), stream);
+    device.run("TMEM unaligned key", input, first, protected_rows, samples, stream,
+               {.key_offset = 1});
+    device.run("TMEM unaligned value", input, first, protected_rows, samples, stream,
+               {.value_offset = 1});
+}
+
 void check_long_flash(cudaStream_t stream) {
     constexpr int ordered_visible = 32768;
     constexpr int flash_visible = 131072;
+    constexpr int aligned_above_limit = flash_visible + 64;
     constexpr int partial = rows - 1;
     constexpr Dispatch partial_protected{"protected_prefill_attention", partial};
-    Input input(flash_visible + 1);
+    const char* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
+    const auto eligible = setting && std::string_view(setting) == "1" ? tmem_split : flash;
+    Input input(aligned_above_limit);
     DeviceInput device(input);
-    for (int visible : {ordered_visible, ordered_visible + 1, 65536}) {
+    for (int visible : {ordered_visible, ordered_visible + 1}) {
         const int position = visible - rows;
         const auto label = std::to_string(visible) + " visible";
         const auto samples = attention_samples(input, position);
@@ -489,15 +587,24 @@ void check_long_flash(cudaStream_t stream) {
     device.run("32769 partial tile", input, ordered_visible + 1 - partial, partial_protected,
                attention_samples(input, ordered_visible + 1 - partial, partial), stream,
                {.count = partial});
+    check_tmem_lower_edge(input, device, eligible, stream);
+    for (int visible : {65536, 98304}) {
+        const int position = visible - rows;
+        const auto label = std::to_string(visible) + " visible";
+        device.run(label.c_str(), input, position, eligible,
+                   attention_samples(input, position), stream);
+    }
     const int position = flash_visible - rows;
     const auto samples = attention_samples(input, position);
-    const auto baseline = device.run("131072 visible", input, position, flash, samples, stream);
+    const auto baseline = device.run("131072 visible", input, position, eligible, samples, stream);
     device.run("131072 exact", input, position, exact, samples, stream, {.use_exact = true});
     device.run("131073 visible", input, position + 1, protected_rows,
                attention_samples(input, position + 1), stream);
-    check_long_causality(input, device, position, baseline, stream);
+    device.run("TMEM aligned end above upper bound", input, aligned_above_limit - rows,
+               protected_rows, attention_samples(input, aligned_above_limit - rows), stream);
+    check_long_causality(input, device, position, baseline, eligible, stream);
     input.add_score_overflow(position);
-    device.run("131072 Flash score overflow recovery", input, position, flash,
+    device.run("131072 score overflow recovery", input, position, eligible,
                attention_samples(input, position), stream);
 }
 

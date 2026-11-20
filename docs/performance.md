@@ -176,7 +176,7 @@ GPU5 operator median GQA fell from 222.465 to 101.679 ms for 1,024 rows at 32,76
 
 [Wide long decode checks](long-paged-decode.md#verification) cover direct controls and HTTP cohorts.
 
-See [W6 warmups and diagnostics](flash-prefill.md#w6-warmups-and-diagnostics) for the long prefill evidence.
+See [W6 prefill diagnostics](flash-prefill.md#w6-warmups-and-diagnostics), [experimental TMEM quality limits](flash-prefill.md#tmem-checkpoint-verification), and the [TMEM prototype](flash-prefill.md#double-buffered-tmem-prototype).
 
 ### Native MTP
 

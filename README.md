@@ -17,7 +17,7 @@ The CUDA cache and public attention implementation is in
 The internal page-parallel path for batched decode is in
 [`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L947)<!-- prefix: "cudaError_t " -->.
 The internal grouped-query attention prefill path is in
-[`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L841)<!-- prefix: "cudaError_t " -->.
+[`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L540)<!-- prefix: "cudaError_t " -->.
 
 ## Build on the project host
 
@@ -54,8 +54,8 @@ Build the candidate MXFP8 correctness check without using a GPU.
 bash tools/build.sh --build-dir build --mxfp8-check
 ```
 
-`mxfp8-gqa-check` links `sglang_cuda`. Run the reported executable on a reserved B200
-to check cache bytes and attention outputs. This build command only compiles and links the check.
+`mxfp8-gqa-check` links the portable `sm_100` attention and the `sm_100a` prefill library.
+Run the reported executable on a reserved B200 to check cache bytes and attention outputs.
 
 For decoded RGB8 images and video, see the [CPU media preprocessing API](docs/media-preprocessing.md).
 The guide covers the standalone C++ library, patch layout, and CPU verification.
@@ -113,14 +113,12 @@ and workspace fallback. Tensor Core prefill accumulates FP32 sums in a different
 order. Model scores and generated token IDs can differ, including when the highest
 scores are far apart.
 
-On the native SM100 build, Tensor Core prefill selects
-[paged MXFP8 flash attention](src/mxfp8_gqa_prefill.cu#L751)<!-- prefix: "__global__ v" -->
-for 144–1,023 query rows through 32,768 visible tokens and 1,024 query rows
-through 131,072 visible tokens. Flash requires 16-byte-aligned K and V payloads
-and sufficient dynamic shared memory. It uses BF16 Tensor Core products and FP32
-online softmax. Unsafe inputs use ordered repair for affected rows and query-head
-pairs. Logits and output token IDs can differ from ordered attention. The `exact`
-policy continues to use its original attention path.
+Tensor Core [paged MXFP8 flash attention](src/mxfp8_gqa_prefill.cu#L450)<!-- prefix: "__global__ v" -->
+accepts 144–1,023 rows through 32,768 visible tokens or 1,024 rows through 131,072.
+It requires aligned payloads and sufficient shared memory. Set
+`SGLANG_EXPERIMENTAL_TMEM_PREFILL=1` to enable [SM100a TMEM attention](docs/flash-prefill.md)
+for eligible long tiles. Regular Flash is the default. Flash uses BF16 products,
+FP32 online softmax, and ordered repair for unsafe rows. The `exact` policy keeps ordered attention.
 
 The ordered fallback shares decoded K and V across two query heads. It uses
 two-row tiles for 64–127 rows and four-row tiles for at least 128 rows, with at

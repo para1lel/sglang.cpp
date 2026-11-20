@@ -5,34 +5,101 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L451)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L267)<!-- prefix: "const auto s" --> |
-| Native CUDA operator | Select flash, ordered multirow, or protected single-row attention for tensor-core multirow prefill. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L841)<!-- prefix: "cudaError_t " --> |
+| Native CUDA operator | Select TMEM Flash, regular Flash, ordered multirow, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L540)<!-- prefix: "cudaError_t " --> |
+| Long-tile pipeline | Partition the visible prefix and merge the partial softmax results. | [TMEM attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L321)<!-- prefix: "__global__ v" --> · [Merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L421)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
 
 ## Runtime path
 
-The CLI and C++ default policy is `exact`. Its original MXFP8 attention path retains the exact prefill contract. With `tensor-core`, the decoder selects native flash by default for eligible multirow tiles on the SM100 build.
+The CLI and C++ default policy is `exact`. Its original MXFP8 attention path retains the exact prefill contract. With `tensor-core`, the decoder selects regular Flash for eligible multirow tiles on the SM100 build. Set `SGLANG_EXPERIMENTAL_TMEM_PREFILL=1` before starting the process to enable experimental TMEM for eligible full 1,024-row tiles. Unset and other values keep regular Flash. The 128-row media, MTP, and tensor-core prefix-cache tile limits keep those routes outside TMEM.
 
-The flash kernel follows the logical page table. A block handles up to 64 query rows and two query heads that share a KV head. It processes 64-key tiles and masks each query at its own position. QK and PV use BF16 Tensor Core products with FP32 accumulators. Online softmax keeps FP32 normalization and rounds the probabilities used by PV to BF16. [Flash kernel](../src/mxfp8_gqa_prefill.cu#L751)<!-- prefix: "__global__ v" -->
+Both Flash paths follow the logical page table. Each work group covers up to 64 query rows and two query heads that share a KV head. It processes 64-key tiles and masks each query at its own position. QK and PV use BF16 Tensor Core products with FP32 accumulators. Online softmax keeps FP32 normalization and rounds the probabilities used by PV to BF16.
 
-When the chunk ends with fewer than 64 rows in a block, the kernel stages zeros for inactive queries. It masks their scores and skips their output stores and repair work. Multiples of 64 use the specialization for complete blocks. [Block launch](../src/mxfp8_gqa_prefill.cu#L798)<!-- prefix: "std::optiona" -->
+When a regular Flash block has fewer than 64 rows, it stages zeros for inactive queries. It masks their scores and skips their output stores and repair work. Multiples of 64 use the specialization for complete blocks. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L450)<!-- prefix: "__global__ v" -->
+
+### Long-tile TMEM pipeline
+
+For each query block and head pair, three CTAs handle contiguous partitions of the visible prefix, with boundaries at 64-key tiles. The last tile uses a causal mask for each query. The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for scores and FP32 value accumulators. Regular Flash stays in the `sm_100` target. [TMEM build target](../xmake.lua#L65)<!-- prefix: "target(\"sgla" -->
+
+Tensor Memory Accelerator (TMA) copies raw K and V from the physical pages into two alternating shared-memory buffers. Producer warps convert scaled MXFP8 to BF16. Packed conversion handles finite payloads and scale exponents 15–148. Other values use the scalar conversion and its range checks.
+
+Four warps consume QK scores and compute softmax while eight producer warps convert V. The next raw tile can load during current-tile work. PV overlaps conversion of the next K tile. Barrier phases and proxy fences order the transfers, conversions, and tensor operations before buffer reuse. [Pipeline](../src/text/mxfp8_gqa_prefill_tmem.cu#L321)<!-- prefix: "__global__ v" --> · [Conversion](../src/text/mxfp8_gqa_prefill_tmem.cu#L99)<!-- prefix: "__device__ _" -->
+
+Each launch uses 76,087,296 bytes of stream-ordered scratch. Each of the three partitions stores a 256-channel FP32 numerator, a local maximum, and a normalization mass for each of 1,024 rows and 24 query heads. The merge rescales to the global maximum, combines the FP32 masses and numerators, divides, and rounds to BF16. The launch queues allocation, attention, merge, and release on the same stream. [Scratch ownership](../src/text/mxfp8_gqa_prefill_tmem.cu#L463)<!-- prefix: "std::optiona" -->
 
 ## Constraints and failure behavior
 
-Flash accepts 144–1,023 query rows through 32,768 visible tokens and 1,024 query rows through 131,072 visible tokens. Both limits include the final query token. Both K and V payload bases must be 16-byte aligned. The device's opt-in shared memory limit must cover the 154,128 dynamic bytes plus the kernel's static allocation. [Eligibility](../src/mxfp8_gqa_prefill.cu#L851)<!-- prefix: "constexpr in" --> · [Capacity check](../src/mxfp8_gqa_prefill.cu#L798)<!-- prefix: "std::optiona" -->
+Flash accepts 144–1,023 query rows through 32,768 visible tokens and 1,024 query rows through 131,072 visible tokens. Both limits include the final query token. Both K and V payload bases must be 16-byte aligned. [Eligibility](../src/mxfp8_gqa_prefill.cu#L550)<!-- prefix: "constexpr in" -->
 
-Other valid shapes, unaligned payloads, and a known shared memory shortfall use the [ordered fallback dispatch](development.md#ordered-multirow-gqa-prefill). Above 32,768 visible tokens, that dispatch uses protected single-row attention. CUDA discovery, configuration, and launch errors propagate. If a query or visible KV value falls outside flash's numerical range, protected attention repairs the affected row and query-head pair. This repair retains selective FP64 recovery.
+With the opt-in, TMEM requires exactly 1,024 query rows and a zero-based start at or above 32,768 that is divisible by 64. It also requires compute capability 10.0, CUDA memory pools, and a K/V pool addressable by signed 32-bit TMA token coordinates. The launch needs opt-in shared memory for 214,016 dynamic bytes plus static allocation. A known resource or device mismatch, or a successful driver lookup without a tensor-map encoder, selects regular Flash. Regular Flash requires 154,128 dynamic bytes plus static allocation.
+
+Other valid shapes, unaligned payloads, and a known regular Flash shared memory shortfall use the [ordered fallback dispatch](development.md#ordered-multirow-gqa-prefill). Above 32,768 visible tokens, that dispatch uses protected single-row attention. CUDA discovery, configuration, and launch errors propagate.
+
+The TMEM launcher checks the required page counts and pointers, then encodes separate K and V tensor maps before allocating scratch. Discovery or encoding errors and allocation failures propagate. After allocation, the launcher attempts release even if attention or merge fails. It returns the first launch failure, or the release status if both launches succeed.
+
+If a query or visible KV value falls outside Flash's numerical range, protected attention repairs the affected row and query-head pair. TMEM propagates the invalid state through the partition statistics to the merge. A bad KV position beyond a query's causal limit leaves that query unaffected. Protected attention retains selective FP64 recovery.
 
 ## Verification
 
 For the explicit tensor-core policy, prioritize measured efficiency over bitwise parity with ordered attention. Flash can change BF16 results, logits, and generated IDs. Compare flash with an independent FP64 reference over the same represented inputs. Check causality, page remaps, output guards, repaired rows, and eager versus CUDA Graph replay. Trace dispatch at the eligibility bounds and through alignment and capacity fallback.
 
-Run [`mxfp8-gqa-check`](development.md#p2-gqa-verification) on a reserved B200. The [flash regression](../tests/mxfp8_gqa_flash_check.cu#L566)<!-- prefix: "void check_f" --> checks capture and replay, sampled FP64 outputs, exact dispatch, and unaligned K and V separately.
+Run [`mxfp8-gqa-check`](development.md#p2-gqa-verification) on a reserved B200 with the setting unset and again with `SGLANG_EXPERIMENTAL_TMEM_PREFILL=1`. The [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L673)<!-- prefix: "void check_f" --> checks capture and replay, sampled FP64 outputs, exact dispatch, and unaligned K and V separately.
 
-The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L504)<!-- prefix: "void check_p" --> check the 143/144-row floor and the 191/192/193-row block boundary. The [partial recovery case](../tests/mxfp8_gqa_flash_check.cu#L523)<!-- prefix: "void check_p" --> checks score overflow and limits nonfinite outputs to the affected channels of the final active row.
+The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L611)<!-- prefix: "void check_p" --> check the 143/144-row floor and the 191/192/193-row block boundary. The [partial recovery case](../tests/mxfp8_gqa_flash_check.cu#L630)<!-- prefix: "void check_p" --> checks score overflow and limits nonfinite outputs to the affected channels of the final active row.
 
-The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L467)<!-- prefix: "void check_l" --> require full-tile flash at 32,768, 32,769, 65,536, and 131,072 visible tokens. They require protected attention at 131,073 and for unaligned full tiles at 32,769. At 1,023 rows, they require flash at 32,768 visible tokens and protected attention at 32,769. The upper-bound cases also check the exact route, causality, and score overflow recovery.
+The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L562)<!-- prefix: "void check_l" --> require regular Flash at 32,768 and 32,769 visible tokens. At 65,536, 98,304, and 131,072, they require regular Flash by default and TMEM with the opt-in. At 131,073 they require protected attention. At 1,023 rows, they require regular Flash at 32,768 visible tokens and protected attention at 32,769. The upper-bound cases check the exact route, causality, and score overflow recovery.
 
 Check ordered and protected fallback bitwise against the ordered FP32 reference for finite scores and quotients. Check FP64 recovery independently. Use the [exact prefill runbook](../tests/prefill/README.md) for the separate `exact` contract.
+
+The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L543)<!-- prefix: "void check_t" --> cover the aligned start below 32,768, positions 32,767 through 32,769, and unaligned K and V separately. With the opt-in, the first eligible tile also repeats graph replay. The [graph check](../tests/mxfp8_gqa_flash_check.cu#L336)<!-- prefix: "void check_t" --> verifies the dependency chain from allocation through attention and merge to release, including the scratch size and pointer.
+
+### TMEM operator verification
+
+The independent B200 release check passed the long-context dispatch, graph, numerical, and causal cases. At 65,536, 98,304, and 131,072 visible tokens, normalized RMSE against FP64 was 0.224%, 0.219%, and 0.221%, respectively, over 12,800 sampled values per shape. At the first eligible start, repeated replay preserved the BF16 output and its guards after the output buffer was overwritten. The 131,072-token causal mutation preserved all 399,360 BF16 values in the first 65 rows bitwise.
+
+At 1,024 query rows, the paired median time including the merge fell from 18.206 to 7.171 ms at 65,536 visible tokens and from 37.343 to 8.937 ms at 131,072. Memcheck and synccheck each reported zero errors on the 65,536-token operator probe.
+
+A separate launch fault probe exercised the device and resource fallbacks, checked CUDA error propagation, and confirmed that split or merge failure still requests scratch release.
+
+### TMEM checkpoint verification
+
+The Qwen3.8-27B-FP8 probe compared TMEM with regular Flash from `ec1ca540` on frozen W6 lane 0, truncated to 65,536, 98,304, and 131,072 prompt IDs. Greedy IDs changed at the first two lengths and matched at 131,072. On the same teacher histories the second argmax matched at all three lengths. The separate 193-token `exact` control matched all 496,640 BF16 logits across its two continuation steps.
+
+At 98,304 prompt tokens, TMEM ran on 1,024 of 1,536 prefill GQA calls. The first argmax changed from 7,035 to 1,455. Full-logit cosine was 0.821539, top-10 overlap was 1/10, and negative log likelihood for ID 7,035 rose by 20.994807 nats. The second argmax was 29,877 in both arms after forcing ID 7,035, with cosine 0.998866. Repeated captures matched all 496,640 BF16 logits within each arm.
+
+Identical-input replays used the first eligible tile at position 32,768 in layer 3 and the tile with the largest sampled difference at position 79,872 in layer 59, both zero-based. Full-tile TMEM versus regular Flash normalized RMSE was 0.06130% and 0.09469%, respectively. Against independent FP64 over seven query rows, all 24 query heads, and all visible tokens per row, regular Flash and TMEM errors were 0.16567% and 0.16538% on the first tile and 0.16412% and 0.15900% on the later tile. Page remaps and causal-tail mutations passed in both kernels.
+
+Using TMEM on only the first eligible call preserved first argmax 7,035 with a 0.010311-nat NLL increase. Using it on the first 256 eligible calls changed the argmax to 3,470 with an 18.999520-nat increase. The probes leave the source of the full-model drift unresolved. Two replayed tiles and one document cannot establish corpus quality or serving acceptance. This drift is the reason TMEM requires an experimental opt-in.
+
+#### Reproduce the first-token comparison
+
+Build the generator with the [P2 build command](development.md#p2-gqa-verification). Regenerate the [W6 fixtures](../benchmarks/concurrent/README.md#regenerate-and-measure) with the Qwen3.8-27B-FP8 tokenizer. Set `FIXTURES` to that fixture directory, `CHECKPOINT` to the checkpoint, and use the same `BUILD_WORK_DIR` and `GPU_UUID` as for the checker.
+
+```bash
+python - "$FIXTURES/W6/00.request.json" > prompt-96k.ids <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as fixture:
+    prompt = json.load(fixture)["prompt"]
+assert len(prompt) == 131072
+print(*prompt[:98304], sep="\n")
+PY
+sha256sum -c <<'SUM'
+735ac7151bc0611bbeee83bacf148ea0b4d83ec0000b1e3312c72cece82e5670  prompt-96k.ids
+SUM
+export CUDA_VISIBLE_DEVICES="$GPU_UUID"
+unset SGLANG_SERIAL_PREFILL_ROWS
+for setting in 0 1; do
+    SGLANG_EXPERIMENTAL_TMEM_PREFILL="$setting" \
+        "$BUILD_WORK_DIR/build/bin/sglang-generate" --checkpoint "$CHECKPOINT" \
+        --device 0 --prompt-file prompt-96k.ids --fp8-prefill tensor-core \
+        --mtp-steps 0 --temperature 0 --max-new-tokens 1 --top-logits 248320 \
+        --warmup 0 --repeats 1 > "prefill-96k-$setting.json"
+done
+```
+
+Compare `output_token_ids` and `step_top_logits` across arms. The full vocabulary is emitted in score order, so join by `token_id` before computing cosine and NLL. This command tests the common first-token history. The original second-step teacher comparison and tile replay used instrumented probes.
 
 ### Partial Flash verification
 
@@ -85,4 +152,14 @@ The earlier GPU6 campaign used an 8,192-token step cap. Both native arms stopped
 
 A separate prototype diagnostic used single requests with two output IDs, the historical 8,192-token step cap, a 1,800-second socket timeout, and a 1,810-second cohort deadline. Both arms completed and agreed on both IDs at 40,960 and 131,072 prompt tokens. The longer Flash route reduced TTFT on those requests. See `artifacts/takeover-w6-flash-code/report.md`.
 
-Report the actual prompt length, concurrency, output budget, and deadlines for short diagnostics. Score W6 from measured cohorts that complete the frozen workload under the [current launch policy](performance.md#scheduler-and-reporting-policy).
+### Double-buffered TMEM prototype
+
+On GPU6, the prototype compared with sealed TMA at 1,024 query rows with shuffled physical pages. Paired median attention time, including split merge, fell from 12.814 to 4.674 ms at 65,536 visible tokens. At 131,072 visible tokens, it fell from 26.256 to 9.018 ms. Sampled normalized RMSE against FP64 was 0.221% and 0.220%, respectively. The partitioned reduction changed 2,546,820 and 2,555,831 of 6,291,456 BF16 outputs against sealed TMA. Two graph replays per sampled variant matched their own eager outputs bitwise.
+
+The paired two-ID single-lane runs changed greedy IDs at 65,536 and 98,304 prompt tokens. Both IDs matched at 131,072. The prototype and its sealed TMA control used an earlier source revision. See `artifacts/takeover-w6-prefill-pipeline/report.md` for the source identities, diagnostic IDs, and timings.
+
+All four prototype W6 lanes emitted their first ID at 77.243–77.273 s. At the 360-second deadline, the lanes had emitted 705, 705, 705, and 704 IDs. All 2,819 observed IDs matched the frozen prefixes. The first warmup ended with zero completed requests and no scored cohort.
+
+The frozen throughput gate allows less than 84.091 s for all 4,096 IDs. At the observed first-ID latency, less than 6.82 s remained for 1,023 decode iterations and final delivery. A separate two-output trace attributed 9.008 s of the first decode step to attention.
+
+Report prompt length, concurrency, output budget, and deadlines for diagnostics. W6 acceptance requires complete measured cohorts under the [current launch policy](performance.md#scheduler-and-reporting-policy) and all [frozen W6 gates](../benchmarks/concurrent/README.md#conditions-and-gates). The prototype leaves W6 acceptance open.

@@ -172,6 +172,8 @@ vLLM completed GPU3 W4. Both 16-lane native runs timed out at 90 s with zero out
 
 GPU5 operator median GQA fell from 222.465 to 101.679 ms for 1,024 rows at 32,768 visible tokens. See `artifacts/takeover-long-prefill-code/handoff.md`.
 
+See [W6 warmups and diagnostics](flash-prefill.md#w6-warmups-and-diagnostics) for the long prefill evidence.
+
 ### Native MTP
 
 Run the [MTP checks](mtp.md#verification) before timing. Use same-width eager K0 to isolate speculation and a separate K0 graph arm to measure the deployment trade-off. Match prompt IDs, arrivals, output budgets, stop policy, and committed outputs. Record binary and checkpoint hashes, GPU UUID, effective dispatch, and device and pinned host allocations. Disable tracing and `--top-logits` for timing.

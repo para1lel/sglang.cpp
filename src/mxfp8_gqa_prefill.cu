@@ -18,6 +18,7 @@ constexpr int ratio = mxfp8_query_heads / mxfp8_kv_heads;
 constexpr int ordered_heads = 2;
 constexpr int keys_per_tile = 32;
 constexpr int max_multirow_visible_tokens = 32768;
+constexpr int max_flash_visible_tokens = 131072;
 constexpr Word warp_mask = 0xffffffffu;
 constexpr float softmax_scale = 1.0f / 16.0f;
 
@@ -823,7 +824,7 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
         return cudaErrorInvalidValue;
     }
     Attention request{cache, pages.device_pages, position, queries, output};
-    if (rows == flash_chunk && position + rows <= max_multirow_visible_tokens &&
+    if (rows == flash_chunk && position + rows <= max_flash_visible_tokens &&
         (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
         (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
         if (const auto status = launch_flash_prefill(request, rows, stream)) {

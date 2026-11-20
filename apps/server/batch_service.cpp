@@ -120,7 +120,6 @@ struct BatchService::State {
     std::mutex mutex;
     std::condition_variable changed;
     Jobs jobs;
-    Selection connections{};
     Selection generating{};
     BatchMetrics counters;
     std::optional<BatchProfile> profile;
@@ -313,10 +312,13 @@ void trace_prefix_cache(const DecoderPrefixCacheStats& stats) {
 }
 
 std::optional<std::uint64_t> BatchService::State::begin_iteration(DecoderBatch& batch) {
-    const std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     if (reset_pending) {
+        lock.unlock();
         batch.reset_prefix_cache();
-        counters.cache = batch.prefix_cache_stats();
+        const auto stats = batch.prefix_cache_stats();
+        lock.lock();
+        counters.cache = stats;
         reset_pending = false;
         changed.notify_all();
         return std::nullopt;
@@ -476,16 +478,6 @@ BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs,
 
 BatchService::~BatchService() = default;
 
-void BatchService::claim_connection(int slot) {
-    const std::lock_guard lock(state_->mutex);
-    state_->connections.at(slot) = true;
-}
-
-void BatchService::release_connection(int slot) {
-    const std::lock_guard lock(state_->mutex);
-    state_->connections.at(slot) = false;
-}
-
 bool BatchService::ready() const {
     return !state_->failed.load();
 }
@@ -499,11 +491,7 @@ void BatchService::rethrow_failure() const {
 
 BatchMetrics BatchService::metrics() const {
     const std::lock_guard lock(state_->mutex);
-    auto result = state_->counters;
-    for (int slot = 0; slot < state_->max_active; ++slot) {
-        result.running += state_->connections[slot] || state_->generating[slot];
-    }
-    return result;
+    return state_->counters;
 }
 
 bool BatchService::reset_prefix_cache() {
@@ -511,10 +499,10 @@ bool BatchService::reset_prefix_cache() {
     if (state_->failure) {
         std::rethrow_exception(state_->failure);
     }
-    for (int slot = 0; slot < state_->max_active; ++slot) {
-        if (state_->connections[slot] || state_->generating[slot]) {
-            return false;
-        }
+    if (state_->reset_pending ||
+        std::any_of(state_->generating.begin(), state_->generating.end(),
+                    [](bool active) { return active; })) {
+        return false;
     }
     state_->reset_pending = true;
     state_->changed.notify_all();
@@ -578,9 +566,6 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
         auto result = state_->consume(lock, slot, *job, callbacks);
         result.cached_prompt_tokens = job->cached_tokens;
         generating = false;
-        if (result.finish_reason != DecoderFinishReason::cancelled) {
-            state_->connections[slot] = false;
-        }
         return result;
     } catch (...) {
         if (!lock.owns_lock()) {

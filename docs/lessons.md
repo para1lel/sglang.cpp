@@ -34,4 +34,6 @@ The [merge guard](batch-graphs.md#page-parallel-gqa-decode) sends an affected he
 
 **Corrected.** The cache-enabled listener accepted and parsed requests on one thread. A stalled body held that thread until the read deadline and delayed unrelated controls and completions.
 
-The [bounded reader pool](prefix-cache.md#native-http-controls) lets another reader accept and dispatch a request. At width one, a CPU loopback regression paused one reader after parsing a complete request. Separate complete health and completion requests returned HTTP 200. Shutdown joined a held reader and discarded its request. The normal loopback suite also passed queue overflow, busy reset, cancellation, and cache accounting.
+The initial correction used a reader pool. At width one, a CPU loopback regression paused one reader after parsing a complete request. Separate health and completion requests returned HTTP 200. Shutdown joined a held reader and discarded its request. The loopback suite also passed checks for queue overflow, busy reset, cancellation, and cache accounting.
+
+The [current HTTP reader](http-server.md#http-admission-and-shutdown) advances multiple incomplete requests from one poll loop.

@@ -175,7 +175,9 @@ Use `GET /ready` to check whether the inference worker can serve requests.
 It returns HTTP 200 with `{"ready":true}` while the worker is available. After a terminal
 worker failure, it returns HTTP 503 with `{"ready":false,"reason":"worker_failed"}`.
 `GET /health` continues to report liveness and the configured limits.
-Extra connections wait in the listener backlog until a socket worker is available.
+The server holds up to `--max-active` completion connections and queues up to the same number
+of parsed requests. A full queue returns HTTP 503 with or without prefix caching.
+See [HTTP admission and shutdown](docs/http-server.md#http-admission-and-shutdown).
 Target-only requests use the selected FP8 prefill policy.
 Set `--max-num-batched-tokens` from `1` through `32768` to lower the step budget. It covers
 prompt rows, ordinary decode rows, and MTP target verification rows across all scheduled requests.

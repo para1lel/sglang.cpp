@@ -33,7 +33,7 @@ Check the `sm_100` image and runtime. Require `GPU returned 42 (expected 42)` an
 
 For P0, use the [checkpoint investigation](research/checkpoint.md) for semantics and pinned SGLang mappings. Propose endpoints, API version, parameters, streaming events, and constraints. Record checkpoint conflicts.
 
-The [baseline smoke](performance.md#first-baseline-run) found identical eight-ID greedy continuations across seven vLLM requests with BF16 KV and MTP off. Use the [GQA cache comparison](performance.md#gqa-cache-comparison) for paired runs.
+The [baseline smoke](performance.md#historical-offline-smoke) found identical eight-ID greedy continuations across seven vLLM requests with BF16 KV and MTP off. Use the [GQA cache comparison](performance.md#gqa-cache-comparison) for paired runs.
 
 ### P1 runtime probe
 
@@ -197,17 +197,15 @@ See [MTP](mtp.md) for exact tiled seeding, joint target verification, and per-la
 
 ### Native streaming server
 
-Follow the [server launch procedure](../README.md#serve-token-ids-over-http). Send empty GET requests. `/ready` returns HTTP 200 with `{"ready":true}`. After permanent failure, it returns HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. `/health` returns HTTP 200 with the limits. Active requests range from 1 to 32. Target rows per step range from 1 to 32,768. Both default to the maximum. [Readiness response](../apps/server/http.cpp#L314)<!-- prefix: "void write_r" --> · [Health response](../apps/sglang-server.cpp#L122)<!-- prefix: "std::string " -->
+See [native HTTP transport](http-server.md) for request admission, overload responses, health, readiness, and shutdown. Set `--max-active` to a value from 1 to 32. Set `--max-num-batched-tokens` to a value from 1 to 32,768. Both default to the maximum. [MTP](mtp.md#runtime-path) requires prefix reuse off. Graph replay is [opt-in](batch-graphs.md). [CLI limits](../apps/sglang-server.cpp#L88)<!-- prefix: "} else if (o" -->
 
-The HTTP server uses one batch scheduler at every capacity. [MTP](mtp.md#runtime-path) requires prefix reuse off. Graph replay is [opt-in](batch-graphs.md). Extra connections can wait in the TCP backlog. Prefix reuse enables a [parsed completion queue and controls](prefix-cache.md#native-http-controls). [CLI limits](../apps/sglang-server.cpp#L90)<!-- prefix: "} else if (o" --> · [Socket workers](../apps/sglang-server.cpp#L177)<!-- prefix: "void serve_b" -->
-
-Lanes share weights and own KV, GDN state, and outputs. [Resident memory admission](batch-graphs.md#resident-memory-admission) applies at every capacity. After permanent worker failure, new completions return HTTP 500 until restart. [Batch failure](../apps/server/batch_service.cpp#L183)<!-- prefix: "void BatchSe" -->
+Lanes share weights and own KV, GDN state, and outputs. [Resident memory admission](batch-graphs.md#resident-memory-admission) applies at every capacity.
 
 Follow the [benchmark token-ID wire contract](../benchmarks/streaming/README.md#wire-contract) and [decoder limits](#constraints-and-failure-behavior). A matching `stop_token_ids` entry emits the ID with `stop`, including at the budget. Zero budget reports `length` without a model step. Benchmark temperature accepts underflow to signed zero. [Request parser](../apps/server/completions.cpp#L27)<!-- prefix: "CompletionRe" --> · [Numeric retry](../apps/server/completions.cpp#L176)<!-- prefix: "json::Value " -->
 
-A reset or failed write cancels that lane. The batch retires its storage before slot reuse. Ready peers can advance while a writer blocks. Clients can use `shutdown(SHUT_WR)` after a complete request. [Cancellation](../apps/server/batch_service.cpp#L428)<!-- prefix: "void BatchSe" --> · [Disconnect check](../apps/server/http.cpp#L263)<!-- prefix: "bool disconn" -->
-
 #### Streaming verification
+
+Run the [CPU transport checks](http-server.md#verification).
 
 Run the [scheduler admission checks](batch-graphs.md#verification) on a reserved B200.
 

@@ -2,28 +2,34 @@
 
 ## CPU reader queue
 
-Run from the repository root in the managed Pixi default environment. The test uses the
-production HTTP parser and prefix listener with in-process socket pairs, a decoder-service
-stand-in, and explicit reader and completion barriers. No GPU or model weights are required.
+Run from the repository root in the managed Pixi default environment. The test drives the
+production HTTP reader and completion queue over loopback. It uses a decoder-service double
+and explicit barriers for final responses and reset acknowledgement. It needs no GPU or weights.
 
 ```bash
 out="$PWD/build/prefix-readers"
 mkdir -p "$out"
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
-"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+"${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
     -Iinclude -I"$toolkit/include" tests/prefix/reader_queue.cpp \
     apps/server/{prefix_controls,http,completions}.cpp src/{json,utf8}.cpp -Wl,--gc-sections \
-    -Wl,--wrap=_ZN6sglang6server17accept_connectionERKNS0_6SocketE \
-    -Wl,--wrap=_ZN6sglang6server12read_requestERKNS0_6SocketE -o "$out/reader-queue"
-timeout 20s "$out/reader-queue"
-timeout 20s "$out/reader-queue" --reader-failure
+    -Wl,--wrap=accept4 -o "$out/reader-queue"
+for mode in --cache-off --cache-on --reader-failure --worker-failure; do
+    timeout 20s "$out/reader-queue" "$mode"
+done
 ```
 
-Expect `prefix reader queue passed` for each run. The test checks control progress while
-two readers wait at a dispatch barrier, concurrent admission to the last pending position,
-FIFO dispatch by admission order, response ownership, and shutdown with a pending request,
-active completions, and a reader still in flight. The second run checks that a reader
-failure triggers the same cleanup and reaches the caller after joining.
+Each mode prints `HTTP reader queue passed` on success. The cache modes check health and
+readiness during partial header and body reads, replacement of the oldest stalled reader, and
+completion queue overflow, cancellation, FIFO order, and slot reuse. Fully buffered 48 KiB
+requests reach idle workers or wait in the saturated queue. Requests beyond the queue capacity
+receive HTTP 503. An incomplete header and body both expire on the original read deadline even
+when the clients send more bytes. A held final response and a blocked write to a client that stops
+reading make reset return HTTP 409 until the completion releases its slot. Health and readiness
+respond while reset acknowledgement is held, and the queued completion starts after reset.
+Shutdown closes active, queued, and partial connections. The failure modes inject a fatal accept
+error and an unavailable decoder worker, and check error propagation, readiness, and descriptor
+cleanup.
 
 ## CUDA state and routes
 

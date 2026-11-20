@@ -10,7 +10,8 @@ class Socket;
 
 using BatchCompletion = std::function<void(const Socket&, int, std::string_view, bool)>;
 
-void serve_prefix_connections(const Socket& listener, BatchService& service, int max_active,
-                              const BatchCompletion& complete, std::string_view health);
+void serve_connections(const Socket& listener, BatchService& service, int max_active,
+                       const BatchCompletion& complete, std::string_view health,
+                       bool prefix_controls);
 
 }

@@ -7,7 +7,6 @@ namespace sglang::server {
 
 struct BatchMetrics {
     DecoderPrefixCacheStats cache;
-    int running = 0;
     int cache_capacity = 0;
     std::uint64_t prompt_tokens = 0;
     std::uint64_t generation_tokens = 0;
@@ -38,8 +37,6 @@ public:
                            const DecoderCallbacks& callbacks,
                            std::vector<DecoderMedia> media = std::vector<DecoderMedia>(),
                            std::size_t expanded_tokens = 0);
-    void claim_connection(int slot);
-    void release_connection(int slot);
     bool ready() const;
     void rethrow_failure() const;
     BatchMetrics metrics() const;

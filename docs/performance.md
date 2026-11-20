@@ -19,7 +19,7 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 Launch both engines with **32,768 aggregate scheduled tokens per step** and **32 maximum in-service requests** for every new performance run, including diagnostics.
 
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-seqs 32`. Leave `--max-num-scheduled-tokens` unset or set it to `32768`. Verify the effective limits.
-- **Native server.** Set `--max-active 32 --max-num-batched-tokens 32768`. Verify both defaults in [`GET /health`](development.md#native-streaming-server). Record admission failures separately from timing under the [resident memory limit](batch-graphs.md#resident-memory-admission).
+- **Native server.** Set `--max-active 32 --max-num-batched-tokens 32768`. Verify both defaults in [`GET /health`](http-server.md). Record admission failures separately from timing under the [resident memory limit](batch-graphs.md#resident-memory-admission).
 
 In every chat report, list each engine's nondefault launch, environment, client, and request settings, including diagnostics. Report effective server maxima, offered and observed concurrency, input lengths, context limits, and output budgets. Preserve frozen run settings, identities, and gates. Acceptance requires a new matched run under this policy with every required mode available.
 

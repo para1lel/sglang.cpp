@@ -1,6 +1,6 @@
 #pragma once
 
-#include <optional>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -38,9 +38,9 @@ void install_shutdown_handlers();
 void stop_serving();
 bool stopping();
 Socket listen_loopback(int port);
-Socket accept_connection(const Socket& listener);
 bool disconnected(const Socket& connection);
-std::optional<HttpRequest> read_request(const Socket& connection);
+void read_connections(const Socket& listener, int capacity,
+                      const std::function<void(Socket&, HttpRequest)>& handle);
 bool write_json(const Socket& connection, std::string_view status, std::string_view json);
 void write_readiness(const Socket& connection, bool ready);
 bool write_metrics(const Socket& connection, std::string_view body);

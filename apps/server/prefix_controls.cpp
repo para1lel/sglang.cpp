@@ -12,13 +12,14 @@
 #include <list>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 namespace sglang::server {
 namespace {
 
 struct Completion {
     Socket connection;
-    HttpRequest request;
+    std::optional<HttpRequest> request;
 };
 
 bool chat_route(const HttpRequest& request) { return request.path == "/v1/chat/completions"; }
@@ -45,7 +46,7 @@ void handle_errors(const Socket& connection, const Handle& handle) {
     }
 }
 
-std::string format_metrics(const BatchMetrics& metrics, std::size_t waiting) {
+std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t waiting) {
     std::string text = "# Native sglang.cpp metrics with frozen W3-prefix compatibility names\n";
     const auto emit = [&text](std::string_view name, auto value) {
         text += name;
@@ -55,7 +56,7 @@ std::string format_metrics(const BatchMetrics& metrics, std::size_t waiting) {
     };
     const int capacity = metrics.cache_capacity * (decoder_batch_prefix_max_tokens /
                                                    mxfp8_page_size);
-    emit("vllm:num_requests_running", metrics.running);
+    emit("vllm:num_requests_running", running);
     emit("vllm:num_requests_waiting", waiting);
     emit("vllm:kv_cache_usage_perc", capacity ? double(metrics.cache.pages) / capacity : 0.0);
     emit("vllm:prompt_tokens_total", metrics.prompt_tokens);
@@ -132,34 +133,84 @@ void stop_profile(const Socket& connection, BatchService& service, const HttpReq
 class ConnectionQueue {
 public:
     ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete,
-                    std::string_view health)
-        : service_(service), capacity_(capacity), complete_(complete), health_(health) {}
+                    std::string_view health, bool prefix_controls)
+        : service_(service), capacity_(capacity), complete_(complete), health_(health),
+          prefix_controls_(prefix_controls) {}
 
-    void read_connections(const Socket& listener);
+    void read(const Socket& listener);
     void run(int slot);
     void stop();
 
 private:
+    struct Lease {
+        ConnectionQueue& queue;
+        bool active = false;
+        ~Lease();
+    };
+
     void route(Socket& connection, HttpRequest request);
-    std::optional<Completion> take(int slot);
-    void serve_control(const Socket& connection, const HttpRequest& request);
+    std::optional<Completion> take(Lease& lease);
+    void serve_control(Socket& connection, const HttpRequest& request);
+    void queue_reset(Socket& connection, const HttpRequest& request);
+    void reset_cache(const Socket& connection);
     void discard_disconnected();
 
     BatchService& service_;
     const int capacity_;
     const BatchCompletion& complete_;
     const std::string_view health_;
+    const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
     std::list<Completion> pending_;
+    std::optional<Socket> reset_;
+    int running_ = 0;
+    bool resetting_ = false;
     bool closing_ = false;
 };
+
+ConnectionQueue::Lease::~Lease() {
+    if (active) {
+        const std::lock_guard lock(queue.mutex_);
+        --queue.running_;
+    }
+}
 
 void ConnectionQueue::discard_disconnected() {
     pending_.remove_if([](const auto& job) { return disconnected(job.connection); });
 }
 
-void ConnectionQueue::serve_control(const Socket& connection, const HttpRequest& request) {
+void ConnectionQueue::queue_reset(Socket& connection, const HttpRequest& request) {
+    require_empty_body(request);
+    {
+        const std::lock_guard lock(mutex_);
+        discard_disconnected();
+        if (!pending_.empty() || running_ != 0 || resetting_) {
+            throw HttpError("409 Conflict", "Cannot reset prefix cache with active requests");
+        }
+        reset_.emplace(std::move(connection));
+        resetting_ = true;
+    }
+    changed_.notify_one();
+}
+
+void ConnectionQueue::reset_cache(const Socket& connection) {
+    handle_errors(connection, [&] {
+        if (!disconnected(connection)) {
+            if (!service_.reset_prefix_cache()) {
+                throw HttpError("409 Conflict", "Cannot reset prefix cache with active requests");
+            }
+            write_json(connection, "200 OK", R"({"success":true})");
+        }
+    });
+    {
+        const std::lock_guard lock(mutex_);
+        resetting_ = false;
+    }
+    changed_.notify_all();
+}
+
+void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& request) {
     if (request.method == "GET" && request.body.empty()) {
         if (request.path == "/health") {
             write_json(connection, "200 OK", health_);
@@ -169,29 +220,20 @@ void ConnectionQueue::serve_control(const Socket& connection, const HttpRequest&
             write_readiness(connection, service_.ready());
             return;
         }
-        if (request.path == "/metrics") {
+        if (prefix_controls_ && request.path == "/metrics") {
             std::string body;
             {
                 const std::lock_guard lock(mutex_);
                 discard_disconnected();
-                body = format_metrics(service_.metrics(), pending_.size());
+                body = format_metrics(service_.metrics(), running_, pending_.size());
             }
             write_metrics(connection, body);
             return;
         }
     }
-    if (request.method == "POST") {
+    if (prefix_controls_ && request.method == "POST") {
         if (request.path == "/reset_prefix_cache") {
-            require_empty_body(request);
-            {
-                const std::lock_guard lock(mutex_);
-                discard_disconnected();
-                if (!pending_.empty() || !service_.reset_prefix_cache()) {
-                    throw HttpError("409 Conflict",
-                                    "Cannot reset prefix cache with active requests");
-                }
-            }
-            write_json(connection, "200 OK", R"({"success":true})");
+            queue_reset(connection, request);
             return;
         }
         if (request.path == "/start_profile") {
@@ -203,7 +245,8 @@ void ConnectionQueue::serve_control(const Socket& connection, const HttpRequest&
             return;
         }
     }
-    throw HttpError("404 Not Found", "Unknown native server route");
+    throw HttpError("404 Not Found", prefix_controls_ ? "Unknown native server route" :
+                    "Expected GET /health, GET /ready, or POST /v1/completions");
 }
 
 void ConnectionQueue::route(Socket& connection, HttpRequest request) {
@@ -226,47 +269,53 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     changed_.notify_one();
 }
 
-void ConnectionQueue::read_connections(const Socket& listener) {
-    while (!stopping()) {
-        auto connection = accept_connection(listener);
-        if (connection.get() >= 0) {
-            handle_errors(connection, [&] {
-                if (auto request = read_request(connection); request && !stopping()) {
-                    route(connection, std::move(*request));
-                }
-            });
-        }
-    }
+void ConnectionQueue::read(const Socket& listener) {
+    read_connections(listener, capacity_ + 1, [&](Socket& connection, HttpRequest request) {
+        handle_errors(connection, [&] { route(connection, std::move(request)); });
+    });
 }
 
-std::optional<Completion> ConnectionQueue::take(int slot) {
+std::optional<Completion> ConnectionQueue::take(Lease& lease) {
     std::unique_lock lock(mutex_);
-    changed_.wait(lock, [&] { return closing_ || !pending_.empty(); });
-    while (!closing_ && !pending_.empty()) {
-        auto job = std::move(pending_.front());
-        pending_.pop_front();
-        if (!disconnected(job.connection)) {
-            service_.claim_connection(slot);
-            return job;
+    for (;;) {
+        changed_.wait(lock, [&] {
+            return closing_ || reset_ || (!resetting_ && !pending_.empty());
+        });
+        if (closing_ || stopping()) {
+            return std::nullopt;
+        }
+        if (reset_) {
+            Completion work{std::move(*reset_), std::nullopt};
+            reset_.reset();
+            return work;
+        }
+        discard_disconnected();
+        if (!pending_.empty()) {
+            auto work = std::move(pending_.front());
+            pending_.pop_front();
+            ++running_;
+            lease.active = true;
+            return work;
         }
     }
-    return std::nullopt;
 }
 
 void ConnectionQueue::run(int slot) {
     for (;;) {
-        auto job = take(slot);
-        if (!job) {
-            const std::lock_guard lock(mutex_);
-            if (closing_) {
-                return;
-            }
-            continue;
+        // Destroy the socket before releasing the active slot.
+        Lease lease{*this};
+        auto work = take(lease);
+        if (!work) {
+            return;
         }
-        handle_errors(job->connection, [&] {
-            complete_(job->connection, slot, job->request.body, chat_route(job->request));
-        });
-        service_.release_connection(slot);
+        if (!work->request) {
+            reset_cache(work->connection);
+        } else if (!disconnected(work->connection)) {
+            const auto& request = *work->request;
+            handle_errors(work->connection, [&] {
+                complete_(work->connection, slot, request.body, chat_route(request));
+            });
+        }
     }
 }
 
@@ -275,20 +324,22 @@ void ConnectionQueue::stop() {
         const std::lock_guard lock(mutex_);
         closing_ = true;
         pending_.clear();
+        reset_.reset();
     }
     changed_.notify_all();
 }
 
 }
 
-void serve_prefix_connections(const Socket& listener, BatchService& service, int max_active,
-                              const BatchCompletion& complete, std::string_view health) {
+void serve_connections(const Socket& listener, BatchService& service, int max_active,
+                       const BatchCompletion& complete, std::string_view health,
+                       bool prefix_controls) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
-        throw std::invalid_argument("Invalid prefix listener capacity");
+        throw std::invalid_argument("Invalid HTTP completion capacity");
     }
-    ConnectionQueue queue(service, max_active, complete, health);
+    ConnectionQueue queue(service, max_active, complete, health, prefix_controls);
     std::vector<std::thread> workers;
-    workers.reserve(2 * max_active);
+    workers.reserve(max_active);
     std::mutex failure_mutex;
     std::exception_ptr failure;
     const auto stop_on_error = [&] {
@@ -308,16 +359,7 @@ void serve_prefix_connections(const Socket& listener, BatchService& service, int
                 }
             });
         }
-        for (int reader = 0; reader < max_active; ++reader) {
-            workers.emplace_back([&] {
-                try {
-                    queue.read_connections(listener);
-                } catch (...) {
-                    stop_on_error();
-                }
-            });
-        }
-        queue.read_connections(listener);
+        queue.read(listener);
     } catch (...) {
         stop_on_error();
     }

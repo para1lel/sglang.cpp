@@ -1,4 +1,5 @@
 #include "sglang/server/http.h"
+#include "sglang/server/completions.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -8,12 +9,15 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <list>
 #include <netinet/tcp.h>
+#include <optional>
 #include <poll.h>
 #include <sys/socket.h>
 #include <system_error>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace sglang::server {
 namespace {
@@ -24,6 +28,7 @@ constexpr std::size_t max_header_bytes = 8192;
 constexpr std::size_t max_body_bytes = 2 * 1024 * 1024;
 constexpr auto io_timeout = std::chrono::seconds(5);
 constexpr auto shutdown_poll = std::chrono::milliseconds(250);
+constexpr auto reader_idle_grace = std::chrono::milliseconds(250);
 constexpr short terminal_events = POLLHUP | POLLERR | POLLNVAL;
 
 std::atomic<bool> stop_requested{false};
@@ -184,21 +189,72 @@ std::size_t content_length(std::string_view headers, const HttpRequest& request)
     return length.value_or(0);
 }
 
-bool receive(const Socket& socket, std::string& bytes, std::size_t limit,
-             Clock::time_point deadline) {
-    char buffer[4096];
-    if (!wait_ready(socket, POLLIN, deadline)) {
+struct IncomingRequest {
+    explicit IncomingRequest(Socket connection) : socket(std::move(connection)) {}
+
+    Socket socket;
+    Clock::time_point last_read = Clock::now();
+    const Clock::time_point deadline = last_read + io_timeout;
+    std::optional<HttpRequest> request;
+
+    Clock::time_point replace_after() const { return last_read + reader_idle_grace; }
+
+    bool read_chunk();
+    bool complete() const { return request && request->body.size() == length; }
+
+private:
+    std::string headers;
+    std::size_t length = 0;
+};
+
+bool IncomingRequest::read_chunk() {
+    char buffer[16 * 1024];
+    auto& bytes = request ? request->body : headers;
+    const auto limit = request ? length : max_header_bytes;
+    const auto count = recv(socket.get(), buffer,
+                            std::min(sizeof(buffer), limit - bytes.size()), 0);
+    if (count <= 0) {
+        return count < 0 && (errno == EAGAIN || errno == EINTR);
+    }
+    last_read = Clock::now();
+    bytes.append(buffer, static_cast<std::size_t>(count));
+    if (!request) {
+        const auto end = headers.find("\r\n\r\n");
+        if (end == std::string::npos) {
+            if (headers.size() == max_header_bytes) {
+                throw HttpError("431 Request Header Fields Too Large", "HTTP headers exceed 8 KiB");
+            }
+            return true;
+        }
+        std::string_view fields(headers.data(), end + 2);
+        request.emplace(parse_request_line(take_line(fields)));
+        length = content_length(fields, *request);
+        request->body = headers.substr(end + 4, length);
+        headers.clear();
+    }
+    return true;
+}
+
+bool read_pending(IncomingRequest& incoming, short events,
+                  const std::function<void(Socket&, HttpRequest)>& handle) {
+    if (stopping() || incoming.deadline <= Clock::now() || (events & terminal_events)) {
         return false;
     }
-    const auto count = recv(socket.get(), buffer, std::min(sizeof(buffer), limit), 0);
-    if (count < 0 && (errno == EAGAIN || errno == EINTR)) {
+    if (!(events & POLLIN)) {
         return true;
     }
-    if (count <= 0) {
-        return false;
+    try {
+        if (!incoming.read_chunk()) {
+            return false;
+        }
+        if (!incoming.complete()) {
+            return true;
+        }
+        handle(incoming.socket, std::move(*incoming.request));
+    } catch (const HttpError& error) {
+        write_error(incoming.socket, error.status, error.what());
     }
-    bytes.append(buffer, static_cast<std::size_t>(count));
-    return true;
+    return false;
 }
 
 }
@@ -242,10 +298,7 @@ Socket listen_loopback(int port) {
     return listener;
 }
 
-Socket accept_connection(const Socket& listener) {
-    if (!wait_ready(listener, POLLIN, Clock::now() + shutdown_poll)) {
-        return Socket(-1);
-    }
+static Socket accept_connection(const Socket& listener) {
     Socket client(accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
     if (client.get() < 0) {
         if (errno == EINTR || errno == EAGAIN || errno == ECONNABORTED) {
@@ -269,29 +322,82 @@ bool disconnected(const Socket& connection) {
     return (count < 0 && errno != EINTR) || (ready.revents & terminal_events);
 }
 
-std::optional<HttpRequest> read_request(const Socket& connection) {
-    const auto deadline = Clock::now() + io_timeout;
-    std::string bytes;
-    auto end = bytes.find("\r\n\r\n");
-    while (end == std::string::npos) {
-        if (bytes.size() >= max_header_bytes) {
-            throw HttpError("431 Request Header Fields Too Large", "HTTP headers exceed 8 KiB");
-        }
-        if (!receive(connection, bytes, max_header_bytes - bytes.size(), deadline)) {
-            return std::nullopt;
-        }
-        end = bytes.find("\r\n\r\n");
-    }
-    std::string_view headers(bytes.data(), end + 2);
-    auto request = parse_request_line(take_line(headers));
-    const auto length = content_length(headers, request);
-    request.body = bytes.substr(end + 4, length);
-    while (request.body.size() < length) {
-        if (!receive(connection, request.body, length - request.body.size(), deadline)) {
-            return std::nullopt;
+static void accept_next(const Socket& listener, std::list<IncomingRequest>& incoming,
+                        std::size_t limit) {
+    auto replace = incoming.end();
+    if (incoming.size() == limit) {
+        const auto now = Clock::now();
+        replace = std::find_if(incoming.begin(), incoming.end(), [&](const auto& request) {
+            if (request.replace_after() > now) {
+                return false;
+            }
+            pollfd ready{request.socket.get(), POLLIN, 0};
+            return poll(&ready, 1, 0) == 0;
+        });
+        if (replace == incoming.end()) {
+            return;
         }
     }
-    return request;
+    auto connection = accept_connection(listener);
+    if (connection.get() >= 0) {
+        if (replace != incoming.end()) {
+            incoming.erase(replace);
+        }
+        incoming.emplace_back(std::move(connection));
+    }
+}
+
+void read_connections(const Socket& listener, int capacity,
+                      const std::function<void(Socket&, HttpRequest)>& handle) {
+    const auto limit = static_cast<std::size_t>(capacity);
+    std::list<IncomingRequest> incoming;
+    std::vector<pollfd> sockets;
+    sockets.reserve(limit + 1);
+    while (!stopping()) {
+        const bool full = incoming.size() == limit;
+        const auto now = Clock::now();
+        short accept_events = full ? 0 : POLLIN;
+        auto deadline = now + shutdown_poll;
+        sockets.clear();
+        sockets.push_back({listener.get(), 0, 0});
+        for (const auto& request : incoming) {
+            sockets.push_back({request.socket.get(), POLLIN, 0});
+            deadline = std::min(deadline, request.deadline);
+            if (full) {
+                const auto replace = request.replace_after();
+                if (replace <= now) {
+                    accept_events = POLLIN;
+                } else {
+                    deadline = std::min(deadline, replace);
+                }
+            }
+        }
+        sockets.front().events = accept_events;
+        const auto remaining =
+            std::chrono::ceil<std::chrono::milliseconds>(deadline - Clock::now());
+        const int timeout = std::max(0, static_cast<int>(remaining.count()));
+        if (poll(sockets.data(), sockets.size(), timeout) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            socket_error("Poll HTTP connections");
+        }
+        if (sockets.front().revents & terminal_events) {
+            throw std::runtime_error("HTTP listener closed unexpectedly");
+        }
+        std::size_t index = 1;
+        for (auto it = incoming.begin(); it != incoming.end();) {
+            if (read_pending(*it, sockets[index++].revents, handle)) {
+                ++it;
+            } else {
+                it = incoming.erase(it);
+            }
+        }
+        if (!stopping() && (sockets.front().revents & POLLIN)) {
+            // A readable socket may still have bytes left after its bounded read this turn.
+            accept_next(listener, incoming, limit);
+        }
+    }
 }
 
 static bool write_response(const Socket& connection, std::string_view status,

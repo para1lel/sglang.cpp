@@ -1,6 +1,6 @@
 # Single-B200 benchmark agreement
 
-Compare correct implementations on the **same physical B200 and immutable checkpoint**. Measure pinned vLLM first. Freeze workloads, repeats, throughput thresholds above 1.0, and latency ceilings before candidate timing.
+Compare correct implementations on the **same physical B200 and immutable checkpoint**. Measure pinned vLLM first. Freeze workloads, repeats, throughput thresholds above 1.0, and latency ceilings before candidate timing. See the [fixed W1–W6 comparison](performance-comparison.md).
 
 ## Implementations and controls
 

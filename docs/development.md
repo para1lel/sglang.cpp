@@ -100,7 +100,7 @@ Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The [
 
 The [ordered decode check](../tests/mxfp8_gqa_check.cu#L542)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 
-Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L912)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L873)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L680)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L728)<!-- prefix: "void check_o" -->, [32,768-token recovery](../tests/mxfp8_gqa_prefill_check.cu#L780)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L936)<!-- prefix: "void check_o" -->.
+Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L930)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L873)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L698)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L746)<!-- prefix: "void check_o" -->, [32,768-token recovery](../tests/mxfp8_gqa_prefill_check.cu#L798)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L936)<!-- prefix: "void check_o" -->.
 
 ### P3 native text decoder
 

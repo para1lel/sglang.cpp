@@ -2,7 +2,7 @@
 
 #include "sglang/decoder_cuda.cuh"
 
-#include "sglang/text_cuda_primitives.cuh"
+#include "sglang/text/text_cuda_primitives.cuh"
 
 #include <cuda_fp8.h>
 

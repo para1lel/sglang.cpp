@@ -788,6 +788,7 @@ __global__ void replay_paged_decode(PagedDecodeBatch<Lane> batch) {
                              input.buffers.output);
     }
 }
+#include "sglang/text/mxfp8_gqa_decode.cuh"
 
 template <typename Lane>
 cudaError_t launch_paged_decode(const Lane* lanes, int count, cudaStream_t stream) {
@@ -803,8 +804,7 @@ cudaError_t launch_paged_decode(const Lane* lanes, int count, cudaStream_t strea
         }
         batch.lanes[index] = lanes[index];
     }
-    split_decode_attention<<<dim3(decode_splits, mxfp8_query_heads, count),
-                             mxfp8_head_dim, 0, stream>>>(batch);
+    launch_decode_split(batch, count, stream);
     auto status = cudaGetLastError();
     if (status != cudaSuccess) {
         return status;

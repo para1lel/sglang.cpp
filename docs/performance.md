@@ -156,15 +156,15 @@ The verifier used unrounded limits. Both W2 arms missed all four gates in this r
 
 ### Native concurrent workloads
 
-Verify [streaming](development.md#streaming-verification). Use K0 and the [scheduler policy](#scheduler-and-reporting-policy). Preserve offered concurrency. [Trace](batch-graphs.md#timing) decode width and replay.
+Verify [streaming](development.md#streaming-verification). Use [K0 scheduling](#scheduler-and-reporting-policy) and preserve offered concurrency. [Trace](batch-graphs.md#timing) decode width and replay.
 
-Historical GPU2 W3 reached 63.779 IDs/s, matched 28,672 IDs, and missed all four gates. [Historical protocol](../benchmarks/concurrent/README.md#conditions-and-gates)
+Historical W3 missed all gates on GPU2 (63.779 IDs/s, 28,672 matching IDs), `w3-fused` (144.84), and GPU3 `9d047fe` (90.519 versus vLLM’s 373.931, 4,096 matching IDs). [Historical protocol](../benchmarks/concurrent/README.md#conditions-and-gates) · `artifacts/takeover-w3/report.md`
 
-GPU6 W3 replay raised throughput from 5.69 to 14.91 IDs/s and matched 4,096 IDs. See `artifacts/long-batch-graph-release/report.md`. Historical `w3-fused` reached 144.84 IDs/s and missed all four gates.
+GPU6 W3 replay rose from 5.69 to 14.91 IDs/s (4,096 matching IDs). `artifacts/long-batch-graph-release/report.md`
 
-GPU3 W3 on `9d047fe` reached 90.519 IDs/s versus vLLM’s 373.931. All 4,096 IDs matched. Native missed all four gates. See `artifacts/takeover-w3/report.md`.
+GPU3 W3 pairing raised median IDs/s from 103.724 to 111.340 (+7.34%). Pinned vLLM reached 374.427. All 4,096 IDs matched. Both native arms missed all four frozen gates. `artifacts/takeover-w3-gqa-perf/report.md`
 
-The prior W4 singleton spent 54.245 of 58.657 s TTFT in protected single-row GQA. See `artifacts/takeover-w4-diagnostic/report.md`.
+The prior W4 singleton spent 54.245 of 58.657 s TTFT in protected single-row GQA. `artifacts/takeover-w4-diagnostic/report.md`
 
 GPU3 singleton median W4 TTFT fell from 58.701 to 29.214 s across three fresh-process pairs. First ID `760` matched.
 

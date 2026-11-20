@@ -561,8 +561,9 @@ void check_paged_finite_range(cudaStream_t stream) {
     constexpr auto elements = (position + 1) * kv_elements_per_token;
     constexpr int hostile_kv_head = 1;
     constexpr int heads_per_kv = sglang::mxfp8_query_heads / sglang::mxfp8_kv_heads;
+    constexpr int first_hostile = hostile_kv_head * heads_per_kv;
     const PagedBank bank;
-    const PagedSlot slot;
+    const std::array<PagedSlot, paged_lanes> slots;
     std::vector<std::int32_t> mapping(paged_pages, std::numeric_limits<int>::max());
     for (int page = 0; page <= position / page_tokens; ++page) {
         mapping[page] = paged_pages - 1 - page;
@@ -571,18 +572,16 @@ void check_paged_finite_range(cudaStream_t stream) {
     const auto binding = bank.binding(position);
     auto active = binding;
     active.scores = {};
-    slot.device_binding.upload(&active, stream);
+    std::array<BoundPagedDecodeLane, paged_lanes> lanes;
+    for (int index = 0; index < paged_lanes; ++index) {
+        slots[index].device_binding.upload(&active, stream);
+        lanes[index] = slots[index].lane();
+    }
     Graph graph;
-    graph.capture(stream, [&] {
-        const auto lane = slot.lane();
-        return paged_decode_gqa(&lane, 1, stream);
-    });
+    graph.capture(stream, [&] { return paged_decode_gqa(lanes.data(), paged_lanes, stream); });
     const DeviceBuffer<BFloat> input_keys(elements), input_values(elements);
     const DeviceBuffer<BFloat> ordered(query_elements);
     const auto bf16 = [](float value) { return __float2bfloat16_rn(value); };
-    std::vector<BFloat> expected(query_elements, bf16(2.0f));
-    std::fill_n(expected.begin() + hostile_kv_head * heads_per_kv * sglang::mxfp8_head_dim,
-                heads_per_kv * sglang::mxfp8_head_dim, bf16(1.0f));
     struct FiniteCase {
         const char* name;
         float query, key, value;
@@ -616,23 +615,42 @@ void check_paged_finite_range(cudaStream_t stream) {
                             bf16(test.value));
             }
         }
-        const std::vector<BFloat> queries(query_elements, bf16(test.query));
         input_keys.upload(host_keys.data(), stream);
         input_values.upload(host_values.data(), stream);
-        slot.queries.upload(queries.data(), stream);
-        slot.output.fill(attention_sentinel, stream);
-        slot.split.fill(attention_sentinel, stream);
         check_cuda(sglang::mxfp8_kv_append(binding.cache, binding.pages, 0, position + 1,
             input_keys.get(), input_values.get(), stream), "Append paged finite-range fixture");
+        const bool score_overflow = test.query < 0.0f;
+        std::array<std::vector<BFloat>, paged_lanes> queries;
+        for (int index = 0; index < paged_lanes; ++index) {
+            const auto& slot = slots[index];
+            queries[index].assign(query_elements, bf16(1.0f));
+            if (score_overflow) {
+                std::fill_n(queries[index].begin() + (first_hostile + index) * head_width,
+                            head_width, bf16(test.query));
+            }
+            slot.queries.upload(queries[index].data(), stream);
+            slot.output.fill(attention_sentinel, stream);
+            slot.split.fill(attention_sentinel, stream);
+        }
         graph.replay(stream);
-        const auto actual = paged_output(slot, stream);
-        require_same(actual, expected, test.name);
-        check_paged_escape_markers(slot, hostile_kv_head * heads_per_kv, heads_per_kv, stream);
-        check_cuda(sglang::decoder::exact_decode_gqa_attention(
-            binding.cache, binding.pages, position, slot.queries.get(), ordered.get(),
-            binding.scores, stream), "Launch ordered finite-range control");
-        require_same(ordered.download(stream), expected, "Ordered finite-range control mismatch");
-        check_paged_eager(slot, binding, actual, stream);
+        for (int index = 0; index < paged_lanes; ++index) {
+            const auto& slot = slots[index];
+            const int first = first_hostile + (score_overflow ? index : 0);
+            const int count = score_overflow ? 1 : heads_per_kv;
+            std::vector<BFloat> expected(query_elements, bf16(2.0f));
+            std::fill_n(expected.begin() + first_hostile * head_width, heads_per_kv * head_width,
+                        bf16(score_overflow ? test.value : 1.0f));
+            std::fill_n(expected.begin() + first * head_width, count * head_width, bf16(1.0f));
+            const auto actual = paged_output(slot, stream);
+            require_same(actual, expected, test.name);
+            check_paged_escape_markers(slot, first, count, stream);
+            check_cuda(sglang::decoder::exact_decode_gqa_attention(
+                binding.cache, binding.pages, position, slot.queries.get(), ordered.get(),
+                binding.scores, stream), "Launch ordered finite-range control");
+            require_same(ordered.download(stream), expected,
+                         "Ordered finite-range control mismatch");
+            check_paged_eager(slot, binding, actual, stream);
+        }
     }
     std::puts("Paged decode recovered from finite-input overflow and value cancellation");
 }

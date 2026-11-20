@@ -178,7 +178,7 @@ Run the [MTP checks](mtp.md#verification) before timing. Use same-width eager K0
 
 To isolate layer-major verification, compare with row-wise MTP at the same depth. To isolate tiled seeding, keep the verifier, exact precision, and depth fixed. Time target prefill and draft KV seeding through workspace release, before the first LM head. Record HTTP TTFT and request latency separately. Include short, tile-boundary, and long prompts. Record tile sizes, pool state, and output length.
 
-Alternate paired arms on the same reserved B200. Match warmups and repeats. Report individual samples, medians, ranges, and paired ratios. The [frozen W3-MTP variant](../benchmarks/variants/README.md) offers four requests. Run K1 with `--max-active 32 --max-num-batched-tokens 32768`. The full matched run is pending. The [earlier eager bursts](mtp.md#measured-continuous-mtp-trade-offs) used 64 output IDs per request.
+Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. [W3-MTP](../benchmarks/variants/README.md) uses four 8,192-token prompts with 1,024 outputs each. K1 starts beyond the [graph limit](mtp.md#k1-target-verification-graph). The matched run remains pending. Use `--max-active 32 --max-num-batched-tokens 32768`.
 
 Positive depth adds counters for the generator's first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds started. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder.cpp#L264)<!-- prefix: "bool propose" --> · [Output commit](../src/decoder.cpp#L238)<!-- prefix: "std::optiona" -->
 
@@ -186,7 +186,7 @@ Trace separately. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rou
 
 Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L55)<!-- prefix: "void trace_v" -->
 
-The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L389)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L932)<!-- prefix: "current.peak" -->
+The [verifier storage bound](mtp.md#constraints-and-failure-behavior) covers device and pinned results. The generator adds the larger of prefill scratch and verifier storage to base model and request bytes. Batch `peak_request_bytes` includes transient prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder.cpp#L389)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L928)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

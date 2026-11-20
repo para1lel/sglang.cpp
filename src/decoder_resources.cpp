@@ -162,7 +162,8 @@ struct Allocations::State {
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
-    std::array<BatchGraph, decoder_batch_max_graph_lanes> batch_graphs{};
+    std::array<BatchGraph, decoder_batch_max_graph_lanes + 1> batch_graphs{};
+    bool verification_graph_incomplete = false;
     bool uncertain_stream = false;
     bool uncertain_graph = false;
     std::vector<void*> blocks;
@@ -411,8 +412,9 @@ void Allocations::capture_graph(const std::function<void()>& enqueue) {
 
 bool Allocations::replay_batch_graph(int width, const std::function<void()>& prepare,
                                      const std::function<void()>& capture_nodes,
-                                     const std::function<bool()>& bind) {
-    auto& batch = state_->batch_graphs.at(width - 1);
+                                     const std::function<bool()>& bind, bool target_verify) {
+    const int index = target_verify ? decoder_batch_max_graph_lanes : width - 1;
+    auto& batch = state_->batch_graphs.at(index);
     if (batch.disabled) {
         return false;
     }
@@ -431,8 +433,12 @@ bool Allocations::replay_batch_graph(int width, const std::function<void()>& pre
         state_->destroy_executable(batch.executable).raise();
         state_->destroy_capture(batch.capture).raise();
         batch.disabled = true;
-        std::fprintf(stderr, "sglang decoder: %s at width %d: %s, using eager batch decode\n",
-                     operation, width, cudaGetErrorString(rejected));
+        if (target_verify) {
+            state_->verification_graph_incomplete = false;
+        }
+        std::fprintf(stderr, "sglang decoder: %s at width %d: %s, using eager %s\n",
+                     operation, width, cudaGetErrorString(rejected),
+                     target_verify ? "K1 target verification" : "batch decode");
         return false;
     };
     if (!batch.executable) {
@@ -441,15 +447,18 @@ bool Allocations::replay_batch_graph(int width, const std::function<void()>& pre
             prepare();
         } catch (const CudaError& error) {
             if (error.status == cudaErrorMemoryAllocation) {
-                return fallback(error.status, "Allocate batch decode graph scratch");
+                return fallback(error.status, "Allocate batch graph scratch");
             }
             throw;
         }
+        if (target_verify) {
+            state_->verification_graph_incomplete = true;
+        }
         const auto begun = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
         if (capture_rejected(begun)) {
-            return fallback(begun, "Begin batch decode graph capture");
+            return fallback(begun, "Begin batch graph capture");
         }
-        check(begun, "Begin batch decode graph capture");
+        check(begun, "Begin batch graph capture");
         cudaError_t enqueue_status = cudaSuccess;
         try {
             capture_nodes();
@@ -457,40 +466,49 @@ bool Allocations::replay_batch_graph(int width, const std::function<void()>& pre
             enqueue_status = error.status;
             if (!capture_rejected(enqueue_status)) {
                 report_cleanup(cudaStreamEndCapture(stream, &batch.capture),
-                               "End failed batch decode graph capture");
+                               "End failed batch graph capture");
                 throw;
             }
         } catch (...) {
             report_cleanup(cudaStreamEndCapture(stream, &batch.capture),
-                           "End interrupted batch decode graph capture");
+                           "End interrupted batch graph capture");
             throw;
         }
         const auto ended = cudaStreamEndCapture(stream, &batch.capture);
         if (capture_rejected(ended)) {
-            return fallback(ended, "End batch decode graph capture");
+            return fallback(ended, "End batch graph capture");
         }
-        check(ended, "End batch decode graph capture");
+        check(ended, "End batch graph capture");
         if (enqueue_status != cudaSuccess) {
-            return fallback(enqueue_status, "Record batch decode graph");
+            return fallback(enqueue_status, "Record batch graph");
         }
         const auto built = cudaGraphInstantiate(&batch.executable, batch.capture, 0);
         if (capture_rejected(built) || built == cudaErrorInvalidValue) {
-            return fallback(built, "Instantiate batch decode graph");
+            return fallback(built, "Instantiate batch graph");
         }
-        check(built, "Instantiate batch decode graph");
+        check(built, "Instantiate batch graph");
         state_->destroy_capture(batch.capture).raise();
+        if (target_verify) {
+            state_->verification_graph_incomplete = false;
+        }
     }
     if (!bind()) {
         return false;
     }
     check(cudaGetLastError(), "Check CUDA error before batch graph launch");
     const auto launched = cudaGraphLaunch(batch.executable, stream);
-    if (launched == cudaErrorInvalidValue || launched == cudaErrorInvalidResourceHandle ||
-        launched == cudaErrorNotSupported) {
-        return fallback(launched, "Launch batch decode graph");
+    if (target_verify && launched != cudaSuccess) {
+        state_->verification_graph_incomplete = true;
+    } else if (launched == cudaErrorInvalidValue || launched == cudaErrorInvalidResourceHandle ||
+               launched == cudaErrorNotSupported) {
+        return fallback(launched, "Launch batch graph");
     }
-    check(launched, "Launch batch decode graph");
+    check(launched, "Launch batch graph");
     return true;
+}
+
+bool Allocations::verification_graph_failed() const {
+    return state_->verification_graph_incomplete || state_->uncertain_graph;
 }
 
 void Allocations::reclaim_deferred() {
@@ -584,6 +602,13 @@ ExactGqaWorkspace Workspace::gqa_scores(int capacity) const {
     constexpr int bytes_per_page = mxfp8_page_size * mxfp8_query_heads * sizeof(float);
     constexpr int score_pages = vocab_size * sizeof(Bf16) / bytes_per_page;
     return {reinterpret_cast<float*>(logits), std::min(capacity, score_pages * mxfp8_page_size)};
+}
+
+BatchGraphScratch::BatchGraphScratch(int device)
+    : memory(device), device_bindings(memory.allocate<BatchDecodeBinding>(work.size())) {
+    for (auto& workspace : work) {
+        workspace.emplace(memory);
+    }
 }
 
 ExactGqaWorkspace Request::batch_graph_scores() {

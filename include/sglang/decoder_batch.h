@@ -41,6 +41,7 @@ struct DecoderBatchStepStats {
     std::size_t sampling_workspace_bytes = 0;
     std::size_t constraint_workspace_bytes = 0;
     int target_rows = 0;
+    std::uint32_t verification_graph_slots = 0;
 };
 
 struct DecoderBatchOptions {

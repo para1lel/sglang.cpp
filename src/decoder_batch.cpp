@@ -114,24 +114,11 @@ struct Lane {
     }
 };
 
-struct BatchGraphScratch {
-    explicit BatchGraphScratch(int device)
-        : memory(device), device_bindings(memory.allocate<BatchDecodeBinding>(work.size())) {
-        for (auto& workspace : work) {
-            workspace.emplace(memory);
-        }
-    }
-
-    Allocations memory;
-    std::array<std::optional<Workspace>, decoder_batch_max_graph_lanes> work;
-    BatchDecodeBinding* device_bindings;
-    std::array<BatchDecodeBinding, decoder_batch_max_graph_lanes> bindings{};
-};
-
 struct BatchStorage {
     std::shared_ptr<const Allocations> weights;
     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
     std::unique_ptr<BatchGraphScratch> graph_scratch;
+    std::optional<VerificationGraph> verification_graph;
     std::optional<PrefixCache> prefix_cache;
 };
 
@@ -368,6 +355,9 @@ struct DecoderBatch::State {
         if (options.prefix_cache_entries != 0) {
             storage->prefix_cache.emplace(model.device, options.prefix_cache_entries);
         }
+        if (options.cuda_graphs) {
+            storage->verification_graph.emplace(execution);
+        }
         execution.open_stream(storage);
         if (options.resident_memory_limit) {
             const auto free = available_device_bytes();
@@ -422,6 +412,7 @@ struct DecoderBatch::State {
         }
         storage->slots = {};
         storage->graph_scratch.reset();
+        storage->verification_graph.reset();
         storage->prefix_cache.reset();
     }
 
@@ -861,7 +852,12 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         return;
     }
     draft_proposals(rounds.data(), count, longest);
-    model.forward_verify(sequences.data(), count, stream);
+    const auto& lane = *rounds[0].lane;
+    auto* graph = storage->verification_graph && count == 1 && lane.options.mtp_steps == 1 &&
+        !lane.media && !lane.options.constraint ? &*storage->verification_graph : nullptr;
+    if (model.forward_verify(sequences.data(), count, stream, graph)) {
+        stats.verification_graph_slots |= std::uint32_t{1} << rounds[0].slot;
+    }
     for (int index = 0; index < count; ++index) {
         auto& lane = *rounds[index].lane;
         if (lane.sampling) {
@@ -979,7 +975,7 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         }
         return results;
     } catch (...) {
-        if (!contains_mtp) {
+        if (!contains_mtp || execution.verification_graph_failed()) {
             disable();
         } else {
             drain("Drain failed decoder batch step");

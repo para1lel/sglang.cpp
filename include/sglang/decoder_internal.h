@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/decoder.h"
+#include "sglang/decoder_batch.h"
 #include "sglang/decoder_constraint.h"
 #include "sglang/decoder_cuda.cuh"
 
@@ -26,6 +27,8 @@ struct MediaPrefill;
 struct MultimodalInput;
 class TargetVerification;
 struct VerificationSequence;
+struct VerificationRow;
+struct VerificationGraph;
 struct SamplingParameters;
 
 using Bf16 = __nv_bfloat16;
@@ -124,7 +127,8 @@ public:
     void free_block(void* pointer, std::size_t bytes);
     bool replay_batch_graph(int width, const std::function<void()>& prepare,
                             const std::function<void()>& capture,
-                            const std::function<bool()>& bind);
+                            const std::function<bool()>& bind, bool target_verify = false);
+    bool verification_graph_failed() const;
     void reclaim_deferred();
     void open_stream(std::shared_ptr<const void> owners = nullptr);
     void close_stream();
@@ -275,6 +279,15 @@ struct BatchGraphLane {
     const BatchDecodeBinding* binding;
 };
 
+struct BatchGraphScratch {
+    explicit BatchGraphScratch(int device);
+
+    Allocations memory;
+    std::array<std::optional<Workspace>, decoder_batch_max_graph_lanes> work;
+    BatchDecodeBinding* device_bindings;
+    std::array<BatchDecodeBinding, decoder_batch_max_graph_lanes> bindings{};
+};
+
 }
 
 namespace sglang {
@@ -289,8 +302,10 @@ struct Decoder::Model {
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     void forward_verify(decoder::TargetVerification& verification, int position,
                         const int* tokens, int count, cudaStream_t stream) const;
-    void forward_verify(const decoder::VerificationSequence* sequences, int count,
-                        cudaStream_t stream) const;
+    bool forward_verify(const decoder::VerificationSequence* sequences, int count,
+                        cudaStream_t stream, decoder::VerificationGraph* graph = nullptr) const;
+    void enqueue_verification(const decoder::VerificationRow* rows, int count,
+                              cudaStream_t stream) const;
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
                        decoder::PrefillWorkspace& workspace,
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,

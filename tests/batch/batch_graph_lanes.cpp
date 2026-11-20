@@ -274,6 +274,214 @@ void singleton(const Decoder& decoder, std::string_view role) {
     run.check_step(pair, 0);
 }
 
+void expect_verification_error(DecoderBatch& batch, unsigned selected, std::string_view message) {
+    bool failed = false;
+    try {
+        batch.advance_chunked(mask(selected));
+    } catch (const std::exception& error) {
+        require(std::string_view(error.what()).find(message) != std::string_view::npos,
+                error.what());
+        failed = true;
+    }
+    require(failed, "K1 operation did not propagate its failure");
+}
+
+void verify_failure(DecoderBatch& batch, unsigned selected, std::string_view message,
+                    bool drained) {
+    expect_verification_error(batch, selected, message);
+    require(!batch.available(), "Failed K1 operation left the batch available");
+    if (drained) {
+        require(batch.request_device_allocation_bytes() == 0,
+                "Drained K1 failure retained request buffers");
+    }
+    try {
+        batch.advance_chunked(mask(selected));
+    } catch (const std::exception& error) {
+        require(std::string_view(error.what()) == "Decoder batch is unavailable", error.what());
+        std::cout << "verify failed-closed\n";
+        return;
+    }
+    require(false, "Failed K1 batch accepted another advance");
+}
+
+void verify_recovery(const Decoder& decoder, DecoderBatch& batch, int slot,
+                     std::string_view message) {
+    expect_verification_error(batch, 1u << slot, message);
+    require(batch.available() && batch.request_device_allocation_bytes() == 0,
+            "Drained K1 operation did not retire its requests");
+    DecoderBatch eager(decoder, {false, 2, 0, 4});
+    DecoderOptions options;
+    options.mtp_steps = 1;
+    options.max_new_tokens = 8;
+    batch.admit(slot, {13, 198, 279, 826}, options);
+    eager.admit(1, {13, 198, 279, 826}, options);
+    for (int step = 0; step < 2; ++step) {
+        DecoderBatchStepStats stats;
+        const auto actual = batch.advance_chunked(mask(1u << slot), &stats)[slot];
+        const auto expected = eager.advance_chunked(mask(2))[1];
+        require(actual.token && actual.token == expected.token &&
+                actual.extra_token_count == expected.extra_token_count &&
+                actual.extra_tokens == expected.extra_tokens &&
+                actual.mtp_verified_rows == expected.mtp_verified_rows &&
+                stats.verification_graph_slots == (step ? 1u << slot : 0),
+                "Replacement after K1 failure differed from eager");
+    }
+    batch.cancel(slot);
+    require(batch.request_device_allocation_bytes() == 0, "K1 replacement retained buffers");
+    std::cout << "verify recovered\n";
+}
+
+void admit_verifier(DecoderBatch& batch, int slot, int depth, int budget, int length, int offset) {
+    constexpr std::array pool{13, 198, 279, 826, 760, 6511, 314, 9338, 369, 1570,
+                              315, 4950, 31784, 303, 806, 352, 952, 969};
+    std::vector<int> prompt;
+    for (int index = 0; index < length; ++index) {
+        prompt.push_back(pool[(index + offset) % pool.size()]);
+    }
+    DecoderOptions options;
+    options.mtp_steps = depth;
+    options.max_new_tokens = budget;
+    options.incremental_kv = true;
+    batch.admit(slot, std::move(prompt), options);
+    std::cout << "verify admit " << slot << ' ' << depth << ' ' << budget << ' '
+              << length << ' ' << offset << '\n';
+}
+
+void verify_exclusions(const Decoder& decoder, bool graphs) {
+    DecoderBatch limited(decoder, {graphs, 2, 0, 1});
+    DecoderOptions options;
+    options.mtp_steps = 1;
+    options.max_new_tokens = 4;
+    limited.admit(1, {13}, options);
+    require(limited.advance_chunked(mask(2))[1].token.has_value(), "No budget-case seed");
+    DecoderBatchStepStats stats;
+    const auto downgraded = limited.advance_chunked(mask(2), &stats)[1];
+    require(downgraded.token && downgraded.mtp_verified_rows == 1 &&
+            !downgraded.mtp_drafted_tokens && stats.target_rows == 1 &&
+            stats.graph_slots == 0 && stats.verification_graph_slots == 0,
+            "One-row budget did not downgrade K1");
+    std::cout << "verify downgrade " << *downgraded.token << '\n';
+    limited.cancel(1);
+
+    DecoderBatch wider(decoder, {graphs, 2, 0, 8});
+    for (int depth = 2; depth <= 4; ++depth) {
+        admit_verifier(wider, 1, depth, 16, 4, depth);
+        require(wider.advance_chunked(mask(2))[1].token.has_value(), "No higher-depth seed");
+        for (int round = 0; round < 2; ++round) {
+            const auto result = wider.advance_chunked(mask(2), &stats)[1];
+            require(result.token && result.mtp_drafted_tokens == depth &&
+                    result.mtp_verified_rows == depth + 1 &&
+                    stats.graph_slots == 0 && stats.verification_graph_slots == 0,
+                    "Higher-depth verification changed shape or used the K1 graph");
+            std::cout << "verify depth " << depth << ' ' << *result.token;
+            for (int extra = 0; extra < result.extra_token_count; ++extra) {
+                std::cout << ' ' << result.extra_tokens[extra];
+            }
+            std::cout << '\n';
+        }
+        wider.cancel(1);
+    }
+}
+
+void verify_graph(const Decoder& decoder, std::string_view role) {
+    const bool graphs = role != "eager";
+    constexpr int first = 3;
+    constexpr int second = 29;
+    constexpr unsigned first_mask = 1u << first;
+    constexpr unsigned second_mask = 1u << second;
+    constexpr unsigned both = first_mask | second_mask;
+    DecoderBatch batch(decoder, {graphs, decoder_batch_max_lanes, 0, 4});
+    int steps = 0;
+    const auto step = [&](unsigned selected, int lanes, int rows, unsigned k0 = 0,
+                          unsigned k1 = 0) {
+        DecoderBatchStepStats stats;
+        const auto result = batch.advance_chunked(mask(selected), &stats);
+        require(stats.verification_lanes == lanes && stats.verification_rows == rows,
+                "Unexpected K1 verification shape");
+        require(stats.graph_slots == k0, "K1 step changed the K0 graph mask");
+        require(stats.verification_graph_slots == k1, "Unexpected K1 target graph mask");
+        std::cout << "verify step " << ++steps << ' ' << selected << ' '
+                  << stats.target_rows << ' ' << lanes << ' ' << rows << '\n'
+                  << "verify graphs " << steps << ' ' << k0 << ' ' << k1 << '\n';
+        for (const int slot : {first, second}) {
+            const auto& lane = result[slot];
+            std::cout << "verify lane " << slot << ' ' << lane.decode << ' '
+                      << lane.token.value_or(-1) << ' ' << lane.extra_token_count << ' '
+                      << (lane.extra_token_count ? lane.extra_tokens[0] : -1) << ' '
+                      << lane.mtp_drafted_tokens << ' ' << lane.mtp_accepted_tokens << ' '
+                      << lane.mtp_verified_rows << ' ' << lane.mtp_replayed_rows << ' '
+                      << lane.mtp_boundary << ' '
+                      << (lane.finish_reason ? static_cast<int>(*lane.finish_reason) : -1)
+                      << '\n';
+        }
+        return result;
+    };
+    const auto prefill = [&](int slot, int length) {
+        for (int done = 0; done < length; done += 4) {
+            require(step(1u << slot, 0, 0)[slot].token.has_value() == (done + 4 >= length),
+                    "K1 prefill seed arrived at the wrong position");
+        }
+    };
+    const auto cancel = [&](int slot) {
+        const auto before = batch.request_device_allocation_bytes();
+        batch.cancel(slot);
+        require(batch.request_device_allocation_bytes() < before,
+                "Cancelled K1 lane retained request buffers");
+        std::cout << "verify cancel " << slot << '\n';
+    };
+    admit_verifier(batch, second, 1, 24, 127, 1);
+    prefill(second, 127);
+    step(second_mask, 1, 2);
+    if (role == "hard") {
+        verify_recovery(decoder, batch, second, "illegal memory access");
+        return;
+    }
+    if (role == "hard-drain") {
+        verify_failure(batch, second_mask, "Drain failed decoder batch step", false);
+        return;
+    }
+    if (role == "cleanup") {
+        verify_failure(batch, second_mask, "Destroy decode capture graph", false);
+        return;
+    }
+    const bool launch_fault = role == "launch" || role == "submitted" || role == "exec-cleanup";
+    const bool replays = role == "graph" || role == "upload" || launch_fault;
+    step(second_mask, 1, 2, 0, replays ? second_mask : 0);
+    if (role == "upload") {
+        verify_recovery(decoder, batch, second, "Upload K1 verifier graph bindings");
+        return;
+    }
+    admit_verifier(batch, first, 0, 16, 4, 2);
+    prefill(first, 4);
+    if (launch_fault) {
+        verify_failure(batch, both, "Launch batch graph", role != "exec-cleanup");
+        return;
+    }
+    step(both, 1, 2, 0, role == "graph" ? second_mask : 0);
+    cancel(second);
+    step(first_mask, 0, 0);
+    step(first_mask, 0, 0, graphs ? first_mask : 0);
+    cancel(first);
+
+    admit_verifier(batch, first, 1, 16, 4, 3);
+    admit_verifier(batch, second, 1, 16, 4, 4);
+    prefill(first, 4);
+    prefill(second, 4);
+    step(both, 2, 4);
+    cancel(second);
+    step(first_mask, 1, 2, 0, role == "graph" ? first_mask : 0);
+    cancel(first);
+
+    admit_verifier(batch, second, 1, 2, 4, 5);
+    prefill(second, 4);
+    const auto boundary = step(second_mask, 0, 0)[second];
+    require(boundary.mtp_boundary && boundary.finish_reason.has_value(),
+            "Single output remaining did not take the K1 boundary path");
+    require(batch.request_device_allocation_bytes() == 0, "K1 requests retained buffers");
+
+    verify_exclusions(decoder, graphs);
+}
+
 void verify_wide(const Decoder& decoder) {
     constexpr int width = decoder_batch_max_lanes;
     constexpr int budget = decoder_batch_max_step_tokens;
@@ -341,19 +549,23 @@ void verify_wide(const Decoder& decoder) {
 int main(int argc, char** argv) {
     try {
         require(argc == 4 || argc == 5,
-                "Expected CHECKPOINT ROLE FP8_PREFILL [boundary|singleton]");
+                "Expected CHECKPOINT ROLE FP8_PREFILL [boundary|singleton|verify]");
         const std::string_view test = argc == 5 ? argv[4] : "";
-        require(test.empty() || test == "boundary" || test == "singleton",
+        require(test.empty() || test == "boundary" || test == "singleton" || test == "verify",
                 "Unexpected graph test scenario");
         const std::string_view role = argv[2];
         const std::string_view policy = argv[3];
         const bool wide = test.empty() && role == "verify-wide" && policy == "exact";
-        require(wide || role == "eager" || role == "graph" ||
+        const bool verify_fault = test == "verify" &&
+            (role == "prepare" || role == "begin" || role == "instantiate" || role == "upload" ||
+             role == "launch" || role == "submitted" || role == "cleanup" ||
+             role == "exec-cleanup" || role == "hard" || role == "hard-drain");
+        require(wide || verify_fault || role == "eager" || role == "graph" ||
                 role == (test == "boundary" ? "score-oom" :
                          test == "singleton" ? "launch" : "hard"),
                 "Unexpected graph test role");
         require(policy == "exact" || policy == "tensor-core", "Expected exact or tensor-core");
-        const Decoder decoder(argv[1], 0, wide, policy == "exact" ?
+        const Decoder decoder(argv[1], 0, wide || test == "verify", policy == "exact" ?
             Fp8PrefillPolicy::exact : Fp8PrefillPolicy::tensor_core);
         if (wide) {
             verify_wide(decoder);
@@ -361,6 +573,8 @@ int main(int argc, char** argv) {
             score_boundary(decoder, role);
         } else if (test == "singleton") {
             singleton(decoder, role);
+        } else if (test == "verify") {
+            verify_graph(decoder, role);
         } else {
             scenario(decoder, role != "eager", role == "hard");
         }

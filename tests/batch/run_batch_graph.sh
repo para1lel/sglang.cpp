@@ -19,6 +19,7 @@ case "$mode" in
         ;;
     admission) test -x "$build/bin/sglang-server" ;;
     boundary|singleton) ;;
+    k1) test -x "$build/bin/sglang-server" ;;
     *) exit 2 ;;
 esac
 if [[ "$mode" != admission ]]; then
@@ -79,6 +80,18 @@ run_singleton() {
     run_lanes singleton-launch launch tensor-core launch failure singleton
 }
 
+run_k1() {
+    for role in eager graph prepare begin instantiate upload launch submitted \
+                hard hard-drain cleanup exec-cleanup; do
+        case "$role" in
+            eager|graph) run_lanes "k1-$role" "$role" tensor-core '' '' verify ;;
+            *) run_lanes "k1-$role" "$role" tensor-core "$role" failure verify ;;
+        esac
+    done
+    python3 -IB "$tests/../mtp/graph_http.py" --server "$build/bin/sglang-server" \
+        --checkpoint "$checkpoint" --evidence "$out/k1-http" --activity "$out/activity.so"
+}
+
 finish_device() {
     test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
     nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=csv \
@@ -90,6 +103,14 @@ if [[ "$mode" == singleton ]]; then
     run_singleton
     finish_device
     python3 -IB "$tests/check_graph_evidence.py" "$out" --singleton-only
+    exit
+fi
+
+if [[ "$mode" == k1 ]]; then
+    compile_observer failure -ldl
+    run_k1
+    finish_device
+    python3 -IB "$tests/check_graph_evidence.py" "$out" --k1-only
     exit
 fi
 
@@ -130,5 +151,6 @@ done
 
 run_boundary
 run_singleton
+run_k1
 finish_device
 python3 -IB "$tests/check_graph_evidence.py" "$out"

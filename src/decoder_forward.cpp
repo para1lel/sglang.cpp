@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <type_traits>
+#include <utility>
 
 namespace sglang {
 namespace {
@@ -156,8 +157,14 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
 }
 
 void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, int state_index) {
+    const auto& first = batch.lanes[0];
+    if (first.binding) {
+        auto& scratch = *first.graph_workspace;
+        scratch.bind_gdn(state_index, batch.count);
+        scratch.replay[state_index].weights = layer.recurrent;
+    }
     batch.each([&](const VerificationRow& row, Workspace&) {
-        if (row.first) {
+        if (row.first && !row.binding) {
             row.verification->bind_gdn(state_index);
         }
     });
@@ -166,11 +173,21 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
     batch.project(layer.z, &Workspace::gdn_z);
     project(layer.b, batch, &Workspace::gdn_b);
     project(layer.a, batch, &Workspace::gdn_a);
-    batch.each([&](const VerificationRow& row, Workspace&) {
-        if (row.first) {
-            row.verification->advance_gdn(state_index, layer.recurrent);
-        }
-    });
+    if (first.binding) {
+        auto& scratch = *first.graph_workspace;
+        check(decode_verify_gdn(batch.count, scratch.replay[state_index].inputs,
+                                first.work->gdn_z, layer.recurrent,
+                                &first.binding->initial[state_index],
+                                &first.binding->tail[state_index], scratch.observable,
+                                first.work->attention, batch.stream),
+              "Advance bound verification GDN");
+    } else {
+        batch.each([&](const VerificationRow& row, Workspace&) {
+            if (row.first) {
+                row.verification->advance_gdn(state_index, layer.recurrent);
+            }
+        });
+    }
     batch.quantize(&Workspace::attention, text_gdn_value_width);
     batch.project(layer.output, &Workspace::projected_attention);
 }
@@ -258,6 +275,25 @@ void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& b
     batch.each([&](const BatchGraphLane&, Workspace& work) { gate_gqa(work, batch.stream); });
 }
 
+void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>& batch,
+                       int cache_index) {
+    const auto& binding = *batch.lanes[0].binding;
+    const auto* cache = &binding.caches[cache_index];
+    for (int index = 0; index < batch.count; ++index) {
+        auto& work = workspace(batch.lanes[index]);
+        const auto* position = &binding.positions[index];
+        check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
+                                    layer.key_norm, work.rope_queries, work.rope_keys,
+                                    batch.stream), "Normalize and rotate bound verification Q/K");
+        check(decode_kv_append(cache, &binding.pages, position, work.rope_keys, work.values,
+                               batch.stream), "Append bound verification MXFP8 KV");
+        check(exact_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
+                                          work.attention, &binding.scores[index], batch.stream),
+              "Read bound verification MXFP8 attention");
+        gate_gqa(work, batch.stream);
+    }
+}
+
 template <typename Lane>
 void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
     std::array<PagedDecodeLane, paged_decode_lanes> reads;
@@ -316,6 +352,12 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     }
     if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
         attend_bound_gqa(layer, batch, cache_index);
+    } else if constexpr (std::is_same_v<Lane, VerificationRow>) {
+        if (batch.lanes[0].binding) {
+            attend_verify_gqa(layer, batch, cache_index);
+        } else {
+            attend_eager_gqa(layer, batch, cache_index);
+        }
     } else {
         attend_eager_gqa(layer, batch, cache_index);
     }
@@ -376,8 +418,8 @@ void Decoder::Model::forward_verify(TargetVerification& verification, int positi
     forward_verify(&sequence, 1, stream);
 }
 
-void Decoder::Model::forward_verify(const VerificationSequence* sequences, int count,
-                                    cudaStream_t stream) const {
+bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int count,
+                                    cudaStream_t stream, VerificationGraph* graph) const {
     if (!sequences || count < 1 || count > decoder_batch_max_mtp_lanes) {
         throw std::invalid_argument("Invalid number of verification sequences");
     }
@@ -394,6 +436,32 @@ void Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
         longest = std::max(longest, sequence.count);
         sequence.verification->begin(sequence.position, sequence.count, stream);
     }
+    const auto& first = sequences[0];
+    if (graph && count == 1 && first.verification->graph_eligible(first) &&
+        std::exchange(graph->warmed, true)) {
+        const bool replayed = graph->execution.replay_batch_graph(1, [&] {
+            graph->scratch = std::make_unique<VerificationGraphScratch>(device);
+        }, [&] {
+            auto& scratch = *graph->scratch;
+            auto* binding = scratch.device_binding;
+            std::array<VerificationRow, k1_verification_rows> rows;
+            for (int index = 0; index < k1_verification_rows; ++index) {
+                auto& work = scratch.workspace.work[index];
+                rows[index] = {nullptr, &work, 0, nullptr, index == 0, binding, &scratch.workspace};
+                check(decode_embedding(embedding, vocab_size, hidden_size, &binding->inputs[index],
+                                       work.residual, stream), "Look up bound verification input");
+            }
+            enqueue_verification(rows.data(), k1_verification_rows, stream);
+        }, [&] {
+            graph->scratch->upload(first, stream);
+            return true;
+        }, true);
+        if (replayed) {
+            first.verification->use_graph_workspace(graph->scratch->workspace);
+            return true;
+        }
+        graph->scratch.reset();
+    }
     std::array<VerificationRow, max_rows> rows;
     int next = 0;
     for (int index = 0; index < longest; ++index) {
@@ -407,8 +475,14 @@ void Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
             }
         }
     }
-    forward_layers(rows.data(), total, stream);
-    const LayerBatch<VerificationRow> batch{rows.data(), total, stream};
+    enqueue_verification(rows.data(), total, stream);
+    return false;
+}
+
+void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count,
+                                          cudaStream_t stream) const {
+    forward_layers(rows, count, stream);
+    const LayerBatch<VerificationRow> batch{rows, count, stream};
     batch.each([&](const VerificationRow&, Workspace& work) { normalize_final(work, stream); });
     project(lm_head, batch, &Workspace::logits);
     batch.each([&](const VerificationRow&, Workspace& work) {

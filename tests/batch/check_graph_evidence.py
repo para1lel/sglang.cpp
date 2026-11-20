@@ -214,6 +214,46 @@ def verify_singleton(evidence):
     print(f"Singleton warmup, sparse replay, recycling and fallback passed ({len(tokens)} rows)")
 
 
+def verify_k1(evidence):
+    def records(role):
+        stem = evidence / f"k1-{role}"
+        lines = stem.with_suffix(".lanes").read_text().splitlines()
+        masks = [tuple(map(int, line.split()[3:])) for line in lines
+                 if line.startswith("verify graphs ")]
+        device, _ = trace(stem.with_suffix(".cupti.tsv"))
+        log = stem.with_suffix(".log").read_text()
+        return [line for line in lines if not line.startswith("verify graphs ")], masks, device, log
+
+    eager, masks, device, _ = records("eager")
+    assert masks and not any(k0 or k1 for k0, k1 in masks) and not device
+    closed = {"launch": 1, "submitted": 2, "hard-drain": 1, "cleanup": 0, "exec-cleanup": 1}
+    recovered = {"upload": 2, "hard": 2}
+    fallbacks = ("prepare", "begin", "instantiate")
+    for role in ("graph", *fallbacks, *closed, *recovered):
+        steps, masks, device, log = records(role)
+        if role in closed or role in recovered:
+            terminal = "verify failed-closed" if role in closed else "verify recovered"
+            assert steps[-1] == terminal
+            assert steps[:-1] == eager[:len(steps) - 1]
+            assert len(device) == (closed | recovered)[role] and len(set(device)) <= 1
+            assert "using eager K1 target verification" not in log
+        else:
+            assert steps == eager
+            submitted = [(k0, k1) for k0, k1 in masks if k0 or k1]
+            identities = {depth: {graph_id for (k0, k1), graph_id
+                                  in zip(submitted, device, strict=True)
+                                  if (k0, k1)[depth]} for depth in (0, 1)}
+            assert len(identities[0]) == 1 and identities[0].isdisjoint(identities[1])
+            assert len(identities[1]) == (role == "graph")
+            assert all(not (k0 and k1) for k0, k1 in submitted)
+            if role == "graph":
+                assert len(submitted) == 4
+            if role in fallbacks:
+                assert "using eager K1 target verification" in log
+        assert log.count(f"inject: {role}\n") == (role != "graph")
+    print("Sparse K1 replay, independent K0, and graph recovery checks passed")
+
+
 def payloads(data):
     return [
         [stream["events"], stream["tokens"], stream["finish"], stream["usage"]]
@@ -251,13 +291,33 @@ def verify_operators(evidence):
     output = (evidence / "operators.log").read_text()
     assert "Rebound cache, page table and position on four device graph replays" in output
     assert "Rebound GDN history and recurrent banks on six device graph replays" in output
+    assert "Score overflow matches protected tiles at 32768 and 32769 visible tokens" in output
     assert "Paged decode matched FP64 and eager across 24 rebound layer-lanes" in output
     assert "Paged decode recovered from finite-input overflow and value cancellation" in output
     assert "MXFP8 GQA check passed" in output
     device, runtime = trace(evidence / "operators.cupti.tsv")
-    replays = [8, 4, 6, 1, 3, 3, 2, 2]
-    assert list(Counter(device).values()) == replays
-    assert all(count(runtime, api) == len(replays) for api in LIFECYCLE)
+    runs = (
+        ("exact decode", 8),
+        ("cache rebinding", 4),
+        ("GDN rebinding", 6),
+        ("prefill causal boundary", 1),
+        ("prefill overflow at 65 visible tokens", 1),
+        ("prefill overflow at 32768 visible tokens", 1),
+        ("prefill overflow at 32769 visible tokens", 1),
+        ("paged decode rebinding", 3),
+        ("paged decode overflow and cancellation", 3),
+        ("ordered finite-range decode", 1),
+        ("split finite-range decode", 1),
+        ("ordered finite-range decode", 1),
+        ("split finite-range decode", 1),
+    )
+    expected = [name for name, launches in runs for _ in range(launches)]
+    names = list(dict.fromkeys(expected))
+    graph_ids = list(dict.fromkeys(device))
+    assert len(graph_ids) == len(names), (names, Counter(device))
+    labels = dict(zip(graph_ids, names, strict=True))
+    assert [labels[graph] for graph in device] == expected, (runs, labels, device)
+    assert all(count(runtime, api) == len(names) for api in LIFECYCLE)
 
 
 def check_slot_mask():
@@ -292,12 +352,13 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--boundary-only", action="store_true")
     mode.add_argument("--singleton-only", action="store_true")
+    mode.add_argument("--k1-only", action="store_true")
     args = parser.parse_args()
     if args.check_slot_mask:
         check_slot_mask()
     output = args.evidence
     if output is None:
-        if not args.check_slot_mask or args.boundary_only or args.singleton_only:
+        if not args.check_slot_mask or args.boundary_only or args.singleton_only or args.k1_only:
             parser.error("Pass an evidence directory or --check-slot-mask")
         return
     if args.boundary_only:
@@ -305,6 +366,9 @@ def main():
         return
     if args.singleton_only:
         verify_singleton(output)
+        return
+    if args.k1_only:
+        verify_k1(output)
         return
     verify_operators(output)
     for policy in ("exact", "tensor-core"):
@@ -314,6 +378,7 @@ def main():
         verify_http(output, policy)
     verify_boundary(output)
     verify_singleton(output)
+    verify_k1(output)
     print("Batch CUDA Graph operator, lane, fault and HTTP checks passed")
 
 

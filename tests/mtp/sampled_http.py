@@ -132,7 +132,7 @@ def stop_case(wanted):
     ids = wanted["tokens"]
     index, token = next((index, token) for index, token in enumerate(ids)
                         if index >= 3 and token not in ids[:index])
-    return MAIN | {"stop_token_ids": [token], "max_tokens": index + 1}
+    return MAIN | {"stop_token_ids": [token], "ignore_eos": False, "max_tokens": index + 1}
 
 
 def media_body():

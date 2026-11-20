@@ -130,6 +130,11 @@ cudaError_t decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                        TextGdnWeights weights, const TextGdnState* state,
                        __nv_bfloat16* workspace, __nv_bfloat16* output, cudaStream_t stream);
 
+cudaError_t decode_verify_gdn(int rows, TextGdnReplayRows inputs, const __nv_bfloat16* z,
+                              TextGdnWeights weights, const TextGdnState* initial,
+                              const TextGdnState* tail, __nv_bfloat16* observable,
+                              __nv_bfloat16* output, cudaStream_t stream);
+
 struct DecodeFp8Projection {
     const std::uint8_t* values;
     const __nv_bfloat16* scales;

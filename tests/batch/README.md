@@ -46,6 +46,15 @@ and CUPTI runtime/device records in the evidence directory.
   allocation failure, cancellation, and slot reuse. It matches greedy IDs and
   complete BF16 rows to eager, correlates masks with CUPTI launches, and
   requires zero request bytes at cleanup.
+- The K1 target verification probe distinguishes two-row target launches from K0
+  replay. It checks sparse slots, request replacement, mixed K0 and K1 decode,
+  and eager execution for verifier groups with multiple K1 lanes, K2–K4,
+  or a one-row budget.
+  Preparation, capture, and instantiation rejection fall back to eager. The
+  fixture checks same-slot replacement after a successful drain and batch
+  disablement after launch-call errors, uncertain teardown, or a failed drain.
+  The HTTP arm compares greedy and seeded SSE, visibility limits, rejection,
+  EOS, output caps, and cancellation.
 - The public HTTP probe sends distinct prompts across decode widths one through
   four and checks independent EOS and explicit stop, cancellation, overlapping
   replacement, and recovery. It also runs a seeded sampled request alongside a
@@ -76,6 +85,14 @@ Run the slot-mask regression without a checkpoint or GPU.
 
 ```bash
 python3 -IB tests/batch/check_graph_evidence.py --check-slot-mask
+```
+
+Run the K1 probe with a fresh evidence destination.
+
+```bash
+GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
+    bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/k1" k1
+python3 -IB tests/batch/check_graph_evidence.py "$out/k1" --k1-only
 ```
 
 ## Wide K0 serving

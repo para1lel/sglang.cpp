@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| GDN entry | Accept the tile, workspace, and state selected by the decoder. | [Tensor-core entry](../src/text_attention_gdn.cu#L528)<!-- prefix: "cudaError_t " --> |
+| GDN entry | Accept the tile, workspace, and state selected by the decoder. | [Tensor-core entry](../src/text_attention_gdn.cu#L537)<!-- prefix: "cudaError_t " --> |
 | GDN operator | Prepare rows, update FP32 recurrent state, and finish BF16 output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L462)<!-- prefix: "cudaError_t " --> |
 | Verification | Compare state, history, and output with the original CUDA path and the independent CPU oracle. | [Segmented probe](../tests/decoder/gdn_check.cu#L516)<!-- prefix: "int main([[m" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L99)<!-- prefix: "int main(int" --> |
 

@@ -9,7 +9,7 @@ token selection run eagerly. Serial target-only decoding uses a CUDA graph by de
 The reusable runtime API is in
 [`include/sglang/decoder.h`](include/sglang/decoder.h#L102)<!-- prefix: "class Decode" -->.
 The batch scheduler options are in
-[`DecoderBatchOptions`](include/sglang/decoder_batch.h#L46)<!-- prefix: "struct Decod" -->.
+[`DecoderBatchOptions`](include/sglang/decoder_batch.h#L47)<!-- prefix: "struct Decod" -->.
 The paged KV-cache and causal grouped-query attention API is in
 [`include/sglang/mxfp8_gqa.h`](include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " -->.
 The CUDA cache and public attention implementation is in
@@ -198,7 +198,10 @@ Use `--mtp-steps 1` through `--mtp-steps 4` for unconstrained greedy and sampled
 MTP supports `--max-active` values from `1` through `32`.
 `--mtp-k` is an alias for `--mtp-steps`. Batched requests share target projections
 within groups of up to four requests and commit their outputs independently.
-Steps that execute MTP work run eagerly, including when `--batch-cuda-graphs` is set.
+With `--batch-cuda-graphs`, a text-only K1 group of one request can replay
+two target verification rows when both positions are below 5,120. The first
+eligible round runs eagerly. Draft, acceptance, sampling, and commit still
+run outside the graph. Other MTP verification shapes run eagerly.
 All groups in a step share the same target-row budget. SSE events and usage fields
 follow the same contract at every depth.
 
@@ -225,7 +228,8 @@ Add `--trace-batches` to log `batch width=… decode=… request_bytes=…` on s
 In serial mode the trace describes token-producing steps and reports zero batch request
 bytes. In batch mode `request_bytes` counts live allocations owned by the batch executor.
 The `batch target_rows=… step_budget=…` line records the charged work for the batch step.
-When a batch graph replays, `batch graph_slots=…` gives the bit mask of replayed slots.
+`batch graph_slots=…` gives the bit mask of slots replayed by K0 decode graphs.
+`DecoderBatchStepStats::verification_graph_slots` gives the K1 verifier replay mask.
 When the batch allocates sampling scratch, `sampling_workspace_bytes=…` reports its size.
 
 `Decoder::generate` accepts optional callbacks. `on_token` receives each selected ID

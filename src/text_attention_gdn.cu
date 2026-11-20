@@ -496,6 +496,19 @@ cudaError_t convolve(int token_count, GdnInputs rows, TextGdnWeights weights, St
                             dim3(conv_threads), args, 0, stream);
 }
 
+template <typename State>
+cudaError_t enqueue_gdn(int token_count, TextGdnMode mode, GdnInputs rows,
+                         const __nv_bfloat16* z, TextGdnWeights weights, State initial,
+                         State final, __nv_bfloat16* observable, __nv_bfloat16* output,
+                         cudaStream_t stream) {
+    const auto status = convolve(token_count, rows, weights, initial, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    return recur_and_finish<true>(token_count, mode, rows, z, weights, initial, final,
+                                  observable, output, stream);
+}
+
 cudaError_t convolve_and_advance(int token_count, TextGdnMode mode, GdnInputs rows,
                                   const __nv_bfloat16* z, TextGdnWeights weights,
                                   TextGdnState initial, TextGdnState final,
@@ -507,12 +520,8 @@ cudaError_t convolve_and_advance(int token_count, TextGdnMode mode, GdnInputs ro
         !initial.history || !initial.recurrent || !observable || !output) {
         return cudaErrorInvalidValue;
     }
-    const auto status = convolve(token_count, rows, weights, initial, stream);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    return recur_and_finish<true>(token_count, mode, rows, z, weights, initial, final,
-                                  observable, output, stream);
+    return enqueue_gdn(token_count, mode, rows, z, weights, initial, final, observable, output,
+                        stream);
 }
 
 bool valid_replay(int count, TextGdnReplayRows rows, TextGdnWeights weights,
@@ -579,13 +588,18 @@ cudaError_t decoder::decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z
                                  TextGdnWeights weights, const TextGdnState* state,
                                  __nv_bfloat16* workspace, __nv_bfloat16* output,
                                  cudaStream_t stream) {
-    const GdnInputs rows{qkv, workspace, b, a};
-    const auto status = convolve(1, rows, weights, state, stream);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    return recur_and_finish<true>(1, TextGdnMode::decode, rows, z, weights, state, state,
-                                  workspace + text_gdn_qkv_width, output, stream);
+    return enqueue_gdn(1, TextGdnMode::decode, {qkv, workspace, b, a}, z, weights, state, state,
+                        workspace + text_gdn_qkv_width, output, stream);
+}
+
+cudaError_t decoder::decode_verify_gdn(int rows, TextGdnReplayRows inputs,
+                                      const __nv_bfloat16* z, TextGdnWeights weights,
+                                      const TextGdnState* initial, const TextGdnState* tail,
+                                      __nv_bfloat16* observable, __nv_bfloat16* output,
+                                      cudaStream_t stream) {
+    const GdnInputs replay{inputs.qkv, inputs.convolved, inputs.b, inputs.a};
+    return enqueue_gdn(rows, TextGdnMode::decode, replay, z, weights, initial, tail, observable,
+                        output, stream);
 }
 
 }

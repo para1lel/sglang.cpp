@@ -1,0 +1,169 @@
+--- a/include/sglang/text_ops.h
++++ b/include/sglang/text_ops.h
+@@ -71,6 +71,12 @@
+ cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_width,
+                            const TextBf16Projection* projections, int count, cudaStream_t stream);
+ 
++/// Independent GEMVs with one grid per descriptor group. Each dot product and
++/// its BF16 output follow text_bf16_gemv, including the unaligned fallback.
++cudaError_t text_bf16_gemv_batch(const __nv_bfloat16* weight, int out_width, int in_width,
++                                 const TextBf16Projection* projections, int count,
++                                 cudaStream_t stream);
++
+ /// Writes width E4M3 bytes and text_fp8_group_count(width) FP32 scales.
+ /// Each scale is max(amax, 1e-10) / 448. Quantization rounds to nearest even
+ /// and saturates to the finite E4M3 range.
+--- a/src/text_ops.cu
++++ b/src/text_ops.cu
+@@ -155,6 +155,58 @@
+                             block_threads, args, 0, stream);
+ }
+ 
++constexpr int bf16_row_pack_capacity = 32;
++using Bf16RowPack = Bf16Projections<bf16_row_pack_capacity>;
++
++template <int TileRows>
++__global__ void bf16_row_pack_kernel(const __nv_bfloat16* weight, int out_width, int in_width,
++                                    int count, const __grid_constant__ Bf16RowPack batch) {
++    const int lane = threadIdx.x % warp_width;
++    const int channel = blockIdx.x * block_warps + threadIdx.x / warp_width;
++    if (channel >= out_width) {
++        return;
++    }
++    const int first = blockIdx.y * TileRows;
++    const int active = min(TileRows, count - first);
++    const auto* row_weight = weight + static_cast<std::size_t>(channel) * in_width;
++    float first_sums[TileRows]{};
++    float second_sums[TileRows]{};
++    for (std::size_t column = lane * 8; column < static_cast<std::size_t>(in_width);
++         column += warp_width * 8) {
++        const auto lhs = load_128(row_weight + column);
++        #pragma unroll
++        for (int index = 0; index < TileRows; ++index) {
++            if (index < active) {
++                const auto rhs = load_128(batch.entries[first + index].input + column);
++                first_sums[index] = bf16x2_dot(lhs.x, rhs.x, first_sums[index]);
++                second_sums[index] = bf16x2_dot(lhs.y, rhs.y, second_sums[index]);
++                first_sums[index] = bf16x2_dot(lhs.z, rhs.z, first_sums[index]);
++                second_sums[index] = bf16x2_dot(lhs.w, rhs.w, second_sums[index]);
++            }
++        }
++    }
++    #pragma unroll
++    for (int index = 0; index < TileRows; ++index) {
++        if (index < active) {
++            const float sum = warp_sum(first_sums[index] + second_sums[index]);
++            if (lane == 0) {
++                batch.entries[first + index].output[channel] = __float2bfloat16_rn(sum);
++            }
++        }
++    }
++}
++
++template <int TileRows>
++cudaError_t launch_bf16_row_pack(const __nv_bfloat16* weight, int out_width, int in_width,
++                                const TextBf16Projection* rows, int count, cudaStream_t stream) {
++    Bf16RowPack batch{};
++    std::copy_n(rows, count, batch.entries);
++    void* parameters[] = {&weight, &out_width, &in_width, &count, &batch};
++    const dim3 grid(divide_up(out_width, block_warps), divide_up(count, TileRows));
++    return cudaLaunchKernel(bf16_row_pack_kernel<TileRows>, grid, block_threads,
++                            parameters, 0, stream);
++}
++
+ __device__ __nv_bfloat16 swiglu(__nv_bfloat16 gate, __nv_bfloat16 up) {
+     const float value = __bfloat162float(gate);
+     const auto activated = __float2bfloat16_rn(value / (1.0f + expf(-value)));
+@@ -639,6 +691,42 @@
+     }
+     return cudaSuccess;
+ }
++
++cudaError_t text_bf16_gemv_batch(const __nv_bfloat16* weight, int out_width,
++                                 int in_width, const TextBf16Projection* rows, int count,
++                                 cudaStream_t stream) {
++    if (!weight || !rows || out_width <= 0 || in_width <= 0 || count <= 0) {
++        return cudaErrorInvalidValue;
++    }
++    bool packed = in_width % 8 == 0 && aligned(weight, 16);
++    for (int i = 0; i < count; ++i) {
++        if (!rows[i].input || !rows[i].output) {
++            return cudaErrorInvalidValue;
++        }
++        packed = packed && aligned(rows[i].input, 16);
++    }
++    if (!packed) {
++        for (int i = 0; i < count; ++i) {
++            const auto status = text_bf16_gemv(weight, rows[i].input, out_width, in_width,
++                                              rows[i].output, stream);
++            if (status != cudaSuccess) {
++                return status;
++            }
++        }
++        return cudaSuccess;
++    }
++    while (count > 0) {
++        const int batch = std::min(count, bf16_row_pack_capacity);
++        const auto status = launch_bf16_row_pack<1>(weight, out_width, in_width, rows,
++                                                    batch, stream);
++        if (status != cudaSuccess) {
++            return status;
++        }
++        rows += batch;
++        count -= batch;
++    }
++    return cudaSuccess;
++}
+ 
+ cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
+                              cudaStream_t stream) {
+--- a/src/decoder_forward.cpp
++++ b/src/decoder_forward.cpp
+@@ -126,10 +126,38 @@
+ }
+ 
+ template <typename Lane>
++bool project_decode_gdn_gates(const GdnLayer& layer, const LayerBatch<Lane>& batch) {
++    if (batch.count <= 1 || batch.count > decoder_batch_max_lanes) {
++        return false;
++    }
++    if constexpr (!std::is_same_v<Lane, BatchGraphLane>) {
++        for (int index = 0; index < batch.count; ++index) {
++            if (batch.lanes[index].mode != TextGdnMode::decode) {
++                return false;
++            }
++        }
++    }
++    std::array<TextBf16Projection, decoder_batch_max_lanes> projections;
++    const auto project_gate = [&](Bf16Weight weight, Bf16* Workspace::*output) {
++        for (int index = 0; index < batch.count; ++index) {
++            const auto& work = workspace(batch.lanes[index]);
++            projections[index] = {work.normalized, work.*output};
++        }
++        check(text_bf16_gemv_batch(weight.values, weight.rows, weight.columns,
++                                    projections.data(), batch.count, batch.stream),
++              "Run batched Gated DeltaNet gate projection");
++    };
++    project_gate(layer.b, &Workspace::gdn_b);
++    project_gate(layer.a, &Workspace::gdn_a);
++    return true;
++}
++
++template <typename Lane>
+ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_index) {
+     batch.quantize(&Workspace::normalized, hidden_size);
+     batch.project(layer.qkv, &Workspace::gdn_qkv);
+     batch.project(layer.z, &Workspace::gdn_z);
++    const bool projected_gates = project_decode_gdn_gates(layer, batch);
+     batch.each([&](const Lane& lane, Workspace& work) {
+         const auto stream = batch.stream;
+         if (batch.single_decode() && layer.b.rows == layer.a.rows &&
+@@ -137,7 +165,7 @@
+             check(decode_bf16_gdn_gates(layer.b.values, layer.a.values, work.normalized,
+                                         layer.b.rows, layer.b.columns, work.gdn_b, work.gdn_a,
+                                         stream), "Run decode Gated DeltaNet gate projections");
+-        } else {
++        } else if (!projected_gates) {
+             project(layer.b, work.normalized, work.gdn_b, stream);
+             project(layer.a, work.normalized, work.gdn_a, stream);
+         }

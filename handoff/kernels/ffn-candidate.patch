@@ -1,0 +1,344 @@
+--- a/src/decoder_forward.cpp
++++ b/src/decoder_forward.cpp
+@@ -1,4 +1,7 @@
+ #include "sglang/decoder_internal.h"
++
++#include "ffn_rows.h"
++#include "gate_up.cuh"
+ 
+ #include "sglang/decoder_batch.h"
+ #include "sglang/decoder_cuda.cuh"
+@@ -370,8 +373,60 @@
+ }
+ 
+ template <typename Lane>
++void project_gate_up(const Layer& layer, const LayerBatch<Lane>& batch) {
++#ifdef SGLANG_EXPERIMENT_FFN_PAIR
++    const auto gate = layer.mlp_gate;
++    const auto up = layer.mlp_up;
++    const GateUpWeights weights{gate.values, gate.scales, up.values, up.scales};
++    for (int first = 0, group = 0; first < batch.count; ++group) {
++        const int rows = batch.projection_rows(group);
++        std::array<GateUpRow, text_fp8_max_batch> pair_rows;
++        std::array<TextFp8Projection, text_fp8_max_batch> gate_rows;
++        std::array<TextFp8Projection, text_fp8_max_batch> up_rows;
++        for (int index = 0; index < rows; ++index) {
++            const auto& work = workspace(batch.lanes[first + index]);
++            const TextFp8ActivationView activation{work.activation.values, work.activation.scales};
++            pair_rows[index] = {activation, work.mlp_gate, work.mlp_up};
++            gate_rows[index] = {activation, work.mlp_gate};
++            up_rows[index] = {activation, work.mlp_up};
++        }
++        std::optional<cudaError_t> paired;
++        if (gate.rows == up.rows && gate.columns == up.columns) {
++            paired = try_gate_up_pair(weights, gate.rows, gate.columns, pair_rows.data(), rows,
++                                      false, batch.stream);
++        }
++        if (paired) {
++            check(*paired, "Run paired gate and up projections");
++        } else {
++            check(text_fp8_gemm(gate.values, gate.scales, gate.rows, gate.columns,
++                                gate_rows.data(), rows, batch.stream), "Run gate projection");
++            check(text_fp8_gemm(up.values, up.scales, up.rows, up.columns,
++                                up_rows.data(), rows, batch.stream), "Run up projection");
++        }
++        first += rows;
++    }
++#else
++    batch.project(layer.mlp_gate, &Workspace::mlp_gate);
++    batch.project(layer.mlp_up, &Workspace::mlp_up);
++#endif
++}
++
++template <typename Lane>
+ void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
+     batch.quantize(&Workspace::normalized, hidden_size);
++    if (batch.count > 1) {
++        static_assert(swiglu_fp8_max_rows >= decoder_batch_max_lanes);
++        project_gate_up(layer, batch);
++        std::array<SwigluFp8Row, swiglu_fp8_max_rows> rows;
++        for (int index = 0; index < batch.count; ++index) {
++            const auto& work = workspace(batch.lanes[index]);
++            rows[index] = {work.mlp_gate, work.mlp_up, work.activation};
++        }
++        check(swiglu_fp8_rows(rows.data(), batch.count, intermediate_size, batch.stream),
++              "Apply batched SwiGLU and FP8 quantization");
++        batch.project(layer.mlp_down, &Workspace::hidden);
++        return;
++    }
+     if (batch.single_decode() && layer.mlp_gate.columns == hidden_size &&
+         layer.mlp_up.columns == hidden_size) {
+         const auto& work = workspace(batch.lanes[0]);
+--- a/src/text_ops.cu
++++ b/src/text_ops.cu
+@@ -1,4 +1,7 @@
+ #include "sglang/text_ops.h"
++
++#include "ffn_rows.h"
++#include "gate_up.cuh"
+ 
+ #include "sglang/decoder_cuda.cuh"
+ 
+@@ -161,21 +164,13 @@
+     return __float2bfloat16_rn(__bfloat162float(activated) * __bfloat162float(up));
+ }
+ 
+-template <bool Batched, bool ApplySwiglu = false>
+-__global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
+-                                    TextFp8Activation output, const __nv_bfloat16* up) {
++template <bool ApplySwiglu>
++__device__ __forceinline__ void quantize_fp8_row(const __nv_bfloat16* input, int width,
++                                                 TextFp8Activation output,
++                                                 const __nv_bfloat16* up) {
+     constexpr int group_warps = text_fp8_group_size / warp_width;
+     __shared__ float warp_maxima[group_warps];
+     __shared__ float reciprocal_scale;
+-    if constexpr (Batched) {
+-        const auto offset = static_cast<std::size_t>(blockIdx.y) * width;
+-        input += offset;
+-        if constexpr (ApplySwiglu) {
+-            up += offset;
+-        }
+-        output.values += offset;
+-        output.scales += static_cast<std::size_t>(blockIdx.y) * gridDim.x;
+-    }
+     const int lane = threadIdx.x % warp_width;
+     const int warp = threadIdx.x / warp_width;
+     const auto col = static_cast<std::size_t>(blockIdx.x) * text_fp8_group_size + threadIdx.x;
+@@ -204,6 +199,43 @@
+         output.values[col] = __nv_cvt_float_to_fp8(value * reciprocal_scale, __NV_SATFINITE,
+                                                    __NV_E4M3);
+     }
++}
++
++template <bool Batched, bool ApplySwiglu = false>
++__global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
++                                    TextFp8Activation output, const __nv_bfloat16* up) {
++    if constexpr (Batched) {
++        const auto offset = static_cast<std::size_t>(blockIdx.y) * width;
++        input += offset;
++        if constexpr (ApplySwiglu) {
++            up += offset;
++        }
++        output.values += offset;
++        output.scales += static_cast<std::size_t>(blockIdx.y) * gridDim.x;
++    }
++    quantize_fp8_row<ApplySwiglu>(input, width, output, up);
++}
++
++template <int Capacity>
++struct SwigluFp8Rows {
++    SwigluFp8Row entries[Capacity];
++};
++
++template <int Capacity>
++__global__ void swiglu_fp8_rows_kernel(int width, SwigluFp8Rows<Capacity> rows) {
++    const auto row = rows.entries[blockIdx.y];
++    quantize_fp8_row<true>(row.gate, width, row.output, row.up);
++}
++
++template <int Capacity>
++cudaError_t launch_swiglu_fp8_rows(const SwigluFp8Row* rows, int count, int width,
++                                    cudaStream_t stream) {
++    SwigluFp8Rows<Capacity> batch{};
++    std::copy_n(rows, count, batch.entries);
++    void* args[]{&width, &batch};
++    const dim3 grid(text_fp8_group_count(width), count);
++    return cudaLaunchKernel(swiglu_fp8_rows_kernel<Capacity>, grid, text_fp8_group_size,
++                            args, 0, stream);
+ }
+ 
+ __device__ float decode_fp8(std::uint8_t bits) {
+@@ -393,6 +425,8 @@
+     return low + high;
+ }
+ 
++#include "gate_up_impl.cuh"
++
+ template <int Count>
+ __global__ void fp8_prefill_tile_kernel(const std::uint8_t* weight,
+                                         const __nv_bfloat16* weight_scales,
+@@ -662,6 +696,26 @@
+                             text_fp8_group_size, args, 0, stream);
+ }
+ 
++cudaError_t swiglu_fp8_rows(const SwigluFp8Row* rows, int count, int width,
++                           cudaStream_t stream) {
++    if (!rows || count < 1 || count > swiglu_fp8_max_rows || width <= 0) {
++        return cudaErrorInvalidValue;
++    }
++    for (int index = 0; index < count; ++index) {
++        const auto& row = rows[index];
++        if (!row.gate || !row.up || !row.output.values || !row.output.scales) {
++            return cudaErrorInvalidValue;
++        }
++    }
++    if (count <= 4) {
++        return launch_swiglu_fp8_rows<4>(rows, count, width, stream);
++    }
++    if (count <= 16) {
++        return launch_swiglu_fp8_rows<16>(rows, count, width, stream);
++    }
++    return launch_swiglu_fp8_rows<swiglu_fp8_max_rows>(rows, count, width, stream);
++}
++
+ cudaError_t decoder::tensor_core_prefill_swiglu_quantize(
+     const __nv_bfloat16* gate, const __nv_bfloat16* up, int width, int rows,
+     TextFp8Activation activation, cudaStream_t stream) {
+@@ -725,6 +779,35 @@
+         }
+     }
+     return cudaSuccess;
++}
++
++std::optional<cudaError_t> try_gate_up_pair(GateUpWeights weights, int n, int k,
++                                          const GateUpRow* rows, int count, bool fuse_epilogue,
++                                          cudaStream_t stream) {
++    if (n <= 0 || k <= 0 || !rows || count < 2 || count > text_fp8_max_batch ||
++        !weights.gate_values || !weights.up_values || !weights.gate_scales ||
++        !weights.up_scales || !aligned(weights.gate_scales, alignof(__nv_bfloat16)) ||
++        !aligned(weights.up_scales, alignof(__nv_bfloat16))) {
++        return std::nullopt;
++    }
++    for (int index = 0; index < count; ++index) {
++        const auto& row = rows[index];
++        if (!row.input.values || !row.input.scales || !row.gate ||
++            (!fuse_epilogue && !row.up) || !aligned(row.input.scales, alignof(float)) ||
++            !aligned(row.gate, alignof(__nv_bfloat16)) ||
++            (!fuse_epilogue && !aligned(row.up, alignof(__nv_bfloat16))) ||
++            !supports_wide_fp8(weights.gate_values, row.input, k) ||
++            !supports_wide_fp8(weights.up_values, row.input, k)) {
++            return std::nullopt;
++        }
++    }
++    switch (count) {
++    case 2: return launch_gate_up_pair<2>(weights, n, k, rows, fuse_epilogue, stream);
++    case 3: return launch_gate_up_pair<3>(weights, n, k, rows, fuse_epilogue, stream);
++    case 4: return launch_gate_up_pair<4>(weights, n, k, rows, fuse_epilogue, stream);
++    case 5: return launch_gate_up_pair<5>(weights, n, k, rows, fuse_epilogue, stream);
++    }
++    return std::nullopt;
+ }
+ 
+ cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+--- /dev/null
++++ b/src/ffn_rows.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "sglang/text_ops.h"
++
++namespace sglang {
++
++inline constexpr int swiglu_fp8_max_rows = 32;
++
++struct SwigluFp8Row {
++    const __nv_bfloat16* gate;
++    const __nv_bfloat16* up;
++    TextFp8Activation output;
++};
++
++// Descriptors are copied at launch. Their device spans are disjoint and belong to the caller.
++cudaError_t swiglu_fp8_rows(const SwigluFp8Row* rows, int count, int width,
++                           cudaStream_t stream);
++
++}  // namespace sglang
+--- /dev/null
++++ b/src/gate_up.cuh
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include "sglang/text_ops.h"
++
++#include <optional>
++
++namespace sglang {
++
++struct GateUpWeights {
++    const std::uint8_t* gate_values;
++    const __nv_bfloat16* gate_scales;
++    const std::uint8_t* up_values;
++    const __nv_bfloat16* up_scales;
++};
++
++struct GateUpRow {
++    TextFp8ActivationView input;
++    __nv_bfloat16* gate;
++    __nv_bfloat16* up;
++};
++
++// Disjoint device spans and the same validity contract as text_fp8_gemm.
++// With fuse_epilogue, gate holds the BF16 SwiGLU result and up stays untouched.
++// Nullopt denotes shape or alignment ineligibility. Neither route has been launched then.
++std::optional<cudaError_t> try_gate_up_pair(GateUpWeights weights, int n, int k,
++                                          const GateUpRow* rows, int count, bool fuse_epilogue,
++                                          cudaStream_t stream);
++
++}  // namespace sglang
+--- /dev/null
++++ b/src/gate_up_impl.cuh
+@@ -0,0 +1,64 @@
++template <int Count>
++struct GateUpRows {
++    GateUpRow entries[Count];
++};
++
++template <int Count>
++__global__ void gate_up_pair_kernel(GateUpWeights weights, int n, int k, int groups,
++                                    GateUpRows<Count> rows, bool fuse_epilogue) {
++    const int lane = threadIdx.x % warp_width;
++    const int row = blockIdx.x * fp8_packed_warps + threadIdx.x / warp_width;
++    if (row >= n) {
++        return;
++    }
++    const auto row_offset = static_cast<std::size_t>(row) * k;
++    const int lane_group = lane / (warp_width / fp8_groups_per_warp);
++    const auto scale_offset = static_cast<std::size_t>(row / text_fp8_group_size) * groups +
++                              lane_group;
++    float gate_sums[Count]{};
++    float up_sums[Count]{};
++    for (int group = 0; group < groups; group += fp8_groups_per_warp) {
++        const auto col = static_cast<std::size_t>(group) * text_fp8_group_size +
++                         lane * fp8_pack_bytes;
++        const auto gate_weight = load_fp8_weight(weights.gate_values + row_offset + col);
++        const auto up_weight = load_fp8_weight(weights.up_values + row_offset + col);
++        const float gate_scale = __bfloat162float(weights.gate_scales[scale_offset + group]);
++        const float up_scale = __bfloat162float(weights.up_scales[scale_offset + group]);
++#pragma unroll
++        for (int index = 0; index < Count; ++index) {
++            const auto input = rows.entries[index].input;
++            const auto rhs = load_128(input.values + col);
++            const float scale = input.scales[group + lane_group];
++            gate_sums[index] = fmaf(fp8_pack_dot(gate_weight, rhs) * scale, gate_scale,
++                                   gate_sums[index]);
++            up_sums[index] = fmaf(fp8_pack_dot(up_weight, rhs) * scale, up_scale,
++                                 up_sums[index]);
++        }
++    }
++#pragma unroll
++    for (int index = 0; index < Count; ++index) {
++        const float gate_sum = warp_sum(gate_sums[index]);
++        const float up_sum = warp_sum(up_sums[index]);
++        if (lane == 0) {
++            const auto gate = __float2bfloat16_rn(gate_sum);
++            const auto up = __float2bfloat16_rn(up_sum);
++            if (fuse_epilogue) {
++                rows.entries[index].gate[row] = swiglu(gate, up);
++            } else {
++                rows.entries[index].gate[row] = gate;
++                rows.entries[index].up[row] = up;
++            }
++        }
++    }
++}
++
++template <int Count>
++cudaError_t launch_gate_up_pair(GateUpWeights weights, int n, int k, const GateUpRow* rows,
++                                bool fuse_epilogue, cudaStream_t stream) {
++    GateUpRows<Count> batch{};
++    std::copy_n(rows, Count, batch.entries);
++    int groups = text_fp8_group_count(k);
++    void* args[]{&weights, &n, &k, &groups, &batch, &fuse_epilogue};
++    return cudaLaunchKernel(gate_up_pair_kernel<Count>, divide_up(n, fp8_packed_warps),
++                            fp8_packed_warps * warp_width, args, 0, stream);
++}

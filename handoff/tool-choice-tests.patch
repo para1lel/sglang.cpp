@@ -1,0 +1,333 @@
+diff --git a/tests/constraints/build_tool_probe.sh b/tests/constraints/build_tool_probe.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..298fc0282d6c8baee7f87419db70efecd3dabea8
+--- /dev/null
++++ b/tests/constraints/build_tool_probe.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++probe_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
++source_dir=$(realpath -- "${1:?Pass the native source directory}")
++build_dir=$(realpath -- "${2:?Pass the matching Release build directory}")
++output=$(realpath -m -- "${3:?Pass the output executable path}")
++
++sources=()
++for name in text_request chat_template chat_output chat_media chat_tool_constraints; do
++    path="$source_dir/apps/server/$name.cpp"
++    if [[ -f "$path" ]]; then
++        sources+=("$path")
++    fi
++done
++
++cuda_headers=()
++if [[ -n ${CONDA_PREFIX:-} ]]; then
++    cuda_headers=(-isystem "$CONDA_PREFIX/targets/x86_64-linux/include")
++fi
++
++"${CXX:-c++}" -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror \
++    -ffunction-sections -fdata-sections -I"$source_dir/include" "${cuda_headers[@]}" \
++    "$probe_dir/tool_probe.cpp" "${sources[@]}" "$source_dir/src/media/multimodal_prompt.cpp" \
++    "$build_dir/lib/libsglang_media_preprocess.a" "$build_dir/lib/libsglang_tokenizer.a" \
++    "$build_dir/lib/libsglang_json.a" -Wl,--gc-sections,--no-undefined -o "$output"
+diff --git a/tests/constraints/tool_mask.py b/tests/constraints/tool_mask.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1262a652d06c8dfc39087fd5012eb46d76ed6f2
+--- /dev/null
++++ b/tests/constraints/tool_mask.py
+@@ -0,0 +1,169 @@
++"""Exercise the native chat request compiler with real checkpoint token masks."""
++
++import argparse
++from dataclasses import dataclass
++import hashlib
++import json
++from pathlib import Path
++import subprocess
++
++CHECKPOINT = Path("/data0/shared/Qwen3.8-27B-FP8")
++EOS = (248044, 248046)
++REFERENCE_SHA = "97eb43d8cd7169ec2e44ace8fc9d141abbf9c3bef2cfb4fb519740913ae7c152"
++
++
++def tool(name, properties, required=(), *, strict=True):
++    return {"type": "function", "function": {"name": name, "strict": strict, "parameters": {
++        "type": "object", "properties": properties, "required": list(required),
++        "additionalProperties": False,
++    }}}
++
++
++WEATHER = tool("weather", {
++    "city": {"type": "string", "enum": ["北京", "Boston"]},
++    "days": {"type": "integer", "minimum": 1, "maximum": 4},
++    "unit": {"type": "string", "enum": ["c", "f"]},
++}, ["city"])
++PING = tool("ping", {})
++
++
++def named(name):
++    return {"type": "function", "function": {"name": name}}
++
++
++def body(mode, *, thinking=False, budget=192, **overrides):
++    tools = [WEATHER, PING]
++    if mode == "required-loose":
++        tools = [item | {"function": item["function"] | {"strict": False}} for item in tools]
++    selected = named("weather") if mode.startswith("named") else mode.split("-")[0]
++    return {"model": CHECKPOINT.name, "messages": [{"role": "user", "content": "fixture"}],
++            "tools": tools, "tool_choice": selected, "enable_thinking": thinking,
++            "max_tokens": budget, "parallel_tool_calls": mode.endswith("parallel")} | overrides
++
++
++def call(name, *parameters):
++    args = "\n".join(f"<parameter={key}>\n{value}\n</parameter>" for key, value in parameters)
++    return f"<tool_call>\n<function={name}>\n{args}\n</function>\n</tool_call>"
++
++
++@dataclass(frozen=True)
++class Case:
++    name: str
++    request: dict
++    output: str | list
++    accept: bool
++    eos: bool
++
++
++def portable_cases():
++    city = call("weather", ("city", "北京"), ("days", 3), ("unit", "c"))
++    ping = call("ping")
++    required = body("required-single")
++    parallel = body("required-parallel")
++    selected = body("named-single")
++    thinking = body("named-single", thinking=True)
++    return [
++        Case("initial", required, "", True, False),
++        Case("prose-first", required, "Here is the result", False, False),
++        Case("first-eos-text", required, [EOS[0]], False, False),
++        Case("first-eos-message", required, [EOS[1]], False, False),
++        Case("strict-valid", required, city, True, True),
++        Case("strict-empty", required, ping, True, True),
++        Case("partial", required, city[:-12], True, False),
++        Case("required-single-two-calls", required, city + ping, False, True),
++        Case("required-parallel-two-calls", parallel, city + ping, True, True),
++        Case("required-parallel-tail", parallel, city + "ordinary tail", True, True),
++        Case("named-valid", selected, city, True, True),
++        Case("named-wrong-tool", selected, ping, False, False),
++        Case("named-parallel-offers-one", body("named-parallel"), city + city, False, True),
++        Case("required-missing", required, call("weather", ("days", 3)), False, False),
++        Case("strict-unknown", required, call("weather", ("city", "Boston"),
++                                             ("other", "c")), False, False),
++        Case("strict-enum", required, call("weather", ("city", "Boston"),
++                                          ("unit", "kelvin")), False, False),
++        Case("strict-number", required, call("weather", ("city", "Boston"),
++                                             ("days", "3.5")), False, False),
++        Case("strict-bound", required, call("weather", ("city", "Boston"),
++                                            ("days", 0)), False, False),
++        Case("strict-order", required, call("weather", ("days", 3),
++                                            ("city", "Boston")), False, False),
++        Case("redundant-think-close", selected, "</think>" + city, False, False),
++        Case("explicit-think-close", thinking, "hidden</think>" + city, True, True),
++        Case("implicit-think-close", thinking, "hidden" + city, True, True),
++        Case("think-eos", thinking, "hidden", True, True),
++        Case("think-then-call-eos", thinking, "hidden</think>" + city[:-12], True, False),
++    ]
++
++
++def pinned_cases(path):
++    raw = path.read_bytes()
++    assert hashlib.sha256(raw).hexdigest() == REFERENCE_SHA
++    reference = json.loads(raw)
++    assert tuple(reference["eos_ids"]) == EOS
++    cases = [Case(f"reference-mask-{index}", body(row["mode"]), row["token_ids"],
++                  row["expected_accept"], row["expected_eos"])
++             for index, row in enumerate(reference["mask_cases"])
++             if row["mode"] in {"required-single", "required-parallel", "named-parallel"}]
++    for key, row in reference["reasoning"].items():
++        mode = key.split("/")[0]
++        cases.append(Case("reference-reasoning-" + key,
++                          body(mode, thinking=row["thinking_initially"]),
++                          [token["token"] for token in row["tokens"]],
++                          all(token["allowed"] for token in row["tokens"]),
++                          all(row["eos_allowed"].values())))
++    return cases
++
++
++def probe(binary, checkpoint, cases, out):
++    wire = "".join(json.dumps([json.dumps(case.request), case.output]) + "\n" for case in cases)
++    result = subprocess.run([binary, checkpoint], input=wire, capture_output=True, text=True,
++                            check=True, timeout=120)
++    out.mkdir()
++    (out / "requests.jsonl").write_text(wire)
++    (out / "probe.log").write_text(result.stdout)
++    received = []
++    lines = []
++    for line in result.stdout.splitlines():
++        if line == "end":
++            received.append(lines)
++            lines = []
++        else:
++            lines.append(line)
++    assert len(received) == len(cases) and not lines
++    return received
++
++
++def check(cases, received):
++    for case, result in zip(cases, received):
++        states = [list(map(int, line.split()[1:])) for line in result if line.startswith("state ")]
++        assert states, (case.name, result)
++        rejected = [line for line in result if line.startswith("rejected ")]
++        assert bool(rejected) != case.accept, (case.name, rejected)
++        assert states[-1][2:4] == [int(case.eos)] * 2, (case.name, states[-1])
++        prompt = json.loads(result[0].removeprefix("prompt "))
++        thinking = case.request["enable_thinking"]
++        suffix = "<think>\n" if thinking else "<think>\n\n</think>\n\n"
++        assert prompt.endswith("<|im_start|>assistant\n" + suffix), (case.name, prompt[-60:])
++        assert '"name": "weather"' in prompt, case.name
++        offered = '"name": "ping"' in prompt
++        assert offered == (case.request["tool_choice"] == "required"), (case.name, offered)
++    assert any(line.startswith("state ") and line.split()[2] == "1"
++               for result in received for line in result)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("probe", type=Path)
++    parser.add_argument("evidence", type=Path)
++    parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
++    parser.add_argument("--reference", type=Path)
++    args = parser.parse_args()
++    cases = portable_cases()
++    if args.reference:
++        cases += pinned_cases(args.reference)
++    check(cases, probe(args.probe, args.checkpoint, cases, args.evidence))
++    print(f"Native tool masks passed {len(cases)} cases")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/constraints/tool_probe.cpp b/tests/constraints/tool_probe.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..27d3630310b895da6d3b98c1a1fc9e600b03455b
+--- /dev/null
++++ b/tests/constraints/tool_probe.cpp
+@@ -0,0 +1,120 @@
++#include "sglang/decoder_constraint.h"
++#include "sglang/server/text_completion.h"
++
++#include <iostream>
++
++namespace {
++
++using namespace sglang;
++
++bool allowed(const ConstraintCursor& cursor, int token) {
++    return std::binary_search(cursor.ids().begin(), cursor.ids().end(), token);
++}
++
++void check_mask(const ConstraintCursor& cursor) {
++    const auto& ids = cursor.ids();
++    const auto& mask = cursor.mask();
++    if (!std::is_sorted(ids.begin(), ids.end()) ||
++        std::adjacent_find(ids.begin(), ids.end()) != ids.end() ||
++        (ids.size() > constraint_max_candidates) != !mask.empty()) {
++        throw std::logic_error("Invalid candidate representation");
++    }
++    if (!mask.empty()) {
++        std::vector<std::uint32_t> expected(constraint_mask_words);
++        for (const auto id : ids) {
++            expected.at(id / 32) |= std::uint32_t{1} << (id % 32);
++        }
++        if (mask != expected) {
++            throw std::logic_error("Dense mask differs from the allowed token IDs");
++        }
++    }
++}
++
++void print_state(const ConstraintCursor& cursor, bool terminal) {
++    std::cout << "state " << cursor.ids().size() << ' ' << !cursor.mask().empty() << ' '
++              << allowed(cursor, end_of_text) << ' ' << allowed(cursor, end_of_message) << ' '
++              << terminal << '\n';
++}
++
++void walk(const TokenConstraint& constraint, const json::Array& tokens, int remaining) {
++    ConstraintCursor live, draft;
++    bool terminal = false;
++    std::cout << "minimum " << constraint.minimum_tokens() << '\n';
++    for (const auto& value : tokens) {
++        const auto token = value.unsigned_integer().value_or(model_vocab_size);
++        if (token >= model_vocab_size) {
++            throw std::invalid_argument("Expected a checkpoint token ID");
++        }
++        live.candidates(constraint, remaining);
++        check_mask(live);
++        print_state(live, terminal);
++        if (!allowed(live, token) || remaining == 0 || terminal) {
++            std::cout << "rejected " << token << '\n';
++            return;
++        }
++        draft.reset_to(live);
++        terminal = draft.commit(constraint, token, remaining - 1);
++        live.candidates(constraint, remaining);
++        if (!allowed(live, token)) {
++            throw std::logic_error("Trial commit changed the live cursor");
++        }
++        --remaining;
++        if (live.commit(constraint, token, remaining) != terminal) {
++            throw std::logic_error("Live and trial commits returned different stop decisions");
++        }
++        std::cout << "accepted " << token << '\n';
++    }
++    live.candidates(constraint, remaining);
++    check_mask(live);
++    print_state(live, terminal);
++}
++
++void probe(const server::CompletionTokenizer& tokenizer, std::string_view input) {
++    const auto parsed = json::parse(input);
++    const auto* values = parsed.array();
++    if (!values || values->size() != 2 || !values->at(0).string()) {
++        throw std::invalid_argument("Expected a request body string and output text or token IDs");
++    }
++    const auto request = server::parse_chat_request(*values->at(0).string(), tokenizer);
++    const auto& output = values->at(1);
++    json::Array encoded;
++    if (const auto text = output.string()) {
++        for (const auto token : tokenizer.get().encode(*text)) {
++            encoded.emplace_back(static_cast<int>(token));
++        }
++    } else if (const auto* ids = output.array()) {
++        encoded = *ids;
++    } else {
++        throw std::invalid_argument("Expected output text or token IDs");
++    }
++    std::string prompt, quoted;
++    for (const auto token : request.prompt) {
++        prompt += tokenizer.get().piece(token);
++    }
++    json::append_quoted(quoted, prompt);
++    std::cout << "prompt " << quoted << '\n';
++    if (const auto& constraint = request.options.constraint) {
++        walk(*constraint, encoded, request.options.max_new_tokens);
++    } else {
++        std::cout << "unconstrained\n";
++    }
++}
++
++}
++
++int main(int argc, char** argv) {
++    if (argc != 2) {
++        std::cerr << "Usage: tool_probe CHECKPOINT\n";
++        return 64;
++    }
++    const server::CompletionTokenizer tokenizer(argv[1], server::SamplingDefaults::model,
++                                                {true, true});
++    for (std::string line; std::getline(std::cin, line);) {
++        try {
++            probe(tokenizer, line);
++        } catch (const std::invalid_argument& error) {
++            std::cout << "invalid " << error.what() << '\n';
++        }
++        std::cout << "end\n";
++    }
++}

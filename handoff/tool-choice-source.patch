@@ -1,0 +1,695 @@
+diff --git a/apps/server/chat_template.cpp b/apps/server/chat_template.cpp
+index 6530c25..57bab7a 100644
+--- a/apps/server/chat_template.cpp
++++ b/apps/server/chat_template.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <charconv>
+ #include <fstream>
++#include <set>
+ 
+ namespace sglang::server {
+ namespace {
+@@ -349,7 +350,8 @@ std::vector<Turn> read_turns(const OrderedObject& chat) {
+         if (!role) {
+             throw std::invalid_argument("Expected a message object with a string role");
+         }
+-        turns.push_back({*role, *message});
++        const bool instruction = *role == "root" || *role == "developer";
++        turns.push_back({instruction ? "system"sv : *role, *message});
+     }
+     return turns;
+ }
+@@ -418,22 +420,98 @@ ChatTemplate::ChatTemplate(const std::filesystem::path& checkpoint) {
+     tools_instructions_ = checkpoint_literal(source, "'\\n\\nIf you choose to call");
+ }
+ 
+-const json::Value* chat_tools(const json::OrderedObject& chat) {
+-    const auto* tools = get(chat, "tools");
+-    if (tools && !tools->is_null() && !tools->array()) {
+-        throw std::invalid_argument("Expected an array of tool schemas");
++namespace {
++
++const Value* field(const Value& value, std::string_view key) {
++    const auto* object = value.ordered_object();
++    return object ? get(*object, key) : nullptr;
++}
++
++void collect_tools(json::Array& output, const Value* value) {
++    if (!value || value->is_null()) return;
++    const auto* tools = value->array();
++    if (!tools) throw std::invalid_argument("Expected an array of tool schemas");
++    output.insert(output.end(), tools->begin(), tools->end());
++}
++
++void collect_message_tools(json::Array& output, const OrderedObject& chat) {
++    const auto* list = get(chat, "messages");
++    if (!list || !list->array()) return;
++    for (const auto& message : *list->array()) {
++        const auto* tools = field(message, "tools");
++        if (!tools || tools->is_null()) continue;
++        const auto* role = field(message, "role");
++        if (role && (role->string() == "system" || role->string() == "developer" ||
++                     role->string() == "root")) {
++            collect_tools(output, tools);
++        } else if (!tools->array() || !tools->array()->empty()) {
++            throw std::invalid_argument("Message tools require a privileged instruction role");
++        }
+     }
+-    const auto* choice = get(chat, "tool_choice");
+-    if (!choice || choice->is_null() || choice->string() == "auto") {
+-        return tools;
++}
++
++ChatToolChoice read_tool_choice(const Value* selector, std::string_view& selected) {
++    if (!selector || selector->is_null() || selector->string() == "auto") {
++        return ChatToolChoice::automatic;
++    }
++    if (selector->string() == "none") return ChatToolChoice::none;
++    if (selector->string() == "required") return ChatToolChoice::required;
++    const auto* type = field(*selector, "type");
++    const auto* function = field(*selector, "function");
++    const auto* name = function ? field(*function, "name") : nullptr;
++    if (!type || type->string() != "function" || !name || !name->string() ||
++        name->string()->empty()) {
++        throw std::invalid_argument("Unsupported tool_choice. Expected auto, none, required, "
++                                    "or a named function.");
++    }
++    selected = *name->string();
++    return ChatToolChoice::named;
++}
++
++}
++
++ChatTools chat_tools(const OrderedObject& chat) {
++    ChatTools output;
++    std::string_view selected;
++    output.choice = read_tool_choice(get(chat, "tool_choice"), selected);
++    if (const auto* parallel = get(chat, "parallel_tool_calls")) {
++        if (!parallel->boolean()) throw std::invalid_argument("Expected boolean parallel_tool_calls");
++        output.parallel = *parallel->boolean();
++    }
++    json::Array effective;
++    collect_tools(effective, get(chat, "tools"));
++    collect_message_tools(effective, chat);
++    if (output.choice == ChatToolChoice::none) return output;
++    std::set<std::string> names;
++    for (auto& tool : effective) {
++        const auto* type = field(tool, "type");
++        const auto* function = field(tool, "function");
++        const auto* value = function ? field(*function, "name") : nullptr;
++        const auto name = value ? value->string().value_or("") : ""sv;
++        if (!type || type->string() != "function" || name.empty() || name.size() > 64 ||
++            name.find_first_of("<>\r\n") != name.npos || !names.emplace(name).second) {
++            throw std::invalid_argument("Expected unique function tools with valid names");
++        }
++        if (output.choice == ChatToolChoice::named && name != selected) continue;
++        const auto* strict = field(*function, "strict");
++        if (strict && !strict->is_null()) {
++            if (!strict->boolean()) throw std::invalid_argument("Expected boolean function.strict");
++            output.strict |= *strict->boolean();
++        }
++        output.tools.push_back(std::move(tool));
+     }
+-    if (choice->string() == "none") {
+-        return nullptr;
++    if (output.forced() && output.tools.empty()) {
++        throw std::invalid_argument("Required or named tool_choice needs an advertised function");
+     }
+-    throw std::invalid_argument("Unsupported tool_choice. Expected auto, none, or null.");
++    return output;
+ }
+ 
+ std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) const {
++    return render(chat, input, chat_tools(chat));
++}
++
++std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input,
++                                 const ChatTools& selection) const {
+     auto turns = read_turns(chat);
+     const bool thinking = boolean(chat, "enable_thinking", true);
+     const bool preserve = boolean(chat, "preserve_thinking", true);
+@@ -453,11 +531,10 @@ std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) con
+                 "Unexpected reasoning effort. Expected xhigh, medium or low.");
+         }
+     }
+-    const auto* value = chat_tools(chat);
+-    const auto* tools = value ? value->array() : nullptr;
++    const auto& tools = selection.tools;
+     const auto system = turns.front().role == "system"
+         ? render_content(turns.front().message, vision, false, true, input) : std::string();
+-    const bool has_tools = tools && !tools->empty();
++    const bool has_tools = !tools.empty();
+     if (!instructions.empty() || has_tools || !system.empty()) {
+         output += "<|im_start|>system\n";
+         output += instructions;
+@@ -466,7 +543,7 @@ std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) con
+         }
+         if (has_tools) {
+             output += tools_intro_;
+-            for (const auto& tool : *tools) {
++            for (const auto& tool : tools) {
+                 if (!tool.ordered_object()) {
+                     throw std::invalid_argument("Expected a tool schema object");
+                 }
+diff --git a/include/sglang/decoder_constraint.h b/include/sglang/decoder_constraint.h
+index f1f9f3f..2ba94d8 100644
+--- a/include/sglang/decoder_constraint.h
++++ b/include/sglang/decoder_constraint.h
+@@ -16,6 +16,9 @@ inline constexpr int constraint_max_candidates = 4096;
+ inline constexpr int constraint_mask_words = (model_vocab_size + 31) / 32;
+ 
+ class ConstraintCursor;
++namespace tokenizer::regex { struct State; }
++
++enum class TriggeredConstraintMode { optional, required, single };
+ 
+ class TokenConstraint {
+ public:
+@@ -25,7 +28,11 @@ public:
+                                                                 std::string_view pattern);
+     static std::shared_ptr<const TokenConstraint> compile_json_schema(
+         const Tokenizer& tokenizer, const json::Value& schema);
++    static std::shared_ptr<const TokenConstraint> compile_triggered(
++        const Tokenizer& tokenizer, std::string_view continuation, std::string_view trigger,
++        TriggeredConstraintMode mode, bool parallel, std::string_view prelude_end);
+     int minimum_tokens() const { return nodes_.front().minimum; }
++    bool is_triggered() const { return kind_ == Kind::triggered; }
+     bool uses_wide_mask() const { return uses_wide_mask_; }
+     bool is_regex() const { return kind_ == Kind::regex; }
+     const char* budget_error() const {
+@@ -33,6 +40,7 @@ public:
+             case Kind::regex: return "max_tokens is too small to complete the regex";
+             case Kind::json_schema: return "max_tokens is too small to complete the JSON Schema";
+             case Kind::ebnf: return "max_tokens is too small to complete an ebnf choice";
++            case Kind::triggered: return "max_tokens is too small to complete a tool call";
+         }
+         throw std::logic_error("Unknown output constraint");
+     }
+@@ -40,7 +48,7 @@ public:
+ private:
+     friend class ConstraintCursor;
+ 
+-    enum class Kind { ebnf, regex, json_schema };
++    enum class Kind { ebnf, regex, json_schema, triggered };
+ 
+     struct Edge {
+         TokenId token;
+@@ -55,6 +63,8 @@ private:
+     TokenConstraint() = default;
+     static std::shared_ptr<const TokenConstraint> compile_regular(
+         const Tokenizer& tokenizer, std::string_view pattern, Kind kind);
++    static std::shared_ptr<const TokenConstraint> compile_states(
++        const Tokenizer& tokenizer, const std::vector<tokenizer::regex::State>& states, Kind kind);
+     std::vector<Node> nodes_{1};
+     bool uses_wide_mask_ = false;
+     Kind kind_ = Kind::ebnf;
+@@ -107,7 +117,8 @@ public:
+         }
+         node_ = edge->next;
+         const auto& next = constraint.nodes_[node_];
+-        return next.accepting && (remaining == 0 || next.edges.empty());
++        return !constraint.is_triggered() && next.accepting &&
++               (remaining == 0 || next.edges.empty());
+     }
+ 
+ private:
+diff --git a/include/sglang/server/chat_template.h b/include/sglang/server/chat_template.h
+index 6024ee7..0407211 100644
+--- a/include/sglang/server/chat_template.h
++++ b/include/sglang/server/chat_template.h
+@@ -8,12 +8,27 @@ namespace sglang::server {
+ 
+ enum class ChatInput { checkpoint_template, http };
+ 
+-const json::Value* chat_tools(const json::OrderedObject& chat);
++enum class ChatToolChoice { none, automatic, required, named };
++
++struct ChatTools {
++    json::Array tools;
++    ChatToolChoice choice = ChatToolChoice::automatic;
++    bool parallel = true;
++    bool strict = false;
++
++    bool forced() const {
++        return choice == ChatToolChoice::required || choice == ChatToolChoice::named;
++    }
++};
++
++ChatTools chat_tools(const json::OrderedObject& chat);
+ 
+ class ChatTemplate {
+ public:
+     explicit ChatTemplate(const std::filesystem::path& checkpoint);
+     std::string render(const json::OrderedObject& chat, ChatInput input) const;
++    std::string render(const json::OrderedObject& chat, ChatInput input,
++                       const ChatTools& selection) const;
+ 
+ private:
+     std::string xhigh_;
+diff --git a/src/tokenizer/json_schema.cpp b/src/tokenizer/json_schema.cpp
+index a94c15c..72a5e87 100644
+--- a/src/tokenizer/json_schema.cpp
++++ b/src/tokenizer/json_schema.cpp
+@@ -1,6 +1,6 @@
+ #include "sglang/decoder_constraint.h"
+ 
+-#include "sglang/json.h"
++#include "sglang/tokenizer/json_schema_pattern.h"
+ 
+ #include <algorithm>
+ #include <iterator>
+@@ -28,7 +28,9 @@ void append_pattern(std::string& output, std::string_view input) {
+     output += input;
+ }
+ 
+-std::string literal(std::string_view value) {
++}
++
++std::string tokenizer::regex_literal(std::string_view value) {
+     std::string pattern;
+     for (const char byte : value) {
+         if (std::string_view(R"(\.^$|?*+()[]{})").find(byte) != std::string_view::npos) {
+@@ -39,10 +41,14 @@ std::string literal(std::string_view value) {
+     return pattern;
+ }
+ 
++namespace {
++
++using tokenizer::regex_literal;
++
+ std::string json_literal(std::string_view value) {
+     std::string json;
+     json::append_quoted(json, value, true);
+-    return literal(json);
++    return regex_literal(json);
+ }
+ 
+ std::string_view type_of(const json::Value& value) {
+@@ -53,7 +59,16 @@ std::string_view type_of(const json::Value& value) {
+     return {};
+ }
+ 
+-std::string enum_value(const json::Value& value, std::string_view type) {
++bool safe_xml_text(std::string_view text) {
++    constexpr std::string_view markers[] = {"</parameter>", "<parameter=", "</function>",
++                                            "</tool_call>", "<function="};
++    return text.find_first_of("\r\n") == text.npos &&
++        std::none_of(std::begin(markers), std::end(markers), [&](auto marker) {
++            return text.find(marker) != text.npos;
++        });
++}
++
++std::string enum_value(const json::Value& value, std::string_view type, bool xml) {
+     const auto actual = type_of(value);
+     if (actual.empty() || (!type.empty() && type != actual &&
+                            !(type == "number" && actual == "integer"))) {
+@@ -63,7 +78,10 @@ std::string enum_value(const json::Value& value, std::string_view type) {
+         if (text->size() > 128) {
+             invalid("enum strings must contain at most 128 UTF-8 bytes");
+         }
+-        return json_literal(*text);
++        if (xml && !safe_xml_text(*text)) {
++            invalid("XML string enum contains a structural delimiter or newline");
++        }
++        return xml ? regex_literal(*text) : json_literal(*text);
+     }
+     if (const auto number = value.signed_integer()) return std::to_string(*number);
+     if (const auto number = value.unsigned_integer()) return std::to_string(*number);
+@@ -71,7 +89,7 @@ std::string enum_value(const json::Value& value, std::string_view type) {
+     return "null";
+ }
+ 
+-std::string enumeration(const json::Value& value, std::string_view type) {
++std::string enumeration(const json::Value& value, std::string_view type, bool xml) {
+     const auto* choices = value.array();
+     if (!choices || choices->empty() || choices->size() > 16) {
+         invalid("enum must have 1 to 16 scalar choices");
+@@ -79,7 +97,7 @@ std::string enumeration(const json::Value& value, std::string_view type) {
+     std::set<std::string> seen;
+     std::string pattern = "(?:";
+     for (const auto& choice : *choices) {
+-        const auto entry = enum_value(choice, type);
++        const auto entry = enum_value(choice, type, xml);
+         if (!seen.insert(entry).second) {
+             invalid("enum has duplicate choices");
+         }
+@@ -95,7 +113,7 @@ const json::OrderedObject& fields(const json::Value& value) {
+     invalid("expected an ordered schema object");
+ }
+ 
+-void check_keywords(const json::OrderedObject& object, std::string_view type) {
++void check_keywords(const json::OrderedObject& object, std::string_view type, bool xml = false) {
+     std::set<std::string_view> names;
+     for (const auto& [name, value] : object) {
+         if (!names.insert(name).second) invalid("duplicate keyword");
+@@ -104,6 +122,8 @@ void check_keywords(const json::OrderedObject& object, std::string_view type) {
+             if (!value.string() || value.string()->size() > 256) {
+                 invalid("title and description must be strings of at most 256 UTF-8 bytes");
+             }
++        } else if (xml && type == "integer" && (name == "minimum" || name == "maximum")) {
++            continue;
+         } else if (type == "object" &&
+                    (name == "properties" || name == "required" || name == "additionalProperties")) {
+             continue;
+@@ -130,6 +150,86 @@ std::set<std::string_view> required_names(const json::OrderedObject& schema) {
+     return names;
+ }
+ 
++std::string alternatives(const std::vector<std::string>& values) {
++    std::string pattern = "(?:";
++    const char* separator = "";
++    for (const auto& value : values) {
++        append_pattern(pattern, separator);
++        append_pattern(pattern, value);
++        separator = "|";
++    }
++    append_pattern(pattern, ")");
++    return pattern;
++}
++
++std::string digits(char first, char last, std::size_t tail = 0) {
++    std::string pattern;
++    if (first == last) {
++        pattern += first;
++    } else {
++        pattern = std::string("[") + first + '-' + last + ']';
++    }
++    if (tail != 0) {
++        pattern += "[0-9]{" + std::to_string(tail) + '}';
++    }
++    return pattern;
++}
++
++std::string decimal_range(std::string_view first, std::string_view last) {
++    const auto common = std::mismatch(first.begin(), first.end(), last.begin()).first;
++    const std::size_t width = common - first.begin();
++    std::string pattern(first.substr(0, width));
++    first.remove_prefix(width);
++    last.remove_prefix(width);
++    if (first.empty()) return pattern;
++    if (first.find_first_not_of('0') == first.npos && last.find_first_not_of('9') == last.npos) {
++        return pattern + "[0-9]{" + std::to_string(first.size()) + '}';
++    }
++    if (first.size() == 1) return pattern + digits(first.front(), last.front());
++    const auto tail = first.size() - 1;
++    std::vector<std::string> choices;
++    choices.push_back(first.front() + decimal_range(first.substr(1), std::string(tail, '9')));
++    if (first.front() + 1 < last.front()) {
++        choices.push_back(digits(first.front() + 1, last.front() - 1, tail));
++    }
++    choices.push_back(last.front() + decimal_range(std::string(tail, '0'), last.substr(1)));
++    return pattern + alternatives(choices);
++}
++
++std::string unsigned_range(std::uint64_t first, std::uint64_t last) {
++    auto low = std::to_string(first);
++    const auto high = std::to_string(last);
++    std::vector<std::string> choices;
++    for (auto length = low.size(); length < high.size(); ++length) {
++        choices.push_back(decimal_range(low, std::string(length, '9')));
++        low = '1' + std::string(length, '0');
++    }
++    choices.push_back(decimal_range(low, high));
++    return alternatives(choices);
++}
++
++constexpr std::int64_t max_integer = 999999999999999999;
++
++std::int64_t integer_bound(const json::OrderedObject& schema, std::string_view key,
++                           std::int64_t fallback) {
++    const auto* value = json::get(schema, key);
++    if (!value) return fallback;
++    const auto number = value->signed_integer();
++    if (!number || *number < -max_integer || *number > max_integer) {
++        invalid("XML integer bounds must be signed integers of at most 18 digits");
++    }
++    return *number;
++}
++
++std::string bounded_integer(const json::OrderedObject& schema) {
++    const auto minimum = integer_bound(schema, "minimum", -max_integer);
++    const auto maximum = integer_bound(schema, "maximum", max_integer);
++    if (minimum > maximum) invalid("minimum exceeds maximum");
++    if (maximum < 0) return '-' + unsigned_range(-maximum, -minimum);
++    if (minimum >= 0) return unsigned_range(minimum, maximum);
++    return alternatives({'-' + unsigned_range(1, -minimum), unsigned_range(0, maximum)});
++}
++
+ struct Member {
+     std::string pattern;
+     bool required;
+@@ -188,7 +288,8 @@ int item_count(const json::OrderedObject& schema, std::string_view key, int fall
+ 
+ class Compiler {
+ public:
+-    std::string node(const json::Value& value, int depth);
++    std::string node(const json::Value& value, int depth, bool xml = false);
++    std::string xml_parameters(const json::Value& value);
+ 
+ private:
+     std::string object(const json::OrderedObject& schema, int depth);
+@@ -240,7 +341,7 @@ std::string Compiler::array(const json::OrderedObject& schema, int depth) {
+     return pattern;
+ }
+ 
+-std::string Compiler::node(const json::Value& value, int depth) {
++std::string Compiler::node(const json::Value& value, int depth, bool xml) {
+     if (depth > 5 || ++node_count_ > 64) {
+         invalid("schema exceeds five nested levels or 64 nodes");
+     }
+@@ -250,18 +351,79 @@ std::string Compiler::node(const json::Value& value, int depth) {
+         if (!field->string() || field->string()->empty()) invalid("type must be a string");
+         type = *field->string();
+     }
+-    check_keywords(schema, type);
+-    if (const auto* choices = json::get(schema, "enum")) return enumeration(*choices, type);
++    check_keywords(schema, type, xml);
++    const bool bounded = xml && (json::get(schema, "minimum") || json::get(schema, "maximum"));
++    if (const auto* choices = json::get(schema, "enum")) {
++        if (bounded) invalid("integer enums and bounds cannot be combined");
++        return enumeration(*choices, type, xml);
++    }
++    if (bounded) return bounded_integer(schema);
+     if (type == "object") return object(schema, depth);
+     if (type == "array") return array(schema, depth);
+     if (type == "boolean") return "(?:true|false)";
+     if (type == "null") return "null";
+-    if (type == "string") return std::string(string_value);
++    if (type == "string") {
++        return xml ? R"((?:[^<\x00-\x1f]|<tool_call>|<think>|</think>)*)" :
++                     std::string(string_value);
++    }
+     if (type == "integer") return std::string(integer);
+     if (type == "number") return std::string(integer) + std::string(fraction);
+     invalid("expected a supported type or a finite scalar enum");
+ }
+ 
++std::string Compiler::xml_parameters(const json::Value& value) {
++    const auto& schema = fields(value);
++    check_keywords(schema, "object");
++    const auto* type = json::get(schema, "type");
++    const auto* additional = json::get(schema, "additionalProperties");
++    if ((type && type->string() != "object") || json::get(schema, "enum") ||
++        (additional && additional->boolean() != false)) {
++        invalid("tool parameters must be a closed ordered object");
++    }
++    auto required = required_names(schema);
++    std::vector<Member> members;
++    std::set<std::string_view> seen;
++    if (const auto* properties = json::get(schema, "properties")) {
++        const auto& values = fields(*properties);
++        if (values.size() > 8) invalid("an object supports at most eight properties");
++        for (const auto& [name, property] : values) {
++            if (name.empty() || name.size() > 64 || name.find_first_of("<>\r\n") != name.npos ||
++                !seen.insert(name).second) {
++                invalid("XML parameter names must be unique valid labels of up to 64 bytes");
++            }
++            auto pattern = regex_literal("<parameter=" + name + ">\n");
++            append_pattern(pattern, node(property, 2, true));
++            append_pattern(pattern, "\n</parameter>\n");
++            members.push_back({std::move(pattern), required.erase(name) != 0});
++        }
++    }
++    if (!required.empty()) invalid("required contains a name outside properties");
++    const bool has_required = std::any_of(members.begin(), members.end(),
++                                         [](const auto& member) { return member.required; });
++    std::string pattern = has_required ? "" : "(?:\n";
++    if (has_required) {
++        for (const auto& member : members) {
++            if (!member.required) append_pattern(pattern, "(?:");
++            append_pattern(pattern, member.pattern);
++            if (!member.required) append_pattern(pattern, ")?");
++        }
++    } else {
++        for (auto first = members.begin(); first != members.end(); ++first) {
++            append_pattern(pattern, "|");
++            append_pattern(pattern, first->pattern);
++            for (auto next = std::next(first); next != members.end(); ++next) {
++                append_pattern(pattern, "(?:" + next->pattern + ")?");
++            }
++        }
++        append_pattern(pattern, ")");
++    }
++    return pattern;
++}
++
++}
++
++std::string tokenizer::xml_parameters_pattern(const json::Value* schema) {
++    return !schema || schema->is_null() ? "\n" : Compiler().xml_parameters(*schema);
+ }
+ 
+ std::shared_ptr<const TokenConstraint> TokenConstraint::compile_json_schema(
+diff --git a/src/tokenizer/regex_constraint.cpp b/src/tokenizer/regex_constraint.cpp
+index d818017..5d1db2c 100644
+--- a/src/tokenizer/regex_constraint.cpp
++++ b/src/tokenizer/regex_constraint.cpp
+@@ -39,6 +39,65 @@ int matching_state(const std::vector<regex::State>& states, const Piece& piece,
+ 
+ using StateSet = std::bitset<regex::max_dfa_states>;
+ 
++struct Trigger {
++    std::string_view marker;
++    int destination;
++};
++
++int plain_states(std::vector<regex::State>& states, const Trigger* triggers, int count) {
++    const int start = static_cast<int>(states.size());
++    std::vector<std::string_view> prefixes(1);
++    for (int index = 0; index < count; ++index) {
++        const auto marker = triggers[index].marker;
++        for (std::size_t length = 1; length < marker.size(); ++length) {
++            const auto prefix = marker.substr(0, length);
++            if (std::find(prefixes.begin(), prefixes.end(), prefix) == prefixes.end()) {
++                prefixes.push_back(prefix);
++            }
++        }
++    }
++    for (const auto prefix : prefixes) {
++        regex::State state{{}, true};
++        for (int byte = 0; byte < 256; ++byte) {
++            const auto next = std::string(prefix) + static_cast<char>(byte);
++            int destination = start;
++            std::size_t longest = 0;
++            for (std::size_t index = 1; index < prefixes.size(); ++index) {
++                if (prefixes[index].size() > longest &&
++                    next.size() >= prefixes[index].size() &&
++                    next.compare(next.size() - prefixes[index].size(), prefixes[index].size(),
++                                 prefixes[index]) == 0) {
++                    longest = prefixes[index].size();
++                    destination = start + static_cast<int>(index);
++                }
++            }
++            for (int index = 0; index < count; ++index) {
++                const auto& trigger = triggers[index];
++                if (next.size() >= trigger.marker.size() &&
++                    next.compare(next.size() - trigger.marker.size(), trigger.marker.size(),
++                                 trigger.marker) == 0) {
++                    destination = trigger.destination;
++                    break;
++                }
++            }
++            state.next[byte] = destination;
++        }
++        states.push_back(state);
++    }
++    return start;
++}
++
++int literal_states(std::vector<regex::State>& states, std::string_view text, int next) {
++    for (const unsigned char byte : std::string(text.rbegin(), text.rend())) {
++        regex::State state{{}, false};
++        state.next.fill(regex::dead_state);
++        state.next[byte] = next;
++        next = static_cast<int>(states.size());
++        states.push_back(state);
++    }
++    return next;
++}
++
+ std::vector<int> shortest(const std::vector<regex::State>& states,
+                           const std::vector<StateSet>& previous) {
+     const auto count = static_cast<int>(states.size());
+@@ -74,7 +133,54 @@ std::shared_ptr<const TokenConstraint> TokenConstraint::compile_regular(
+     const auto states = kind == Kind::regex
+         ? regex::determinize(regex::parse(pattern))
+         : regex::determinize_schema(regex::parse_generated(pattern));
++    return compile_states(tokenizer, states, kind);
++}
++
++std::shared_ptr<const TokenConstraint> TokenConstraint::compile_triggered(
++    const Tokenizer& tokenizer, std::string_view continuation, std::string_view trigger,
++    TriggeredConstraintMode mode, bool parallel, std::string_view prelude_end) {
++    if (trigger.empty() || trigger.size() + prelude_end.size() > 64) {
++        throw std::invalid_argument("Invalid constraint trigger length");
++    }
++    auto states = regex::determinize_schema(regex::parse_generated(continuation));
++    const int frame_count = static_cast<int>(states.size());
++    const Trigger next_frame{trigger, 0};
++    const bool follow = mode == TriggeredConstraintMode::required && parallel;
++    const int plain = follow || mode == TriggeredConstraintMode::optional
++        ? plain_states(states, &next_frame, 1) : regex::dead_state;
++    const int after = mode == TriggeredConstraintMode::optional && !parallel
++        ? plain_states(states, nullptr, 0) : plain;
++    if (after != regex::dead_state) {
++        for (int index = 0; index < frame_count; ++index) {
++            if (states[index].accepting) {
++                states[index].next = states[after].next;
++            }
++        }
++    }
++    const int forced = mode == TriggeredConstraintMode::optional ? plain :
++        literal_states(states, trigger, 0);
++    int entry = forced;
++    if (!prelude_end.empty()) {
++        const Trigger triggers[] = {next_frame, {prelude_end, forced}};
++        entry = plain_states(states, triggers, 2);
++    }
++    std::swap(states[0], states[entry]);
++    for (auto& state : states) {
++        for (auto& next : state.next) {
++            if (next == 0) next = entry;
++            else if (next == entry) next = 0;
++        }
++    }
++    return compile_states(tokenizer, states, Kind::triggered);
++}
++
++std::shared_ptr<const TokenConstraint> TokenConstraint::compile_states(
++    const Tokenizer& tokenizer, const std::vector<regex::State>& states, Kind kind) {
++    if (states.size() > regex::max_dfa_states) {
++        throw std::invalid_argument("Output constraint exceeds the DFA state limit");
++    }
+     const auto pieces = output_pieces(tokenizer);
++    const auto edge_limit = kind == Kind::triggered ? max_token_edges * 2 : max_token_edges;
+     auto result = std::shared_ptr<TokenConstraint>(new TokenConstraint);
+     result->kind_ = kind;
+     result->nodes_.resize(states.size());
+@@ -92,8 +198,8 @@ std::shared_ptr<const TokenConstraint> TokenConstraint::compile_regular(
+             if (next == regex::dead_state) {
+                 continue;
+             }
+-            if (++edge_count > max_token_edges) {
+-                throw std::invalid_argument("regex exceeds the 4194304-token-transition limit");
++            if (++edge_count > edge_limit) {
++                throw std::invalid_argument("Output constraint exceeds the token-transition limit");
+             }
+             node.edges.push_back({piece.token, next});
+             previous[next].set(state);
+diff --git a/include/sglang/tokenizer/json_schema_pattern.h b/include/sglang/tokenizer/json_schema_pattern.h
+new file mode 100644
+index 0000000..4ef7913
+--- /dev/null
++++ b/include/sglang/tokenizer/json_schema_pattern.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include "sglang/json.h"
++
++namespace sglang::tokenizer {
++
++std::string regex_literal(std::string_view text);
++std::string xml_parameters_pattern(const json::Value* schema);
++
++}

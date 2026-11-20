@@ -1,0 +1,216 @@
+--- a/include/sglang/text/mxfp8_gqa_wide_tc.cuh
++++ b/include/sglang/text/mxfp8_gqa_wide_tc.cuh
+@@ -13,6 +13,12 @@
+     alignas(16) std::uint16_t probability[wide_warps][16][wide_prob_stride];
+ };
+ 
++struct WideRawKv {
++    alignas(16) std::uint8_t payload[wide_warps][wide_keys][mxfp8_head_dim];
++    alignas(8) std::uint8_t scales[wide_warps][wide_keys][mxfp8_groups];
++};
++static_assert(sizeof(WideRawKv) == 16896);
++
+ struct WideMerge {
+     float value[wide_warps][wide_heads][mxfp8_head_dim];
+     float maximum[wide_warps][wide_heads];
+@@ -102,6 +108,60 @@
+                            wide_decode_pair<CommonScale>(payload.w >> 16, scale, bad));
+ }
+ 
++template <int Bytes>
++__device__ __forceinline__ void wide_copy_async(void* target, const void* source) {
++    const auto shared = static_cast<unsigned int>(__cvta_generic_to_shared(target));
++    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;"
++                 :: "r"(shared), "l"(source), "n"(Bytes) : "memory");
++}
++
++template <bool Value>
++__device__ __forceinline__ void wide_issue_kv(WideRawKv& raw, const decoder::PagedDecodeLane& input,
++                                             int warp, int lane, int first, int end) {
++    const int count = min(wide_keys, end - first);
++    const int page = input.pages.device_pages[first / mxfp8_page_size];
++    const int slot = first % mxfp8_page_size;
++    const auto* payload = Value ? input.cache.value_payload : input.cache.key_payload;
++    const auto* scales = Value ? input.cache.value_scales : input.cache.key_scales;
++    const int channel = (lane % 16) * 16;
++    #pragma unroll 2
++    for (int index = lane / 16; index < wide_keys; index += 2) {
++        if (index < count) {
++            const auto data = payload_offset(page, slot + index, blockIdx.y) + channel;
++            wide_copy_async<16>(&raw.payload[warp][index][channel], payload + data);
++        }
++    }
++    if (lane < count) {
++        const auto exponent = scale_offset(page, slot + lane, blockIdx.y, 0);
++        wide_copy_async<8>(&raw.scales[warp][lane][0], scales + exponent);
++    }
++    asm volatile("cp.async.commit_group;" ::: "memory");
++}
++
++__device__ __forceinline__ void wide_read_kv(WideTile& tile, const WideRawKv& raw,
++                                            int warp, int lane, int count, bool& bad) {
++    asm volatile("cp.async.wait_group 0;" ::: "memory");
++    __syncwarp();
++    const int channel = (lane % 16) * 16;
++    #pragma unroll 2
++    for (int index = lane / 16; index < wide_keys; index += 2) {
++        auto* destination = &tile.kv[warp][index][channel];
++        if (index < count) {
++            const auto words = *reinterpret_cast<const uint4*>(&raw.payload[warp][index][channel]);
++            const auto scale = raw.scales[warp][index][channel / 32];
++            if (scale >= 15 && scale <= 148) {
++                wide_store_vector<true>(destination, words, scale, bad);
++            } else {
++                wide_store_vector<false>(destination, words, scale, bad);
++            }
++        } else {
++            auto* zeros = reinterpret_cast<uint4*>(destination);
++            zeros[0] = zeros[1] = make_uint4(0, 0, 0, 0);
++        }
++    }
++    __syncwarp();
++}
++
+ template <bool Value>
+ __device__ __forceinline__ void wide_stage(WideTile& tile, decoder::PagedDecodeLane input,
+                                            int warp, int lane, int first, int count, bool& bad) {
+@@ -175,7 +235,10 @@
+     }
+ }
+ 
+-__global__ void split_long_decode_tensor(const __grid_constant__ LongDecodeBatch batch) {
++template <bool Staged>
++__device__ __forceinline__ void wide_decode_split(const LongDecodeBatch& batch, bool overlap) {
++    extern __shared__ __align__(16) unsigned char wide_raw_bytes[];
++    auto& raw = *reinterpret_cast<WideRawKv*>(wide_raw_bytes);
+     __shared__ union {
+         WideTile tile;
+         WideMerge merge;
+@@ -214,10 +277,27 @@
+     float mass = 0.0f;
+     WideAccumulator numerator[mxfp8_head_dim / 8]{};
+     bool bad_cache = false;
+-    for (int offset = first + warp * wide_keys; offset < end; offset += wide_warps * wide_keys) {
++    const int warp_first = first + warp * wide_keys;
++    constexpr int tile_step = wide_warps * wide_keys;
++    if constexpr (Staged) {
++        if (overlap && warp_first < end) {
++            wide_issue_kv<false>(raw, input, warp, lane, warp_first, end);
++        }
++    }
++    for (int offset = warp_first; offset < end; offset += tile_step) {
+         const int count = min(wide_keys, end - offset);
+-        wide_stage<false>(tile, input, warp, lane, offset, count, bad_cache);
+-        __syncwarp();
++        if constexpr (Staged) {
++            if (!overlap) {
++                wide_issue_kv<false>(raw, input, warp, lane, offset, end);
++            }
++            wide_read_kv(tile, raw, warp, lane, count, bad_cache);
++            if (overlap) {
++                wide_issue_kv<true>(raw, input, warp, lane, offset, end);
++            }
++        } else {
++            wide_stage<false>(tile, input, warp, lane, offset, count, bad_cache);
++            __syncwarp();
++        }
+         WideAccumulator scores[2]{};
+         #pragma unroll 4
+         for (int dim = 0; dim < mxfp8_head_dim; dim += 16) {
+@@ -228,7 +308,17 @@
+                      wide_load_right<false>(&tile.kv[warp][lane % 8 + 8][channel]));
+         }
+         __syncwarp();
+-        wide_stage<true>(tile, input, warp, lane, offset, count, bad_cache);
++        if constexpr (Staged) {
++            if (!overlap) {
++                wide_issue_kv<true>(raw, input, warp, lane, offset, end);
++            }
++            wide_read_kv(tile, raw, warp, lane, count, bad_cache);
++            if (overlap && offset + tile_step < end) {
++                wide_issue_kv<false>(raw, input, warp, lane, offset + tile_step, end);
++            }
++        } else {
++            wide_stage<true>(tile, input, warp, lane, offset, count, bad_cache);
++        }
+         float next = maximum;
+         #pragma unroll
+         for (int key = 0; key < wide_keys; key += 8) {
+@@ -274,3 +364,12 @@
+     wide_write_partials(shared.merge, input, first_head, warp, row, column, maximum, mass, bad,
+                         bad_query, numerator);
+ }
++
++__global__ void split_long_decode_tensor(const __grid_constant__ LongDecodeBatch batch) {
++    wide_decode_split<false>(batch, false);
++}
++
++__global__ void split_long_decode_tensor_staged(const __grid_constant__ LongDecodeBatch batch,
++                                                bool overlap) {
++    wide_decode_split<true>(batch, overlap);
++}
+--- a/include/sglang/text/mxfp8_gqa_decode.cuh
++++ b/include/sglang/text/mxfp8_gqa_decode.cuh
+@@ -384,6 +384,7 @@
+     }
+     LongDecodeBatch batch{};
+     bool tensor = count > decoder::paged_decode_lanes;
++    bool aligned_scales = true;
+     for (int index = 0; index < count; ++index) {
+         const auto& lane = lanes[index];
+         const auto& buffers = lane.buffers;
+@@ -396,13 +397,38 @@
+         const auto key = reinterpret_cast<std::uintptr_t>(lane.cache.key_payload);
+         const auto value = reinterpret_cast<std::uintptr_t>(lane.cache.value_payload);
+         tensor &= (key | value) % alignof(uint4) == 0;
++        const auto key_scale = reinterpret_cast<std::uintptr_t>(lane.cache.key_scales);
++        const auto value_scale = reinterpret_cast<std::uintptr_t>(lane.cache.value_scales);
++        aligned_scales &= (key_scale | value_scale) % alignof(std::uint64_t) == 0;
+         batch.lanes[index] = lane;
+     }
+     void* arguments[] = {&batch};
+-    auto status = cudaLaunchKernel(
+-        tensor ? split_long_decode_tensor : split_long_decode_attention,
+-        dim3(decode_splits, tensor ? mxfp8_kv_heads : mxfp8_query_heads / split_query_heads, count),
+-        tensor ? wide_warps * 32 : mxfp8_head_dim, arguments, 0, stream);
++    const dim3 split_grid(decode_splits,
++                          tensor ? mxfp8_kv_heads : mxfp8_query_heads / split_query_heads, count);
++    const char* setting = tensor && aligned_scales ? std::getenv("SGLANG_EXPERIMENTAL_LONG_KV")
++                                                  : nullptr;
++    const std::string_view mode = setting ? setting : "";
++    bool overlap = mode == "overlap";
++    bool staged = overlap || mode == "serial";
++    if (staged) {
++        const auto attribute = cudaFuncSetAttribute(split_long_decode_tensor_staged,
++            cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(WideRawKv));
++        if (attribute != cudaSuccess && attribute != cudaErrorInvalidValue &&
++            attribute != cudaErrorNotSupported) {
++            return attribute;
++        }
++        staged = attribute == cudaSuccess;
++    }
++    cudaError_t status;
++    if (staged) {
++        void* staged_arguments[] = {&batch, &overlap};
++        status = cudaLaunchKernel(split_long_decode_tensor_staged, split_grid, wide_warps * 32,
++                                  staged_arguments, sizeof(WideRawKv), stream);
++    } else {
++        status = cudaLaunchKernel(tensor ? split_long_decode_tensor : split_long_decode_attention,
++                                  split_grid, tensor ? wide_warps * 32 : mxfp8_head_dim,
++                                  arguments, 0, stream);
++    }
+     if (status != cudaSuccess) {
+         return status;
+     }
+--- a/src/mxfp8_gqa.cu
++++ b/src/mxfp8_gqa.cu
+@@ -4,7 +4,9 @@
+ #include "sglang/decoder_cuda.cuh"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <limits>
++#include <string_view>
+ #include <type_traits>
+ 
+ #include <cuda_fp8.h>

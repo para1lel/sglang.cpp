@@ -9,7 +9,7 @@ import socket
 import struct
 import time
 
-from routes import FIXTURE, HEADERS, Routes, benchmark
+from routes import FIXTURE, HEADERS, MODEL, Routes, benchmark
 
 
 RUNNING = "vllm:num_requests_running"
@@ -86,8 +86,9 @@ class Controls(Routes):
             assert set(step) == {"elapsed_ns", "width", "prefill_rows", "decode_lanes",
                                  "graph_slots"}, step
             assert all(type(value) is int and value >= 0 for value in step.values()), step
-            assert step["elapsed_ns"] > 0 and 0 <= step["decode_lanes"] <= step["width"] <= 2
-            assert step["width"] > 0 and step["graph_slots"] in (0, 3), step
+            assert 0 < step["width"] <= 2 and step["decode_lanes"] <= step["width"]
+            assert step["elapsed_ns"] > 0 and step["graph_slots"] < 4, step
+            assert step["graph_slots"].bit_count() <= step["decode_lanes"], step
         return response["steps"]
 
     def open_stream(self, name, prompt, salt, count=4096):
@@ -237,6 +238,7 @@ def run(controls):
     check_profile_controls(controls, prefix, prefix_output)
     check_wrong_prefix_and_eviction(controls, prefix, prefix_output)
     live_reset(controls, prefix, prefix_output)
+    check_text_stops(controls)
 
 
 def check_health(controls):
@@ -250,6 +252,62 @@ def check_health(controls):
     assert type(active) is int and active == 2, health
     assert type(tokens) is int and 1 <= tokens <= 32768, health
     assert json.loads(controls.control("ready", "/ready")) == {"ready": True}
+
+
+def check_text_reply(controls, name, request, expected_text, ids, reason, cached):
+    before = controls.wait_for(f"{name}-before", 0, 0)
+    raw, content = controls.raw(name, request)
+    after = controls.wait_for(f"{name}-after", 0, 0)
+    assert after[CACHED] - before[CACHED] == cached, (name, before, after)
+    assert after[COMPUTED] - before[COMPUTED] == 161 - cached, (name, before, after)
+    if request.get("stream"):
+        assert content == "text/event-stream", name
+        frames = raw.split(b"\n\n")
+        assert frames[-2:] == [b"data: [DONE]", b""], name
+        messages = [json.loads(frame.removeprefix(b"data: ")) for frame in frames[:-2]]
+        usage = messages.pop()
+        assert usage["choices"] == [], name
+        terminal, = messages.pop()["choices"]
+        assert terminal["finish_reason"] == reason and terminal["token_ids"] == [], name
+        choices = [message["choices"][0] for message in messages]
+        assert [choice["token_ids"] for choice in choices] == [[token] for token in ids], name
+        assert all(choice["finish_reason"] is None for choice in choices), name
+        text = "".join(choice["text"] for choice in choices) + terminal["text"]
+        assert text == expected_text, name
+    else:
+        assert content == "application/json", name
+        usage = json.loads(raw)
+        choice, = usage["choices"]
+        assert (choice["text"], choice["token_ids"], choice["finish_reason"]) == (
+            expected_text, ids, reason), (name, choice)
+    assert usage["usage"]["total_tokens"] == 161 + len(ids), name
+    return usage["usage"]
+
+
+def check_text_stops(controls):
+    # The exact-prefill continuation is " seven, eight,". Both stops trigger on its first comma.
+    prompt = ("Prefix cache fixture. " * 36
+              + "\n\nThe sequence starts at one, two, three, four, five, six,")
+    body = {"model": MODEL, "prompt": prompt, "max_tokens": 4, "return_token_ids": True,
+            "temperature": 0, "seed": 0, "cache_salt": "warm-stop-repro"}
+    stream = {"stream": True, "stream_options": {"include_usage": True}}
+    string_stop = {"stop": [","]}
+    token_stop = {"stop_token_ids": [11]}
+    stopped_ids = [7840, 11]
+    full_ids = [*stopped_ids, 7810, 11]
+    cases = (
+        ("cold-string-json", string_stop, " seven", stopped_ids, "stop", 0),
+        ("warm-no-stop-json", {}, " seven, eight,", full_ids, "length", 128),
+        ("warm-token-json", token_stop, " seven", stopped_ids, "stop", 128),
+        ("warm-string-json", string_stop, " seven", stopped_ids, "stop", 128),
+        ("warm-token-sse", stream | token_stop, " seven", stopped_ids, "stop", 128),
+        ("warm-string-sse", stream | string_stop, " seven", stopped_ids, "stop", 128),
+        ("warm-after-stop-sse", stream, " seven, eight,", full_ids, "length", 128),
+    )
+    usages = [check_text_reply(controls, name, body | options, text, ids, reason, cached)
+              for name, options, text, ids, reason, cached in cases]
+    for (name, _, _, ids, _, cached), usage in zip(cases, usages, strict=True):
+        controls.usage(name, usage, 161, len(ids), cached)
 
 
 def main():

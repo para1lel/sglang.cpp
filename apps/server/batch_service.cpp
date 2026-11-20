@@ -462,7 +462,6 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
             std::rethrow_exception(job.error);
         } else if (job.finish) {
             result.finish_reason = *job.finish;
-            result.cached_prompt_tokens = job.cached_tokens;
             return result;
         } else {
             changed.wait_for(lock, disconnect_poll);
@@ -577,6 +576,7 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
     state_->changed.notify_all();
     try {
         auto result = state_->consume(lock, slot, *job, callbacks);
+        result.cached_prompt_tokens = job->cached_tokens;
         generating = false;
         if (result.finish_reason != DecoderFinishReason::cancelled) {
             state_->connections[slot] = false;

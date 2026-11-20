@@ -121,9 +121,15 @@ Arguments parse_arguments(int argc, char** argv) {
             throw std::invalid_argument("Invalid argument " + std::string(option));
         }
     }
-    if (arguments.prefix_cache_entries != 0 && (arguments.eager || arguments.mtp_steps != 0)) {
-        throw std::invalid_argument(
-            "--prefix-cache-entries requires --mtp-steps 0. Omit --eager.");
+    if (arguments.prefix_cache_entries != 0) {
+        if (arguments.eager) {
+            throw std::invalid_argument("--prefix-cache-entries requires omitting --eager");
+        }
+        if (arguments.mtp_steps != 0 && arguments.fp8_prefill ==
+            sglang::Fp8PrefillPolicy::tensor_core) {
+            throw std::invalid_argument(
+                "MTP with --prefix-cache-entries requires --fp8-prefill exact");
+        }
     }
     return arguments;
 }
@@ -156,7 +162,7 @@ int main(int argc, char** argv) {
                      "MTP steps: 0 by default, up to 4. --mtp-k is an alias.\n"
                      "Batch graphs: enable graph replay for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
-                     "Prefix cache: disabled by default. Requires MTP off. Omit --eager.\n"
+                     "Prefix cache: disabled by default. Omit --eager. MTP requires exact.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n"
                   << sglang::cli::fp8_prefill_usage;
         return 0;

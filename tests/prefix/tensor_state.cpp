@@ -237,6 +237,7 @@ int main(int argc, char** argv) {
             inspect(oracle, candidate, lane, head(lane, 6400), 6400, 6400, logits);
             inspect(oracle, candidate, lane, w3_prime, 8192, 6400, logits);
         }
+        return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

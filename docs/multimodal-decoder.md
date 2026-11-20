@@ -42,9 +42,9 @@ Prefill scores the first output. When the next forward pass consumes the output 
 
 ## Constraints and failure behavior
 
-Use `mtp_steps = 0`. Media prefill and decode run eager with private KV and GDN state. Call `Decoder::generate_multimodal` for serial generation or `DecoderBatch::admit_multimodal` for a batch lane. A media lane bypasses prefix reuse and retains its feature owners through normal or deferred CUDA cleanup. Text lanes can advance in the same batch. [Serial allocation](../src/decoder.cpp#L369)<!-- prefix: "const Reques" --> · [Batch admission](../src/decoder_batch.cpp#L413)<!-- prefix: "int DecoderB" -->
+Use `mtp_steps = 0`. Media prefill and decode run eager with private KV and GDN state. Call `Decoder::generate_multimodal` for serial generation or `DecoderBatch::admit_multimodal` for a batch lane. A media lane bypasses prefix reuse and retains its feature owners through normal or deferred CUDA cleanup. Text lanes can advance in the same batch. [Serial allocation](../src/decoder.cpp#L369)<!-- prefix: "const Reques" --> · [Batch admission](../src/decoder_batch.cpp#L423)<!-- prefix: "int DecoderB" -->
 
-Media prefill uses tiles of up to 128 positions, including with the tensor-core policy. The target step cap can reduce the executed rows. A serial request can fall back to single-row prefill when workspace allocation fails. [Serial tiles](../src/decoder.cpp#L286)<!-- prefix: "bool Decoder" --> · [Batch tiles](../src/decoder_batch.cpp#L729)<!-- prefix: "const auto t" -->
+Media prefill uses tiles of up to 128 positions, including with the tensor-core policy. The target step cap can reduce the executed rows. A serial request can fall back to single-row prefill when workspace allocation fails. [Serial tiles](../src/decoder.cpp#L286)<!-- prefix: "bool Decoder" --> · [Batch tiles](../src/decoder_batch.cpp#L745)<!-- prefix: "const auto t" -->
 
 The decoder accepts the normal greedy, [sampling](text-serving.md#sampling), and [finite-choice](text-serving.md#finite-choice-constraints) options for K0. The usual token and cancellation callbacks apply. The decoder accepts salts of up to 256 bytes. The salt has no effect on media generation. `cached_prompt_tokens` stays zero. [Request validation](../src/media/decoder_media.cpp#L100)<!-- prefix: "DecoderResul" -->
 

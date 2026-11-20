@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L451)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L267)<!-- prefix: "const auto s" --> |
+| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L455)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L267)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, ordered multirow, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L540)<!-- prefix: "cudaError_t " --> |
 | Long-tile pipeline | Partition the visible prefix and merge the partial softmax results. | [TMEM attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L321)<!-- prefix: "__global__ v" --> · [Merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L421)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |

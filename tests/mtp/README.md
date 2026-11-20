@@ -64,5 +64,6 @@ sampled depth-0 case checks active and queued cancellation, rejection of a busy
 prefix-cache reset, and unchanged seeded output after an idle reset. The runner
 saves requests, transcripts, effective caps, startup results, and server traces.
 The startup matrix checks positive-depth admission through capacity 32,
-batch graphs at capacity one, the depth-zero requirement for prefix caching,
-and explicit eager with positive depth and the batch graph flag.
+batch graphs at capacity one, and exact prefill for combined prefix caching and MTP.
+It also checks explicit eager with positive depth and the batch graph flag, and
+rejects explicit eager when prefix caching is enabled.

@@ -416,6 +416,12 @@ void PrefillWorkspace::close() {
     check(release(), "Release prefill workspace");
 }
 
+void Decoder::Model::seed_draft(Workspace& work, MtpDraftRequest& draft, int position,
+                                int shifted_token, cudaStream_t stream) const {
+    normalize_final(work, stream);
+    draft.enqueue(position, shifted_token, work.normalized, false, stream);
+}
+
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
                                    PrefillWorkspace& workspace, MtpDraftRequest* draft,
                                    int prompt_remaining, const MediaPrefill* media) const {
@@ -439,9 +445,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                 media ? media->positions + token_position : nullptr};
             forward(&lane, 1, stream);
             if (draft && row + 1 < prompt_remaining) {
-                normalize_final(request.work, stream);
-                draft->enqueue(position + row, tokens[row + 1], request.work.normalized, false,
-                               stream);
+                seed_draft(request.work, *draft, token_position, tokens[row + 1], stream);
             }
         }
         return;

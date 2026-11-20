@@ -224,7 +224,8 @@ when `--batch-cuda-graphs` is also set.
 
 Set `--prefix-cache-entries` from `1` through `4` to enable
 [prefix reuse](docs/prefix-cache.md). The default is `0`.
-Keep `--mtp-steps 0` and omit `--eager`. Exact prefill remains the default.
+Omit `--eager`. Text MTP uses the default `exact` prefill policy with prefix reuse.
+Tensor-core prefix reuse requires `--mtp-steps 0`.
 Use `--fp8-prefill tensor-core` to opt in to [page-aligned prefill](docs/prefix-cache.md#tensor-core-scheduling).
 Tensor-core cache requests keep fixed prompt tile boundaries across scheduler turns.
 Their full tiles use 128 rows, or the largest power of two within a smaller step budget.

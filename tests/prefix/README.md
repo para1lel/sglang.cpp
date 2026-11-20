@@ -128,3 +128,36 @@ with an 8,192-token request, remaps source and destination pages independently, 
 cancels before an incomplete prefix can publish. It compares active KV payloads and
 scales, GDN history and recurrence, hidden and residual vectors, the seeded first ID,
 and every BF16 logit.
+
+## Prefix cache with MTP
+
+Use an exact-prefill release build and a reserved B200. Supply the frozen 257- and 8192-ID
+files used by the matching-prefix checks. Run from the repository root with the managed
+Pixi default environment active.
+
+```bash
+toolkit="$CONDA_PREFIX/targets/x86_64-linux"
+draft=$(nm --defined-only "$out/lib/libsglang_decoder.a" | \
+    awk '$3 ~ /^_ZN6sglang7decoder15MtpDraftRequest7enqueue/ && $3 !~ /[.]/ {print $3}')
+test -n "$draft"
+"$CXX" -std=c++17 -O3 -pthread -fno-access-control -Iinclude -Isrc -I"$toolkit/include" \
+    tests/prefix/mtp_state.cpp -L"$out/lib" -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" \
+    -Wl,--wrap=cudaMemcpy2DAsync -Wl,--wrap="$draft" \
+    -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
+    -lsglang_tokenizer -lcudart -o "$out/prefix-mtp-state"
+CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/prefix-mtp-state" "$checkpoint" "$short_ids" "$long_ids"
+CUDA_VISIBLE_DEVICES="$GPU_UUID" python3 -B tests/prefix/mtp_routes.py \
+    --server "$out/bin/sglang-server" --checkpoint "$checkpoint" --output "$out/mtp-routes"
+```
+
+The native check compares exact target KV, GDN state, and full first logits against fresh
+requests. It checks a K0 prime followed by a positive-depth miss and same-key enrichment,
+K1–K4 consumers, K0 full and partial hits on a paired entry, and a changed suffix that shifts
+prefill tiles. The link observer checks the first rebuilt draft row against the new prompt
+suffix on a partial hit and the current selected first token on a full hit. Draft-side copy
+faults exercise interrupted publication, restore, and retry. Cache accounting checks the
+combined resident charge at capacities one and four.
+
+The HTTP check compares seeded, constrained text and chat requests at depths one and four
+with fresh depth-zero controls. It checks the IDs, stop, usage, draft metrics, real verifier
+rounds, and cache reset. It saves the effective commands, wire responses, and traces.

@@ -28,6 +28,7 @@ struct Lane {
     std::optional<SamplingParameters> sampling = std::nullopt;
     std::optional<MtpConstraintRound> constraint_round{};
     int checkpoint = 0;
+    int counted_draft_rows = 0;
     bool restored_prompt = false;
     std::shared_ptr<const MultimodalInput> media = nullptr;
     MediaPrefill media_prefill{};
@@ -319,7 +320,8 @@ struct DecoderBatch::State {
         DeviceScope device(model.device);
         storage->weights = model.memory;
         if (options.prefix_cache_entries != 0) {
-            storage->prefix_cache.emplace(model.device, options.prefix_cache_entries);
+            storage->prefix_cache.emplace(model.device, options.prefix_cache_entries,
+                                          !tensor_cache && model.mtp_weights != nullptr);
         }
         if (options.cuda_graphs) {
             storage->verification_graph.emplace(execution);
@@ -353,6 +355,14 @@ struct DecoderBatch::State {
             disable();
             throw;
         }
+    }
+    void fail_step(bool recoverable) {
+        if (!recoverable || execution.verification_graph_failed()) {
+            disable();
+            return;
+        }
+        drain("Drain failed decoder batch step");
+        storage->slots = {};
     }
     std::optional<Lane>& slot_at(int slot) {
         if (slot < 0 || slot >= options.max_lanes) {
@@ -446,10 +456,11 @@ void DecoderBatch::State::initialize(Lane& lane) {
                              opts.incremental_kv ? lane.capacity() : 0);
     if (lane.media) {
         lane.media_prefill = upload_media_positions(*lane.request, *lane.media, stream);
-    } else if (auto& cache = storage->prefix_cache; cache && !lane.draft) {
+    } else if (auto& cache = storage->prefix_cache) {
         lane.checkpoint = PrefixCache::checkpoint(prompt);
         lane.progress.advance(cache->restore(*lane.request, lane.prompt, opts.prefix_cache_salt,
-                                             stream));
+                                             stream, lane.draft.get()));
+        lane.counted_draft_rows = lane.draft ? lane.draft->valid_prefix() : 0;
     }
     if (lane.progress.position == 0) {
         lane.request->reset(stream);
@@ -663,6 +674,11 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         }
         results[slot].decode = remaining == 0;
         contains_mtp = contains_mtp || lane.draft != nullptr;
+        const int position = lane.progress.position;
+        if (rows[slot] && lane.draft && position > lane.draft->valid_prefix()) {
+            model.seed_draft(lane.request->work, *lane.draft, position - 1,
+                             lane.prompt[position], stream);
+        }
         text_decode = text_decode && !lane.media;
         if (results[slot].decode && lane.draft && lane.remaining_output() > 1) {
             speculative[slot] = decode_rows;
@@ -746,10 +762,10 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, int max_rows,
             continue;
         }
         auto& lane = *storage->slots[slot];
-        if (rows[slot] == 1 && lane.draft && lane.remaining_prompt() > 1) {
-            model.normalize_final(lane.request->work, stream);
-            lane.draft->enqueue(lane.progress.position, lane.prompt[lane.progress.position + 1],
-                                lane.request->work.normalized, false, stream);
+        if (rows[slot] == 1 && lane.draft && lane.prefill_limit() > 1) {
+            const int position = lane.progress.position;
+            model.seed_draft(lane.request->work, *lane.draft, position,
+                             lane.prompt[position + 1], stream);
         } else if (rows[slot] > 1) {
             const auto* media = lane.media ? &lane.media_prefill : nullptr;
             for (int offset = 0; offset < rows[slot];) {
@@ -757,7 +773,7 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, int max_rows,
                 const int position = lane.progress.position + offset;
                 model.prefill_chunk(*lane.request, lane.prompt.data() + position, count,
                                     position, workspace, lane.draft.get(),
-                                    lane.remaining_prompt() - offset, media);
+                                    lane.prefill_limit() - offset, media);
                 offset += count;
             }
         }
@@ -846,6 +862,7 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
                                    DecoderBatchStepStats* stats) {
     require_ready();
     bool contains_mtp = false;
+    bool publishing_prefix = false;
     try {
         DeviceScope device(model.device);
         auto& slots = storage->slots;
@@ -892,12 +909,15 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             } else if (result.mtp_verified_rows == 0 &&
                        (result.decode || current.prefill_rows[slot] != 0)) {
                 const int rows = current.prefill_rows[slot];
-                if (auto& cache = storage->prefix_cache; cache && rows != 0 && !lane->media &&
-                    lane->options.mtp_steps == 0) {
-                    cache->count_prefill(rows);
+                if (auto& cache = storage->prefix_cache; cache && rows != 0 && !lane->media) {
+                    const int draft_rows = lane->draft ? lane->draft->valid_prefix() : 0;
+                    cache->count_prefill(rows, draft_rows - lane->counted_draft_rows);
+                    lane->counted_draft_rows = draft_rows;
                     if (lane->progress.position + rows == lane->checkpoint) {
+                        publishing_prefix = true;
                         cache->store(*lane->request, lane->prompt, lane->options.prefix_cache_salt,
-                                     lane->checkpoint, execution.stream());
+                                     lane->checkpoint, execution.stream(), lane->draft.get());
+                        publishing_prefix = false;
                     }
                 }
                 if (result.token) {
@@ -926,13 +946,11 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             *stats = current;
         }
         return results;
+    } catch (const CudaError& error) {
+        fail_step(!CudaError::terminal(error.status) && (contains_mtp || publishing_prefix));
+        throw;
     } catch (...) {
-        if (!contains_mtp || execution.verification_graph_failed()) {
-            disable();
-        } else {
-            drain("Drain failed decoder batch step");
-            storage->slots = {};
-        }
+        fail_step(contains_mtp && !publishing_prefix);
         throw;
     }
 }

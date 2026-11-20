@@ -1,5 +1,7 @@
 #include "sglang/decoder_prefix_cache.h"
 
+#include "sglang/decoder_mtp.h"
+
 #include <algorithm>
 #include <bitset>
 
@@ -9,8 +11,6 @@ namespace {
 constexpr int max_pages = decoder_batch_prefix_max_tokens / mxfp8_page_size;
 constexpr int max_request_pages = text_attention_max_tokens / mxfp8_page_size;
 static_assert(decoder_batch_prefix_max_tokens % mxfp8_page_size == 0);
-constexpr auto payload_bytes = full_attention_layers * max_pages * mxfp8_payload_bytes_per_page;
-constexpr auto scale_bytes = full_attention_layers * max_pages * mxfp8_scale_bytes_per_page;
 
 using PageMapping = std::array<std::int32_t, max_request_pages>;
 
@@ -91,37 +91,50 @@ void copy_gdn(TextGdnState dst, TextGdnState src, cudaStream_t stream) {
 
 }
 
-PrefixCache::Entry::Entry(Allocations& memory)
-    : kv{memory.allocate<std::uint8_t>(payload_bytes),
-         memory.allocate<std::uint8_t>(payload_bytes),
-         memory.allocate<std::uint8_t>(scale_bytes),
-         memory.allocate<std::uint8_t>(scale_bytes), max_pages},
+static Mxfp8KvCache allocate_kv(Allocations& memory, int layers) {
+    const auto payload = layers * max_pages * mxfp8_payload_bytes_per_page;
+    const auto scales = layers * max_pages * mxfp8_scale_bytes_per_page;
+    return {
+        memory.allocate<std::uint8_t>(payload), memory.allocate<std::uint8_t>(payload),
+        memory.allocate<std::uint8_t>(scales), memory.allocate<std::uint8_t>(scales), max_pages,
+    };
+}
+
+PrefixCache::Entry::Entry(Allocations& memory, bool with_draft)
+    : kv(allocate_kv(memory, full_attention_layers)),
       gdn{memory.allocate<Bf16>(gdn_layers * gdn_history_elements),
           memory.allocate<float>(gdn_layers * gdn_state_elements)},
       hidden(memory.allocate<Bf16>(hidden_size)),
-      residual(memory.allocate<Bf16>(hidden_size)) {}
+      residual(memory.allocate<Bf16>(hidden_size)),
+      draft(with_draft ? allocate_kv(memory, 1) : Mxfp8KvCache{}) {}
 
-PrefixCache::PrefixCache(int device, int capacity) : memory_(device) {
+PrefixCache::PrefixCache(int device, int capacity, bool with_draft) : memory_(device) {
     if (capacity < 1 || capacity > decoder_batch_prefix_max_entries) {
         throw std::invalid_argument("Invalid prefix cache capacity");
     }
     entries_.reserve(capacity);
     for (int index = 0; index < capacity; ++index) {
-        entries_.push_back(std::make_unique<Entry>(memory_));
+        entries_.push_back(std::make_unique<Entry>(memory_, with_draft));
     }
     counters_.device_bytes = memory_.bytes();
+    if (with_draft) {
+        counters_.draft_device_bytes = capacity * max_pages *
+            2 * (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
+    }
 }
 
 int PrefixCache::checkpoint(int tokens) {
     return std::min(tokens, decoder_batch_prefix_max_tokens) / mxfp8_page_size * mxfp8_page_size;
 }
 
-int PrefixCache::find(const std::vector<int>& prompt, std::string_view salt, int limit) const {
+int PrefixCache::find(const std::vector<int>& prompt, std::string_view salt, int limit,
+                      bool require_draft) const {
     int best = -1;
     int longest = 0;
     for (int index = 0; index < static_cast<int>(entries_.size()); ++index) {
         const auto& entry = *entries_[index];
         if (entry.tokens > longest && entry.tokens <= limit &&
+            (!require_draft || entry.draft_rows == entry.tokens - 1) &&
             salt == std::string_view(entry.salt.data(), entry.salt_size) &&
             std::equal(entry.ids.begin(), entry.ids.begin() + entry.tokens, prompt.begin())) {
             longest = entry.tokens;
@@ -136,9 +149,13 @@ void PrefixCache::touch(int index) {
 }
 
 int PrefixCache::restore(Request& request, const std::vector<int>& prompt, std::string_view salt,
-                         cudaStream_t stream) {
-    const int index = find(prompt, salt, checkpoint(static_cast<int>(prompt.size())));
+                         cudaStream_t stream, MtpDraftRequest* draft) {
+    const int limit = checkpoint(static_cast<int>(prompt.size()));
+    const int index = find(prompt, salt, limit, draft != nullptr);
     if (index == -1) {
+        if (draft && find(prompt, salt, limit) != -1) {
+            ++counters_.draft_misses;
+        }
         return 0;
     }
     const auto& entry = *entries_[index];
@@ -148,9 +165,15 @@ int PrefixCache::restore(Request& request, const std::vector<int>& prompt, std::
         copy_kv(request.caches.front(), physical, entry.kv, logical, length, stream);
     });
     copy_gdn(request.states.front(), entry.gdn, stream);
-    if (entry.tokens == static_cast<int>(prompt.size())) {
+    if (draft || entry.tokens == static_cast<int>(prompt.size())) {
         copy_state(request.work.hidden, entry.hidden, hidden_size, stream);
         copy_state(request.work.residual, entry.residual, hidden_size, stream);
+    }
+    if (draft) {
+        draft->restore_prefix(entry.draft, entry.draft_rows, stream);
+        counters_.draft_cached_rows += entry.draft_rows;
+    } else {
+        check(cudaStreamSynchronize(stream), "Complete decoder prefix restoration");
     }
     touch(index);
     ++counters_.hits;
@@ -159,43 +182,56 @@ int PrefixCache::restore(Request& request, const std::vector<int>& prompt, std::
 }
 
 void PrefixCache::store(const Request& request, const std::vector<int>& prompt,
-                        std::string_view salt, int tokens, cudaStream_t stream) {
+                        std::string_view salt, int tokens, cudaStream_t stream,
+                        const MtpDraftRequest* draft) {
     if (tokens < 1 || tokens > decoder_batch_prefix_max_tokens || tokens % mxfp8_page_size != 0 ||
-        std::size_t(tokens) > prompt.size() || salt.size() > decoder_prefix_max_salt_bytes) {
+        std::size_t(tokens) > prompt.size() || salt.size() > decoder_prefix_max_salt_bytes ||
+        (draft && (!counters_.draft_device_bytes || draft->valid_prefix() != tokens - 1))) {
         throw std::invalid_argument("Invalid prefix cache checkpoint");
     }
     const int index = find(prompt, salt, tokens);
-    if (index != -1 && entries_[index]->tokens == tokens) {
+    const bool matched = index != -1 && entries_[index]->tokens == tokens;
+    if (matched && (!draft || entries_[index]->draft_rows == tokens - 1)) {
         touch(index);
         return;
     }
     const int pages = tokens / mxfp8_page_size;
     const auto mapping = read_request_pages(request, pages, stream);
-    auto& entry = *entries_.back();
-    counters_.evictions += entry.tokens != 0;
-    entry.tokens = 0;
+    const auto free_entry = std::find_if(entries_.begin(), entries_.end(),
+                                        [](const auto& entry) { return entry->tokens == 0; });
+    const int available = std::min(free_entry - entries_.begin(),
+                                   static_cast<std::ptrdiff_t>(entries_.size()) - 1);
+    const int victim = matched ? index : available;
+    auto& entry = *entries_[victim];
+    counters_.evictions += !matched && entry.tokens != 0;
+    entry.tokens = entry.draft_rows = 0;
     copy_page_runs(mapping, pages, [&](int logical, int physical, int length) {
         copy_kv(entry.kv, logical, request.caches.front(), physical, length, stream);
     });
     copy_gdn(entry.gdn, request.states.front(), stream);
     copy_state(entry.hidden, request.work.hidden, hidden_size, stream);
     copy_state(entry.residual, request.work.residual, hidden_size, stream);
+    if (draft) {
+        draft->snapshot_prefix(entry.draft, tokens - 1, stream);
+    }
     check(cudaStreamSynchronize(stream), "Complete decoder prefix checkpoint");
     ++counters_.stores;
     std::copy_n(prompt.begin(), tokens, entry.ids.begin());
     std::copy(salt.begin(), salt.end(), entry.salt.begin());
     entry.salt_size = salt.size();
     entry.tokens = tokens;
-    touch(static_cast<int>(entries_.size()) - 1);
+    entry.draft_rows = draft ? tokens - 1 : 0;
+    touch(victim);
 }
 
-void PrefixCache::count_prefill(int tokens) {
+void PrefixCache::count_prefill(int tokens, int draft_rows) {
     counters_.prefill_tokens += tokens;
+    counters_.draft_prefill_rows += draft_rows;
 }
 
 void PrefixCache::reset() {
     for (auto& entry : entries_) {
-        entry->tokens = 0;
+        entry->tokens = entry->draft_rows = 0;
     }
 }
 

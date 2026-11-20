@@ -52,6 +52,37 @@ private:
     const Checkpoint& checkpoint_;
 };
 
+// The checkpoint ends one row before a page boundary. The final scale group is
+// the last group in each head's interleaved scale plane.
+void copy_draft_prefix(Mxfp8KvCache dst, Mxfp8KvCache src, int rows, cudaStream_t stream) {
+    const int full_pages = rows / mxfp8_page_size;
+    const int pages = full_pages + 1;
+    if (rows < 1 || rows % mxfp8_page_size != mxfp8_page_size - 1 ||
+        pages > dst.page_count || pages > src.page_count) {
+        throw std::invalid_argument("Invalid MTP checkpoint extent");
+    }
+    const auto payload = rows * mxfp8_kv_heads * mxfp8_head_dim;
+    const auto scale_offset = full_pages * mxfp8_scale_bytes_per_page;
+    constexpr auto head_scales = mxfp8_page_size * mxfp8_groups;
+    const auto copy_payload = [&](auto* to, const auto* from) {
+        check(cudaMemcpyAsync(to, from, payload, cudaMemcpyDeviceToDevice, stream),
+              "Copy MTP prefix payload");
+    };
+    const auto copy_scales = [&](auto* to, const auto* from) {
+        if (full_pages != 0) {
+            check(cudaMemcpyAsync(to, from, scale_offset, cudaMemcpyDeviceToDevice, stream),
+                  "Copy complete MTP prefix scale pages");
+        }
+        check(cudaMemcpy2DAsync(to + scale_offset, head_scales, from + scale_offset, head_scales,
+                                head_scales - mxfp8_groups, mxfp8_kv_heads,
+                                cudaMemcpyDeviceToDevice, stream), "Copy MTP prefix tail scales");
+    };
+    copy_payload(dst.key_payload, src.key_payload);
+    copy_payload(dst.value_payload, src.value_payload);
+    copy_scales(dst.key_scales, src.key_scales);
+    copy_scales(dst.value_scales, src.value_scales);
+}
+
 struct DraftWorkspace {
     explicit DraftWorkspace(Allocations& memory)
         : embedding(memory.allocate<Bf16>(hidden_size)),
@@ -371,6 +402,22 @@ int MtpDraftRequest::read_token() const {
 }
 
 int MtpDraftRequest::valid_prefix() const { return state_->prefix; }
+
+void MtpDraftRequest::snapshot_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream) const {
+    if (state_->failed || state_->prefix != rows) {
+        throw std::logic_error("Draft request is not at its cache checkpoint");
+    }
+    copy_draft_prefix(snapshot, state_->cache, rows, stream);
+}
+
+void MtpDraftRequest::restore_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream) {
+    if (state_->failed || state_->prefix != 0 || rows >= state_->capacity) {
+        throw std::logic_error("Invalid draft request for prefix restoration");
+    }
+    copy_draft_prefix(state_->cache, snapshot, rows, stream);
+    check(cudaStreamSynchronize(stream), "Complete paired decoder prefix restoration");
+    state_->prefix = rows;
+}
 
 void MtpDraftRequest::rewind(int valid_tokens) {
     if (state_->failed) {

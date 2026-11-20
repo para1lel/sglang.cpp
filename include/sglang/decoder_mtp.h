@@ -56,6 +56,10 @@ public:
     std::size_t device_allocation_bytes() const;
 
 private:
+    friend class PrefixCache;
+    void snapshot_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream) const;
+    void restore_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream);
+
     struct State;
     std::unique_ptr<State> state_;
 };

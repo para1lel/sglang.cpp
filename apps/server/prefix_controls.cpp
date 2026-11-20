@@ -71,6 +71,10 @@ std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t
     emit("sglang_cpp:prefix_cache_hits_total", metrics.cache.hits);
     emit("sglang_cpp:prefix_cache_stores_total", metrics.cache.stores);
     emit("sglang_cpp:prefix_cache_evictions_total", metrics.cache.evictions);
+    emit("sglang_cpp:prefix_cache_draft_device_bytes", metrics.cache.draft_device_bytes);
+    emit("sglang_cpp:prefix_cache_draft_cached_rows_total", metrics.cache.draft_cached_rows);
+    emit("sglang_cpp:prefix_cache_draft_prefill_rows_total", metrics.cache.draft_prefill_rows);
+    emit("sglang_cpp:prefix_cache_draft_misses_total", metrics.cache.draft_misses);
     return text;
 }
 

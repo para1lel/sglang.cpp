@@ -63,6 +63,10 @@ struct DecoderPrefixCacheStats {
     std::uint64_t prefill_tokens = 0;
     std::uint64_t stores = 0;
     std::uint64_t evictions = 0;
+    std::size_t draft_device_bytes = 0;
+    std::uint64_t draft_cached_rows = 0;
+    std::uint64_t draft_prefill_rows = 0;
+    std::uint64_t draft_misses = 0;
 };
 
 /// The Decoder must outlive the batch. Use one host thread to operate a batch.

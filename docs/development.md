@@ -73,11 +73,11 @@ Exact scoring reduces eight groups in FP32, sums in group order, and scales by `
 
 #### Ordered multirow GQA prefill
 
-Tensor-core prefill uses two-row tiles at 64–127 rows and four-row tiles from 128 rows. The final row must see at most 32,768 tokens. [Dispatch](../src/mxfp8_gqa_prefill.cu#L466)<!-- prefix: "cudaError_t " -->
+The [flash route](flash-prefill.md#runtime-path) handles eligible tensor-core chunks. Ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more, through 32,768 visible tokens. [Dispatch](../src/mxfp8_gqa_prefill.cu#L816)<!-- prefix: "cudaError_t " -->
 
-Blocks share decoded K/V across two query heads and tile rows. Each processes 32 KV tokens at a time with per-row causality. Tiles preserve the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L272)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L395)<!-- prefix: "for (int fir" -->
+Tiles share decoded K/V across rows and two query heads. Each 32-token block preserves per-row causality, the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L273)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L396)<!-- prefix: "for (int fir" -->
 
-Other chunks and leftover rows use protected single-row attention. Both paths replay nonfinite visible scores by head and nonfinite quotients by channel in FP64. They keep finite FP64 replacements. [Recovery](../include/sglang/mxfp8_gqa.h#L63)<!-- prefix: "/// Shared a" -->
+Other shapes and leftover rows use protected single-row attention. Both routes recompute nonfinite visible scores by head and nonfinite quotients by channel in FP64, retaining finite replacements. [Recovery](../include/sglang/mxfp8_gqa.h#L63)<!-- prefix: "/// Shared a" -->
 
 Zero rows succeed. Otherwise, negative positions, negative rows, and position-plus-row overflow return `cudaErrorInvalidValue`.
 
@@ -96,11 +96,11 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     "${BUILD_WORK_DIR:?set the printed build directory}/build/bin/mxfp8-gqa-check"
 ```
 
-Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The [verifier](../tests/mxfp8_gqa_check.cu#L640)<!-- prefix: "void run_che" --> checks append, attention, and page reuse against packed KV and BF16.
+Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The [verifier](../tests/mxfp8_gqa_check.cu#L639)<!-- prefix: "void run_che" --> checks append, attention, and page reuse against packed KV and BF16.
 
-The [ordered decode check](../tests/mxfp8_gqa_check.cu#L542)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
+The [ordered decode check](../tests/mxfp8_gqa_check.cu#L541)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 
-Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L930)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L873)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L698)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L746)<!-- prefix: "void check_o" -->, [32,768-token recovery](../tests/mxfp8_gqa_prefill_check.cu#L798)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L936)<!-- prefix: "void check_o" -->.
+Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L930)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L872)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L698)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L746)<!-- prefix: "void check_o" -->, [32,768-token recovery](../tests/mxfp8_gqa_prefill_check.cu#L798)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L935)<!-- prefix: "void check_o" -->.
 
 ### P3 native text decoder
 
@@ -131,7 +131,7 @@ At input widths ≥8192, eligible projections use 64×128 tiles below 1024 rows 
 Multirow K0 tensor-core prefill keeps these operators during projection fallback.
 
 - [GDN prefill](gdn-prefill.md) fuses convolution, Q/K normalization, and gate preparation. Recurrence keeps token order. [Preparation](../src/text_attention_gdn.cu#L75)<!-- prefix: "__global__ v" -->
-- [Ordered multirow GQA](#ordered-multirow-gqa-prefill) follows KV append. [Call](../src/decoder_prefill.cpp#L265)<!-- prefix: "const auto s" -->
+- [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L265)<!-- prefix: "const auto s" -->
 - Fused residual RMSNorm and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L236)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L665)<!-- prefix: "cudaError_t " -->
 
 Other target prefill and draft decode use direct attention. Both prefill policies share target decode. Outside packed paged decode, eager decode uses exact attention within inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Beyond these limits both use direct attention. [Row dispatch](../src/decoder_forward.cpp#L196)<!-- prefix: "cudaError_t " -->

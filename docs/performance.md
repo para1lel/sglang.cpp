@@ -133,7 +133,7 @@ Run [exact prefill checks](development.md#chunked-prefill-verification) with def
 
 For arithmetic-preserving [prefill fusions](development.md#runtime-path), match full BF16 logits, committed KV and GDN state, and staged BF16 and FP8 values bitwise. Hold the policy and tile schedule fixed. Include raw MXFP8 exponents 0 and 255. Cover single rows, two- and four-row tiles, page crossings, positive MTP depth under both policies, and graph and eager decode.
 
-Match [two- and four-row GQA](development.md#ordered-multirow-gqa-prefill) and protected single rows bitwise against ordered FP32 for finite scores and quotients. Check FP64 recovery independently. Trace each dispatch and recovery separately.
+Use the [GQA verification criteria and measurements](flash-prefill.md#verification) for flash, ordered fallback, and protected single rows.
 
 For cross-policy comparisons, check full BF16 logits within predefined tolerances on identical histories and prefill boundaries. Use shared teacher-forced tokens after greedy divergence. Report logit errors, ranks, top-two margins, free-running IDs, and first divergence.
 

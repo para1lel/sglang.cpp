@@ -17,7 +17,7 @@ The CUDA cache and public attention implementation is in
 The internal page-parallel path for batched decode is in
 [`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L980)<!-- prefix: "cudaError_t " -->.
 The internal grouped-query attention prefill path is in
-[`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L466)<!-- prefix: "cudaError_t " -->.
+[`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L816)<!-- prefix: "cudaError_t " -->.
 
 ## Build on the project host
 
@@ -110,12 +110,19 @@ and workspace fallback. Tensor Core prefill accumulates FP32 sums in a different
 order. Model scores and generated token IDs can differ, including when the highest
 scores are far apart.
 
-Paged MXFP8 attention in this mode shares decoded K and V across two query heads.
-Chunks with 64–127 rows use two-row tiles when the last row sees at most 32,768 tokens.
-Chunks with at least 128 rows use four-row tiles under the same bound.
-Leftover rows, shorter chunks, and chunks beyond the bound use the protected single-row path.
-The shared path keeps the 32-channel score reduction order, causal token order,
-BF16 output rounding, and selective FP64 recovery.
+On the native SM100 build, Tensor Core prefill selects
+[paged MXFP8 flash attention](src/mxfp8_gqa_prefill.cu#L731)<!-- prefix: "__global__ v" -->
+for 1,024-row chunks with at most 32,768 visible tokens, 16-byte-aligned K and V
+payloads, and sufficient dynamic shared memory. It uses BF16 Tensor Core products
+and FP32 online softmax. Unsafe inputs use ordered repair for affected rows and
+query-head pairs. Logits and output token IDs can differ from ordered attention.
+The `exact` policy continues to use its original attention path.
+
+The ordered fallback shares decoded K and V across two query heads. It uses
+two-row tiles for 64–127 rows and four-row tiles for at least 128 rows, with at
+most 32,768 visible tokens. Leftover rows, shorter chunks, and chunks beyond the
+bound use protected single-row attention. Ordered attention keeps the FP32 score
+reduction tree, causal token order, BF16 output rounding, and selective FP64 recovery.
 
 The selection applies to the model for its lifetime. For C++, pass
 `sglang::Fp8PrefillPolicy::tensor_core` as the fourth argument to

@@ -3,6 +3,7 @@
 #include "sglang/decoder.h"
 #include "sglang/json.h"
 #include "sglang/server/chat_media.h"
+#include "sglang/server/chat_output.h"
 #include "sglang/server/completions.h"
 
 namespace sglang::server {
@@ -16,6 +17,7 @@ struct TextRequest {
     bool chat = false;
     std::vector<std::string> stop_text;
     std::optional<MediaPrompt> media;
+    ChatOutputOptions chat_output;
 };
 
 using TextGenerator = std::function<DecoderResult(const std::vector<int>&, const DecoderOptions&,

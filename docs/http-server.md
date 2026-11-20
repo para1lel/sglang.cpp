@@ -1,8 +1,8 @@
 # Native HTTP transport
 
-The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L170)<!-- prefix: "serve_connec" -->
+The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L184)<!-- prefix: "serve_connec" -->
 
-Send empty GET requests to `/health` and `/ready`. `/health` returns HTTP 200 with the limits. `/ready` returns HTTP 200 with `{"ready":true}`. After permanent decoder worker failure, it returns HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. Both routes bypass the completion queue. New completions return HTTP 500 after permanent decoder worker failure. The [cache controls](prefix-cache.md#native-http-controls) require prefix reuse. [Health response](../apps/sglang-server.cpp#L120)<!-- prefix: "std::string " --> · [Readiness response](../apps/server/http.cpp#L420)<!-- prefix: "void write_r" --> · [Batch failure](../apps/server/batch_service.cpp#L182)<!-- prefix: "void BatchSe" -->
+Send empty GET requests to `/health` and `/ready`. `/health` returns HTTP 200 with the limits. `/ready` returns HTTP 200 with `{"ready":true}`. After permanent decoder worker failure, it returns HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. Both routes bypass the completion queue. New completions return HTTP 500 after permanent decoder worker failure. The [cache controls](prefix-cache.md#native-http-controls) require prefix reuse. [Health response](../apps/sglang-server.cpp#L131)<!-- prefix: "std::string " --> · [Readiness response](../apps/server/http.cpp#L420)<!-- prefix: "void write_r" --> · [Batch failure](../apps/server/batch_service.cpp#L182)<!-- prefix: "void BatchSe" -->
 
 ## HTTP admission and shutdown
 

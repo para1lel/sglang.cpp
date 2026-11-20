@@ -6,13 +6,13 @@ Multi-token prediction (MTP) drafts candidates and verifies them in order agains
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L162)<!-- prefix: "BatchService" --> |
+| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L176)<!-- prefix: "BatchService" --> |
 | MTP round | Draft proposals and commit target outputs in order. | [Proposals](../src/decoder_verify.cpp#L130)<!-- prefix: "bool MtpRoun" --> · [Commit](../src/decoder_verify.cpp#L180)<!-- prefix: "bool MtpRoun" --> |
 | Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_forward.cpp#L448)<!-- prefix: "bool Decoder" --> · [State commit](../src/decoder_verify.cpp#L344)<!-- prefix: "void TargetV" --> |
 
 ## Runtime path
 
-Set `--mtp-steps` or `--mtp-k` to `1`–`4` to enable MTP and limit draft proposals per round. Positive depths work at server capacities 1–32 with prefix reuse off. The server applies the depth to text completions and text-only chat, including sampled requests and [requests with an output constraint](output-constraints.md). [Media requests](multimodal-decoder.md) use K0. The server uses the same batch scheduler at every capacity. `Decoder::generate` uses that scheduler with one lane for MTP. [Depth option](../apps/sglang-server.cpp#L103)<!-- prefix: "} else if (o" --> · [HTTP selection](../apps/server/batch_service.cpp#L537)<!-- prefix: "DecoderResul" -->
+Set `--mtp-steps` or `--mtp-k` to `1`–`4` to enable MTP and limit draft proposals per round. Positive depths work at server capacities 1–32 with prefix reuse off. The server applies the depth to text completions and text-only chat, including sampled requests and [requests with an output constraint](output-constraints.md). [Media requests](multimodal-decoder.md) use K0. The server uses the same batch scheduler at every capacity. `Decoder::generate` uses that scheduler with one lane for MTP. [Depth option](../apps/sglang-server.cpp#L114)<!-- prefix: "} else if (o" --> · [HTTP selection](../apps/server/batch_service.cpp#L537)<!-- prefix: "DecoderResul" -->
 
 MTP loads its draft weights once and shares the target embedding and LM head. Each positive-budget MTP request owns target state, draft MXFP8 KV, and any verifier storage it allocates. C++ batch callers can set different proposal limits per lane. Positive-depth lanes skip [prefix reuse](prefix-cache.md). [Weights](../src/decoder.cpp#L236)<!-- prefix: "Decoder::Dec" --> · [Admission](../src/decoder_batch.cpp#L427)<!-- prefix: "int DecoderB" -->
 

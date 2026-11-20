@@ -68,36 +68,76 @@ const char* finish_reason(const TextRequest& request, const DecoderResult& resul
     throw std::logic_error("Decoder returned an inconsistent completion");
 }
 
+struct ToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments;
+};
+
+void append_call(std::string& output, std::size_t index, std::string_view id,
+                 std::string_view name, std::string_view arguments, bool delta) {
+    output += '{';
+    if (delta) {
+        output += R"("index":)" + std::to_string(index) + ',';
+    }
+    if (!id.empty()) {
+        output += R"("type":"function","id":)";
+        json::append_quoted(output, id);
+        output += ',';
+    }
+    output += R"("function":{)";
+    if (!name.empty()) {
+        output += R"("name":)";
+        json::append_quoted(output, name);
+        output += ',';
+    }
+    output += R"("arguments":)";
+    json::append_quoted(output, arguments);
+    output += "}}";
+}
+
 class TextResponse {
 public:
     TextResponse(const Socket& connection, const Tokenizer& tokenizer, const TextRequest& request)
         : connection_(connection), tokenizer_(tokenizer), request_(request),
-          prefix_(response_prefix(request)) {}
+          prefix_(response_prefix(request)) {
+        if (request.chat_output.enabled()) {
+            parser_.emplace(request.chat_output);
+        }
+    }
 
     bool token(int id);
     void finish(const DecoderResult& result);
     bool started() const { return streaming_; }
-    bool stopped() const { return text_stopped_; }
+    bool stopped() const { return text_stopped_ && !write_failed_; }
 
 private:
     std::string filter_stop(std::string_view delta, bool final = false);
     void append_media_prompt_ids(std::string& output) const;
-    void append_text(std::string& output, std::string_view text, bool finished) const;
+    void append_message(std::string& output, std::string_view text) const;
+    void append_delta(std::string& output, const ChatOutputEvent* delta,
+                      std::string_view call_id) const;
     std::string choice(std::string_view text, const int* ids, std::size_t count,
-                       const char* reason = nullptr) const;
+                       const char* reason = nullptr, const ChatOutputEvent* delta = nullptr,
+                       std::string_view call_id = std::string_view()) const;
     bool event(std::string_view data);
-    void finish_stream(const char* reason, std::size_t count, std::string_view tail,
-                       int cached_tokens);
+    bool accept(const ChatOutputEvent& delta, const int* id);
+    bool project(std::string_view text, const int* id = nullptr);
+    void finish_stream(const char* reason, std::size_t count, int cached_tokens);
 
     const Socket& connection_;
     const Tokenizer& tokenizer_;
     const TextRequest& request_;
     const std::string prefix_;
     Utf8Stream utf8_;
+    std::optional<ChatOutputParser> parser_;
     std::string text_;
+    std::string reasoning_;
+    std::vector<ToolCall> tool_calls_;
     std::string pending_stop_;
     bool text_stopped_ = false;
     bool streaming_ = false;
+    bool write_failed_ = false;
 };
 
 void TextResponse::append_media_prompt_ids(std::string& output) const {
@@ -107,28 +147,65 @@ void TextResponse::append_media_prompt_ids(std::string& output) const {
     }
 }
 
-void TextResponse::append_text(std::string& output, std::string_view text, bool finished) const {
+void TextResponse::append_message(std::string& output, std::string_view text) const {
+    output += R"(,"message":{"role":"assistant","content":)";
+    if (text.empty() && !tool_calls_.empty()) {
+        output += "null";
+    } else {
+        json::append_quoted(output, text);
+    }
+    if (!reasoning_.empty()) {
+        output += R"(,"reasoning_content":)";
+        json::append_quoted(output, reasoning_);
+    }
+    if (!tool_calls_.empty()) {
+        output += R"(,"tool_calls":[)";
+        for (const auto& call : tool_calls_) {
+            if (&call != &tool_calls_.front()) {
+                output += ',';
+            }
+            append_call(output, 0, call.id, call.name, call.arguments, false);
+        }
+        output += ']';
+    }
+    output += '}';
+}
+
+void TextResponse::append_delta(std::string& output, const ChatOutputEvent* delta,
+                                std::string_view call_id) const {
+    output += R"(,"delta":{)";
+    if (delta) {
+        switch (delta->kind) {
+        case ChatOutputKind::content:
+        case ChatOutputKind::reasoning:
+            output += delta->kind == ChatOutputKind::content ? R"("content":)" :
+                                                               R"("reasoning_content":)";
+            json::append_quoted(output, delta->text);
+            break;
+        case ChatOutputKind::tool_call:
+            output += R"("tool_calls":[)";
+            append_call(output, delta->index, call_id, call_id.empty() ? std::string_view{} :
+                        delta->name, call_id.empty() ? delta->text : std::string_view{}, true);
+            output += ']';
+            break;
+        }
+    }
+    output += '}';
+}
+
+std::string TextResponse::choice(std::string_view text, const int* ids, std::size_t count,
+                                 const char* reason, const ChatOutputEvent* delta,
+                                 std::string_view call_id) const {
+    auto output = prefix_ + R"("choices":[{"index":0)";
     if (!request_.chat) {
         output += R"(,"text":)";
         json::append_quoted(output, text);
     } else if (!request_.stream) {
-        output += R"(,"message":{"role":"assistant","content":)";
-        json::append_quoted(output, text);
-        output += '}';
+        append_message(output, text);
     } else {
-        output += R"(,"delta":{)";
-        if (!finished) {
-            output += R"("content":)";
-            json::append_quoted(output, text);
-        }
-        output += '}';
+        const ChatOutputEvent raw{ChatOutputKind::content, text, 0, {}};
+        append_delta(output, reason || parser_ ? delta : &raw, call_id);
     }
-}
-
-std::string TextResponse::choice(std::string_view text, const int* ids, std::size_t count,
-                                 const char* reason) const {
-    auto output = prefix_ + R"("choices":[{"index":0)";
-    append_text(output, text, reason != nullptr);
     if (request_.return_token_ids) {
         output += R"(,"token_ids":)";
         append_ids(output, ids, count);
@@ -158,11 +235,13 @@ bool TextResponse::event(std::string_view data) {
                                   R"("finish_reason":null}])";
             append_media_prompt_ids(role);
             if (!write_event(connection_, role + '}')) {
+                write_failed_ = true;
                 return false;
             }
         }
     }
-    return streaming_ && write_event(connection_, data);
+    write_failed_ = !streaming_ || !write_event(connection_, data);
+    return !write_failed_;
 }
 
 std::string TextResponse::filter_stop(std::string_view delta, bool final) {
@@ -195,6 +274,51 @@ std::string TextResponse::filter_stop(std::string_view delta, bool final) {
     return output;
 }
 
+bool TextResponse::accept(const ChatOutputEvent& delta, const int* id) {
+    std::string call_id;
+    if (delta.kind == ChatOutputKind::tool_call) {
+        static std::atomic<std::uint64_t> next_call_id{1};
+        call_id = "call_" + std::to_string(next_call_id.fetch_add(1, std::memory_order_relaxed));
+    }
+    if (request_.stream) {
+        return event(choice({}, id, id ? 1 : 0, nullptr, &delta, call_id) + '}') &&
+            (call_id.empty() || event(choice({}, nullptr, 0, nullptr, &delta) + '}'));
+    }
+    switch (delta.kind) {
+    case ChatOutputKind::content:
+        text_ += delta.text;
+        break;
+    case ChatOutputKind::reasoning:
+        reasoning_ += delta.text;
+        break;
+    case ChatOutputKind::tool_call:
+        tool_calls_.push_back({std::move(call_id), std::string(delta.name),
+                               std::string(delta.text)});
+        break;
+    }
+    return true;
+}
+
+bool TextResponse::project(std::string_view text, const int* id) {
+    if (parser_) {
+        if (!parser_->push(text, [&](const ChatOutputEvent& delta) {
+                const bool sent = accept(delta, id);
+                id = nullptr;
+                return sent;
+            })) {
+            return false;
+        }
+        if (request_.stream && request_.return_token_ids && id) {
+            return event(choice({}, id, 1) + '}');
+        }
+    } else if (!request_.stream) {
+        text_ += text;
+    } else if (!text.empty() || (id && request_.return_token_ids)) {
+        return event(choice(text, id, id ? 1 : 0) + '}');
+    }
+    return !disconnected(connection_);
+}
+
 bool TextResponse::token(int id) {
     std::string delta;
     if (!request_.options.stops_at(id)) {
@@ -203,21 +327,10 @@ bool TextResponse::token(int id) {
     if (!request_.stop_text.empty()) {
         delta = filter_stop(delta);
     }
-    if (!request_.stream) {
-        text_ += delta;
-        return !text_stopped_ && !disconnected(connection_);
-    }
-    if (!delta.empty() || request_.return_token_ids) {
-        return event(choice(delta, &id, 1) + '}') && !text_stopped_;
-    }
-    return !text_stopped_ && !disconnected(connection_);
+    return project(delta, &id) && !text_stopped_;
 }
 
-void TextResponse::finish_stream(const char* reason, std::size_t count, std::string_view tail,
-                                 int cached_tokens) {
-    if (!tail.empty() && !event(choice(tail, nullptr, 0) + '}')) {
-        return;
-    }
+void TextResponse::finish_stream(const char* reason, std::size_t count, int cached_tokens) {
     if (!event(choice({}, nullptr, 0, reason) + '}')) {
         return;
     }
@@ -235,13 +348,25 @@ void TextResponse::finish_stream(const char* reason, std::size_t count, std::str
 
 void TextResponse::finish(const DecoderResult& result) {
     const auto tail = filter_stop(utf8_.finish(), true);
-    const auto reason = text_stopped_ ? "stop" : finish_reason(request_, result);
-    const auto count = result.output_token_ids.size();
-    if (request_.stream) {
-        finish_stream(reason, count, tail, result.cached_prompt_tokens);
+    auto reason = text_stopped_ ? "stop" : finish_reason(request_, result);
+    if (!project(tail)) {
         return;
     }
-    text_ += tail;
+    if (parser_) {
+        const bool stopped = std::string_view(reason) == "stop";
+        if (!parser_->finish(stopped ? ChatEnd::stop : ChatEnd::length,
+                            [&](const auto& delta) { return accept(delta, nullptr); })) {
+            return;
+        }
+        if (stopped && parser_->calls()) {
+            reason = "tool_calls";
+        }
+    }
+    const auto count = result.output_token_ids.size();
+    if (request_.stream) {
+        finish_stream(reason, count, result.cached_prompt_tokens);
+        return;
+    }
     auto output = choice(text_, result.output_token_ids.data(), count, reason);
     append_usage(output, request_.prompt.size(), count, result.cached_prompt_tokens);
     write_json(connection_, "200 OK", output + '}');

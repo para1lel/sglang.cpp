@@ -418,6 +418,21 @@ ChatTemplate::ChatTemplate(const std::filesystem::path& checkpoint) {
     tools_instructions_ = checkpoint_literal(source, "'\\n\\nIf you choose to call");
 }
 
+const json::Value* chat_tools(const json::OrderedObject& chat) {
+    const auto* tools = get(chat, "tools");
+    if (tools && !tools->is_null() && !tools->array()) {
+        throw std::invalid_argument("Expected an array of tool schemas");
+    }
+    const auto* choice = get(chat, "tool_choice");
+    if (!choice || choice->is_null() || choice->string() == "auto") {
+        return tools;
+    }
+    if (choice->string() == "none") {
+        return nullptr;
+    }
+    throw std::invalid_argument("Unsupported tool_choice. Expected auto, none, or null.");
+}
+
 std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) const {
     auto turns = read_turns(chat);
     const bool thinking = boolean(chat, "enable_thinking", true);
@@ -438,15 +453,8 @@ std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) con
                 "Unexpected reasoning effort. Expected xhigh, medium or low.");
         }
     }
-    const auto* value = get(chat, "tools");
+    const auto* value = chat_tools(chat);
     const auto* tools = value ? value->array() : nullptr;
-    if (value && !value->is_null() && !tools) {
-        throw std::invalid_argument("Expected an array of tool schemas");
-    }
-    if (const auto* choice = get(chat, "tool_choice");
-        input == ChatInput::http && choice && choice->string() != "auto") {
-        throw std::invalid_argument("Unsupported tool_choice. Expected auto or omission.");
-    }
     const auto system = turns.front().role == "system"
         ? render_content(turns.front().message, vision, false, true, input) : std::string();
     const bool has_tools = tools && !tools->empty();

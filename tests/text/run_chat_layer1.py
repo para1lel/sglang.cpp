@@ -56,14 +56,14 @@ def ready(port):
 
 
 @contextmanager
-def server(binary, checkpoint, out, width, *, graph=False, mtp=False, observer=None):
+def server(binary, checkpoint, out, width, *, graph=False, mtp=False, observer=None, flags=()):
     with closing(socket.socket()) as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     out.mkdir()
     command = [
         str(binary), "--checkpoint", str(checkpoint), "--port", str(port),
-        "--max-active", str(width), "--trace-batches",
+        "--max-active", str(width), "--trace-batches", *flags,
     ]
     if graph:
         command.append("--batch-cuda-graphs")

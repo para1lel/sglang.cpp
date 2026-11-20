@@ -1,6 +1,6 @@
 # Native output constraints
 
-Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finite-choice-constraints), a regular expression, or the JSON Schema subset below. Pick one constraint per request. Both JSON and SSE use the same constraint.
+Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finite-choice-constraints), a regular expression, or the JSON Schema subset below. Pick one constraint per request. Both JSON and SSE use the same constraint. Constrained chat keeps reasoning and tool markers in `content`, even when [chat output parsers](chat-serving.md#qwen-reasoning-and-tool-calls) are enabled.
 
 ## Responsibilities and sources of truth
 

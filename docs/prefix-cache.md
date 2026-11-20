@@ -4,14 +4,14 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L97)<!-- prefix: "} else if (o" --> · [Salt parser](../apps/server/text_request.cpp#L438)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L27)<!-- prefix: "void append_" --> |
+| Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L108)<!-- prefix: "} else if (o" --> · [Salt parser](../apps/server/text_request.cpp#L471)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L27)<!-- prefix: "void append_" --> |
 | HTTP controls | Dispatch cache reset, metrics, and bounded scheduler profiling. | [Control routes](../apps/server/prefix_controls.cpp#L213)<!-- prefix: "void Connect" --> |
 | Batch | Restore request state, schedule remaining prompt rows, and publish completed checkpoints. | [Admission](../src/decoder_batch.cpp#L427)<!-- prefix: "int DecoderB" --> · [Checkpoint publication](../src/decoder_batch.cpp#L927)<!-- prefix: "cache-\u003estore" --> |
 | Cache | Match checkpoint keys and own the copies until eviction or batch teardown. | [Lookup](../src/decoder_prefix_cache.cpp#L119)<!-- prefix: "int PrefixCa" --> · [Restore](../src/decoder_prefix_cache.cpp#L138)<!-- prefix: "int PrefixCa" --> · [Store](../src/decoder_prefix_cache.cpp#L161)<!-- prefix: "void PrefixC" --> |
 
 ## Runtime path
 
-Use `--prefix-cache-entries 1` through `4` for native prefix reuse. The default `0` disables reuse. Keep `--mtp-steps 0` and omit `--eager`. The default prefill policy is `exact`. Pass `--fp8-prefill tensor-core` to select tensor-core prefill. Prefix reuse works at every server capacity, including `--max-active 1`. Use `--batch-cuda-graphs` to enable eligible replay. [CLI validation](../apps/sglang-server.cpp#L113)<!-- prefix: "if (argument" --> · [Control flag](../apps/sglang-server.cpp#L177)<!-- prefix: "}, health, a" -->
+Use `--prefix-cache-entries 1` through `4` for native prefix reuse. The default `0` disables reuse. Keep `--mtp-steps 0` and omit `--eager`. The default prefill policy is `exact`. Pass `--fp8-prefill tensor-core` to select tensor-core prefill. Prefix reuse works at every server capacity, including `--max-active 1`. Use `--batch-cuda-graphs` to enable eligible replay. [CLI validation](../apps/sglang-server.cpp#L124)<!-- prefix: "if (argument" --> · [Control flag](../apps/sglang-server.cpp#L191)<!-- prefix: "}, health, a" -->
 
 Native text, chat, and benchmark ID requests accept an optional `cache_salt` string of up to 256 UTF-8 bytes. Omission uses an empty string. Invalid salts return HTTP 400 even when reuse is disabled. Native text and chat support greedy, sampled, and finite-choice requests with prefix reuse. The benchmark ID route keeps its greedy policy.
 

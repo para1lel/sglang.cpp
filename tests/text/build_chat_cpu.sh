@@ -8,7 +8,7 @@ output=$(realpath -m -- "${3:?Pass the output executable path}")
 
 sources=("$source/apps/sglang-server.cpp")
 for name in batch_service completions http text_request text_completion chat_template \
-    chat_media prefix_controls; do
+    chat_media chat_output prefix_controls; do
     file="$source/apps/server/$name.cpp"
     if [[ -f "$file" ]]; then
         sources+=("$file")
@@ -36,6 +36,10 @@ fi
 media_api=()
 if [[ $(<"$source/include/sglang/decoder_batch.h") == *admit_multimodal* ]]; then
     media_api=(-DSGLANG_TEST_BATCH_MEDIA)
+fi
+vision_header="$source/include/sglang/server/vision_completion.h"
+if [[ -f "$vision_header" && $(<"$vision_header") == *'generate(const Decoder&'* ]]; then
+    media_api+=(-DSGLANG_TEST_SERIAL_MEDIA)
 fi
 
 "${CXX:-c++}" -std=c++17 -O2 -pthread \

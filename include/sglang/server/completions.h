@@ -18,18 +18,26 @@ class VisionCompletion;
 
 enum class SamplingDefaults { model, openai };
 
+struct ChatParsers {
+    bool qwen3_reasoning = false;
+    bool qwen3_coder_tools = false;
+};
+
 class CompletionTokenizer {
 public:
     explicit CompletionTokenizer(const std::filesystem::path& checkpoint,
-                                 SamplingDefaults sampling = SamplingDefaults::model);
+                                 SamplingDefaults sampling = SamplingDefaults::model,
+                                 ChatParsers parsers = ChatParsers());
     ~CompletionTokenizer();
     const Tokenizer& get() const;
     const ChatTemplate& chat_template() const;
     const DecoderOptions& chat_sampling_defaults() const;
+    ChatParsers chat_parsers() const { return chat_parsers_; }
 
 private:
     const std::filesystem::path checkpoint_;
     const SamplingDefaults sampling_mode_;
+    const ChatParsers chat_parsers_;
     mutable std::once_flag loaded_;
     mutable std::unique_ptr<const Tokenizer> tokenizer_;
     mutable std::once_flag chat_loaded_;

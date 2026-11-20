@@ -337,7 +337,8 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
         } else if (key != "messages" && key != "tools" && key != "tool_choice" &&
                    key != "add_generation_prompt" && key != "add_vision_id" &&
                    key != "enable_thinking" && key != "preserve_thinking" &&
-                   key != "reasoning_effort") {
+                   key != "reasoning_effort" && key != "separate_reasoning" &&
+                   key != "stream_reasoning" && key != "parallel_tool_calls") {
             throw std::invalid_argument("Unsupported chat completion option: " + key);
         }
     }
@@ -375,6 +376,38 @@ void normalize_template_options(json::OrderedObject& chat) {
     }
 }
 
+bool chat_flag(const json::OrderedObject& chat, std::string_view key) {
+    const auto* value = json::get(chat, key);
+    if (!value) {
+        return true;
+    }
+    if (const auto flag = value->boolean()) {
+        return *flag;
+    }
+    throw std::invalid_argument("Expected a boolean for " + std::string(key));
+}
+
+void set_chat_output(TextRequest& request, const json::OrderedObject& chat,
+                     std::string_view prompt, ChatParsers parsers) {
+    const bool separate = chat_flag(chat, "separate_reasoning");
+    const bool stream = chat_flag(chat, "stream_reasoning");
+    if (!chat_flag(chat, "parallel_tool_calls")) {
+        bad_request("parallel_tool_calls=false is unsupported");
+    }
+    if (request.media || request.options.constraint) {
+        return;
+    }
+    constexpr std::string_view open_suffix = "<|im_start|>assistant\n<think>\n";
+    auto& output = request.chat_output;
+    output.separate_reasoning = parsers.qwen3_reasoning && separate;
+    output.stream_reasoning = stream;
+    output.prompt_has_open_think = prompt.size() >= open_suffix.size() &&
+        prompt.substr(prompt.size() - open_suffix.size()) == open_suffix;
+    if (parsers.qwen3_coder_tools) {
+        read_chat_tools(output, chat_tools(chat));
+    }
+}
+
 json::Value parse_body(std::string_view body, json::Syntax syntax) {
     try {
         return json::parse(body, syntax);
@@ -386,8 +419,8 @@ json::Value parse_body(std::string_view body, json::Syntax syntax) {
 }
 
 CompletionTokenizer::CompletionTokenizer(const std::filesystem::path& checkpoint,
-                                         SamplingDefaults sampling)
-    : checkpoint_(checkpoint), sampling_mode_(sampling) {}
+                                         SamplingDefaults sampling, ChatParsers parsers)
+    : checkpoint_(checkpoint), sampling_mode_(sampling), chat_parsers_(parsers) {}
 
 CompletionTokenizer::~CompletionTokenizer() = default;
 
@@ -473,6 +506,7 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
         }
     }
     finish_options(request, options, tokenizer);
+    set_chat_output(request, normalized, prompt, tokenizer.chat_parsers());
     return request;
 }
 

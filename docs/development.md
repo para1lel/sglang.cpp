@@ -197,7 +197,7 @@ See [MTP](mtp.md) for exact tiled seeding, joint target verification, and per-la
 
 ### Native streaming server
 
-See [native HTTP transport](http-server.md) for request admission, overload responses, health, readiness, and shutdown. Set `--max-active` to a value from 1 to 32. Set `--max-num-batched-tokens` to a value from 1 to 32,768. Both default to the maximum. [MTP](mtp.md#runtime-path) requires prefix reuse off. Graph replay is [opt-in](batch-graphs.md). [CLI limits](../apps/sglang-server.cpp#L88)<!-- prefix: "} else if (o" -->
+See [native HTTP transport](http-server.md) for request admission, overload responses, health, readiness, and shutdown. Set `--max-active` to a value from 1 to 32. Set `--max-num-batched-tokens` to a value from 1 to 32,768. Both default to the maximum. [MTP](mtp.md#runtime-path) requires prefix reuse off. Graph replay is [opt-in](batch-graphs.md). [CLI limits](../apps/sglang-server.cpp#L99)<!-- prefix: "} else if (o" -->
 
 Lanes share weights and own KV, GDN state, and outputs. [Resident memory admission](batch-graphs.md#resident-memory-admission) applies at every capacity.
 

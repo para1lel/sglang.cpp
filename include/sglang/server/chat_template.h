@@ -8,6 +8,8 @@ namespace sglang::server {
 
 enum class ChatInput { checkpoint_template, http };
 
+const json::Value* chat_tools(const json::OrderedObject& chat);
+
 class ChatTemplate {
 public:
     explicit ChatTemplate(const std::filesystem::path& checkpoint);

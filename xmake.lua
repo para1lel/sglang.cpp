@@ -154,7 +154,8 @@ target("sglang-server")
     add_deps("sglang_decoder", "sglang_tokenizer", "sglang_media_preprocess", "sglang_vision")
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
-              "apps/server/chat_template.cpp", "apps/server/completions.cpp",
+              "apps/server/chat_template.cpp", "apps/server/chat_output.cpp",
+              "apps/server/completions.cpp",
               "apps/server/http.cpp", "apps/server/prefix_controls.cpp",
               "apps/server/text_request.cpp", "apps/server/text_completion.cpp",
               "apps/server/chat_media.cpp", "apps/server/vision_completion.cpp")

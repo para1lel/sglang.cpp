@@ -7,9 +7,11 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -72,9 +74,43 @@ void record_sampling(const DecoderOptions& options, std::size_t prompt_size) {
     std::cerr << output.str();
 }
 
+std::map<std::int64_t, std::vector<int>> read_output_scripts() {
+    std::map<std::int64_t, std::vector<int>> scripts;
+    const auto* path = std::getenv("SGLANG_TEST_CHAT_OUTPUT_IDS");
+    if (!path) {
+        return scripts;
+    }
+    std::ifstream input(path);
+    for (std::string line; std::getline(input, line);) {
+        std::istringstream values(line);
+        std::int64_t seed;
+        std::vector<int> ids;
+        if (!(values >> seed)) {
+            throw std::runtime_error("Missing scripted output seed");
+        }
+        for (int id; values >> id;) {
+            ids.push_back(id);
+        }
+        if (!values.eof() || ids.empty() || !scripts.emplace(seed, std::move(ids)).second) {
+            throw std::runtime_error("Invalid scripted output token IDs");
+        }
+    }
+    if (!input.eof() || scripts.empty()) {
+        throw std::runtime_error("Cannot read scripted chat outputs");
+    }
+    return scripts;
+}
+
+const std::vector<int>* scripted_output(const DecoderOptions& options) {
+    static const auto scripts = read_output_scripts();
+    const auto found = scripts.find(options.seed.value_or(0));
+    return found == scripts.end() ? nullptr : &found->second;
+}
+
 struct Lane {
     DecoderOptions options;
     std::size_t prompt_size;
+    const std::vector<int>* script = scripted_output(options);
     int tokens = 0;
 
     DecoderBatchStep step() {
@@ -84,9 +120,12 @@ struct Lane {
         const auto offset = prompt_size == han_partial_prompt_tokens
             ? 0 : (prompt_size % sequence.size() + sequence.size() - 17 % sequence.size());
         const auto index = (static_cast<std::size_t>(tokens) + offset) % sequence.size();
-        const auto token = sampling_probe()
-            ? sampling_sequence[static_cast<std::size_t>(tokens) % sampling_sequence.size()]
-            : sequence[index];
+        auto token = sequence[index];
+        if (script) {
+            token = script->at(static_cast<std::size_t>(tokens) % script->size());
+        } else if (sampling_probe()) {
+            token = sampling_sequence[static_cast<std::size_t>(tokens) % sampling_sequence.size()];
+        }
         ++tokens;
         if (options.stops_at(token)) {
             return {token, DecoderFinishReason::stop, true};
@@ -228,10 +267,12 @@ VisionCompletion::VisionCompletion(const std::filesystem::path& checkpoint, int 
 
 VisionCompletion::~VisionCompletion() = default;
 
+#ifdef SGLANG_TEST_SERIAL_MEDIA
 DecoderResult VisionCompletion::generate(const Decoder&, const MediaPrompt&,
                                          const DecoderOptions&, const DecoderCallbacks&) {
     throw std::logic_error("The CPU decoder does not accept media");
 }
+#endif
 
 #ifdef SGLANG_TEST_BATCH_MEDIA
 DecoderResult VisionCompletion::generate(BatchService&, int, const MediaPrompt&,

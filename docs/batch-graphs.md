@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Validate graph options, construct the batch service, and report batch steps. | [CLI option](../apps/sglang-server.cpp#L61)<!-- prefix: "if (option =" --> · [Batch service](../apps/sglang-server.cpp#L162)<!-- prefix: "BatchService" --> · [Trace](../apps/server/batch_service.cpp#L298)<!-- prefix: "void trace_b" --> |
+| Server | Validate graph options, construct the batch service, and report batch steps. | [CLI option](../apps/sglang-server.cpp#L62)<!-- prefix: "if (option =" --> · [Batch service](../apps/sglang-server.cpp#L176)<!-- prefix: "BatchService" --> · [Trace](../apps/server/batch_service.cpp#L298)<!-- prefix: "void trace_b" --> |
 | Decoder batch | Select eligible decode steps, bind lane state, and return winners by slot. | [Batch options](../include/sglang/decoder_batch.h#L49)<!-- prefix: "struct Decod" --> · [Eligibility](../src/decoder_batch.cpp#L711)<!-- prefix: "const bool g" --> · [Readback](../src/decoder_batch.cpp#L804)<!-- prefix: "results[slot" --> |
 | CUDA resources | Recover from eligible pre-submission failures and retain resources while completion is uncertain. | [Fallback](../src/decoder_resources.cpp#L413)<!-- prefix: "bool Allocat" --> · [Cleanup](../src/decoder_resources.cpp#L212)<!-- prefix: "CleanupError" --> |
 
@@ -62,7 +62,7 @@ A nonfinite visible score, visible V scale byte above 160, or invalid partial or
 
 ## Verification
 
-Follow the [batch graph test runbook](../tests/batch/README.md) to build the release server, `mxfp8-gqa-check`, and `batch-graph-lanes`. Enable `--mxfp8-gqa-check=y` and `--batch-graph-lanes=y` in XMake. The runner checks bound operators, lane reuse, fault recovery, and HTTP parity under both prefill policies. Its CPU regression rejects a mask with the correct population count that includes a zero-budget slot. [Test target](../xmake.lua#L238)<!-- prefix: "option(\"batc" -->
+Follow the [batch graph test runbook](../tests/batch/README.md) to build the release server, `mxfp8-gqa-check`, and `batch-graph-lanes`. Enable `--mxfp8-gqa-check=y` and `--batch-graph-lanes=y` in XMake. The runner checks bound operators, lane reuse, fault recovery, and HTTP parity under both prefill policies. Its CPU regression rejects a mask with the correct population count that includes a zero-budget slot. [Test target](../xmake.lua#L239)<!-- prefix: "option(\"batc" -->
 
 On the reserved B200, compare each packed width against eager with identical inputs under the same prefill policy. Compare greedy IDs and complete BF16 vocabulary rows. Require bitwise parity when the attention route matches. Record differences when the route changes. Check the singleton at both narrow-window edges and adjacent visible lengths. Cross from 5,120 to 5,121 visible tokens. Verify replay at 5,120, direct eager attention at 5,121, and zero new request-owned score bytes on that transition. Check positions 127–129 for page crossing. At multi-lane widths, exercise inline and long strides in one replay. Change slot masks and request bindings at one width. Reject first-use score allocations at different packed lanes. Check retained bytes, eager continuation, and executable reuse after cancellation and slot reuse. Verify repeated bindings reuse existing allocations. Select a zero-budget lane alongside replaying lanes. After retirement, require zero request bytes.
 

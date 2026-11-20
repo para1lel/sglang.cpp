@@ -142,3 +142,52 @@ requests and requires CUPTI device graph replays at each width. It checks
 continued replay when a cancelled chat is replaced while three legacy streams
 stay active. The same candidate binary runs depth-four MTP with one scheduler
 slot and checks greedy parity, including the explicit legacy stop fixture.
+
+## Qwen chat output
+
+Build the Release server and use the managed Pixi environment with Python 3.11
+or newer. Set `build` to the absolute XMake output directory containing the
+server and static libraries. Use a fresh evidence directory for each run.
+
+```bash
+build="$PWD/build"
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+out="$PWD/artifacts/chat-output"
+mkdir -p "$out"
+bash tests/text/build_chat_cpu.sh "$PWD" "$build" "$out/chat-cpu"
+CUDA_VISIBLE_DEVICES='' python3 -B tests/text/check_chat_output_cpu.py \
+    --server "$out/chat-cpu" --checkpoint "$checkpoint" --evidence "$out/cpu"
+```
+
+The CPU HTTP check runs the server with deterministic checkpoint token IDs.
+It splits markers and UTF-8 scalars across tokens and checks how JSON and SSE
+carry the same output. It checks independent flags, tool selection, typed
+arguments, and replay after a connection reset. Recovery cases distinguish
+closed parameters containing literal wrappers from unclosed parameters
+followed by another call. They cover invalid sibling fields, JSON quotes,
+stray closing tags, the token limit, and explicit stops.
+
+Compile the direct parser check against the same tokenizer and JSON libraries.
+It verifies whole input, single bytes, checkpoint tokenizer pieces, every
+split into two chunks, and seeded random chunks. It also checks cancellation.
+
+```bash
+"${CXX:-c++}" -std=c++17 -O2 -pthread -Iinclude \
+    tests/text/chat_output_chunks.cpp apps/server/chat_output.cpp \
+    "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
+    -o "$out/chat-output-chunks"
+"$out/chat-output-chunks" "$checkpoint/tokenizer.json"
+```
+
+Hold the shared UUID lock on an idle B200 for the native check.
+
+```bash
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved GPU UUID}" \
+    python3 -B tests/text/test_chat_output.py --server "$build/bin/sglang-server" \
+    --checkpoint "$checkpoint" --evidence "$out/gpu"
+```
+
+The native check compares parser-off and parser-on generation at width one.
+It repeats the parsed responses with four concurrent requests and checks the
+server trace for overlapping decode lanes. The reasoning and tool examples
+also run without token diagnostics or an SSE usage frame.

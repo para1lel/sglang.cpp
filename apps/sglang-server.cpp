@@ -21,6 +21,7 @@ struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
     sglang::Fp8PrefillPolicy fp8_prefill = sglang::Fp8PrefillPolicy::exact;
     SamplingDefaults sampling = SamplingDefaults::model;
+    ChatParsers chat_parsers;
     int device = 0;
     int port = 17384;
     int max_active = sglang::decoder_batch_max_lanes;
@@ -76,6 +77,16 @@ Arguments parse_arguments(int argc, char** argv) {
             arguments.sampling = SamplingDefaults::model;
         } else if (option == "--sampling-defaults" && value == "openai") {
             arguments.sampling = SamplingDefaults::openai;
+        } else if (option == "--reasoning-parser") {
+            if (value != "qwen3") {
+                throw std::invalid_argument("Expected --reasoning-parser qwen3");
+            }
+            arguments.chat_parsers.qwen3_reasoning = true;
+        } else if (option == "--tool-call-parser") {
+            if (value != "qwen3_coder") {
+                throw std::invalid_argument("Expected --tool-call-parser qwen3_coder");
+            }
+            arguments.chat_parsers.qwen3_coder_tools = true;
         } else if (option == "--fp8-prefill") {
             arguments.fp8_prefill = sglang::cli::parse_fp8_prefill(value);
         } else if (option == "--device") {
@@ -137,6 +148,8 @@ int main(int argc, char** argv) {
                      "                     [--max-num-batched-tokens N] [--trace-batches]\n"
                      "                     [--fp8-prefill exact|tensor-core]\n"
                      "                     [--prefix-cache-entries 0..4]\n"
+                     "                     [--reasoning-parser qwen3]\n"
+                     "                     [--tool-call-parser qwen3_coder]\n"
                      "Active requests: 32 by default, range 1-32.\n"
                      "Waiting completions: up to --max-active. Full queue returns HTTP 503.\n"
                      "Target rows per step: 32768 by default, range 1-32768.\n"
@@ -156,7 +169,8 @@ int main(int argc, char** argv) {
         if (stopping()) {
             return 0;
         }
-        const CompletionTokenizer tokenizer(arguments.checkpoint, arguments.sampling);
+        const CompletionTokenizer tokenizer(arguments.checkpoint, arguments.sampling,
+                                            arguments.chat_parsers);
         const auto health = health_json(arguments);
         VisionCompletion vision(arguments.checkpoint, arguments.device);
         BatchService service(decoder, arguments.trace_batches,

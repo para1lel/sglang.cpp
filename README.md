@@ -270,8 +270,7 @@ See [text completion options and verification](docs/text-serving.md) for prompt 
 ### Submit a chat conversation
 
 Send `messages` with model `Qwen3.8-27B-FP8` to `POST /v1/chat/completions`.
-The server renders the pinned checkpoint template and sends its prompt through the
-same serial or batched decoder as raw text and token-ID requests.
+The server renders the checkpoint template and shares the decoder with raw text and token IDs.
 
 ```bash
 curl -N http://127.0.0.1:17384/v1/chat/completions \
@@ -279,11 +278,11 @@ curl -N http://127.0.0.1:17384/v1/chat/completions \
   -d '{"model":"Qwen3.8-27B-FP8","messages":[{"role":"user","content":"Explain why the sky is blue."}],"stream":true}'
 ```
 
-Chat accepts inline decoded RGB8 images and video. Media requests use eager target execution
-and bypass prefix reuse.
-See [image and video inputs](docs/chat-serving.md#image-and-video-inputs) for the attachment format.
-An opt-in build with libpng and FFmpeg also accepts inline PNG images and MP4 video.
-See [codec build and verification](docs/chat-serving.md#codec-checks) for setup and checks.
+Enable [Qwen chat parsers](docs/chat-serving.md#qwen-reasoning-and-tool-calls) with
+`--reasoning-parser qwen3` or `--tool-call-parser qwen3_coder`.
+
+[Decoded RGB8 images and video](docs/chat-serving.md#image-and-video-inputs) use eager target
+execution and bypass prefix reuse. [Optional codecs](docs/chat-serving.md#codec-checks) add PNG and MP4.
 
 ### Sample output tokens
 
@@ -295,7 +294,7 @@ Explicit sampling controls override the route defaults.
 If a chat request omits its output limit, the server uses the final prompt length to set the budget.
 Batch admission can lower that implicit budget to fit the worker's resident capacity.
 See [chat sampling and output limits](docs/chat-serving.md#sampling-defaults-and-output-budget).
-The [chat defaults loader](apps/server/text_request.cpp#L408)<!-- prefix: "const Decode" -->
+The [chat defaults loader](apps/server/text_request.cpp#L441)<!-- prefix: "const Decode" -->
 and [output limit calculation](apps/server/text_request.cpp#L246)<!-- prefix: "void finish_" -->
 implement these defaults.
 

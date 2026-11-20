@@ -160,9 +160,8 @@ struct ScratchLayout {
     std::byte* data = nullptr;
     std::size_t bytes = 0;
 
-    template <typename Element>
+    template <typename Element, std::size_t alignment = 16>
     Element* take(std::size_t count) {
-        constexpr std::size_t alignment = 16;
         const auto offset = (bytes + alignment - 1) / alignment * alignment;
         bytes = offset + count * sizeof(Element);
         return data ? reinterpret_cast<Element*>(data + offset) : nullptr;
@@ -176,7 +175,7 @@ struct TileBuffers {
           residual(layout.take<Bf16>(rows * hidden_size)),
           projected_attention(layout.take<Bf16>(rows * hidden_size)),
           attention(layout.take<Bf16>(rows * std::max(text_gdn_value_width, text_gqa_q_width))),
-          mlp_gate(layout.take<Bf16>(rows * intermediate_size)),
+          mlp_gate(layout.take<Bf16, 32>(rows * intermediate_size)),
           mlp_up(layout.take<Bf16>(rows * intermediate_size)),
           q_gate(layout.take<Bf16>(rows * text_gqa_q_gate_width)),
           keys(layout.take<Bf16>(rows * text_gqa_kv_width)),
@@ -230,17 +229,20 @@ struct Chunk : PrefillProjections {
                             work.keys, work.values, work.rope_keys});
     }
 
-    void gdn(const GdnLayer& layer, TextGdnState state) const {
+    void gdn(const GdnLayer& layer, TextGdnState state, int bank) const {
         const TextFp8ActivationView input{activation.values, activation.scales};
         project(layer.qkv, input, work.gdn_qkv);
         project(layer.z, input, work.gdn_z);
         project(layer.b, work.normalized, work.gdn_b);
         project(layer.a, work.normalized, work.gdn_a);
         static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
+        const bool chunked_recurrence = position != 0 || bank != 0;
         const auto status = tensor_core_fp8
             ? tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
                                       layer.recurrent, state, work.gdn_scratch,
-                                      reinterpret_cast<float2*>(work.keys), work.attention, stream)
+                                      reinterpret_cast<float2*>(work.keys), work.attention, stream,
+                                      chunked_recurrence ? work.mlp_gate : nullptr,
+                                      rows * intermediate_size * sizeof(Bf16))
             : text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
                                work.gdn_a, layer.recurrent, state, work.gdn_scratch,
                                text_gdn_workspace_bytes(rows), work.attention, stream);
@@ -469,7 +471,8 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         if (is_full_attention(index)) {
             chunk.gqa(layer.gqa, request.caches[gqa_index++], request.pages);
         } else {
-            chunk.gdn(layer.gdn, request.states[gdn_index++]);
+            chunk.gdn(layer.gdn, request.states[gdn_index], gdn_index);
+            ++gdn_index;
         }
         chunk.normalize(work.projected_attention, work.residual, layer.attention_norm);
         chunk.mlp(layer);

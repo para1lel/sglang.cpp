@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L449)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L265)<!-- prefix: "const auto s" --> |
+| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L451)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L267)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select flash or ordered attention for tensor-core multirow prefill. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L816)<!-- prefix: "cudaError_t " --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
 

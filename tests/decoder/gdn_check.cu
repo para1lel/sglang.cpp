@@ -298,6 +298,9 @@ namespace {
 
 bool trace_launches = false;
 std::vector<std::pair<bool, unsigned int>> recurrent_launches;
+#ifdef SGLANG_TEST_GDN_CHUNK
+std::vector<std::array<unsigned int, 4>> chunk_launches;
+#endif
 cudaEvent_t recurrence_start = nullptr;
 cudaEvent_t recurrence_stop = nullptr;
 
@@ -339,13 +342,14 @@ struct PrefillCase {
                               stream.stream));
     }
 
-    void launch(int rows, int offset) const {
+    template<typename... ChunkScratch>
+    void launch(int rows, int offset, ChunkScratch... chunk) const {
         const sglang::TextGdnWeights weights{convolution.data(), a_log.data(), dt_bias.data(),
                                              norm.data()};
         const sglang::TextGdnState state{history.data(), recurrent.data()};
         check(sglang::decoder::tensor_core_prefill_gdn(
             rows, qkv.data(), z.data(), beta.data(), decay.data(), weights, state,
-            scratch.data() + offset, gates.data(), output.data(), stream.stream));
+            scratch.data() + offset, gates.data(), output.data(), stream.stream, chunk...));
     }
 };
 
@@ -441,6 +445,194 @@ void check_segmented(bool paired, bool short_run, const char* path) {
     }
 }
 
+#ifdef SGLANG_TEST_GDN_CHUNK
+constexpr int chunk_rows = 32;
+constexpr int guard_bytes = 32;
+constexpr unsigned char poison = 0xa5;
+
+std::size_t chunk_bytes(int rows) {
+    constexpr int bytes_per_head = 2 * chunk_rows * chunk_rows * sizeof(BFloat) +
+                                   3 * chunk_rows * sizeof(float);
+    return (rows + chunk_rows - 1) / chunk_rows * value_heads * bytes_per_head;
+}
+
+struct ChunkResult {
+    std::vector<BFloat> output;
+    std::vector<float> state;
+    std::vector<BFloat> history;
+};
+
+ChunkResult launch_chunk(const PrefillCase& gpu, const Rows& rows, unsigned char* scratch,
+                         std::size_t bytes, bool chunked) {
+    gpu.upload(rows);
+    recurrent_launches.clear();
+    chunk_launches.clear();
+    trace_launches = true;
+    gpu.launch(rows.count, 0, scratch, bytes);
+    trace_launches = false;
+    if (chunked) {
+        const auto chunks = static_cast<unsigned>((rows.count + chunk_rows - 1) / chunk_rows);
+        if (!recurrent_launches.empty() ||
+            chunk_launches != std::vector<std::array<unsigned int, 4>>{
+                {0, value_heads, chunks, 128}, {1, value_heads, 4, 128}}) {
+            throw std::runtime_error("Expected V9 matrix preparation and warp MMA recurrence");
+        }
+    } else {
+        check_launch(0, true);
+        if (recurrent_launches.size() != 1 || !chunk_launches.empty()) {
+            throw std::runtime_error("Expected only the paired ordered recurrence");
+        }
+    }
+    check(cudaStreamSynchronize(gpu.stream.stream));
+    return {gpu.output.download(rows.count * value_width), gpu.recurrent.download(state_size),
+            gpu.history.download(qkv_width * history_width)};
+}
+
+template<typename Value>
+void same_bits(const std::vector<Value>& actual, const std::vector<Value>& expected,
+               std::size_t count, const char* label) {
+    if (std::memcmp(actual.data(), expected.data(), count * sizeof(Value))) {
+        throw std::runtime_error(label);
+    }
+}
+
+struct Error {
+    double maximum = 0;
+    double squared = 0;
+    double energy = 0;
+
+    void add(double actual, double expected) {
+        const double delta = std::abs(actual - expected);
+        if (!std::isfinite(delta)) {
+            throw std::runtime_error("Nonfinite GDN result");
+        }
+        maximum = std::max(maximum, delta);
+        squared += delta * delta;
+        energy += expected * expected;
+    }
+
+    double relative() const { return std::sqrt(squared / energy); }
+};
+
+void verify_chunk(const ChunkResult& result, const std::vector<BFloat>& expected,
+                  const Reference& reference, int rows, const char* label, bool chunked) {
+    same_bits(result.history, reference.history, reference.history.size(),
+              "Convolution history differs from FP64 sequence");
+    Error output, state;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const double target = number(expected[index]);
+        output.add(number(result.output[index]), target);
+    }
+    for (std::size_t index = 0; index < result.state.size(); ++index) {
+        state.add(result.state[index], reference.recurrent[index]);
+    }
+    std::cout << label << " rows=" << rows << " output_max=" << output.maximum
+              << " output_nrmse=" << output.relative() << " state_max=" << state.maximum
+              << " state_nrmse=" << state.relative() << std::endl;
+    if (output.maximum > (chunked ? 0.012 : 0.005) ||
+        output.relative() > (chunked ? 0.025 : 0.003) ||
+        state.maximum > (chunked ? 0.003 : 0.0002) ||
+        state.relative() > (chunked ? 0.02 : 0.002)) {
+        throw std::runtime_error(std::string(label) + " GDN exceeded the FP64 error budget");
+    }
+}
+
+void verify_chunk_workspace(const Device<unsigned char>& buffer, std::size_t size,
+                            std::size_t bytes) {
+    const auto after = buffer.download(size);
+    const auto payload = after.begin() + guard_bytes;
+    if (!std::all_of(after.begin(), payload, [](auto byte) { return byte == poison; }) ||
+        !std::all_of(payload + bytes, after.end(), [](auto byte) { return byte == poison; }) ||
+        std::all_of(payload, payload + bytes, [](auto byte) { return byte == poison; })) {
+        throw std::runtime_error("Unexpected chunk workspace footprint");
+    }
+}
+
+void check_chunked() {
+    constexpr int capacity = 193;
+    const Weights weights;
+    Reference reference;
+    reference.history = input(qkv_width * history_width, 43, 1.0 / 128);
+    for (std::size_t index = 0; index < state_size; ++index) {
+        reference.recurrent[index] = (static_cast<int>(index % 127) - 63) * (1.0 / 8192);
+    }
+    PrefillCase ordered(capacity, weights, reference);
+    PrefillCase chunked(capacity, weights, reference);
+    PrefillCase alternate(capacity, weights, reference);
+    PrefillCase exact_boundary(capacity, weights, reference);
+    const auto size = chunk_bytes(capacity) + 2 * guard_bytes;
+    Device<unsigned char> buffer(size);
+    auto* scratch = buffer.data() + guard_bytes;
+    const std::vector<unsigned char> initial(size, poison);
+
+    for (const int count : {127, 128, 129, 193}) {
+        auto rows = request_rows(count, 71 + count);
+        for (std::size_t index = 0; index < rows.decay.size(); ++index) {
+            rows.decay[index] = as_bf16(number(rows.decay[index]) - 3.0);
+        }
+        auto changed_reference = reference;
+        const auto expected = reference_forward(rows, true, weights, reference);
+        const auto baseline = launch_chunk(ordered, rows, nullptr, 0, false);
+        verify_chunk(baseline, expected, reference, count, "ordered", false);
+        const auto bytes = chunk_bytes(count);
+        buffer.upload(initial);
+        if (count <= 128) {
+            unsigned char* fallback = count == 128 ? scratch + 1 : scratch;
+            const auto legal = launch_chunk(chunked, rows, fallback, bytes, false);
+            same_bits(legal.output, baseline.output, expected.size(), "Fallback output differs");
+            same_bits(legal.state, baseline.state, state_size, "Fallback state differs");
+            same_bits(legal.history, baseline.history, reference.history.size(),
+                      "Fallback history differs");
+            if (buffer.download(size) != initial) {
+                throw std::runtime_error("Ordered fallback wrote chunk workspace");
+            }
+        } else {
+            const auto actual = launch_chunk(chunked, rows, scratch, bytes, true);
+            verify_chunk(actual, expected, reference, count, "chunked", true);
+            verify_chunk_workspace(buffer, size, bytes);
+        }
+        if (count == 127) {
+            launch_chunk(alternate, rows, nullptr, 0, false);
+            launch_chunk(exact_boundary, rows, nullptr, 0, false);
+        }
+        if (count == 128) {
+            const auto shortfall = launch_chunk(alternate, rows, scratch, bytes - 1, false);
+            same_bits(shortfall.output, baseline.output, expected.size(), "Wrong shortfall output");
+            same_bits(shortfall.state, baseline.state, state_size, "Shortfall state differs");
+            same_bits(shortfall.history, baseline.history, reference.history.size(),
+                      "Shortfall history differs");
+            if (buffer.download(size) != initial) {
+                throw std::runtime_error("Shortfall wrote chunk workspace");
+            }
+            const auto boundary = launch_chunk(exact_boundary, rows, scratch, bytes, true);
+            verify_chunk(boundary, expected, reference, count, "chunked boundary", true);
+            verify_chunk_workspace(buffer, size, bytes);
+        }
+        if (count == 129) {
+            constexpr int change = chunk_rows + 7;
+            auto changed = rows;
+            std::fill_n(changed.qkv.begin() + change * qkv_width, qkv_width, as_bf16(0));
+            std::fill_n(changed.beta.begin() + change * value_heads, value_heads, as_bf16(3));
+            const auto changed_expected = reference_forward(changed, true, weights,
+                                                            changed_reference);
+            const auto distinct = launch_chunk(alternate, changed, scratch, bytes, true);
+            verify_chunk(distinct, changed_expected, changed_reference, count, "perturbed", true);
+            verify_chunk_workspace(buffer, size, bytes);
+            const auto original = chunked.output.download(expected.size());
+            const auto prefix = change * value_width;
+            same_bits(distinct.output, original, prefix, "A future input changed a causal output");
+            const auto boundary = 2 * chunk_rows * value_width;
+            if (!std::memcmp(distinct.output.data() + prefix, original.data() + prefix,
+                             (boundary - prefix) * sizeof(BFloat)) ||
+                !std::memcmp(distinct.output.data() + boundary, original.data() + boundary,
+                             (expected.size() - boundary) * sizeof(BFloat))) {
+                throw std::runtime_error("Perturbation did not reach both windows");
+            }
+        }
+    }
+}
+#endif
+
 class Event {
 public:
     Event() { check(cudaEventCreate(&event)); }
@@ -493,6 +685,14 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
         const char* name = nullptr;
         check(cudaFuncGetName(&name, function));
         const std::string_view kernel(name);
+#ifdef SGLANG_TEST_GDN_CHUNK
+        if (trace_launches && kernel.find("gdn_chunk") != std::string_view::npos &&
+            (kernel.find("prepare") != std::string_view::npos ||
+             kernel.find("recur_warp") != std::string_view::npos)) {
+            const unsigned int stage = kernel.find("recur_warp") != std::string_view::npos;
+            chunk_launches.push_back({stage, grid.x, grid.y, block.x});
+        }
+#endif
         if (kernel.find("gdn_prefill_recur") != std::string_view::npos) {
             if (trace_launches) {
                 recurrent_launches.emplace_back(
@@ -516,6 +716,12 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
 int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     try {
 #ifdef SGLANG_TEST_GDN_TILED
+#ifdef SGLANG_TEST_GDN_CHUNK
+        if (argc == 2 && std::string_view(argv[1]) == "chunked") {
+            check_chunked();
+            return 0;
+        }
+#endif
         if (argc == 3 && std::string_view(argv[1]) == "timing") {
             time_prefill(std::stoi(argv[2]));
             return 0;
@@ -531,7 +737,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
         }
         if (argc != 1) {
             throw std::invalid_argument(
-                "Expected segmented|short paired|original CAPTURE or timing N");
+                "Expected segmented|short paired|original CAPTURE, timing N or chunked");
         }
 #endif
         GpuCase gpu;

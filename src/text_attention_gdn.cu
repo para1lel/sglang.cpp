@@ -1,4 +1,5 @@
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/text/gdn_chunk.cuh"
 
 #include <cuda_runtime.h>
 
@@ -462,7 +463,15 @@ cudaError_t recur_and_finish(int token_count, TextGdnMode mode, GdnInputs rows,
 cudaError_t prefill_gdn(
     int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
     const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
-    __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream) {
+    __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream,
+    void* chunk_scratch, std::size_t chunk_bytes) {
+    bool chunked = gdn_chunk::eligible(rows, chunk_scratch, chunk_bytes);
+    if (chunked) {
+        const auto status = gdn_chunk::configure(chunked);
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
     void* prepare_arguments[] = {&qkv, &state.history, &weights, &a, &b, &workspace, &gates};
     auto status = cudaLaunchKernel(gdn_prefill_prepare, dim3(rows * (conv_blocks_per_token + 1)),
                                    dim3(conv_threads), prepare_arguments, 0, stream);
@@ -475,8 +484,13 @@ cudaError_t prefill_gdn(
                         reinterpret_cast<std::uintptr_t>(workspace) % alignof(uint4) == 0;
     const auto recur = paired ? gdn_prefill_recur_paired : gdn_prefill_recur;
     const int threads = paired ? paired_recurrent_threads : recurrent_threads;
-    status = cudaLaunchKernel(recur, dim3(text_gdn_value_heads * value_blocks_per_head),
-                              dim3(threads), recurrent_arguments, 0, stream);
+    if (chunked) {
+        status = gdn_chunk::launch(rows, workspace, gates, chunk_scratch,
+                                   state.recurrent, observable, stream);
+    } else {
+        status = cudaLaunchKernel(recur, dim3(text_gdn_value_heads * value_blocks_per_head),
+                                  dim3(threads), recurrent_arguments, 0, stream);
+    }
     if (status != cudaSuccess) {
         return status;
     }
@@ -537,8 +551,10 @@ bool valid_replay(int count, TextGdnReplayRows rows, TextGdnWeights weights,
 cudaError_t decoder::tensor_core_prefill_gdn(
     int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
     const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
-    __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream) {
-    return prefill_gdn(rows, qkv, z, b, a, weights, state, workspace, gates, output, stream);
+    __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream,
+    void* chunk_scratch, std::size_t chunk_bytes) {
+    return prefill_gdn(rows, qkv, z, b, a, weights, state, workspace, gates, output, stream,
+                       chunk_scratch, chunk_bytes);
 }
 
 cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,

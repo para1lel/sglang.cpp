@@ -206,6 +206,34 @@ if has_config("sampling-check") then
     target_end()
 end
 
+option("gdn-check")
+    set_default(false)
+option_end()
+
+if has_config("gdn-check") then
+    target("gdn-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_cugencodes("sm_100")
+        add_cuflags("--dependency-target-name=", {force = true})
+        add_deps("sglang_cuda")
+        add_defines("SGLANG_TEST_GDN_TILED", "SGLANG_TEST_GDN_CHUNK")
+        add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
+        add_files("tests/decoder/gdn_check.cu")
+    target_end()
+
+    target("gdn-routes")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_decoder")
+        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
+        add_files("tests/decoder/gdn_routes.cpp")
+    target_end()
+end
+
 option("batch-graph-lanes")
     set_default(false)
 option_end()

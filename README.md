@@ -103,6 +103,9 @@ The generator and HTTP server accept `--fp8-prefill exact|tensor-core`. The defa
 `exact` uses the exact FP8 projection path. For target-only requests, `tensor-core`
 uses SM100 Tensor Cores for eligible FP8 projections in chunks of at least three rows.
 Smaller chunks and ineligible projections use the exact path.
+Tensor Core GDN prefill uses chunked recurrence on SM100 for eligible calls with at
+least 128 rows. The first GDN bank uses ordered recurrence for the tile at absolute
+context position zero. Exact prefill keeps its original recurrence.
 With `SGLANG_SERIAL_PREFILL_ROWS` unset, serial K0 text requests on an NVIDIA B200 use a
 1,024-row cap for prompts of at least 512 encoded tokens. Other requests use a
 128-row cap. See [serial prefill](docs/text-serving.md#serial-prefill) for overrides

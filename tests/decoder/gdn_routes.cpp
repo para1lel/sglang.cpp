@@ -1,0 +1,223 @@
+#include "sglang/decoder_batch.h"
+
+#include <cuda_runtime.h>
+
+#include <array>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <iterator>
+#include <stdexcept>
+#include <string_view>
+#include <vector>
+
+extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, std::size_t,
+                                              cudaStream_t);
+
+namespace {
+
+using namespace sglang;
+using Mask = std::array<bool, decoder_batch_max_lanes>;
+constexpr int page = 128;
+constexpr int banks = 48;
+
+enum class Stage { ordered, prepare, chunked, exact };
+
+std::vector<Stage> launches;
+bool record = false;
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+template<typename Operation>
+auto trace(Operation operation) {
+    launches.clear();
+    record = true;
+    auto result = operation();
+    record = false;
+    return result;
+}
+
+void expect_route(std::vector<Stage> expected, const char* label) {
+    std::array<int, 4> counts{};
+    for (const auto stage : launches) {
+        ++counts[static_cast<int>(stage)];
+    }
+    std::cout << label << " ordered=" << counts[0] << " v9_prepare=" << counts[1]
+              << " v9_recur=" << counts[2] << " exact=" << counts[3] << std::endl;
+    require(launches == expected, "Unexpected GDN prefill launch order");
+}
+
+void expect_tile(bool first, const char* label) {
+    std::vector<Stage> expected;
+    if (first) {
+        expected.push_back(Stage::ordered);
+    }
+    for (int bank = first ? 1 : 0; bank < banks; ++bank) {
+        expected.push_back(Stage::prepare);
+        expected.push_back(Stage::chunked);
+    }
+    expect_route(std::move(expected), label);
+}
+
+void check_exact(const Decoder& decoder, const std::vector<int>& prompt) {
+    const auto result = trace([&] {
+        return decoder.generate(prompt, {.max_new_tokens = 4, .top_logits = 16});
+    });
+    expect_route(std::vector<Stage>(2 * banks, Stage::exact), "serial exact");
+    require(result.output_token_ids.size() == 4 && result.step_top_logits.size() == 4 &&
+            result.finish_reason == DecoderFinishReason::length, "Exact generation incomplete");
+    for (std::size_t step = 0; step < result.output_token_ids.size(); ++step) {
+        const auto& top = result.step_top_logits[step];
+        require(top.size() == 16, "Exact generation omitted logits");
+        std::cout << "exact token=" << result.output_token_ids[step];
+        for (const auto& entry : top) {
+            std::cout << ' ' << entry.token_id << '=' << std::hexfloat << entry.logit;
+        }
+        std::cout << '\n';
+    }
+}
+
+struct Step {
+    std::array<DecoderBatchStep, decoder_batch_max_lanes> lanes;
+    DecoderBatchStepStats stats;
+};
+
+Step advance(DecoderBatch& batch, const Mask& selected) {
+    Step step;
+    step.lanes = trace([&] { return batch.advance_chunked(selected, &step.stats); });
+    return step;
+}
+
+int token(const Step& step, int slot, bool decode, bool finished) {
+    const auto& lane = step.lanes[slot];
+    require(lane.token && lane.decode == decode && !lane.sampling_failed &&
+            !lane.constraint_failed, "Unexpected generation step");
+    require(finished ? lane.finish_reason == DecoderFinishReason::length : !lane.finish_reason,
+            "Unexpected lane retirement");
+    return *lane.token;
+}
+
+void check_tensor_core(const Decoder& decoder, const std::vector<int>& prompt) {
+    DecoderBatch batch(decoder, {.cuda_graphs = true, .max_lanes = 2, .prefix_cache_entries = 2});
+    const std::vector<int> prefix(prompt.begin(), prompt.begin() + page);
+    DecoderOptions options{.max_new_tokens = 4, .prefix_cache_salt = "gdn-routes"};
+    require(batch.admit(0, prefix, options) == 0, "First prefix unexpectedly restored");
+    const auto prime = advance(batch, Mask{true});
+    expect_tile(true, "first absolute tile");
+    require(prime.stats.prefill_rows[0] == page && prime.stats.graph_slots == 0 &&
+            prime.stats.prefill_workspace_bytes > 0, "Wrong prefix prime scheduler step");
+    token(prime, 0, false, false);
+
+    options.max_new_tokens = 5;
+    require(batch.admit(1, prompt, options) == page, "Incorrect restored prefix position");
+    const auto live = batch.request_device_allocation_bytes();
+    const auto mixed = advance(batch, Mask{true, true});
+    expect_tile(false, "restored absolute tile with decode peer");
+    require(mixed.stats.prefill_rows[0] == 0 && mixed.stats.prefill_rows[1] == page &&
+            mixed.stats.graph_slots == 0 &&
+            mixed.stats.prefill_workspace_bytes == prime.stats.prefill_workspace_bytes &&
+            mixed.stats.peak_request_bytes == live + mixed.stats.prefill_workspace_bytes &&
+            batch.request_device_allocation_bytes() == live, "Wrong mixed scheduler workspace");
+    token(mixed, 0, true, false);
+    std::array restored{token(mixed, 1, false, false), -1, -1, -1, -1};
+    const auto warm = advance(batch, Mask{true, true});
+    expect_route({}, "decode-only graph warmup");
+    require(warm.stats.graph_slots == 0 && warm.stats.prefill_workspace_bytes == 0,
+            "Wrong two-lane graph warmup");
+    token(warm, 0, true, false);
+    restored[1] = token(warm, 1, true, false);
+    const auto decode = advance(batch, Mask{true, true});
+    expect_route({}, "decode-only graph");
+    require(decode.stats.graph_slots == 3 && decode.stats.prefill_workspace_bytes == 0,
+            "Two decode lanes did not use a decode-only graph");
+    token(decode, 0, true, true);
+    restored[2] = token(decode, 1, true, false);
+    const auto single_warm = advance(batch, Mask{false, true});
+    expect_route({}, "single-lane graph warmup");
+    require(single_warm.stats.graph_slots == 0 && single_warm.stats.prefill_workspace_bytes == 0,
+            "Wrong single-lane graph warmup");
+    restored[3] = token(single_warm, 1, true, false);
+    const auto retire = advance(batch, Mask{false, true});
+    expect_route({}, "retiring decode");
+    require(retire.stats.graph_slots == 2 && retire.stats.prefill_workspace_bytes == 0,
+            "Retiring lane did not use a single decode graph");
+    restored[4] = token(retire, 1, true, true);
+    require(batch.request_device_allocation_bytes() == 0, "Retired lanes kept request storage");
+    const auto cache = batch.prefix_cache_stats();
+    require(cache.hits == 1 && cache.cached_tokens == page && cache.prefill_tokens == 2 * page,
+            "Incorrect restored-prefix accounting");
+
+    batch.reset_prefix_cache();
+    require(batch.admit(1, prompt, options) == 0, "Reset prefix cache returned an entry");
+    const auto first = advance(batch, Mask{false, true});
+    expect_tile(true, "reused lane first absolute tile");
+    require(!first.lanes[1].token && first.stats.prefill_rows[1] == page, "Wrong first cold tile");
+    const auto second = advance(batch, Mask{false, true});
+    expect_tile(false, "reused lane second absolute tile");
+    require(second.stats.prefill_rows[1] == page, "Wrong second cold tile");
+    std::array cold{token(second, 1, false, false), -1, -1, -1, -1};
+    for (std::size_t index = 1; index < cold.size(); ++index) {
+        cold[index] = token(advance(batch, Mask{false, true}), 1, true, index + 1 == cold.size());
+    }
+    require(batch.request_device_allocation_bytes() == 0, "Reused lane retained request storage");
+    require(restored == cold, "Prefix restore or mixed step changed greedy output");
+    std::cout << "restored=" << page << " mixed_workspace=" << mixed.stats.prefill_workspace_bytes
+              << " peak=" << mixed.stats.peak_request_bytes << " tokens";
+    for (const auto id : cold) {
+        std::cout << ' ' << id;
+    }
+    std::cout << '\n';
+}
+
+}
+
+extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, dim3 block,
+                                               void** args, std::size_t shared,
+                                               cudaStream_t stream) {
+    if (record) {
+        const char* name = nullptr;
+        const auto status = cudaFuncGetName(&name, function);
+        if (status != cudaSuccess) {
+            return status;
+        }
+        const std::string_view kernel(name);
+        if (kernel.find("gdn_prefill_recur") != kernel.npos) {
+            launches.push_back(Stage::ordered);
+        } else if (kernel.find("gdn_chunk") != kernel.npos) {
+            if (kernel.find("prepare") != kernel.npos) {
+                launches.push_back(Stage::prepare);
+            } else if (kernel.find("recur_warp") != kernel.npos) {
+                launches.push_back(Stage::chunked);
+            }
+        } else if (kernel.find("gdn_recurILb1E") != kernel.npos) {
+            launches.push_back(Stage::exact);
+        }
+    }
+    return __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
+}
+
+int main(int argc, char** argv) try {
+    require(argc == 4, "Usage: gdn-routes CHECKPOINT PROMPT_IDS exact|tensor-core");
+    const std::string_view mode = argv[3];
+    require(mode == "exact" || mode == "tensor-core", "Expected exact or tensor-core");
+    std::ifstream file(argv[2]);
+    std::vector<int> prompt{std::istream_iterator<int>(file), std::istream_iterator<int>()};
+    require(prompt.size() >= 2 * page, "Expected at least 256 prompt token IDs");
+    prompt.resize(2 * page);
+    const bool exact = mode == "exact";
+    const Decoder decoder(argv[1], 0, false,
+                          exact ? Fp8PrefillPolicy::exact : Fp8PrefillPolicy::tensor_core);
+    if (exact) {
+        check_exact(decoder, prompt);
+    } else {
+        check_tensor_core(decoder, prompt);
+    }
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << "GDN route check failed: " << error.what() << '\n';
+    return 1;
+}

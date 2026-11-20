@@ -52,6 +52,31 @@ two default requests, and no capture or launch on the eager request. The second 
 must reuse the first graph. All three requests must return identical greedy IDs and full score
 bits within each prefill policy.
 
+## GDN prefill
+
+In the managed Pixi environment, enable the opt-in GDN checks and reserve a B200.
+The operator check uses synthetic inputs and the route check loads the local checkpoint.
+
+```bash
+out="$PWD/build/gdn-checks"
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release --gdn-check=y
+xmake build -P "$PWD" gdn-check gdn-routes
+jq -r '.prompt[]' tests/prefix/route-cases.json > "$out/prompt.ids"
+export CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}"
+"$out/bin/gdn-check"
+"$out/bin/gdn-check" short paired "$out/ordered.bin"
+"$out/bin/gdn-check" chunked
+for policy in exact tensor-core; do
+    "$out/bin/gdn-routes" "$checkpoint" "$out/prompt.ids" "$policy"
+done
+```
+
+The chunked check observes the matrix and recurrence launches, compares outputs and state with
+an FP64 sequence, and verifies causal outputs and workspace guards. The route check observes
+the first absolute tile, restored prefix, mixed prefill and decode, and reuse of a retired lane.
+Its exact mode emits four generated IDs and 16 scores per step for comparison across builds.
+
 ## Checkpoint metadata
 
 Build the checkpoint library in the managed Pixi environment. Both checks run

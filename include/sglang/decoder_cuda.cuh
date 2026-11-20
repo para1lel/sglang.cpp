@@ -29,7 +29,8 @@ cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __
                                     const __nv_bfloat16* b, const __nv_bfloat16* a,
                                     TextGdnWeights weights, TextGdnState state,
                                     __nv_bfloat16* workspace, float2* gates,
-                                    __nv_bfloat16* output, cudaStream_t stream);
+                                    __nv_bfloat16* output, cudaStream_t stream,
+                                    void* chunk_scratch = nullptr, std::size_t chunk_bytes = 0);
 
 cudaError_t tensor_core_prefill_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
                                     int rows, const __nv_bfloat16* queries,

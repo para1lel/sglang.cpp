@@ -289,3 +289,32 @@ if has_config("media-preprocess-check") then
         add_files("tests/media/preprocess_check.cpp")
     target_end()
 end
+
+option("long-decode-check")
+    set_default(false)
+option_end()
+
+if has_config("long-decode-check") then
+    target("long-decode-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_cugencodes("sm_100")
+        add_cuflags("--dependency-target-name=", {force = true})
+        add_deps("sglang_cuda")
+        add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
+        add_files("tests/decoder/long_decode_check.cu")
+    target_end()
+
+    target("long-decode-routes")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_decoder")
+        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
+        add_ldflags("-Wl,--wrap=_ZN6sglang11text_argmaxEPK13__nv_bfloat16i" ..
+                    "PNS_18TextLogitCandidateES4_P11CUstream_st", {force = true})
+        add_files("tests/decoder/long_decode_routes.cpp")
+    target_end()
+end

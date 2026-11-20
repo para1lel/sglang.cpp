@@ -98,3 +98,38 @@ done
 python3 -B tests/decoder/test_checkpoint_metadata.py \
     "$out/checkpoint_metadata_probe" "$checkpoint" --fixtures "$out"
 ```
+
+## Wide long-context decode
+
+Use the managed Pixi environment and a reserved B200 with `GPU_UUID` set.
+The operator check uses synthetic MXFP8 attention and needs no checkpoint.
+The route check uses the local checkpoint and cycles the supplied prompt IDs.
+
+```bash
+out="$PWD/build/long-decode"
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release --long-decode-check=y
+xmake build -P "$PWD" long-decode-check long-decode-routes
+python3 -c 'import json, sys; print(*json.load(open(sys.argv[1]))["prompt"])' \
+    tests/prefix/route-cases.json >"$out/prompt.ids"
+for mode in full recovery small; do
+    CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
+        "$out/bin/long-decode-check" "$mode"
+done
+for policy in exact tensor-core; do
+    CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/bin/long-decode-routes" \
+        "$checkpoint" "$out/prompt.ids" candidate "$policy"
+done
+```
+
+The operator check covers 32 packed lanes, shuffled pages, lengths from
+32,768 through 262,144, FP64 recovery, guard bytes, and rejected argument
+and launch-failure cases. It verifies actual CUDA launch geometry and compares
+attention to an FP64 oracle and the public ordered path.
+
+The checkpoint check uses sparse slots, mixed long and short lengths, fixed-seed
+sampling, slot reuse, and small-width eager and graph paths. The exact arm uses
+short prompts. For a matched comparison, build the route executable against
+the old production sources too and run that executable with `base` in place
+of `candidate`. Compare the `token` lines. An optional final file argument
+records raw BF16 logits for the three width-five steps in ascending slot order.

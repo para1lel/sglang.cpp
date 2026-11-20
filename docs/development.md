@@ -65,11 +65,12 @@ Each 128-token page holds 131,072 payload bytes and 4,096 scale bytes per tensor
 
 Link `sglang_cuda`. Apply RoPE to Q and K. Append contiguous BF16 K and V `[tokens, 4, 256]`. Pass the ready prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Retain storage through stream completion. [Library](../xmake.lua#L46)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L48)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L55)<!-- prefix: "cudaError_t " -->
 
-For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. Direct attention decodes K and V and converts Q to FP32. [Scale calculation](../src/mxfp8_gqa.cu#L36)<!-- prefix: "__device__ i" --> · [Direct attention](../src/mxfp8_gqa.cu#L99)<!-- prefix: "__global__ v" -->
+For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. Direct attention decodes K and V and converts Q to FP32. [Scale calculation](../src/mxfp8_gqa.cu#L37)<!-- prefix: "__device__ i" --> · [Direct attention](../src/mxfp8_gqa.cu#L100)<!-- prefix: "__global__ v" -->
 
-Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L220)<!-- prefix: "__device__ f" --> · [Replay](../src/mxfp8_gqa.cu#L404)<!-- prefix: "__device__ _" -->
+Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L221)<!-- prefix: "__device__ f" --> · [Replay](../src/mxfp8_gqa.cu#L405)<!-- prefix: "__device__ _" -->
 
 [Singleton](batch-graphs.md#page-parallel-gqa-decode) and [packed decode](batch-graphs.md#packed-paged-gqa-decode) group softmax and value reductions by KV pages.
+[Wide long decode](long-paged-decode.md) covers wider eager forwards.
 
 #### Ordered multirow GQA prefill
 
@@ -110,7 +111,7 @@ Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L930)<!-- prefix
 | --- | --- | --- |
 | `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L281)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L102)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L525)<!-- prefix: "void Decoder" --> |
+| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L102)<!-- prefix: "class Decode" --> · [Layer dispatch](../src/decoder_forward.cpp#L529)<!-- prefix: "void Decoder" --> |
 
 Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L89)<!-- prefix: "target(\"sgla" -->
 
@@ -120,7 +121,7 @@ The decoder validates tensor names, dtypes, and shapes before upload. Upload ret
 
 Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L525)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L711)<!-- prefix: "void Request" -->
 
-Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L419)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L494)<!-- prefix: "void Decoder" -->
+Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L419)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L498)<!-- prefix: "void Decoder" -->
 
 Both binaries accept `--fp8-prefill exact|tensor-core`. Pass `Fp8PrefillPolicy` as the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L97)<!-- prefix: "enum class F" -->
 
@@ -140,7 +141,7 @@ The lane stream orders append, attention, and gating. Logits storage holds score
 
 Tuned FP8 projections require one target decode row in the forward group. This includes serial graphs, single-lane batch graphs, lone ordinary eager decode, and single-row verification. GQA combines Q/gate, K, and V. The MLP fusion rounds gate and up to BF16 before SwiGLU. GDN QKV and Z stay separate. [Lane selection](../src/decoder_forward.cpp#L51)<!-- prefix: "bool single_" --> · [Batch packing](../src/decoder_batch.cpp#L708)<!-- prefix: "if (rows[slo" -->
 
-Tuned GEMV requires 16-byte-aligned FP8 weights and activations and input widths of 5,120, 6,144, or 17,408. Both fusions require the same alignment and width 5,120. Q/gate, K, and V require 12,288, 1,024, and 1,024 output rows. Gate and up require 17,408 each. Other valid inputs use separate operations. Output spans must be disjoint from inputs and each other. Fused SwiGLU permits identical gate and up spans. [Tuned GEMV](../src/text_decode_fp8.cu#L276)<!-- prefix: "cudaError_t " --> · [Fused QKV](../src/text_decode_fp8.cu#L298)<!-- prefix: "cudaError_t " --> · [Fused SwiGLU](../src/text_decode_fp8.cu#L321)<!-- prefix: "cudaError_t " --> · [Buffers](../include/sglang/decoder_cuda.cuh#L146)<!-- prefix: "// Read-only" -->
+Tuned GEMV requires 16-byte-aligned FP8 weights and activations and input widths of 5,120, 6,144, or 17,408. Both fusions require the same alignment and width 5,120. Q/gate, K, and V require 12,288, 1,024, and 1,024 output rows. Gate and up require 17,408 each. Other valid inputs use separate operations. Output spans must be disjoint from inputs and each other. Fused SwiGLU permits identical gate and up spans. [Tuned GEMV](../src/text_decode_fp8.cu#L276)<!-- prefix: "cudaError_t " --> · [Fused QKV](../src/text_decode_fp8.cu#L298)<!-- prefix: "cudaError_t " --> · [Fused SwiGLU](../src/text_decode_fp8.cu#L321)<!-- prefix: "cudaError_t " --> · [Buffers](../include/sglang/decoder_cuda.cuh#L153)<!-- prefix: "// Read-only" -->
 
 Row-wise prefill and MTP draft decode use GEMV. Each forward layer divides a multirow FP8 projection into balanced groups of at most five rows. Eligible groups of two to five use packed GEMM. Other groups use GEMV. Wide GEMV and packed GEMM require 512-divisible input widths and 16-byte-aligned FP8 payloads. [Grouping](../src/decoder_forward.cpp#L59)<!-- prefix: "int projecti" --> · [GEMV](../src/text_ops.cu#L674)<!-- prefix: "cudaError_t " --> · [GEMM](../src/text_ops.cu#L692)<!-- prefix: "cudaError_t " -->
 

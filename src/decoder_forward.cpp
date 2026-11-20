@@ -296,8 +296,9 @@ void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>&
 
 template <typename Lane>
 void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
-    std::array<PagedDecodeLane, paged_decode_lanes> reads;
-    std::array<Workspace*, paged_decode_lanes> pending;
+    std::array<PagedDecodeLane, decoder_batch_max_lanes> reads;
+    std::array<Workspace*, decoder_batch_max_lanes> pending;
+    const bool wide = batch.count > paged_decode_lanes;
     int count = 0;
     batch.each([&](const Lane& lane, Workspace& work) {
         auto& request = *lane.request;
@@ -315,8 +316,9 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
                    rotary_position);
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
-            if (batch.count > 1 && batch.count <= paged_decode_lanes &&
-                lane.mode == TextGdnMode::decode && paged_decode_position(lane.position)) {
+            if (lane.mode == TextGdnMode::decode && (wide
+                    ? lane.long_gqa && long_paged_decode_position(lane.position)
+                    : batch.count > 1 && paged_decode_position(lane.position))) {
                 reads[count] = {cache, request.pages, lane.position, paged_gqa_buffers(work)};
                 pending[count++] = &work;
                 return;
@@ -327,7 +329,9 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         gate_gqa(work, batch.stream);
     });
     if (count > 0) {
-        check(paged_decode_gqa(reads.data(), count, batch.stream), "Read paged MXFP8 attention");
+        const auto status = wide ? long_paged_decode_gqa(reads.data(), count, batch.stream)
+                                 : paged_decode_gqa(reads.data(), count, batch.stream);
+        check(status, "Read paged MXFP8 attention");
         for (int index = 0; index < count; ++index) {
             gate_gqa(*pending[index], batch.stream);
         }

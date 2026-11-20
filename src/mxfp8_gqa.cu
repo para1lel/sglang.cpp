@@ -1,5 +1,6 @@
 #include "sglang/mxfp8_gqa.h"
 
+#include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
 
 #include <algorithm>
@@ -534,10 +535,12 @@ struct alignas(16) DecodePartial {
 static_assert(sizeof(DecodePartial) * decode_splits * mxfp8_query_heads ==
               decoder::paged_decode_scratch_bytes);
 
-template <typename Lane>
+template <typename Lane, int Count = decoder::paged_decode_lanes>
 struct PagedDecodeBatch {
-    Lane lanes[decoder::paged_decode_lanes];
+    Lane lanes[Count];
 };
+
+using LongDecodeBatch = PagedDecodeBatch<decoder::PagedDecodeLane, decoder_batch_max_lanes>;
 
 __device__ decoder::PagedDecodeLane resolve_lane(decoder::PagedDecodeLane lane) { return lane; }
 
@@ -649,11 +652,13 @@ __global__ void split_decode_attention(PagedDecodeBatch<Lane> batch) {
     }
 }
 
-template <typename Lane>
-__global__ void merge_decode_attention(PagedDecodeBatch<Lane> batch) {
+template <typename Lane, int Count>
+__global__ void merge_decode_attention(PagedDecodeBatch<Lane, Count> batch) {
     const auto input = resolve_lane(batch.lanes[blockIdx.z]);
-    if (!decoder::paged_decode_position(input.position)) {
-        return;
+    if constexpr (Count == decoder::paged_decode_lanes) {
+        if (!decoder::paged_decode_position(input.position)) {
+            return;
+        }
     }
     __shared__ float weights[decode_splits];
     __shared__ float mass;
@@ -789,44 +794,6 @@ __global__ void replay_paged_decode(PagedDecodeBatch<Lane> batch) {
     }
 }
 #include "sglang/text/mxfp8_gqa_decode.cuh"
-
-template <typename Lane>
-cudaError_t launch_paged_decode(const Lane* lanes, int count, cudaStream_t stream) {
-    if (!lanes || count < 1 || count > decoder::paged_decode_lanes) {
-        return cudaErrorInvalidValue;
-    }
-    PagedDecodeBatch<Lane> batch{};
-    for (int index = 0; index < count; ++index) {
-        const auto buffers = lanes[index].buffers;
-        const auto address = reinterpret_cast<std::uintptr_t>(buffers.scratch);
-        if (!buffers.queries || !buffers.output || !address || address % alignof(DecodePartial)) {
-            return cudaErrorInvalidValue;
-        }
-        batch.lanes[index] = lanes[index];
-    }
-    launch_decode_split(batch, count, stream);
-    auto status = cudaGetLastError();
-    if (status != cudaSuccess) {
-        return status;
-    }
-    merge_decode_attention<<<dim3(mxfp8_query_heads, 1, count),
-                             mxfp8_head_dim, 0, stream>>>(batch);
-    status = cudaGetLastError();
-    if (status != cudaSuccess) {
-        return status;
-    }
-    if constexpr (std::is_same_v<Lane, decoder::BoundPagedDecodeLane>) {
-        bound_exact_decode_scores<<<dim3(32, mxfp8_query_heads, count),
-                                    mxfp8_head_dim, 0, stream>>>(batch);
-        status = cudaGetLastError();
-        if (status != cudaSuccess) {
-            return status;
-        }
-    }
-    replay_paged_decode<<<dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels, count),
-                          mxfp8_head_dim, 0, stream>>>(batch);
-    return cudaGetLastError();
-}
 
 int score_grid_capacity(decoder::ExactGqaWorkspace workspace) {
     return workspace.scores ? workspace.capacity : 0;
@@ -995,6 +962,11 @@ cudaError_t decoder::paged_decode_gqa(const PagedDecodeLane* lanes, int count,
 cudaError_t decoder::paged_decode_gqa(
     const BoundPagedDecodeLane* lanes, int count, cudaStream_t stream) {
     return launch_paged_decode(lanes, count, stream);
+}
+
+cudaError_t decoder::long_paged_decode_gqa(const PagedDecodeLane* lanes, int count,
+                                          cudaStream_t stream) {
+    return launch_long_paged_decode(lanes, count, stream);
 }
 
 }

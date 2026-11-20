@@ -708,6 +708,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         if (rows[slot] <= 1) {
             packed_slots[slot] = count;
             work[count++] = lane.input();
+            work[count - 1].long_gqa = results[slot].decode && !lane.draft && !lane.media &&
+                model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
         }
         if (rows[slot] == remaining) {
             scoring[slot] = lane.request.get();

@@ -221,3 +221,191 @@ void launch_decode_split(const PagedDecodeBatch<Lane>& batch, int count, cudaStr
                                  mxfp8_head_dim, 0, stream>>>(batch);
     }
 }
+
+struct LongSplit {
+    float history[split_query_heads];
+    PairedSplit paired[split_query_heads];
+};
+
+__device__ void score_long_decode_tile(decoder::PagedDecodeLane input, LongSplit& state,
+                                       const PairedQuery& query, int first, int count,
+                                       int kv_head, int warp, int lane,
+                                       bool (&invalid)[split_query_heads]) {
+    float local_max[split_query_heads] = {-CUDART_INF_F, -CUDART_INF_F};
+    for (int index = warp; index < count; index += split_warps) {
+        const int token = first + index;
+        const int page = input.pages.device_pages[token / mxfp8_page_size];
+        float scores[split_query_heads]{};
+        paired_decode_scores(input.cache, page, token % mxfp8_page_size, kv_head, lane,
+                             query, scores);
+        if (lane == 0) {
+            #pragma unroll
+            for (int pair = 0; pair < split_query_heads; ++pair) {
+                const float score = scores[pair] * softmax_scale;
+                state.paired[pair].weights[index] = score;
+                local_max[pair] = fmaxf(local_max[pair], score);
+                invalid[pair] |= !isfinite(score);
+            }
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int pair = 0; pair < split_query_heads; ++pair) {
+            state.paired[pair].maxima[warp] = local_max[pair];
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        #pragma unroll
+        for (int pair = 0; pair < split_query_heads; ++pair) {
+            auto& split = state.paired[pair];
+            const float maximum = warp_max(lane < split_warps ? split.maxima[lane] :
+                                                                -CUDART_INF_F);
+            if (lane == 0) {
+                const float next = fmaxf(split.maximum, maximum);
+                state.history[pair] = expf(split.maximum - next);
+                split.maximum = next;
+            }
+        }
+    }
+    __syncthreads();
+}
+
+__global__ void split_long_decode_attention(const __grid_constant__ LongDecodeBatch batch) {
+    __shared__ LongSplit state;
+    const auto input = batch.lanes[blockIdx.z];
+    const int head = blockIdx.y * split_query_heads;
+    const int thread = threadIdx.x;
+    const int warp = thread / mxfp8_group_size;
+    const int lane = thread % mxfp8_group_size;
+    const int kv_head = head / queries_per_kv_head;
+    const int visible = input.position + 1;
+    const int pages = (visible + mxfp8_page_size - 1) / mxfp8_page_size;
+    const int first = blockIdx.x * pages / decode_splits * mxfp8_page_size;
+    const int end = min(visible, (blockIdx.x + 1) * pages / decode_splits * mxfp8_page_size);
+    PairedQuery query;
+    load_paired_query(input.buffers.queries, head, lane, query);
+    float sums[split_query_heads][mxfp8_groups]{};
+    float masses[split_query_heads]{};
+    bool invalid[split_query_heads]{};
+    if (thread == 0) {
+        #pragma unroll
+        for (int pair = 0; pair < split_query_heads; ++pair) {
+            state.paired[pair].maximum = -CUDART_INF_F;
+        }
+    }
+    for (int tile = first; tile < end; tile += split_tokens) {
+        const int count = min(split_tokens, end - tile);
+        score_long_decode_tile(input, state, query, tile, count, kv_head, warp, lane, invalid);
+        paired_decode_values(input, state.paired, tile, count, kv_head, warp, lane, invalid);
+        #pragma unroll
+        for (int pair = 0; pair < split_query_heads; ++pair) {
+            const auto& split = state.paired[pair];
+            const float history = state.history[pair];
+            #pragma unroll
+            for (int group = 0; group < mxfp8_groups; ++group) {
+                const int channel = group * mxfp8_group_size + lane;
+                sums[pair][group] = fmaf(history, sums[pair][group], split.values[warp][channel]);
+            }
+            if (lane == 0) {
+                masses[pair] = fmaf(history, masses[pair], split.masses[warp]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int pair = 0; pair < split_query_heads; ++pair) {
+        auto& split = state.paired[pair];
+        #pragma unroll
+        for (int group = 0; group < mxfp8_groups; ++group) {
+            split.values[warp][group * mxfp8_group_size + lane] = sums[pair][group];
+            invalid[pair] |= !isfinite(sums[pair][group]);
+        }
+        if (lane == 0) {
+            split.masses[warp] = masses[pair];
+        }
+        auto& partial = decode_partials(input.buffers, head + pair)[blockIdx.x];
+        store_paired_partial(partial, split, invalid[pair], thread, warp, lane);
+    }
+}
+
+__global__ void replay_long_paged_decode(const __grid_constant__ LongDecodeBatch batch) {
+    const auto input = batch.lanes[blockIdx.z];
+    const int head = blockIdx.x;
+    if (!isfinite(decode_partials(input.buffers, head)[0].maximum)) {
+        wide_decode_head(input, head);
+    }
+}
+
+template <typename Lane>
+cudaError_t launch_paged_decode(const Lane* lanes, int count, cudaStream_t stream) {
+    if (!lanes || count < 1 || count > decoder::paged_decode_lanes) {
+        return cudaErrorInvalidValue;
+    }
+    PagedDecodeBatch<Lane> batch{};
+    for (int index = 0; index < count; ++index) {
+        const auto buffers = lanes[index].buffers;
+        const auto address = reinterpret_cast<std::uintptr_t>(buffers.scratch);
+        if (!buffers.queries || !buffers.output || !address || address % alignof(DecodePartial)) {
+            return cudaErrorInvalidValue;
+        }
+        batch.lanes[index] = lanes[index];
+    }
+    launch_decode_split(batch, count, stream);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    merge_decode_attention<<<dim3(mxfp8_query_heads, 1, count),
+                             mxfp8_head_dim, 0, stream>>>(batch);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if constexpr (std::is_same_v<Lane, decoder::BoundPagedDecodeLane>) {
+        bound_exact_decode_scores<<<dim3(32, mxfp8_query_heads, count),
+                                    mxfp8_head_dim, 0, stream>>>(batch);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    replay_paged_decode<<<dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels, count),
+                          mxfp8_head_dim, 0, stream>>>(batch);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_long_paged_decode(const decoder::PagedDecodeLane* lanes, int count,
+                                    cudaStream_t stream) {
+    if (!lanes || count < 1 || count > decoder_batch_max_lanes) {
+        return cudaErrorInvalidValue;
+    }
+    LongDecodeBatch batch{};
+    for (int index = 0; index < count; ++index) {
+        const auto& lane = lanes[index];
+        const auto& buffers = lane.buffers;
+        const auto address = reinterpret_cast<std::uintptr_t>(buffers.scratch);
+        if (!decoder::long_paged_decode_position(lane.position) ||
+            !cache_covers(lane.cache, lane.pages, lane.position + 1) ||
+            !buffers.queries || !buffers.output || !address || address % alignof(DecodePartial)) {
+            return cudaErrorInvalidValue;
+        }
+        batch.lanes[index] = lane;
+    }
+    void* arguments[] = {&batch};
+    auto status = cudaLaunchKernel(
+        split_long_decode_attention,
+        dim3(decode_splits, mxfp8_query_heads / split_query_heads, count),
+        mxfp8_head_dim, arguments, 0, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    const dim3 grid(mxfp8_query_heads, 1, count);
+    status = cudaLaunchKernel(
+        merge_decode_attention<decoder::PagedDecodeLane, decoder_batch_max_lanes>,
+        grid, mxfp8_head_dim, arguments, 0, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    return cudaLaunchKernel(replay_long_paged_decode, grid, mxfp8_head_dim, arguments, 0, stream);
+}

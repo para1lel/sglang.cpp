@@ -263,6 +263,7 @@ struct ForwardLane {
     const Bf16* feature = nullptr;
     const MropePosition* mrope = nullptr;
     int rotary_position = -1;
+    bool long_gqa = false;
 };
 
 struct BatchDecodeBinding {

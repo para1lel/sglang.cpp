@@ -36,4 +36,19 @@ For the direct checkpoint control, admit all 16 W4 requests before advancing. Ke
 
 For serving, use the [frozen protocol](../benchmarks/concurrent/README.md#regenerate-and-measure) and the same client and server policy in both arms. Keep graph-enabled K0, capacity 32, a 32,768-token step cap, tensor-core prefill, and prefix caching disabled. W4 submits 16 prompts of 32,768 IDs and requests 1,024 output IDs each. W5 extends coverage to 32 prompts with 4,096 output IDs each. Complete two warmups and five measured cohorts for a valid row, under the original 90-second socket and 360-second cohort limits. Preserve partial IDs, completion counts, and deadline failures for invalid rows. Score throughput and latency gates only over complete valid cohorts.
 
-Record prefill overlays as separate experiments. The earlier combined W4 experiment used partial Flash prefill through 32,768 visible tokens. The production prefill contract is in [Flash prefill](flash-prefill.md). Use identical prefill code on both sides of an isolated long-decode comparison.
+Record prefill overlays as separate experiments. Use identical prefill code on both sides of an isolated long-decode comparison. The [Flash prefill contract](flash-prefill.md#constraints-and-failure-behavior) defines the selected 144-row floor.
+
+### Combined 256-row Flash experiment
+
+The earlier combined build used the 256-row Flash floor, landed GDN, and wide long decode. In W4, it completed all 112 HTTP requests and matched all 114,688 frozen greedy IDs. It missed all four external gates.
+
+| W4 metric | Combined build | Frozen gate |
+| --- | ---: | ---: |
+| Median output IDs/s | 62.209 | > 358.723 |
+| p95 TTFT (s) | 81.627 | ≤ 50.227 |
+| p95 TPOT (ms) | 200.896 | ≤ 59.994 |
+| p95 E2E (s) | 261.143 | ≤ 46.590 |
+
+On W5, the same build completed zero of 32 requests on the first warmup. All 32 reached the 90-second socket timeout before the first ID. The client skipped measured cohorts, leaving the W5 throughput and latency gates unscored.
+
+See `artifacts/takeover-w4-integrated/handoff.md` for the combined build identities and raw evidence.

@@ -137,6 +137,24 @@ __device__ int score_recovery_mask(int warp, int lane, bool invalid_score) {
     return mask;
 }
 
+template <bool recover_scores, typename Real>
+__device__ __forceinline__ void ordered_weights(OrderedTile<Real>& shared, int warp, int lane,
+                                               int count, Real& maximum, bool& invalid_score) {
+    const Real prior_maximum = maximum;
+    const Real score = lane < count ? shared.scores[warp][lane] : -CUDART_INF_F;
+    const Real prefix = ordered_prefix(fmax(prior_maximum, score), lane);
+    const Real previous = __shfl_up_sync(warp_mask, prefix, 1);
+    maximum = __shfl_sync(warp_mask, prefix, count - 1);
+    if (lane < count) {
+        if constexpr (recover_scores) {
+            invalid_score |= !isfinite(score);
+        }
+        shared.history_weight[warp][lane] =
+            exp((lane == 0 ? prior_maximum : previous) - prefix);
+        shared.token_weight[warp][lane] = exp(score - prefix);
+    }
+}
+
 template <typename Real, bool recover_scores = false>
 __device__ int ordered_attention(OrderedTile<Real>& shared, Attention request, int row_index,
                                  int query_head, int invalid = 0) {
@@ -160,7 +178,7 @@ __device__ int ordered_attention(OrderedTile<Real>& shared, Attention request, i
     Real mass = 0;
     Real weighted_value[ordered_heads]{};
     bool invalid_score = false;
-    for (int first = 0; first <= last; first += keys_per_tile) {
+    for (int first = 0;; first += keys_per_tile) {
         const int count = min(keys_per_tile, last - first + 1);
         const int page = request.pages[first / mxfp8_page_size];
         const int token = first % mxfp8_page_size;
@@ -193,19 +211,7 @@ __device__ int ordered_attention(OrderedTile<Real>& shared, Attention request, i
         }
         __syncthreads();
         if (warp < ordered_heads) {
-            const Real prior_maximum = maximum;
-            const Real score = lane < count ? shared.scores[warp][lane] : -CUDART_INF_F;
-            const Real prefix = ordered_prefix(fmax(prior_maximum, score), lane);
-            const Real previous = __shfl_up_sync(warp_mask, prefix, 1);
-            maximum = __shfl_sync(warp_mask, prefix, count - 1);
-            if (lane < count) {
-                if constexpr (recover_scores) {
-                    invalid_score |= !isfinite(score);
-                }
-                shared.history_weight[warp][lane] =
-                    exp((lane == 0 ? prior_maximum : previous) - prefix);
-                shared.token_weight[warp][lane] = exp(score - prefix);
-            }
+            ordered_weights<recover_scores>(shared, warp, lane, count, maximum, invalid_score);
         }
         __syncthreads();
         #pragma unroll 4
@@ -228,6 +234,9 @@ __device__ int ordered_attention(OrderedTile<Real>& shared, Attention request, i
             shared.denominator[warp] = mass;
         }
         __syncthreads();
+        if (last - first < keys_per_tile) {
+            break;
+        }
     }
     int failed = store_ordered(request, row, channel, weighted_value, shared.denominator, invalid);
     if constexpr (recover_scores) {
@@ -605,18 +614,21 @@ __device__ void flash_stage_kv(FlashTile& tile, Attention request, int first,
     }
 }
 
-__device__ void flash_stage_query(FlashTile& tile, Attention request, int row, int head) {
+template <bool Partial>
+__device__ void flash_stage_query(FlashTile& tile, Attention request, int row, int head,
+                                   int active_rows) {
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     if (threadIdx.x == 0) {
         tile.bad_key = INT_MAX;
     }
     for (int member = warp; member < flash_queries; member += flash_threads / 32) {
+        const bool active = !Partial || member / ordered_heads < active_rows;
         const auto offset = row_offset(row + member / ordered_heads, head + member % ordered_heads);
         bool bad = false;
         #pragma unroll
         for (int channel = lane; channel < channels; channel += 32) {
-            const auto bits = __bfloat16_as_ushort(request.queries[offset + channel]);
+            const auto bits = active ? __bfloat16_as_ushort(request.queries[offset + channel]) : 0;
             const unsigned magnitude = bits & 0x7fffu;
             const bool invalid = magnitude > 0x4e80u || (magnitude && magnitude < 0x80u);
             tile.query[member][channel] = invalid ? 0 : bits;
@@ -708,12 +720,18 @@ __device__ __forceinline__ void flash_values(const FlashTile& tile, int query, i
     }
 }
 
-__device__ void flash_store(Attention request, int row, int head,
+template <bool Partial>
+__device__ void flash_store(Attention request, int row, int head, int active_rows,
                             int query, int lane, const FlashSoftmax (&state)[2],
                             const Accumulator (&numerator)[channels / 8]) {
     #pragma unroll
     for (int half = 0; half < 2; ++half) {
         const int member = query + lane / 4 + half * 8;
+        if constexpr (Partial) {
+            if (member / ordered_heads >= active_rows) {
+                continue;
+            }
+        }
         const auto output = row_offset(row + member / ordered_heads, head + member % ordered_heads);
         const float inverse_mass = __frcp_rn(state[half].mass);
         #pragma unroll
@@ -728,8 +746,9 @@ __device__ void flash_store(Attention request, int row, int head,
     }
 }
 
+template <bool Partial>
 __launch_bounds__(flash_threads, 1)
-__global__ void flash_prefill_attention(Attention request) {
+__global__ void flash_prefill_attention(Attention request, int rows) {
     extern __shared__ FlashTile shared[];
     auto& tile = shared[0];
     __shared__ OrderedScratch fallback;
@@ -741,10 +760,11 @@ __global__ void flash_prefill_attention(Attention request) {
     const int query = warp * flash_mma_rows;
     const int member = query + lane / 4;
     const int column = (lane % 4) * 2;
-    const int last = position + flash_rows;
+    const int active_rows = Partial ? min(flash_rows, rows - row) : flash_rows;
+    const int last = position + active_rows;
     Accumulator numerator[channels / 8]{};
     FlashSoftmax state[2]{{-CUDART_INF_F, 0.0f}, {-CUDART_INF_F, 0.0f}};
-    flash_stage_query(tile, request, row, head);
+    flash_stage_query<Partial>(tile, request, row, head, active_rows);
     __syncthreads();
     for (int first = 0; first < last; first += flash_keys) {
         flash_stage_kv(tile, request, first, min(flash_keys, last - first), head / ratio);
@@ -752,17 +772,20 @@ __global__ void flash_prefill_attention(Attention request) {
         Accumulator scores[flash_score_fragments]{};
         flash_scores(tile, query, lane, scores);
         const int visible = position + member / ordered_heads - first + 1;
-        const auto top = flash_softmax<0>(tile, member, column, visible, scores, state[0]);
-        const auto bottom = flash_softmax<1>(tile, member + 8, column,
-                                             visible + 8 / ordered_heads, scores, state[1]);
+        const int top_visible = !Partial || member / ordered_heads < active_rows ? visible : 0;
+        const int bottom_visible = !Partial || (member + 8) / ordered_heads < active_rows
+            ? visible + 8 / ordered_heads : 0;
+        const auto top = flash_softmax<0>(tile, member, column, top_visible, scores, state[0]);
+        const auto bottom = flash_softmax<1>(tile, member + 8, column, bottom_visible,
+                                             scores, state[1]);
         __syncwarp();
         flash_values(tile, query, lane, top, bottom, numerator);
         __syncthreads();
     }
-    flash_store(request, row, head, query, lane, state, numerator);
+    flash_store<Partial>(request, row, head, active_rows, query, lane, state, numerator);
     if (__syncthreads_or(threadIdx.x < flash_queries && tile.bad_query[threadIdx.x]) ||
         tile.bad_key < last) {
-        for (int offset = 0; offset < flash_rows; ++offset) {
+        for (int offset = 0; offset < active_rows; ++offset) {
             if (position + offset >= tile.bad_key ||
                 tile.bad_query[offset * ordered_heads] ||
                 tile.bad_query[offset * ordered_heads + 1]) {
@@ -785,22 +808,23 @@ std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
         return status;
     }
     cudaFuncAttributes attributes{};
-    status = cudaFuncGetAttributes(&attributes, flash_prefill_attention);
+    const auto kernel = rows % flash_rows == 0 ? flash_prefill_attention<false> :
+                                                flash_prefill_attention<true>;
+    status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) {
         return status;
     }
     if (static_cast<std::size_t>(shared_limit) < sizeof(FlashTile) + attributes.sharedSizeBytes) {
         return std::nullopt;
     }
-    status = cudaFuncSetAttribute(flash_prefill_attention,
+    status = cudaFuncSetAttribute(kernel,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(FlashTile));
     if (status != cudaSuccess) {
         return status;
     }
-    const dim3 blocks(rows / flash_rows, mxfp8_query_heads / ordered_heads);
-    void* args[] = {&request};
-    return cudaLaunchKernel(flash_prefill_attention, blocks, flash_threads, args,
-                            sizeof(FlashTile), stream);
+    const dim3 blocks((rows + flash_rows - 1) / flash_rows, mxfp8_query_heads / ordered_heads);
+    void* args[] = {&request, &rows};
+    return cudaLaunchKernel(kernel, blocks, flash_threads, args, sizeof(FlashTile), stream);
 }
 
 }
@@ -824,7 +848,11 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
         return cudaErrorInvalidValue;
     }
     Attention request{cache, pages.device_pages, position, queries, output};
-    if (rows == flash_chunk && position + rows <= max_flash_visible_tokens &&
+    constexpr int min_flash_rows = 144;
+    const int visible = position + rows;
+    const int flash_limit = rows == flash_chunk ? max_flash_visible_tokens :
+                                                  max_multirow_visible_tokens;
+    if (rows >= min_flash_rows && rows <= flash_chunk && visible <= flash_limit &&
         (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
         (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
         if (const auto status = launch_flash_prefill(request, rows, stream)) {
@@ -833,7 +861,7 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     }
     void* args[] = {&request, &rows};
     constexpr int min_paired_rows = 64;
-    if (rows < min_paired_rows || position + rows > max_multirow_visible_tokens) {
+    if (rows < min_paired_rows || visible > max_multirow_visible_tokens) {
         const dim3 blocks(rows, mxfp8_query_heads / ordered_heads);
         return cudaLaunchKernel(protected_prefill_attention, blocks, channels, args, 0, stream);
     }

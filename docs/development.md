@@ -74,9 +74,9 @@ Exact scoring reduces eight groups in FP32, sums in group order, and scales by `
 
 #### Ordered multirow GQA prefill
 
-The [flash route](flash-prefill.md#constraints-and-failure-behavior) handles eligible tensor-core chunks. Ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more, through 32,768 visible tokens. [Dispatch](../src/mxfp8_gqa_prefill.cu#L817)<!-- prefix: "cudaError_t " -->
+The [flash route](flash-prefill.md#constraints-and-failure-behavior) handles eligible tensor-core chunks. Ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more, through 32,768 visible tokens. [Dispatch](../src/mxfp8_gqa_prefill.cu#L841)<!-- prefix: "cudaError_t " -->
 
-Tiles share decoded K/V across rows and two query heads. Each 32-token block preserves per-row causality, the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L274)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L397)<!-- prefix: "for (int fir" -->
+Tiles share decoded K/V across rows and two query heads. Each 32-token block preserves per-row causality, the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L283)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L406)<!-- prefix: "for (int fir" -->
 
 Other shapes and leftover rows use protected single-row attention. Both routes recompute nonfinite visible scores by head and nonfinite quotients by channel in FP64, retaining finite replacements. [Recovery](../include/sglang/mxfp8_gqa.h#L63)<!-- prefix: "/// Shared a" -->
 

@@ -76,11 +76,11 @@ struct Input {
     std::vector<Byte> keys, values, key_scales, value_scales;
     std::vector<BFloat> queries;
 
-    explicit Input(int tokens)
+    explicit Input(int tokens, int count = rows)
         : physical_pages((tokens + mxfp8_page_size - 1) / mxfp8_page_size + 3),
           keys(physical_pages * mxfp8_payload_bytes_per_page, 0x7f), values(keys),
           key_scales(physical_pages * mxfp8_scale_bytes_per_page, 255), value_scales(key_scales),
-          queries(output_elements) {
+          queries(static_cast<std::size_t>(count) * row_width) {
         pages.resize(physical_pages);
         std::iota(pages.begin(), pages.end(), 0);
         std::mt19937 random(1729);
@@ -137,15 +137,15 @@ struct Input {
         }
     }
 
-    void add_score_overflow(int position) {
-        for (int token = 0; token <= position + 1; ++token) {
+    void add_score_overflow(int position, int row = 1) {
+        for (int token = 0; token <= position + row; ++token) {
             std::fill_n(keys.begin() + payload_offset(token, 0), channels, 0);
         }
-        const auto key = payload_offset(position + 1, 0);
-        const auto scale = scale_offset(position + 1, 0);
+        const auto key = payload_offset(position + row, 0);
+        const auto scale = scale_offset(position + row, 0);
         std::fill_n(keys.begin() + key, channels, 0x40);
         std::fill_n(key_scales.begin() + scale, mxfp8_groups, 127);
-        std::fill_n(queries.begin() + row_width, channels, __float2bfloat16_rn(0x1p126f));
+        std::fill_n(queries.begin() + row * row_width, channels, __float2bfloat16_rn(0x1p126f));
     }
 };
 
@@ -228,6 +228,15 @@ constexpr Dispatch exact{"attention_kernel", rows, mxfp8_query_heads};
 constexpr Dispatch multirow{"multirow_prefill_attention", rows / 4};
 constexpr Dispatch protected_rows{"protected_prefill_attention", rows};
 
+constexpr Dispatch flash_dispatch(int count) {
+    return {count % 64 == 0 ? "flash_prefill_attentionILb0EE" : "flash_prefill_attentionILb1EE",
+            static_cast<unsigned>((count + 63) / 64)};
+}
+
+constexpr Dispatch ordered_dispatch(int count) {
+    return {"multirow_prefill_attention", static_cast<unsigned>(count / 4 + count % 4)};
+}
+
 struct Graph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
@@ -309,15 +318,24 @@ void check_dispatch(const char* label, cudaGraph_t graph, Dispatch expected) {
     }
 }
 
-void check_output(const char* label, const std::vector<BFloat>& output,
-                  const std::vector<Sample>& samples, int count) {
+void check_guards(const char* label, const std::vector<BFloat>& output, int count) {
     const auto elements = static_cast<std::size_t>(count) * row_width;
     for (int index = 0; index < guard; ++index) {
-        if (__bfloat16_as_ushort(output[index]) != 0xffff ||
-            __bfloat16_as_ushort(output[guard + elements + index]) != 0xffff) {
-            throw std::runtime_error(std::string(label) + ": output guard overwritten");
+        if (__bfloat16_as_ushort(output[index]) != 0xffff) {
+            throw std::runtime_error(std::string(label) + ": prefix output guard overwritten");
         }
     }
+    for (std::size_t index = guard + elements; index < output.size(); ++index) {
+        if (__bfloat16_as_ushort(output[index]) != 0xffff) {
+            throw std::runtime_error(std::string(label) + ": inactive output overwritten");
+        }
+    }
+}
+
+void check_output(const char* label, const std::vector<BFloat>& output,
+                  const std::vector<Sample>& samples, int count) {
+    check_guards(label, output, count);
+    const auto elements = static_cast<std::size_t>(count) * row_width;
     for (std::size_t index = 0; index < elements; ++index) {
         if (!std::isfinite(__bfloat162float(output[guard + index]))) {
             throw std::runtime_error(std::string(label) + ": nonfinite output at " +
@@ -366,13 +384,13 @@ struct RunOptions {
 struct DeviceInput {
     DeviceBuffer<Byte> keys, values, key_scales, value_scales;
     DeviceBuffer<std::int32_t> pages;
-    DeviceBuffer<BFloat> queries{output_elements};
+    DeviceBuffer<BFloat> queries;
     DeviceBuffer<BFloat> output{output_elements + 2 * guard};
 
     explicit DeviceInput(const Input& input)
         : keys(input.keys.size() + 1), values(input.values.size() + 1),
           key_scales(input.key_scales.size()), value_scales(input.value_scales.size()),
-          pages(input.pages.size()) {}
+          pages(input.pages.size()), queries(input.queries.size()) {}
 
     std::vector<BFloat> run(const char* label, const Input& input, int position, Dispatch expected,
                             const std::vector<Sample>& samples, cudaStream_t stream,
@@ -407,7 +425,11 @@ struct DeviceInput {
                    "Instantiate Flash check graph");
         check_cuda(cudaGraphLaunch(graph.executable, stream), "Replay Flash check graph");
         auto result = output.download(stream);
-        check_output(label, result, samples, options.count);
+        if (samples.empty()) {
+            check_guards(label, result, options.count);
+        } else {
+            check_output(label, result, samples, options.count);
+        }
         return result;
     }
 };
@@ -446,7 +468,6 @@ void check_long_flash(cudaStream_t stream) {
     constexpr int ordered_visible = 32768;
     constexpr int flash_visible = 131072;
     constexpr int partial = rows - 1;
-    constexpr Dispatch partial_multirow{"multirow_prefill_attention", partial / 4 + partial % 4};
     constexpr Dispatch partial_protected{"protected_prefill_attention", partial};
     Input input(flash_visible + 1);
     DeviceInput device(input);
@@ -462,7 +483,7 @@ void check_long_flash(cudaStream_t stream) {
                        {.value_offset = 1});
         }
     }
-    device.run("32768 partial tile", input, ordered_visible - partial, partial_multirow,
+    device.run("32768 partial tile", input, ordered_visible - partial, flash_dispatch(partial),
                attention_samples(input, ordered_visible - partial, partial), stream,
                {.count = partial});
     device.run("32769 partial tile", input, ordered_visible + 1 - partial, partial_protected,
@@ -480,10 +501,72 @@ void check_long_flash(cudaStream_t stream) {
                attention_samples(input, position), stream);
 }
 
+void check_partial_boundaries(cudaStream_t stream) {
+    constexpr int position = 61;
+    for (int count : {143, 144, 191, 192, 193, 1023, rows}) {
+        Input input(position + count, count);
+        input.add_causal_marker(position, count - 1);
+        DeviceInput device(input);
+        const auto samples = attention_samples(input, position, count);
+        const auto label = std::to_string(count) + " query rows";
+        const auto expected = count == 143 ? ordered_dispatch(count) : flash_dispatch(count);
+        device.run(label.c_str(), input, position, expected, samples, stream, {.count = count});
+        if (count == 144) {
+            device.run("144 rows unaligned key", input, position, ordered_dispatch(count),
+                       samples, stream, {.count = count, .key_offset = 1});
+            device.run("144 rows unaligned value", input, position, ordered_dispatch(count),
+                       samples, stream, {.count = count, .value_offset = 1});
+        }
+    }
+}
+
+void check_partial_recovery(cudaStream_t stream) {
+    constexpr int position = 61;
+    constexpr int count = 193;
+    constexpr int last = count - 1;
+    Input input(position + count, count);
+    DeviceInput device(input);
+    const auto expected = flash_dispatch(count);
+    const RunOptions options{.count = count};
+    input.add_score_overflow(position, last);
+    const auto baseline = device.run("partial final row score overflow", input, position,
+                                     expected, attention_samples(input, position, count),
+                                     stream, options);
+    const auto changed_value = input.payload_offset(position + last, 0);
+    input.values[changed_value] = 0x7f;
+    input.queries[last * row_width + 2 * queries_per_kv * channels] =
+        __ushort_as_bfloat16(0x7f80);
+    const auto changed = device.run("partial final row nonfinite inputs", input, position,
+                                    expected, {}, stream, options);
+    const auto last_offset = static_cast<std::size_t>(last) * row_width;
+    for (std::size_t index = 0; index < last_offset; ++index) {
+        if (__bfloat16_as_ushort(baseline[guard + index]) !=
+            __bfloat16_as_ushort(changed[guard + index])) {
+            throw std::runtime_error("Nonfinite future input changed a causal prefix output");
+        }
+    }
+    std::size_t nonfinite = 0;
+    for (int head = 0; head < mxfp8_query_heads; ++head) {
+        for (int channel = 0; channel < channels; ++channel) {
+            const bool poisoned = head == 2 * queries_per_kv ||
+                                  (head < queries_per_kv && channel == 0);
+            const auto value = changed[guard + last_offset + head * channels + channel];
+            if (std::isfinite(__bfloat162float(value)) == poisoned) {
+                throw std::runtime_error("Nonfinite recovery affected the wrong output channel");
+            }
+            nonfinite += static_cast<std::size_t>(poisoned);
+        }
+    }
+    std::printf("MXFP8 prefill partial nonfinite causal_prefix=%zu nonfinite_outputs=%zu\n",
+                last_offset, nonfinite);
+}
+
 }
 
 void check_flash_prefill(cudaStream_t stream) {
     check_dispatch_errors(stream);
+    check_partial_boundaries(stream);
+    check_partial_recovery(stream);
     constexpr int position = 61;
     {
         Input input(position + rows);

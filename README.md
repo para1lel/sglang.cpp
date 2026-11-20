@@ -17,7 +17,7 @@ The CUDA cache and public attention implementation is in
 The internal page-parallel path for batched decode is in
 [`src/mxfp8_gqa.cu`](src/mxfp8_gqa.cu#L947)<!-- prefix: "cudaError_t " -->.
 The internal grouped-query attention prefill path is in
-[`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L817)<!-- prefix: "cudaError_t " -->.
+[`src/mxfp8_gqa_prefill.cu`](src/mxfp8_gqa_prefill.cu#L841)<!-- prefix: "cudaError_t " -->.
 
 ## Build on the project host
 
@@ -114,12 +114,13 @@ order. Model scores and generated token IDs can differ, including when the highe
 scores are far apart.
 
 On the native SM100 build, Tensor Core prefill selects
-[paged MXFP8 flash attention](src/mxfp8_gqa_prefill.cu#L732)<!-- prefix: "__global__ v" -->
-for 1,024-row chunks with at most 131,072 visible tokens, 16-byte-aligned K and V
-payloads, and sufficient dynamic shared memory. It uses BF16 Tensor Core products
-and FP32 online softmax. Unsafe inputs use ordered repair for affected rows and
-query-head pairs. Logits and output token IDs can differ from ordered attention.
-The `exact` policy continues to use its original attention path.
+[paged MXFP8 flash attention](src/mxfp8_gqa_prefill.cu#L751)<!-- prefix: "__global__ v" -->
+for 144–1,023 query rows through 32,768 visible tokens and 1,024 query rows
+through 131,072 visible tokens. Flash requires 16-byte-aligned K and V payloads
+and sufficient dynamic shared memory. It uses BF16 Tensor Core products and FP32
+online softmax. Unsafe inputs use ordered repair for affected rows and query-head
+pairs. Logits and output token IDs can differ from ordered attention. The `exact`
+policy continues to use its original attention path.
 
 The ordered fallback shares decoded K and V across two query heads. It uses
 two-row tiles for 64–127 rows and four-row tiles for at least 128 rows, with at

@@ -7,6 +7,7 @@ from copy import deepcopy
 import http.client
 import json
 from pathlib import Path
+import select
 import socket
 import struct
 import subprocess
@@ -20,8 +21,8 @@ HEADERS = {"Content-Type": "application/json", "Connection": "close"}
 RGB8 = "data:application/x-sglang-rgb8;base64,"
 
 
-def exchange(port, route, body=None):
-    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=90)) as client:
+def exchange(port, route, body=None, *, timeout=90):
+    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)) as client:
         client.request("GET" if body is None else "POST", route,
                        None if body is None else json.dumps(body), HEADERS)
         with client.getresponse() as response:
@@ -164,40 +165,94 @@ def ordinary(args, port, label, content):
     return expected, prompt
 
 
-def start(port, body):
-    client = http.client.HTTPConnection("127.0.0.1", port, timeout=90)
+def start(port, body, *, fragment=False):
+    client = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     try:
         client.connect()
         client.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-        client.request("POST", CHAT, json.dumps(body), HEADERS)
+        payload = json.dumps(body).encode()
+        client.putrequest("POST", CHAT)
+        for name, value in HEADERS.items():
+            client.putheader(name, value)
+        client.putheader("Content-Length", str(len(payload)))
+        client.endheaders(payload[:-1] if fragment else payload)
     except BaseException:
         client.close()
         raise
     return client
 
 
-def cancel_and_replace(args, port, log, content, expected):
-    with closing(start(port, chat(content, 1024, True))) as active:
+def wait_retired(log, offset):
+    deadline = time.monotonic() + 20
+    with log.open("rb") as trace:
+        while time.monotonic() < deadline:
+            trace.seek(offset)
+            if b"batch width=0 decode=0 request_bytes=0\n" in trace.read():
+                return
+            time.sleep(0.01)
+    raise AssertionError("The reset media request did not retire with zero request bytes")
+
+
+def wait_pending(args, port):
+    deadline = time.monotonic() + 2
+    running = b'vllm:num_requests_running{engine="0"} 1'
+    waiting = b'vllm:num_requests_waiting{engine="0"} 1'
+    while (remaining := deadline - time.monotonic()) > 0:
+        status, _, raw = exchange(port, "/metrics", timeout=remaining)
+        assert status == 200, (status, raw)
+        lines = raw.splitlines()
+        if running in lines and waiting in lines:
+            (args.evidence / "fragmented-pending.prom").write_bytes(raw)
+            return
+    raise AssertionError("The complete request did not enter the pending queue")
+
+
+def reject_overflow(args, label, first, second):
+    ready, _, _ = select.select([first.sock, second.sock], [], [], 5)
+    assert len(ready) == 1, (label, "expected one response while the worker was occupied")
+    first_rejected = ready[0] is first.sock
+    rejected, pending = (first, second) if first_rejected else (second, first)
+    (args.evidence / f"{label}-queue-full-peer.txt").write_text(
+        "first\n" if first_rejected else "second\n"
+    )
+    with rejected.getresponse() as response:
+        raw = response.read()
+        mime = response.headers.get_content_type()
+        (args.evidence / f"{label}-queue-full.body").write_bytes(raw)
+        (args.evidence / f"{label}-queue-full.http").write_text(f"{response.status} {mime}\n")
+        assert (response.status, mime) == (503, "application/json"), (label, response.status, raw)
+        assert json.loads(raw)["error"]["message"] == "Native completion queue is full", raw
+    assert not select.select([pending.sock], [], [], 0)[0], (label, "pending request responded")
+    return first_rejected
+
+
+def cancel_and_replace(args, port, log, content, expected, *, fragment=False):
+    label = "fragmented" if fragment else "whole"
+    body = chat(content, 1024, True)
+    with closing(start(port, body)) as active:
         transport = active.sock
         with active.getresponse() as response:
             assert response.status == 200
-            while True:
-                line = response.readline()
-                assert line
-                if line.startswith(b"data: ") and b'"token_ids":[' in line:
-                    (args.evidence / "active-first-token.sse").write_bytes(line)
-                    break
-            with closing(start(port, chat(content, 1024, True))) as cancelled:
-                with closing(start(port, chat(content, stream=True))) as survivor:
-                    cancelled.close()
-                    transport.close()
-                    response.close()
-                    with survivor.getresponse() as survived:
-                        assert survived.status == 200
-                        raw = survived.read()
-                        (args.evidence / "survivor.sse").write_bytes(raw)
-    assert stream_result(raw, 4) == expected
-    assert "batch width=0 decode=0" in log.read_text()
+            for line in response:
+                if line.startswith(b"data: ") and line.rstrip() != b"data: [DONE]":
+                    choices = json.loads(line[6:])["choices"]
+                    if choices and choices[0].get("token_ids"):
+                        (args.evidence / f"{label}-active-first-token.sse").write_bytes(line)
+                        break
+            else:
+                raise AssertionError("The active media stream ended before its first token")
+            offset = log.stat().st_size
+            with closing(start(port, body, fragment=fragment)) as first:
+                with closing(start(port, body)) as second:
+                    if fragment:
+                        wait_pending(args, port)
+                        first.send(b"}")
+                    first_rejected = reject_overflow(args, label, first, second)
+                    assert not fragment or first_rejected
+            transport.close()
+    wait_retired(log, offset)
+    survivor = capture(args, f"{label}-survivor", port, CHAT, chat(content, stream=True))
+    assert stream_result(survivor, 4) == expected
 
 
 def main(args):
@@ -219,8 +274,10 @@ def main(args):
         assert ordinary(args, port, "media-k0", content) == (expected, prompt)
     for label, options in (("continuous", ["--max-active", "2"]),
                            ("cached", ["--max-active", "1", "--prefix-cache-entries", "1"])):
-        with serve(args, label, *options) as (port, _):
+        with serve(args, label, *options) as (port, log):
             assert ordinary(args, port, f"{label}-media", content) == (expected, prompt)
+            if label == "cached":
+                cancel_and_replace(args, port, log, content, (*expected, prompt), fragment=True)
             ordinary(args, port, f"{label}-plain", "Say hello.")
     print("Decoded media HTTP route contract passed.")
 

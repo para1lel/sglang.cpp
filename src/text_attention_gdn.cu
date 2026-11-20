@@ -167,6 +167,39 @@ constexpr int paired_recurrent_min_rows = 32;
 constexpr int recurrent_tile_rows = 8;
 constexpr int value_pairs_per_block = value_rows_per_block / 2;
 
+__device__ float2 multiply_channels(float2 values, float factor) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
+    return __fmul2_rn(values, {factor, factor});
+#else
+    return {values.x * factor, values.y * factor};
+#endif
+}
+
+__device__ float2 multiply_add_channels(float2 values, float factor, float2 addends) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
+    return __ffma2_rn(values, {factor, factor}, addends);
+#else
+    return {fmaf(values.x, factor, addends.x), fmaf(values.y, factor, addends.y)};
+#endif
+}
+
+__device__ float2 add_channels(float2 values, float2 addends) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
+    return __fadd2_rn(values, addends);
+#else
+    return {values.x + addends.x, values.y + addends.y};
+#endif
+}
+
+__device__ float2 warp_sum_channels(float2 value) {
+    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+        const float2 peer = {__shfl_xor_sync(0xffffffffu, value.x, offset),
+                             __shfl_xor_sync(0xffffffffu, value.y, offset)};
+        value = add_channels(value, peer);
+    }
+    return value;
+}
+
 __global__ void gdn_prefill_recur_paired(int rows, const __nv_bfloat16* convolved,
                                         const float2* gates, float* recurrent,
                                         __nv_bfloat16* observable) {
@@ -184,11 +217,10 @@ __global__ void gdn_prefill_recur_paired(int rows, const __nv_bfloat16* convolve
     const int feature = first_feature + 2 * warp;
     auto* first_state = recurrent + feature * text_gdn_head_dim + lane;
     auto* second_state = first_state + text_gdn_head_dim;
-    float first_keys[keys_per_lane], second_keys[keys_per_lane];
+    float2 state_keys[keys_per_lane];
     #pragma unroll
     for (int part = 0; part < keys_per_lane; ++part) {
-        first_keys[part] = first_state[part * warp_size];
-        second_keys[part] = second_state[part * warp_size];
+        state_keys[part] = {first_state[part * warp_size], second_state[part * warp_size]};
     }
     for (int first = 0; first < rows; first += recurrent_tile_rows) {
         const int count = min(recurrent_tile_rows, rows - first);
@@ -228,43 +260,40 @@ __global__ void gdn_prefill_recur_paired(int rows, const __nv_bfloat16* convolve
             const auto gate = tile_gates[local_row];
             const auto targets = __bfloat1622float2(tile_targets[local_row][warp]);
             float keys[keys_per_lane], queries[keys_per_lane];
-            float first_prediction = 0.0f, second_prediction = 0.0f;
+            float2 prediction = {0.0f, 0.0f};
             #pragma unroll
             for (int part = 0; part < keys_per_lane; ++part) {
                 const int key = part * warp_size + lane;
                 constexpr float query_scale = 0.08838834764831845f;
                 keys[part] = __bfloat162float(keys_bf16[key]);
                 queries[part] = __bfloat162float(queries_bf16[key]) * query_scale;
-                first_keys[part] *= gate.x;
-                second_keys[part] *= gate.x;
-                first_prediction = fmaf(first_keys[part], keys[part], first_prediction);
-                second_prediction = fmaf(second_keys[part], keys[part], second_prediction);
+                state_keys[part] = multiply_channels(state_keys[part], gate.x);
+                prediction = multiply_add_channels(state_keys[part], keys[part], prediction);
             }
-            const float first_correction = gate.y * (targets.x - warp_sum(first_prediction));
-            const float second_correction = gate.y * (targets.y - warp_sum(second_prediction));
-            float first_result = 0.0f, second_result = 0.0f;
+            const float2 predicted = warp_sum_channels(prediction);
+            const auto correction = multiply_channels(
+                add_channels(targets, {-predicted.x, -predicted.y}), gate.y);
+            float2 result = {0.0f, 0.0f};
             #pragma unroll
             for (int part = 0; part < keys_per_lane; ++part) {
-                first_keys[part] = fmaf(first_correction, keys[part], first_keys[part]);
-                second_keys[part] = fmaf(second_correction, keys[part], second_keys[part]);
-                first_result = fmaf(first_keys[part], queries[part], first_result);
-                second_result = fmaf(second_keys[part], queries[part], second_result);
+                state_keys[part] =
+                    multiply_add_channels(correction, keys[part], state_keys[part]);
+                result = multiply_add_channels(state_keys[part], queries[part], result);
             }
-            const float first_sum = warp_sum(first_result);
-            const float second_sum = warp_sum(second_result);
+            const float2 sum = warp_sum_channels(result);
             if (lane == 0) {
                 auto* row_output =
                     observable + static_cast<std::size_t>(first + local_row) * text_gdn_value_width;
                 reinterpret_cast<__nv_bfloat162*>(row_output)[feature / 2] =
-                    __floats2bfloat162_rn(first_sum, second_sum);
+                    __float22bfloat162_rn(sum);
             }
         }
         __syncthreads();
     }
     #pragma unroll
     for (int part = 0; part < keys_per_lane; ++part) {
-        first_state[part * warp_size] = first_keys[part];
-        second_state[part * warp_size] = second_keys[part];
+        first_state[part * warp_size] = state_keys[part].x;
+        second_state[part * warp_size] = state_keys[part].y;
     }
 }
 

@@ -230,6 +230,77 @@ class NativeParallelSampling(unittest.TestCase):
             self.assertEqual(batch_frame(stream)["meta_info"]["finish_reason"], ABORTED)
             self.assertEqual(batch_frame(stream), "[DONE]")
 
+    def test_terminal_child_reused_as_normalized_parent_while_sibling_runs(self):
+        gate = self.output / "terminal-parent-step"
+        gate.with_suffix(".0").touch()
+        log = self.output / "terminal-parent.log"
+        active = named("owner", budget=41)
+        active["sampling_params"]["n"] = 2
+        with patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)), \
+             server(self.binary, self.checkpoint, log, "--max-active", "3") as port, \
+             closing(generate_client(port, active)) as client, \
+             http.client.HTTPResponse(client) as stream:
+            stream.begin()
+            self.assertEqual(stream.status, 200)
+            first = sorted((batch_frame(stream), batch_frame(stream)),
+                           key=lambda item: item["index"])
+            self.assertEqual([item["index"] for item in first], [0, 1])
+            self.assertTrue(all(item["meta_info"]["finish_reason"] is None for item in first))
+            old_ids = self.sample_ids(first)
+            retired, sibling = (item["meta_info"]["id"] for item in first)
+            parallel = {"input_ids": [[32], [32]], "rid": [retired, "unowned"],
+                        "sampling_params": {"n": 2, "max_new_tokens": 0}}
+            admitted = len(receipts(log))
+            status, error = send(port, GENERATE, parallel)
+            self.assertEqual(status, 400, error)
+            self.assertIn(f"Duplicate request ID detected: {retired}", error["error"]["message"])
+            self.assertEqual(len(receipts(log)), admitted)
+
+            self.abort_id(port, retired)
+            terminal = batch_frame(stream)
+            self.assertEqual(terminal["meta_info"]["id"], retired)
+            self.assertEqual(terminal["meta_info"]["finish_reason"], ABORTED)
+            self.assertEqual(terminal["output_ids"], [32])
+            self.abort_id(port, retired)
+            result = self.generate(parallel, port=port)
+            self.assertEqual(len(result), 4)
+            self.assertTrue(self.sample_ids(result).isdisjoint(old_ids | {"unowned"}))
+            self.assertTrue(all(item["output_ids"] == [] for item in result))
+            status, error = send(port, GENERATE, parallel | {"rid": [retired, sibling]})
+            self.assertEqual(status, 400, error)
+            self.assertIn(f"Duplicate request ID detected: {sibling}", error["error"]["message"])
+
+            replacement = {"input_ids": [[32], [32]], "rid": [retired, "companion"],
+                           "sampling_params": [{"max_new_tokens": 42, "sampling_seed": -41},
+                                               {"max_new_tokens": 0}], "stream": True}
+            with closing(generate_client(port, replacement)) as other, \
+                 http.client.HTTPResponse(other) as new_stream:
+                new_stream.begin()
+                self.assertEqual(new_stream.status, 200)
+                first_replacement = batch_frame(new_stream)
+                self.assertEqual(first_replacement["index"], 0)
+                self.assertEqual(first_replacement["meta_info"]["id"], retired)
+                self.assertIsNone(first_replacement["meta_info"]["finish_reason"])
+                self.abort_id(port, sibling)
+                old_terminal = batch_frame(stream)
+                self.assertEqual(old_terminal["meta_info"]["id"], sibling)
+                self.assertEqual(old_terminal["meta_info"]["finish_reason"], ABORTED)
+                self.assertEqual(old_terminal["output_ids"], [32])
+                self.assertEqual(batch_frame(stream), "[DONE]")
+                self.assertIsNone(batch_frame(stream))
+                companion = batch_frame(new_stream)
+                self.assertEqual(companion["meta_info"]["id"], "companion")
+                status, error = send(port, GENERATE, named(retired, budget=0, stream=False))
+                self.assertEqual(status, 400, error)
+                self.assertIn("Duplicate request ID", error["error"]["message"])
+                self.abort_id(port, retired)
+                terminal = batch_frame(new_stream)
+                self.assertEqual(terminal["meta_info"]["id"], retired)
+                self.assertEqual(terminal["meta_info"]["finish_reason"], ABORTED)
+                self.assertEqual(terminal["output_ids"], [32])
+                self.assertEqual(batch_frame(new_stream), "[DONE]")
+                self.assertIsNone(batch_frame(new_stream))
+
     def check_disconnect(self, port, payload, log):
         with closing(generate_client(port, payload)) as client:
             with http.client.HTTPResponse(client) as stream:

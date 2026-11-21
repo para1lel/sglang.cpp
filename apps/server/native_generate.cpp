@@ -438,7 +438,12 @@ NativeGenerate::register_ids(const GenerateInput& input) {
     std::optional<std::random_device> random;
     if (input.samples > 1) {
         for (const auto& id : ids) {
-            if (id && (ids_.count(*id) || !normalized.insert(*id).second)) {
+            if (!id) {
+                continue;
+            }
+            const auto known = ids_.find(*id);
+            if ((known != ids_.end() && !known->second->finished()) ||
+                !normalized.insert(*id).second) {
                 throw std::invalid_argument("Duplicate request ID detected: " + *id);
             }
         }

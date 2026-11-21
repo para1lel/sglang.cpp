@@ -4,17 +4,21 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder batch | Mark K0 text decode lanes under the tensor-core policy. | [Lane eligibility](../src/decoder_batch.cpp#L648)<!-- prefix: "const bool p" --> |
+| Decoder batch | Mark K0 text decode lanes under the tensor-core policy. | [Lane eligibility](../src/decoder_batch.cpp#L651)<!-- prefix: "const bool p" --> |
 | Eager forward | Compact eligible attention reads and order KV append, attention, and gating on the batch stream. | [Forward dispatch](../src/decoder_forward.cpp#L299)<!-- prefix: "void attend_" --> |
 | CUDA operator | Validate the group, select a split, merge partials, and recover individual heads. | [Launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L380)<!-- prefix: "cudaError_t " --> · [Tensor-core split](../include/sglang/text/mxfp8_gqa_wide_tc.cuh#L178)<!-- prefix: "__global__ v" --> · [Paired split](../include/sglang/text/mxfp8_gqa_decode.cuh#L274)<!-- prefix: "__global__ v" --> · [Merge](../src/mxfp8_gqa.cu#L658)<!-- prefix: "__global__ v" --> · [Recovery](../include/sglang/text/mxfp8_gqa_decode.cuh#L332)<!-- prefix: "__global__ v" --> |
 
 ## Runtime path
 
-Start the batch server with `--fp8-prefill tensor-core` to enable [packed K0 text decode](batch-graphs.md#runtime-path). The fused GQA step requires at least two eligible decode lanes, with a live position, KV cache, and page table per lane. The same operator runs in eager and replay. Negative positions mark inactive rows. See the [batch failure contract](batch-graphs.md#constraints-and-failure-behavior) for first-use packed scratch errors. [Packed dispatch](../src/text/decoder_graph_packed.cpp#L449)<!-- prefix: "bool run_pac" --> · [Fused API](../include/sglang/text/gqa_decode_step.h#L28)<!-- prefix: "cudaError_t " -->
+Start the batch server with `--fp8-prefill tensor-core` to enable [packed K0 text decode](batch-graphs.md#runtime-path). The fused GQA step requires at least two eligible decode lanes, with a live position, KV cache, and page table per lane. The same operator runs in eager and replay. Negative positions mark inactive rows. See the [batch failure contract](batch-graphs.md#constraints-and-failure-behavior) for first-use packed scratch errors. [Packed dispatch](../src/text/decoder_graph_packed.cpp#L457)<!-- prefix: "bool run_pac" --> · [Fused API](../include/sglang/text/gqa_decode_step.h#L28)<!-- prefix: "cudaError_t " -->
 
 ### Fused packed GQA
 
 The fused step prepares Q and K, appends the new packed KV, and runs attention and output gating on the batch stream. The split uses whole 64-token chunks, with up to 16 partials per lane and query head. It preserves the original BF16 Q and expands raw E4M3 operands exactly to BF16. QK and PV use BF16 MMA with FP32 accumulation. PV rounds the probability times the relative V scale to BF16. Range checks cover operands, scale updates, and the merge. A flagged head replays attention in FP64. The fast path can still lose precision through cancellation. See [the regression inputs and results](lessons.md#l006--fp16-operand-loss-in-split-gqa). [Fused step](../src/text/gqa_decode_prepare.cu#L77)<!-- prefix: "cudaError_t " --> · [Split selection](../include/sglang/text/gqa_decode_split.cuh#L41)<!-- prefix: "__host__ __d" --> · [Merge](../include/sglang/text/gqa_decode_split.cuh#L102)<!-- prefix: "__device__ i" -->
+
+### Packed FP8 projections
+
+Packed eager and replay use the same FP8 projection dispatch. SM100 uses 8-, 16-, 32-, or 64-column activation tiles. Ineligible calls use per-target GEMV. With one TMEM accumulator slot per TMA stage, the FP8 copy and consumer warps wait on the same MMA completion phase. The copy warp refills shared memory and signals copy readiness. Consumer warps read TMEM and release the accumulator slot. The MMA warp waits for copy readiness and slot release before reuse. BF16 keeps separate completion signals. FP8 keeps its tile layouts, split-K plan, rank reduction order, BF16 rounding, and scratch footprint. The barriers and buffers stay CTA-local. Local B200 graph timings cover isolated projections with synthetic inputs at checkpoint shapes. W3 projection savings are estimates from an archived trace. [Projection dispatch](../src/text/decode_proj_fp8.cu#L213)<!-- prefix: "const int co" --> · [Fallback](../src/text_ops.cu#L864)<!-- prefix: "if (const au" --> · [Copy wait](../include/sglang/text/decode_proj_sm100.cuh#L178)<!-- prefix: "const auto* " --> · [Accumulator release](../src/text/decode_proj_fp8.cu#L65)<!-- prefix: "release_slot" --> · [Reuse guard](../include/sglang/text/decode_proj_sm100.cuh#L199)<!-- prefix: "wait_barrier" -->
 
 ### Legacy wide eager decode
 
@@ -30,7 +34,7 @@ Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation
 
 ## Constraints and failure behavior
 
-Default `exact` policy, media, MTP, and prefill rows retain their legacy routes. Out-of-window lanes in the legacy wide forward use the row dispatch. The legacy long primitive accepts one through 32 descriptors, independently of the serving width requirement. [Eligibility](../src/decoder_batch.cpp#L648)<!-- prefix: "const bool p" --> · [Row dispatch](../src/decoder_forward.cpp#L328)<!-- prefix: "check(read_g" --> · [Primitive](../src/mxfp8_gqa.cu#L975)<!-- prefix: "cudaError_t " -->
+Default `exact` policy, media, MTP, and prefill rows retain their legacy routes. Out-of-window lanes in the legacy wide forward use the row dispatch. The legacy long primitive accepts one through 32 descriptors, independently of the serving width requirement. [Eligibility](../src/decoder_batch.cpp#L651)<!-- prefix: "const bool p" --> · [Row dispatch](../src/decoder_forward.cpp#L328)<!-- prefix: "check(read_g" --> · [Primitive](../src/mxfp8_gqa.cu#L975)<!-- prefix: "cudaError_t " -->
 
 The launcher checks the complete group before submission. An invalid count, null required pointer, unaligned scratch address, out-of-window position, or insufficient declared cache or page-table capacity returns `cudaErrorInvalidValue`. The caller supplies valid device page entries and enough scratch for each lane. The launcher stops at the first synchronous CUDA launch error. Earlier launches can still be in flight. The forward propagates the error through the batch execution path. [Validation and launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L380)<!-- prefix: "cudaError_t " --> · [Cache coverage](../src/mxfp8_gqa.cu#L158)<!-- prefix: "bool cache_c" --> · [Forward error](../src/decoder_forward.cpp#L335)<!-- prefix: "check(status" -->
 

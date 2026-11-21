@@ -92,6 +92,7 @@ run_packed_oom() {
 }
 
 run_packed_setup() {
+    run_lanes packed-pin-release graph tensor-core packed-pin-release failure packed-pin-release
     compile_observer setup -ldl -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcupti
     BATCH_KERNEL_ACTIVITY=1 run_lanes packed-setup-terminal graph tensor-core '' setup packed-setup
     for role in prefill mixed; do
@@ -143,6 +144,7 @@ fi
 compile_observer oom -ldl
 if [[ "$mode" == packed-setup ]]; then
     test "$layout" = packed
+    compile_observer failure -ldl
     run_packed_oom
     run_packed_setup
     finish_device

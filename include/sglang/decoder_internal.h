@@ -136,6 +136,7 @@ public:
 
     std::size_t bytes() const;
     TransferBuffers& transfers();
+    TextLogitCandidate* prepare_packed_winners();
     cudaStream_t stream() const;
     cudaGraphExec_t graph() const;
     void capture_graph(const std::function<void()>& enqueue);
@@ -484,6 +485,7 @@ struct DecodeGraphs {
 
 struct DecodeRun {
     std::array<Workspace*, decoder_batch_max_lanes> ready{};
+    std::array<const TextLogitCandidate*, decoder_batch_max_lanes> winners{};
     std::uint64_t graphed = 0;
 };
 
@@ -492,6 +494,7 @@ struct DecodeRunOptions {
     bool graph_step;
     bool narrow_allowed;
     bool packed;
+    std::uint64_t greedy_winners;
 };
 
 // Enqueues one decode step for lanes. ready[index] names the workspace that already holds logits

@@ -68,6 +68,7 @@ thread_local std::unordered_map<cudaGraphExec_t, PackedHead> executables;
 thread_local PackedHead captured{}, submitted{};
 thread_local cudaStream_t capture_stream = nullptr, packed_stream = nullptr;
 thread_local bool packed_replay = false;
+thread_local unsigned bulk_rows = 0;
 thread_local PackedBindings* bindings = nullptr;
 thread_local std::vector<Pending> pending;
 thread_local unsigned short* rows[capacity]{};
@@ -118,12 +119,18 @@ void flush(cudaStream_t stream) {
     const bool has_packed = submitted.rows && stream == packed_stream;
     if (has_packed) {
         static FILE* packed_output = open_output("BATCH_PACKED_OUTPUT", "w");
-        if (!packed_output || !bindings || pending.empty() || stream != pending_stream) {
+        if (!packed_output || !bindings || pending.empty() || stream != pending_stream ||
+            bindings->active < 2 || static_cast<unsigned>(bindings->active) > submitted.rows ||
+            (bulk_rows && bulk_rows != static_cast<unsigned>(bindings->active))) {
             std::abort();
         }
-        std::fprintf(packed_output, "%d %u %d", packed_replay, submitted.rows, bindings->active);
+        std::fprintf(packed_output, "%d %u %d %u",
+                     packed_replay, submitted.rows, bindings->active, bulk_rows);
         for (unsigned row = 0; row < submitted.rows; ++row) {
             std::fprintf(packed_output, " %d", bindings->lanes[row].position);
+        }
+        for (int row = 0; row < bindings->active; ++row) {
+            std::fprintf(packed_output, " %d", bindings->tokens[row]);
         }
         for (const auto& item : pending) {
             std::fprintf(packed_output, " %d", item.packed_row);
@@ -131,6 +138,7 @@ void flush(cudaStream_t stream) {
         std::fputc('\n', packed_output);
         std::fflush(packed_output);
         submitted = {};
+        bulk_rows = 0;
     }
     if (pending.empty() || stream != pending_stream) {
         return;
@@ -146,6 +154,92 @@ void flush(cudaStream_t stream) {
     }
     pending.clear();
     std::fflush(output());
+}
+
+using Copy = decltype(&cudaMemcpyAsync);
+
+void* allocate_observer_buffer(std::size_t bytes) {
+    static const auto allocate = next<decltype(&cudaMallocHost)>("cudaMallocHost");
+    void* buffer = nullptr;
+    if (allocate(&buffer, bytes) != cudaSuccess) {
+        std::abort();
+    }
+    return buffer;
+}
+
+void observe_copy(Copy copy, void* dst, const void* src, std::size_t bytes, cudaStream_t stream) {
+    if (copy(dst, src, bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        std::abort();
+    }
+}
+
+void observe_score(Copy copy, const int* winner, Logits logits, int packed_row,
+                   cudaStream_t stream) {
+    const auto [device, vocab] = logits;
+    if (pending.size() == capacity || (!pending.empty() && pending_stream != stream) ||
+        vocab != sglang::decoder::vocab_size) {
+        std::abort();
+    }
+    auto*& row = rows[pending.size()];
+    if (!row) {
+        row = static_cast<unsigned short*>(allocate_observer_buffer(vocab * sizeof(*row)));
+    }
+    observe_copy(copy, row, device, vocab * sizeof(*row), stream);
+    pending.push_back({winner, vocab, packed_row});
+    pending_stream = stream;
+}
+
+void observe_packed_score(Copy copy, const int* winner, int row, cudaStream_t stream) {
+    auto logits = submitted.logits;
+    logits.device = static_cast<const unsigned short*>(logits.device) +
+        static_cast<std::size_t>(row) * logits.count;
+    observe_score(copy, winner, logits, row, stream);
+}
+
+void observe_bindings(Copy copy, cudaStream_t stream) {
+    if (!bindings) {
+        bindings = static_cast<PackedBindings*>(allocate_observer_buffer(sizeof(*bindings)));
+    }
+    observe_copy(copy, bindings, submitted.bindings, sizeof(*bindings), stream);
+}
+
+void observe_readback(Copy copy, void* dst, const void* src, std::size_t count,
+                      cudaStream_t stream) {
+    const bool packed = submitted.rows && packed_stream == stream;
+    if (packed && src == submitted.winners) {
+        if (!pending.empty() || count < 2 * sizeof(Candidate) ||
+            count > submitted.rows * sizeof(Candidate) || count % sizeof(Candidate) != 0) {
+            std::abort();
+        }
+        bulk_rows = count / sizeof(Candidate);
+        observe_bindings(copy, stream);
+        const auto* records = static_cast<const Candidate*>(dst);
+        for (unsigned row = 0; row < bulk_rows; ++row) {
+            observe_packed_score(copy, &records[row].token_id, row, stream);
+        }
+        return;
+    }
+    if (count != sizeof(int)) {
+        return;
+    }
+    if (packed && pending.empty()) {
+        observe_bindings(copy, stream);
+    }
+    if (packed) {
+        const auto first = reinterpret_cast<std::uintptr_t>(submitted.winners) +
+            offsetof(Candidate, token_id);
+        const auto address = reinterpret_cast<std::uintptr_t>(src);
+        if (address >= first && address - first < submitted.rows * sizeof(Candidate) &&
+            (address - first) % sizeof(Candidate) == 0) {
+            observe_packed_score(copy, static_cast<const int*>(dst),
+                                 (address - first) / sizeof(Candidate), stream);
+            return;
+        }
+    }
+    const auto found = winners.find(src);
+    if (found != winners.end()) {
+        observe_score(copy, static_cast<const int*>(dst), found->second, -1, stream);
+    }
 }
 
 using LaunchKernel = cudaError_t (*)(cudaKernel_t, dim3, dim3, void**, std::size_t, cudaStream_t);
@@ -279,56 +373,11 @@ extern "C" cudaError_t cudaGraphLaunch(cudaGraphExec_t executable, cudaStream_t 
 extern "C" cudaError_t cudaMemcpyAsync(void* dst, const void* src, std::size_t count,
                                       cudaMemcpyKind kind, cudaStream_t stream) {
     static const auto copy = next<decltype(&cudaMemcpyAsync)>("cudaMemcpyAsync");
-    if (output() && kind == cudaMemcpyDeviceToHost && count == sizeof(int)) {
-        static const auto allocate = next<decltype(&cudaMallocHost)>("cudaMallocHost");
-        Logits logits{};
-        int packed_row = -1;
-        if (submitted.rows && packed_stream == stream) {
-            const auto first = reinterpret_cast<std::uintptr_t>(submitted.winners) +
-                offsetof(Candidate, token_id);
-            const auto address = reinterpret_cast<std::uintptr_t>(src);
-            if (address >= first && address - first < capacity * sizeof(Candidate) &&
-                (address - first) % sizeof(Candidate) == 0) {
-                packed_row = (address - first) / sizeof(Candidate);
-                logits = submitted.logits;
-                logits.device = static_cast<const unsigned short*>(logits.device) +
-                    static_cast<std::size_t>(packed_row) * logits.count;
-            }
-            if (pending.empty()) {
-                if (!bindings && allocate(reinterpret_cast<void**>(&bindings), sizeof(*bindings))
-                    != cudaSuccess) {
-                    std::abort();
-                }
-                if (copy(bindings, submitted.bindings, sizeof(*bindings), kind, stream)
-                    != cudaSuccess) {
-                    std::abort();
-                }
-            }
-        }
-        const auto found = winners.find(src);
-        if (packed_row == -1 && found != winners.end()) {
-            logits = found->second;
-        }
-        if (logits.device) {
-            const auto [device, vocab] = logits;
-            if (pending.size() == capacity || (!pending.empty() && pending_stream != stream) ||
-                vocab != sglang::decoder::vocab_size) {
-                std::abort();
-            }
-            auto*& row = rows[pending.size()];
-            if (!row) {
-                if (allocate(reinterpret_cast<void**>(&row), vocab * sizeof(*row)) != cudaSuccess) {
-                    std::abort();
-                }
-            }
-            if (copy(row, device, vocab * sizeof(*row), kind, stream) != cudaSuccess) {
-                std::abort();
-            }
-            pending.push_back({static_cast<const int*>(dst), vocab, packed_row});
-            pending_stream = stream;
-        }
+    const auto status = copy(dst, src, count, kind, stream);
+    if (status == cudaSuccess && kind == cudaMemcpyDeviceToHost && output()) {
+        observe_readback(copy, dst, src, count, stream);
     }
-    return copy(dst, src, count, kind, stream);
+    return status;
 }
 
 extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {

@@ -344,7 +344,9 @@ struct DecoderBatch::State {
     void score(Lane& lane, Request& request, Workspace& work, bool logits_ready);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats);
-    void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring, Steps&);
+    void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring,
+                        const std::array<int, decoder_batch_max_lanes>& packed_slots,
+                        const DecodeRun& run, Steps& results);
     std::size_t reserve(DecoderOptions& request, int prompt, std::size_t media_bytes) const;
     void initialize(Lane& lane);
     void drain(const char* operation, std::optional<Lane>* lane = nullptr) {
@@ -609,6 +611,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     PrefillRows speculative{};
     const int max_rows = *std::max_element(rows.begin(), rows.end());
     bool text_decode = max_rows == 0;
+    std::uint64_t greedy_winners = 0;
     int count = 0;
     for (int slot = 0; slot < options.max_lanes; ++slot) {
         if (!selected[slot] || !slots[slot] || !slots[slot]->request) {
@@ -649,6 +652,10 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             work[count - 1].packed = plain;
             work[count - 1].long_gqa =
                 plain && model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+            if (plain && !lane.sampling && !lane.options.constraint &&
+                lane.request->memory.transfers().logits.empty()) {
+                greedy_winners |= std::uint64_t{1} << packed_slots[slot];
+            }
         }
         if (rows[slot] == remaining) {
             scoring[slot] = lane.request.get();
@@ -658,7 +665,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
                                       {options.cuda_graphs, text_decode && !contains_mtp,
                                        !contains_mtp && max_rows == 0,
                                        !contains_mtp &&
-                                           model.fp8_prefill() == Fp8PrefillPolicy::tensor_core});
+                                           model.fp8_prefill() == Fp8PrefillPolicy::tensor_core,
+                                       greedy_winners});
     prefill(rows, max_rows, stats);
     bool submitted = count != 0 || max_rows > 1;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
@@ -666,7 +674,9 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             auto& lane = *slots[slot];
             const int index = lane.restored_prompt ? -1 : packed_slots[slot];
             auto* ready = index < 0 ? nullptr : run.ready[index];
-            score(lane, *request, ready ? *ready : request->work, ready != nullptr);
+            if (index < 0 || !run.winners[index]) {
+                score(lane, *request, ready ? *ready : request->work, ready != nullptr);
+            }
             submitted = true;
             if (index >= 0 && (run.graphed >> index & 1) != 0) {
                 stats.graph_slots |= std::uint32_t{1} << slot;
@@ -684,7 +694,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     if (stats.verification_lanes == 0 && submitted) {
         check(cudaStreamSynchronize(stream), "Complete decoder batch step");
     }
-    collect_scores(scoring, results);
+    collect_scores(scoring, packed_slots, run, results);
 }
 
 void DecoderBatch::State::prefill(const PrefillRows& rows, int max_rows,
@@ -741,14 +751,20 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, int max_rows,
 }
 
 void DecoderBatch::State::collect_scores(
-    const std::array<Request*, decoder_batch_max_lanes>& scoring, Steps& results) {
+    const std::array<Request*, decoder_batch_max_lanes>& scoring,
+    const std::array<int, decoder_batch_max_lanes>& packed_slots, const DecodeRun& run,
+    Steps& results) {
     const auto& slots = storage->slots;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (scoring[slot]) {
             const auto& lane = *slots[slot];
+            const int index = packed_slots[slot];
+            const auto* winner = index < 0 ? nullptr : run.winners[index];
             try {
-                results[slot].token = read_token(*scoring[slot], lane.sampling.has_value(),
-                                                  lane.options.constraint != nullptr);
+                results[slot].token = winner
+                    ? validate_winner(winner->token_id, false, false)
+                    : read_token(*scoring[slot], lane.sampling.has_value(),
+                                 lane.options.constraint != nullptr);
             } catch (const DecoderSamplingError&) {
                 results[slot].sampling_failed = true;
             } catch (const DecoderConstraintError&) {

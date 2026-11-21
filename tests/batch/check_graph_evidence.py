@@ -189,7 +189,7 @@ def verify_buckets(device, runtime, masks, widths, packed=False):
     return bindings
 
 
-def verify_packed_rows(stem, steps, enabled):
+def verify_packed_rows(stem, steps, enabled, bulk=True):
     trace_path = stem.with_suffix(".packed")
     if not enabled:
         assert not trace_path.exists(), trace_path
@@ -200,7 +200,7 @@ def verify_packed_rows(stem, steps, enabled):
         kind, *values = line.split()
         if kind == "step":
             graph_masks[int(values[0])] = int(values[2])
-    positions = {}
+    positions, previous_tokens = {}, {}
     by_step = {}
     for row in steps:
         kind, *values = row
@@ -211,38 +211,49 @@ def verify_packed_rows(stem, steps, enabled):
             by_step[step] = []
         elif kind == "lane":
             slot, job, prefill, decode, token, _ = map(int, values)
-            by_step[step].append((slot, positions[job], prefill, decode, token))
+            by_step[step].append((slot, positions[job], prefill, decode, token,
+                                  previous_tokens.get(job)))
             positions[job] += prefill + decode
-    coverage, mixed_scatter = Counter(), 0
+            if token >= 0:
+                previous_tokens[job] = token
+    coverage, mixed_scatter, bulk_calls = Counter(), 0, 0
     for step, lanes in by_step.items():
-        decode_lanes = [(slot, position) for slot, position, _, decode, _ in lanes if decode]
+        decode_lanes = [(slot, position, previous) for slot, position, _, decode, _, previous
+                        in lanes if decode]
         if len(decode_lanes) < 2:
             continue
         width = len(decode_lanes)
         bucket = bucket_for(width, True)
         row = next(observed, None)
         assert row is not None, (stem, step, f"missing packed evidence for width {width}")
-        replay, rows, active, *binding = map(int, row.split())
+        replay, rows, active, readback, *binding = map(int, row.split())
         assert (rows, active) == (bucket, width), (stem, step, row, bucket, width)
-        decode_mask = sum(1 << slot for slot, _ in decode_lanes)
+        expected_bulk = width if bulk and not any(lane[2] for lane in lanes) else 0
+        assert readback == expected_bulk, (stem, step, "bulk winner rows", readback, expected_bulk)
+        decode_mask = sum(1 << slot for slot, _, _ in decode_lanes)
         expected_replay = int(graph_masks[step] == decode_mask)
         assert replay == expected_replay, (stem, step, row, decode_mask)
-        assert binding[:width] == [position for _, position in decode_lanes], (stem, step, row)
+        assert binding[:width] == [position for _, position, _ in decode_lanes], (stem, step, row)
         assert all(position < 0 for position in binding[width:rows]), (stem, step, row)
-        row_for_slot = {slot: row for row, (slot, _) in enumerate(decode_lanes)}
-        expected_rows = [row_for_slot.get(slot, -1) for slot, _, _, _, token in lanes
+        assert binding[rows:rows + active] == [previous for _, _, previous in decode_lanes], (
+            stem, step, "unexpected active tokens", row
+        )
+        row_for_slot = {slot: index for index, (slot, _, _) in enumerate(decode_lanes)}
+        expected_rows = [row_for_slot.get(slot, -1) for slot, _, _, _, token, _ in lanes
                          if token >= 0]
-        assert binding[rows:] == expected_rows, (
-            stem, step, "unexpected score scatter", binding[rows:], expected_rows
+        assert binding[rows + active:] == expected_rows, (
+            stem, step, "unexpected score scatter", binding[rows + active:], expected_rows
         )
         mixed_scatter += -1 in expected_rows
+        bulk_calls += bool(readback)
         coverage[(width, bucket, bool(replay))] += 1
     assert next(observed, None) is None, (stem, "unexpected packed submission")
     assert coverage, stem
     print(f"{stem.name}: checked {sum(coverage.values())} packed submissions, "
           f"{sum(width * calls for (width, _, _), calls in coverage.items())} active rows, "
           f"{sum((bucket - width) * calls for (width, bucket, _), calls in coverage.items())} "
-          f"negative padding rows, {mixed_scatter} mixed score submissions")
+          f"negative padding rows, {bulk_calls} bulk winner copies, "
+          f"{mixed_scatter} mixed score submissions")
     return coverage, mixed_scatter
 
 
@@ -378,6 +389,18 @@ def verify_packed_buckets(evidence):
     compare_scores(graph.with_suffix(".scores"), eager.with_suffix(".scores"), steps)
     assert (baseline, tokens) == (steps, observed)
     print(f"All packed bucket widths passed complete BF16 score comparison ({len(tokens)} rows)")
+
+
+def verify_packed_pin_release(evidence):
+    stem = evidence / "packed-pin-release"
+    log = stem.with_suffix(".log").read_text().splitlines()
+    expected = ["inject: packed-pin-release", "released packed winner pin after rejected free"]
+    assert [line for line in log if line in expected] == expected, (stem, log)
+    steps, masks, tokens = lane_trace(stem.with_suffix(".lanes"))
+    assert masks == [5] and len(tokens) == 6, (stem, masks, tokens)
+    verify_packed_rows(stem, steps, True)
+    verify_scores(stem.with_suffix(".scores"), tokens)
+    print("Packed winner pin recovered after rejected release")
 
 
 def verify_singleton(evidence):
@@ -619,6 +642,7 @@ def main():
         return
     if args.packed_setup_only:
         verify_packed_boundary(output, ("packed-oom",))
+        verify_packed_pin_release(output)
         verify_packed_setup_terminal(output)
         verify_packed_setup_ineligible(output)
         return
@@ -653,6 +677,7 @@ def main():
     check("legacy boundary", verify_boundary)
     if packed:
         check("packed boundary", verify_packed_boundary)
+        check("packed pin release", verify_packed_pin_release)
         check("packed setup terminal", verify_packed_setup_terminal)
         check("packed setup eligibility", verify_packed_setup_ineligible)
         check("packed buckets", verify_packed_buckets)

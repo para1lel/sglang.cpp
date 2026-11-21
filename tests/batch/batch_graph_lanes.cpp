@@ -268,6 +268,18 @@ void packed_oom(const Decoder& decoder, bool graphs) {
     run.check_step(15, 0);
 }
 
+void packed_pin_release(const Decoder& decoder) {
+    {
+        Instance run(decoder, true);
+        run.admit(0, 19, 5);
+        run.admit(2, 21, 5);
+        run.prefill(5, 0);
+        run.check_step(5, 0);
+        run.check_step(5, 5);
+    }
+    const DecoderBatch reclaim(decoder, {true, 4});
+}
+
 void packed_buckets(const Decoder& decoder, bool graphs) {
     constexpr unsigned all_slots = ~0u;
     constexpr int slots = decoder_batch_max_lanes;
@@ -663,11 +675,12 @@ int main(int argc, char** argv) {
     try {
         require(argc == 4 || argc == 5,
                 "Expected CHECKPOINT ROLE FP8_PREFILL "
-                "[boundary|packed-boundary|packed-buckets|packed-setup|singleton|verify]");
+                "[boundary|packed-boundary|packed-buckets|packed-pin-release|"
+                "packed-setup|singleton|verify]");
         const std::string_view test = argc == 5 ? argv[4] : "";
         require(test.empty() || test == "boundary" || test == "packed-boundary" ||
-                test == "packed-buckets" || test == "packed-setup" ||
-                test == "singleton" || test == "verify",
+                test == "packed-buckets" || test == "packed-pin-release" ||
+                test == "packed-setup" || test == "singleton" || test == "verify",
                 "Unexpected graph test scenario");
         const std::string_view role = argv[2];
         const std::string_view policy = argv[3];
@@ -699,6 +712,10 @@ int main(int argc, char** argv) {
         } else if (test == "packed-buckets") {
             require(policy == "tensor-core", "Packed buckets require tensor-core");
             packed_buckets(decoder, role != "eager");
+        } else if (test == "packed-pin-release") {
+            require(policy == "tensor-core" && role == "graph",
+                    "Packed winner pin release requires tensor-core graphs");
+            packed_pin_release(decoder);
         } else if (test == "packed-setup") {
             require(policy == "tensor-core", "Packed setup requires tensor-core");
             if (role == "graph") {

@@ -5,6 +5,7 @@
 #include "sglang/text/gqa_decode_step.h"
 #include "sglang/text_ops.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <utility>
 
@@ -74,6 +75,7 @@ public:
     void bind(const ForwardLane* lanes, const Plan& plan);
     void upload(cudaStream_t stream) const;
     void enqueue(int rows, cudaStream_t stream) const;
+    void read_winners(TextLogitCandidate* winners, int active, cudaStream_t stream) const;
     Workspace* view(int row) { return &views_[row]; }
 
     std::array<bool, packed_decode_buckets.size()> warmed{};
@@ -358,6 +360,12 @@ void PackedDecode::enqueue(int rows, cudaStream_t stream) const {
     head(step);
 }
 
+void PackedDecode::read_winners(TextLogitCandidate* winners, int active,
+                                cudaStream_t stream) const {
+    check(cudaMemcpyAsync(winners, rows_.argmax, active * sizeof(TextLogitCandidate),
+                          cudaMemcpyDeviceToHost, stream), "Read packed greedy winners");
+}
+
 DecodeGraphs::DecodeGraphs() = default;
 DecodeGraphs::~DecodeGraphs() = default;
 DecodeGraphs::DecodeGraphs(DecodeGraphs&&) noexcept = default;
@@ -456,6 +464,11 @@ bool run_packed(const DecoderModel& model, Allocations& execution, DecodeGraphs&
     if (!packed) {
         return false;
     }
+    const bool read_winners = options.graph_step &&
+        std::all_of(plan.lane.begin(), plan.lane.begin() + plan.active, [&](int index) {
+            return (options.greedy_winners >> index & 1) != 0;
+        });
+    auto* winners = read_winners ? execution.prepare_packed_winners() : nullptr;
     packed->bind(lanes, plan);
     const auto stream = execution.stream();
     const bool graph = options.cuda_graphs && options.graph_step &&
@@ -471,11 +484,17 @@ bool run_packed(const DecoderModel& model, Allocations& execution, DecodeGraphs&
         packed->upload(stream);
         packed->enqueue(plan.rows, stream);
     }
+    if (winners) {
+        packed->read_winners(winners, plan.active, stream);
+    }
     std::array<bool, decoder_batch_max_lanes> claimed{};
     for (int row = 0; row < plan.active; ++row) {
         const int index = plan.lane[row];
         claimed[index] = true;
         run.ready[index] = packed->view(row);
+        if (winners) {
+            run.winners[index] = winners + row;
+        }
         if (replayed) {
             run.graphed |= std::uint64_t{1} << index;
         }

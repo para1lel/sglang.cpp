@@ -149,7 +149,7 @@ struct Allocations::State {
 
     explicit State(int owner) : device(owner) { reclaim(owner); }
 
-    bool owns_cuda() const { return stream != nullptr || !blocks.empty(); }
+    bool owns_cuda() const { return stream || packed_winners || !blocks.empty(); }
 
     CleanupError close_stream(std::shared_ptr<const void>& drained_owners);
     CleanupError release_selected(std::shared_ptr<const void>& drained_owners);
@@ -173,6 +173,8 @@ struct Allocations::State {
     CleanupError uncertain;
     CleanupError terminal;
     TransferBuffers transfers;
+    TextLogitCandidate* packed_winners = nullptr;
+    bool packed_winners_unavailable = false;
     std::shared_ptr<const void> owners;
     std::unique_ptr<State> next;
 };
@@ -249,6 +251,18 @@ CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& d
     if (terminal || (stream && !uncertain_stream)) {
         return error;
     }
+    CleanupError pinned;
+    if (packed_winners) {
+        pinned = {cudaFreeHost(packed_winners), "Free packed winner storage"};
+        if (pinned) {
+            failure(pinned);
+            if (terminal) {
+                return terminal;
+            }
+        } else {
+            packed_winners = nullptr;
+        }
+    }
     while (blocks.size() > uncertain_blocks) {
         const CleanupError freed{cudaFree(blocks.back()), "Free decoder allocation"};
         if (!freed) {
@@ -264,7 +278,7 @@ CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& d
         }
         std::swap(blocks[uncertain_blocks++], blocks.back());
     }
-    return uncertain;
+    return uncertain ? uncertain : pinned;
 }
 
 CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_owners) {
@@ -390,6 +404,26 @@ Allocations::~Allocations() {
 std::size_t Allocations::bytes() const { return state_->bytes; }
 
 TransferBuffers& Allocations::transfers() { return state_->transfers; }
+
+TextLogitCandidate* Allocations::prepare_packed_winners() {
+    if (!state_->packed_winners && !state_->packed_winners_unavailable) {
+        check(cudaPeekAtLastError(), "Check CUDA error before allocating packed winner storage");
+        void* storage = nullptr;
+        const auto bytes = packed_decode_max_rows * sizeof(TextLogitCandidate);
+        const auto status = cudaMallocHost(&storage, bytes);
+        if (status == cudaErrorMemoryAllocation) {
+            const auto pending = cudaGetLastError();
+            if (pending != status) {
+                check(pending, "Check CUDA error after allocating packed winner storage");
+            }
+            state_->packed_winners_unavailable = true;
+        } else {
+            check(status, "Allocate packed winner storage");
+            state_->packed_winners = static_cast<TextLogitCandidate*>(storage);
+        }
+    }
+    return state_->packed_winners;
+}
 
 cudaStream_t Allocations::stream() const { return state_->stream; }
 

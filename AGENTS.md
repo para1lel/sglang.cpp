@@ -36,8 +36,13 @@ rule-mode routing. Keep weights at `/data0/shared/Qwen3.8-27B-FP8`.
 
 Install local hooks with `git config --local core.hooksPath .githooks` and install
 `.agents/checks/requirements.txt` with the default Pixi Python. Hooks check the selected
-index and commit message. Perform semantic and English review separately. Schedule GPU
-and performance checks for the affected milestones. Keep raw results in `artifacts/`.
+index and commit message. Perform semantic and English review separately. Keep raw results
+in `artifacts/`.
+
+Run tests only when concrete evidence strongly supports the expected outcome.
+Prioritize operator and framework tuning and focused local measurements.
+Start E2E only when prior evidence makes success highly likely, and stop at the first missed
+gate (W5 before W6).
 
 Commit each independently verified change using Conventional Commits. Push each commit to
 the private `origin` before starting the next change. Check the remote branch SHA against

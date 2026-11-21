@@ -52,10 +52,16 @@ struct WarpScales {
     float value[mxfp8_groups][tile_tokens];
 };
 
+struct Query {
+    uint4 words[mxfp8_groups][32];
+    bool flag[32];
+};
+
 struct Shared {
     Stage stage[stages];
     WarpScales scales[warps];
     int pages[max_split_pages];
+    Query query;
 };
 
 struct Merge {
@@ -68,10 +74,6 @@ struct Merge {
 constexpr std::size_t shared_bytes = sizeof(Shared);
 static_assert(sizeof(Merge) <= sizeof(Stage) * stages && sizeof(Stage) % 16 == 0);
 static_assert(2 * (shared_bytes + 1024) <= 233472, "two CTAs must fit on one SM");
-
-struct Query {
-    unsigned int pair[mxfp8_groups][4];
-};
 
 /// Online state of one warp. `out` holds sum(p * v) * 2^(142 - R_g) for group g, where
 /// R_g is the largest value-scale byte seen in that group (packed bytes in `reference`).
@@ -167,9 +169,9 @@ __device__ void issue_warp_tile(const Shared& shared, Stage& stage,
 }
 
 /// Loads one BF16 query head per MMA row and flags operands outside the FP32 score range.
-__device__ Query load_query(const __nv_bfloat16* queries, int kv_head, int row, int quad,
-                            bool& flag) {
-    Query query;
+__device__ void load_query(Query& query, const __nv_bfloat16* queries, int kv_head, int lane) {
+    const int row = lane / 4;
+    const int quad = lane % 4;
     const bool active = row < group_heads;
     const auto* base = queries + (kv_head * group_heads + row) * mxfp8_head_dim + quad * 8;
     bool bad = false;
@@ -177,21 +179,18 @@ __device__ Query load_query(const __nv_bfloat16* queries, int kv_head, int row, 
     for (int group = 0; group < mxfp8_groups; ++group) {
         const uint4 raw = active ? *reinterpret_cast<const uint4*>(base + group * 32)
                                  : make_uint4(0, 0, 0, 0);
-        query.pair[group][0] = raw.x;
-        query.pair[group][1] = raw.y;
-        query.pair[group][2] = raw.z;
-        query.pair[group][3] = raw.w;
+        query.words[group][lane] = raw;
+        const unsigned int pairs[] = {raw.x, raw.y, raw.z, raw.w};
         #pragma unroll
         for (int index = 0; index < 4; ++index) {
-            const auto bits = query.pair[group][index];
+            const auto bits = pairs[index];
             const float low = fabsf(__uint_as_float(bits << 16));
             const float high = fabsf(__uint_as_float(bits & 0xffff0000u));
             bad |= !(low < query_limit && high < query_limit);
             bad |= (low != 0.0f && low < query_min) || (high != 0.0f && high < query_min);
         }
     }
-    flag = active && bad;
-    return query;
+    query.flag[lane] = active && bad;
 }
 
 __device__ int slot_token(int warp, int quad, int slot) {
@@ -265,6 +264,7 @@ __device__ void tile_scores(const Stage& stage, const WarpScales& scales, const 
     }
     #pragma unroll
     for (int group = 0; group < mxfp8_groups; ++group) {
+        const auto words = query.words[group][4 * row + quad];
         #pragma unroll
         for (int tile = 0; tile < 2; ++tile) {
             const int token = warp * tile_tokens + tile * 8 + row;
@@ -274,8 +274,8 @@ __device__ void tile_scores(const Stage& stage, const WarpScales& scales, const 
             expand(bits.x, k0, k1);
             expand(bits.y, k2, k3);
             float sum[4] = {};
-            mma(sum, query.pair[group][0], 0u, query.pair[group][1], 0u, k0, k1);
-            mma(sum, query.pair[group][2], 0u, query.pair[group][3], 0u, k2, k3);
+            mma(sum, words.x, 0u, words.y, 0u, k0, k1);
+            mma(sum, words.z, 0u, words.w, 0u, k2, k3);
             const auto factor =
                 *reinterpret_cast<const float2*>(&scales.key[group][tile * 8 + 2 * quad]);
             score[2 * tile] = fmaf(sum[0], factor.x, score[2 * tile]);
@@ -455,9 +455,12 @@ __global__ void __launch_bounds__(threads, 2) split_kernel(
     for (int index = threadIdx.x; index < page_total; index += threads) {
         shared.pages[index] = lane.pages.device_pages[first_page + index];
     }
-    __syncthreads();
     const int warp = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
+    if (warp == 0) {
+        load_query(shared.query, lane.buffers.queries, kv_head, lane_id);
+    }
+    __syncthreads();
     #pragma unroll
     for (int index = 0; index < stages - 1; ++index) {
         if (first + index < last) {
@@ -468,8 +471,7 @@ __global__ void __launch_bounds__(threads, 2) split_kernel(
     }
     Running run{};
     run.maximum = -CUDART_INF_F;
-    const auto query = load_query(lane.buffers.queries, kv_head, lane_id / 4, lane_id % 4,
-                                  run.flag);
+    run.flag = shared.query.flag[lane_id];
     for (int chunk = first; chunk < last; ++chunk) {
         wait_pending<stages - 2>();
         __syncwarp();
@@ -479,8 +481,8 @@ __global__ void __launch_bounds__(threads, 2) split_kernel(
                             first_page, warp, lane_id);
         }
         commit();
-        process_tile(shared.stage[(chunk - first) % stages], shared.scales[warp], query, run,
-                     chunk, lane.position, warp, lane_id);
+        process_tile(shared.stage[(chunk - first) % stages], shared.scales[warp], shared.query,
+                     run, chunk, lane.position, warp, lane_id);
     }
     wait_pending<0>();
     __syncthreads();

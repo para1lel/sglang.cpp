@@ -220,9 +220,18 @@ __global__ void multirow_prefill_attention(Attention request, int rows) {
 constexpr int flash_mma_rows = 16;
 constexpr int flash_stride = channels + 8;
 constexpr int flash_wide_rows = 88;
+constexpr int flash_short_rows = 32;
+constexpr int flash_medium_rows = 48;
 
 template <int Rows>
-constexpr int flash_threads = Rows * ordered_heads / flash_mma_rows * 32;
+constexpr int flash_math_threads = Rows * ordered_heads / flash_mma_rows * 32;
+
+template <int Rows>
+constexpr int flash_threads = flash_math_threads<Rows> < channels
+    ? channels : flash_math_threads<Rows>;
+
+template <int Rows>
+constexpr bool flash_paired_fragments = Rows != flash_rows;
 
 template <int Rows>
 struct FlashTile {
@@ -430,7 +439,7 @@ __device__ __forceinline__ void flash_scores(const FlashTile<Rows>& tile, int qu
     #pragma unroll 4
     for (int dim = 0; dim < channels; dim += 16) {
         const auto q = load_flash_a(&tile.query[query + lane % 16][dim + (lane / 16) * 8]);
-        if constexpr (Rows == flash_wide_rows) {
+        if constexpr (flash_paired_fragments<Rows>) {
             const auto* keys = &tile.key[lane % 8 + (lane / 16) * 8][dim + (lane & 8)];
             #pragma unroll
             for (int group = 0; group < flash_score_fragments; group += 2) {
@@ -449,12 +458,12 @@ __device__ __forceinline__ void flash_scores(const FlashTile<Rows>& tile, int qu
 }
 
 
-template <int Half, bool Wide>
+template <int Half, bool FastPrefix>
 __device__ __forceinline__ float flash_softmax(
     int column, int count, bool full, Accumulator (&scores)[flash_score_fragments],
     FragmentA (&probabilities)[flash_value_fragments], FlashSoftmax& state) {
     float maximum = state.maximum;
-    if (Wide && full) {
+    if (FastPrefix && full) {
         #pragma unroll
         for (int group = 0; group < flash_score_fragments; ++group) {
             #pragma unroll
@@ -505,7 +514,7 @@ __device__ __forceinline__ void flash_values(
     const FlashTile<Rows>& tile, int lane, float top, float bottom,
     const FragmentA (&probabilities)[flash_value_fragments],
     Accumulator (&numerator)[channels / 8]) {
-    if (Rows != flash_wide_rows || __any_sync(warp_mask, top != 1.0f || bottom != 1.0f)) {
+    if (!flash_paired_fragments<Rows> || __any_sync(warp_mask, top != 1.0f || bottom != 1.0f)) {
         #pragma unroll
         for (auto& accumulator : numerator) {
             accumulator.values[0] *= top;
@@ -517,7 +526,7 @@ __device__ __forceinline__ void flash_values(
     #pragma unroll
     for (int fragment = 0; fragment < flash_value_fragments; ++fragment) {
         const int key = fragment * 16;
-        if constexpr (Rows == flash_wide_rows) {
+        if constexpr (flash_paired_fragments<Rows>) {
             const auto* values = &tile.value[key + lane % 16][(lane / 16) * 8];
             #pragma unroll
             for (int column = 0; column < channels; column += 16) {
@@ -599,27 +608,31 @@ __global__ void flash_prefill_attention(Attention request, int rows) {
                                      head / ratio);
             }
         }
-        Accumulator scores[flash_score_fragments]{};
-        flash_scores(tile, query, lane, scores);
-        const int visible = position + member / ordered_heads - first + 1;
-        const int top_visible = !Partial || member / ordered_heads < active_rows ? visible : 0;
-        const int bottom_visible = !Partial || (member + 8) / ordered_heads < active_rows
-            ? visible + 8 / ordered_heads : 0;
-        constexpr bool wide = Rows == flash_wide_rows;
-        const bool full = next <= position + query / ordered_heads + 1 &&
-                          (!Partial || query + flash_mma_rows <= active_rows * ordered_heads);
-        FragmentA probabilities[flash_value_fragments];
-        const auto top = flash_softmax<0, wide>(column, top_visible, full, scores,
-                                                probabilities, state[0]);
-        const auto bottom = flash_softmax<1, wide>(column, bottom_visible, full, scores,
-                                                   probabilities, state[1]);
-        flash_values(tile, lane, top, bottom, probabilities, numerator);
+        if (threadIdx.x < flash_math_threads<Rows>) {
+            Accumulator scores[flash_score_fragments]{};
+            flash_scores(tile, query, lane, scores);
+            const int visible = position + member / ordered_heads - first + 1;
+            const int top_visible = !Partial || member / ordered_heads < active_rows ? visible : 0;
+            const int bottom_visible = !Partial || (member + 8) / ordered_heads < active_rows
+                ? visible + 8 / ordered_heads : 0;
+            const bool full = next <= position + query / ordered_heads + 1 &&
+                              (!Partial || query + flash_mma_rows <= active_rows * ordered_heads);
+            FragmentA probabilities[flash_value_fragments];
+            constexpr bool fast = flash_paired_fragments<Rows>;
+            const auto top = flash_softmax<0, fast>(column, top_visible, full, scores,
+                                                    probabilities, state[0]);
+            const auto bottom = flash_softmax<1, fast>(column, bottom_visible, full, scores,
+                                                       probabilities, state[1]);
+            flash_values(tile, lane, top, bottom, probabilities, numerator);
+        }
         if constexpr (Async) {
             asm volatile("cp.async.wait_group 0;" ::: "memory");
         }
         __syncthreads();
     }
-    flash_store<Partial>(request, row, head, active_rows, query, lane, state, numerator);
+    if (threadIdx.x < flash_math_threads<Rows>) {
+        flash_store<Partial>(request, row, head, active_rows, query, lane, state, numerator);
+    }
     if (__syncthreads_or(threadIdx.x < Rows * ordered_heads && tile.bad_query[threadIdx.x]) ||
         tile.bad_key < last) {
         if constexpr (Rows > flash_rows) {
@@ -676,6 +689,38 @@ std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
                                      flash_wide_rows, flash_threads<flash_wide_rows>,
                                      sizeof(FlashTile<flash_wide_rows>) + sizeof(FlashPayload))) {
             return wide;
+        }
+    }
+    constexpr int min_long_prefix = 4096;
+    if (aligned_scales && rows < flash_chunk && request.position >= min_long_prefix) {
+        int multiprocessors = 0;
+        status = cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device);
+        if (status != cudaSuccess) {
+            return status;
+        }
+        constexpr int head_pairs = mxfp8_query_heads / ordered_heads;
+        const int tiles_per_head = multiprocessors / head_pairs;
+        if (rows <= tiles_per_head * flash_short_rows) {
+            if (const auto short_tile = launch(
+                    flash_prefill_attention<flash_short_rows, true, true>, flash_short_rows,
+                    flash_threads<flash_short_rows>,
+                    sizeof(FlashTile<flash_short_rows>) + sizeof(FlashPayload))) {
+                return short_tile;
+            }
+        } else if (rows <= tiles_per_head * flash_medium_rows) {
+            if (const auto medium_tile = launch(
+                    flash_prefill_attention<flash_medium_rows, true, true>, flash_medium_rows,
+                    flash_threads<flash_medium_rows>,
+                    sizeof(FlashTile<flash_medium_rows>) + sizeof(FlashPayload))) {
+                return medium_tile;
+            }
+        } else if (rows > tiles_per_head * flash_rows && rows <= tiles_per_head * flash_wide_rows) {
+            if (const auto wide = launch(
+                    flash_prefill_attention<flash_wide_rows, true, true>, flash_wide_rows,
+                    flash_threads<flash_wide_rows>,
+                    sizeof(FlashTile<flash_wide_rows>) + sizeof(FlashPayload))) {
+                return wide;
+            }
         }
     }
     for (bool async : {true, false}) {

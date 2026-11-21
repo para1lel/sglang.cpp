@@ -645,6 +645,34 @@ void check_future_values(const char* label, Input& input, DeviceInput& device, i
                 label, prefix, suffix_differences);
 }
 
+Dispatch long_1023_dispatch() {
+    int device = 0;
+    int multiprocessors = 0;
+    int shared_limit = 0;
+    check_cuda(cudaGetDevice(&device), "Get Flash check device");
+    check_cuda(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device),
+               "Read Flash check multiprocessor count");
+    check_cuda(cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                      device),
+               "Read Flash check shared memory limit");
+    if (multiprocessors >= 384 && shared_limit >= 137776) {
+        return {"flash_prefill_attentionILi32ELb1ELb1EE", 32, head_blocks, 1, 256};
+    }
+    if (multiprocessors >= 264 && shared_limit >= 154800) {
+        return {"flash_prefill_attentionILi48ELb1ELb1EE", 22, head_blocks, 1, 256};
+    }
+    if (multiprocessors >= 144 && multiprocessors < 192 && shared_limit >= 197360) {
+        return {"flash_prefill_attentionILi88ELb1ELb1EE", 12, head_blocks, 1, 352};
+    }
+    if (shared_limit >= 171824) {
+        return {"flash_prefill_attentionILi64ELb1ELb1EE", 16, head_blocks, 1, 256};
+    }
+    if (shared_limit >= 138032) {
+        return {"flash_prefill_attentionILi64ELb1ELb0EE", 16, head_blocks, 1, 256};
+    }
+    return ordered_dispatch(1023);
+}
+
 void check_paired_prefill(cudaStream_t stream, bool default_mode) {
     constexpr int position = 8192;
     constexpr int partial = rows - 1;
@@ -667,8 +695,19 @@ void check_paired_prefill(cudaStream_t stream, bool default_mode) {
     device.run("paired page-aligned nonchunk start", input, position + mxfp8_page_size,
                default_mode ? flash : tmem_paired,
                attention_samples(input, position + mxfp8_page_size), stream);
-    device.run("paired partial tile", input, position, flash_dispatch(partial),
-               attention_samples(input, position, partial), stream, {.count = partial});
+    const auto partial_samples = attention_samples(input, position, partial);
+    const auto aligned_partial = device.run("paired partial tile", input, position,
+                                            long_1023_dispatch(), partial_samples, stream,
+                                            {.count = partial});
+    constexpr Dispatch synchronous_partial{"flash_prefill_attentionILi64ELb1ELb0EE",
+                                            16, head_blocks, 1, 256};
+    const auto unaligned_partial = device.run("paired partial tile with unaligned value scales",
+                                              input, position, synchronous_partial, partial_samples,
+                                              stream, {.count = partial, .value_scale_offset = 1});
+    if (std::memcmp(aligned_partial.data(), unaligned_partial.data(),
+                    aligned_partial.size() * sizeof(BFloat))) {
+        throw std::runtime_error("Unaligned scales changed the partial Flash output");
+    }
     check_future_values("paired final page causality", input, device, position,
                         rows - mxfp8_page_size / 2, baseline, tmem_paired, stream);
 }
@@ -809,7 +848,7 @@ void check_long_flash(cudaStream_t stream) {
                        {.value_offset = 1});
         }
     }
-    device.run("32768 partial tile", input, ordered_visible - partial, flash_dispatch(partial),
+    device.run("32768 partial tile", input, ordered_visible - partial, long_1023_dispatch(),
                attention_samples(input, ordered_visible - partial, partial), stream,
                {.count = partial});
     device.run("32769 partial tile", input, ordered_visible + 1 - partial, partial_protected,

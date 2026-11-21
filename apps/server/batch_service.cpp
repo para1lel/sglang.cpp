@@ -18,12 +18,32 @@
 namespace sglang::server {
 namespace {
 
+struct OutputMailbox {
+    std::array<DecoderBatchStep, 2> steps{};
+    std::size_t head = 0;
+    std::size_t size = 0;
+
+    bool empty() const { return size == 0; }
+    bool full() const { return size == steps.size(); }
+    const DecoderBatchStep& front() const { return steps[head]; }
+
+    void push(const DecoderBatchStep& step) {
+        steps[(head + size) % steps.size()] = step;
+        ++size;
+    }
+
+    void pop() {
+        head = (head + 1) % steps.size();
+        --size;
+    }
+};
+
 struct Job {
     std::vector<int> prompt;
     std::size_t prompt_tokens = 0;
     DecoderOptions options;
     std::vector<DecoderMedia> media;
-    std::optional<DecoderBatchStep> pending;
+    OutputMailbox pending;
     std::optional<DecoderFinishReason> finish;
     std::exception_ptr error;
     BatchRequestId* request_id = nullptr;
@@ -31,12 +51,21 @@ struct Job {
     bool admitted = false;
     bool cancelled = false;
     bool prefill_completed = false;
+    bool buffer_decode_output = false;
+    bool output_started = false;
+    bool output_overlapped = false;
 
     bool aborted() const { return request_id && request_id->aborted(); }
-    bool ready() const { return cancelled || aborted() || !pending; }
+    bool ready(bool buffered = false) const {
+        return cancelled || aborted() || (buffered ? !pending.full() : pending.empty());
+    }
 };
 
 using Jobs = std::array<std::shared_ptr<Job>, decoder_batch_max_lanes>;
+struct Work {
+    Jobs jobs;
+    bool buffered;
+};
 using Selection = std::array<bool, decoder_batch_max_lanes>;
 using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
 struct BatchJob {
@@ -109,9 +138,9 @@ struct BatchService::State {
     void run(const Decoder& decoder, std::promise<void> started);
     void process(DecoderBatch& batch);
     std::optional<std::uint64_t> begin_iteration(DecoderBatch& batch);
-    std::optional<Jobs> wait_for_jobs();
-    bool wide_decode_ready() const;
-    bool prepare(DecoderBatch& batch, int slot, const std::shared_ptr<Job>& job);
+    std::optional<Work> wait_for_jobs();
+    bool wide_decode_ready(bool buffered) const;
+    bool prepare(DecoderBatch& batch, int slot, const std::shared_ptr<Job>& job, bool buffered);
     void publish(int slot, Job& job, const DecoderBatchStep& step);
     void record_profile(std::uint64_t epoch, std::uint64_t elapsed, int width,
                         const Steps& steps, const DecoderBatchStepStats& stats);
@@ -221,7 +250,7 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
     changed.notify_all();
 }
 
-bool BatchService::State::wide_decode_ready() const {
+bool BatchService::State::wide_decode_ready(bool buffered) const {
     if (!cuda_graphs || mtp_steps != 0 || max_active != decoder_batch_max_lanes) {
         return false;
     }
@@ -230,24 +259,28 @@ bool BatchService::State::wide_decode_ready() const {
         if (!job || job->cancelled || job->aborted() || !job->prefill_completed) {
             return false;
         }
-        ready += job->ready();
+        if (buffered && (!job->buffer_decode_output || !job->output_started)) {
+            return false;
+        }
+        ready += job->ready(buffered);
     }
     return ready >= wide_decode_min_ready;
 }
 
-std::optional<Jobs> BatchService::State::wait_for_jobs() {
+std::optional<Work> BatchService::State::wait_for_jobs() {
     std::unique_lock lock(mutex);
     const auto end = jobs.begin() + max_active;
     changed.wait(lock, [&] {
-        return closing || reset_pending || std::any_of(jobs.begin(), end, [](const auto& job) {
-            return job && job->ready();
-        });
+        return closing || reset_pending || wide_decode_ready(true) ||
+               std::any_of(jobs.begin(), end, [](const auto& job) {
+                   return job && job->ready();
+               });
     });
     const bool admitting = std::any_of(jobs.begin(), end, [](const auto& job) {
         return job && !job->admitted && !job->cancelled && !job->aborted();
     });
     changed.wait_for(lock, mailbox_grace, [&] {
-        return closing || reset_pending || wide_decode_ready() ||
+        return closing || reset_pending || wide_decode_ready(true) || wide_decode_ready(false) ||
                std::all_of(jobs.begin(), end, [admitting](const auto& job) {
                    return job ? job->ready() : !admitting;
                });
@@ -255,15 +288,15 @@ std::optional<Jobs> BatchService::State::wait_for_jobs() {
     if (closing) {
         return std::nullopt;
     }
-    return jobs;
+    return Work{jobs, wide_decode_ready(true)};
 }
 
 bool BatchService::State::prepare(DecoderBatch& batch, int slot,
-                                  const std::shared_ptr<Job>& job) {
+                                  const std::shared_ptr<Job>& job, bool buffered) {
     bool cancelled;
     {
         const std::lock_guard lock(mutex);
-        if (!job || !job->ready()) {
+        if (!job || !job->ready(buffered)) {
             return false;
         }
         cancelled = job->cancelled || job->aborted();
@@ -324,7 +357,8 @@ void BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& st
             }
             counters.generation_tokens += 1 + step.extra_token_count;
         }
-        job.pending = step;
+        job.output_overlapped |= !job.pending.empty();
+        job.pending.push(step);
     }
     if (step.sampling_failed || step.constraint_failed) {
         job.error = step.constraint_failed ? std::make_exception_ptr(DecoderConstraintError())
@@ -395,7 +429,7 @@ void BatchService::State::process(DecoderBatch& batch) {
         const auto epoch = *iteration;
         Selection selected{};
         for (int slot = 0; slot < max_active; ++slot) {
-            selected[slot] = prepare(batch, slot, (*snapshot)[slot]);
+            selected[slot] = prepare(batch, slot, snapshot->jobs[slot], snapshot->buffered);
         }
         const int width = std::count(selected.begin(), selected.end(), true);
         Steps steps{};
@@ -473,7 +507,7 @@ void BatchService::State::process(DecoderBatch& batch) {
             }
             for (int slot = 0; slot < max_active; ++slot) {
                 if (selected[slot]) {
-                    publish(slot, *(*snapshot)[slot], steps[slot]);
+                    publish(slot, *snapshot->jobs[slot], steps[slot]);
                 }
             }
         }
@@ -510,8 +544,9 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
             return result;
         }
         const bool can_emit = announced || !job.admitted || !callbacks.on_admitted;
-        if (job.pending && can_emit) {
-            const auto step = *job.pending;
+        const bool drop_output = job.output_overlapped && job.aborted();
+        if (!job.pending.empty() && can_emit && !drop_output) {
+            const auto step = job.pending.front();
             lock.unlock();
             const bool accepted = emit_step(step, callbacks, result);
             lock.lock();
@@ -520,14 +555,15 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
                 result.finish_reason = DecoderFinishReason::cancelled;
                 return result;
             }
-            job.pending.reset();
+            job.pending.pop();
+            job.output_started = true;
             changed.notify_all();
         } else if (job.error) {
             std::rethrow_exception(job.error);
         } else if (job.finish && can_emit) {
             result.finish_reason = *job.finish;
             return result;
-        } else if (!job.pending && !job.finish) {
+        } else if ((job.pending.empty() || drop_output) && !job.finish) {
             changed.wait_for(lock, disconnect_poll);
         }
     }
@@ -624,12 +660,12 @@ bool BatchService::State::drain_batch(std::unique_lock<std::mutex>& lock, BatchJ
         if (finish == DecoderFinishReason::cancelled) {
             return false;
         }
-        if (!job.pending && !finish) {
+        if (job.pending.empty() && !finish) {
             continue;
         }
         auto& result = results[item.index];
-        if (job.pending) {
-            emit_step(*job.pending, collect, result);
+        if (!job.pending.empty()) {
+            emit_step(job.pending.front(), collect, result);
         }
         result.cached_prompt_tokens = job.cached_tokens;
         if (finish) {
@@ -643,8 +679,8 @@ bool BatchService::State::drain_batch(std::unique_lock<std::mutex>& lock, BatchJ
                 return false;
             }
         }
-        if (job.pending) {
-            job.pending.reset();
+        if (!job.pending.empty()) {
+            job.pending.pop();
             changed.notify_all();
         }
         if (finish) {
@@ -788,6 +824,9 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
     job->prompt_tokens = media.empty() ? prompt.size() : expanded_tokens;
     job->options = options;
     job->request_id = request_id;
+    job->buffer_decode_output = callbacks.buffer_decode_output && media.empty() &&
+        prompt.size() >= decoder_batch_max_step_tokens && !options.samples() &&
+        !options.constraint && !options.eager && options.top_logits == 0;
     if (media.empty()) {
         job->options.mtp_steps = state_->mtp_steps;
     }

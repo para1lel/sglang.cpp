@@ -115,6 +115,16 @@ Run the slot-mask regression without a checkpoint or GPU.
 python3 -IB tests/batch/check_graph_evidence.py --check-slot-mask
 ```
 
+Run the CPU output terminal regression with the managed Pixi environment active.
+It holds a token callback while the real batch worker stages the next step.
+It checks that abort drops the queued ID and that published stop and length
+results drain their queued IDs exactly once.
+
+```bash
+mkdir -p "$out"
+bash tests/batch/run_service_output_terminal.sh "$PWD" "$out/service-output-terminal"
+```
+
 Run the K1 probe with a fresh evidence destination.
 
 ```bash

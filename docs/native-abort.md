@@ -4,10 +4,10 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Native generation | Assign one request ID per prompt and track which item owns each ID. | [ID input](../apps/server/native_generate.cpp#L272)<!-- prefix: "std::vector\u003c" --> · [Registration](../apps/server/native_generate.cpp#L320)<!-- prefix: "NativeGenera" --> |
+| Native generation | Assign one request ID per prompt and track which item owns each ID. | [ID input](../apps/server/native_generate.cpp#L273)<!-- prefix: "std::vector\u003c" --> · [Registration](../apps/server/native_generate.cpp#L321)<!-- prefix: "NativeGenera" --> |
 | HTTP control | Dispatch `POST /abort_request` on the reader and release fully aborted queue entries. | [Control route](../apps/server/prefix_controls.cpp#L239)<!-- prefix: "void Connect" --> · [Queue cleanup](../apps/server/prefix_controls.cpp#L412)<!-- prefix: "void Connect" --> |
-| Decoder service | Skip waiting items, retire running items, and preserve published output. | [ID state](../include/sglang/server/batch_service.h#L31)<!-- prefix: "class BatchR" --> · [Retirement](../apps/server/batch_service.cpp#L261)<!-- prefix: "bool BatchSe" --> · [Waiting items](../apps/server/batch_service.cpp#L585)<!-- prefix: "bool BatchSe" --> |
-| Native response | Report each item's terminal abort on its original generation connection. | [Finish metadata](../apps/server/native_generate.cpp#L62)<!-- prefix: "if (terminal" --> · [Pre-admission response](../apps/server/native_generate.cpp#L222)<!-- prefix: "void complet" --> |
+| Decoder service | Skip waiting items, retire running items, and apply abort delivery according to the job's overlap history. | [ID state](../include/sglang/server/batch_service.h#L31)<!-- prefix: "class BatchR" --> · [Retirement](../apps/server/batch_service.cpp#L294)<!-- prefix: "bool BatchSe" --> · [Waiting items](../apps/server/batch_service.cpp#L621)<!-- prefix: "bool BatchSe" --> · [Abort delivery](../apps/server/batch_service.cpp#L547)<!-- prefix: "const bool d" --> |
+| Native response | Report each item's terminal abort on its original generation connection. | [Finish metadata](../apps/server/native_generate.cpp#L62)<!-- prefix: "if (terminal" --> · [Pre-admission response](../apps/server/native_generate.cpp#L223)<!-- prefix: "void complet" --> |
 
 ## Runtime path
 
@@ -35,9 +35,11 @@ HTTP 200 has an empty body. It acknowledges receipt of the control request. Use 
 - A named abort targets an exact live ID. If it changes that item's state, it also marks already-dispatched items whose IDs start with the same string. A batch string such as `job` produces IDs such as `job_0`. Aborting `job` has no effect unless `job` itself is also a live item.
 - `abort_all: true` marks all currently registered native generation items, including items with server-assigned IDs and items still waiting. The `rid` value has no effect in this mode.
 - An item aborted before decoder submission produces empty `output_ids` and a finish reason of `{"type":"abort","message":"Abort in waiting queue"}`.
-- An item aborted after submission keeps output already accepted by the response worker. Its finish reason is `{"type":"abort","message":"Aborted","status_code":null,"err_type":null}`.
+- An item aborted after submission returns `{"type":"abort","message":"Aborted","status_code":null,"err_type":null}` as its finish reason. Its output IDs follow the delivery rules below.
 
-The scheduler observes the abort at its next cancellation check. Work already in flight can finish its current step. A normal terminal result that wins the state transition stays final. [Matching](../apps/server/native_generate.cpp#L374)<!-- prefix: "bool changed" --> · [Publish](../apps/server/batch_service.cpp#L310)<!-- prefix: "void BatchSe" -->
+The scheduler observes the abort at its next cancellation check. Work already in flight can finish its current step. A normal terminal result that wins the state transition stays final. [Matching](../apps/server/native_generate.cpp#L375)<!-- prefix: "bool changed" --> · [Publish](../apps/server/batch_service.cpp#L343)<!-- prefix: "void BatchSe" -->
+
+If a job has never published a step while another is pending, an abort still delivers any single already-published step before the terminal result. Once a job has published overlapping steps through [bounded decode output](http-server.md#bounded-decode-output), an abort winner discards every unclaimed step, even after ordinary scheduling resumes. A callback already claimed can finish. The abort terminal includes the IDs accepted by the writer. [Overlap history](../apps/server/batch_service.cpp#L360)<!-- prefix: "job.output_o" --> · [Single-item delivery](../apps/server/batch_service.cpp#L547)<!-- prefix: "const bool d" --> · [Batch delivery](../apps/server/batch_service.cpp#L667)<!-- prefix: "if (!job.pen" -->
 
 An abort terminal uses the regular JSON or SSE result shape. Batch JSON retains input order, and batch SSE retains each item's index. A stream that completes normally with abort results sends one `[DONE]`. A fully aborted request can open SSE before it has admitted any decoder work. A partially aborted batch keeps its remaining items and opens SSE when one is admitted.
 
@@ -45,7 +47,7 @@ An abort terminal uses the regular JSON or SSE result shape. Batch JSON retains 
 
 Duplicate effective IDs within a batch or against live items return HTTP 400. A failed registration releases its reservations. A finished item can reuse its ID while siblings from its previous batch are still running. Cleanup removes a registration only when it still owns that ID.
 
-If a request disconnects or fails, reuse its IDs after the associated work and queue entry have been cleaned up. A late named abort targets whichever live item currently owns that ID. Use distinct caller IDs when late control requests can overlap a replacement. [Cleanup](../apps/server/native_generate.cpp#L305)<!-- prefix: "~Registratio" --> · [Terminal state](../include/sglang/server/batch_service.h#L64)<!-- prefix: "bool finishe" -->
+If a request disconnects or fails, reuse its IDs after the associated work and queue entry have been cleaned up. A late named abort targets whichever live item currently owns that ID. Use distinct caller IDs when late control requests can overlap a replacement. [Cleanup](../apps/server/native_generate.cpp#L306)<!-- prefix: "~Registratio" --> · [Terminal state](../include/sglang/server/batch_service.h#L64)<!-- prefix: "bool finishe" -->
 
 ### Capacity
 

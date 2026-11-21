@@ -144,6 +144,7 @@ void stream_completion(const Socket& connection, const CompletionRequest& reques
         [&] { return disconnected(connection); },
         [&] { return stream.start(); },
         [&] { return stream.poll(); },
+        true,
     };
 
     try {

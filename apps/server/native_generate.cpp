@@ -139,6 +139,7 @@ void complete_single(const Socket& connection, BatchService& service, int slot,
         [&] { return disconnected(connection); },
         [&] { return !streaming || stream.start(); },
         [&] { return stream.poll(); },
+        streaming,
     };
     try {
         const auto result = service.generate(slot, request.prompt, request.options, callbacks,

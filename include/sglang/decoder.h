@@ -81,6 +81,7 @@ struct DecoderCallbacks {
     std::function<bool()> is_cancelled;
     std::function<bool()> on_admitted = {};
     std::function<bool()> on_stream_poll = {};
+    bool buffer_decode_output = false;
 };
 
 struct DecoderLogit {

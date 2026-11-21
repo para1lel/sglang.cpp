@@ -208,7 +208,7 @@ Lanes share weights and own KV, GDN state, and outputs. [Resident memory admissi
 
 See [`POST /generate`](native-generate.md) for the native request and response format.
 
-Follow the [benchmark wire contract](../benchmarks/streaming/README.md#wire-contract), [stream transport](http-server.md#completion-streams), and [decoder limits](#constraints-and-failure-behavior). A `stop_token_ids` match emits the ID with `stop`, including at the budget. Zero budget reports `length` without a model step. Prompt IDs appear in the first token event or the zero-budget terminal choice. Benchmark temperature accepts underflow to signed zero. [Request parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" --> · [Numeric retry](../apps/server/completions.cpp#L172)<!-- prefix: "json::Value " --> · [Terminal choice](../apps/server/completions.cpp#L113)<!-- prefix: "void finish_" -->
+Follow the [benchmark wire contract](../benchmarks/streaming/README.md#wire-contract), [stream transport](http-server.md#completion-streams), and [decoder limits](#constraints-and-failure-behavior). A `stop_token_ids` match emits the ID with `stop`, including at the budget. Zero budget reports `length` without a model step. Prompt IDs appear in the first token event or the zero-budget terminal choice. Benchmark temperature accepts underflow to signed zero. [Request parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" --> · [Numeric retry](../apps/server/completions.cpp#L174)<!-- prefix: "json::Value " --> · [Terminal choice](../apps/server/completions.cpp#L113)<!-- prefix: "void finish_" -->
 
 #### Streaming verification
 

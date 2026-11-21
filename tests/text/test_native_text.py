@@ -159,7 +159,7 @@ def verify_raw(port, sample, ids, pieces, *, reason="length", overrides=None):
 
 def verify_errors(port, tokenizer_ids):
     invalid = (
-        raw("", 0), raw([220], 0), raw("x", -1), raw("a", 0, stop_token_ids=[-1]),
+        raw("", 0), raw([[220], "x"], 0), raw("x", -1), raw("a", 0, stop_token_ids=[-1]),
         raw("a", 0, stop_token_ids=[248320]), legacy([-1], 0), legacy([248320], 0),
         legacy([220], 0, stop_token_ids=[248320]), raw("x y z", 262143),
         raw("é" * 524289, 0), raw("x", 0, temperature=-1),

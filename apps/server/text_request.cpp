@@ -281,6 +281,40 @@ void encode_prompt(std::vector<int>& output, int max_new_tokens, std::string_vie
     }
 }
 
+std::vector<int> token_prompt(const json::Value& input, int max_new_tokens,
+                              const char* shape_error, const char* token_error) {
+    const auto* tokens = input.array();
+    if (!tokens || tokens->empty()) {
+        bad_request(shape_error);
+    }
+    if (tokens->size() > checkpoint_context - max_new_tokens) {
+        bad_request("Prompt and output budget must fit the 262144-token context");
+    }
+    std::vector<int> prompt;
+    prompt.reserve(tokens->size());
+    for (const auto& value : *tokens) {
+        const auto token = value.unsigned_integer();
+        if (!token || *token >= model_vocab_size) {
+            bad_request(token_error);
+        }
+        prompt.push_back(static_cast<int>(*token));
+    }
+    return prompt;
+}
+
+std::vector<int> completion_prompt(const json::Value& input, bool text, int max_new_tokens,
+                                   const CompletionTokenizer& tokenizer) {
+    if (!text) {
+        return token_prompt(input, max_new_tokens, "Expected a nonempty array of prompt token IDs",
+                            "Prompt token IDs must be integers in [0, 248320)");
+    }
+    const auto prompt = input.string().value_or("");
+    validate_prompt(prompt);
+    std::vector<int> ids;
+    encode_prompt(ids, max_new_tokens, prompt, tokenizer);
+    return ids;
+}
+
 bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
         key == "ignore_eos" || key == "stop_token_ids" || key == "stop" ||
@@ -290,21 +324,56 @@ bool is_text_option(std::string_view key) {
         key == "cache_salt";
 }
 
-TextRequest parse_text(const json::Object& object, const CompletionTokenizer& tokenizer) {
+TextCompletionRequest parse_text(const json::Object& object,
+                                 const CompletionTokenizer& tokenizer) {
     for (const auto& [key, value] : object) {
-        if (key != "prompt" && !is_text_option(key)) {
+        if (key != "prompt" && key != "n" && !is_text_option(key)) {
             throw std::invalid_argument("Unsupported text completion option: " + key);
         }
     }
     if (json::get_string(object, "model") != model_name) {
-        bad_request("Expected model Qwen3.8-27B-FP8 for a string prompt");
+        if (json::get_string(object, "prompt")) {
+            bad_request("Expected model Qwen3.8-27B-FP8 for a string prompt");
+        }
+        bad_request("Expected model Qwen3.8-27B-FP8");
     }
-    const auto prompt = json::get_string(object, "prompt").value_or("");
-    validate_prompt(prompt);
-    auto request = text_options(object, tokenizer, false);
-    encode_prompt(request.prompt, request.options.max_new_tokens, prompt, tokenizer);
+    if (const auto* count = json::get(object, "n"); count && count->unsigned_integer() != 1) {
+        bad_request("Expected n to be 1");
+    }
+    const auto* prompt = json::get(object, "prompt");
+    const auto* list = prompt ? prompt->array() : nullptr;
+    if (!prompt || (!prompt->string() && (!list || list->empty()))) {
+        bad_request("Expected a nonempty prompt string or array");
+    }
+    TextCompletionRequest completion;
+    auto& request = completion.request;
+    request = text_options(object, tokenizer, false);
+    const int budget = request.options.max_new_tokens;
+    const bool batch = list && (list->front().string() || list->front().array());
+    if (!batch) {
+        request.prompt = completion_prompt(*prompt, list == nullptr, budget, tokenizer);
+        finish_options(request, object, tokenizer);
+        return completion;
+    }
+    if (list->size() > decoder_batch_max_lanes) {
+        bad_request("Expected 1 to 32 completion batch items");
+    }
+    if (list->size() * budget > checkpoint_context) {
+        bad_request("Batch output budgets must total at most 262144 tokens");
+    }
+    const bool text = list->front().string().has_value();
+    completion.batch.reserve(list->size());
+    for (const auto& item : *list) {
+        if (text ? !item.string() : !item.array()) {
+            bad_request("Expected a homogeneous list of text prompts or token ID arrays");
+        }
+        completion.batch.push_back({completion_prompt(item, text, budget, tokenizer), {}});
+    }
     finish_options(request, object, tokenizer);
-    return request;
+    for (auto& item : completion.batch) {
+        item.options = request.options;
+    }
+    return completion;
 }
 
 json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
@@ -508,7 +577,8 @@ const DecoderOptions& CompletionTokenizer::chat_sampling_defaults() const {
     return *sampling_defaults_;
 }
 
-TextRequest parse_text_request(const json::Object& body, const CompletionTokenizer& tokenizer) {
+TextCompletionRequest parse_text_request(const json::Object& body,
+                                         const CompletionTokenizer& tokenizer) {
     return parse_text(body, tokenizer);
 }
 
@@ -585,21 +655,9 @@ BatchPrompt generate_prompt(const json::Value& input, bool text, DecoderOptions 
         }
         encode_prompt(request.prompt, request.options.max_new_tokens, prompt, tokenizer);
     } else {
-        const auto* tokens = input.array();
-        if (!tokens || tokens->empty()) {
-            bad_request("Expected one nonempty flat array of input_ids");
-        }
-        if (tokens->size() > checkpoint_context - request.options.max_new_tokens) {
-            bad_request("Prompt and output budget must fit the 262144-token context");
-        }
-        request.prompt.reserve(tokens->size());
-        for (const auto& value : *tokens) {
-            const auto token = value.unsigned_integer();
-            if (!token || *token >= model_vocab_size) {
-                bad_request("input_ids must contain integers in [0, 248320)");
-            }
-            request.prompt.push_back(static_cast<int>(*token));
-        }
+        request.prompt = token_prompt(input, request.options.max_new_tokens,
+                                      "Expected one nonempty flat array of input_ids",
+                                      "input_ids must contain integers in [0, 248320)");
     }
     return request;
 }

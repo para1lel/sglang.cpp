@@ -165,8 +165,10 @@ void stream_completion(const Socket& connection, const CompletionRequest& reques
 const json::Object* native_text_body(const json::Value& parsed) {
     const auto* object = parsed.object();
     const auto model = object ? json::get_string(*object, "model") : std::nullopt;
+    const auto* prompt = object ? json::get(*object, "prompt") : nullptr;
     return object && model != "benchmark" &&
-        (json::get_string(*object, "prompt") || model == model_name) ? object : nullptr;
+        (model == model_name || (prompt && (prompt->string() || prompt->array()))) ?
+        object : nullptr;
 }
 
 json::Value parse_completion_body(std::string_view body, bool allow_text) {
@@ -203,11 +205,21 @@ json::Value parse_completion_body(std::string_view body, bool allow_text) {
     }
 }
 
-void dispatch_completion(const Socket& connection, std::string_view body,
-                         const CompletionTokenizer* tokenizer, const TextGenerator& generate,
-                         bool chat,
-                         const MediaGenerator& generate_media = MediaGenerator{}) {
+void dispatch_completion(const Socket& connection, BatchService& service, int slot,
+                         const CompletionTokenizer* tokenizer, std::string_view body,
+                         bool chat = false, VisionCompletion* vision = nullptr) {
+    service.rethrow_failure();
+    const TextGenerator generate = [&](const auto& prompt, const auto& options,
+                                       const auto& callbacks) {
+        return service.generate(slot, prompt, options, callbacks);
+    };
     if (chat && tokenizer) {
+        MediaGenerator generate_media;
+        if (vision) {
+            generate_media = [&](const auto& prompt, const auto& options, const auto& callbacks) {
+                return vision->generate(service, slot, prompt, options, callbacks);
+            };
+        }
         complete_chat_request(connection, body, *tokenizer, generate, generate_media);
         return;
     }
@@ -218,27 +230,15 @@ void dispatch_completion(const Socket& connection, std::string_view body,
         throw HttpError("400 Bad Request", "Invalid JSON request body");
     }
     if (const auto* text = tokenizer ? native_text_body(parsed) : nullptr) {
-        complete_text(connection, parse_text_request(*text, *tokenizer), *tokenizer,
-                      generate);
+        auto completion = parse_text_request(*text, *tokenizer);
+        if (completion.batch.empty()) {
+            complete_text(connection, completion.request, *tokenizer, generate);
+        } else {
+            complete_text_batch(connection, std::move(completion), *tokenizer, service, slot);
+        }
         return;
     }
     stream_completion(connection, parse_benchmark(parsed.object()), generate);
-}
-
-void complete_batch(const Socket& connection, BatchService& service, int slot,
-                    const CompletionTokenizer* tokenizer, std::string_view body,
-                    bool chat = false, VisionCompletion* vision = nullptr) {
-    service.rethrow_failure();
-    MediaGenerator generate_media;
-    if (vision) {
-        generate_media = [&](const auto& prompt, const auto& options, const auto& callbacks) {
-            return vision->generate(service, slot, prompt, options, callbacks);
-        };
-    }
-    dispatch_completion(connection, body, tokenizer,
-                        [&](const auto& prompt, const auto& options, const auto& callbacks) {
-        return service.generate(slot, prompt, options, callbacks);
-    }, chat, generate_media);
 }
 
 }
@@ -248,18 +248,18 @@ void write_error(const Socket& connection, std::string_view status, const char* 
 }
 
 void complete(const Socket& connection, BatchService& service, int slot, std::string_view body) {
-    complete_batch(connection, service, slot, nullptr, body);
+    dispatch_completion(connection, service, slot, nullptr, body);
 }
 
 void complete(const Socket& connection, BatchService& service, int slot,
               const CompletionTokenizer& tokenizer, std::string_view body) {
-    complete_batch(connection, service, slot, &tokenizer, body);
+    dispatch_completion(connection, service, slot, &tokenizer, body);
 }
 
 void complete_chat(const Socket& connection, BatchService& service, int slot,
                    const CompletionTokenizer& tokenizer, std::string_view body,
                    VisionCompletion* vision) {
-    complete_batch(connection, service, slot, &tokenizer, body, true, vision);
+    dispatch_completion(connection, service, slot, &tokenizer, body, true, vision);
 }
 
 }

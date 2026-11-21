@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | HTTP transport | Validate the request framing and route `POST /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if (request." --> · [Route](../apps/server/prefix_controls.cpp#L320)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
-| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L622)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L653)<!-- prefix: "std::vector\u003c" --> |
+| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L680)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L711)<!-- prefix: "std::vector\u003c" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L251)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L857)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L610)<!-- prefix: "bool BatchSe" --> |
 | Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L51)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L163)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L193)<!-- prefix: "void stream_" --> |
@@ -117,7 +117,7 @@ Supply exactly one non-null prompt field. A batch contains 1–32 items of the s
 If you send a parameter array, its length must equal the number of prompts. Each entry must have the type given in the table.
 Missing sampling keys in each object use the native defaults.
 The sum of batch output budgets must be at most 262,144 tokens. Each prompt and its own budget must fit the model context.
-[Batch form](../apps/server/text_request.cpp#L642)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/text_request.cpp#L607)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L668)<!-- prefix: "int remainin" -->
+[Batch form](../apps/server/text_request.cpp#L700)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/text_request.cpp#L665)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L726)<!-- prefix: "int remainin" -->
 
 | Sampling field | Accepted values and default |
 | --- | --- |

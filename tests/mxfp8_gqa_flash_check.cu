@@ -1,4 +1,5 @@
 #include "sglang/mxfp8_gqa.h"
+#include "sglang/text/prefill_attn_sm100.h"
 
 #include <algorithm>
 #include <array>
@@ -547,6 +548,71 @@ struct DeviceInput {
         }
         return result;
     }
+
+    void check_staged_scratch(const Input& input, int position, const std::vector<BFloat>& raw,
+                              cudaStream_t stream) const {
+        constexpr std::size_t scratch_guard = 128;
+        constexpr Byte poison = 0xa5;
+        const auto page_heads = static_cast<std::size_t>((position + rows) / mxfp8_page_size) *
+                                mxfp8_kv_heads;
+        const auto key_bytes = page_heads * mxfp8_page_size * channels * sizeof(BFloat);
+        const auto value_bytes = key_bytes + page_heads * sizeof(int);
+        DeviceBuffer<Byte> key_scratch(key_bytes + 2 * scratch_guard);
+        DeviceBuffer<Byte> value_scratch(value_bytes + 2 * scratch_guard);
+        const Mxfp8KvCache cache{keys.get(), values.get(), key_scales.get(), value_scales.get(),
+                                 input.physical_pages};
+        const Mxfp8PageTable table{pages.get(), static_cast<int>(input.pages.size())};
+        const auto check_scratch = [&](const DeviceBuffer<Byte>& buffer, std::size_t bytes,
+                                       bool written) {
+            const auto contents = buffer.download(stream);
+            const auto clean = [](Byte value) { return value == poison; };
+            const auto begin = contents.begin() + scratch_guard;
+            const auto end = begin + bytes;
+            if (!std::all_of(contents.begin(), begin, clean) ||
+                !std::all_of(end, contents.end(), clean) ||
+                std::all_of(begin, end, clean) == written) {
+                throw std::runtime_error("Paired prefill wrote the wrong scratch span");
+            }
+        };
+        for (const auto mode : {std::string_view("fit"), std::string_view("short"),
+                                std::string_view("capture")}) {
+            check_cuda(cudaMemsetAsync(key_scratch.get(), poison, key_bytes + 2 * scratch_guard,
+                                      stream), "Poison decoded keys");
+            check_cuda(cudaMemsetAsync(value_scratch.get(), poison,
+                                      value_bytes + 2 * scratch_guard, stream),
+                       "Poison decoded values");
+            check_cuda(cudaMemsetAsync(output.get(), 0xff, raw.size() * sizeof(BFloat), stream),
+                       "Poison staged attention output");
+            const decoder::PairedPrefillScratch scratch{
+                reinterpret_cast<std::byte*>(key_scratch.get() + scratch_guard), key_bytes,
+                reinterpret_cast<std::byte*>(value_scratch.get() + scratch_guard),
+                value_bytes - (mode == "short")};
+            Graph graph;
+            if (mode == "capture") {
+                check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                           "Begin paired capture with scratch");
+            }
+            check_cuda(decoder::tensor_core_model_prefill_gqa(
+                           cache, table, position, rows, queries.get(), output.get() + guard,
+                           stream, scratch), "Dispatch paired attention with scratch");
+            if (mode == "capture") {
+                check_cuda(cudaStreamEndCapture(stream, &graph.graph),
+                           "End paired capture with scratch");
+                check_dispatch("paired capture with scratch", graph.graph, tmem_paired_tail);
+                check_cuda(cudaGraphInstantiate(&graph.executable, graph.graph, 0),
+                           "Instantiate paired capture with scratch");
+                check_cuda(cudaGraphLaunch(graph.executable, stream),
+                           "Replay paired capture with scratch");
+            }
+            const auto result = output.download(stream);
+            if (std::memcmp(result.data(), raw.data(), raw.size() * sizeof(BFloat))) {
+                throw std::runtime_error("Paired workspace changed the raw attention output");
+            }
+            check_scratch(key_scratch, key_bytes, mode == "fit");
+            check_scratch(value_scratch, value_bytes, mode == "fit");
+        }
+        std::puts("MXFP8 paired scratch exact-fit, one-byte-short and capture matched raw");
+    }
 };
 
 void check_future_values(const char* label, Input& input, DeviceInput& device, int position,
@@ -854,6 +920,14 @@ void check_flash_prefill(cudaStream_t stream) {
         check_unaligned_paired_prefill(stream, default_mode);
         check_paired_prefill(stream, default_mode);
         check_tail_recovery(stream, 8192, rows, tmem_paired);
+    }
+    if (default_mode) {
+        constexpr int position = 8193;
+        Input input(position + rows);
+        DeviceInput device(input);
+        const auto raw = device.run("paired scratch raw reference", input, position,
+                                    tmem_paired_tail, attention_samples(input, position), stream);
+        device.check_staged_scratch(input, position, raw, stream);
     }
     if (explicit_paired) {
         return;

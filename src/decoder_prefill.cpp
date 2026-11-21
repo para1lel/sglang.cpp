@@ -192,6 +192,15 @@ struct TileBuffers {
               layout.take<std::uint8_t>(rows * intermediate_size),
               layout.take<float>(rows * text_fp8_group_count(intermediate_size))} {}
 
+    PairedPrefillScratch gqa_scratch() const {
+        const auto mlp_begin = reinterpret_cast<std::uintptr_t>(mlp_gate);
+        const auto mlp_end = reinterpret_cast<std::uintptr_t>(q_gate);
+        const auto gdn_begin = reinterpret_cast<std::uintptr_t>(gdn_qkv);
+        const auto gdn_end = reinterpret_cast<std::uintptr_t>(activation.values);
+        return {reinterpret_cast<std::byte*>(mlp_gate), mlp_end - mlp_begin,
+                reinterpret_cast<std::byte*>(gdn_qkv), gdn_end - gdn_begin};
+    }
+
     Bf16* hidden;
     Bf16* normalized;
     Bf16* residual;
@@ -292,7 +301,7 @@ struct Chunk : PrefillProjections {
               "Append prefill MXFP8 KV");
         const auto status = tensor_core_fp8
             ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
-                                            work.attention, stream)
+                                            work.attention, stream, work.gqa_scratch())
             : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
                                    work.attention, stream);
         check(status, "Read causal prefill MXFP8 attention");

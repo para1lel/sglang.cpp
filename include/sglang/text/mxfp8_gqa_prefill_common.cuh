@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/mxfp8_gqa.h"
+#include "sglang/text/prefill_attn_sm100.h"
 
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -16,6 +17,11 @@ std::optional<cudaError_t> launch_tmem_prefill(
 std::optional<cudaError_t> launch_paired_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream);
+
+std::optional<cudaError_t> launch_staged_tmem_prefill(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
+    decoder::PairedPrefillScratch scratch);
 
 namespace {
 

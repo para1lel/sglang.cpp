@@ -19,14 +19,28 @@ std::optional<cudaError_t> launch_prefill_attn_sm100(
 
 namespace decoder {
 
+struct PairedPrefillScratch {
+    std::byte* keys = nullptr;
+    std::size_t key_bytes = 0;
+    std::byte* values = nullptr;
+    std::size_t value_bytes = 0;
+};
+
+cudaError_t tensor_core_multirow_prefill_gqa(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
+    PairedPrefillScratch scratch);
+
 inline cudaError_t tensor_core_model_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream) {
+    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
+    PairedPrefillScratch scratch = PairedPrefillScratch{}) {
     if (const auto status = launch_prefill_attn_sm100(cache, pages, position, rows,
                                                       queries, output, stream)) {
         return *status;
     }
-    return tensor_core_multirow_prefill_gqa(cache, pages, position, rows, queries, output, stream);
+    return tensor_core_multirow_prefill_gqa(cache, pages, position, rows, queries, output,
+                                           stream, scratch);
 }
 
 }

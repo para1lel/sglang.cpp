@@ -709,6 +709,13 @@ cudaError_t decoder::tensor_core_prefill_gqa(
 cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const Bf16* queries, Bf16* output, cudaStream_t stream) {
+    return tensor_core_multirow_prefill_gqa(cache, pages, position, rows, queries, output,
+                                           stream, PairedPrefillScratch{});
+}
+
+cudaError_t decoder::tensor_core_multirow_prefill_gqa(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
+    const Bf16* queries, Bf16* output, cudaStream_t stream, PairedPrefillScratch scratch) {
     if (rows == 0) {
         return cudaSuccess;
     }
@@ -729,6 +736,13 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
             constexpr int max_default_paired_position = 31744;
             const bool default_paired = !setting && position <= max_default_paired_position &&
                 (position % flash_chunk == 0 || position % mxfp8_page_size != 0);
+            if (default_paired && scratch.keys && scratch.values) {
+                if (const auto status = launch_staged_tmem_prefill(cache, pages, position,
+                                                                  queries, output, stream,
+                                                                  scratch)) {
+                    return *status;
+                }
+            }
             if (default_paired || mode == "paired") {
                 if (const auto status = launch_paired_tmem_prefill(cache, pages, position, queries,
                                                                   output, stream)) {

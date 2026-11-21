@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstddef>
 #include <cooperative_groups.h>
+#include <memory>
 
 namespace sglang {
 namespace {
@@ -263,16 +264,23 @@ __device__ float tmem_probabilities(Probability& probability_tile, Word row_addr
     return history;
 }
 
-template <bool Paired = false, typename Tile>
+template <bool Paired = false, bool Staged = false, typename Tile>
 __device__ __forceinline__ void tmem_query_key(Tile& tile, Word mma,
                                               Word score_column = tmem_scores) {
+    const auto& keys = [&]() -> auto& {
+        if constexpr (Staged) {
+            return tile.key[(score_column - tmem_scores) / flash_keys];
+        } else {
+            return tile.key;
+        }
+    }();
     #pragma unroll
     for (int dimension = 0; dimension < channels; dimension += 16) {
         const int sub = dimension / tmem_swizzle;
         const int offset = dimension % tmem_swizzle;
         tmem_mma<flash_keys, false, Paired>(tile.tmem + score_column,
                                            tmem_descriptor(&tile.query[sub][0][offset]),
-                                           tmem_descriptor(&tile.key[sub][0][offset]),
+                                           tmem_descriptor(&keys[sub][0][offset]),
                                            dimension != 0);
     }
     tmem_commit<Paired>(mma);
@@ -329,7 +337,7 @@ __device__ __forceinline__ void tmem_store_output(
     }
 }
 
-template <bool Paired = false, typename Tile>
+template <bool Paired = false, bool Staged = false, typename Tile>
 __device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
                                                Word copy, Word mma) {
     if (threadIdx.x == 0) {
@@ -339,6 +347,19 @@ __device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
                      "fence.proxy.async.shared::cta;"
                      :: "r"(copy), "r"(mma) : "memory");
         if constexpr (Paired) {
+            if constexpr (Staged) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
+                             "mbarrier.init.shared::cta.b64 [%1], 2;"
+                             :: "r"(tmem_smem(&tile.value_copy_ready)),
+                                "r"(tmem_smem(&tile.key_ready[1])) : "memory");
+            }
+            const Word key_ready = [&] {
+                if constexpr (Staged) {
+                    return tmem_smem(&tile.key_ready[0]);
+                } else {
+                    return tmem_smem(&tile.key_ready);
+                }
+            }();
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
                          "mbarrier.init.shared::cta.b64 [%1], 1;\n"
                          "mbarrier.init.shared::cta.b64 [%2], 1;\n"
@@ -352,7 +373,7 @@ __device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
                             "r"(tmem_smem(&tile.output_ready[1])),
                             "r"(tmem_smem(&tile.operands_ready[0])),
                             "r"(tmem_smem(&tile.operands_ready[1])),
-                            "r"(tmem_smem(&tile.key_ready)) : "memory");
+                            "r"(key_ready) : "memory");
         }
     }
     if constexpr (Paired) {
@@ -538,7 +559,8 @@ __device__ void pair_prefetch(PairPayload& raw, Attention request, const PairMap
     }
 }
 
-__device__ void pair_repair(PairTile& tile, Attention request,
+template <typename Tile>
+__device__ void pair_repair(Tile& tile, Attention request,
                             cooperative_groups::cluster_group pair, int row, int head) {
     __shared__ OrderedScratch fallback;
     const int peer_key = *pair.map_shared_rank(&tile.bad_key, 1 - pair.block_rank());
@@ -580,14 +602,19 @@ __device__ __forceinline__ void pair_wait(Word ready, Word phase) {
                  :: "r"(ready), "r"(phase) : "memory");
 }
 
-__device__ __forceinline__ void pair_issue_mmas(PairTile& tile, Word key, int end) {
-    tmem_query_key<true>(tile, tmem_smem(&tile.scores_ready[0]));
+template <bool Staged = false, typename Tile>
+__device__ __forceinline__ void pair_issue_mmas(Tile& tile, int end) {
+    tmem_query_key<true, Staged>(tile, tmem_smem(&tile.scores_ready[0]));
     for (int chunk = 0; chunk * flash_keys < end; ++chunk) {
         const int stage = chunk & 1;
         if ((chunk + 1) * flash_keys < end) {
-            pair_wait(key, stage);
-            tmem_query_key<true>(tile, tmem_smem(&tile.scores_ready[1 - stage]),
-                                 tmem_scores + (1 - stage) * flash_keys);
+            if constexpr (Staged) {
+                pair_wait(tmem_smem(&tile.key_ready[1 - stage]), (chunk >> 1) & 1);
+            } else {
+                pair_wait(tmem_smem(&tile.key_ready), stage);
+            }
+            tmem_query_key<true, Staged>(tile, tmem_smem(&tile.scores_ready[1 - stage]),
+                                         tmem_scores + (1 - stage) * flash_keys);
         }
         pair_wait(tmem_smem(&tile.operands_ready[stage]), (chunk >> 1) & 1);
         tmem_probability_value<true>(tile.tmem, tile.probability[stage], tile.value[stage],
@@ -631,7 +658,7 @@ __global__ void tmem_pair_attention(Attention request, const __grid_constant__ P
         pair_prefetch(tile.raw[1], request, maps, mxfp8_page_size, kv_head, rank, copy);
     }
     if (issuer) {
-        pair_issue_mmas(tile, key, end);
+        pair_issue_mmas(tile, end);
     }
     const Word row_address = tile.tmem + ((warp * 32) << 16);
     FlashSoftmax state{-CUDART_INF_F, 0.0f};
@@ -800,87 +827,6 @@ bool paired_kernel_unavailable(cudaError_t status) {
 
 }
 
-std::optional<cudaError_t> launch_paired_tmem_prefill(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
-    const Bf16* queries, Bf16* output, cudaStream_t stream) {
-    constexpr auto dynamic_shared = sizeof(PairTile);
-    if (position < 0 || position > INT_MAX - flash_chunk - mxfp8_page_size) {
-        return std::nullopt;
-    }
-    const auto kernel = position % mxfp8_page_size ? tmem_pair_attention<true> :
-                                                     tmem_pair_attention<false>;
-    const int required_pages = (position + flash_chunk + mxfp8_page_size - 1) / mxfp8_page_size;
-    if (pages.page_count < required_pages || cache.page_count < required_pages ||
-        !pages.device_pages || !cache.key_payload || !cache.value_payload ||
-        !cache.key_scales || !cache.value_scales || !queries || !output) {
-        return cudaErrorInvalidValue;
-    }
-    constexpr auto tma_alignment = 16;
-    if (cache.page_count > INT_MAX / mxfp8_page_size ||
-        reinterpret_cast<std::uintptr_t>(cache.key_payload) % tma_alignment != 0 ||
-        reinterpret_cast<std::uintptr_t>(cache.value_payload) % tma_alignment != 0 ||
-        reinterpret_cast<std::uintptr_t>(cache.key_scales) % tma_alignment != 0 ||
-        reinterpret_cast<std::uintptr_t>(cache.value_scales) % tma_alignment != 0) {
-        return std::nullopt;
-    }
-    int device = 0;
-    auto status = cudaGetDevice(&device);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    cudaDeviceProp properties{};
-    status = cudaGetDeviceProperties(&properties, device);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    if (properties.major != 10 || properties.minor != 0 || !properties.clusterLaunch) {
-        return std::nullopt;
-    }
-    cudaFuncAttributes attributes{};
-    status = cudaFuncGetAttributes(&attributes, kernel);
-    if (paired_kernel_unavailable(status)) {
-        return std::nullopt;
-    }
-    if (status != cudaSuccess) {
-        return status;
-    }
-    if (properties.sharedMemPerBlockOptin < dynamic_shared + attributes.sharedSizeBytes ||
-        attributes.maxThreadsPerBlock < pair_threads || attributes.requiredClusterWidth != 2 ||
-        attributes.requiredClusterHeight != 1 || attributes.requiredClusterDepth != 1) {
-        return std::nullopt;
-    }
-    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  dynamic_shared);
-    if (paired_kernel_unavailable(status) || status == cudaErrorInvalidValue) {
-        return std::nullopt;
-    }
-    if (status != cudaSuccess) {
-        return status;
-    }
-    const dim3 blocks(flash_chunk / flash_rows, mxfp8_query_heads / ordered_heads);
-    const cudaLaunchConfig_t config{blocks, dim3(pair_threads), dynamic_shared, stream, nullptr, 0};
-    int clusters = 0;
-    status = cudaOccupancyMaxActiveClusters(&clusters, kernel, &config);
-    if (paired_kernel_unavailable(status) || status == cudaErrorInvalidClusterSize ||
-        status == cudaErrorInvalidConfiguration || status == cudaErrorInvalidValue) {
-        return std::nullopt;
-    }
-    if (status != cudaSuccess) {
-        return status;
-    }
-    if (clusters == 0) {
-        return std::nullopt;
-    }
-    PairMaps maps{};
-    const auto encoded = encode_pair_maps(cache, maps);
-    if (!encoded || *encoded != cudaSuccess) {
-        return encoded;
-    }
-    Attention request{cache, pages.device_pages, position, queries, output};
-    void* args[] = {&request, &maps};
-    return cudaLaunchKernel(kernel, blocks, pair_threads, args, dynamic_shared, stream);
-}
-
 std::optional<cudaError_t> launch_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
     const Bf16* queries, Bf16* output, cudaStream_t stream, bool ordered) {
@@ -980,3 +926,5 @@ std::optional<cudaError_t> launch_tmem_prefill(
 }
 
 }
+
+#include "sglang/text/mxfp8_gqa_prefill_paired.cuh"

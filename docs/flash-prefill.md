@@ -4,14 +4,14 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L486)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L293)<!-- prefix: "const auto s" --> |
+| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L495)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L302)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, ordered multirow, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L709)<!-- prefix: "cudaError_t " --> |
-| Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L600)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L417)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L697)<!-- prefix: "__global__ v" --> |
+| Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L627)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L438)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L724)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
 
 ## Runtime path
 
-The CLI and C++ default is `exact`. Under `tensor-core`, native dispatch checks `SGLANG_EXPERIMENTAL_TMEM_PREFILL` for full Flash tiles. Each start position counts preceding tokens from zero. [TMEM selection](../src/mxfp8_gqa_prefill.cu#L726)<!-- prefix: "if (rows == " -->
+The CLI and C++ default is `exact`. Under `tensor-core`, native dispatch checks `SGLANG_EXPERIMENTAL_TMEM_PREFILL` for full Flash tiles. Each start position counts preceding tokens from zero. [TMEM selection](../src/mxfp8_gqa_prefill.cu#L733)<!-- prefix: "if (rows == " -->
 
 | Setting | TMEM route | Start position for 1,024 query rows |
 | --- | --- | --- |
@@ -21,7 +21,7 @@ The CLI and C++ default is `exact`. Under `tensor-core`, native dispatch checks 
 | `1` | Three-part split | At least 32,768, divisible by 64 |
 | Any other set value, including empty or `wide` | Disabled | Regular Flash and its fallbacks |
 
-The model tries the [SM100 page-128 opt-ins](sm100-page128-prefill.md) before native dispatch. Media, MTP, and tensor-core prefix-cache tiles cap at 128 rows.
+The model tries the [SM100 page-128 opt-ins](sm100-page128-prefill.md) before native dispatch. Media, MTP, and tensor-core prefix-cache tiles cap at 128 rows. The [native prefill workspace](native-prefill-workspace.md) supplies reusable staging for the default paired route.
 
 Flash and TMEM follow the logical page table and process causal 64-key tiles. QK and PV use BF16 products, FP32 accumulation, and online normalization.
 
@@ -37,39 +37,39 @@ The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for score
 
 Tensor Memory Accelerator (TMA) alternates two shared buffers for raw KV. Producers use packed BF16 conversion for finite MXFP8 payloads with scale exponents 15–148. Other values use scalar range checks.
 
-In single-CTA TMEM, four warps compute softmax and eight convert V. PV overlaps the next K conversion. [Pipeline](../src/text/mxfp8_gqa_prefill_tmem.cu#L417)<!-- prefix: "__global__ v" --> · [Conversion](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L74)<!-- prefix: "__device__ _" -->
+In single-CTA TMEM, four warps compute softmax and eight convert V. PV overlaps the next K conversion. [Pipeline](../src/text/mxfp8_gqa_prefill_tmem.cu#L438)<!-- prefix: "__global__ v" --> · [Conversion](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L74)<!-- prefix: "__device__ _" -->
 
-Single-CTA ordered TMEM assigns 64 query rows and one head pair to each CTA. It keeps wide Flash's four-lane softmax sum, BF16 probabilities, FP32 normalization, and BF16 output. Capture adds one kernel node with zero global scratch. [Output](../src/text/mxfp8_gqa_prefill_tmem.cu#L315)<!-- prefix: "__device__ _" --> · [Launch](../src/text/mxfp8_gqa_prefill_tmem.cu#L953)<!-- prefix: "if (ordered)" -->
+Single-CTA ordered TMEM assigns 64 query rows and one head pair to each CTA. It keeps wide Flash's four-lane softmax sum, BF16 probabilities, FP32 normalization, and BF16 output. Capture adds one kernel node with zero global scratch. [Output](../src/text/mxfp8_gqa_prefill_tmem.cu#L323)<!-- prefix: "__device__ _" --> · [Launch](../src/text/mxfp8_gqa_prefill_tmem.cu#L899)<!-- prefix: "if (ordered)" -->
 
-Each cluster handles 128 query rows and one head pair. TMA refills full-page buffers after readers release them. Partial pages use mapped loads and zero out-of-bounds operands. Score masks follow query positions. [Tail staging](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L135)<!-- prefix: "if (tail) {" --> · [Page transition](../src/text/mxfp8_gqa_prefill_tmem.cu#L675)<!-- prefix: "const bool n" -->
+Each cluster handles 128 query rows and one head pair. TMA refills full-page buffers after readers release them. Partial pages use mapped loads and zero out-of-bounds operands. Score masks follow query positions. [Tail staging](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L135)<!-- prefix: "if (tail) {" --> · [Page transition](../src/text/mxfp8_gqa_prefill_tmem.cu#L702)<!-- prefix: "const bool n" -->
 
-For paired full pages, TMA uses a 128-byte swizzle for raw V. V producers remap token rows and 16-byte vectors to reduce shared-memory bank conflicts during raw loads and decoded BF16 stores. The cache retains E4M3 payloads and separate E8M0 scales per token, KV head, and 32 channels. [V map](../src/text/mxfp8_gqa_prefill_tmem.cu#L774)<!-- prefix: "result = enc" --> · [Producer mapping](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L115)<!-- prefix: "const int fi" --> · [Scale indexing](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L64)<!-- prefix: "__device__ s" -->
+For paired full pages, TMA uses a 128-byte swizzle for raw V. V producers remap token rows and 16-byte vectors to reduce shared-memory bank conflicts during raw loads and decoded BF16 stores. The cache retains E4M3 payloads and separate E8M0 scales per token, KV head, and 32 channels. [V map](../src/text/mxfp8_gqa_prefill_tmem.cu#L801)<!-- prefix: "result = enc" --> · [Producer mapping](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L115)<!-- prefix: "const int fi" --> · [Scale indexing](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L70)<!-- prefix: "__device__ s" -->
 
-Two stages alternate scores, BF16 probabilities, and V. Producers wait for QK before reusing decoded K. When both CTAs publish K readiness, a rank-zero warp issues the next 64-key QK during current softmax. [Stages](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L25)<!-- prefix: "struct align" --> · [Issuer](../src/text/mxfp8_gqa_prefill_tmem.cu#L583)<!-- prefix: "__device__ _" --> · [K handoff](../src/text/mxfp8_gqa_prefill_tmem.cu#L682)<!-- prefix: "pair_publish" -->
+Two stages alternate scores, BF16 probabilities, and V. Producers wait for QK before reusing decoded K. When both CTAs publish K readiness, a rank-zero warp issues the next 64-key QK during current softmax. [Stages](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L25)<!-- prefix: "struct align" --> · [Issuer](../src/text/mxfp8_gqa_prefill_tmem.cu#L606)<!-- prefix: "__device__ _" --> · [K handoff](../src/text/mxfp8_gqa_prefill_tmem.cu#L709)<!-- prefix: "pair_publish" -->
 
-PV waits for both CTAs to publish BF16 probabilities and V. Stages reuse operands after PV completes. Softmax keeps 64-key reduction order and rescales the FP32 accumulator after the preceding PV. The final wait precedes output, cooperative TMEM deallocation, and repair. [Operand wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L592)<!-- prefix: "pair_wait(tm" --> · [Correction](../src/text/mxfp8_gqa_prefill_tmem.cu#L651)<!-- prefix: "tmem_correct" --> · [Final wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L657)<!-- prefix: "tmem_mma_wai" --> · [Repair](../src/text/mxfp8_gqa_prefill_tmem.cu#L541)<!-- prefix: "__device__ v" -->
+PV waits for both CTAs to publish BF16 probabilities and V. Stages reuse operands after PV completes. Softmax keeps 64-key reduction order and rescales the FP32 accumulator after the preceding PV. The final wait precedes output, cooperative TMEM deallocation, and repair. [Operand wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L619)<!-- prefix: "pair_wait(tm" --> · [Correction](../src/text/mxfp8_gqa_prefill_tmem.cu#L678)<!-- prefix: "tmem_correct" --> · [Final wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L684)<!-- prefix: "tmem_mma_wai" --> · [Repair](../src/text/mxfp8_gqa_prefill_tmem.cu#L563)<!-- prefix: "__device__ v" -->
 
-Capture records one kernel node with maps by value and zero global scratch. Replay keeps that route. Keep KV, pages, queries, and output valid through replay. Intermediate prefill can skip scoring. [Kernel arguments](../src/text/mxfp8_gqa_prefill_tmem.cu#L600)<!-- prefix: "__global__ v" --> · [Batch scoring](../src/decoder_batch.cpp#L660)<!-- prefix: "if (rows[slo" -->
+Capture records one kernel node with maps by value and zero global scratch. Replay keeps that route. Keep KV, pages, queries, and output valid through replay. Intermediate prefill can skip scoring. [Kernel arguments](../src/text/mxfp8_gqa_prefill_tmem.cu#L627)<!-- prefix: "__global__ v" --> · [Batch scoring](../src/decoder_batch.cpp#L660)<!-- prefix: "if (rows[slo" -->
 
-Split TMEM assigns three contiguous partitions to three CTAs per query block and head pair. Its 76,087,296 scratch bytes hold FP32 numerators, maxima, and masses. Merge rescales to the global maximum, combines, normalizes, and rounds to BF16. Allocation, attention, merge, and release share one stream. [Scratch allocation](../src/text/mxfp8_gqa_prefill_tmem.cu#L963)<!-- prefix: "status = cud" -->
+Split TMEM assigns three contiguous partitions to three CTAs per query block and head pair. Its 76,087,296 scratch bytes hold FP32 numerators, maxima, and masses. Merge rescales to the global maximum, combines, normalizes, and rounds to BF16. Allocation, attention, merge, and release share one stream. [Scratch allocation](../src/text/mxfp8_gqa_prefill_tmem.cu#L909)<!-- prefix: "status = cud" -->
 
 ## Constraints and failure behavior
 
-Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L723)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L466)<!-- prefix: "if (rows == " -->
+Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L730)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L475)<!-- prefix: "if (rows == " -->
 
 Wide staging needs 195,024 dynamic shared-memory bytes. When it cannot fit, the 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select synchronous staging when it fits.
 
-TMEM requires compute capability 10.0, signed 32-bit TMA token coordinates, and the full-tile Flash visibility limit. Single-CTA ordered and split TMEM need 214,016 dynamic shared-memory bytes plus static allocation. Split TMEM needs CUDA memory pools. [Resource checks](../src/text/mxfp8_gqa_prefill_tmem.cu#L884)<!-- prefix: "std::optiona" -->
+TMEM requires compute capability 10.0, signed 32-bit TMA token coordinates, and the full-tile Flash visibility limit. Single-CTA ordered and split TMEM need 214,016 dynamic shared-memory bytes plus static allocation. Split TMEM needs CUDA memory pools. [Resource checks](../src/text/mxfp8_gqa_prefill_tmem.cu#L830)<!-- prefix: "std::optiona" -->
 
-Paired TMEM needs 16-byte alignment for all four KV bases. It needs a 416-thread kernel image, a resident two-CTA cluster, and 218,112 dynamic shared-memory bytes plus static allocation. [Paired checks](../src/text/mxfp8_gqa_prefill_tmem.cu#L803)<!-- prefix: "std::optiona" -->
+Raw paired TMEM needs 16-byte alignment for all four KV bases. It needs a 416-thread kernel image, a resident two-CTA cluster, and 218,112 dynamic shared-memory bytes plus static allocation. [Paired checks](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L361)<!-- prefix: "std::optiona" -->
 
-Unsupported clusters, kernel configurations, encoders, or tensor maps fall through to regular Flash before submission. Missing buffers or too few pages return `cudaErrorInvalidValue`. Unexpected CUDA setup errors and the paired launch status return to the caller. [Encoder](../src/text/mxfp8_gqa_prefill_tmem.cu#L737)<!-- prefix: "std::optiona" --> · [Submission](../src/text/mxfp8_gqa_prefill_tmem.cu#L881)<!-- prefix: "return cudaL" -->
+Unsupported clusters, kernel configurations, encoders, or tensor maps fall through to regular Flash before submission. Missing buffers or too few pages return `cudaErrorInvalidValue`. Unexpected CUDA setup errors and the paired launch status return to the caller. [Encoder](../src/text/mxfp8_gqa_prefill_tmem.cu#L764)<!-- prefix: "std::optiona" --> · [Submission](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L385)<!-- prefix: "return cudaL" -->
 
 Other valid shapes, unaligned payloads, and a known regular Flash shared memory shortfall use the [ordered fallback dispatch](development.md#ordered-multirow-gqa-prefill). Above 32,768 visible tokens, that dispatch uses protected single-row attention. CUDA discovery, configuration, and launch errors propagate.
 
 Single-CTA ordered and split TMEM fall through on device or resource mismatch or successful lookup without an encoder. Missing buffers, insufficient pages, or encoding failure return `cudaErrorInvalidValue`. CUDA discovery, configuration, launch, and split allocation errors propagate. After split allocation, the launcher attempts release and returns the first launch error or release status.
 
-Protected attention repairs affected rows and head pairs when a query or visible KV value falls outside Flash's numerical range. Ordered TMEM repairs after releasing TMEM. Split TMEM marks partitions for repair at merge. Invalid KV affects only queries that can see it. Protected attention retains selective FP64 recovery. [Single-CTA ordered repair](../src/text/mxfp8_gqa_prefill_tmem.cu#L489)<!-- prefix: "if constexpr" -->
+Protected attention repairs affected rows and head pairs when a query or visible KV value falls outside Flash's numerical range. Ordered TMEM repairs after releasing TMEM. Split TMEM marks partitions for repair at merge. Invalid KV affects only queries that can see it. Protected attention retains selective FP64 recovery. [Single-CTA ordered repair](../src/text/mxfp8_gqa_prefill_tmem.cu#L510)<!-- prefix: "if constexpr" -->
 
 ### Reference implementations
 
@@ -79,23 +79,23 @@ FlashInfer's [Blackwell paged context API](https://github.com/flashinfer-ai/flas
 
 Flash can change BF16 results, logits, and IDs. Compare with independent FP64 over the same represented inputs. Check causality, remaps, guards, repair, and eager versus graph replay. Trace eligibility, alignment, and capacity fallbacks. Measure tensor-core efficiency.
 
-Run the [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L847)<!-- prefix: "void check_f" --> on a reserved B200 using the [checker commands](development.md#p2-gqa-verification). Against FP64, require sampled maximum absolute error below 0.08 and normalized RMSE below 0.005. [FP64 limits](../tests/mxfp8_gqa_flash_check.cu#L450)<!-- prefix: "if (!(max_ab" -->
+Run the [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L913)<!-- prefix: "void check_f" --> on a reserved B200 using the [checker commands](development.md#p2-gqa-verification). Against FP64, require sampled maximum absolute error below 0.08 and normalized RMSE below 0.005. [FP64 limits](../tests/mxfp8_gqa_flash_check.cu#L451)<!-- prefix: "if (!(max_ab" -->
 
-The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L774)<!-- prefix: "void check_p" --> cover the 143/144-row floor, the 191/192/193-row boundary, and parity with unaligned K or V scales. [Tail recovery](../tests/mxfp8_gqa_flash_check.cu#L807)<!-- prefix: "void check_t" --> limits nonfinite outputs to affected channels on the final active row.
+The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L840)<!-- prefix: "void check_p" --> cover the 143/144-row floor, the 191/192/193-row boundary, and parity with unaligned K or V scales. [Tail recovery](../tests/mxfp8_gqa_flash_check.cu#L873)<!-- prefix: "void check_t" --> limits nonfinite outputs to affected channels on the final active row.
 
-The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L700)<!-- prefix: "void check_l" --> cover partial tiles at 32,768/32,769 visible tokens, the 131,072-token cap, causality, and overflow recovery. At 32,768, ordered TMEM preserves BF16 output with unaligned scales. At 32,769, compare wide and synchronous Flash.
+The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L766)<!-- prefix: "void check_l" --> cover partial tiles at 32,768/32,769 visible tokens, the 131,072-token cap, causality, and overflow recovery. At 32,768, ordered TMEM preserves BF16 output with unaligned scales. At 32,769, compare wide and synchronous Flash.
 
 Check ordered and protected fallback bitwise against the ordered FP32 reference for finite scores and quotients. Check FP64 recovery independently. Use the [exact prefill runbook](../tests/prefill/README.md) for the separate `exact` contract.
 
-The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L681)<!-- prefix: "void check_t" --> check dispatch and payload alignment at starts 8,192 for ordered TMEM and 32,768 for split TMEM. [Graph checks](../tests/mxfp8_gqa_flash_check.cu#L381)<!-- prefix: "void check_d" --> require one ordered kernel node or four split nodes. [Split checks](../tests/mxfp8_gqa_flash_check.cu#L351)<!-- prefix: "void check_t" --> verify dependencies and scratch lifetime.
+The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L747)<!-- prefix: "void check_t" --> check dispatch and payload alignment at starts 8,192 for ordered TMEM and 32,768 for split TMEM. [Graph checks](../tests/mxfp8_gqa_flash_check.cu#L382)<!-- prefix: "void check_d" --> require one ordered kernel node or four split nodes. [Split checks](../tests/mxfp8_gqa_flash_check.cu#L352)<!-- prefix: "void check_t" --> verify dependencies and scratch lifetime.
 
 ### Paired ordered TMEM verification
 
-The [aligned regression](../tests/mxfp8_gqa_flash_check.cu#L582)<!-- prefix: "void check_p" --> checks dispatch, scale alignment, replay, and causality. The [unaligned regression](../tests/mxfp8_gqa_flash_check.cu#L660)<!-- prefix: "void check_u" --> checks page offsets 1, 63, 64, and 127, replay, short page counts, and causal repair.
+The [aligned regression](../tests/mxfp8_gqa_flash_check.cu#L648)<!-- prefix: "void check_p" --> checks dispatch, scale alignment, replay, and causality. The [unaligned regression](../tests/mxfp8_gqa_flash_check.cu#L726)<!-- prefix: "void check_u" --> checks page offsets 1, 63, 64, and 127, replay, short page counts, and causal repair.
 
 For paired pipeline changes, replay aligned and unaligned 1,024-row checkpoint captures with remapped pages. Compare all BF16 output with the prior kernel and wide Flash. Require one paired graph node and check eager parity. For V staging, mutate one visible V value on a full page and one on a partial page. Check unchanged earlier rows and unaffected head groups. Run memcheck, initcheck, and synccheck on repair with unwritten tail padding. Record the racecheck launch size and repair coverage.
 
-Measure CUDA Graph replay in base, candidate, candidate, base order on the reserved B200. Weight matched starts by launch count. State interpolation and fixed costs for workload estimates. Serving acceptance uses the [frozen gates](performance.md#scheduler-and-reporting-policy).
+Time raw paired graph replay in A/B/B/A order. Weight starts by launch count. See [eager staging checks](native-prefill-workspace.md#verification) and [serving gates](performance.md#scheduler-and-reporting-policy).
 
 ### Ordered TMEM operator verification
 

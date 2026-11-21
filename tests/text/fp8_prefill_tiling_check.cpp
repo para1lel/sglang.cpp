@@ -57,6 +57,10 @@ struct Launch {
 
 Launch observed;
 int launch_count = 0;
+int paired_attempts = 0;
+bool decline_paired = false;
+bool fail_paired_launch = false;
+constexpr char paired_kernel[] = "TileILi128ELi128ELi6ELi2ELi1ELi2EE";
 
 struct Case {
     int outputs;
@@ -155,7 +159,46 @@ void check_or_save_bf16(const std::filesystem::path& directory, const std::strin
     require(bool(control), key + " failed to preserve baseline");
 }
 
-void projection(const Checkpoint& checkpoint, const Case& shape, bool tiling,
+void verify_paired_fallback(const std::uint8_t* weights, const Bf16* scales,
+                            TextFp8ActivationView input, Bf16* output, cudaStream_t stream) {
+    const auto run = [&](bool allow_large) {
+        launch_count = 0;
+        paired_attempts = 0;
+        return try_text_fp8_gemm_sm100(weights, scales, input, 1024, 5120, 17408,
+                                       output, stream, allow_large);
+    };
+    require(!run(false) && launch_count == 0, "Paired shape bypassed the large-row guard");
+
+    decline_paired = true;
+    const auto fallback = run(true);
+    decline_paired = false;
+    require(fallback == cudaSuccess && paired_attempts == 1 && launch_count == 1 &&
+            observed.grid.x == 40 && observed.grid.y == 8 &&
+            observed.name.find(paired_kernel) == std::string::npos,
+            "Unavailable paired kernel did not use the ordinary TMA kernel");
+    check(cudaStreamSynchronize(stream));
+
+    fail_paired_launch = true;
+    const auto failure = run(true);
+    fail_paired_launch = false;
+    require(failure == cudaErrorInvalidConfiguration && paired_attempts == 1 &&
+            launch_count == 0, "Paired launch failure was retried or lost");
+}
+
+void verify_row_limits(const Case& shape, const std::uint8_t* weights, const Bf16* scales,
+                       TextFp8ActivationView input, Bf16* output, cudaStream_t stream) {
+    for (const auto [rows, allow_large] : {std::pair{2, true}, {129, false}, {2049, true}}) {
+        launch_count = 0;
+        const auto status = try_text_fp8_gemm_sm100(weights, scales, input, rows, shape.outputs,
+                                                   shape.inputs, output, stream, allow_large);
+        require(!status && launch_count == 0, "Expected no launch for rows=" +
+            std::to_string(rows) + ", status=" +
+            (status ? cudaGetErrorString(*status) : "declined"));
+    }
+}
+
+void projection(const Checkpoint& checkpoint, const Case& shape, bool tiling, bool paired,
+                bool compare,
                 const std::filesystem::path& baseline, cudaStream_t stream) {
     const int inputs = shape.inputs;
     const int outputs = shape.outputs;
@@ -201,14 +244,18 @@ void projection(const Checkpoint& checkpoint, const Case& shape, bool tiling,
         std::ranges::fill(active, poison);
         check(cudaMemcpy(output.data, active.data(), active.size_bytes(), cudaMemcpyHostToDevice));
         launch_count = 0;
+        const bool paired_shape = paired && rows == 1024 && outputs == 5120 && inputs == 17408;
         const auto status = try_text_fp8_gemm_sm100(weights.data, weight_scales.data,
             activation_view, rows, outputs, inputs, output.data + guard, stream, true);
         require(status == cudaSuccess && launch_count == 1, key + " failed SM100 dispatch");
         const auto [tile_rows, tile_columns] = expected_tile(tiling, rows, outputs, inputs);
         const std::string kernel = "TileILi" + std::to_string(tile_rows) + "ELi" +
                                    std::to_string(tile_columns) + "E";
-        require(observed.grid.x == ceil_div(outputs, tile_columns) &&
-                observed.grid.y == ceil_div(rows, tile_rows) &&
+        const int row_tiles = ceil_div(rows, tile_rows);
+        const int column_tiles = ceil_div(outputs, tile_columns);
+        require(observed.grid.x == (paired_shape ? column_tiles * row_tiles : column_tiles) &&
+                observed.grid.y == (paired_shape ? 1 : row_tiles) &&
+                (observed.name.find(paired_kernel) != std::string::npos) == paired_shape &&
                 observed.name.find(kernel) != std::string::npos, key + " wrong launch geometry");
         check(cudaStreamSynchronize(stream));
         check(cudaMemcpy(active.data(), output.data, active.size_bytes(), cudaMemcpyDeviceToHost));
@@ -232,21 +279,19 @@ void projection(const Checkpoint& checkpoint, const Case& shape, bool tiling,
                         std::to_string(column));
             }
         }
-        check_or_save_bf16(baseline, key, result, tiling);
+        check_or_save_bf16(baseline, key, result, compare);
         const auto* bytes = reinterpret_cast<const char*>(result.data());
         std::cout << key << '\t' << tile_rows << 'x' << tile_columns << '\t' << result.size()
                   << '\t' << std::setprecision(8) << max_error << '\t'
                   << tokenizer::sha256({bytes, result.size_bytes()}) << '\n';
+        if (paired_shape) {
+            verify_paired_fallback(weights.data, weight_scales.data, activation_view,
+                                   output.data + guard, stream);
+        }
     }
     if (max_rows >= 1024) {
-        for (const auto [rows, allow_large] : {std::pair{2, true}, {129, false}, {2049, true}}) {
-            launch_count = 0;
-            const auto status = try_text_fp8_gemm_sm100(weights.data, weight_scales.data,
-                activation_view, rows, outputs, inputs, output.data + guard, stream, allow_large);
-            require(!status && launch_count == 0, "Expected no launch for rows=" +
-                std::to_string(rows) + ", status=" +
-                (status ? cudaGetErrorString(*status) : "declined"));
-        }
+        verify_row_limits(shape, weights.data, weight_scales.data, activation_view,
+                          output.data + guard, stream);
     }
 }
 
@@ -255,13 +300,33 @@ void projection(const Checkpoint& checkpoint, const Case& shape, bool tiling,
 extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, std::size_t,
                                               cudaStream_t);
 
+extern "C" cudaError_t __real_cudaFuncGetAttributes(cudaFuncAttributes*, const void*);
+
+extern "C" cudaError_t __wrap_cudaFuncGetAttributes(cudaFuncAttributes* attributes,
+                                                    const void* function) {
+    if (decline_paired) {
+        const char* name = nullptr;
+        if (cudaFuncGetName(&name, function) == cudaSuccess &&
+            name && std::strstr(name, paired_kernel)) {
+            ++paired_attempts;
+            return cudaErrorInvalidDeviceFunction;
+        }
+    }
+    return __real_cudaFuncGetAttributes(attributes, function);
+}
+
 extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, dim3 block,
                                               void** args, std::size_t shared,
                                               cudaStream_t stream) {
-    const auto status = __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
     const char* name = nullptr;
-    if (status == cudaSuccess && cudaFuncGetName(&name, function) == cudaSuccess && name &&
-        std::strstr(name, "fp8_tma")) {
+    const bool tma = cudaFuncGetName(&name, function) == cudaSuccess &&
+                     name && std::strstr(name, "fp8_tma");
+    if (fail_paired_launch && tma && std::strstr(name, paired_kernel)) {
+        ++paired_attempts;
+        return cudaErrorInvalidConfiguration;
+    }
+    const auto status = __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
+    if (status == cudaSuccess && tma) {
         observed = {grid, name};
         ++launch_count;
     }
@@ -269,9 +334,13 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
 }
 
 int main(int argc, char** argv) try {
-    require(argc == 4, "Pass checkpoint, base or tiling, and baseline output directory");
-    const bool tiling = std::string_view(argv[2]) == "tiling";
-    require(tiling || std::string_view(argv[2]) == "base", "Unexpected arm");
+    require(argc == 4, "Pass checkpoint, base/tiling/wide-base/paired, and baseline directory");
+    const std::string_view arm = argv[2];
+    require(arm == "base" || arm == "tiling" || arm == "wide-base" || arm == "paired",
+            "Unexpected arm");
+    const bool paired = arm == "paired";
+    const bool tiling = arm != "base";
+    const bool compare = paired || arm == "tiling";
     const Checkpoint checkpoint(argv[1]);
     cudaStream_t stream = nullptr;
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -288,7 +357,7 @@ int main(int argc, char** argv) try {
         {4096, 5120, nullptr, {64, 65}},
     };
     for (const auto& shape : shapes) {
-        projection(checkpoint, shape, tiling, argv[3], stream);
+        projection(checkpoint, shape, tiling, paired, compare, argv[3], stream);
     }
     check(cudaStreamDestroy(stream));
     return 0;

@@ -15,7 +15,7 @@ constexpr int warp_size = 32;
 constexpr int accum_stages = 2;
 constexpr int packed_wide_tile_cols = 256;
 
-template <int Rows, int Cols, int Copies, int Batch, int Resident>
+template <int Rows, int Cols, int Copies, int Batch, int Resident, int CopyBatch = 1>
 struct Tile {
     static constexpr int rows = Rows;
     static constexpr int cols = Cols;
@@ -28,19 +28,22 @@ struct Tile {
     static constexpr int consumers = Rows * Cols / (warp_size * warp_cols);
     static constexpr int threads = (consumers + 2) * warp_size;
     static constexpr int stage_bytes = (Rows + Cols) * group_size;
+    static constexpr int copy_batch = CopyBatch;
+    static constexpr int copy_slots = Copies / CopyBatch;
     static constexpr int accum_cols = Rows == 64 ? Cols / 2 : Cols;
     static constexpr int tmem_cols = accum_stages * Batch * accum_cols;
     static constexpr int store_width = 8;
 
     static_assert(Rows == 128 || (Rows == 64 && Cols == 128));
     static_assert(group_size % 32 == 0 && (group_size % Cols == 0 || wide));
+    static_assert(Copies % CopyBatch == 0);
     static_assert(tmem_cols >= 32 && tmem_cols <= 512 && (tmem_cols & (tmem_cols - 1)) == 0);
 };
 
 template <class Config>
 struct Pipeline {
-    unsigned long long copy_ready[Config::copies];
-    unsigned long long copy_empty[Config::copies];
+    unsigned long long copy_ready[Config::copy_slots];
+    unsigned long long copy_empty[Config::copy_slots];
     unsigned long long accum_ready[accum_stages];
     unsigned long long accum_empty[accum_stages];
     unsigned tmem;
@@ -82,17 +85,23 @@ __device__ void copy_tile(const CUtensorMap* map, unsigned shared, unsigned barr
 template <class Config>
 __device__ void produce_tiles(Pipeline<Config>& pipe, unsigned shared, const CUtensorMap* input,
                               const CUtensorMap* weight, int row_base, int col_base, int groups) {
-    for (int group = 0; group < groups; ++group) {
-        const int slot = group % Config::copies;
+    for (int group = 0; group < groups; group += Config::copy_batch) {
+        const int slot = (group % Config::copies) / Config::copy_batch;
         if (group >= Config::copies) {
             wait_barrier(&pipe.copy_empty[slot], (group / Config::copies - 1) % 2);
         }
+        const int remaining = groups - group;
+        const int count = remaining < Config::copy_batch ? remaining : Config::copy_batch;
         const unsigned barrier = shared_address(&pipe.copy_ready[slot]);
         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-                     :: "r"(barrier), "r"(Config::stage_bytes) : "memory");
-        const unsigned start = shared + slot * Config::stage_bytes;
-        copy_tile(input, start, barrier, group * group_size, row_base);
-        copy_tile(weight, start + Config::rows * group_size, barrier, group * group_size, col_base);
+                     :: "r"(barrier), "r"(count * Config::stage_bytes) : "memory");
+        for (int offset = 0; offset < count; ++offset) {
+            const unsigned start =
+                shared + (slot * Config::copy_batch + offset) * Config::stage_bytes;
+            const int position = (group + offset) * group_size;
+            copy_tile(input, start, barrier, position, row_base);
+            copy_tile(weight, start + Config::rows * group_size, barrier, position, col_base);
+        }
     }
 }
 
@@ -112,13 +121,16 @@ __device__ void multiply_tiles(Pipeline<Config>& pipe, unsigned shared, int grou
                                      accumulator_f32;
     for (int group = 0; group < groups; ++group) {
         const int stage = group % Config::copies;
+        const int copy_slot = stage / Config::copy_batch;
         const int batch = group / Config::batch;
         const int accum = group % (accum_stages * Config::batch);
         if (batch >= accum_stages && group % Config::batch == 0) {
             wait_barrier(&pipe.accum_empty[batch % accum_stages], (batch / accum_stages - 1) % 2);
         }
-        wait_barrier(&pipe.copy_ready[stage], (group / Config::copies) % 2);
-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        if (group % Config::copy_batch == 0) {
+            wait_barrier(&pipe.copy_ready[copy_slot], (group / Config::copies) % 2);
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        }
         const unsigned start = shared + stage * Config::stage_bytes;
         const unsigned destination = pipe.tmem + accum * Config::accum_cols;
         #pragma unroll
@@ -140,7 +152,9 @@ __device__ void multiply_tiles(Pipeline<Config>& pipe, unsigned shared, int grou
                                 "r"(instruction), "r"(chunk) : "memory");
             }
         }
-        commit_mma(&pipe.copy_empty[stage]);
+        if (group % Config::copy_batch == Config::copy_batch - 1 || group == groups - 1) {
+            commit_mma(&pipe.copy_empty[copy_slot]);
+        }
         if (group % Config::batch == Config::batch - 1 || group == groups - 1) {
             commit_mma(&pipe.accum_ready[batch % accum_stages]);
         }
@@ -277,7 +291,7 @@ void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
     }
     const unsigned shared = shared_address(tiles);
     if (threadIdx.x == 0) {
-        for (int slot = 0; slot < Config::copies; ++slot) {
+        for (int slot = 0; slot < Config::copy_slots; ++slot) {
             init_barrier(&pipe.copy_ready[slot], 1);
             init_barrier(&pipe.copy_empty[slot], 1);
         }
@@ -533,6 +547,13 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
     const auto status = tma_device(stream, device);
     if (status != cudaSuccess) {
         return status;
+    }
+    if (rows == 1024 && out_width == 5120 && in_width == 17408) {
+        const auto paired = launch_tma<Tile<128, 128, 6, 2, 1, 2>>(
+            weight, weight_scales, input, rows, out_width, in_width, output, stream, device, 8);
+        if (paired) {
+            return paired;
+        }
     }
     const bool narrow_high_k = in_width >= 8192 && rows < 1024;
     if ((rows <= 64 && out_width >= 4096) || narrow_high_k) {

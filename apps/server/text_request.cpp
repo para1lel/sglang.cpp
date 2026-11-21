@@ -223,6 +223,24 @@ void set_constraint(const json::Object& object, const CompletionTokenizer& token
     }
 }
 
+int openai_logprob_count(const json::Object& object, bool chat) {
+    const auto* enabled = json::get(object, "logprobs");
+    const auto* count = chat ? json::get(object, "top_logprobs") : enabled;
+    const auto top = count && !count->is_null() ? count->unsigned_integer()
+                                               : std::optional<std::uint64_t>{0};
+    if (!top || *top > decoder_max_generated_top_logprobs) {
+        bad_request(chat ? "Expected integer top_logprobs in [0, 20]"
+                         : "Expected integer logprobs in [0, 20]");
+    }
+    if (chat) {
+        return read_bool(object, "logprobs") ? static_cast<int>(*top) : -1;
+    }
+    if (read_bool(object, "echo")) {
+        bad_request("Text completions do not support echo");
+    }
+    return enabled && !enabled->is_null() ? static_cast<int>(*top) : -1;
+}
+
 TextRequest text_options(const json::Object& object, const CompletionTokenizer& tokenizer,
                          bool chat) {
     TextRequest request;
@@ -249,6 +267,10 @@ TextRequest text_options(const json::Object& object, const CompletionTokenizer& 
     request.stop_text = stop_text(object);
     set_sampling(object, request.options);
     set_cache_salt(object, request.options);
+    request.options.generated_top_logprobs = openai_logprob_count(object, chat);
+    if (request.options.generated_top_logprobs >= 0 && request.options.samples()) {
+        bad_request("Generated logprobs require greedy sampling");
+    }
     return request;
 }
 
@@ -264,6 +286,9 @@ void finish_options(TextRequest& request, const json::Object& object,
             chat_token_limit - static_cast<int>(request.prompt.size());
     }
     set_constraint(object, tokenizer, request.options);
+    if (request.options.generated_top_logprobs >= 0 && request.options.constraint) {
+        bad_request("Generated logprobs do not support response constraints");
+    }
     if (request.options.constraint && !request.stop_text.empty()) {
         bad_request("Text stops cannot be combined with a response constraint");
     }
@@ -322,7 +347,7 @@ std::vector<int> completion_prompt(const json::Value& input, bool text, int max_
 bool is_text_option(std::string_view key) {
     return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
         key == "ignore_eos" || key == "stop_token_ids" || key == "stop" ||
-        key == "return_token_ids" ||
+        key == "return_token_ids" || key == "logprobs" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
         key == "min_p" || key == "ebnf" || key == "regex" || key == "response_format" ||
         key == "cache_salt";
@@ -331,7 +356,7 @@ bool is_text_option(std::string_view key) {
 TextCompletionRequest parse_text(const json::Object& object,
                                  const CompletionTokenizer& tokenizer) {
     for (const auto& [key, value] : object) {
-        if (key != "prompt" && key != "n" && !is_text_option(key)) {
+        if (key != "prompt" && key != "n" && key != "echo" && !is_text_option(key)) {
             throw std::invalid_argument("Unsupported text completion option: " + key);
         }
     }
@@ -397,7 +422,7 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
         } else if ((key == "temperature" || key == "top_p" || key == "top_k" ||
                     key == "min_p" || key == "seed") && value.is_null()) {
             continue;
-        } else if (is_text_option(key)) {
+        } else if (is_text_option(key) || key == "top_logprobs") {
             options.emplace(key, value);
         } else if (key == "max_completion_tokens") {
             if (!value.is_null()) {
@@ -821,6 +846,9 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
     normalize_template_options(normalized);
     const auto options = chat_text_options(normalized, media.has_value());
     auto request = text_options(options, tokenizer, true);
+    if (media && request.options.generated_top_logprobs >= 0) {
+        bad_request("Generated logprobs do not support decoded media chat");
+    }
     const auto tools = chat_tools(normalized);
     const auto prompt = tokenizer.chat_template().render(normalized, ChatInput::http, tools);
     validate_prompt(prompt);
@@ -839,6 +867,9 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
     }
     finish_options(request, options, tokenizer);
     set_chat_output(request, normalized, prompt, tokenizer, tools);
+    if (request.options.generated_top_logprobs >= 0 && request.chat_output.enabled()) {
+        bad_request("Generated logprobs do not support chat reasoning or tool output parsers");
+    }
     return request;
 }
 

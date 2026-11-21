@@ -1,0 +1,213 @@
+"""Exercise generated logprobs through the OpenAI routes with a scripted decoder."""
+
+import argparse
+from collections import defaultdict
+from contextlib import closing
+import json
+import os
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+
+from test_native_chat import request
+from test_native_text import event, legacy, stream_options
+from test_sampling_routes_cpu import CHAT, TEXT, body, server
+
+
+class OpenAILogprobs(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        scripts = cls.output / "scripted-scores.txt"
+        scripts.write_text("11 32 33 34 35 36\n12 172 254 106 115 5513\n", encoding="ascii")
+        cls.enterClassContext(patch.dict(os.environ, SGLANG_TEST_CHAT_OUTPUT_IDS=str(scripts),
+                                         SGLANG_TEST_SCRIPTED_MTP="1"))
+        cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint,
+                                               cls.output / "scores.log", "--max-active", "4",
+                                               sampling=False))
+
+    def payload(self, route, top=3, **options):
+        score = {"logprobs": top} if route == TEXT else {
+            "logprobs": True, "top_logprobs": top,
+        }
+        defaults = {"temperature": 0, "ignore_eos": True, "max_tokens": 5}
+        return body(route, **(defaults | score | options))
+
+    def exchange(self, route, payload, port=None, status=200):
+        connection, response = request(port or self.port, route, payload)
+        with closing(connection), response:
+            self.assertEqual(response.status, status, (route, payload))
+            if status == 200 and payload.get("stream"):
+                self.assertEqual(response.headers.get_content_type(), "text/event-stream")
+                frames = list(iter(lambda: event(response), "[DONE]"))
+                self.assertEqual(response.read(), b"")
+                return frames
+            self.assertEqual(response.headers.get_content_type(), "application/json")
+            return json.load(response)
+
+    def pair(self, route, payload, port=None):
+        answer = self.exchange(route, payload, port)
+        frames = self.exchange(route, payload | stream_options(), port)
+        self.assertEqual(frames[-1], {**frames[-1], "choices": [], "usage": answer["usage"]})
+        grouped = defaultdict(list)
+        for frame in frames[:-1]:
+            for choice in frame["choices"]:
+                grouped[choice["index"]].append(choice)
+        self.assertEqual(sorted(grouped), list(range(len(answer["choices"]))))
+        for choice in answer["choices"]:
+            chunks = grouped[choice["index"]]
+            self.assertEqual(chunks[-1]["finish_reason"], choice["finish_reason"])
+            self.assertIsNone(chunks[-1]["logprobs"])
+            self.assertTrue(all(chunk["finish_reason"] is None for chunk in chunks[:-1]))
+            self.assertEqual([token for chunk in chunks for token in chunk.get("token_ids", [])],
+                             choice.get("token_ids", []))
+            rows = [chunk["logprobs"] for chunk in chunks if chunk["logprobs"] is not None]
+            for field, expected in choice["logprobs"].items():
+                self.assertEqual([entry for row in rows for entry in row[field]], expected)
+            if route == CHAT:
+                self.assertEqual(chunks[0]["delta"], {"role": "assistant"})
+                self.assertIsNone(chunks[0]["logprobs"])
+                text = "".join(chunk["delta"].get("content") or "" for chunk in chunks)
+                self.assertEqual(text, choice["message"]["content"] or "")
+            else:
+                self.assertEqual("".join(chunk["text"] for chunk in chunks), choice["text"])
+        return answer, grouped
+
+    def selected(self, route, choice):
+        scores = choice["logprobs"]
+        if route == TEXT:
+            return scores["token_logprobs"]
+        return [row["logprob"] for row in scores["content"]]
+
+    def visible(self, route, choice):
+        return choice["text"] if route == TEXT else choice["message"]["content"] or ""
+
+    def test_indexed_prompt_forms_and_top_twenty(self):
+        for scalar, batch in (("Test", ["Test", "Several extra words"]),
+                              ([32], [[32], [33, 34, 35]])):
+            with self.subTest(prompt=batch):
+                many, _ = self.pair(TEXT, self.payload(TEXT, top=20, prompt=batch))
+                first, _ = self.pair(TEXT, self.payload(TEXT, top=20, prompt=scalar))
+                self.assertEqual(first["choices"][0]["logprobs"], many["choices"][0]["logprobs"])
+                expected_usage = 0
+                for index, prompt in enumerate(batch):
+                    single = self.exchange(TEXT, self.payload(TEXT, top=20, prompt=prompt))
+                    choice = many["choices"][index]
+                    reference = single["choices"][0]
+                    for field in ("text", "token_ids", "logprobs", "finish_reason"):
+                        self.assertEqual(choice[field], reference[field])
+                    expected_usage += single["usage"]["prompt_tokens"]
+                    self.assertEqual(choice["logprobs"]["text_offset"], [-1] * 5)
+                    for selected, alternatives in zip(self.selected(TEXT, choice),
+                                                      choice["logprobs"]["top_logprobs"]):
+                        self.assertEqual(sorted(alternatives.values(), reverse=True),
+                                         [selected - rank for rank in range(20)])
+                self.assertNotEqual(many["choices"][0]["token_ids"],
+                                    many["choices"][1]["token_ids"])
+                self.assertEqual(many["usage"]["prompt_tokens"], expected_usage)
+                self.assertEqual(many["usage"]["completion_tokens"], 10)
+
+    def test_chat_and_completion_bytes_and_stops(self):
+        for route in (TEXT, CHAT):
+            with self.subTest(route=route):
+                answer, chunks = self.pair(route, self.payload(route, top=20, seed=12))
+                choice = answer["choices"][0]
+                self.assertEqual(choice["token_ids"], [172, 254, 106, 115, 5513])
+                self.assertEqual(self.visible(route, choice), "𠮷�")
+                self.assertEqual(self.selected(route, choice), [-0.25, -0.5, -0.75, -1, -1.25])
+                self.assertEqual(sum(chunk["logprobs"] is not None for chunk in chunks[0]), 5)
+                if route == CHAT:
+                    rows = choice["logprobs"]["content"]
+                    self.assertEqual([row["bytes"] for row in rows],
+                                     [[240], [160], [174], [183], [239, 191, 189]])
+                    self.assertEqual([row["token"] for row in rows], ["�"] * 5)
+                    for row in rows:
+                        self.assertEqual([score["logprob"] for score in row["top_logprobs"]],
+                                         [row["logprob"] - rank for rank in range(20)])
+                else:
+                    self.assertEqual(choice["logprobs"]["tokens"], ["ð", "\xa0", "®", "·", "�"])
+
+                for options, count in (({"stop": "BC"}, 3),
+                                       ({"stop_token_ids": [33], "ignore_eos": False}, 2)):
+                    with self.subTest(route=route, stops=options):
+                        answer, chunks = self.pair(route, self.payload(
+                            route, seed=11, return_token_ids=False, **options))
+                        choice = answer["choices"][0]
+                        self.assertNotIn("token_ids", choice)
+                        self.assertEqual(choice["finish_reason"], "stop")
+                        self.assertEqual(self.visible(route, choice), "A")
+                        self.assertEqual(answer["usage"]["completion_tokens"], count)
+                        self.assertEqual(self.selected(route, choice),
+                                         [-0.25 * index for index in range(1, count + 1)])
+                        hidden_scores = [chunk for chunk in chunks[0] if chunk["logprobs"] and
+                                         not (chunk["text"] if route == TEXT else
+                                              chunk["delta"].get("content"))]
+                        self.assertEqual(len(hidden_scores), count - 1)
+
+    def test_selected_only_empty_and_greedy_top_k_one(self):
+        for route in (TEXT, CHAT):
+            for budget in (0, 2):
+                with self.subTest(route=route, budget=budget):
+                    answer, _ = self.pair(route, self.payload(
+                        route, top=0, max_tokens=budget, temperature=1, top_k=1, seed=11))
+                    choice = answer["choices"][0]
+                    self.assertEqual(choice["token_ids"], [32, 33][:budget])
+                    self.assertEqual(self.selected(route, choice), [-0.25, -0.5][:budget])
+                    self.assertEqual(answer["usage"]["completion_tokens"], budget)
+                    rows = choice["logprobs"]
+                    if route == TEXT:
+                        self.assertEqual(rows["top_logprobs"], [])
+                    else:
+                        self.assertTrue(all(row["top_logprobs"] == [] for row in rows["content"]))
+
+    def test_validation_opt_out_and_frozen_legacy(self):
+        for route, invalid in (
+            (TEXT, ({"logprobs": False}, {"logprobs": -1}, {"logprobs": 21},
+                    {"logprobs": 1.5}, {"echo": True}, {"n": 2}, {"regex": "A+"},
+                    {"temperature": .5})),
+            (CHAT, ({"logprobs": 1}, {"top_logprobs": -1}, {"top_logprobs": 21},
+                    {"top_logprobs": 1.5}, {"n": 2}, {"regex": "A+"}, {"temperature": .5})),
+        ):
+            for options in invalid:
+                with self.subTest(route=route, options=options):
+                    answer = self.exchange(route, self.payload(route, stream=True, **options),
+                                           status=400)
+                    self.assertTrue(answer["error"]["message"])
+            plain = self.payload(route, logprobs=None if route == TEXT else False)
+            for answer in (self.exchange(route, plain),
+                           *self.exchange(route, plain | stream_options())):
+                self.assertTrue(all("logprobs" not in choice for choice in answer["choices"]))
+        accepted = self.exchange(TEXT, legacy([32, 33], 2))
+        self.assertEqual(accepted[-1]["usage"]["completion_tokens"], 2)
+        rejected = self.exchange(TEXT, legacy([32, 33], 2, logprobs=0), status=400)
+        self.assertIn("frozen benchmark", rejected["error"]["message"])
+
+    def test_speculative_boundary(self):
+        log = self.output / "scores-mtp.log"
+        with server(self.binary, self.checkpoint, log, "--max-active", "2", "--mtp-steps", "3",
+                    sampling=False) as port:
+            for route in (TEXT, CHAT):
+                with self.subTest(route=route):
+                    for stream in (False, True):
+                        error = self.exchange(route, self.payload(route, seed=11, stream=stream),
+                                              port, status=400)
+                        self.assertIn("MTP disabled", error["error"]["message"])
+                    plain = self.payload(route, seed=11, stream=True,
+                                         logprobs=None if route == TEXT else False, stop="BC")
+                    chunks = [choice for frame in self.exchange(route, plain, port)
+                              for choice in frame["choices"]]
+                    self.assertEqual(chunks[-1]["finish_reason"], "stop")
+                    self.assertTrue(all("logprobs" not in choice for choice in chunks))
+            self.assertIn("cpu scripted mtp tokens=", log.read_text())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--server", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args, tests = parser.parse_known_args()
+    OpenAILogprobs.binary = args.server.resolve(strict=True)
+    OpenAILogprobs.checkpoint = args.checkpoint.resolve(strict=True)
+    OpenAILogprobs.output = args.output.resolve()
+    OpenAILogprobs.output.mkdir(parents=True, exist_ok=True)
+    unittest.main(argv=[__file__, *tests], verbosity=2)

@@ -39,10 +39,12 @@ void set_cache_salt(const json::Object& object, DecoderOptions& options);
 void append_ids(std::string& output, const int* ids, std::size_t count);
 void complete_text(const Socket& connection, const TextRequest& request,
                    const CompletionTokenizer& tokenizer, const TextGenerator& generate);
+void complete_scored_text(const Socket& connection, const TextRequest& request,
+                          const CompletionTokenizer& tokenizer, BatchService& service, int slot);
 void complete_text_batch(const Socket& connection, TextCompletionRequest completion,
                          const CompletionTokenizer& tokenizer, BatchService& service, int slot);
 void complete_chat_request(const Socket& connection, std::string_view body,
                            const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                           const MediaGenerator& generate_media);
+                           const MediaGenerator& generate_media, BatchService& service, int slot);
 
 }

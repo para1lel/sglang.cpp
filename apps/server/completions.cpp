@@ -221,7 +221,8 @@ void dispatch_completion(const Socket& connection, BatchService& service, int sl
                 return vision->generate(service, slot, prompt, options, callbacks);
             };
         }
-        complete_chat_request(connection, body, *tokenizer, generate, generate_media);
+        complete_chat_request(connection, body, *tokenizer, generate, generate_media,
+                              service, slot);
         return;
     }
     json::Value parsed;
@@ -232,10 +233,12 @@ void dispatch_completion(const Socket& connection, BatchService& service, int sl
     }
     if (const auto* text = tokenizer ? native_text_body(parsed) : nullptr) {
         auto completion = parse_text_request(*text, *tokenizer);
-        if (completion.batch.empty()) {
-            complete_text(connection, completion.request, *tokenizer, generate);
-        } else {
+        if (!completion.batch.empty()) {
             complete_text_batch(connection, std::move(completion), *tokenizer, service, slot);
+        } else if (completion.request.options.generated_top_logprobs >= 0) {
+            complete_scored_text(connection, completion.request, *tokenizer, service, slot);
+        } else {
+            complete_text(connection, completion.request, *tokenizer, generate);
         }
         return;
     }

@@ -44,6 +44,7 @@ struct BatchJob {
 using BatchJobs = std::array<BatchJob, decoder_batch_max_lanes>;
 constexpr auto disconnect_poll = std::chrono::milliseconds(10);
 constexpr auto mailbox_grace = std::chrono::milliseconds(1);
+constexpr int wide_decode_min_ready = 25;
 
 void trace_prefill_rows(const DecoderBatchStepStats& stats, int max_active) {
     std::string line = "batch prefill_rows=";
@@ -107,6 +108,7 @@ struct BatchService::State {
     void process(DecoderBatch& batch);
     std::optional<std::uint64_t> begin_iteration(DecoderBatch& batch);
     std::optional<Jobs> wait_for_jobs();
+    bool wide_decode_ready() const;
     bool prepare(DecoderBatch& batch, int slot, const std::shared_ptr<Job>& job);
     void publish(int slot, Job& job, const DecoderBatchStep& step);
     void record_profile(std::uint64_t epoch, std::uint64_t elapsed, int width,
@@ -210,6 +212,20 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
     changed.notify_all();
 }
 
+bool BatchService::State::wide_decode_ready() const {
+    if (!cuda_graphs || mtp_steps != 0 || max_active != decoder_batch_max_lanes) {
+        return false;
+    }
+    int ready = 0;
+    for (const auto& job : jobs) {
+        if (!job || job->cancelled || !job->prefill_completed) {
+            return false;
+        }
+        ready += job->ready();
+    }
+    return ready >= wide_decode_min_ready;
+}
+
 std::optional<Jobs> BatchService::State::wait_for_jobs() {
     std::unique_lock lock(mutex);
     const auto end = jobs.begin() + max_active;
@@ -222,7 +238,7 @@ std::optional<Jobs> BatchService::State::wait_for_jobs() {
         return job && !job->admitted && !job->cancelled;
     });
     changed.wait_for(lock, mailbox_grace, [&] {
-        return closing || reset_pending ||
+        return closing || reset_pending || wide_decode_ready() ||
                std::all_of(jobs.begin(), end, [admitting](const auto& job) {
                    return job ? job->ready() : !admitting;
                });
@@ -279,9 +295,9 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
 
 void BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& step) {
     if (step.token && !job.cancelled) {
+        const bool first_token = !std::exchange(job.prefill_completed, true);
         if (counters.cache_capacity != 0) {
-            if (!job.prefill_completed) {
-                job.prefill_completed = true;
+            if (first_token) {
                 counters.prompt_tokens += job.prompt_tokens;
                 ++counters.prefill_requests;
             }

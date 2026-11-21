@@ -396,8 +396,9 @@ DecodeGraphs& DecodeGraphs::operator=(DecodeGraphs&&) noexcept = default;
 
 namespace {
 
-ExactGqaWorkspace singleton_scores(Allocations& execution, const ForwardLane& lane) {
-    if (lane.position < singleton_score_min_visible - 1 ||
+ExactGqaWorkspace singleton_scores(Allocations& execution, const ForwardLane& lane,
+                                   int minimum_visible) {
+    if (lane.position < minimum_visible - 1 ||
         lane.position >= singleton_score_max_visible) {
         return {};
     }
@@ -415,6 +416,19 @@ ExactGqaWorkspace singleton_scores(Allocations& execution, const ForwardLane& la
         scores.capacity = pages * mxfp8_page_size;
     }
     return scores;
+}
+
+void prepare_eager_scores(Allocations& execution, ForwardLane* lanes, int count,
+                          std::uint64_t score_rows) {
+    for (int index = 0; index < count; ++index) {
+        if ((score_rows >> index & 1) == 0) {
+            continue;
+        }
+        auto& lane = lanes[index];
+        const int inline_capacity =
+            lane.request->work.gqa_scores(text_attention_max_tokens).capacity;
+        lane.singleton_scores = singleton_scores(execution, lane, inline_capacity + 1);
+    }
 }
 
 bool replay_narrow(const DecoderModel& model, Allocations& execution, DecodeGraphs& graphs,
@@ -470,8 +484,9 @@ DecodeRun run_narrow(const DecoderModel& model, Allocations& execution, DecodeGr
     const auto stream = execution.stream();
     auto& first = lanes[0];
     first.narrow_gqa = count == 1 && options.narrow_allowed && first.rotary_position == -1;
-    first.singleton_scores = first.narrow_gqa && first.mode == TextGdnMode::decode
-        ? singleton_scores(execution, first) : ExactGqaWorkspace{};
+    if (first.narrow_gqa && first.mode == TextGdnMode::decode) {
+        first.singleton_scores = singleton_scores(execution, first, singleton_score_min_visible);
+    }
     const bool graph = options.cuda_graphs && options.graph_step &&
         count <= decoder_batch_max_graph_lanes && replay_narrow(model, execution, graphs, lanes,
                                                                 count);
@@ -571,6 +586,9 @@ DecodeRun run_decode_lanes(const DecoderModel& model, Allocations& execution,
     DecodeRun run;
     if (count == 0) {
         return run;
+    }
+    if (options.eager_score_rows) {
+        prepare_eager_scores(execution, lanes, count, options.eager_score_rows);
     }
     if (options.packed && count >= packed_decode_min_lanes &&
         run_packed(model, execution, graphs, lanes, count, options, run)) {

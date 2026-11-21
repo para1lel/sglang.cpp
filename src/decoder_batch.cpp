@@ -645,6 +645,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     const int max_rows = *std::max_element(rows.begin(), rows.end());
     bool text_decode = max_rows == 0;
     std::uint64_t greedy_winners = 0;
+    std::uint64_t final_text_rows = 0;
     int count = 0;
     for (int slot = 0; slot < options.max_lanes; ++slot) {
         if (!selected[slot] || !slots[slot] || !slots[slot]->request) {
@@ -685,6 +686,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             work[count - 1].packed = plain;
             work[count - 1].long_gqa =
                 plain && model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+            const bool final_text = rows[slot] == 1 && remaining == 1 && !lane.media;
+            final_text_rows |= std::uint64_t{final_text} << packed_slots[slot];
             if (plain && !lane.sampling && !lane.options.requires_target_only() &&
                 !lane.options.constraint && lane.request->memory.transfers().logits.empty()) {
                 greedy_winners |= std::uint64_t{1} << packed_slots[slot];
@@ -694,12 +697,15 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             scoring[slot] = lane.request.get();
         }
     }
+    const bool tensor_core = !contains_mtp &&
+        model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+    const auto eager_score_rows = tensor_core && max_rows > 0
+        ? final_text_rows | (count == 1 && work[0].packed ? std::uint64_t{1} : 0)
+        : 0;
     const auto run = run_decode_lanes(model, execution, storage->decode_graphs, work.data(), count,
                                       {options.cuda_graphs, text_decode && !contains_mtp,
-                                       !contains_mtp && max_rows == 0,
-                                       !contains_mtp &&
-                                           model.fp8_prefill() == Fp8PrefillPolicy::tensor_core,
-                                       greedy_winners});
+                                       !contains_mtp && max_rows == 0, tensor_core,
+                                       greedy_winners, eager_score_rows});
     if (max_rows) prefill(rows, count == 0 && !contains_mtp, stats);
     bool submitted = count != 0 || max_rows > 1;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
@@ -717,11 +723,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         }
     }
     stats.constraint_workspace_bytes = constraint_workspace.bytes();
-    if (contains_mtp) {
-        int next_slot = 0;
-        while (next_slot < options.max_lanes) {
-            speculate_group(speculative, next_slot, results, stats);
-        }
+    for (int next_slot = 0; contains_mtp && next_slot < options.max_lanes;) {
+        speculate_group(speculative, next_slot, results, stats);
     }
     stats.sampling_workspace_bytes = sampling_workspace ? sampling_workspace_bytes() : 0;
     if (stats.verification_lanes == 0 && submitted) {

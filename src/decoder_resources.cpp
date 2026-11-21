@@ -469,7 +469,7 @@ ExactGqaWorkspace Allocations::prepare_singleton_scores() {
             }
             state_->singleton_scores = ExactGqaWorkspace{};
             std::fprintf(stderr, "sglang decoder: Allocate singleton scores: %s, "
-                         "using ordered eager decode for long singletons\n",
+                         "using direct ordered eager attention\n",
                          cudaGetErrorString(error.status));
         }
     }

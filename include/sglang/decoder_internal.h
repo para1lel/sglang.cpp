@@ -555,6 +555,7 @@ struct DecodeRunOptions {
     bool narrow_allowed;
     bool packed;
     std::uint64_t greedy_winners;
+    std::uint64_t eager_score_rows;
 };
 
 // Enqueues one decode step for lanes. ready[index] names the workspace that already holds logits

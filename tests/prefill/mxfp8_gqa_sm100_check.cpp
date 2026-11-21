@@ -144,21 +144,32 @@ void check_reference(const std::vector<__nv_bfloat16>& output) {
     require(maximum < 0.00002, "SM100 rising-max control exceeded the absolute error limit");
 }
 
-void check_graph(cudaGraph_t graph) {
+unsigned check_graph(cudaGraph_t graph) {
     std::size_t count = 0;
     check(cudaGraphGetNodes(graph, nullptr, &count));
     require(count == 5, "Expected five SM100 stream-capture nodes");
     std::array<cudaGraphNode_t, 5> nodes{};
     check(cudaGraphGetNodes(graph, nodes.data(), &count));
     std::array<cudaGraphNodeType, 5> types{};
+    unsigned producer_threads = 0;
     for (std::size_t index = 0; index < count; ++index) {
         check(cudaGraphNodeGetType(nodes[index], &types[index]));
+        if (types[index] == cudaGraphNodeTypeKernel) {
+            cudaKernelNodeParams parameters{};
+            check(cudaGraphKernelNodeGetParams(nodes[index], &parameters));
+            if (parameters.sharedMemBytes != 0) {
+                require(producer_threads == 0, "Expected one SM100 producer");
+                producer_threads = parameters.blockDim.x;
+            }
+        }
     }
     std::sort(types.begin(), types.end());
     const std::array<cudaGraphNodeType, 5> expected{
         cudaGraphNodeTypeKernel, cudaGraphNodeTypeKernel, cudaGraphNodeTypeMemset,
         cudaGraphNodeTypeMemAlloc, cudaGraphNodeTypeMemFree};
     require(types == expected, "Unexpected SM100 stream-capture nodes");
+    require(producer_threads != 0, "Missing SM100 producer");
+    return producer_threads;
 }
 
 void check_replay(Mxfp8KvCache cache, Mxfp8PageTable pages, const __nv_bfloat16* queries,
@@ -184,6 +195,88 @@ void check_replay(Mxfp8KvCache cache, Mxfp8PageTable pages, const __nv_bfloat16*
     require(std::memcmp(first.data(), repeated.data(), query_elements * sizeof(*output)) == 0,
             "SM100 graph replay changed after poisoning");
     check_reference(first);
+}
+
+constexpr int tma_position = 8192;
+constexpr int tma_rows = 1024;
+constexpr int tma_pages = (tma_position + tma_rows) / mxfp8_page_size;
+constexpr std::size_t tma_elements = tma_rows * mxfp8_query_heads * channels;
+
+std::vector<__nv_bfloat16> replay_tma_case(
+    const char* mode, unsigned threads, Mxfp8KvCache cache, Mxfp8PageTable pages,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream) {
+    require(setenv("SGLANG_PREFILL_ATTN", mode, 1) == 0, "Could not select SM100 mode");
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    check(decoder::tensor_core_model_prefill_gqa(cache, pages, tma_position, tma_rows,
+                                               queries, output, stream));
+    check(cudaStreamEndCapture(stream, &graph));
+    require(check_graph(graph) == threads, "Unexpected SM100 producer variant");
+    check(cudaGraphInstantiate(&executable, graph, 0));
+    check(cudaGraphDestroy(graph));
+    check(cudaMemsetAsync(output, 0xff, tma_elements * sizeof(*output), stream));
+    check(cudaGraphLaunch(executable, stream));
+    check(cudaStreamSynchronize(stream));
+    check(cudaGraphExecDestroy(executable));
+    std::vector<__nv_bfloat16> result(tma_elements);
+    check(cudaMemcpy(result.data(), output, tma_elements * sizeof(*output),
+                     cudaMemcpyDeviceToHost));
+    return result;
+}
+
+void check_tma(cudaStream_t stream) {
+    constexpr std::size_t payload_bytes = tma_pages * mxfp8_payload_bytes_per_page;
+    constexpr std::size_t scale_bytes = tma_pages * mxfp8_scale_bytes_per_page;
+    Buffer<std::uint8_t> keys(payload_bytes), values(payload_bytes);
+    Buffer<std::uint8_t> key_scales(scale_bytes), value_scales(scale_bytes);
+    Buffer<std::uint8_t> unaligned_scales(scale_bytes + 1);
+    Buffer<int> mapping(tma_pages);
+    Buffer<__nv_bfloat16> queries(tma_elements), output(tma_elements);
+    std::vector<std::uint8_t> payload(payload_bytes), scales(scale_bytes);
+    for (std::size_t index = 0; index < payload.size(); ++index) {
+        payload[index] = static_cast<std::uint8_t>(0x28 + (index ^ (index >> 9)) % 23);
+    }
+    keys.upload(payload);
+    std::reverse(payload.begin(), payload.end());
+    values.upload(payload);
+    for (std::size_t index = 0; index < scales.size(); ++index) {
+        scales[index] = static_cast<std::uint8_t>(123 + index % 7);
+    }
+    key_scales.upload(scales);
+    check(cudaMemcpy(unaligned_scales.data + 1, scales.data(), scale_bytes,
+                     cudaMemcpyHostToDevice));
+    std::reverse(scales.begin(), scales.end());
+    value_scales.upload(scales);
+    std::vector<int> pages(tma_pages);
+    for (int page = 0; page < tma_pages; ++page) {
+        pages[page] = tma_pages - 1 - page;
+    }
+    mapping.upload(pages);
+    std::vector<__nv_bfloat16> host_queries(tma_elements);
+    for (std::size_t index = 0; index < host_queries.size(); ++index) {
+        host_queries[index] = __float2bfloat16(static_cast<float>(index % 13) / 64.0f);
+    }
+    queries.upload(host_queries);
+    Mxfp8KvCache cache{keys.data, values.data, key_scales.data, value_scales.data, tma_pages};
+    const Mxfp8PageTable table{mapping.data, tma_pages};
+    require(unsetenv("SGLANG_PREFILL_ATTN") == 0, "Could not reset SM100 mode");
+    require(!launch_prefill_attn_sm100(cache, table, tma_position, tma_rows,
+                                     queries.data, output.data, stream),
+            "SM100 launcher accepted the default mode");
+    const auto split = replay_tma_case("sm100", 544, cache, table, queries.data,
+                                       output.data, stream);
+    const auto bulk = replay_tma_case("sm100-tma", 576, cache, table, queries.data,
+                                      output.data, stream);
+    require(!sm100_prefill_enabled(), "TMA mode enabled wide SM100 tile planning");
+    require(std::isfinite(__bfloat162float(split.front())), "SM100 split output was nonfinite");
+    require(std::memcmp(split.data(), bulk.data(), tma_elements * sizeof(*output.data)) == 0,
+            "TMA replay differed from SM100 split");
+    cache.key_scales = unaligned_scales.data + 1;
+    const auto fallback = replay_tma_case("sm100-tma", 544, cache, table, queries.data,
+                                          output.data, stream);
+    require(std::memcmp(split.data(), fallback.data(), tma_elements * sizeof(*output.data)) == 0,
+            "TMA scale-alignment fallback differed from SM100 split");
 }
 
 }
@@ -216,6 +309,7 @@ int main() try {
                                      output.data, stream), "SM100 launch accepted unaligned Q");
     check(cudaDeviceSynchronize());
     check_replay(cache, pages, queries.data, output.data, stream);
+    check_tma(stream);
     check(cudaStreamDestroy(stream));
     return 0;
 } catch (const std::exception& error) {

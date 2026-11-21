@@ -65,3 +65,19 @@ Configure the release build with `--mxfp8-gqa-check=y` and build
 `build/bin/mxfp8-gqa-sm100-check` on the reserved GPU. It enables the experimental
 route internally, compares sampled output against FP64 attention, checks graph
 replay, and verifies rejection of undersized page tables and unaligned queries.
+At position 8,192 the check compares the TMA producer and scale-alignment fallback
+against original split across all 6,291,456 BF16 values after poisoned-output graph
+replay. It requires a 576-thread TMA producer and 544-thread split producers. It also
+checks launcher decline with the selector unset and normal tile planning under
+`sm100-tma`. The rising-max FP64 control requires maximum absolute error below
+`2e-5`.
+
+Run the setup fault controls against the same Release archive in the default Pixi
+environment. They interpose on the production launcher's CUDA calls and need no GPU.
+They require split dispatch on recoverable encoder and TMA attribute rejections,
+error propagation before stream work on unexpected failures, and one release with
+the original error returned after a producer launch failure.
+
+```sh
+bash tests/prefill/page128_setup_faults.sh build
+```

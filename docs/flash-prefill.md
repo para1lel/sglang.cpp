@@ -13,9 +13,7 @@
 
 The CLI and C++ default `exact` keeps the original MXFP8 path. With `tensor-core`, set `SGLANG_EXPERIMENTAL_TMEM_PREFILL=ordered` to try ordered TMEM or `1` to try split TMEM. An unset variable or any other value leaves portable dispatch on its regular Flash and fallback routes. Media, MTP, and tensor-core prefix-cache tiles cap at 128 rows.
 
-On SM100, `SGLANG_PREFILL_ATTN=sm100` makes the model's tensor-core prefill try experimental split attention first. If that launcher declines, the portable dispatcher can try the selected TMEM mode. The SM100 launcher accepts up to 8,192 query rows and 262,144 visible tokens. It requires at least 144 rows through 32,768 visible tokens, 16-byte alignment for Q and output, and 32-byte alignment for K and V payloads. On B200, the batch can use 2,048-row tiles for text prompts of at most 32,768 tokens when the tensor-core prefix-cache tile planner is inactive and the request has no MTP draft. The kernel rescales the online softmax whenever its maximum increases and waits for PV completion before accumulator reuse. [Model dispatch](../include/sglang/text/prefill_attn_sm100.h#L22)<!-- prefix: "inline cudaE" --> · [SM100 launcher](../src/text/prefill_attn_sm100.cu#L717)<!-- prefix: "std::optiona" --> · [Batch tile cap](../src/decoder_batch.cpp#L709)<!-- prefix: "const bool w" -->
-
-For ordinary multisplit results, each half of the finish block handles one query head. Each thread rescales positive-mass splits to their largest score, accumulates in FP32 in split order, and writes two adjacent BF16 channels. A combined mass that fails `> 0` yields two positive zeros. The producer writes ordinary single-split results. Protected repair uses the whole finish block. [Merge](../src/text/prefill_attn_sm100.cu#L549)<!-- prefix: "__device__ v" --> · [Finish](../src/text/prefill_attn_sm100.cu#L585)<!-- prefix: "prefill_attn" --> · [Producer output](../src/text/prefill_attn_sm100.cu#L410)<!-- prefix: "__device__ v" -->
+Packed wide Flash remains the default for eligible tensor-core tiles. See [SM100 page-128 split prefill](sm100-page128-prefill.md) for the `sm100` and `sm100-tma` opt-ins.
 
 Regular Flash and both TMEM modes follow the logical page table and process causal 64-key tiles for query-head pairs. QK and PV use BF16 Tensor Core products with FP32 accumulation and online normalization.
 
@@ -62,12 +60,6 @@ Run the [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L714)<!-- prefix: "
 The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L638)<!-- prefix: "void check_p" --> cover the 143/144-row floor, the 191/192/193-row boundary, and parity with unaligned K or V scales. [Partial recovery](../tests/mxfp8_gqa_flash_check.cu#L671)<!-- prefix: "void check_p" --> limits nonfinite outputs to affected channels on the final active row.
 
 The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L568)<!-- prefix: "void check_l" --> check the 32,768/32,769 partial-tile boundary, the 131,072-token cap, causality, and overflow recovery. At 32,768 visible tokens, ordered TMEM preserves BF16 output with unaligned scales. Its 32,769-token control checks bitwise parity between wide Flash and synchronous Flash with unaligned scales.
-
-Build `mxfp8-gqa-sm100-check` with `--mxfp8-gqa-check=y` in the SM100 Release build and run it on the reserved B200. The check enables the experimental launcher itself. The rising-max control requires maximum absolute error below 0.00002. The Candidate B rerun measured 2.12333e-06 in that control. See `artifacts/coding-fix-a/final-mxfp8-gqa-sm100.log`. [Build target](../xmake.lua#L202)<!-- prefix: "target(\"mxfp" --> · [Rising-max assertion](../tests/prefill/mxfp8_gqa_sm100_check.cpp#L144)<!-- prefix: "require(maxi" -->
-
-Independent B200 replay matched the previous merge's BF16 bytes across remapped pages, poisoned output, a 193-row tail, and exceptional inputs. The direct four-split finish probe passed FP64 comparison and memcheck.
-
-Paired median CUDA Graph replay time fell 2.26–6.48% for three 1,024-row, three-split shapes. Across six pairs per shape, reductions were 2.13–6.73%. The four single-split medians rose 0.11–1.54%. Timing includes scratch allocation, flag initialization, both kernels, and release. Checkpoint quality and full serving performance require separate qualification. See `artifacts/resume-merge-accept/handoff.md`.
 
 Check ordered and protected fallback bitwise against the ordered FP32 reference for finite scores and quotients. Check FP64 recovery independently. Use the [exact prefill runbook](../tests/prefill/README.md) for the separate `exact` contract.
 

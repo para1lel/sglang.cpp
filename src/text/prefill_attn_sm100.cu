@@ -4,6 +4,8 @@
 #include "sglang/text/mxfp8_gqa_prefill_common.cuh"
 #include "sglang/text/prefill_attn_tcgen05.cuh"
 
+#include <cuda.h>
+#include <cudaTypedefs.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -30,6 +32,10 @@ constexpr int convert_threads = 256;
 constexpr int mma_warp = softmax_warps + convert_threads / 32;
 constexpr int attn_threads = (mma_warp + 1) * 32;
 constexpr int load_depth = 4;
+constexpr int copy_depth = 3;
+constexpr int copy_bytes = slot_bytes / 2;
+constexpr int scale_bytes = tile_keys * mxfp8_groups;
+constexpr int key_copy_channels = copy_bytes / tile_keys;
 constexpr int score_column = 256;
 constexpr int tensor_columns = 512;
 constexpr float score_scale = softmax_scale * 1.4426950408889634f;
@@ -51,7 +57,27 @@ struct alignas(1024) AttnShared {
     Bits tensor;
 };
 
+struct alignas(128) CopySlot {
+    std::uint8_t payload[copy_bytes];
+    std::uint8_t scales[scale_bytes];
+    unsigned long long full;
+    unsigned long long empty;
+};
+
+struct alignas(1024) CopyShared {
+    AttnShared attention;
+    CopySlot slots[copy_depth];
+};
+
+struct CopyMaps {
+    CUtensorMap keys;
+    CUtensorMap values;
+    CUtensorMap key_scales;
+    CUtensorMap value_scales;
+};
+
 constexpr std::size_t attn_smem_bytes = sizeof(AttnShared) + 1024;
+constexpr std::size_t copy_smem_bytes = sizeof(CopyShared) + 1024;
 
 struct AttnPlan {
     Attention request;
@@ -105,10 +131,11 @@ __device__ __forceinline__ int swizzled(int row, int unit) {
     return row * 128 + ((unit ^ (row & 7)) * 16);
 }
 
+template <int Threads>
 __device__ void stage_query(AttnShared& shared, const AttnPlan& plan, const Unit& unit) {
     const int lane = threadIdx.x % 32;
     const int chunk = lane / 8;
-    for (int member = threadIdx.x / 32; member < members; member += attn_threads / 32) {
+    for (int member = threadIdx.x / 32; member < members; member += Threads / 32) {
         const int flat = unit.first_member + member;
         uint4 bits = make_uint4(0, 0, 0, 0);
         bool bad = false;
@@ -287,6 +314,73 @@ __device__ void convert_loop(AttnShared& shared, const AttnPlan& plan, const Uni
             if (sequence + load_depth < total) {
                 issue_load(ring[index], plan, unit, sequence + load_depth, thread);
             }
+        }
+    }
+}
+
+__device__ __forceinline__ void copy_tensor(const CUtensorMap* map, void* destination,
+                                           Bits barrier, int column, int row) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3}], [%4];"
+                 :: "r"(shared_address(destination)), "l"(map), "r"(column), "r"(row),
+                    "r"(barrier) : "memory");
+}
+
+__device__ void copy_loop(CopyShared& shared, const AttnPlan& plan, const Unit& unit,
+                          const CopyMaps& maps) {
+    for (int sequence = 0; sequence < 8 * unit.tiles; ++sequence) {
+        const Item item = item_of(sequence, unit.tiles);
+        const int page = plan.request.pages[unit.first_tile + item.tile];
+        const auto* map = item.value ? &maps.values : &maps.keys;
+        const auto* scales = item.value ? &maps.value_scales : &maps.key_scales;
+        const int channel = unit.kv * channels + (item.value ? 0 : item.part * key_copy_channels);
+        const int row = page * mxfp8_page_size + (item.value ? item.part * 32 : 0);
+        auto& slot = shared.slots[sequence % copy_depth];
+        barrier_wait(shared_address(&slot.empty), ((sequence / copy_depth) & 1) ^ 1);
+        proxy_fence();
+        const Bits barrier = shared_address(&slot.full);
+        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                     :: "r"(barrier), "r"(copy_bytes + scale_bytes) : "memory");
+        copy_tensor(map, slot.payload, barrier, channel, row);
+        copy_tensor(scales, slot.scales, barrier, 0, page * mxfp8_kv_heads + unit.kv);
+    }
+}
+
+__device__ void convert_copies(CopyShared& shared, const AttnPlan& plan, const Unit& unit) {
+    const int thread = threadIdx.x - softmax_warps * 32;
+    const int lane = threadIdx.x % 32;
+    const int total = 8 * unit.tiles;
+    for (int sequence = 0; sequence < total; ++sequence) {
+        const auto item = item_of(sequence, unit.tiles);
+        int key = 0;
+        int group = 0;
+        slot_coordinates(item, thread, key, group);
+        Payload payload{};
+        payload.position = (unit.first_tile + item.tile) * tile_keys + key;
+        auto& source = shared.slots[sequence % copy_depth];
+        barrier_wait(shared_address(&source.full), (sequence / copy_depth) & 1);
+        if (payload.position <= unit.limit) {
+            const auto* packed = reinterpret_cast<const uint4*>(source.payload) + thread * 2;
+            payload.low = packed[0];
+            payload.high = packed[1];
+            payload.scale = source.scales[scale_offset(0, key, 0) + group];
+        }
+        __syncwarp();
+        if (lane == 0) {
+            barrier_arrive(shared_address(&source.empty));
+        }
+        auto& attention = shared.attention;
+        const int slot = sequence % slot_count;
+        barrier_wait(shared_address(&attention.slot_empty[slot]),
+                     ((sequence / slot_count) & 1) ^ 1);
+        if (sequence == slot_count || sequence == total - 4) {
+            named_sync(5, convert_threads);
+        }
+        write_slot(attention.slot[slot], payload, plan, unit, sequence, thread);
+        proxy_fence();
+        __syncwarp();
+        if (lane == 0) {
+            barrier_arrive(shared_address(&attention.slot_full[slot]));
         }
     }
 }
@@ -505,8 +599,10 @@ __device__ void init_barriers(AttnShared& shared) {
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 
-__global__ void __launch_bounds__(attn_threads, 1)
-prefill_attn_kernel(const __grid_constant__ AttnPlan plan) {
+template <bool Bulk>
+__global__ void __launch_bounds__(attn_threads + (Bulk ? 32 : 0), 1)
+prefill_attn_kernel(const __grid_constant__ AttnPlan plan,
+                    const __grid_constant__ CopyMaps maps) {
     extern __shared__ std::uint8_t raw[];
     auto& shared = *reinterpret_cast<AttnShared*>(
         (reinterpret_cast<std::uintptr_t>(raw) + 1023) & ~std::uintptr_t{1023});
@@ -524,8 +620,16 @@ prefill_attn_kernel(const __grid_constant__ AttnPlan plan) {
     }
     if (threadIdx.x == 32) {
         init_barriers(shared);
+        if constexpr (Bulk) {
+            auto& copies = *reinterpret_cast<CopyShared*>(&shared);
+            for (auto& slot : copies.slots) {
+                barrier_init(shared_address(&slot.full), 1);
+                barrier_init(shared_address(&slot.empty), convert_threads / 32);
+            }
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        }
     }
-    stage_query(shared, plan, unit);
+    stage_query<attn_threads + (Bulk ? 32 : 0)>(shared, plan, unit);
     proxy_fence();
     tensor_before_sync();
     __syncthreads();
@@ -534,9 +638,17 @@ prefill_attn_kernel(const __grid_constant__ AttnPlan plan) {
     if (warp < softmax_warps) {
         softmax_loop(shared, plan, unit, tensor);
     } else if (warp < mma_warp) {
-        convert_loop(shared, plan, unit);
+        if constexpr (Bulk) {
+            convert_copies(*reinterpret_cast<CopyShared*>(&shared), plan, unit);
+        } else {
+            convert_loop(shared, plan, unit);
+        }
     } else if (threadIdx.x % 32 == 0) {
-        mma_loop(shared, unit, tensor);
+        if (warp == mma_warp) {
+            mma_loop(shared, unit, tensor);
+        } else if constexpr (Bulk) {
+            copy_loop(*reinterpret_cast<CopyShared*>(&shared), plan, unit, maps);
+        }
     }
     tensor_before_sync();
     __syncthreads();
@@ -692,7 +804,7 @@ cudaError_t prepare_device(int device, int& sms) {
     const bool eligible = major == 10 && minor == 0 && pools && multiprocessors > 0 &&
                           optin >= static_cast<int>(attn_smem_bytes);
     if (eligible) {
-        const auto status = cudaFuncSetAttribute(prefill_attn_kernel,
+        const auto status = cudaFuncSetAttribute(prefill_attn_kernel<false>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(attn_smem_bytes));
         if (status != cudaSuccess) {
             return status;
@@ -707,6 +819,91 @@ bool aligned(const void* pointer, std::size_t alignment) {
     return pointer && reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
 }
 
+cudaError_t copy_encode_failure(CUresult status) {
+    switch (status) {
+        case CUDA_ERROR_INVALID_VALUE:
+        case CUDA_ERROR_NOT_SUPPORTED: return cudaSuccess;
+        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
+        case CUDA_ERROR_CONTEXT_IS_DESTROYED: return cudaErrorContextIsDestroyed;
+        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
+        case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
+        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
+        case CUDA_ERROR_ILLEGAL_ADDRESS: return cudaErrorIllegalAddress;
+        case CUDA_ERROR_LAUNCH_FAILED: return cudaErrorLaunchFailure;
+        default: return cudaErrorUnknown;
+    }
+}
+
+cudaError_t decline_copies(cudaError_t rejected) {
+    const auto pending = cudaGetLastError();
+    return pending == rejected ? cudaSuccess : pending;
+}
+
+cudaError_t prepare_copies(const Mxfp8KvCache& cache, int device, CopyMaps& maps, bool& bulk) {
+    if (!aligned(cache.key_scales, 16) || !aligned(cache.value_scales, 16) ||
+        cache.page_count > INT_MAX / mxfp8_page_size) {
+        return cudaSuccess;
+    }
+    int optin = 0;
+    auto status = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status != cudaSuccess || optin < static_cast<int>(copy_smem_bytes)) {
+        return status;
+    }
+    if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) {
+        return pending;
+    }
+    void* entry = nullptr;
+    status = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &entry, 12000,
+                                              cudaEnableDefault, nullptr);
+    if (status == cudaErrorNotSupported) {
+        return decline_copies(status);
+    }
+    if (status != cudaSuccess || !entry) {
+        return status;
+    }
+    const auto encode = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(entry);
+    constexpr cuuint64_t stride[] = {mxfp8_kv_heads * channels};
+    const cuuint64_t shape[] = {
+        stride[0], static_cast<cuuint64_t>(cache.page_count) * mxfp8_page_size};
+    constexpr cuuint32_t elements[] = {1, 1};
+    constexpr cuuint32_t key_box[] = {key_copy_channels, tile_keys};
+    constexpr cuuint32_t value_box[] = {channels, 32};
+    constexpr cuuint64_t scale_stride[] = {scale_bytes / 4};
+    const cuuint64_t scale_shape[] = {
+        scale_stride[0], static_cast<cuuint64_t>(cache.page_count) * mxfp8_kv_heads};
+    constexpr cuuint64_t scale_bytes_stride[] = {scale_bytes};
+    constexpr cuuint32_t scale_box[] = {scale_bytes / 4, 1};
+    CUresult encoded = CUDA_SUCCESS;
+    const auto encode_map = [&](CUtensorMap& map, std::uint8_t* data, CUtensorMapDataType type,
+                                const cuuint64_t* dimensions, const cuuint64_t* strides,
+                                const cuuint32_t* box) {
+        if (encoded == CUDA_SUCCESS) {
+            encoded = encode(&map, type, 2, data, dimensions, strides, box,
+                             elements, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                             CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        }
+    };
+    encode_map(maps.keys, cache.key_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8, shape, stride, key_box);
+    encode_map(maps.values, cache.value_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+               shape, stride, value_box);
+    encode_map(maps.key_scales, cache.key_scales, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+               scale_shape, scale_bytes_stride, scale_box);
+    encode_map(maps.value_scales, cache.value_scales, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+               scale_shape, scale_bytes_stride, scale_box);
+    if (encoded != CUDA_SUCCESS) {
+        return copy_encode_failure(encoded);
+    }
+    status = cudaFuncSetAttribute(prefill_attn_kernel<true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  static_cast<int>(copy_smem_bytes));
+    if (status == cudaErrorInvalidValue || status == cudaErrorNotSupported ||
+        status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice) {
+        return decline_copies(status);
+    }
+    bulk = status == cudaSuccess;
+    return status;
+}
+
 }
 
 bool sm100_prefill_enabled() {
@@ -718,7 +915,8 @@ std::optional<cudaError_t> launch_prefill_attn_sm100(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream) {
     const char* setting = std::getenv("SGLANG_PREFILL_ATTN");
-    if (!setting || std::string_view(setting) != "sm100" || rows == 0) {
+    const std::string_view mode = setting ? setting : "";
+    if ((mode != "sm100" && mode != "sm100-tma") || rows == 0) {
         return std::nullopt;
     }
     if (position < 0 || rows < 0 || position > INT_MAX - rows) {
@@ -751,6 +949,14 @@ std::optional<cudaError_t> launch_prefill_attn_sm100(
     if (sms == 0) {
         return std::nullopt;
     }
+    CopyMaps maps{};
+    bool bulk = false;
+    if (mode == "sm100-tma" && rows == flash_chunk &&
+        position >= 8192 && position % tile_keys == 0) {
+        if (const auto status = prepare_copies(cache, device, maps, bulk); status != cudaSuccess) {
+            return status;
+        }
+    }
     AttnPlan plan{};
     plan.request = Attention{cache, pages.device_pages, position, queries, output};
     plan.rows = rows;
@@ -774,11 +980,13 @@ std::optional<cudaError_t> launch_prefill_attn_sm100(
     plan.partial = plan.splits > 1 ?
         reinterpret_cast<float*>(bytes + 256 + flag_bytes + stats_bytes) : nullptr;
     status = cudaMemsetAsync(plan.bad_key, 0x7f, mxfp8_kv_heads * sizeof(int), stream);
-    void* args[] = {&plan};
+    void* args[] = {&plan, &maps};
     if (status == cudaSuccess) {
-        status = cudaLaunchKernel(reinterpret_cast<const void*>(prefill_attn_kernel),
-                                  dim3(static_cast<unsigned>(units)), dim3(attn_threads),
-                                  args, attn_smem_bytes, stream);
+        const auto kernel = bulk ? prefill_attn_kernel<true> : prefill_attn_kernel<false>;
+        status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel),
+                                  dim3(static_cast<unsigned>(units)),
+                                  dim3(attn_threads + (bulk ? 32 : 0)), args,
+                                  bulk ? copy_smem_bytes : attn_smem_bytes, stream);
     }
     if (status == cudaSuccess) {
         status = cudaLaunchKernel(reinterpret_cast<const void*>(prefill_attn_finish),

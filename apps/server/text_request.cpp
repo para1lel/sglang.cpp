@@ -512,14 +512,18 @@ TextRequest parse_text_request(const json::Object& body, const CompletionTokeniz
     return parse_text(body, tokenizer);
 }
 
-GenerateRequest parse_generate_request(std::string_view body,
-                                       const CompletionTokenizer& tokenizer) {
-    const auto parsed = parse_body(body, json::Syntax::strict);
-    const auto* object = parsed.object();
-    if (!object) {
-        bad_request("Expected a JSON object for /generate");
+namespace {
+
+void set_cache_salt_value(const json::Value& value, DecoderOptions& options) {
+    const auto salt = value.string();
+    if (!salt || salt->size() > decoder_prefix_max_salt_bytes) {
+        bad_request("Expected a cache_salt string of up to 256 bytes");
     }
-    for (const auto& [key, value] : *object) {
+    options.prefix_cache_salt = *salt;
+}
+
+void validate_generate_fields(const json::Object& object) {
+    for (const auto& [key, value] : object) {
         if (key == "text" || key == "input_ids" || key == "sampling_params" ||
             key == "stream" || key == "cache_salt") {
             continue;
@@ -532,22 +536,21 @@ GenerateRequest parse_generate_request(std::string_view body,
         }
         throw std::invalid_argument("Unsupported /generate field: " + key);
     }
+}
 
-    GenerateRequest request;
-    request.options.max_new_tokens = 128;
-    request.options.temperature = 1.0;
-    if (const auto* stream = json::get(*object, "stream"); stream && !stream->is_null()) {
-        request.stream = read_bool(*object, "stream");
-    }
+DecoderOptions generate_options(const json::Value* params, const json::Value* salt) {
+    DecoderOptions options;
+    options.max_new_tokens = 128;
+    options.temperature = 1.0;
     json::Object sampling;
-    if (const auto* value = json::get(*object, "sampling_params"); value && !value->is_null()) {
-        const auto* params = value->object();
-        if (!params) {
+    if (params && !params->is_null()) {
+        const auto* object = params->object();
+        if (!object) {
             bad_request("Expected one sampling_params object");
         }
-        for (const auto& [key, parameter] : *params) {
+        for (const auto& [key, parameter] : *object) {
             if (key == "max_new_tokens") {
-                request.options.max_new_tokens = text_budget(parameter,
+                options.max_new_tokens = text_budget(parameter,
                     "Expected a finite nonnegative integer sampling_params.max_new_tokens");
             } else if (key == "n") {
                 if (!parameter.is_null() && parameter.unsigned_integer() != 1) {
@@ -564,28 +567,25 @@ GenerateRequest parse_generate_request(std::string_view body,
             }
         }
     }
-    set_sampling(sampling, request.options, "sampling_seed");
-    set_stops(sampling, request.options);
-    const auto* salt = json::get(*object, "cache_salt");
+    set_sampling(sampling, options, "sampling_seed");
+    set_stops(sampling, options);
     if (salt && !salt->is_null()) {
-        set_cache_salt(*object, request.options);
+        set_cache_salt_value(*salt, options);
     }
+    return options;
+}
 
-    const auto* text = json::get(*object, "text");
-    const auto* ids = json::get(*object, "input_ids");
-    const bool has_text = text && !text->is_null();
-    const bool has_ids = ids && !ids->is_null();
-    if (has_text == has_ids) {
-        bad_request("Provide exactly one of text or input_ids");
-    }
-    if (has_text) {
-        const auto prompt = text->string().value_or("");
+BatchPrompt generate_prompt(const json::Value& input, bool text, DecoderOptions options,
+                            const CompletionTokenizer& tokenizer) {
+    BatchPrompt request{{}, std::move(options)};
+    if (text) {
+        const auto prompt = input.string().value_or("");
         if (prompt.empty() || prompt.size() > 1024 * 1024) {
             bad_request("Expected one nonempty text string of up to 1048576 bytes");
         }
         encode_prompt(request.prompt, request.options.max_new_tokens, prompt, tokenizer);
     } else {
-        const auto* tokens = ids->array();
+        const auto* tokens = input.array();
         if (!tokens || tokens->empty()) {
             bad_request("Expected one nonempty flat array of input_ids");
         }
@@ -604,13 +604,76 @@ GenerateRequest parse_generate_request(std::string_view body,
     return request;
 }
 
-void set_cache_salt(const json::Object& object, DecoderOptions& options) {
-    if (json::get(object, "cache_salt")) {
-        const auto salt = json::get_string(object, "cache_salt");
-        if (!salt || salt->size() > decoder_prefix_max_salt_bytes) {
-            bad_request("Expected a cache_salt string of up to 256 bytes");
+const json::Array* generate_parameter_list(const json::Value* value, std::size_t count,
+                                           bool strings) {
+    const auto* list = value ? value->array() : nullptr;
+    if (list && (list->size() != count ||
+        std::any_of(list->begin(), list->end(), [&](const auto& item) {
+            return strings ? !item.string() : !item.object();
+        }))) {
+        bad_request(strings ? "Expected one cache_salt string per batch item"
+                            : "Expected one sampling_params object per batch item");
+    }
+    return list;
+}
+
+}
+
+GenerateRequests parse_generate_requests(std::string_view body,
+                                         const CompletionTokenizer& tokenizer) {
+    const auto parsed = parse_body(body, json::Syntax::strict);
+    const auto* object = parsed.object();
+    if (!object) {
+        bad_request("Expected a JSON object for /generate");
+    }
+    validate_generate_fields(*object);
+    GenerateRequests requests;
+    if (const auto* stream = json::get(*object, "stream"); stream && !stream->is_null()) {
+        requests.stream = read_bool(*object, "stream");
+    }
+    const auto* text = json::get(*object, "text");
+    const auto* ids = json::get(*object, "input_ids");
+    const bool has_text = text && !text->is_null();
+    const bool has_ids = ids && !ids->is_null();
+    if (has_text == has_ids) {
+        bad_request("Provide exactly one of text or input_ids");
+    }
+    const auto& input = has_text ? *text : *ids;
+    const auto* list = input.array();
+    requests.batch = list && (has_text || (!list->empty() && list->front().array()));
+    const auto* params = json::get(*object, "sampling_params");
+    const auto* salt = json::get(*object, "cache_salt");
+    if (!requests.batch) {
+        requests.items.push_back(generate_prompt(input, has_text,
+            generate_options(params, salt), tokenizer));
+        return requests;
+    }
+    if (requests.stream) {
+        bad_request("Only non-streaming /generate batches are supported");
+    }
+    if (list->empty() || list->size() > decoder_batch_max_lanes) {
+        bad_request("Expected 1 to 32 /generate batch items");
+    }
+    const auto* param_list = generate_parameter_list(params, list->size(), false);
+    const auto* salt_list = generate_parameter_list(salt, list->size(), true);
+    requests.items.reserve(list->size());
+    int remaining = checkpoint_context;
+    for (std::size_t index = 0; index < list->size(); ++index) {
+        auto options = generate_options(param_list ? &(*param_list)[index] : params,
+                                        salt_list ? &(*salt_list)[index] : salt);
+        remaining -= options.max_new_tokens;
+        if (remaining < 0) {
+            bad_request("Batch output budgets must total at most 262144 tokens");
         }
-        options.prefix_cache_salt = *salt;
+        requests.items.push_back(generate_prompt((*list)[index], has_text,
+                                                 std::move(options), tokenizer));
+    }
+    return requests;
+}
+
+void set_cache_salt(const json::Object& object, DecoderOptions& options) {
+    if (const auto* salt = json::get(object, "cache_salt")) {
+        set_cache_salt_value(*salt, options);
     }
 }
 

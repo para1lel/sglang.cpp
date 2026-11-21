@@ -37,6 +37,11 @@ struct Job {
 using Jobs = std::array<std::shared_ptr<Job>, decoder_batch_max_lanes>;
 using Selection = std::array<bool, decoder_batch_max_lanes>;
 using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
+struct BatchJob {
+    std::shared_ptr<Job> job;
+    std::size_t index = 0;
+};
+using BatchJobs = std::array<BatchJob, decoder_batch_max_lanes>;
 constexpr auto disconnect_poll = std::chrono::milliseconds(10);
 constexpr auto mailbox_grace = std::chrono::milliseconds(1);
 
@@ -110,6 +115,13 @@ struct BatchService::State {
     void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);
     DecoderResult consume(std::unique_lock<std::mutex>& lock, int slot, Job& job,
                           const DecoderCallbacks& callbacks);
+    void cancel_batch(std::unique_lock<std::mutex>& lock, const BatchJobs& active);
+    bool consume_batch(std::unique_lock<std::mutex>& lock, int owner,
+                       const std::vector<BatchPrompt>& prompts,
+                       const std::function<bool()>& is_cancelled, BatchJobs& active,
+                       std::vector<DecoderResult>& results);
+    void enqueue_batch(int owner, const std::vector<BatchPrompt>& prompts, BatchJobs& active,
+                       std::size_t& next);
 
     const bool trace;
     const bool cuda_graphs;
@@ -481,6 +493,98 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
     }
 }
 
+void BatchService::State::cancel_batch(std::unique_lock<std::mutex>& lock,
+                                       const BatchJobs& active) {
+    const auto owned = [&](int slot) {
+        return active[slot].job && jobs[slot] == active[slot].job;
+    };
+    for (int slot = 0; slot < max_active; ++slot) {
+        if (owned(slot)) {
+            jobs[slot]->cancelled = true;
+        }
+    }
+    changed.notify_all();
+    changed.wait(lock, [&] {
+        for (int slot = 0; slot < max_active; ++slot) {
+            if (owned(slot)) {
+                return false;
+            }
+        }
+        return true;
+    });
+}
+
+void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt>& prompts,
+                                        BatchJobs& active, std::size_t& next) {
+    for (int offset = 0; offset < max_active && next < prompts.size(); ++offset) {
+        const int slot = (owner + offset) % max_active;
+        if (jobs[slot] || active[slot].job || (slot != owner && generating[slot])) {
+            continue;
+        }
+        auto job = std::make_shared<Job>();
+        job->prompt = prompts[next].prompt;
+        job->prompt_tokens = job->prompt.size();
+        job->options = prompts[next].options;
+        job->options.mtp_steps = mtp_steps;
+        active[slot] = {job, next++};
+        jobs[slot] = std::move(job);
+    }
+}
+
+bool BatchService::State::consume_batch(std::unique_lock<std::mutex>& lock, int owner,
+                                        const std::vector<BatchPrompt>& prompts,
+                                        const std::function<bool()>& is_cancelled,
+                                        BatchJobs& active, std::vector<DecoderResult>& results) {
+    const DecoderCallbacks callbacks;
+    std::size_t next = 0;
+    std::size_t completed = 0;
+    while (completed < prompts.size()) {
+        lock.unlock();
+        const bool cancelled = is_cancelled && is_cancelled();
+        lock.lock();
+        if (cancelled) {
+            return false;
+        }
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+        bool drained = false;
+        for (auto& item : active) {
+            if (!item.job) {
+                continue;
+            }
+            auto& job = *item.job;
+            if (job.error) {
+                std::rethrow_exception(job.error);
+            }
+            auto& result = results[item.index];
+            if (job.pending) {
+                emit_step(*job.pending, callbacks, result);
+                job.pending.reset();
+                drained = true;
+            }
+            if (job.finish) {
+                if (*job.finish == DecoderFinishReason::cancelled) {
+                    return false;
+                }
+                result.finish_reason = *job.finish;
+                result.cached_prompt_tokens = job.cached_tokens;
+                item.job.reset();
+                ++completed;
+            }
+        }
+        const auto submitted = next;
+        enqueue_batch(owner, prompts, active, next);
+        if (drained || next != submitted) {
+            changed.notify_all();
+        }
+        if (completed < prompts.size()) {
+            changed.wait_for(lock, disconnect_poll);
+        }
+    }
+    return true;
+}
+
 BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
                            int max_active, int prefix_cache_entries, int max_num_batched_tokens)
     : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps, max_active,
@@ -570,12 +674,31 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
         throw std::logic_error("Connection already has an active decoder job");
     }
     generating = true;
-    queue = job;
-    state_->changed.notify_all();
     try {
+        while (queue && !state_->failure) {
+            lock.unlock();
+            const bool cancelled = callbacks.is_cancelled && callbacks.is_cancelled();
+            lock.lock();
+            if (cancelled) {
+                generating = false;
+                state_->changed.notify_all();
+                DecoderResult result;
+                result.finish_reason = DecoderFinishReason::cancelled;
+                return result;
+            }
+            if (queue) {
+                state_->changed.wait_for(lock, disconnect_poll);
+            }
+        }
+        if (state_->failure) {
+            std::rethrow_exception(state_->failure);
+        }
+        queue = job;
+        state_->changed.notify_all();
         auto result = state_->consume(lock, slot, *job, callbacks);
         result.cached_prompt_tokens = job->cached_tokens;
         generating = false;
+        state_->changed.notify_all();
         return result;
     } catch (...) {
         if (!lock.owns_lock()) {
@@ -583,8 +706,47 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
         }
         state_->cancel(lock, slot, *job);
         generating = false;
+        state_->changed.notify_all();
         throw;
     }
+}
+
+std::optional<std::vector<DecoderResult>>
+BatchService::generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
+                             const std::function<bool()>& is_cancelled) {
+    if (slot < 0 || slot >= state_->max_active) {
+        throw std::out_of_range("Invalid decoder batch service slot");
+    }
+    std::vector<DecoderResult> results(prompts.size());
+    BatchJobs active;
+    std::unique_lock lock(state_->mutex);
+    state_->changed.wait(lock, [&] { return !state_->reset_pending; });
+    auto& generating = state_->generating[slot];
+    if (generating) {
+        throw std::logic_error("Connection already has an active decoder job");
+    }
+    generating = true;
+    bool completed;
+    try {
+        completed = state_->consume_batch(lock, slot, prompts, is_cancelled, active, results);
+    } catch (...) {
+        if (!lock.owns_lock()) {
+            lock.lock();
+        }
+        state_->cancel_batch(lock, active);
+        generating = false;
+        state_->changed.notify_all();
+        throw;
+    }
+    if (!completed) {
+        state_->cancel_batch(lock, active);
+    }
+    generating = false;
+    state_->changed.notify_all();
+    if (completed) {
+        return results;
+    }
+    return std::nullopt;
 }
 
 }

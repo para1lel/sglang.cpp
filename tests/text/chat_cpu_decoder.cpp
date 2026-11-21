@@ -208,6 +208,11 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     if (lane) {
         throw std::logic_error("Invalid CPU lane admission");
     }
+    const auto* rejected_seed = std::getenv("SGLANG_TEST_BATCH_ADMISSION_FAILURE");
+    if (rejected_seed && options.seed && std::to_string(*options.seed) == rejected_seed) {
+        std::cerr << ("cpu reject seed=" + std::to_string(*options.seed) + '\n');
+        throw DecoderCapacityError("Injected batch admission failure", true);
+    }
     lane.emplace(Lane{options, prompt.size()});
     record_sampling(options, prompt.size());
     std::cerr << ("cpu admit slot=" + std::to_string(slot) +
@@ -256,6 +261,10 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
         }
         result[slot] = lane->step();
         if (result[slot].finish_reason) {
+            if (sampling_probe()) {
+                std::cerr << ("cpu finish budget=" +
+                              std::to_string(lane->options.max_new_tokens) + '\n');
+            }
             lane.reset();
         }
     }

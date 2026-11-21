@@ -26,10 +26,8 @@ def get(port, path):
             return response.status, response.read()
 
 
-def queue_client(port, budget):
-    wire = json.dumps({
-        "input_ids": [32], "stream": True, "sampling_params": {"max_new_tokens": budget},
-    }).encode()
+def generate_client(port, payload):
+    wire = json.dumps(payload).encode()
     client = socket.create_connection(("127.0.0.1", port), timeout=5)
     try:
         client.sendall(
@@ -41,6 +39,12 @@ def queue_client(port, budget):
     except OSError:
         client.close()
         raise
+
+
+def queue_client(port, budget):
+    return generate_client(port, {
+        "input_ids": [32], "stream": True, "sampling_params": {"max_new_tokens": budget},
+    })
 
 
 def abort(client):
@@ -146,8 +150,7 @@ class NativeGenerate(unittest.TestCase):
     def test_strict_requests_and_framing(self):
         invalid = [
             ([], "JSON object"), ({}, "exactly one"), ({"text": "", "input_ids": None}, "text"),
-            ({"text": ["A"]}, "text"), ({"text": "A", "input_ids": [32]}, "exactly one"),
-            ({"input_ids": []}, "input_ids"), ({"input_ids": [[32]]}, "input_ids"),
+            ({"text": "A", "input_ids": [32]}, "exactly one"), ({"input_ids": []}, "input_ids"),
             *[({"input_ids": [token]}, "input_ids") for token in (-1, 248320, True, 1.5)],
             *[({"text": "A", key: value}, key) for key, value in (
                 ("model", MODEL), ("stream", 1), ("lora_path", "adapter"), ("return_logprob", True),
@@ -192,6 +195,142 @@ class NativeGenerate(unittest.TestCase):
                 self.assertEqual(content_type, "application/json")
                 self.assertIn("message", json.loads(data)["error"])
         self.assertEqual(len(receipts(self.log)), first)
+
+    def test_batch_shape_and_input_order(self):
+        log = self.output / "batch-order.log"
+        with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
+            result = self.generate({
+                "input_ids": [[32], [33, 33], [34, 34, 34]],
+                "sampling_params": [{"max_new_tokens": 8, "sampling_seed": 0},
+                                    {"max_new_tokens": 1, "sampling_seed": -7},
+                                    {"max_new_tokens": 4, "sampling_seed": 11}],
+                "cache_salt": ["first", "second", "third"],
+            }, port=port)
+            self.assertIsInstance(result, list)
+            self.assertEqual(len(result), 3)
+            ids = {
+                self.check_packet(result[0], "AAAAAAAA", [32] * 8,
+                                  {"type": "length", "length": 8}),
+                self.check_packet(result[1], "A", [32], {"type": "length", "length": 1},
+                                  prompt_tokens=2),
+                self.check_packet(result[2], "A", [32, self.eos],
+                                  {"type": "stop", "matched": self.eos}, prompt_tokens=3),
+            }
+            self.assertEqual(len(ids), 3)
+            self.assertEqual([line for line in log.read_text().splitlines()
+                              if line.startswith("cpu finish budget=")],
+                             ["cpu finish budget=1", "cpu finish budget=4", "cpu finish budget=8"])
+            options = {"max_new_tokens": 1, "sampling_seed": 0}
+            result = self.generate({"text": ["A", "A B"], "sampling_params": options},
+                                   port=port)
+            self.assertEqual(len(result), 2)
+            for packet, prompt_tokens in zip(result, (1, 2)):
+                self.check_packet(packet, "A", [32], {"type": "length", "length": 1},
+                                  prompt_tokens=prompt_tokens)
+            for field, scalar in (("text", "A"), ("input_ids", [32])):
+                with self.subTest(field=field):
+                    common = {"sampling_params": options}
+                    item = self.generate(common | {field: scalar}, port=port)
+                    batch = self.generate(common | {field: [scalar]}, port=port)
+                    self.assertIsInstance(batch, list)
+                    singleton, = batch
+                    self.assertNotEqual(singleton["meta_info"].pop("id"),
+                                        item["meta_info"].pop("id"))
+                    self.assertEqual(singleton, item)
+
+    def test_invalid_batch_never_admits_a_lane(self):
+        invalid = [
+            ({"text": ["A", ""]}, "text"),
+            ({"input_ids": [[32], [248320]]}, "input_ids"),
+            ({"input_ids": [[32], 33]}, "input_ids"),
+            ({"text": ["A", "B"], "sampling_params": [{"max_new_tokens": 1}, {"top_p": 0}]},
+             "top_p"),
+            ({"text": ["A", "B"], "sampling_params": [{}]}, "sampling_params"),
+            ({"text": ["A", "B"], "cache_salt": ["a", "x" * 257]}, "cache_salt"),
+            ({"text": ["A", "B"], "cache_salt": ["a"]}, "cache_salt"),
+            ({"input_ids": [[32], [33, 34]],
+              "sampling_params": [{"max_new_tokens": 1}, {"max_new_tokens": 262143}]}, "context"),
+            ({"input_ids": [[32], [33]], "sampling_params": {"max_new_tokens": 131073}},
+             "total"),
+            ({"text": ["A"] * 33}, "batch items"),
+            ({"text": ["A"], "stream": True}, "non-streaming"),
+        ]
+        log = self.output / "batch-invalid.log"
+        with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
+            for payload, field in invalid:
+                with self.subTest(field=field, payload=str(payload)[:240]):
+                    status, result = send(port, GENERATE, payload)
+                    self.assertEqual(status, 400, result)
+                    self.assertIn(field, result["error"]["message"])
+                self.assertNotIn("cpu admit", log.read_text())
+
+    def check_batch_reuse(self, port):
+        self.wait_queue(port, 0, 0)
+        result = self.generate({"text": ["A", "B"], "sampling_params": {"max_new_tokens": 1}},
+                               port=port)
+        self.assertEqual(len(result), 2)
+        for packet in result:
+            self.check_packet(packet, "A", [32], {"type": "length", "length": 1})
+
+    def test_batch_admission_failure_cancels_running_sibling(self):
+        log = self.output / "batch-admission-failure.log"
+        with patch.dict("os.environ", SGLANG_TEST_BATCH_ADMISSION_FAILURE="-900"), \
+             server(self.binary, self.checkpoint, log, "--max-active", "2",
+                    "--prefix-cache-entries", "1") as port:
+            status, result = send(port, GENERATE, {
+                "input_ids": [[32], [33, 33], [34], [35]],
+                "sampling_params": [{"max_new_tokens": 2048, "sampling_seed": 0},
+                                    {"max_new_tokens": 1},
+                                    {"max_new_tokens": 7, "sampling_seed": -900},
+                                    {"max_new_tokens": 9}],
+            })
+            self.assertEqual(status, 503, result)
+            self.assertEqual(result, {"error": {"message": "Injected batch admission failure"}})
+            log_text = log.read_text()
+            admitted, = [line for line in log_text.splitlines()
+                         if line.startswith("cpu admit ") and line.endswith(" budget=2048")]
+            markers = (admitted, "cpu finish budget=1", "cpu reject seed=-900",
+                       admitted.replace("cpu admit ", "cpu cancel ", 1))
+            offsets = [log_text.index(marker) for marker in markers]
+            self.assertEqual(offsets, sorted(offsets))
+            self.assertEqual(sorted(receipt["budget"] for receipt in receipts(log)), [1, 2048])
+            self.check_batch_reuse(port)
+        self.assertIn("cpu admit slot=1 prompt=1 budget=1", log.read_text())
+
+    def test_batch_disconnect_cancels_all_admitted_lanes(self):
+        log = self.output / "batch-disconnect.log"
+        with server(self.binary, self.checkpoint, log, "--max-active", "2",
+                    "--prefix-cache-entries", "1") as port:
+            with generate_client(port, {
+                "input_ids": [[32], [33, 33], [34]],
+                "sampling_params": {"max_new_tokens": 2048, "sampling_seed": 0},
+            }) as client:
+                deadline = time.monotonic() + 3
+                while True:
+                    admitted = {line for line in log.read_text().splitlines()
+                                if line.startswith("cpu admit ") and line.endswith(" budget=2048")}
+                    if len(admitted) == 2:
+                        break
+                    self.assertLess(time.monotonic(), deadline, log.read_text())
+                    time.sleep(0.01)
+                with queue_client(port, 1) as scalar:
+                    self.wait_queue(port, 2, 0)
+                    self.assertEqual(sorted(item["prompt_tokens"] for item in receipts(log)),
+                                     [1, 2])
+                    abort(client)
+                    with http.client.HTTPResponse(scalar) as reply:
+                        reply.begin()
+                        self.assertEqual(reply.status, 200)
+                        self.check_packet(event(reply), "A", [32],
+                                          {"type": "length", "length": 1})
+                        self.assertEqual(event(reply), "[DONE]")
+            self.wait_queue(port, 0, 0)
+            cancelled = {line for line in log.read_text().splitlines()
+                         if line.startswith("cpu cancel ")}
+            self.assertEqual(cancelled, {line.replace("cpu admit ", "cpu cancel ", 1)
+                                         for line in admitted})
+            self.assertEqual([item["budget"] for item in receipts(log)], [2048, 2048, 1])
+            self.check_batch_reuse(port)
 
     def test_models_and_existing_routes(self):
         status, data = get(self.port, MODELS)

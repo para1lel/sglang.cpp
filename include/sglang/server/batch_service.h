@@ -26,6 +26,11 @@ struct BatchProfile {
     std::vector<BatchProfileStep> steps;
 };
 
+struct BatchPrompt {
+    std::vector<int> prompt;
+    DecoderOptions options;
+};
+
 class BatchService {
 public:
     BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false, int mtp_steps = 0,
@@ -37,6 +42,9 @@ public:
                            const DecoderCallbacks& callbacks,
                            std::vector<DecoderMedia> media = std::vector<DecoderMedia>(),
                            std::size_t expanded_tokens = 0);
+    std::optional<std::vector<DecoderResult>>
+    generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
+                   const std::function<bool()>& is_cancelled);
     bool ready() const;
     void rethrow_failure() const;
     BatchMetrics metrics() const;

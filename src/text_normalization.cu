@@ -86,6 +86,12 @@ __device__ void stage_rms_vector(const __nv_bfloat16* input, __nv_bfloat16* shar
         : "memory");
 }
 
+__device__ void stage_rms_vector_async(const __nv_bfloat16* input, __nv_bfloat16* shared) {
+    const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(shared));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+                 :: "r"(address), "l"(input) : "memory");
+}
+
 __device__ __forceinline__ float rms_inverse(float squares, int width) {
     __shared__ float warp_squares[block_warps];
     __shared__ float inverse_rms;
@@ -156,7 +162,60 @@ __global__ void rms_norm_vector_kernel(const __nv_bfloat16* branch,
     }
 }
 
-template <bool HasResidual>
+__device__ float4 rms_quant_values(uint2 bits) {
+    return {__uint_as_float(bits.x << 16), __uint_as_float(bits.x & 0xffff0000u),
+            __uint_as_float(bits.y << 16), __uint_as_float(bits.y & 0xffff0000u)};
+}
+
+__device__ float rms_quant_maximum(float4 values) {
+    return fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)),
+                 fmaxf(fabsf(values.z), fabsf(values.w)));
+}
+
+__device__ __nv_fp8x4_storage_t rms_quant_pack(float4 values, float reciprocal) {
+    const float4 scaled{values.x * reciprocal, values.y * reciprocal,
+                        values.z * reciprocal, values.w * reciprocal};
+    return __nv_fp8x4_e4m3(scaled).__x;
+}
+
+__device__ void rms_quantize_subwarps(const __nv_bfloat16* normalized,
+                                      TextFp8Activation activation, std::size_t offset) {
+    constexpr int lanes = 8;
+    constexpr int half_group = text_fp8_group_size / 2;
+    constexpr int groups = rms_hidden_width / text_fp8_group_size;
+    constexpr int values_per_lane = half_group / lanes;
+    constexpr int groups_per_block = block_threads / lanes;
+    static_assert(values_per_lane == 8);
+    static_assert(warp_width % lanes == 0 && groups % (warp_width / lanes) == 0);
+    const int lane = threadIdx.x % lanes;
+    for (int group = threadIdx.x / lanes; group < groups; group += groups_per_block) {
+        const int col = group * text_fp8_group_size + lane * values_per_lane;
+        const auto lower = *reinterpret_cast<const uint4*>(normalized + col);
+        const auto upper = *reinterpret_cast<const uint4*>(normalized + col + half_group);
+        const float4 first = rms_quant_values({lower.x, lower.y});
+        const float4 second = rms_quant_values({lower.z, lower.w});
+        const float4 third = rms_quant_values({upper.x, upper.y});
+        const float4 fourth = rms_quant_values({upper.z, upper.w});
+        float maximum = fmaxf(fmaxf(rms_quant_maximum(first), rms_quant_maximum(second)),
+                              fmaxf(rms_quant_maximum(third), rms_quant_maximum(fourth)));
+        for (int delta = lanes / 2; delta > 0; delta /= 2) {
+            maximum = fmaxf(maximum, __shfl_down_sync(warp_mask, maximum, delta, lanes));
+        }
+        float reciprocal = 0.0f;
+        if (lane == 0) {
+            const float scale = __fdiv_rn(fmaxf(quant_epsilon, maximum), fp8_max);
+            activation.scales[static_cast<std::size_t>(blockIdx.x) * groups + group] = scale;
+            reciprocal = __fdiv_rn(1.0f, scale);
+        }
+        reciprocal = __shfl_sync(warp_mask, reciprocal, 0, lanes);
+        auto* packed = reinterpret_cast<uint2*>(activation.values + offset + col);
+        *packed = {rms_quant_pack(first, reciprocal), rms_quant_pack(second, reciprocal)};
+        packed[half_group / sizeof(uint2)] =
+            {rms_quant_pack(third, reciprocal), rms_quant_pack(fourth, reciprocal)};
+    }
+}
+
+template <bool HasResidual, bool PackedGroups = false>
 __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
                                      const __nv_bfloat16* weight, __nv_bfloat16* normalized,
                                      TextFp8Activation activation) {
@@ -175,11 +234,21 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
     }
     for (int col = threadIdx.x * vector_width; col < rms_hidden_width;
          col += block_threads * vector_width) {
-        stage_rms_vector(branch + col, branch_values + col);
-        if constexpr (HasResidual) {
-            stage_rms_vector(residual + col, residual_values + col);
+        if constexpr (PackedGroups) {
+            stage_rms_vector_async(branch + col, branch_values + col);
+            stage_rms_vector_async(residual + col, residual_values + col);
+            stage_rms_vector_async(weight + col, gains + col);
+        } else {
+            stage_rms_vector(branch + col, branch_values + col);
+            if constexpr (HasResidual) {
+                stage_rms_vector(residual + col, residual_values + col);
+            }
+            stage_rms_vector(weight + col, gains + col);
         }
-        stage_rms_vector(weight + col, gains + col);
+    }
+    if constexpr (PackedGroups) {
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
     }
     __syncthreads();
     float values[values_per_thread];
@@ -206,6 +275,10 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
         }
     }
     __syncthreads();
+    if constexpr (PackedGroups) {
+        rms_quantize_subwarps(branch_values, activation, offset);
+        return;
+    }
     const int lane = threadIdx.x % warp_width;
     const int warp = threadIdx.x / warp_width;
     for (int group = warp; group < groups; group += block_warps) {
@@ -246,6 +319,10 @@ cudaError_t decoder::tensor_core_prefill_rms_quantize(
             : status;
     }
     void* args[] = {&branch, &residual, &weight, &normalized, &activation};
+    if (residual && rows >= 2 && rows <= 32 && aligned(activation.values, alignof(uint2))) {
+        return cudaLaunchKernel(prefill_rms_quantize<true, true>, rows, block_threads,
+                                args, 0, stream);
+    }
     const auto kernel = residual ? prefill_rms_quantize<true> : prefill_rms_quantize<false>;
     return cudaLaunchKernel(kernel, rows, block_threads, args, 0, stream);
 }

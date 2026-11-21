@@ -138,7 +138,7 @@ Multirow K0 tensor-core prefill keeps these operators during projection fallback
 
 - [GDN prefill](gdn-prefill.md) prepares convolution, Q/K, and gates before ordered or chunked recurrence. [Preparation](../src/text_attention_gdn.cu#L76)<!-- prefix: "__global__ v" -->
 - [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L293)<!-- prefix: "const auto s" -->
-- Fused residual RMSNorm and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L236)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L706)<!-- prefix: "cudaError_t " -->
+- [Fused residual RMSNorm](fp8-prefill-projections.md#fused-activation-quantization) and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L309)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L706)<!-- prefix: "cudaError_t " -->
 
 Other target prefill and draft decode use direct attention. Wide long decode requires the tensor-core policy. Eager decode can use exact attention within inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Serial decode uses direct attention beyond these limits. [Row dispatch](../src/decoder_forward.cpp#L196)<!-- prefix: "cudaError_t " -->
 
@@ -150,7 +150,7 @@ Tuned GEMV requires 16-byte-aligned FP8 weights and activations and input widths
 
 Row-wise prefill and MTP draft decode use GEMV. The legacy forward layer divides a multirow FP8 projection into balanced groups of at most five rows. Eligible groups of two to five use packed GEMM. Other groups use GEMV. Wide GEMV and this packed GEMM require 512-divisible input widths and 16-byte-aligned FP8 payloads. [Fused packed K0](batch-graphs.md#packed-paged-gqa-decode) uses bucketed projections. [Legacy grouping](../src/decoder_forward.cpp#L59)<!-- prefix: "int projecti" --> · [GEMV](../src/text_ops.cu#L723)<!-- prefix: "cudaError_t " --> · [GEMM](../src/text_ops.cu#L741)<!-- prefix: "cudaError_t " -->
 
-Single-row BF16 RMSNorm uses vector loads at width 5,120 with 16-byte-aligned branch, gains, and optional residual. Other calls use generic kernels. [RMSNorm dispatch](../src/text_normalization.cu#L253)<!-- prefix: "cudaError_t " -->
+Single-row BF16 RMSNorm uses vector loads at width 5,120 with 16-byte-aligned branch, gains, and optional residual. Other calls use generic kernels. [RMSNorm dispatch](../src/text_normalization.cu#L330)<!-- prefix: "cudaError_t " -->
 
 Outside MTP verification, one target decode row can use warp quantization and combined GDN gates. Quantization needs whole 128-channel groups, 8-byte-aligned BF16 input, and 4-byte-aligned E4M3 values. It preserves FP32 round-to-nearest scale and reciprocal divisions and saturated E4M3 conversion. Other valid layouts use the generic quantizer. [Dispatch](../src/decoder_forward.cpp#L71)<!-- prefix: "void quantiz" --> · [Quantizer](../src/text_decode_bandwidth.cu#L295)<!-- prefix: "cudaError_t " -->
 

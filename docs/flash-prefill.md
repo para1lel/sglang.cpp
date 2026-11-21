@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L486)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L293)<!-- prefix: "const auto s" --> |
-| Native CUDA operator | Select TMEM Flash, regular Flash, ordered multirow, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L648)<!-- prefix: "cudaError_t " --> |
+| Native CUDA operator | Select TMEM Flash, regular Flash, ordered multirow, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L709)<!-- prefix: "cudaError_t " --> |
 | Long-tile pipeline | Partition the visible prefix and merge the partial softmax results. | [TMEM attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L321)<!-- prefix: "__global__ v" --> · [Merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L421)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
 
@@ -17,11 +17,13 @@ On SM100, `SGLANG_PREFILL_ATTN=sm100` makes the model's tensor-core prefill try 
 
 For ordinary multisplit results, each half of the finish block handles one query head. Each thread rescales positive-mass splits to their largest score, accumulates in FP32 in split order, and writes two adjacent BF16 channels. A combined mass that fails `> 0` yields two positive zeros. The producer writes ordinary single-split results. Protected repair uses the whole finish block. [Merge](../src/text/prefill_attn_sm100.cu#L549)<!-- prefix: "__device__ v" --> · [Finish](../src/text/prefill_attn_sm100.cu#L585)<!-- prefix: "prefill_attn" --> · [Producer output](../src/text/prefill_attn_sm100.cu#L410)<!-- prefix: "__device__ v" -->
 
-Both Flash paths follow the logical page table and process 64-key tiles for pairs of query heads that share a KV head. Each query applies its own causal mask. QK and PV use BF16 Tensor Core products with FP32 accumulators and FP32 online normalization.
+Both Flash paths follow the logical page table and process 64-key tiles for pairs of query heads that share a KV head. Causal limits apply per query. QK and PV use BF16 Tensor Core products with FP32 accumulators and FP32 online normalization.
 
-Regular Flash packs rounded BF16 probabilities directly into PV registers and preserves the reduction order. Asynchronous staging uses `cp.async` to load the next tile's MXFP8 payloads and scales during current-tile computation. Partial blocks stage zeros, mask scores, and skip output stores and protected repair for inactive queries. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L509)<!-- prefix: "__global__ v" -->
+Regular Flash packs rounded BF16 probabilities directly into PV registers and preserves the reduction order. Asynchronous staging uses `cp.async` to load the next tile's MXFP8 payloads and scales during current-tile computation. Partial blocks stage zeros, mask scores, and skip output stores and protected repair for inactive queries. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L566)<!-- prefix: "__global__ v" -->
 
-For a full 1,024-row tile starting at position 1,024 or later, regular Flash tries 88-row, 352-thread blocks. The 144 blocks fit in one wave on the 148-SM B200. Extra warps finish before protected repair. [Wide dispatch](../src/mxfp8_gqa_prefill.cu#L613)<!-- prefix: "if (aligned_" -->
+For a full 1,024-row tile starting at position 1,024 or later, regular Flash tries 88-row, 352-thread blocks. The 144 blocks fit in one wave on the 148-SM B200. Extra warps finish before protected repair. [Wide dispatch](../src/mxfp8_gqa_prefill.cu#L674)<!-- prefix: "if (aligned_" -->
+
+In wide blocks, each `ldmatrix.x4` loads two BF16 K or V fragments for MMA operations in the same order. A warp skips score mask checks when all its queries are active and its first query sees all 64 keys. It skips PV accumulator rescaling when every history multiplier in the warp equals `+1`. [Fragment loads](../src/mxfp8_gqa_prefill.cu#L288)<!-- prefix: "__device__ _" --> · [Score mask](../src/mxfp8_gqa_prefill.cu#L609)<!-- prefix: "const bool f" --> · [PV rescaling](../src/mxfp8_gqa_prefill.cu#L508)<!-- prefix: "if (Rows != " -->
 
 ### Long-tile TMEM pipeline
 
@@ -35,11 +37,11 @@ Each launch uses 76,087,296 bytes of stream-ordered scratch. Each of the three p
 
 ## Constraints and failure behavior
 
-Regular Flash accepts 144–1,024 query rows through 32,768 visible tokens and only full tiles through 131,072. Visible tokens equal the zero-based start position plus the row count. Both payload bases must be 16-byte aligned. The decoder sends a one-row tile through ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L662)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L466)<!-- prefix: "if (rows == " -->
+Regular Flash accepts 144–1,024 query rows through 32,768 visible tokens and only full tiles through 131,072. Visible tokens equal the zero-based start position plus the row count. Both payload bases must be 16-byte aligned. The decoder sends a one-row tile through ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L723)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L466)<!-- prefix: "if (rows == " -->
 
 Wide staging requires 195,024 dynamic shared-memory bytes. The 64-row variants need 169,488 bytes with asynchronous staging or 135,696 bytes with synchronous staging. Each variant also needs its static allocation. Asynchronous staging requires 8-byte alignment for both scale bases. A capacity shortfall for wide staging selects the 64-row variants. Unaligned scales or insufficient space for asynchronous staging selects synchronous staging when it fits.
 
-With the opt-in, TMEM requires exactly 1,024 query rows and at most 131,072 visible tokens. The zero-based start must be at least 32,768 and divisible by 64. TMEM also requires compute capability 10.0, CUDA memory pools, and a K/V pool addressable by signed 32-bit TMA token coordinates. The launch needs opt-in shared memory for 214,016 dynamic bytes plus static allocation. A known resource or device mismatch, or a successful driver lookup without a tensor-map encoder, selects regular Flash when eligible. [TMEM eligibility](../src/mxfp8_gqa_prefill.cu#L665)<!-- prefix: "if (rows == " -->
+With the opt-in, TMEM requires exactly 1,024 query rows and at most 131,072 visible tokens. The zero-based start must be at least 32,768 and divisible by 64. TMEM also requires compute capability 10.0, CUDA memory pools, and a K/V pool addressable by signed 32-bit TMA token coordinates. The launch needs opt-in shared memory for 214,016 dynamic bytes plus static allocation. A known resource or device mismatch, or a successful driver lookup without a tensor-map encoder, selects regular Flash when eligible. [TMEM eligibility](../src/mxfp8_gqa_prefill.cu#L726)<!-- prefix: "if (rows == " -->
 
 Other valid shapes, unaligned payloads, and a known regular Flash shared memory shortfall use the [ordered fallback dispatch](development.md#ordered-multirow-gqa-prefill). Above 32,768 visible tokens, that dispatch uses protected single-row attention. CUDA discovery, configuration, and launch errors propagate.
 

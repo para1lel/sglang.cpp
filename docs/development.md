@@ -74,7 +74,7 @@ Exact scoring reduces eight groups in FP32, sums in group order, and scales by `
 
 #### Ordered multirow GQA prefill
 
-Eligible tensor-core chunks use [Flash](flash-prefill.md#constraints-and-failure-behavior). Through 32,768 visible tokens, ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more. [Dispatch](../src/mxfp8_gqa_prefill.cu#L648)<!-- prefix: "cudaError_t " -->
+Eligible tensor-core chunks use [Flash](flash-prefill.md#constraints-and-failure-behavior). Through 32,768 visible tokens, ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more. [Dispatch](../src/mxfp8_gqa_prefill.cu#L709)<!-- prefix: "cudaError_t " -->
 
 Tiles share decoded K/V across rows and two query heads. Each 32-token block preserves causality, the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L37)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L160)<!-- prefix: "for (int fir" -->
 

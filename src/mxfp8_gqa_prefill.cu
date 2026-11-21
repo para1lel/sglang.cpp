@@ -252,6 +252,11 @@ struct FragmentB {
     Word words[2];
 };
 
+struct FragmentPairB {
+    FragmentB first;
+    FragmentB second;
+};
+
 struct Accumulator {
     float values[4];
 };
@@ -275,6 +280,24 @@ __device__ __forceinline__ FragmentB load_flash_b(const std::uint16_t* address) 
     } else {
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
             : "=r"(result.words[0]), "=r"(result.words[1]) : "r"(shared) : "memory");
+    }
+    return result;
+}
+
+template <bool Transpose>
+__device__ __forceinline__ FragmentPairB load_flash_b_pair(const std::uint16_t* address) {
+    FragmentPairB result;
+    const auto shared = static_cast<Word>(__cvta_generic_to_shared(address));
+    if constexpr (Transpose) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(result.first.words[0]), "=r"(result.first.words[1]),
+              "=r"(result.second.words[0]), "=r"(result.second.words[1])
+            : "r"(shared) : "memory");
+    } else {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(result.first.words[0]), "=r"(result.first.words[1]),
+              "=r"(result.second.words[0]), "=r"(result.second.words[1])
+            : "r"(shared) : "memory");
     }
     return result;
 }
@@ -407,28 +430,50 @@ __device__ __forceinline__ void flash_scores(const FlashTile<Rows>& tile, int qu
     #pragma unroll 4
     for (int dim = 0; dim < channels; dim += 16) {
         const auto q = load_flash_a(&tile.query[query + lane % 16][dim + (lane / 16) * 8]);
-        const auto* keys = &tile.key[lane % 8][dim + (lane & 8)];
-        #pragma unroll
-        for (int group = 0; group < flash_score_fragments; ++group) {
-            flash_mma(scores[group], q, load_flash_b<false>(keys + group * 8 * flash_stride));
+        if constexpr (Rows == flash_wide_rows) {
+            const auto* keys = &tile.key[lane % 8 + (lane / 16) * 8][dim + (lane & 8)];
+            #pragma unroll
+            for (int group = 0; group < flash_score_fragments; group += 2) {
+                const auto pair = load_flash_b_pair<false>(keys + group * 8 * flash_stride);
+                flash_mma(scores[group], q, pair.first);
+                flash_mma(scores[group + 1], q, pair.second);
+            }
+        } else {
+            const auto* keys = &tile.key[lane % 8][dim + (lane & 8)];
+            #pragma unroll
+            for (int group = 0; group < flash_score_fragments; ++group) {
+                flash_mma(scores[group], q, load_flash_b<false>(keys + group * 8 * flash_stride));
+            }
         }
     }
 }
 
 
-template <int Half>
+template <int Half, bool Wide>
 __device__ __forceinline__ float flash_softmax(
-    int column, int count, Accumulator (&scores)[flash_score_fragments],
+    int column, int count, bool full, Accumulator (&scores)[flash_score_fragments],
     FragmentA (&probabilities)[flash_value_fragments], FlashSoftmax& state) {
     float maximum = state.maximum;
-    #pragma unroll
-    for (int group = 0; group < flash_score_fragments; ++group) {
+    if (Wide && full) {
         #pragma unroll
-        for (int item = 0; item < 2; ++item) {
-            const int token = group * 8 + column + item;
-            auto& score = scores[group].values[Half * 2 + item];
-            score = token < count ? score * softmax_scale : -CUDART_INF_F;
-            maximum = fmaxf(maximum, score);
+        for (int group = 0; group < flash_score_fragments; ++group) {
+            #pragma unroll
+            for (int item = 0; item < 2; ++item) {
+                auto& score = scores[group].values[Half * 2 + item];
+                score *= softmax_scale;
+                maximum = fmaxf(maximum, score);
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int group = 0; group < flash_score_fragments; ++group) {
+            #pragma unroll
+            for (int item = 0; item < 2; ++item) {
+                const int token = group * 8 + column + item;
+                auto& score = scores[group].values[Half * 2 + item];
+                score = token < count ? score * softmax_scale : -CUDART_INF_F;
+                maximum = fmaxf(maximum, score);
+            }
         }
     }
     maximum = fmaxf(maximum, __shfl_xor_sync(warp_mask, maximum, 2, 4));
@@ -460,20 +505,32 @@ __device__ __forceinline__ void flash_values(
     const FlashTile<Rows>& tile, int lane, float top, float bottom,
     const FragmentA (&probabilities)[flash_value_fragments],
     Accumulator (&numerator)[channels / 8]) {
-    #pragma unroll
-    for (auto& accumulator : numerator) {
-        accumulator.values[0] *= top;
-        accumulator.values[1] *= top;
-        accumulator.values[2] *= bottom;
-        accumulator.values[3] *= bottom;
+    if (Rows != flash_wide_rows || __any_sync(warp_mask, top != 1.0f || bottom != 1.0f)) {
+        #pragma unroll
+        for (auto& accumulator : numerator) {
+            accumulator.values[0] *= top;
+            accumulator.values[1] *= top;
+            accumulator.values[2] *= bottom;
+            accumulator.values[3] *= bottom;
+        }
     }
     #pragma unroll
     for (int fragment = 0; fragment < flash_value_fragments; ++fragment) {
         const int key = fragment * 16;
-        #pragma unroll
-        for (int column = 0; column < channels; column += 8) {
-            const auto v = load_flash_b<true>(&tile.value[key + lane % 16][column]);
-            flash_mma(numerator[column / 8], probabilities[fragment], v);
+        if constexpr (Rows == flash_wide_rows) {
+            const auto* values = &tile.value[key + lane % 16][(lane / 16) * 8];
+            #pragma unroll
+            for (int column = 0; column < channels; column += 16) {
+                const auto pair = load_flash_b_pair<true>(values + column);
+                flash_mma(numerator[column / 8], probabilities[fragment], pair.first);
+                flash_mma(numerator[column / 8 + 1], probabilities[fragment], pair.second);
+            }
+        } else {
+            #pragma unroll
+            for (int column = 0; column < channels; column += 8) {
+                const auto v = load_flash_b<true>(&tile.value[key + lane % 16][column]);
+                flash_mma(numerator[column / 8], probabilities[fragment], v);
+            }
         }
     }
 }
@@ -548,10 +605,14 @@ __global__ void flash_prefill_attention(Attention request, int rows) {
         const int top_visible = !Partial || member / ordered_heads < active_rows ? visible : 0;
         const int bottom_visible = !Partial || (member + 8) / ordered_heads < active_rows
             ? visible + 8 / ordered_heads : 0;
+        constexpr bool wide = Rows == flash_wide_rows;
+        const bool full = next <= position + query / ordered_heads + 1 &&
+                          (!Partial || query + flash_mma_rows <= active_rows * ordered_heads);
         FragmentA probabilities[flash_value_fragments];
-        const auto top = flash_softmax<0>(column, top_visible, scores, probabilities, state[0]);
-        const auto bottom = flash_softmax<1>(column, bottom_visible, scores, probabilities,
-                                             state[1]);
+        const auto top = flash_softmax<0, wide>(column, top_visible, full, scores,
+                                                probabilities, state[0]);
+        const auto bottom = flash_softmax<1, wide>(column, bottom_visible, full, scores,
+                                                   probabilities, state[1]);
         flash_values(tile, lane, top, bottom, probabilities, numerator);
         if constexpr (Async) {
             asm volatile("cp.async.wait_group 0;" ::: "memory");

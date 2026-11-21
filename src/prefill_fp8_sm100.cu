@@ -556,6 +556,14 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
         }
     }
     const bool narrow_high_k = in_width >= 8192 && rows < 1024;
+    if (rows > 128 && rows < 1024 && (out_width >= 8192 || in_width >= 6144)) {
+        const auto paired = launch_tma<Tile<128, 128, 6, 2, 1, 2>>(
+            weight, weight_scales, input, rows, out_width, in_width, output, stream, device,
+            1 + (rows - 1) / 128);
+        if (paired) {
+            return paired;
+        }
+    }
     if ((rows <= 64 && out_width >= 4096) || narrow_high_k) {
         return launch_tma<Tile<64, 128, 6, 2, 1>>(weight, weight_scales, input, rows,
                                                  out_width, in_width, output, stream, device);
@@ -635,6 +643,19 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
             packed_mlp_chunk ? 8 : 1);
         if (wide) {
             return wide;
+        }
+    }
+    if (rows < 1024) {
+        const int row_tiles = 1 + (rows - 1) / 128;
+        const auto paired = wide_slices
+            ? launch_tma<Tile<128, packed_wide_tile_cols, 4, 1, 1, 2>>(
+                  first.weight, first.scales, input, rows, total_width, in_width, output,
+                  stream, device, row_tiles)
+            : launch_tma<Tile<128, 128, 6, 2, 1, 2>>(
+                  first.weight, first.scales, input, rows, total_width, in_width, output,
+                  stream, device, row_tiles);
+        if (paired) {
+            return paired;
         }
     }
     return launch_tma<Tile<128, 128, 6, 2, 1>>(first.weight, first.scales, input, rows,

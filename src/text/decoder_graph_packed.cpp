@@ -119,10 +119,12 @@ private:
     TextFp8ActivationView quantize(const Bf16* input, int width, const Step& step) const;
     void normalize(const Bf16* branch, Bf16* residual, const Bf16* weight,
                    const Step& step) const;
+    void project_input(LayerResidual input, const Bf16* norm,
+                       const TextFp8DecodeTarget* targets, int count, const Step& step) const;
     void project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output,
                  const Step& step) const;
-    void gdn(const GdnLayer& layer, int bank, const Step& step) const;
-    void gqa(const GqaLayer& layer, int bank, const Step& step) const;
+    void gdn(const Layer& weights, LayerResidual input, int bank, const Step& step) const;
+    void gqa(const Layer& weights, LayerResidual input, int bank, const Step& step) const;
     void attend(const GqaLayer& layer, int bank, const Step& step) const;
     void mlp(const Layer& layer, const Step& step) const;
     void head(const Step& step) const;
@@ -267,11 +269,18 @@ TextFp8ActivationView PackedDecode::quantize(const Bf16* input, int width,
 
 void PackedDecode::normalize(const Bf16* branch, Bf16* residual, const Bf16* weight,
                              const Step& step) const {
-    const auto launch = branch == rows_.projected_attention
-        ? RmsQuantizeLaunch::packed_gate_up : RmsQuantizeLaunch::ordinary;
     check(tensor_core_prefill_rms_quantize(branch, residual, weight, hidden_size, step.rows,
-                                           rows_.normalized, rows_.activation, step.stream, launch),
+                                           rows_.normalized, rows_.activation, step.stream,
+                                           RmsQuantizeLaunch::packed_gate_up),
           "Normalize and quantize packed decode residual");
+}
+
+void PackedDecode::project_input(LayerResidual input, const Bf16* norm,
+                                 const TextFp8DecodeTarget* targets, int count,
+                                 const Step& step) const {
+    check(tensor_core_decode_rms_project(input.branch, input.residual, norm, hidden_size,
+                                        step.rows, rows_.normalized, rows_.activation, targets,
+                                        count, step.stream), "Project packed attention input");
 }
 
 void PackedDecode::project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output,
@@ -280,12 +289,12 @@ void PackedDecode::project(Fp8Weight weight, TextFp8ActivationView input, Bf16* 
                                step.rows, output, step.stream), "Run packed decode projection");
 }
 
-void PackedDecode::gdn(const GdnLayer& layer, int bank, const Step& step) const {
-    const TextFp8ActivationView input{rows_.activation.values, rows_.activation.scales};
+void PackedDecode::gdn(const Layer& weights, LayerResidual input, int bank,
+                       const Step& step) const {
+    const auto& layer = weights.gdn;
     const TextFp8DecodeTarget targets[]{target(layer.qkv, rows_.gdn_qkv),
                                         target(layer.z, rows_.gdn_z)};
-    check(text_fp8_decode_rows_fused(targets, 2, input, hidden_size, step.rows, step.stream),
-          "Run packed Gated DeltaNet input projections");
+    project_input(input, weights.input_norm, targets, 2, step);
     check(text_bf16_decode_gates(layer.b.values, layer.a.values, rows_.normalized, step.rows,
                                  rows_.gdn_b, rows_.gdn_a, step.stream),
           "Run packed Gated DeltaNet gate projections");
@@ -317,13 +326,13 @@ void PackedDecode::attend(const GqaLayer& layer, int bank, const Step& step) con
           "Run packed grouped-query attention step");
 }
 
-void PackedDecode::gqa(const GqaLayer& layer, int bank, const Step& step) const {
-    const TextFp8ActivationView input{rows_.activation.values, rows_.activation.scales};
+void PackedDecode::gqa(const Layer& weights, LayerResidual input, int bank,
+                       const Step& step) const {
+    const auto& layer = weights.gqa;
     const TextFp8DecodeTarget targets[]{target(layer.q_gate, rows_.q_gate),
                                         target(layer.key, rows_.keys),
                                         target(layer.value, rows_.values)};
-    check(text_fp8_decode_rows_fused(targets, 3, input, hidden_size, step.rows, step.stream),
-          "Run packed QKV projections");
+    project_input(input, weights.input_norm, targets, 3, step);
     attend(layer, bank, step);
     project(layer.output, quantize(rows_.attention, text_gqa_q_width, step),
             rows_.projected_attention, step);
@@ -362,10 +371,15 @@ void PackedDecode::enqueue(int rows, cudaStream_t stream) const {
         const auto [branch, residual] = residuals(rows_);
         normalize(branch, residual, weight, step);
     };
-    execute_layers(model_.layers, normalize_step,
-                   [&](const GqaLayer& layer, int bank) { gqa(layer, bank, step); },
-                   [&](const GdnLayer& layer, int bank) { gdn(layer, bank, step); },
-                   [&](const Layer& layer) { mlp(layer, step); });
+    execute_layers_with_attention_input(
+        model_.layers, normalize_step,
+        [&](const Layer& layer, int bank, const auto& input) {
+            gqa(layer, input(rows_), bank, step);
+        },
+        [&](const Layer& layer, int bank, const auto& input) {
+            gdn(layer, input(rows_), bank, step);
+        },
+        [&](const Layer& layer) { mlp(layer, step); });
     head(step);
 }
 

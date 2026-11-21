@@ -42,12 +42,16 @@ cudaError_t tensor_core_prefill_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages, in
                                     int rows, const __nv_bfloat16* queries,
                                     __nv_bfloat16* output, cudaStream_t stream);
 
-enum class RmsQuantizeLaunch { ordinary, packed_gate_up };
+enum class RmsQuantizeLaunch { ordinary, packed_gate_up, prefetch_decode_weights };
 
 cudaError_t tensor_core_prefill_rms_quantize(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,
     cudaStream_t stream, RmsQuantizeLaunch launch = RmsQuantizeLaunch::ordinary);
+cudaError_t tensor_core_decode_rms_project(
+    const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,
+    const TextFp8DecodeTarget* targets, int count, cudaStream_t stream);
 cudaError_t tensor_core_prefill_swiglu_quantize(
     const __nv_bfloat16* gate, const __nv_bfloat16* up, int width, int rows,
     TextFp8Activation activation, cudaStream_t stream);

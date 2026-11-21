@@ -215,7 +215,7 @@ __device__ void rms_quantize_subwarps(const __nv_bfloat16* normalized,
     }
 }
 
-template <bool HasResidual, bool PackedGroups = false, bool LaunchGateUp = false>
+template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false>
 __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
                                      const __nv_bfloat16* weight, __nv_bfloat16* normalized,
                                      TextFp8Activation activation) {
@@ -251,7 +251,7 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
         asm volatile("cp.async.wait_group 0;" ::: "memory");
     }
     __syncthreads();
-    if constexpr (LaunchGateUp) {
+    if constexpr (LaunchDependents) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     float values[values_per_thread];
@@ -322,9 +322,17 @@ cudaError_t decoder::tensor_core_prefill_rms_quantize(
             : status;
     }
     void* args[] = {&branch, &residual, &weight, &normalized, &activation};
+    const bool prefetch_weights = launch == RmsQuantizeLaunch::prefetch_decode_weights;
     if (residual && rows >= 2 && rows <= 32 && aligned(activation.values, alignof(uint2))) {
-        const auto kernel = launch == RmsQuantizeLaunch::packed_gate_up && rows == 32
+        const bool early = prefetch_weights ||
+                           (launch == RmsQuantizeLaunch::packed_gate_up && rows == 32);
+        const auto kernel = early
             ? prefill_rms_quantize<true, true, true> : prefill_rms_quantize<true, true>;
+        return cudaLaunchKernel(kernel, rows, block_threads, args, 0, stream);
+    }
+    if (prefetch_weights) {
+        const auto kernel = residual ? prefill_rms_quantize<true, false, true>
+                                     : prefill_rms_quantize<false, false, true>;
         return cudaLaunchKernel(kernel, rows, block_threads, args, 0, stream);
     }
     const auto kernel = residual ? prefill_rms_quantize<true> : prefill_rms_quantize<false>;

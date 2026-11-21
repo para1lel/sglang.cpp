@@ -858,9 +858,11 @@ cudaError_t text_fp8_decode_rows(const std::uint8_t* weight, const __nv_bfloat16
     return text_fp8_decode_rows_fused(&target, 1, input, in_width, rows, stream);
 }
 
-cudaError_t text_fp8_decode_rows_fused(const TextFp8DecodeTarget* targets, int count,
-                                       TextFp8ActivationView input, int in_width, int rows,
-                                       cudaStream_t stream) {
+namespace {
+
+cudaError_t decode_fp8_rows(const TextFp8DecodeTarget* targets, int count,
+                            TextFp8ActivationView input, int in_width, int rows,
+                            cudaStream_t stream, const Fp8DecodeInputProducer* producer) {
     if (!targets || count < 1 || count > text_decode_max_targets || !input.values ||
         !input.scales || in_width <= 0 || rows <= 0 || rows > 65535) {
         return cudaErrorInvalidValue;
@@ -872,8 +874,14 @@ cudaError_t text_fp8_decode_rows_fused(const TextFp8DecodeTarget* targets, int c
         }
     }
     if (const auto status = try_text_fp8_decode_sm100(targets, count, input, in_width, rows,
-                                                      stream)) {
+                                                      stream, producer)) {
         return *status;
+    }
+    if (producer) {
+        const auto status = producer->launch(producer->context, false);
+        if (status != cudaSuccess) {
+            return status;
+        }
     }
     for (int index = 0; index < count; ++index) {
         const auto& target = targets[index];
@@ -885,6 +893,32 @@ cudaError_t text_fp8_decode_rows_fused(const TextFp8DecodeTarget* targets, int c
         }
     }
     return cudaSuccess;
+}
+
+}
+
+cudaError_t text_fp8_decode_rows_fused(const TextFp8DecodeTarget* targets, int count,
+                                       TextFp8ActivationView input, int in_width, int rows,
+                                       cudaStream_t stream) {
+    return decode_fp8_rows(targets, count, input, in_width, rows, stream, nullptr);
+}
+
+cudaError_t decoder::tensor_core_decode_rms_project(
+    const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,
+    const TextFp8DecodeTarget* targets, int count, cudaStream_t stream) {
+    const auto normalize = [&](bool prefetch_weights) {
+        const auto launch = prefetch_weights ? RmsQuantizeLaunch::prefetch_decode_weights
+                                             : RmsQuantizeLaunch::ordinary;
+        return tensor_core_prefill_rms_quantize(branch, residual, weight, width, rows,
+                                                normalized, activation, stream, launch);
+    };
+    const Fp8DecodeInputProducer producer{
+        &normalize, [](const void* context, bool prefetch_weights) {
+            return (*static_cast<const decltype(normalize)*>(context))(prefetch_weights);
+        }};
+    return decode_fp8_rows(targets, count, {activation.values, activation.scales}, width, rows,
+                           stream, &producer);
 }
 
 cudaError_t text_bf16_decode_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,

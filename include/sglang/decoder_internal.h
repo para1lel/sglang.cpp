@@ -214,8 +214,8 @@ struct LayerResidual {
 };
 
 template <typename Normalize, typename Gqa, typename Gdn, typename Mlp>
-void execute_layers(const std::array<Layer, layer_count>& layers, Normalize normalize,
-                    Gqa gqa, Gdn gdn, Mlp mlp) {
+void execute_layers_with_attention_input(const std::array<Layer, layer_count>& layers,
+                                         Normalize normalize, Gqa gqa, Gdn gdn, Mlp mlp) {
     int gqa_index = 0;
     int gdn_index = 0;
     for (int index = 0; index < layer_count; ++index) {
@@ -224,17 +224,31 @@ void execute_layers(const std::array<Layer, layer_count>& layers, Normalize norm
             return first ? LayerResidual{work.residual, nullptr}
                          : LayerResidual{work.hidden, work.residual};
         };
-        normalize(layer.input_norm, "Normalize layer input", input);
         if (is_full_attention(index)) {
-            gqa(layer.gqa, gqa_index++);
+            gqa(layer, gqa_index++, input);
         } else {
-            gdn(layer.gdn, gdn_index++);
+            gdn(layer, gdn_index++, input);
         }
         normalize(layer.attention_norm, "Normalize post-attention residual", [](const auto& work) {
             return LayerResidual{work.projected_attention, work.residual};
         });
         mlp(layer);
     }
+}
+
+template <typename Normalize, typename Gqa, typename Gdn, typename Mlp>
+void execute_layers(const std::array<Layer, layer_count>& layers, Normalize normalize,
+                    Gqa gqa, Gdn gdn, Mlp mlp) {
+    execute_layers_with_attention_input(
+        layers, normalize,
+        [&](const Layer& layer, int bank, const auto& input) {
+            normalize(layer.input_norm, "Normalize layer input", input);
+            gqa(layer.gqa, bank);
+        },
+        [&](const Layer& layer, int bank, const auto& input) {
+            normalize(layer.input_norm, "Normalize layer input", input);
+            gdn(layer.gdn, bank);
+        }, mlp);
 }
 
 struct Workspace {

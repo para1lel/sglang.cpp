@@ -10,12 +10,19 @@
 
 namespace sglang {
 
+struct Fp8DecodeInputProducer {
+    const void* context;
+    cudaError_t (*launch)(const void* context, bool prefetch_weights);
+};
+
 /// Swap-AB tcgen05 decode projections for SM 10.0. An empty result means the
 /// device, shape or alignment is unsupported and the caller should fall back.
 std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* targets,
                                                      int count, TextFp8ActivationView input,
                                                      int in_width, int rows,
-                                                     cudaStream_t stream);
+                                                     cudaStream_t stream,
+                                                     const Fp8DecodeInputProducer* producer =
+                                                         nullptr);
 
 std::optional<cudaError_t> try_text_bf16_decode_sm100(
     const __nv_bfloat16* weight, const __nv_bfloat16* input, int out_width, int in_width,

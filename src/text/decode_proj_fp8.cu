@@ -211,7 +211,8 @@ bool use_mlp_pipeline(const TextFp8DecodeTarget* targets, int count, int in_widt
 std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* targets,
                                                      int count, TextFp8ActivationView input,
                                                      int in_width, int rows,
-                                                     cudaStream_t stream) {
+                                                     cudaStream_t stream,
+                                                     const Fp8DecodeInputProducer* producer) {
     if (!supported_targets(targets, count, in_width, input)) {
         return std::nullopt;
     }
@@ -264,6 +265,12 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* 
                        ((job.groups - 1) / plan.splits + 1) * (columns + 1) * sizeof(float);
     const dim3 grid(plan.splits, blocks, (rows - 1) / columns + 1);
     void* args[] = {&job};
+    if (producer) {
+        status = producer->launch(producer->context, true);
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
     return launch_split(kernel, grid, shared, args, stream, grid.x);
 }
 

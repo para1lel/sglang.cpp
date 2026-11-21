@@ -91,7 +91,7 @@ An unseeded sampled request resolves one seed with `std::random_device`. The fro
 
 ## Finite-choice constraints
 
-Set `ebnf` on a native text or chat request to restrict the generated text to one literal, in JSON or SSE. Use one rule of the form `root ::= "yes" | "no"`. Each alternative is a nonempty double-quoted string with JSON escapes. The decoded bytes must be valid UTF-8. A single literal is valid. [HTTP validation](../apps/server/text_request.cpp#L287)<!-- prefix: "void set_con" --> · [Compiler](../src/tokenizer/constraint.cpp#L82)<!-- prefix: "std::shared_" -->
+Set top-level `ebnf` on a `/v1/completions` or `/v1/chat/completions` request to restrict output to one literal in JSON or SSE. Use one rule of the form `root ::= "yes" | "no"`. Each alternative is a nonempty double-quoted string with JSON escapes. The decoded bytes must be valid UTF-8. A single literal is valid. [/generate field](output-constraints.md#native-ebnf) · [HTTP validation](../apps/server/text_request.cpp#L287)<!-- prefix: "void set_con" --> · [Compiler](../src/tokenizer/constraint.cpp#L82)<!-- prefix: "std::shared_" -->
 
 ```bash
 curl --fail-with-body http://127.0.0.1:17384/v1/completions \

@@ -285,7 +285,7 @@ const json::Value& response_schema(const json::Value& value) {
 }
 
 void set_constraint(const json::Object& object, const CompletionTokenizer& tokenizer,
-                    DecoderOptions& options, const char* budget_error = nullptr) {
+                    DecoderOptions& options) {
     const auto* regex = json::get(object, "regex");
     const auto* ebnf = json::get(object, "ebnf");
     const auto* schema = json::get(object, "response_format");
@@ -318,7 +318,7 @@ void set_constraint(const json::Object& object, const CompletionTokenizer& token
             : TokenConstraint::compile(tokenizer.get(), *value->string());
     }
     if (options.max_new_tokens < options.constraint->minimum_tokens()) {
-        bad_request(budget_error ? budget_error : options.constraint->budget_error());
+        bad_request(options.constraint->budget_error());
     }
 }
 
@@ -773,7 +773,8 @@ DecoderOptions generate_options(const json::Value* params, const CompletionToken
                        key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
                        key == "stop_token_ids" || key == "logit_bias" ||
                        key == "frequency_penalty" || key == "presence_penalty" ||
-                       key == "repetition_penalty" || key == "regex" || key == "json_schema") {
+                       key == "repetition_penalty" || key == "regex" || key == "json_schema" ||
+                       key == "ebnf") {
                 if (!parameter.is_null()) {
                     sampling.emplace(key, parameter);
                 }
@@ -786,10 +787,7 @@ DecoderOptions generate_options(const json::Value* params, const CompletionToken
     set_sampling(sampling, options, "sampling_seed");
     set_logit_bias(sampling, options);
     set_stops(sampling, options);
-    set_generate_json_schema(sampling, tokenizer.get(), options);
-    if (const auto* regex = json::get(sampling, "regex"); regex && regex->string() != "") {
-        set_constraint(sampling, tokenizer, options, "max_new_tokens cannot complete the regex");
-    }
+    set_generate_constraint(sampling, tokenizer.get(), options);
     return options;
 }
 

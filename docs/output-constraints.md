@@ -55,7 +55,7 @@ Compilation allows up to 4,096 nondeterministic states, 256 deterministic states
 
 ### Native generate
 
-Set `sampling_params.regex` to constrain generated text in `POST /generate`. Omission, null, and `""` disable the constraint. A broadcast sampling object shares the compiled pattern. Each item tracks its own progress. Use a sampling object array for distinct patterns.
+Set `sampling_params.regex` to constrain generated text in `POST /generate`. Omission, null, and `""` disable that field. At most one of `regex`, `json_schema`, and `ebnf` can be active per item. A broadcast sampling object shares the compiled constraint. Each item owns its cursor and budget. Use a sampling object array for distinct constraints or to mix constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L496)<!-- prefix: "void set_gen" -->
 
 ```json
 {
@@ -127,9 +127,17 @@ Put the serialized schema in `sampling_params.json_schema` on `POST /generate`. 
 }
 ```
 
-Omission, null, and `""` disable the constraint. Two active fields among `regex` and `json_schema` return HTTP 400. A broadcast sampling object shares compilation across items. An array of sampling objects can mix schemas, regexes, and unconstrained items. Each item has its own cursor and budget. JSON and cumulative SSE return the generated JSON as a string in `text`.
+The [native sampling rules](#native-generate) apply. JSON and cumulative SSE return the generated JSON as a string in `text`.
 
 The [schema subset](#json-schema) and [native finish rules](#native-generate) apply. A complete match at the token cap reports `length` unless a stop takes precedence. Text stops can trim the displayed JSON. Use model EOS handling and omit `stop_token_ids`. Zero or insufficient budget, malformed or unsupported schemas, and generated logprobs on the same constrained item return HTTP 400 before decoder admission or SSE headers. An unconstrained sibling can request generated logprobs. [Native validation](../apps/server/native_generate.cpp#L496)<!-- prefix: "void set_gen" -->
+
+### Native EBNF
+
+Set `sampling_params.ebnf` to a string such as `root ::= "ready" | "pending"` on `POST /generate`. Use one `root` rule with nonempty, double-quoted UTF-8 literals and JSON escapes. The [finite-choice limits](text-serving.md#finite-choice-constraints) apply, including the 16,384-byte grammar cap, 32 alternatives, 256 bytes per decoded literal, and 2,048 decoded bytes total. Additional rules, references, concatenation, and repetition are unsupported.
+
+The [native sampling and finish rules](#native-generate) apply. Omit `stop_token_ids` and leave `ignore_eos` false when EBNF is active. Invalid syntax, field conflicts, insufficient budget, and same-item generated logprobs return HTTP 400 before decoder admission or SSE headers. Text stops can trim a literal in the response. JSON and cumulative SSE keep the normal `/generate` shapes, with `index` on batch SSE frames.
+
+Run `tests/text/test_native_ebnf.py` with a release server and the checkpoint. It checks literal and UTF-8 boundaries, mixed constraints, per-item cursors, and the top-level OpenAI form.
 
 ### Selection and finish
 

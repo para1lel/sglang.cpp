@@ -493,41 +493,53 @@ void NativeGenerate::abort(const Socket& connection, std::string_view body) {
     write_json(connection, "200 OK", "");
 }
 
-void set_generate_json_schema(const json::Object& sampling, const Tokenizer& tokenizer,
-                              DecoderOptions& options) {
-    const auto* schema = json::get(sampling, "json_schema");
-    if (!schema) {
+void set_generate_constraint(const json::Object& sampling, const Tokenizer& tokenizer,
+                             DecoderOptions& options) {
+    std::string_view kind;
+    std::string_view source;
+    for (const std::string_view field : {"regex", "json_schema", "ebnf"}) {
+        const auto* value = json::get(sampling, field);
+        if (!value) {
+            continue;
+        }
+        const auto text = value->string();
+        if (!text) {
+            const auto name = field == "regex" ? "regex" : "sampling_params." + std::string(field);
+            throw std::invalid_argument(name + " must be a string");
+        }
+        if (text->empty()) {
+            continue;
+        }
+        if (!kind.empty()) {
+            throw std::invalid_argument("Use one of sampling_params.regex, "
+                                        "sampling_params.json_schema and sampling_params.ebnf");
+        }
+        kind = field;
+        source = *text;
+    }
+    if (kind.empty()) {
         return;
     }
-    const auto encoded = schema->string();
-    if (!encoded) {
-        throw std::invalid_argument("sampling_params.json_schema must be a string");
-    }
-    if (encoded->empty()) {
-        return;
-    }
-    if (const auto* regex = json::get(sampling, "regex")) {
-        const auto pattern = regex->string();
-        if (!pattern) {
-            throw std::invalid_argument("regex must be a string");
-        }
-        if (!pattern->empty()) {
-            throw std::invalid_argument("Use one of sampling_params.json_schema and "
-                                        "sampling_params.regex");
-        }
-    }
+    const auto name = kind == "json_schema" ? "JSON Schema" : kind;
     if (options.ignore_eos || json::get(sampling, "stop_token_ids")) {
-        throw std::invalid_argument("JSON Schema requires model EOS stops without "
-                                    "stop_token_ids overrides");
+        throw std::invalid_argument(std::string(name) +
+                                    " requires model EOS stops without stop_token_ids overrides");
     }
-    try {
-        const auto parsed = json::parse(*encoded, json::Syntax::ordered);
-        options.constraint = TokenConstraint::compile_json_schema(tokenizer, parsed);
-    } catch (const json::ParseError&) {
-        throw std::invalid_argument("sampling_params.json_schema must contain valid JSON");
+    if (kind == "json_schema") {
+        try {
+            const auto parsed = json::parse(source, json::Syntax::ordered);
+            options.constraint = TokenConstraint::compile_json_schema(tokenizer, parsed);
+        } catch (const json::ParseError&) {
+            throw std::invalid_argument("sampling_params.json_schema must contain valid JSON");
+        }
+    } else if (kind == "regex") {
+        options.constraint = TokenConstraint::compile_regex(tokenizer, source);
+    } else {
+        options.constraint = TokenConstraint::compile(tokenizer, source);
     }
     if (options.max_new_tokens < options.constraint->minimum_tokens()) {
-        throw std::invalid_argument("max_new_tokens cannot complete the JSON Schema");
+        const auto target = kind == "ebnf" ? "an ebnf choice" : "the " + std::string(name);
+        throw std::invalid_argument("max_new_tokens cannot complete " + target);
     }
 }
 

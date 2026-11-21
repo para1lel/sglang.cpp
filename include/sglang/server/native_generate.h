@@ -22,8 +22,8 @@ struct GenerateInput {
 };
 
 GenerateInput parse_generate_input(std::string_view body);
-void set_generate_json_schema(const json::Object& sampling, const Tokenizer& tokenizer,
-                              DecoderOptions& options);
+void set_generate_constraint(const json::Object& sampling, const Tokenizer& tokenizer,
+                             DecoderOptions& options);
 std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
                                                const CompletionTokenizer& tokenizer);
 

@@ -4,13 +4,13 @@ Both `/v1/completions` and `/v1/chat/completions` can return the score of each c
 
 ## Request requirements
 
-Use greedy decoding and disable server MTP. Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Active sampling, output constraints, decoded media, and active chat reasoning or tool output parsers return HTTP 400 before SSE. The completion route accepts `echo: false` and rejects `echo: true`. Scores cover generated tokens only. [Score options](../apps/server/text_request.cpp#L318)<!-- prefix: "int openai_l" -->
+Use greedy decoding and disable server MTP. Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Active sampling, output constraints, decoded media, and active chat reasoning or tool output parsers return HTTP 400 before SSE. The completion route accepts `echo: false` and rejects `echo: true`. Scores cover generated tokens only. [Score options](../apps/server/text_request.cpp#L325)<!-- prefix: "int openai_l" -->
 
 Generated logprobs use the scores after [output penalties](output-penalties.md) and logit bias.
 
 ## Logit bias
 
-In OpenAI completions and native `/generate`, `logit_bias` maps decimal token ID strings in `[0, 248320)` to finite offsets in `[-1e30, 1e30]`. When different spellings identify the same token, the last entry supplies its offset. Omission, null, an empty object, and zero offsets leave scores unchanged. Active offsets apply to FP32 scores before greedy or sampled selection and respect output constraints. Active bias uses target-only decoding for that request, including on an MTP server. Generated logprobs use the adjusted scores and follow the request requirements above. [Bias parser](../apps/server/text_request.cpp#L133)<!-- prefix: "void set_log" -->
+In OpenAI completions and native `/generate`, `logit_bias` maps decimal token ID strings in `[0, 248320)` to finite offsets in `[-1e30, 1e30]`. When different spellings identify the same token, the last entry supplies its offset. Omission, null, an empty object, and zero offsets leave scores unchanged. Active offsets apply to FP32 scores before greedy or sampled selection and respect output constraints. Active bias uses target-only decoding for that request, including on an MTP server. Generated logprobs use the adjusted scores and follow the request requirements above. [Bias parser](../apps/server/text_request.cpp#L140)<!-- prefix: "void set_log" -->
 
 ## Text completions
 

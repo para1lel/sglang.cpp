@@ -234,3 +234,5 @@ validation before streaming. The GPU runner takes both UUID locks and runs
 the checkpoint against a host oracle for FP32 score addition, log-softmax,
 and seeded selection. It also checks constraint masking, packed eager and
 graph parity, and a target-only biased lane beside an MTP lane.
+The minimum-output checks cover all three request routes, full-vocabulary
+stop masking, seeded and greedy selection, and different minima in packed lanes.

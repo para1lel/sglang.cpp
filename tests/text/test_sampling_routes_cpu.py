@@ -202,6 +202,39 @@ class Routes(unittest.TestCase):
                         self.exchange(route, {**payload({name: invalid}), "stream": True},
                                       status=400)
 
+    def test_minimum_output(self):
+        for route in ("/generate", TEXT, CHAT):
+            native = route == "/generate"
+            name = "min_new_tokens" if native else "min_tokens"
+            other = "min_tokens" if native else "min_new_tokens"
+
+            def payload(fields, *, budget=3, stream=False):
+                if native:
+                    return {"input_ids": [32, 220], "stream": stream, "sampling_params": {
+                        "max_new_tokens": budget, "temperature": 0, **fields,
+                    }}
+                return body(route, max_tokens=budget, temperature=0, stream=stream, **fields)
+
+            with self.subTest(route=route):
+                _, implicit = self.exchange(route, payload({}))
+                _, zero = self.exchange(route, payload({name: 0}))
+                self.assertEqual(implicit, zero)
+                self.assertEqual(zero["minimum"], 0)
+                for value in (1, 3):
+                    _, seen = self.exchange(route, payload({name: value}, stream=True))
+                    self.assertEqual(seen["minimum"], value)
+                for value in (-1, 4, True, "1", 1.5, [], 2**40):
+                    self.exchange(route, payload({name: value}, stream=True), status=400)
+                self.exchange(route, payload({name: 1}, budget=0), status=400)
+                self.exchange(route, payload({other: 1}), status=400)
+                if native:
+                    _, seen = self.exchange(route, payload({name: None}))
+                    self.assertEqual(seen, zero)
+                else:
+                    self.exchange(route, payload({name: None}), status=400)
+        self.exchange(CHAT, body(CHAT, max_tokens=3, max_completion_tokens=1, min_tokens=2),
+                      status=400)
+
     def test_repetition_penalty(self):
         for route in ("/generate", TEXT, CHAT):
             def payload(fields, *, stream=False):

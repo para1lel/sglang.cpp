@@ -445,6 +445,7 @@ std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
     request.max_new_tokens = limit_resident_output(
         prompt, request, resident_capacity, std::min(unreserved, resident_capacity - charged),
         extra_bytes);
+    request.min_new_tokens = std::min(request.min_new_tokens, request.max_new_tokens);
     request.incremental_kv = false;
     return extra_bytes + request_resident_bytes(RequestProgress::capacity(prompt, request),
         reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
@@ -533,7 +534,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         if (input) validate_feature_device(*input, state_->model.device);
         reclaim_prefill_workspaces(state_->model.device);
         const auto resident = state_->reserve(options, static_cast<int>(prompt.size()),
-            output_penalty_bytes(options) +
+            logit_adjustment_bytes(options) +
             (input ? input->prompt.positions.size() * sizeof(MropePosition) : 0));
         if (options.max_new_tokens != requested.max_new_tokens) {
             validate_request(prompt, options, !media);
@@ -605,7 +606,8 @@ bool DecoderBatch::available() const { return !state_->failed; }
 void DecoderBatch::State::score(int slot, Lane& lane, Workspace& work, bool logits_ready) {
     const auto stream = execution.stream();
     if (!logits_ready) model.compute_logits(work, stream);
-    auto* adjusted = lane.options.requires_target_only() ? &adjusted_workspace : nullptr;
+    auto* adjusted = lane.options.adjusts_logits(lane.progress.generated)
+        ? &adjusted_workspace : nullptr;
     if (lane.options.generated_top_logprobs >= 0) {
         const bool repetition = lane.options.repetition_penalty != 1;
         auto* readback = logprob_readback + slot;
@@ -688,7 +690,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
                 plain && model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
             const bool final_text = rows[slot] == 1 && remaining == 1 && !lane.media;
             final_text_rows |= std::uint64_t{final_text} << packed_slots[slot];
-            if (plain && !lane.sampling && !lane.options.requires_target_only() &&
+            if (plain && !lane.sampling && !lane.options.adjusts_logits(lane.progress.generated) &&
                 !lane.options.constraint && lane.request->memory.transfers().logits.empty()) {
                 greedy_winners |= std::uint64_t{1} << packed_slots[slot];
             }
@@ -781,7 +783,8 @@ void DecoderBatch::State::collect_scores(
                 } else {
                     results[slot].token = winner
                         ? validate_winner(winner->token_id, false, false)
-                        : read_token(*scoring[slot], lane.sampling.has_value(),
+                        : read_token(*scoring[slot], lane.sampling || lane.progress.generated <
+                                     lane.options.min_new_tokens,
                                      lane.options.constraint != nullptr);
                 }
             } catch (const DecoderSamplingError&) {

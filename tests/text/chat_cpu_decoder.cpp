@@ -82,6 +82,7 @@ void record_sampling(const DecoderOptions& options, std::size_t prompt_size) {
            << ",\"frequency_penalty\":" << options.frequency_penalty
            << ",\"presence_penalty\":" << options.presence_penalty
            << ",\"repetition_penalty\":" << options.repetition_penalty
+           << ",\"minimum\":" << options.min_new_tokens
            << ",\"budget\":" << options.max_new_tokens << ",\"seed\":";
     if (options.seed) {
         output << *options.seed;

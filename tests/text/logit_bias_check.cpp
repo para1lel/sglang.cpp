@@ -11,6 +11,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <unordered_set>
 
 namespace {
 
@@ -178,6 +179,189 @@ void verify_singleton(const Decoder& decoder, const Tokenizer& tokenizer) {
     verify_invalid(decoder);
     std::cout << "singleton: full exact FP32 rows, generated log-softmax, four seeds, "
                  "constraint and eight direct rejections passed\n";
+}
+
+std::vector<Row> minimum_rows(const Decoder& decoder, const std::vector<int>& input,
+                              const DecoderOptions& options) {
+    constexpr float forcing_bias = 40;
+    DecoderOptions control;
+    control.max_new_tokens = options.max_new_tokens;
+    control.top_logits = model_vocab_size;
+    control.logit_bias = biases({{32, forcing_bias}});
+    const auto raw = decoder.generate(input, control);
+    require(raw.output_token_ids == std::vector<int>(control.max_new_tokens, 32),
+            "minimum oracle did not retain the forced history");
+    std::vector<Row> expected;
+    for (auto row : raw.step_top_logits) {
+        require(row.size() == model_vocab_size && row.front().token_id == 32,
+                "minimum oracle did not export the full vocabulary");
+        row.front().logit -= forcing_bias;
+        if (expected.size() < static_cast<std::size_t>(options.min_new_tokens)) {
+            for (auto& score : row) {
+                if (score.token_id == end_of_text || score.token_id == end_of_message ||
+                    score.token_id == 33 || score.token_id == 34) {
+                    score.logit = -std::numeric_limits<float>::infinity();
+                }
+            }
+        }
+        expected.push_back(biased_row(std::move(row), *options.logit_bias));
+    }
+    return expected;
+}
+
+void verify_minimum_batch(const Decoder& decoder, const std::vector<int>& input,
+                          const DecoderOptions& options, const std::vector<Row>& expected) {
+    std::vector<DecoderTokenLogprobs> eager;
+    for (bool graphs : {false, true}) {
+        DecoderBatch batch(decoder, {graphs, 2});
+        auto scored = options;
+        scored.top_logits = 0;
+        scored.generated_top_logprobs = 5;
+        scored.mtp_steps = 2;
+        auto short_lane = scored;
+        short_lane.min_new_tokens = 2;
+        batch.admit(0, input, scored);
+        batch.admit(1, input, short_lane);
+        std::uint32_t graph_slots = 0;
+        for (int index = 0; index < scored.max_new_tokens; ++index) {
+            DecoderBatchStepStats stats;
+            const auto steps = batch.advance_chunked({true, index <= 2}, &stats);
+            graph_slots |= stats.graph_slots;
+            const auto& step = steps[0];
+            const bool final = index + 1 == scored.max_new_tokens;
+            require(step.token == expected[index].front().token_id && step.generated_logprobs &&
+                        step.mtp_drafted_tokens == 0 && !step.mtp_boundary &&
+                        step.finish_reason.has_value() == final,
+                    "minimum lane token, finish, or MTP route differs");
+            const auto& scores = *step.generated_logprobs;
+            require(scores.selected.token_id == *step.token && scores.alternatives.size() == 5,
+                    "minimum generated scores do not describe the selected token");
+            if (index < scored.min_new_tokens) {
+                for (const auto& candidate : scores.alternatives) {
+                    require(!scored.stops_at(candidate.token_id),
+                            "minimum returned a suppressed stop among the top scores");
+                }
+            }
+            if (graphs) {
+                const auto equal = [](const DecoderLogprob& left, const DecoderLogprob& right) {
+                    return left.token_id == right.token_id && left.value == right.value;
+                };
+                require(equal(scores.selected, eager[index].selected) &&
+                            std::equal(scores.alternatives.begin(), scores.alternatives.end(),
+                                       eager[index].alternatives.begin(),
+                                       eager[index].alternatives.end(), equal),
+                        "minimum eager and captured generated scores differ");
+            } else {
+                eager.push_back(scores);
+            }
+            if (index <= 2) {
+                const auto& peer = steps[1];
+                require(peer.token == (index < 2 ? 32 : end_of_text) &&
+                            peer.finish_reason.has_value() == (index == 2),
+                        "minimum mask leaked across lanes");
+            }
+        }
+        require(graph_slots == (graphs ? 3u : 0u), "minimum batch graph route differs");
+    }
+}
+
+void verify_minimum(const Decoder& decoder) {
+    const std::vector<int> input{32, 33, end_of_text, 220, 32};
+    DecoderOptions options;
+    options.min_new_tokens = 3;
+    options.max_new_tokens = 4;
+    options.stop_token_id = 33;
+    options.additional_stop_token_ids = {34, end_of_text};
+    options.top_logits = model_vocab_size;
+    options.logit_bias = biases({{32, 40}, {33, 80}, {34, 60}, {end_of_text, 120},
+                                 {end_of_message, 100}});
+    const auto expected = minimum_rows(decoder, input, options);
+    for (const auto repetition : {1.0, 0.5}) {
+        options.repetition_penalty = repetition;
+        auto oracle = expected;
+        if (repetition != 1) {
+            for (int index = 1; index < options.max_new_tokens; ++index) {
+                const auto entry = std::find_if(oracle[index].begin(), oracle[index].end(),
+                    [](const auto& score) { return score.token_id == 32; });
+                const float value = entry->logit - 40;
+                entry->logit = 40 + (value < 0 ? value * 0.5f : value / 0.5f);
+                std::sort(oracle[index].begin(), oracle[index].end(),
+                          [](const auto& left, const auto& right) {
+                    return left.logit == right.logit ? left.token_id < right.token_id
+                                                    : left.logit > right.logit;
+                });
+            }
+        }
+        for (const double temperature : {0.0, 0.8}) {
+            options.temperature = temperature;
+            options.top_k = 1;
+            options.seed = 101;
+            const auto actual = decoder.generate(input, options);
+            require(actual.output_token_ids == std::vector<int>({32, 32, 32, end_of_text}),
+                    "minimum selection admitted a stop early or suppressed it after the minimum");
+            for (int index = 0; index < options.max_new_tokens; ++index) {
+                const auto& row = actual.step_top_logits.at(index);
+                require(std::equal(row.begin(), row.end(), oracle[index].begin(),
+                                   oracle[index].end(), exact),
+                        "minimum-adjusted full logits differ from oracle");
+            }
+        }
+    }
+    options.temperature = 0;
+    options.repetition_penalty = 1;
+    verify_minimum_batch(decoder, input, options, expected);
+    options.min_new_tokens = options.max_new_tokens;
+    options.top_logits = 0;
+    const auto capped = decoder.generate(input, options);
+    require(capped.output_token_ids == std::vector<int>(options.max_new_tokens, 32),
+            "minimum equal to maximum allowed an early stop");
+    std::cout << "minimum: 16 exact full-vocabulary rows, greedy and seeded selection, "
+                 "repetition, mixed graph lanes and min=max passed\n";
+}
+
+void verify_minimum_sampling(const Decoder& decoder) {
+    DecoderOptions options;
+    options.max_new_tokens = 1;
+    options.min_new_tokens = 1;
+    options.stop_token_id = 33;
+    options.additional_stop_token_ids = {34};
+    options.logit_bias = biases({{33, 90}, {34, 80}, {end_of_text, 110}, {end_of_message, 100}});
+    const std::vector<int> input{32, 220, 33, end_of_message};
+    auto expected = minimum_rows(decoder, input, options).front();
+    Bias balanced;
+    const float peak = expected.front().logit + 4;
+    for (const auto& score : {expected[0], expected[1], expected[2]}) {
+        balanced.push_back({score.token_id, peak - score.logit});
+    }
+    expected = biased_row(std::move(expected), balanced);
+    balanced.insert(balanced.end(), options.logit_bias->begin(), options.logit_bias->end());
+    options.logit_bias = biases(std::move(balanced));
+    options.temperature = 0.85;
+    options.top_k = 12;
+    options.top_p = 0.9;
+    options.min_p = 0.01;
+    std::unordered_set<int> winners;
+    for (const auto seed : {0, 4, 11, 42}) {
+        options.seed = seed;
+        const auto winner = sample(expected, options);
+        winners.insert(winner);
+        require(decoder.generate(input, options).output_token_ids == std::vector<int>{winner},
+                "minimum sampling differs from the masked distribution");
+    }
+    require(winners.size() > 1, "minimum sampling fixture did not exercise multiple winners");
+
+    for (int token = 0; token < static_cast<int>(model_vocab_size); ++token) {
+        options.additional_stop_token_ids.insert(token);
+    }
+    for (const auto temperature : {0.0, 0.85}) {
+        options.temperature = temperature;
+        try {
+            decoder.generate(input, options);
+            require(false, "fully masked minimum unexpectedly emitted an ID");
+        } catch (const DecoderSamplingError&) {
+        }
+    }
+    std::cout << "minimum: four seeded full-distribution decisions and all-masked errors passed\n";
 }
 
 void verify_output_history(const Decoder& decoder) {
@@ -348,7 +532,7 @@ void verify_repetition_kernel() {
     const auto select = [&](OutputPenalties penalties, int previous, int bias_count,
                             RepetitionSelection selection) {
         require(select_repetition_logits(buffer->source, vocabulary, buffer->bias, bias_count,
-                                         &buffer->mask, penalties, previous, selection,
+                                         {&buffer->mask}, penalties, previous, selection,
                                          workspace.get(), bytes, nullptr) == cudaSuccess &&
                 cudaDeviceSynchronize() == cudaSuccess, "select repetition scores");
     };
@@ -525,6 +709,8 @@ int main(int argc, char** argv) {
         const Tokenizer tokenizer(checkpoint / "tokenizer.json");
         verify_singleton(decoder, tokenizer);
         verify_output_history(decoder);
+        verify_minimum(decoder);
+        verify_minimum_sampling(decoder);
         verify_repetition_kernel();
         verify_repetition_model(decoder, tokenizer);
         const auto eager = run_batch(decoder, false, false);

@@ -48,8 +48,9 @@ int text_budget(const json::Value& value,
 }
 
 void set_stops(const json::Object& object, DecoderOptions& options) {
-    const bool ignore_eos = read_bool(object, "ignore_eos");
-    if (!ignore_eos) {
+    options.ignore_eos = read_bool(object, "ignore_eos");
+    const bool keep_ids = !options.ignore_eos || options.min_new_tokens > 0;
+    if (keep_ids) {
         options.additional_stop_token_ids = {end_of_text, end_of_message};
     }
     if (const auto* value = json::get(object, "stop_token_ids")) {
@@ -62,10 +63,16 @@ void set_stops(const json::Object& object, DecoderOptions& options) {
             if (!id || *id >= model_vocab_size) {
                 bad_request("Stop token ID falls outside the vocabulary");
             }
-            if (!ignore_eos) {
+            if (keep_ids) {
                 options.additional_stop_token_ids.insert(static_cast<int>(*id));
             }
         }
+    }
+}
+
+void validate_minimum(const DecoderOptions& options, const char* error) {
+    if (options.min_new_tokens > options.max_new_tokens) {
+        bad_request(error);
     }
 }
 
@@ -347,6 +354,10 @@ TextRequest text_options(const json::Object& object, const CompletionTokenizer& 
     request.options.incremental_kv = chat && (!budget || budget->is_null());
     request.options.max_new_tokens = request.options.incremental_kv ? 0 :
         (budget ? text_budget(*budget) : 16);
+    if (const auto* minimum = json::get(object, "min_tokens")) {
+        request.options.min_new_tokens =
+            text_budget(*minimum, "Expected a nonnegative integer min_tokens");
+    }
     if (const auto* value = json::get(object, "stream_options")) {
         const auto* options = value->object();
         if (!request.stream || !options || options->size() != 1 ||
@@ -378,6 +389,7 @@ void finish_options(TextRequest& request, const json::Object& object,
         request.options.max_new_tokens =
             chat_token_limit - static_cast<int>(request.prompt.size());
     }
+    validate_minimum(request.options, "min_tokens must not exceed the output token budget");
     set_constraint(object, tokenizer, request.options);
     if (request.options.generated_top_logprobs >= 0 && request.options.constraint) {
         bad_request("Generated logprobs do not support response constraints");
@@ -438,7 +450,8 @@ std::vector<int> completion_prompt(const json::Value& input, bool text, int max_
 }
 
 bool is_text_option(std::string_view key) {
-    return key == "model" || key == "max_tokens" || key == "stream" || key == "stream_options" ||
+    return key == "model" || key == "max_tokens" || key == "min_tokens" ||
+        key == "stream" || key == "stream_options" ||
         key == "ignore_eos" || key == "stop_token_ids" || key == "stop" ||
         key == "return_token_ids" || key == "logprobs" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
@@ -745,6 +758,11 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
             if (key == "max_new_tokens") {
                 options.max_new_tokens = text_budget(parameter,
                     "Expected a finite nonnegative integer sampling_params.max_new_tokens");
+            } else if (key == "min_new_tokens") {
+                if (!parameter.is_null()) {
+                    options.min_new_tokens = text_budget(parameter,
+                        "Expected a nonnegative integer sampling_params.min_new_tokens");
+                }
             } else if (key == "n") {
                 if (!parameter.is_null() && parameter.unsigned_integer() != 1) {
                     bad_request("Only sampling_params.n = 1 is supported");
@@ -764,6 +782,7 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
             }
         }
     }
+    validate_minimum(options, "sampling_params.min_new_tokens must not exceed max_new_tokens");
     set_sampling(sampling, options, "sampling_seed");
     set_logit_bias(sampling, options);
     set_stops(sampling, options);

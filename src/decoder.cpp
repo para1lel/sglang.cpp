@@ -121,6 +121,9 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
         prompt.size() > std::size_t(text_attention_max_tokens - options.max_new_tokens)) {
         throw std::invalid_argument("Prompt and output budget must fit the 262144-token context");
     }
+    if (options.min_new_tokens < 0 || options.min_new_tokens > options.max_new_tokens) {
+        throw std::invalid_argument("min_new_tokens must be in [0, max_new_tokens]");
+    }
 }
 
 SamplingParameters request_sampling(const DecoderOptions& options) {
@@ -141,12 +144,31 @@ bool needs_seen_history(const DecoderOptions& options) {
     return options.presence_penalty != 0 || options.repetition_penalty != 1;
 }
 
-std::size_t output_penalty_bytes(const DecoderOptions& options) {
-    return vocab_size * ((options.frequency_penalty != 0 ? sizeof(float) : 0) +
-                         (needs_seen_history(options) ? sizeof(std::uint8_t) : 0));
+std::size_t logit_adjustment_bytes(const DecoderOptions& options) {
+    const auto stop_bytes = options.min_new_tokens > 0
+        ? constraint_mask_words * sizeof(std::uint32_t) : 0;
+    return stop_bytes + vocab_size * ((options.frequency_penalty != 0 ? sizeof(float) : 0) +
+                                      (needs_seen_history(options) ? sizeof(std::uint8_t) : 0));
+}
+
+void Request::prepare_minimum_stops(const DecoderOptions& options, cudaStream_t stream) {
+    minimum_stop_upload.resize(constraint_mask_words);
+    const auto mark = [this](int token) {
+        minimum_stop_upload[token / 32] |= std::uint32_t{1} << (token % 32);
+    };
+    mark(end_of_text);
+    mark(end_of_message);
+    if (options.stop_token_id) mark(*options.stop_token_id);
+    for (const int token : options.additional_stop_token_ids) mark(token);
+    auto* buffer = memory.allocate<std::uint32_t>(constraint_mask_words);
+    check(cudaMemcpyAsync(buffer, minimum_stop_upload.data(),
+                          constraint_mask_words * sizeof(*buffer), cudaMemcpyHostToDevice,
+                          stream), "Upload minimum-output stop mask");
+    minimum_stop_mask = buffer;
 }
 
 void Request::prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream) {
+    if (options.min_new_tokens > 0) prepare_minimum_stops(options, stream);
     if (options.logit_bias && !options.logit_bias->empty()) {
         const auto& entries = *options.logit_bias;
         auto* buffer = memory.allocate<DecoderLogitBias>(entries.size());
@@ -197,10 +219,12 @@ void AdjustedLogitsWorkspace::prepare(Allocations& memory, Request& request,
 
 void AdjustedLogitsWorkspace::apply(const Request& request, const Workspace& work,
                                     const DecoderOptions& options, const std::uint32_t* allowed,
-                                    int previous_token, cudaStream_t stream) const {
+                                    int generated, int previous_token, cudaStream_t stream) const {
     const int count = options.logit_bias ? options.logit_bias->size() : 0;
-    check(adjust_logits(work.logits, logits, vocab_size, request.logit_bias, count, allowed,
-                        request.output_penalties, previous_token, stream), "Adjust decoder logits");
+    const auto* denied = generated < options.min_new_tokens ? request.minimum_stop_mask : nullptr;
+    check(adjust_logits(work.logits, logits, vocab_size, request.logit_bias, count,
+                        {allowed, denied}, request.output_penalties, previous_token, stream),
+          "Adjust decoder logits");
 }
 
 void AdjustedLogitsWorkspace::select(const Request& request, Workspace& work,
@@ -223,16 +247,16 @@ void AdjustedLogitsWorkspace::select(const Request& request, Workspace& work,
                            logprobs ? options.generated_top_logprobs : -1, logprobs}, stream);
         return;
     }
-    apply(request, work, options, allowed ? mask : nullptr, previous_token, stream);
+    apply(request, work, options, allowed ? mask : nullptr, position, previous_token, stream);
     if (parameters) {
         check(sample_logits(logits, vocab_size, &work.argmax->token_id, *parameters,
                             position, sampling, sampling_bytes, stream), "Sample adjusted logits");
     } else {
         check(text_argmax(logits, vocab_size, work.argmax_scratch, work.argmax, stream),
               "Choose highest adjusted logit");
-        if (allowed) {
+        if (allowed || position < options.min_new_tokens) {
             check(check_allowed_logit(logits, &work.argmax->token_id, stream),
-                  "Validate adjusted constrained token");
+                  "Validate unmasked adjusted token");
         }
     }
 }
@@ -242,7 +266,10 @@ void AdjustedLogitsWorkspace::select_repetition(
     const std::uint32_t* allowed, int previous_token, RepetitionSelection selection,
     cudaStream_t stream) const {
     const int count = options.logit_bias ? options.logit_bias->size() : 0;
-    check(select_repetition_logits(work.logits, vocab_size, request.logit_bias, count, allowed,
+    const auto* denied =
+        selection.position < options.min_new_tokens ? request.minimum_stop_mask : nullptr;
+    check(select_repetition_logits(work.logits, vocab_size, request.logit_bias, count,
+                                  {allowed, denied},
                                   request.output_penalties, previous_token, selection,
                                   repetition, repetition_bytes, stream),
           "Select from repetition-adjusted logits");
@@ -277,7 +304,7 @@ void RequestProgress::select(Request& request, Workspace& work, const DecoderOpt
     auto& adjusted_logits = transfers.adjusted_logits;
     if (adjusted && !adjusted_logits.empty()) {
         if (options.constraint) {
-            adjusted->apply(request, work, options, nullptr, -1, stream);
+            adjusted->apply(request, work, options, nullptr, generated, -1, stream);
         }
         check(cudaMemcpyAsync(adjusted_logits.data(), adjusted->logits,
                               adjusted_logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
@@ -286,6 +313,7 @@ void RequestProgress::select(Request& request, Workspace& work, const DecoderOpt
     auto& repetition_logits = transfers.repetition_logits;
     if (adjusted && !repetition_logits.empty()) {
         RepetitionSelection selection;
+        selection.position = generated;
         selection.debug = repetition_logits.data();
         selection.debug_count = repetition_logits.size();
         adjusted->select_repetition(request, work, options, nullptr, -1, selection, stream);
@@ -591,7 +619,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                                 sampling ? &*sampling : nullptr, request.sampling_workspace,
                                 stream, adjusted ? &adjusted_workspace : nullptr);
                 check(cudaStreamSynchronize(stream), "Complete decoder step");
-                const int token = read_token(request, sampling.has_value(),
+                const int token = read_token(request, sampling || progress.generated <
+                                             options.min_new_tokens,
                                              options.constraint != nullptr);
                 const auto& transfers = request.memory.transfers();
                 if (const auto finish = progress.commit(options, token, transfers.logits.data(),

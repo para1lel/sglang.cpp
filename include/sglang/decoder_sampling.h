@@ -23,6 +23,11 @@ struct OutputPenalties {
     double repetition = 1.0;
 };
 
+struct LogitMasks {
+    const std::uint32_t* allowed = nullptr;
+    const std::uint32_t* denied = nullptr;
+};
+
 struct GeneratedLogprobReadback;
 
 struct RepetitionSelection {
@@ -45,12 +50,12 @@ cudaError_t sample_logits(const float* scores, int vocabulary, int* token,
                           SamplingParameters parameters, int position, void* workspace,
                           std::size_t workspace_bytes, cudaStream_t stream);
 cudaError_t adjust_logits(const __nv_bfloat16* source, float* scores, int vocabulary,
-                          const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
+                          const DecoderLogitBias* bias, int count, LogitMasks masks,
                           OutputPenalties penalties, int previous_token, cudaStream_t stream);
 std::size_t repetition_workspace_bytes(int vocabulary, bool ranked);
 cudaError_t select_repetition_logits(
     const __nv_bfloat16* source, int vocabulary, const DecoderLogitBias* bias, int bias_count,
-    const std::uint32_t* mask, OutputPenalties penalties, int previous_token,
+    LogitMasks masks, OutputPenalties penalties, int previous_token,
     RepetitionSelection selection, void* workspace, std::size_t bytes, cudaStream_t stream);
 cudaError_t check_allowed_logit(const float* scores, int* token, cudaStream_t stream);
 

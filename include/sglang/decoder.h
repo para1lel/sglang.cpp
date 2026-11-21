@@ -49,6 +49,8 @@ struct DecoderOptions {
     double frequency_penalty = 0.0;
     double presence_penalty = 0.0;
     double repetition_penalty = 1.0;
+    int min_new_tokens = 0;
+    bool ignore_eos = false;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 
@@ -56,12 +58,16 @@ struct DecoderOptions {
         return frequency_penalty != 0 || presence_penalty != 0 || repetition_penalty != 1;
     }
 
-    bool requires_target_only() const {
-        return has_output_penalties() || (logit_bias && !logit_bias->empty());
+    bool adjusts_logits(int generated) const {
+        return has_output_penalties() || (logit_bias && !logit_bias->empty()) ||
+            generated < min_new_tokens;
     }
 
+    bool requires_target_only() const { return adjusts_logits(0); }
+
     bool stops_at(int token) const {
-        return stop_token_id == token || additional_stop_token_ids.count(token) != 0;
+        return !ignore_eos &&
+            (stop_token_id == token || additional_stop_token_ids.count(token) != 0);
     }
 };
 

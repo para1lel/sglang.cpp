@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | HTTP transport | Validate the request framing and route `POST /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if (request." --> · [Route](../apps/server/prefix_controls.cpp#L337)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
-| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L862)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L893)<!-- prefix: "std::vector\u003c" --> |
+| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L881)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L912)<!-- prefix: "std::vector\u003c" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L335)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L944)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L638)<!-- prefix: "bool BatchSe" --> |
 | Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L106)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L242)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L274)<!-- prefix: "void stream_" --> |
@@ -120,7 +120,7 @@ With `stop` omitted, null, or `[]`, an unscored single prompt uses ID-based deco
 ### Generated-token logprobs
 
 Set top-level `return_logprob: true` and `sampling_params.temperature: 0`. The server requires MTP disabled. Every scored item uses unconstrained greedy decoding. A batch can mix scored and unscored items.
-[Validation](../apps/server/text_request.cpp#L832)<!-- prefix: "void generat" --> · [MTP check](../apps/server/native_generate.cpp#L345)<!-- prefix: "if (scored &" -->
+[Validation](../apps/server/text_request.cpp#L851)<!-- prefix: "void generat" --> · [MTP check](../apps/server/native_generate.cpp#L345)<!-- prefix: "if (scored &" -->
 
 | Top-level field | Accepted values |
 | --- | --- |
@@ -138,7 +138,7 @@ Scores accumulate in SSE alongside the IDs. Stop and abort results include score
 [Serialization](../apps/server/native_generate.cpp#L49)<!-- prefix: "void append_" --> · [Frame](../apps/server/native_generate.cpp#L144)<!-- prefix: "if (result &" -->
 
 Each scored row adds an FP32 log-softmax reduction outside graph replay. It reads BF16 target logits or FP32 scores adjusted by [output penalties](output-penalties.md) or logit bias. The argmax supplies the selected ID. The score readback transfers the selected record and requested alternatives to pinned host memory. Scratch and readback allocate on first scored admission.
-[Scoring](../src/decoder_batch.cpp#L609)<!-- prefix: "if (lane.opt" --> · [Readback](../src/text/decoder_logprobs.cu#L190)<!-- prefix: "cudaError_t " --> · [Allocation](../src/decoder_batch.cpp#L528)<!-- prefix: "if (top \u003e= 0" -->
+[Scoring](../src/decoder_batch.cpp#L611)<!-- prefix: "if (lane.opt" --> · [Readback](../src/text/decoder_logprobs.cu#L190)<!-- prefix: "cudaError_t " --> · [Allocation](../src/decoder_batch.cpp#L529)<!-- prefix: "if (top \u003e= 0" -->
 
 ## Constraints and failure behavior
 
@@ -159,11 +159,12 @@ Supply exactly one non-null prompt field. A batch contains 1–32 items of the s
 If you send a parameter array, its length must equal the number of prompts. Each entry must have the type given in the table.
 Missing sampling keys in each object use the native defaults.
 The sum of batch output budgets must be at most 262,144 tokens. Each prompt and its own budget must fit the model context.
-[Batch form](../apps/server/text_request.cpp#L882)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/text_request.cpp#L807)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L911)<!-- prefix: "int remainin" -->
+[Batch form](../apps/server/text_request.cpp#L901)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/text_request.cpp#L826)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L930)<!-- prefix: "int remainin" -->
 
 | Sampling field | Accepted values and default |
 | --- | --- |
 | `max_new_tokens` | Nonnegative integer. Omission uses 128. Null is invalid. The prompt length plus this budget must fit 262,144 tokens. |
+| `min_new_tokens` | [Minimum output](output-penalties.md#minimum-output), default zero. |
 | `temperature`, `top_p`, `top_k`, `min_p` | Use the [shared sampling limits](text-serving.md#sampling). Defaults are `1`, `1`, `-1`, and `0`, respectively. |
 | `sampling_seed` | Signed 64-bit integer, with no seed by default. |
 | `frequency_penalty`, `presence_penalty` | [Output penalties](output-penalties.md). Omission or null uses zero. |
@@ -174,10 +175,10 @@ The sum of batch output budgets must be at most 262,144 tokens. Each prompt and 
 | `stop_token_ids` | Array of at most 248,320 integer IDs in `[0, 248320)`. Without explicit IDs, the model stops on `248044` or `248046` unless `ignore_eos` is true. |
 | `stop` | One UTF-8 string or an array of up to 32 UTF-8 strings. Omission, null, and `[]` disable text matching. The empty string `""` is a stop pattern. |
 
-Null uses the default for every sampling field except `max_new_tokens`. The server validates explicit stop IDs even with `ignore_eos: true`.
+Null uses the sampling defaults except for `max_new_tokens`. Explicit stop IDs are always validated.
 `stop` belongs inside `sampling_params`. A nested list or a non-string list element returns HTTP 400.
 The empty stop matches at the first generated step if selected by the configured order. It retains the first generated ID and returns empty text. Zero output budget still yields a length finish.
-[Stop parser](../apps/server/text_request.cpp#L72)<!-- prefix: "std::vector\u003c" --> · [Batch options](../apps/server/text_request.cpp#L910)<!-- prefix: "const auto b" -->
+[Stop parser](../apps/server/text_request.cpp#L79)<!-- prefix: "std::vector\u003c" --> · [Batch options](../apps/server/text_request.cpp#L929)<!-- prefix: "const auto b" -->
 Client compatibility fields accept only disabled values.
 Use `false` or null for `return_routed_experts`, and null for `lora_path`.
 Other fields return HTTP 400, including `model`, `messages`, a top-level `stop`, and output constraints.

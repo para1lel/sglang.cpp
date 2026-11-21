@@ -327,9 +327,11 @@ struct Request {
     void grow_kv(int positions, int written, cudaStream_t stream);
     void reset(cudaStream_t stream);
     void reset();
+    void prepare_minimum_stops(const DecoderOptions& options, cudaStream_t stream);
     void prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream);
     ExactGqaWorkspace batch_graph_scores();
 
+    std::vector<std::uint32_t> minimum_stop_upload;
     Allocations memory;
     Workspace work;
     int* decode_position;
@@ -341,10 +343,11 @@ struct Request {
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;
     const DecoderLogitBias* logit_bias = nullptr;
+    const std::uint32_t* minimum_stop_mask = nullptr;
     OutputPenalties output_penalties;
 };
 
-std::size_t output_penalty_bytes(const DecoderOptions& options);
+std::size_t logit_adjustment_bytes(const DecoderOptions& options);
 
 struct AdjustedLogitsWorkspace {
     float* logits = nullptr;
@@ -362,7 +365,8 @@ struct AdjustedLogitsWorkspace {
                 int position, int previous_token, cudaStream_t stream,
                 GeneratedLogprobReadback* logprobs = nullptr) const;
     void apply(const Request& request, const Workspace& work, const DecoderOptions& options,
-               const std::uint32_t* allowed, int previous_token, cudaStream_t stream) const;
+               const std::uint32_t* allowed, int generated, int previous_token,
+               cudaStream_t stream) const;
     void select_repetition(const Request& request, const Workspace& work,
                            const DecoderOptions& options, const std::uint32_t* allowed,
                            int previous_token, RepetitionSelection selection,

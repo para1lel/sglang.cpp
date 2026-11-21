@@ -404,8 +404,11 @@ std::size_t biased_sampling_temporary_bytes(int vocabulary) {
     return std::max(sort, scan);
 }
 
-__device__ bool is_allowed(const std::uint32_t* mask, int token) {
-    return !mask || (mask[token / 32] >> (token % 32) & 1u);
+__device__ bool is_allowed(LogitMasks masks, int token) {
+    const auto bit = std::uint32_t{1} << (token % 32);
+    const int word = token / 32;
+    return (!masks.allowed || (masks.allowed[word] & bit)) &&
+        (!masks.denied || !(masks.denied[word] & bit));
 }
 
 __device__ float subtract_history(float score, int token, OutputPenalties penalties,
@@ -431,14 +434,14 @@ __device__ float subtract_history(float score, int token, OutputPenalties penalt
 }
 
 __global__ void initialize_scores(const __nv_bfloat16* source, float* scores, int vocabulary,
-                                  const std::uint32_t* mask, OutputPenalties penalties,
+                                  LogitMasks masks, OutputPenalties penalties,
                                   int previous_token) {
     const int token = blockIdx.x * blockDim.x + threadIdx.x;
     if (token < vocabulary) {
         bool seen = false;
         const float score = subtract_history(__bfloat162float(source[token]), token,
                                               penalties, previous_token, seen);
-        scores[token] = is_allowed(mask, token) ? score : -CUDART_INF_F;
+        scores[token] = is_allowed(masks, token) ? score : -CUDART_INF_F;
     }
 }
 
@@ -557,7 +560,7 @@ RepetitionScratch repetition_scratch(void* workspace, int vocabulary, bool ranke
 }
 
 __global__ void prepare_repetition(const __nv_bfloat16* source, int vocabulary,
-                                   const std::uint32_t* mask, OutputPenalties penalties,
+                                   LogitMasks masks, OutputPenalties penalties,
                                    int previous, RepetitionScratch scratch) {
     const int token = blockIdx.x * blockDim.x + threadIdx.x;
     bool wide = false;
@@ -566,7 +569,7 @@ __global__ void prepare_repetition(const __nv_bfloat16* source, int vocabulary,
         bool seen = false;
         float score = subtract_history(__bfloat162float(source[token]), token, penalties,
                                         previous, seen);
-        if (!is_allowed(mask, token)) score = -CUDART_INF_F;
+        if (!is_allowed(masks, token)) score = -CUDART_INF_F;
         scratch.entries[token].base = score;
         scratch.entries[token].bias = 0;
         scratch.entries[token].repeated = seen;
@@ -840,11 +843,11 @@ cudaError_t sample_logits(const float* scores, int vocabulary, int* token,
 }
 
 cudaError_t adjust_logits(const __nv_bfloat16* source, float* scores, int vocabulary,
-                          const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
+                          const DecoderLogitBias* bias, int count, LogitMasks masks,
                           OutputPenalties penalties, int previous_token, cudaStream_t stream) {
     if (penalties.repetition != 1.0) return cudaErrorInvalidValue;
     initialize_scores<<<(vocabulary + group_size - 1) / group_size, group_size, 0, stream>>>(
-        source, scores, vocabulary, mask, penalties, previous_token);
+        source, scores, vocabulary, masks, penalties, previous_token);
     const auto status = cudaGetLastError();
     if (status != cudaSuccess || count == 0) return status;
     add_bias<<<(count + group_size - 1) / group_size, group_size, 0, stream>>>(scores, bias, count);
@@ -867,7 +870,7 @@ std::size_t repetition_workspace_bytes(int vocabulary, bool ranked) {
 
 cudaError_t select_repetition_logits(
     const __nv_bfloat16* source, int vocabulary, const DecoderLogitBias* bias, int bias_count,
-    const std::uint32_t* mask, OutputPenalties penalties, int previous_token,
+    LogitMasks masks, OutputPenalties penalties, int previous_token,
     RepetitionSelection selection, void* workspace, std::size_t bytes, cudaStream_t stream) {
     if (!workspace || vocabulary < 1 || vocabulary > token_mask + 1 ||
         (!selection.token && !selection.debug) || !(penalties.repetition > 0) ||
@@ -882,7 +885,7 @@ cudaError_t select_repetition_logits(
     if (status != cudaSuccess) return status;
     const int blocks = (vocabulary + group_size - 1) / group_size;
     prepare_repetition<<<blocks, group_size, 0, stream>>>(
-        source, vocabulary, mask, penalties, previous_token, scratch);
+        source, vocabulary, masks, penalties, previous_token, scratch);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     if (bias_count) {
@@ -895,12 +898,13 @@ cudaError_t select_repetition_logits(
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     if (!ranked) {
+        const bool masked = masks.allowed || masks.denied;
         repetition_argmax<false><<<blocks, group_size, 0, stream>>>(
-            scratch, vocabulary, mask != nullptr, nullptr);
+            scratch, vocabulary, masked, nullptr);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         repetition_argmax<true><<<1, group_size, 0, stream>>>(
-            scratch, blocks, mask != nullptr, selection.token);
+            scratch, blocks, masked, selection.token);
         return cudaGetLastError();
     }
     auto temp_bytes = bytes - scratch.overhead;

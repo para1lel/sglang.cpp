@@ -8,7 +8,7 @@ checkpoint token IDs. `/v1/tokenize` and `/v1/detokenize` are aliases.
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L297)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L192)<!-- prefix: "if (tokeniza" --> · [Queue admission](../apps/server/prefix_controls.cpp#L337)<!-- prefix: "void Connect" --> |
-| Tokenization worker | Validate request fields and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L300)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_request.cpp#L540)<!-- prefix: "const Tokeni" --> |
+| Tokenization worker | Validate request fields and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L300)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_request.cpp#L544)<!-- prefix: "const Tokeni" --> |
 
 ## Runtime path
 

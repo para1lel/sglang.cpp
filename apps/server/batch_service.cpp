@@ -1,6 +1,7 @@
 #include "sglang/server/batch_service.h"
 
 #include "sglang/server/output_mailbox.h"
+#include "sglang/server/text_stop.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +28,7 @@ struct Job {
     std::optional<DecoderFinishReason> finish;
     std::exception_ptr error;
     BatchRequestId* request_id = nullptr;
+    std::unique_ptr<NativeTextStop> text_stop;
     int cached_tokens = 0;
     bool admitted = false;
     bool cancelled = false;
@@ -37,13 +39,17 @@ struct Job {
     bool health_check = false;
 
     bool aborted() const { return request_id && request_id->aborted(); }
+    bool has_output() const { return !pending.empty() && !(output_overlapped && aborted()); }
     bool ready(bool buffered = false) const {
         return cancelled || aborted() || (buffered ? !pending.full() : pending.empty());
+    }
+    bool can_buffer() const {
+        return media.empty() && prompt.size() >= decoder_batch_max_step_tokens &&
+            !options.samples() && !options.constraint && !options.eager && options.top_logits == 0;
     }
 };
 
 using Clock = std::chrono::steady_clock;
-
 struct HealthProbe {
     std::shared_ptr<Job> job;
     Clock::time_point deadline;
@@ -66,18 +72,6 @@ constexpr auto disconnect_poll = std::chrono::milliseconds(10);
 constexpr auto mailbox_grace = std::chrono::milliseconds(1);
 constexpr int wide_decode_min_ready = 25;
 
-void trace_prefill_rows(const DecoderBatchStepStats& stats, int max_active) {
-    std::string line = "batch prefill_rows=";
-    for (int slot = 0; slot < std::max(max_active, decoder_batch_max_mtp_lanes); ++slot) {
-        if (slot != 0) {
-            line += ',';
-        }
-        line += std::to_string(stats.prefill_rows[slot]);
-    }
-    std::cerr << (line + " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) +
-                  '\n');
-}
-
 void trace_verification(const Steps& steps, const DecoderBatchStepStats& stats) {
     std::cerr << ("batch verify lanes=" + std::to_string(stats.verification_lanes) +
                   " rows=" + std::to_string(stats.verification_rows) +
@@ -95,26 +89,36 @@ void trace_verification(const Steps& steps, const DecoderBatchStepStats& stats) 
     }
 }
 
-bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& callbacks,
-               DecoderResult& result) {
-    result.mtp_rounds += step.mtp_drafted_tokens != 0;
-    result.mtp_drafted_tokens += step.mtp_drafted_tokens;
-    result.output_token_ids.push_back(*step.token);
-    result.mtp_accepted_tokens += step.mtp_accepted_tokens > 0;
-    if (callbacks.on_token && !callbacks.on_token(*step.token)) {
-        return false;
-    }
-    for (int index = 0; index < step.extra_token_count; ++index) {
-        if (callbacks.is_cancelled && callbacks.is_cancelled()) {
-            return false;
+void trace_batch_details(const Steps& steps, const DecoderBatchStepStats& stats,
+                         int max_active, int max_num_batched_tokens, int mtp_steps) {
+    std::string line = "batch prefill_rows=";
+    for (int slot = 0; slot < std::max(max_active, decoder_batch_max_mtp_lanes); ++slot) {
+        if (slot != 0) {
+            line += ',';
         }
-        result.output_token_ids.push_back(step.extra_tokens[index]);
-        result.mtp_accepted_tokens += index + 1 < step.mtp_accepted_tokens;
-        if (callbacks.on_token && !callbacks.on_token(step.extra_tokens[index])) {
-            return false;
-        }
+        line += std::to_string(stats.prefill_rows[slot]);
     }
-    return true;
+    std::cerr << (line + " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) +
+                  '\n');
+    std::cerr << ("batch target_rows=" + std::to_string(stats.target_rows) +
+                  " step_budget=" + std::to_string(max_num_batched_tokens) + '\n');
+    if (stats.graph_slots) {
+        std::cerr << ("batch graph_slots=" + std::to_string(stats.graph_slots) + '\n');
+    }
+    if (stats.sampling_workspace_bytes) {
+        std::cerr << ("batch sampling_workspace_bytes=" +
+                      std::to_string(stats.sampling_workspace_bytes) + '\n');
+    }
+    if (stats.constraint_workspace_bytes) {
+        std::cerr << ("batch constraint_workspace_bytes=" +
+                      std::to_string(stats.constraint_workspace_bytes) + '\n');
+    }
+    if (mtp_steps != 0) {
+        trace_verification(steps, stats);
+    } else {
+        std::cerr << ("batch peak_request_bytes=" + std::to_string(stats.peak_request_bytes) +
+                      '\n');
+    }
 }
 
 }
@@ -148,7 +152,7 @@ struct BatchService::State {
                        BatchJobs& active,
                        std::vector<DecoderResult>& results);
     void enqueue_batch(int owner, const std::vector<BatchPrompt>& prompts, BatchJobs& active,
-                       std::size_t& next);
+                       std::size_t& next, bool buffered);
     bool drain_waiting_aborts(std::unique_lock<std::mutex>& lock,
                               const std::vector<BatchPrompt>& prompts,
                               const BatchCallbacks& callbacks, std::vector<DecoderResult>& results,
@@ -449,8 +453,11 @@ void BatchService::State::process(DecoderBatch& batch) {
         }
         const auto epoch = *iteration;
         Selection selected{};
+        bool match_text = false;
         for (int slot = 0; slot < max_active; ++slot) {
-            selected[slot] = prepare(batch, slot, snapshot->jobs[slot], snapshot->buffered);
+            const auto& job = snapshot->jobs[slot];
+            selected[slot] = prepare(batch, slot, job, snapshot->buffered);
+            match_text |= selected[slot] && job->text_stop != nullptr;
         }
         const int width = std::count(selected.begin(), selected.end(), true);
         Steps steps{};
@@ -484,29 +491,18 @@ void BatchService::State::process(DecoderBatch& batch) {
             if (width || bytes != traced_bytes) {
                 trace_batch_step(width, decode, bytes);
                 if (width) {
-                    trace_prefill_rows(stats, max_active);
-                    std::cerr << ("batch target_rows=" + std::to_string(stats.target_rows) +
-                                  " step_budget=" + std::to_string(max_num_batched_tokens) + '\n');
-                    if (stats.graph_slots) {
-                        std::cerr << ("batch graph_slots=" +
-                                     std::to_string(stats.graph_slots) + '\n');
-                    }
-                    if (stats.sampling_workspace_bytes) {
-                        std::cerr << ("batch sampling_workspace_bytes=" +
-                                      std::to_string(stats.sampling_workspace_bytes) + '\n');
-                    }
-                    if (stats.constraint_workspace_bytes) {
-                        std::cerr << ("batch constraint_workspace_bytes=" +
-                                      std::to_string(stats.constraint_workspace_bytes) + '\n');
-                    }
-                    if (mtp_steps != 0) {
-                        trace_verification(steps, stats);
-                    } else {
-                        std::cerr << ("batch peak_request_bytes=" +
-                                      std::to_string(stats.peak_request_bytes) + '\n');
-                    }
+                    trace_batch_details(steps, stats, max_active, max_num_batched_tokens,
+                                        mtp_steps);
                 }
                 traced_bytes = bytes;
+            }
+        }
+        if (match_text) {
+            for (int slot = 0; slot < max_active; ++slot) {
+                const auto& job = snapshot->jobs[slot];
+                if (selected[slot] && job->text_stop && job->text_stop->apply(steps[slot])) {
+                    batch.cancel(slot);
+                }
             }
         }
         const auto cache = prefix_cache_entries ? batch.prefix_cache_stats()
@@ -561,8 +557,8 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
             return result;
         }
         const bool can_emit = announced || !job.admitted || !callbacks.on_admitted;
-        const bool drop_output = job.output_overlapped && job.aborted();
-        if (!job.pending.empty() && can_emit && !drop_output) {
+        const bool has_output = job.has_output();
+        if (has_output && can_emit) {
             const auto step = job.pending.front();
             lock.unlock();
             const bool accepted = emit_step(step, callbacks, result);
@@ -580,7 +576,7 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
         } else if (job.finish && can_emit) {
             result.finish_reason = *job.finish;
             return result;
-        } else if ((job.pending.empty() || drop_output) && !job.finish) {
+        } else if (!has_output && !job.finish) {
             changed.wait_for(lock, disconnect_poll);
         }
     }
@@ -608,7 +604,7 @@ void BatchService::State::cancel_batch(std::unique_lock<std::mutex>& lock,
 }
 
 void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt>& prompts,
-                                        BatchJobs& active, std::size_t& next) {
+                                        BatchJobs& active, std::size_t& next, bool buffered) {
     for (int offset = 0; offset < max_active && next < prompts.size(); ++offset) {
         while (next < prompts.size() && prompts[next].request_id &&
                prompts[next].request_id->aborted_waiting()) {
@@ -627,6 +623,10 @@ void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt
         job->options = prompts[next].options;
         job->options.mtp_steps = mtp_steps;
         job->request_id = prompts[next].request_id;
+        job->buffer_decode_output = buffered && job->can_buffer();
+        if (prompts[next].text_stops) {
+            job->text_stop = std::make_unique<NativeTextStop>(prompts[next].text_stops);
+        }
         if (job->request_id && !job->request_id->dispatch()) {
             break;
         }
@@ -673,20 +673,24 @@ bool BatchService::State::drain_batch(std::unique_lock<std::mutex>& lock, BatchJ
         if (job.error) {
             std::rethrow_exception(job.error);
         }
-        const auto finish = job.finish;
-        if (finish == DecoderFinishReason::cancelled) {
+        if (job.finish == DecoderFinishReason::cancelled) {
             return false;
         }
-        if (job.pending.empty() && !finish) {
+        const bool has_step = job.has_output();
+        const auto finish = has_step && job.pending.size > 1 ? std::nullopt : job.finish;
+        if (!has_step && !finish) {
             continue;
         }
         auto& result = results[item.index];
-        if (!job.pending.empty()) {
+        if (has_step) {
             emit_step(job.pending.front(), collect, result);
         }
         result.cached_prompt_tokens = job.cached_tokens;
         if (finish) {
             result.finish_reason = *finish;
+            if (*finish == DecoderFinishReason::stop && job.text_stop) {
+                result.matched_text_stop = job.text_stop->matched;
+            }
         }
         if (callbacks.on_output) {
             lock.unlock();
@@ -696,8 +700,9 @@ bool BatchService::State::drain_batch(std::unique_lock<std::mutex>& lock, BatchJ
                 return false;
             }
         }
-        if (!job.pending.empty()) {
+        if (has_step) {
             job.pending.pop();
+            job.output_started = true;
             changed.notify_all();
         }
         if (finish) {
@@ -715,6 +720,7 @@ bool BatchService::State::consume_batch(std::unique_lock<std::mutex>& lock, int 
     std::size_t next = 0;
     std::size_t completed = 0;
     bool announced = false;
+    const bool buffered = prompts.size() == 1 && callbacks.buffer_decode_output;
     while (completed < prompts.size()) {
         lock.unlock();
         const bool connected = (!callbacks.is_cancelled || !callbacks.is_cancelled()) &&
@@ -754,11 +760,12 @@ bool BatchService::State::consume_batch(std::unique_lock<std::mutex>& lock, int 
             }
         }
         const auto submitted = next;
-        enqueue_batch(owner, prompts, active, next);
+        enqueue_batch(owner, prompts, active, next, buffered);
         if (next != submitted) {
             changed.notify_all();
         }
-        if (completed < prompts.size()) {
+        if (completed < prompts.size() && (!buffered || std::none_of(active.begin(), active.end(),
+            [](const auto& item) { return item.job && item.job->has_output(); }))) {
             changed.wait_for(lock, disconnect_poll);
         }
     }
@@ -886,13 +893,11 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
     job->prompt_tokens = media.empty() ? prompt.size() : expanded_tokens;
     job->options = options;
     job->request_id = request_id;
-    job->buffer_decode_output = callbacks.buffer_decode_output && media.empty() &&
-        prompt.size() >= decoder_batch_max_step_tokens && !options.samples() &&
-        !options.constraint && !options.eager && options.top_logits == 0;
     if (media.empty()) {
         job->options.mtp_steps = state_->mtp_steps;
     }
     job->media = std::move(media);
+    job->buffer_decode_output = callbacks.buffer_decode_output && job->can_buffer();
     std::unique_lock lock(state_->mutex);
     state_->changed.wait(lock, [&] { return !state_->reset_pending; });
     if (state_->failure) {

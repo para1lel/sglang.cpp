@@ -1,4 +1,5 @@
 #include "sglang/server/text_completion.h"
+#include "sglang/server/text_stop.h"
 
 #include "sglang/json.h"
 #include "sglang/server/http.h"
@@ -123,6 +124,10 @@ public:
         if (request.chat_output.enabled()) {
             parser_.emplace(request.chat_output);
         }
+        if (!request.stop_text.empty()) {
+            stop_patterns_.emplace(request.stop_text);
+            stop_buffer_.emplace(*stop_patterns_);
+        }
     }
 
     bool token(int id);
@@ -160,7 +165,8 @@ private:
     std::string text_;
     std::string reasoning_;
     std::vector<ToolCall> tool_calls_;
-    std::string pending_stop_;
+    std::optional<TextStops> stop_patterns_;
+    std::optional<TextStopBuffer> stop_buffer_;
     bool text_stopped_ = false;
     bool sent_event_ = false;
     bool write_failed_ = false;
@@ -269,33 +275,16 @@ bool TextResponse::event(std::string_view data) {
 }
 
 std::string TextResponse::filter_stop(std::string_view delta, bool final) {
-    if (request_.stop_text.empty()) {
+    if (!stop_buffer_) {
         return std::string(delta);
     }
     if (text_stopped_) {
         return {};
     }
-    pending_stop_ += delta;
-    std::size_t stop_position = std::string::npos;
-    std::size_t held = 0;
-    for (const auto& stop : request_.stop_text) {
-        stop_position = std::min(stop_position, pending_stop_.find(stop));
-        if (!final && stop_position == std::string::npos) {
-            const std::string_view pending = pending_stop_;
-            for (auto size = std::min(stop.size() - 1, pending.size()); size > held; --size) {
-                if (pending.substr(pending.size() - size) ==
-                    std::string_view(stop).substr(0, size)) {
-                    held = size;
-                    break;
-                }
-            }
-        }
-    }
-    text_stopped_ = stop_position != std::string::npos;
-    const auto ready = text_stopped_ ? stop_position : pending_stop_.size() - held;
-    auto output = pending_stop_.substr(0, ready);
-    pending_stop_.erase(0, ready);
-    return output;
+    stop_buffer_->push(delta);
+    const auto match = stop_buffer_->match();
+    text_stopped_ = match.has_value();
+    return stop_buffer_->take(final, match);
 }
 
 bool TextResponse::accept(const ChatOutputEvent& delta, const int* id) {

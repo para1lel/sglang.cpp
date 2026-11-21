@@ -185,7 +185,7 @@ class NativeGenerate(unittest.TestCase):
                 ("max_new_tokens", None), ("max_new_tokens", -1), ("max_new_tokens", 1.5),
                 ("n", 2), ("top_p", 0), ("temperature", -1), ("min_p", 2), ("top_k", 0),
                 ("sampling_seed", 2**63), ("ignore_eos", "yes"),
-                ("stop", "X"), ("stop_regex", "X"), ("regex", "X"), ("frequency_penalty", 0),
+                ("stop", ["X", 1]), ("stop_regex", "X"), ("regex", "X"), ("frequency_penalty", 0),
             )],
             ({"text": "A", "sampling_params": {"stop_token_ids": [-1]}}, "vocabulary"),
             ({"input_ids": [0, 1], "sampling_params": {"max_new_tokens": 262143}}, "context"),

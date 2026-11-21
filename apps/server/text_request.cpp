@@ -6,6 +6,7 @@
 #include "sglang/json.h"
 #include "sglang/server/http.h"
 #include "sglang/server/native_generate.h"
+#include "sglang/server/text_stop.h"
 
 #include <algorithm>
 #include <charconv>
@@ -67,7 +68,7 @@ void set_stops(const json::Object& object, DecoderOptions& options) {
     }
 }
 
-std::vector<std::string> stop_text(const json::Object& object) {
+std::vector<std::string> stop_text(const json::Object& object, bool native = false) {
     const auto* value = json::get(object, "stop");
     if (!value || value->is_null()) {
         return {};
@@ -75,12 +76,15 @@ std::vector<std::string> stop_text(const json::Object& object) {
     std::vector<std::string> stops;
     const auto append = [&](const json::Value& item) {
         const auto text = item.string();
-        if (!text || text->empty()) {
-            bad_request("Expected a nonempty stop string");
+        if (!text || (!native && text->empty())) {
+            bad_request(native ? "Expected a stop string" : "Expected a nonempty stop string");
         }
         stops.emplace_back(*text);
     };
     if (const auto* array = value->array()) {
+        if (native && array->size() > 32) {
+            bad_request("At most 32 stop strings are allowed");
+        }
         for (const auto& item : *array) {
             append(item);
         }
@@ -626,6 +630,8 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
                 if (!parameter.is_null() && parameter.unsigned_integer() != 1) {
                     bad_request("Only sampling_params.n = 1 is supported");
                 }
+            } else if (key == "stop") {
+                continue;
             } else if (key == "temperature" || key == "top_p" || key == "top_k" ||
                        key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
                        key == "stop_token_ids") {
@@ -645,9 +651,23 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
     return options;
 }
 
+std::shared_ptr<const NativeTextStops> generate_stops(const json::Value* params,
+                                                     const CompletionTokenizer& tokenizer) {
+    const auto* object = params ? params->object() : nullptr;
+    if (object) {
+        const auto stops = stop_text(*object, true);
+        if (!stops.empty()) {
+            return std::make_shared<NativeTextStops>(NativeTextStops{tokenizer.get(),
+                                                                     TextStops(stops)});
+        }
+    }
+    return nullptr;
+}
+
 BatchPrompt generate_prompt(const json::Value& input, bool text, DecoderOptions options,
-                            const CompletionTokenizer& tokenizer) {
-    BatchPrompt request{{}, std::move(options)};
+                            const CompletionTokenizer& tokenizer,
+                            std::shared_ptr<const NativeTextStops> stops) {
+    BatchPrompt request{{}, std::move(options), nullptr, std::move(stops)};
     if (text) {
         const auto prompt = input.string().value_or("");
         if (prompt.empty() || prompt.size() > 1024 * 1024) {
@@ -717,12 +737,14 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
     items.reserve(input.count);
     if (!input.batch) {
         items.push_back(generate_prompt(prompt, input.text,
-                                       generate_options(params, salt), tokenizer));
+                                       generate_options(params, salt), tokenizer,
+                                       generate_stops(params, tokenizer)));
         return items;
     }
     const auto& list = *prompt.array();
     const auto* param_list = generate_parameter_list(params, input.count, false);
     const auto* salt_list = generate_parameter_list(salt, input.count, true);
+    const auto broadcast_stops = param_list ? nullptr : generate_stops(params, tokenizer);
     int remaining = checkpoint_context;
     for (std::size_t index = 0; index < input.count; ++index) {
         auto options = generate_options(param_list ? &(*param_list)[index] : params,
@@ -731,7 +753,10 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
         if (remaining < 0) {
             bad_request("Batch output budgets must total at most 262144 tokens");
         }
-        items.push_back(generate_prompt(list[index], input.text, std::move(options), tokenizer));
+        const auto stops = param_list ? generate_stops(&(*param_list)[index], tokenizer)
+                                      : broadcast_stops;
+        items.push_back(generate_prompt(list[index], input.text, std::move(options), tokenizer,
+                                        stops));
     }
     return items;
 }

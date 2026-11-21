@@ -116,7 +116,7 @@ The [overflow control](../tests/mxfp8_gqa_prefill_check.cu#L798)<!-- prefix: "vo
 | --- | --- | --- |
 | `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L281)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L108)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L215)<!-- prefix: "void execute" --> |
+| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L109)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L215)<!-- prefix: "void execute" --> |
 
 Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L95)<!-- prefix: "target(\"sgla" -->
 
@@ -130,7 +130,7 @@ One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, the
 
 Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L465)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L532)<!-- prefix: "void Decoder" -->
 
-Both binaries accept `--fp8-prefill exact|tensor-core`. Pass `Fp8PrefillPolicy` as the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L103)<!-- prefix: "enum class F" -->
+Both binaries accept `--fp8-prefill exact|tensor-core`. Pass `Fp8PrefillPolicy` as the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L104)<!-- prefix: "enum class F" -->
 
 See [FP8 prefill projections](fp8-prefill-projections.md) for SM100 eligibility, tile selection, and fallback.
 

@@ -2,6 +2,7 @@
 
 #include "sglang/server/http.h"
 #include "sglang/server/text_completion.h"
+#include "sglang/server/text_stop.h"
 #include "sglang/utf8.h"
 
 #include <algorithm>
@@ -15,7 +16,8 @@ std::string_view finish_type(const DecoderResult& result, const DecoderOptions& 
     const auto& ids = result.output_token_ids;
     const auto budget = static_cast<std::size_t>(options.max_new_tokens);
     const bool matched_stop = !ids.empty() && options.stops_at(ids.back());
-    if (result.finish_reason == DecoderFinishReason::stop && matched_stop &&
+    if (result.finish_reason == DecoderFinishReason::stop &&
+        (matched_stop || result.matched_text_stop) &&
         ids.size() <= budget) {
         return "stop";
     }
@@ -29,12 +31,16 @@ std::string_view finish_type(const DecoderResult& result, const DecoderOptions& 
 class GenerateResponse {
 public:
     GenerateResponse(const BatchPrompt& request, const Tokenizer& tokenizer)
-        : request_(request), tokenizer_(tokenizer) {}
+        : request_(request), tokenizer_(tokenizer) {
+        if (request_.text_stops) {
+            stop_buffer_.emplace(request_.text_stops->stops);
+        }
+    }
 
     void token(int id);
     bool stream_token(EventStream& stream, int id);
     std::string finish(const DecoderResult& result);
-    std::string indexed(std::size_t index, const DecoderResult& result, bool terminal);
+    std::string frame(std::optional<std::size_t> index, const DecoderResult& result, bool terminal);
 
 private:
     std::string body(const std::vector<int>& ids, const DecoderResult* result,
@@ -43,6 +49,7 @@ private:
     const BatchPrompt& request_;
     const Tokenizer& tokenizer_;
     Utf8Stream utf8_;
+    std::optional<TextStopBuffer> stop_buffer_;
     std::string text_;
     std::vector<int> streamed_ids_;
     std::size_t decoded_tokens_ = 0;
@@ -68,7 +75,13 @@ std::string GenerateResponse::body(const std::vector<int>& ids,
         output += R"({"type":)";
         json::append_quoted(output, type);
         if (type == "stop") {
-            output += R"(,"matched":)" + std::to_string(ids.back());
+            output += R"(,"matched":)";
+            if (result->matched_text_stop) {
+                const auto& stops = request_.text_stops->stops.patterns;
+                json::append_quoted(output, stops[*result->matched_text_stop].text);
+            } else {
+                output += std::to_string(ids.back());
+            }
         } else {
             output += R"(,"length":)" + std::to_string(ids.size());
         }
@@ -103,15 +116,28 @@ std::string GenerateResponse::finish(const DecoderResult& result) {
     return body(result.output_token_ids, &result, true);
 }
 
-std::string GenerateResponse::indexed(std::size_t index, const DecoderResult& result,
-                                      bool terminal) {
+std::string GenerateResponse::frame(std::optional<std::size_t> index,
+                                    const DecoderResult& result, bool terminal) {
     const auto& ids = result.output_token_ids;
     while (decoded_tokens_ < ids.size()) {
-        token(ids[decoded_tokens_++]);
+        const int id = ids[decoded_tokens_++];
+        if (!stop_buffer_) {
+            token(id);
+        } else if (result.matched_text_stop || !request_.options.stops_at(id)) {
+            stop_buffer_->push(utf8_.push(tokenizer_.piece(id, true)));
+        }
     }
-    auto output = terminal ? finish(result) : body(ids, &result, false);
-    output.pop_back();
-    output += R"(,"index":)" + std::to_string(index) + '}';
+    if (stop_buffer_) {
+        if (terminal) {
+            stop_buffer_->push(utf8_.finish());
+        }
+        text_ += stop_buffer_->take(terminal, result.matched_text_stop);
+    }
+    auto output = terminal ? finish(result) : body(ids, index ? &result : nullptr, false);
+    if (index) {
+        output.pop_back();
+        output += R"(,"index":)" + std::to_string(*index) + '}';
+    }
     return output;
 }
 
@@ -169,30 +195,33 @@ void write_batch(const Socket& connection, const Tokenizer& tokenizer,
             return;
         }
         GenerateResponse response(items[index], tokenizer);
-        const auto& result = results[index];
-        for (int token : result.output_token_ids) {
-            response.token(token);
-        }
         if (index != 0) {
             output += ',';
         }
-        output += response.finish(result);
+        output += response.frame(std::nullopt, results[index], true);
     }
     output += ']';
     write_json(connection, "200 OK", output);
 }
 
 void complete_batch(const Socket& connection, BatchService& service, int slot,
-                    const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items) {
+                    const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items,
+                    bool indexed) {
     const auto& pieces = tokenizer.get();
     const BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
     if (const auto results = service.generate_batch(slot, items, callbacks)) {
-        write_batch(connection, pieces, items, *results);
+        if (indexed) {
+            write_batch(connection, pieces, items, *results);
+        } else if (!disconnected(connection)) {
+            GenerateResponse response(items.front(), pieces);
+            write_json(connection, "200 OK", response.frame(std::nullopt, results->front(), true));
+        }
     }
 }
 
 void stream_batch(const Socket& connection, BatchService& service, int slot,
-                  const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items) {
+                  const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items,
+                  bool indexed) {
     const auto& pieces = tokenizer.get();
     EventStream stream(connection);
     std::vector<GenerateResponse> responses;
@@ -205,8 +234,10 @@ void stream_batch(const Socket& connection, BatchService& service, int slot,
         [&] { return stream.start(); },
         [&] { return stream.poll(); },
         [&](std::size_t index, const DecoderResult& result, bool terminal) {
-            return stream.write(responses[index].indexed(index, result, terminal));
+            const auto frame_index = indexed ? std::optional{index} : std::nullopt;
+            return stream.write(responses[index].frame(frame_index, result, terminal));
         },
+        !indexed,
     };
     try {
         if (service.generate_batch(slot, items, callbacks) && stream.write("[DONE]")) {
@@ -238,8 +269,8 @@ void complete_aborted(const Socket& connection, const Tokenizer& tokenizer,
             write_json(connection, "200 OK", response.finish(result));
             return;
         }
-        const auto output = input.batch ? response.indexed(index, result, true)
-                                        : response.finish(result);
+        const auto output = response.frame(input.batch ? std::optional{index} : std::nullopt,
+                                           result, true);
         if (!stream.start() || !stream.write(output)) {
             return;
         }
@@ -261,12 +292,12 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
     }
     if (!slot) {
         complete_aborted(connection, tokenizer.get(), input, items);
-    } else if (input.batch && input.stream) {
-        stream_batch(connection, service, *slot, tokenizer, items);
-    } else if (input.batch) {
-        complete_batch(connection, service, *slot, tokenizer, items);
-    } else {
+    } else if (!input.batch && !items.front().text_stops) {
         complete_single(connection, service, *slot, tokenizer, items.front(), input.stream);
+    } else if (input.stream) {
+        stream_batch(connection, service, *slot, tokenizer, items, input.batch);
+    } else {
+        complete_batch(connection, service, *slot, tokenizer, items, input.batch);
     }
 }
 

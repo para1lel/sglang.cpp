@@ -8,6 +8,8 @@
 
 namespace sglang::server {
 
+struct NativeTextStops;
+
 struct BatchMetrics {
     DecoderPrefixCacheStats cache;
     int cache_capacity = 0;
@@ -91,6 +93,7 @@ struct BatchPrompt {
     std::vector<int> prompt;
     DecoderOptions options;
     BatchRequestId* request_id = nullptr;
+    std::shared_ptr<const NativeTextStops> text_stops = nullptr;
 };
 
 struct BatchCallbacks {
@@ -98,6 +101,7 @@ struct BatchCallbacks {
     std::function<bool()> on_admitted;
     std::function<bool()> on_stream_poll;
     std::function<bool(std::size_t, const DecoderResult&, bool)> on_output;
+    bool buffer_decode_output = false;
 };
 
 class BatchService {

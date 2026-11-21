@@ -98,6 +98,7 @@ struct DecoderResult {
     std::size_t mtp_accepted_tokens = 0;
     std::size_t mtp_rounds = 0;
     std::size_t cached_prompt_tokens = 0;
+    std::optional<std::size_t> matched_text_stop = std::nullopt;
 };
 
 enum class Fp8PrefillPolicy {

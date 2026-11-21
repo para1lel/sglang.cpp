@@ -164,6 +164,26 @@ struct Lane {
         return {token, tokens == options.max_new_tokens
             ? std::optional{DecoderFinishReason::length} : std::nullopt, true};
     }
+
+    DecoderBatchStep advance() {
+        const bool speculative = script && tokens != 0 && options.mtp_steps > 0 &&
+                                 std::getenv("SGLANG_TEST_SCRIPTED_MTP");
+        auto result = step();
+        if (!speculative || !result.token || result.finish_reason) {
+            return result;
+        }
+        result.mtp_drafted_tokens = options.mtp_steps;
+        while (result.extra_token_count < options.mtp_steps && !result.finish_reason) {
+            const auto extra = step();
+            result.extra_tokens[result.extra_token_count++] = extra.token.value();
+            result.finish_reason = extra.finish_reason;
+        }
+        result.extra_token = result.extra_tokens.front();
+        result.mtp_accepted_tokens = 1 + result.extra_token_count;
+        std::cerr << ("cpu scripted mtp tokens=" + std::to_string(result.mtp_accepted_tokens) +
+                      " terminal=" + std::to_string(result.finish_reason.has_value()) + '\n');
+        return result;
+    }
 };
 
 bool health_control(std::string_view name) {
@@ -301,7 +321,7 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
         if (simulate_stream_clock() && lane->tokens != 0) {
             simulated_seconds.fetch_add(3);
         }
-        result[slot] = lane->step();
+        result[slot] = lane->advance();
         if (lane->health && result[slot].token) {
             std::cerr << "cpu health token\n";
         }

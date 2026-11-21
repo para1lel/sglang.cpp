@@ -27,4 +27,26 @@ struct OutputMailbox {
     }
 };
 
+inline bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& callbacks,
+                      DecoderResult& result) {
+    result.mtp_rounds += step.mtp_drafted_tokens != 0;
+    result.mtp_drafted_tokens += step.mtp_drafted_tokens;
+    result.output_token_ids.push_back(*step.token);
+    result.mtp_accepted_tokens += step.mtp_accepted_tokens > 0;
+    if (callbacks.on_token && !callbacks.on_token(*step.token)) {
+        return false;
+    }
+    for (int index = 0; index < step.extra_token_count; ++index) {
+        if (callbacks.is_cancelled && callbacks.is_cancelled()) {
+            return false;
+        }
+        result.output_token_ids.push_back(step.extra_tokens[index]);
+        result.mtp_accepted_tokens += index + 1 < step.mtp_accepted_tokens;
+        if (callbacks.on_token && !callbacks.on_token(step.extra_tokens[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }

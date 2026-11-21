@@ -208,9 +208,9 @@ __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
     }
 }
 
-__global__ void prefill_swiglu_quantize_warp(const __nv_bfloat16* gate,
-                                            const __nv_bfloat16* up, int width,
-                                            TextFp8Activation output) {
+template <bool ApplySwiglu>
+__global__ void prefill_quantize_warp(const __nv_bfloat16* input, const __nv_bfloat16* up,
+                                    int width, TextFp8Activation output) {
     static_assert(text_fp8_group_size == warp_width * 4);
     const int groups = width / text_fp8_group_size;
     const int group = blockIdx.x * block_warps + threadIdx.x / warp_width;
@@ -220,17 +220,19 @@ __global__ void prefill_swiglu_quantize_warp(const __nv_bfloat16* gate,
     const int lane = threadIdx.x % warp_width;
     const auto offset = static_cast<std::size_t>(blockIdx.y) * width +
                         group * text_fp8_group_size + lane * 4;
-    const auto* gate_pairs = reinterpret_cast<const __nv_bfloat162*>(gate + offset);
-    const auto* up_pairs = reinterpret_cast<const __nv_bfloat162*>(up + offset);
-    const auto gate_first = gate_pairs[0];
-    const auto gate_second = gate_pairs[1];
-    const auto up_first = up_pairs[0];
-    const auto up_second = up_pairs[1];
+    const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(input + offset);
+    auto first = pairs[0];
+    auto second = pairs[1];
+    if constexpr (ApplySwiglu) {
+        const auto* up_pairs = reinterpret_cast<const __nv_bfloat162*>(up + offset);
+        const auto up_first = up_pairs[0];
+        const auto up_second = up_pairs[1];
+        first = {swiglu(first.x, up_first.x), swiglu(first.y, up_first.y)};
+        second = {swiglu(second.x, up_second.x), swiglu(second.y, up_second.y)};
+    }
     const float4 values{
-        __bfloat162float(swiglu(gate_first.x, up_first.x)),
-        __bfloat162float(swiglu(gate_first.y, up_first.y)),
-        __bfloat162float(swiglu(gate_second.x, up_second.x)),
-        __bfloat162float(swiglu(gate_second.y, up_second.y)),
+        __bfloat162float(first.x), __bfloat162float(first.y),
+        __bfloat162float(second.x), __bfloat162float(second.y),
     };
     const float maximum = fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)),
                                 fmaxf(fabsf(values.z), fabsf(values.w)));
@@ -698,6 +700,14 @@ cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int ro
         return cudaErrorInvalidValue;
     }
     const __nv_bfloat16* up = nullptr;
+    if (rows == 1024 && width == text_gqa_q_width &&
+        aligned(input, alignof(__nv_bfloat162)) &&
+        aligned(output.values, alignof(__nv_fp8x4_storage_t))) {
+        const dim3 grid(divide_up(width / text_fp8_group_size, block_warps), rows);
+        void* warp_args[] = {&input, &up, &width, &output};
+        return cudaLaunchKernel(prefill_quantize_warp<false>, grid, block_threads, warp_args,
+                                0, stream);
+    }
     void* args[] = {&input, &width, &output, &up};
     return cudaLaunchKernel(quantize_fp8_kernel<true>, dim3(text_fp8_group_count(width), rows),
                             text_fp8_group_size, args, 0, stream);
@@ -712,7 +722,7 @@ cudaError_t decoder::tensor_core_prefill_swiglu_quantize(
         aligned(activation.values, alignof(__nv_fp8x4_storage_t))) {
         const dim3 grid(divide_up(width / text_fp8_group_size, block_warps), rows);
         void* warp_args[] = {&gate, &up, &width, &activation};
-        return cudaLaunchKernel(prefill_swiglu_quantize_warp, grid, block_threads,
+        return cudaLaunchKernel(prefill_quantize_warp<true>, grid, block_threads,
                                 warp_args, 0, stream);
     }
     const dim3 grid(text_fp8_group_count(width), rows);

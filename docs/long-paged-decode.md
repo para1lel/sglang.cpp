@@ -28,7 +28,7 @@ Packed eager and replay use the same FP8 projection dispatch and pass the bucket
 
 The FP8 copy and consumer warps wait on the same MMA completion phase. The copy warp refills shared memory and signals copy readiness. Consumer warps read TMEM and release the accumulator slot. The MMA warp waits for copy readiness and slot release before reuse. The four-stage pipeline halves the TMEM allocation and lowers dynamic shared memory at the cost of fewer stages for overlapping copies with compute. Its shared-memory request fits two CTAs per SM on B200. The split planner still uses the 64-column kernel and eight-stage footprint, preserving the split-K reduction order and BF16 rounding. [Copy completion](../include/sglang/text/decode_proj_sm100.cuh#L177)<!-- prefix: "const auto* " --> · [Accumulator release](../src/text/decode_proj_fp8.cu#L101)<!-- prefix: "release_slot" --> · [Reuse guard](../include/sglang/text/decode_proj_sm100.cuh#L198)<!-- prefix: "wait_barrier" --> · [Split planning](../src/text/decode_proj_fp8.cu#L232)<!-- prefix: "auto status " --> · [Shared-memory request](../src/text/decode_proj_fp8.cu#L263)<!-- prefix: "const int sh" -->
 
-Other eligible FP8 shapes, including the MLP down projection, use eight stages. BF16 retains separate completion signals. If the SM100 dispatcher declines the call, the entry point uses per-target GEMV. [Fallback](../src/text_ops.cu#L868)<!-- prefix: "for (int ind" -->
+Other eligible FP8 shapes, including the MLP down projection, use eight stages. BF16 retains separate completion signals. If the SM100 dispatcher declines the call, the entry point uses per-target GEMV. [Fallback](../src/text_ops.cu#L880)<!-- prefix: "const auto s" -->
 
 ### Legacy wide eager decode
 

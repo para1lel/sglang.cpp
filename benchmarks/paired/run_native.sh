@@ -5,7 +5,8 @@ usage() {
     echo "Usage: bash benchmarks/paired/run_native.sh" \
         "BUILD_DIR GPU_INDEX NEW_OUTPUT_DIR [GROUP ...]"
     echo "Groups: W1-W2 W3 W4 W5 W6 (default: all in this order)"
-    echo "Set PAIRED_VLLM_RESULTS to check counts against saved vLLM runs."
+    echo "Set PAIRED_VLLM_RESULTS to validate a saved same-device control."
+    echo "Set PAIRED_COMPARISON_MODE=frozen for the published GPU2 W3-W6 reference."
 }
 
 if [[ ${1:-} == --help ]]; then
@@ -38,17 +39,25 @@ if [[ ! $warmups =~ ^[1-9][0-9]*$ || ! $measured =~ ^([2-9]|[1-9][0-9]+)$ ]]; th
     echo "Use at least one warmup and two measured concurrent cohorts." >&2
     exit 2
 fi
-if [[ -n ${PAIRED_VLLM_RESULTS:-} ]]; then
-    for group in "${groups[@]}"; do
-        check_saved_counts "$group"
-    done
+mode=${PAIRED_COMPARISON_MODE:-}
+if [[ -n ${PAIRED_VLLM_RESULTS:-} && -z $mode ]]; then
+    mode=matched
+fi
+case "$mode:${PAIRED_VLLM_RESULTS:+saved}" in
+    :|matched:saved|frozen:) ;;
+    *) echo "Use matched mode with saved vLLM results or frozen mode without them." >&2; exit 2 ;;
+esac
+if [[ $mode == frozen && " ${groups[*]} " == *" W1-W2 "* ]]; then
+    echo "Select W3, W4, W5 or W6 for the published frozen reference." >&2
+    exit 2
 fi
 trap stop_group EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 prepare_run "$index" "$target"
-printf 'warmups=%s\nmeasured=%s\nsaved_vllm_results=%s\nallow_count_mismatch=%s\n' \
+printf 'warmups=%s\nmeasured=%s\nsaved_vllm_results=%s\nallow_count_mismatch=%s\nmode=%s\n' \
     "$warmups" "$measured" "${PAIRED_VLLM_RESULTS:-}" "${PAIRED_ALLOW_COUNT_MISMATCH:-0}" \
+    "${mode:-unpaired}" \
     >"$output/comparison-inputs.txt"
 sha256sum "$binary" "$paired_dir/run_native.sh" >"$output/native.sha256"
 export CUDA_VISIBLE_DEVICES=$gpu_uuid CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -63,6 +72,9 @@ env | LC_ALL=C sort |
 if [[ ${groups[*]} != W1-W2 ]]; then
     prepare_fixtures
 fi
+if [[ -n $mode ]]; then
+    plan_comparison "$mode" "${groups[@]}"
+fi
 exit_code=0
 for group in "${groups[@]}"; do
     run=$output/$group
@@ -73,7 +85,17 @@ for group in "${groups[@]}"; do
         --max-active 32 --max-num-batched-tokens 32768 &&
         jq -e '.max_active == 32 and .max_num_batched_tokens == 32768' "$run/health.json" >/dev/null
     then
-        measure_group "$group" "$run" native || exit_code=1
+        if ! measure_group "$group" "$run" native; then
+            exit_code=1
+        elif [[ -n $mode ]]; then
+            if comparison_identity finish "$mode" "$group" "$comparison_plan_sha256" \
+                >"$run/comparison.tmp"; then
+                mv -- "$run/comparison.tmp" "$run/comparison.json"
+            else
+                rm -- "$run/comparison.tmp"
+                exit_code=1
+            fi
+        fi
     else
         exit_code=1
     fi

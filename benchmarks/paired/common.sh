@@ -40,36 +40,40 @@ check_idle() {
     fi
 }
 
-check_saved_counts() {
-    local group=$1
-    local summary=$PAIRED_VLLM_RESULTS/vllm-$group/$group/measurement/summary.json
-    local expected="$warmups $measured"
-    local actual
-    if [[ $group == W1-W2 ]]; then
-        expected='3 9'
-        actual=$(jq -er 'select(.workloads.W1.valid and .workloads.W2.valid) |
-            select(.workloads.W1.warmups_successful == .workloads.W2.warmups_successful
-                and .workloads.W1.successful == .workloads.W2.successful) |
-            [.workloads.W1.warmups_successful,.workloads.W1.successful] | join(" ")' \
-            "$summary") || actual=
-    else
-        actual=$(jq -er 'select(.status == "complete") |
-            [.request_outcomes[].tag] |
-            [(map(select(startswith("warmup-"))) | length),
-             (map(select(startswith("measured-"))) | length)] | join(" ")' \
-            "$summary") || actual=
-    fi
-    if [[ -z $actual ]]; then
-        echo "No complete vLLM evidence for $group in $summary." >&2
-        return 1
-    fi
-    if [[ $actual != "$expected" ]]; then
-        echo "$group saved vLLM warmup/measured counts: $actual. Requested: $expected." >&2
-        if [[ ${PAIRED_ALLOW_COUNT_MISMATCH:-0} != 1 ]]; then
-            return 2
+comparison_identity() {
+    PYTHONPATH=$protocol "$client_python" -B "$paired_dir/identity.py" "$protocol" "$output" "$@"
+}
+
+plan_comparison() {
+    local mode=$1
+    shift
+    local manifest=${PAIRED_CHECKPOINT_MANIFEST:-}
+    local options=()
+    if [[ $mode == matched ]]; then
+        local saved
+        saved=$(realpath -- "$PAIRED_VLLM_RESULTS")
+        options+=(--saved "$saved")
+        if [[ -z $manifest && -f $saved/checkpoint.sha256 ]]; then
+            manifest=$saved/checkpoint.sha256
+        elif [[ -z $manifest ]]; then
+            manifest=$saved/meta/checkpoint.sha256
         fi
-        echo "Using the explicit PAIRED_ALLOW_COUNT_MISMATCH override." >&2
+        if [[ ${PAIRED_ALLOW_COUNT_MISMATCH:-0} == 1 ]]; then
+            options+=(--allow-count-mismatch)
+        fi
     fi
+    if [[ ! -f $manifest ]]; then
+        echo "Provide the published model file list as PAIRED_CHECKPOINT_MANIFEST." >&2
+        return 2
+    fi
+    cp -- "$manifest" "$output/checkpoint.sha256"
+    local plan
+    plan=$(comparison_identity plan "$mode" "$checkpoint" "$output/checkpoint.sha256" \
+        "${fixtures:-$output}" "$warmups" "$measured" "$@" "${options[@]}")
+    comparison_plan_sha256=$(printf '%s\n' "$plan" | sha256sum)
+    comparison_plan_sha256=${comparison_plan_sha256%% *}
+    printf '%s\n' "$plan" >"$output/comparison-plan.tmp"
+    mv -- "$output/comparison-plan.tmp" "$output/comparison-plan.json"
 }
 
 prepare_run() {

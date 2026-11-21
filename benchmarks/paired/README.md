@@ -1,9 +1,9 @@
 # Paired baseline replay
 
 Run the native arm of the [fixed W1–W6 benchmark](../../docs/performance-comparison.md)
-against a release build containing `bin/sglang-server`. On the benchmark host, this
-command uses B200 GPU 2 and the published two warmup and five measured cohorts
-for each concurrent row. The output directory must be new, with an existing parent.
+against a release build containing `bin/sglang-server`. The default below runs
+the native arm on B200 GPU 2, with two warmups and five measured cohorts for each
+concurrent row. The output directory must be new, with an existing parent.
 
 ```bash
 bash benchmarks/paired/run_native.sh /path/to/build 2 artifacts/paired-candidate
@@ -11,7 +11,8 @@ bash benchmarks/paired/run_native.sh /path/to/build 2 artifacts/paired-candidate
 
 Use the default Pixi environment or provide the native binary's runtime libraries.
 The driver needs Bash, `nvidia-smi`, `flock`, `setsid`, `numactl`, `taskset`, `curl`,
-`jq`, GNU coreutils and client Python 3. The vLLM directory must exist and allow
+`jq`, GNU coreutils and client Python 3.11 or newer for identity checks. The vLLM
+directory must exist and allow
 opening or creating a shared lock for the physical GPU UUID. Regenerating fixtures
 also requires the pinned vLLM environment with `tokenizers`.
 
@@ -27,8 +28,10 @@ also requires the pinned vLLM environment with `tokenizers`.
 | `PAIRED_PROTOCOL_ROOT` | Repository root. Use a frozen export for a paired comparison. |
 | `PAIRED_FIXTURES` | Generate W3–W6 requests from the checkpoint tokenizer with pinned vLLM Python. Set a directory to reuse them. |
 | `PAIRED_WARMUPS` / `PAIRED_MEASURED` | `2` / `5` for W3–W6 |
-| `PAIRED_VLLM_RESULTS` | Unset. Set the saved evidence root to check each requested group's cohort counts. |
-| `PAIRED_ALLOW_COUNT_MISMATCH` | `0`. Set to `1` for exploratory runs with differing counts. |
+| `PAIRED_VLLM_RESULTS` | Unset. Set the saved vLLM evidence root to request a verified same-device comparison. |
+| `PAIRED_COMPARISON_MODE` | `matched` when saved results are supplied. Use `frozen` with W3–W6 and no saved results for the published GPU2 reference. |
+| `PAIRED_CHECKPOINT_MANIFEST` | The saved `checkpoint.sha256` or `meta/checkpoint.sha256` in matched mode. Supply the published manifest explicitly in frozen mode. |
+| `PAIRED_ALLOW_COUNT_MISMATCH` | `0`. Set to `1` to label an otherwise verified comparison exploratory when cohort counts differ. |
 
 ## Replay the retained GPU 2 arm
 
@@ -69,12 +72,42 @@ PAIRED_VLLM_RESULTS="$saved" PAIRED_WARMUPS=1 PAIRED_MEASURED=3 \
     bash benchmarks/paired/run_native.sh /path/to/build 2 artifacts/paired-candidate-gpu2
 ```
 
-The concurrent observer validates every request body against the frozen fixture
-manifest. For W1/W2, verify that `manifest.client_sha256`, `manifest.fixture_sha256`
-and `manifest.request_sha256` under the native `summary.json` match the saved
-vLLM summary. These identity checks allow the two engines to emit different IDs.
-With `PAIRED_VLLM_RESULTS` set, count mismatches fail before startup unless the
-exploratory override is set. A paired performance claim requires matching counts.
+The driver resolves the physical GPU before checking saved evidence. It checks the
+saved device inventory and the worker's compute UUID at readiness and measurement
+end, CPU and NUMA placement, observed engine settings, the published checkpoint
+file hashes, the protocol and request hashes, and the cohort schedule. It replays
+saved wire captures against the frozen fixture and recorded summary. Results can
+differ between engines. Each engine's own greedy IDs must repeat across cohorts.
+The retained 1/3 concurrent capture predates the collector's in-run repeat check.
+Its collector digest is recognized, and offline replay verifies the missing check
+and reconstructs the fixture manifest identity from the summary and request bytes.
+
+The driver writes `comparison-plan.json` before launch and keeps its SHA-256 and
+the selected mode for the completion check. It replays the native wire captures
+and checks repeat IDs, measured statistics, and process, device, settings and
+protocol evidence before producing `GROUP/comparison.json`. Its `comparison`
+field labels `same-device matched-cap` or `exploratory (count mismatch)`. A count
+override leaves all other checks in force. The result records which arms were
+replayed and whether cross-engine IDs were compared. The native receipts
+establish its launch settings and scheduler limits. Actual kernel dispatch
+requires independent profiling.
+
+## Compare against the published frozen reference
+
+The published W3–W6 GPU2 vLLM reference uses an 8,192-token scheduler cap. Select
+one or more concurrent groups, retain the native 32,768-token cap, and use the
+published checkpoint manifest:
+
+```bash
+PAIRED_COMPARISON_MODE=frozen \
+PAIRED_CHECKPOINT_MANIFEST="$saved/checkpoint.sha256" \
+    bash benchmarks/paired/run_native.sh /path/to/build 7 artifacts/frozen-w5 W5
+```
+
+The comparison records the frozen archive identity and uses the `published frozen
+reference (cross-cap)` label. It adds `cross-device` when the observed native UUID
+differs from GPU2. Interpret its speed gates against that published reference.
+Use a verified same-device, matched-cap vLLM arm to make a matched performance claim.
 
 ## Observe and compare
 
@@ -97,7 +130,7 @@ Compare median output IDs/s and pooled request p95 latency. In the raw W1/W2
 summary, use `workloads.W1` or `workloads.W2`, then `output_tokens_per_second.p50` and
 `ttft_ms.p95`, `tpot_ms.p95` and `e2e_ms.p95`. In W3–W6, use
 `throughput.output_tokens_per_second.p50` and the same latency keys under `latency_ms`.
-The saved `comparison.json` exposes `rows.W1.vllm` through `rows.W6.vllm` with
+The retained archive's aggregate `comparison.json` exposes `rows.W1.vllm` through `rows.W6.vllm` with
 `output_ids_per_second_p50` and `latency_p95_ms`. Each row's `fresh_vllm_thresholds`
 uses the saved same-card vLLM variability. W3–W6 `wire_and_timing_gates` contains
 archived speed checks after successful wire validation. Those speed misses do

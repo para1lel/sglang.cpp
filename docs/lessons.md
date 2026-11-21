@@ -109,3 +109,16 @@ The independent `artifacts/resume-verifier/packed-fix-accept/report.md` records 
 The original packed winner buffer used a deleter that logged a rejected `cudaFreeHost` and lost the pointer. The independent fault probe recovered the live pin by retrying from its observer. The repair gives the pin to [batch execution](batch-graphs.md#constraints-and-failure-behavior), where drain and graph teardown precede release and a rejected free leaves the pin eligible for deferred reclamation.
 
 The `packed-setup` procedure in [L009](#l009--terminal-error-during-first-packed-decode-setup) runs the rejected-free arm. Its observer rejects the first release of the winner-copy destination and requires a successful retry on that same address. The checker also requires a packed replay mask of `0x5`, six token IDs, and valid BF16 score records. [Fault arm](../tests/batch/run_batch_graph.sh#L95)<!-- prefix: "run_lanes pa" --> · [Assertions](../tests/batch/check_graph_evidence.py#L394)<!-- prefix: "def verify_p" -->
+
+## L011 · Saved benchmark counts concealed mismatched controls
+
+The paired launcher accepted a saved summary when its cohort counts matched,
+before resolving the target GPU. The review reproduced acceptance with an
+unrelated GPU and fixture. Resolve the UUID first, compare the saved process
+receipts and fixed inputs, and require native process evidence before labeling
+a completed run. Keep the published cross-cap results under their own label.
+See the [paired benchmark procedure](../benchmarks/paired/README.md).
+
+The offline regression runs with `python3 -B -m unittest discover -s tests -p test_paired_identity.py`.
+It uses saved-run receipts and the fixed streaming requests and checks that
+unchanged counts cannot hide identity differences.

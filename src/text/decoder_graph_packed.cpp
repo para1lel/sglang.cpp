@@ -96,7 +96,9 @@ private:
         Bf16* gdn_z;
         Bf16* gdn_b;
         Bf16* gdn_a;
-        Bf16* convolved;
+        float* normalized_qk;
+        float2* gdn_gates;
+        Bf16* convolved_values;
         Bf16* observable;
         Bf16* mlp_gate;
         Bf16* mlp_up;
@@ -180,7 +182,11 @@ PackedDecode::PackedDecode(const DecoderModel& model)
     rows_.gdn_z = allocate_rows(text_gdn_value_width);
     rows_.gdn_b = allocate_rows(text_gdn_value_heads);
     rows_.gdn_a = allocate_rows(text_gdn_value_heads);
-    rows_.convolved = allocate_rows(text_gdn_qkv_width);
+    rows_.normalized_qk = allocate_scratch<float>(
+        std::size_t{2 * text_gdn_qk_width} * packed_capacity);
+    rows_.gdn_gates = allocate_scratch<float2>(
+        std::size_t{text_gdn_value_heads} * packed_capacity);
+    rows_.convolved_values = allocate_rows(text_gdn_value_width);
     rows_.observable = allocate_rows(text_gdn_value_width);
     rows_.mlp_gate = allocate_rows(intermediate_size);
     rows_.mlp_up = allocate_rows(intermediate_size);
@@ -282,7 +288,8 @@ void PackedDecode::gdn(const GdnLayer& layer, int bank, const Step& step) const 
                                  rows_.gdn_b, rows_.gdn_a, step.stream),
           "Run packed Gated DeltaNet gate projections");
     const PackedGdnRows rows{rows_.gdn_qkv, rows_.gdn_z, rows_.gdn_b, rows_.gdn_a,
-                             rows_.convolved, rows_.observable, rows_.attention};
+                             rows_.normalized_qk, rows_.gdn_gates, rows_.convolved_values,
+                             rows_.observable, rows_.attention};
     check(packed_decode_gdn(step.rows, &device_->active, rows, layer.recurrent,
                             device_->states[bank].data(), step.stream),
           "Advance packed Gated DeltaNet state");

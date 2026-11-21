@@ -10,7 +10,7 @@
 
 ## Runtime path
 
-Start the batch server with `--fp8-prefill tensor-core` to enable [packed K0 text decode](batch-graphs.md#runtime-path). The fused GQA step requires at least two eligible decode lanes, with a live position, KV cache, and page table per lane. The same operator runs in eager and replay. Negative positions mark inactive rows. See the [batch failure contract](batch-graphs.md#constraints-and-failure-behavior) for first-use packed scratch errors. [Packed dispatch](../src/text/decoder_graph_packed.cpp#L457)<!-- prefix: "bool run_pac" --> · [Fused API](../include/sglang/text/gqa_decode_step.h#L28)<!-- prefix: "cudaError_t " -->
+Start the batch server with `--fp8-prefill tensor-core` to enable [packed K0 text decode](batch-graphs.md#runtime-path). The fused GQA step requires at least two eligible decode lanes, with a live position, KV cache, and page table per lane. The same operator runs in eager and replay. Negative positions mark inactive rows. See the [batch failure contract](batch-graphs.md#constraints-and-failure-behavior) for first-use packed scratch errors. [Packed dispatch](../src/text/decoder_graph_packed.cpp#L464)<!-- prefix: "bool run_pac" --> · [Fused API](../include/sglang/text/gqa_decode_step.h#L28)<!-- prefix: "cudaError_t " -->
 
 ### Fused packed GQA
 

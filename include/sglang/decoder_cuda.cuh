@@ -151,7 +151,9 @@ struct PackedGdnRows {
     const __nv_bfloat16* z;
     const __nv_bfloat16* b;
     const __nv_bfloat16* a;
-    __nv_bfloat16* convolved;
+    float* normalized_qk;
+    float2* gates;
+    __nv_bfloat16* convolved_values;
     __nv_bfloat16* observable;
     __nv_bfloat16* output;
 };

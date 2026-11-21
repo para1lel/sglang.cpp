@@ -852,12 +852,12 @@ bool paired_kernel_unavailable(cudaError_t status) {
 }
 
 std::optional<cudaError_t> encode_flash_maps(Mxfp8KvCache cache, CUtensorMap& key_map,
-                                             CUtensorMap& value_map) {
+                                             CUtensorMap& value_map, bool automatic) {
     void* entry = nullptr;
     const auto status = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &entry, 12000,
                                                          cudaEnableDefault, nullptr);
     if (status != cudaSuccess) {
-        return status;
+        return flash_setup_error(status, automatic && status == cudaErrorNotSupported);
     }
     if (!entry) {
         return std::nullopt;
@@ -873,11 +873,26 @@ std::optional<cudaError_t> encode_flash_maps(Mxfp8KvCache cache, CUtensorMap& ke
                       elements, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
                       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     };
-    if (encode_payload(key_map, cache.key_payload) != CUDA_SUCCESS ||
-        encode_payload(value_map, cache.value_payload) != CUDA_SUCCESS) {
-        return cudaErrorInvalidValue;
+    auto result = encode_payload(key_map, cache.key_payload);
+    if (result == CUDA_SUCCESS) {
+        result = encode_payload(value_map, cache.value_payload);
     }
-    return cudaSuccess;
+    if (!automatic) {
+        return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
+    }
+    switch (result) {
+    case CUDA_SUCCESS: return cudaSuccess;
+    case CUDA_ERROR_INVALID_VALUE:
+    case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
+    case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
+    case CUDA_ERROR_CONTEXT_IS_DESTROYED: return cudaErrorContextIsDestroyed;
+    case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
+    case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
+    case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
+    case CUDA_ERROR_ILLEGAL_ADDRESS: return cudaErrorIllegalAddress;
+    case CUDA_ERROR_LAUNCH_FAILED: return cudaErrorLaunchFailure;
+    default: return cudaErrorUnknown;
+    }
 }
 
 }
@@ -885,7 +900,7 @@ std::optional<cudaError_t> encode_flash_maps(Mxfp8KvCache cache, CUtensorMap& ke
 std::optional<cudaError_t> launch_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
     const Bf16* queries, Bf16* output, cudaStream_t stream, bool ordered,
-    int ragged_rows) {
+    int ragged_rows, bool automatic) {
     constexpr auto dynamic_shared = sizeof(TmemFlashTile);
     constexpr int max_physical_pages = INT_MAX / mxfp8_page_size + 1;
     const int rows = ragged_rows ? ragged_rows : flash_chunk;
@@ -916,15 +931,20 @@ std::optional<cudaError_t> launch_tmem_prefill(
         return status;
     }
     if (properties.major != 10 || properties.minor != 0 ||
+        (automatic && properties.multiProcessorCount != 148) ||
         (!ordered && !properties.memoryPoolsSupported)) {
         return std::nullopt;
+    }
+    const auto pending = automatic ? cudaPeekAtLastError() : cudaSuccess;
+    if (pending != cudaSuccess) {
+        return pending;
     }
     const auto kernel = ragged_rows ? tmem_flash_attention<true, true> :
         ordered ? tmem_flash_attention<true> : tmem_flash_attention<false>;
     cudaFuncAttributes attributes{};
     status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) {
-        return status;
+        return flash_setup_error(status, automatic && paired_kernel_unavailable(status));
     }
     if (properties.sharedMemPerBlockOptin < dynamic_shared + attributes.sharedSizeBytes) {
         return std::nullopt;
@@ -932,10 +952,11 @@ std::optional<cudaError_t> launch_tmem_prefill(
     status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   dynamic_shared);
     if (status != cudaSuccess) {
-        return status;
+        return flash_setup_error(status, automatic &&
+            (status == cudaErrorInvalidValue || paired_kernel_unavailable(status)));
     }
     CUtensorMap key_map{}, value_map{};
-    const auto encoded = encode_flash_maps(cache, key_map, value_map);
+    const auto encoded = encode_flash_maps(cache, key_map, value_map, automatic);
     if (!encoded || *encoded != cudaSuccess) {
         return encoded;
     }

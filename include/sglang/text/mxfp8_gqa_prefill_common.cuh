@@ -13,7 +13,7 @@ namespace sglang {
 std::optional<cudaError_t> launch_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream, bool ordered,
-    int ragged_rows = 0);
+    int ragged_rows = 0, bool automatic = false);
 
 std::optional<cudaError_t> launch_paired_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
@@ -327,6 +327,17 @@ struct FlashSoftmax {
     float maximum;
     float mass;
 };
+
+inline std::optional<cudaError_t> flash_setup_error(cudaError_t status, bool unavailable) {
+    if (!unavailable) {
+        return status;
+    }
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess && pending != status) {
+        return pending;
+    }
+    return std::nullopt;
+}
 
 }
 }

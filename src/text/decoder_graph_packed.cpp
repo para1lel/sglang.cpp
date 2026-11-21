@@ -267,8 +267,10 @@ TextFp8ActivationView PackedDecode::quantize(const Bf16* input, int width,
 
 void PackedDecode::normalize(const Bf16* branch, Bf16* residual, const Bf16* weight,
                              const Step& step) const {
+    const auto launch = branch == rows_.projected_attention
+        ? RmsQuantizeLaunch::packed_gate_up : RmsQuantizeLaunch::ordinary;
     check(tensor_core_prefill_rms_quantize(branch, residual, weight, hidden_size, step.rows,
-                                           rows_.normalized, rows_.activation, step.stream),
+                                           rows_.normalized, rows_.activation, step.stream, launch),
           "Normalize and quantize packed decode residual");
 }
 

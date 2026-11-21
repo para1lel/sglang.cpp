@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder | Select the prefill policy and supply activation and output buffers. | [Packed call](../src/decoder_prefill.cpp#L229)<!-- prefix: "bool project" --> |
-| Fused RMSNorm | Produce BF16 normalized values, E4M3 activations, and FP32 activation scales for prefill and packed decode. | [Launcher](../src/text_normalization.cu#L309)<!-- prefix: "cudaError_t " --> |
+| Fused RMSNorm | Produce BF16 normalized values, E4M3 activations, and FP32 activation scales for prefill and packed decode. | [Launcher](../src/text_normalization.cu#L312)<!-- prefix: "cudaError_t " --> |
 | Attention output quantizer | Convert BF16 GDN and GQA output rows for their FP8 output projections. | [Row launcher](../src/text_ops.cu#L697)<!-- prefix: "cudaError_t " --> |
 | SM100 operator | Select the tile, manage CTA-local storage, and write BF16 outputs. | [Down dispatch](../src/prefill_fp8_sm100.cu#L551)<!-- prefix: "if (rows == " --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L631)<!-- prefix: "if (rows == " --> |
 
@@ -29,9 +29,9 @@ The kernel writes row-major E4M3 values and 48 row-major FP32 scales per row. It
 
 ### Fused activation quantization
 
-Packed decode and tensor-core prefill share the fused RMSNorm launcher. The eight-lane quantizer requires 2–32 launch rows, width 5,120, and a residual buffer. In packed decode, the bucket width sets the launch row count. Branch, residual, and gain buffers require 16-byte alignment. The E4M3 output requires 8-byte alignment. Eligible prefill tiles also use this path. Other valid calls use the existing fused kernel or separate RMSNorm and quantization according to width and input alignment. [Packed decode](../src/text/decoder_graph_packed.cpp#L268)<!-- prefix: "void PackedD" --> · [Prefill](../src/decoder_prefill.cpp#L334)<!-- prefix: "void normali" --> · [Selection](../src/text_normalization.cu#L322)<!-- prefix: "if (residual" -->
+Packed decode and tensor-core prefill share the fused RMSNorm launcher. The eight-lane quantizer requires 2–32 launch rows, width 5,120, and a residual buffer. In packed decode, the bucket width sets the launch row count. Branch, residual, and gain buffers require 16-byte alignment. The E4M3 output requires 8-byte alignment. Eligible prefill tiles also use this path. Other valid calls use the existing fused kernel or separate RMSNorm and quantization according to width and input alignment. [Packed decode](../src/text/decoder_graph_packed.cpp#L268)<!-- prefix: "void PackedD" --> · [Prefill](../src/decoder_prefill.cpp#L334)<!-- prefix: "void normali" --> · [Selection](../src/text_normalization.cu#L325)<!-- prefix: "if (residual" -->
 
-The specialization keeps the FP32 RMS accumulation order and produces BF16 residual and normalized rows. It quantizes the rounded normalized row with one FP32 scale per 128 channels. Scale and reciprocal use FP32 round-to-nearest division. The conversion saturates to finite E4M3. [RMS arithmetic](../src/text_normalization.cu#L254)<!-- prefix: "float values" --> · [Quantizer](../src/text_normalization.cu#L181)<!-- prefix: "__device__ v" -->
+The specialization keeps the FP32 RMS accumulation order and produces BF16 residual and normalized rows. It quantizes the rounded normalized row with one FP32 scale per 128 channels. Scale and reciprocal use FP32 round-to-nearest division. The conversion saturates to finite E4M3. [RMS arithmetic](../src/text_normalization.cu#L257)<!-- prefix: "float values" --> · [Quantizer](../src/text_normalization.cu#L181)<!-- prefix: "__device__ v" -->
 
 ## Constraints and failure behavior
 

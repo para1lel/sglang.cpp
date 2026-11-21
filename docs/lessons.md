@@ -90,7 +90,7 @@ The scripted clock advances by three seconds per decode step. Both text and chat
 
 The original first-use handler caught every CUDA error from packed setup. An injected illegal-address status at setup synchronization reached legacy dispatch. The repair permits legacy dispatch only for packed scratch allocation OOM after the CUDA error check and release of partial allocations. A terminal status reaches the batch handler and disables the batch before any legacy submission or decode publication. [Batch error handler](../src/decoder_batch.cpp#L951)<!-- prefix: "} catch (con" -->
 
-The initial repair still attempted setup for two one-row prefills or one decode with one one-row prefill. The independent fault probe disabled the batch in both cases. The second repair selects at least two packable lanes and a bucket before requesting scratch. It uses the same plan for binding. Both corrected controls published their expected results without hitting the fault. [Setup order](../src/text/decoder_graph_packed.cpp#L493)<!-- prefix: "if (!PackedD" -->
+The initial repair still attempted setup for two one-row prefills or one decode with one one-row prefill. The independent fault probe disabled the batch in both cases. The second repair selects at least two packable lanes and a bucket before requesting scratch. It uses the same plan for binding. Both corrected controls published their expected results without hitting the fault. [Setup order](../src/text/decoder_graph_packed.cpp#L495)<!-- prefix: "if (!PackedD" -->
 
 Use the [batch graph runbook](../tests/batch/README.md) to build Release tests in the managed environment. Set `out` to that build, `checkpoint` to the local checkpoint, and `GPU_UUID` to a reserved B200. Use a fresh evidence directory.
 

@@ -215,7 +215,7 @@ __device__ void rms_quantize_subwarps(const __nv_bfloat16* normalized,
     }
 }
 
-template <bool HasResidual, bool PackedGroups = false>
+template <bool HasResidual, bool PackedGroups = false, bool LaunchGateUp = false>
 __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
                                      const __nv_bfloat16* weight, __nv_bfloat16* normalized,
                                      TextFp8Activation activation) {
@@ -251,6 +251,9 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
         asm volatile("cp.async.wait_group 0;" ::: "memory");
     }
     __syncthreads();
+    if constexpr (LaunchGateUp) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     float values[values_per_thread];
     float squares = 0.0f;
 #pragma unroll
@@ -309,7 +312,7 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
 cudaError_t decoder::tensor_core_prefill_rms_quantize(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,
-    cudaStream_t stream) {
+    cudaStream_t stream, RmsQuantizeLaunch launch) {
     if (width != rms_hidden_width || !aligned(branch, alignof(uint4)) ||
         !aligned(residual, alignof(uint4)) || !aligned(weight, alignof(uint4))) {
         const auto status = text_rms_norm_rows(branch, residual, weight, width, rows,
@@ -320,8 +323,9 @@ cudaError_t decoder::tensor_core_prefill_rms_quantize(
     }
     void* args[] = {&branch, &residual, &weight, &normalized, &activation};
     if (residual && rows >= 2 && rows <= 32 && aligned(activation.values, alignof(uint2))) {
-        return cudaLaunchKernel(prefill_rms_quantize<true, true>, rows, block_threads,
-                                args, 0, stream);
+        const auto kernel = launch == RmsQuantizeLaunch::packed_gate_up && rows == 32
+            ? prefill_rms_quantize<true, true, true> : prefill_rms_quantize<true, true>;
+        return cudaLaunchKernel(kernel, rows, block_threads, args, 0, stream);
     }
     const auto kernel = residual ? prefill_rms_quantize<true> : prefill_rms_quantize<false>;
     return cudaLaunchKernel(kernel, rows, block_threads, args, 0, stream);

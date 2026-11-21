@@ -762,16 +762,17 @@ std::optional<cudaError_t> encode_pair_maps(Mxfp8KvCache cache, PairMaps& maps) 
     constexpr cuuint32_t scale_box[] = {pair_scale_bytes / 4, 1};
     const auto encode_map = [&](CUtensorMap& map, void* source, CUtensorMapDataType type,
                                 unsigned rank, const cuuint64_t* dimensions,
-                                const cuuint64_t* steps, const cuuint32_t* box) {
+                                const cuuint64_t* steps, const cuuint32_t* box,
+                                CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE) {
         return encode(&map, type, rank, source, dimensions, steps, box, elements,
-                      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                      CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
                       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     };
     auto result = encode_map(maps.keys, cache.key_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
                              3, shape, strides, key_box);
     if (result == CUDA_SUCCESS) {
         result = encode_map(maps.values, cache.value_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                            3, shape, strides, value_box);
+                            3, shape, strides, value_box, CU_TENSOR_MAP_SWIZZLE_128B);
     }
     if (result == CUDA_SUCCESS) {
         result = encode_map(maps.key_scales, cache.key_scales, CU_TENSOR_MAP_DATA_TYPE_UINT32,

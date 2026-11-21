@@ -11,6 +11,7 @@ constexpr int tmem_swizzle = 64;
 constexpr int tmem_producers = 256;
 constexpr int pair_key_rows = flash_keys / 2;
 constexpr int pair_value_channels = channels / 2;
+constexpr int pair_value_swizzle = 128;
 constexpr int pair_page_halves = mxfp8_page_size / flash_keys;
 constexpr int pair_scale_bytes = mxfp8_page_size * mxfp8_groups;
 
@@ -42,6 +43,8 @@ static_assert(flash_chunk % mxfp8_page_size == 0);
 static_assert(sizeof(PairPayload) ==
               pair_page_halves * (pair_key_rows * channels + flash_keys * pair_value_channels) +
                   2 * pair_scale_bytes);
+static_assert(pair_value_channels == pair_value_swizzle && sizeof(PairPayload) % 1024 == 0 &&
+              offsetof(PairPayload, value) % 1024 == 0 && offsetof(PairTile, raw) % 1024 == 0);
 static_assert(offsetof(PairPayload, key) % 128 == 0 &&
               offsetof(PairPayload, value) % 128 == 0 &&
               offsetof(PairPayload, key_scales) % 128 == 0 &&
@@ -103,15 +106,22 @@ __device__ void pair_stage_kv(PairTile& tile, const PairPayload& payload, int fi
     constexpr int width = Key ? channels : pair_value_channels;
     constexpr int row_count = Key ? pair_key_rows : flash_keys;
     constexpr int token_lanes = width / vector_elements;
+    constexpr int vectors_per_subtile = tmem_swizzle / vector_elements;
+    constexpr int paired_row_bits = vectors_per_subtile | 1;
+    constexpr int value_swizzle_rows = pair_value_swizzle / sizeof(uint4);
     const int producer = threadIdx.x - flash_queries;
-    const int vector = producer % token_lanes;
+    const int vector_lane = producer % token_lanes;
+    const int row = producer / token_lanes;
+    const int first_row = Key ? row : row ^ ((vector_lane / vectors_per_subtile) * paired_row_bits);
+    const int vector = Key ? vector_lane :
+        vector_lane % vectors_per_subtile + (row & 1) * vectors_per_subtile;
     const int channel = vector * vector_elements;
     const int scale_channel = channel + (Key ? 0 : rank * pair_value_channels);
     const int half = (first / flash_keys) % pair_page_halves;
     const auto* scales = Key ? payload.key_scales : payload.value_scales;
     const bool tail = PartialPage && first >= full_end;
     const int page = tail ? request.pages[first / mxfp8_page_size] : 0;
-    for (int index = producer / token_lanes; index < row_count;
+    for (int index = first_row; index < row_count;
          index += tmem_producers / token_lanes) {
         const int sub = channel / tmem_swizzle;
         const int column = channel % tmem_swizzle;
@@ -134,21 +144,25 @@ __device__ void pair_stage_kv(PairTile& tile, const PairPayload& payload, int fi
             const int scale = (token % mxfp8_group_size) * (pair_scale_bytes / mxfp8_group_size)
                              + (token / mxfp8_group_size) * mxfp8_groups
                              + scale_channel / mxfp8_group_size;
+            const int value_column = vector ^ (index % value_swizzle_rows);
             const uint4 data = Key ? payload.key[half][index][vector] :
-                                     payload.value[half][index][vector];
+                                     payload.value[half][index][value_column];
             tmem_decode(decoded, data, scales[scale], bad);
         }
         if constexpr (Key) {
             *reinterpret_cast<uint4*>(&tile.key[sub][index][low]) = packed[0];
             *reinterpret_cast<uint4*>(&tile.key[sub][index][high]) = packed[1];
+            const Word active = __ballot_sync(warp_mask, bad);
+            const int lane_base = (producer % 32) & ~(token_lanes - 1);
+            if (vector == 0 && ((active >> lane_base) & ((1u << token_lanes) - 1))) {
+                atomicMin(&tile.bad_key, logical);
+            }
         } else {
             *reinterpret_cast<uint4*>(&tile.value[stage][sub][index][low]) = packed[0];
             *reinterpret_cast<uint4*>(&tile.value[stage][sub][index][high]) = packed[1];
-        }
-        const Word active = __ballot_sync(warp_mask, bad);
-        const int lane_base = (producer % 32) & ~(token_lanes - 1);
-        if (vector == 0 && ((active >> lane_base) & ((1u << token_lanes) - 1))) {
-            atomicMin(&tile.bad_key, logical);
+            if (bad) {
+                atomicMin(&tile.bad_key, logical);
+            }
         }
     }
 }

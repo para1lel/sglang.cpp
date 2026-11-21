@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -16,6 +17,26 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+std::atomic<int> simulated_seconds{0};
+
+bool simulate_stream_clock() {
+    return std::getenv("SGLANG_TEST_STREAM_CLOCK") != nullptr;
+}
+
+}
+
+extern "C" Clock::time_point __real__ZNSt6chrono3_V212steady_clock3nowEv() noexcept;
+extern "C" Clock::time_point __wrap__ZNSt6chrono3_V212steady_clock3nowEv() noexcept {
+    if (!simulate_stream_clock()) {
+        return __real__ZNSt6chrono3_V212steady_clock3nowEv();
+    }
+    static const auto start = __real__ZNSt6chrono3_V212steady_clock3nowEv();
+    return start + std::chrono::seconds(simulated_seconds.load());
+}
 
 namespace sglang {
 namespace {
@@ -230,6 +251,9 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
         }
         has_greedy |= !lane->options.samples();
         has_sampled |= lane->options.samples();
+        if (simulate_stream_clock() && lane->tokens != 0) {
+            simulated_seconds.fetch_add(3);
+        }
         result[slot] = lane->step();
         if (result[slot].finish_reason) {
             lane.reset();

@@ -59,12 +59,12 @@ Start W1–W6 with disjoint prefixes and MTP off. Keep [W3-prefix](prefix-cache.
 
 **Required reporting.** For each workload and engine report output tokens/s, TTFT, TPOT, and end-to-end latency. Retain input and output counts and failed requests.
 
-**Proposed timing protocol.** Use one streaming client and monotonic clock for both engines. Time cohorts from first submission to last terminal response. Preserve submission, first and last token, intermediate token events when observable, and completion times per request. Exclude empty events from token counts. Require every request to finish at its specified length.
+**Proposed timing protocol.** Use one streaming client and monotonic clock for both engines. Time cohorts from first submission to last terminal response. Preserve submission, HTTP headers, token events, and completion times per request. Exclude [SSE keepalives](http-server.md#completion-streams) and other empty events from token counts. Require each request to finish at its specified length.
 
 | Metric | Definition for one measured cohort |
 | --- | --- |
 | Output tokens/s | Sum of emitted output tokens divided by elapsed cohort seconds. Exclude input, padding, and rejected drafts. |
-| TTFT (ms) | Time from request submission to its first output token, including queueing and prefill. |
+| TTFT (ms) | Submission to first output token, including queueing and prefill. Unavailable for zero output tokens. [Client calculation](../benchmarks/streaming/client.py#L180)<!-- prefix: "\"ttft_ms\": (" --> |
 | TPOT (ms/token) | `(last token time − first token time) / (output token count − 1)`, per request. Mark unavailable for fewer than two tokens. |
 | End-to-end latency (ms) | Time from request submission to its terminal response. Record stream chunking when multiple tokens arrive together. |
 | Requests/s and aggregate tokens/s | Completed requests per cohort second, and total input plus output tokens per cohort second, respectively. |

@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import select
 from pathlib import Path
 import struct
 import subprocess
@@ -141,11 +140,15 @@ def check_reset(port, log_path, evidence, width, cases):
     offset = log_path.stat().st_size
     with Stream(port, cases[257]) as cancelled:
         cancelled.post()
-        deadline = time.monotonic() + 15
+        cancelled.open()
+        admitted = time.monotonic()
+        processed = sum(sum(rows) for _, _, rows, _ in prefill_rows(log_path, offset))
+        require(processed < len(cancelled.request["prompt"]),
+                "Streaming headers must arrive before prefill completes")
+        deadline = admitted + 15
         while not any(max(rows) > 1 for _, _, rows, _ in prefill_rows(log_path, offset)):
             require(time.monotonic() < deadline, "No submitted chunk before reset")
             time.sleep(0.005)
-        require(not select.select([cancelled.sock], [], [], 0)[0], "Reset must precede output")
         cancelled.reset()
     cancelled_retirement = await_request_retirement(log_path, offset, width, "cancelled request")
     offset = log_path.stat().st_size

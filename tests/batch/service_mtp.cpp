@@ -32,8 +32,15 @@ bool check(const Scenario& scenario) {
     sglang::DecoderOptions options;
     options.max_new_tokens = seed_only ? 1 : 6;
     std::vector<int> emitted;
+    bool admitted = false;
     sglang::DecoderCallbacks callbacks;
+    callbacks.on_admitted = [&] {
+        require(!admitted, "Duplicate admission notification");
+        admitted = true;
+        return true;
+    };
     callbacks.on_token = [&](int token) {
+        require(admitted, "Token callback before admission callback");
         emitted.push_back(token);
         return scenario.interrupt != Interrupt::callback ||
                emitted.size() < scenario.expected_ids.size();

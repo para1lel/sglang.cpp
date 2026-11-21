@@ -8,6 +8,7 @@
 #include <atomic>
 #include <ctime>
 #include <iostream>
+#include <utility>
 
 namespace sglang::server {
 
@@ -99,7 +100,7 @@ void append_call(std::string& output, std::size_t index, std::string_view id,
 class TextResponse {
 public:
     TextResponse(const Socket& connection, const Tokenizer& tokenizer, const TextRequest& request)
-        : connection_(connection), tokenizer_(tokenizer), request_(request),
+        : connection_(connection), stream_(connection), tokenizer_(tokenizer), request_(request),
           prefix_(response_prefix(request)) {
         if (request.chat_output.enabled()) {
             parser_.emplace(request.chat_output);
@@ -107,9 +108,14 @@ public:
     }
 
     bool token(int id);
+    bool start() {
+        return !request_.stream || stream_.start();
+    }
+    bool poll() { return stream_.poll(); }
     void finish(const DecoderResult& result);
-    bool started() const { return streaming_; }
+    bool started() const { return stream_.started(); }
     bool stopped() const { return text_stopped_ && !write_failed_; }
+    void fail();
 
 private:
     std::string filter_stop(std::string_view delta, bool final = false);
@@ -126,6 +132,7 @@ private:
     void finish_stream(const char* reason, std::size_t count, int cached_tokens);
 
     const Socket& connection_;
+    EventStream stream_;
     const Tokenizer& tokenizer_;
     const TextRequest& request_;
     const std::string prefix_;
@@ -136,7 +143,7 @@ private:
     std::vector<ToolCall> tool_calls_;
     std::string pending_stop_;
     bool text_stopped_ = false;
-    bool streaming_ = false;
+    bool sent_event_ = false;
     bool write_failed_ = false;
 };
 
@@ -209,7 +216,7 @@ std::string TextResponse::choice(std::string_view text, const int* ids, std::siz
     if (request_.return_token_ids) {
         output += R"(,"token_ids":)";
         append_ids(output, ids, count);
-        if (!streaming_ && !request_.media) {
+        if (!sent_event_ && !request_.media) {
             output += R"(,"prompt_token_ids":)";
             append_ids(output, request_.prompt.data(), request_.prompt.size());
         }
@@ -228,19 +235,20 @@ std::string TextResponse::choice(std::string_view text, const int* ids, std::siz
 }
 
 bool TextResponse::event(std::string_view data) {
-    if (!streaming_) {
-        streaming_ = start_events(connection_);
-        if (streaming_ && request_.chat) {
-            auto role = prefix_ + R"("choices":[{"index":0,"delta":{"role":"assistant"},)"
-                                  R"("finish_reason":null}])";
-            append_media_prompt_ids(role);
-            if (!write_event(connection_, role + '}')) {
-                write_failed_ = true;
-                return false;
-            }
+    if (!start()) {
+        write_failed_ = true;
+        return false;
+    }
+    if (!std::exchange(sent_event_, true) && request_.chat) {
+        auto role = prefix_ + R"("choices":[{"index":0,"delta":{"role":"assistant"},)"
+                              R"("finish_reason":null}])";
+        append_media_prompt_ids(role);
+        if (!stream_.write(role + '}')) {
+            write_failed_ = true;
+            return false;
         }
     }
-    write_failed_ = !streaming_ || !write_event(connection_, data);
+    write_failed_ = !stream_.write(data);
     return !write_failed_;
 }
 
@@ -342,7 +350,13 @@ void TextResponse::finish_stream(const char* reason, std::size_t count, int cach
         }
     }
     if (event("[DONE]")) {
-        end_events(connection_);
+        stream_.end();
+    }
+}
+
+void TextResponse::fail() {
+    if (stream_.write(R"({"error":{"message":"Native decoder failed"}})")) {
+        stream_.end();
     }
 }
 
@@ -383,6 +397,8 @@ void complete_text(const Socket& connection, const TextRequest& request,
     const DecoderCallbacks callbacks{
         [&](int token) { return response.token(token); },
         [&] { return disconnected(connection); },
+        [&] { return response.start(); },
+        [&] { return response.poll(); },
     };
     try {
         const auto result = generate(request.prompt, request.options, callbacks);
@@ -395,9 +411,7 @@ void complete_text(const Socket& connection, const TextRequest& request,
             throw;
         }
         std::cerr << "Completion failed: " << error.what() << '\n';
-        if (write_event(connection, R"({"error":{"message":"Native decoder failed"}})")) {
-            end_events(connection);
-        }
+        response.fail();
     }
 }
 

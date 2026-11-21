@@ -78,6 +78,8 @@ enum class DecoderFinishReason {
 struct DecoderCallbacks {
     std::function<bool(int)> on_token;
     std::function<bool()> is_cancelled;
+    std::function<bool()> on_admitted = {};
+    std::function<bool()> on_stream_poll = {};
 };
 
 struct DecoderLogit {

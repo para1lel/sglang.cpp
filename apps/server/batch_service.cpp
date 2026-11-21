@@ -245,7 +245,9 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
                 batch.admit_multimodal(slot, std::move(job->prompt), job->options, job->media);
                 job->media.clear();
             }
+            const std::lock_guard lock(mutex);
             job->admitted = true;
+            changed.notify_all();
         } catch (...) {
             if (!batch.available()) {
                 throw;
@@ -439,16 +441,24 @@ void BatchService::State::cancel(std::unique_lock<std::mutex>& lock, int slot, J
 DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, int slot,
                                            Job& job, const DecoderCallbacks& callbacks) {
     DecoderResult result;
+    bool announced = false;
     for (;;) {
+        const bool announce = job.admitted && !job.error && callbacks.on_admitted && !announced;
+        const bool poll_stream = announced && callbacks.on_stream_poll && !job.error &&
+            !job.finish;
         lock.unlock();
-        const bool abandoned = callbacks.is_cancelled && callbacks.is_cancelled();
+        const bool connected = (!callbacks.is_cancelled || !callbacks.is_cancelled()) &&
+            (!announce || callbacks.on_admitted()) &&
+            (!poll_stream || callbacks.on_stream_poll());
         lock.lock();
-        if (abandoned) {
+        announced = announced || announce;
+        if (!connected) {
             cancel(lock, slot, job);
             result.finish_reason = DecoderFinishReason::cancelled;
             return result;
         }
-        if (job.pending) {
+        const bool can_emit = announced || !job.admitted || !callbacks.on_admitted;
+        if (job.pending && can_emit) {
             const auto step = *job.pending;
             lock.unlock();
             const bool accepted = emit_step(step, callbacks, result);
@@ -462,10 +472,10 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
             changed.notify_all();
         } else if (job.error) {
             std::rethrow_exception(job.error);
-        } else if (job.finish) {
+        } else if (job.finish && can_emit) {
             result.finish_reason = *job.finish;
             return result;
-        } else {
+        } else if (!job.pending && !job.finish) {
             changed.wait_for(lock, disconnect_poll);
         }
     }

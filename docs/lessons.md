@@ -37,3 +37,19 @@ The [merge guard](batch-graphs.md#page-parallel-gqa-decode) sends an affected he
 The initial correction used a reader pool. At width one, a CPU loopback regression paused one reader after parsing a complete request. Separate health and completion requests returned HTTP 200. Shutdown joined a held reader and discarded its request. The loopback suite also passed checks for queue overflow, busy reset, cancellation, and cache accounting.
 
 The [current HTTP reader](http-server.md#http-admission-and-shutdown) advances multiple incomplete requests from one poll loop.
+
+## L008 · Buffered tokens suppress SSE keepalives
+
+The original batch consumer deferred keepalives when a decoder step was pending and reset the timer when it handled that step. Stop matching or chat parsing can accept a token without writing an SSE frame. One B200 probe delivered six decode steps about three seconds apart. A partial stop string held all six tokens until completion. The first data frame arrived 18.349 seconds after the HTTP 200 headers, with zero comments. The no-step control saw a comment near 15 seconds on benchmark, text, and chat streams.
+
+The [corrected writer](http-server.md#completion-streams) measures 15 seconds from the last successful header, data, or comment write. A step that only buffers tokens leaves the deadline unchanged. The coding rerun sent a comment after 15.006 seconds, then delivered all six exclamation marks, finish, usage, and `[DONE]`. The no-step controls and first-token timing checks also passed. Independent acceptance is in progress.
+
+Run the scripted CPU regression from the repository root in the managed environment. Set `out` to an existing output directory and `checkpoint` to the local Qwen3.8-27B-FP8 checkpoint. Use a fresh `$out/keepalive` directory. [Scripted regression](../tests/text/check_stream_keepalive_cpu.py#L58)<!-- prefix: "def main():" -->
+
+```bash
+bash tests/text/build_chat_cpu.sh "$PWD" - "$out/chat-cpu"
+python3 -IB tests/text/check_stream_keepalive_cpu.py \
+    --binary "$out/chat-cpu" --checkpoint "$checkpoint" --evidence "$out/keepalive"
+```
+
+The scripted clock advances by three seconds per decode step. Both text and chat must send two comments, including one after the deadline restarts on visible data. The test also checks role, content, finish, usage, and `[DONE]`. The matched build and wire evidence are in `artifacts/resume-stream-fix/handoff.md` in the scheduler worktree.

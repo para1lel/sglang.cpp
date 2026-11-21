@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <utility>
 
 namespace sglang::server {
 namespace {
@@ -109,15 +110,8 @@ std::string error_body(const char* message) {
     return output + "}}";
 }
 
-bool begin_stream(const Socket& connection, bool& streaming) {
-    if (!streaming) {
-        streaming = start_events(connection);
-    }
-    return streaming;
-}
-
-void finish_stream(const Socket& connection, const CompletionRequest& request,
-                   const DecoderResult& result, bool& streaming) {
+void finish_stream(EventStream& stream, const CompletionRequest& request,
+                   const DecoderResult& result) {
     const auto output_count = result.output_token_ids.size();
     const auto budget = static_cast<std::size_t>(request.options.max_new_tokens);
     const auto stop_id = request.options.stop_token_id;
@@ -128,40 +122,42 @@ void finish_stream(const Socket& connection, const CompletionRequest& request,
                    stop_matched || output_count != budget)) {
         throw std::logic_error("Decoder returned an inconsistent completion");
     }
-    const auto* prompt = streaming ? nullptr : &request.prompt;
-    if (begin_stream(connection, streaming) &&
-        write_event(connection, choice_event(std::nullopt, prompt, stopped ? "stop" : "length")) &&
-        write_event(connection, usage_event(request.prompt.size(), output_count,
-                                            result.cached_prompt_tokens)) &&
-        write_event(connection, "[DONE]")) {
-        end_events(connection);
+    const auto* prompt = output_count == 0 ? &request.prompt : nullptr;
+    if (stream.start() &&
+        stream.write(choice_event(std::nullopt, prompt, stopped ? "stop" : "length")) &&
+        stream.write(usage_event(request.prompt.size(), output_count,
+                                 result.cached_prompt_tokens)) &&
+        stream.write("[DONE]")) {
+        stream.end();
     }
 }
 
 void stream_completion(const Socket& connection, const CompletionRequest& request,
                        const TextGenerator& generate) {
-    bool streaming = false;
+    EventStream stream(connection);
+    bool first_token = true;
     const DecoderCallbacks callbacks{
         [&](int token) {
-            const auto* prompt = streaming ? nullptr : &request.prompt;
-            return begin_stream(connection, streaming) &&
-                   write_event(connection, choice_event(token, prompt, nullptr));
+            const auto* prompt = std::exchange(first_token, false) ? &request.prompt : nullptr;
+            return stream.start() && stream.write(choice_event(token, prompt, nullptr));
         },
         [&] { return disconnected(connection); },
+        [&] { return stream.start(); },
+        [&] { return stream.poll(); },
     };
 
     try {
         const auto result = generate(request.prompt, request.options, callbacks);
         if (result.finish_reason != DecoderFinishReason::cancelled) {
-            finish_stream(connection, request, result, streaming);
+            finish_stream(stream, request, result);
         }
     } catch (const std::exception& error) {
-        if (!streaming) {
+        if (!stream.started()) {
             throw;
         }
         std::cerr << "Completion failed: " << error.what() << '\n';
-        if (write_event(connection, error_body("Native decoder failed"))) {
-            end_events(connection);
+        if (stream.write(error_body("Native decoder failed"))) {
+            stream.end();
         }
     }
 }

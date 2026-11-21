@@ -430,24 +430,38 @@ bool write_metrics(const Socket& connection, std::string_view body) {
     return write_response(connection, "200 OK", "text/plain; version=0.0.4", body);
 }
 
-bool start_events(const Socket& connection) {
-    return send_all(connection,
-                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\n"
-                    "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n");
+bool EventStream::send(std::string_view bytes) {
+    if (!send_all(connection_, bytes)) {
+        return false;
+    }
+    last_write_ = std::chrono::steady_clock::now();
+    return true;
 }
 
-bool write_event(const Socket& connection, std::string_view data) {
+bool EventStream::start() {
+    return started() ||
+        send("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\n"
+             "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n");
+}
+
+bool EventStream::poll() {
+    return !last_write_ ||
+        std::chrono::steady_clock::now() - *last_write_ < std::chrono::seconds(15) ||
+        send("3\r\n:\n\n\r\n");
+}
+
+bool EventStream::write(std::string_view data) {
     char size[2 * sizeof(std::size_t)];
     const auto encoded = std::to_chars(size, size + sizeof(size), data.size() + 8, 16);
     std::string chunk(size, encoded.ptr);
     chunk += "\r\ndata: ";
     chunk += data;
     chunk += "\n\n\r\n";
-    return send_all(connection, chunk);
+    return send(chunk);
 }
 
-bool end_events(const Socket& connection) {
-    return send_all(connection, "0\r\n\r\n");
+bool EventStream::end() {
+    return send("0\r\n\r\n");
 }
 
 }

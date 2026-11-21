@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -44,8 +46,22 @@ void read_connections(const Socket& listener, int capacity,
 bool write_json(const Socket& connection, std::string_view status, std::string_view json);
 void write_readiness(const Socket& connection, bool ready);
 bool write_metrics(const Socket& connection, std::string_view body);
-bool start_events(const Socket& connection);
-bool write_event(const Socket& connection, std::string_view data);
-bool end_events(const Socket& connection);
+
+class EventStream {
+public:
+    explicit EventStream(const Socket& connection) : connection_(connection) {}
+
+    bool started() const { return last_write_.has_value(); }
+    bool start();
+    bool poll();
+    bool write(std::string_view data);
+    bool end();
+
+private:
+    bool send(std::string_view bytes);
+
+    const Socket& connection_;
+    std::optional<std::chrono::steady_clock::time_point> last_write_;
+};
 
 }

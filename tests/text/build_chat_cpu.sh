@@ -46,5 +46,6 @@ fi
     -Wall -Wextra -Wpedantic -Werror -ffunction-sections -fdata-sections \
     -I"$source/include" "${cuda_headers[@]}" "${media_api[@]}" "${sources[@]}" \
     "$tests/chat_cpu_decoder.cpp" "${libraries[@]}" \
+    -Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv \
     -Wl,--gc-sections,--print-gc-sections,--no-undefined,-Map,"$output.map" \
     -o "$output"

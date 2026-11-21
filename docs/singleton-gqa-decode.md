@@ -4,13 +4,13 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L691)<!-- prefix: "const auto r" --> · [Lane selection](../src/text/decoder_graph_packed.cpp#L472)<!-- prefix: "first.narrow" --> |
+| Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L697)<!-- prefix: "const auto r" --> · [Lane selection](../src/text/decoder_graph_packed.cpp#L472)<!-- prefix: "first.narrow" --> |
 | Batch execution owner | Allocates and releases the shared score buffer. | [Allocation](../src/decoder_resources.cpp#L455)<!-- prefix: "ExactGqaWork" --> · [Device release](../src/decoder_resources.cpp#L263)<!-- prefix: "CleanupError" --> |
 | Exact attention | Computes FP32 scores and consumes them in token order. | [Score and replay launches](../src/mxfp8_gqa.cu#L810)<!-- prefix: "cudaError_t " --> |
 
 ## Runtime path
 
-The batch selects this path for one ordinary text decode row with 32,768–36,864 visible tokens, including the current token. The step needs zero prefill rows, no MTP work, and no rotary position override. Both FP8 prefill policies support it. Independent full-prefix-hit scoring can share the step. The standalone serial decoder and the eager remainder of a packed group keep their existing attention paths. [Window](../include/sglang/decoder_internal.h#L411)<!-- prefix: "inline const" --> · [Packed remainder](../src/text/decoder_graph_packed.cpp#L558)<!-- prefix: "if (remainin" -->
+The batch selects this path for one ordinary text decode row with 32,768–36,864 visible tokens, including the current token. The step needs zero prefill rows, no MTP work, and no rotary position override. Both FP8 prefill policies support it. Independent full-prefix-hit scoring can share the step. The standalone serial decoder and the eager remainder of a packed group keep their existing attention paths. [Window](../include/sglang/decoder_internal.h#L422)<!-- prefix: "inline const" --> · [Packed remainder](../src/text/decoder_graph_packed.cpp#L558)<!-- prefix: "if (remainin" -->
 
 The batch stream owner allocates one buffer on first eligible use. It allocates before graph capture or eager submission. The bound is 3,538,944 device bytes (3.375 MiB) for 24 FP32 scores per position across 36,864 positions. All GQA layers and later requests share the buffer in stream order. It adds zero request-owned bytes. Request KV and existing graph scratch have separate allocations. [Query heads](../include/sglang/mxfp8_gqa.h#L11)<!-- prefix: "inline const" --> · [Resident admission](batch-graphs.md#resident-memory-admission)
 

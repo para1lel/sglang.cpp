@@ -1,6 +1,8 @@
 #include "sglang/decoder.h"
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_constraint.h"
+#include "sglang/decoder_sampling.h"
+#include "sglang/text/decoder_logprobs.h"
 
 #include <algorithm>
 #include <array>
@@ -253,6 +255,225 @@ void verify_output_history(const Decoder& decoder) {
               << tied[top].logit << ", bias " << tie_bias << ")\n";
 }
 
+template <class Buffer, class Select>
+void verify_extreme_repetition(Buffer& buffer, const Select& select) {
+    using namespace sglang::decoder;
+    const float lowest = -std::numeric_limits<float>::max();
+    const float infinity = std::numeric_limits<float>::infinity();
+    const auto set_logits = [&](const std::array<float, 5>& scores) {
+        std::transform(scores.begin(), scores.end(), buffer.source,
+                       [](float score) { return __float2bfloat16(score); });
+    };
+    const std::array factors{1e-40, 1e-46, std::numeric_limits<double>::denorm_min()};
+    const SamplingParameters sampling{1.0, 1.0, 1, 42};
+    GeneratedLogprobReadback scores{};
+    std::fill_n(buffer.seen, 5, 1);
+    for (const double factor : factors) {
+        const OutputPenalties penalties{nullptr, buffer.seen, 0, 0, factor};
+        set_logits({1, 2, 0, -2, infinity});
+        select(penalties, -1, 0, {nullptr, 0, &buffer.token});
+        require(buffer.token == 1, "distinct huge logits must preserve the greedy winner");
+        select(penalties, -1, 0, {&sampling, 0, &buffer.token});
+        require(buffer.token == 1, "distinct huge logits must preserve sampling rank");
+        select(penalties, -1, 0, {nullptr, 0, &buffer.token, 5, &scores});
+        require(buffer.token == 1 && scores.selected.token_id == 1 &&
+                scores.selected.value == 0 &&
+                scores.alternatives[1].token_id == 0 && scores.alternatives[1].value == lowest &&
+                scores.alternatives[2].token_id == 2 && scores.alternatives[3].token_id == 3 &&
+                scores.alternatives[4].token_id == 4, "extreme logprob ranking or mask differs");
+
+        set_logits({2, 2, 0, -2, infinity});
+        buffer.bias[0] = {1, static_cast<float>(std::log(3.0))};
+        select(penalties, -1, 1, {nullptr, 0, &buffer.token});
+        require(buffer.token == 1, "log(3) must break the equal repeated greedy tie");
+        select(penalties, -1, 1, {&sampling, 0, &buffer.token});
+        require(buffer.token == 1, "log(3) must break the equal repeated top-k tie");
+        select(penalties, -1, 1, {nullptr, 0, &buffer.token, 2, &scores});
+        require(buffer.token == 1 && scores.alternatives[1].token_id == 0 &&
+                std::abs(std::exp(scores.selected.value) - 0.75) < 1e-7 &&
+                std::abs(std::exp(scores.alternatives[1].value) - 0.25) < 1e-7,
+                "log(3) must retain the 75/25 distribution for equal repeated logits");
+
+        buffer.bias[0] = {1, 2};
+        select(penalties, -1, 1, {nullptr, 0, &buffer.token, 2, &scores});
+        const double log_mass = std::log1p(std::exp(-2.0));
+        require(buffer.token == 1 && scores.alternatives[1].token_id == 0 &&
+                std::abs(scores.selected.value + log_mass) < 1e-7 &&
+                std::abs(scores.alternatives[1].value + 2 + log_mass) < 1e-7,
+                "centered logprobs lost the finite difference between huge scores");
+
+        set_logits({-2, -1, -infinity, -infinity, infinity});
+        select(penalties, -1, 0, {nullptr, 0, &buffer.token});
+        require(buffer.token == 1, "negative underflow must preserve the greedy winner");
+    }
+    set_logits({3, 0x1p-130f, 0, -infinity, infinity});
+    std::fill_n(buffer.seen, 5, 0);
+    buffer.seen[1] = 1;
+    const OutputPenalties boundary{nullptr, buffer.seen, 0, 0, 0x1.5555555555555p-132};
+    select(boundary, -1, 0, {nullptr, 0, &buffer.token});
+    require(buffer.token == 1, "rounded quotient must retain the ranking residual");
+    select(boundary, -1, 0, {&sampling, 0, &buffer.token});
+    require(buffer.token == 1, "rounded quotient must retain the sampling rank");
+    buffer.bias[0] = {1, -0x1p-54f};
+    select(boundary, -1, 1, {nullptr, 0, &buffer.token});
+    require(buffer.token == 1, "bias smaller than the quotient residual must retain rank");
+    buffer.bias[0] = {1, -0x1p-52f};
+    select(boundary, -1, 1, {nullptr, 0, &buffer.token});
+    require(buffer.token == 0, "bias larger than the quotient residual must change rank");
+    std::cout << "repetition: exact signs/history, extreme ranking and centered scores passed\n";
+}
+
+void verify_repetition_kernel() {
+    constexpr int vocabulary = 5;
+    struct Buffer {
+        __nv_bfloat16 source[vocabulary];
+        float frequency[vocabulary];
+        std::uint8_t seen[vocabulary];
+        DecoderLogitBias bias[2];
+        std::uint32_t mask;
+        int token;
+    };
+    void* storage = nullptr;
+    require(cudaMallocManaged(&storage, sizeof(Buffer)) == cudaSuccess, "allocate test scores");
+    const std::unique_ptr<Buffer, decltype(&cudaFree)> buffer(static_cast<Buffer*>(storage),
+                                                              &cudaFree);
+    using sglang::decoder::OutputPenalties;
+    using sglang::decoder::RepetitionSelection;
+    using sglang::decoder::select_repetition_logits;
+    const auto bytes = sglang::decoder::repetition_workspace_bytes(vocabulary, true);
+    void* scratch = nullptr;
+    require(cudaMalloc(&scratch, bytes) == cudaSuccess, "allocate repetition workspace");
+    const std::unique_ptr<void, decltype(&cudaFree)> workspace(scratch, &cudaFree);
+    std::array<DecoderLogit, vocabulary> ranked{};
+    const auto select = [&](OutputPenalties penalties, int previous, int bias_count,
+                            RepetitionSelection selection) {
+        require(select_repetition_logits(buffer->source, vocabulary, buffer->bias, bias_count,
+                                         &buffer->mask, penalties, previous, selection,
+                                         workspace.get(), bytes, nullptr) == cudaSuccess &&
+                cudaDeviceSynchronize() == cudaSuccess, "select repetition scores");
+    };
+    RepetitionSelection debug;
+    debug.debug = ranked.data();
+    debug.debug_count = ranked.size();
+    const std::array raw{8.0f, -8.0f, 1.0f, 0.0f, 5.0f};
+    for (int token = 0; token < vocabulary; ++token) {
+        buffer->source[token] = __float2bfloat16(raw[token]);
+    }
+    std::copy_n(std::array<DecoderLogitBias, 2>{{{0, 0.75f}, {4, 100.0f}}}.begin(),
+                2, buffer->bias);
+    buffer->mask = 0b01111u;
+    for (const float repetition : {0.5f, 2.0f}) {
+        std::fill_n(buffer->frequency, vocabulary, 0.0f);
+        std::fill_n(buffer->seen, vocabulary, 0);
+        std::array<int, vocabulary> counts{};
+        const sglang::decoder::OutputPenalties penalties{
+            buffer->frequency, buffer->seen, 1.0f, 0.5f, repetition,
+        };
+        for (const int previous : {-1, 0, 1, 0, 2}) {
+            select(penalties, previous, 2, debug);
+            if (previous >= 0) ++counts[previous];
+            std::array<DecoderLogit, vocabulary> expected{};
+            for (int token = 0; token < vocabulary; ++token) {
+                float score = raw[token];
+                if (counts[token]) {
+                    score -= static_cast<float>(counts[token]) + 0.5f;
+                    score = score < 0 ? score * repetition : score / repetition;
+                }
+                if (token == 0) score += 0.75f;
+                if (token == 4) score = -std::numeric_limits<float>::infinity();
+                expected[token] = {token, score};
+            }
+            std::sort(expected.begin(), expected.end(), [](const auto& left, const auto& right) {
+                return left.logit == right.logit ? left.token_id < right.token_id
+                                                 : left.logit > right.logit;
+            });
+            require(std::equal(expected.begin(), expected.end(), ranked.begin(), exact),
+                    "repetition kernel order or sign differs");
+        }
+    }
+    verify_extreme_repetition(*buffer, select);
+}
+
+void verify_repetition_model(const Decoder& decoder, const Tokenizer& tokenizer) {
+    constexpr int repeated = 32;
+    constexpr float forcing_bias = 24.25f;
+    constexpr int budget = 4;
+    const std::vector<int> tokens{repeated, repeated, 220, repeated};
+    DecoderOptions options;
+    options.eager = true;
+    options.max_new_tokens = budget;
+    const auto ordinary = decoder.generate(tokens, options).output_token_ids;
+    options.repetition_penalty = 1;
+    require(decoder.generate(tokens, options).output_token_ids == ordinary,
+            "neutral repetition changed ordinary generated IDs");
+    options.logit_bias = biases({{repeated, forcing_bias}});
+    options.top_logits = model_vocab_size;
+    const auto control = decoder.generate(tokens, options);
+    require(control.output_token_ids == std::vector<int>(budget, repeated),
+            "control did not repeat");
+
+    for (const double repetition : {0.5, 2.0}) {
+        options.repetition_penalty = repetition;
+        options.frequency_penalty = 0.5;
+        options.presence_penalty = 0.75;
+        const auto adjusted = decoder.generate(tokens, options);
+        require(adjusted.output_token_ids == control.output_token_ids, "forced history diverged");
+        std::vector<Row> expected;
+        for (int index = 0; index < budget; ++index) {
+            auto row = control.step_top_logits.at(index);
+            auto& winner = row.front().logit;
+            if (index != 0) {
+                winner -= forcing_bias;
+                winner -= 0.5f * static_cast<float>(index) + 0.75f;
+                const auto factor = static_cast<float>(repetition);
+                winner = winner < 0 ? winner * factor : winner / factor;
+                winner += forcing_bias;
+            }
+            const auto& actual = adjusted.step_top_logits.at(index);
+            require(std::equal(row.begin(), row.end(), actual.begin(), actual.end(), exact),
+                    "direct repetition row differs from full-vocabulary oracle");
+            expected.push_back(std::move(row));
+        }
+        auto scored = options;
+        scored.eager = false;
+        scored.top_logits = 0;
+        scored.generated_top_logprobs = 5;
+        scored.mtp_steps = 2;
+        DecoderBatch batch(decoder, {true, 1});
+        batch.admit(0, tokens, scored);
+        std::uint32_t graph_slots = 0;
+        for (int index = 0; index < budget; ++index) {
+            DecoderBatchStepStats stats;
+            const auto step = batch.advance_chunked({true}, &stats)[0];
+            graph_slots |= stats.graph_slots;
+            require(step.token == repeated && step.generated_logprobs &&
+                    step.mtp_drafted_tokens == 0 && !step.mtp_boundary, "scored repetition route");
+            verify_scores(*step.generated_logprobs, expected[index], 5);
+        }
+        require(graph_slots == 1, "repetition did not use the eligible K0 graph");
+    }
+
+    auto extreme = options;
+    extreme.top_logits = 0;
+    extreme.seed = 42;
+    for (const double factor : {1e-40, 1e-46}) {
+        extreme.repetition_penalty = factor;
+        for (const double temperature : {0.0, 1.0}) {
+            extreme.temperature = temperature;
+            require(decoder.generate(tokens, extreme).output_token_ids.size() == budget,
+                    "tiny repetition factor must complete greedy and sampled generation");
+        }
+    }
+
+    options.top_logits = 0;
+    options.constraint = TokenConstraint::compile_regex(tokenizer, "^AA$");
+    options.logit_bias = biases({{33, 100.0f}});
+    require(decoder.generate(tokens, options).output_token_ids == std::vector<int>({32, 32}),
+            "constraint or repetition allowed a prohibited token");
+    std::cout << "repetition: neutral IDs, eight exact checkpoint rows, K0 graph logprobs, "
+                 "and combined constraints passed\n";
+}
+
 using TokenStreams = std::array<std::vector<int>, 2>;
 
 TokenStreams run_batch(const Decoder& decoder, bool graphs, bool mtp) {
@@ -304,6 +525,8 @@ int main(int argc, char** argv) {
         const Tokenizer tokenizer(checkpoint / "tokenizer.json");
         verify_singleton(decoder, tokenizer);
         verify_output_history(decoder);
+        verify_repetition_kernel();
+        verify_repetition_model(decoder, tokenizer);
         const auto eager = run_batch(decoder, false, false);
         require(run_batch(decoder, true, false) == eager, "packed parity differs");
         require(run_batch(decoder, true, true) == eager, "mixed MTP parity differs");

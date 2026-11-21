@@ -100,6 +100,9 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     if (!(options.presence_penalty >= -2 && options.presence_penalty <= 2)) {
         throw std::invalid_argument("presence_penalty must be finite and in [-2, 2]");
     }
+    if (!(options.repetition_penalty > 0 && options.repetition_penalty <= 2)) {
+        throw std::invalid_argument("repetition_penalty must be finite and in (0, 2]");
+    }
     if (options.top_k != -1 && options.top_k < 1) {
         throw std::invalid_argument("top_k must be -1 or at least 1");
     }
@@ -134,9 +137,13 @@ SamplingParameters request_sampling(const DecoderOptions& options) {
     return {options.temperature, options.top_p, top_k, seed, options.min_p};
 }
 
+bool needs_seen_history(const DecoderOptions& options) {
+    return options.presence_penalty != 0 || options.repetition_penalty != 1;
+}
+
 std::size_t output_penalty_bytes(const DecoderOptions& options) {
     return vocab_size * ((options.frequency_penalty != 0 ? sizeof(float) : 0) +
-                         (options.presence_penalty != 0 ? sizeof(std::uint8_t) : 0));
+                         (needs_seen_history(options) ? sizeof(std::uint8_t) : 0));
 }
 
 void Request::prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream) {
@@ -154,27 +161,37 @@ void Request::prepare_logit_adjustments(const DecoderOptions& options, cudaStrea
         check(cudaMemsetAsync(totals, 0, vocab_size * sizeof(*totals), stream),
               "Initialize frequency penalties");
     }
-    if (options.presence_penalty != 0) {
+    if (needs_seen_history(options)) {
         output_penalties.presence = static_cast<float>(options.presence_penalty);
+        output_penalties.repetition = options.repetition_penalty;
         auto*& seen = output_penalties.seen;
         seen = memory.allocate<std::uint8_t>(vocab_size);
         check(cudaMemsetAsync(seen, 0, vocab_size * sizeof(*seen), stream),
-              "Initialize presence penalties");
+              "Initialize seen-token history");
     }
 }
 
 void AdjustedLogitsWorkspace::prepare(Allocations& memory, Request& request,
                                       const DecoderOptions& options, cudaStream_t stream) {
     request.prepare_logit_adjustments(options, stream);
-    if (!logits) {
-        logits = memory.allocate<float>(vocab_size);
-    }
-    if (options.samples() && !sampling) {
-        sampling_bytes = biased_sampling_workspace_bytes(vocab_size);
-        sampling = memory.allocate<std::byte>(sampling_bytes);
-    }
     if (options.constraint && !mask) {
         mask = memory.allocate<std::uint32_t>(constraint_mask_words);
+    }
+    if (options.repetition_penalty != 1) {
+        const bool ranked = options.samples() || options.generated_top_logprobs >= 0 ||
+            options.top_logits > 0;
+        if (!repetition || (ranked && !repetition_ranked)) {
+            const auto bytes = repetition_workspace_bytes(vocab_size, ranked);
+            repetition = memory.allocate<std::byte>(bytes);
+            repetition_bytes = bytes;
+            repetition_ranked = ranked;
+        }
+    } else {
+        if (!logits) logits = memory.allocate<float>(vocab_size);
+        if (options.samples() && !sampling) {
+            sampling_bytes = biased_sampling_workspace_bytes(vocab_size);
+            sampling = memory.allocate<std::byte>(sampling_bytes);
+        }
     }
 }
 
@@ -190,7 +207,8 @@ void AdjustedLogitsWorkspace::select(const Request& request, Workspace& work,
                                       const DecoderOptions& options,
                                       const ConstraintCursor* allowed,
                                       const SamplingParameters* parameters, int position,
-                                      int previous_token, cudaStream_t stream) const {
+                                      int previous_token, cudaStream_t stream,
+                                      GeneratedLogprobReadback* logprobs) const {
     if (allowed) {
         if (allowed->ids().empty()) {
             throw std::logic_error("Output constraint has no remaining continuation");
@@ -198,6 +216,12 @@ void AdjustedLogitsWorkspace::select(const Request& request, Workspace& work,
         check(cudaMemcpyAsync(mask, allowed->mask().data(), constraint_mask_words *
                               sizeof(*mask), cudaMemcpyHostToDevice, stream),
               "Upload allowed token mask");
+    }
+    if (options.repetition_penalty != 1) {
+        select_repetition(request, work, options, allowed ? mask : nullptr, previous_token,
+                          {parameters, position, &work.argmax->token_id,
+                           logprobs ? options.generated_top_logprobs : -1, logprobs}, stream);
+        return;
     }
     apply(request, work, options, allowed ? mask : nullptr, previous_token, stream);
     if (parameters) {
@@ -211,6 +235,17 @@ void AdjustedLogitsWorkspace::select(const Request& request, Workspace& work,
                   "Validate adjusted constrained token");
         }
     }
+}
+
+void AdjustedLogitsWorkspace::select_repetition(
+    const Request& request, const Workspace& work, const DecoderOptions& options,
+    const std::uint32_t* allowed, int previous_token, RepetitionSelection selection,
+    cudaStream_t stream) const {
+    const int count = options.logit_bias ? options.logit_bias->size() : 0;
+    check(select_repetition_logits(work.logits, vocab_size, request.logit_bias, count, allowed,
+                                  request.output_penalties, previous_token, selection,
+                                  repetition, repetition_bytes, stream),
+          "Select from repetition-adjusted logits");
 }
 
 void RequestProgress::select(Request& request, Workspace& work, const DecoderOptions& options,
@@ -248,15 +283,21 @@ void RequestProgress::select(Request& request, Workspace& work, const DecoderOpt
                               adjusted_logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
                               stream), "Read adjusted decoder step logits");
     }
+    auto& repetition_logits = transfers.repetition_logits;
+    if (adjusted && !repetition_logits.empty()) {
+        RepetitionSelection selection;
+        selection.debug = repetition_logits.data();
+        selection.debug_count = repetition_logits.size();
+        adjusted->select_repetition(request, work, options, nullptr, -1, selection, stream);
+    }
 }
 
-std::optional<DecoderFinishReason> RequestProgress::commit(const DecoderOptions& options, int token,
-                                                           const Bf16* logits,
-                                                           SerialOutput* output,
-                                                           const float* adjusted_logits) {
+std::optional<DecoderFinishReason> RequestProgress::commit(
+    const DecoderOptions& options, int token, const Bf16* logits, SerialOutput* output,
+    const float* adjusted_logits, const std::vector<DecoderLogit>* ranked) {
     last_token = token;
     ++generated;
-    if (output && !output->emit(token, logits, adjusted_logits)) {
+    if (output && !output->emit(token, logits, adjusted_logits, ranked)) {
         return DecoderFinishReason::cancelled;
     }
     const int remaining = remaining_output(options);
@@ -359,10 +400,15 @@ SerialOutput::SerialOutput(const DecoderCallbacks& callbacks, int top_count, Dec
     }
 }
 
-bool SerialOutput::emit(int token, const Bf16* logits, const float* adjusted_logits) {
+bool SerialOutput::emit(int token, const Bf16* logits, const float* adjusted_logits,
+                        const std::vector<DecoderLogit>* repetition_logits) {
     result_.output_token_ids.push_back(token);
     const bool keep_running = !callbacks_.on_token || callbacks_.on_token(token);
-    if (top_count_ > 0) {
+    if (repetition_logits && !repetition_logits->empty()) {
+        const auto end = std::find_if(repetition_logits->begin(), repetition_logits->end(),
+                                      [](const auto& score) { return score.token_id < 0; });
+        result_.step_top_logits.emplace_back(repetition_logits->begin(), end);
+    } else if (top_count_ > 0) {
         result_.step_top_logits.push_back(
             top_logits(logits, adjusted_logits, top_count_, ranking_));
     }
@@ -511,8 +557,12 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         AdjustedLogitsWorkspace adjusted_workspace;
         if (adjusted) {
             request.reset();
-            request.memory.transfers().adjusted_logits.resize(options.top_logits > 0
-                                                               ? vocab_size : 0);
+            auto& transfers = request.memory.transfers();
+            if (options.repetition_penalty != 1) {
+                transfers.repetition_logits.resize(options.top_logits);
+            } else if (options.top_logits > 0) {
+                transfers.adjusted_logits.resize(vocab_size);
+            }
             adjusted_workspace.prepare(request.memory, request, options, request.memory.stream());
         } else {
             prepare_serial_request(request, options);
@@ -546,7 +596,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 const auto& transfers = request.memory.transfers();
                 if (const auto finish = progress.commit(options, token, transfers.logits.data(),
                                                         &output,
-                                                        transfers.adjusted_logits.data())) {
+                                                        transfers.adjusted_logits.data(),
+                                                        &transfers.repetition_logits)) {
                     return *finish;
                 }
             }

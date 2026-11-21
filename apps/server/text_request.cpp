@@ -178,10 +178,24 @@ double sampling_penalty(const json::Object& object, std::string_view key) {
     return *penalty;
 }
 
+double repetition_penalty(const json::Object& object, double fallback, bool allow_null) {
+    const auto* value = json::get(object, "repetition_penalty");
+    if (!value || (allow_null && value->is_null())) {
+        return fallback;
+    }
+    const auto penalty = sampling_number(*value);
+    if (!penalty || !(*penalty > 0 && *penalty <= 2)) {
+        bad_request("repetition_penalty must be a finite number in (0, 2]");
+    }
+    return *penalty;
+}
+
 void set_sampling(const json::Object& object, DecoderOptions& options,
-                  std::string_view seed_key = "seed") {
+                  std::string_view seed_key = "seed", bool allow_null_repetition = true) {
     options.frequency_penalty = sampling_penalty(object, "frequency_penalty");
     options.presence_penalty = sampling_penalty(object, "presence_penalty");
+    options.repetition_penalty =
+        repetition_penalty(object, options.repetition_penalty, allow_null_repetition);
     if (const auto* value = json::get(object, "temperature")) {
         const auto temperature = sampling_number(*value);
         if (!temperature || !std::isfinite(*temperature) || *temperature < 0) {
@@ -343,7 +357,7 @@ TextRequest text_options(const json::Object& object, const CompletionTokenizer& 
     }
     set_stops(object, request.options);
     request.stop_text = stop_text(object);
-    set_sampling(object, request.options);
+    set_sampling(object, request.options, "seed", chat);
     set_logit_bias(object, request.options);
     set_cache_salt(object, request.options);
     request.options.generated_top_logprobs = openai_logprob_count(object, chat);
@@ -429,8 +443,8 @@ bool is_text_option(std::string_view key) {
         key == "return_token_ids" || key == "logprobs" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
         key == "min_p" || key == "logit_bias" || key == "ebnf" || key == "regex" ||
-        key == "frequency_penalty" || key == "presence_penalty" || key == "response_format" ||
-        key == "cache_salt";
+        key == "frequency_penalty" || key == "presence_penalty" ||
+        key == "repetition_penalty" || key == "response_format" || key == "cache_salt";
 }
 
 TextCompletionRequest parse_text(const json::Object& object,
@@ -740,7 +754,8 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
             } else if (key == "temperature" || key == "top_p" || key == "top_k" ||
                        key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
                        key == "stop_token_ids" || key == "logit_bias" ||
-                       key == "frequency_penalty" || key == "presence_penalty") {
+                       key == "frequency_penalty" || key == "presence_penalty" ||
+                       key == "repetition_penalty") {
                 if (!parameter.is_null()) {
                     sampling.emplace(key, parameter);
                 }

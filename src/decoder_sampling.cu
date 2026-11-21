@@ -1,11 +1,15 @@
 #include "sglang/decoder_sampling.h"
+#include "sglang/text/decoder_logprobs.h"
 
+#include <cub/block/block_reduce.cuh>
+#include <cub/device/device_merge_sort.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
 #include <algorithm>
+#include <cfloat>
 
 namespace sglang::decoder {
 namespace {
@@ -355,33 +359,38 @@ __device__ int first_crossing(const double* prefix, int count, double cutoff) {
     return first;
 }
 
-__global__ void choose_biased_token(BiasSamplingScratch scratch, int vocabulary,
-                                    SamplingParameters parameters, int position, int* token) {
-    const auto peak = scratch.sorted[0];
-    *token = -1;
-    if (peak == 0 || peak == invalid_key) {
-        return;
-    }
+__device__ int choose_rank(const double* weights, const double* prefix, int vocabulary,
+                          SamplingParameters parameters, int position) {
     int keep = min(vocabulary, parameters.top_k);
     if (parameters.top_p < 1.0) {
-        const auto cutoff = parameters.top_p * scratch.prefix[vocabulary - 1];
-        keep = min(keep, first_crossing(scratch.prefix, keep, cutoff) + 1);
+        const auto cutoff = parameters.top_p * prefix[vocabulary - 1];
+        keep = min(keep, first_crossing(prefix, keep, cutoff) + 1);
     }
     if (parameters.min_p > 0.0) {
         int first = 1;
         while (first < keep) {
             const int middle = first + (keep - first) / 2;
-            if (scratch.weights[middle] >= parameters.min_p) {
+            if (weights[middle] >= parameters.min_p) {
                 first = middle + 1;
             } else {
                 keep = middle;
             }
         }
     }
-    const double mass = scratch.prefix[keep - 1];
+    const double mass = prefix[keep - 1];
     const double draw = min(uniform(parameters.seed, position) * mass, nextafter(mass, 0.0));
-    const int rank = first_crossing(scratch.prefix, keep, draw);
-    *token = static_cast<int>(token_mask - (scratch.sorted[rank] & token_mask));
+    return first_crossing(prefix, keep, draw);
+}
+
+__global__ void choose_biased_token(BiasSamplingScratch scratch, int vocabulary,
+                                    SamplingParameters parameters, int position, int* token) {
+    const auto peak = scratch.sorted[0];
+    *token = -1;
+    if (peak != 0 && peak != invalid_key) {
+        const int rank = choose_rank(scratch.weights, scratch.prefix, vocabulary,
+                                     parameters, position);
+        *token = static_cast<int>(token_mask - (scratch.sorted[rank] & token_mask));
+    }
 }
 
 std::size_t biased_sampling_temporary_bytes(int vocabulary) {
@@ -399,13 +408,8 @@ __device__ bool is_allowed(const std::uint32_t* mask, int token) {
     return !mask || (mask[token / 32] >> (token % 32) & 1u);
 }
 
-__global__ void initialize_scores(const __nv_bfloat16* source, float* scores, int vocabulary,
-                                  const std::uint32_t* mask, OutputPenalties penalties,
-                                  int previous_token) {
-    const int token = blockIdx.x * blockDim.x + threadIdx.x;
-    if (token >= vocabulary) {
-        return;
-    }
+__device__ float subtract_history(float score, int token, OutputPenalties penalties,
+                                  int previous_token, bool& seen) {
     float total = 0.0f;
     if (penalties.frequency_totals) {
         total = penalties.frequency_totals[token];
@@ -418,12 +422,24 @@ __global__ void initialize_scores(const __nv_bfloat16* source, float* scores, in
         if (token == previous_token) {
             penalties.seen[token] = 1;
         }
-        if (penalties.seen[token]) {
+        seen = penalties.seen[token] != 0;
+        if (seen) {
             total += penalties.presence;
         }
     }
-    scores[token] = is_allowed(mask, token) ? __bfloat162float(source[token]) - total
-                                           : -CUDART_INF_F;
+    return score - total;
+}
+
+__global__ void initialize_scores(const __nv_bfloat16* source, float* scores, int vocabulary,
+                                  const std::uint32_t* mask, OutputPenalties penalties,
+                                  int previous_token) {
+    const int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token < vocabulary) {
+        bool seen = false;
+        const float score = subtract_history(__bfloat162float(source[token]), token,
+                                              penalties, previous_token, seen);
+        scores[token] = is_allowed(mask, token) ? score : -CUDART_INF_F;
+    }
 }
 
 __global__ void add_bias(float* scores, const DecoderLogitBias* bias, int count) {
@@ -437,6 +453,311 @@ __global__ void add_bias(float* scores, const DecoderLogitBias* bias, int count)
 __global__ void validate_allowed(const float* scores, int* token) {
     if (*token >= 0 && !isfinite(scores[*token])) {
         *token = -1;
+    }
+}
+
+struct ScaledScore {
+    double fraction;
+    int exponent;
+};
+
+__device__ ScaledScore scaled_score(double value, int exponent = 0) {
+    if (value == 0 || !isfinite(value)) return {value, 0};
+    int shift;
+    const double fraction = frexp(value, &shift);
+    return {fraction, exponent + shift};
+}
+
+struct WideScore {
+    ScaledScore high;
+    ScaledScore low;
+};
+
+__device__ WideScore add_scaled(ScaledScore left, ScaledScore right) {
+    if (left.fraction == 0) return {right, {}};
+    if (right.fraction == 0 || !isfinite(left.fraction)) return {left, {}};
+    if (left.exponent < right.exponent) {
+        const auto swap = left;
+        left = right;
+        right = swap;
+    }
+    if (left.exponent - right.exponent > 60) return {left, right};
+    const double aligned = scalbn(right.fraction, right.exponent - left.exponent);
+    const double sum = left.fraction + aligned;
+    const double rounded = sum - left.fraction;
+    const double remainder = (left.fraction - (sum - rounded)) + (aligned - rounded);
+    return {scaled_score(sum, left.exponent), scaled_score(remainder, left.exponent)};
+}
+
+__device__ WideScore scale_repetition(ScaledScore score, double repetition) {
+    int exponent;
+    const double fraction = frexp(repetition, &exponent);
+    if (score.fraction < 0) {
+        const double product = score.fraction * fraction;
+        return {scaled_score(product, score.exponent + exponent),
+                scaled_score(fma(score.fraction, fraction, -product), score.exponent + exponent)};
+    }
+    const double quotient = score.fraction / fraction;
+    const double remainder = fma(-quotient, fraction, score.fraction) / fraction;
+    return {scaled_score(quotient, score.exponent - exponent),
+            scaled_score(remainder, score.exponent - exponent)};
+}
+
+__device__ int compare_scaled(ScaledScore left, ScaledScore right) {
+    if (left.fraction == right.fraction && left.exponent == right.exponent) return 0;
+    const bool same_sign = (left.fraction > 0 && right.fraction > 0) ||
+        (left.fraction < 0 && right.fraction < 0);
+    if (same_sign && left.exponent != right.exponent) {
+        return (left.exponent < right.exponent) == (left.fraction > 0) ? -1 : 1;
+    }
+    return left.fraction < right.fraction ? -1 : 1;
+}
+
+struct RepetitionEntry {
+    float base;
+    float bias;
+    bool repeated;
+    WideScore score;
+};
+
+struct RepetitionState {
+    unsigned wide;
+    unsigned invalid;
+    int tiles[1024];
+    GeneratedLogprobReadback logprobs;
+};
+
+struct RepetitionScratch {
+    RepetitionState* state;
+    RepetitionEntry* entries;
+    int* ranked;
+    double* weights;
+    double* prefix;
+    DecoderLogit* debug;
+    void* temporary;
+    std::size_t overhead;
+};
+
+RepetitionScratch repetition_scratch(void* workspace, int vocabulary, bool ranked) {
+    auto* state = static_cast<RepetitionState*>(workspace);
+    auto offset = (sizeof(RepetitionState) + 255) & ~std::size_t{255};
+    const auto address = reinterpret_cast<std::uintptr_t>(workspace);
+    auto* entries = reinterpret_cast<RepetitionEntry*>(address + offset);
+    offset += vocabulary * sizeof(RepetitionEntry);
+    auto* order = reinterpret_cast<int*>(address + offset);
+    offset = (offset + vocabulary * sizeof(int) + 7) & ~std::size_t{7};
+    auto* weights = reinterpret_cast<double*>(address + offset);
+    auto* prefix = reinterpret_cast<double*>(address + offset + vocabulary * sizeof(double));
+    if (ranked) offset += 2 * vocabulary * sizeof(double);
+    auto* debug = reinterpret_cast<DecoderLogit*>(address + offset);
+    if (ranked) offset += vocabulary * sizeof(DecoderLogit);
+    offset = (offset + 255) & ~std::size_t{255};
+    return {state, entries, order, weights, prefix, debug,
+            reinterpret_cast<void*>(address + offset), offset};
+}
+
+__global__ void prepare_repetition(const __nv_bfloat16* source, int vocabulary,
+                                   const std::uint32_t* mask, OutputPenalties penalties,
+                                   int previous, RepetitionScratch scratch) {
+    const int token = blockIdx.x * blockDim.x + threadIdx.x;
+    bool wide = false;
+    bool invalid = false;
+    if (token < vocabulary) {
+        bool seen = false;
+        float score = subtract_history(__bfloat162float(source[token]), token, penalties,
+                                        previous, seen);
+        if (!is_allowed(mask, token)) score = -CUDART_INF_F;
+        scratch.entries[token].base = score;
+        scratch.entries[token].bias = 0;
+        scratch.entries[token].repeated = seen;
+        scratch.ranked[token] = token;
+        invalid = isnan(score) || score == CUDART_INF_F;
+        if (seen && score != 0 && isfinite(score)) {
+            const auto base = static_cast<double>(score);
+            const double scaled = base < 0 ? base * penalties.repetition
+                                          : base / penalties.repetition;
+            wide = fabs(scaled) > 0x1p24 || fabs(scaled) < FLT_MIN ||
+                penalties.repetition < FLT_MIN;
+        }
+    }
+    if (__syncthreads_or(wide) && threadIdx.x == 0) atomicOr(&scratch.state->wide, 1u);
+    if (__syncthreads_or(invalid) && threadIdx.x == 0) atomicOr(&scratch.state->invalid, 1u);
+}
+
+__global__ void add_repetition_bias(RepetitionEntry* entries, const DecoderLogitBias* bias,
+                                     int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) entries[bias[index].token_id].bias = bias[index].bias;
+}
+
+__global__ void encode_repetition(RepetitionScratch scratch, int vocabulary,
+                                   double repetition) {
+    const int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= vocabulary) return;
+    auto& entry = scratch.entries[token];
+    const auto base = static_cast<double>(entry.base);
+    if (!scratch.state->wide || !isfinite(base)) {
+        const float value = entry.repeated && isfinite(base)
+            ? static_cast<float>(base < 0 ? base * repetition : base / repetition)
+            : entry.base;
+        entry.score = {scaled_score(entry.bias ? value + entry.bias : value), {}};
+        entry.bias = 0;
+        return;
+    }
+    WideScore score{scaled_score(base), {}};
+    if (entry.repeated && base != 0) {
+        score = scale_repetition(score.high, repetition);
+    }
+    entry.score = score;
+}
+
+__device__ __noinline__ ScaledScore score_difference(const RepetitionEntry& left,
+                                                     const RepetitionEntry& right) {
+    const auto lhs = left.score;
+    const auto rhs = right.score;
+    const auto high = add_scaled(lhs.high, {-rhs.high.fraction, rhs.high.exponent});
+    const auto low = add_scaled(lhs.low, {-rhs.low.fraction, rhs.low.exponent});
+    if (left.bias == right.bias) {
+        const auto residual = add_scaled(high.low, low.high);
+        return add_scaled(high.high, residual.high).high;
+    }
+
+    const ScaledScore terms[]{high.high, high.low, low.high, low.low,
+                              scaled_score(left.bias), scaled_score(-right.bias)};
+    ScaledScore partials[6];
+    int count = 0;
+    for (auto term : terms) {
+        int retained = 0;
+        for (int index = 0; index < count; ++index) {
+            const auto sum = add_scaled(term, partials[index]);
+            if (sum.low.fraction != 0) partials[retained++] = sum.low;
+            term = sum.high;
+        }
+        if (term.fraction != 0) partials[retained++] = term;
+        count = retained;
+    }
+    return count ? partials[count - 1] : ScaledScore{};
+}
+
+struct RepetitionOrder {
+    const RepetitionEntry* entries;
+
+    __device__ bool operator()(int left, int right) const {
+        if (left < 0) return false;
+        if (right < 0) return true;
+        const auto& left_entry = entries[left];
+        const auto& right_entry = entries[right];
+        const auto lhs = left_entry.score;
+        const auto rhs = right_entry.score;
+        const double first = lhs.high.fraction;
+        const double second = rhs.high.fraction;
+        if (isnan(first) != isnan(second)) return isnan(second);
+        if (isnan(first) || first == CUDART_INF || second == CUDART_INF ||
+            first == -CUDART_INF || second == -CUDART_INF) {
+            return first == second || isnan(first) ? left < right : first > second;
+        }
+        if (left_entry.bias != right_entry.bias) {
+            const double difference = score_difference(left_entry, right_entry).fraction;
+            return difference ? difference > 0 : left < right;
+        }
+        const int high = compare_scaled(lhs.high, rhs.high);
+        if (high) return high > 0;
+        const int low = compare_scaled(lhs.low, rhs.low);
+        return low ? low > 0 : left < right;
+    }
+};
+
+struct RepetitionWinner {
+    RepetitionOrder order;
+    bool constrained;
+
+    __device__ int operator()(int left, int right) const {
+        return order(left, right) ? left : right;
+    }
+
+    __device__ int valid(int token) const {
+        const double value = order.entries[token].score.high.fraction;
+        return isnan(value) || (constrained && !isfinite(value)) ? -1 : token;
+    }
+};
+
+template <bool Final>
+__global__ void repetition_argmax(RepetitionScratch scratch, int count, bool constrained,
+                                  int* winner) {
+    using Reduce = cub::BlockReduce<int, group_size>;
+    __shared__ typename Reduce::TempStorage temp;
+    const RepetitionWinner best{{scratch.entries}, constrained};
+    int token = -1;
+    for (int index = blockIdx.x * group_size + threadIdx.x; index < count;
+         index += gridDim.x * group_size) {
+        token = best(token, Final ? scratch.state->tiles[index] : best.valid(index));
+    }
+    const int chosen = Reduce(temp).Reduce(token, best);
+    if (threadIdx.x == 0) {
+        if constexpr (Final) *winner = chosen;
+        else scratch.state->tiles[blockIdx.x] = chosen;
+    }
+}
+
+__device__ double score_distance(const RepetitionEntry& score, const RepetitionEntry& maximum,
+                                  double temperature) {
+    if (!isfinite(score.score.high.fraction)) return -CUDART_INF;
+    const auto distance = score_difference(score, maximum);
+    int exponent;
+    const double fraction = frexp(temperature, &exponent);
+    return fmin(0.0, scalbn(distance.fraction / fraction, distance.exponent - exponent));
+}
+
+__global__ void repetition_weights(RepetitionScratch scratch, int count, double temperature) {
+    const int rank = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rank < count) {
+        const auto& maximum = scratch.entries[scratch.ranked[0]];
+        const auto& score = scratch.entries[scratch.ranked[rank]];
+        scratch.weights[rank] = !scratch.state->invalid && isfinite(maximum.score.high.fraction)
+            ? exp(score_distance(score, maximum, temperature)) : 0.0;
+    }
+}
+
+__global__ void sample_repetition(RepetitionScratch scratch, int vocabulary,
+                                   SamplingParameters parameters, int position, int* token) {
+    *token = -1;
+    if (scratch.prefix[vocabulary - 1] > 0) {
+        const int rank = choose_rank(scratch.weights, scratch.prefix, vocabulary,
+                                     parameters, position);
+        *token = scratch.ranked[rank];
+    }
+}
+
+__global__ void score_repetition(RepetitionScratch scratch, int vocabulary, int top, int* token) {
+    const int rank = threadIdx.x;
+    const int winner = scratch.ranked[0];
+    const double mass = scratch.prefix[vocabulary - 1];
+    if (rank == 0) {
+        *token = mass > 0 ? winner : -1;
+        scratch.state->logprobs.selected = {*token, mass > 0 ? float(-log(mass)) : 0.0f};
+    }
+    if (rank < top && mass > 0) {
+        const int id = scratch.ranked[rank];
+        const auto& maximum = scratch.entries[winner];
+        const auto& score = scratch.entries[id];
+        const double logprob = score_distance(score, maximum, 1.0) - log(mass);
+        scratch.state->logprobs.alternatives[rank] = {
+            id, static_cast<float>(fmax(-static_cast<double>(FLT_MAX), logprob))};
+    }
+}
+
+__global__ void export_repetition(RepetitionScratch scratch, DecoderLogit* output, int count) {
+    const int rank = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rank < count) {
+        const int id = scratch.ranked[rank];
+        const auto& score = scratch.entries[id];
+        double display = scalbn(score.score.high.fraction, score.score.high.exponent);
+        const auto& maximum = scratch.entries[scratch.ranked[0]];
+        if (scratch.state->wide && isfinite(score.score.high.fraction) &&
+            isfinite(maximum.score.high.fraction)) {
+            display = fmax(-static_cast<double>(FLT_MAX), score_distance(score, maximum, 1.0));
+        }
+        output[rank] = {isnan(display) ? -1 : id, static_cast<float>(display)};
     }
 }
 
@@ -510,12 +831,100 @@ cudaError_t sample_logits(const float* scores, int vocabulary, int* token,
 cudaError_t adjust_logits(const __nv_bfloat16* source, float* scores, int vocabulary,
                           const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
                           OutputPenalties penalties, int previous_token, cudaStream_t stream) {
+    if (penalties.repetition != 1.0) return cudaErrorInvalidValue;
     initialize_scores<<<(vocabulary + group_size - 1) / group_size, group_size, 0, stream>>>(
         source, scores, vocabulary, mask, penalties, previous_token);
     const auto status = cudaGetLastError();
     if (status != cudaSuccess || count == 0) return status;
     add_bias<<<(count + group_size - 1) / group_size, group_size, 0, stream>>>(scores, bias, count);
     return cudaGetLastError();
+}
+
+std::size_t repetition_workspace_bytes(int vocabulary, bool ranked) {
+    std::size_t sort = 0;
+    std::size_t scan = 0;
+    if (ranked) {
+        cub::DeviceMergeSort::SortKeys(
+            nullptr, sort, static_cast<int*>(nullptr), vocabulary, RepetitionOrder{nullptr});
+        cub::DeviceScan::InclusiveSum(
+            nullptr, scan, static_cast<double*>(nullptr), static_cast<double*>(nullptr),
+            vocabulary);
+    }
+    return repetition_scratch(nullptr, vocabulary, ranked).overhead + std::max(sort, scan);
+}
+
+cudaError_t select_repetition_logits(
+    const __nv_bfloat16* source, int vocabulary, const DecoderLogitBias* bias, int bias_count,
+    const std::uint32_t* mask, OutputPenalties penalties, int previous_token,
+    RepetitionSelection selection, void* workspace, std::size_t bytes, cudaStream_t stream) {
+    if (!workspace || vocabulary < 1 || vocabulary > token_mask + 1 ||
+        (!selection.token && !selection.debug) || !(penalties.repetition > 0) ||
+        selection.top > decoder_max_generated_top_logprobs || selection.top > vocabulary ||
+        (selection.top >= 0 && !selection.logprobs) || selection.debug_count > vocabulary) {
+        return cudaErrorInvalidValue;
+    }
+    const bool ranked = selection.sampling || selection.logprobs || selection.debug;
+    const auto scratch = repetition_scratch(workspace, vocabulary, ranked);
+    if (bytes < scratch.overhead) return cudaErrorInvalidValue;
+    auto status = cudaMemsetAsync(scratch.state, 0, offsetof(RepetitionState, tiles), stream);
+    if (status != cudaSuccess) return status;
+    const int blocks = (vocabulary + group_size - 1) / group_size;
+    prepare_repetition<<<blocks, group_size, 0, stream>>>(
+        source, vocabulary, mask, penalties, previous_token, scratch);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    if (bias_count) {
+        add_repetition_bias<<<(bias_count + group_size - 1) / group_size, group_size, 0, stream>>>(
+            scratch.entries, bias, bias_count);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
+    encode_repetition<<<blocks, group_size, 0, stream>>>(scratch, vocabulary, penalties.repetition);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    if (!ranked) {
+        repetition_argmax<false><<<blocks, group_size, 0, stream>>>(
+            scratch, vocabulary, mask != nullptr, nullptr);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        repetition_argmax<true><<<1, group_size, 0, stream>>>(
+            scratch, blocks, mask != nullptr, selection.token);
+        return cudaGetLastError();
+    }
+    auto temp_bytes = bytes - scratch.overhead;
+    status = cub::DeviceMergeSort::SortKeys(scratch.temporary, temp_bytes, scratch.ranked,
+                                           vocabulary, RepetitionOrder{scratch.entries}, stream);
+    if (status != cudaSuccess) return status;
+    if (selection.debug) {
+        const int count = selection.debug_count;
+        export_repetition<<<(count + group_size - 1) / group_size, group_size, 0, stream>>>(
+            scratch, scratch.debug, count);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        return cudaMemcpyAsync(selection.debug, scratch.debug, count * sizeof(DecoderLogit),
+                               cudaMemcpyDeviceToHost, stream);
+    }
+    const double temperature = selection.sampling ? selection.sampling->temperature : 1.0;
+    repetition_weights<<<blocks, group_size, 0, stream>>>(scratch, vocabulary, temperature);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    temp_bytes = bytes - scratch.overhead;
+    status = cub::DeviceScan::InclusiveSum(scratch.temporary, temp_bytes, scratch.weights,
+                                          scratch.prefix, vocabulary, stream);
+    if (status != cudaSuccess) return status;
+    if (selection.sampling) {
+        sample_repetition<<<1, 1, 0, stream>>>(
+            scratch, vocabulary, *selection.sampling, selection.position, selection.token);
+        return cudaGetLastError();
+    }
+    score_repetition<<<1, group_size, 0, stream>>>(
+        scratch, vocabulary, selection.top, selection.token);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    return cudaMemcpyAsync(selection.logprobs, &scratch.state->logprobs,
+                           offsetof(GeneratedLogprobReadback, alternatives) +
+                               selection.top * sizeof(DecoderLogprob),
+                           cudaMemcpyDeviceToHost, stream);
 }
 
 cudaError_t check_allowed_logit(const float* scores, int* token, cudaStream_t stream) {

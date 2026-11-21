@@ -159,10 +159,11 @@ class NativeGenerate(unittest.TestCase):
         self.generate({"text": "A", "sampling_params": {
             "max_new_tokens": 1, "temperature": None, "top_k": None, "top_p": None,
             "min_p": None, "sampling_seed": None, "ignore_eos": None, "stop_token_ids": None,
+            "repetition_penalty": None,
         }})
         implicit, explicit, nullable = receipts(self.log)[first:]
         expected = {"temperature": 1, "top_k": -1, "top_p": 1, "min_p": 0,
-                    "frequency_penalty": 0, "presence_penalty": 0,
+                    "frequency_penalty": 0, "presence_penalty": 0, "repetition_penalty": 1,
                     "seed": None, "budget": 128, "sampled": True, "prompt_tokens": 1,
                     "stops": sorted(EOS), "logit_bias": []}
         self.assertEqual(implicit, expected)
@@ -187,7 +188,7 @@ class NativeGenerate(unittest.TestCase):
                 ("n", 2), ("top_p", 0), ("temperature", -1), ("min_p", 2), ("top_k", 0),
                 ("sampling_seed", 2**63), ("ignore_eos", "yes"),
                 ("stop", ["X", 1]), ("stop_regex", "X"), ("regex", "X"),
-                ("frequency_penalty", 2.01),
+                ("frequency_penalty", 2.01), ("repetition_penalty", 0),
             )],
             ({"text": "A", "sampling_params": {"stop_token_ids": [-1]}}, "vocabulary"),
             ({"input_ids": [0, 1], "sampling_params": {"max_new_tokens": 262143}}, "context"),
@@ -271,6 +272,8 @@ class NativeGenerate(unittest.TestCase):
             ({"input_ids": [[32], 33]}, "input_ids"),
             ({"text": ["A", "B"], "sampling_params": [{"max_new_tokens": 1}, {"top_p": 0}]},
              "top_p"),
+            ({"text": ["A", "B"], "sampling_params": [{}, {"repetition_penalty": 2.01}]},
+             "repetition_penalty"),
             ({"text": ["A", "B"], "sampling_params": [{}]}, "sampling_params"),
             ({"text": ["A", "B"], "cache_salt": ["a", "x" * 257]}, "cache_salt"),
             ({"text": ["A", "B"], "cache_salt": ["a"]}, "cache_salt"),
@@ -289,6 +292,20 @@ class NativeGenerate(unittest.TestCase):
                     self.assertEqual(status, 400, result)
                     self.assertIn(field, result["error"]["message"])
                 self.assertNotIn("cpu admit", log.read_text())
+
+    def test_batch_repetition_penalty_forwarding(self):
+        first = len(receipts(self.log))
+        options = {"max_new_tokens": 1, "temperature": 0}
+        result = self.generate({"input_ids": [[32], [32, 33], [32, 33, 34]],
+                                "sampling_params": [
+                                    options | {"repetition_penalty": 2},
+                                    options | {"repetition_penalty": 0.5},
+                                    options | {"repetition_penalty": None},
+                                ]})
+        self.assertEqual([packet["output_ids"] for packet in result], [[32]] * 3)
+        by_length = {seen["prompt_tokens"]: seen["repetition_penalty"]
+                     for seen in receipts(self.log)[first:]}
+        self.assertEqual(by_length, {1: 2, 2: 0.5, 3: 1})
 
     def check_batch_headers(self, reply):
         reply.begin()

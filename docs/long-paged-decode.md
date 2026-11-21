@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder batch | Mark K0 text decode lanes under the tensor-core policy. | [Lane eligibility](../src/decoder_batch.cpp#L678)<!-- prefix: "const bool p" --> |
+| Decoder batch | Mark K0 text decode lanes under the tensor-core policy. | [Lane eligibility](../src/decoder_batch.cpp#L684)<!-- prefix: "const bool p" --> |
 | Packed input projection | Pair layer-input RMSNorm and FP8 quantization with the GDN or GQA input projection. | [Packed call](../src/text/decoder_graph_packed.cpp#L278)<!-- prefix: "void PackedD" --> · [Projection API](../src/text_ops.cu#L918)<!-- prefix: "cudaError_t " --> |
 | Eager forward | Compact eligible attention reads and order KV append, attention, and gating on the batch stream. | [Forward dispatch](../src/decoder_forward.cpp#L304)<!-- prefix: "void attend_" --> |
 | CUDA operator | Validate the group, select a split, merge partials, and recover individual heads. | [Launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L380)<!-- prefix: "cudaError_t " --> · [Tensor-core split](../include/sglang/text/mxfp8_gqa_wide_tc.cuh#L178)<!-- prefix: "__global__ v" --> · [Paired split](../include/sglang/text/mxfp8_gqa_decode.cuh#L274)<!-- prefix: "__global__ v" --> · [Merge](../src/mxfp8_gqa.cu#L658)<!-- prefix: "__global__ v" --> · [Recovery](../include/sglang/text/mxfp8_gqa_decode.cuh#L332)<!-- prefix: "__global__ v" --> |
@@ -33,7 +33,7 @@ Other eligible FP8 shapes, including the MLP down projection, use eight stages. 
 
 #### Packed RMSNorm programmatic launch
 
-Packed K0 uses one layer-input producer for GDN QKV and Z or for GQA Q/gate, K, and V. The first layer normalizes the embedding rows without a residual add. Later layers add the previous MLP output to the residual. [Layer input](../include/sglang/decoder_internal.h#L225)<!-- prefix: "const auto i" --> · [GDN targets](../src/text/decoder_graph_packed.cpp#L295)<!-- prefix: "const TextFp" --> · [GQA targets](../src/text/decoder_graph_packed.cpp#L332)<!-- prefix: "const TextFp" -->
+Packed K0 uses one layer-input producer for GDN QKV and Z or for GQA Q/gate, K, and V. The first layer normalizes the embedding rows without a residual add. Later layers add the previous MLP output to the residual. [Layer input](../include/sglang/decoder_internal.h#L227)<!-- prefix: "const auto i" --> · [GDN targets](../src/text/decoder_graph_packed.cpp#L295)<!-- prefix: "const TextFp" --> · [GQA targets](../src/text/decoder_graph_packed.cpp#L332)<!-- prefix: "const TextFp" -->
 
 Once the SM100 dispatcher prepares the projection, it requests the producer's early trigger before launching the consumer. The fused producer issues the trigger after input staging and CTA synchronization, before RMS reduction and output stores. This also applies to the fused variants without a residual or eight-lane quantization. If RMSNorm requires separate normalization and quantization, those launches use ordinary stream ordering and omit the early RMS trigger. If projection falls back to GEMV, the dispatcher requests ordinary production and uses ordinary projection edges. [Consumer dispatch](../src/text/decode_proj_fp8.cu#L268)<!-- prefix: "if (producer" --> · [Fused selection](../src/text_normalization.cu#L312)<!-- prefix: "cudaError_t " --> · [Trigger](../src/text_normalization.cu#L255)<!-- prefix: "asm volatile" --> · [GEMV producer call](../src/text_ops.cu#L893)<!-- prefix: "const auto s" -->
 
@@ -55,7 +55,7 @@ Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation
 
 ## Constraints and failure behavior
 
-Default `exact` policy, media, MTP, and prefill rows retain their legacy routes. Out-of-window lanes in the legacy wide forward use the row dispatch. The legacy long primitive accepts one through 32 descriptors, independently of the serving width requirement. [Eligibility](../src/decoder_batch.cpp#L678)<!-- prefix: "const bool p" --> · [Row dispatch](../src/decoder_forward.cpp#L335)<!-- prefix: "check(read_g" --> · [Primitive](../src/mxfp8_gqa.cu#L975)<!-- prefix: "cudaError_t " -->
+Default `exact` policy, media, MTP, and prefill rows retain their legacy routes. Out-of-window lanes in the legacy wide forward use the row dispatch. The legacy long primitive accepts one through 32 descriptors, independently of the serving width requirement. [Eligibility](../src/decoder_batch.cpp#L684)<!-- prefix: "const bool p" --> · [Row dispatch](../src/decoder_forward.cpp#L335)<!-- prefix: "check(read_g" --> · [Primitive](../src/mxfp8_gqa.cu#L975)<!-- prefix: "cudaError_t " -->
 
 The launcher checks the complete group before submission. An invalid count, null required pointer, unaligned scratch address, out-of-window position, or insufficient declared cache or page-table capacity returns `cudaErrorInvalidValue`. The caller supplies valid device page entries and enough scratch for each lane. The launcher stops at the first synchronous CUDA launch error. Earlier launches can still be in flight. The forward propagates the error through the batch execution path. [Validation and launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L380)<!-- prefix: "cudaError_t " --> · [Cache coverage](../src/mxfp8_gqa.cu#L158)<!-- prefix: "bool cache_c" --> · [Forward error](../src/decoder_forward.cpp#L342)<!-- prefix: "check(status" -->
 

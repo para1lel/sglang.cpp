@@ -607,11 +607,17 @@ void DecoderBatch::State::score(int slot, Lane& lane, Workspace& work, bool logi
     if (!logits_ready) model.compute_logits(work, stream);
     auto* adjusted = lane.options.requires_target_only() ? &adjusted_workspace : nullptr;
     if (lane.options.generated_top_logprobs >= 0) {
-        if (adjusted) adjusted->select(*lane.request, work, lane.options, nullptr, nullptr,
-                                      lane.progress.generated, lane.progress.last_token, stream);
+        const bool repetition = lane.options.repetition_penalty != 1;
+        auto* readback = logprob_readback + slot;
+        if (adjusted) {
+            adjusted->select(*lane.request, work, lane.options, nullptr, nullptr,
+                             lane.progress.generated, lane.progress.last_token, stream,
+                             repetition ? readback : nullptr);
+        }
+        if (repetition) return;
         check(enqueue_generated_logprobs(work.logits, vocab_size, work.argmax,
                                         lane.options.generated_top_logprobs, logprob_workspace,
-                                        logprob_readback + slot, stream,
+                                        readback, stream,
                                         adjusted ? adjusted->logits : nullptr), "Score token");
         return;
     }

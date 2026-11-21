@@ -20,6 +20,19 @@ struct OutputPenalties {
     std::uint8_t* seen = nullptr;
     float frequency = 0.0f;
     float presence = 0.0f;
+    double repetition = 1.0;
+};
+
+struct GeneratedLogprobReadback;
+
+struct RepetitionSelection {
+    const SamplingParameters* sampling = nullptr;
+    int position = 0;
+    int* token = nullptr;
+    int top = -1;
+    GeneratedLogprobReadback* logprobs = nullptr;
+    DecoderLogit* debug = nullptr;
+    int debug_count = 0;
 };
 
 SamplingParameters request_sampling(const DecoderOptions& options);
@@ -34,6 +47,11 @@ cudaError_t sample_logits(const float* scores, int vocabulary, int* token,
 cudaError_t adjust_logits(const __nv_bfloat16* source, float* scores, int vocabulary,
                           const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
                           OutputPenalties penalties, int previous_token, cudaStream_t stream);
+std::size_t repetition_workspace_bytes(int vocabulary, bool ranked);
+cudaError_t select_repetition_logits(
+    const __nv_bfloat16* source, int vocabulary, const DecoderLogitBias* bias, int bias_count,
+    const std::uint32_t* mask, OutputPenalties penalties, int previous_token,
+    RepetitionSelection selection, void* workspace, std::size_t bytes, cudaStream_t stream);
 cudaError_t check_allowed_logit(const float* scores, int* token, cudaStream_t stream);
 
 }

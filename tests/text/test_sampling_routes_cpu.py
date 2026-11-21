@@ -202,6 +202,39 @@ class Routes(unittest.TestCase):
                         self.exchange(route, {**payload({name: invalid}), "stream": True},
                                       status=400)
 
+    def test_repetition_penalty(self):
+        for route in ("/generate", TEXT, CHAT):
+            def payload(fields, *, stream=False):
+                if route == "/generate":
+                    return {"input_ids": [32, 220], "stream": stream, "sampling_params": {
+                        "max_new_tokens": 3, "temperature": 0, **fields,
+                    }}
+                return body(route, max_tokens=3, temperature=0, stream=stream, **fields)
+
+            with self.subTest(route=route):
+                _, default = self.exchange(route, payload({}))
+                _, neutral = self.exchange(route, payload({"repetition_penalty": 1}))
+                self.assertEqual(default, neutral)
+                self.assertEqual(neutral["repetition_penalty"], 1)
+                for value in (5e-324, 1e-46, 0.375, 2):
+                    _, seen = self.exchange(route, payload({
+                        "repetition_penalty": value, "frequency_penalty": -0.25,
+                        "presence_penalty": 0.5, "logit_bias": {"32": 0.125},
+                    }, stream=True))
+                    self.assertEqual(seen["repetition_penalty"], value)
+                    self.assertEqual(seen["frequency_penalty"], -0.25)
+                    self.assertEqual(seen["presence_penalty"], 0.5)
+                    self.assertEqual(seen["logit_bias"], [[32, 0.125]])
+                for invalid in (0, -0.01, 2.01, True, "0.5", [], {}):
+                    self.exchange(route, payload({"repetition_penalty": invalid}, stream=True),
+                                  status=400)
+                null = payload({"repetition_penalty": None})
+                if route == TEXT:
+                    self.exchange(route, null, status=400)
+                else:
+                    _, seen = self.exchange(route, null)
+                    self.assertEqual(seen, default)
+
     def completion(self, packet, seen, count, reason):
         choice, = packet["choices"]
         self.assertEqual(choice["finish_reason"], reason)
@@ -393,15 +426,22 @@ class Routes(unittest.TestCase):
                 "config.json", "tokenizer.json", "chat_template.jinja", "tokenizer_config.json"
             ):
                 (checkpoint / name).symlink_to(self.checkpoint / name)
-            config = {**self.config, "temperature": 0.625, "top_k": 7, "top_p": 0.8}
+            config = {**self.config, "temperature": 0.625, "top_k": 7, "top_p": 0.8,
+                      "repetition_penalty": 1.25}
             (checkpoint / "generation_config.json").write_text(json.dumps(config))
             with server(self.binary, checkpoint, log, "--max-active", "1") as port:
                 _, chat = self.exchange(CHAT, body(CHAT, max_tokens=1), port=port, log=log)
                 with self.subTest(route=CHAT):
                     self.check_model_defaults(chat, config)
+                    self.assertEqual(chat["repetition_penalty"], 1.25)
+                    for value, expected in ((None, 1.25), (1, 1)):
+                        payload = body(CHAT, max_tokens=1, repetition_penalty=value)
+                        _, seen = self.exchange(CHAT, payload, port=port, log=log)
+                        self.assertEqual(seen["repetition_penalty"], expected)
                 _, text = self.exchange(TEXT, body(TEXT, max_tokens=1), port=port, log=log)
                 with self.subTest(route=TEXT):
                     self.selection(text)
+                    self.assertEqual(text["repetition_penalty"], 1)
 
     def test_chat_openai_defaults(self):
         log = self.output / "openai.log"

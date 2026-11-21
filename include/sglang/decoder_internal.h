@@ -41,7 +41,8 @@ public:
     SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result);
     const std::function<bool()>& cancel_probe() const { return callbacks_.is_cancelled; }
     bool cancelled() const { return cancel_probe() && cancel_probe()(); }
-    bool emit(int token, const Bf16* logits, const float* adjusted_logits);
+    bool emit(int token, const Bf16* logits, const float* adjusted_logits,
+              const std::vector<DecoderLogit>* repetition_logits);
 
 private:
     const DecoderCallbacks& callbacks_;
@@ -118,6 +119,7 @@ struct TransferBuffers {
     int winner = -1;
     std::vector<Bf16> logits;
     std::vector<float> adjusted_logits;
+    std::vector<DecoderLogit> repetition_logits;
     std::shared_ptr<void> verification_results;
     std::shared_ptr<void> mtp_constraint_inputs;
 };
@@ -349,14 +351,22 @@ struct AdjustedLogitsWorkspace {
     std::uint32_t* mask = nullptr;
     std::byte* sampling = nullptr;
     std::size_t sampling_bytes = 0;
+    std::byte* repetition = nullptr;
+    std::size_t repetition_bytes = 0;
+    bool repetition_ranked = false;
 
     void prepare(Allocations& memory, Request& request, const DecoderOptions& options,
                  cudaStream_t stream);
     void select(const Request& request, Workspace& work, const DecoderOptions& options,
                 const ConstraintCursor* allowed, const SamplingParameters* parameters,
-                int position, int previous_token, cudaStream_t stream) const;
+                int position, int previous_token, cudaStream_t stream,
+                GeneratedLogprobReadback* logprobs = nullptr) const;
     void apply(const Request& request, const Workspace& work, const DecoderOptions& options,
                const std::uint32_t* allowed, int previous_token, cudaStream_t stream) const;
+    void select_repetition(const Request& request, const Workspace& work,
+                           const DecoderOptions& options, const std::uint32_t* allowed,
+                           int previous_token, RepetitionSelection selection,
+                           cudaStream_t stream) const;
 };
 
 struct RequestProgress {
@@ -381,7 +391,8 @@ struct RequestProgress {
     std::optional<DecoderFinishReason> commit(const DecoderOptions& options, int token,
                                               const Bf16* logits = nullptr,
                                               SerialOutput* output = nullptr,
-                                              const float* adjusted_logits = nullptr);
+                                              const float* adjusted_logits = nullptr,
+                                              const std::vector<DecoderLogit>* ranked = nullptr);
 };
 
 int validate_winner(int winner, bool sampled, bool constrained);

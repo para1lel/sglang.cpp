@@ -48,10 +48,13 @@ struct DecoderOptions {
     std::shared_ptr<const std::vector<DecoderLogitBias>> logit_bias;
     double frequency_penalty = 0.0;
     double presence_penalty = 0.0;
+    double repetition_penalty = 1.0;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 
-    bool has_output_penalties() const { return frequency_penalty != 0 || presence_penalty != 0; }
+    bool has_output_penalties() const {
+        return frequency_penalty != 0 || presence_penalty != 0 || repetition_penalty != 1;
+    }
 
     bool requires_target_only() const {
         return has_output_penalties() || (logit_bias && !logit_bias->empty());

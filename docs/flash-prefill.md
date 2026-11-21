@@ -5,13 +5,13 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L610)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L323)<!-- prefix: "const auto s" --> |
-| Native CUDA operator | Select TMEM Flash, regular Flash, ordered multirow, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L761)<!-- prefix: "cudaError_t " --> |
+| Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L839)<!-- prefix: "cudaError_t " --> |
 | Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L627)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L438)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L724)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
 
 ## Runtime path
 
-The CLI and C++ default to `exact`. With `tensor-core`, `SGLANG_EXPERIMENTAL_TMEM_PREFILL` selects full-tile TMEM by zero-based query start. [TMEM selection](../src/mxfp8_gqa_prefill.cu#L778)<!-- prefix: "if (rows == " -->
+The CLI and C++ default to `exact`. With `tensor-core`, `SGLANG_EXPERIMENTAL_TMEM_PREFILL` selects full-tile TMEM by zero-based query start. [TMEM selection](../src/mxfp8_gqa_prefill.cu#L856)<!-- prefix: "if (rows == " -->
 
 | Setting | TMEM route | Start position for 1,024 query rows |
 | --- | --- | --- |
@@ -25,13 +25,13 @@ The [SM100 page-128 opt-ins](sm100-page128-prefill.md) precede native dispatch. 
 
 Flash and TMEM follow the logical page table and process causal 64-key tiles. QK and PV use BF16 products, FP32 accumulation, and online normalization.
 
-Regular Flash packs BF16 probabilities into PV registers in reduction order. `cp.async` overlaps the next tile's KV loads with computation. Partial blocks stage zeros, mask scores, and skip output and repair for inactive queries. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L575)<!-- prefix: "__global__ v" -->
+Regular Flash packs BF16 probabilities into PV registers in reduction order. `cp.async` overlaps the next tile's KV loads with computation. Partial blocks stage zeros, mask scores, and skip output and repair for inactive queries. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L653)<!-- prefix: "__global__ v" -->
 
-From position 1,024, full Flash tiles try one B200 wave of 144 blocks with 88 rows and 352 threads each. [Wide dispatch](../src/mxfp8_gqa_prefill.cu#L687)<!-- prefix: "if (aligned_" -->
+From position 1,024, full Flash tiles try one B200 wave of 144 blocks with 88 rows and 352 threads each. [Wide dispatch](../src/mxfp8_gqa_prefill.cu#L765)<!-- prefix: "if (aligned_" -->
 
-Aligned partial tiles from position 4,096 size CTAs for 12 head pairs and the device SM count. Try 32 or 48 rows if they fit one wave. Try 88 when it fits one wave and 64 needs two. On 148 SMs, these choices cover grants of 144–384, 385–576, and 769–1,023 rows, respectively. The 32- and 48-row CTAs use 256 threads for staging and repair, with 128 and 192 for MMA. [Partial dispatch](../src/mxfp8_gqa_prefill.cu#L695)<!-- prefix: "if (aligned_" -->
+Aligned partial tiles from position 4,096 size CTAs for 12 head pairs and the device SM count. Try 32 or 48 rows if they fit one wave. Try 88 when it fits one wave and 64 needs two. On 148 SMs, these choices cover grants of 144–384, 385–576, and 769–1,023 rows, respectively. The 32- and 48-row CTAs use 256 threads for staging and repair, with 128 and 192 for MMA. [Partial dispatch](../src/mxfp8_gqa_prefill.cu#L773)<!-- prefix: "if (aligned_" -->
 
-The 32-, 48-, and 88-row variants use `ldmatrix.x4` to load two BF16 K or V fragments in MMA order. A warp skips masking if all queries are active and see all 64 keys. It skips PV rescaling if every history multiplier is `+1`. Extra warps in an 88-row block finish before repair. [Fragment loads](../src/mxfp8_gqa_prefill.cu#L297)<!-- prefix: "__device__ _" --> · [Score mask](../src/mxfp8_gqa_prefill.cu#L618)<!-- prefix: "const bool f" --> · [PV rescaling](../src/mxfp8_gqa_prefill.cu#L529)<!-- prefix: "if constexpr" -->
+The 32-, 48-, and 88-row variants use `ldmatrix.x4` to load two BF16 K or V fragments in MMA order. A warp skips masking if all queries are active and see all 64 keys. It skips PV rescaling if every history multiplier is `+1`. Extra warps in an 88-row block finish before repair. [Fragment loads](../src/mxfp8_gqa_prefill.cu#L369)<!-- prefix: "__device__ _" --> · [Score mask](../src/mxfp8_gqa_prefill.cu#L696)<!-- prefix: "const bool f" --> · [PV rescaling](../src/mxfp8_gqa_prefill.cu#L607)<!-- prefix: "if constexpr" -->
 
 ### Long-tile TMEM pipeline
 
@@ -57,7 +57,7 @@ Split TMEM assigns three contiguous partitions to three CTAs per query block and
 
 ## Constraints and failure behavior
 
-Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L775)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L590)<!-- prefix: "if (rows == " -->
+Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L853)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L590)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 
@@ -67,7 +67,7 @@ Raw paired TMEM needs 16-byte alignment for all four KV bases. It needs a 416-th
 
 Unsupported clusters, kernel configurations, encoders, or tensor maps fall through to regular Flash before submission. Missing buffers or too few pages return `cudaErrorInvalidValue`. Unexpected CUDA setup errors and the paired launch status return to the caller. [Encoder](../src/text/mxfp8_gqa_prefill_tmem.cu#L764)<!-- prefix: "std::optiona" --> · [Submission](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L385)<!-- prefix: "return cudaL" -->
 
-Other valid shapes, unaligned payloads, and a known regular Flash shared memory shortfall use the [ordered fallback dispatch](development.md#ordered-multirow-gqa-prefill). Above 32,768 visible tokens, that dispatch uses protected single-row attention. CUDA discovery, configuration, and launch errors propagate.
+Other valid shapes, unaligned payloads, and a known regular Flash shared memory shortfall use the [ordered fallback dispatch](ordered-gqa-prefill.md#constraints-and-failure-behavior). CUDA discovery, configuration, and launch errors propagate.
 
 Single-CTA ordered and split TMEM fall through on device or resource mismatch or successful lookup without an encoder. Missing buffers, insufficient pages, or encoding failure return `cudaErrorInvalidValue`. CUDA discovery, configuration, launch, and split allocation errors propagate. After split allocation, the launcher attempts release and returns the first launch error or release status.
 

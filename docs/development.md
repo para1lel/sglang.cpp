@@ -74,13 +74,7 @@ Exact scoring reduces eight groups in FP32, sums in group order, and scales by `
 
 #### Ordered multirow GQA prefill
 
-Eligible tensor-core chunks use [Flash](flash-prefill.md#constraints-and-failure-behavior). Through 32,768 visible tokens, ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more. [Dispatch](../src/mxfp8_gqa_prefill.cu#L761)<!-- prefix: "cudaError_t " -->
-
-Tiles share decoded K/V across rows and two query heads. Each 32-token block preserves causality, the FP32 score tree, token-ordered softmax and value updates, and BF16 rounding. [Scores](../src/mxfp8_gqa_prefill.cu#L37)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L160)<!-- prefix: "for (int fir" -->
-
-Other shapes and tails use protected single-row attention. Both routes retain finite FP64 replacements for nonfinite visible scores per head and quotients per channel. [Recovery](../include/sglang/mxfp8_gqa.h#L63)<!-- prefix: "/// Shared a" -->
-
-Zero rows succeed. Negative positions or rows and position-plus-row overflow otherwise return `cudaErrorInvalidValue`.
+The [ordered prefill contract](ordered-gqa-prefill.md) covers dispatch, tile selection, causal scoring, and FP64 recovery.
 
 #### P2 GQA verification
 
@@ -104,9 +98,9 @@ Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero in eac
 
 The [ordered decode check](../tests/mxfp8_gqa_check.cu#L541)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 
-Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L930)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L872)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L698)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L746)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L935)<!-- prefix: "void check_o" -->.
+Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L931)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L872)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L698)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L746)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L935)<!-- prefix: "void check_o" -->.
 
-The [overflow control](../tests/mxfp8_gqa_prefill_check.cu#L798)<!-- prefix: "void check_o" --> offsets the K payload by one byte to exercise protected recovery at 32,768 and 32,769 visible tokens.
+Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for staged tails and overflow controls.
 
 ### P3 native text decoder
 

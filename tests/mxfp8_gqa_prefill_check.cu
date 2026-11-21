@@ -802,12 +802,10 @@ void check_ordered_prefill_score_overflow(cudaStream_t stream) {
     constexpr auto payload = page_count * sglang::mxfp8_payload_bytes_per_page;
     constexpr auto scales = page_count * sglang::mxfp8_scale_bytes_per_page;
     std::vector<std::int32_t> mapping(page_count);
-    for (int page = 0; page < page_count; ++page) {
-        mapping[page] = page_count - 1 - page;
-    }
+    std::generate(mapping.rbegin(), mapping.rend(), [page = 0]() mutable { return page++; });
     const Pages pages{std::move(mapping)};
     pages.device.upload(pages.mapping.data(), stream);
-    const DeviceBuffer<Byte> keys(payload), values(payload);
+    const DeviceBuffer<Byte> keys(payload), values(payload), unaligned_keys(payload + 1);
     const DeviceBuffer<Byte> key_scales(scales), value_scales(scales);
     const sglang::Mxfp8KvCache view{keys.get(), values.get(), key_scales.get(), value_scales.get(),
                                   page_count};
@@ -820,29 +818,32 @@ void check_ordered_prefill_score_overflow(cudaStream_t stream) {
                "Set leading overflow key");
     check_cuda(cudaMemsetAsync(view.value_payload + offset, 0x40, head_width, stream),
                "Set leading overflow value");
+    auto control = view;
+    control.key_payload = unaligned_keys.get() + 1;
+    check_cuda(cudaMemcpyAsync(control.key_payload, keys.get(), payload,
+                               cudaMemcpyDeviceToDevice, stream), "Copy unaligned overflow keys");
     std::vector<BFloat> input(rows * query_elements, __float2bfloat16_rn(0.0f));
     for (int row = 0; row < rows; ++row) {
-        std::fill_n(input.begin() + row * query_elements, head_width,
-                    __float2bfloat16_rn(0x1p126f));
+        std::fill_n(&input[row * query_elements], head_width, __float2bfloat16_rn(0x1p126f));
     }
     const DeviceBuffer<BFloat> queries(input.size());
     queries.upload(input.data(), stream);
     const DeviceBuffer<BFloat> output(rows * query_elements + 2 * prefill_guard);
     for (const int first : {0, limit - rows, limit - rows + 1}) {
-        const auto launch = [&](int row, int count) {
+        const auto launch = [&](sglang::Mxfp8KvCache cache) {
             return sglang::decoder::tensor_core_multirow_prefill_gqa(
-                view, pages.view(), first + row, count, queries.get() + row * query_elements,
-                output.get() + prefill_guard + row * query_elements, stream);
+                cache, pages.view(), first, rows, queries.get(), output.get() + prefill_guard,
+                stream);
         };
         Graph graph;
-        graph.capture(stream, [&] { return launch(0, rows); });
-        graph.check_grid(first + rows <= limit ? rows / 2 + rows % 2 : rows);
+        graph.capture(stream, [&] { return launch(view); });
+        graph.check_grid(first == 0 ? rows / 2 + rows % 2 :
+                         first + rows <= limit ? rows / 4 + rows % 4 : rows);
         output.fill(attention_sentinel, stream);
         graph.replay(stream);
         const auto actual = download_prefill(output, stream);
         output.fill(attention_sentinel, stream);
-        check_cuda(launch(0, 32), "Launch first protected overflow tile");
-        check_cuda(launch(32, rows - 32), "Launch second protected overflow tile");
+        check_cuda(launch(control), "Launch unaligned overflow control");
         require_same(actual, download_prefill(output, stream), "Protected overflow parity");
         for (int row = 0; row < rows; ++row) {
             const float mean = __bfloat162float(__double2bfloat16(1.0 + 1.0 / (first + row + 1)));

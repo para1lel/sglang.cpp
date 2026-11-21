@@ -33,25 +33,38 @@ constexpr int groups_per_warp = mxfp8_group_size / score_lanes;
 constexpr int group_passes = mxfp8_groups / groups_per_warp;
 static_assert(groups_per_warp == 4 && mxfp8_groups % groups_per_warp == 0);
 
-template <int Heads>
+template <int Tokens>
+struct PrefillPayload {
+    alignas(16) std::uint8_t key[Tokens][channels];
+    alignas(16) std::uint8_t value[Tokens][channels];
+    alignas(8) std::uint8_t key_scale[Tokens][mxfp8_groups];
+    alignas(8) std::uint8_t value_scale[Tokens][mxfp8_groups];
+};
+
+template <int Tokens, int Threads>
+__device__ void prefetch_payload(PrefillPayload<Tokens>& raw, Attention request, int first,
+                                 int visible, int kv_head);
+
+template <int Heads, bool Staged>
 __device__ void tile_scores(OrderedTile<float, Heads>& shared, Mxfp8KvCache cache,
                             std::size_t payload, std::size_t scale, int end, int warp, int lane,
-                            const float4 (&queries)[group_passes][Heads]) {
+                            const float4 (&queries)[group_passes][Heads],
+                            const PrefillPayload<keys_per_tile>* raw) {
     const int group_in_warp = lane / score_lanes;
     for (int token = warp; token < end; token += score_warps) {
         float dots[Heads]{};
         #pragma unroll
         for (int pass = 0; pass < group_passes; ++pass) {
             const int group = pass * groups_per_warp + group_in_warp;
-            const auto offset = payload + token * payload_stride + group * mxfp8_group_size
-                + lane % score_lanes;
-            const auto exponent = cache.key_scales[scale + token * scale_stride + group];
-            const float key0 = ordered_decode(cache.key_payload[offset], exponent);
-            const float key1 = ordered_decode(cache.key_payload[offset + score_lanes], exponent);
-            const float key2 = ordered_decode(
-                cache.key_payload[offset + 2 * score_lanes], exponent);
-            const float key3 = ordered_decode(
-                cache.key_payload[offset + 3 * score_lanes], exponent);
+            const int channel = group * mxfp8_group_size + lane % score_lanes;
+            const auto* key = Staged ? &raw->key[token][channel] :
+                cache.key_payload + payload + token * payload_stride + channel;
+            const auto exponent = Staged ? raw->key_scale[token][group] :
+                cache.key_scales[scale + token * scale_stride + group];
+            const float key0 = ordered_decode(key[0], exponent);
+            const float key1 = ordered_decode(key[score_lanes], exponent);
+            const float key2 = ordered_decode(key[2 * score_lanes], exponent);
+            const float key3 = ordered_decode(key[3 * score_lanes], exponent);
             #pragma unroll
             for (int head = 0; head < Heads; ++head) {
                 const auto query = queries[pass][head];
@@ -79,15 +92,24 @@ __device__ void tile_scores(OrderedTile<float, Heads>& shared, Mxfp8KvCache cach
     }
 }
 
-template <int Heads>
-__device__ void tile_weights(OrderedTile<float, Heads>& shared, int count, int warp, int lane,
-                             float& maximum,
-                             bool& invalid_score) {
+template <int Heads, bool SkipUnitHistory>
+__device__ bool tile_weights(OrderedTile<float, Heads>& shared, int count, int warp, int lane,
+                             float& maximum, bool& invalid_score) {
     if (warp >= Heads || count == 0) {
-        return;
+        return true;
     }
     const float prior = maximum;
     const float score = lane < count ? shared.scores[warp][lane] : -CUDART_INF_F;
+    if constexpr (SkipUnitHistory) {
+        if (isfinite(prior) && __all_sync(warp_mask, score <= prior)) {
+            if (lane < count) {
+                invalid_score |= !isfinite(score);
+                shared.history_weight[warp][lane] = 1.0f;
+                shared.token_weight[warp][lane] = expf(score - prior);
+            }
+            return true;
+        }
+    }
     const float prefix = ordered_prefix(fmaxf(prior, score), lane);
     const float previous = __shfl_up_sync(warp_mask, prefix, 1);
     maximum = __shfl_sync(warp_mask, prefix, count - 1);
@@ -96,41 +118,53 @@ __device__ void tile_weights(OrderedTile<float, Heads>& shared, int count, int w
         shared.history_weight[warp][lane] = expf((lane == 0 ? prior : previous) - prefix);
         shared.token_weight[warp][lane] = expf(score - prefix);
     }
+    return false;
 }
 
-template <int Heads>
+template <bool Staged>
+__device__ __forceinline__ float tile_value(Mxfp8KvCache cache, std::size_t payload,
+                                            std::size_t scale, int token, int channel, int warp,
+                                            const PrefillPayload<keys_per_tile>* raw) {
+    return Staged ? ordered_decode(raw->value[token][channel], raw->value_scale[token][warp]) :
+        ordered_decode(cache.value_payload[payload + token * payload_stride + channel],
+                       cache.value_scales[scale + token * scale_stride + warp]);
+}
+
+template <bool UnitHistory, int Heads>
+__device__ __forceinline__ void ordered_value_step(OrderedTile<float, Heads>& shared, int head,
+                                                   int token, float value, float& weighted) {
+    const float history = UnitHistory ? weighted : shared.history_weight[head][token] * weighted;
+    weighted = fmaf(shared.token_weight[head][token], value, history);
+}
+
+template <int Heads, bool Staged, bool UnitHistory>
 __device__ void tile_values(OrderedTile<float, Heads>& shared, Mxfp8KvCache cache,
                             std::size_t payload, std::size_t scale, int first_visible, int end,
-                            int channel, int warp, float (&weighted)[Heads]) {
+                            int channel, int warp, float (&weighted)[Heads],
+                            const PrefillPayload<keys_per_tile>* raw) {
     const int count = max(0, min(keys_per_tile, first_visible));
     #pragma unroll 4
     for (int token = 0; token < count; ++token) {
-        const float value = ordered_decode(cache.value_payload[payload + token * payload_stride
-                                                                + channel],
-                                          cache.value_scales[scale + token * scale_stride + warp]);
+        const float value = tile_value<Staged>(cache, payload, scale, token, channel, warp, raw);
         #pragma unroll
         for (int head = 0; head < Heads; ++head) {
-            weighted[head] = fmaf(shared.token_weight[head][token], value,
-                                  shared.history_weight[head][token] * weighted[head]);
+            ordered_value_step<UnitHistory>(shared, head, token, value, weighted[head]);
         }
     }
     for (int token = count; token < end; ++token) {
-        const float value = ordered_decode(cache.value_payload[payload + token * payload_stride
-                                                                + channel],
-                                          cache.value_scales[scale + token * scale_stride + warp]);
+        const float value = tile_value<Staged>(cache, payload, scale, token, channel, warp, raw);
         #pragma unroll
         for (int head = ordered_heads; head < Heads; ++head) {
             if (token < first_visible + head / ordered_heads) {
-                weighted[head] = fmaf(shared.token_weight[head][token], value,
-                                      shared.history_weight[head][token] * weighted[head]);
+                ordered_value_step<UnitHistory>(shared, head, token, value, weighted[head]);
             }
         }
     }
 }
 
-template <int Heads>
+template <int Heads, bool Staged>
 __device__ int tile_attention(OrderedTile<float, Heads>& shared, Attention request, int row,
-                             int head) {
+                             int head, PrefillPayload<keys_per_tile>* stages) {
     static_assert(Heads <= score_warps);
     constexpr int tile_rows = Heads / ordered_heads;
     const int channel = threadIdx.x;
@@ -157,28 +191,65 @@ __device__ int tile_attention(OrderedTile<float, Heads>& shared, Attention reque
     float mass = 0.0f;
     float maximum = -CUDART_INF_F;
     bool invalid_score = false;
-    for (int first = 0; first < last + tile_rows; first += keys_per_tile) {
+    const int total = last + tile_rows;
+    if constexpr (Staged) {
+        prefetch_payload<keys_per_tile, channels>(stages[0], request, 0,
+                                                  min(keys_per_tile, total), kv_head);
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+    }
+    for (int first = 0; first < total; first += keys_per_tile) {
         const int first_visible = last - first + 1;
         const int end = min(keys_per_tile, last - first + tile_rows);
         const int visible = max(0, min(keys_per_tile, first_visible + warp / ordered_heads));
-        const int page = request.pages[first / mxfp8_page_size];
-        const int token = first % mxfp8_page_size;
-        const auto payload = payload_offset(page, token, kv_head);
-        const auto scale = scale_offset(page, token, kv_head);
-        tile_scores(shared, request.cache, payload, scale, end, warp, lane, query);
+        const int stage = (first / keys_per_tile) % 2;
+        if constexpr (Staged) {
+            const int next = first + keys_per_tile;
+            if (next < total) {
+                prefetch_payload<keys_per_tile, channels>(stages[1 - stage], request, next,
+                    min(keys_per_tile, total - next), kv_head);
+            }
+        }
+        std::size_t payload = 0, scale = 0;
+        if constexpr (!Staged) {
+            const int page = request.pages[first / mxfp8_page_size];
+            const int token = first % mxfp8_page_size;
+            payload = payload_offset(page, token, kv_head);
+            scale = scale_offset(page, token, kv_head);
+        }
+        const auto* raw = Staged ? stages + stage : nullptr;
+        tile_scores<Heads, Staged>(shared, request.cache, payload, scale, end, warp, lane,
+                                  query, raw);
         __syncthreads();
-        tile_weights(shared, visible, warp, lane, maximum, invalid_score);
-        __syncthreads();
-        tile_values(shared, request.cache, payload, scale, first_visible, end, channel, warp,
-                    weighted);
+        const bool unit_history = tile_weights<Heads, Staged>(
+            shared, visible, warp, lane, maximum, invalid_score);
+        bool all_unit_history = false;
+        if constexpr (Staged) {
+            all_unit_history = __syncthreads_and(unit_history);
+        } else {
+            __syncthreads();
+        }
+        if (all_unit_history) {
+            tile_values<Heads, Staged, true>(shared, request.cache, payload, scale, first_visible,
+                                            end, channel, warp, weighted, raw);
+        } else {
+            tile_values<Heads, Staged, false>(shared, request.cache, payload, scale, first_visible,
+                                             end, channel, warp, weighted, raw);
+        }
         if (warp < Heads && lane == 0) {
             for (int index = 0; index < visible; ++index) {
-                mass = fmaf(shared.history_weight[warp][index], mass,
-                            shared.token_weight[warp][index]);
+                const float weight = shared.token_weight[warp][index];
+                mass = all_unit_history ? mass + weight :
+                    fmaf(shared.history_weight[warp][index], mass, weight);
             }
-            shared.denominator[warp] = mass;
+        }
+        if constexpr (Staged) {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
         }
         __syncthreads();
+    }
+    if (warp < Heads && lane == 0) {
+        shared.denominator[warp] = mass;
     }
     int invalid = score_recovery_mask<Heads>(warp, lane, invalid_score);
     #pragma unroll
@@ -192,7 +263,7 @@ __device__ int tile_attention(OrderedTile<float, Heads>& shared, Attention reque
     return invalid;
 }
 
-template <int Rows, int Blocks>
+template <int Rows, int Blocks, bool Staged = false>
 __launch_bounds__(channels, Blocks)
 __global__ void multirow_prefill_attention(Attention request, int rows) {
     __shared__ OrderedTile<float, Rows * ordered_heads> shared;
@@ -205,7 +276,13 @@ __global__ void multirow_prefill_attention(Attention request, int rows) {
         return;
     }
     const int row = tile * Rows;
-    const int invalid = tile_attention(shared, request, row, head);
+    PrefillPayload<keys_per_tile>* stages = nullptr;
+    if constexpr (Staged) {
+        __shared__ PrefillPayload<keys_per_tile> storage[2];
+        stages = storage;
+    }
+    const int invalid = tile_attention<Rows * ordered_heads, Staged>(
+        shared, request, row, head, stages);
     if (__syncthreads_or(invalid != 0)) {
         constexpr int mask = (1 << ordered_heads) - 1;
         for (int offset = 0; offset < Rows; ++offset) {
@@ -243,12 +320,7 @@ struct FlashTile {
     int bad_key;
 };
 
-struct FlashPayload {
-    alignas(16) std::uint8_t key[flash_keys][channels];
-    alignas(16) std::uint8_t value[flash_keys][channels];
-    alignas(8) std::uint8_t key_scale[flash_keys][mxfp8_groups];
-    alignas(8) std::uint8_t value_scale[flash_keys][mxfp8_groups];
-};
+using FlashPayload = PrefillPayload<flash_keys>;
 
 constexpr int flash_vector_elements = 16;
 constexpr int flash_token_lanes = channels / flash_vector_elements;
@@ -345,15 +417,15 @@ __device__ __forceinline__ void flash_copy(std::uint8_t* destination,
     }
 }
 
-template <int Rows>
-__device__ __forceinline__ void flash_prefetch(FlashPayload& raw, Attention request, int first,
-                                               int visible, int kv_head) {
+template <int Tokens, int Threads>
+__device__ void prefetch_payload(PrefillPayload<Tokens>& raw, Attention request, int first,
+                                 int visible, int kv_head) {
     const int channel = (threadIdx.x % flash_token_lanes) * flash_vector_elements;
     const int page = request.pages[first / mxfp8_page_size];
     const auto cache = request.cache;
     #pragma unroll
-    for (int index = threadIdx.x / flash_token_lanes; index < flash_keys;
-         index += flash_threads<Rows> / flash_token_lanes) {
+    for (int index = threadIdx.x / flash_token_lanes; index < Tokens;
+         index += Threads / flash_token_lanes) {
         const int token = (first + index) % mxfp8_page_size;
         const auto payload = payload_offset(page, token, kv_head) + channel;
         flash_copy<16>(&raw.key[index][channel], cache.key_payload + payload, index < visible);
@@ -365,6 +437,12 @@ __device__ __forceinline__ void flash_prefetch(FlashPayload& raw, Attention requ
         }
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+template <int Rows>
+__device__ __forceinline__ void flash_prefetch(FlashPayload& raw, Attention request, int first,
+                                               int visible, int kv_head) {
+    prefetch_payload<flash_keys, flash_threads<Rows>>(raw, request, first, visible, kv_head);
 }
 
 template <bool Async, int Rows>
@@ -809,6 +887,24 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     }
     void* args[] = {&request, &rows};
     constexpr int min_paired_rows = 64;
+    constexpr int min_staged_visible = 8192;
+    constexpr int min_wide_tail_rows = 32;
+    constexpr int min_paired_tail_rows = 12;
+    if (rows >= 2 && rows < min_flash_rows &&
+        visible >= min_staged_visible && visible <= max_multirow_visible_tokens &&
+        reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0 &&
+        reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0 &&
+        reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) == 0 &&
+        reinterpret_cast<std::uintptr_t>(cache.value_scales) % alignof(std::uint64_t) == 0) {
+        const int tile_rows = rows >= min_wide_tail_rows ? wide_rows :
+            rows >= min_paired_tail_rows && rows % paired_rows == 0 ? paired_rows : 1;
+        const dim3 blocks(rows / tile_rows + rows % tile_rows, mxfp8_query_heads / ordered_heads);
+        const auto kernel = tile_rows == wide_rows ?
+            multirow_prefill_attention<wide_rows, 2, true> : tile_rows == paired_rows ?
+            multirow_prefill_attention<paired_rows, 3, true> :
+            multirow_prefill_attention<1, 4, true>;
+        return cudaLaunchKernel(kernel, blocks, channels, args, 0, stream);
+    }
     if (rows < min_paired_rows || visible > max_multirow_visible_tokens) {
         const dim3 blocks(rows, mxfp8_query_heads / ordered_heads);
         return cudaLaunchKernel(protected_prefill_attention, blocks, channels, args, 0, stream);

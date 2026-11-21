@@ -85,15 +85,7 @@ int sample(const Row& row, const DecoderOptions& options) {
     throw std::runtime_error("oracle draw fell outside retained mass");
 }
 
-void verify_scores(const Decoder& decoder, DecoderOptions options, const Row& row) {
-    options.top_logits = 0;
-    options.generated_top_logprobs = 8;
-    DecoderBatch batch(decoder, {false, 1});
-    batch.admit(0, prompt, options);
-    std::array<bool, decoder_batch_max_lanes> selected{true};
-    const auto step = batch.advance_chunked(selected)[0];
-    require(step.token == row.front().token_id && step.generated_logprobs,
-            "scored selection differs from oracle");
+void verify_scores(const DecoderTokenLogprobs& receipt, const Row& row, std::size_t top) {
     const auto mass = weights(row, 1);
     const auto log_mass = std::log(std::accumulate(mass.begin(), mass.end(), 0.0));
     const auto check = [&](const DecoderLogprob& value, const DecoderLogit& entry) {
@@ -101,9 +93,8 @@ void verify_scores(const Decoder& decoder, DecoderOptions options, const Row& ro
         require(value.token_id == entry.token_id && std::abs(value.value - expected) < 6e-6,
                 "generated score differs from full-vocabulary log-softmax");
     };
-    const auto& receipt = *step.generated_logprobs;
     check(receipt.selected, row.front());
-    require(receipt.alternatives.size() == 8, "scored top count differs");
+    require(receipt.alternatives.size() == top, "scored top count differs");
     for (std::size_t rank = 0; rank < receipt.alternatives.size(); ++rank) {
         check(receipt.alternatives[rank], row[rank]);
     }
@@ -151,7 +142,15 @@ void verify_singleton(const Decoder& decoder, const Tokenizer& tokenizer) {
             std::equal(row.begin(), row.end(), result.step_top_logits.at(0).begin(),
                        result.step_top_logits.at(0).end(), exact),
             "direct biased row differs from exact FP32 oracle");
-    verify_scores(decoder, options, row);
+    auto scored = options;
+    scored.top_logits = 0;
+    scored.generated_top_logprobs = 8;
+    DecoderBatch batch(decoder, {false, 1});
+    batch.admit(0, prompt, scored);
+    const auto step = batch.advance_chunked({true})[0];
+    require(step.token == row.front().token_id && step.generated_logprobs,
+            "scored selection differs from oracle");
+    verify_scores(*step.generated_logprobs, row, 8);
     options.top_logits = 0;
     options.temperature = 0.83;
     options.top_k = 7;
@@ -177,6 +176,81 @@ void verify_singleton(const Decoder& decoder, const Tokenizer& tokenizer) {
     verify_invalid(decoder);
     std::cout << "singleton: full exact FP32 rows, generated log-softmax, four seeds, "
                  "constraint and eight direct rejections passed\n";
+}
+
+void verify_output_history(const Decoder& decoder) {
+    constexpr int repeated = 32;
+    constexpr int last_token = model_vocab_size - 1;
+    constexpr float forcing_bias = 24.25f;
+    constexpr int budget = 7;
+    constexpr int top = 5;
+    const std::vector<int> repeated_prompt{repeated, repeated, 220, repeated};
+    DecoderOptions control;
+    control.eager = true;
+    control.max_new_tokens = budget;
+    control.top_logits = model_vocab_size;
+    control.logit_bias = biases({{repeated, forcing_bias}});
+    const auto raw = decoder.generate(repeated_prompt, control);
+    require(raw.output_token_ids == std::vector<int>(budget, repeated),
+            "zero-penalty control did not repeat the prompt token");
+
+    auto options = control;
+    options.eager = false;
+    options.top_logits = 0;
+    options.generated_top_logprobs = top;
+    options.frequency_penalty = 0.29;
+    options.presence_penalty = 1.1;
+    require(raw.step_top_logits.size() == budget &&
+                raw.step_top_logits[1].size() == model_vocab_size,
+            "zero-penalty control did not expose the full cutoff row");
+    const auto& cutoff = raw.step_top_logits[1];
+    const auto tied_token = std::find_if(cutoff.begin(), cutoff.end(), [](const auto& entry) {
+        return entry.token_id == last_token;
+    });
+    const auto cutoff_winner = cutoff[top - 1];
+    require(tied_token != cutoff.end() && cutoff_winner.token_id < last_token &&
+                tied_token->logit < cutoff_winner.logit,
+            "zero-penalty control has no lower-ranked token to lift to the cutoff");
+    const float tie_bias = cutoff_winner.logit - tied_token->logit;
+    options.logit_bias = biases({{repeated, forcing_bias}, {last_token, tie_bias}});
+
+    std::vector<Row> expected;
+    float frequency = 0;
+    for (const auto& scores : raw.step_top_logits) {
+        require(scores.size() == model_vocab_size && scores.front().token_id == repeated,
+                "zero-penalty control did not expose the full forced row");
+        auto row = scores;
+        row.front().logit -= forcing_bias;
+        if (!expected.empty()) {
+            row.front().logit -= frequency + static_cast<float>(options.presence_penalty);
+        }
+        expected.push_back(biased_row(std::move(row), *options.logit_bias));
+        frequency += static_cast<float>(options.frequency_penalty);
+    }
+    require(expected.size() == budget, "zero-penalty control row count differs");
+    const auto& tied = expected[1];
+    require(tied[top - 1].token_id == cutoff_winner.token_id && tied[top].token_id == last_token &&
+                tied[top - 1].logit == tied[top].logit,
+            "penalty fixture did not put equal logits across the top cutoff");
+    for (bool graphs : {false, true}) {
+        DecoderBatch batch(decoder, {graphs, 1});
+        batch.admit(0, repeated_prompt, options);
+        std::uint32_t graph_slots = 0;
+        for (int index = 0; index < budget; ++index) {
+            DecoderBatchStepStats stats;
+            const auto step = batch.advance_chunked({true}, &stats)[0];
+            graph_slots |= stats.graph_slots;
+            require(step.token == repeated && step.generated_logprobs &&
+                        static_cast<bool>(step.finish_reason) == (index + 1 == budget),
+                    "penalty history step did not emit the forced token and scores");
+            verify_scores(*step.generated_logprobs, expected[index], top);
+        }
+        require(graph_slots == (graphs ? 1u : 0u), "penalty history graph route differs");
+    }
+    std::cout << "penalties: seven full-row log-softmax checks per route, empty and repeated "
+                 "output history, and a tie at the top cutoff passed (retained "
+              << cutoff_winner.token_id << ", excluded " << last_token << ", logit "
+              << tied[top].logit << ", bias " << tie_bias << ")\n";
 }
 
 using TokenStreams = std::array<std::vector<int>, 2>;
@@ -229,6 +303,7 @@ int main(int argc, char** argv) {
         Decoder decoder(checkpoint, 0, true, Fp8PrefillPolicy::tensor_core);
         const Tokenizer tokenizer(checkpoint / "tokenizer.json");
         verify_singleton(decoder, tokenizer);
+        verify_output_history(decoder);
         const auto eager = run_batch(decoder, false, false);
         require(run_batch(decoder, true, false) == eager, "packed parity differs");
         require(run_batch(decoder, true, true) == eager, "mixed MTP parity differs");

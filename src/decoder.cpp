@@ -57,7 +57,7 @@ void validate_constraint(const DecoderOptions& options) {
 }
 
 void validate_logit_bias(const DecoderOptions& options) {
-    if (!options.requires_target_only()) {
+    if (!options.logit_bias) {
         return;
     }
     int previous = -1;
@@ -94,6 +94,12 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     if (!(options.min_p >= 0 && options.min_p <= 1)) {
         throw std::invalid_argument("min_p must be in [0, 1]");
     }
+    if (!(options.frequency_penalty >= -2 && options.frequency_penalty <= 2)) {
+        throw std::invalid_argument("frequency_penalty must be finite and in [-2, 2]");
+    }
+    if (!(options.presence_penalty >= -2 && options.presence_penalty <= 2)) {
+        throw std::invalid_argument("presence_penalty must be finite and in [-2, 2]");
+    }
     if (options.top_k != -1 && options.top_k < 1) {
         throw std::invalid_argument("top_k must be -1 or at least 1");
     }
@@ -128,17 +134,38 @@ SamplingParameters request_sampling(const DecoderOptions& options) {
     return {options.temperature, options.top_p, top_k, seed, options.min_p};
 }
 
-void Request::upload_logit_bias(const DecoderOptions& options, cudaStream_t stream) {
-    const auto& entries = *options.logit_bias;
-    auto* buffer = memory.allocate<DecoderLogitBias>(entries.size());
-    check(cudaMemcpyAsync(buffer, entries.data(), entries.size() * sizeof(*buffer),
-                          cudaMemcpyHostToDevice, stream), "Upload logit bias");
-    logit_bias = buffer;
+std::size_t output_penalty_bytes(const DecoderOptions& options) {
+    return vocab_size * ((options.frequency_penalty != 0 ? sizeof(float) : 0) +
+                         (options.presence_penalty != 0 ? sizeof(std::uint8_t) : 0));
 }
 
-void BiasedWorkspace::prepare(Allocations& memory, Request& request, const DecoderOptions& options,
-                              cudaStream_t stream) {
-    request.upload_logit_bias(options, stream);
+void Request::prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream) {
+    if (options.logit_bias && !options.logit_bias->empty()) {
+        const auto& entries = *options.logit_bias;
+        auto* buffer = memory.allocate<DecoderLogitBias>(entries.size());
+        check(cudaMemcpyAsync(buffer, entries.data(), entries.size() * sizeof(*buffer),
+                              cudaMemcpyHostToDevice, stream), "Upload logit bias");
+        logit_bias = buffer;
+    }
+    if (options.frequency_penalty != 0) {
+        output_penalties.frequency = static_cast<float>(options.frequency_penalty);
+        auto*& totals = output_penalties.frequency_totals;
+        totals = memory.allocate<float>(vocab_size);
+        check(cudaMemsetAsync(totals, 0, vocab_size * sizeof(*totals), stream),
+              "Initialize frequency penalties");
+    }
+    if (options.presence_penalty != 0) {
+        output_penalties.presence = static_cast<float>(options.presence_penalty);
+        auto*& seen = output_penalties.seen;
+        seen = memory.allocate<std::uint8_t>(vocab_size);
+        check(cudaMemsetAsync(seen, 0, vocab_size * sizeof(*seen), stream),
+              "Initialize presence penalties");
+    }
+}
+
+void AdjustedLogitsWorkspace::prepare(Allocations& memory, Request& request,
+                                      const DecoderOptions& options, cudaStream_t stream) {
+    request.prepare_logit_adjustments(options, stream);
     if (!logits) {
         logits = memory.allocate<float>(vocab_size);
     }
@@ -151,10 +178,19 @@ void BiasedWorkspace::prepare(Allocations& memory, Request& request, const Decod
     }
 }
 
-void BiasedWorkspace::select(const Request& request, Workspace& work,
-                             const DecoderOptions& options, const ConstraintCursor* allowed,
-                             const SamplingParameters* parameters, int position,
-                             cudaStream_t stream) const {
+void AdjustedLogitsWorkspace::apply(const Request& request, const Workspace& work,
+                                    const DecoderOptions& options, const std::uint32_t* allowed,
+                                    int previous_token, cudaStream_t stream) const {
+    const int count = options.logit_bias ? options.logit_bias->size() : 0;
+    check(adjust_logits(work.logits, logits, vocab_size, request.logit_bias, count, allowed,
+                        request.output_penalties, previous_token, stream), "Adjust decoder logits");
+}
+
+void AdjustedLogitsWorkspace::select(const Request& request, Workspace& work,
+                                      const DecoderOptions& options,
+                                      const ConstraintCursor* allowed,
+                                      const SamplingParameters* parameters, int position,
+                                      int previous_token, cudaStream_t stream) const {
     if (allowed) {
         if (allowed->ids().empty()) {
             throw std::logic_error("Output constraint has no remaining continuation");
@@ -163,18 +199,16 @@ void BiasedWorkspace::select(const Request& request, Workspace& work,
                               sizeof(*mask), cudaMemcpyHostToDevice, stream),
               "Upload allowed token mask");
     }
-    check(apply_logit_bias(work.logits, logits, vocab_size, request.logit_bias,
-                          options.logit_bias->size(), allowed ? mask : nullptr, stream),
-          "Apply logit bias");
+    apply(request, work, options, allowed ? mask : nullptr, previous_token, stream);
     if (parameters) {
         check(sample_logits(logits, vocab_size, &work.argmax->token_id, *parameters,
-                            position, sampling, sampling_bytes, stream), "Sample biased logits");
+                            position, sampling, sampling_bytes, stream), "Sample adjusted logits");
     } else {
         check(text_argmax(logits, vocab_size, work.argmax_scratch, work.argmax, stream),
-              "Choose highest biased logit");
+              "Choose highest adjusted logit");
         if (allowed) {
             check(check_allowed_logit(logits, &work.argmax->token_id, stream),
-                  "Validate biased constrained token");
+                  "Validate adjusted constrained token");
         }
     }
 }
@@ -182,13 +216,13 @@ void BiasedWorkspace::select(const Request& request, Workspace& work,
 void RequestProgress::select(Request& request, Workspace& work, const DecoderOptions& options,
                              const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
                              void* sampling_workspace, cudaStream_t stream,
-                             const BiasedWorkspace* biased) {
+                             const AdjustedLogitsWorkspace* adjusted) {
     if (options.constraint) {
-        constraint.candidates(*options.constraint, remaining_output(options), biased != nullptr);
+        constraint.candidates(*options.constraint, remaining_output(options), adjusted != nullptr);
     }
-    if (biased) {
-        biased->select(request, work, options, options.constraint ? &constraint : nullptr,
-                       sampling, generated, stream);
+    if (adjusted) {
+        adjusted->select(request, work, options, options.constraint ? &constraint : nullptr,
+                         sampling, generated, last_token, stream);
     } else if (options.constraint) {
         select_constrained(work, scratch, constraint, sampling, generated, sampling_workspace,
                             stream);
@@ -205,14 +239,24 @@ void RequestProgress::select(Request& request, Workspace& work, const DecoderOpt
         check(cudaMemcpyAsync(logits.data(), work.logits, logits.size() * sizeof(Bf16),
                               cudaMemcpyDeviceToHost, stream), "Read decoder step logits");
     }
+    auto& adjusted_logits = transfers.adjusted_logits;
+    if (adjusted && !adjusted_logits.empty()) {
+        if (options.constraint) {
+            adjusted->apply(request, work, options, nullptr, -1, stream);
+        }
+        check(cudaMemcpyAsync(adjusted_logits.data(), adjusted->logits,
+                              adjusted_logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                              stream), "Read adjusted decoder step logits");
+    }
 }
 
 std::optional<DecoderFinishReason> RequestProgress::commit(const DecoderOptions& options, int token,
                                                            const Bf16* logits,
-                                                           SerialOutput* output) {
+                                                           SerialOutput* output,
+                                                           const float* adjusted_logits) {
     last_token = token;
     ++generated;
-    if (output && !output->emit(token, logits)) {
+    if (output && !output->emit(token, logits, adjusted_logits)) {
         return DecoderFinishReason::cancelled;
     }
     const int remaining = remaining_output(options);
@@ -274,16 +318,11 @@ private:
     bool owns_slot_;
 };
 
-std::vector<DecoderLogit> top_logits(const Bf16* scores, std::size_t count,
-                                    std::vector<DecoderLogit>& ranking,
-                                    const std::vector<DecoderLogitBias>* bias) {
+std::vector<DecoderLogit> top_logits(const Bf16* scores, const float* adjusted, std::size_t count,
+                                    std::vector<DecoderLogit>& ranking) {
     ranking.clear();
-    std::size_t entry = 0;
     for (int index = 0; index < vocab_size; ++index) {
-        float logit = __bfloat162float(scores[index]);
-        if (bias && entry < bias->size() && (*bias)[entry].token_id == index) {
-            logit += (*bias)[entry++].bias;
-        }
+        const float logit = adjusted ? adjusted[index] : __bfloat162float(scores[index]);
         if (!std::isnan(logit)) {
             ranking.push_back({index, logit});
         }
@@ -313,19 +352,19 @@ void prepare_serial_request(Request& request, const DecoderOptions& options) {
 
 }
 
-SerialOutput::SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result,
-                           const std::vector<DecoderLogitBias>* bias)
-    : callbacks_(callbacks), top_count_(top_count), result_(result), bias_(bias) {
+SerialOutput::SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result)
+    : callbacks_(callbacks), top_count_(top_count), result_(result) {
     if (top_count_ > 0) {
         ranking_.reserve(vocab_size);
     }
 }
 
-bool SerialOutput::emit(int token, const Bf16* logits) {
+bool SerialOutput::emit(int token, const Bf16* logits, const float* adjusted_logits) {
     result_.output_token_ids.push_back(token);
     const bool keep_running = !callbacks_.on_token || callbacks_.on_token(token);
     if (top_count_ > 0) {
-        result_.step_top_logits.push_back(top_logits(logits, top_count_, ranking_, bias_));
+        result_.step_top_logits.push_back(
+            top_logits(logits, adjusted_logits, top_count_, ranking_));
     }
     return keep_running;
 }
@@ -444,8 +483,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     const auto sampling = options.samples() ? std::optional{request_sampling(options)}
                                             : std::nullopt;
-    const bool biased = options.requires_target_only();
-    const RequestLease lease(request_in_use, !options.eager && !media && !biased);
+    const bool adjusted = options.requires_target_only();
+    const RequestLease lease(request_in_use, !options.eager && !media && !adjusted);
     std::unique_ptr<Request> eager_request;
     auto& storage = lease.owns_slot() ? decode_request : eager_request;
     try {
@@ -469,18 +508,19 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                                                 kv_limit);
         }
         auto& request = *storage;
-        BiasedWorkspace biased_workspace;
-        if (biased) {
+        AdjustedLogitsWorkspace adjusted_workspace;
+        if (adjusted) {
             request.reset();
-            request.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
-            biased_workspace.prepare(request.memory, request, options, request.memory.stream());
+            request.memory.transfers().adjusted_logits.resize(options.top_logits > 0
+                                                               ? vocab_size : 0);
+            adjusted_workspace.prepare(request.memory, request, options, request.memory.stream());
         } else {
             prepare_serial_request(request, options);
         }
         const auto prefill = media
             ? upload_media_positions(request, *media, request.memory.stream()) : MediaPrefill{};
         const int rotary_delta = media ? media->prompt.next_position - prompt_count : 0;
-        SerialOutput output(callbacks, options.top_logits, result, options.logit_bias.get());
+        SerialOutput output(callbacks, options.top_logits, result);
         result.peak_device_allocation_bytes += request.memory.bytes();
         const auto run_request = [&] {
             RequestProgress progress;
@@ -499,12 +539,14 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 advance_serial(request, progress, input, bool(media), rotary_delta);
                 progress.select(request, request.work, options, request.constraint_workspace,
                                 sampling ? &*sampling : nullptr, request.sampling_workspace,
-                                stream, biased ? &biased_workspace : nullptr);
+                                stream, adjusted ? &adjusted_workspace : nullptr);
                 check(cudaStreamSynchronize(stream), "Complete decoder step");
                 const int token = read_token(request, sampling.has_value(),
                                              options.constraint != nullptr);
-                const auto* logits = request.memory.transfers().logits.data();
-                if (const auto finish = progress.commit(options, token, logits, &output)) {
+                const auto& transfers = request.memory.transfers();
+                if (const auto finish = progress.commit(options, token, transfers.logits.data(),
+                                                        &output,
+                                                        transfers.adjusted_logits.data())) {
                     return *finish;
                 }
             }

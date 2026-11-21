@@ -4,7 +4,9 @@ Both `/v1/completions` and `/v1/chat/completions` can return the score of each c
 
 ## Request requirements
 
-Use greedy decoding and disable server MTP. Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Active sampling, output constraints, decoded media, and active chat reasoning or tool output parsers return HTTP 400 before SSE. The completion route accepts `echo: false` and rejects `echo: true`. Scores cover generated tokens only. [Score options](../apps/server/text_request.cpp#L289)<!-- prefix: "int openai_l" -->
+Use greedy decoding and disable server MTP. Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Active sampling, output constraints, decoded media, and active chat reasoning or tool output parsers return HTTP 400 before SSE. The completion route accepts `echo: false` and rejects `echo: true`. Scores cover generated tokens only. [Score options](../apps/server/text_request.cpp#L304)<!-- prefix: "int openai_l" -->
+
+Generated logprobs use the scores after [output penalties](output-penalties.md) and logit bias.
 
 ## Logit bias
 

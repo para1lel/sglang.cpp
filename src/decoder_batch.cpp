@@ -348,7 +348,7 @@ struct DecoderBatch::State {
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring,
                         const std::array<int, decoder_batch_max_lanes>& packed_slots,
                         const DecodeRun& run, Steps& results);
-    std::size_t reserve(DecoderOptions& request, int prompt, std::size_t media_bytes) const;
+    std::size_t reserve(DecoderOptions& request, int prompt, std::size_t extra_bytes) const;
     void initialize(Lane& lane);
     void drain(const char* operation, std::optional<Lane>* lane = nullptr) {
         try {
@@ -404,7 +404,7 @@ struct DecoderBatch::State {
     std::byte* logprob_workspace = nullptr;
     GeneratedLogprobReadback* logprob_readback = nullptr;
     ConstraintWorkspace constraint_workspace;
-    BiasedWorkspace biased_workspace;
+    AdjustedLogitsWorkspace adjusted_workspace;
     std::size_t resident_capacity = 0;
     int prefill_cursor = 0;
     bool failed = false;
@@ -432,7 +432,7 @@ int DecoderBatch::admit_multimodal(int slot, std::vector<int> prompt, const Deco
 }
 
 std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
-                                         std::size_t media_bytes) const {
+                                         std::size_t extra_bytes) const {
     if (!options.resident_memory_limit) {
         return 0;
     }
@@ -444,9 +444,9 @@ std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
     const auto unreserved = free - std::min(free, decoder_shared_reserve);
     request.max_new_tokens = limit_resident_output(
         prompt, request, resident_capacity, std::min(unreserved, resident_capacity - charged),
-        media_bytes);
+        extra_bytes);
     request.incremental_kv = false;
-    return media_bytes + request_resident_bytes(RequestProgress::capacity(prompt, request),
+    return extra_bytes + request_resident_bytes(RequestProgress::capacity(prompt, request),
         reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
         request.mtp_steps != 0);
 }
@@ -461,7 +461,7 @@ void DecoderBatch::State::initialize(Lane& lane) {
     lane.request->initialize(opts.incremental_kv ? prompt : lane.capacity(), stream,
                              opts.incremental_kv ? lane.capacity() : 0);
     if (opts.requires_target_only()) {
-        biased_workspace.prepare(execution, *lane.request, opts, stream);
+        adjusted_workspace.prepare(execution, *lane.request, opts, stream);
     }
     if (lane.media) {
         lane.media_prefill = upload_media_positions(*lane.request, *lane.media, stream);
@@ -530,12 +530,11 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
             state_->logprob_workspace =
                 state_->execution.allocate<std::byte>(generated_logprob_workspace_bytes());
         }
-        if (input) {
-            validate_feature_device(*input, state_->model.device);
-        }
+        if (input) validate_feature_device(*input, state_->model.device);
         reclaim_prefill_workspaces(state_->model.device);
         const auto resident = state_->reserve(options, static_cast<int>(prompt.size()),
-            input ? input->prompt.positions.size() * sizeof(MropePosition) : 0);
+            output_penalty_bytes(options) +
+            (input ? input->prompt.positions.size() * sizeof(MropePosition) : 0));
         if (options.max_new_tokens != requested.max_new_tokens) {
             validate_request(prompt, options, !media);
         }
@@ -606,24 +605,25 @@ bool DecoderBatch::available() const { return !state_->failed; }
 void DecoderBatch::State::score(int slot, Lane& lane, Workspace& work, bool logits_ready) {
     const auto stream = execution.stream();
     if (!logits_ready) model.compute_logits(work, stream);
-    auto* biased = lane.options.requires_target_only() ? &biased_workspace : nullptr;
+    auto* adjusted = lane.options.requires_target_only() ? &adjusted_workspace : nullptr;
     if (lane.options.generated_top_logprobs >= 0) {
-        if (biased) biased->select(*lane.request, work, lane.options, nullptr, nullptr, 0, stream);
+        if (adjusted) adjusted->select(*lane.request, work, lane.options, nullptr, nullptr,
+                                      lane.progress.generated, lane.progress.last_token, stream);
         check(enqueue_generated_logprobs(work.logits, vocab_size, work.argmax,
                                         lane.options.generated_top_logprobs, logprob_workspace,
                                         logprob_readback + slot, stream,
-                                        biased ? biased->logits : nullptr), "Score token");
+                                        adjusted ? adjusted->logits : nullptr), "Score token");
         return;
     }
-    if (!biased && lane.sampling && !sampling_workspace) {
+    if (!adjusted && lane.sampling && !sampling_workspace) {
         sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
     }
-    if (!biased && lane.options.constraint) {
+    if (!adjusted && lane.options.constraint) {
         constraint_workspace.allocate(execution, lane.options.constraint->uses_wide_mask());
     }
     lane.progress.select(*lane.request, work, lane.options, constraint_workspace,
                          lane.sampling ? &*lane.sampling : nullptr, sampling_workspace, stream,
-                         biased);
+                         adjusted);
 }
 
 void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& decode,

@@ -6,7 +6,7 @@ Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finit
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP request | Validate the constraint fields and compile with the checkpoint tokenizer. | [Request validation](../apps/server/text_request.cpp#L251)<!-- prefix: "void set_con" --> |
+| HTTP request | Validate the constraint fields and compile with the checkpoint tokenizer. | [Request validation](../apps/server/text_request.cpp#L266)<!-- prefix: "void set_con" --> |
 | Regular expression compiler | Build the token transition table and compute the minimum budget. | [Tokenizer compiler](../src/tokenizer/regex_constraint.cpp#L153)<!-- prefix: "std::shared_" --> |
 | Schema compiler | Convert the supported schema to a token constraint. | [Schema compiler](../src/tokenizer/json_schema.cpp#L435)<!-- prefix: "std::shared_" --> |
 | Tool-call constraint | Compile and cache the grammar for the selected functions and request mode. | [Tool grammar cache](../apps/server/chat_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" --> · [Trigger compiler](../src/tokenizer/regex_constraint.cpp#L166)<!-- prefix: "std::shared_" --> |
@@ -77,7 +77,7 @@ Send `response_format` with `POST /v1/chat/completions`. For `POST /v1/completio
 }
 ```
 
-`response_format` contains exactly `type` and `json_schema`. The descriptor requires `schema`. It accepts optional `strict: true`, a nonempty `name` of at most 64 bytes, and `description` of at most 256 bytes. A supplied `strict: false` is invalid. HTTP rejects `json_object`, `text`, and other format types. [Envelope validation](../apps/server/text_request.cpp#L217)<!-- prefix: "const json::" -->
+`response_format` contains exactly `type` and `json_schema`. The descriptor requires `schema`. It accepts optional `strict: true`, a nonempty `name` of at most 64 bytes, and `description` of at most 256 bytes. A supplied `strict: false` is invalid. HTTP rejects `json_object`, `text`, and other format types. [Envelope validation](../apps/server/text_request.cpp#L232)<!-- prefix: "const json::" -->
 
 | Schema | Supported output |
 | --- | --- |

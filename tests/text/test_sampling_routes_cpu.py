@@ -176,6 +176,32 @@ class Routes(unittest.TestCase):
                 ).encode()
                 self.exchange(route, duplicate, status=400)
 
+    def test_output_history_penalties(self):
+        names = ("frequency_penalty", "presence_penalty")
+        for route in ("/generate", TEXT, CHAT):
+            def payload(fields):
+                if route == "/generate":
+                    return {"input_ids": [32, 220], "sampling_params": {
+                        "max_new_tokens": 1, "temperature": 0, **fields,
+                    }}
+                return body(route, max_tokens=1, temperature=0, **fields)
+
+            for values in ((0, 0), (-2, 2), (2, -2), (-0.29, 1.125), (None, None)):
+                with self.subTest(route=route, values=values):
+                    request_body = payload(dict(zip(names, values)))
+                    if values[0] is None and route != "/generate":
+                        self.exchange(route, request_body, status=400)
+                    else:
+                        _, seen = self.exchange(route, request_body)
+                        self.assertEqual(tuple(seen[name] for name in names),
+                                         (0, 0) if values[0] is None else values)
+
+            for name in names:
+                for invalid in (-2.01, 2.01, True, "0.5", []):
+                    with self.subTest(route=route, name=name, invalid=invalid):
+                        self.exchange(route, {**payload({name: invalid}), "stream": True},
+                                      status=400)
+
     def completion(self, packet, seen, count, reason):
         choice, = packet["choices"]
         self.assertEqual(choice["finish_reason"], reason)

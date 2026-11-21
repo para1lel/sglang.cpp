@@ -79,6 +79,8 @@ void record_sampling(const DecoderOptions& options, std::size_t prompt_size) {
            << "cpu sampling {\"temperature\":" << options.temperature
            << ",\"top_k\":" << options.top_k << ",\"top_p\":" << options.top_p
            << ",\"min_p\":" << options.min_p
+           << ",\"frequency_penalty\":" << options.frequency_penalty
+           << ",\"presence_penalty\":" << options.presence_penalty
            << ",\"budget\":" << options.max_new_tokens << ",\"seed\":";
     if (options.seed) {
         output << *options.seed;

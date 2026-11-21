@@ -4,6 +4,7 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_constraint.h"
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/decoder_sampling.h"
 
 #include <array>
 #include <atomic>
@@ -31,24 +32,21 @@ struct VerificationSequence;
 struct VerificationRow;
 struct VerificationGraph;
 struct MtpRound;
-struct SamplingParameters;
 struct GeneratedLogprobReadback;
 
 using Bf16 = __nv_bfloat16;
 
 class SerialOutput {
 public:
-    SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result,
-                 const std::vector<DecoderLogitBias>* bias = nullptr);
+    SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result);
     const std::function<bool()>& cancel_probe() const { return callbacks_.is_cancelled; }
     bool cancelled() const { return cancel_probe() && cancel_probe()(); }
-    bool emit(int token, const Bf16* logits);
+    bool emit(int token, const Bf16* logits, const float* adjusted_logits);
 
 private:
     const DecoderCallbacks& callbacks_;
     const int top_count_;
     DecoderResult& result_;
-    const std::vector<DecoderLogitBias>* bias_;
     std::vector<DecoderLogit> ranking_;
 };
 
@@ -119,6 +117,7 @@ struct TransferBuffers {
     std::vector<std::int32_t> logical_pages;
     int winner = -1;
     std::vector<Bf16> logits;
+    std::vector<float> adjusted_logits;
     std::shared_ptr<void> verification_results;
     std::shared_ptr<void> mtp_constraint_inputs;
 };
@@ -326,7 +325,7 @@ struct Request {
     void grow_kv(int positions, int written, cudaStream_t stream);
     void reset(cudaStream_t stream);
     void reset();
-    void upload_logit_bias(const DecoderOptions& options, cudaStream_t stream);
+    void prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream);
     ExactGqaWorkspace batch_graph_scores();
 
     Allocations memory;
@@ -340,9 +339,12 @@ struct Request {
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;
     const DecoderLogitBias* logit_bias = nullptr;
+    OutputPenalties output_penalties;
 };
 
-struct BiasedWorkspace {
+std::size_t output_penalty_bytes(const DecoderOptions& options);
+
+struct AdjustedLogitsWorkspace {
     float* logits = nullptr;
     std::uint32_t* mask = nullptr;
     std::byte* sampling = nullptr;
@@ -352,7 +354,9 @@ struct BiasedWorkspace {
                  cudaStream_t stream);
     void select(const Request& request, Workspace& work, const DecoderOptions& options,
                 const ConstraintCursor* allowed, const SamplingParameters* parameters,
-                int position, cudaStream_t stream) const;
+                int position, int previous_token, cudaStream_t stream) const;
+    void apply(const Request& request, const Workspace& work, const DecoderOptions& options,
+               const std::uint32_t* allowed, int previous_token, cudaStream_t stream) const;
 };
 
 struct RequestProgress {
@@ -373,10 +377,11 @@ struct RequestProgress {
     void select(Request& request, Workspace& work, const DecoderOptions& options,
                 const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
                 void* sampling_workspace, cudaStream_t stream,
-                const BiasedWorkspace* biased = nullptr);
+                const AdjustedLogitsWorkspace* adjusted = nullptr);
     std::optional<DecoderFinishReason> commit(const DecoderOptions& options, int token,
                                               const Bf16* logits = nullptr,
-                                              SerialOutput* output = nullptr);
+                                              SerialOutput* output = nullptr,
+                                              const float* adjusted_logits = nullptr);
 };
 
 int validate_winner(int winner, bool sampled, bool constrained);

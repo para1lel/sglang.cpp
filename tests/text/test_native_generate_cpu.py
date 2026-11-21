@@ -162,6 +162,7 @@ class NativeGenerate(unittest.TestCase):
         }})
         implicit, explicit, nullable = receipts(self.log)[first:]
         expected = {"temperature": 1, "top_k": -1, "top_p": 1, "min_p": 0,
+                    "frequency_penalty": 0, "presence_penalty": 0,
                     "seed": None, "budget": 128, "sampled": True, "prompt_tokens": 1,
                     "stops": sorted(EOS), "logit_bias": []}
         self.assertEqual(implicit, expected)
@@ -185,7 +186,8 @@ class NativeGenerate(unittest.TestCase):
                 ("max_new_tokens", None), ("max_new_tokens", -1), ("max_new_tokens", 1.5),
                 ("n", 2), ("top_p", 0), ("temperature", -1), ("min_p", 2), ("top_k", 0),
                 ("sampling_seed", 2**63), ("ignore_eos", "yes"),
-                ("stop", ["X", 1]), ("stop_regex", "X"), ("regex", "X"), ("frequency_penalty", 0),
+                ("stop", ["X", 1]), ("stop_regex", "X"), ("regex", "X"),
+                ("frequency_penalty", 2.01),
             )],
             ({"text": "A", "sampling_params": {"stop_token_ids": [-1]}}, "vocabulary"),
             ({"input_ids": [0, 1], "sampling_params": {"max_new_tokens": 262143}}, "context"),

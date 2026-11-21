@@ -400,11 +400,30 @@ __device__ bool is_allowed(const std::uint32_t* mask, int token) {
 }
 
 __global__ void initialize_scores(const __nv_bfloat16* source, float* scores, int vocabulary,
-                                   const std::uint32_t* mask) {
+                                  const std::uint32_t* mask, OutputPenalties penalties,
+                                  int previous_token) {
     const int token = blockIdx.x * blockDim.x + threadIdx.x;
-    if (token < vocabulary) {
-        scores[token] = is_allowed(mask, token) ? __bfloat162float(source[token]) : -CUDART_INF_F;
+    if (token >= vocabulary) {
+        return;
     }
+    float total = 0.0f;
+    if (penalties.frequency_totals) {
+        total = penalties.frequency_totals[token];
+        if (token == previous_token) {
+            total += penalties.frequency;
+            penalties.frequency_totals[token] = total;
+        }
+    }
+    if (penalties.seen) {
+        if (token == previous_token) {
+            penalties.seen[token] = 1;
+        }
+        if (penalties.seen[token]) {
+            total += penalties.presence;
+        }
+    }
+    scores[token] = is_allowed(mask, token) ? __bfloat162float(source[token]) - total
+                                           : -CUDART_INF_F;
 }
 
 __global__ void add_bias(float* scores, const DecoderLogitBias* bias, int count) {
@@ -488,13 +507,13 @@ cudaError_t sample_logits(const float* scores, int vocabulary, int* token,
     return cudaGetLastError();
 }
 
-cudaError_t apply_logit_bias(const __nv_bfloat16* source, float* scores, int vocabulary,
-                            const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
-                            cudaStream_t stream) {
+cudaError_t adjust_logits(const __nv_bfloat16* source, float* scores, int vocabulary,
+                          const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
+                          OutputPenalties penalties, int previous_token, cudaStream_t stream) {
     initialize_scores<<<(vocabulary + group_size - 1) / group_size, group_size, 0, stream>>>(
-        source, scores, vocabulary, mask);
+        source, scores, vocabulary, mask, penalties, previous_token);
     const auto status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
+    if (status != cudaSuccess || count == 0) return status;
     add_bias<<<(count + group_size - 1) / group_size, group_size, 0, stream>>>(scores, bias, count);
     return cudaGetLastError();
 }

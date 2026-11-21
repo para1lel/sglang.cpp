@@ -15,6 +15,13 @@ struct SamplingParameters {
     double min_p = 0.0;
 };
 
+struct OutputPenalties {
+    float* frequency_totals = nullptr;
+    std::uint8_t* seen = nullptr;
+    float frequency = 0.0f;
+    float presence = 0.0f;
+};
+
 SamplingParameters request_sampling(const DecoderOptions& options);
 std::size_t sampling_workspace_bytes();
 cudaError_t sample_logits(const __nv_bfloat16* scores, int vocabulary, int* token,
@@ -24,9 +31,9 @@ std::size_t biased_sampling_workspace_bytes(int vocabulary);
 cudaError_t sample_logits(const float* scores, int vocabulary, int* token,
                           SamplingParameters parameters, int position, void* workspace,
                           std::size_t workspace_bytes, cudaStream_t stream);
-cudaError_t apply_logit_bias(const __nv_bfloat16* source, float* scores, int vocabulary,
-                            const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
-                            cudaStream_t stream);
+cudaError_t adjust_logits(const __nv_bfloat16* source, float* scores, int vocabulary,
+                          const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
+                          OutputPenalties penalties, int previous_token, cudaStream_t stream);
 cudaError_t check_allowed_logit(const float* scores, int* token, cudaStream_t stream);
 
 }

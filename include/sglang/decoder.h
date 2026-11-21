@@ -46,10 +46,16 @@ struct DecoderOptions {
     bool incremental_kv = false;
     int generated_top_logprobs = -1;
     std::shared_ptr<const std::vector<DecoderLogitBias>> logit_bias;
+    double frequency_penalty = 0.0;
+    double presence_penalty = 0.0;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 
-    bool requires_target_only() const { return logit_bias && !logit_bias->empty(); }
+    bool has_output_penalties() const { return frequency_penalty != 0 || presence_penalty != 0; }
+
+    bool requires_target_only() const {
+        return has_output_penalties() || (logit_bias && !logit_bias->empty());
+    }
 
     bool stops_at(int token) const {
         return stop_token_id == token || additional_stop_token_ids.count(token) != 0;

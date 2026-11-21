@@ -165,8 +165,23 @@ void set_logit_bias(const json::Object& object, DecoderOptions& options) {
     }
 }
 
+double sampling_penalty(const json::Object& object, std::string_view key) {
+    const auto* value = json::get(object, key);
+    if (!value) {
+        return 0.0;
+    }
+    const auto penalty = sampling_number(*value);
+    if (!penalty || !std::isfinite(*penalty) || *penalty < -2 || *penalty > 2) {
+        const auto message = std::string(key) + " must be a finite number in [-2, 2]";
+        bad_request(message.c_str());
+    }
+    return *penalty;
+}
+
 void set_sampling(const json::Object& object, DecoderOptions& options,
                   std::string_view seed_key = "seed") {
+    options.frequency_penalty = sampling_penalty(object, "frequency_penalty");
+    options.presence_penalty = sampling_penalty(object, "presence_penalty");
     if (const auto* value = json::get(object, "temperature")) {
         const auto temperature = sampling_number(*value);
         if (!temperature || !std::isfinite(*temperature) || *temperature < 0) {
@@ -414,7 +429,7 @@ bool is_text_option(std::string_view key) {
         key == "return_token_ids" || key == "logprobs" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
         key == "min_p" || key == "logit_bias" || key == "ebnf" || key == "regex" ||
-        key == "response_format" ||
+        key == "frequency_penalty" || key == "presence_penalty" || key == "response_format" ||
         key == "cache_salt";
 }
 
@@ -724,7 +739,8 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
                 continue;
             } else if (key == "temperature" || key == "top_p" || key == "top_k" ||
                        key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
-                       key == "stop_token_ids" || key == "logit_bias") {
+                       key == "stop_token_ids" || key == "logit_bias" ||
+                       key == "frequency_penalty" || key == "presence_penalty") {
                 if (!parameter.is_null()) {
                     sampling.emplace(key, parameter);
                 }

@@ -228,7 +228,8 @@ struct Dispatch {
 };
 
 constexpr Dispatch flash{"flash_prefill_attentionILi88ELb1ELb1EE", 12, head_blocks, 1, 352};
-constexpr Dispatch tmem_split{"tmem_flash_attention", rows / 64, head_blocks, 3, 384};
+constexpr Dispatch tmem_ordered{"tmem_flash_attentionILb1EE", rows / 64, head_blocks, 1, 384};
+constexpr Dispatch tmem_split{"tmem_flash_attentionILb0EE", rows / 64, head_blocks, 3, 384};
 constexpr Dispatch tmem_merge{"tmem_merge", rows, head_blocks, 1, channels};
 constexpr Dispatch exact{"attention_kernel", rows, mxfp8_query_heads};
 constexpr Dispatch multirow{"multirow_prefill_attention", rows / 4};
@@ -545,9 +546,8 @@ void check_long_causality(Input& input, DeviceInput& device, int position,
                 prefix, suffix_differences);
 }
 
-void check_tmem_lower_edge(Input& input, DeviceInput& device, Dispatch eligible,
+void check_tmem_lower_edge(Input& input, DeviceInput& device, int first, Dispatch eligible,
                            cudaStream_t stream) {
-    constexpr int first = 32768;
     constexpr int key_tile = 64;
     device.run("TMEM aligned start below lower bound", input, first - key_tile, flash,
                attention_samples(input, first - key_tile), stream);
@@ -555,12 +555,13 @@ void check_tmem_lower_edge(Input& input, DeviceInput& device, Dispatch eligible,
                attention_samples(input, first - 1), stream);
     const auto samples = attention_samples(input, first);
     device.run("TMEM first aligned start", input, first, eligible, samples, stream,
-               {.repeat_graph = eligible.grid_depth > 1});
+               {.repeat_graph = std::string_view(eligible.kernel) != flash.kernel});
     device.run("TMEM nonaligned start", input, first + 1, flash,
                attention_samples(input, first + 1), stream);
-    device.run("TMEM unaligned key", input, first, protected_rows, samples, stream,
+    const auto unaligned = first + rows <= 32768 ? multirow : protected_rows;
+    device.run("TMEM unaligned key", input, first, unaligned, samples, stream,
                {.key_offset = 1});
-    device.run("TMEM unaligned value", input, first, protected_rows, samples, stream,
+    device.run("TMEM unaligned value", input, first, unaligned, samples, stream,
                {.value_offset = 1});
 }
 
@@ -571,20 +572,33 @@ void check_long_flash(cudaStream_t stream) {
     constexpr int partial = rows - 1;
     constexpr Dispatch partial_protected{"protected_prefill_attention", partial};
     const char* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
-    const auto eligible = setting && std::string_view(setting) == "1" ? tmem_split : flash;
+    const std::string_view mode = setting ? setting : "";
+    const bool ordered = mode == "ordered";
+    const auto eligible = ordered ? tmem_ordered : (mode == "1" ? tmem_split : flash);
+    const int wide_scale_control = ordered ? ordered_visible + 1 : ordered_visible;
     Input input(aligned_above_limit);
     DeviceInput device(input);
     for (int visible : {ordered_visible, ordered_visible + 1}) {
         const int position = visible - rows;
         const auto label = std::to_string(visible) + " visible";
         const auto samples = attention_samples(input, position);
-        const auto baseline = device.run(label.c_str(), input, position, flash, samples, stream);
-        if (visible == ordered_visible) {
+        const auto expected = ordered && visible == ordered_visible ? tmem_ordered : flash;
+        const auto baseline = device.run(label.c_str(), input, position, expected, samples, stream);
+        if (visible == wide_scale_control) {
             constexpr Dispatch sync{"flash_prefill_attentionILi64ELb0ELb0EE", rows / 64};
-            const auto unaligned = device.run("32768 unaligned key scales", input, position,
+            const auto scale_label = label + " with unaligned key scales";
+            const auto unaligned = device.run(scale_label.c_str(), input, position,
                                               sync, samples, stream, {.key_scale_offset = 1});
             if (std::memcmp(unaligned.data(), baseline.data(), baseline.size() * sizeof(BFloat))) {
                 throw std::runtime_error("Unaligned Flash scales changed the wide tile output");
+            }
+        }
+        if (ordered && visible == ordered_visible) {
+            const auto unaligned = device.run("32768 ordered TMEM with unaligned scales",
+                                              input, position, tmem_ordered, samples, stream,
+                                              {.key_scale_offset = 1, .value_scale_offset = 1});
+            if (std::memcmp(unaligned.data(), baseline.data(), baseline.size() * sizeof(BFloat))) {
+                throw std::runtime_error("Unaligned scales changed the ordered TMEM output");
             }
         }
         if (visible == ordered_visible + 1) {
@@ -600,7 +614,7 @@ void check_long_flash(cudaStream_t stream) {
     device.run("32769 partial tile", input, ordered_visible + 1 - partial, partial_protected,
                attention_samples(input, ordered_visible + 1 - partial, partial), stream,
                {.count = partial});
-    check_tmem_lower_edge(input, device, eligible, stream);
+    check_tmem_lower_edge(input, device, ordered ? 8192 : 32768, eligible, stream);
     for (int visible : {65536, 98304}) {
         const int position = visible - rows;
         const auto label = std::to_string(visible) + " visible";

@@ -723,12 +723,13 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     if (rows >= min_flash_rows && rows <= flash_chunk && visible <= flash_limit &&
         (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
         (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
-        if (rows == flash_chunk && position >= max_multirow_visible_tokens &&
-            position % flash_keys == 0) {
+        if (rows == flash_chunk && position >= 8192 && position % flash_keys == 0) {
             const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
-            if (setting && std::string_view(setting) == "1") {
+            const std::string_view mode = setting ? setting : "";
+            const bool ordered = mode == "ordered";
+            if (ordered || (mode == "1" && position >= max_multirow_visible_tokens)) {
                 if (const auto status = launch_tmem_prefill(cache, pages, position, queries,
-                                                           output, stream)) {
+                                                           output, stream, ordered)) {
                     return *status;
                 }
             }

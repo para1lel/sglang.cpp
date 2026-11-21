@@ -95,9 +95,10 @@ export CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}"
 checker="${BUILD_WORK_DIR:?set the printed build directory}/build/bin/mxfp8-gqa-check"
 env -u SGLANG_EXPERIMENTAL_TMEM_PREFILL "$checker"
 SGLANG_EXPERIMENTAL_TMEM_PREFILL=1 "$checker"
+SGLANG_EXPERIMENTAL_TMEM_PREFILL=ordered "$checker"
 ```
 
-Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero in both [dispatch modes](flash-prefill.md#verification). The [verifier](../tests/mxfp8_gqa_check.cu#L639)<!-- prefix: "void run_che" --> covers append, attention, and page reuse with packed KV and BF16.
+Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero in all three runs. The [Flash checks](flash-prefill.md#verification) verify regular Flash with TMEM unset, four graph nodes with split TMEM, and one with ordered TMEM. The [verifier](../tests/mxfp8_gqa_check.cu#L639)<!-- prefix: "void run_che" --> covers append, attention, and page reuse with packed KV and BF16.
 
 The [ordered decode check](../tests/mxfp8_gqa_check.cu#L541)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 

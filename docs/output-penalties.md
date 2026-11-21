@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Request options | Validate the wire values and populate `DecoderOptions`. | [HTTP validation](../apps/server/text_request.cpp#L168)<!-- prefix: "double sampl" --> · [Native defaults](../apps/server/text_request.cpp#L740)<!-- prefix: "const auto* " --> · [C++ options](../include/sglang/decoder.h#L49)<!-- prefix: "double frequ" --> |
 | Decoder | Keep each item's history and choose its execution path. | [Batch depth](../src/decoder_batch.cpp#L506)<!-- prefix: "if (options." --> · [Direct execution](../src/decoder.cpp#L533)<!-- prefix: "const Reques" --> |
-| CUDA score adjustment | Update history and rank the adjusted scores. | [History update](../src/decoder_sampling.cu#L411)<!-- prefix: "__device__ f" --> · [Repetition selection](../src/decoder_sampling.cu#L856)<!-- prefix: "cudaError_t " --> |
+| CUDA score adjustment | Update history and rank the adjusted scores. | [History update](../src/decoder_sampling.cu#L411)<!-- prefix: "__device__ f" --> · [Repetition selection](../src/decoder_sampling.cu#L868)<!-- prefix: "cudaError_t " --> |
 
 ## Runtime path
 
@@ -14,7 +14,7 @@ The first output uses an empty history. Before selecting each subsequent output,
 
 For a seen ID, CUDA then multiplies a negative score by `repetition_penalty` or divides a nonnegative score by it. It applies this scaling once per score regardless of how often the ID appeared. Values above one discourage reuse, and values below one encourage it. Prompt IDs, including reused prefixes, do not seed this history.
 
-Repetition scaling uses FP64 and preserves a zero score. Extreme rows keep a separate exponent, a low-order arithmetic residual, and small bias differences alongside large values. CUDA ranks these scores before subtracting the row maximum for probability calculations. Greedy selection breaks equal represented scores by token ID.
+Repetition scaling uses FP64 and preserves a zero score. Ordinary rows rank the adjusted FP32 scores and use FP64 score differences for normalization. Extreme rows keep a separate exponent, a low-order arithmetic residual, and small bias differences alongside large values. CUDA ranks these scores before subtracting the row maximum for probability calculations. Greedy selection breaks equal represented scores by token ID.
 
 CUDA applies any output constraint mask and then adds [logit bias](openai-logprobs.md#logit-bias). For extreme rows, ranking and normalization subtract the repetition-adjusted bases before applying the bias difference. This preserves a small bias between equal large scores. Direct C++ `top_logits` reports ranked scores before constraint masking. For extreme rows with a finite maximum, the readback subtracts that maximum and limits the reported difference to the finite FP32 range. Reported logprobs also use a finite FP32 lower bound. Selection and normalization use the scores before either reporting limit. [Direct score readback](../src/decoder.cpp#L287)<!-- prefix: "if (adjusted" -->
 

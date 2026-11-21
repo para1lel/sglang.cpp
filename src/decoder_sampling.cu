@@ -600,7 +600,8 @@ __global__ void encode_repetition(RepetitionScratch scratch, int vocabulary,
         const float value = entry.repeated && isfinite(base)
             ? static_cast<float>(base < 0 ? base * repetition : base / repetition)
             : entry.base;
-        entry.score = {scaled_score(entry.bias ? value + entry.bias : value), {}};
+        entry.base = entry.bias ? value + entry.bias : value;
+        entry.score = {scaled_score(entry.base), {}};
         entry.bias = 0;
         return;
     }
@@ -641,12 +642,19 @@ __device__ __noinline__ ScaledScore score_difference(const RepetitionEntry& left
 
 struct RepetitionOrder {
     const RepetitionEntry* entries;
+    const unsigned* wide;
 
     __device__ bool operator()(int left, int right) const {
         if (left < 0) return false;
         if (right < 0) return true;
         const auto& left_entry = entries[left];
         const auto& right_entry = entries[right];
+        if (!*wide) {
+            const float first = left_entry.base;
+            const float second = right_entry.base;
+            if (isnan(first) != isnan(second)) return isnan(second);
+            return first == second || isnan(first) ? left < right : first > second;
+        }
         const auto lhs = left_entry.score;
         const auto rhs = right_entry.score;
         const double first = lhs.high.fraction;
@@ -686,7 +694,7 @@ __global__ void repetition_argmax(RepetitionScratch scratch, int count, bool con
                                   int* winner) {
     using Reduce = cub::BlockReduce<int, group_size>;
     __shared__ typename Reduce::TempStorage temp;
-    const RepetitionWinner best{{scratch.entries}, constrained};
+    const RepetitionWinner best{{scratch.entries, &scratch.state->wide}, constrained};
     int token = -1;
     for (int index = blockIdx.x * group_size + threadIdx.x; index < count;
          index += gridDim.x * group_size) {
@@ -700,9 +708,10 @@ __global__ void repetition_argmax(RepetitionScratch scratch, int count, bool con
 }
 
 __device__ double score_distance(const RepetitionEntry& score, const RepetitionEntry& maximum,
-                                  double temperature) {
+                                  double temperature, bool wide) {
     if (!isfinite(score.score.high.fraction)) return -CUDART_INF;
-    const auto distance = score_difference(score, maximum);
+    const auto distance = wide ? score_difference(score, maximum) :
+        scaled_score(static_cast<double>(score.base) - static_cast<double>(maximum.base));
     int exponent;
     const double fraction = frexp(temperature, &exponent);
     return fmin(0.0, scalbn(distance.fraction / fraction, distance.exponent - exponent));
@@ -714,7 +723,7 @@ __global__ void repetition_weights(RepetitionScratch scratch, int count, double 
         const auto& maximum = scratch.entries[scratch.ranked[0]];
         const auto& score = scratch.entries[scratch.ranked[rank]];
         scratch.weights[rank] = !scratch.state->invalid && isfinite(maximum.score.high.fraction)
-            ? exp(score_distance(score, maximum, temperature)) : 0.0;
+            ? exp(score_distance(score, maximum, temperature, scratch.state->wide)) : 0.0;
     }
 }
 
@@ -740,7 +749,8 @@ __global__ void score_repetition(RepetitionScratch scratch, int vocabulary, int 
         const int id = scratch.ranked[rank];
         const auto& maximum = scratch.entries[winner];
         const auto& score = scratch.entries[id];
-        const double logprob = score_distance(score, maximum, 1.0) - log(mass);
+        const double logprob = score_distance(score, maximum, 1.0, scratch.state->wide) -
+            log(mass);
         scratch.state->logprobs.alternatives[rank] = {
             id, static_cast<float>(fmax(-static_cast<double>(FLT_MAX), logprob))};
     }
@@ -755,7 +765,8 @@ __global__ void export_repetition(RepetitionScratch scratch, DecoderLogit* outpu
         const auto& maximum = scratch.entries[scratch.ranked[0]];
         if (scratch.state->wide && isfinite(score.score.high.fraction) &&
             isfinite(maximum.score.high.fraction)) {
-            display = fmax(-static_cast<double>(FLT_MAX), score_distance(score, maximum, 1.0));
+            display = fmax(-static_cast<double>(FLT_MAX), score_distance(score, maximum, 1.0,
+                                                                        true));
         }
         output[rank] = {isnan(display) ? -1 : id, static_cast<float>(display)};
     }
@@ -845,7 +856,8 @@ std::size_t repetition_workspace_bytes(int vocabulary, bool ranked) {
     std::size_t scan = 0;
     if (ranked) {
         cub::DeviceMergeSort::SortKeys(
-            nullptr, sort, static_cast<int*>(nullptr), vocabulary, RepetitionOrder{nullptr});
+            nullptr, sort, static_cast<int*>(nullptr), vocabulary,
+            RepetitionOrder{nullptr, nullptr});
         cub::DeviceScan::InclusiveSum(
             nullptr, scan, static_cast<double*>(nullptr), static_cast<double*>(nullptr),
             vocabulary);
@@ -893,7 +905,9 @@ cudaError_t select_repetition_logits(
     }
     auto temp_bytes = bytes - scratch.overhead;
     status = cub::DeviceMergeSort::SortKeys(scratch.temporary, temp_bytes, scratch.ranked,
-                                           vocabulary, RepetitionOrder{scratch.entries}, stream);
+                                           vocabulary,
+                                           RepetitionOrder{scratch.entries, &scratch.state->wide},
+                                           stream);
     if (status != cudaSuccess) return status;
     if (selection.debug) {
         const int count = selection.debug_count;

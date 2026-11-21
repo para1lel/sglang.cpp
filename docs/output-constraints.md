@@ -1,7 +1,7 @@
 # Native output constraints
 
 Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finite-choice-constraints), a regular expression, or the JSON Schema subset below. Pick one constraint per request. JSON and SSE use the same constraint. These whole-output constraints keep reasoning and tool markers in chat `content`. Text chat can also select a [tool-call constraint](#tool-call-constraints) that feeds the chat output parsers.
-`POST /generate` accepts the same regular expression subset in [`sampling_params.regex`](#native-generate).
+`POST /generate` accepts the same subsets through [`sampling_params.regex`](#native-generate) and [`sampling_params.json_schema`](#native-json-schema).
 
 ## Responsibilities and sources of truth
 
@@ -111,6 +111,25 @@ Output is compact JSON. Object keys follow `properties` order even if `required`
 The root counts as level one. A schema may have up to five levels and 64 nodes. The expanded pattern can use up to 8,192 bytes. Compilation allows up to 4,096 nondeterministic states and 1,024 deterministic states before minimization. After minimization, the 256-state and 4,194,304-token-transition limits apply. HTTP returns 400 for malformed schemas, unsupported keywords, compiler limits, and insufficient budget.
 
 C++ callers can pass an ordered schema object to `TokenConstraint::compile_json_schema(tokenizer, schema)`. Parse the schema with `json::Syntax::ordered` to preserve property order.
+
+### Native JSON Schema
+
+Put the serialized schema in `sampling_params.json_schema` on `POST /generate`. For example, a Python client can use `json.dumps(schema)` for this field. The field accepts a string containing the schema itself.
+
+```json
+{
+  "text": "Is the order ready?",
+  "sampling_params": {
+    "json_schema": "{\"enum\":[\"ready\",\"pending\"]}",
+    "max_new_tokens": 16,
+    "temperature": 0
+  }
+}
+```
+
+Omission, null, and `""` disable the constraint. Two active fields among `regex` and `json_schema` return HTTP 400. A broadcast sampling object shares compilation across items. An array of sampling objects can mix schemas, regexes, and unconstrained items. Each item has its own cursor and budget. JSON and cumulative SSE return the generated JSON as a string in `text`.
+
+The [schema subset](#json-schema) and [native finish rules](#native-generate) apply. A complete match at the token cap reports `length` unless a stop takes precedence. Text stops can trim the displayed JSON. Use model EOS handling and omit `stop_token_ids`. Zero or insufficient budget, malformed or unsupported schemas, and generated logprobs on the same constrained item return HTTP 400 before decoder admission or SSE headers. An unconstrained sibling can request generated logprobs. [Native validation](../apps/server/native_generate.cpp#L496)<!-- prefix: "void set_gen" -->
 
 ### Selection and finish
 

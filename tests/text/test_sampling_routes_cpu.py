@@ -176,6 +176,48 @@ class Routes(unittest.TestCase):
                 ).encode()
                 self.exchange(route, duplicate, status=400)
 
+    def test_native_schema_validation_precedes_submission(self):
+        schema = json.dumps({"type": "null"})
+        invalid = (
+            *[({"json_schema": value}, {}, "must be a string")
+              for value in ({}, False, 0, [])],
+            ({"json_schema": "{"}, {}, "must contain valid JSON"),
+            ({"json_schema": '{"type":"null","type":"string"}'}, {}, "must contain valid JSON"),
+            ({"json_schema": "true"}, {}, "JSON Schema"),
+            ({"json_schema": '{"$ref":"#"}'}, {}, "JSON Schema"),
+            ({"json_schema": schema, "regex": "A"}, {}, "Use one of"),
+            ({"json_schema": schema, "regex": False}, {}, "regex must be a string"),
+            ({"json_schema": schema, "max_new_tokens": 0}, {}, "max_new_tokens"),
+            ({"json_schema": '{"enum":["a b c d"]}', "max_new_tokens": 1}, {},
+             "max_new_tokens"),
+            ({"json_schema": schema, "ignore_eos": True}, {}, "model EOS"),
+            ({"json_schema": schema, "stop_token_ids": []}, {}, "model EOS"),
+            ({"json_schema": schema, "temperature": 0}, {"return_logprob": True}, "logprobs"),
+            ([{"json_schema": schema}, {"json_schema": "["}], {"input_ids": [[32], [33]]},
+             "must contain valid JSON"),
+            ({}, {"json_schema": schema}, "Unsupported"),
+        )
+        first = len(receipts(self.log))
+        for params, fields, message in invalid:
+            for stream in (False, True):
+                with self.subTest(params=params, fields=fields, stream=stream):
+                    payload = {"input_ids": [32], "sampling_params": params,
+                               "stream": stream, **fields}
+                    status, result = send(self.port, "/generate", payload)
+                    self.assertEqual(status, 400, result)
+                    self.assertIn(message, result["error"]["message"])
+        self.assertEqual(len(receipts(self.log)), first)
+
+    def test_native_schema_null_and_empty_use_plain_sampling(self):
+        for fields in ({}, {"json_schema": None}, {"json_schema": ""}):
+            with self.subTest(fields=fields):
+                item, _ = self.exchange("/generate", {
+                    "input_ids": [32], "sampling_params": {"max_new_tokens": 1, **fields},
+                })
+                self.assertEqual(item["output_ids"], [32])
+                self.assertEqual(item["meta_info"]["finish_reason"],
+                                 {"type": "length", "length": 1})
+
     def test_output_history_penalties(self):
         names = ("frequency_penalty", "presence_penalty")
         for route in ("/generate", TEXT, CHAT):

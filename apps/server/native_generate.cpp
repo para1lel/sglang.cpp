@@ -1,5 +1,5 @@
+#include "sglang/decoder_constraint.h"
 #include "sglang/server/native_generate.h"
-
 #include "sglang/server/http.h"
 #include "sglang/server/text_completion.h"
 #include "sglang/server/text_stop.h"
@@ -491,6 +491,44 @@ void NativeGenerate::abort(const Socket& connection, std::string_view body) {
         service_.notify_abort();
     }
     write_json(connection, "200 OK", "");
+}
+
+void set_generate_json_schema(const json::Object& sampling, const Tokenizer& tokenizer,
+                              DecoderOptions& options) {
+    const auto* schema = json::get(sampling, "json_schema");
+    if (!schema) {
+        return;
+    }
+    const auto encoded = schema->string();
+    if (!encoded) {
+        throw std::invalid_argument("sampling_params.json_schema must be a string");
+    }
+    if (encoded->empty()) {
+        return;
+    }
+    if (const auto* regex = json::get(sampling, "regex")) {
+        const auto pattern = regex->string();
+        if (!pattern) {
+            throw std::invalid_argument("regex must be a string");
+        }
+        if (!pattern->empty()) {
+            throw std::invalid_argument("Use one of sampling_params.json_schema and "
+                                        "sampling_params.regex");
+        }
+    }
+    if (options.ignore_eos || json::get(sampling, "stop_token_ids")) {
+        throw std::invalid_argument("JSON Schema requires model EOS stops without "
+                                    "stop_token_ids overrides");
+    }
+    try {
+        const auto parsed = json::parse(*encoded, json::Syntax::ordered);
+        options.constraint = TokenConstraint::compile_json_schema(tokenizer, parsed);
+    } catch (const json::ParseError&) {
+        throw std::invalid_argument("sampling_params.json_schema must contain valid JSON");
+    }
+    if (options.max_new_tokens < options.constraint->minimum_tokens()) {
+        throw std::invalid_argument("max_new_tokens cannot complete the JSON Schema");
+    }
 }
 
 }

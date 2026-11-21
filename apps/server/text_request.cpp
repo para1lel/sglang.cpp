@@ -773,7 +773,7 @@ DecoderOptions generate_options(const json::Value* params, const CompletionToken
                        key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
                        key == "stop_token_ids" || key == "logit_bias" ||
                        key == "frequency_penalty" || key == "presence_penalty" ||
-                       key == "repetition_penalty" || key == "regex") {
+                       key == "repetition_penalty" || key == "regex" || key == "json_schema") {
                 if (!parameter.is_null()) {
                     sampling.emplace(key, parameter);
                 }
@@ -786,6 +786,7 @@ DecoderOptions generate_options(const json::Value* params, const CompletionToken
     set_sampling(sampling, options, "sampling_seed");
     set_logit_bias(sampling, options);
     set_stops(sampling, options);
+    set_generate_json_schema(sampling, tokenizer.get(), options);
     if (const auto* regex = json::get(sampling, "regex"); regex && regex->string() != "") {
         set_constraint(sampling, tokenizer, options, "max_new_tokens cannot complete the regex");
     }

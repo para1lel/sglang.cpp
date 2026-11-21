@@ -334,7 +334,12 @@ __device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
                      "fence.proxy.async.shared::cta;"
                      :: "r"(copy), "r"(mma) : "memory");
         if constexpr (Paired) {
-            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
+                         "mbarrier.init.shared::cta.b64 [%1], 2;\n"
+                         "fence.proxy.async.shared::cta;\n"
+                         "fence.mbarrier_init.release.cluster;"
+                         :: "r"(tmem_smem(&tile.value_ready)),
+                            "r"(tmem_smem(&tile.key_ready)) : "memory");
         }
     }
     if constexpr (Paired) {
@@ -354,8 +359,8 @@ __device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
 template <bool Ordered, typename Tile>
 __device__ __forceinline__ void tmem_softmax_tile(Tile& tile, Word row_address, Word mma,
                                                  int position, int first, int begin,
-                                                 FlashSoftmax& state) {
-    tmem_mma_wait(mma, 0);
+                                                 FlashSoftmax& state, Word phase = 0) {
+    tmem_mma_wait(mma, phase);
     const int member = threadIdx.x;
     const int visible = position + member / ordered_heads - first + 1;
     const float history = first + flash_keys <= position + 1 ?
@@ -487,9 +492,10 @@ __device__ void pair_copy_payload(const CUtensorMap* map, void* destination, Wor
                     "r"(page * pair_page_halves), "r"(barrier) : "memory");
 }
 
+template <int Issuer = 0>
 __device__ void pair_prefetch(PairPayload& raw, Attention request, const PairMaps& maps,
                               int first, int kv_head, int rank, Word barrier) {
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == Issuer) {
         const int page = request.pages[first / mxfp8_page_size];
         const int head = kv_head * channels;
         const int scales = page * mxfp8_kv_heads + kv_head;
@@ -525,6 +531,25 @@ __device__ void pair_repair(PairTile& tile, Attention request,
     }
 }
 
+__device__ __forceinline__ void pair_publish_key(Word key) {
+    asm volatile("fence.proxy.async.shared::cta;\n"
+                 "bar.sync 1, %0;" :: "n"(tmem_producers) : "memory");
+    if (threadIdx.x == flash_queries) {
+        asm volatile("{ .reg .u32 leader;\n"
+                     "mapa.shared::cluster.u32 leader, %0, 0;\n"
+                     "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [leader]; }"
+                     :: "r"(key) : "memory");
+    }
+}
+
+__device__ __forceinline__ void pair_wait_key(Word key, Word phase) {
+    asm volatile("{ .reg .pred ready;\n"
+                 "KEY_WAIT: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ready,"
+                 " [%0], %1;\n"
+                 "@!ready bra.uni KEY_WAIT; }"
+                 :: "r"(key), "r"(phase) : "memory");
+}
+
 template <bool PartialPage>
 __launch_bounds__(tmem_threads, 1) __attribute__((cluster_dims(2, 1, 1)))
 __global__ void tmem_pair_attention(Attention request, const __grid_constant__ PairMaps maps) {
@@ -543,6 +568,8 @@ __global__ void tmem_pair_attention(Attention request, const __grid_constant__ P
     const bool issuer = rank == 0 && threadIdx.x == 0;
     const Word copy = tmem_smem(&tile.copy_ready);
     const Word mma = tmem_smem(&tile.mma_ready);
+    const Word value = tmem_smem(&tile.value_ready);
+    const Word key = tmem_smem(&tile.key_ready);
     tmem_initialize<true>(tile, warp, copy, mma);
     tmem_stage_query(tile, request, row, head);
     __syncthreads();
@@ -554,22 +581,28 @@ __global__ void tmem_pair_attention(Attention request, const __grid_constant__ P
     }
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     pair.sync();
+    if (mxfp8_page_size < full_end) {
+        pair_prefetch(tile.raw[1], request, maps, mxfp8_page_size, kv_head, rank, copy);
+    }
     const Word row_address = tile.tmem + ((warp * 32) << 16);
     FlashSoftmax state{-CUDART_INF_F, 0.0f};
     for (int first = 0; first < end; first += flash_keys) {
         const int page = first / mxfp8_page_size;
         const int buffer = page & 1;
+        const Word phase = (first / flash_keys) & 1;
         const int next = first + flash_keys;
         const bool next_page = next % mxfp8_page_size == 0;
-        if (!next_page && first + mxfp8_page_size < full_end) {
-            pair_prefetch(tile.raw[1 - buffer], request, maps, first + mxfp8_page_size,
-                          kv_head, rank, copy);
-        }
         if (issuer) {
+            if (first != 0) {
+                pair_wait_key(key, phase ^ 1);
+            }
             tmem_query_key<true>(tile, mma);
         }
+        if (first != 0) {
+            tmem_mma_wait(value, phase ^ 1);
+        }
         if (softmax) {
-            tmem_softmax_tile<true>(tile, row_address, mma, position, first, 0, state);
+            tmem_softmax_tile<true>(tile, row_address, mma, position, first, 0, state, phase);
         } else {
             pair_stage_kv<false, PartialPage>(tile, tile.raw[buffer], first, rank, request,
                                              kv_head, full_end, end);
@@ -577,7 +610,7 @@ __global__ void tmem_pair_attention(Attention request, const __grid_constant__ P
         }
         pair.sync();
         if (issuer) {
-            tmem_probability_value<true>(tile, mma, first != 0);
+            tmem_probability_value<true>(tile, value, first != 0);
         }
         if (!softmax && next < end) {
             if (next_page && next < full_end) {
@@ -585,11 +618,14 @@ __global__ void tmem_pair_attention(Attention request, const __grid_constant__ P
             }
             pair_stage_kv<true, PartialPage>(tile, tile.raw[buffer ^ static_cast<int>(next_page)],
                                             next, rank, request, kv_head, full_end, end);
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            pair_publish_key(key);
+            if (next_page && next + mxfp8_page_size < full_end) {
+                pair_prefetch<flash_queries>(tile.raw[buffer], request, maps,
+                                             next + mxfp8_page_size, kv_head, rank, copy);
+            }
         }
-        tmem_mma_wait(mma, 1);
-        pair.sync();
     }
+    tmem_mma_wait(value, ((end - 1) / flash_keys) & 1);
     if (softmax) {
         tmem_store_output(row_address, state, request, row, head);
     }

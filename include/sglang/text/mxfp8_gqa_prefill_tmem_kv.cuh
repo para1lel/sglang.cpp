@@ -32,6 +32,8 @@ struct alignas(1024) PairTile {
     Word tmem;
     alignas(8) unsigned long long copy_ready;
     alignas(8) unsigned long long mma_ready;
+    alignas(8) unsigned long long value_ready;
+    alignas(8) unsigned long long key_ready;
 };
 
 static_assert(mxfp8_page_size == 2 * flash_keys && mxfp8_page_size == 2 * flash_rows);

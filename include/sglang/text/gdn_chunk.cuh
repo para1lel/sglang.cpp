@@ -46,10 +46,12 @@ using ARow = mma::fragment<mma::matrix_a, tile, tile, tile, Bf16, mma::row_major
 using BCol = mma::fragment<mma::matrix_b, tile, tile, tile, Bf16, mma::col_major>;
 using Acc = mma::fragment<mma::accumulator, tile, tile, tile, float>;
 
+template<int PrepareThreads>
 __device__ __forceinline__ void stage_qk(Bf16* target, const Bf16* convolved,
-                                        int first, int valid, int head) {
+                                        int first, int valid, int qk_head) {
     constexpr int vectors_per_row = dimension / vector_elements;
-    for (int vector = threadIdx.x; vector < 2 * rows * vectors_per_row; vector += threads) {
+    for (int vector = threadIdx.x; vector < 2 * rows * vectors_per_row;
+         vector += PrepareThreads) {
         const int row = vector / vectors_per_row;
         const int position = row % rows;
         const int component = vector % vectors_per_row * vector_elements;
@@ -57,41 +59,43 @@ __device__ __forceinline__ void stage_qk(Bf16* target, const Bf16* convolved,
         uint4 value{};
         if (position < valid) {
             const auto* source = convolved + static_cast<std::size_t>(first + position) *
-                text_gdn_qkv_width + plane * text_gdn_qk_width + head / group * dimension;
+                text_gdn_qkv_width + plane * text_gdn_qk_width + qk_head * dimension;
             value = *reinterpret_cast<const uint4*>(source + component);
         }
         *reinterpret_cast<uint4*>(target + row * key_stride + component) = value;
     }
 }
 
+template<int SharedHeads>
 __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved,
-                                                 const float2* gates, Matrices* matrices) {
+                                                const float2* gates, Matrices* matrices) {
+    constexpr int prepare_warps = warps * SharedHeads;
     const int first = blockIdx.y * rows;
     if (first >= count) {
         return;
     }
     __shared__ alignas(32) Bf16 qk[2 * rows * key_stride];
     __shared__ alignas(32) float dots[2 * rows * rows];
-    __shared__ float lower[rows * rows];
-    __shared__ float decay[rows];
-    __shared__ float beta[rows];
-    const int head = blockIdx.x;
+    __shared__ float lower[SharedHeads][rows * rows];
+    __shared__ float decay[SharedHeads][rows];
+    __shared__ float beta[SharedHeads][rows];
+    const int first_head = blockIdx.x * SharedHeads;
     const int valid = min(count - first, rows);
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    auto& matrix = matrices[blockIdx.y * heads + head];
+    auto* chunk = matrices + blockIdx.y * heads + first_head;
 
-    stage_qk(qk, convolved, first, valid, head);
-    if (threadIdx.x < rows) {
-        const auto gate = threadIdx.x < valid
-            ? gates[(first + threadIdx.x) * heads + head] : make_float2(1.0f, 0.0f);
-        decay[threadIdx.x] = gate.x;
-        beta[threadIdx.x] = gate.y;
-        matrix.beta[threadIdx.x] = gate.y;
+    stage_qk<threads * SharedHeads>(qk, convolved, first, valid, first_head / group);
+    if (warp < SharedHeads) {
+        const auto gate = lane < valid
+            ? gates[(first + lane) * heads + first_head + warp] : make_float2(1.0f, 0.0f);
+        decay[warp][lane] = gate.x;
+        beta[warp][lane] = gate.y;
+        chunk[warp].beta[lane] = gate.y;
     }
     __syncthreads();
 
-    for (int task = warp; task < 2 * time_tiles * time_tiles; task += warps) {
+    for (int task = warp; task < 2 * time_tiles * time_tiles; task += prepare_warps) {
         const int plane = task / (time_tiles * time_tiles);
         const int target = task / time_tiles % time_tiles * tile;
         const int source = task % time_tiles * tile;
@@ -114,34 +118,37 @@ __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved
     }
     __syncthreads();
 
-    if (threadIdx.x < rows) {
-        const int target = threadIdx.x;
+    if (warp < SharedHeads) {
+        auto& matrix = chunk[warp];
         float product = 1.0f;
-        for (int source = target; source >= 0; --source) {
-            const int index = target * rows + source;
-            lower[source * rows + target] = source < target
-                ? product * beta[target] * dots[rows * rows + index] : 0.0f;
+        for (int source = lane; source >= 0; --source) {
+            const int index = lane * rows + source;
+            lower[warp][source * rows + lane] = source < lane
+                ? product * beta[warp][lane] * dots[rows * rows + index] : 0.0f;
             matrix.scores[index] = __float2bfloat16(product * dots[index]);
-            if (target == rows - 1) {
+            if (lane == rows - 1) {
                 matrix.tail[source] = product;
             }
-            product *= decay[source];
+            product *= decay[warp][source];
         }
-        matrix.initial[target] = product;
+        matrix.initial[lane] = product;
     }
-    for (int index = threadIdx.x; index < rows * rows; index += threads) {
+    const int value_head = warp / warps;
+    const int head_warp = warp % warps;
+    auto& matrix = chunk[value_head];
+    for (int index = head_warp * 32 + lane; index < rows * rows; index += threads) {
         if (index / rows < index % rows) {
             matrix.scores[index] = __float2bfloat16(0.0f);
         }
     }
     __syncthreads();
 
-    for (int column = warp; column < rows; column += warps) {
+    for (int column = head_warp; column < rows; column += warps) {
         float inverse = lane == column ? 1.0f : 0.0f;
         for (int pivot = column; pivot < rows - 1; ++pivot) {
             const float solved = __shfl_sync(0xffffffffu, inverse, pivot);
             if (lane > pivot) {
-                inverse = fmaf(-lower[pivot * rows + lane], solved, inverse);
+                inverse = fmaf(-lower[value_head][pivot * rows + lane], solved, inverse);
             }
         }
         matrix.inverse[lane * rows + column] = __float2bfloat16(inverse);
@@ -150,12 +157,12 @@ __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved
 
 __global__ void prepare(int count, const Bf16* convolved, const float2* gates,
                         Matrices* matrices) {
-    prepare_segment(count, convolved, gates, matrices);
+    prepare_segment<1>(count, convolved, gates, matrices);
 }
 
 __global__ void prepare_segments(const __grid_constant__ Segments segments) {
     const auto& segment = segments.values[blockIdx.z];
-    prepare_segment(segment.count, segment.convolved, segment.gates, segment.matrices);
+    prepare_segment<group>(segment.count, segment.convolved, segment.gates, segment.matrices);
 }
 #else
 __global__ void prepare(int, const Bf16*, const float2*, Matrices*) {
@@ -224,8 +231,8 @@ inline cudaError_t launch_segments(Segments segments, int count, int max_rows,
                                    cudaStream_t stream) {
     void* args[] = {&segments};
     const auto chunks = (max_rows + rows - 1) / rows;
-    const auto status = cudaLaunchKernel(prepare_segments, dim3(heads, chunks, count),
-                                         dim3(threads), args, 0, stream);
+    const auto status = cudaLaunchKernel(prepare_segments, dim3(text_gdn_qk_heads, chunks, count),
+                                         dim3(threads * group), args, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }

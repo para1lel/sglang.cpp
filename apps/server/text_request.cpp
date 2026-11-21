@@ -285,7 +285,7 @@ const json::Value& response_schema(const json::Value& value) {
 }
 
 void set_constraint(const json::Object& object, const CompletionTokenizer& tokenizer,
-                    DecoderOptions& options) {
+                    DecoderOptions& options, const char* budget_error = nullptr) {
     const auto* regex = json::get(object, "regex");
     const auto* ebnf = json::get(object, "ebnf");
     const auto* schema = json::get(object, "response_format");
@@ -318,7 +318,7 @@ void set_constraint(const json::Object& object, const CompletionTokenizer& token
             : TokenConstraint::compile(tokenizer.get(), *value->string());
     }
     if (options.max_new_tokens < options.constraint->minimum_tokens()) {
-        bad_request(options.constraint->budget_error());
+        bad_request(budget_error ? budget_error : options.constraint->budget_error());
     }
 }
 
@@ -744,7 +744,7 @@ void validate_generate_fields(const json::Object& object) {
     }
 }
 
-DecoderOptions generate_options(const json::Value* params, const json::Value* salt) {
+DecoderOptions generate_options(const json::Value* params, const CompletionTokenizer& tokenizer) {
     DecoderOptions options;
     options.max_new_tokens = 128;
     options.temperature = 1.0;
@@ -773,7 +773,7 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
                        key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
                        key == "stop_token_ids" || key == "logit_bias" ||
                        key == "frequency_penalty" || key == "presence_penalty" ||
-                       key == "repetition_penalty") {
+                       key == "repetition_penalty" || key == "regex") {
                 if (!parameter.is_null()) {
                     sampling.emplace(key, parameter);
                 }
@@ -786,8 +786,8 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
     set_sampling(sampling, options, "sampling_seed");
     set_logit_bias(sampling, options);
     set_stops(sampling, options);
-    if (salt && !salt->is_null()) {
-        set_cache_salt_value(*salt, options);
+    if (const auto* regex = json::get(sampling, "regex"); regex && regex->string() != "") {
+        set_constraint(sampling, tokenizer, options, "max_new_tokens cannot complete the regex");
     }
     return options;
 }
@@ -868,6 +868,9 @@ void generate_logprob_options(const GenerateInput& input, std::size_t index, Bat
         bad_request("Expected boolean return_text_in_logprobs");
     }
     if (enabled && enabled->boolean() == true) {
+        if (item.options.constraint) {
+            bad_request("Generated logprobs do not support response constraints");
+        }
         if (item.options.samples()) {
             bad_request("return_logprob requires greedy sampling");
         }
@@ -914,31 +917,28 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
     const auto& prompt = *json::get(input.fields, input.text ? "text" : "input_ids");
     const auto* params = json::get(input.fields, "sampling_params");
     const auto* salt = json::get(input.fields, "cache_salt");
+    const auto* list = input.batch ? prompt.array() : nullptr;
+    const auto* param_list = list ? generate_parameter_list(params, input.count, false) : nullptr;
+    const auto* salt_list = list ? generate_parameter_list(salt, input.count, true) : nullptr;
+    const auto broadcast = param_list ? DecoderOptions{} : generate_options(params, tokenizer);
+    const auto broadcast_stops = param_list ? nullptr : generate_stops(params, tokenizer);
     std::vector<BatchPrompt> items;
     items.reserve(input.count);
-    if (!input.batch) {
-        items.push_back(generate_prompt(prompt, input.text,
-                                       generate_options(params, salt), tokenizer,
-                                       generate_stops(params, tokenizer)));
-        generate_logprob_options(input, 0, items.back());
-        return items;
-    }
-    const auto& list = *prompt.array();
-    const auto* param_list = generate_parameter_list(params, input.count, false);
-    const auto* salt_list = generate_parameter_list(salt, input.count, true);
-    const auto broadcast_stops = param_list ? nullptr : generate_stops(params, tokenizer);
     int remaining = checkpoint_context;
     for (std::size_t index = 0; index < input.count; ++index) {
-        auto options = generate_options(param_list ? &(*param_list)[index] : params,
-                                        salt_list ? &(*salt_list)[index] : salt);
+        auto options = param_list ? generate_options(&(*param_list)[index], tokenizer) : broadcast;
+        const auto* item_salt = salt_list ? &(*salt_list)[index] : salt;
+        if (item_salt && !item_salt->is_null()) {
+            set_cache_salt_value(*item_salt, options);
+        }
         remaining -= options.max_new_tokens;
         if (remaining < 0) {
             bad_request("Batch output budgets must total at most 262144 tokens");
         }
         const auto stops = param_list ? generate_stops(&(*param_list)[index], tokenizer)
                                       : broadcast_stops;
-        items.push_back(generate_prompt(list[index], input.text, std::move(options), tokenizer,
-                                        stops));
+        items.push_back(generate_prompt(list ? (*list)[index] : prompt, input.text,
+                                        std::move(options), tokenizer, stops));
         generate_logprob_options(input, index, items.back());
     }
     return items;

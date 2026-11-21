@@ -1,6 +1,7 @@
 # Native output constraints
 
 Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finite-choice-constraints), a regular expression, or the JSON Schema subset below. Pick one constraint per request. JSON and SSE use the same constraint. These whole-output constraints keep reasoning and tool markers in chat `content`. Text chat can also select a [tool-call constraint](#tool-call-constraints) that feeds the chat output parsers.
+`POST /generate` accepts the same regular expression subset in [`sampling_params.regex`](#native-generate).
 
 ## Responsibilities and sources of truth
 
@@ -52,6 +53,24 @@ The pattern must contain 1 to 1,024 UTF-8 bytes after JSON decoding. Escape a re
 
 Compilation allows up to 4,096 nondeterministic states, 256 deterministic states, and 4,194,304 token transitions. It builds transitions from checkpoint token bytes, including pieces that split UTF-8 scalars. A token can span several pattern positions. Only complete UTF-8 matches can accept.
 
+### Native generate
+
+Set `sampling_params.regex` to constrain generated text in `POST /generate`. Omission, null, and `""` disable the constraint. A broadcast sampling object shares the compiled pattern. Each item tracks its own progress. Use a sampling object array for distinct patterns.
+
+```json
+{
+  "text": ["Order number:", "Status:"],
+  "sampling_params": [
+    {"regex": "ORD-[0-9]{2}", "max_new_tokens": 12, "temperature": 0},
+    {"regex": "ready|pending", "max_new_tokens": 8, "temperature": 0}
+  ]
+}
+```
+
+An accepting state with no continuation finishes immediately, including below `min_new_tokens`. An early grammar finish reports `stop` with the last generated ID as `matched` and includes its text. A match at the token budget reports `length` unless a text stop or model EOS wins that step. While a match can continue, `min_new_tokens` masks model EOS until the minimum is reached. An explicit text stop can finish earlier and trim the displayed match.
+
+Use model EOS handling and omit `stop_token_ids` when a pattern is active. An invalid pattern, insufficient budget, or same-item generated-token logprob request returns HTTP 400 before decoder submission. A batch can contain both constrained items and unconstrained scored items.
+
 ### JSON Schema
 
 Send `response_format` with `POST /v1/chat/completions`. For `POST /v1/completions`, replace `messages` with `prompt`. Chat returns the generated JSON as a string in `message.content`. Text returns it in `choices[0].text`. For SSE, join the text deltas before parsing the JSON.
@@ -99,7 +118,7 @@ Each request owns its cursor. For whole-output constraints, the cursor excludes 
 
 For whole-output constraints, a match with no continuation stops immediately. Acceptance at the last allowed token also stops. Neither case adds EOS. With budget left at a match that can continue, either model EOS ID can compete with valid continuations. A selected EOS counts in usage and diagnostic IDs. Its text is omitted. A nullable regex with `max_tokens: 0` returns no IDs and `finish_reason: "length"`. A completed match during decoding returns `stop`.
 
-HTTP 400 covers conflicting constraints, invalid input, compiler limits, and an impossible token budget. Omit `stop_token_ids` entirely. Leave `ignore_eos` false. Omit nonempty text stops. The benchmark model and HTTP media chat reject `regex` and `response_format`. At K0, a full prefix hit uses the new request's constraint and seed for its first eager selection. [Prefix reuse](prefix-cache.md#runtime-path)
+HTTP 400 covers conflicting constraints, invalid input, compiler limits, and an impossible token budget. Omit `stop_token_ids` entirely. Leave `ignore_eos` false. OpenAI routes require omitting nonempty text stops when using a constraint. `/generate` applies its [native text stops and finish metadata](#native-generate). The benchmark model and HTTP media chat reject `regex` and `response_format`. At K0, a full prefix hit uses the new request's constraint and seed for its first eager selection. [Prefix reuse](prefix-cache.md#runtime-path)
 
 C++ callers can use `TokenConstraint::compile_regex(tokenizer, pattern)` with the checkpoint tokenizer. Use the [shared C++ constraint options](text-serving.md#finite-choice-constraints).
 

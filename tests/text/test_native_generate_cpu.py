@@ -188,7 +188,7 @@ class NativeGenerate(unittest.TestCase):
                 ("max_new_tokens", None), ("max_new_tokens", -1), ("max_new_tokens", 1.5),
                 ("n", 2), ("top_p", 0), ("temperature", -1), ("min_p", 2), ("top_k", 0),
                 ("sampling_seed", 2**63), ("ignore_eos", "yes"),
-                ("stop", ["X", 1]), ("stop_regex", "X"), ("regex", "X"),
+                ("stop", ["X", 1]), ("stop_regex", "X"), ("regex", 1),
                 ("frequency_penalty", 2.01), ("repetition_penalty", 0),
             )],
             ({"text": "A", "sampling_params": {"stop_token_ids": [-1]}}, "vocabulary"),
@@ -223,6 +223,36 @@ class NativeGenerate(unittest.TestCase):
                 self.assertEqual(content_type, "application/json")
                 self.assertIn("message", json.loads(data)["error"])
         self.assertEqual(len(receipts(self.log)), first)
+
+    def test_regex_request_validation(self):
+        invalid = (
+            ({"regex": "["}, {}, "regex"),
+            ({"regex": "A", "max_new_tokens": 0}, {}, "max_new_tokens"),
+            ({"regex": "A", "ignore_eos": True}, {}, "model EOS"),
+            ({"regex": "A", "stop_token_ids": [32]}, {}, "model EOS"),
+            ({"regex": "A", "temperature": 0}, {"return_logprob": True}, "logprobs"),
+        )
+        first = len(receipts(self.log))
+        for params, fields, message in invalid:
+            with self.subTest(params=params, fields=fields):
+                status, result = send(self.port, GENERATE, {
+                    "text": "A", "stream": True, "sampling_params": params, **fields,
+                })
+                self.assertEqual(status, 400, result)
+                self.assertIn(message, result["error"]["message"])
+        status, result = send(self.port, GENERATE, {
+            "input_ids": [[32], [33]], "sampling_params": [{"regex": "A"}, {"regex": False}],
+        })
+        self.assertEqual(status, 400, result)
+        self.assertIn("regex must be a string", result["error"]["message"])
+        self.assertEqual(len(receipts(self.log)), first)
+        items = self.generate({
+            "text": ["A", "B"], "sampling_params": [
+                {"regex": None, "max_new_tokens": 1}, {"regex": "", "max_new_tokens": 1},
+            ],
+        })
+        for item in items:
+            self.check_packet(item, "A", [32], {"type": "length", "length": 1})
 
     def test_batch_shape_and_input_order(self):
         log = self.output / "batch-order.log"

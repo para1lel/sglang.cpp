@@ -17,6 +17,10 @@ std::string_view finish_type(const DecoderResult& result, const DecoderOptions& 
     const auto& ids = result.output_token_ids;
     const auto budget = static_cast<std::size_t>(options.max_new_tokens);
     const bool matched_stop = !ids.empty() && options.stops_at(ids.back());
+    if (result.finish_reason == DecoderFinishReason::constraint &&
+        options.constraint && !ids.empty() && ids.size() <= budget) {
+        return ids.size() == budget && !matched_stop ? "length" : "stop";
+    }
     if (result.finish_reason == DecoderFinishReason::stop &&
         (matched_stop || result.matched_text_stop) &&
         ids.size() <= budget) {
@@ -350,7 +354,8 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
     }
     if (!slot) {
         complete_aborted(connection, tokenizer.get(), input, items);
-    } else if (!input.batch && !items.front().text_stops && !scored) {
+    } else if (!input.batch && !items.front().text_stops && !scored &&
+               !items.front().options.constraint) {
         complete_single(connection, service, *slot, tokenizer, items.front(), input.stream);
     } else if (input.stream) {
         stream_batch(connection, service, *slot, tokenizer, items, input.batch);

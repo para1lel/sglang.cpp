@@ -834,25 +834,26 @@ std::optional<cudaError_t> decoder::try_batched_paged_prefill(
     bool partial = false;
     const auto& first = sequences[0];
     const bool ragged = default_ragged_prefill(first.cache, first.position, first.rows);
+    constexpr int early_grouped_min_position = 4096;
+    bool early_ragged = count <= 3 && multiprocessors == 148;
+    bool below_ragged_floor = false;
+    for (int index = 0; index < count; ++index) {
+        const auto& sequence = sequences[index];
+        if (!valid_paged_prefill_sequence(sequence, min_flash_rows, max_multirow_visible_tokens)) {
+            return std::nullopt;
+        }
+        early_ragged = early_ragged && sequence.rows == 256 &&
+            sequence.position >= early_grouped_min_position;
+        below_ragged_floor |= sequence.position < default_ragged_min_position;
+    }
+    if (early_ragged && below_ragged_floor) {
+        if (const auto result = launch_batched_ragged_tmem(sequences, count, stream)) {
+            return result;
+        }
+    }
     for (int index = 0; index < count; ++index) {
         const auto& sequence = sequences[index];
         const auto& cache = sequence.cache;
-        if (sequence.rows < min_flash_rows || sequence.rows >= flash_chunk ||
-            sequence.position < 0 ||
-            sequence.position > max_multirow_visible_tokens - sequence.rows ||
-            !sequence.pages.device_pages || !sequence.queries || !sequence.output ||
-            !cache.key_payload || !cache.value_payload ||
-            !cache.key_scales || !cache.value_scales ||
-            reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) ||
-            reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) ||
-            reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) ||
-            reinterpret_cast<std::uintptr_t>(cache.value_scales) % alignof(std::uint64_t)) {
-            return std::nullopt;
-        }
-        const int last_page = (sequence.position + sequence.rows - 1) / mxfp8_page_size;
-        if (last_page >= sequence.pages.page_count || last_page >= cache.page_count) {
-            return std::nullopt;
-        }
         const bool lane_ragged = default_ragged_prefill(cache, sequence.position, sequence.rows);
         if (lane_ragged != ragged || (ragged && sequence.rows > 384)) {
             return std::nullopt;

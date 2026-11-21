@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder prefill | Own the arena and lend two scratch spans during GQA. | [Tile layout](../src/decoder_prefill.cpp#L173)<!-- prefix: "TileBuffers(" --> · [Scratch view](../src/decoder_prefill.cpp#L195)<!-- prefix: "PairedPrefil" --> |
-| Native Flash dispatcher | Try staged attention within the default paired route. | [Selection](../src/mxfp8_gqa_prefill.cu#L936)<!-- prefix: "const bool d" --> |
+| Native Flash dispatcher | Try staged attention within the default paired route. | [Selection](../src/mxfp8_gqa_prefill.cu#L937)<!-- prefix: "const bool d" --> |
 | Paired launcher | Check bounds and capture state, then submit predecode and attention on the caller's stream. | [Staged launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L389)<!-- prefix: "std::optiona" --> |
 
 ## Runtime path
@@ -41,7 +41,7 @@ Eligible text steps that contain both prefill and decode can also group whole gr
 
 The step reuses one stream-ordered arena. Its row capacity covers the largest real group or original scalar tile. Grouped work writes every real row before use, with no per-segment padding clears. If the larger allocation is unavailable, the step retries the original capacity before starting any grouped work. Tensor-prefix caching, MTP, media, and ineligible grants retain their existing paths. Use `--trace-batches` to inspect grouped rows alongside the original grants. [Step guard](../src/decoder_batch.cpp#L771)<!-- prefix: "const bool l" --> · [Allocation fallback](../src/decoder_prefill.cpp#L746)<!-- prefix: "if (!workspa" -->
 
-Within an existing projection group, compatible GQA grants can share one CUDA launch. Each grant keeps its query tiles, page table, cache position, and output slice. The launch keeps the default Flash or ordered ragged TMEM tile for each grant. Groups with incompatible routes or an unavailable grouped kernel use the lane-local reader. The group uses the same arena. [Group dispatch](../src/decoder_prefill.cpp#L448)<!-- prefix: "void read_pa" --> · [Kernel selection](../src/mxfp8_gqa_prefill.cu#L815)<!-- prefix: "std::optiona" -->
+Within an existing projection group, compatible GQA grants can share one CUDA launch. Each grant keeps its query tiles, page table, cache position, and output slice. On B200, two or three 256-row grants can try ordered ragged TMEM when every start is at least 4,096. When the early route is unavailable, dispatch resumes grouped Flash, grouped TMEM, and lane-local selection. The group uses the same arena. [Group dispatch](../src/decoder_prefill.cpp#L448)<!-- prefix: "void read_pa" --> · [Kernel selection](../src/mxfp8_gqa_prefill.cu#L815)<!-- prefix: "std::optiona" -->
 
 ## Verification
 

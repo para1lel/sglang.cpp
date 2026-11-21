@@ -449,5 +449,22 @@ inline bool paired_kernel_unavailable(cudaError_t status) {
            status == cudaErrorNotSupported;
 }
 
+inline bool valid_paged_prefill_sequence(const decoder::PagedPrefillSequence& sequence,
+                                        int min_rows, int max_visible) {
+    const auto& cache = sequence.cache;
+    if (sequence.rows < min_rows || sequence.rows >= flash_chunk ||
+        sequence.position < 0 || sequence.position > max_visible - sequence.rows ||
+        !sequence.pages.device_pages || !sequence.queries || !sequence.output ||
+        !cache.key_payload || !cache.value_payload || !cache.key_scales || !cache.value_scales ||
+        reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) ||
+        reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) ||
+        reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) ||
+        reinterpret_cast<std::uintptr_t>(cache.value_scales) % alignof(std::uint64_t)) {
+        return false;
+    }
+    const int last_page = (sequence.position + sequence.rows - 1) / mxfp8_page_size;
+    return last_page < sequence.pages.page_count && last_page < cache.page_count;
+}
+
 }
 }

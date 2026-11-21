@@ -15,7 +15,8 @@ constexpr int warp_size = 32;
 constexpr int accum_stages = 2;
 constexpr int packed_wide_tile_cols = 256;
 
-template <int Rows, int Cols, int Copies, int Batch, int Resident, int CopyBatch = 1>
+template <int Rows, int Cols, int Copies, int Batch, int Resident, int CopyBatch = 1,
+          bool Compact = false>
 struct Tile {
     static constexpr int rows = Rows;
     static constexpr int cols = Cols;
@@ -23,8 +24,8 @@ struct Tile {
     static constexpr int batch = Batch;
     static constexpr int resident = Resident;
     static constexpr bool wide = Cols == packed_wide_tile_cols;
-    static constexpr int warp_cols = wide ? group_size : (Cols < 64 ? Cols : 64);
-    static constexpr int partial_cols = wide ? 16 : warp_cols;
+    static constexpr int warp_cols = wide || Compact ? group_size : (Cols < 64 ? Cols : 64);
+    static constexpr int partial_cols = wide || Compact ? 16 : warp_cols;
     static constexpr int consumers = Rows * Cols / (warp_size * warp_cols);
     static constexpr int threads = (consumers + 2) * warp_size;
     static constexpr int stage_bytes = (Rows + Cols) * group_size;
@@ -37,6 +38,7 @@ struct Tile {
     static_assert(Rows == 128 || (Rows == 64 && Cols == 128));
     static_assert(group_size % 32 == 0 && (group_size % Cols == 0 || wide));
     static_assert(Copies % CopyBatch == 0);
+    static_assert(!Compact || (Rows == 128 && Cols == 128));
     static_assert(tmem_cols >= 32 && tmem_cols <= 512 && (tmem_cols & (tmem_cols - 1)) == 0);
 };
 
@@ -636,6 +638,15 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
     const bool packed_mlp_chunk = projections.size() == 2 &&
                                   output.slices[0].width == 17408 &&
                                   output.slices[1].width == 17408;
+    if (rows == 768 && in_width == 5120 && packed_mlp_chunk) {
+        using GateUpTile = Tile<128, 128, 3, 1, 2, 1, true>;
+        const auto compact = launch_tma<GateUpTile>(
+            first.weight, first.scales, input, rows, total_width, in_width, output,
+            stream, device, rows / GateUpTile::rows);
+        if (compact) {
+            return compact;
+        }
+    }
     if (rows == 1024 && in_width == 5120 && wide_slices &&
         (packed_mlp_chunk || total_width == 16384 || total_width == 14336)) {
         const auto wide = launch_tma<Tile<128, packed_wide_tile_cols, 4, 1, 1>>(

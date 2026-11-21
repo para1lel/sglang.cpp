@@ -341,7 +341,7 @@ struct DecoderBatch::State {
     Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats);
     void submit(const Selection& selected, const PrefillRows& decode, Steps& results,
                 DecoderBatchStepStats& stats, bool& contains_mtp);
-    void prefill(const PrefillRows& rows, int max_rows, DecoderBatchStepStats& stats);
+    void prefill(const PrefillRows& rows, bool only_prefill, DecoderBatchStepStats& stats);
     void score(int slot, Lane& lane, Workspace& work, bool logits_ready);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats);
@@ -694,7 +694,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
                                        !contains_mtp &&
                                            model.fp8_prefill() == Fp8PrefillPolicy::tensor_core,
                                        greedy_winners});
-    prefill(rows, max_rows, stats);
+    if (max_rows) prefill(rows, count == 0 && !contains_mtp, stats);
     bool submitted = count != 0 || max_rows > 1;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = scoring[slot]) {
@@ -724,57 +724,33 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     collect_scores(scoring, packed_slots, run, results);
 }
 
-void DecoderBatch::State::prefill(const PrefillRows& rows, int max_rows,
+void DecoderBatch::State::prefill(const PrefillRows& rows, bool only_prefill,
                                   DecoderBatchStepStats& stats) {
-    if (max_rows == 0) {
-        return;
-    }
     const auto stream = execution.stream();
     const int budget = options.max_num_batched_tokens;
     const int cache_tile = tensor_cache && budget ? cache_prefill_tile(budget) : 0;
     const int tile_limit = cache_tile ? cache_tile : batch_prefill_tile_rows;
     const bool wide = !cache_tile && model.is_b200() &&
         model.fp8_prefill() == Fp8PrefillPolicy::tensor_core && sm100_prefill_enabled();
-    const auto tile_rows = [&](const Lane& lane, int count) {
-        int limit = lane.draft || lane.media ? prefill_chunk_rows : tile_limit;
-        if (wide && !lane.draft && !lane.media && lane.prompt.size() <= sm100_prefill_max_visible) {
-            limit = serial_prefill_max_rows;
-        }
-        return std::min(count, limit);
-    };
-    int capacity = 1;
-    for (int slot = 0; slot < options.max_lanes; ++slot) {
-        if (rows[slot] > 1) {
-            capacity = std::max(capacity, tile_rows(*storage->slots[slot], rows[slot]));
-        }
-    }
-    PrefillWorkspace workspace(stream, capacity);
-    if (tensor_cache && max_rows > 1 && !workspace.data()) {
-        throw std::runtime_error("Tensor-core prefix cache requires a prefill workspace");
-    }
-    stats.prefill_workspace_bytes = workspace.bytes();
+    std::array<PrefillGrant, decoder_batch_max_lanes> grants;
+    int count = 0;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (rows[slot] == 0) {
             continue;
         }
         auto& lane = *storage->slots[slot];
-        if (rows[slot] == 1 && lane.draft && lane.prefill_limit() > 1) {
-            const int position = lane.progress.position;
-            model.seed_draft(lane.request->work, *lane.draft, position,
-                             lane.prompt[position + 1], stream);
-        } else if (rows[slot] > 1) {
-            const auto* media = lane.media ? &lane.media_prefill : nullptr;
-            for (int offset = 0; offset < rows[slot];) {
-                const int count = tile_rows(lane, rows[slot] - offset);
-                const int position = lane.progress.position + offset;
-                model.prefill_chunk(*lane.request, lane.prompt.data() + position, count,
-                                    position, workspace, lane.draft.get(),
-                                    lane.prefill_limit() - offset, media);
-                offset += count;
-            }
+        int limit = lane.draft || lane.media ? prefill_chunk_rows : tile_limit;
+        if (wide && !lane.draft && !lane.media && lane.prompt.size() <= sm100_prefill_max_visible) {
+            limit = serial_prefill_max_rows;
         }
+        const int position = lane.progress.position;
+        grants[count++] = {lane.request.get(), lane.prompt.data() + position, position, rows[slot],
+                           std::min(rows[slot], limit), lane.prefill_limit(), lane.draft.get(),
+                           lane.media ? &lane.media_prefill : nullptr};
     }
-    workspace.close();
+    const bool layerwise = only_prefill && !tensor_cache && budget > 0 &&
+        budget <= decoder_default_max_num_batched_tokens;
+    model.prefill_grants(grants.data(), count, stream, tensor_cache, layerwise, stats);
 }
 
 void DecoderBatch::State::collect_scores(

@@ -93,15 +93,16 @@ void trace_batch_details(const Steps& steps, const DecoderBatchStepStats& stats,
                          int max_active, int max_num_batched_tokens, int mtp_steps) {
     std::string line = "batch prefill_rows=";
     for (int slot = 0; slot < std::max(max_active, decoder_batch_max_mtp_lanes); ++slot) {
-        if (slot != 0) {
-            line += ',';
-        }
-        line += std::to_string(stats.prefill_rows[slot]);
+        line += (slot == 0 ? "" : ",") + std::to_string(stats.prefill_rows[slot]);
     }
     std::cerr << (line + " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) +
                   '\n');
     std::cerr << ("batch target_rows=" + std::to_string(stats.target_rows) +
                   " step_budget=" + std::to_string(max_num_batched_tokens) + '\n');
+    if (stats.layerwise_prefill_groups)
+        std::cerr << ("batch layerwise_prefill_groups=" +
+                      std::to_string(stats.layerwise_prefill_groups) + " rows=" +
+                      std::to_string(stats.layerwise_prefill_rows) + '\n');
     if (stats.graph_slots) {
         std::cerr << ("batch graph_slots=" + std::to_string(stats.graph_slots) + '\n');
     }

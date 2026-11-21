@@ -10,7 +10,7 @@
 
 ## Runtime path
 
-Under `tensor-core`, the native dispatcher can stage a 1,024-row tile at starts 8,192 through 31,744 inclusive. The start must be a multiple of 1,024 or have a nonzero offset within a 128-token page. This uses the default paired selection with `SGLANG_EXPERIMENTAL_TMEM_PREFILL` unset. Explicit selectors and callers without scratch keep their existing paths. The [SM100 page-128 opt-ins](sm100-page128-prefill.md) run before native dispatch. [Decoder call](../src/decoder_prefill.cpp#L302)<!-- prefix: "const auto s" -->
+Under `tensor-core`, the native dispatcher can stage a 1,024-row tile at starts 8,192 through 31,744 inclusive. The start must be a multiple of 1,024 or have a nonzero offset within a 128-token page. This uses the default paired selection with `SGLANG_EXPERIMENTAL_TMEM_PREFILL` unset. Explicit selectors and callers without scratch keep their existing paths. The [SM100 page-128 opt-ins](sm100-page128-prefill.md) run before native dispatch. [Decoder call](../src/decoder_prefill.cpp#L323)<!-- prefix: "const auto s" -->
 
 The decoder lends two disjoint spans of its existing `PrefillWorkspace` allocation. The first address is inclusive and the end address is exclusive. These capacities apply to a 1,024-row arena.
 
@@ -19,9 +19,9 @@ The decoder lends two disjoint spans of its existing `PrefillWorkspace` allocati
 | BF16 K | `mlp_gate` through the end of `mlp_up`, bounded by `q_gate` | 68 MiB | 64 MiB |
 | BF16 V and invalid-token indices | `gdn_qkv`, `gdn_z`, `gdn_b`, `gdn_a`, and GDN scratch, bounded by `activation.values` | 64.1875 MiB | 64 MiB + 4 KiB |
 
-Each span has room for up to 127 bytes of padding for 128-byte alignment. The launcher checks both spans separately. Workspace allocation size, memory pool setup, and KV cache capacity stay the same. The staged route adds zero device allocation bytes. [Arena allocation](../src/decoder_prefill.cpp#L386)<!-- prefix: "PrefillWorks" --> · [Bounds](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L398)<!-- prefix: "const int fu" -->
+Each span has room for up to 127 bytes of padding for 128-byte alignment. The launcher checks both spans separately. Workspace allocation size, memory pool setup, and KV cache capacity stay the same. The staged route adds zero device allocation bytes. [Arena allocation](../src/decoder_prefill.cpp#L501)<!-- prefix: "PrefillWorks" --> · [Bounds](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L398)<!-- prefix: "const int fu" -->
 
-The MLP projection writes its gate and up buffers after GQA. GDN layers write their projection and scratch inputs before use. Predecode, paired attention, later layer work, and workspace release use the workspace's execution stream. Stream ordering puts the last attention read before the next write to either span. Keep both spans exclusive to that stream until the queued work completes. [Layer loop](../src/decoder_prefill.cpp#L512)<!-- prefix: "execute_laye" --> · [Release](../src/decoder_prefill.cpp#L441)<!-- prefix: "cudaError_t " -->
+The MLP projection writes its gate and up buffers after GQA. GDN layers write their projection and scratch inputs before use. Predecode, paired attention, later layer work, and workspace release use the workspace's execution stream. Stream ordering puts the last attention read before the next write to either span. Keep both spans exclusive to that stream until the queued work completes. [Layer loop](../src/decoder_prefill.cpp#L622)<!-- prefix: "execute_laye" --> · [Release](../src/decoder_prefill.cpp#L556)<!-- prefix: "cudaError_t " -->
 
 Predecode follows the page table and expands each complete MXFP8 page once. Separate K and V TMA producers load alternating shared-memory stages. A partial page uses the native masked conversion. The paired kernel retains the ordered BF16 operands, FP32 softmax and accumulation, and protected repair. [Predecode](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L77)<!-- prefix: "__global__ v" --> · [Producers](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L146)<!-- prefix: "__device__ v" -->
 
@@ -32,6 +32,12 @@ The [CUDA 13.4 stream ordering guide](https://docs.nvidia.com/cuda/archive/13.4.
 Missing or undersized scratch, capture, and a known staging setup rejection select raw paired attention before staged work enters the stream. Setup rejection includes unavailable kernel resources, supported predecode unavailability statuses, and tensor-map rejection or descriptor out-of-memory. The raw path retains its [existing fallback rules](flash-prefill.md#constraints-and-failure-behavior). [Capture check](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L415)<!-- prefix: "const auto c" --> · [Setup and submission](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L435)<!-- prefix: "const auto e" -->
 
 Unexpected CUDA failures return to the caller. After predecode submission succeeds, the attention launch status also returns directly. A paired graph capture records the original raw kernel with maps by value and borrows neither span. Keep the captured cache, page table, queries, and output valid through replay. [Raw launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L361)<!-- prefix: "std::optiona" --> · [CUDA graph capture](https://docs.nvidia.com/cuda/archive/13.4.2/cuda-programming-guide/04-special-topics/cuda-graphs.html#stream-capture)
+
+## Multi-request text prefill
+
+On B200, a tensor-core prefill-only step with a positive budget of at most 8,192 rows can group consecutive text grants in slot order. Each grant must fit one of its original tiles and contribute at least 256 rows in multiples of 128. A group has at least two grants and at most 1,023 total rows. Normalization, quantization, dense projections, and the MLP run across the concatenated rows. GDN and GQA keep each grant's original positions, recurrent state, and KV pages. Each request receives its own final hidden and residual row. [Grouping](../src/decoder_prefill.cpp#L398)<!-- prefix: "PrefillGroup" --> · [Layer loop](../src/decoder_prefill.cpp#L412)<!-- prefix: "void prefill" -->
+
+The step reuses one stream-ordered arena. Its row capacity covers the largest group or original scalar tile. If the larger allocation is unavailable, the step retries the original capacity before starting any grouped work. Mixed decode, tensor-prefix caching, MTP, media, and ineligible grants retain their existing paths. Use `--trace-batches` to observe grouped rows alongside the original row grants. [Step guard](../src/decoder_batch.cpp#L751)<!-- prefix: "const bool l" --> · [Allocation fallback](../src/decoder_prefill.cpp#L660)<!-- prefix: "if (!workspa" -->
 
 ## Verification
 

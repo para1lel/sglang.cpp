@@ -23,6 +23,7 @@ namespace sglang::decoder {
 class MtpDraftWeights;
 class MtpDraftRequest;
 class PrefillWorkspace;
+struct PrefillGrant;
 struct MediaPrefill;
 struct MultimodalInput;
 class TargetVerification;
@@ -452,6 +453,8 @@ struct Decoder::Model {
                        decoder::PrefillWorkspace& workspace,
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
                        const decoder::MediaPrefill* media = nullptr) const;
+    void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
+                        bool tensor_cache, bool layerwise, DecoderBatchStepStats& stats) const;
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;

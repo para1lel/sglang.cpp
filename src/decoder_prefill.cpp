@@ -201,6 +201,22 @@ struct TileBuffers {
                 reinterpret_cast<std::byte*>(gdn_qkv), gdn_end - gdn_begin};
     }
 
+    TileBuffers attention_segment(int offset) const {
+        static_assert(text_gdn_value_width == text_gqa_q_width);
+        auto segment = *this;
+        segment.attention += offset * text_gqa_q_width;
+        segment.q_gate += offset * text_gqa_q_gate_width;
+        segment.keys += offset * text_gqa_kv_width;
+        segment.values += offset * text_gqa_kv_width;
+        segment.rope_queries += offset * text_gqa_q_width;
+        segment.rope_keys += offset * text_gqa_kv_width;
+        segment.gdn_qkv += offset * text_gdn_qkv_width;
+        segment.gdn_z += offset * text_gdn_value_width;
+        segment.gdn_b += offset * text_gdn_value_heads;
+        segment.gdn_a += offset * text_gdn_value_heads;
+        return segment;
+    }
+
     Bf16* hidden;
     Bf16* normalized;
     Bf16* residual;
@@ -253,7 +269,7 @@ struct Chunk : PrefillProjections {
                             work.keys, work.values, work.rope_keys});
     }
 
-    void gdn(const GdnLayer& layer, TextGdnState state, int bank) const {
+    void gdn_input(const GdnLayer& layer) const {
         const TextFp8ActivationView input{activation.values, activation.scales};
         if (!project_packed(input, {
                 {layer.qkv.values, layer.qkv.scales, work.gdn_qkv, layer.qkv.rows},
@@ -264,6 +280,9 @@ struct Chunk : PrefillProjections {
         }
         project(layer.b, work.normalized, work.gdn_b);
         project(layer.a, work.normalized, work.gdn_a);
+    }
+
+    void gdn_recur(const GdnLayer& layer, TextGdnState state, int bank) const {
         static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
         const bool chunked_recurrence = position != 0 || bank != 0;
         const auto status = tensor_core_fp8
@@ -276,11 +295,9 @@ struct Chunk : PrefillProjections {
                                work.gdn_a, layer.recurrent, state, work.gdn_scratch,
                                text_gdn_workspace_bytes(rows), work.attention, stream);
         check(status, "Advance prefill Gated DeltaNet state");
-        project(layer.output, quantize(work.attention, text_gdn_value_width),
-                work.projected_attention);
     }
 
-    void gqa(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages) const {
+    void gqa_input(const GqaLayer& layer) const {
         const TextFp8ActivationView input{activation.values, activation.scales};
         if (!project_packed(input, {
                 {layer.q_gate.values, layer.q_gate.scales, work.q_gate, layer.q_gate.rows},
@@ -291,6 +308,10 @@ struct Chunk : PrefillProjections {
             project(layer.key, input, work.keys);
             project(layer.value, input, work.values);
         }
+    }
+
+    void gqa_attention(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages,
+                       PairedPrefillScratch scratch) const {
         const auto rotation = mrope
             ? mrope_gqa_preprocess(mrope, rows, work.q_gate, work.keys, layer.query_norm,
                                     layer.key_norm, work.rope_queries, work.rope_keys, stream)
@@ -301,13 +322,16 @@ struct Chunk : PrefillProjections {
               "Append prefill MXFP8 KV");
         const auto status = tensor_core_fp8
             ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
-                                            work.attention, stream, work.gqa_scratch())
+                                            work.attention, stream, scratch)
             : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
                                    work.attention, stream);
         check(status, "Read causal prefill MXFP8 attention");
         check(text_gqa_postgate(rows, work.q_gate, work.attention, work.attention, stream),
               "Gate prefill grouped-query attention");
-        project(layer.output, quantize(work.attention, text_gqa_q_width), work.projected_attention);
+    }
+
+    void attention_output(Fp8Weight output, int width) const {
+        project(output, quantize(work.attention, width), work.projected_attention);
     }
 
     void mlp(const Layer& layer) const {
@@ -343,6 +367,97 @@ struct Chunk : PrefillProjections {
         quantize(work.normalized, hidden_size);
     }
 };
+
+void gather_embeddings(const Bf16* embedding, const int* tokens, int rows,
+                       Bf16* residual, cudaStream_t stream) {
+    for (int offset = 0; offset < rows; offset += text_embedding_max_rows) {
+        const int count = std::min(text_embedding_max_rows, rows - offset);
+        check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens + offset, count,
+                                  residual + offset * hidden_size, stream),
+              "Gather prefill embeddings");
+    }
+}
+
+void stage_prefill_row(Request& request, const TileBuffers& work, int row, cudaStream_t stream) {
+    const int offset = row * hidden_size;
+    const auto bytes = hidden_size * sizeof(Bf16);
+    check(cudaMemcpyAsync(request.work.hidden, work.hidden + offset, bytes,
+                          cudaMemcpyDeviceToDevice, stream), "Stage final prefill hidden row");
+    check(cudaMemcpyAsync(request.work.residual, work.residual + offset, bytes,
+                          cudaMemcpyDeviceToDevice, stream), "Stage final prefill residual row");
+}
+
+constexpr int layerwise_row_alignment = 128;
+constexpr int max_layerwise_rows = 1023;
+
+struct PrefillGroup {
+    int grants;
+    int rows;
+};
+
+PrefillGroup prefill_group(const PrefillGrant* grants, int count) {
+    PrefillGroup group{0, 0};
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        if (grant.rows < 256 || grant.rows != grant.tile_rows ||
+            grant.rows % layerwise_row_alignment || grant.rows > max_layerwise_rows - group.rows) {
+            break;
+        }
+        ++group.grants;
+        group.rows += grant.rows;
+    }
+    return group.grants > 1 ? group : PrefillGroup{1, 0};
+}
+
+void prefill_layerwise(const std::array<Layer, layer_count>& layers,
+                       const Bf16* embedding, const PrefillGrant* grants, PrefillGroup group,
+                       PrefillWorkspace& workspace) {
+    const auto stream = workspace.stream();
+    ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
+    const TileBuffers buffers(layout, workspace.capacity());
+    const Chunk chunk{{buffers.activation, group.rows, stream, true}, buffers, 0, nullptr};
+    const auto each_segment = [&](auto run) {
+        int offset = 0;
+        for (int index = 0; index < group.grants; ++index) {
+            const auto& grant = grants[index];
+            run(grant, offset);
+            offset += grant.rows;
+        }
+    };
+    each_segment([&](const PrefillGrant& grant, int offset) {
+        gather_embeddings(embedding, grant.tokens, grant.rows,
+                          buffers.residual + offset * hidden_size, stream);
+    });
+    const auto attention = [&](const PrefillGrant& grant, int offset) {
+        return Chunk{{{}, grant.rows, stream, true}, buffers.attention_segment(offset),
+                     grant.position, nullptr};
+    };
+    execute_layers(
+        layers,
+        [&](const Bf16* weight, const char*, const auto& residuals) {
+            const auto [branch, residual] = residuals(buffers);
+            chunk.normalize(branch, residual, weight);
+        },
+        [&](const GqaLayer& layer, int bank) {
+            chunk.gqa_input(layer);
+            each_segment([&](const PrefillGrant& grant, int offset) {
+                attention(grant, offset).gqa_attention(
+                    layer, grant.request->caches[bank], grant.request->pages, {});
+            });
+            chunk.attention_output(layer.output, text_gqa_q_width);
+        },
+        [&](const GdnLayer& layer, int bank) {
+            chunk.gdn_input(layer);
+            each_segment([&](const PrefillGrant& grant, int offset) {
+                attention(grant, offset).gdn_recur(layer, grant.request->states[bank], bank);
+            });
+            chunk.attention_output(layer.output, text_gdn_value_width);
+        },
+        [&](const Layer& layer) { chunk.mlp(layer); });
+    each_segment([&](const PrefillGrant& grant, int offset) {
+        stage_prefill_row(*grant.request, buffers, offset + grant.rows - 1, stream);
+    });
+}
 
 }
 
@@ -496,12 +611,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
                       media ? media->positions + position : nullptr};
     const auto& work = chunk.work;
-    for (int offset = 0; offset < rows; offset += text_embedding_max_rows) {
-        const int count = std::min(text_embedding_max_rows, rows - offset);
-        check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens + offset, count,
-                                  work.residual + offset * hidden_size, stream),
-              "Gather prefill embeddings");
-    }
+    gather_embeddings(embedding, tokens, rows, work.residual, stream);
     if (media) {
         media->substitute(work.residual, position, rows, stream);
     }
@@ -511,21 +621,73 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     };
     execute_layers(layers, normalize,
                    [&](const GqaLayer& layer, int bank) {
-                       chunk.gqa(layer, request.caches[bank], request.pages);
+                       chunk.gqa_input(layer);
+                       chunk.gqa_attention(layer, request.caches[bank], request.pages,
+                                           work.gqa_scratch());
+                       chunk.attention_output(layer.output, text_gqa_q_width);
                    },
                    [&](const GdnLayer& layer, int bank) {
-                       chunk.gdn(layer, request.states[bank], bank);
+                       chunk.gdn_input(layer);
+                       chunk.gdn_recur(layer, request.states[bank], bank);
+                       chunk.attention_output(layer.output, text_gdn_value_width);
                    },
                    [&](const Layer& layer) { chunk.mlp(layer); });
     if (draft && prompt_remaining > 1) {
         chunk.seed_draft(*draft, tokens + 1, std::min(rows, prompt_remaining - 1), final_norm);
     }
-    const int last = (rows - 1) * hidden_size;
-    const auto bytes = hidden_size * sizeof(Bf16);
-    check(cudaMemcpyAsync(request.work.hidden, work.hidden + last, bytes,
-                          cudaMemcpyDeviceToDevice, stream), "Stage final prefill hidden row");
-    check(cudaMemcpyAsync(request.work.residual, work.residual + last, bytes,
-                          cudaMemcpyDeviceToDevice, stream), "Stage final prefill residual row");
+    stage_prefill_row(request, work, rows - 1, stream);
+}
+
+void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaStream_t stream,
+                                   bool tensor_cache, bool layerwise,
+                                   DecoderBatchStepStats& stats) const {
+    int scalar_capacity = 1;
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        scalar_capacity = std::max(scalar_capacity, grant.tile_rows);
+        layerwise = layerwise && !grant.draft && !grant.media;
+    }
+    layerwise = layerwise && is_b200() && fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+    int capacity = scalar_capacity;
+    if (layerwise) {
+        for (int index = 0; index < count;) {
+            const auto group = prefill_group(grants + index, count - index);
+            capacity = std::max(capacity, group.rows);
+            index += group.grants;
+        }
+    }
+    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity);
+    if (!workspace->data() && capacity > scalar_capacity) {
+        workspace.emplace(stream, scalar_capacity);
+        layerwise = false;
+    }
+    if (tensor_cache && scalar_capacity > 1 && !workspace->data()) {
+        throw std::runtime_error("Tensor-core prefix cache requires a prefill workspace");
+    }
+    stats.prefill_workspace_bytes = workspace->bytes();
+    for (int index = 0; index < count;) {
+        const auto group = layerwise && workspace->data() ? prefill_group(grants + index,
+                                                                         count - index)
+                                                        : PrefillGroup{1, 0};
+        const auto& grant = grants[index];
+        if (group.grants > 1) {
+            prefill_layerwise(layers, embedding, grants + index, group, *workspace);
+            ++stats.layerwise_prefill_groups;
+            stats.layerwise_prefill_rows += group.rows;
+        } else if (grant.rows == 1 && grant.draft && grant.prompt_remaining > 1) {
+            seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1], stream);
+        } else if (grant.rows > 1) {
+            for (int offset = 0; offset < grant.rows;) {
+                const int count = std::min(grant.tile_rows, grant.rows - offset);
+                prefill_chunk(*grant.request, grant.tokens + offset, count,
+                              grant.position + offset, *workspace, grant.draft,
+                              grant.prompt_remaining - offset, grant.media);
+                offset += count;
+            }
+        }
+        index += group.grants;
+    }
+    workspace->close();
 }
 
 }

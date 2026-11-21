@@ -116,7 +116,7 @@ The [overflow control](../tests/mxfp8_gqa_prefill_check.cu#L798)<!-- prefix: "vo
 | --- | --- | --- |
 | `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L281)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L128)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L219)<!-- prefix: "void execute" --> |
+| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L128)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L220)<!-- prefix: "void execute" --> |
 
 Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L95)<!-- prefix: "target(\"sgla" -->
 
@@ -126,9 +126,9 @@ The decoder validates tensor names, dtypes, and shapes before upload. Upload ret
 
 Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L435)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L813)<!-- prefix: "void Request" -->
 
-One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L512)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L571)<!-- prefix: "void Decoder" -->
+One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L622)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L571)<!-- prefix: "void Decoder" -->
 
-Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L465)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L532)<!-- prefix: "void Decoder" -->
+Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L580)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L532)<!-- prefix: "void Decoder" -->
 
 Both binaries accept `--fp8-prefill exact|tensor-core`. Pass `Fp8PrefillPolicy` as the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L123)<!-- prefix: "enum class F" -->
 
@@ -137,7 +137,7 @@ See [FP8 prefill projections](fp8-prefill-projections.md) for SM100 eligibility,
 Multirow K0 tensor-core prefill keeps these operators during projection fallback.
 
 - [GDN prefill](gdn-prefill.md) prepares convolution, Q/K, and gates before ordered or chunked recurrence. [Preparation dispatch](../src/text_attention_gdn.cu#L552)<!-- prefix: "const bool g" -->
-- [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L302)<!-- prefix: "const auto s" -->
+- [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L323)<!-- prefix: "const auto s" -->
 - [Fused residual RMSNorm](fp8-prefill-projections.md#fused-activation-quantization) and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L312)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L717)<!-- prefix: "cudaError_t " -->
 
 Other target prefill and draft decode use direct attention. Wide long decode requires the tensor-core policy. Eager decode can use exact attention within inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Serial decode uses direct attention beyond these limits. [Row dispatch](../src/decoder_forward.cpp#L196)<!-- prefix: "cudaError_t " -->
@@ -168,7 +168,7 @@ The decoder retains CUDA resources and transfer buffers while completion is unce
 
 Private CUDA pools separate workspaces at or below 128 rows from larger ones. One pool per device and class can set a release threshold. The thresholds are 32 MiB and 512 MiB respectively. Other pools use CUDA defaults. [Retention](../src/decoder_prefill.cpp#L44)<!-- prefix: "void configu" -->
 
-Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L546)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L536)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L386)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L441)<!-- prefix: "cudaError_t " -->
+Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L546)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L536)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L501)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L556)<!-- prefix: "cudaError_t " -->
 
 `--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" -->
 

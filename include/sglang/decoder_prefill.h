@@ -10,6 +10,17 @@ struct PrefillPool;
 
 void reclaim_prefill_workspaces(int device);
 
+struct PrefillGrant {
+    Request* request;
+    const int* tokens;
+    int position;
+    int rows;
+    int tile_rows;
+    int prompt_remaining;
+    MtpDraftRequest* draft;
+    const MediaPrefill* media;
+};
+
 struct PrefillProjections {
     TextFp8Activation activation;
     int rows;

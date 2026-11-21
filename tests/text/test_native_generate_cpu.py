@@ -163,7 +163,7 @@ class NativeGenerate(unittest.TestCase):
         implicit, explicit, nullable = receipts(self.log)[first:]
         expected = {"temperature": 1, "top_k": -1, "top_p": 1, "min_p": 0,
                     "seed": None, "budget": 128, "sampled": True, "prompt_tokens": 1,
-                    "stops": sorted(EOS)}
+                    "stops": sorted(EOS), "logit_bias": []}
         self.assertEqual(implicit, expected)
         self.assertEqual(nullable, expected | {"budget": 1})
         self.assertEqual(explicit, expected | {

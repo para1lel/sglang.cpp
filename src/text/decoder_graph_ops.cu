@@ -9,6 +9,8 @@ namespace {
 constexpr int warp_size = 32;
 constexpr int values_per_warp = 4;
 constexpr int recurrent_warps = 8;
+constexpr int streaming_recurrent_warps = 4;
+constexpr int streaming_min_rows = 8;
 constexpr int value_rows_per_block = recurrent_warps * values_per_warp;
 constexpr int recurrent_threads = recurrent_warps * warp_size;
 constexpr int value_blocks_per_head = text_gdn_head_dim / value_rows_per_block;
@@ -35,6 +37,15 @@ __device__ float warp_sum(float value) {
     return value;
 }
 
+__device__ float2 warp_sum(float2 value) {
+    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+        const float2 peer{__shfl_xor_sync(0xffffffffu, value.x, offset),
+                          __shfl_xor_sync(0xffffffffu, value.y, offset)};
+        value = __fadd2_rn(value, peer);
+    }
+    return value;
+}
+
 __device__ float sigmoid(float value) {
     return 1.0f / (1.0f + expf(-value));
 }
@@ -48,12 +59,13 @@ __device__ std::size_t row_offset(int width) {
 }
 
 // Mirrors gdn_convolve for one decode token: taps read history, then the current row.
+template <bool AdvanceHistory>
 __global__ void packed_gdn_convolve(const int* active, decoder::PackedGdnRows rows,
                                     const TextGdnState* states, TextGdnWeights weights) {
     if (static_cast<int>(blockIdx.y) >= *active) {
         return;
     }
-    const auto* history = states[blockIdx.y].history;
+    auto* history = states[blockIdx.y].history;
     const auto* qkv = rows.qkv + row_offset(text_gdn_qkv_width);
     const int channel = blockIdx.x * conv_threads + threadIdx.x;
     float value = 0.0f;
@@ -65,6 +77,11 @@ __global__ void packed_gdn_convolve(const int* active, decoder::PackedGdnRows ro
             : qkv[channel];
         value = fmaf(__bfloat162float(sample),
                      __bfloat162float(weights.convolution[channel * conv_taps + tap]), value);
+        if constexpr (AdvanceHistory) {
+            if (tap > 0) {
+                history[channel * text_gdn_history_taps + tap - 1] = sample;
+            }
+        }
     }
     const auto mixed = __float2bfloat16(value * sigmoid(value));
     constexpr int qk_width = 2 * text_gdn_qk_width;
@@ -161,14 +178,91 @@ __global__ void packed_gdn_recur(const int* active, decoder::PackedGdnRows rows,
     }
 }
 
+__global__ void packed_gdn_recur_streaming(const int* active, decoder::PackedGdnRows rows,
+                                           const TextGdnState* states) {
+    if (static_cast<int>(blockIdx.y) >= *active) {
+        return;
+    }
+    constexpr int warps = streaming_recurrent_warps;
+    constexpr int rows_per_block = values_per_warp * warps;
+    constexpr int blocks_per_head = text_gdn_head_dim / rows_per_block;
+    const int head = blockIdx.x / blocks_per_head;
+    const int qk_head = head / value_heads_per_qk_head;
+    const int warp = threadIdx.x / warp_size;
+    const int lane = threadIdx.x % warp_size;
+    const int value = (blockIdx.x % blocks_per_head) * rows_per_block + warp;
+    const int feature = head * text_gdn_head_dim + value;
+    const auto* query = rows.normalized_qk + row_offset(2 * text_gdn_qk_width)
+                        + qk_head * text_gdn_head_dim;
+    const auto* key = query + text_gdn_qk_width;
+    const auto gate = rows.gates[row_offset(text_gdn_value_heads) + head];
+    const float2 decay{gate.x, gate.x};
+    const float2 beta{gate.y, gate.y};
+
+    auto* recurrent = states[blockIdx.y].recurrent + feature * text_gdn_head_dim + lane;
+    constexpr int state_stride = warps * text_gdn_head_dim;
+    constexpr int pairs_per_warp = values_per_warp / 2;
+    float2 state_keys[pairs_per_warp][keys_per_lane];
+    float2 prediction[pairs_per_warp]{};
+    #pragma unroll
+    for (int part = 0; part < keys_per_lane; ++part) {
+        const int offset = part * warp_size;
+        const float component = key[offset + lane];
+        #pragma unroll
+        for (int pair = 0; pair < pairs_per_warp; ++pair) {
+            const auto* address = recurrent + 2 * pair * state_stride + offset;
+            const float2 state{__ldcs(address), __ldcs(address + state_stride)};
+            state_keys[pair][part] = __fmul2_rn(state, decay);
+            prediction[pair] = __ffma2_rn(state_keys[pair][part], {component, component},
+                                         prediction[pair]);
+        }
+    }
+    const auto index = row_offset(text_gdn_value_width) + feature;
+    float2 correction[pairs_per_warp];
+    #pragma unroll
+    for (int pair = 0; pair < pairs_per_warp; ++pair) {
+        const auto entry = index + 2 * pair * warps;
+        const auto predicted = warp_sum(prediction[pair]);
+        const float2 delta{__bfloat162float(rows.convolved_values[entry]) - predicted.x,
+                           __bfloat162float(rows.convolved_values[entry + warps]) - predicted.y};
+        correction[pair] = __fmul2_rn(beta, delta);
+    }
+    float2 result[pairs_per_warp]{};
+    #pragma unroll
+    for (int part = 0; part < keys_per_lane; ++part) {
+        const int offset = part * warp_size;
+        const float key_component = key[offset + lane];
+        const float query_component = query[offset + lane];
+        #pragma unroll
+        for (int pair = 0; pair < pairs_per_warp; ++pair) {
+            const auto updated = __ffma2_rn(correction[pair], {key_component, key_component},
+                                            state_keys[pair][part]);
+            result[pair] = __ffma2_rn(updated, {query_component, query_component}, result[pair]);
+            auto* address = recurrent + 2 * pair * state_stride + offset;
+            __stcs(address, updated.x);
+            __stcs(address + state_stride, updated.y);
+        }
+    }
+    #pragma unroll
+    for (int pair = 0; pair < pairs_per_warp; ++pair) {
+        const auto sum = warp_sum(result[pair]);
+        if (lane == 0) {
+            const auto entry = index + 2 * pair * warps;
+            rows.observable[entry] = __float2bfloat16(sum.x);
+            rows.observable[entry + warps] = __float2bfloat16(sum.y);
+        }
+    }
+}
+
 // Mirrors gdn_finish for one decode token: gated norm blocks, then history shift blocks.
+template <bool AdvanceHistory>
 __global__ void packed_gdn_finish(const int* active, decoder::PackedGdnRows rows,
                                   const __nv_bfloat16* norm, const TextGdnState* states) {
     if (static_cast<int>(blockIdx.y) >= *active) {
         return;
     }
     const int channel = threadIdx.x;
-    if (static_cast<int>(blockIdx.x) >= text_gdn_value_heads) {
+    if (!AdvanceHistory && static_cast<int>(blockIdx.x) >= text_gdn_value_heads) {
         auto* history = states[blockIdx.y].history;
         const auto* qkv = rows.qkv + row_offset(text_gdn_qkv_width);
         const int feature = (blockIdx.x - text_gdn_value_heads) * text_gdn_head_dim + channel;
@@ -306,7 +400,25 @@ cudaError_t decoder::packed_decode_gdn(int rows, const int* active, PackedGdnRow
         !weights.convolution || !weights.a_log || !weights.dt_bias || !weights.norm) {
         return cudaErrorInvalidValue;
     }
-    packed_gdn_convolve<<<dim3(conv_blocks, rows), conv_threads, 0, stream>>>(
+    if (rows >= streaming_min_rows) {
+        packed_gdn_convolve<true><<<dim3(conv_blocks, rows), conv_threads, 0, stream>>>(
+            active, inputs, states, weights);
+        auto status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            return status;
+        }
+        constexpr int blocks = text_gdn_value_width / (streaming_recurrent_warps * values_per_warp);
+        packed_gdn_recur_streaming<<<dim3(blocks, rows), streaming_recurrent_warps * warp_size,
+                                     0, stream>>>(active, inputs, states);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            return status;
+        }
+        packed_gdn_finish<true><<<dim3(text_gdn_value_heads, rows), text_gdn_head_dim, 0, stream>>>(
+            active, inputs, weights.norm, states);
+        return cudaGetLastError();
+    }
+    packed_gdn_convolve<false><<<dim3(conv_blocks, rows), conv_threads, 0, stream>>>(
         active, inputs, states, weights);
     auto status = cudaGetLastError();
     if (status != cudaSuccess) {
@@ -318,8 +430,8 @@ cudaError_t decoder::packed_decode_gdn(int rows, const int* active, PackedGdnRow
     if (status != cudaSuccess) {
         return status;
     }
-    packed_gdn_finish<<<dim3(text_gdn_value_heads + history_blocks, rows), text_gdn_head_dim, 0,
-                        stream>>>(active, inputs, weights.norm, states);
+    packed_gdn_finish<false><<<dim3(text_gdn_value_heads + history_blocks, rows), text_gdn_head_dim,
+                               0, stream>>>(active, inputs, weights.norm, states);
     return cudaGetLastError();
 }
 

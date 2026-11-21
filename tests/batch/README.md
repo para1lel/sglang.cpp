@@ -52,7 +52,9 @@ and CUPTI runtime/device records in the evidence directory.
   target rows, or a one-row budget.
   Preparation, capture, and instantiation rejection fall back to eager. The
   fixture checks same-slot replacement after a successful drain and batch
-  disablement after launch-call errors, uncertain teardown, or a failed drain.
+  disablement after launch-call errors, uncertain teardown, a terminal CUDA
+  error, or a terminal error during recovery. It verifies that the disabled
+  batch rejects further decode and admission.
   The HTTP arm compares greedy and seeded SSE, visibility limits, rejection,
   EOS, output caps, and cancellation.
 - The public HTTP probe sends distinct prompts across decode widths one through

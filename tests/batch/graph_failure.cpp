@@ -105,12 +105,13 @@ extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
         dlsym(RTLD_NEXT, "cudaStreamSynchronize"));
     if (fail_drain) {
         fail_drain = false;
+        std::fputs("inject: terminal drain failure\n", stderr);
         return cudaErrorIllegalAddress;
     }
     if (pending && inject("hard-drain")) {
         pending = false;
         fail_drain = true;
-        return cudaErrorIllegalAddress;
+        return cudaErrorInvalidValue;
     }
     if (pending && inject("hard")) {
         pending = false;

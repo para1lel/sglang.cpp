@@ -226,8 +226,9 @@ def verify_k1(evidence):
 
     eager, masks, device, _ = records("eager")
     assert masks and not any(k0 or k1 for k0, k1 in masks) and not device
-    closed = {"launch": 1, "submitted": 2, "hard-drain": 1, "cleanup": 0, "exec-cleanup": 1}
-    recovered = {"upload": 2, "hard": 2}
+    closed = {"launch": 1, "submitted": 2, "hard": 1, "hard-drain": 1,
+              "cleanup": 0, "exec-cleanup": 1}
+    recovered = {"upload": 2}
     fallbacks = ("prepare", "begin", "instantiate")
     for role in ("graph", *fallbacks, *closed, *recovered):
         steps, masks, device, log = records(role)
@@ -251,6 +252,7 @@ def verify_k1(evidence):
             if role in fallbacks:
                 assert "using eager K1 target verification" in log
         assert log.count(f"inject: {role}\n") == (role != "graph")
+        assert log.count("inject: terminal drain failure\n") == (role == "hard-drain")
     print("Sparse K1 replay, independent K0, and graph recovery checks passed")
 
 

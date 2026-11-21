@@ -286,6 +286,16 @@ void expect_verification_error(DecoderBatch& batch, unsigned selected, std::stri
     require(failed, "K1 operation did not propagate its failure");
 }
 
+void expect_unavailable_admission(DecoderBatch& batch) {
+    try {
+        batch.admit(0, {13}, DecoderOptions{});
+    } catch (const std::exception& error) {
+        require(std::string_view(error.what()) == "Decoder batch is unavailable", error.what());
+        return;
+    }
+    require(false, "Failed K1 batch accepted another request");
+}
+
 void verify_failure(DecoderBatch& batch, unsigned selected, std::string_view message,
                     bool drained) {
     expect_verification_error(batch, selected, message);
@@ -294,14 +304,9 @@ void verify_failure(DecoderBatch& batch, unsigned selected, std::string_view mes
         require(batch.request_device_allocation_bytes() == 0,
                 "Drained K1 failure retained request buffers");
     }
-    try {
-        batch.advance_chunked(mask(selected));
-    } catch (const std::exception& error) {
-        require(std::string_view(error.what()) == "Decoder batch is unavailable", error.what());
-        std::cout << "verify failed-closed\n";
-        return;
-    }
-    require(false, "Failed K1 batch accepted another advance");
+    expect_verification_error(batch, selected, "Decoder batch is unavailable");
+    expect_unavailable_admission(batch);
+    std::cout << "verify failed-closed\n";
 }
 
 void verify_recovery(const Decoder& decoder, DecoderBatch& batch, int slot,
@@ -433,7 +438,7 @@ void verify_graph(const Decoder& decoder, std::string_view role) {
     prefill(second, 127);
     step(second_mask, 1, 2);
     if (role == "hard") {
-        verify_recovery(decoder, batch, second, "illegal memory access");
+        verify_failure(batch, second_mask, "illegal memory access", false);
         return;
     }
     if (role == "hard-drain") {

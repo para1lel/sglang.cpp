@@ -1,6 +1,6 @@
 # Native text completions
 
-Send `POST /v1/completions` with `model` set to `Qwen3.8-27B-FP8` and `prompt` set to a UTF-8 string. The same endpoint serves the frozen `benchmark` model with a [prompt ID array and token-ID SSE](../benchmarks/streaming/README.md#wire-contract). Use [native chat](chat-serving.md) to render conversation history.
+Send `POST /v1/completions` with `model` set to `Qwen3.8-27B-FP8` and `prompt` set to a UTF-8 string. The same endpoint serves the frozen `benchmark` model with a [prompt ID array and token-ID SSE](../benchmarks/streaming/README.md#wire-contract). Use [native chat](chat-serving.md) to render conversation history. Use [`POST /generate`](native-generate.md) for raw text or prompt IDs with native sampling parameters and cumulative output.
 
 ## Send a request
 
@@ -30,9 +30,9 @@ The server rejects malformed JSON, duplicate decoded keys, and nesting beyond 32
 | `response_format` | Optional [bounded JSON Schema](output-constraints.md#json-schema). |
 | `cache_salt` | Optional [prefix cache key](prefix-cache.md#runtime-path) component. |
 
-Raw text accepts one string prompt and returns one choice. It rejects `n` and `max_completion_tokens`. Both routes reject unknown options, including `logprobs`, `logit_bias`, `frequency_penalty`, `presence_penalty`, and `repetition_penalty`. [Request options](../apps/server/text_request.cpp#L281)<!-- prefix: "bool is_text" -->
+Raw text accepts one string prompt and returns one choice. It rejects `n` and `max_completion_tokens`. Both routes reject unknown options, including `logprobs`, `logit_bias`, `frequency_penalty`, `presence_penalty`, and `repetition_penalty`. [Request options](../apps/server/text_request.cpp#L284)<!-- prefix: "bool is_text" -->
 
-Tokenizer load occurs on the first text or chat request that reaches encoding. The server reads `tokenizer.json` from the selected checkpoint directory and verifies its size and SHA-256. A missing, unreadable, or mismatched asset returns HTTP 500 before output starts. A subsequent request retries a failed load. Successful loads share an immutable tokenizer across text and chat requests. The benchmark ID route uses the IDs supplied by the client.
+The server loads the tokenizer when a request first needs it. It reads `tokenizer.json` from the selected checkpoint directory and verifies its size and SHA-256. A missing, unreadable, or mismatched asset returns HTTP 500 before output starts. A subsequent request retries a failed load. Text, chat, and `/generate` share the immutable tokenizer. The benchmark ID route uses the IDs supplied by the client.
 
 ## Serial prefill
 
@@ -58,7 +58,7 @@ If `is_cancelled` returns true at entry, direct C++ generation finishes with `ca
 
 ## Sampling
 
-Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L91)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L24)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L61)<!-- prefix: "void validat" -->
+Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L93)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L24)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L61)<!-- prefix: "void validat" -->
 
 | Field | Valid values |
 | --- | --- |
@@ -68,7 +68,7 @@ Native HTTP uses these controls for JSON and SSE. C++ and the generator use the 
 | `min_p` | Number in `[0, 1]`. The minimum weight is `min_p` times the maximum weight in the selection row. |
 | `seed` | Signed 64-bit integer. Omission or null leaves the seed unset. |
 
-Raw text defaults to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Explicit values override them. Null numeric controls other than `seed` return HTTP 400. Chat uses its [server-selected defaults](chat-serving.md#sampling-defaults-and-output-budget). [Route defaults](../apps/server/text_request.cpp#L218)<!-- prefix: "TextRequest " -->
+Raw text defaults to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Explicit values override them. Null numeric controls other than `seed` return HTTP 400. Chat uses its [server-selected defaults](chat-serving.md#sampling-defaults-and-output-budget). [Route defaults](../apps/server/text_request.cpp#L222)<!-- prefix: "TextRequest " -->
 
 The decoder validates options even on the greedy path. CUDA ranks BF16 logits by descending score, then ascending token ID. It divides score differences by temperature before exponentiation. For `top_p < 1`, the nucleus includes the token where cumulative weight first exceeds `top_p` times the selection row's total weight. The unconstrained row covers the vocabulary. Selection draws from the nucleus intersected with top-k and weights at or above the `min_p` threshold. Each draw depends on the resolved seed and zero-based output index. Identical rows and options preserve draws across slot changes. [Seed resolution](../src/decoder.cpp#L102)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L187)<!-- prefix: "__global__ v" -->
 
@@ -80,7 +80,7 @@ An unseeded sampled request resolves one seed with `std::random_device`. The fro
 
 ## Finite-choice constraints
 
-Set `ebnf` on a native text or chat request to restrict the generated text to one literal, in JSON or SSE. Use one rule of the form `root ::= "yes" | "no"`. Each alternative is a nonempty double-quoted string with JSON escapes. The decoded bytes must be valid UTF-8. A single literal is valid. [HTTP validation](../apps/server/text_request.cpp#L180)<!-- prefix: "void set_con" --> · [Compiler](../src/tokenizer/constraint.cpp#L82)<!-- prefix: "std::shared_" -->
+Set `ebnf` on a native text or chat request to restrict the generated text to one literal, in JSON or SSE. Use one rule of the form `root ::= "yes" | "no"`. Each alternative is a nonempty double-quoted string with JSON escapes. The decoded bytes must be valid UTF-8. A single literal is valid. [HTTP validation](../apps/server/text_request.cpp#L184)<!-- prefix: "void set_con" --> · [Compiler](../src/tokenizer/constraint.cpp#L82)<!-- prefix: "std::shared_" -->
 
 ```bash
 curl --fail-with-body http://127.0.0.1:17384/v1/completions \

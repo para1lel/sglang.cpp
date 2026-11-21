@@ -5,6 +5,7 @@
 #include "sglang/decoder_constraint.h"
 #include "sglang/json.h"
 #include "sglang/server/http.h"
+#include "sglang/server/native_generate.h"
 
 #include <algorithm>
 #include <charconv>
@@ -32,10 +33,11 @@ bool read_bool(const json::Object& object, std::string_view key) {
     return *result;
 }
 
-int text_budget(const json::Value& value) {
+int text_budget(const json::Value& value,
+                const char* error = "Expected a nonnegative integer max_tokens") {
     const auto budget = value.unsigned_integer();
     if (!budget) {
-        bad_request("Expected a nonnegative integer max_tokens");
+        bad_request(error);
     }
     if (*budget >= checkpoint_context) {
         bad_request("Prompt and output budget must fit the 262144-token context");
@@ -88,7 +90,8 @@ std::vector<std::string> stop_text(const json::Object& object) {
     return stops;
 }
 
-void set_sampling(const json::Object& object, DecoderOptions& options) {
+void set_sampling(const json::Object& object, DecoderOptions& options,
+                  std::string_view seed_key = "seed") {
     if (const auto* value = json::get(object, "temperature")) {
         auto temperature = value->number();
         if (const auto* wide = value->wide_integer()) {
@@ -131,14 +134,15 @@ void set_sampling(const json::Object& object, DecoderOptions& options) {
             bad_request("top_k must be -1 or a positive integer");
         }
     }
-    if (const auto* value = json::get(object, "seed"); value && !value->is_null()) {
+    if (const auto* value = json::get(object, seed_key); value && !value->is_null()) {
         const auto positive = value->unsigned_integer();
         options.seed = value->signed_integer();
         if (positive && *positive <= std::numeric_limits<std::int64_t>::max()) {
             options.seed = static_cast<std::int64_t>(*positive);
         }
         if (!options.seed) {
-            bad_request("seed must be a signed 64-bit integer");
+            const auto message = std::string(seed_key) + " must be a signed 64-bit integer";
+            bad_request(message.c_str());
         }
     }
 }
@@ -267,12 +271,11 @@ void validate_prompt(std::string_view prompt) {
     }
 }
 
-void encode_prompt(TextRequest& request, std::string_view prompt,
+void encode_prompt(std::vector<int>& output, int max_new_tokens, std::string_view prompt,
                    const CompletionTokenizer& tokenizer) {
     try {
-        const auto ids = tokenizer.get().encode(prompt,
-            checkpoint_context - request.options.max_new_tokens);
-        request.prompt.assign(ids.begin(), ids.end());
+        const auto ids = tokenizer.get().encode(prompt, checkpoint_context - max_new_tokens);
+        output.assign(ids.begin(), ids.end());
     } catch (const std::length_error&) {
         bad_request("Prompt and output budget must fit the 262144-token context");
     }
@@ -299,7 +302,7 @@ TextRequest parse_text(const json::Object& object, const CompletionTokenizer& to
     const auto prompt = json::get_string(object, "prompt").value_or("");
     validate_prompt(prompt);
     auto request = text_options(object, tokenizer, false);
-    encode_prompt(request, prompt, tokenizer);
+    encode_prompt(request.prompt, request.options.max_new_tokens, prompt, tokenizer);
     finish_options(request, object, tokenizer);
     return request;
 }
@@ -509,6 +512,98 @@ TextRequest parse_text_request(const json::Object& body, const CompletionTokeniz
     return parse_text(body, tokenizer);
 }
 
+GenerateRequest parse_generate_request(std::string_view body,
+                                       const CompletionTokenizer& tokenizer) {
+    const auto parsed = parse_body(body, json::Syntax::strict);
+    const auto* object = parsed.object();
+    if (!object) {
+        bad_request("Expected a JSON object for /generate");
+    }
+    for (const auto& [key, value] : *object) {
+        if (key == "text" || key == "input_ids" || key == "sampling_params" ||
+            key == "stream" || key == "cache_salt") {
+            continue;
+        }
+        if (((key == "return_logprob" || key == "return_routed_experts") &&
+             (value.is_null() || value.boolean() == false)) ||
+            (key == "logprob_start_len" && (value.is_null() || value.signed_integer() == -1)) ||
+            (key == "lora_path" && value.is_null())) {
+            continue;
+        }
+        throw std::invalid_argument("Unsupported /generate field: " + key);
+    }
+
+    GenerateRequest request;
+    request.options.max_new_tokens = 128;
+    request.options.temperature = 1.0;
+    if (const auto* stream = json::get(*object, "stream"); stream && !stream->is_null()) {
+        request.stream = read_bool(*object, "stream");
+    }
+    json::Object sampling;
+    if (const auto* value = json::get(*object, "sampling_params"); value && !value->is_null()) {
+        const auto* params = value->object();
+        if (!params) {
+            bad_request("Expected one sampling_params object");
+        }
+        for (const auto& [key, parameter] : *params) {
+            if (key == "max_new_tokens") {
+                request.options.max_new_tokens = text_budget(parameter,
+                    "Expected a finite nonnegative integer sampling_params.max_new_tokens");
+            } else if (key == "n") {
+                if (!parameter.is_null() && parameter.unsigned_integer() != 1) {
+                    bad_request("Only sampling_params.n = 1 is supported");
+                }
+            } else if (key == "temperature" || key == "top_p" || key == "top_k" ||
+                       key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
+                       key == "stop_token_ids") {
+                if (!parameter.is_null()) {
+                    sampling.emplace(key, parameter);
+                }
+            } else {
+                throw std::invalid_argument("Unsupported /generate sampling parameter: " + key);
+            }
+        }
+    }
+    set_sampling(sampling, request.options, "sampling_seed");
+    set_stops(sampling, request.options);
+    const auto* salt = json::get(*object, "cache_salt");
+    if (salt && !salt->is_null()) {
+        set_cache_salt(*object, request.options);
+    }
+
+    const auto* text = json::get(*object, "text");
+    const auto* ids = json::get(*object, "input_ids");
+    const bool has_text = text && !text->is_null();
+    const bool has_ids = ids && !ids->is_null();
+    if (has_text == has_ids) {
+        bad_request("Provide exactly one of text or input_ids");
+    }
+    if (has_text) {
+        const auto prompt = text->string().value_or("");
+        if (prompt.empty() || prompt.size() > 1024 * 1024) {
+            bad_request("Expected one nonempty text string of up to 1048576 bytes");
+        }
+        encode_prompt(request.prompt, request.options.max_new_tokens, prompt, tokenizer);
+    } else {
+        const auto* tokens = ids->array();
+        if (!tokens || tokens->empty()) {
+            bad_request("Expected one nonempty flat array of input_ids");
+        }
+        if (tokens->size() > checkpoint_context - request.options.max_new_tokens) {
+            bad_request("Prompt and output budget must fit the 262144-token context");
+        }
+        request.prompt.reserve(tokens->size());
+        for (const auto& value : *tokens) {
+            const auto token = value.unsigned_integer();
+            if (!token || *token >= model_vocab_size) {
+                bad_request("input_ids must contain integers in [0, 248320)");
+            }
+            request.prompt.push_back(static_cast<int>(*token));
+        }
+    }
+    return request;
+}
+
 void set_cache_salt(const json::Object& object, DecoderOptions& options) {
     if (json::get(object, "cache_salt")) {
         const auto salt = json::get_string(object, "cache_salt");
@@ -534,7 +629,7 @@ TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer&
     const auto tools = chat_tools(normalized);
     const auto prompt = tokenizer.chat_template().render(normalized, ChatInput::http, tools);
     validate_prompt(prompt);
-    encode_prompt(request, prompt, tokenizer);
+    encode_prompt(request.prompt, request.options.max_new_tokens, prompt, tokenizer);
     if (media) {
         auto& prepared = request.media.emplace();
         prepared.template_ids = std::move(request.prompt);

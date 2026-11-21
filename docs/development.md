@@ -200,9 +200,11 @@ See [MTP](mtp.md) for exact tiled seeding, joint target verification, and per-la
 
 ### Native streaming server
 
-See [native HTTP transport](http-server.md) for admission, overload, health, readiness, and shutdown. `--max-active` accepts 1–32 and `--max-num-batched-tokens` accepts 1–32,768. Both default to their maximum. [MTP](mtp.md#runtime-path) supports [exact prefix reuse](prefix-cache.md). Graph replay is [opt-in](batch-graphs.md). [CLI limits](../apps/sglang-server.cpp#L99)<!-- prefix: "} else if (o" -->
+See [native HTTP transport](http-server.md) for admission, overload, health, readiness, and shutdown. `--max-active` accepts 1–32 and `--max-num-batched-tokens` accepts 1–32,768. Both default to their maximum. [MTP](mtp.md#runtime-path) supports [exact prefix reuse](prefix-cache.md). Graph replay is [opt-in](batch-graphs.md). [CLI limits](../apps/sglang-server.cpp#L100)<!-- prefix: "} else if (o" -->
 
 Lanes share weights and own KV, GDN state, and outputs. [Resident memory admission](batch-graphs.md#resident-memory-admission) applies at every capacity.
+
+See [`POST /generate`](native-generate.md) for the native request and response format.
 
 Follow the [benchmark wire contract](../benchmarks/streaming/README.md#wire-contract), [stream transport](http-server.md#completion-streams), and [decoder limits](#constraints-and-failure-behavior). A `stop_token_ids` match emits the ID with `stop`, including at the budget. Zero budget reports `length` without a model step. Prompt IDs appear in the first token event or the zero-budget terminal choice. Benchmark temperature accepts underflow to signed zero. [Request parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" --> · [Numeric retry](../apps/server/completions.cpp#L172)<!-- prefix: "json::Value " --> · [Terminal choice](../apps/server/completions.cpp#L113)<!-- prefix: "void finish_" -->
 

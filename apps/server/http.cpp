@@ -178,7 +178,8 @@ std::size_t content_length(std::string_view headers, const HttpRequest& request)
     if (length.value_or(0) > max_body_bytes) {
         throw HttpError("413 Content Too Large", "Request body exceeds 2 MiB");
     }
-    if (request.method == "POST" && request.path == "/v1/completions") {
+    if (request.method == "POST" &&
+        (request.path == "/v1/completions" || request.path == "/generate")) {
         if (!length) {
             throw HttpError("411 Length Required", "Expected Content-Length");
         }

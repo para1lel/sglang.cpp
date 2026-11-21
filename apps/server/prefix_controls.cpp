@@ -138,9 +138,9 @@ void stop_profile(const Socket& connection, BatchService& service, const HttpReq
 class ConnectionQueue {
 public:
     ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete,
-                    std::string_view health, bool prefix_controls)
-        : service_(service), capacity_(capacity), complete_(complete), health_(health),
-          prefix_controls_(prefix_controls) {}
+                    std::string_view health, bool prefix_controls, const BatchGenerate& generate)
+        : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
+          health_(health), prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -163,6 +163,7 @@ private:
     BatchService& service_;
     const int capacity_;
     const BatchCompletion& complete_;
+    const BatchGenerate& generate_;
     const std::string_view health_;
     const bool prefix_controls_;
     std::mutex mutex_;
@@ -264,13 +265,20 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
             return;
         }
     }
-    throw HttpError("404 Not Found", prefix_controls_ ? "Unknown native server route" :
-                    "Expected GET /health, /ready, or /v1/models, "
-                    "or POST /v1/completions or /v1/chat/completions");
+    if (prefix_controls_) {
+        throw HttpError("404 Not Found", "Unknown native server route");
+    }
+    std::string routes = "Expected GET /health, /ready, or /v1/models, "
+                         "or POST /v1/completions or /v1/chat/completions";
+    if (generate_) {
+        routes += " or /generate";
+    }
+    throw HttpError("404 Not Found", routes.c_str());
 }
 
 void ConnectionQueue::route(Socket& connection, HttpRequest request) {
-    if (!completion_route(request)) {
+    const bool generate = generate_ && request.method == "POST" && request.path == "/generate";
+    if (!generate && !completion_route(request)) {
         serve_control(connection, request);
         return;
     }
@@ -333,7 +341,11 @@ void ConnectionQueue::run(int slot) {
         } else if (!disconnected(work->connection)) {
             const auto& request = *work->request;
             handle_errors(work->connection, [&] {
-                complete_(work->connection, slot, request.body, chat_route(request));
+                if (request.path == "/generate") {
+                    generate_(work->connection, slot, request.body);
+                } else {
+                    complete_(work->connection, slot, request.body, chat_route(request));
+                }
             });
         }
     }
@@ -353,11 +365,11 @@ void ConnectionQueue::stop() {
 
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
-                       bool prefix_controls) {
+                       bool prefix_controls, const BatchGenerate& generate) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
-    ConnectionQueue queue(service, max_active, complete, health, prefix_controls);
+    ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate);
     std::vector<std::thread> workers;
     workers.reserve(max_active);
     std::mutex failure_mutex;

@@ -5,6 +5,7 @@
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
+#include "sglang/server/native_generate.h"
 #include "sglang/server/prefix_controls.h"
 #include "sglang/server/vision_completion.h"
 
@@ -194,7 +195,10 @@ int main(int argc, char** argv) {
                 } else {
                     complete(connection, service, slot, tokenizer, body);
                 }
-            }, health, arguments.prefix_cache_entries != 0);
+            }, health, arguments.prefix_cache_entries != 0,
+            [&](const Socket& connection, int slot, std::string_view body) {
+                complete_generate(connection, service, slot, tokenizer, body);
+            });
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';
         return 1;

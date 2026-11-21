@@ -191,3 +191,22 @@ The native check compares parser-off and parser-on generation at width one.
 It repeats the parsed responses with four concurrent requests and checks the
 server trace for overlapping decode lanes. The reasoning and tool examples
 also run without token diagnostics or an SSE usage frame.
+
+## Native generate on CPU
+
+Run from the repository root in the managed Pixi default environment. The
+scripted decoder uses the checkpoint tokenizer and does not load weights.
+
+```bash
+out="$PWD/artifacts/native-generate-cpu"
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+mkdir -p "$out"
+bash tests/text/build_chat_cpu.sh "$PWD" - "$out/server"
+CUDA_VISIBLE_DEVICES='' python3 -B tests/text/test_native_generate_cpu.py \
+    --binary "$out/server" --checkpoint "$checkpoint" --output "$out/evidence"
+```
+
+The suite checks raw text and token ID inputs, cumulative SSE, sampling defaults,
+validation, model discovery, and shared queue overflow. It disconnects a queued
+client and an active stream over TCP and checks that a waiting request and a
+subsequent request reuse the released slot.

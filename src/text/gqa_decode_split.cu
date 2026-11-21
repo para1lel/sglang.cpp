@@ -15,7 +15,7 @@ constexpr int threads = warps * 32;
 constexpr int tile_tokens = 16;
 constexpr int chunk_tokens = split_chunk_tokens;
 constexpr int chunks_per_page = mxfp8_page_size / chunk_tokens;
-constexpr int stages = 3;
+constexpr int stages = 2;
 constexpr int key_stride = mxfp8_head_dim + 32;
 constexpr int value_stride = mxfp8_head_dim + 16;
 constexpr int scale_row = 2 * mxfp8_groups;
@@ -129,9 +129,9 @@ __device__ __forceinline__ float power_of_two(int biased) {
     return __uint_as_float(static_cast<unsigned int>(biased) << 23);
 }
 
-__device__ void issue_chunk(const Shared& shared, Stage& stage,
-                            const decoder::PagedDecodeLane& lane, int kv_head, int chunk,
-                            int first_page) {
+__device__ void issue_warp_tile(const Shared& shared, Stage& stage,
+                               const decoder::PagedDecodeLane& lane, int kv_head, int chunk,
+                               int first_page, int warp, int lane_id) {
     const int half = chunk % chunks_per_page;
     const auto physical =
         static_cast<std::size_t>(shared.pages[chunk / chunks_per_page - first_page]);
@@ -140,9 +140,9 @@ __device__ void issue_chunk(const Shared& shared, Stage& stage,
         (static_cast<std::size_t>(half * chunk_tokens) * mxfp8_kv_heads + kv_head) *
             mxfp8_head_dim;
     #pragma unroll
-    for (int step = 0; step < chunk_tokens * copies_per_token / threads; ++step) {
-        const int index = static_cast<int>(threadIdx.x) + step * threads;
-        const int token = index / copies_per_token;
+    for (int step = 0; step < tile_tokens * copies_per_token / 32; ++step) {
+        const int index = lane_id + step * 32;
+        const int token = warp * tile_tokens + index / copies_per_token;
         const int column = index % copies_per_token * 16;
         const bool valid = first + token <= lane.position;
         const auto source = payload + token * mxfp8_kv_heads * mxfp8_head_dim + column;
@@ -150,15 +150,20 @@ __device__ void issue_chunk(const Shared& shared, Stage& stage,
         copy_16(stage.values + token * value_stride + column, lane.cache.value_payload + source,
                 valid);
     }
-    if (threadIdx.x < 2 * mxfp8_group_size) {
-        const int row = threadIdx.x % mxfp8_group_size;
-        const bool value = threadIdx.x >= mxfp8_group_size;
-        const std::size_t source =
-            (physical * mxfp8_kv_heads + kv_head) * mxfp8_scale_bytes_per_page / mxfp8_kv_heads +
-            row * (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups + half * scale_row;
-        copy_16((value ? stage.value_scales : stage.key_scales) + row * scale_row,
-                (value ? lane.cache.value_scales : lane.cache.key_scales) + source, true);
-    }
+    static_assert(mxfp8_groups == 8 && tile_tokens == 16);
+    const int token = warp * tile_tokens + lane_id % tile_tokens;
+    const int offset = token % mxfp8_group_size * scale_row +
+                       token / mxfp8_group_size * mxfp8_groups;
+    const bool value = lane_id >= tile_tokens;
+    const std::size_t source =
+        (physical * mxfp8_kv_heads + kv_head) * mxfp8_scale_bytes_per_page / mxfp8_kv_heads +
+        token % mxfp8_group_size * (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups +
+        half * scale_row + token / mxfp8_group_size * mxfp8_groups;
+    const auto dest = __cvta_generic_to_shared(
+        (value ? stage.value_scales : stage.key_scales) + offset);
+    const auto* source_ptr = (value ? lane.cache.value_scales : lane.cache.key_scales) + source;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;"
+                 :: "r"(static_cast<unsigned int>(dest)), "l"(source_ptr) : "memory");
 }
 
 /// Loads one BF16 query head per MMA row and flags operands outside the FP32 score range.
@@ -451,26 +456,27 @@ __global__ void __launch_bounds__(threads, 2) split_kernel(
         shared.pages[index] = lane.pages.device_pages[first_page + index];
     }
     __syncthreads();
+    const int warp = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
     #pragma unroll
     for (int index = 0; index < stages - 1; ++index) {
         if (first + index < last) {
-            issue_chunk(shared, shared.stage[index], lane, kv_head, first + index, first_page);
+            issue_warp_tile(shared, shared.stage[index], lane, kv_head, first + index, first_page,
+                            warp, lane_id);
         }
         commit();
     }
-    const int warp = threadIdx.x / 32;
-    const int lane_id = threadIdx.x % 32;
     Running run{};
     run.maximum = -CUDART_INF_F;
     const auto query = load_query(lane.buffers.queries, kv_head, lane_id / 4, lane_id % 4,
                                   run.flag);
     for (int chunk = first; chunk < last; ++chunk) {
         wait_pending<stages - 2>();
-        __syncthreads();
+        __syncwarp();
         const int next = chunk + stages - 1;
         if (next < last) {
-            issue_chunk(shared, shared.stage[(next - first) % stages], lane, kv_head, next,
-                        first_page);
+            issue_warp_tile(shared, shared.stage[(next - first) % stages], lane, kv_head, next,
+                            first_page, warp, lane_id);
         }
         commit();
         process_tile(shared.stage[(chunk - first) % stages], shared.scales[warp], query, run,

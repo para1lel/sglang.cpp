@@ -56,6 +56,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 ## API and limits
 
+- `GET /v1/models` lists the served model. See [model discovery](docs/http-server.md#model-discovery).
 - [Chat completions](docs/chat-serving.md) accept `messages` at `POST /v1/chat/completions`.
   The guide covers images, video, reasoning, and tool calls.
 - [Text completions](docs/text-serving.md) accept a UTF-8 `prompt` at `POST /v1/completions`.

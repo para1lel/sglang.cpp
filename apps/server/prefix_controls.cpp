@@ -7,6 +7,7 @@
 #include "sglang/server/http.h"
 
 #include <condition_variable>
+#include <ctime>
 #include <exception>
 #include <iostream>
 #include <list>
@@ -214,6 +215,16 @@ void ConnectionQueue::reset_cache(const Socket& connection) {
     changed_.notify_all();
 }
 
+void write_models(const Socket& connection) {
+    std::string body = R"({"object":"list","data":[{"id":)";
+    json::append_quoted(body, model_name);
+    body += R"(,"object":"model","created":)" + std::to_string(std::time(nullptr));
+    body += R"(,"owned_by":"sglang","root":)";
+    json::append_quoted(body, model_name);
+    body += R"(,"parent":null,"max_model_len":)" + std::to_string(checkpoint_context) + "}]}";
+    write_json(connection, "200 OK", body);
+}
+
 void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& request) {
     if (request.method == "GET" && request.body.empty()) {
         if (request.path == "/health") {
@@ -222,6 +233,10 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
         }
         if (request.path == "/ready") {
             write_readiness(connection, service_.ready());
+            return;
+        }
+        if (request.path == "/v1/models") {
+            write_models(connection);
             return;
         }
         if (prefix_controls_ && request.path == "/metrics") {
@@ -250,7 +265,8 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
         }
     }
     throw HttpError("404 Not Found", prefix_controls_ ? "Unknown native server route" :
-                    "Expected GET /health, GET /ready, or POST /v1/completions");
+                    "Expected GET /health, /ready, or /v1/models, "
+                    "or POST /v1/completions or /v1/chat/completions");
 }
 
 void ConnectionQueue::route(Socket& connection, HttpRequest request) {

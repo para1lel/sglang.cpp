@@ -20,6 +20,7 @@ from test_native_text import MODEL, event, legacy
 
 TEXT = "/v1/completions"
 CHAT = "/v1/chat/completions"
+MODELS = "/v1/models"
 SCRIPT = [32, 248046, 33, 248044, 34, 35, 36]
 OPTIONS_PREFIX = "cpu sampling {"
 CHAT_CONTEXT_RESERVE = 2
@@ -143,6 +144,58 @@ class Routes(unittest.TestCase):
     def check_chat_default_budget(self, seen, prompt_tokens=CHAT_TEST_PROMPT_TOKENS):
         self.assertEqual(seen["prompt_tokens"], prompt_tokens)
         self.assertEqual(seen["budget"], self.context - CHAT_CONTEXT_RESERVE - prompt_tokens)
+
+    def control(self, port, path, *, method="GET", payload=None, status=200,
+                content_type="application/json"):
+        with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
+            connection.request(method, path, payload)
+            with connection.getresponse() as response:
+                data = response.read()
+                self.assertEqual(response.status, status, (method, path, data))
+                self.assertEqual(response.headers.get_content_type(), content_type)
+                self.assertEqual(response.getheader("Content-Length"), str(len(data)))
+                return json.loads(data) if content_type == "application/json" else data
+
+    def check_model_discovery(self, port, log, *, prefix_controls):
+        started = int(time.time())
+        catalog = self.control(port, MODELS)
+        self.assertEqual(set(catalog), {"object", "data"})
+        self.assertEqual(catalog["object"], "list")
+        self.assertIsInstance(catalog["data"], list)
+        card, = catalog["data"]
+        self.assertIs(type(card["created"]), int)
+        self.assertLessEqual(started, card["created"])
+        self.assertLessEqual(card["created"], int(time.time()))
+        self.assertEqual(card, {
+            "id": MODEL, "object": "model", "created": card["created"],
+            "owned_by": "sglang", "root": MODEL, "parent": None,
+            "max_model_len": self.context,
+        })
+        self.assertIs(type(card["max_model_len"]), int)
+        for route in (TEXT, CHAT):
+            with self.subTest(route=route):
+                payload = body(route, model=card["id"], max_tokens=1)
+                packet, seen = self.exchange(route, payload, port=port, log=log)
+                self.completion(packet, seen, 1, "length")
+        for method, payload in (("POST", None), ("GET", b"{}")):
+            error = self.control(port, MODELS, method=method, payload=payload, status=404)
+            self.assertIn("error", error)
+        self.assertEqual(self.control(port, "/health")["max_active"], 1)
+        self.assertEqual(self.control(port, "/ready"), {"ready": True})
+        if prefix_controls:
+            metrics = self.control(port, "/metrics", content_type="text/plain")
+            self.assertIn(b"sglang_cpp:prefix_cache_entries", metrics)
+        else:
+            self.assertIn("error", self.control(port, "/metrics", status=404))
+
+    def test_model_discovery(self):
+        with self.subTest(prefix_controls=False):
+            self.check_model_discovery(self.port, self.log, prefix_controls=False)
+        with self.subTest(prefix_controls=True):
+            log = self.output / "models-prefix.log"
+            with server(self.binary, self.checkpoint, log, "--max-active", "1",
+                        "--prefix-cache-entries", "1") as port:
+                self.check_model_discovery(port, log, prefix_controls=True)
 
     def test_text_omitted_sampling_and_budget(self):
         packet, seen = self.exchange(TEXT, body(TEXT, ignore_eos=True))

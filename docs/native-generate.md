@@ -60,6 +60,7 @@ It validates all items and encodes all text prompts before it submits any decode
 Both input forms use the checkpoint tokenizer to render generated IDs.
 
 A batch occupies one HTTP queue entry and one completion worker. Its items share the decoder scheduler with other completions.
+An item that decodes alone can use [score-backed singleton attention](singleton-gqa-decode.md).
 The batch submits items to its worker's lane and can use available lanes without a reservation.
 If a new completion reserves a borrowed lane, it can use the lane after the current item retires.
 The worker submits remaining items as lanes become available. A batch can therefore contain more items than `--max-active`.

@@ -137,6 +137,7 @@ public:
     std::size_t bytes() const;
     TransferBuffers& transfers();
     TextLogitCandidate* prepare_packed_winners();
+    ExactGqaWorkspace prepare_singleton_scores();
     cudaStream_t stream() const;
     cudaGraphExec_t graph() const;
     void capture_graph(const std::function<void()>& enqueue);
@@ -357,6 +358,7 @@ struct ForwardLane {
     int rotary_position = -1;
     bool long_gqa = false;
     bool packed = false;
+    ExactGqaWorkspace singleton_scores{};
 };
 
 // Packed decode runs one padded row per lane. Buckets bound graph executables; eager packed steps
@@ -365,6 +367,11 @@ inline constexpr int packed_decode_min_lanes = 2;
 inline constexpr std::array<int, 12> packed_decode_buckets{1, 2, 4, 8, 12, 16, 24, 32,
                                                            40, 48, 56, 64};
 inline constexpr int packed_decode_max_rows = decoder_batch_max_lanes;
+
+inline constexpr int singleton_score_min_visible = 32768;
+inline constexpr int singleton_score_max_visible = 36864;
+static_assert(singleton_score_max_visible % mxfp8_page_size == 0 &&
+              singleton_score_max_visible <= text_attention_max_tokens);
 
 struct BatchDecodeBinding {
     TextLogitCandidate input;

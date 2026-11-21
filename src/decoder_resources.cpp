@@ -175,6 +175,7 @@ struct Allocations::State {
     TransferBuffers transfers;
     TextLogitCandidate* packed_winners = nullptr;
     bool packed_winners_unavailable = false;
+    std::optional<ExactGqaWorkspace> singleton_scores;
     std::shared_ptr<const void> owners;
     std::unique_ptr<State> next;
 };
@@ -423,6 +424,30 @@ TextLogitCandidate* Allocations::prepare_packed_winners() {
         }
     }
     return state_->packed_winners;
+}
+
+ExactGqaWorkspace Allocations::prepare_singleton_scores() {
+    if (!state_->singleton_scores) {
+        check(cudaPeekAtLastError(), "Check CUDA error before allocating singleton scores");
+        constexpr auto count = static_cast<std::size_t>(singleton_score_max_visible) *
+            mxfp8_query_heads;
+        try {
+            state_->singleton_scores = {allocate<float>(count), singleton_score_max_visible};
+        } catch (const CudaError& error) {
+            if (error.status != cudaErrorMemoryAllocation) {
+                throw;
+            }
+            const auto pending = cudaGetLastError();
+            if (pending != error.status) {
+                check(pending, "Check CUDA error before singleton score fallback");
+            }
+            state_->singleton_scores = ExactGqaWorkspace{};
+            std::fprintf(stderr, "sglang decoder: Allocate singleton scores: %s, "
+                         "using ordered eager decode for long singletons\n",
+                         cudaGetErrorString(error.status));
+        }
+    }
+    return *state_->singleton_scores;
 }
 
 cudaStream_t Allocations::stream() const { return state_->stream; }

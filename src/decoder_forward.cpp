@@ -194,10 +194,15 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
 
 template <typename Position>
 cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
-                     Position position, TextGdnMode mode, bool narrow_gqa, cudaStream_t stream) {
+                     Position position, TextGdnMode mode, bool narrow_gqa,
+                     ExactGqaWorkspace singleton_scores, cudaStream_t stream) {
     const int capacity = pages.page_count * mxfp8_page_size;
     const auto scores = work.gqa_scores(capacity);
     if constexpr (std::is_same_v<Position, int>) {
+        if (singleton_scores.scores) {
+            return exact_decode_gqa_attention(cache, pages, position, work.rope_queries,
+                                              work.attention, singleton_scores, stream);
+        }
         if (mode == TextGdnMode::prefill || position >= scores.capacity) {
             return mxfp8_gqa_attention(cache, pages, position + 1, position, 1,
                                        work.rope_queries, work.attention, stream);
@@ -305,6 +310,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         auto& request = *lane.request;
         const auto cache = request.caches[cache_index];
         bool narrow_gqa = false;
+        ExactGqaWorkspace singleton_scores{};
         const MropePosition* mrope = nullptr;
         int rotary_position = -1;
         if constexpr (!std::is_same_v<Lane, VerificationRow>) {
@@ -313,6 +319,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
             mrope = lane.mrope;
             rotary_position = lane.rotary_position;
+            singleton_scores = lane.singleton_scores;
         }
         append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
                    rotary_position);
@@ -326,7 +333,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
             }
         }
         check(read_gqa(work, request.pages, cache, lane.position, lane.mode, narrow_gqa,
-                       batch.stream), "Read causal MXFP8 attention");
+                       singleton_scores, batch.stream), "Read causal MXFP8 attention");
         gate_gqa(work, batch.stream);
     });
     if (count > 0) {

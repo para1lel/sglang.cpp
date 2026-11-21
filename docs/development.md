@@ -129,9 +129,7 @@ Prefill follows token order. The final prompt row gives initial logits. [Serial 
 
 Both binaries accept `--fp8-prefill exact|tensor-core`. Pass `Fp8PrefillPolicy` as the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L101)<!-- prefix: "enum class F" -->
 
-Tensor-core projections require K0, at least three rows, widths divisible by 128, and contiguous, 16-byte-aligned E4M3 payloads. The `sm_100a` build uses TMA, TMEM, and `tcgen05`. It requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Ineligible calls use SIMT. Errors propagate. [Projection](../src/decoder_prefill.cpp#L346)<!-- prefix: "void Prefill" --> · [Eligibility](../src/prefill_fp8_sm100.cu#L510)<!-- prefix: "const int ma" --> · [Build](../xmake.lua#L67)<!-- prefix: "target(\"sgla" -->
-
-At input widths ≥8192, eligible projections use 64×128 tiles below 1024 rows and 128×128 otherwise. [Projection tiles](../src/prefill_fp8_sm100.cu#L521)<!-- prefix: "const bool n" -->
+See [FP8 prefill projections](fp8-prefill-projections.md) for SM100 eligibility, tile selection, and fallback.
 
 Multirow K0 tensor-core prefill keeps these operators during projection fallback.
 

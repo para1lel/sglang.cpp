@@ -13,6 +13,7 @@ namespace {
 constexpr int group_size = text_fp8_group_size;
 constexpr int warp_size = 32;
 constexpr int accum_stages = 2;
+constexpr int packed_qkv_tile_cols = 256;
 
 template <int Rows, int Cols, int Copies, int Batch, int Resident>
 struct Tile {
@@ -21,7 +22,9 @@ struct Tile {
     static constexpr int copies = Copies;
     static constexpr int batch = Batch;
     static constexpr int resident = Resident;
-    static constexpr int warp_cols = Cols < 64 ? Cols : 64;
+    static constexpr bool wide = Cols == packed_qkv_tile_cols;
+    static constexpr int warp_cols = wide ? group_size : (Cols < 64 ? Cols : 64);
+    static constexpr int partial_cols = wide ? 16 : warp_cols;
     static constexpr int consumers = Rows * Cols / (warp_size * warp_cols);
     static constexpr int threads = (consumers + 2) * warp_size;
     static constexpr int stage_bytes = (Rows + Cols) * group_size;
@@ -30,7 +33,7 @@ struct Tile {
     static constexpr int store_width = 8;
 
     static_assert(Rows == 128 || (Rows == 64 && Cols == 128));
-    static_assert(group_size % 32 == 0 && group_size % Cols == 0);
+    static_assert(group_size % 32 == 0 && (group_size % Cols == 0 || wide));
     static_assert(tmem_cols >= 32 && tmem_cols <= 512 && (tmem_cols & (tmem_cols - 1)) == 0);
 };
 
@@ -146,7 +149,15 @@ __device__ void multiply_tiles(Pipeline<Config>& pipe, unsigned shared, int grou
 
 template <int Count>
 __device__ void load_partial(unsigned source, unsigned (&out)[Count]) {
-    if constexpr (Count == 32) {
+    if constexpr (Count == 16) {
+        asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0,%1,%2,%3,%4,%5,%6,%7,"
+                     "%8,%9,%10,%11,%12,%13,%14,%15}, [%16];\ntcgen05.wait::ld.sync.aligned;"
+                     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
+                       "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7]),
+                       "=r"(out[8]), "=r"(out[9]), "=r"(out[10]), "=r"(out[11]),
+                       "=r"(out[12]), "=r"(out[13]), "=r"(out[14]), "=r"(out[15])
+                     : "r"(source) : "memory");
+    } else if constexpr (Count == 32) {
         asm volatile("tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,"
                      "%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,"
                      "%26,%27,%28,%29,%30,%31}, [%32];\ntcgen05.wait::ld.sync.aligned;"
@@ -207,12 +218,15 @@ __device__ void accumulate(Pipeline<Config>& pipe, const float* activation,
             wait_barrier(&pipe.accum_ready[batch % accum_stages], (batch / accum_stages) % 2);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
         }
-        unsigned partial[Config::warp_cols];
-        load_partial(tmem + slot * Config::accum_cols, partial);
         #pragma unroll
-        for (int col = 0; col < Config::warp_cols; col += 2) {
-            scale_pair(result[col], result[col + 1], __uint_as_float(partial[col]),
-                       __uint_as_float(partial[col + 1]), scale);
+        for (int base = 0; base < Config::warp_cols; base += Config::partial_cols) {
+            unsigned partial[Config::partial_cols];
+            load_partial(tmem + slot * Config::accum_cols + base, partial);
+            #pragma unroll
+            for (int col = 0; col < Config::partial_cols; col += 2) {
+                scale_pair(result[base + col], result[base + col + 1],
+                           __uint_as_float(partial[col]), __uint_as_float(partial[col + 1]), scale);
+            }
         }
         if (group % Config::batch == Config::batch - 1 || group == groups - 1) {
             asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
@@ -290,7 +304,8 @@ void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
         const int row = row_base + local_row;
         const auto* activation = row < rows ? activation_scales + std::size_t(row) * groups
                                             : nullptr;
-        const auto* weight = weight_scales + std::size_t(col_base / group_size) * groups;
+        const int scale_col = Config::wide ? col_base + local_col : col_base;
+        const auto* weight = weight_scales + std::size_t(scale_col / group_size) * groups;
         const unsigned tmem = pipe.tmem + (tmem_row << 16) + tmem_col;
         accumulate(pipe, activation, weight, groups, tmem, result);
     } else if (warp == Config::consumers && lane == 0) {
@@ -551,6 +566,7 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
     int total_width = 0;
     SplitOutput output{};
     int index = 0;
+    bool wide_slices = true;
     for (const auto& projection : projections) {
         if (projection.width <= 0 ||
             projection.width > std::numeric_limits<int>::max() - total_width) {
@@ -564,6 +580,7 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
             reinterpret_cast<std::uintptr_t>(projection.scales) != scales.end) {
             return std::nullopt;
         }
+        wide_slices &= projection.width % packed_qkv_tile_cols == 0;
         output.slices[index++] = {projection.output, projection.width};
         total_width += projection.width;
     }
@@ -585,6 +602,14 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
     const auto status = tma_device(stream, device);
     if (status != cudaSuccess) {
         return status;
+    }
+    if (rows == 1024 && in_width == 5120 && wide_slices &&
+        (total_width == 16384 || total_width == 14336)) {
+        const auto wide = launch_tma<Tile<128, packed_qkv_tile_cols, 4, 1, 1>>(
+            first.weight, first.scales, input, rows, total_width, in_width, output, stream, device);
+        if (wide) {
+            return wide;
+        }
     }
     return launch_tma<Tile<128, 128, 6, 2, 1>>(first.weight, first.scales, input, rows,
                                               total_width, in_width, output, stream, device);

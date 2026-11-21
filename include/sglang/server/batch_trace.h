@@ -1,0 +1,68 @@
+#pragma once
+
+#include "sglang/decoder_batch.h"
+
+#include <algorithm>
+#include <array>
+#include <iostream>
+#include <string>
+
+namespace sglang::server {
+
+inline void trace_verification(const std::array<DecoderBatchStep, decoder_batch_max_lanes>& steps,
+                               const DecoderBatchStepStats& stats) {
+    std::cerr << ("batch verify lanes=" + std::to_string(stats.verification_lanes) +
+                  " rows=" + std::to_string(stats.verification_rows) +
+                  " peak_request_bytes=" + std::to_string(stats.peak_request_bytes) + '\n');
+    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+        const auto& step = steps[slot];
+        if (step.mtp_verified_rows || step.mtp_boundary) {
+            std::cerr << ("batch mtp slot=" + std::to_string(slot) +
+                          " drafted=" + std::to_string(step.mtp_drafted_tokens) +
+                          " accepted=" + std::to_string(step.mtp_accepted_tokens) +
+                          " verified=" + std::to_string(step.mtp_verified_rows) +
+                          " replayed=" + std::to_string(step.mtp_replayed_rows) +
+                          " boundary=" + std::to_string(step.mtp_boundary) + '\n');
+        }
+    }
+}
+
+inline void trace_batch_details(const std::array<DecoderBatchStep, decoder_batch_max_lanes>& steps,
+                                const DecoderBatchStepStats& stats, int max_active,
+                                int max_num_batched_tokens, int mtp_steps) {
+    std::string line = "batch prefill_rows=";
+    for (int slot = 0; slot < std::max(max_active, decoder_batch_max_mtp_lanes); ++slot) {
+        if (slot != 0) {
+            line += ',';
+        }
+        line += std::to_string(stats.prefill_rows[slot]);
+    }
+    std::cerr << (line + " workspace_bytes=" + std::to_string(stats.prefill_workspace_bytes) +
+                  '\n');
+    std::cerr << ("batch target_rows=" + std::to_string(stats.target_rows) +
+                  " step_budget=" + std::to_string(max_num_batched_tokens) + '\n');
+    if (stats.layerwise_prefill_groups) {
+        std::cerr << ("batch layerwise_prefill_groups=" +
+                      std::to_string(stats.layerwise_prefill_groups) +
+                      " rows=" + std::to_string(stats.layerwise_prefill_rows) + '\n');
+    }
+    if (stats.graph_slots) {
+        std::cerr << ("batch graph_slots=" + std::to_string(stats.graph_slots) + '\n');
+    }
+    if (stats.sampling_workspace_bytes) {
+        std::cerr << ("batch sampling_workspace_bytes=" +
+                      std::to_string(stats.sampling_workspace_bytes) + '\n');
+    }
+    if (stats.constraint_workspace_bytes) {
+        std::cerr << ("batch constraint_workspace_bytes=" +
+                      std::to_string(stats.constraint_workspace_bytes) + '\n');
+    }
+    if (mtp_steps != 0) {
+        trace_verification(steps, stats);
+    } else {
+        std::cerr << ("batch peak_request_bytes=" + std::to_string(stats.peak_request_bytes) +
+                      '\n');
+    }
+}
+
+}

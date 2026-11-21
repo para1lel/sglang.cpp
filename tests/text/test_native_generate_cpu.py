@@ -753,36 +753,84 @@ class NativeGenerate(unittest.TestCase):
             self.assertIsNone(batch_frame(reply))
 
     def test_finished_batch_item_reuse_survives_old_request_cleanup(self):
-        port, gate, _ = self.start_abort_server(active=3)
-        gate.with_suffix(".0").touch()
-        payload = named(["reusable", "old-sibling"]) | {
+        self.check_id_reuse_with_owner(busy_owner=False)
+
+    def test_finished_batch_item_reuse_with_busy_owner(self):
+        self.check_id_reuse_with_owner(busy_owner=True)
+
+    def check_id_reuse_with_owner(self, *, busy_owner):
+        port, gate, log = self.start_abort_server(active=2)
+        first_step = gate.with_suffix(".0")
+        finish = {"type": "length", "length": 1}
+        old_ids = ["reusable", "old-sibling"] if busy_owner else ["old-sibling", "reusable"]
+        reuse_index = old_ids.index("reusable")
+        sibling_index = old_ids.index("old-sibling")
+        payload = named(old_ids) | {
             "input_ids": [[32], [33]],
-            "sampling_params": [{"max_new_tokens": 1}, named("old")["sampling_params"]],
+            "sampling_params": [named(rid, budget=1 if rid == "reusable" else 2)["sampling_params"]
+                                for rid in old_ids],
         }
-        with generate_client(port, payload) as old, http.client.HTTPResponse(old) as stream:
-            self.check_batch_headers(stream)
-            first = [batch_frame(stream), batch_frame(stream)]
-            for packet in first:
-                if packet["index"] == 0:
-                    finish = {"type": "length", "length": 1}
-                    self.check_named_finish(packet, "reusable", [32], finish, index=0)
-                else:
-                    self.check_named_finish(packet, "old-sibling", [32], None, index=1)
-            new_batch = named(["reusable"]) | {"input_ids": [[32]]}
-            with generate_client(port, new_batch) as new, \
-                 http.client.HTTPResponse(new) as reply:
-                self.check_batch_headers(reply)
-                self.check_named_finish(batch_frame(reply), "reusable", [32], None, index=0)
-                self.abort_request(port, {"rid": "old-sibling"})
-                self.check_named_finish(batch_frame(stream), "old-sibling", [32], ABORTED,
-                                        index=1)
-                self.assertEqual(batch_frame(stream), "[DONE]")
-                self.assertIsNone(batch_frame(stream))
-                self.wait_queue(port, 1, 0)
-                self.abort_request(port, {"rid": "reusable"})
-                self.check_named_finish(batch_frame(reply), "reusable", [32], ABORTED, index=0)
-                self.assertEqual(batch_frame(reply), "[DONE]")
-                self.assertIsNone(batch_frame(reply))
+        first_step.touch()
+        with generate_client(port, named("parked", budget=3)) as parked, \
+             http.client.HTTPResponse(parked) as parked_reply:
+            self.check_batch_headers(parked_reply)
+            self.check_named_finish(batch_frame(parked_reply), "parked", [32], None)
+            first_step.unlink()
+            log_offset = len(log.read_bytes())
+            with generate_client(port, payload) as old, http.client.HTTPResponse(old) as stream:
+                self.check_batch_headers(stream)
+                self.wait_queue(port, 2, 0)
+                self.abort_request(port, {"rid": "parked"})
+                self.check_named_finish(batch_frame(parked_reply), "parked", [32], ABORTED)
+                self.assertEqual(batch_frame(parked_reply), "[DONE]")
+                self.assertIsNone(batch_frame(parked_reply))
+                deadline = time.monotonic() + 3
+                while True:
+                    admitted = [line for line in log.read_bytes()[log_offset:].splitlines()
+                                if line.startswith(b"cpu admit ")]
+                    if len(admitted) == 2:
+                        break
+                    self.assertLess(time.monotonic(), deadline, admitted)
+                    time.sleep(0.01)
+                first_step.touch()
+                first = {packet["index"]: packet for packet in
+                         (batch_frame(stream), batch_frame(stream))}
+                self.check_named_finish(first[reuse_index], "reusable", [32], finish,
+                                        index=reuse_index)
+                self.check_named_finish(first[sibling_index], "old-sibling", [32], None,
+                                        index=sibling_index)
+                self.check_live_reused_registration(port, stream, sibling_index)
+        self.wait_queue(port, 0, 0)
+        self.check_reused_ids(port, ["reusable", "old-sibling", "companion"])
+        self.wait_queue(port, 0, 0)
+
+    def check_live_reused_registration(self, port, stream, sibling_index):
+        payload = named(["reusable", "companion"]) | {
+            "input_ids": [[32], [32]],
+            "sampling_params": [named("reusable")["sampling_params"], {"max_new_tokens": 0}],
+        }
+        duplicate = named(["reusable", "duplicate-probe"], budget=0, stream=False) | {
+            "input_ids": [[32], [32]],
+        }
+        with generate_client(port, payload) as new, http.client.HTTPResponse(new) as reply:
+            self.check_batch_headers(reply)
+            self.check_named_finish(batch_frame(reply), "reusable", [32], None, index=0)
+            self.wait_queue(port, 2, 0)
+            self.abort_request(port, {"rid": "old-sibling"})
+            self.check_named_finish(batch_frame(stream), "old-sibling", [32], ABORTED,
+                                    index=sibling_index)
+            self.assertEqual(batch_frame(stream), "[DONE]")
+            self.assertIsNone(batch_frame(stream))
+            self.wait_queue(port, 1, 0)
+            self.check_named_finish(batch_frame(reply), "companion", [],
+                                    {"type": "length", "length": 0}, index=1)
+            status, result = send(port, GENERATE, duplicate)
+            self.assertEqual(status, 400, result)
+            self.assertIn("Duplicate request ID", result["error"]["message"])
+            self.abort_request(port, {"rid": "reusable"})
+            self.check_named_finish(batch_frame(reply), "reusable", [32], ABORTED, index=0)
+            self.assertEqual(batch_frame(reply), "[DONE]")
+            self.assertIsNone(batch_frame(reply))
 
     def test_ids_released_after_batch_failure(self):
         port, _, log = self.start_abort_server(active=2, fail=True)

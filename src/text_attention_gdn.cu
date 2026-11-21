@@ -1,7 +1,10 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/text/gdn_chunk.cuh"
+#include "sglang/text/text_cuda_primitives.cuh"
 
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace sglang {
 namespace {
@@ -467,6 +470,23 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
     }
 }
 
+__device__ void finish_history(int token_count, const __nv_bfloat16* qkv,
+                                const __nv_bfloat16* history, __nv_bfloat16* final_history,
+                                int feature) {
+    #pragma unroll
+    for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
+        final_history[feature * text_gdn_history_taps + tap] =
+            raw_sample(qkv, history, token_count - text_gdn_history_taps + tap, feature);
+    }
+}
+
+__device__ __nv_bfloat16 finish_value(float value, float inverse_rms, __nv_bfloat16 norm,
+                                      __nv_bfloat16 z) {
+    const float gate = __bfloat162float(z);
+    return __float2bfloat16(value * inverse_rms * __bfloat162float(norm)
+                            * (gate * sigmoid(gate)));
+}
+
 template <typename State>
 __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                            const __nv_bfloat16* norm, const __nv_bfloat16* observable,
@@ -474,14 +494,8 @@ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv
     const int norm_blocks = output ? token_count * text_gdn_value_heads : 0;
     const int channel = threadIdx.x;
     if (blockIdx.x >= norm_blocks) {
-        const auto* history = history_value(initial);
-        auto* final_history = history_value(final);
         const int feature = (blockIdx.x - norm_blocks) * text_gdn_head_dim + channel;
-        #pragma unroll
-        for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
-            final_history[feature * text_gdn_history_taps + tap] =
-                raw_sample(qkv, history, token_count - text_gdn_history_taps + tap, feature);
-        }
+        finish_history(token_count, qkv, history_value(initial), history_value(final), feature);
         return;
     }
 
@@ -499,9 +513,60 @@ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv
         squares += warp_squares[warp];
     }
     const float inverse_rms = rsqrtf(squares / text_gdn_head_dim + norm_epsilon);
-    const float gate = __bfloat162float(z[index]);
-    output[index] = __float2bfloat16(value * inverse_rms * __bfloat162float(norm[channel])
-                                    * (gate * sigmoid(gate)));
+    output[index] = finish_value(value, inverse_rms, norm[channel], z[index]);
+}
+
+constexpr int finish_heads_per_block = 4;
+constexpr int finish_threads = finish_heads_per_block * warp_size;
+
+__global__ void gdn_finish_quantized(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
+                                     const __nv_bfloat16* norm, const __nv_bfloat16* observable,
+                                     TextGdnState state, TextFp8Activation output) {
+    static_assert(text_gdn_head_dim == text_fp8_group_size);
+    static_assert(text_gdn_value_heads % finish_heads_per_block == 0);
+    constexpr int parts = text_gdn_head_dim / warp_size;
+    const int norm_blocks = rows * (text_gdn_value_heads / finish_heads_per_block);
+    if (blockIdx.x >= norm_blocks) {
+        const int feature = (blockIdx.x - norm_blocks) * finish_threads + threadIdx.x;
+        finish_history(rows, qkv, state.history, state.history, feature);
+        return;
+    }
+
+    const int lane = threadIdx.x % warp_size;
+    const int group = blockIdx.x * finish_heads_per_block + threadIdx.x / warp_size;
+    const auto offset = static_cast<std::size_t>(group) * text_gdn_head_dim + lane;
+    float values[parts];
+    float squares = 0.0f;
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const float value = __bfloat162float(observable[offset + part * warp_size]);
+        values[part] = value;
+        squares += warp_sum(value * value);
+    }
+    const float inverse_rms = rsqrtf(squares / text_gdn_head_dim + norm_epsilon);
+    float maximum = 0.0f;
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const int channel = lane + part * warp_size;
+        const auto value = finish_value(values[part], inverse_rms, norm[channel],
+                                        z[offset + part * warp_size]);
+        values[part] = __bfloat162float(value);
+        maximum = fmaxf(maximum, fabsf(values[part]));
+    }
+    const float amax = text_kernel::warp_max(maximum);
+    float reciprocal = 0.0f;
+    if (lane == 0) {
+        const float scale = __fdiv_rn(fmaxf(text_kernel::quant_epsilon, amax),
+                                      text_kernel::fp8_max);
+        output.scales[group] = scale;
+        reciprocal = __fdiv_rn(1.0f, scale);
+    }
+    reciprocal = __shfl_sync(text_kernel::warp_mask, reciprocal, 0);
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        output.values[offset + part * warp_size] = __nv_cvt_float_to_fp8(
+            values[part] * reciprocal, __NV_SATFINITE, __NV_E4M3);
+    }
 }
 
 struct GdnInputs {
@@ -536,10 +601,11 @@ cudaError_t recur_and_finish(int token_count, TextGdnMode mode, GdnInputs rows,
                             finish_arguments, 0, stream);
 }
 
+template <typename Output>
 cudaError_t prefill_gdn(
     int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
     const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
-    __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream,
+    __nv_bfloat16* workspace, float2* gates, Output output, cudaStream_t stream,
     void* chunk_scratch, std::size_t chunk_bytes) {
     bool chunked = gdn_chunk::eligible(rows, chunk_scratch, chunk_bytes);
     if (chunked) {
@@ -573,12 +639,20 @@ cudaError_t prefill_gdn(
     if (status != cudaSuccess) {
         return status;
     }
-    const int finish_blocks =
-        rows * text_gdn_value_heads + text_gdn_qkv_width / text_gdn_head_dim;
-    void* finish_arguments[] = {
-        &rows, &qkv, &z, &weights.norm, &observable, &state, &state, &output};
-    return cudaLaunchKernel(gdn_finish<TextGdnState>, dim3(finish_blocks), dim3(text_gdn_head_dim),
-                            finish_arguments, 0, stream);
+    if constexpr (std::is_same_v<Output, TextFp8Activation>) {
+        const int blocks = rows * (text_gdn_value_heads / finish_heads_per_block) +
+                           text_gdn_qkv_width / finish_threads;
+        void* arguments[] = {&rows, &qkv, &z, &weights.norm, &observable, &state, &output};
+        return cudaLaunchKernel(gdn_finish_quantized, dim3(blocks), dim3(finish_threads),
+                                arguments, 0, stream);
+    } else {
+        const int finish_blocks =
+            rows * text_gdn_value_heads + text_gdn_qkv_width / text_gdn_head_dim;
+        void* finish_arguments[] = {
+            &rows, &qkv, &z, &weights.norm, &observable, &state, &state, &output};
+        return cudaLaunchKernel(gdn_finish<TextGdnState>, dim3(finish_blocks),
+                                dim3(text_gdn_head_dim), finish_arguments, 0, stream);
+    }
 }
 
 template <typename State>
@@ -632,6 +706,18 @@ cudaError_t decoder::tensor_core_prefill_gdn(
     const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
     __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream,
     void* chunk_scratch, std::size_t chunk_bytes) {
+    return prefill_gdn(rows, qkv, z, b, a, weights, state, workspace, gates, output, stream,
+                       chunk_scratch, chunk_bytes);
+}
+
+cudaError_t decoder::tensor_core_prefill_gdn(
+    int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
+    const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
+    __nv_bfloat16* workspace, float2* gates, TextFp8Activation output, cudaStream_t stream,
+    void* chunk_scratch, std::size_t chunk_bytes) {
+    if (text_gdn_workspace_bytes(rows) == 0 || !output.values || !output.scales) {
+        return cudaErrorInvalidValue;
+    }
     return prefill_gdn(rows, qkv, z, b, a, weights, state, workspace, gates, output, stream,
                        chunk_scratch, chunk_bytes);
 }

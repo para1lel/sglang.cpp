@@ -282,19 +282,37 @@ struct Chunk : PrefillProjections {
         project(layer.a, work.normalized, work.gdn_a);
     }
 
-    void gdn_recur(const GdnLayer& layer, TextGdnState state, int bank) const {
+    void gdn_recur(const GdnLayer& layer, TextGdnState state, int bank,
+                   TextFp8Activation quantized) const {
         static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
         const bool chunked_recurrence = position != 0 || bank != 0;
+        auto* gates = reinterpret_cast<float2*>(work.keys);
+        auto* scratch = chunked_recurrence ? work.mlp_gate : nullptr;
+        const auto scratch_bytes = rows * intermediate_size * sizeof(Bf16);
+        if (quantized.values) {
+            check(tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+                                          layer.recurrent, state, work.gdn_scratch, gates,
+                                          quantized, stream, scratch, scratch_bytes),
+                  "Advance and quantize prefill Gated DeltaNet");
+            return;
+        }
         const auto status = tensor_core_fp8
             ? tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                                      layer.recurrent, state, work.gdn_scratch,
-                                      reinterpret_cast<float2*>(work.keys), work.attention, stream,
-                                      chunked_recurrence ? work.mlp_gate : nullptr,
-                                      rows * intermediate_size * sizeof(Bf16))
+                                      layer.recurrent, state, work.gdn_scratch, gates,
+                                      work.attention, stream, scratch, scratch_bytes)
             : text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
                                work.gdn_a, layer.recurrent, state, work.gdn_scratch,
                                text_gdn_workspace_bytes(rows), work.attention, stream);
         check(status, "Advance prefill Gated DeltaNet state");
+    }
+
+    void gdn_attention(const GdnLayer& layer, TextGdnState state, int bank) const {
+        const bool quantized = tensor_core_fp8 && !mrope;
+        gdn_recur(layer, state, bank, quantized ? activation : TextFp8Activation{});
+        const auto input = quantized
+            ? TextFp8ActivationView{activation.values, activation.scales}
+            : quantize(work.attention, text_gdn_value_width);
+        project(layer.output, input, work.projected_attention);
     }
 
     void gqa_input(const GqaLayer& layer) const {
@@ -449,9 +467,14 @@ void prefill_layerwise(const std::array<Layer, layer_count>& layers,
         [&](const GdnLayer& layer, int bank) {
             chunk.gdn_input(layer);
             each_segment([&](const PrefillGrant& grant, int offset) {
-                attention(grant, offset).gdn_recur(layer, grant.request->states[bank], bank);
+                const TextFp8Activation fp8{
+                    buffers.activation.values + std::size_t(offset) * text_gdn_value_width,
+                    buffers.activation.scales + std::size_t(offset) * text_gdn_value_heads,
+                };
+                attention(grant, offset).gdn_recur(layer, grant.request->states[bank], bank, fp8);
             });
-            chunk.attention_output(layer.output, text_gdn_value_width);
+            chunk.project(layer.output, {buffers.activation.values, buffers.activation.scales},
+                          buffers.projected_attention);
         },
         [&](const Layer& layer) { chunk.mlp(layer); });
     each_segment([&](const PrefillGrant& grant, int offset) {
@@ -628,8 +651,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                    },
                    [&](const GdnLayer& layer, int bank) {
                        chunk.gdn_input(layer);
-                       chunk.gdn_recur(layer, request.states[bank], bank);
-                       chunk.attention_output(layer.output, text_gdn_value_width);
+                       chunk.gdn_attention(layer, request.states[bank], bank);
                    },
                    [&](const Layer& layer) { chunk.mlp(layer); });
     if (draft && prompt_remaining > 1) {

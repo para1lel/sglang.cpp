@@ -94,6 +94,19 @@ def server(binary, checkpoint, log, *flags, sampling=True, with_process=False):
 
 
 class Routes(unittest.TestCase):
+    def test_scheduler_budget_default_and_override(self):
+        for flag, budget in (((), 8192), (("--max-num-batched-tokens", "32768"), 32768)):
+            with self.subTest(budget=budget):
+                log = self.output / f"scheduler-budget-{budget}.log"
+                with server(self.binary, self.checkpoint, log, *flag) as port:
+                    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as conn:
+                        conn.request("GET", "/health")
+                        with conn.getresponse() as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(json.load(response), {
+                                "max_active": 32, "max_num_batched_tokens": budget,
+                            })
+
     @classmethod
     def setUpClass(cls):
         cls.config = json.loads((cls.checkpoint / "generation_config.json").read_text())

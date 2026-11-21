@@ -11,7 +11,7 @@
 
 ## Runtime path
 
-Use `--prefix-cache-entries 1` through `4` for native prefix reuse. The default `0` disables reuse. Omit `--eager`. The default `exact` prefill policy supports prefix reuse at MTP depths 0–4. For tensor-core prefill with prefix reuse, use MTP depth 0. Prefix reuse works at every server capacity, including `--max-active 1`. Use `--batch-cuda-graphs` to enable eligible replay. [CLI validation](../apps/sglang-server.cpp#L128)<!-- prefix: "if (argument" --> · [Control flag](../apps/sglang-server.cpp#L225)<!-- prefix: "}, health, a" -->
+Use `--prefix-cache-entries 1` through `4` for native prefix reuse. The default `0` disables reuse. Omit `--eager`. The default `exact` prefill policy supports prefix reuse at MTP depths 0–4. For tensor-core prefill with prefix reuse, use MTP depth 0. Prefix reuse works at every server capacity, including `--max-active 1`. Use `--batch-cuda-graphs` to enable eligible replay. [CLI validation](../apps/sglang-server.cpp#L128)<!-- prefix: "if (argument" --> · [Control flag](../apps/sglang-server.cpp#L226)<!-- prefix: "}, health, a" -->
 
 Native text, chat, benchmark ID, and `/generate` requests accept an optional `cache_salt` string of up to 256 UTF-8 bytes. Omission uses an empty string. See [native generation options](native-generate.md#constraints-and-failure-behavior) for null and per-item salts. Invalid salts return HTTP 400 even when reuse is disabled. Native text, chat, and `/generate` support greedy and sampled requests with prefix reuse. Text and chat also support finite-choice requests. The benchmark ID route keeps its greedy policy.
 

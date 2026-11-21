@@ -1,6 +1,6 @@
 # Fixed W1–W6 serving comparison
 
-Under the 32,768-token scheduling cap, native passed W1 and missed only the time-to-first-token gate on W2. It missed all four speed gates on W3 and W4. W5 and W6 stopped in the first warmup before any HTTP headers or output IDs arrived.
+Under the historical 32,768-token scheduling cap, native passed W1 and missed only the time-to-first-token gate on W2. It missed all four speed gates on W3 and W4. W5 and W6 stopped in the first warmup before any HTTP headers or output IDs arrived. For new formal results, follow the [paired 8,192-token protocol](../benchmarks/paired/README.md).
 
 ## Matched conditions
 
@@ -79,7 +79,7 @@ Projection and paged GQA show the largest duration differences. W4 used 1,600 na
 
 **FP16 activation sidecar.** On native `f6ee1249f9218a5427f4ead1af3a65e8657229ad`, the quantizer also wrote exact FP16 values so grouped projections could skip repeated activation conversions. E4M3 bytes, FP32 scales, and BF16 projection outputs matched bitwise. Quantization plus projection slowed on six of seven real shapes at both tested widths. Even the shared Q+KV stage slowed despite faster isolated KV. The trace-weighted warm operator estimates rose from 13.779 to 17.121 ms for W3 and from 54.596 to 67.857 ms for W4. The candidate doubled activation load instructions in the measured loop and used more registers. Actual DRAM traffic and achieved occupancy remain unmeasured. The results stayed at operator scope and the sidecar did not enter serving.
 
-## Reproduction
+## Reproduction of the 32,768-token runs
 
 Use the fixed source and checkpoint above. Build the native release with XMake in the default Pixi environment. Run pinned vLLM in its separate environment. Reserve the same UUID for both arms. Verify effective caps and KV policy before the first request. Run latency measurements without profiling. Keep separate runs for dispatch traces. [Native build](development.md) · [vLLM environment](../benchmarks/vllm/README.md)
 
@@ -90,7 +90,7 @@ For native, use `--fp8-prefill tensor-core --batch-cuda-graphs --mtp-steps 0 --p
 --compilation-config '{"mode":"NONE","cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
 
-Use the frozen direct-ID clients and fresh output directories. Use each measured run's reproduction entry below for the exact launch commands. The archived launch examples use older settings. Apply the matched configuration and verify each worker's live settings. [W1/W2 client](../benchmarks/streaming/README.md#run) · [W3–W6 fixtures and client](../benchmarks/concurrent/README.md#regenerate-and-measure)
+Use the frozen direct-ID clients and fresh output directories. Use each measured run's reproduction entry below for the exact launch commands and verify each worker's live settings. [W1/W2 client](../benchmarks/streaming/README.md#run) · [W3–W6 fixtures and client](../benchmarks/concurrent/README.md#regenerate-and-measure)
 
 The original host retains exact commands, hashes, recorded samples, and offline replay scripts under these ignored paths. The tracked protocols can regenerate the fixtures and run a fresh comparison. Byte-for-byte evidence replay requires the original artifacts.
 

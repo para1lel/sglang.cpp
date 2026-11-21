@@ -67,7 +67,7 @@ If `is_cancelled` returns true at entry, direct C++ generation finishes with `ca
 
 ## Sampling
 
-Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L97)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L25)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L61)<!-- prefix: "void validat" -->
+Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L97)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L26)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L61)<!-- prefix: "void validat" -->
 
 | Field | Valid values |
 | --- | --- |

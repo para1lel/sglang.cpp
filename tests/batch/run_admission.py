@@ -21,7 +21,8 @@ from media import http_routes as media
 
 
 DEFAULT_ACTIVE = 32
-DEFAULT_TOKENS = 32768
+DEFAULT_TOKENS = 8192
+MAX_TOKENS = 32768
 SMALL_TOKENS = 64
 TOKEN_OPTION = "--max-num-batched-tokens"
 NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
@@ -247,6 +248,7 @@ def check_wide_mtp(args):
 def check_cli(args):
     valid = [[], ["--max-active", "1"], ["--max-active", "4"],
              ["--max-active", str(DEFAULT_ACTIVE), TOKEN_OPTION, str(DEFAULT_TOKENS)],
+             [TOKEN_OPTION, str(MAX_TOKENS)],
              [TOKEN_OPTION, str(args.small_tokens)],
              ["--max-active", "1", "--eager"], ["--max-active", "4", "--mtp-steps", "1"],
              ["--max-active", "4", "--mtp-steps", "1", "--eager"],
@@ -254,7 +256,7 @@ def check_cli(args):
              ["--mtp-steps", "1", "--prefix-cache-entries", "2"],
              ["--max-active", str(DEFAULT_ACTIVE), "--mtp-k", "4"]]
     invalid = [([TOKEN_OPTION, value], TOKEN_OPTION)
-               for value in ("0", "-1", "wide", str(DEFAULT_TOKENS + 1), "2147483648")]
+               for value in ("0", "-1", "wide", str(MAX_TOKENS + 1), "2147483648")]
     invalid.extend([(["--max-active", "33"], "--max-active"),
                     (["--mtp-steps", "5"], "--mtp-steps"),
                     (["--mtp-k", "5"], "--mtp-steps"),

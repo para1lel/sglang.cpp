@@ -29,7 +29,7 @@ struct Arguments {
     int device = 0;
     int port = 17384;
     int max_active = sglang::decoder_batch_max_lanes;
-    int max_num_batched_tokens = sglang::decoder_batch_max_step_tokens;
+    int max_num_batched_tokens = sglang::decoder_default_max_num_batched_tokens;
     int mtp_steps = 0;
     int prefix_cache_entries = 0;
     bool eager = false;
@@ -184,7 +184,8 @@ int main(int argc, char** argv) {
                      "                     [--tool-call-parser qwen3_coder]\n"
                      "Active requests: 32 by default, range 1-32.\n"
                      "Waiting completions: up to --max-active. Full queue returns HTTP 503.\n"
-                     "Target rows per step: 32768 by default, range 1-32768.\n"
+                     "Target rows per step: " << sglang::decoder_default_max_num_batched_tokens
+                  << " by default, range 1-32768.\n"
                      "MTP steps: 0 by default, up to 4. --mtp-k is an alias.\n"
                      "Batch graphs: enable graph replay for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"

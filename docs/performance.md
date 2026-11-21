@@ -16,12 +16,14 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 
 ## Scheduler and reporting policy
 
-Launch both engines with **32,768 aggregate scheduled tokens per step** and **32 maximum in-service requests** for every new performance run, including diagnostics.
+Launch both engines with **8,192 aggregate scheduled tokens per step** and **32 maximum in-service requests** for every new formal comparison.
 
-- **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-seqs 32`. Leave `--max-num-scheduled-tokens` unset or set it to `32768`. Verify the effective limits.
-- **Native server.** Set `--max-active 32 --max-num-batched-tokens 32768`. Verify both defaults in [`GET /health`](http-server.md). Record admission failures separately from timing under the [resident memory limit](batch-graphs.md#resident-memory-admission).
+- **Pinned vLLM.** Set `--max-num-batched-tokens 8192 --max-num-scheduled-tokens 8192 --max-num-seqs 32 --async-scheduling`. Verify the worker settings.
+- **Native server.** Set `--max-active 32 --max-num-batched-tokens 8192`. Verify [`GET /health`](http-server.md).
 
-In every chat report, list each engine's nondefault launch, environment, client, and request settings, including diagnostics. Report effective server maxima, offered and observed concurrency, input lengths, context limits, and output budgets. Preserve frozen run settings, identities, and gates. Acceptance requires a new matched run under this policy with every required mode available.
+Use the [paired launchers](../benchmarks/paired/README.md). Label other caps exploratory or historical. Preserve historical evidence and explicit operator microbenchmark settings.
+
+Report nondefault settings, effective limits, offered and observed concurrency, input lengths, context and output budgets, and [admission failures](batch-graphs.md#resident-memory-admission) separately from timing. Acceptance requires a fresh matched run with every required mode.
 
 ## GQA cache comparison
 
@@ -186,7 +188,7 @@ Run the [MTP checks](mtp.md#verification) before timing. Use same-width eager K0
 
 To isolate layer-major verification, compare with row-wise MTP at the same depth. To isolate tiled seeding, keep the verifier, exact precision, and depth fixed. Time target prefill and draft KV seeding through workspace release, before the first LM head. Record HTTP TTFT and request latency separately. Include short, tile-boundary, and long prompts. Record tile sizes, pool state, and output length.
 
-Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. [W3-MTP](../benchmarks/variants/README.md) uses four 8,192-token prompts with 1,024 outputs each. K1 starts beyond the [graph limit](mtp.md#target-verification-graph). The matched run remains pending. Use `--max-active 32 --max-num-batched-tokens 32768`.
+Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. [W3-MTP](../benchmarks/variants/README.md) uses four 8,192-token prompts with 1,024 outputs each. K1 starts beyond the [graph limit](mtp.md#target-verification-graph). The matched run remains pending. Use `--max-active 32 --max-num-batched-tokens 8192`.
 
 Positive depth adds counters for the generator's first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L130)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L973)<!-- prefix: "result.mtp_r" -->
 

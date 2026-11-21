@@ -170,9 +170,9 @@ def check_http_baseline(args, cases, name, width, flags, limits):
 
 def check_http(args, cases):
     check_http_baseline(args, cases, "http-default", None, (),
-                        {"max_active": 32, "max_num_batched_tokens": 32768})
+                        {"max_active": 32, "max_num_batched_tokens": 8192})
     check_http_baseline(args, cases, "http-1", "1", ("--eager", "--fp8-prefill", "exact"),
-                        {"max_active": 1, "max_num_batched_tokens": 32768})
+                        {"max_active": 1, "max_num_batched_tokens": 8192})
     for width, lengths in ((2, (129, 257)), (4, (2, 127, 129, 257))):
         evidence = args.evidence / f"http-{width}"
         flags = ("--max-num-batched-tokens", str(BATCH_TOKEN_BUDGET))

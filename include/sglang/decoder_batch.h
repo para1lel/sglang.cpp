@@ -51,7 +51,7 @@ struct DecoderBatchOptions {
     bool cuda_graphs = false;
     int max_lanes = decoder_batch_max_mtp_lanes;
     int prefix_cache_entries = 0;
-    int max_num_batched_tokens = 0;
+    int max_num_batched_tokens = decoder_default_max_num_batched_tokens;
     std::optional<std::size_t> resident_memory_limit = std::nullopt;
 };
 

@@ -100,12 +100,24 @@ def vllm_settings(run, args, group):
     cap = scheduler["max_num_batched_tokens"]
     context = 2560 if group == "W1-W2" else 132096
     configured = scheduler.get("max_num_scheduled_tokens_configured")
-    effective = scheduler.get("max_num_scheduled_tokens_effective", cap)
-    require(type(cap) is int and cap == effective and configured in {None, cap}
+    scheduled_flag = "--max-num-scheduled-tokens"
+    if scheduled_flag in args:
+        require(type(configured) is int and configured == cap
+                and arg(args, scheduled_flag) == str(cap),
+                f"{run}: {scheduled_flag} differs from worker observation")
+    else:
+        require(configured is None, f"{run}: unexpected configured scheduled token cap")
+    historical = cap == 32768 and "max_num_scheduled_tokens_configured" not in scheduler
+    if cap == 8192:
+        require(scheduled_flag in args and "--async-scheduling" in args,
+                f"{run}: expected explicit 8192 scheduled cap and async scheduling")
+    effective = scheduler.get("max_num_scheduled_tokens_effective", cap if historical else None)
+    async_scheduling = scheduler.get("async_scheduling", True if historical else None)
+    require(type(cap) is int and type(effective) is int and cap == effective
             and scheduler["max_num_seqs"] == 32 and scheduler["max_model_len"] == context
             and scheduler["enable_chunked_prefill"] is True
-            and scheduler.get("async_scheduling") in {None, True}
-            and not any(item.startswith(("--max-num-scheduled-tokens", "--no-async-scheduling",
+            and async_scheduling is True
+            and not any(item.startswith((scheduled_flag + "=", "--no-async-scheduling",
                                          "--enforce-eager"))
                         for item in args),
             f"{run}: unexpected effective vLLM scheduler settings")

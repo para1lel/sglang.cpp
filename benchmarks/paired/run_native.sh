@@ -5,6 +5,7 @@ usage() {
     echo "Usage: bash benchmarks/paired/run_native.sh" \
         "BUILD_DIR GPU_INDEX NEW_OUTPUT_DIR [GROUP ...]"
     echo "Groups: W1-W2 W3 W4 W5 W6 (default: all in this order)"
+    echo "PAIRED_MAX_NUM_BATCHED_TOKENS defaults to 8192."
     echo "Set PAIRED_VLLM_RESULTS to validate a saved same-device control."
     echo "Set PAIRED_COMPARISON_MODE=frozen for the published GPU2 W3-W6 reference."
 }
@@ -35,10 +36,7 @@ for group in "${groups[@]}"; do
 done
 
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
-if [[ ! $warmups =~ ^[1-9][0-9]*$ || ! $measured =~ ^([2-9]|[1-9][0-9]+)$ ]]; then
-    echo "Use at least one warmup and two measured concurrent cohorts." >&2
-    exit 2
-fi
+validate_run_settings
 mode=${PAIRED_COMPARISON_MODE:-}
 if [[ -n ${PAIRED_VLLM_RESULTS:-} && -z $mode ]]; then
     mode=matched
@@ -55,9 +53,10 @@ trap stop_group EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 prepare_run "$index" "$target"
-printf 'warmups=%s\nmeasured=%s\nsaved_vllm_results=%s\nallow_count_mismatch=%s\nmode=%s\n' \
-    "$warmups" "$measured" "${PAIRED_VLLM_RESULTS:-}" "${PAIRED_ALLOW_COUNT_MISMATCH:-0}" \
-    "${mode:-unpaired}" \
+printf '%s\n' "warmups=$warmups" "measured=$measured" \
+    "saved_vllm_results=${PAIRED_VLLM_RESULTS:-}" \
+    "allow_count_mismatch=${PAIRED_ALLOW_COUNT_MISMATCH:-0}" \
+    "mode=${mode:-unpaired}" "max_num_batched_tokens=$token_budget" \
     >"$output/comparison-inputs.txt"
 sha256sum "$binary" "$paired_dir/run_native.sh" >"$output/native.sha256"
 export CUDA_VISIBLE_DEVICES=$gpu_uuid CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -82,8 +81,9 @@ for group in "${groups[@]}"; do
     echo "$group on $gpu_uuid"
     if start_group "$run" "$binary" --checkpoint "$checkpoint" --device 0 --port "$port" \
         --fp8-prefill tensor-core --batch-cuda-graphs --mtp-steps 0 --prefix-cache-entries 0 \
-        --max-active 32 --max-num-batched-tokens 32768 &&
-        jq -e '.max_active == 32 and .max_num_batched_tokens == 32768' "$run/health.json" >/dev/null
+        --max-active 32 --max-num-batched-tokens "$token_budget" &&
+        jq -e --argjson budget "$token_budget" \
+        '.max_active == 32 and .max_num_batched_tokens == $budget' "$run/health.json" >/dev/null
     then
         if ! measure_group "$group" "$run" native; then
             exit_code=1

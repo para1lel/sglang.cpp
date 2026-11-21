@@ -54,7 +54,7 @@ bool check(const Scenario& scenario) {
     sglang::DecoderResult result;
     try {
         const sglang::Decoder decoder("unused");
-        Service service(decoder, true, false, 4, 4, 0, 32768);
+        Service service(decoder, true, false, 4, 4, 0);
         result = service.generate(3, {7}, options, callbacks);
     } catch (...) {
         std::cerr.rdbuf(original);
@@ -105,7 +105,7 @@ struct DecoderBatch::State {
 DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
     : state_(std::make_unique<State>()) {
     require(!options.cuda_graphs && options.max_lanes == 4 &&
-                options.prefix_cache_entries == 0 && options.max_num_batched_tokens == 32768,
+                options.prefix_cache_entries == 0 && options.max_num_batched_tokens == 8192,
             "Unexpected service scheduler configuration");
 }
 DecoderBatch::~DecoderBatch() = default;
@@ -174,6 +174,10 @@ bool DecoderBatch::available() const { return true; }
 
 int main() {
     try {
+        require(sglang::DecoderOptions{}.max_num_batched_tokens == 8192,
+                "Unexpected standalone decoder budget default");
+        require(sglang::DecoderBatchOptions{}.max_num_batched_tokens == 8192,
+                "Unexpected batch decoder budget default");
         const bool seed = check({"seed only", Interrupt::none, {100}, 0, Finish::length});
         const bool callback = check({"callback false", Interrupt::callback, {100, 101}, 1,
                                      Finish::cancelled});

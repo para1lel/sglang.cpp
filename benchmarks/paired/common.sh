@@ -10,6 +10,7 @@ compat=${PAIRED_CUDA_COMPAT:-$host_root/software/cuda-compat-13.4/usr/local/cuda
 client_python=${PAIRED_CLIENT_PYTHON:-/usr/bin/python3}
 warmups=${PAIRED_WARMUPS:-2}
 measured=${PAIRED_MEASURED:-5}
+token_budget=${PAIRED_MAX_NUM_BATCHED_TOKENS-8192}
 server_cpus=${PAIRED_SERVER_CPUS:-24-33}
 client_cpus=${PAIRED_CLIENT_CPUS:-34-35}
 port=${PAIRED_PORT:-17393}
@@ -18,6 +19,17 @@ gpu_fields=timestamp,index,uuid,memory.used,utilization.gpu,temperature.gpu,cloc
 gpu_fields+=,clocks.current.memory,power.draw
 server_pid=
 monitor_pid=
+
+validate_run_settings() {
+    if [[ ! $warmups =~ ^[1-9][0-9]*$ || ! $measured =~ ^([2-9]|[1-9][0-9]+)$ ]]; then
+        echo "Use at least one warmup and two measured concurrent cohorts." >&2
+        return 2
+    fi
+    if [[ ! $token_budget =~ ^[1-9][0-9]{0,4}$ ]] || (( token_budget > 32768 )); then
+        echo "Use PAIRED_MAX_NUM_BATCHED_TOKENS in [1, 32768]." >&2
+        return 2
+    fi
+}
 
 write_command() {
     local destination=$1
@@ -69,7 +81,8 @@ plan_comparison() {
     cp -- "$manifest" "$output/checkpoint.sha256"
     local plan
     plan=$(comparison_identity plan "$mode" "$checkpoint" "$output/checkpoint.sha256" \
-        "${fixtures:-$output}" "$warmups" "$measured" "$@" "${options[@]}")
+        "${fixtures:-$output}" "$warmups" "$measured" "$@" \
+        --max-num-batched-tokens "$token_budget" "${options[@]}")
     comparison_plan_sha256=$(printf '%s\n' "$plan" | sha256sum)
     comparison_plan_sha256=${comparison_plan_sha256%% *}
     printf '%s\n' "$plan" >"$output/comparison-plan.tmp"

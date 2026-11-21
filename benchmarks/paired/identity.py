@@ -30,7 +30,13 @@ FROZEN_PROTOCOL = dict(zip(CONCURRENT, (
     "8221e70bdda0fd06f8c8a3f3bb4f6fdd274fc1b76380b268b2dcdcd1f7593abe",
     "b9f6699abece4b64de7879880daf42b5172c09f69077467cc386e4a05f963dfe",
 ), strict=True))
-NATIVE_CAP = 32768
+DEFAULT_TOKEN_BUDGET = 8192
+
+
+def token_budget(value):
+    require(type(value) is int and 1 <= value <= 32768,
+            "Expected --max-num-batched-tokens in [1, 32768]")
+    return value
 
 
 def current_protocol(group, protocol):
@@ -173,8 +179,8 @@ def saved_arm(args, group, hashes, lanes, native_device, native_cpus):
             f"{run}: unexpected vLLM runtime identity")
     require(worker["compilation"] == pinned["compilation"],
             f"{run}: effective vLLM graph configuration differs")
-    require(worker["scheduler"]["max_num_batched_tokens"] == NATIVE_CAP,
-            f"{run}: saved vLLM scheduler cap differs from {NATIVE_CAP}")
+    require(worker["scheduler"]["max_num_batched_tokens"] == args.max_num_batched_tokens,
+            f"{run}: saved vLLM scheduler cap differs from {args.max_num_batched_tokens}")
     report, counts = summary(run, group, hashes, args.protocol)
     recorded = artifact_hashes(capture / "protocol.sha256")
     manifest = "concurrent/fixture-manifest.json"
@@ -211,22 +217,34 @@ def frozen_arm(hashes):
             "archive": reference["archive"], "protocol": hashes}
 
 
-def comparison_label(mode, arm, hashes, native_device, counts):
+def comparison_label(mode, arm, hashes, native_device, counts, budget):
     if mode == "frozen":
         require(arm == frozen_arm(hashes) and tuple(arm["counts"]) == tuple(counts),
                 "Frozen comparison arm differs from the published reference")
+        differences = []
         if arm["device"]["uuid"] != native_device["uuid"]:
-            return "published frozen reference (cross-device, cross-cap)"
-        return "published frozen reference (cross-cap)"
+            differences.append("cross-device")
+        if arm["effective"]["config"]["max_num_batched_tokens"] != budget:
+            differences.append("cross-cap")
+        label = "published frozen reference"
+        return label + (" (" + ", ".join(differences) + ")" if differences else "")
+    scheduler = arm["effective"]["scheduler"]
     require("archive" not in arm and arm["device"] == native_device
-            and arm["effective"]["scheduler"]["max_num_batched_tokens"] == NATIVE_CAP,
+            and scheduler["max_num_batched_tokens"] == budget,
             "Matched comparison requires a same-device saved arm with the native scheduler cap")
     if tuple(arm["counts"]) != tuple(counts):
         return "exploratory (count mismatch)"
+    if budget != DEFAULT_TOKEN_BUDGET:
+        return f"exploratory (non-protocol cap {budget})"
+    require(scheduler["max_num_scheduled_tokens_configured"] == budget
+            and scheduler["max_num_scheduled_tokens_effective"] == budget
+            and scheduler["async_scheduling"] is True,
+            "Formal comparison requires observed 8192-token vLLM scheduling")
     return "same-device matched-cap"
 
 
 def plan(args):
+    budget = token_budget(args.max_num_batched_tokens)
     require((args.mode == "matched") == (args.saved is not None),
             "Use matched mode with saved vLLM results or frozen mode with the published reference")
     require(args.mode != "frozen" or "W1-W2" not in args.groups,
@@ -257,14 +275,14 @@ def plan(args):
         matched_counts = tuple(arm["counts"]) == expected
         require(matched_counts or (args.mode == "matched" and args.allow_count_mismatch),
                 f"{group}: saved warmup/measured counts {arm['counts']} differ from {expected}")
-        label = comparison_label(args.mode, arm, hashes, native_device, expected)
+        label = comparison_label(args.mode, arm, hashes, native_device, expected, budget)
         rows[group] = {"planned_comparison": label, "vllm": arm,
                        "protocol": hashes, "counts": expected}
     for checkpoint in sorted(checkpoints):
         subprocess.run(["sha256sum", "--check", "--strict", "--quiet",
                         str(args.checkpoint_manifest.resolve())], cwd=checkpoint, check=True)
     return {"status": "planned", "mode": args.mode, "device": native_device, "cpus": cpus,
-            "checkpoint": str(args.checkpoint.resolve()),
+            "checkpoint": str(args.checkpoint.resolve()), "max_num_batched_tokens": budget,
             "fixtures": str(args.fixtures.resolve()),
             "checkpoint_manifest_sha256": checkpoint_hash, "groups": rows}
 
@@ -276,6 +294,7 @@ def finish(args):
     planned = json.loads(plan_bytes)
     require(planned["status"] == "planned" and planned["mode"] == args.mode,
             "Comparison plan mode differs from the requested comparison")
+    budget = token_budget(planned["max_num_batched_tokens"])
     row = planned["groups"][args.group]
     run = args.output / args.group
     require(device(args.output) == planned["device"]
@@ -286,9 +305,9 @@ def finish(args):
     observed_device(run, pid, planned["device"]["uuid"])
     launch = command(run, "server", planned["cpus"])
     health = load(run / "health.json")
-    require(health["max_active"] == 32 and health["max_num_batched_tokens"] == NATIVE_CAP,
+    require(health["max_active"] == 32 and health["max_num_batched_tokens"] == budget,
             f"{run}: effective native scheduler settings differ")
-    settings = {"device": "0", "max-active": "32", "max-num-batched-tokens": str(NATIVE_CAP),
+    settings = {"device": "0", "max-active": "32", "max-num-batched-tokens": str(budget),
                 "fp8-prefill": "tensor-core", "prefix-cache-entries": "0", "mtp-steps": "0"}
     require(Path(arg(launch, "--checkpoint")).resolve() == Path(planned["checkpoint"])
             and all(arg(launch, "--" + name) == value for name, value in settings.items())
@@ -301,7 +320,8 @@ def finish(args):
             f"{run}: unexpected CUDA visibility or native route override")
     hashes = current_protocol(args.group, args.protocol)
     require(hashes == row["protocol"], f"{run}: candidate protocol changed during the run")
-    label = comparison_label(args.mode, row["vllm"], hashes, planned["device"], row["counts"])
+    label = comparison_label(args.mode, row["vllm"], hashes, planned["device"], row["counts"],
+                             budget)
     require(label == row["planned_comparison"], f"{run}: comparison label disagrees with the arms")
     recorded = artifact_hashes(args.output / "protocol.sha256")
     require(all(recorded.get(name) == sha for name, sha in hashes.items()),
@@ -339,6 +359,7 @@ def main():
     preflight.add_argument("measured", type=int)
     preflight.add_argument("groups", nargs="+", choices=["W1-W2", *ROWS])
     preflight.add_argument("--saved", type=Path)
+    preflight.add_argument("--max-num-batched-tokens", type=int, default=DEFAULT_TOKEN_BUDGET)
     preflight.add_argument("--allow-count-mismatch", action="store_true")
     complete = modes.add_parser("finish")
     complete.add_argument("mode", choices=("matched", "frozen"))

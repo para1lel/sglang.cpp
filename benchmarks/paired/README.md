@@ -1,20 +1,25 @@
-# Paired baseline replay
+# Paired W1–W6 benchmark
 
-Run the native arm of the [fixed W1–W6 benchmark](../../docs/performance-comparison.md)
-against a release build containing `bin/sglang-server`. The default below runs
-the native arm on B200 GPU 2, with two warmups and five measured cohorts for each
-concurrent row. The output directory must be new, with an existing parent.
+Run pinned vLLM first, then run the native release build on the same reserved B200.
+Both commands default to 8,192 scheduled tokens and 32 in-service requests, with
+two warmups and five measured cohorts for each concurrent row. Select the same GPU
+and CPU placement for both arms. Each output directory must be new.
 
 ```bash
-bash benchmarks/paired/run_native.sh /path/to/build 2 artifacts/paired-candidate
+export PAIRED_CHECKPOINT_MANIFEST="$PWD/artifacts/test-bench-baseline/checkpoint.sha256"
+bash benchmarks/paired/run_vllm.sh 2 artifacts/paired-vllm-8192
+PAIRED_VLLM_RESULTS="$PWD/artifacts/paired-vllm-8192" \
+    bash benchmarks/paired/run_native.sh /path/to/build 2 artifacts/paired-native-8192
 ```
 
 Use the default Pixi environment or provide the native binary's runtime libraries.
 The driver needs Bash, `nvidia-smi`, `flock`, `setsid`, `numactl`, `taskset`, `curl`,
 `jq`, GNU coreutils and client Python 3.11 or newer for identity checks. The vLLM
-directory must exist and allow
-opening or creating a shared lock for the physical GPU UUID. Regenerating fixtures
-also requires the pinned vLLM environment with `tokenizers`.
+directory needs its pinned checkout, installed environment, wheel and native hash
+receipts, and a writable shared lock for the physical GPU UUID. The vLLM arm
+also uses the retained compiler cache seed. Set `PAIRED_FIXTURES` to share frozen
+requests or let each arm regenerate them with the pinned tokenizer. The comparison
+checks the fixture and request bytes. Both arms record resolved settings before timing.
 
 | Environment variable | Default |
 | --- | --- |
@@ -28,21 +33,23 @@ also requires the pinned vLLM environment with `tokenizers`.
 | `PAIRED_PROTOCOL_ROOT` | Repository root. Use a frozen export for a paired comparison. |
 | `PAIRED_FIXTURES` | Generate W3–W6 requests from the checkpoint tokenizer with pinned vLLM Python. Set a directory to reuse them. |
 | `PAIRED_WARMUPS` / `PAIRED_MEASURED` | `2` / `5` for W3–W6 |
+| `PAIRED_MAX_NUM_BATCHED_TOKENS` | `8192`. Any other explicit cap is exploratory or historical. The native range is 1–32768. With 32 sequences vLLM requires 32–32768. |
+| `PAIRED_VLLM_SEED_CACHE` | `$PAIRED_HOST_ROOT/cache/vllm-81a8cb063e62`, copied into each vLLM group's private cache. |
 | `PAIRED_VLLM_RESULTS` | Unset. Set the saved vLLM evidence root to request a verified same-device comparison. |
 | `PAIRED_COMPARISON_MODE` | `matched` when saved results are supplied. Use `frozen` with W3–W6 and no saved results for the published GPU2 reference. |
 | `PAIRED_CHECKPOINT_MANIFEST` | The saved `checkpoint.sha256` or `meta/checkpoint.sha256` in matched mode. Supply the published manifest explicitly in frozen mode. |
 | `PAIRED_ALLOW_COUNT_MISMATCH` | `0`. Set to `1` to label an otherwise verified comparison exploratory when cohort counts differ. |
 
-## Replay the retained GPU 2 arm
+## Replay the historical GPU 2 arm
 
-On the benchmark host, `artifacts/test-bench-baseline` holds the saved vLLM arm
+On the benchmark host, `artifacts/test-bench-baseline` holds the saved 32,768-token vLLM arm
 for all six rows. See `REPRODUCE.md` there for the pinned vLLM commands,
 `comparison.json` for the paired statistics, and
 `vllm-GROUP/GROUP/measurement/summary.json` for each vLLM group's client output.
 The retained run used physical UUID `GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`,
 CPUs 24–33 for the server and 34–35 for the client, and local NUMA allocation.
 Reuse that UUID, CPU placement and memory policy. Measure a new vLLM arm on the
-chosen card for any other placement or the published 2/5 concurrent protocol.
+chosen card for other placement and use two fresh 8,192-token arms for the formal protocol.
 
 Export the frozen protocol commit into a new directory and check the saved
 evidence, checkpoint and protocol bytes before running a candidate. Run these
@@ -69,6 +76,7 @@ printf '%s  %s\n' "$fixture_hash" "$manifest" |
 
 PAIRED_PROTOCOL_ROOT="$frozen" PAIRED_FIXTURES="$saved/fixtures" \
 PAIRED_VLLM_RESULTS="$saved" PAIRED_WARMUPS=1 PAIRED_MEASURED=3 \
+PAIRED_MAX_NUM_BATCHED_TOKENS=32768 \
     bash benchmarks/paired/run_native.sh /path/to/build 2 artifacts/paired-candidate-gpu2
 ```
 
@@ -86,8 +94,10 @@ The driver writes `comparison-plan.json` before launch and keeps its SHA-256 and
 the selected mode for the completion check. It replays the native wire captures
 and checks repeat IDs, measured statistics, and process, device, settings and
 protocol evidence before producing `GROUP/comparison.json`. Its `comparison`
-field labels `same-device matched-cap` or `exploratory (count mismatch)`. A count
-override leaves all other checks in force. The result records which arms were
+field uses `same-device matched-cap` only after both effective caps are verified
+at 8,192. With matching caps at another value it uses `exploratory (non-protocol
+cap 32768)` for the historical example. A cohort count override yields
+`exploratory (count mismatch)` and leaves all other checks in force. The result records which arms were
 replayed and whether cross-engine IDs were compared. The native receipts
 establish its launch settings and scheduler limits. Actual kernel dispatch
 requires independent profiling.
@@ -95,25 +105,27 @@ requires independent profiling.
 ## Compare against the published frozen reference
 
 The published W3–W6 GPU2 vLLM reference uses an 8,192-token scheduler cap. Select
-one or more concurrent groups, retain the native 32,768-token cap, and use the
-published checkpoint manifest:
+one or more concurrent groups and use the published manifest for an archival comparison.
+The following command reproduces the historical native 32,768-token setting:
 
 ```bash
 PAIRED_COMPARISON_MODE=frozen \
 PAIRED_CHECKPOINT_MANIFEST="$saved/checkpoint.sha256" \
+PAIRED_MAX_NUM_BATCHED_TOKENS=32768 \
     bash benchmarks/paired/run_native.sh /path/to/build 7 artifacts/frozen-w5 W5
 ```
 
-The comparison records the frozen archive identity and uses the `published frozen
-reference (cross-cap)` label. It adds `cross-device` when the observed native UUID
-differs from GPU2. Interpret its speed gates against that published reference.
-Use a verified same-device, matched-cap vLLM arm to make a matched performance claim.
+The comparison records the archive identity and uses the `published frozen reference`
+label with `cross-cap` or `cross-device` when those settings differ from the reference.
+Interpret its speed gates against the archive. Formal results require new measured
+arms whose observed caps both equal 8,192 on the same physical device.
 
 ## Observe and compare
 
 Append any of `W1-W2 W3 W4 W5 W6` to select groups. Each group starts a fresh
-server with 32 active slots, a 32,768-token scheduling cap, tensor-core FP8 prefill,
-batch CUDA graphs, and MTP and prefix reuse disabled. W1 and W2 use three warmups
+server with 32 active slots and an 8,192-token scheduling cap. The native arm uses
+tensor-core FP8 prefill and batch CUDA graphs. Both arms disable MTP and prefix reuse.
+W1 and W2 use three warmups
 and nine measured requests each. W3–W6 use a 90 s socket timeout, a 15 s barrier
 timeout and a 360 s cohort deadline. The submission span must be at most 50 ms,
 and every lane must produce output before any stream ends.

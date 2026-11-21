@@ -91,20 +91,28 @@ def write_measurement(run, hashes, freeze_baseline=True):
     (run / "client-exit-code.txt").write_text("0\n")
 
 
-def write_saved_worker(run, checkpoint, reference):
+def write_saved_worker(run, checkpoint, reference, cap, *, historical=False):
     worker = reference["observed_vllm_settings"]
     worker.update(
-        scheduler={"max_model_len": 2560, "max_num_batched_tokens": 32768, "max_num_seqs": 32,
-                   "max_num_scheduled_tokens_effective": 32768, "enable_chunked_prefill": True},
+        scheduler={"max_model_len": 2560, "max_num_batched_tokens": cap, "max_num_seqs": 32,
+                   "enable_chunked_prefill": True},
         parallel={"tp": 1, "dp": 1, "pp": 1}, quantization="fp8", skip_tokenizer_init=True,
         flashinfer="0.7.4",
         kv_transfer=False, kv_offloading_size=None, cpu_offload="cpu_offload_gb=0.0, "
         "offload_group_size=0, ")
     worker["cache"]["kv_cache_memory_bytes"] = 10 << 30
+    if not historical:
+        worker["scheduler"].update(max_num_scheduled_tokens_configured=cap,
+                                   max_num_scheduled_tokens_effective=cap,
+                                   async_scheduling=True)
+    scheduler_flags = [] if historical else [
+        "--max-num-scheduled-tokens", str(cap), "--async-scheduling",
+    ]
     write_json(run / "effective-worker.json", {"results": [worker]})
     write_command(run, "server", "24-33", [
         "python", "-m", "vllm.entrypoints.openai.api_server", "--model", str(checkpoint),
-        "--max-model-len", "2560", "--max-num-seqs", "32", "--max-num-batched-tokens", "32768",
+        "--max-model-len", "2560", "--max-num-seqs", "32", "--max-num-batched-tokens", str(cap),
+        *scheduler_flags,
         "--generation-config", "vllm", "--seed", "0", "--stream-interval", "1",
         "--language-model-only", "--no-enable-prefix-caching"])
     (run / "server-pid.txt").write_text("1000\n")
@@ -135,7 +143,8 @@ class PairedIdentityTest(unittest.TestCase):
         self.args = SimpleNamespace(
             mode="matched", saved=saved, output=output, protocol=ROOT, groups=[GROUP], group=GROUP,
             checkpoint=checkpoint, checkpoint_manifest=manifest, warmups=2, measured=5,
-            fixtures=self.root / "fixtures", allow_count_mismatch=False)
+            fixtures=self.root / "fixtures", allow_count_mismatch=False,
+            max_num_batched_tokens=8192)
         self.reference["checkpoint_manifest_sha256"] = identity.digest(manifest)
         patcher = patch.object(identity.concurrent, "reference", side_effect=self.fixture_reference)
         patcher.start()
@@ -146,7 +155,7 @@ class PairedIdentityTest(unittest.TestCase):
         hashes = identity.current_protocol(GROUP, ROOT)
         (capture / "protocol.sha256").write_text("".join(
             f"{sha}  /saved/benchmarks/{name}\n" for name, sha in hashes.items()))
-        write_saved_worker(self.saved_run, checkpoint, self.fixture_reference())
+        write_saved_worker(self.saved_run, checkpoint, self.fixture_reference(), 8192)
         write_command(self.saved_run, "client", "34-35", [
             "python", str(ROOT / "benchmarks/streaming/client.py"), "--freeze-baseline"])
         write_measurement(self.saved_run, hashes)
@@ -179,10 +188,28 @@ class PairedIdentityTest(unittest.TestCase):
     def test_compare_observed_scheduler_cap(self):
         receipt = self.saved_run / "effective-worker.json"
         worker = identity.load(receipt)
-        worker["results"][0]["scheduler"]["max_num_scheduled_tokens_effective"] = 8192
+        worker["results"][0]["scheduler"]["max_num_scheduled_tokens_effective"] = 32768
         write_json(receipt, worker)
         with self.assertRaisesRegex(ValueError, "effective vLLM scheduler"):
             identity.plan(self.args)
+
+    def test_reject_unobserved_protocol_cap(self):
+        receipt = self.saved_run / "effective-worker.json"
+        worker = identity.load(receipt)
+        del worker["results"][0]["scheduler"]["max_num_scheduled_tokens_effective"]
+        write_json(receipt, worker)
+        with self.assertRaisesRegex(ValueError, "effective vLLM scheduler"):
+            identity.plan(self.args)
+
+    def test_historical_cap_is_exploratory_even_with_identical_counts(self):
+        write_saved_worker(self.saved_run, self.args.checkpoint, self.fixture_reference(),
+                           32768, historical=True)
+        with self.assertRaisesRegex(ValueError, "vLLM scheduler cap"):
+            identity.plan(self.args)
+        self.args.max_num_batched_tokens = 32768
+        self.prepare_native()
+        result = identity.finish(self.args)
+        self.assertEqual(result["comparison"], "exploratory (non-protocol cap 32768)")
 
     def test_reject_vllm_eager_command_with_graph_receipt(self):
         command = self.saved_run / "server-command.sh"
@@ -218,10 +245,17 @@ class PairedIdentityTest(unittest.TestCase):
             first = identity.plan(self.args)["groups"]["W5"]
             write_receipts(self.args.output, 2, OTHER_GPU)
             second = identity.plan(self.args)["groups"]["W5"]
-        self.assertEqual(fixtures.call_count, 2)
-        self.assertEqual(first["planned_comparison"], "published frozen reference (cross-cap)")
+            self.args.max_num_batched_tokens = 32768
+            third = identity.plan(self.args)["groups"]["W5"]
+            write_receipts(self.args.output, 2, GPU)
+            fourth = identity.plan(self.args)["groups"]["W5"]
+        self.assertEqual(fixtures.call_count, 4)
+        self.assertEqual(first["planned_comparison"], "published frozen reference")
         self.assertEqual(second["planned_comparison"],
+                         "published frozen reference (cross-device)")
+        self.assertEqual(third["planned_comparison"],
                          "published frozen reference (cross-device, cross-cap)")
+        self.assertEqual(fourth["planned_comparison"], "published frozen reference (cross-cap)")
 
     def prepare_native(self):
         output = self.args.output
@@ -234,13 +268,15 @@ class PairedIdentityTest(unittest.TestCase):
         write_compute(run, GPU, 2000)
         write_command(run, "server", "24-33", [
             "sglang-server", "--checkpoint", str(self.args.checkpoint), "--device", "0",
-            "--max-active", "32", "--max-num-batched-tokens", "32768",
+            "--max-active", "32", "--max-num-batched-tokens",
+            str(self.args.max_num_batched_tokens),
             "--fp8-prefill", "tensor-core", "--prefix-cache-entries", "0", "--mtp-steps", "0",
             "--batch-cuda-graphs"])
         write_command(run, "client", "34-35", [
             "python", str(ROOT / "benchmarks/streaming/client.py")])
         (output / "native-environment.txt").write_text(f"CUDA_VISIBLE_DEVICES={GPU}\n")
-        write_json(run / "health.json", {"max_active": 32, "max_num_batched_tokens": 32768})
+        write_json(run / "health.json", {"max_active": 32,
+                                        "max_num_batched_tokens": self.args.max_num_batched_tokens})
         hashes = identity.current_protocol(GROUP, ROOT)
         (output / "protocol.sha256").write_text("".join(
             f"{sha}  /native/benchmarks/{name}\n" for name, sha in hashes.items()))
@@ -256,6 +292,23 @@ class PairedIdentityTest(unittest.TestCase):
         result = identity.finish(self.args)
         self.assertEqual(result["comparison"], "same-device matched-cap")
         self.assertFalse(result["quality"]["cross_engine_ids_compared"])
+
+    def test_reject_native_health_cap_mismatch(self):
+        run = self.prepare_native()
+        write_json(run / "health.json", {"max_active": 32, "max_num_batched_tokens": 32768})
+        with self.assertRaisesRegex(ValueError, "effective native scheduler settings"):
+            identity.finish(self.args)
+
+    def test_reject_vllm_effective_cap_mismatch_at_finish(self):
+        self.prepare_native()
+        path = self.args.output / "comparison-plan.json"
+        plan = identity.load(path)
+        scheduler = plan["groups"][GROUP]["vllm"]["effective"]["scheduler"]
+        scheduler["max_num_scheduled_tokens_effective"] = 32768
+        write_json(path, plan)
+        self.args.plan_sha256 = identity.digest(path)
+        with self.assertRaisesRegex(ValueError, "requires observed 8192-token vLLM scheduling"):
+            identity.finish(self.args)
 
     def test_reject_relabelled_comparison_plan(self):
         self.prepare_native()

@@ -21,7 +21,7 @@ Each score digest covers the little-endian 32-bit token ID and IEEE 754 binary32
 each ranked score, in output step and rank order.
 
 The HTTP check starts one server with its default capacity, token budget, and FP8 prefill policy.
-It verifies the advertised capacity of 32 and budget of 32,768, then checks complete streams
+It verifies the advertised capacity of 32 and budget of 8,192, then checks complete streams
 against the frozen oracle. The 511-token probe distinguishes `exact` from `tensor-core` by the
 first generated token. A separate server runs the same prompts and generation budgets with
 `--max-active 1 --eager --fp8-prefill exact` to exercise the scheduler with one slot.

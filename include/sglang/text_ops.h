@@ -159,5 +159,7 @@ cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int 
 /// The caller can also copy the BF16 logits to host for top scores.
 cudaError_t text_argmax(const __nv_bfloat16* logits, int vocab_size, TextLogitCandidate* scratch,
                         TextLogitCandidate* output, cudaStream_t stream);
+cudaError_t text_argmax(const float* logits, int vocab_size, TextLogitCandidate* scratch,
+                        TextLogitCandidate* output, cudaStream_t stream);
 
 }

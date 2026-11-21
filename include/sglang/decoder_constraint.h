@@ -86,7 +86,7 @@ inline bool constraint_eos(int token) {
 
 class ConstraintCursor {
 public:
-    void candidates(const TokenConstraint& constraint, int remaining) {
+    void candidates(const TokenConstraint& constraint, int remaining, bool force_mask = false) {
         candidates_.clear();
         const auto& node = constraint.nodes_[node_];
         const int limit = constraint.is_triggered() ? std::numeric_limits<int>::max() : remaining;
@@ -118,7 +118,7 @@ public:
                                                 end_of_message), end_of_message);
         }
         mask_.clear();
-        if (candidates_.size() > constraint_max_candidates) {
+        if (force_mask || candidates_.size() > constraint_max_candidates) {
             mask_.assign(constraint_mask_words, 0);
             for (const int id : candidates_) {
                 mask_[id / 32] |= std::uint32_t{1} << (id % 32);

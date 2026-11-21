@@ -142,6 +142,40 @@ class Routes(unittest.TestCase):
         self.assertAlmostEqual(seen["min_p"], min_p, places=6)
         self.assertIs(seen["sampled"], sampled)
 
+    def test_sparse_logit_bias(self):
+        for route in ("/generate", TEXT, CHAT):
+            def payload(fields):
+                if route == "/generate":
+                    return {"input_ids": [32, 220], "sampling_params": {
+                        "max_new_tokens": 1, "temperature": 0, **fields,
+                    }}
+                return body(route, max_tokens=1, temperature=0, **fields)
+
+            with self.subTest(route=route):
+                for fields in ({}, {"logit_bias": None}, {"logit_bias": {}},
+                               {"logit_bias": {"32": 4, "032": -0.0}}):
+                    _, seen = self.exchange(route, payload(fields))
+                    self.assertEqual(seen["logit_bias"], [])
+                _, seen = self.exchange(route, payload({"logit_bias": {
+                    "95": -2.25, "32": 1, " +0032 ": 0.125, str(self.vocab - 1): 2**70,
+                }}))
+                self.assertEqual(seen["logit_bias"], [
+                    [32, 0.125], [95, -2.25], [self.vocab - 1, 2**70],
+                ])
+                _, seen = self.exchange(route, payload({"logit_bias": {
+                    " +0032 ": 0.125, "32": 1,
+                }}))
+                self.assertEqual(seen["logit_bias"], [[32, 1]])
+                for invalid in ([], 1, {"": 1}, {"32x": 1}, {"+-0": 1}, {"-1": 1},
+                                {str(self.vocab): 1}, {"32": True}, {"32": "1"},
+                                {"32": None}, {"32": 1e31}, {"32": -1e31}):
+                    self.exchange(route, {**payload({"logit_bias": invalid}), "stream": True},
+                                  status=400)
+                duplicate = json.dumps(payload({"logit_bias": {"32": 1}})).replace(
+                    '"32": 1', '"32": 1, "32": 2',
+                ).encode()
+                self.exchange(route, duplicate, status=400)
+
     def completion(self, packet, seen, count, reason):
         choice, = packet["choices"]
         self.assertEqual(choice["finish_reason"], reason)

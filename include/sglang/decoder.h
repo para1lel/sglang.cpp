@@ -23,6 +23,11 @@ inline constexpr int decoder_default_max_num_batched_tokens = 8192;
 
 class TokenConstraint;
 
+struct DecoderLogitBias {
+    int token_id;
+    float bias;
+};
+
 struct DecoderOptions {
     int max_new_tokens = 1;
     std::optional<int> stop_token_id;
@@ -40,11 +45,11 @@ struct DecoderOptions {
     int max_num_batched_tokens = decoder_default_max_num_batched_tokens;
     bool incremental_kv = false;
     int generated_top_logprobs = -1;
+    std::shared_ptr<const std::vector<DecoderLogitBias>> logit_bias;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 
-    /// No text option requires target-only decoding. Media and cache checks are separate.
-    bool requires_target_only() const { return false; }
+    bool requires_target_only() const { return logit_bias && !logit_bias->empty(); }
 
     bool stops_at(int token) const {
         return stop_token_id == token || additional_stop_token_ids.count(token) != 0;

@@ -210,3 +210,27 @@ The suite checks raw text and token ID inputs, cumulative SSE, sampling defaults
 validation, model discovery, and shared queue overflow. It disconnects a queued
 client and an active stream over TCP and checks that a waiting request and a
 subsequent request reuse the released slot.
+
+## Sparse logit bias
+
+Run from the repository root in the managed Pixi default environment. Set
+`build` to the XMake Release output directory for the same source tree, with
+`sglang-server` and its libraries built. Set `GPU_UUID` to the reserved B200.
+
+```bash
+build="$PWD/build"
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+out="$PWD/artifacts/logit-bias-check"
+mkdir -p "$out"
+bash tests/text/build_chat_cpu.sh "$PWD" "$build" "$out/server"
+CUDA_VISIBLE_DEVICES='' python3 -B tests/text/test_sampling_routes_cpu.py \
+    --server "$out/server" --checkpoint "$checkpoint" --output "$out/cpu"
+bash tests/text/run_logit_bias_check.sh "$build" "$checkpoint" \
+    "${GPU_UUID:?Set the reserved B200 UUID}" "$out/gpu"
+```
+
+The CPU HTTP suite checks token ID aliases in wire order, empty bias, and
+validation before streaming. The GPU runner takes both UUID locks and runs
+the checkpoint against a host oracle for FP32 score addition, log-softmax,
+and seeded selection. It also checks constraint masking, packed eager and
+graph parity, and a target-only biased lane beside an MTP lane.

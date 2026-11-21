@@ -404,6 +404,7 @@ struct DecoderBatch::State {
     std::byte* logprob_workspace = nullptr;
     GeneratedLogprobReadback* logprob_readback = nullptr;
     ConstraintWorkspace constraint_workspace;
+    BiasedWorkspace biased_workspace;
     std::size_t resident_capacity = 0;
     int prefill_cursor = 0;
     bool failed = false;
@@ -459,6 +460,9 @@ void DecoderBatch::State::initialize(Lane& lane) {
     }
     lane.request->initialize(opts.incremental_kv ? prompt : lane.capacity(), stream,
                              opts.incremental_kv ? lane.capacity() : 0);
+    if (opts.requires_target_only()) {
+        biased_workspace.prepare(execution, *lane.request, opts, stream);
+    }
     if (lane.media) {
         lane.media_prefill = upload_media_positions(*lane.request, *lane.media, stream);
     } else if (auto& cache = storage->prefix_cache) {
@@ -476,10 +480,10 @@ void DecoderBatch::State::initialize(Lane& lane) {
             lane.verification = std::make_unique<TargetVerification>(
                 *lane.request, lane.capacity(), prompt, rows, false, stream);
         }
-        if (lane.sampling && !sampling_workspace) {
+        if (lane.sampling && !opts.requires_target_only() && !sampling_workspace) {
             sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
         }
-        if (opts.constraint) {
+        if (opts.constraint && !opts.requires_target_only()) {
             constraint_workspace.allocate(execution, opts.constraint->uses_wide_mask());
         }
     }
@@ -499,6 +503,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         prompt = std::move(input->prompt.token_ids);
     }
     validate_request(prompt, options, !media);
+    if (options.requires_target_only()) options.mtp_steps = 0;
     const int top = options.generated_top_logprobs;
     if (top < -1 || top > decoder_max_generated_top_logprobs ||
         (top >= 0 && (media || options.samples() || options.constraint || options.mtp_steps ||
@@ -600,23 +605,25 @@ bool DecoderBatch::available() const { return !state_->failed; }
 
 void DecoderBatch::State::score(int slot, Lane& lane, Workspace& work, bool logits_ready) {
     const auto stream = execution.stream();
-    if (!logits_ready) {
-        model.compute_logits(work, stream);
-    }
+    if (!logits_ready) model.compute_logits(work, stream);
+    auto* biased = lane.options.requires_target_only() ? &biased_workspace : nullptr;
     if (lane.options.generated_top_logprobs >= 0) {
+        if (biased) biased->select(*lane.request, work, lane.options, nullptr, nullptr, 0, stream);
         check(enqueue_generated_logprobs(work.logits, vocab_size, work.argmax,
                                         lane.options.generated_top_logprobs, logprob_workspace,
-                                        logprob_readback + slot, stream), "Score generated token");
+                                        logprob_readback + slot, stream,
+                                        biased ? biased->logits : nullptr), "Score token");
         return;
     }
-    if (lane.sampling && !sampling_workspace) {
+    if (!biased && lane.sampling && !sampling_workspace) {
         sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
     }
-    if (lane.options.constraint) {
+    if (!biased && lane.options.constraint) {
         constraint_workspace.allocate(execution, lane.options.constraint->uses_wide_mask());
     }
     lane.progress.select(*lane.request, work, lane.options, constraint_workspace,
-                         lane.sampling ? &*lane.sampling : nullptr, sampling_workspace, stream);
+                         lane.sampling ? &*lane.sampling : nullptr, sampling_workspace, stream,
+                         biased);
 }
 
 void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& decode,
@@ -672,8 +679,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             work[count - 1].packed = plain;
             work[count - 1].long_gqa =
                 plain && model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
-            if (plain && !lane.sampling && !lane.options.constraint &&
-                lane.request->memory.transfers().logits.empty()) {
+            if (plain && !lane.sampling && !lane.options.requires_target_only() &&
+                !lane.options.constraint && lane.request->memory.transfers().logits.empty()) {
                 greedy_winners |= std::uint64_t{1} << packed_slots[slot];
             }
         }

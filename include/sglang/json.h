@@ -21,7 +21,7 @@ struct WideInteger {
     std::string digits;
 };
 
-enum class Syntax { strict, ordered, benchmark, checkpoint, completion };
+enum class Syntax { strict, ordered, benchmark, checkpoint, completion, native_generate };
 
 class Value {
 public:

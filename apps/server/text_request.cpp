@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
 
 namespace sglang::server {
 namespace {
@@ -94,18 +95,80 @@ std::vector<std::string> stop_text(const json::Object& object, bool native = fal
     return stops;
 }
 
+std::optional<double> sampling_number(const json::Value& value) {
+    if (const auto* wide = value.wide_integer()) {
+        double parsed = 0;
+        const auto* end = wide->digits.data() + wide->digits.size();
+        const auto conversion = std::from_chars(wide->digits.data(), end, parsed);
+        if (conversion.ec == std::errc{} && conversion.ptr == end) {
+            return parsed;
+        }
+    }
+    return value.number();
+}
+
+int bias_token(std::string_view key) {
+    constexpr std::string_view whitespace = " \t\n\r\f\v";
+    const auto first = key.find_first_not_of(whitespace);
+    if (first == std::string_view::npos) {
+        bad_request("logit_bias keys must be token IDs in [0, 248320)");
+    }
+    key = key.substr(first, key.find_last_not_of(whitespace) - first + 1);
+    if (key.front() == '+') {
+        key.remove_prefix(1);
+        if (key.empty() || key.front() < '0' || key.front() > '9') {
+            bad_request("logit_bias keys must be token IDs in [0, 248320)");
+        }
+    }
+    int token = -1;
+    const auto* end = key.data() + key.size();
+    const auto parsed = std::from_chars(key.data(), end, token);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || token < 0 ||
+        static_cast<TokenId>(token) >= model_vocab_size) {
+        bad_request("logit_bias keys must be token IDs in [0, 248320)");
+    }
+    return token;
+}
+
+void set_logit_bias(const json::Object& object, DecoderOptions& options) {
+    const auto* value = json::get(object, "logit_bias");
+    if (!value || value->is_null()) {
+        return;
+    }
+    std::map<int, float> entries;
+    const auto read = [&](const auto& fields) {
+        for (const auto& [key, value] : fields) {
+            const int token = bias_token(key);
+            const auto bias = sampling_number(value);
+            if (!bias || !std::isfinite(*bias) || std::abs(*bias) > 1e30) {
+                bad_request("logit_bias values must be finite numbers in [-1e30, 1e30]");
+            }
+            entries[token] = static_cast<float>(*bias);
+        }
+    };
+    if (const auto* fields = value->ordered_object()) {
+        read(*fields);
+    } else if (const auto* fields = value->object()) {
+        read(*fields);
+    } else {
+        bad_request("logit_bias must be an object mapping token IDs to numbers");
+    }
+    std::vector<DecoderLogitBias> active;
+    for (const auto& [token, bias] : entries) {
+        if (bias != 0) {
+            active.push_back({token, bias});
+        }
+    }
+    if (!active.empty()) {
+        options.logit_bias =
+            std::make_shared<const std::vector<DecoderLogitBias>>(std::move(active));
+    }
+}
+
 void set_sampling(const json::Object& object, DecoderOptions& options,
                   std::string_view seed_key = "seed") {
     if (const auto* value = json::get(object, "temperature")) {
-        auto temperature = value->number();
-        if (const auto* wide = value->wide_integer()) {
-            double parsed = 0;
-            const auto* end = wide->digits.data() + wide->digits.size();
-            const auto conversion = std::from_chars(wide->digits.data(), end, parsed);
-            if (conversion.ec == std::errc{} && conversion.ptr == end) {
-                temperature = parsed;
-            }
-        }
+        const auto temperature = sampling_number(*value);
         if (!temperature || !std::isfinite(*temperature) || *temperature < 0) {
             bad_request("temperature must be finite and nonnegative");
         }
@@ -266,6 +329,7 @@ TextRequest text_options(const json::Object& object, const CompletionTokenizer& 
     set_stops(object, request.options);
     request.stop_text = stop_text(object);
     set_sampling(object, request.options);
+    set_logit_bias(object, request.options);
     set_cache_salt(object, request.options);
     request.options.generated_top_logprobs = openai_logprob_count(object, chat);
     if (request.options.generated_top_logprobs >= 0 && request.options.samples()) {
@@ -349,7 +413,8 @@ bool is_text_option(std::string_view key) {
         key == "ignore_eos" || key == "stop_token_ids" || key == "stop" ||
         key == "return_token_ids" || key == "logprobs" ||
         key == "temperature" || key == "top_p" || key == "top_k" || key == "seed" ||
-        key == "min_p" || key == "ebnf" || key == "regex" || key == "response_format" ||
+        key == "min_p" || key == "logit_bias" || key == "ebnf" || key == "regex" ||
+        key == "response_format" ||
         key == "cache_salt";
 }
 
@@ -659,7 +724,7 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
                 continue;
             } else if (key == "temperature" || key == "top_p" || key == "top_k" ||
                        key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
-                       key == "stop_token_ids") {
+                       key == "stop_token_ids" || key == "logit_bias") {
                 if (!parameter.is_null()) {
                     sampling.emplace(key, parameter);
                 }
@@ -669,6 +734,7 @@ DecoderOptions generate_options(const json::Value* params, const json::Value* sa
         }
     }
     set_sampling(sampling, options, "sampling_seed");
+    set_logit_bias(sampling, options);
     set_stops(sampling, options);
     if (salt && !salt->is_null()) {
         set_cache_salt_value(*salt, options);
@@ -763,7 +829,7 @@ void generate_logprob_options(const GenerateInput& input, std::size_t index, Bat
 }
 
 GenerateInput parse_generate_input(std::string_view body) {
-    auto parsed = parse_body(body, json::Syntax::strict);
+    auto parsed = parse_body(body, json::Syntax::native_generate);
     auto* object = parsed.object();
     if (!object) {
         bad_request("Expected a JSON object for /generate");

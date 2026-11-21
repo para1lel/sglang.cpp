@@ -119,7 +119,9 @@ Value Parser::object(std::size_t depth, bool ordered) {
             }
             const bool schema = syntax_ == Syntax::completion && depth == 1 &&
                 key == "response_format";
-            auto entry = value(depth, ordered || schema);
+            const bool bias = (syntax_ == Syntax::completion || syntax_ == Syntax::native_generate)
+                && key == "logit_bias";
+            auto entry = value(depth, ordered || schema || bias);
             if (ordered) {
                 if (!keys.insert(key).second) {
                     fail("duplicate JSON object key");

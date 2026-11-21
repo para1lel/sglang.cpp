@@ -56,6 +56,20 @@ void validate_constraint(const DecoderOptions& options) {
     }
 }
 
+void validate_logit_bias(const DecoderOptions& options) {
+    if (!options.requires_target_only()) {
+        return;
+    }
+    int previous = -1;
+    for (const auto [token, bias] : *options.logit_bias) {
+        if (token <= previous || !valid_token(token) || !std::isfinite(bias) ||
+            bias == 0.0f || std::abs(bias) > 1e30f) {
+            throw std::invalid_argument("Invalid, duplicate or unsorted decoder logit bias");
+        }
+        previous = token;
+    }
+}
+
 }
 
 void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
@@ -90,6 +104,7 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
         throw std::invalid_argument("Target step budget must be nonnegative");
     }
     validate_constraint(options);
+    validate_logit_bias(options);
     if (!allow_mtp && options.mtp_steps != 0) {
         throw std::invalid_argument("MTP requires serial generation");
     }
@@ -113,11 +128,68 @@ SamplingParameters request_sampling(const DecoderOptions& options) {
     return {options.temperature, options.top_p, top_k, seed, options.min_p};
 }
 
+void Request::upload_logit_bias(const DecoderOptions& options, cudaStream_t stream) {
+    const auto& entries = *options.logit_bias;
+    auto* buffer = memory.allocate<DecoderLogitBias>(entries.size());
+    check(cudaMemcpyAsync(buffer, entries.data(), entries.size() * sizeof(*buffer),
+                          cudaMemcpyHostToDevice, stream), "Upload logit bias");
+    logit_bias = buffer;
+}
+
+void BiasedWorkspace::prepare(Allocations& memory, Request& request, const DecoderOptions& options,
+                              cudaStream_t stream) {
+    request.upload_logit_bias(options, stream);
+    if (!logits) {
+        logits = memory.allocate<float>(vocab_size);
+    }
+    if (options.samples() && !sampling) {
+        sampling_bytes = biased_sampling_workspace_bytes(vocab_size);
+        sampling = memory.allocate<std::byte>(sampling_bytes);
+    }
+    if (options.constraint && !mask) {
+        mask = memory.allocate<std::uint32_t>(constraint_mask_words);
+    }
+}
+
+void BiasedWorkspace::select(const Request& request, Workspace& work,
+                             const DecoderOptions& options, const ConstraintCursor* allowed,
+                             const SamplingParameters* parameters, int position,
+                             cudaStream_t stream) const {
+    if (allowed) {
+        if (allowed->ids().empty()) {
+            throw std::logic_error("Output constraint has no remaining continuation");
+        }
+        check(cudaMemcpyAsync(mask, allowed->mask().data(), constraint_mask_words *
+                              sizeof(*mask), cudaMemcpyHostToDevice, stream),
+              "Upload allowed token mask");
+    }
+    check(apply_logit_bias(work.logits, logits, vocab_size, request.logit_bias,
+                          options.logit_bias->size(), allowed ? mask : nullptr, stream),
+          "Apply logit bias");
+    if (parameters) {
+        check(sample_logits(logits, vocab_size, &work.argmax->token_id, *parameters,
+                            position, sampling, sampling_bytes, stream), "Sample biased logits");
+    } else {
+        check(text_argmax(logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+              "Choose highest biased logit");
+        if (allowed) {
+            check(check_allowed_logit(logits, &work.argmax->token_id, stream),
+                  "Validate biased constrained token");
+        }
+    }
+}
+
 void RequestProgress::select(Request& request, Workspace& work, const DecoderOptions& options,
                              const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
-                             void* sampling_workspace, cudaStream_t stream) {
+                             void* sampling_workspace, cudaStream_t stream,
+                             const BiasedWorkspace* biased) {
     if (options.constraint) {
-        constraint.candidates(*options.constraint, remaining_output(options));
+        constraint.candidates(*options.constraint, remaining_output(options), biased != nullptr);
+    }
+    if (biased) {
+        biased->select(request, work, options, options.constraint ? &constraint : nullptr,
+                       sampling, generated, stream);
+    } else if (options.constraint) {
         select_constrained(work, scratch, constraint, sampling, generated, sampling_workspace,
                             stream);
     } else if (sampling) {
@@ -203,10 +275,15 @@ private:
 };
 
 std::vector<DecoderLogit> top_logits(const Bf16* scores, std::size_t count,
-                                    std::vector<DecoderLogit>& ranking) {
+                                    std::vector<DecoderLogit>& ranking,
+                                    const std::vector<DecoderLogitBias>* bias) {
     ranking.clear();
+    std::size_t entry = 0;
     for (int index = 0; index < vocab_size; ++index) {
-        const float logit = __bfloat162float(scores[index]);
+        float logit = __bfloat162float(scores[index]);
+        if (bias && entry < bias->size() && (*bias)[entry].token_id == index) {
+            logit += (*bias)[entry++].bias;
+        }
         if (!std::isnan(logit)) {
             ranking.push_back({index, logit});
         }
@@ -236,8 +313,9 @@ void prepare_serial_request(Request& request, const DecoderOptions& options) {
 
 }
 
-SerialOutput::SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result)
-    : callbacks_(callbacks), top_count_(top_count), result_(result) {
+SerialOutput::SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result,
+                           const std::vector<DecoderLogitBias>* bias)
+    : callbacks_(callbacks), top_count_(top_count), result_(result), bias_(bias) {
     if (top_count_ > 0) {
         ranking_.reserve(vocab_size);
     }
@@ -247,7 +325,7 @@ bool SerialOutput::emit(int token, const Bf16* logits) {
     result_.output_token_ids.push_back(token);
     const bool keep_running = !callbacks_.on_token || callbacks_.on_token(token);
     if (top_count_ > 0) {
-        result_.step_top_logits.push_back(top_logits(logits, top_count_, ranking_));
+        result_.step_top_logits.push_back(top_logits(logits, top_count_, ranking_, bias_));
     }
     return keep_running;
 }
@@ -366,7 +444,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     const auto sampling = options.samples() ? std::optional{request_sampling(options)}
                                             : std::nullopt;
-    const RequestLease lease(request_in_use, !options.eager && !media);
+    const bool biased = options.requires_target_only();
+    const RequestLease lease(request_in_use, !options.eager && !media && !biased);
     std::unique_ptr<Request> eager_request;
     auto& storage = lease.owns_slot() ? decode_request : eager_request;
     try {
@@ -390,11 +469,18 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                                                 kv_limit);
         }
         auto& request = *storage;
-        prepare_serial_request(request, options);
+        BiasedWorkspace biased_workspace;
+        if (biased) {
+            request.reset();
+            request.memory.transfers().logits.resize(options.top_logits > 0 ? vocab_size : 0);
+            biased_workspace.prepare(request.memory, request, options, request.memory.stream());
+        } else {
+            prepare_serial_request(request, options);
+        }
         const auto prefill = media
             ? upload_media_positions(request, *media, request.memory.stream()) : MediaPrefill{};
         const int rotary_delta = media ? media->prompt.next_position - prompt_count : 0;
-        SerialOutput output(callbacks, options.top_logits, result);
+        SerialOutput output(callbacks, options.top_logits, result, options.logit_bias.get());
         result.peak_device_allocation_bytes += request.memory.bytes();
         const auto run_request = [&] {
             RequestProgress progress;
@@ -413,7 +499,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 advance_serial(request, progress, input, bool(media), rotary_delta);
                 progress.select(request, request.work, options, request.constraint_workspace,
                                 sampling ? &*sampling : nullptr, request.sampling_workspace,
-                                stream);
+                                stream, biased ? &biased_workspace : nullptr);
                 check(cudaStreamSynchronize(stream), "Complete decoder step");
                 const int token = read_token(request, sampling.has_value(),
                                              options.constraint != nullptr);
@@ -443,7 +529,8 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     if (options.generated_top_logprobs != -1) {
         throw std::invalid_argument("Generated logprobs require the batch decoder");
     }
-    if (options.mtp_steps != 0 && !model_->mtp_weights) {
+    const int proposals = options.requires_target_only() ? 0 : options.mtp_steps;
+    if (proposals != 0 && !model_->mtp_weights) {
         throw std::invalid_argument("MTP weights must be enabled when constructing the decoder");
     }
     DecoderResult result;
@@ -458,7 +545,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     DeviceScope selected_device(model_->device);
     reclaim_prefill_workspaces(model_->device);
     result.output_token_ids.reserve(options.max_new_tokens);
-    if (options.mtp_steps == 0) {
+    if (proposals == 0) {
         model_->generate_serial(prompt_token_ids, options, callbacks, result);
     } else {
         const int limit = options.max_num_batched_tokens

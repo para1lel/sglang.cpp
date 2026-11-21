@@ -100,6 +100,14 @@ void record_sampling(const DecoderOptions& options, std::size_t prompt_size) {
     for (std::size_t index = 0; index < stops.size(); ++index) {
         output << (index == 0 ? "" : ",") << stops[index];
     }
+    output << "],\"logit_bias\":[";
+    if (options.logit_bias) {
+        const auto& entries = *options.logit_bias;
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            const auto [token, bias] = entries[index];
+            output << (index == 0 ? "" : ",") << '[' << token << ',' << bias << ']';
+        }
+    }
     output << "]}\n";
     std::cerr << output.str();
 }

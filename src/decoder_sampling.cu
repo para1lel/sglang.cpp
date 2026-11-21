@@ -1,7 +1,11 @@
 #include "sglang/decoder_sampling.h"
 
+#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 #include <math_constants.h>
+
+#include <algorithm>
 
 namespace sglang::decoder {
 namespace {
@@ -297,6 +301,126 @@ __global__ void choose_token(const __nv_bfloat16* scores, int vocabulary, int st
     }
 }
 
+constexpr int token_bits = 18;
+constexpr std::uint64_t token_mask = (1u << token_bits) - 1;
+constexpr std::uint64_t invalid_key = (std::uint64_t{1} << (32 + token_bits)) - 1;
+using ScoreKey = std::uint64_t;
+
+struct BiasSamplingScratch {
+    ScoreKey* keys;
+    ScoreKey* sorted;
+    double* weights;
+    double* prefix;
+    void* temporary;
+};
+
+__global__ void rank_scores(const float* scores, int vocabulary, ScoreKey* keys) {
+    const int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token < vocabulary) {
+        const float score = scores[token];
+        const auto bits = __float_as_uint(score == 0 ? 0.0f : score);
+        const auto ordered = bits ^ (bits & 0x80000000u ? 0xffffffffu : 0x80000000u);
+        const auto key = (ScoreKey{ordered} << token_bits) | (token_mask - token);
+        keys[token] = isfinite(score) ? key : score == -CUDART_INF_F ? 0 : invalid_key;
+    }
+}
+
+__device__ double ranked_weight(ScoreKey key, ScoreKey peak, double temperature) {
+    const auto score = [](ScoreKey value) {
+        const auto ordered = static_cast<unsigned>(value >> token_bits);
+        return static_cast<double>(
+            __uint_as_float(ordered ^ (ordered & 0x80000000u ? 0x80000000u : 0xffffffffu)));
+    };
+    return key != 0 && peak != invalid_key ? exp((score(key) - score(peak)) / temperature) : 0.0;
+}
+
+__global__ void measure_weights(const ScoreKey* keys, int vocabulary, double temperature,
+                                double* weights) {
+    const int rank = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rank < vocabulary) {
+        weights[rank] = ranked_weight(keys[rank], keys[0], temperature);
+    }
+}
+
+__device__ int first_crossing(const double* prefix, int count, double cutoff) {
+    int first = 0;
+    while (first < count) {
+        const int middle = first + (count - first) / 2;
+        if (prefix[middle] > cutoff) {
+            count = middle;
+        } else {
+            first = middle + 1;
+        }
+    }
+    return first;
+}
+
+__global__ void choose_biased_token(BiasSamplingScratch scratch, int vocabulary,
+                                    SamplingParameters parameters, int position, int* token) {
+    const auto peak = scratch.sorted[0];
+    *token = -1;
+    if (peak == 0 || peak == invalid_key) {
+        return;
+    }
+    int keep = min(vocabulary, parameters.top_k);
+    if (parameters.top_p < 1.0) {
+        const auto cutoff = parameters.top_p * scratch.prefix[vocabulary - 1];
+        keep = min(keep, first_crossing(scratch.prefix, keep, cutoff) + 1);
+    }
+    if (parameters.min_p > 0.0) {
+        int first = 1;
+        while (first < keep) {
+            const int middle = first + (keep - first) / 2;
+            if (scratch.weights[middle] >= parameters.min_p) {
+                first = middle + 1;
+            } else {
+                keep = middle;
+            }
+        }
+    }
+    const double mass = scratch.prefix[keep - 1];
+    const double draw = min(uniform(parameters.seed, position) * mass, nextafter(mass, 0.0));
+    const int rank = first_crossing(scratch.prefix, keep, draw);
+    *token = static_cast<int>(token_mask - (scratch.sorted[rank] & token_mask));
+}
+
+std::size_t biased_sampling_temporary_bytes(int vocabulary) {
+    std::size_t sort = 0;
+    std::size_t scan = 0;
+    cub::DeviceRadixSort::SortKeysDescending(
+        nullptr, sort, static_cast<ScoreKey*>(nullptr), static_cast<ScoreKey*>(nullptr),
+        vocabulary, 0, 32 + token_bits);
+    cub::DeviceScan::InclusiveSum(
+        nullptr, scan, static_cast<double*>(nullptr), static_cast<double*>(nullptr), vocabulary);
+    return std::max(sort, scan);
+}
+
+__device__ bool is_allowed(const std::uint32_t* mask, int token) {
+    return !mask || (mask[token / 32] >> (token % 32) & 1u);
+}
+
+__global__ void initialize_scores(const __nv_bfloat16* source, float* scores, int vocabulary,
+                                   const std::uint32_t* mask) {
+    const int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token < vocabulary) {
+        scores[token] = is_allowed(mask, token) ? __bfloat162float(source[token]) : -CUDART_INF_F;
+    }
+}
+
+__global__ void add_bias(float* scores, const DecoderLogitBias* bias, int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const auto entry = bias[index];
+        scores[entry.token_id] += entry.bias;
+    }
+}
+
+__global__ void validate_allowed(const float* scores, int* token) {
+    if (*token >= 0 && !isfinite(scores[*token])) {
+        *token = -1;
+    }
+}
+
 }
 
 std::size_t sampling_workspace_bytes() { return sizeof(Scratch); }
@@ -318,6 +442,65 @@ cudaError_t sample_logits(const __nv_bfloat16* scores, int vocabulary, int* toke
     choose_score<<<1, 1, 0, stream>>>(scratch, parameters, position);
     count_stripes<<<stripes, group_size, 0, stream>>>(scores, vocabulary, scratch);
     choose_token<<<1, group_size, 0, stream>>>(scores, vocabulary, stripes, scratch, token);
+    return cudaGetLastError();
+}
+
+std::size_t biased_sampling_workspace_bytes(int vocabulary) {
+    return 2 * vocabulary * (sizeof(ScoreKey) + sizeof(double)) +
+        biased_sampling_temporary_bytes(vocabulary) + 255;
+}
+
+cudaError_t sample_logits(const float* scores, int vocabulary, int* token,
+                          SamplingParameters parameters, int position, void* workspace,
+                          std::size_t workspace_bytes, cudaStream_t stream) {
+    if (vocabulary < 1 || vocabulary > token_mask + 1 || parameters.top_k < 1) {
+        return cudaErrorInvalidValue;
+    }
+    auto* keys = static_cast<ScoreKey*>(workspace);
+    auto* weights = reinterpret_cast<double*>(keys + 2 * vocabulary);
+    const auto end = reinterpret_cast<std::uintptr_t>(weights + 2 * vocabulary);
+    const BiasSamplingScratch scratch{
+        keys, keys + vocabulary, weights, weights + vocabulary,
+        reinterpret_cast<void*>((end + 255) & ~std::uintptr_t{255})};
+    const int blocks = (vocabulary + group_size - 1) / group_size;
+    const auto offset = reinterpret_cast<std::uintptr_t>(scratch.temporary) -
+        reinterpret_cast<std::uintptr_t>(workspace);
+    if (workspace_bytes <= offset) {
+        return cudaErrorInvalidValue;
+    }
+    auto bytes = workspace_bytes - offset;
+    rank_scores<<<blocks, group_size, 0, stream>>>(scores, vocabulary, scratch.keys);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    status = cub::DeviceRadixSort::SortKeysDescending(
+        scratch.temporary, bytes, scratch.keys, scratch.sorted, vocabulary, 0, 32 + token_bits,
+        stream);
+    if (status != cudaSuccess) return status;
+    measure_weights<<<blocks, group_size, 0, stream>>>(
+        scratch.sorted, vocabulary, parameters.temperature, scratch.weights);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    bytes = workspace_bytes - offset;
+    status = cub::DeviceScan::InclusiveSum(
+        scratch.temporary, bytes, scratch.weights, scratch.prefix, vocabulary, stream);
+    if (status != cudaSuccess) return status;
+    choose_biased_token<<<1, 1, 0, stream>>>(scratch, vocabulary, parameters, position, token);
+    return cudaGetLastError();
+}
+
+cudaError_t apply_logit_bias(const __nv_bfloat16* source, float* scores, int vocabulary,
+                            const DecoderLogitBias* bias, int count, const std::uint32_t* mask,
+                            cudaStream_t stream) {
+    initialize_scores<<<(vocabulary + group_size - 1) / group_size, group_size, 0, stream>>>(
+        source, scores, vocabulary, mask);
+    const auto status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    add_bias<<<(count + group_size - 1) / group_size, group_size, 0, stream>>>(scores, bias, count);
+    return cudaGetLastError();
+}
+
+cudaError_t check_allowed_logit(const float* scores, int* token, cudaStream_t stream) {
+    validate_allowed<<<1, 1, 0, stream>>>(scores, token);
     return cudaGetLastError();
 }
 

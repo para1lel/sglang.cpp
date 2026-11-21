@@ -17,6 +17,7 @@ std::shared_ptr<const DecoderTokenLogprobs>
 collect_generated_logprobs(const GeneratedLogprobReadback& row, int top);
 cudaError_t enqueue_generated_logprobs(const __nv_bfloat16* logits, int vocabulary,
                                        const TextLogitCandidate* winner, int top, void* workspace,
-                                       GeneratedLogprobReadback* host, cudaStream_t stream);
+                                       GeneratedLogprobReadback* host, cudaStream_t stream,
+                                       const float* biased_logits = nullptr);
 
 }

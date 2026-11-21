@@ -6,6 +6,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang::decoder {
 namespace {
@@ -33,11 +34,21 @@ struct Scratch {
     GeneratedLogprobReadback result;
 };
 
-__device__ Key rank_key(unsigned bits, unsigned token) {
-    if ((bits & 0x7fffu) == 0) {
+template <typename Score>
+__device__ Key rank_key(Score raw, unsigned token) {
+    constexpr bool bf16 = std::is_same_v<Score, __nv_bfloat16>;
+    constexpr unsigned sign = bf16 ? 0x8000u : 0x80000000u;
+    constexpr unsigned mask = bf16 ? 0xffffu : 0xffffffffu;
+    unsigned bits;
+    if constexpr (bf16) {
+        bits = __bfloat16_as_ushort(raw);
+    } else {
+        bits = __float_as_uint(raw);
+    }
+    if ((bits & (sign - 1)) == 0) {
         bits = 0;
     }
-    const unsigned ordered = bits ^ (bits & 0x8000u ? 0xffffu : 0x8000u);
+    const unsigned ordered = bits ^ (bits & sign ? mask : sign);
     return (Key{ordered} << token_bits) | (token_mask - token);
 }
 
@@ -45,7 +56,8 @@ __device__ int token_id(Key key) {
     return token_mask - (key & token_mask);
 }
 
-__global__ void measure_tiles(const __nv_bfloat16* logits, int vocabulary, int top, Tile* tiles) {
+template <typename Score>
+__global__ void measure_tiles(const Score* logits, int vocabulary, int top, Tile* tiles) {
     __shared__ union {
         FloatReduce::TempStorage reduce;
         Sort::TempStorage sort;
@@ -59,11 +71,11 @@ __global__ void measure_tiles(const __nv_bfloat16* logits, int vocabulary, int t
     const int base = blockIdx.x * tile_size + threadIdx.x;
     for (int item = 0; item < items; ++item) {
         const int token = base + item * threads;
-        const auto raw = token < vocabulary ? logits[token] : __float2bfloat16(-CUDART_INF_F);
-        const float score = __bfloat162float(raw);
+        const auto raw = token < vocabulary ? logits[token] : static_cast<Score>(-CUDART_INF_F);
+        const float score = static_cast<float>(raw);
         scores[item] = score;
         if (top) {
-            keys[item] = token < vocabulary ? rank_key(__bfloat16_as_ushort(raw), token) : 0;
+            keys[item] = token < vocabulary ? rank_key(raw, token) : 0;
         }
         bad |= isnan(score) || score == CUDART_INF_F;
         local_max = fmaxf(local_max, score);
@@ -89,7 +101,8 @@ __global__ void measure_tiles(const __nv_bfloat16* logits, int vocabulary, int t
     }
     if (top) {
         __syncthreads();
-        Sort(temporary.sort).SortDescendingBlockedToStriped(keys, 0, token_bits + 16);
+        constexpr int key_bits = token_bits + 8 * sizeof(Score);
+        Sort(temporary.sort).SortDescendingBlockedToStriped(keys, 0, key_bits);
         if (threadIdx.x < top) {
             tile.ranked[threadIdx.x] = keys[0];
         }
@@ -100,7 +113,8 @@ __device__ float log_probability(float score, float maximum, float log_mass) {
     return fmaxf(-FLT_MAX, (score - maximum) - log_mass);
 }
 
-__global__ void finish_row(const __nv_bfloat16* logits, int vocabulary,
+template <typename Score>
+__global__ void finish_row(const Score* logits, int vocabulary,
                            const TextLogitCandidate* winner, int count, int top, Scratch* scratch) {
     __shared__ union {
         FloatReduce::TempStorage reduce;
@@ -127,7 +141,7 @@ __global__ void finish_row(const __nv_bfloat16* logits, int vocabulary,
     if (index == 0) {
         log_mass = logf(total);
         scratch->result.selected = {
-            chosen, log_probability(__bfloat162float(logits[chosen]), maximum, log_mass)};
+            chosen, log_probability(static_cast<float>(logits[chosen]), maximum, log_mass)};
     }
     __syncthreads();
     int cursor = 0;
@@ -138,7 +152,7 @@ __global__ void finish_row(const __nv_bfloat16* logits, int vocabulary,
             best = key;
             const int token = token_id(key);
             scratch->result.alternatives[rank] = {
-                token, log_probability(__bfloat162float(logits[token]), maximum, log_mass)};
+                token, log_probability(static_cast<float>(logits[token]), maximum, log_mass)};
         }
         __syncthreads();
         cursor += candidate == best;
@@ -150,7 +164,8 @@ __global__ void finish_row(const __nv_bfloat16* logits, int vocabulary,
 
 std::size_t generated_logprob_workspace_bytes() { return sizeof(Scratch); }
 
-cudaError_t enqueue_generated_logprobs(const __nv_bfloat16* logits, int vocabulary,
+template <typename Score>
+cudaError_t enqueue_logprobs(const Score* logits, int vocabulary,
                                        const TextLogitCandidate* winner, int top, void* workspace,
                                        GeneratedLogprobReadback* host, cudaStream_t stream) {
     if (!logits || !winner || !workspace || !host || vocabulary < 1 ||
@@ -170,6 +185,16 @@ cudaError_t enqueue_generated_logprobs(const __nv_bfloat16* logits, int vocabula
     if (status != cudaSuccess) return status;
     return cudaMemcpyAsync(host, &scratch->result, offsetof(GeneratedLogprobReadback, alternatives)
         + top * sizeof(DecoderLogprob), cudaMemcpyDeviceToHost, stream);
+}
+
+cudaError_t enqueue_generated_logprobs(const __nv_bfloat16* logits, int vocabulary,
+                                       const TextLogitCandidate* winner, int top, void* workspace,
+                                       GeneratedLogprobReadback* host, cudaStream_t stream,
+                                       const float* biased_logits) {
+    if (biased_logits) {
+        return enqueue_logprobs(biased_logits, vocabulary, winner, top, workspace, host, stream);
+    }
+    return enqueue_logprobs(logits, vocabulary, winner, top, workspace, host, stream);
 }
 
 }

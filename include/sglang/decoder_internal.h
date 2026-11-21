@@ -37,7 +37,8 @@ using Bf16 = __nv_bfloat16;
 
 class SerialOutput {
 public:
-    SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result);
+    SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result,
+                 const std::vector<DecoderLogitBias>* bias = nullptr);
     const std::function<bool()>& cancel_probe() const { return callbacks_.is_cancelled; }
     bool cancelled() const { return cancel_probe() && cancel_probe()(); }
     bool emit(int token, const Bf16* logits);
@@ -46,6 +47,7 @@ private:
     const DecoderCallbacks& callbacks_;
     const int top_count_;
     DecoderResult& result_;
+    const std::vector<DecoderLogitBias>* bias_;
     std::vector<DecoderLogit> ranking_;
 };
 
@@ -323,6 +325,7 @@ struct Request {
     void grow_kv(int positions, int written, cudaStream_t stream);
     void reset(cudaStream_t stream);
     void reset();
+    void upload_logit_bias(const DecoderOptions& options, cudaStream_t stream);
     ExactGqaWorkspace batch_graph_scores();
 
     Allocations memory;
@@ -335,6 +338,20 @@ struct Request {
     std::optional<ExactGqaWorkspace> long_graph_scores;
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;
+    const DecoderLogitBias* logit_bias = nullptr;
+};
+
+struct BiasedWorkspace {
+    float* logits = nullptr;
+    std::uint32_t* mask = nullptr;
+    std::byte* sampling = nullptr;
+    std::size_t sampling_bytes = 0;
+
+    void prepare(Allocations& memory, Request& request, const DecoderOptions& options,
+                 cudaStream_t stream);
+    void select(const Request& request, Workspace& work, const DecoderOptions& options,
+                const ConstraintCursor* allowed, const SamplingParameters* parameters,
+                int position, cudaStream_t stream) const;
 };
 
 struct RequestProgress {
@@ -354,7 +371,8 @@ struct RequestProgress {
     void advance(int rows) { position += rows; }
     void select(Request& request, Workspace& work, const DecoderOptions& options,
                 const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
-                void* sampling_workspace, cudaStream_t stream);
+                void* sampling_workspace, cudaStream_t stream,
+                const BiasedWorkspace* biased = nullptr);
     std::optional<DecoderFinishReason> commit(const DecoderOptions& options, int token,
                                               const Bf16* logits = nullptr,
                                               SerialOutput* output = nullptr);

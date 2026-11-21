@@ -850,14 +850,22 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     const int visible = position + rows;
     const int flash_limit = rows == flash_chunk ? max_flash_visible_tokens :
                                                   max_multirow_visible_tokens;
+    const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
+    const std::string_view mode = setting ? setting : "";
+    if (mode == "ragged" && rows >= 256 && rows <= 512 && position >= 4096 &&
+        visible <= max_multirow_visible_tokens) {
+        if (const auto status = launch_tmem_prefill(cache, pages, position, queries, output,
+                                                   stream, true, rows)) {
+            return *status;
+        }
+    }
     if (rows >= min_flash_rows && rows <= flash_chunk && visible <= flash_limit &&
         (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
         (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
         if (rows == flash_chunk && position >= 8192) {
-            const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
-            const std::string_view mode = setting ? setting : "";
             constexpr int max_default_paired_position = 31744;
-            const bool default_paired = !setting && position <= max_default_paired_position &&
+            const bool default_paired = (!setting || mode == "ragged") &&
+                position <= max_default_paired_position &&
                 (position % flash_chunk == 0 || position % mxfp8_page_size != 0);
             if (default_paired && scratch.keys && scratch.values) {
                 if (const auto status = launch_staged_tmem_prefill(cache, pages, position,

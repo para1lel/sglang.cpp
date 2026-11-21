@@ -9,7 +9,7 @@
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L342)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L945)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L639)<!-- prefix: "bool BatchSe" --> |
 | Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L112)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L249)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L281)<!-- prefix: "void stream_" --> |
-| Text stops | Select stops before token publication and hold ambiguous text. | [Worker match](../include/sglang/server/text_stop.h#L153)<!-- prefix: "bool apply(D" --> · [Response frame](../apps/server/native_generate.cpp#L177)<!-- prefix: "std::string " --> |
+| Text stops | Select stops before token publication and hold ambiguous text. | [Worker match](../include/sglang/server/text_stop.h#L156)<!-- prefix: "bool apply(D" --> · [Response frame](../apps/server/native_generate.cpp#L177)<!-- prefix: "std::string " --> |
 
 ## Runtime path
 
@@ -100,20 +100,20 @@ Single-prompt streams can use [bounded decode output](http-server.md#bounded-dec
 
 ### Text stops
 
-`sampling_params.stop` searches generated text. A string is one stop, and a list gives the stops for one item. A single sampling object broadcasts that list to every batch item. Use a `sampling_params` array of objects to set different stops per item.
+`sampling_params.stop` searches generated text including special token pieces, regardless of `skip_special_tokens`. A string is one stop, and a list gives the stops for one item. A single sampling object broadcasts that list to every batch item. Use a `sampling_params` array of objects to set different stops per item.
 
 The worker checks each decoder step for a match. If several strings match within that step, the first matching string in configured order wins. The worker uses that string's first occurrence, including a match that began in an earlier step. A text match takes precedence over a token-ID stop or length finish in the same step. Text stops still apply when `ignore_eos` is true.
-[Match order](../include/sglang/server/text_stop.h#L67)<!-- prefix: "std::optiona" --> · [Step finish](../include/sglang/server/text_stop.h#L170)<!-- prefix: "matched = ma" -->
+[Match order](../include/sglang/server/text_stop.h#L67)<!-- prefix: "std::optiona" --> · [Step finish](../include/sglang/server/text_stop.h#L173)<!-- prefix: "matched = ma" -->
 
-For a text stop, the final object contains `{"type":"stop","matched":"…"}` with the exact configured string. By default, `text` ends before the match. IDs and usage include the token that completed it, even if the match starts inside that token. The worker drops any later MTP IDs before publishing and cancels the lane if it is still live. Other items keep running.
-[Finish serialization](../apps/server/native_generate.cpp#L132)<!-- prefix: "if (type == " --> · [Clipping](../include/sglang/server/text_stop.h#L174)<!-- prefix: "const auto e" --> · [Lane retirement](../apps/server/batch_service.cpp#L458)<!-- prefix: "if (selected" -->
+For a text stop, the final object contains `{"type":"stop","matched":"…"}` with the exact configured string. IDs and usage include the token that completed it, even if the match starts inside that token. The worker drops any later MTP IDs before publishing and cancels the lane if it is still live. Other items keep running.
+[Finish serialization](../apps/server/native_generate.cpp#L132)<!-- prefix: "if (type == " --> · [Clipping](../include/sglang/server/text_stop.h#L177)<!-- prefix: "const auto e" --> · [Lane retirement](../apps/server/batch_service.cpp#L458)<!-- prefix: "if (selected" -->
 
-Set `sampling_params.no_stop_trim: true` to keep the matched string through its last byte in `text`, or to decode the matched stop ID into `text`. For example, stopping on `ll` in the token `hello` returns `hell`. The option changes only `text` in JSON and SSE. IDs, usage, finish metadata, and optional token logprobs follow the same rules with either setting.
+The response searches rendered `text` for the matched string. By default it trims from the first occurrence. Set `sampling_params.no_stop_trim` to `true` to keep text through the end of that occurrence. For example, stopping on `ll` in the token `hello` returns `hell`. If the matched string is absent after special token filtering, both settings return all rendered text through the matching token. IDs, usage, finish metadata, and optional token logprobs follow the same rules with either setting.
 
-Set `sampling_params.skip_special_tokens: false` to decode generated special tokens into `text` and include their pieces in native text-stop matching. A matched special stop ID appears in `text` only when `no_stop_trim` is also true. Prompt tokens stay outside the output and the stop matcher. Generated-token logprob text uses its independent piece decoding.
+Set `sampling_params.skip_special_tokens` to `false` to show generated special tokens in `text`. A matched stop ID contributes visible text when `no_stop_trim` is true and its piece is visible. Prompt tokens stay outside the output and the stop matcher. Generated-token logprob text uses its independent piece decoding.
 
-A split UTF-8 character enters the matcher after its last byte arrives. The decoder emits U+FFFD for invalid bytes or for an incomplete character when it flushes. Stop strings match the resulting UTF-8 text, including replacement characters. The writer holds any trailing text that could complete a stop in a later step. An event can add IDs while its text stays unchanged. When an item ends without a text match, the terminal event releases the held text.
-[UTF-8 assembly](../src/utf8.cpp#L63)<!-- prefix: "std::string " --> · [UTF-8 flush](../src/utf8.cpp#L96)<!-- prefix: "std::string " --> · [Text release](../include/sglang/server/text_stop.h#L118)<!-- prefix: "std::string " -->
+A split UTF-8 character enters the matcher after its last byte arrives. The decoder emits U+FFFD for invalid bytes or for an incomplete character when it flushes. Stop strings match the resulting UTF-8 text, including replacement characters. The writer holds trailing stop prefixes and text starting at a rendered occurrence until it knows which bytes to release. This keeps text cumulative even when hiding a special token joins visible pieces into a stop string. An event can add IDs while its text stays unchanged. When an item ends without a text match, the terminal event releases the held text.
+[UTF-8 assembly](../src/utf8.cpp#L63)<!-- prefix: "std::string " --> · [UTF-8 flush](../src/utf8.cpp#L96)<!-- prefix: "std::string " --> · [Text release](../include/sglang/server/text_stop.h#L122)<!-- prefix: "std::string " -->
 
 An unscored and unconstrained scalar prompt with `n: 1` and no text stops uses ID-based callbacks. Text stops, output constraints, and scores use step delivery with the same unindexed shape. An event can carry several MTP IDs, including on the terminal step. Eligible unindexed SSE can use bounded delivery. Indexed requests use ordinary scheduling.
 [Dispatch](../apps/server/native_generate.cpp#L360)<!-- prefix: "} else if (!" --> · [Bounded delivery](http-server.md#bounded-decode-output)

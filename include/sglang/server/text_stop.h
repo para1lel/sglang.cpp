@@ -81,15 +81,19 @@ public:
     }
 
     std::size_t bytes() const { return seen_; }
+    bool has_match(std::size_t index) const { return states_[index].start.has_value(); }
     std::size_t matched_start(std::size_t index) const { return states_[index].start.value(); }
     std::size_t matched_end(std::size_t index) const { return states_[index].end; }
 
     std::size_t safe_end() const {
-        std::size_t held = 0;
+        auto end = seen_;
         for (const auto& state : states_) {
-            held = std::max(held, state.prefix);
+            end = std::min(end, seen_ - state.prefix);
+            if (state.start) {
+                end = std::min(end, *state.start);
+            }
         }
-        return seen_ - held;
+        return end;
     }
 
 private:
@@ -117,7 +121,7 @@ public:
 
     std::string take(bool final, std::optional<std::size_t> match, bool include_match = false) {
         auto end = final ? matcher_.bytes() : matcher_.safe_end();
-        if (match) {
+        if (match && matcher_.has_match(*match)) {
             end = include_match ? matcher_.matched_end(*match) : matcher_.matched_start(*match);
         }
         auto output = pending_.substr(offset_, end - consumed_);
@@ -146,20 +150,19 @@ struct NativeTextStops {
 
 class NativeTextStop {
 public:
-    NativeTextStop(std::shared_ptr<const NativeTextStops> config, bool skip_special_tokens)
-        : config_(std::move(config)), matcher_(config_->stops),
-          skip_special_tokens_(skip_special_tokens) {}
+    explicit NativeTextStop(std::shared_ptr<const NativeTextStops> config)
+        : config_(std::move(config)), matcher_(config_->stops) {}
 
     bool apply(DecoderBatchStep& step) {
         if (!step.token || step.sampling_failed || step.constraint_failed) {
             return false;
         }
         std::array<std::size_t, decoder_batch_max_mtp_steps + 1> ends{};
-        matcher_.push(utf8_.push(config_->tokenizer.piece(*step.token, skip_special_tokens_)));
+        matcher_.push(utf8_.push(config_->tokenizer.piece(*step.token, false)));
         ends.front() = matcher_.bytes();
         for (int index = 0; index < step.extra_token_count; ++index) {
             const int token = step.extra_tokens[index];
-            matcher_.push(utf8_.push(config_->tokenizer.piece(token, skip_special_tokens_)));
+            matcher_.push(utf8_.push(config_->tokenizer.piece(token, false)));
             ends[index + 1] = matcher_.bytes();
         }
         const auto count = 1 + step.extra_token_count;
@@ -189,7 +192,6 @@ private:
     std::shared_ptr<const NativeTextStops> config_;
     TextStopMatcher matcher_;
     Utf8Stream utf8_;
-    bool skip_special_tokens_;
 };
 
 }

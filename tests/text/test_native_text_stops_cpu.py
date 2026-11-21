@@ -44,6 +44,10 @@ class NativeTextStops(unittest.TestCase):
             125: [a, b, a, q],
             126: [a, cls.eos, b],
             127: [a, cls.special, b, q],
+            128: [a, cls.special, cls.hello, q],
+            129: [a, cls.special, b, q, a, b, e],
+            130: [a, cls.special, *cls.snow, b, q],
+            131: [a, cls.hello, cls.special, q],
         }
         script = cls.output / "text-stops.ids"
         script.write_text("".join(f"{seed} {' '.join(map(str, ids))}\n"
@@ -182,7 +186,7 @@ class NativeTextStops(unittest.TestCase):
         frames = self.exchange(params, True, inputs=inputs, **scores)
         expected = [("A", [a, self.special], stopped(special)),
                     ("A" + special, [a, self.special], stopped(special)),
-                    ("AB", [a, self.special, b], length(3))]
+                    ("A", [a, self.special], stopped(special))]
         self.assertEqual(len(plain), len(expected))
         self.assertEqual({frame["index"] for frame in frames}, set(range(len(expected))))
         for index, (text, ids, reason) in enumerate(expected):
@@ -196,6 +200,63 @@ class NativeTextStops(unittest.TestCase):
                     self.assertEqual([entry[1] for entry in selected], frame["output_ids"])
                     if len(selected) > 1:
                         self.assertEqual(selected[1], [-0.5, self.special, special])
+
+    def test_hidden_text_match_defaults_and_id_precedence(self):
+        a, *_ = self.letters
+        special = "<|object_ref_start|>"
+        for visibility in ({}, {"skip_special_tokens": None}, {"skip_special_tokens": True},
+                           {"skip_special_tokens": False}):
+            shown = visibility.get("skip_special_tokens") is False
+            for keep in (False, True):
+                with self.subTest(visibility=visibility, keep=keep):
+                    retained = "A" + special if shown and keep else "A"
+                    params = options(127, 4, no_stop_trim=keep, **visibility)
+                    self.scalar(params | {"stop": special}, retained, [a, self.special],
+                                stopped(special), ["A"])
+                    self.scalar(params | {"stop": special, "stop_token_ids": [self.special]},
+                                retained, [a, self.special], stopped(special), ["A"])
+                    self.scalar(params | {"stop_token_ids": [self.special]}, retained,
+                                [a, self.special], stopped(self.special), ["A"])
+        eos = "<|im_end|>"
+        for keep in (False, True):
+            for skip in (False, True):
+                retained = "A" + eos if keep and not skip else "A"
+                self.scalar(options(126, 4, stop=eos, no_stop_trim=keep,
+                                    skip_special_tokens=skip),
+                            retained, [a, self.eos], stopped(eos), ["A"])
+
+    def test_text_stops_span_hidden_and_visible_pieces(self):
+        a, b, *_ = self.letters
+        special = "<|object_ref_start|>"
+        for skip in (False, True):
+            for keep in (False, True):
+                with self.subTest(skip=skip, keep=keep):
+                    snow_prefix = ["A"] * 4 + ["A⛄" if skip else "A"]
+                    for stop, seed, ids, prefix, hidden, intermediate in (
+                        (special + "he", 128, [a, self.special, self.hello], "A", "Ahello",
+                         ["A"] * 2),
+                        (special + "⛄B", 130, [a, self.special, *self.snow, b], "A", "A⛄B",
+                         snow_prefix),
+                        ("lo" + special, 131, [a, self.hello, self.special], "Ahel", "Ahello",
+                         ["A", "Ahel"]),
+                    ):
+                        text = hidden if skip else (prefix + stop if keep else prefix)
+                        self.scalar(options(seed, 8, stop=stop, no_stop_trim=keep,
+                                            skip_special_tokens=skip),
+                                    text, ids, stopped(stop), intermediate)
+                    stop = "A" + special + "B"
+                    text = "AB" if skip else (stop if keep else "")
+                    self.scalar(options(127, 6, stop=stop, no_stop_trim=keep,
+                                        skip_special_tokens=skip),
+                                text, [a, self.special, b], stopped(stop), ["", ""])
+
+    def test_rendered_join_releases_on_length_or_trims_after_raw_match(self):
+        a, b, _, _, _, q, _ = self.letters
+        initial = [a, self.special, b]
+        self.scalar(options(127, 3, stop="AB"), "AB", initial, length(3), ["", ""])
+        for keep, text in ((False, ""), (True, "AB")):
+            self.scalar(options(129, 7, stop="AB", no_stop_trim=keep),
+                        text, [*initial, q, a, b], stopped("AB"), [""] * 5)
 
     def test_invalid_skip_special_tokens_does_not_admit_batch(self):
         before = len(receipts(self.log))
@@ -335,6 +396,8 @@ class NativeTextStops(unittest.TestCase):
                                 no_stop_trim=True),
                         "A" + special_stop, [a, self.special], stopped(special_stop),
                         ["A"], port=port)
+            self.scalar(options(127, 4, stop=special_stop, no_stop_trim=True),
+                        "A", [a, self.special], stopped(special_stop), ["A"], port=port)
             self.check_openai(port, 123, "BC", "A", [a, b, c], "stop", 6)
             self.scalar(options(123, 5, stop="QZ"), "ABCDE", [a, b, c, d, e],
                         length(5), ["A"], port=port)

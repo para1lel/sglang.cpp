@@ -32,6 +32,7 @@ class NativeTextStops(unittest.TestCase):
         cls.letters = [by_piece[bytes([letter])] for letter in b"ABCDEQZ"]
         cls.hello = by_piece[b"hello"]
         cls.snow = [by_piece[bytes([byte])] for byte in "⛄".encode()]
+        cls.eos = 248046
         a, b, c, d, e, q, z = cls.letters
         scripts = {
             120: [cls.hello, q],
@@ -40,6 +41,7 @@ class NativeTextStops(unittest.TestCase):
             123: [a, b, c, d, e, q],
             124: [a, cls.snow[0], b],
             125: [a, b, a, q],
+            126: [a, cls.eos, b],
         }
         script = cls.output / "text-stops.ids"
         script.write_text("".join(f"{seed} {' '.join(map(str, ids))}\n"
@@ -50,8 +52,9 @@ class NativeTextStops(unittest.TestCase):
         cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint, cls.log,
                                                "--max-active", "2"))
 
-    def exchange(self, params, stream, *, port=None, inputs=None, expected_status=200):
-        packet = {"input_ids": inputs or [32], "sampling_params": params, "stream": stream}
+    def exchange(self, params, stream, *, port=None, inputs=None, expected_status=200, **fields):
+        packet = {"input_ids": inputs or [32], "sampling_params": params, "stream": stream,
+                  **fields}
         connection, response = request(self.port if port is None else port, GENERATE, packet)
         with closing(connection), response:
             self.assertEqual(response.status, expected_status)
@@ -123,6 +126,86 @@ class NativeTextStops(unittest.TestCase):
         self.scalar(options(124, 4, stop_token_ids=[b]), "A�", [a, self.snow[0], b],
                     stopped(b), ["A", "A"])
 
+    def test_no_stop_trim_text_and_length(self):
+        a, b, c, *_ = self.letters
+        for value, text in ((False, "A"), (None, "A"), (True, "ABC")):
+            with self.subTest(value=value):
+                self.scalar(options(123, 6, stop="BC", no_stop_trim=value),
+                            text, [a, b, c], stopped("BC"), ["A", "A"])
+        self.scalar(options(120, 4, stop="ll", no_stop_trim=True),
+                    "hell", [self.hello], stopped("ll"), [])
+        self.scalar(options(123, 2, stop="BC", no_stop_trim=True), "AB", [a, b],
+                    length(2), ["A"])
+        self.scalar(options(122, 8, stop="⛄B", no_stop_trim=True), "A⛄B",
+                    [a, *self.snow, b], stopped("⛄B"), ["A"] * 4)
+
+    def test_no_stop_trim_token_ids_and_eos(self):
+        a, b, *_ = self.letters
+        for value, text in ((False, "A"), (True, "AB")):
+            with self.subTest(value=value):
+                self.scalar(options(123, 6, stop_token_ids=[b], no_stop_trim=value),
+                            text, [a, b], stopped(b), ["A"])
+                self.scalar(options(126, 6, no_stop_trim=value),
+                            "A", [a, self.eos], stopped(self.eos), ["A"])
+        self.scalar(options(123, 6, stop_token_ids=[a], no_stop_trim=True),
+                    "A", [a], stopped(a), [])
+
+    def test_no_stop_trim_broadcast_to_parallel_samples(self):
+        a, b, c, *_ = self.letters
+        params = options(123, 6, n=2, stop="BC", no_stop_trim=True)
+        inputs = [[a], [a, b]]
+        plain = self.exchange(params, False, inputs=inputs)
+        frames = self.exchange(params, True, inputs=inputs)
+        self.assertEqual(len(plain), 4)
+        self.assertEqual({frame["index"] for frame in frames}, set(range(4)))
+        for index, packet in enumerate(plain):
+            self.assertNotIn("index", packet)
+            prompts = len(inputs[index // 2])
+            self.terminal(packet, "ABC", [a, b, c], stopped("BC"), prompts)
+            lane = [frame for frame in frames if frame["index"] == index]
+            self.sequence(lane, "ABC", [a, b, c], stopped("BC"), prompts=prompts)
+
+    def test_no_stop_trim_indexed_json_and_scored_sse(self):
+        a, b, c, *_ = self.letters
+        params = [options(123, 6, stop="BC", no_stop_trim=True),
+                  options(123, 6, stop="QZ", stop_token_ids=[b], no_stop_trim=True),
+                  options(123, 6, stop="BC", no_stop_trim=False)]
+        inputs = [[a], [a, b], [a, b, c]]
+        scores = {"return_logprob": [True, True, False],
+                  "top_logprobs_num": [2, 2, 0], "return_text_in_logprobs": True}
+        plain = self.exchange(params, False, inputs=inputs, **scores)
+        frames = self.exchange(params, True, inputs=inputs, **scores)
+        expected = [("ABC", [a, b, c], stopped("BC")), ("AB", [a, b], stopped(b)),
+                    ("A", [a, b, c], stopped("BC"))]
+        self.assertEqual(len(plain), len(expected))
+        self.assertEqual({frame["index"] for frame in frames}, set(range(len(expected))))
+        for index, (text, ids, reason) in enumerate(expected):
+            with self.subTest(index=index):
+                self.assertNotIn("index", plain[index])
+                self.terminal(plain[index], text, ids, reason, index + 1)
+                lane = [frame for frame in frames if frame["index"] == index]
+                self.sequence(lane, text, ids, reason, prompts=index + 1)
+                for frame in [plain[index], *lane]:
+                    meta = frame["meta_info"]
+                    if index == 2:
+                        self.assertFalse(any("logprob" in key for key in meta))
+                        continue
+                    selected = [[-0.25 * ordinal, token, chr(ord("A") + self.letters.index(token))]
+                                for ordinal, token in enumerate(frame["output_ids"], 1)]
+                    self.assertEqual(meta["output_token_logprobs_length"], len(selected))
+                    self.assertEqual(meta["output_token_logprobs"], selected)
+                    alternatives = [[row, [row[0] - 1, 1, '"']] for row in selected]
+                    self.assertEqual(meta["output_top_logprobs"], alternatives)
+
+    def test_invalid_no_stop_trim_does_not_admit_batch(self):
+        before = len(receipts(self.log))
+        for value in (0, "true", [], {}):
+            with self.subTest(value=value):
+                params = [options(123, 2), options(123, 2, no_stop_trim=value)]
+                error = self.exchange(params, True, inputs=[[32], [33]], expected_status=400)
+                self.assertIn("no_stop_trim", error["error"]["message"])
+        self.assertEqual(len(receipts(self.log)), before)
+
     def test_per_item_batch_json_and_sse(self):
         a, b, c, d, *_ = self.letters
         params = [options(123, 6, stop="BC"), options(123, 4, stop=["DX"]),
@@ -188,6 +271,8 @@ class NativeTextStops(unittest.TestCase):
                     cancels = [line for line in lines if line.startswith("cpu cancel slot=")]
                     self.assertEqual(len(cancels), 0 if budget == 4 else 2)
             self.scalar(options(123, 6, stop="BC", stop_token_ids=[d]), "A", [a, b, c],
+                        stopped("BC"), ["A"], port=port)
+            self.scalar(options(123, 7, stop="BC", no_stop_trim=True), "ABC", [a, b, c],
                         stopped("BC"), ["A"], port=port)
             self.check_openai(port, 123, "BC", "A", [a, b, c], "stop", 6)
             self.scalar(options(123, 5, stop="QZ"), "ABCDE", [a, b, c, d, e],

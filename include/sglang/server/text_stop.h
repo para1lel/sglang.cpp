@@ -115,9 +115,11 @@ public:
 
     std::optional<std::size_t> match() const { return matcher_.match(false); }
 
-    std::string take(bool final, std::optional<std::size_t> match) {
-        const auto end = match ? matcher_.matched_start(*match)
-                               : final ? matcher_.bytes() : matcher_.safe_end();
+    std::string take(bool final, std::optional<std::size_t> match, bool include_match = false) {
+        auto end = final ? matcher_.bytes() : matcher_.safe_end();
+        if (match) {
+            end = include_match ? matcher_.matched_end(*match) : matcher_.matched_start(*match);
+        }
         auto output = pending_.substr(offset_, end - consumed_);
         offset_ += output.size();
         consumed_ = end;

@@ -744,8 +744,9 @@ void validate_generate_fields(const json::Object& object) {
     }
 }
 
-DecoderOptions generate_options(const json::Value* params, const CompletionTokenizer& tokenizer) {
-    DecoderOptions options;
+BatchPrompt generate_options(const json::Value* params, const CompletionTokenizer& tokenizer) {
+    BatchPrompt request;
+    auto& options = request.options;
     options.max_new_tokens = 128;
     options.temperature = 1.0;
     json::Object sampling;
@@ -770,7 +771,7 @@ DecoderOptions generate_options(const json::Value* params, const CompletionToken
                        key == "stop_token_ids" || key == "logit_bias" ||
                        key == "frequency_penalty" || key == "presence_penalty" ||
                        key == "repetition_penalty" || key == "regex" || key == "json_schema" ||
-                       key == "ebnf") {
+                       key == "ebnf" || key == "no_stop_trim") {
                 if (!parameter.is_null()) {
                     sampling.emplace(key, parameter);
                 }
@@ -784,7 +785,8 @@ DecoderOptions generate_options(const json::Value* params, const CompletionToken
     set_logit_bias(sampling, options);
     set_stops(sampling, options);
     set_generate_constraint(sampling, tokenizer.get(), options);
-    return options;
+    request.no_stop_trim = read_bool(sampling, "no_stop_trim");
+    return request;
 }
 
 std::shared_ptr<const NativeTextStops> generate_stops(const json::Value* params,
@@ -800,10 +802,10 @@ std::shared_ptr<const NativeTextStops> generate_stops(const json::Value* params,
     return nullptr;
 }
 
-BatchPrompt generate_prompt(const json::Value& input, bool text, DecoderOptions options,
+BatchPrompt generate_prompt(const json::Value& input, bool text, BatchPrompt request,
                             const CompletionTokenizer& tokenizer,
                             std::shared_ptr<const NativeTextStops> stops) {
-    BatchPrompt request{{}, std::move(options), nullptr, std::move(stops)};
+    request.text_stops = std::move(stops);
     if (text) {
         const auto prompt = input.string().value_or("");
         if (prompt.empty() || prompt.size() > 1024 * 1024) {
@@ -922,14 +924,15 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
     const auto* param_list = params ? params->array() : nullptr;
     const auto* salt_list = input.indexed() ? generate_parameter_list(salt, input.count, true)
                                             : nullptr;
-    const auto broadcast = param_list ? DecoderOptions{} : generate_options(params, tokenizer);
+    const auto broadcast = param_list ? BatchPrompt{} : generate_options(params, tokenizer);
     const auto broadcast_stops = param_list ? nullptr : generate_stops(params, tokenizer);
     std::vector<BatchPrompt> items;
     items.reserve(input.item_count());
     const int samples = static_cast<int>(input.samples);
     int remaining = checkpoint_context;
     for (std::size_t index = 0; index < input.count; ++index) {
-        auto options = param_list ? generate_options(&(*param_list)[index], tokenizer) : broadcast;
+        auto item = param_list ? generate_options(&(*param_list)[index], tokenizer) : broadcast;
+        auto& options = item.options;
         const auto* item_salt = salt_list ? &(*salt_list)[index] : salt;
         if (item_salt && !item_salt->is_null()) {
             set_cache_salt_value(*item_salt, options);
@@ -941,7 +944,7 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
         const auto stops = param_list ? generate_stops(&(*param_list)[index], tokenizer)
                                       : broadcast_stops;
         items.push_back(generate_prompt(list ? (*list)[index] : prompt, input.text,
-                                        std::move(options), tokenizer, stops));
+                                        std::move(item), tokenizer, stops));
         generate_logprob_options(input, index, items.back());
         items.insert(items.end(), input.samples - 1, items.back());
     }

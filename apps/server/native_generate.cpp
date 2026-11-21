@@ -154,7 +154,7 @@ std::string GenerateResponse::body(const std::vector<int>& ids,
 }
 
 void GenerateResponse::token(int id) {
-    if (!request_.options.stops_at(id)) {
+    if (request_.no_stop_trim || !request_.options.stops_at(id)) {
         text_ += utf8_.push(tokenizer_.piece(id, true));
     }
 }
@@ -181,7 +181,8 @@ std::string GenerateResponse::frame(std::optional<std::size_t> index,
         const int id = ids[decoded_tokens_++];
         if (!stop_buffer_) {
             token(id);
-        } else if (result.matched_text_stop || !request_.options.stops_at(id)) {
+        } else if (result.matched_text_stop || request_.no_stop_trim ||
+                   !request_.options.stops_at(id)) {
             stop_buffer_->push(utf8_.push(tokenizer_.piece(id, true)));
         }
     }
@@ -189,7 +190,7 @@ std::string GenerateResponse::frame(std::optional<std::size_t> index,
         if (terminal) {
             stop_buffer_->push(utf8_.finish());
         }
-        text_ += stop_buffer_->take(terminal, result.matched_text_stop);
+        text_ += stop_buffer_->take(terminal, result.matched_text_stop, request_.no_stop_trim);
     }
     auto output = terminal ? finish(result) : body(ids, &result, false, index.has_value());
     if (index) {

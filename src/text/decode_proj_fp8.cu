@@ -121,7 +121,7 @@ void fp8_decode(const __grid_constant__ Fp8Job job) {
     auto* scales = reinterpret_cast<float*>(tiles + stages * stage_bytes<Columns>);
     auto* weight_scales = scales + count * Columns;
     if (threadIdx.x == 0) {
-        init_pipeline(pipe);
+        init_pipeline<true>(pipe);
     }
     if (warp == mma_warp) {
         allocate_tmem<Columns>(pipe);
@@ -140,8 +140,8 @@ void fp8_decode(const __grid_constant__ Fp8Job job) {
     } else if (warp == mma_warp && threadIdx.x % warp_size == 0) {
         multiply<instruction, true, Columns>(pipe, shared, count);
     } else if (warp == copy_warp && threadIdx.x % warp_size == 0) {
-        produce<group_size, Columns>(pipe, shared, &job.weight[target], &job.activation,
-                                      row_base, act_row, first, count);
+        produce<group_size, Columns, true>(pipe, shared, &job.weight[target], &job.activation,
+                                            row_base, act_row, first, count);
     }
     wait_dependencies();
     __syncthreads();

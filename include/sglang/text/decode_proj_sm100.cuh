@@ -23,6 +23,9 @@ inline constexpr int weight_bytes = tile_rows * 128;
 template <int Columns>
 inline constexpr int stage_bytes = weight_bytes + Columns * 128;
 
+template <bool PerStage>
+inline constexpr bool share_mma_completion = PerStage && stages == accum_slots;
+
 struct Pipeline {
     unsigned long long copy_ready[stages];
     unsigned long long copy_empty[stages];
@@ -100,10 +103,13 @@ __device__ __forceinline__ void free_tmem(const Pipeline& pipe) {
                  :: "r"(pipe.tmem), "r"(accum_slots * Columns) : "memory");
 }
 
+template <bool PerStage = false>
 __device__ __forceinline__ void init_pipeline(Pipeline& pipe) {
     for (int slot = 0; slot < stages; ++slot) {
         init_barrier(&pipe.copy_ready[slot], 1);
-        init_barrier(&pipe.copy_empty[slot], 1);
+        if constexpr (!share_mma_completion<PerStage>) {
+            init_barrier(&pipe.copy_empty[slot], 1);
+        }
     }
     for (int slot = 0; slot < accum_slots; ++slot) {
         init_barrier(&pipe.accum_ready[slot], 1);
@@ -158,7 +164,7 @@ __device__ __forceinline__ void release_slot(unsigned long long* barrier) {
     }
 }
 
-template <int Elements, int Columns>
+template <int Elements, int Columns, bool PerStage = false>
 __device__ void produce(Pipeline& pipe, unsigned shared, const CUtensorMap* weight,
                         const CUtensorMap* activation, int row_base, int act_row, int first,
                         int count) {
@@ -169,12 +175,13 @@ __device__ void produce(Pipeline& pipe, unsigned shared, const CUtensorMap* weig
                   (first + index) * Elements, row_base);
     }
     wait_dependencies();
+    const auto* mma_done = share_mma_completion<PerStage> ? pipe.accum_ready : pipe.copy_empty;
     for (int index = 0; index < count; ++index) {
         const int stage = index % stages;
         const unsigned start = shared + stage * stage_bytes<Columns>;
         const int col = (first + index) * Elements;
         if (index >= stages) {
-            wait_barrier(&pipe.copy_empty[stage], (index / stages - 1) & 1);
+            wait_barrier(&mma_done[stage], (index / stages - 1) & 1);
             expect_bytes(&pipe.copy_ready[stage], stage_bytes<Columns>);
             copy_tile(weight, start, &pipe.copy_ready[stage], col, row_base);
         }
@@ -215,7 +222,9 @@ __device__ void multiply(Pipeline& pipe, unsigned shared, int count) {
                                 "r"(Instruction), "r"(accumulate) : "memory");
             }
         }
-        commit_mma(&pipe.copy_empty[stage]);
+        if constexpr (!share_mma_completion<PerStage>) {
+            commit_mma(&pipe.copy_empty[stage]);
+        }
         if (PerStage || index == count - 1) {
             commit_mma(&pipe.accum_ready[slot]);
         }

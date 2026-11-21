@@ -11,7 +11,7 @@
 
 ## Runtime path
 
-The CLI, server, and C++ default to `exact`. With `tensor-core`, `SGLANG_EXPERIMENTAL_TMEM_PREFILL` selects full-tile TMEM by zero-based query start. [TMEM selection](../src/mxfp8_gqa_prefill.cu#L935)<!-- prefix: "if (rows == " -->
+The CLI, server, and C++ default to `exact`. With `tensor-core`, `SGLANG_EXPERIMENTAL_TMEM_PREFILL` selects full-tile TMEM by zero-based query start. [TMEM selection](../src/mxfp8_gqa_prefill.cu#L936)<!-- prefix: "if (rows == " -->
 
 | Setting | TMEM route | Start position for 1,024 query rows |
 | --- | --- | --- |
@@ -61,7 +61,7 @@ Split TMEM uses three contiguous partitions per query block and head pair. Its 7
 
 ## Constraints and failure behavior
 
-Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L932)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L736)<!-- prefix: "if (rows == " -->
+Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L736)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 

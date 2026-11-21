@@ -466,5 +466,15 @@ inline bool valid_paged_prefill_sequence(const decoder::PagedPrefillSequence& se
     return last_page < sequence.pages.page_count && last_page < cache.page_count;
 }
 
+inline bool default_ragged_prefill_tail(const decoder::PagedPrefillSequence& sequence,
+                                       int max_visible) {
+    constexpr int min_rows = 3 * flash_rows / 2;
+    constexpr int max_rows = 2 * flash_rows;
+    constexpr int min_visible = 28672;
+    return sequence.rows >= min_rows && sequence.rows <= max_rows &&
+        valid_paged_prefill_sequence(sequence, min_rows, max_visible) &&
+        sequence.position + sequence.rows >= min_visible;
+}
+
 }
 }

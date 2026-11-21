@@ -920,10 +920,11 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
                                                   max_multirow_visible_tokens;
     const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
     const std::string_view mode = setting ? setting : "";
-    const bool default_ragged = !setting && default_ragged_prefill(cache, position, rows);
-    if ((default_ragged || (mode == "ragged" && position >= 4096)) &&
-        rows >= 256 && rows <= 512 &&
-        visible <= max_multirow_visible_tokens) {
+    const bool default_ragged = !setting && (default_ragged_prefill(cache, position, rows) ||
+        (!std::getenv("SGLANG_PREFILL_ATTN") && default_ragged_prefill_tail(
+            {cache, pages, position, rows, queries, output}, max_multirow_visible_tokens)));
+    const bool ragged_opt_in = mode == "ragged" && position >= 4096 && rows >= 256 && rows <= 512;
+    if ((default_ragged || ragged_opt_in) && visible <= max_multirow_visible_tokens) {
         if (const auto status = launch_tmem_prefill(cache, pages, position, queries, output,
                                                    stream, true, rows, default_ragged)) {
             return *status;

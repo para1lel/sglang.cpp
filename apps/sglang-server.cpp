@@ -1,7 +1,9 @@
 #include "sglang/fp8_prefill_option.h"
 
+#include "sglang/checkpoint.h"
 #include "sglang/decoder.h"
 #include "sglang/decoder_batch.h"
+#include "sglang/json.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
@@ -141,6 +143,28 @@ std::string health_json(const Arguments& arguments) {
         ",\"max_num_batched_tokens\":" + std::to_string(arguments.max_num_batched_tokens) + "}";
 }
 
+std::string model_info_json(const Arguments& arguments) {
+    std::string body = R"({"model_path":)";
+    const auto checkpoint = arguments.checkpoint.string();
+    sglang::json::append_quoted(body, checkpoint);
+    body += R"(,"served_model_name":)";
+    sglang::json::append_quoted(body, sglang::model_name);
+    body += R"(,"tokenizer_path":)";
+    sglang::json::append_quoted(body, checkpoint);
+    body += R"(,"is_generation":true,"preferred_sampling_params":null,)";
+    body += R"("weight_version":"default","load_format":"safetensors","reasoning_parser":)";
+    body += arguments.chat_parsers.qwen3_reasoning ? R"("qwen3")" : "null";
+    body += R"(,"tool_call_parser":)";
+    body += arguments.chat_parsers.qwen3_coder_tools ? R"("qwen3_coder")" : "null";
+    body += R"(,"disaggregation_mode":"null","has_image_understanding":true,)";
+    body += R"("has_audio_understanding":false,"model_type":)";
+    sglang::json::append_quoted(body, sglang::checkpoint_model_type);
+    body += R"(,"architectures":[)";
+    sglang::json::append_quoted(body, sglang::checkpoint_architecture);
+    body += "]}";
+    return body;
+}
+
 Socket listen(const Arguments& arguments) {
     auto listener = listen_loopback(arguments.port);
     std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
@@ -188,6 +212,7 @@ int main(int argc, char** argv) {
         if (stopping()) {
             return 0;
         }
+        const auto model_info = model_info_json(arguments);
         const auto listener = listen(arguments);
         serve_connections(listener, service, arguments.max_active,
             [&](const Socket& connection, int slot, std::string_view body, bool chat) {
@@ -201,7 +226,7 @@ int main(int argc, char** argv) {
                 complete_generate(connection, service, slot, tokenizer, body);
             }, [&](const Socket& connection, TokenizationRoute route, std::string_view body) {
                 serve_tokenization(connection, route, tokenizer, body);
-            });
+            }, model_info);
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';
         return 1;

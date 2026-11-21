@@ -134,8 +134,8 @@ void check_fields(const json::Object& actual,
 void validate_text_config(const Path& path) {
     const auto config = read_json_file(path);
     check_fields(config, {
-        {"architectures", json::Array{"Qwen3_5ForConditionalGeneration"}},
-        {"model_type", "qwen3_5"},
+        {"architectures", json::Array{std::string(checkpoint_architecture)}},
+        {"model_type", std::string(checkpoint_model_type)},
         {"tie_word_embeddings", false},
     }, path, "");
 

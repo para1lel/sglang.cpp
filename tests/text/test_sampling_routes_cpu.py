@@ -21,6 +21,7 @@ from test_native_text import MODEL, event, legacy
 TEXT = "/v1/completions"
 CHAT = "/v1/chat/completions"
 MODELS = "/v1/models"
+MODEL_INFO = ("/model_info", "/get_model_info")
 SCRIPT = [32, 248046, 33, 248044, 34, 35, 36]
 OPTIONS_PREFIX = "cpu sampling {"
 CHAT_CONTEXT_RESERVE = 2
@@ -196,6 +197,79 @@ class Routes(unittest.TestCase):
             with server(self.binary, self.checkpoint, log, "--max-active", "1",
                         "--prefix-cache-entries", "1") as port:
                 self.check_model_discovery(port, log, prefix_controls=True)
+
+    def check_model_info(self, port, checkpoint, *, reasoning=None, tools=None):
+        config = json.loads((checkpoint / "config.json").read_text())
+        card, = self.control(port, MODELS)["data"]
+        expected = {
+            "model_path": str(checkpoint),
+            "served_model_name": card["id"],
+            "tokenizer_path": str(checkpoint),
+            "is_generation": True,
+            "preferred_sampling_params": None,
+            "weight_version": "default",
+            "load_format": "safetensors",
+            "reasoning_parser": reasoning,
+            "tool_call_parser": tools,
+            "disaggregation_mode": "null",
+            "has_image_understanding": True,
+            "has_audio_understanding": False,
+            "model_type": config["model_type"],
+            "architectures": config["architectures"],
+        }
+        for path in MODEL_INFO:
+            with self.subTest(path=path):
+                info = self.control(port, path)
+                self.assertEqual(info, expected)
+                for field in ("is_generation", "has_image_understanding",
+                              "has_audio_understanding"):
+                    self.assertIs(info[field], expected[field])
+
+    def test_model_info(self):
+        self.check_model_info(self.port, self.checkpoint)
+
+    def test_model_info_parser_flags(self):
+        cases = (
+            (("--reasoning-parser", "qwen3"), "qwen3", None),
+            (("--tool-call-parser", "qwen3_coder"), None, "qwen3_coder"),
+            (("--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder"),
+             "qwen3", "qwen3_coder"),
+        )
+        with TemporaryDirectory(prefix="model-info-", dir=self.output) as directory:
+            checkpoint = Path(directory) / 'checkpoint 你好 "with quotes"'
+            checkpoint.symlink_to(self.checkpoint, target_is_directory=True)
+            for flags, reasoning, tools in cases:
+                with self.subTest(reasoning=reasoning, tools=tools):
+                    log = self.output / f"model-info-{reasoning}-{tools}.log"
+                    with server(self.binary, checkpoint, log, "--prefix-cache-entries", "1",
+                                *flags) as port:
+                        self.check_model_info(port, checkpoint, reasoning=reasoning, tools=tools)
+                    self.assertEqual(receipts(log), [])
+
+    def test_model_info_http_routing(self):
+        for path in MODEL_INFO:
+            for suffix in ("/", "?x=1", "_extra"):
+                with self.subTest(target=path + suffix):
+                    self.assertIn("error", self.control(self.port, path + suffix, status=404))
+            self.assertIn("error", self.control(self.port, path, payload=b"{}", status=404))
+            for method in ("POST", "PUT", "HEAD", "OPTIONS", "GE(T"):
+                with self.subTest(path=path, method=method):
+                    with socket.create_connection(("127.0.0.1", self.port), timeout=5) as client:
+                        client.sendall(f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                                       .encode("ascii"))
+                        with client.makefile("rb") as response:
+                            status, _, data = response.read().partition(b"\r\n\r\n")
+                    if method == "GE(T":
+                        self.assertTrue(status.startswith(b"HTTP/1.1 400 "))
+                        self.assertIn("error", json.loads(data))
+                    else:
+                        self.assertTrue(status.startswith(b"HTTP/1.1 405 "))
+                        self.assertIn(b"\r\nAllow: GET\r\n", status)
+                        self.assertIn(b"\r\nContent-Type: application/json\r\n", status)
+                        if method == "HEAD":
+                            self.assertEqual(data, b"")
+                        else:
+                            self.assertEqual(json.loads(data), {"detail": "Method Not Allowed"})
 
     def test_text_omitted_sampling_and_budget(self):
         packet, seen = self.exchange(TEXT, body(TEXT, ignore_eos=True))

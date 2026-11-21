@@ -44,4 +44,7 @@ private:
     std::unique_ptr<Storage> storage_;
 };
 
+inline constexpr std::string_view checkpoint_model_type = "qwen3_5";
+inline constexpr std::string_view checkpoint_architecture = "Qwen3_5ForConditionalGeneration";
+
 }

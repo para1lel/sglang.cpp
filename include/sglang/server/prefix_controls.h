@@ -16,6 +16,7 @@ using Tokenization = std::function<void(const Socket&, TokenizationRoute, std::s
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
                        bool prefix_controls, const BatchGenerate& generate = BatchGenerate{},
-                       const Tokenization& tokenize = Tokenization{});
+                       const Tokenization& tokenize = Tokenization{},
+                       std::string_view model_info = std::string_view{});
 
 }

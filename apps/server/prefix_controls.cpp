@@ -139,9 +139,10 @@ class ConnectionQueue {
 public:
     ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete,
                     std::string_view health, bool prefix_controls, const BatchGenerate& generate,
-                    const Tokenization& tokenize)
+                    const Tokenization& tokenize, std::string_view model_info)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
-          tokenize_(tokenize), health_(health), prefix_controls_(prefix_controls) {}
+          tokenize_(tokenize), health_(health), model_info_(model_info),
+          prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -167,6 +168,7 @@ private:
     const BatchGenerate& generate_;
     const Tokenization& tokenize_;
     const std::string_view health_;
+    const std::string_view model_info_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -229,6 +231,18 @@ void write_models(const Socket& connection) {
 }
 
 void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& request) {
+    if (!model_info_.empty() &&
+        (request.path == "/model_info" || request.path == "/get_model_info")) {
+        if (request.method != "GET") {
+            write_get_only(connection, request.method == "HEAD");
+            return;
+        }
+        if (!request.body.empty()) {
+            throw HttpError("404 Not Found", "Expected an empty model information request");
+        }
+        write_json(connection, "200 OK", model_info_);
+        return;
+    }
     if (request.method == "GET" && request.body.empty()) {
         if (request.path == "/health") {
             write_json(connection, "200 OK", health_);
@@ -270,8 +284,11 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
     if (prefix_controls_) {
         throw HttpError("404 Not Found", "Unknown native server route");
     }
-    std::string routes = "Expected GET /health, /ready, or /v1/models, "
-                         "or POST /v1/completions or /v1/chat/completions";
+    std::string routes = "Expected GET /health, /ready, or /v1/models";
+    if (!model_info_.empty()) {
+        routes += " or /model_info or /get_model_info";
+    }
+    routes += ", or POST /v1/completions or /v1/chat/completions";
     if (generate_) {
         routes += " or /generate";
     }
@@ -383,12 +400,12 @@ void ConnectionQueue::stop() {
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
                        bool prefix_controls, const BatchGenerate& generate,
-                       const Tokenization& tokenize) {
+                       const Tokenization& tokenize, std::string_view model_info) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
-                          tokenize);
+                          tokenize, model_info);
     std::vector<std::thread> workers;
     workers.reserve(max_active);
     std::mutex failure_mutex;

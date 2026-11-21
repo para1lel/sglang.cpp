@@ -427,20 +427,29 @@ void read_connections(const Socket& listener, int capacity,
 }
 
 static bool write_response(const Socket& connection, std::string_view status,
-                           std::string_view content_type, std::string_view body) {
+                           std::string_view content_type, std::string_view body,
+                           std::string_view header = std::string_view{}, bool head_only = false) {
     std::string response = "HTTP/1.1 ";
     response += status;
     response += "\r\nConnection: close\r\nContent-Type: ";
     response += content_type;
+    response += header;
     response += "\r\nContent-Length: ";
     response += std::to_string(body.size());
     response += "\r\n\r\n";
-    response += body;
+    if (!head_only) {
+        response += body;
+    }
     return send_all(connection, response);
 }
 
 bool write_json(const Socket& connection, std::string_view status, std::string_view json) {
     return write_response(connection, status, "application/json", json);
+}
+
+void write_get_only(const Socket& connection, bool head_only) {
+    write_response(connection, "405 Method Not Allowed", "application/json",
+                   R"({"detail":"Method Not Allowed"})", "\r\nAllow: GET", head_only);
 }
 
 void write_tokenization_error(const Socket& connection, std::string_view status,

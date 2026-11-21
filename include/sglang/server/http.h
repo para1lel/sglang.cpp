@@ -47,6 +47,7 @@ TokenizationRoute tokenization_route(const HttpRequest& request);
 void read_connections(const Socket& listener, int capacity,
                       const std::function<void(Socket&, HttpRequest)>& handle);
 bool write_json(const Socket& connection, std::string_view status, std::string_view json);
+void write_get_only(const Socket& connection, bool head_only);
 void write_tokenization_error(const Socket& connection, std::string_view status,
                               std::string_view type, std::string_view message);
 void write_readiness(const Socket& connection, bool ready);

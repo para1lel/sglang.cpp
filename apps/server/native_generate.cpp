@@ -155,7 +155,7 @@ std::string GenerateResponse::body(const std::vector<int>& ids,
 
 void GenerateResponse::token(int id) {
     if (request_.no_stop_trim || !request_.options.stops_at(id)) {
-        text_ += utf8_.push(tokenizer_.piece(id, true));
+        text_ += utf8_.push(tokenizer_.piece(id, request_.skip_special_tokens));
     }
 }
 
@@ -183,7 +183,7 @@ std::string GenerateResponse::frame(std::optional<std::size_t> index,
             token(id);
         } else if (result.matched_text_stop || request_.no_stop_trim ||
                    !request_.options.stops_at(id)) {
-            stop_buffer_->push(utf8_.push(tokenizer_.piece(id, true)));
+            stop_buffer_->push(utf8_.push(tokenizer_.piece(id, request_.skip_special_tokens)));
         }
     }
     if (stop_buffer_) {

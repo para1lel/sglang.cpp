@@ -96,6 +96,7 @@ struct BatchPrompt {
     std::shared_ptr<const NativeTextStops> text_stops = nullptr;
     bool return_text_in_logprobs = false;
     bool no_stop_trim = false;
+    bool skip_special_tokens = true;
 };
 
 struct BatchCallbacks {

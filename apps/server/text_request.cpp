@@ -23,10 +23,10 @@ namespace {
     throw HttpError("400 Bad Request", message);
 }
 
-bool read_bool(const json::Object& object, std::string_view key) {
+bool read_bool(const json::Object& object, std::string_view key, bool fallback = false) {
     const auto* value = json::get(object, key);
     if (!value) {
-        return false;
+        return fallback;
     }
     const auto result = value->boolean();
     if (!result) {
@@ -771,7 +771,7 @@ BatchPrompt generate_options(const json::Value* params, const CompletionTokenize
                        key == "stop_token_ids" || key == "logit_bias" ||
                        key == "frequency_penalty" || key == "presence_penalty" ||
                        key == "repetition_penalty" || key == "regex" || key == "json_schema" ||
-                       key == "ebnf" || key == "no_stop_trim") {
+                       key == "ebnf" || key == "no_stop_trim" || key == "skip_special_tokens") {
                 if (!parameter.is_null()) {
                     sampling.emplace(key, parameter);
                 }
@@ -786,6 +786,7 @@ BatchPrompt generate_options(const json::Value* params, const CompletionTokenize
     set_stops(sampling, options);
     set_generate_constraint(sampling, tokenizer.get(), options);
     request.no_stop_trim = read_bool(sampling, "no_stop_trim");
+    request.skip_special_tokens = read_bool(sampling, "skip_special_tokens", true);
     return request;
 }
 

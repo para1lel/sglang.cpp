@@ -593,7 +593,8 @@ void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt
         job->request_id = prompts[next].request_id;
         job->buffer_decode_output = buffered && job->can_buffer();
         if (prompts[next].text_stops) {
-            job->text_stop = std::make_unique<NativeTextStop>(prompts[next].text_stops);
+            job->text_stop = std::make_unique<NativeTextStop>(prompts[next].text_stops,
+                                                            prompts[next].skip_special_tokens);
         }
         if (job->request_id && !job->request_id->dispatch()) {
             break;

@@ -33,6 +33,7 @@ class NativeTextStops(unittest.TestCase):
         cls.hello = by_piece[b"hello"]
         cls.snow = [by_piece[bytes([byte])] for byte in "⛄".encode()]
         cls.eos = 248046
+        cls.special = 248047
         a, b, c, d, e, q, z = cls.letters
         scripts = {
             120: [cls.hello, q],
@@ -42,6 +43,7 @@ class NativeTextStops(unittest.TestCase):
             124: [a, cls.snow[0], b],
             125: [a, b, a, q],
             126: [a, cls.eos, b],
+            127: [a, cls.special, b, q],
         }
         script = cls.output / "text-stops.ids"
         script.write_text("".join(f"{seed} {' '.join(map(str, ids))}\n"
@@ -149,6 +151,60 @@ class NativeTextStops(unittest.TestCase):
                             "A", [a, self.eos], stopped(self.eos), ["A"])
         self.scalar(options(123, 6, stop_token_ids=[a], no_stop_trim=True),
                     "A", [a], stopped(a), [])
+
+    def test_skip_special_tokens_defaults_and_terminal_ids(self):
+        a, b, *_ = self.letters
+        special = "<|object_ref_start|>"
+        for params in ({}, {"skip_special_tokens": None}, {"skip_special_tokens": True},
+                       {"skip_special_tokens": False}):
+            with self.subTest(params=params):
+                visible = params.get("skip_special_tokens") is False
+                prefix = "A" + (special if visible else "")
+                self.scalar(options(127, 3, **params), prefix + "B", [a, self.special, b],
+                            length(3), ["A", prefix])
+        for trim, text in ((False, "A"), (True, "A<|im_end|>")):
+            self.scalar(options(126, 6, skip_special_tokens=False, no_stop_trim=trim),
+                        text, [a, self.eos], stopped(self.eos), ["A"])
+        self.scalar(options(127, 6, stop_token_ids=[self.special], skip_special_tokens=False,
+                            no_stop_trim=True), "A" + special, [a, self.special],
+                    stopped(self.special), ["A"])
+
+    def test_skip_special_tokens_text_match_and_indexed_scores(self):
+        a, b, *_ = self.letters
+        special = "<|object_ref_start|>"
+        params = [options(127, 4, stop=special, skip_special_tokens=False),
+                  options(127, 4, stop=special, skip_special_tokens=False, no_stop_trim=True),
+                  options(127, 3, stop=special)]
+        scores = {"return_logprob": True, "top_logprobs_num": 2,
+                  "return_text_in_logprobs": True}
+        inputs = [[self.special], [self.special, a], [self.special, a, b]]
+        plain = self.exchange(params, False, inputs=inputs, **scores)
+        frames = self.exchange(params, True, inputs=inputs, **scores)
+        expected = [("A", [a, self.special], stopped(special)),
+                    ("A" + special, [a, self.special], stopped(special)),
+                    ("AB", [a, self.special, b], length(3))]
+        self.assertEqual(len(plain), len(expected))
+        self.assertEqual({frame["index"] for frame in frames}, set(range(len(expected))))
+        for index, (text, ids, reason) in enumerate(expected):
+            with self.subTest(index=index):
+                self.terminal(plain[index], text, ids, reason, index + 1)
+                lane = [frame for frame in frames if frame["index"] == index]
+                self.sequence(lane, text, ids, reason, prompts=index + 1)
+                for frame in [plain[index], *lane]:
+                    meta = frame["meta_info"]
+                    selected = meta["output_token_logprobs"]
+                    self.assertEqual([entry[1] for entry in selected], frame["output_ids"])
+                    if len(selected) > 1:
+                        self.assertEqual(selected[1], [-0.5, self.special, special])
+
+    def test_invalid_skip_special_tokens_does_not_admit_batch(self):
+        before = len(receipts(self.log))
+        for value in (0, "false", [], {}):
+            with self.subTest(value=value):
+                params = [options(127, 2), options(127, 2, skip_special_tokens=value)]
+                error = self.exchange(params, True, inputs=[[32], [33]], expected_status=400)
+                self.assertIn("skip_special_tokens", error["error"]["message"])
+        self.assertEqual(len(receipts(self.log)), before)
 
     def test_no_stop_trim_broadcast_to_parallel_samples(self):
         a, b, c, *_ = self.letters
@@ -274,6 +330,11 @@ class NativeTextStops(unittest.TestCase):
                         stopped("BC"), ["A"], port=port)
             self.scalar(options(123, 7, stop="BC", no_stop_trim=True), "ABC", [a, b, c],
                         stopped("BC"), ["A"], port=port)
+            special_stop = "<|object_ref"
+            self.scalar(options(127, 4, stop=special_stop, skip_special_tokens=False,
+                                no_stop_trim=True),
+                        "A" + special_stop, [a, self.special], stopped(special_stop),
+                        ["A"], port=port)
             self.check_openai(port, 123, "BC", "A", [a, b, c], "stop", 6)
             self.scalar(options(123, 5, stop="QZ"), "ABCDE", [a, b, c, d, e],
                         length(5), ["A"], port=port)

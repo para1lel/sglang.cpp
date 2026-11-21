@@ -12,7 +12,6 @@ inline constexpr int warp_size = 32;
 inline constexpr int tile_rows = 128;
 inline constexpr int tile_cols = 64;
 inline constexpr int stages = 8;
-inline constexpr int accum_slots = 8;
 inline constexpr int consumer_warps = tile_rows / warp_size;
 inline constexpr int mma_warp = consumer_warps;
 inline constexpr int copy_warp = consumer_warps + 1;
@@ -23,16 +22,16 @@ inline constexpr int weight_bytes = tile_rows * 128;
 template <int Columns>
 inline constexpr int stage_bytes = weight_bytes + Columns * 128;
 
-template <bool PerStage>
-inline constexpr bool share_mma_completion = PerStage && stages == accum_slots;
-
-struct Pipeline {
-    unsigned long long copy_ready[stages];
-    unsigned long long copy_empty[stages];
-    unsigned long long accum_ready[accum_slots];
-    unsigned long long accum_empty[accum_slots];
+template <int Slots>
+struct DecodePipeline {
+    unsigned long long copy_ready[Slots];
+    unsigned long long copy_empty[Slots];
+    unsigned long long accum_ready[Slots];
+    unsigned long long accum_empty[Slots];
     unsigned tmem;
 };
+
+using Pipeline = DecodePipeline<stages>;
 
 __device__ __forceinline__ unsigned shared_address(const void* pointer) {
     return static_cast<unsigned>(__cvta_generic_to_shared(pointer));
@@ -90,28 +89,28 @@ __device__ __forceinline__ void fence_before_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
 }
 
-template <int Columns>
-__device__ __forceinline__ void allocate_tmem(Pipeline& pipe) {
+template <int Columns, int Slots>
+__device__ __forceinline__ void allocate_tmem(DecodePipeline<Slots>& pipe) {
     asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                 :: "r"(shared_address(&pipe.tmem)), "r"(accum_slots * Columns) : "memory");
+                 :: "r"(shared_address(&pipe.tmem)), "r"(Slots * Columns) : "memory");
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
 }
 
-template <int Columns>
-__device__ __forceinline__ void free_tmem(const Pipeline& pipe) {
+template <int Columns, int Slots>
+__device__ __forceinline__ void free_tmem(const DecodePipeline<Slots>& pipe) {
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                 :: "r"(pipe.tmem), "r"(accum_slots * Columns) : "memory");
+                 :: "r"(pipe.tmem), "r"(Slots * Columns) : "memory");
 }
 
-template <bool PerStage = false>
-__device__ __forceinline__ void init_pipeline(Pipeline& pipe) {
-    for (int slot = 0; slot < stages; ++slot) {
+template <bool PerStage = false, int Slots>
+__device__ __forceinline__ void init_pipeline(DecodePipeline<Slots>& pipe) {
+    for (int slot = 0; slot < Slots; ++slot) {
         init_barrier(&pipe.copy_ready[slot], 1);
-        if constexpr (!share_mma_completion<PerStage>) {
+        if constexpr (!PerStage) {
             init_barrier(&pipe.copy_empty[slot], 1);
         }
     }
-    for (int slot = 0; slot < accum_slots; ++slot) {
+    for (int slot = 0; slot < Slots; ++slot) {
         init_barrier(&pipe.accum_ready[slot], 1);
         init_barrier(&pipe.accum_empty[slot], consumer_warps);
     }
@@ -164,24 +163,24 @@ __device__ __forceinline__ void release_slot(unsigned long long* barrier) {
     }
 }
 
-template <int Elements, int Columns, bool PerStage = false>
-__device__ void produce(Pipeline& pipe, unsigned shared, const CUtensorMap* weight,
+template <int Elements, int Columns, bool PerStage = false, int Slots>
+__device__ void produce(DecodePipeline<Slots>& pipe, unsigned shared, const CUtensorMap* weight,
                         const CUtensorMap* activation, int row_base, int act_row, int first,
                         int count) {
-    const int prefetched = count < stages ? count : stages;
+    const int prefetched = count < Slots ? count : Slots;
     for (int index = 0; index < prefetched; ++index) {
         expect_bytes(&pipe.copy_ready[index], stage_bytes<Columns>);
         copy_tile(weight, shared + index * stage_bytes<Columns>, &pipe.copy_ready[index],
                   (first + index) * Elements, row_base);
     }
     wait_dependencies();
-    const auto* mma_done = share_mma_completion<PerStage> ? pipe.accum_ready : pipe.copy_empty;
+    const auto* mma_done = PerStage ? pipe.accum_ready : pipe.copy_empty;
     for (int index = 0; index < count; ++index) {
-        const int stage = index % stages;
+        const int stage = index % Slots;
         const unsigned start = shared + stage * stage_bytes<Columns>;
         const int col = (first + index) * Elements;
-        if (index >= stages) {
-            wait_barrier(&mma_done[stage], (index / stages - 1) & 1);
+        if (index >= Slots) {
+            wait_barrier(&mma_done[stage], (index / Slots - 1) & 1);
             expect_bytes(&pipe.copy_ready[stage], stage_bytes<Columns>);
             copy_tile(weight, start, &pipe.copy_ready[stage], col, row_base);
         }
@@ -190,15 +189,15 @@ __device__ void produce(Pipeline& pipe, unsigned shared, const CUtensorMap* weig
     launch_dependents();
 }
 
-template <unsigned Instruction, bool PerStage, int Columns>
-__device__ void multiply(Pipeline& pipe, unsigned shared, int count) {
+template <unsigned Instruction, bool PerStage, int Columns, int Slots>
+__device__ void multiply(DecodePipeline<Slots>& pipe, unsigned shared, int count) {
     for (int index = 0; index < count; ++index) {
-        const int stage = index % stages;
-        const int slot = PerStage ? index % accum_slots : 0;
-        if (PerStage && index >= accum_slots) {
-            wait_barrier(&pipe.accum_empty[slot], (index / accum_slots - 1) & 1);
+        const int stage = index % Slots;
+        const int slot = PerStage ? stage : 0;
+        if (PerStage && index >= Slots) {
+            wait_barrier(&pipe.accum_empty[slot], (index / Slots - 1) & 1);
         }
-        wait_barrier(&pipe.copy_ready[stage], (index / stages) & 1);
+        wait_barrier(&pipe.copy_ready[stage], (index / Slots) & 1);
         fence_after_sync();
         const unsigned start = shared + stage * stage_bytes<Columns>;
         const unsigned destination = pipe.tmem + slot * Columns;
@@ -222,7 +221,7 @@ __device__ void multiply(Pipeline& pipe, unsigned shared, int count) {
                                 "r"(Instruction), "r"(accumulate) : "memory");
             }
         }
-        if constexpr (!share_mma_completion<PerStage>) {
+        if constexpr (!PerStage) {
             commit_mma(&pipe.copy_empty[stage]);
         }
         if (PerStage || index == count - 1) {

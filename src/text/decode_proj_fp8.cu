@@ -10,6 +10,9 @@ using namespace decode_proj;
 
 constexpr int group_size = text_fp8_group_size;
 constexpr int max_targets = text_decode_max_targets;
+constexpr int mlp_slots = 4;
+constexpr int hidden_width = 5120;
+constexpr int intermediate_width = 17408;
 template <int Columns>
 constexpr int scale_bytes = (Columns + 1) * int(sizeof(float));
 
@@ -51,13 +54,14 @@ __device__ void promote(const unsigned (&partial)[Fragment], const float* scales
     }
 }
 
-template <int Columns>
-__device__ void consume_single(Pipeline& pipe, const float* scales, const float* weight_scales,
+template <int Columns, int Slots>
+__device__ void consume_single(DecodePipeline<Slots>& pipe, const float* scales,
+                               const float* weight_scales,
                                int count, unsigned lane_base, float& result) {
     for (int index = 0; index < count; ++index) {
-        const int slot = index % accum_slots;
+        const int slot = index % Slots;
         const float scale = weight_scales[index];
-        wait_barrier(&pipe.accum_ready[slot], (index / accum_slots) & 1);
+        wait_barrier(&pipe.accum_ready[slot], (index / Slots) & 1);
         fence_after_sync();
         const float partial = load_tmem1(lane_base + slot * Columns);
         const float scaled = __fmul_rn(partial, scales[index * Columns]);
@@ -66,8 +70,9 @@ __device__ void consume_single(Pipeline& pipe, const float* scales, const float*
     }
 }
 
-template <int Columns>
-__device__ void consume(Pipeline& pipe, const float* scales, const float* weight_scales,
+template <int Columns, int Slots>
+__device__ void consume(DecodePipeline<Slots>& pipe, const float* scales,
+                        const float* weight_scales,
                         int count, int active, float (&result)[Columns]) {
     const int warp = threadIdx.x / warp_size;
     const unsigned lane_base = pipe.tmem + (static_cast<unsigned>(warp * warp_size) << 16);
@@ -77,9 +82,9 @@ __device__ void consume(Pipeline& pipe, const float* scales, const float* weight
     }
     constexpr int fragment = Columns == 8 ? 8 : 16;
     for (int index = 0; index < count; ++index) {
-        const int slot = index % accum_slots;
+        const int slot = index % Slots;
         const float scale = weight_scales[index];
-        wait_barrier(&pipe.accum_ready[slot], (index / accum_slots) & 1);
+        wait_barrier(&pipe.accum_ready[slot], (index / Slots) & 1);
         fence_after_sync();
         #pragma unroll
         for (int block = 0; block < Columns; block += fragment) {
@@ -97,13 +102,13 @@ __device__ void consume(Pipeline& pipe, const float* scales, const float* weight
     }
 }
 
-template <int Columns>
+template <int Columns, int Slots = stages>
 __global__ __launch_bounds__(threads, 1)
 void fp8_decode(const __grid_constant__ Fp8Job job) {
     constexpr unsigned instruction =
         ((tile_rows / 16) << 24) | ((Columns / 8) << 17) | (1u << 4);
     alignas(1024) extern __shared__ unsigned char tiles[];
-    __shared__ Pipeline pipe;
+    __shared__ DecodePipeline<Slots> pipe;
     const int splits = gridDim.x;
     const int first = blockIdx.x * job.groups / splits;
     const int count = (blockIdx.x + 1) * job.groups / splits - first;
@@ -118,7 +123,7 @@ void fp8_decode(const __grid_constant__ Fp8Job job) {
     }
     const int row_block = blockIdx.y - job.first_block[target];
     const int row_base = row_block * tile_rows;
-    auto* scales = reinterpret_cast<float*>(tiles + stages * stage_bytes<Columns>);
+    auto* scales = reinterpret_cast<float*>(tiles + Slots * stage_bytes<Columns>);
     auto* weight_scales = scales + count * Columns;
     if (threadIdx.x == 0) {
         init_pipeline<true>(pipe);
@@ -195,6 +200,12 @@ bool supported_targets(const TextFp8DecodeTarget* targets, int count, int in_wid
     return true;
 }
 
+bool use_mlp_pipeline(const TextFp8DecodeTarget* targets, int count, int in_width, int rows) {
+    return rows >= 16 && rows <= 32 && in_width == hidden_width && count == 2 &&
+           targets[0].out_width == intermediate_width &&
+           targets[1].out_width == intermediate_width;
+}
+
 }
 
 std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* targets,
@@ -227,23 +238,29 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* 
         return std::nullopt;
     }
     const void* kernel = full_kernel;
-    if (columns == 8) {
+    int slot = 0;
+    const bool short_pipeline = use_mlp_pipeline(targets, count, in_width, rows);
+    if (short_pipeline) {
+        kernel = columns == 16 ? reinterpret_cast<const void*>(fp8_decode<16, mlp_slots>)
+                               : reinterpret_cast<const void*>(fp8_decode<32, mlp_slots>);
+        slot = columns == 16 ? 7 : 8;
+    } else if (columns == 8) {
         kernel = reinterpret_cast<const void*>(fp8_decode<8>);
-        int limit = 0;
-        status = configure(kernel, 6, target.device, limit);
-        if (status != cudaSuccess) {
-            return status;
-        }
+        slot = 6;
     } else if (columns != tile_cols) {
         kernel = columns == 16 ? reinterpret_cast<const void*>(fp8_decode<16>)
                                : reinterpret_cast<const void*>(fp8_decode<32>);
+        slot = columns == 16 ? 2 : 3;
+    }
+    if (slot != 0) {
         int limit = 0;
-        status = configure(kernel, columns == 16 ? 2 : 3, target.device, limit);
+        status = configure(kernel, slot, target.device, limit);
         if (status != cudaSuccess) {
             return status;
         }
     }
-    const int shared = stages * (weight_bytes + columns * 128) +
+    const int slots = short_pipeline ? mlp_slots : stages;
+    const int shared = slots * (weight_bytes + columns * 128) +
                        ((job.groups - 1) / plan.splits + 1) * (columns + 1) * sizeof(float);
     const dim3 grid(plan.splits, blocks, (rows - 1) / columns + 1);
     void* args[] = {&job};

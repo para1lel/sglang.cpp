@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder batch | Mark K0 text decode lanes under the tensor-core policy. | [Lane eligibility](../src/decoder_batch.cpp#L651)<!-- prefix: "const bool p" --> |
+| Decoder batch | Mark K0 text decode lanes under the tensor-core policy. | [Lane eligibility](../src/decoder_batch.cpp#L671)<!-- prefix: "const bool p" --> |
 | Eager forward | Compact eligible attention reads and order KV append, attention, and gating on the batch stream. | [Forward dispatch](../src/decoder_forward.cpp#L304)<!-- prefix: "void attend_" --> |
 | CUDA operator | Validate the group, select a split, merge partials, and recover individual heads. | [Launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L380)<!-- prefix: "cudaError_t " --> · [Tensor-core split](../include/sglang/text/mxfp8_gqa_wide_tc.cuh#L178)<!-- prefix: "__global__ v" --> · [Paired split](../include/sglang/text/mxfp8_gqa_decode.cuh#L274)<!-- prefix: "__global__ v" --> · [Merge](../src/mxfp8_gqa.cu#L658)<!-- prefix: "__global__ v" --> · [Recovery](../include/sglang/text/mxfp8_gqa_decode.cuh#L332)<!-- prefix: "__global__ v" --> |
 
@@ -44,7 +44,7 @@ Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation
 
 ## Constraints and failure behavior
 
-Default `exact` policy, media, MTP, and prefill rows retain their legacy routes. Out-of-window lanes in the legacy wide forward use the row dispatch. The legacy long primitive accepts one through 32 descriptors, independently of the serving width requirement. [Eligibility](../src/decoder_batch.cpp#L651)<!-- prefix: "const bool p" --> · [Row dispatch](../src/decoder_forward.cpp#L335)<!-- prefix: "check(read_g" --> · [Primitive](../src/mxfp8_gqa.cu#L975)<!-- prefix: "cudaError_t " -->
+Default `exact` policy, media, MTP, and prefill rows retain their legacy routes. Out-of-window lanes in the legacy wide forward use the row dispatch. The legacy long primitive accepts one through 32 descriptors, independently of the serving width requirement. [Eligibility](../src/decoder_batch.cpp#L671)<!-- prefix: "const bool p" --> · [Row dispatch](../src/decoder_forward.cpp#L335)<!-- prefix: "check(read_g" --> · [Primitive](../src/mxfp8_gqa.cu#L975)<!-- prefix: "cudaError_t " -->
 
 The launcher checks the complete group before submission. An invalid count, null required pointer, unaligned scratch address, out-of-window position, or insufficient declared cache or page-table capacity returns `cudaErrorInvalidValue`. The caller supplies valid device page entries and enough scratch for each lane. The launcher stops at the first synchronous CUDA launch error. Earlier launches can still be in flight. The forward propagates the error through the batch execution path. [Validation and launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L380)<!-- prefix: "cudaError_t " --> · [Cache coverage](../src/mxfp8_gqa.cu#L158)<!-- prefix: "bool cache_c" --> · [Forward error](../src/decoder_forward.cpp#L342)<!-- prefix: "check(status" -->
 

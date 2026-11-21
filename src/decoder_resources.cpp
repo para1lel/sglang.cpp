@@ -2,6 +2,7 @@
 
 #include "sglang/checkpoint.h"
 #include "sglang/decoder_batch.h"
+#include "sglang/text/decoder_logprobs.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -149,7 +150,9 @@ struct Allocations::State {
 
     explicit State(int owner) : device(owner) { reclaim(owner); }
 
-    bool owns_cuda() const { return stream || packed_winners || !blocks.empty(); }
+    bool owns_cuda() const {
+        return stream || packed_winners || generated_logprobs || !blocks.empty();
+    }
 
     CleanupError close_stream(std::shared_ptr<const void>& drained_owners);
     CleanupError release_selected(std::shared_ptr<const void>& drained_owners);
@@ -157,6 +160,15 @@ struct Allocations::State {
     CleanupError failure(CleanupError error);
     CleanupError destroy_capture(cudaGraph_t& handle);
     CleanupError destroy_executable(cudaGraphExec_t& handle);
+
+    template <typename Element>
+    CleanupError release_pinned(Element*& pointer, const char* operation) {
+        if (!pointer) return {};
+        const CleanupError error{cudaFreeHost(pointer), operation};
+        if (error) return failure(error);
+        pointer = nullptr;
+        return {};
+    }
 
     int device;
     cudaStream_t stream = nullptr;
@@ -174,6 +186,7 @@ struct Allocations::State {
     CleanupError terminal;
     TransferBuffers transfers;
     TextLogitCandidate* packed_winners = nullptr;
+    GeneratedLogprobReadback* generated_logprobs = nullptr;
     bool packed_winners_unavailable = false;
     std::optional<ExactGqaWorkspace> singleton_scores;
     std::shared_ptr<const void> owners;
@@ -252,18 +265,10 @@ CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& d
     if (terminal || (stream && !uncertain_stream)) {
         return error;
     }
-    CleanupError pinned;
-    if (packed_winners) {
-        pinned = {cudaFreeHost(packed_winners), "Free packed winner storage"};
-        if (pinned) {
-            failure(pinned);
-            if (terminal) {
-                return terminal;
-            }
-        } else {
-            packed_winners = nullptr;
-        }
-    }
+    const auto packed = release_pinned(packed_winners, "Free packed winner storage");
+    if (terminal) return terminal;
+    const auto logprobs = release_pinned(generated_logprobs, "Free generated logprob readback");
+    if (terminal) return terminal;
     while (blocks.size() > uncertain_blocks) {
         const CleanupError freed{cudaFree(blocks.back()), "Free decoder allocation"};
         if (!freed) {
@@ -279,7 +284,8 @@ CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& d
         }
         std::swap(blocks[uncertain_blocks++], blocks.back());
     }
-    return uncertain ? uncertain : pinned;
+    if (uncertain) return uncertain;
+    return packed ? packed : logprobs;
 }
 
 CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_owners) {
@@ -405,6 +411,26 @@ Allocations::~Allocations() {
 std::size_t Allocations::bytes() const { return state_->bytes; }
 
 TransferBuffers& Allocations::transfers() { return state_->transfers; }
+
+GeneratedLogprobReadback* Allocations::prepare_generated_logprobs() {
+    auto& host = state_->generated_logprobs;
+    if (!host) {
+        void* memory = nullptr;
+        check(cudaMallocHost(&memory, decoder_batch_max_lanes * sizeof(GeneratedLogprobReadback)),
+              "Allocate generated logprob readback");
+        host = static_cast<GeneratedLogprobReadback*>(memory);
+    }
+    return host;
+}
+
+std::shared_ptr<const DecoderTokenLogprobs>
+collect_generated_logprobs(const GeneratedLogprobReadback& row, int top) {
+    if (row.selected.token_id < 0) {
+        throw DecoderSamplingError();
+    }
+    return std::make_shared<DecoderTokenLogprobs>(
+        DecoderTokenLogprobs{row.selected, {row.alternatives, row.alternatives + top}});
+}
 
 TextLogitCandidate* Allocations::prepare_packed_winners() {
     if (!state_->packed_winners && !state_->packed_winners_unavailable) {

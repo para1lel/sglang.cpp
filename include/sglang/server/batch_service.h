@@ -94,6 +94,7 @@ struct BatchPrompt {
     DecoderOptions options;
     BatchRequestId* request_id = nullptr;
     std::shared_ptr<const NativeTextStops> text_stops = nullptr;
+    bool return_text_in_logprobs = false;
 };
 
 struct BatchCallbacks {
@@ -121,6 +122,7 @@ public:
                    const BatchCallbacks& callbacks);
     void notify_abort();
     bool ready() const;
+    bool supports_generated_logprobs() const;
     bool wait_for_generation(std::chrono::steady_clock::time_point started,
                              std::chrono::steady_clock::time_point deadline,
                              const std::function<bool()>& cancelled);

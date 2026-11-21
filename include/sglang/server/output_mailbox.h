@@ -32,6 +32,9 @@ inline bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& call
     result.mtp_rounds += step.mtp_drafted_tokens != 0;
     result.mtp_drafted_tokens += step.mtp_drafted_tokens;
     result.output_token_ids.push_back(*step.token);
+    if (step.generated_logprobs) {
+        result.generated_logprobs.push_back(step.generated_logprobs);
+    }
     result.mtp_accepted_tokens += step.mtp_accepted_tokens > 0;
     if (callbacks.on_token && !callbacks.on_token(*step.token)) {
         return false;

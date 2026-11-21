@@ -440,6 +440,9 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
                                 const DecoderOptions& options,
                                 const DecoderCallbacks& callbacks) const {
     validate_request(prompt_token_ids, options, true);
+    if (options.generated_top_logprobs != -1) {
+        throw std::invalid_argument("Generated logprobs require the batch decoder");
+    }
     if (options.mtp_steps != 0 && !model_->mtp_weights) {
         throw std::invalid_argument("MTP weights must be enabled when constructing the decoder");
     }

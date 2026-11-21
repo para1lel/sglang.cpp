@@ -158,11 +158,21 @@ struct Lane {
             token = sampling_sequence[static_cast<std::size_t>(tokens) % sampling_sequence.size()];
         }
         ++tokens;
-        if (options.stops_at(token)) {
-            return {token, DecoderFinishReason::stop, true};
-        }
-        return {token, tokens == options.max_new_tokens
+        DecoderBatchStep step{token, tokens == options.max_new_tokens
             ? std::optional{DecoderFinishReason::length} : std::nullopt, true};
+        if (options.stops_at(token)) {
+            step.finish_reason = DecoderFinishReason::stop;
+        }
+        if (options.generated_top_logprobs >= 0) {
+            const DecoderLogprob selected{token, -0.25f * tokens};
+            std::vector<DecoderLogprob> alternatives;
+            for (int rank = 0; rank < options.generated_top_logprobs; ++rank) {
+                alternatives.push_back({rank == 0 ? token : rank, selected.value - rank});
+            }
+            step.generated_logprobs = std::make_shared<const DecoderTokenLogprobs>(
+                DecoderTokenLogprobs{selected, std::move(alternatives)});
+        }
+        return step;
     }
 
     DecoderBatchStep advance() {

@@ -61,7 +61,7 @@ target("sglang_cuda")
     add_files("src/text_decode_bandwidth.cu")
     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
     add_files("src/text_normalization.cu")
-    add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu")
+add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu", "src/text/decoder_logprobs.cu")
     add_files("src/text/decoder_graph_ops.cu")
 
 target("sglang_prefill_fp8_sm100")
@@ -343,5 +343,20 @@ if has_config("long-decode-check") then
                     "9WorkspaceERKNS_14DecoderOptionsERKNS0_19ConstraintWorkspaceEPKNS0_" ..
                     "18SamplingParametersEPvP11CUstream_st", {force = true})
         add_files("tests/decoder/long_decode_routes.cpp")
+    target_end()
+end
+
+option("generated-logprobs-check")
+    set_default(false)
+option_end()
+
+if has_config("generated-logprobs-check") then
+    target("generated-logprobs-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_decoder")
+        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_files("tests/text/generated_logprobs_check.cpp")
     target_end()
 end

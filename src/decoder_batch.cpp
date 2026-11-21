@@ -1,6 +1,7 @@
 #include "sglang/decoder_internal.h"
 
 #include "sglang/decoder_batch.h"
+#include "sglang/text/decoder_logprobs.h"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_prefill.h"
@@ -341,7 +342,7 @@ struct DecoderBatch::State {
     void submit(const Selection& selected, const PrefillRows& decode, Steps& results,
                 DecoderBatchStepStats& stats, bool& contains_mtp);
     void prefill(const PrefillRows& rows, int max_rows, DecoderBatchStepStats& stats);
-    void score(Lane& lane, Request& request, Workspace& work, bool logits_ready);
+    void score(int slot, Lane& lane, Workspace& work, bool logits_ready);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats);
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring,
@@ -400,6 +401,8 @@ struct DecoderBatch::State {
     const bool tensor_cache;
     Allocations execution;
     std::byte* sampling_workspace = nullptr;
+    std::byte* logprob_workspace = nullptr;
+    GeneratedLogprobReadback* logprob_readback = nullptr;
     ConstraintWorkspace constraint_workspace;
     std::size_t resident_capacity = 0;
     int prefill_cursor = 0;
@@ -496,6 +499,12 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         prompt = std::move(input->prompt.token_ids);
     }
     validate_request(prompt, options, !media);
+    const int top = options.generated_top_logprobs;
+    if (top < -1 || top > decoder_max_generated_top_logprobs ||
+        (top >= 0 && (media || options.samples() || options.constraint || options.mtp_steps ||
+                      options.top_logits || state_->output))) {
+        throw std::invalid_argument("Generated logprobs require unconstrained greedy batch K=0");
+    }
     if (options.prefix_cache_salt.size() > decoder_prefix_max_salt_bytes) {
         throw std::invalid_argument("Prefix cache salt exceeds 256 bytes");
     }
@@ -511,6 +520,11 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     }
     try {
         DeviceScope device(state_->model.device);
+        if (top >= 0 && !state_->logprob_workspace) {
+            state_->logprob_readback = state_->execution.prepare_generated_logprobs();
+            state_->logprob_workspace =
+                state_->execution.allocate<std::byte>(generated_logprob_workspace_bytes());
+        }
         if (input) {
             validate_feature_device(*input, state_->model.device);
         }
@@ -584,10 +598,16 @@ void DecoderBatch::reset_prefix_cache() {
 
 bool DecoderBatch::available() const { return !state_->failed; }
 
-void DecoderBatch::State::score(Lane& lane, Request& request, Workspace& work, bool logits_ready) {
+void DecoderBatch::State::score(int slot, Lane& lane, Workspace& work, bool logits_ready) {
     const auto stream = execution.stream();
     if (!logits_ready) {
         model.compute_logits(work, stream);
+    }
+    if (lane.options.generated_top_logprobs >= 0) {
+        check(enqueue_generated_logprobs(work.logits, vocab_size, work.argmax,
+                                        lane.options.generated_top_logprobs, logprob_workspace,
+                                        logprob_readback + slot, stream), "Score generated token");
+        return;
     }
     if (lane.sampling && !sampling_workspace) {
         sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
@@ -595,7 +615,7 @@ void DecoderBatch::State::score(Lane& lane, Request& request, Workspace& work, b
     if (lane.options.constraint) {
         constraint_workspace.allocate(execution, lane.options.constraint->uses_wide_mask());
     }
-    lane.progress.select(request, work, lane.options, constraint_workspace,
+    lane.progress.select(*lane.request, work, lane.options, constraint_workspace,
                          lane.sampling ? &*lane.sampling : nullptr, sampling_workspace, stream);
 }
 
@@ -674,8 +694,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             auto& lane = *slots[slot];
             const int index = lane.restored_prompt ? -1 : packed_slots[slot];
             auto* ready = index < 0 ? nullptr : run.ready[index];
-            if (index < 0 || !run.winners[index]) {
-                score(lane, *request, ready ? *ready : request->work, ready != nullptr);
+            if (index < 0 || !run.winners[index] || lane.options.generated_top_logprobs >= 0) {
+                score(slot, lane, ready ? *ready : request->work, ready != nullptr);
             }
             submitted = true;
             if (index >= 0 && (run.graphed >> index & 1) != 0) {
@@ -761,10 +781,17 @@ void DecoderBatch::State::collect_scores(
             const int index = packed_slots[slot];
             const auto* winner = index < 0 ? nullptr : run.winners[index];
             try {
-                results[slot].token = winner
-                    ? validate_winner(winner->token_id, false, false)
-                    : read_token(*scoring[slot], lane.sampling.has_value(),
-                                 lane.options.constraint != nullptr);
+                const int top = lane.options.generated_top_logprobs;
+                if (top >= 0) {
+                    const auto& readback = logprob_readback[slot];
+                    results[slot].generated_logprobs = collect_generated_logprobs(readback, top);
+                    results[slot].token = readback.selected.token_id;
+                } else {
+                    results[slot].token = winner
+                        ? validate_winner(winner->token_id, false, false)
+                        : read_token(*scoring[slot], lane.sampling.has_value(),
+                                     lane.options.constraint != nullptr);
+                }
             } catch (const DecoderSamplingError&) {
                 results[slot].sampling_failed = true;
             } catch (const DecoderConstraintError&) {

@@ -61,7 +61,21 @@ struct Scenario {
 
 Scenario* scenario;
 
-void check_terminal(Outcome outcome) {
+void check_scores(const DecoderResult& result) {
+    require(result.generated_logprobs.size() == result.output_token_ids.size(),
+            "Score count differs from retained token count");
+    for (std::size_t index = 0; index < result.output_token_ids.size(); ++index) {
+        const int token = result.output_token_ids[index];
+        require(static_cast<bool>(result.generated_logprobs[index]), "Retained score was empty");
+        const auto& score = *result.generated_logprobs[index];
+        require(score.selected.token_id == token && score.selected.value == -0.25f * token &&
+                    score.alternatives.size() == 1 &&
+                    score.alternatives.front().token_id == token,
+                "A queued score no longer belongs to its retained token");
+    }
+}
+
+void check_terminal(Outcome outcome, bool scored) {
     Scenario events;
     scenario = &events;
     const Decoder decoder({}, 0, false, Fp8PrefillPolicy::exact);
@@ -76,6 +90,29 @@ void check_terminal(Outcome outcome) {
             options.max_new_tokens = slot == 0 && outcome == Outcome::length ? queued_token : 16;
             if (slot == 0 && outcome == Outcome::stop) {
                 options.stop_token_id = queued_token;
+            }
+            if (scored && slot == 0) {
+                options.generated_top_logprobs = 1;
+                BatchPrompt prompt;
+                prompt.prompt.assign(decoder_batch_max_step_tokens, slot);
+                prompt.options = options;
+                prompt.request_id = &id;
+                const BatchCallbacks callbacks{{}, {}, {},
+                    [&](std::size_t index, const DecoderResult& result, bool terminal) {
+                        require(index == 0, "Scored scalar got an unexpected batch index");
+                        check_scores(result);
+                        const auto delivered = static_cast<std::size_t>(received[slot]);
+                        if (result.output_token_ids.size() > delivered) {
+                            events.deliver(slot, ++received[slot], result.output_token_ids.back());
+                        }
+                        if (terminal) {
+                            results[slot] = result;
+                        }
+                        return true;
+                    }, true};
+                require(service.generate_batch(slot, {prompt}, callbacks).has_value(),
+                        "Scored scalar batch disconnected");
+                return;
             }
             DecoderCallbacks callbacks{[&, slot](int token) {
                 return events.deliver(slot, ++received[slot], token);
@@ -114,14 +151,19 @@ void check_terminal(Outcome outcome) {
                 received[0] == static_cast<int>(tokens.size()),
             "Wrong terminal result, queued ID or delivery count");
     require(events.target_cancels == int(aborted), "Unexpected decoder retirement count");
+    if (scored) {
+        check_scores(target);
+    }
     for (int slot = 1; slot < width; ++slot) {
         require(results[slot].finish_reason == DecoderFinishReason::length &&
                     received[slot] == 16 &&
-                    results[slot].output_token_ids.size() == 16,
+                    results[slot].output_token_ids.size() == 16 &&
+                    results[slot].generated_logprobs.empty(),
                 "A peer lost output or its terminal result");
     }
     require(service.reset_prefix_cache(), "The worker did not release all slots");
-    std::cout << "Buffered terminal " << static_cast<int>(outcome) << " passed\n";
+    std::cout << "Buffered terminal " << static_cast<int>(outcome)
+              << (scored ? " scored passed\n" : " unscored passed\n");
 }
 
 }
@@ -187,6 +229,11 @@ Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepS
         step.decode = ordinal > 1;
         step.token = 1000 * slot + ordinal;
         const auto& options = state_->options[slot];
+        if (options.generated_top_logprobs == 1) {
+            const DecoderLogprob score{*step.token, -0.25f * *step.token};
+            step.generated_logprobs =
+                std::make_shared<const DecoderTokenLogprobs>(DecoderTokenLogprobs{score, {score}});
+        }
         if (options.stops_at(*step.token)) {
             step.finish_reason = DecoderFinishReason::stop;
         } else if (ordinal == options.max_new_tokens) {
@@ -207,6 +254,7 @@ Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepS
 
 int main() {
     for (const auto outcome : {Outcome::abort, Outcome::stop, Outcome::length}) {
-        check_terminal(outcome);
+        check_terminal(outcome, false);
+        check_terminal(outcome, true);
     }
 }

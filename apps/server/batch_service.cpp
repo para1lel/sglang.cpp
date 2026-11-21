@@ -779,9 +779,8 @@ BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs,
 
 BatchService::~BatchService() = default;
 
-bool BatchService::ready() const {
-    return !state_->failed.load();
-}
+bool BatchService::ready() const { return !state_->failed.load(); }
+bool BatchService::supports_generated_logprobs() const { return state_->mtp_steps == 0; }
 
 bool BatchService::wait_for_generation(Clock::time_point started, Clock::time_point deadline,
                                        const std::function<bool()>& cancelled) {

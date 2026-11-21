@@ -599,13 +599,13 @@ void set_cache_salt_value(const json::Value& value, DecoderOptions& options) {
 void validate_generate_fields(const json::Object& object) {
     for (const auto& [key, value] : object) {
         if (key == "text" || key == "input_ids" || key == "sampling_params" ||
-            key == "stream" || key == "cache_salt" || key == "rid") {
+            key == "stream" || key == "cache_salt" || key == "rid" ||
+            key == "return_logprob" || key == "logprob_start_len" || key == "top_logprobs_num" ||
+            key == "return_text_in_logprobs") {
             continue;
         }
-        if (((key == "return_logprob" || key == "return_routed_experts") &&
-             (value.is_null() || value.boolean() == false)) ||
-            (key == "logprob_start_len" && (value.is_null() || value.signed_integer() == -1)) ||
-            (key == "lora_path" && value.is_null())) {
+        if ((key == "return_routed_experts" && (value.is_null() || value.boolean() == false)) ||
+            ((key == "lora_path" || key == "token_ids_logprob") && value.is_null())) {
             continue;
         }
         throw std::invalid_argument("Unsupported /generate field: " + key);
@@ -695,6 +695,46 @@ const json::Array* generate_parameter_list(const json::Value* value, std::size_t
     return list;
 }
 
+const json::Value* generate_logprob_field(const GenerateInput& input, std::string_view key,
+                                         std::size_t index) {
+    const auto* value = json::get(input.fields, key);
+    if (const auto* list = value ? value->array() : nullptr) {
+        if (!input.batch || list->size() != input.count) {
+            throw std::invalid_argument("Expected one " + std::string(key) + " per batch item");
+        }
+        return &(*list)[index];
+    }
+    return value;
+}
+
+void generate_logprob_options(const GenerateInput& input, std::size_t index, BatchPrompt& item) {
+    const auto* enabled = generate_logprob_field(input, "return_logprob", index);
+    const auto* start = generate_logprob_field(input, "logprob_start_len", index);
+    const auto* top = generate_logprob_field(input, "top_logprobs_num", index);
+    const auto* text = json::get(input.fields, "return_text_in_logprobs");
+    if (enabled && !enabled->is_null() && !enabled->boolean()) {
+        bad_request("Expected boolean return_logprob");
+    }
+    if (start && !start->is_null() && start->signed_integer() != -1) {
+        bad_request("Only logprob_start_len = -1 is supported");
+    }
+    const auto count = top && !top->is_null() ? top->unsigned_integer()
+                                             : std::optional<std::uint64_t>{0};
+    if (!count || *count > decoder_max_generated_top_logprobs) {
+        bad_request("Expected integer top_logprobs_num in [0, 20]");
+    }
+    if (text && !text->is_null() && !text->boolean()) {
+        bad_request("Expected boolean return_text_in_logprobs");
+    }
+    if (enabled && enabled->boolean() == true) {
+        if (item.options.samples()) {
+            bad_request("return_logprob requires greedy sampling");
+        }
+        item.options.generated_top_logprobs = static_cast<int>(*count);
+        item.return_text_in_logprobs = text && text->boolean() == true;
+    }
+}
+
 }
 
 GenerateInput parse_generate_input(std::string_view body) {
@@ -739,6 +779,7 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
         items.push_back(generate_prompt(prompt, input.text,
                                        generate_options(params, salt), tokenizer,
                                        generate_stops(params, tokenizer)));
+        generate_logprob_options(input, 0, items.back());
         return items;
     }
     const auto& list = *prompt.array();
@@ -757,6 +798,7 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
                                       : broadcast_stops;
         items.push_back(generate_prompt(list[index], input.text, std::move(options), tokenizer,
                                         stops));
+        generate_logprob_options(input, index, items.back());
     }
     return items;
 }

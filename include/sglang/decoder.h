@@ -17,6 +17,7 @@ struct DecoderMedia;
 class MediaDecoderCheck;
 
 inline constexpr int decoder_max_mtp_steps = 4;
+inline constexpr int decoder_max_generated_top_logprobs = 20;
 inline constexpr std::size_t decoder_prefix_max_salt_bytes = 256;
 
 class TokenConstraint;
@@ -37,6 +38,7 @@ struct DecoderOptions {
     double min_p = 0.0;
     int max_num_batched_tokens = 0;
     bool incremental_kv = false;
+    int generated_top_logprobs = -1;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 
@@ -89,6 +91,16 @@ struct DecoderLogit {
     float logit;
 };
 
+struct DecoderLogprob {
+    int token_id;
+    float value;
+};
+
+struct DecoderTokenLogprobs {
+    DecoderLogprob selected;
+    std::vector<DecoderLogprob> alternatives;
+};
+
 struct DecoderResult {
     std::vector<int> output_token_ids;
     DecoderFinishReason finish_reason = DecoderFinishReason::length;
@@ -99,6 +111,7 @@ struct DecoderResult {
     std::size_t mtp_rounds = 0;
     std::size_t cached_prompt_tokens = 0;
     std::optional<std::size_t> matched_text_stop = std::nullopt;
+    std::vector<std::shared_ptr<const DecoderTokenLogprobs>> generated_logprobs{};
 };
 
 enum class Fp8PrefillPolicy {

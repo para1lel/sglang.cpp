@@ -6,6 +6,7 @@
 #include "sglang/utf8.h"
 
 #include <algorithm>
+#include <charconv>
 #include <iostream>
 #include <iterator>
 
@@ -28,6 +29,53 @@ std::string_view finish_type(const DecoderResult& result, const DecoderOptions& 
     throw std::logic_error("Decoder returned an inconsistent /generate result");
 }
 
+void append_logprob(std::string& output, const DecoderLogprob& score, const Tokenizer* tokenizer) {
+    char number[32];
+    const auto formatted = std::to_chars(number, number + sizeof(number), score.value);
+    output += '[';
+    output.append(number, formatted.ptr);
+    output += ',' + std::to_string(score.token_id) + ',';
+    if (tokenizer) {
+        Utf8Stream utf8;
+        auto text = utf8.push(tokenizer->piece(score.token_id, false));
+        text += utf8.finish();
+        json::append_quoted(output, text);
+    } else {
+        output += "null";
+    }
+    output += ']';
+}
+
+void append_logprobs(std::string& output, const BatchPrompt& request, const Tokenizer& tokenizer,
+                     const DecoderResult& result) {
+    const auto& scores = result.generated_logprobs;
+    if (scores.size() != result.output_token_ids.size()) {
+        throw std::logic_error("Generated logprob count differs from output token count");
+    }
+    const auto* pieces = request.return_text_in_logprobs ? &tokenizer : nullptr;
+    output += R"(,"input_token_logprobs":[],"output_token_logprobs":[)";
+    for (std::size_t index = 0; index < scores.size(); ++index) {
+        if (index) output += ',';
+        append_logprob(output, scores[index]->selected, pieces);
+    }
+    output += R"(],"output_token_logprobs_length":)" + std::to_string(scores.size());
+    if (request.options.generated_top_logprobs == 0) {
+        return;
+    }
+    output += R"(,"input_top_logprobs":[],"output_top_logprobs":[)";
+    for (std::size_t index = 0; index < scores.size(); ++index) {
+        if (index) output += ',';
+        output += '[';
+        const auto& alternatives = scores[index]->alternatives;
+        for (std::size_t rank = 0; rank < alternatives.size(); ++rank) {
+            if (rank) output += ',';
+            append_logprob(output, alternatives[rank], pieces);
+        }
+        output += ']';
+    }
+    output += ']';
+}
+
 class GenerateResponse {
 public:
     GenerateResponse(const BatchPrompt& request, const Tokenizer& tokenizer)
@@ -44,7 +92,7 @@ public:
 
 private:
     std::string body(const std::vector<int>& ids, const DecoderResult* result,
-                     bool terminal) const;
+                     bool terminal, bool include_cached = true) const;
 
     const BatchPrompt& request_;
     const Tokenizer& tokenizer_;
@@ -56,7 +104,8 @@ private:
 };
 
 std::string GenerateResponse::body(const std::vector<int>& ids,
-                                   const DecoderResult* result, bool terminal) const {
+                                   const DecoderResult* result, bool terminal,
+                                   bool include_cached) const {
     std::string output = R"({"text":)";
     json::append_quoted(output, text_);
     output += R"(,"output_ids":)";
@@ -89,8 +138,11 @@ std::string GenerateResponse::body(const std::vector<int>& ids,
     } else {
         output += "null";
     }
-    if (result) {
+    if (result && include_cached) {
         output += R"(,"cached_tokens":)" + std::to_string(result->cached_prompt_tokens);
+    }
+    if (result && request_.options.generated_top_logprobs >= 0) {
+        append_logprobs(output, request_, tokenizer_, *result);
     }
     return output + "}}";
 }
@@ -133,7 +185,7 @@ std::string GenerateResponse::frame(std::optional<std::size_t> index,
         }
         text_ += stop_buffer_->take(terminal, result.matched_text_stop);
     }
-    auto output = terminal ? finish(result) : body(ids, index ? &result : nullptr, false);
+    auto output = terminal ? finish(result) : body(ids, &result, false, index.has_value());
     if (index) {
         output.pop_back();
         output += R"(,"index":)" + std::to_string(*index) + '}';
@@ -287,12 +339,18 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
         return;
     }
     auto items = parse_generate_prompts(input, tokenizer);
+    const bool scored = std::any_of(items.begin(), items.end(), [](const auto& item) {
+        return item.options.generated_top_logprobs >= 0;
+    });
+    if (scored && !service.supports_generated_logprobs()) {
+        throw std::invalid_argument("Generated logprobs require server MTP disabled");
+    }
     for (std::size_t index = 0; index < items.size(); ++index) {
         items[index].request_id = ids[index].get();
     }
     if (!slot) {
         complete_aborted(connection, tokenizer.get(), input, items);
-    } else if (!input.batch && !items.front().text_stops) {
+    } else if (!input.batch && !items.front().text_stops && !scored) {
         complete_single(connection, service, *slot, tokenizer, items.front(), input.stream);
     } else if (input.stream) {
         stream_batch(connection, service, *slot, tokenizer, items, input.batch);

@@ -31,6 +31,7 @@ struct VerificationRow;
 struct VerificationGraph;
 struct MtpRound;
 struct SamplingParameters;
+struct GeneratedLogprobReadback;
 
 using Bf16 = __nv_bfloat16;
 
@@ -137,6 +138,7 @@ public:
     std::size_t bytes() const;
     TransferBuffers& transfers();
     TextLogitCandidate* prepare_packed_winners();
+    GeneratedLogprobReadback* prepare_generated_logprobs();
     ExactGqaWorkspace prepare_singleton_scores();
     cudaStream_t stream() const;
     cudaGraphExec_t graph() const;

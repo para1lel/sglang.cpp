@@ -533,7 +533,7 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
 std::optional<cudaError_t> try_text_fp8_gemm_sm100(
     const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
     int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream,
-    bool allow_large_rows) {
+    bool allow_large_rows, bool grouped_projection) {
     if (rows <= 0 || out_width <= 0 || in_width <= 0 ||
         !valid_buffers(weight, weight_scales, input, rows, out_width, in_width,
                        output, out_width)) {
@@ -558,7 +558,8 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
         }
     }
     const bool narrow_high_k = in_width >= 8192 && rows < 1024;
-    if (rows > 128 && rows < 1024 && (out_width >= 8192 || in_width >= 6144)) {
+    if (rows > 128 && (rows < 1024 || grouped_projection) &&
+        (out_width >= 8192 || in_width >= 6144)) {
         const auto paired = launch_tma<Tile<128, 128, 6, 2, 1, 2>>(
             weight, weight_scales, input, rows, out_width, in_width, output, stream, device,
             1 + (rows - 1) / 128);
@@ -584,7 +585,8 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
 
 std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
     TextFp8ActivationView input, int rows, int in_width,
-    std::initializer_list<PrefillFp8Projection> projections, cudaStream_t stream) {
+    std::initializer_list<PrefillFp8Projection> projections, cudaStream_t stream,
+    bool grouped_projection) {
     if (rows <= 0 || in_width <= 0 || projections.size() < 2 || projections.size() > 3) {
         return cudaErrorInvalidValue;
     }
@@ -638,7 +640,7 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
     const bool packed_mlp_chunk = projections.size() == 2 &&
                                   output.slices[0].width == 17408 &&
                                   output.slices[1].width == 17408;
-    if (rows == 768 && in_width == 5120 && packed_mlp_chunk) {
+    if ((rows == 768 || grouped_projection) && in_width == 5120 && packed_mlp_chunk) {
         using GateUpTile = Tile<128, 128, 3, 1, 2, 1, true>;
         const auto compact = launch_tma<GateUpTile>(
             first.weight, first.scales, input, rows, total_width, in_width, output,
@@ -656,7 +658,7 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
             return wide;
         }
     }
-    if (rows < 1024) {
+    if (rows < 1024 || grouped_projection) {
         const int row_tiles = 1 + (rows - 1) / 128;
         const auto paired = wide_slices
             ? launch_tma<Tile<128, packed_wide_tile_cols, 4, 1, 1, 2>>(

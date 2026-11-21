@@ -26,6 +26,7 @@ struct PrefillProjections {
     int rows;
     cudaStream_t stream;
     bool tensor_core_fp8 = false;
+    bool grouped_projection = false;
 
     TextFp8ActivationView quantize(const Bf16* input, int width) const;
     void project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output) const;

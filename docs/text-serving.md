@@ -53,7 +53,7 @@ The binaries and default C++ constructor use visible CUDA ordinal 0. Use `--devi
 
 Set `SGLANG_SERIAL_PREFILL_ROWS=128` to retain 128-row tiles. Values `256`, `512`, `1024`, and `2048` override the cap for serial tensor-core K0 on supported devices. An empty or unrecognized value uses the 128-row cap. Exact prefill, positive-depth MTP, and the batch scheduler ignore this setting.
 
-Prefill processes the aligned prefix and any shorter tail in order. The larger tile fits the prompt and the step cap, both rounded down to multiples of 128. If large scratch is unavailable, prefill retries with a tile bounded by 128 and the step cap. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L477)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L588)<!-- prefix: "PrefillWorks" -->
+Prefill processes the aligned prefix and any shorter tail in order. The larger tile fits the prompt and the step cap, both rounded down to multiples of 128. If large scratch is unavailable, prefill retries with a tile bounded by 128 and the step cap. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L477)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L647)<!-- prefix: "PrefillWorks" -->
 
 The actual tile size determines eligibility for [MXFP8 flash prefill](flash-prefill.md#constraints-and-failure-behavior).
 

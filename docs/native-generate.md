@@ -4,10 +4,10 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Validate the request framing and route `POST /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if (request." --> · [Route](../apps/server/prefix_controls.cpp#L320)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
+| HTTP transport | Validate the request framing and route `POST /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if (request." --> · [Route](../apps/server/prefix_controls.cpp#L337)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
 | Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L680)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L711)<!-- prefix: "std::vector\u003c" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L252)<!-- prefix: "void complet" --> |
-| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L896)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L646)<!-- prefix: "bool BatchSe" --> |
+| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L958)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L663)<!-- prefix: "bool BatchSe" --> |
 | Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L51)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L164)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L194)<!-- prefix: "void stream_" --> |
 
 ## Runtime path
@@ -65,7 +65,7 @@ An item that decodes alone can use [score-backed singleton attention](singleton-
 The batch submits items to its worker's lane and can use available lanes without a reservation.
 If a new completion reserves a borrowed lane, it can use the lane after the current item retires.
 The worker submits remaining items as lanes become available. A batch can therefore contain more items than `--max-active`.
-[Lane selection](../apps/server/batch_service.cpp#L593)<!-- prefix: "void BatchSe" -->
+[Lane selection](../apps/server/batch_service.cpp#L610)<!-- prefix: "void BatchSe" -->
 
 ### JSON and SSE
 
@@ -75,7 +75,7 @@ A one-item batch still returns a JSON array. Each item has its own ID and metada
 With `stream: true`, one connection opens [chunked HTTP 200](http-server.md#completion-streams) after successful decoder admission or when all items have been aborted before admission.
 A single prompt sends result events without `index`. Every batch result event includes a top-level `index`, the zero-based position of its prompt in the request.
 Items can interleave and finish in any order. A one-item batch still sends indexed events.
-[Indexed result](../apps/server/native_generate.cpp#L106)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L694)<!-- prefix: "bool BatchSe" -->
+[Indexed result](../apps/server/native_generate.cpp#L106)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L711)<!-- prefix: "bool BatchSe" -->
 
 | Field | Meaning |
 | --- | --- |
@@ -97,7 +97,7 @@ The [keepalive timer](http-server.md#completion-streams) applies to the whole co
 Skip comments and measure each item's TTFT at its first event with output IDs. A zero-budget item has no first-token sample.
 The completion worker writes outside the scheduler mutex. A blocked write can hold the batch's pending results while other ready completions advance.
 Single-prompt streams can use [bounded decode output](http-server.md#bounded-decode-output) on an eligible cohort. Cumulative IDs, terminal metadata, and keepalives follow the same response contract.
-[Batch result delivery](../apps/server/batch_service.cpp#L646)<!-- prefix: "bool BatchSe" -->
+[Batch result delivery](../apps/server/batch_service.cpp#L663)<!-- prefix: "bool BatchSe" -->
 
 ## Constraints and failure behavior
 
@@ -150,7 +150,7 @@ The error event applies to the stream and has no item index. Previously delivere
 On a generation failure, disconnect, or failed write, the worker discards unsubmitted items, cancels the active jobs still owned by the batch, and waits for their retirement before releasing the slot.
 Decoder effects already published, such as prefix-cache entries, can remain.
 The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
-[Batch cancellation](../apps/server/batch_service.cpp#L572)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L36)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L118)<!-- prefix: "void write_s" -->
+[Batch cancellation](../apps/server/batch_service.cpp#L589)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L45)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L118)<!-- prefix: "void write_s" -->
 After successful HTTP parsing, a method other than POST at `/generate` returns HTTP 404.
 A disconnected client can cancel queued or active work through the [shared transport](http-server.md#http-admission-and-shutdown).
 Send [`POST /abort_request`](native-abort.md) from a second connection to cancel by ID.

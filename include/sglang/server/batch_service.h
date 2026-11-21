@@ -4,6 +4,7 @@
 #include "sglang/decoder_media.h"
 
 #include <atomic>
+#include <chrono>
 
 namespace sglang::server {
 
@@ -116,6 +117,9 @@ public:
                    const BatchCallbacks& callbacks);
     void notify_abort();
     bool ready() const;
+    bool wait_for_generation(std::chrono::steady_clock::time_point started,
+                             std::chrono::steady_clock::time_point deadline,
+                             const std::function<bool()>& cancelled);
     void rethrow_failure() const;
     BatchMetrics metrics() const;
     bool reset_prefix_cache();

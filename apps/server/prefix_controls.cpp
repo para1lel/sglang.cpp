@@ -7,6 +7,7 @@
 #include "sglang/server/http.h"
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <ctime>
 #include <exception>
@@ -19,10 +20,18 @@
 namespace sglang::server {
 namespace {
 
+using Clock = std::chrono::steady_clock;
+constexpr auto generation_health_timeout = std::chrono::seconds(20);
+
 struct Completion {
     Socket connection;
     std::optional<HttpRequest> request;
     QueuedGenerate generate = QueuedGenerate{};
+};
+
+struct HealthCheck {
+    Socket connection;
+    Clock::time_point started;
 };
 
 bool chat_route(const HttpRequest& request) { return request.path == "/v1/chat/completions"; }
@@ -150,6 +159,7 @@ public:
     void read(const Socket& listener);
     void run(int slot);
     void run_aborted();
+    void run_health();
     void stop();
 
 private:
@@ -162,6 +172,7 @@ private:
     void route(Socket& connection, HttpRequest request);
     std::optional<Completion> take(Lease& lease);
     void serve_control(Socket& connection, const HttpRequest& request);
+    void queue_health(Socket& connection, const HttpRequest& request);
     void queue_reset(Socket& connection, const HttpRequest& request);
     void reset_cache(const Socket& connection);
     void discard_disconnected();
@@ -178,7 +189,9 @@ private:
     std::mutex mutex_;
     std::condition_variable changed_;
     std::condition_variable abort_ready_;
+    std::condition_variable health_ready_;
     std::list<Completion> pending_;
+    std::list<HealthCheck> health_checks_;
     std::optional<Socket> reset_;
     int running_ = 0;
     bool resetting_ = false;
@@ -237,6 +250,10 @@ void write_models(const Socket& connection) {
 }
 
 void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& request) {
+    if (request.path == "/health_generate") {
+        queue_health(connection, request);
+        return;
+    }
     if (abort_ && request.method == "POST" && request.path == "/abort_request") {
         {
             const std::lock_guard lock(mutex_);
@@ -300,7 +317,7 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
     if (prefix_controls_) {
         throw HttpError("404 Not Found", "Unknown native server route");
     }
-    std::string routes = "Expected GET /health, /ready, or /v1/models";
+    std::string routes = "Expected GET /health, /ready, /health_generate, or /v1/models";
     if (!model_info_.empty()) {
         routes += " or /model_info or /get_model_info";
     }
@@ -436,6 +453,48 @@ void ConnectionQueue::run_aborted() {
     }
 }
 
+void ConnectionQueue::queue_health(Socket& connection, const HttpRequest& request) {
+    if (request.method != "GET") {
+        write_get_only(connection, request.method == "HEAD");
+        return;
+    }
+    if (!request.body.empty()) {
+        throw HttpError("404 Not Found", "Expected an empty generation health request");
+    }
+    const auto started = Clock::now();
+    {
+        const std::lock_guard lock(mutex_);
+        health_checks_.remove_if([](const auto& check) {
+            return disconnected(check.connection);
+        });
+        if (!stopping() && service_.ready() &&
+            health_checks_.size() < static_cast<std::size_t>(capacity_)) {
+            health_checks_.push_back({std::move(connection), started});
+            health_ready_.notify_one();
+            return;
+        }
+    }
+    write_generation_health(connection, false);
+}
+
+void ConnectionQueue::run_health() {
+    for (;;) {
+        std::unique_lock lock(mutex_);
+        health_ready_.wait(lock, [&] { return closing_ || !health_checks_.empty(); });
+        if (health_checks_.empty()) {
+            return;
+        }
+        auto work = std::move(health_checks_.front());
+        health_checks_.pop_front();
+        lock.unlock();
+
+        const auto cancelled = [&] { return disconnected(work.connection); };
+        const bool healthy = service_.wait_for_generation(
+            work.started, work.started + generation_health_timeout, cancelled);
+        write_generation_health(work.connection, healthy && service_.ready());
+    }
+}
+
 void ConnectionQueue::stop() {
     {
         const std::lock_guard lock(mutex_);
@@ -445,6 +504,7 @@ void ConnectionQueue::stop() {
     }
     changed_.notify_all();
     abort_ready_.notify_one();
+    health_ready_.notify_one();
 }
 
 }
@@ -460,7 +520,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
                           tokenize, model_info, abort);
     std::vector<std::thread> workers;
-    workers.reserve(max_active + (abort ? 1 : 0));
+    workers.reserve(max_active + (abort ? 2 : 1));
     std::mutex failure_mutex;
     std::exception_ptr failure;
     const auto stop_on_error = [&] {
@@ -471,6 +531,13 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
         stop_serving();
     };
     try {
+        workers.emplace_back([&] {
+            try {
+                queue.run_health();
+            } catch (...) {
+                stop_on_error();
+            }
+        });
         if (abort) {
             workers.emplace_back([&] {
                 try {

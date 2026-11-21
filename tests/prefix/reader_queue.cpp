@@ -131,6 +131,11 @@ BatchService::~BatchService() = default;
 
 bool BatchService::ready() const { return !worker_failed; }
 
+bool BatchService::wait_for_generation(Clock::time_point, Clock::time_point,
+                                       const std::function<bool()>& cancelled) {
+    return ready() && !cancelled();
+}
+
 void BatchService::rethrow_failure() const {
     if (!ready()) {
         throw std::runtime_error("Injected decoder worker failure");

@@ -64,9 +64,9 @@ bool wait_ready(const Socket& socket, short events, Clock::time_point deadline) 
     return false;
 }
 
-bool send_all(const Socket& socket, std::string_view bytes) {
+bool send_all(const Socket& socket, std::string_view bytes, bool during_shutdown = false) {
     const auto deadline = Clock::now() + io_timeout;
-    while (!bytes.empty() && !stopping()) {
+    while (!bytes.empty() && (!stopping() || during_shutdown)) {
         const auto count = send(socket.get(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
         if (count > 0) {
             bytes.remove_prefix(static_cast<std::size_t>(count));
@@ -471,6 +471,13 @@ void write_readiness(const Socket& connection, bool ready) {
         write_json(connection, "503 Service Unavailable",
                    R"({"ready":false,"reason":"worker_failed"})");
     }
+}
+
+void write_generation_health(const Socket& connection, bool healthy) {
+    send_all(connection, healthy && !stopping()
+        ? "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        : "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        true);
 }
 
 bool write_metrics(const Socket& connection, std::string_view body) {

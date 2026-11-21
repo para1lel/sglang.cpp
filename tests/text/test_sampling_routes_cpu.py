@@ -54,7 +54,7 @@ def receipts(log):
 
 
 @contextmanager
-def server(binary, checkpoint, log, *flags, sampling=True):
+def server(binary, checkpoint, log, *flags, sampling=True, with_process=False):
     with closing(socket.socket()) as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
@@ -82,7 +82,7 @@ def server(binary, checkpoint, log, *flags, sampling=True):
                     time.sleep(0.02)
             else:
                 raise AssertionError(f"server did not become ready: {log.read_text()}")
-            yield port
+            yield (port, process) if with_process else port
         finally:
             if process.poll() is None:
                 process.terminate()

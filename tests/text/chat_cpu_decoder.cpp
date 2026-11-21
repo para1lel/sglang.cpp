@@ -142,6 +142,7 @@ struct Lane {
     std::size_t prompt_size;
     const std::vector<int>* script = scripted_output(options);
     int tokens = 0;
+    bool health = false;
 
     DecoderBatchStep step() {
         if (tokens == options.max_new_tokens) {
@@ -164,6 +165,11 @@ struct Lane {
             ? std::optional{DecoderFinishReason::length} : std::nullopt, true};
     }
 };
+
+bool health_control(std::string_view name) {
+    const auto* path = std::getenv("SGLANG_TEST_HEALTH_CONTROL");
+    return path && std::filesystem::exists(std::filesystem::path(path) / name);
+}
 
 }
 
@@ -200,6 +206,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt, const DecoderOpt
 
 struct DecoderBatch::State {
     std::array<std::optional<Lane>, decoder_batch_max_lanes> lanes;
+    bool available = true;
 };
 
 DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
@@ -222,7 +229,16 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
         std::cerr << ("cpu reject seed=" + std::to_string(*options.seed) + '\n');
         throw DecoderCapacityError("Injected batch admission failure", true);
     }
+    const bool health = std::getenv("SGLANG_TEST_HEALTH_CONTROL") &&
+                        prompt.size() == 1 && prompt.front() == 0;
+    if (health) {
+        std::cerr << "cpu health prompt=0\n";
+        if (health_control("reject")) {
+            throw DecoderCapacityError("Injected health admission failure", true);
+        }
+    }
     lane.emplace(Lane{options, prompt.size()});
+    lane->health = health;
     record_sampling(options, prompt.size());
     std::cerr << ("cpu admit slot=" + std::to_string(slot) +
                   " prompt=" + std::to_string(prompt.size()) +
@@ -263,6 +279,18 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
         if (!lane) {
             throw std::logic_error("Selected an empty CPU lane");
         }
+        if (lane->health && !health_control("release")) {
+            continue;
+        }
+        if (lane->health && health_control("fail")) {
+            state_->available = false;
+            throw std::runtime_error("Injected permanent health decoder failure");
+        }
+        if (lane->health && health_control("finish-empty")) {
+            result[slot].finish_reason = DecoderFinishReason::length;
+            lane.reset();
+            continue;
+        }
         const auto* gate = std::getenv("SGLANG_TEST_BATCH_STEP_GATE");
         if (gate && lane->options.seed == -41 &&
             !std::filesystem::exists(std::string(gate) + "." + std::to_string(lane->tokens))) {
@@ -274,6 +302,9 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
             simulated_seconds.fetch_add(3);
         }
         result[slot] = lane->step();
+        if (lane->health && result[slot].token) {
+            std::cerr << "cpu health token\n";
+        }
         if (result[slot].finish_reason) {
             if (sampling_probe()) {
                 std::cerr << ("cpu finish budget=" +
@@ -294,7 +325,7 @@ std::size_t DecoderBatch::request_device_allocation_bytes() const {
 }
 
 bool DecoderBatch::available() const {
-    return true;
+    return state_->available;
 }
 
 DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {

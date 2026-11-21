@@ -12,7 +12,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L28)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L745)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L37)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L745)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L412)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L515)<!-- prefix: "std::string " --> |
 | Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L61)<!-- prefix: "DecoderResul" --> |
 | Chat output parsers | Apply the request options and parse reasoning and tool calls. | [Request options](../apps/server/text_request.cpp#L499)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/chat_output.cpp#L773)<!-- prefix: "bool ChatOut" --> |
@@ -140,7 +140,7 @@ If both budgets are absent or null, the output limit is 262,142 minus the final 
 
 ### Image and video inputs
 
-Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Each media lane uses private eager K0 state. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Media depth selection](../apps/server/batch_service.cpp#L830)<!-- prefix: "if (media.em" -->
+Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Each media lane uses private eager K0 state. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Media depth selection](../apps/server/batch_service.cpp#L892)<!-- prefix: "if (media.em" -->
 
 Omit `add_special_tokens` or set it to `false`. Set `enable_thinking` at the top level or as the only member of `chat_template_kwargs`.
 

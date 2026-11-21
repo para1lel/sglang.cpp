@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP control | Match `GET /model_info` and its deprecated alias `GET /get_model_info`. | [Control route](../apps/server/prefix_controls.cpp#L239)<!-- prefix: "void Connect" --> |
+| HTTP control | Match `GET /model_info` and its deprecated alias `GET /get_model_info`. | [Control route](../apps/server/prefix_controls.cpp#L252)<!-- prefix: "void Connect" --> |
 | Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L146)<!-- prefix: "std::string " --> |
 | Checkpoint | Supply the supported model type and architecture. | [Checkpoint identity](../include/sglang/checkpoint.h#L47)<!-- prefix: "inline const" --> |
 

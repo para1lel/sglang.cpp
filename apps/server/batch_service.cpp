@@ -1,6 +1,6 @@
 #include "sglang/server/batch_service.h"
 
-#include "sglang/decoder_batch.h"
+#include "sglang/server/output_mailbox.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,26 +18,6 @@
 namespace sglang::server {
 namespace {
 
-struct OutputMailbox {
-    std::array<DecoderBatchStep, 2> steps{};
-    std::size_t head = 0;
-    std::size_t size = 0;
-
-    bool empty() const { return size == 0; }
-    bool full() const { return size == steps.size(); }
-    const DecoderBatchStep& front() const { return steps[head]; }
-
-    void push(const DecoderBatchStep& step) {
-        steps[(head + size) % steps.size()] = step;
-        ++size;
-    }
-
-    void pop() {
-        head = (head + 1) % steps.size();
-        --size;
-    }
-};
-
 struct Job {
     std::vector<int> prompt;
     std::size_t prompt_tokens = 0;
@@ -54,11 +34,20 @@ struct Job {
     bool buffer_decode_output = false;
     bool output_started = false;
     bool output_overlapped = false;
+    bool health_check = false;
 
     bool aborted() const { return request_id && request_id->aborted(); }
     bool ready(bool buffered = false) const {
         return cancelled || aborted() || (buffered ? !pending.full() : pending.empty());
     }
+};
+
+using Clock = std::chrono::steady_clock;
+
+struct HealthProbe {
+    std::shared_ptr<Job> job;
+    Clock::time_point deadline;
+    bool progressed = false;
 };
 
 using Jobs = std::array<std::shared_ptr<Job>, decoder_batch_max_lanes>;
@@ -139,9 +128,11 @@ struct BatchService::State {
     void process(DecoderBatch& batch);
     std::optional<std::uint64_t> begin_iteration(DecoderBatch& batch);
     std::optional<Work> wait_for_jobs();
+    bool idle_for_health() const;
     bool wide_decode_ready(bool buffered) const;
     bool prepare(DecoderBatch& batch, int slot, const std::shared_ptr<Job>& job, bool buffered);
-    void publish(int slot, Job& job, const DecoderBatchStep& step);
+    bool publish(int slot, Job& job, const DecoderBatchStep& step);
+    void publish_steps(const Jobs& snapshot, const Selection& selected, const Steps& steps);
     void record_profile(std::uint64_t epoch, std::uint64_t elapsed, int width,
                         const Steps& steps, const DecoderBatchStepStats& stats);
     void fail_jobs(std::exception_ptr error, bool permanent);
@@ -173,6 +164,8 @@ struct BatchService::State {
     std::condition_variable changed;
     Jobs jobs;
     Selection generating{};
+    Clock::time_point last_generation = Clock::time_point::min();
+    std::optional<HealthProbe> health_probe;
     BatchMetrics counters;
     std::optional<BatchProfile> profile;
     std::uint64_t profile_epoch = 0;
@@ -267,11 +260,18 @@ bool BatchService::State::wide_decode_ready(bool buffered) const {
     return ready >= wide_decode_min_ready;
 }
 
+bool BatchService::State::idle_for_health() const {
+    return health_probe && !reset_pending && Clock::now() < health_probe->deadline &&
+           !health_probe->progressed && !health_probe->job->finish && !health_probe->job->error &&
+           std::none_of(jobs.begin(), jobs.end(), [](const auto& job) { return bool(job); }) &&
+           std::none_of(generating.begin(), generating.end(), [](bool active) { return active; });
+}
+
 std::optional<Work> BatchService::State::wait_for_jobs() {
     std::unique_lock lock(mutex);
     const auto end = jobs.begin() + max_active;
     changed.wait(lock, [&] {
-        return closing || reset_pending || wide_decode_ready(true) ||
+        return closing || reset_pending || wide_decode_ready(true) || idle_for_health() ||
                std::any_of(jobs.begin(), end, [](const auto& job) {
                    return job && job->ready();
                });
@@ -287,6 +287,9 @@ std::optional<Work> BatchService::State::wait_for_jobs() {
     });
     if (closing) {
         return std::nullopt;
+    }
+    if (idle_for_health()) {
+        jobs.front() = health_probe->job;
     }
     return Work{jobs, wide_decode_ready(true)};
 }
@@ -340,17 +343,18 @@ bool BatchService::State::prepare(DecoderBatch& batch, int slot,
     return true;
 }
 
-void BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& step) {
+bool BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& step) {
     const bool terminal = step.finish_reason || step.sampling_failed || step.constraint_failed;
     if (terminal && job.request_id && !job.request_id->finish() && !job.cancelled) {
         job.request_id->finish_abort();
         job.finish = DecoderFinishReason::aborted;
         jobs[slot].reset();
-        return;
+        return false;
     }
-    if (step.token && !job.cancelled && !job.aborted()) {
+    const bool published = step.token && !job.cancelled && !job.aborted();
+    if (published) {
         const bool first_token = !std::exchange(job.prefill_completed, true);
-        if (counters.cache_capacity != 0) {
+        if (counters.cache_capacity != 0 && !job.health_check) {
             if (first_token) {
                 counters.prompt_tokens += job.prompt_tokens;
                 ++counters.prefill_requests;
@@ -364,11 +368,28 @@ void BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& st
         job.error = step.constraint_failed ? std::make_exception_ptr(DecoderConstraintError())
                                            : std::make_exception_ptr(DecoderSamplingError());
         jobs[slot].reset();
-        return;
+        return false;
     }
     if (step.finish_reason) {
         job.finish = step.finish_reason;
         jobs[slot].reset();
+    }
+    return published;
+}
+
+void BatchService::State::publish_steps(const Jobs& snapshot, const Selection& selected,
+                                        const Steps& steps) {
+    bool generated = false;
+    for (int slot = 0; slot < max_active; ++slot) {
+        if (selected[slot] && publish(slot, *snapshot[slot], steps[slot])) {
+            generated = true;
+        }
+    }
+    if (generated) {
+        last_generation = Clock::now();
+        if (health_probe && last_generation <= health_probe->deadline) {
+            health_probe->progressed = true;
+        }
     }
 }
 
@@ -505,11 +526,7 @@ void BatchService::State::process(DecoderBatch& batch) {
             if (epoch) {
                 record_profile(epoch, elapsed, width, steps, stats);
             }
-            for (int slot = 0; slot < max_active; ++slot) {
-                if (selected[slot]) {
-                    publish(slot, *snapshot->jobs[slot], steps[slot]);
-                }
-            }
+            publish_steps(snapshot->jobs, selected, steps);
         }
         changed.notify_all();
     }
@@ -759,6 +776,50 @@ bool BatchService::ready() const {
     return !state_->failed.load();
 }
 
+bool BatchService::wait_for_generation(Clock::time_point started, Clock::time_point deadline,
+                                       const std::function<bool()>& cancelled) {
+    auto& state = *state_;
+    std::unique_lock lock(state.mutex);
+    if (state.closing || state.failure || state.health_probe || cancelled()) {
+        return false;
+    }
+    if (state.last_generation > started && state.last_generation <= deadline) {
+        return true;
+    }
+    if (Clock::now() >= deadline) {
+        return false;
+    }
+
+    auto job = std::make_shared<Job>();
+    job->prompt = {0};
+    job->health_check = true;
+    state.health_probe.emplace(HealthProbe{job, deadline});
+    state.changed.notify_all();
+    bool healthy = false;
+    try {
+        while (!state.closing && !state.failure && !cancelled()) {
+            if (state.health_probe->progressed) {
+                healthy = true;
+                break;
+            }
+            const auto now = Clock::now();
+            if (now >= deadline || job->error || job->finish) {
+                break;
+            }
+            state.changed.wait_until(lock, std::min(deadline, now + disconnect_poll));
+        }
+    } catch (...) {
+        job->cancelled = true;
+        state.health_probe.reset();
+        state.changed.notify_all();
+        throw;
+    }
+    job->cancelled = true;
+    state.health_probe.reset();
+    state.changed.notify_all();
+    return healthy;
+}
+
 void BatchService::rethrow_failure() const {
     if (!ready()) {
         const std::lock_guard lock(state_->mutex);
@@ -776,7 +837,8 @@ bool BatchService::reset_prefix_cache() {
     if (state_->failure) {
         std::rethrow_exception(state_->failure);
     }
-    if (state_->reset_pending ||
+    const auto& first = state_->jobs.front();
+    if (state_->reset_pending || (first && first->health_check) ||
         std::any_of(state_->generating.begin(), state_->generating.end(),
                     [](bool active) { return active; })) {
         return false;

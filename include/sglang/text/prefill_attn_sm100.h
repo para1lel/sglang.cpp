@@ -26,6 +26,18 @@ struct PairedPrefillScratch {
     std::size_t value_bytes = 0;
 };
 
+struct PagedPrefillSequence {
+    Mxfp8KvCache cache;
+    Mxfp8PageTable pages;
+    int position;
+    int rows;
+    const __nv_bfloat16* queries;
+    __nv_bfloat16* output;
+};
+
+std::optional<cudaError_t> try_batched_paged_prefill(
+    const PagedPrefillSequence* sequences, int count, cudaStream_t stream);
+
 cudaError_t tensor_core_multirow_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,

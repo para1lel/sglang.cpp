@@ -328,8 +328,7 @@ struct Chunk : PrefillProjections {
         }
     }
 
-    void gqa_attention(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages,
-                       PairedPrefillScratch scratch) const {
+    void gqa_append(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages) const {
         const auto rotation = mrope
             ? mrope_gqa_preprocess(mrope, rows, work.q_gate, work.keys, layer.query_norm,
                                     layer.key_norm, work.rope_queries, work.rope_keys, stream)
@@ -338,14 +337,23 @@ struct Chunk : PrefillProjections {
         check(rotation, "Normalize and rotate prefill Q/K");
         check(mxfp8_kv_append(cache, pages, position, rows, work.rope_keys, work.values, stream),
               "Append prefill MXFP8 KV");
+    }
+
+    void gqa_gate() const {
+        check(text_gqa_postgate(rows, work.q_gate, work.attention, work.attention, stream),
+              "Gate prefill grouped-query attention");
+    }
+
+    void gqa_attention(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages,
+                       PairedPrefillScratch scratch) const {
+        gqa_append(layer, cache, pages);
         const auto status = tensor_core_fp8
             ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
                                             work.attention, stream, scratch)
             : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
                                    work.attention, stream);
         check(status, "Read causal prefill MXFP8 attention");
-        check(text_gqa_postgate(rows, work.q_gate, work.attention, work.attention, stream),
-              "Gate prefill grouped-query attention");
+        gqa_gate();
     }
 
     void attention_output(Fp8Weight output, int width) const {
@@ -429,6 +437,19 @@ PrefillGroup prefill_group(const PrefillGrant* grants, int count) {
     return group.grants > 1 ? group : PrefillGroup{1, 0};
 }
 
+void read_paged_sequences(const PagedPrefillSequence* sequences, int count, cudaStream_t stream) {
+    if (const auto batched = try_batched_paged_prefill(sequences, count, stream)) {
+        check(*batched, "Read batched causal prefill MXFP8 attention");
+        return;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& sequence = sequences[index];
+        check(tensor_core_model_prefill_gqa(sequence.cache, sequence.pages, sequence.position,
+                                           sequence.rows, sequence.queries, sequence.output,
+                                           stream), "Read causal prefill MXFP8 attention");
+    }
+}
+
 void prefill_layerwise(const std::array<Layer, layer_count>& layers,
                        const Bf16* embedding, const PrefillGrant* grants, PrefillGroup group,
                        PrefillWorkspace& workspace) {
@@ -460,10 +481,18 @@ void prefill_layerwise(const std::array<Layer, layer_count>& layers,
         },
         [&](const GqaLayer& layer, int bank) {
             chunk.gqa_input(layer);
+            std::array<PagedPrefillSequence, max_layerwise_rows / 256> sequences;
+            int index = 0;
             each_segment([&](const PrefillGrant& grant, int offset) {
-                attention(grant, offset).gqa_attention(
-                    layer, grant.request->caches[bank], grant.request->pages, {});
+                const auto segment = attention(grant, offset);
+                const auto cache = grant.request->caches[bank];
+                const auto pages = grant.request->pages;
+                segment.gqa_append(layer, cache, pages);
+                sequences[index++] = {cache, pages, grant.position, grant.rows,
+                                      segment.work.rope_queries, segment.work.attention};
             });
+            read_paged_sequences(sequences.data(), index, stream);
+            chunk.gqa_gate();
             chunk.attention_output(layer.output, text_gqa_q_width);
         },
         [&](const GdnLayer& layer, int bank) {

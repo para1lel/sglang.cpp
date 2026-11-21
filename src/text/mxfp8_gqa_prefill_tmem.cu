@@ -461,15 +461,10 @@ __device__ __forceinline__ void tmem_stage_tile(
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
 
-template <bool Ordered, bool Ragged = false>
-__launch_bounds__(tmem_threads, 1)
-__global__ void tmem_flash_attention(Attention request,
-                                     const __grid_constant__ CUtensorMap key_map,
-                                     const __grid_constant__ CUtensorMap value_map,
-                                     float* partial, float2* statistics, int rows) {
-    alignas(1024) extern __shared__ unsigned char shared_tmem[];
-    auto& tile = *reinterpret_cast<TmemFlashTile*>(shared_tmem);
-    const int row = blockIdx.x * flash_rows;
+template <bool Ordered, bool Ragged>
+__device__ __forceinline__ void tmem_flash_tile(
+    TmemFlashTile& tile, Attention request, const CUtensorMap& key_map,
+    const CUtensorMap& value_map, float* partial, float2* statistics, int rows, int row) {
     const int active_rows = Ragged ? min(flash_rows, rows - row) : flash_rows;
     const int head = blockIdx.y * ordered_heads;
     const int position = request.position + row;
@@ -549,6 +544,18 @@ __global__ void tmem_flash_attention(Attention request,
             }
         }
     }
+}
+
+template <bool Ordered, bool Ragged = false>
+__launch_bounds__(tmem_threads, 1)
+__global__ void tmem_flash_attention(Attention request,
+                                     const __grid_constant__ CUtensorMap key_map,
+                                     const __grid_constant__ CUtensorMap value_map,
+                                     float* partial, float2* statistics, int rows) {
+    alignas(1024) extern __shared__ unsigned char shared_tmem[];
+    tmem_flash_tile<Ordered, Ragged>(*reinterpret_cast<TmemFlashTile*>(shared_tmem),
+                                     request, key_map, value_map, partial, statistics, rows,
+                                     blockIdx.x * flash_rows);
 }
 
 struct PairMaps {
@@ -846,11 +853,6 @@ std::optional<cudaError_t> encode_pair_maps(Mxfp8KvCache cache, PairMaps& maps) 
     }
 }
 
-bool paired_kernel_unavailable(cudaError_t status) {
-    return status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice ||
-           status == cudaErrorNotSupported;
-}
-
 std::optional<cudaError_t> encode_flash_maps(Mxfp8KvCache cache, CUtensorMap& key_map,
                                              CUtensorMap& value_map, bool automatic) {
     void* entry = nullptr;
@@ -995,3 +997,4 @@ std::optional<cudaError_t> launch_tmem_prefill(
 }
 
 #include "sglang/text/mxfp8_gqa_prefill_paired.cuh"
+#include "sglang/text/mxfp8_gqa_prefill_tmem_batch.cuh"

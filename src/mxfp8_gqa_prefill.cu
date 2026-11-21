@@ -33,18 +33,6 @@ constexpr int groups_per_warp = mxfp8_group_size / score_lanes;
 constexpr int group_passes = mxfp8_groups / groups_per_warp;
 static_assert(groups_per_warp == 4 && mxfp8_groups % groups_per_warp == 0);
 
-template <int Tokens>
-struct PrefillPayload {
-    alignas(16) std::uint8_t key[Tokens][channels];
-    alignas(16) std::uint8_t value[Tokens][channels];
-    alignas(8) std::uint8_t key_scale[Tokens][mxfp8_groups];
-    alignas(8) std::uint8_t value_scale[Tokens][mxfp8_groups];
-};
-
-template <int Tokens, int Threads>
-__device__ void prefetch_payload(PrefillPayload<Tokens>& raw, Attention request, int first,
-                                 int visible, int kv_head);
-
 template <int Heads, bool Staged>
 __device__ void tile_scores(OrderedTile<float, Heads>& shared, Mxfp8KvCache cache,
                             std::size_t payload, std::size_t scale, int end, int warp, int lane,
@@ -296,9 +284,6 @@ __global__ void multirow_prefill_attention(Attention request, int rows) {
 
 constexpr int flash_mma_rows = 16;
 constexpr int flash_stride = channels + 8;
-constexpr int flash_wide_rows = 88;
-constexpr int flash_short_rows = 32;
-constexpr int flash_medium_rows = 48;
 
 template <int Rows>
 constexpr int flash_math_threads = Rows * ordered_heads / flash_mma_rows * 32;
@@ -321,9 +306,6 @@ struct FlashTile {
 };
 
 using FlashPayload = PrefillPayload<flash_keys>;
-
-constexpr int flash_vector_elements = 16;
-constexpr int flash_token_lanes = channels / flash_vector_elements;
 
 struct FragmentA {
     Word words[4];
@@ -400,43 +382,6 @@ __device__ __forceinline__ void flash_decode_vector(std::uint16_t* destination,
     } else {
         flash_store_vector<false>(destination, payload, scale, bad);
     }
-}
-
-template <int Bytes>
-__device__ __forceinline__ void flash_copy(std::uint8_t* destination,
-                                          const std::uint8_t* source, bool active) {
-    const auto address = static_cast<Word>(__cvta_generic_to_shared(destination));
-    const int source_bytes = active ? Bytes : 0;
-    if constexpr (Bytes == 16) {
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-            :: "r"(address), "l"(source), "r"(source_bytes) : "memory");
-    } else {
-        static_assert(Bytes == 8);
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;"
-            :: "r"(address), "l"(source), "r"(source_bytes) : "memory");
-    }
-}
-
-template <int Tokens, int Threads>
-__device__ void prefetch_payload(PrefillPayload<Tokens>& raw, Attention request, int first,
-                                 int visible, int kv_head) {
-    const int channel = (threadIdx.x % flash_token_lanes) * flash_vector_elements;
-    const int page = request.pages[first / mxfp8_page_size];
-    const auto cache = request.cache;
-    #pragma unroll
-    for (int index = threadIdx.x / flash_token_lanes; index < Tokens;
-         index += Threads / flash_token_lanes) {
-        const int token = (first + index) % mxfp8_page_size;
-        const auto payload = payload_offset(page, token, kv_head) + channel;
-        flash_copy<16>(&raw.key[index][channel], cache.key_payload + payload, index < visible);
-        flash_copy<16>(&raw.value[index][channel], cache.value_payload + payload, index < visible);
-        if (channel == 0) {
-            const auto scale = scale_offset(page, token, kv_head);
-            flash_copy<8>(raw.key_scale[index], cache.key_scales + scale, index < visible);
-            flash_copy<8>(raw.value_scale[index], cache.value_scales + scale, index < visible);
-        }
-    }
-    asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
 template <int Rows>
@@ -649,14 +594,10 @@ __device__ void flash_store(Attention request, int row, int head, int active_row
 }
 
 template <int Rows, bool Partial, bool Async>
-__launch_bounds__(flash_threads<Rows>, 1)
-__global__ void flash_prefill_attention(Attention request, int rows) {
-    alignas(16) extern __shared__ unsigned char shared[];
-    auto& tile = *reinterpret_cast<FlashTile<Rows>*>(shared);
+__device__ __forceinline__ void flash_attention_tile(Attention request, int rows, int row,
+                                                    int head, FlashTile<Rows>& tile,
+                                                    OrderedScratch& fallback) {
     auto* raw = Async ? reinterpret_cast<FlashPayload*>(&tile + 1) : nullptr;
-    __shared__ OrderedScratch fallback;
-    const int row = blockIdx.x * Rows;
-    const int head = blockIdx.y * ordered_heads;
     const int position = request.position + row;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -728,6 +669,59 @@ __global__ void flash_prefill_attention(Attention request, int rows) {
     }
 }
 
+template <int Rows, bool Partial, bool Async>
+__launch_bounds__(flash_threads<Rows>, 1)
+__global__ void flash_prefill_attention(Attention request, int rows) {
+    alignas(16) extern __shared__ unsigned char shared[];
+    __shared__ OrderedScratch fallback;
+    flash_attention_tile<Rows, Partial, Async>(
+        request, rows, blockIdx.x * Rows, blockIdx.y * ordered_heads,
+        *reinterpret_cast<FlashTile<Rows>*>(shared), fallback);
+}
+
+constexpr int min_long_prefix = 4096;
+constexpr int min_flash_rows = 144;
+
+template <int Rows, bool Partial>
+__launch_bounds__(flash_threads<Rows>, 1)
+__global__ void batched_paged_attention(const __grid_constant__ PagedAttentionBatch batch) {
+    alignas(16) extern __shared__ unsigned char shared[];
+    __shared__ OrderedScratch fallback;
+    const int tile = blockIdx.x;
+    const int index = batch.locate(tile);
+    flash_attention_tile<Rows, Partial, true>(
+        batch.requests[index], batch.rows[index], batch.row(tile, index, Rows),
+        blockIdx.y * ordered_heads,
+        *reinterpret_cast<FlashTile<Rows>*>(shared), fallback);
+}
+
+template <int Rows, bool Partial>
+std::optional<cudaError_t> launch_paged_batch(PagedAttentionBatch& batch, int shared_limit,
+                                             cudaStream_t stream) {
+    const auto kernel = batched_paged_attention<Rows, Partial>;
+    constexpr auto bytes = sizeof(FlashTile<Rows>) + sizeof(FlashPayload);
+    cudaFuncAttributes attributes{};
+    auto status = cudaFuncGetAttributes(&attributes, kernel);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (static_cast<std::size_t>(shared_limit) < bytes + attributes.sharedSizeBytes) {
+        return std::nullopt;
+    }
+    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    int tiles = 0;
+    for (int index = 0; index < batch.count; ++index) {
+        tiles += (batch.rows[index] + Rows - 1) / Rows;
+        batch.tile_end[index] = tiles;
+    }
+    void* args[] = {&batch};
+    return cudaLaunchKernel(kernel, dim3(tiles, head_pairs), flash_threads<Rows>, args,
+                            bytes, stream);
+}
+
 std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
                                                cudaStream_t stream) {
     int device = 0;
@@ -769,30 +763,28 @@ std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
             return wide;
         }
     }
-    constexpr int min_long_prefix = 4096;
     if (aligned_scales && rows < flash_chunk && request.position >= min_long_prefix) {
         int multiprocessors = 0;
         status = cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device);
         if (status != cudaSuccess) {
             return status;
         }
-        constexpr int head_pairs = mxfp8_query_heads / ordered_heads;
-        const int tiles_per_head = multiprocessors / head_pairs;
-        if (rows <= tiles_per_head * flash_short_rows) {
+        const int tile_rows = long_flash_tile_rows(rows, multiprocessors / head_pairs);
+        if (tile_rows == flash_short_rows) {
             if (const auto short_tile = launch(
                     flash_prefill_attention<flash_short_rows, true, true>, flash_short_rows,
                     flash_threads<flash_short_rows>,
                     sizeof(FlashTile<flash_short_rows>) + sizeof(FlashPayload))) {
                 return short_tile;
             }
-        } else if (rows <= tiles_per_head * flash_medium_rows) {
+        } else if (tile_rows == flash_medium_rows) {
             if (const auto medium_tile = launch(
                     flash_prefill_attention<flash_medium_rows, true, true>, flash_medium_rows,
                     flash_threads<flash_medium_rows>,
                     sizeof(FlashTile<flash_medium_rows>) + sizeof(FlashPayload))) {
                 return medium_tile;
             }
-        } else if (rows > tiles_per_head * flash_rows && rows <= tiles_per_head * flash_wide_rows) {
+        } else if (tile_rows == flash_wide_rows) {
             if (const auto wide = launch(
                     flash_prefill_attention<flash_wide_rows, true, true>, flash_wide_rows,
                     flash_threads<flash_wide_rows>,
@@ -818,6 +810,82 @@ std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
     return std::nullopt;
 }
 
+}
+
+std::optional<cudaError_t> decoder::try_batched_paged_prefill(
+    const PagedPrefillSequence* sequences, int count, cudaStream_t stream) {
+    if (!sequences || count < 2 || count > paged_batch_sequences ||
+        std::getenv("SGLANG_PREFILL_ATTN") || std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL")) {
+        return std::nullopt;
+    }
+    int device = 0;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    int multiprocessors = 0;
+    status = cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    PagedAttentionBatch batch{};
+    batch.count = count;
+    int tile_rows = 0;
+    bool partial = false;
+    const auto& first = sequences[0];
+    const bool ragged = default_ragged_prefill(first.cache, first.position, first.rows);
+    for (int index = 0; index < count; ++index) {
+        const auto& sequence = sequences[index];
+        const auto& cache = sequence.cache;
+        if (sequence.rows < min_flash_rows || sequence.rows >= flash_chunk ||
+            sequence.position < 0 ||
+            sequence.position > max_multirow_visible_tokens - sequence.rows ||
+            !sequence.pages.device_pages || !sequence.queries || !sequence.output ||
+            !cache.key_payload || !cache.value_payload ||
+            !cache.key_scales || !cache.value_scales ||
+            reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) ||
+            reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) ||
+            reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) ||
+            reinterpret_cast<std::uintptr_t>(cache.value_scales) % alignof(std::uint64_t)) {
+            return std::nullopt;
+        }
+        const int last_page = (sequence.position + sequence.rows - 1) / mxfp8_page_size;
+        if (last_page >= sequence.pages.page_count || last_page >= cache.page_count) {
+            return std::nullopt;
+        }
+        const bool lane_ragged = default_ragged_prefill(cache, sequence.position, sequence.rows);
+        if (lane_ragged != ragged || (ragged && sequence.rows > 384)) {
+            return std::nullopt;
+        }
+        if (ragged) {
+            continue;
+        }
+        const int shape = sequence.position >= min_long_prefix
+            ? long_flash_tile_rows(sequence.rows, multiprocessors / head_pairs) : flash_rows;
+        const bool tail = shape != flash_rows || sequence.rows % flash_rows != 0;
+        if ((shape != flash_rows && shape != flash_short_rows) ||
+            (index && (tile_rows != shape || partial != tail))) {
+            return std::nullopt;
+        }
+        tile_rows = shape;
+        partial = tail;
+        batch.requests[index] = {cache, sequence.pages.device_pages, sequence.position,
+                                 sequence.queries, sequence.output};
+        batch.rows[index] = sequence.rows;
+    }
+    if (ragged) {
+        return launch_batched_ragged_tmem(sequences, count, stream);
+    }
+    int shared_limit = 0;
+    status = cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (tile_rows == flash_short_rows) {
+        return launch_paged_batch<flash_short_rows, true>(batch, shared_limit, stream);
+    }
+    return partial ? launch_paged_batch<flash_rows, true>(batch, shared_limit, stream)
+                   : launch_paged_batch<flash_rows, false>(batch, shared_limit, stream);
 }
 
 cudaError_t decoder::tensor_core_prefill_gqa(
@@ -846,15 +914,12 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
         return cudaErrorInvalidValue;
     }
     Attention request{cache, pages.device_pages, position, queries, output};
-    constexpr int min_flash_rows = 144;
     const int visible = position + rows;
     const int flash_limit = rows == flash_chunk ? max_flash_visible_tokens :
                                                   max_multirow_visible_tokens;
     const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
     const std::string_view mode = setting ? setting : "";
-    const bool default_ragged = !setting && position >= 8192 &&
-        (reinterpret_cast<std::uintptr_t>(cache.key_scales) |
-         reinterpret_cast<std::uintptr_t>(cache.value_scales)) % 8 == 0;
+    const bool default_ragged = !setting && default_ragged_prefill(cache, position, rows);
     if ((default_ragged || (mode == "ragged" && position >= 4096)) &&
         rows >= 256 && rows <= 512 &&
         visible <= max_multirow_visible_tokens) {

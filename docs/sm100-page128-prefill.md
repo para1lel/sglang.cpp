@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model | Try the page-128 launcher under the tensor-core prefill policy. | [Model dispatch](../include/sglang/text/prefill_attn_sm100.h#L34)<!-- prefix: "inline cudaE" --> |
+| Model | Try the page-128 launcher under the tensor-core prefill policy. | [Model dispatch](../include/sglang/text/prefill_attn_sm100.h#L46)<!-- prefix: "inline cudaE" --> |
 | Batch planner | Select the tile row count. | [Batch tile cap](../src/decoder_batch.cpp#L744)<!-- prefix: "const bool w" --> |
 | SM100 launcher | Check eligibility, select staging, and submit stream work. | [Launcher](../src/text/prefill_attn_sm100.cu#L914)<!-- prefix: "std::optiona" --> |
 

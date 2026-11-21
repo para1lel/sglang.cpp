@@ -15,6 +15,7 @@ constexpr int keys_per_lane = text_gdn_head_dim / warp_size;
 constexpr int conv_threads = 128;
 constexpr int conv_taps = text_gdn_history_taps + 1;
 constexpr int conv_blocks_per_token = text_gdn_qkv_width / conv_threads;
+constexpr int prefill_rows_per_block = 4;
 constexpr float norm_epsilon = 1.0e-6f;
 
 static_assert(recurrent_threads == 2 * text_gdn_head_dim);
@@ -22,6 +23,7 @@ static_assert(text_gdn_head_dim % warp_size == 0);
 static_assert(text_gdn_value_heads % text_gdn_qk_heads == 0);
 static_assert(text_gdn_qkv_width % conv_threads == 0);
 static_assert(conv_threads == text_gdn_head_dim);
+static_assert(conv_taps == 4);
 
 __device__ float warp_sum(float value) {
     for (int offset = warp_size / 2; offset > 0; offset /= 2) {
@@ -110,6 +112,80 @@ __global__ void gdn_prefill_prepare(const __nv_bfloat16* qkv, const __nv_bfloat1
         mixed = __float2bfloat16(component * rsqrtf(squares + norm_epsilon));
     }
     convolved[static_cast<std::size_t>(row) * text_gdn_qkv_width + channel] = mixed;
+}
+
+__global__ void gdn_prefill_prepare_grouped(
+    const __nv_bfloat16* qkv, const __nv_bfloat16* history, TextGdnWeights weights,
+    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* convolved, float2* gates) {
+    constexpr int blocks_per_group = conv_blocks_per_token + 1;
+    constexpr int warps = conv_threads / warp_size;
+    const int first = blockIdx.x / blocks_per_group * prefill_rows_per_block;
+    const int block = blockIdx.x % blocks_per_group;
+    const int feature = threadIdx.x;
+    if (block == conv_blocks_per_token) {
+        if (feature < text_gdn_value_heads) {
+            const float negative_a = -expf(__bfloat162float(weights.a_log[feature]));
+            const float dt_bias = __bfloat162float(weights.dt_bias[feature]);
+            #pragma unroll
+            for (int row = 0; row < prefill_rows_per_block; ++row) {
+                const int index = (first + row) * text_gdn_value_heads + feature;
+                gates[index] = {
+                    expf(negative_a * softplus(__bfloat162float(a[index]) + dt_bias)),
+                    sigmoid(__bfloat162float(b[index]))};
+            }
+        }
+        return;
+    }
+
+    const int channel = block * conv_threads + feature;
+    const auto* taps = weights.convolution + channel * conv_taps;
+    const float weight0 = __bfloat162float(taps[0]);
+    const float weight1 = __bfloat162float(taps[1]);
+    const float weight2 = __bfloat162float(taps[2]);
+    const float weight3 = __bfloat162float(taps[3]);
+    float oldest = __bfloat162float(raw_sample(qkv, history, first - 3, channel));
+    float middle = __bfloat162float(raw_sample(qkv, history, first - 2, channel));
+    float latest = __bfloat162float(raw_sample(qkv, history, first - 1, channel));
+    __nv_bfloat16 mixed[prefill_rows_per_block];
+    #pragma unroll
+    for (int row = 0; row < prefill_rows_per_block; ++row) {
+        const float current = __bfloat162float(raw_sample(qkv, history, first + row, channel));
+        float value = fmaf(oldest, weight0, 0.0f);
+        value = fmaf(middle, weight1, value);
+        value = fmaf(latest, weight2, value);
+        value = fmaf(current, weight3, value);
+        mixed[row] = __float2bfloat16(value * sigmoid(value));
+        oldest = middle;
+        middle = latest;
+        latest = current;
+    }
+    if (channel < 2 * text_gdn_qk_width) {
+        __shared__ float warp_squares[prefill_rows_per_block][warps];
+        #pragma unroll
+        for (int row = 0; row < prefill_rows_per_block; ++row) {
+            const float component = __bfloat162float(mixed[row]);
+            const float partial = warp_sum(component * component);
+            if (feature % warp_size == 0) {
+                warp_squares[row][feature / warp_size] = partial;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int row = 0; row < prefill_rows_per_block; ++row) {
+            float squares = 0.0f;
+            #pragma unroll
+            for (int warp = 0; warp < warps; ++warp) {
+                squares += warp_squares[row][warp];
+            }
+            const float component = __bfloat162float(mixed[row]);
+            mixed[row] = __float2bfloat16(component * rsqrtf(squares + norm_epsilon));
+        }
+    }
+    #pragma unroll
+    for (int row = 0; row < prefill_rows_per_block; ++row) {
+        convolved[static_cast<std::size_t>(first + row) * text_gdn_qkv_width + channel] =
+            mixed[row];
+    }
 }
 
 __global__ void gdn_prefill_recur(int rows, const __nv_bfloat16* convolved, const float2* gates,
@@ -473,7 +549,10 @@ cudaError_t prefill_gdn(
         }
     }
     void* prepare_arguments[] = {&qkv, &state.history, &weights, &a, &b, &workspace, &gates};
-    auto status = cudaLaunchKernel(gdn_prefill_prepare, dim3(rows * (conv_blocks_per_token + 1)),
+    const bool grouped = rows >= gdn_chunk::min_count && rows % prefill_rows_per_block == 0;
+    const auto prepare = grouped ? gdn_prefill_prepare_grouped : gdn_prefill_prepare;
+    const int prepare_groups = grouped ? rows / prefill_rows_per_block : rows;
+    auto status = cudaLaunchKernel(prepare, dim3(prepare_groups * (conv_blocks_per_token + 1)),
                                    dim3(conv_threads), prepare_arguments, 0, stream);
     if (status != cudaSuccess) {
         return status;

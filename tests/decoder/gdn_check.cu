@@ -560,6 +560,7 @@ void check_chunked() {
     PrefillCase chunked(capacity, weights, reference);
     PrefillCase alternate(capacity, weights, reference);
     PrefillCase exact_boundary(capacity, weights, reference);
+    PrefillCase perturbed_boundary(capacity, weights, reference);
     const auto size = chunk_bytes(capacity) + 2 * guard_bytes;
     Device<unsigned char> buffer(size);
     auto* scratch = buffer.data() + guard_bytes;
@@ -594,6 +595,7 @@ void check_chunked() {
         if (count == 127) {
             launch_chunk(alternate, rows, nullptr, 0, false);
             launch_chunk(exact_boundary, rows, nullptr, 0, false);
+            launch_chunk(perturbed_boundary, rows, nullptr, 0, false);
         }
         if (count == 128) {
             const auto shortfall = launch_chunk(alternate, rows, scratch, bytes - 1, false);
@@ -608,19 +610,23 @@ void check_chunked() {
             verify_chunk(boundary, expected, reference, count, "chunked boundary", true);
             verify_chunk_workspace(buffer, size, bytes);
         }
-        if (count == 129) {
+        if (count == 128 || count == 129) {
             constexpr int change = chunk_rows + 7;
             auto changed = rows;
             std::fill_n(changed.qkv.begin() + change * qkv_width, qkv_width, as_bf16(0));
             std::fill_n(changed.beta.begin() + change * value_heads, value_heads, as_bf16(3));
             const auto changed_expected = reference_forward(changed, true, weights,
                                                             changed_reference);
-            const auto distinct = launch_chunk(alternate, changed, scratch, bytes, true);
+            const auto& perturbed = count == 128 ? perturbed_boundary : alternate;
+            const auto distinct = launch_chunk(perturbed, changed, scratch, bytes, true);
             verify_chunk(distinct, changed_expected, changed_reference, count, "perturbed", true);
             verify_chunk_workspace(buffer, size, bytes);
-            const auto original = chunked.output.download(expected.size());
+            const auto& unperturbed = count == 128 ? exact_boundary : chunked;
+            const auto original = unperturbed.output.download(expected.size());
             const auto prefix = change * value_width;
             same_bits(distinct.output, original, prefix, "A future input changed a causal output");
+            same_bits(distinct.history, unperturbed.history.download(reference.history.size()),
+                      reference.history.size(), "An earlier perturbation changed the raw tail");
             const auto boundary = 2 * chunk_rows * value_width;
             if (!std::memcmp(distinct.output.data() + prefix, original.data() + prefix,
                              (boundary - prefix) * sizeof(BFloat)) ||

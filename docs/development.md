@@ -136,7 +136,7 @@ See [FP8 prefill projections](fp8-prefill-projections.md) for SM100 eligibility,
 
 Multirow K0 tensor-core prefill keeps these operators during projection fallback.
 
-- [GDN prefill](gdn-prefill.md) prepares convolution, Q/K, and gates before ordered or chunked recurrence. [Preparation](../src/text_attention_gdn.cu#L76)<!-- prefix: "__global__ v" -->
+- [GDN prefill](gdn-prefill.md) prepares convolution, Q/K, and gates before ordered or chunked recurrence. [Preparation dispatch](../src/text_attention_gdn.cu#L552)<!-- prefix: "const bool g" -->
 - [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L293)<!-- prefix: "const auto s" -->
 - [Fused residual RMSNorm](fp8-prefill-projections.md#fused-activation-quantization) and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L309)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L706)<!-- prefix: "cudaError_t " -->
 

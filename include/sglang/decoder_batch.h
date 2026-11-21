@@ -32,6 +32,7 @@ struct DecoderBatchStep {
     bool constraint_failed = false;
     int mtp_verified_rows = 0;
     std::shared_ptr<const DecoderTokenLogprobs> generated_logprobs = nullptr;
+    std::shared_ptr<const DecoderPromptLogprobs> prompt_logprobs = nullptr;
 };
 
 struct DecoderBatchStepStats {

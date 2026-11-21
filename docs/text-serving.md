@@ -1,6 +1,6 @@
 # Native text completions
 
-Send `POST /v1/completions` with `model` set to `Qwen3.8-27B-FP8` and one or more text or token-ID prompts. The same endpoint serves the frozen `benchmark` model with a [prompt ID array and token-ID SSE](../benchmarks/streaming/README.md#wire-contract). Use [native chat](chat-serving.md) to render conversation history. Use [`POST /generate`](native-generate.md) for native sampling parameters and cumulative output. Use [native tokenization](native-tokenization.md) to convert between text and IDs on the CPU.
+`POST /v1/completions` serves `Qwen3.8-27B-FP8` with text or token-ID prompts and the frozen `benchmark` model with [token-ID SSE](../benchmarks/streaming/README.md#wire-contract). See [native chat](chat-serving.md), [`POST /generate`](native-generate.md), and [CPU tokenization](native-tokenization.md).
 
 ## Send a request
 
@@ -19,29 +19,32 @@ curl --fail-with-body http://127.0.0.1:17384/v1/completions \
 | `["Hello", "World"]` | Two UTF-8 strings |
 | `[[220, 16], [220, 17]]` | Two sequences of token IDs |
 
-Each string must contain 1 to 1,048,576 UTF-8 bytes. Each ID sequence must be nonempty and contain integers in `[0, 248320)`. IDs go directly to the decoder. Each prompt and its output budget must fit 262,144 tokens. A batch contains 1 to 32 prompts of one form and shares request options across all items. The sum of output budgets must be at most 262,144 tokens. Invalid prompts and options return HTTP 400 before decoder admission. [Prompt parsing](../apps/server/text_request.cpp#L463)<!-- prefix: "TextCompleti" --> · [Resident memory admission](batch-graphs.md#resident-memory-admission)
+Each string must contain 1 to 1,048,576 UTF-8 bytes. Each ID sequence must be nonempty and contain integers in `[0, 248320)`. IDs go directly to the decoder. Each prompt and its output budget must fit 262,144 tokens. A batch contains 1 to 32 prompts of one form and shares request options across all items. The sum of output budgets must be at most 262,144 tokens. Invalid prompts and options return HTTP 400 before decoder admission. [Prompt parsing](../apps/server/text_request.cpp#L460)<!-- prefix: "TextCompleti" --> · [Resident memory admission](batch-graphs.md#resident-memory-admission)
 
-HTTP accepts up to 8 KiB of headers and 2 MiB of body. Larger headers return 431 and larger bodies return 413. The server rejects malformed JSON, duplicate decoded keys, nesting beyond 32 containers, and floating-point range errors. It preserves oversized integer `top_k` values for validation and clamping. The frozen `benchmark` parser retains its signed-zero underflow handling and fixed fields. [Numeric dispatch](../apps/server/completions.cpp#L175)<!-- prefix: "json::Value " --> · [Benchmark parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" -->
+HTTP caps headers at 8 KiB (431) and bodies at 2 MiB (413). It rejects malformed JSON, duplicate decoded keys, nesting beyond 32 containers, and floating-point range errors. Oversized integer `top_k` values are clamped after validation. The frozen `benchmark` parser retains signed-zero underflow and fixed fields. [Numeric dispatch](../apps/server/completions.cpp#L175)<!-- prefix: "json::Value " --> · [Benchmark parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" -->
 
 | Field | Behavior |
 | --- | --- |
 | `max_tokens` | Nonnegative integer output budget. Omit it to use 16. Null is invalid. For an unconstrained request, zero returns no output IDs. |
 | `min_tokens` | [Minimum output](output-penalties.md#minimum-output), default zero. |
 | `n` | Omit it or send the integer `1`. Each prompt yields one choice. |
+| `echo` | Boolean, default `false`. Set it to `true` to prepend the prompt to each choice's text. |
 | `stream` | Boolean, default `false`. Set it to `true` for SSE. |
 | `stream_options` | For SSE, set `{"include_usage":true}` to receive a separate usage event. |
 | `ignore_eos` | Boolean, default `false`. Set it to `true` to disable model stop IDs `248044` and `248046` and all explicit stop IDs. |
 | `stop_token_ids` | Array of explicit stop IDs in `[0, 248320)`. The server validates them even when `ignore_eos` is `true`. |
 | `stop` | One nonempty string or an array of nonempty strings. Omission, null, and an empty array disable text stops. |
 | `return_token_ids` | Boolean, default `false`. Set it to `true` to include diagnostic prompt and output IDs for each choice. |
-| `logprobs` | Integer `0`–`20`. Requests [generated-token scores](openai-logprobs.md#text-completions). |
+| `logprobs` | Integer `0`–`20`. Requests [token scores](openai-logprobs.md#text-completions). |
 | `logit_bias` | Optional [per-token offsets](openai-logprobs.md#logit-bias). |
 | `ebnf` | Optional string that restricts output to [one literal choice](#finite-choice-constraints). |
 | `regex` | Optional [whole-output regular expression](output-constraints.md#regular-expressions). |
 | `response_format` | Optional [bounded JSON Schema](output-constraints.md#json-schema). |
 | `cache_salt` | Optional [prefix cache key](prefix-cache.md#runtime-path) component. |
 
-The text route accepts `echo: false` and [output penalties](output-penalties.md), including `repetition_penalty`. It rejects `echo: true`, `max_completion_tokens`, and unknown options. [Request options](../apps/server/text_request.cpp#L452)<!-- prefix: "bool is_text" -->
+Echo copies string prompts and decodes ID prompts with special tokens hidden. Each SSE index echoes once, in its first choice. Stops apply to generated output. With `max_tokens: 0`, echo returns the prompt with zero completion tokens.
+
+The text route accepts [output penalties](output-penalties.md), including `repetition_penalty`, and rejects `max_completion_tokens` and unknown options. [Request options](../apps/server/text_request.cpp#L449)<!-- prefix: "bool is_text" -->
 
 Text, chat, and `/generate` share the immutable tokenizer. On first use, the server checks the size and SHA-256 of the checkpoint's `tokenizer.json`. A missing, unreadable, or mismatched asset returns HTTP 500 before output starts. Later requests retry the load. The benchmark ID route requires no tokenizer.
 
@@ -53,7 +56,7 @@ The binaries and default C++ constructor use visible CUDA ordinal 0. Use `--devi
 
 Set `SGLANG_SERIAL_PREFILL_ROWS=128` to retain 128-row tiles. Values `256`, `512`, `1024`, and `2048` override the cap for serial tensor-core K0 on supported devices. An empty or unrecognized value uses the 128-row cap. Exact prefill, positive-depth MTP, and the batch scheduler ignore this setting.
 
-Prefill processes the aligned prefix and any shorter tail in order. The larger tile fits the prompt and the step cap, both rounded down to multiples of 128. If large scratch is unavailable, prefill retries with a tile bounded by 128 and the step cap. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L477)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L647)<!-- prefix: "PrefillWorks" -->
+Prefill processes the aligned prefix and any shorter tail in order. The larger tile fits the prompt and the step cap, both rounded down to multiples of 128. If large scratch is unavailable, prefill retries with a tile bounded by 128 and the step cap. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L477)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L669)<!-- prefix: "PrefillWorks" -->
 
 The actual tile size determines eligibility for [MXFP8 flash prefill](flash-prefill.md#constraints-and-failure-behavior).
 
@@ -63,7 +66,7 @@ Reserve a B200 and use the same release binaries for both settings. Follow the [
 
 ## Request progress
 
-Serial generation and batch lanes track the next target position and the number of emitted output IDs separately. The position advances with restored prefixes, prompt inputs, and consumed decode rows. Scoring the final prompt row emits the first output without processing another input. Each emitted ID uses one unit of the output budget. For a positive output budget, the logical target KV limit is `prompt length + output budget - 1` positions. [Progress state](../include/sglang/decoder_internal.h#L376)<!-- prefix: "struct Reque" --> · [First score](../src/decoder.cpp#L520)<!-- prefix: "if (progress" -->
+Serial generation and batch lanes track the next target position and the number of emitted output IDs separately. The position advances with restored prefixes, prompt inputs, and consumed decode rows. Scoring the final prompt row emits the first output without processing another input. Each emitted ID uses one unit of the output budget. For a positive output budget, the logical target KV limit is `prompt length + output budget - 1` positions. [Progress state](../include/sglang/decoder_internal.h#L381)<!-- prefix: "struct Reque" --> · [First score](../src/decoder.cpp#L520)<!-- prefix: "if (progress" -->
 
 If `is_cancelled` returns true at entry, direct C++ generation finishes with `cancelled` before prefill. To deliver a selected ID, it appends the ID, calls `on_token`, then records requested top logits. If `on_token` returns false, the result retains that ID and its requested logits and finishes with `cancelled`. Otherwise, a constraint finish or stop match takes precedence over length. In direct MTP, the callback runs before the verifier commits the [consumed target state](mtp.md#runtime-path). [Result update](../src/decoder.cpp#L431)<!-- prefix: "bool SerialO" --> · [Finish decision](../src/decoder.cpp#L323)<!-- prefix: "std::optiona" -->
 
@@ -79,13 +82,13 @@ Native HTTP uses these controls for JSON and SSE. C++ and the generator use the 
 | `min_p` | Number in `[0, 1]`. The minimum weight is `min_p` times the maximum weight in the selection row. |
 | `seed` | Signed 64-bit integer. Omission or null leaves the seed unset. |
 
-Raw text defaults to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Explicit values override them. Null numeric controls other than `seed` return HTTP 400. Chat uses its [server-selected defaults](chat-serving.md#sampling-defaults-and-output-budget). [Route defaults](../apps/server/text_request.cpp#L343)<!-- prefix: "TextRequest " -->
+Raw text defaults to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Explicit values override them. Null numeric controls other than `seed` return HTTP 400. Chat uses its [server-selected defaults](chat-serving.md#sampling-defaults-and-output-budget). [Route defaults](../apps/server/text_request.cpp#L340)<!-- prefix: "TextRequest " -->
 
 The decoder validates options even on the greedy path. CUDA ranks scores in descending order and breaks ties by ascending token ID. It divides score differences by temperature before exponentiation. For `top_p < 1`, the nucleus includes the token where cumulative weight first exceeds `top_p` times the selection row's total weight. The unconstrained row covers the vocabulary. Selection draws from the nucleus intersected with top-k and weights at or above the `min_p` threshold. Each draw depends on the resolved seed and zero-based output index. Identical rows and options preserve draws across slot changes. [Seed resolution](../src/decoder.cpp#L129)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L195)<!-- prefix: "__global__ v" -->
 
-Native text requests can use configured [sampled MTP](mtp.md#sampled-mtp), including requests with an output constraint. The frozen benchmark ID route stays greedy. K0 sampling runs on the decoder stream after eager scoring or [eligible graph replay](batch-graphs.md#runtime-path). [Batch dispatch](../apps/server/batch_service.cpp#L865)<!-- prefix: "DecoderResul" -->
+Native text requests can use configured [sampled MTP](mtp.md#sampled-mtp), including requests with an output constraint. The frozen benchmark ID route stays greedy. K0 sampling runs on the decoder stream after eager scoring or [eligible graph replay](batch-graphs.md#runtime-path). [Batch dispatch](../apps/server/batch_service.cpp#L866)<!-- prefix: "DecoderResul" -->
 
-Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L358)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L907)<!-- prefix: "if (result.s" -->
+Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L358)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L906)<!-- prefix: "if (result.s" -->
 
 An unseeded sampled request resolves one seed with `std::random_device`. The frozen benchmark client explicitly sends `temperature: 0`, `seed: 0`, and `ignore_eos: true`. [Benchmark request](../benchmarks/streaming/client.py#L39)<!-- prefix: "def request_" -->
 
@@ -105,7 +108,7 @@ The compiler matches checkpoint token bytes against literal prefixes. A token ma
 
 CUDA gathers allowed BF16 scores in token ID order or masks the adjusted FP32 row. Both run after eager scoring or K0 graph replay. Greedy breaks ties by lowest token ID. Sampling uses allowed-token weights. The selector returns a vocabulary ID for the four-byte readback. Serial C++ `top_logits` reports full-vocabulary scores. [BF16 selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [FP32 selection](../src/decoder.cpp#L230)<!-- prefix: "void Adjuste" -->
 
-A request stops when it reaches a leaf or completes a literal at the budget limit. This adds no EOS token. At a literal that prefixes a longer choice, the next step can select model EOS if budget remains. A selected EOS counts in usage and diagnostic IDs. The writer omits it from text. Every successful EBNF completion reports HTTP `finish_reason: "stop"`. [Cursor update](../include/sglang/decoder_constraint.h#L134)<!-- prefix: "bool commit(" --> · [HTTP finish](../apps/server/text_completion.cpp#L171)<!-- prefix: "const char* " -->
+A request stops when it reaches a leaf or completes a literal at the budget limit. This adds no EOS token. At a literal that prefixes a longer choice, the next step can select model EOS if budget remains. A selected EOS counts in usage and diagnostic IDs. The writer omits it from text. Every successful EBNF completion reports HTTP `finish_reason: "stop"`. [Cursor update](../include/sglang/decoder_constraint.h#L134)<!-- prefix: "bool commit(" --> · [HTTP finish](../apps/server/text_completion.cpp#L212)<!-- prefix: "const char* " -->
 
 Constrained text can use the configured [MTP depth](mtp.md#runtime-path) and share a batch with other text requests. K0 constraint selection can follow [eligible graph replay](batch-graphs.md#runtime-path).
 
@@ -115,13 +118,13 @@ An invalid constrained winner causes serial `DecoderConstraintError`. The batch 
 
 ## Read the response
 
-JSON returns `choices` in prompt order with `index`, `text`, and `finish_reason` in each choice. SSE sends one choice per data event. Choices can interleave. Join text deltas by the zero-based `index` inside each choice. Each index has one terminal choice. When `stream_options.include_usage` is `true`, one usage event with `choices: []` follows all terminal choices. A successful stream ends with one `[DONE]`. [Batch response](../apps/server/text_completion.cpp#L617)<!-- prefix: "void complet" -->
+JSON returns `choices` in prompt order with `index`, `text`, and `finish_reason` in each choice. SSE sends one choice per data event. Choices can interleave. Join text deltas by the zero-based `index` inside each choice. Each index has one terminal choice. When `stream_options.include_usage` is `true`, one usage event with `choices: []` follows all terminal choices. A successful stream ends with one `[DONE]`. [Batch response](../apps/server/text_completion.cpp#L689)<!-- prefix: "void complet" -->
 
 Usage totals prompt and output IDs. `prompt_tokens_details.cached_tokens` sums [restored prompt IDs](prefix-cache.md#runtime-path). A matching stop ID counts as output and appears in diagnostic IDs. The writer omits its text and reports `stop`, even at the budget. Unconstrained budget exhaustion reports `length`. See [finite-choice](#finite-choice-constraints) and [other constrained finishes](output-constraints.md#selection-and-finish).
 
-Each choice skips special and unmapped IDs in text, holds incomplete UTF-8 across tokens, and replaces malformed bytes or an incomplete final character with U+FFFD. Diagnostic SSE can carry an ID with empty text or final text with zero IDs. Each index's first diagnostic choice includes `prompt_token_ids`, even if that choice is terminal at zero budget. [Response writer](../apps/server/text_completion.cpp#L454)<!-- prefix: "bool TextRes" -->
+Each choice skips special and unmapped IDs in text, holds incomplete UTF-8 across tokens, and replaces malformed bytes or an incomplete final character with U+FFFD. Diagnostic SSE can carry an ID with empty text or final text with zero IDs. Each index's first diagnostic choice includes `prompt_token_ids`, even if that choice is terminal at zero budget. [Response writer](../apps/server/text_completion.cpp#L524)<!-- prefix: "bool TextRes" -->
 
-Both formats omit a matched text stop and subsequent text in that choice. The writer holds a possible stop prefix across tokens and flushes it if generation ends without a match. Nonempty text stops apply with `ignore_eos: true` and conflict with output constraints. A text stop yields `stop` and counts through the matching token, even when [batched MTP](mtp.md#runtime-path) produces further IDs in that step. Other choices continue. A failed write or TCP reset cancels unfinished choices and discards pending bytes. [Stop matching](../apps/server/text_completion.cpp#L394)<!-- prefix: "std::string " --> · [Finish choice](../apps/server/text_completion.cpp#L482)<!-- prefix: "std::optiona" --> · [Batch token delivery](../apps/server/text_completion.cpp#L531)<!-- prefix: "bool consume" --> · [Completion streams](http-server.md#completion-streams)
+Both formats omit a matched text stop and subsequent text in that choice. The writer holds a possible stop prefix across tokens and flushes it if generation ends without a match. Nonempty text stops apply with `ignore_eos: true` and conflict with output constraints. A text stop yields `stop` and counts through the matching token, even when [batched MTP](mtp.md#runtime-path) produces further IDs in that step. Other choices continue. A failed write or TCP reset cancels unfinished choices and discards pending bytes. [Stop matching](../apps/server/text_completion.cpp#L464)<!-- prefix: "std::string " --> · [Finish choice](../apps/server/text_completion.cpp#L552)<!-- prefix: "std::optiona" --> · [Batch token delivery](../apps/server/text_completion.cpp#L602)<!-- prefix: "bool consume" --> · [Completion streams](http-server.md#completion-streams)
 
 ## Run with bundled libraries
 

@@ -310,7 +310,8 @@ bool BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& st
         jobs[slot].reset();
         return false;
     }
-    const bool published = step.token && !job.cancelled && !job.aborted();
+    const bool published = (step.token || step.prompt_logprobs) &&
+        !step.sampling_failed && !job.cancelled && !job.aborted();
     if (published) {
         const bool first_token = !std::exchange(job.prefill_completed, true);
         if (counters.cache_capacity != 0 && !job.health_check) {
@@ -318,7 +319,7 @@ bool BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& st
                 counters.prompt_tokens += job.prompt_tokens;
                 ++counters.prefill_requests;
             }
-            counters.generation_tokens += 1 + step.extra_token_count;
+            counters.generation_tokens += step.token.has_value() + step.extra_token_count;
         }
         job.output_overlapped |= !job.pending.empty();
         job.pending.push(step);

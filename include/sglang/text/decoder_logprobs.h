@@ -19,5 +19,8 @@ cudaError_t enqueue_generated_logprobs(const __nv_bfloat16* logits, int vocabula
                                        const TextLogitCandidate* winner, int top, void* workspace,
                                        GeneratedLogprobReadback* host, cudaStream_t stream,
                                        const float* biased_logits = nullptr);
+cudaError_t enqueue_prompt_logprobs(const __nv_bfloat16* logits, int vocabulary, int token,
+                                    int top, void* workspace, GeneratedLogprobReadback* host,
+                                    cudaStream_t stream);
 
 }

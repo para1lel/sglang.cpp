@@ -334,9 +334,6 @@ int openai_logprob_count(const json::Object& object, bool chat) {
     if (chat) {
         return read_bool(object, "logprobs") ? static_cast<int>(*top) : -1;
     }
-    if (read_bool(object, "echo")) {
-        bad_request("Text completions do not support echo");
-    }
     return enabled && !enabled->is_null() ? static_cast<int>(*top) : -1;
 }
 
@@ -484,10 +481,13 @@ TextCompletionRequest parse_text(const json::Object& object,
     TextCompletionRequest completion;
     auto& request = completion.request;
     request = text_options(object, tokenizer, false);
+    const bool echo = read_bool(object, "echo");
+    request.options.score_prompt = echo && request.options.generated_top_logprobs > 0;
     const int budget = request.options.max_new_tokens;
     const bool batch = list && (list->front().string() || list->front().array());
     if (!batch) {
         request.prompt = completion_prompt(*prompt, list == nullptr, budget, tokenizer);
+        if (echo) request.echo = completion_echo(*prompt, request.prompt, tokenizer.get());
         finish_options(request, object, tokenizer);
         return completion;
     }
@@ -504,6 +504,10 @@ TextCompletionRequest parse_text(const json::Object& object,
             bad_request("Expected a homogeneous list of text prompts or token ID arrays");
         }
         completion.batch.push_back({completion_prompt(item, text, budget, tokenizer), {}});
+        if (echo) {
+            completion.batch_echoes.push_back(
+                completion_echo(item, completion.batch.back().prompt, tokenizer.get()));
+        }
     }
     finish_options(request, object, tokenizer);
     for (auto& item : completion.batch) {
@@ -672,13 +676,6 @@ CompletionTokenizer::CompletionTokenizer(const std::filesystem::path& checkpoint
     : checkpoint_(checkpoint), sampling_mode_(sampling), chat_parsers_(parsers) {}
 
 CompletionTokenizer::~CompletionTokenizer() = default;
-
-const Tokenizer& CompletionTokenizer::get() const {
-    std::call_once(loaded_, [this] {
-        tokenizer_ = std::make_unique<const Tokenizer>(checkpoint_ / "tokenizer.json");
-    });
-    return *tokenizer_;
-}
 
 const ChatTemplate& CompletionTokenizer::chat_template() const {
     std::call_once(chat_loaded_, [this] {

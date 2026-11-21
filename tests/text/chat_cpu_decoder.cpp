@@ -155,6 +155,7 @@ struct Lane {
     const std::vector<int>* script = scripted_output(options);
     int tokens = 0;
     bool health = false;
+    std::shared_ptr<const DecoderPromptLogprobs> prompt_scores = nullptr;
 
     DecoderBatchStep step() {
         if (tokens == options.max_new_tokens) {
@@ -191,6 +192,7 @@ struct Lane {
         const bool speculative = script && tokens != 0 && options.mtp_steps > 0 &&
                                  std::getenv("SGLANG_TEST_SCRIPTED_MTP");
         auto result = step();
+        result.prompt_logprobs = std::exchange(prompt_scores, nullptr);
         if (!speculative || !result.token || result.finish_reason) {
             return result;
         }
@@ -207,6 +209,19 @@ struct Lane {
         return result;
     }
 };
+
+std::shared_ptr<const DecoderPromptLogprobs> scripted_prompt_scores(
+    const std::vector<int>& prompt, int top) {
+    auto scores = std::make_shared<DecoderPromptLogprobs>();
+    for (std::size_t index = 1; index < prompt.size(); ++index) {
+        DecoderTokenLogprobs row{{prompt[index], -1.5f * index}, {}};
+        for (int rank = 0; rank < top; ++rank) {
+            row.alternatives.push_back({32 + rank, -0.125f * (rank + 1)});
+        }
+        scores->push_back(std::make_shared<const DecoderTokenLogprobs>(std::move(row)));
+    }
+    return scores;
+}
 
 bool health_control(std::string_view name) {
     const auto* path = std::getenv("SGLANG_TEST_HEALTH_CONTROL");
@@ -281,6 +296,9 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     }
     lane.emplace(Lane{options, prompt.size()});
     lane->health = health;
+    if (options.score_prompt) {
+        lane->prompt_scores = scripted_prompt_scores(prompt, options.generated_top_logprobs);
+    }
     record_sampling(options, prompt.size());
     std::cerr << ("cpu admit slot=" + std::to_string(slot) +
                   " prompt=" + std::to_string(prompt.size()) +

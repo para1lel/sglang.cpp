@@ -330,6 +330,20 @@ std::size_t available_device_bytes() {
     return free;
 }
 
+void validate_batch_options(const DecoderBatchOptions& options) {
+    if (options.max_lanes < 1 || options.max_lanes > decoder_batch_max_lanes) {
+        throw std::invalid_argument("Invalid decoder batch capacity");
+    }
+    if (options.prefix_cache_entries < 0 ||
+        options.prefix_cache_entries > decoder_batch_prefix_max_entries) {
+        throw std::invalid_argument("Invalid prefix cache capacity");
+    }
+    if (options.max_num_batched_tokens < 0 ||
+        options.max_num_batched_tokens > decoder_batch_max_step_tokens) {
+        throw std::invalid_argument("Invalid decoder batch step budget");
+    }
+}
+
 int reserved_verification_rows(int output, int mtp_steps) {
     return mtp_steps && output > 1 ? std::min(mtp_steps + 1, output - 1) : 0;
 }
@@ -350,7 +364,8 @@ int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t
                           std::size_t free_bytes, std::size_t extra_bytes) {
     const auto fits = [&](int output, std::size_t bytes) {
         const auto resident = request_resident_bytes(
-            prompt + output - 1, reserved_verification_rows(output, options.mtp_steps),
+            prompt + std::max(output, int(options.score_prompt)) - 1,
+            reserved_verification_rows(output, options.mtp_steps),
             options.mtp_steps != 0);
         return resident + extra_bytes <= bytes;
     };
@@ -366,7 +381,8 @@ int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t
             }
         }
     }
-    if (output == 0 || !fits(output, total_bytes)) {
+    if ((output == 0 && (!options.score_prompt || options.max_new_tokens > 0)) ||
+        !fits(output, total_bytes)) {
         throw DecoderCapacityError("Prompt and output budget exceed resident decoder capacity",
                                    false);
     }

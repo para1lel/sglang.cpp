@@ -6,6 +6,7 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_sampling.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -17,6 +18,8 @@
 
 namespace sglang {
 class Checkpoint;
+struct DecoderBatchOptions;
+struct DecoderBatchStep;
 }
 
 namespace sglang::decoder {
@@ -25,6 +28,7 @@ class MtpDraftWeights;
 class MtpDraftRequest;
 class PrefillWorkspace;
 struct PrefillGrant;
+struct PromptLogprobCapture;
 struct MediaPrefill;
 struct MultimodalInput;
 class TargetVerification;
@@ -92,6 +96,7 @@ struct CudaError : std::runtime_error {
 };
 
 std::size_t available_device_bytes();
+void validate_batch_options(const DecoderBatchOptions& options);
 int reserved_verification_rows(int output, int mtp_steps);
 std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft);
 int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t total_bytes,
@@ -381,7 +386,7 @@ struct RequestProgress {
     ConstraintCursor constraint{};
 
     static int capacity(int prompt, const DecoderOptions& options) {
-        return prompt + options.max_new_tokens - 1;
+        return prompt + std::max(options.max_new_tokens, int(options.score_prompt)) - 1;
     }
     int remaining_prompt(int prompt) const { return position < prompt ? prompt - position : 0; }
     int remaining_output(const DecoderOptions& options) const {
@@ -472,7 +477,8 @@ struct Decoder::Model {
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
                        decoder::PrefillWorkspace& workspace,
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
-                       const decoder::MediaPrefill* media = nullptr) const;
+                       const decoder::MediaPrefill* media = nullptr,
+                       const decoder::PromptLogprobCapture* scores = nullptr) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
                         bool tensor_cache, bool layerwise, bool mixed,
                         DecoderBatchStepStats& stats) const;
@@ -486,6 +492,7 @@ struct Decoder::Model {
     void seed_draft(decoder::Workspace& work, decoder::MtpDraftRequest& draft, int position,
                     int shifted_token, cudaStream_t stream) const;
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
+    void compute_prefill_logits(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request, bool decode = false) const;
     void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;
     bool prefill_serial(decoder::Request& request, decoder::RequestProgress& progress,

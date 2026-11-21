@@ -1,8 +1,10 @@
 #include "sglang/decoder_prefill.h"
+#include "sglang/decoder_batch.h"
 
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/prefill_fp8.h"
+#include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/prefill_attn_sm100.h"
 
 #include <algorithm>
@@ -413,6 +415,26 @@ void stage_prefill_row(Request& request, const TileBuffers& work, int row, cudaS
                           cudaMemcpyDeviceToDevice, stream), "Stage final prefill residual row");
 }
 
+void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant,
+                            const TileBuffers* buffers, int offset, cudaStream_t stream) {
+    if (!grant.scores) return;
+    const auto& capture = *grant.scores;
+    const int scored = capture.scored_rows(grant.position, grant.rows);
+    for (int start = 0; start < scored; start += decoder_batch_max_lanes) {
+        const int count = std::min(scored - start, decoder_batch_max_lanes);
+        for (int index = 0; index < count; ++index) {
+            const int row = start + index;
+            auto work = grant.request->work;
+            if (buffers) {
+                work.hidden = buffers->hidden + (offset + row) * hidden_size;
+                work.residual = buffers->residual + (offset + row) * hidden_size;
+            }
+            capture.enqueue(model, work, grant.position + row, index, stream);
+        }
+        capture.collect(count, stream);
+    }
+}
+
 constexpr int layerwise_row_alignment = 128;
 constexpr int max_layerwise_rows = 1023;
 static_assert(max_layerwise_rows / 256 <= max_gdn_prefill_segments);
@@ -552,8 +574,7 @@ void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
     });
 }
 
-void prefill_layerwise(const std::array<Layer, layer_count>& layers,
-                       const Bf16* embedding, const PrefillGrant* grants, PrefillGroup group,
+void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, PrefillGroup group,
                        PrefillWorkspace& workspace, bool mixed) {
     const auto stream = workspace.stream();
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
@@ -561,11 +582,11 @@ void prefill_layerwise(const std::array<Layer, layer_count>& layers,
     const bool grouped = group.rows > max_layerwise_rows;
     const Chunk chunk{{buffers.activation, group.rows, stream, true, grouped}, buffers, 0, nullptr};
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
-        gather_embeddings(embedding, grant.tokens, grant.rows,
+        gather_embeddings(model.embedding, grant.tokens, grant.rows,
                           buffers.residual + offset * hidden_size, stream);
     });
     execute_layers(
-        layers,
+        model.layers,
         [&](const Bf16* weight, const char*, const auto& residuals) {
             const auto [branch, residual] = residuals(buffers);
             chunk.normalize(branch, residual, weight);
@@ -590,6 +611,7 @@ void prefill_layerwise(const std::array<Layer, layer_count>& layers,
         },
         [&](const Layer& layer) { chunk.mlp(layer); });
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
+        capture_prefill_scores(model, grant, &buffers, offset, stream);
         stage_prefill_row(*grant.request, buffers, offset + grant.rows - 1, stream);
     });
 }
@@ -723,9 +745,44 @@ void Decoder::Model::seed_draft(Workspace& work, MtpDraftRequest& draft, int pos
     draft.enqueue(position, shifted_token, work.normalized, false, stream);
 }
 
+int PromptLogprobCapture::scored_rows(int position, int rows) const {
+    return std::min(rows, static_cast<int>(prompt->size()) - position - 1);
+}
+
+void PromptLogprobCapture::enqueue(const DecoderModel& model, Workspace& work, int position,
+                                  int index, cudaStream_t stream) const {
+    model.compute_prefill_logits(work, stream);
+    const int token = (*prompt)[position + 1];
+    check(enqueue_prompt_logprobs(work.logits, vocab_size, token, top, workspace,
+                                  readback + index, stream), "Score prompt token");
+}
+
+void PromptLogprobCapture::collect(int rows, cudaStream_t stream) const {
+    if (!rows) return;
+    check(cudaStreamSynchronize(stream), "Collect prompt token scores");
+    for (int index = 0; index < rows; ++index) {
+        const auto& row = readback[index];
+        output->push_back(
+            row.selected.token_id < 0 ? nullptr : collect_generated_logprobs(row, top));
+    }
+}
+
+void decoder::finish_prompt_logprobs(const DecoderOptions& options, DecoderPromptLogprobs& scores,
+                                     DecoderBatchStep& result) {
+    result.sampling_failed = std::any_of(scores.begin(), scores.end(),
+                                        [](const auto& row) { return !row; });
+    if (!result.sampling_failed) {
+        result.prompt_logprobs = std::make_shared<DecoderPromptLogprobs>(std::move(scores));
+    }
+    if (options.max_new_tokens == 0 || result.sampling_failed) {
+        result.finish_reason = DecoderFinishReason::length;
+    }
+}
+
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
                                    PrefillWorkspace& workspace, MtpDraftRequest* draft,
-                                   int prompt_remaining, const MediaPrefill* media) const {
+                                   int prompt_remaining, const MediaPrefill* media,
+                                   const PromptLogprobCapture* scores) const {
     const auto stream = workspace.stream();
     if (!stream || !tokens || rows < 1 || rows > workspace.capacity() || position < 0 ||
         position > text_attention_max_tokens - rows ||
@@ -738,6 +795,8 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                          [](int token) { return token >= 0 && token < vocab_size; })) {
             throw std::invalid_argument("Invalid decoder prefill token");
         }
+        int pending = 0;
+        const int scored = scores ? scores->scored_rows(position, rows) : 0;
         for (int row = 0; row < rows; ++row) {
             const int token_position = position + row;
             const ForwardLane lane{
@@ -745,10 +804,17 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                 media ? media->feature(token_position) : nullptr,
                 media ? media->positions + token_position : nullptr};
             forward(&lane, 1, stream);
+            if (row < scored) {
+                scores->enqueue(*this, request.work, token_position, pending++, stream);
+                if (pending == decoder_batch_max_lanes) {
+                    scores->collect(std::exchange(pending, 0), stream);
+                }
+            }
             if (draft && row + 1 < prompt_remaining) {
                 seed_draft(request.work, *draft, token_position, tokens[row + 1], stream);
             }
         }
+        if (scores) scores->collect(pending, stream);
         return;
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
@@ -779,6 +845,11 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                    [&](const Layer& layer) { chunk.mlp(layer); });
     if (draft && prompt_remaining > 1) {
         chunk.seed_draft(*draft, tokens + 1, std::min(rows, prompt_remaining - 1), final_norm);
+    }
+    if (scores) {
+        const PrefillGrant grant{&request, tokens, position, rows, rows, 0, nullptr, nullptr,
+                                 scores};
+        capture_prefill_scores(*this, grant, &work, 0, stream);
     }
     stage_prefill_row(request, work, rows - 1, stream);
 }
@@ -820,17 +891,19 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
             ? projection_group(grants + index, count - index, max_rows, mixed) : PrefillGroup{1, 0};
         const auto& grant = grants[index];
         if (group.grants > 1) {
-            prefill_layerwise(layers, embedding, grants + index, group, *workspace, mixed);
+            prefill_layerwise(*this, grants + index, group, *workspace, mixed);
             ++stats.layerwise_prefill_groups;
             stats.layerwise_prefill_rows += group.rows;
         } else if (grant.rows == 1 && grant.draft && grant.prompt_remaining > 1) {
             seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1], stream);
-        } else if (grant.rows > 1) {
+        } else if (grant.rows == 1) {
+            capture_prefill_scores(*this, grant, nullptr, 0, stream);
+        } else {
             for (int offset = 0; offset < grant.rows;) {
                 const int count = std::min(grant.tile_rows, grant.rows - offset);
                 prefill_chunk(*grant.request, grant.tokens + offset, count,
                               grant.position + offset, *workspace, grant.draft,
-                              grant.prompt_remaining - offset, grant.media);
+                              grant.prompt_remaining - offset, grant.media, grant.scores);
                 offset += count;
             }
         }

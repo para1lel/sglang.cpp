@@ -115,7 +115,8 @@ __device__ float log_probability(float score, float maximum, float log_mass) {
 
 template <typename Score>
 __global__ void finish_row(const Score* logits, int vocabulary,
-                           const TextLogitCandidate* winner, int count, int top, Scratch* scratch) {
+                           const TextLogitCandidate* winner, int token, int count, int top,
+                           Scratch* scratch) {
     __shared__ union {
         FloatReduce::TempStorage reduce;
         KeyReduce::TempStorage rank;
@@ -132,7 +133,7 @@ __global__ void finish_row(const Score* logits, int vocabulary,
         scratch->result.selected = {-1, 0.0f};
     }
     __syncthreads();
-    const int chosen = winner->token_id;
+    const int chosen = winner ? winner->token_id : token;
     if (!isfinite(maximum) || chosen < 0 || chosen >= vocabulary) {
         return;
     }
@@ -166,9 +167,10 @@ std::size_t generated_logprob_workspace_bytes() { return sizeof(Scratch); }
 
 template <typename Score>
 cudaError_t enqueue_logprobs(const Score* logits, int vocabulary,
-                                       const TextLogitCandidate* winner, int top, void* workspace,
-                                       GeneratedLogprobReadback* host, cudaStream_t stream) {
-    if (!logits || !winner || !workspace || !host || vocabulary < 1 ||
+                             const TextLogitCandidate* winner, int token, int top, void* workspace,
+                             GeneratedLogprobReadback* host, cudaStream_t stream) {
+    if (!logits || (!winner && (token < 0 || token >= vocabulary)) || !workspace || !host ||
+        vocabulary < 1 ||
         vocabulary > max_vocabulary || top < 0 || top > decoder_max_generated_top_logprobs ||
         top > vocabulary) {
         return cudaErrorInvalidValue;
@@ -180,7 +182,7 @@ cudaError_t enqueue_logprobs(const Score* logits, int vocabulary,
     measure_tiles<<<count, threads, 0, stream>>>(logits, vocabulary, top, scratch->tiles);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    finish_row<<<1, threads, 0, stream>>>(logits, vocabulary, winner, count, top, scratch);
+    finish_row<<<1, threads, 0, stream>>>(logits, vocabulary, winner, token, count, top, scratch);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     return cudaMemcpyAsync(host, &scratch->result, offsetof(GeneratedLogprobReadback, alternatives)
@@ -191,10 +193,17 @@ cudaError_t enqueue_generated_logprobs(const __nv_bfloat16* logits, int vocabula
                                        const TextLogitCandidate* winner, int top, void* workspace,
                                        GeneratedLogprobReadback* host, cudaStream_t stream,
                                        const float* biased_logits) {
+    if (!winner) return cudaErrorInvalidValue;
     if (biased_logits) {
-        return enqueue_logprobs(biased_logits, vocabulary, winner, top, workspace, host, stream);
+        return enqueue_logprobs(biased_logits, vocabulary, winner, 0, top, workspace, host, stream);
     }
-    return enqueue_logprobs(logits, vocabulary, winner, top, workspace, host, stream);
+    return enqueue_logprobs(logits, vocabulary, winner, 0, top, workspace, host, stream);
+}
+
+cudaError_t enqueue_prompt_logprobs(const __nv_bfloat16* logits, int vocabulary, int token,
+                                    int top, void* workspace, GeneratedLogprobReadback* host,
+                                    cudaStream_t stream) {
+    return enqueue_logprobs(logits, vocabulary, nullptr, token, top, workspace, host, stream);
 }
 
 }

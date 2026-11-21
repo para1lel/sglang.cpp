@@ -56,7 +56,8 @@ class OpenAILogprobs(unittest.TestCase):
         for choice in answer["choices"]:
             chunks = grouped[choice["index"]]
             self.assertEqual(chunks[-1]["finish_reason"], choice["finish_reason"])
-            self.assertIsNone(chunks[-1]["logprobs"])
+            if not (payload.get("echo") and len(chunks) == 1):
+                self.assertIsNone(chunks[-1]["logprobs"])
             self.assertTrue(all(chunk["finish_reason"] is None for chunk in chunks[:-1]))
             self.assertEqual([token for chunk in chunks for token in chunk.get("token_ids", [])],
                              choice.get("token_ids", []))
@@ -159,10 +160,57 @@ class OpenAILogprobs(unittest.TestCase):
                     else:
                         self.assertTrue(all(row["top_logprobs"] == [] for row in rows["content"]))
 
+    def test_echo_prompt_forms_usage_and_stops(self):
+        cases = (("BC\n", ["BC\n"]), (["BC", "  A\n"], ["BC", "  A\n"]),
+                 ([248046, 33, 34], ["BC"]), ([[248046, 33, 34], [32]], ["BC", "A"]))
+        for prompt, rendered in cases:
+            for budget in (0, 4):
+                for top in (0, 2):
+                    with self.subTest(prompt=prompt, budget=budget, top=top):
+                        payload = self.payload(TEXT, top=top, prompt=prompt, echo=True,
+                                               seed=11, max_tokens=budget, stop="BC")
+                        answer, chunks = self.pair(TEXT, payload)
+                        count = 3 if budget else 0
+                        self.assertEqual(answer["usage"]["completion_tokens"],
+                                         count * len(rendered))
+                        for choice, text in zip(answer["choices"], rendered):
+                            self.assertEqual(choice["text"], text + ("A" if budget else ""))
+                            self.assertEqual(choice["finish_reason"], "stop" if budget else
+                                             "length")
+                            self.assertEqual(chunks[choice["index"]][0]["text"],
+                                             text + ("A" if budget else ""))
+                            ids = choice["prompt_token_ids"]
+                            prompt_values = [None] + [-1.5 * offset
+                                                      for offset in range(1, len(ids))]
+                            expected = (prompt_values if top else []) + [
+                                -0.25 * offset for offset in range(1, count + 1)
+                            ]
+                            scores = choice["logprobs"]
+                            self.assertEqual(scores["token_logprobs"], expected)
+                            self.assertEqual(scores["text_offset"], [-1] * len(expected))
+                            if top:
+                                self.assertIsNone(scores["top_logprobs"][0])
+                                self.assertEqual(scores["top_logprobs"][1:len(ids)],
+                                                 [{"A": -0.125, "B": -0.25}] * (len(ids) - 1))
+                            else:
+                                self.assertEqual(scores["top_logprobs"], [])
+
+    def test_echo_unscored_and_stop_never_crosses_prompt(self):
+        for echo in (False, True):
+            answer = self.exchange(TEXT, body(TEXT, prompt="B", seed=11, echo=echo,
+                                              temperature=0, max_tokens=1, stop="BA"))
+            choice = answer["choices"][0]
+            self.assertEqual(choice["text"], "BA" if echo else "A")
+            self.assertEqual(choice["finish_reason"], "length")
+            self.assertNotIn("logprobs", choice)
+        answer = self.exchange(TEXT, body(TEXT, prompt=[248046], echo=True, max_tokens=0))
+        self.assertEqual(answer["choices"][0]["text"], "")
+        self.assertEqual(answer["usage"]["completion_tokens"], 0)
+
     def test_validation_opt_out_and_frozen_legacy(self):
         for route, invalid in (
             (TEXT, ({"logprobs": False}, {"logprobs": -1}, {"logprobs": 21},
-                    {"logprobs": 1.5}, {"echo": True}, {"n": 2}, {"regex": "A+"},
+                    {"logprobs": 1.5}, {"echo": "true"}, {"n": 2}, {"regex": "A+"},
                     {"temperature": .5})),
             (CHAT, ({"logprobs": 1}, {"top_logprobs": -1}, {"top_logprobs": 21},
                     {"top_logprobs": 1.5}, {"n": 2}, {"regex": "A+"}, {"temperature": .5})),

@@ -10,6 +10,22 @@ struct PrefillPool;
 
 void reclaim_prefill_workspaces(int device);
 
+struct PromptLogprobCapture {
+    const std::vector<int>* prompt;
+    DecoderPromptLogprobs* output;
+    GeneratedLogprobReadback* readback;
+    void* workspace;
+    int top;
+
+    int scored_rows(int position, int rows) const;
+    void enqueue(const DecoderModelAccess::Model& model, Workspace& work, int position,
+                 int index, cudaStream_t stream) const;
+    void collect(int rows, cudaStream_t stream) const;
+};
+
+void finish_prompt_logprobs(const DecoderOptions& options, DecoderPromptLogprobs& scores,
+                            DecoderBatchStep& result);
+
 struct PrefillGrant {
     Request* request;
     const int* tokens;
@@ -19,6 +35,7 @@ struct PrefillGrant {
     int prompt_remaining;
     MtpDraftRequest* draft;
     const MediaPrefill* media;
+    const PromptLogprobCapture* scores = nullptr;
 };
 
 struct PrefillProjections {

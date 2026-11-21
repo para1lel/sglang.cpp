@@ -29,6 +29,10 @@ struct OutputMailbox {
 
 inline bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& callbacks,
                       DecoderResult& result) {
+    if (step.prompt_logprobs) {
+        result.prompt_logprobs = step.prompt_logprobs;
+    }
+    if (!step.token) return true;
     result.mtp_rounds += step.mtp_drafted_tokens != 0;
     result.mtp_drafted_tokens += step.mtp_drafted_tokens;
     result.output_token_ids.push_back(*step.token);

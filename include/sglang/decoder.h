@@ -51,6 +51,7 @@ struct DecoderOptions {
     double repetition_penalty = 1.0;
     int min_new_tokens = 0;
     bool ignore_eos = false;
+    bool score_prompt = false;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 
@@ -122,6 +123,8 @@ struct DecoderTokenLogprobs {
     std::vector<DecoderLogprob> alternatives;
 };
 
+using DecoderPromptLogprobs = std::vector<std::shared_ptr<const DecoderTokenLogprobs>>;
+
 struct DecoderResult {
     std::vector<int> output_token_ids;
     DecoderFinishReason finish_reason = DecoderFinishReason::length;
@@ -133,6 +136,7 @@ struct DecoderResult {
     std::size_t cached_prompt_tokens = 0;
     std::optional<std::size_t> matched_text_stop = std::nullopt;
     std::vector<std::shared_ptr<const DecoderTokenLogprobs>> generated_logprobs{};
+    std::shared_ptr<const DecoderPromptLogprobs> prompt_logprobs = nullptr;
 };
 
 enum class Fp8PrefillPolicy {

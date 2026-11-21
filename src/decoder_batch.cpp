@@ -10,10 +10,8 @@
 #include "sglang/decoder_prefix_cache.h"
 #include "sglang/prefill_fp8.h"
 #include "sglang/text/prefill_attn_sm100.h"
-
 #include <algorithm>
 #include <utility>
-
 namespace sglang {
 namespace {
 
@@ -36,6 +34,7 @@ struct Lane {
     std::shared_ptr<const MultimodalInput> media = nullptr;
     MediaPrefill media_prefill{};
     std::size_t resident_bytes = 0;
+    DecoderPromptLogprobs prompt_logprobs{};
 
     int remaining_prompt() const { return progress.remaining_prompt(int(prompt.size())); }
     int prefill_limit() const {
@@ -309,17 +308,7 @@ struct DecoderBatch::State {
           tensor_cache(options.prefix_cache_entries > 0 &&
                        model.fp8_prefill() == Fp8PrefillPolicy::tensor_core),
           execution(model.device) {
-        if (options.max_lanes < 1 || options.max_lanes > decoder_batch_max_lanes) {
-            throw std::invalid_argument("Invalid decoder batch capacity");
-        }
-        if (options.prefix_cache_entries < 0 ||
-            options.prefix_cache_entries > decoder_batch_prefix_max_entries) {
-            throw std::invalid_argument("Invalid prefix cache capacity");
-        }
-        if (options.max_num_batched_tokens < 0 ||
-            options.max_num_batched_tokens > decoder_batch_max_step_tokens) {
-            throw std::invalid_argument("Invalid decoder batch step budget");
-        }
+        validate_batch_options(options);
         DeviceScope device(model.device);
         storage->weights = model.memory;
         if (options.prefix_cache_entries != 0) {
@@ -469,9 +458,11 @@ void DecoderBatch::State::initialize(Lane& lane) {
         lane.media_prefill = upload_media_positions(*lane.request, *lane.media, stream);
     } else if (auto& cache = storage->prefix_cache) {
         lane.checkpoint = PrefixCache::checkpoint(prompt);
-        lane.progress.advance(cache->restore(*lane.request, lane.prompt, opts.prefix_cache_salt,
-                                             stream, lane.draft.get()));
-        lane.counted_draft_rows = lane.draft ? lane.draft->valid_prefix() : 0;
+        if (!opts.score_prompt) {
+            lane.progress.advance(cache->restore(*lane.request, lane.prompt, opts.prefix_cache_salt,
+                                                 stream, lane.draft.get()));
+            lane.counted_draft_rows = lane.draft ? lane.draft->valid_prefix() : 0;
+        }
     }
     if (lane.progress.position == 0) {
         lane.request->reset(stream);
@@ -507,7 +498,8 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     validate_request(prompt, options, !media);
     if (options.requires_target_only()) options.mtp_steps = 0;
     const int top = options.generated_top_logprobs;
-    if (top < -1 || top > decoder_max_generated_top_logprobs ||
+    if ((options.score_prompt && top <= 0) ||
+        top < -1 || top > decoder_max_generated_top_logprobs ||
         (top >= 0 && (media || options.samples() || options.constraint || options.mtp_steps ||
                       options.top_logits || state_->output))) {
         throw std::invalid_argument("Generated logprobs require unconstrained greedy batch K=0");
@@ -521,7 +513,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     if (options.mtp_steps != 0 && !state_->model.mtp_weights) {
         throw std::invalid_argument("Decoder batch requires draft weights for MTP");
     }
-    if (options.max_new_tokens == 0) {
+    if (options.max_new_tokens == 0 && !options.score_prompt) {
         lane.emplace(Lane{nullptr, std::move(prompt), options});
         return 0;
     }
@@ -696,7 +688,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
                 greedy_winners |= std::uint64_t{1} << packed_slots[slot];
             }
         }
-        if (rows[slot] == remaining) {
+        if (rows[slot] == remaining && lane.options.max_new_tokens > 0) {
             scoring[slot] = lane.request.get();
         }
     }
@@ -745,6 +737,7 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
     const bool wide = !cache_tile && model.is_b200() &&
         model.fp8_prefill() == Fp8PrefillPolicy::tensor_core && sm100_prefill_enabled();
     std::array<PrefillGrant, decoder_batch_max_lanes> grants;
+    std::array<PromptLogprobCapture, decoder_batch_max_lanes> captures;
     int count = 0;
     bool contains_decode = false;
     bool text_batch = true;
@@ -763,9 +756,15 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
             limit = serial_prefill_max_rows;
         }
         const int position = lane.progress.position;
-        grants[count++] = {lane.request.get(), lane.prompt.data() + position, position, rows[slot],
-                           std::min(rows[slot], limit), lane.prefill_limit(), lane.draft.get(),
-                           lane.media ? &lane.media_prefill : nullptr};
+        if (lane.options.score_prompt) {
+            captures[count] = {&lane.prompt, &lane.prompt_logprobs, logprob_readback,
+                               logprob_workspace, lane.options.generated_top_logprobs};
+        }
+        grants[count] = {lane.request.get(), lane.prompt.data() + position, position, rows[slot],
+                         std::min(rows[slot], limit), lane.prefill_limit(), lane.draft.get(),
+                         lane.media ? &lane.media_prefill : nullptr,
+                         lane.options.score_prompt ? &captures[count] : nullptr};
+        ++count;
     }
     const bool mixed = contains_decode && text_batch;
     const bool layerwise = (only_prefill || mixed) && !contains_mtp && !tensor_cache &&
@@ -937,6 +936,9 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
                     }
                 }
                 lane->progress.advance(std::max(1, rows));
+                if (rows && lane->options.score_prompt && !lane->remaining_prompt()) {
+                    finish_prompt_logprobs(lane->options, lane->prompt_logprobs, result);
+                }
             }
             if (result.finish_reason) {
                 retire(lane);

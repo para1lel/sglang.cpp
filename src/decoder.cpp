@@ -648,7 +648,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
                                 const DecoderOptions& options,
                                 const DecoderCallbacks& callbacks) const {
     validate_request(prompt_token_ids, options, true);
-    if (options.generated_top_logprobs != -1) {
+    if (options.generated_top_logprobs != -1 || options.score_prompt) {
         throw std::invalid_argument("Generated logprobs require the batch decoder");
     }
     const int proposals = options.requires_target_only() ? 0 : options.mtp_steps;

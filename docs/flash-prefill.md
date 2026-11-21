@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L756)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L350)<!-- prefix: "const auto s" --> |
+| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L822)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L352)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L908)<!-- prefix: "cudaError_t " --> |
 | Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L545)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L751)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
@@ -55,13 +55,13 @@ Two stages alternate scores, BF16 probabilities, and V. Producers await QK befor
 
 PV awaits both CTAs' BF16 probabilities and V, then releases operands. Softmax preserves 64-key reduction order and rescales the FP32 accumulator after the preceding PV. The final wait precedes output, deallocation, and repair. [Operand wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L646)<!-- prefix: "pair_wait(tm" --> · [Correction](../src/text/mxfp8_gqa_prefill_tmem.cu#L705)<!-- prefix: "tmem_correct" --> · [Final wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L711)<!-- prefix: "tmem_mma_wai" --> · [Repair](../src/text/mxfp8_gqa_prefill_tmem.cu#L590)<!-- prefix: "__device__ v" -->
 
-Capture records one node with maps by value and zero global scratch. Keep KV, pages, queries, and output valid through replay. Intermediate prefill can skip scoring. [Arguments](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Batch scoring](../src/decoder_batch.cpp#L699)<!-- prefix: "if (rows[slo" -->
+Capture records one node with maps by value and zero global scratch. Keep KV, pages, queries, and output valid through replay. Intermediate prefill can skip scoring. [Arguments](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Batch scoring](../src/decoder_batch.cpp#L751)<!-- prefix: "if (rows[slo" -->
 
 Split TMEM uses three contiguous partitions per query block and head pair. Its 76,087,296 scratch bytes hold FP32 numerators, maxima, and masses. Merge rescales, combines, normalizes, and rounds to BF16. Allocation and release share one stream. [Scratch allocation](../src/text/mxfp8_gqa_prefill_tmem.cu#L973)<!-- prefix: "status = cud" -->
 
 ## Constraints and failure behavior
 
-Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L736)<!-- prefix: "if (rows == " -->
+Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L793)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 

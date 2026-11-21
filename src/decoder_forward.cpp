@@ -621,13 +621,18 @@ void Decoder::Model::compute_decode_logits(const DecodeHeadRows& rows, cudaStrea
     }
 }
 
-void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode) const {
+void Decoder::Model::compute_prefill_logits(Workspace& work, cudaStream_t stream) const {
     normalize_final(work, stream);
+    project(lm_head, work.normalized, work.logits, stream);
+}
+
+void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode) const {
     if (decode) {
+        normalize_final(work, stream);
         check(decode_bf16_lm_head(lm_head.values, work.normalized, lm_head.rows, lm_head.columns,
                                   work.logits, stream), "Run decode LM head");
     } else {
-        project(lm_head, work.normalized, work.logits, stream);
+        compute_prefill_logits(work, stream);
     }
     check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
           "Select greedy token");

@@ -24,15 +24,16 @@ struct alignas(128) PairPayload {
 struct alignas(1024) PairTile {
     std::uint16_t query[channels / tmem_swizzle][flash_queries][tmem_swizzle];
     std::uint16_t key[channels / tmem_swizzle][pair_key_rows][tmem_swizzle];
-    std::uint16_t value[pair_value_channels / tmem_swizzle][flash_keys][tmem_swizzle];
-    std::uint16_t probability[flash_queries][flash_keys];
+    std::uint16_t value[2][pair_value_channels / tmem_swizzle][flash_keys][tmem_swizzle];
+    std::uint16_t probability[2][flash_queries][flash_keys];
     PairPayload raw[2];
     int bad_query[flash_queries];
     int bad_key;
     Word tmem;
     alignas(8) unsigned long long copy_ready;
-    alignas(8) unsigned long long mma_ready;
-    alignas(8) unsigned long long value_ready;
+    alignas(8) unsigned long long scores_ready[2];
+    alignas(8) unsigned long long output_ready[2];
+    alignas(8) unsigned long long operands_ready[2];
     alignas(8) unsigned long long key_ready;
 };
 
@@ -96,7 +97,8 @@ __device__ __forceinline__ void pair_decode_tail(
 
 template <bool Key, bool PartialPage>
 __device__ void pair_stage_kv(PairTile& tile, const PairPayload& payload, int first, int rank,
-                             const Attention& request, int kv_head, int full_end, int end) {
+                             const Attention& request, int kv_head, int full_end, int end,
+                             int stage = 0) {
     constexpr int vector_elements = 16;
     constexpr int width = Key ? channels : pair_value_channels;
     constexpr int row_count = Key ? pair_key_rows : flash_keys;
@@ -140,8 +142,8 @@ __device__ void pair_stage_kv(PairTile& tile, const PairPayload& payload, int fi
             *reinterpret_cast<uint4*>(&tile.key[sub][index][low]) = packed[0];
             *reinterpret_cast<uint4*>(&tile.key[sub][index][high]) = packed[1];
         } else {
-            *reinterpret_cast<uint4*>(&tile.value[sub][index][low]) = packed[0];
-            *reinterpret_cast<uint4*>(&tile.value[sub][index][high]) = packed[1];
+            *reinterpret_cast<uint4*>(&tile.value[stage][sub][index][low]) = packed[0];
+            *reinterpret_cast<uint4*>(&tile.value[stage][sub][index][high]) = packed[1];
         }
         const Word active = __ballot_sync(warp_mask, bad);
         const int lane_base = (producer % 32) & ~(token_lanes - 1);

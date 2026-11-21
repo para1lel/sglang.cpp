@@ -229,8 +229,8 @@ struct Dispatch {
 };
 
 constexpr Dispatch flash{"flash_prefill_attentionILi88ELb1ELb1EE", 12, head_blocks, 1, 352};
-constexpr Dispatch tmem_paired{"tmem_pair_attention", rows / 64, head_blocks, 1, 384, 2};
-constexpr Dispatch tmem_paired_tail{"tmem_pair_attentionILb1EE", rows / 64, head_blocks, 1, 384, 2};
+constexpr Dispatch tmem_paired{"tmem_pair_attention", rows / 64, head_blocks, 1, 416, 2};
+constexpr Dispatch tmem_paired_tail{"tmem_pair_attentionILb1EE", rows / 64, head_blocks, 1, 416, 2};
 constexpr Dispatch tmem_ordered{"tmem_flash_attentionILb1EE", rows / 64, head_blocks, 1, 384};
 constexpr Dispatch tmem_split{"tmem_flash_attentionILb0EE", rows / 64, head_blocks, 3, 384};
 constexpr Dispatch tmem_merge{"tmem_merge", rows, head_blocks, 1, channels};

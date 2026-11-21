@@ -38,6 +38,9 @@ __device__ void flash_tma_prefetch(FlashPayload& raw, Attention request, int fir
 constexpr int tmem_cols = 512;
 constexpr int tmem_scores = channels;
 constexpr int tmem_threads = flash_queries + tmem_producers;
+constexpr int pair_threads = tmem_threads + 32;
+
+static_assert(tmem_scores + 2 * flash_keys <= tmem_cols);
 constexpr int tmem_parts = 3;
 constexpr int tmem_partial_rows = flash_chunk * mxfp8_query_heads;
 
@@ -215,12 +218,13 @@ __device__ __forceinline__ Word tmem_pack(float low, float high) {
     return packed;
 }
 
-template <bool Historical, bool Ordered, typename Tile>
-__device__ float tmem_probabilities(Tile& tile, Word row_address, int member,
-                                     int visible, FlashSoftmax& state) {
+template <bool Historical, bool Ordered, typename Probability>
+__device__ float tmem_probabilities(Probability& probability_tile, Word row_address, int member,
+                                    int visible, FlashSoftmax& state,
+                                    Word score_column = tmem_scores) {
     float scores[2][32];
-    tmem_load(row_address + tmem_scores, scores[0]);
-    tmem_load(row_address + tmem_scores + 32, scores[1]);
+    tmem_load(row_address + score_column, scores[0]);
+    tmem_load(row_address + score_column + 32, scores[1]);
     float maximum = state.maximum;
     #pragma unroll
     for (int half = 0; half < 2; ++half) {
@@ -245,7 +249,7 @@ __device__ float tmem_probabilities(Tile& tile, Word row_address, int member,
                 mass[Ordered ? item / 2 : item % 4] += probability[item];
             }
             const int column = tmem_swizzled(member, half * 32 + vector);
-            *reinterpret_cast<uint4*>(&tile.probability[member][column]) =
+            *reinterpret_cast<uint4*>(&probability_tile[member][column]) =
                 make_uint4(tmem_pack(probability[0], probability[1]),
                            tmem_pack(probability[2], probability[3]),
                            tmem_pack(probability[4], probability[5]),
@@ -260,12 +264,13 @@ __device__ float tmem_probabilities(Tile& tile, Word row_address, int member,
 }
 
 template <bool Paired = false, typename Tile>
-__device__ __forceinline__ void tmem_query_key(Tile& tile, Word mma) {
+__device__ __forceinline__ void tmem_query_key(Tile& tile, Word mma,
+                                              Word score_column = tmem_scores) {
     #pragma unroll
     for (int dimension = 0; dimension < channels; dimension += 16) {
         const int sub = dimension / tmem_swizzle;
         const int offset = dimension % tmem_swizzle;
-        tmem_mma<flash_keys, false, Paired>(tile.tmem + tmem_scores,
+        tmem_mma<flash_keys, false, Paired>(tile.tmem + score_column,
                                            tmem_descriptor(&tile.query[sub][0][offset]),
                                            tmem_descriptor(&tile.key[sub][0][offset]),
                                            dimension != 0);
@@ -273,14 +278,14 @@ __device__ __forceinline__ void tmem_query_key(Tile& tile, Word mma) {
     tmem_commit<Paired>(mma);
 }
 
-template <bool Paired = false, typename Tile>
+template <bool Paired = false, typename Probability, typename Value>
 __device__ __forceinline__ void tmem_probability_value(
-    Tile& tile, Word mma, bool history) {
+    Word tmem, const Probability& probability, const Value& value, Word mma, bool history) {
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     #pragma unroll
     for (int token = 0; token < flash_keys; token += 16) {
-        tmem_mma<channels, true, Paired>(tile.tmem, tmem_descriptor(&tile.probability[0][token]),
-                                        tmem_descriptor<true>(&tile.value[0][token][0]),
+        tmem_mma<channels, true, Paired>(tmem, tmem_descriptor(&probability[0][token]),
+                                        tmem_descriptor<true>(&value[0][token][0]),
                                         history || token != 0);
     }
     tmem_commit<Paired>(mma);
@@ -335,10 +340,18 @@ __device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
                      :: "r"(copy), "r"(mma) : "memory");
         if constexpr (Paired) {
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
-                         "mbarrier.init.shared::cta.b64 [%1], 2;\n"
+                         "mbarrier.init.shared::cta.b64 [%1], 1;\n"
+                         "mbarrier.init.shared::cta.b64 [%2], 1;\n"
+                         "mbarrier.init.shared::cta.b64 [%3], 4;\n"
+                         "mbarrier.init.shared::cta.b64 [%4], 4;\n"
+                         "mbarrier.init.shared::cta.b64 [%5], 2;\n"
                          "fence.proxy.async.shared::cta;\n"
                          "fence.mbarrier_init.release.cluster;"
-                         :: "r"(tmem_smem(&tile.value_ready)),
+                         :: "r"(tmem_smem(&tile.scores_ready[1])),
+                            "r"(tmem_smem(&tile.output_ready[0])),
+                            "r"(tmem_smem(&tile.output_ready[1])),
+                            "r"(tmem_smem(&tile.operands_ready[0])),
+                            "r"(tmem_smem(&tile.operands_ready[1])),
                             "r"(tmem_smem(&tile.key_ready)) : "memory");
         }
     }
@@ -356,17 +369,8 @@ __device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
     }
 }
 
-template <bool Ordered, typename Tile>
-__device__ __forceinline__ void tmem_softmax_tile(Tile& tile, Word row_address, Word mma,
-                                                 int position, int first, int begin,
-                                                 FlashSoftmax& state, Word phase = 0) {
-    tmem_mma_wait(mma, phase);
-    const int member = threadIdx.x;
-    const int visible = position + member / ordered_heads - first + 1;
-    const float history = first + flash_keys <= position + 1 ?
-        tmem_probabilities<true, Ordered>(tile, row_address, member, visible, state) :
-        tmem_probabilities<false, Ordered>(tile, row_address, member, visible, state);
-    if (first != begin && __any_sync(warp_mask, history != 1.0f)) {
+__device__ __forceinline__ void tmem_correct_output(Word row_address, float history) {
+    if (__any_sync(warp_mask, history != 1.0f)) {
         #pragma unroll 1
         for (int column = 0; column < channels; column += 32) {
             float accumulator[32];
@@ -378,6 +382,31 @@ __device__ __forceinline__ void tmem_softmax_tile(Tile& tile, Word row_address, 
             tmem_store(row_address + column, accumulator);
         }
         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+    }
+}
+
+template <bool Ordered, typename Probability>
+__device__ __forceinline__ float tmem_softmax_chunk(Probability& probability, Word row_address,
+                                                    int position, int first, FlashSoftmax& state,
+                                                    Word score_column = tmem_scores) {
+    const int member = threadIdx.x;
+    const int visible = position + member / ordered_heads - first + 1;
+    return first + flash_keys <= position + 1 ?
+        tmem_probabilities<true, Ordered>(probability, row_address, member, visible, state,
+                                         score_column) :
+        tmem_probabilities<false, Ordered>(probability, row_address, member, visible, state,
+                                          score_column);
+}
+
+template <bool Ordered, typename Tile>
+__device__ __forceinline__ void tmem_softmax_tile(Tile& tile, Word row_address, Word mma,
+                                                 int position, int first, int begin,
+                                                 FlashSoftmax& state, Word phase = 0) {
+    tmem_mma_wait(mma, phase);
+    const float history = tmem_softmax_chunk<Ordered>(tile.probability, row_address,
+                                                      position, first, state);
+    if (first != begin) {
+        tmem_correct_output(row_address, history);
     }
     asm volatile("tcgen05.fence::before_thread_sync;\n"
                  "fence.proxy.async.shared::cta;" ::: "memory");
@@ -435,7 +464,7 @@ __global__ void tmem_flash_attention(Attention request,
         }
         __syncthreads();
         if (threadIdx.x == 0) {
-            tmem_probability_value(tile, mma, first != begin);
+            tmem_probability_value(tile.tmem, tile.probability, tile.value, mma, first != begin);
         }
         if (!softmax && next < end) {
             tmem_copy_wait(copy, 1 - buffer);
@@ -531,27 +560,43 @@ __device__ void pair_repair(PairTile& tile, Attention request,
     }
 }
 
-__device__ __forceinline__ void pair_publish_key(Word key) {
+template <int Barrier, int Count, int Leader>
+__device__ __forceinline__ void pair_publish(Word ready) {
     asm volatile("fence.proxy.async.shared::cta;\n"
-                 "bar.sync 1, %0;" :: "n"(tmem_producers) : "memory");
-    if (threadIdx.x == flash_queries) {
+                 "bar.sync %0, %1;" :: "n"(Barrier), "n"(Count) : "memory");
+    if (threadIdx.x == Leader) {
         asm volatile("{ .reg .u32 leader;\n"
                      "mapa.shared::cluster.u32 leader, %0, 0;\n"
                      "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [leader]; }"
-                     :: "r"(key) : "memory");
+                     :: "r"(ready) : "memory");
     }
 }
 
-__device__ __forceinline__ void pair_wait_key(Word key, Word phase) {
+__device__ __forceinline__ void pair_wait(Word ready, Word phase) {
     asm volatile("{ .reg .pred ready;\n"
-                 "KEY_WAIT: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ready,"
+                 "PAIR_WAIT: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ready,"
                  " [%0], %1;\n"
-                 "@!ready bra.uni KEY_WAIT; }"
-                 :: "r"(key), "r"(phase) : "memory");
+                 "@!ready bra.uni PAIR_WAIT; }"
+                 :: "r"(ready), "r"(phase) : "memory");
+}
+
+__device__ __forceinline__ void pair_issue_mmas(PairTile& tile, Word key, int end) {
+    tmem_query_key<true>(tile, tmem_smem(&tile.scores_ready[0]));
+    for (int chunk = 0; chunk * flash_keys < end; ++chunk) {
+        const int stage = chunk & 1;
+        if ((chunk + 1) * flash_keys < end) {
+            pair_wait(key, stage);
+            tmem_query_key<true>(tile, tmem_smem(&tile.scores_ready[1 - stage]),
+                                 tmem_scores + (1 - stage) * flash_keys);
+        }
+        pair_wait(tmem_smem(&tile.operands_ready[stage]), (chunk >> 1) & 1);
+        tmem_probability_value<true>(tile.tmem, tile.probability[stage], tile.value[stage],
+                                      tmem_smem(&tile.output_ready[stage]), chunk != 0);
+    }
 }
 
 template <bool PartialPage>
-__launch_bounds__(tmem_threads, 1) __attribute__((cluster_dims(2, 1, 1)))
+__launch_bounds__(pair_threads, 1) __attribute__((cluster_dims(2, 1, 1)))
 __global__ void tmem_pair_attention(Attention request, const __grid_constant__ PairMaps maps) {
     extern __shared__ PairTile shared_pair[];
     auto& tile = shared_pair[0];
@@ -565,16 +610,17 @@ __global__ void tmem_pair_attention(Attention request, const __grid_constant__ P
     const int full_end = PartialPage ? end - end % mxfp8_page_size : end;
     const int warp = threadIdx.x / 32;
     const bool softmax = warp < flash_queries / 32;
-    const bool issuer = rank == 0 && threadIdx.x == 0;
+    const bool producer = threadIdx.x >= flash_queries && threadIdx.x < tmem_threads;
+    const bool issuer = rank == 0 && threadIdx.x == tmem_threads;
     const Word copy = tmem_smem(&tile.copy_ready);
-    const Word mma = tmem_smem(&tile.mma_ready);
-    const Word value = tmem_smem(&tile.value_ready);
     const Word key = tmem_smem(&tile.key_ready);
-    tmem_initialize<true>(tile, warp, copy, mma);
-    tmem_stage_query(tile, request, row, head);
+    tmem_initialize<true>(tile, warp, copy, tmem_smem(&tile.scores_ready[0]));
+    if (threadIdx.x < tmem_threads) {
+        tmem_stage_query(tile, request, row, head);
+    }
     __syncthreads();
     pair_prefetch(tile.raw[0], request, maps, 0, kv_head, rank, copy);
-    if (!softmax) {
+    if (producer) {
         tmem_copy_wait(copy, 0);
         pair_stage_kv<true, PartialPage>(tile, tile.raw[0], 0, rank, request, kv_head,
                                         full_end, end);
@@ -584,50 +630,61 @@ __global__ void tmem_pair_attention(Attention request, const __grid_constant__ P
     if (mxfp8_page_size < full_end) {
         pair_prefetch(tile.raw[1], request, maps, mxfp8_page_size, kv_head, rank, copy);
     }
+    if (issuer) {
+        pair_issue_mmas(tile, key, end);
+    }
     const Word row_address = tile.tmem + ((warp * 32) << 16);
     FlashSoftmax state{-CUDART_INF_F, 0.0f};
-    for (int first = 0; first < end; first += flash_keys) {
-        const int page = first / mxfp8_page_size;
-        const int buffer = page & 1;
-        const Word phase = (first / flash_keys) & 1;
-        const int next = first + flash_keys;
-        const bool next_page = next % mxfp8_page_size == 0;
-        if (issuer) {
-            if (first != 0) {
-                pair_wait_key(key, phase ^ 1);
+    if (softmax) {
+        for (int first = 0, chunk = 0; first < end; first += flash_keys, ++chunk) {
+            const int stage = chunk & 1;
+            const Word phase = (chunk >> 1) & 1;
+            tmem_mma_wait(tmem_smem(&tile.scores_ready[stage]), phase);
+            if (chunk >= 2) {
+                tmem_mma_wait(tmem_smem(&tile.output_ready[stage]), phase ^ 1);
             }
-            tmem_query_key<true>(tile, mma);
+            const float history = tmem_softmax_chunk<true>(
+                tile.probability[stage], row_address, position, first, state,
+                tmem_scores + stage * flash_keys);
+            if (chunk != 0) {
+                tmem_mma_wait(tmem_smem(&tile.output_ready[1 - stage]), ((chunk - 1) >> 1) & 1);
+                tmem_correct_output(row_address, history);
+            }
+            asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+            pair_publish<2, flash_queries, 0>(tmem_smem(&tile.operands_ready[stage]));
         }
-        if (first != 0) {
-            tmem_mma_wait(value, phase ^ 1);
-        }
-        if (softmax) {
-            tmem_softmax_tile<true>(tile, row_address, mma, position, first, 0, state, phase);
-        } else {
+        const int final_chunk = (end - 1) / flash_keys;
+        tmem_mma_wait(tmem_smem(&tile.output_ready[final_chunk & 1]), (final_chunk >> 1) & 1);
+        tmem_store_output(row_address, state, request, row, head);
+    }
+    if (producer) {
+        for (int first = 0, chunk = 0; first < end; first += flash_keys, ++chunk) {
+            const int stage = chunk & 1;
+            const Word phase = (chunk >> 1) & 1;
+            const int buffer = (first / mxfp8_page_size) & 1;
+            if (chunk >= 2) {
+                tmem_mma_wait(tmem_smem(&tile.output_ready[stage]), phase ^ 1);
+            }
             pair_stage_kv<false, PartialPage>(tile, tile.raw[buffer], first, rank, request,
-                                             kv_head, full_end, end);
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        }
-        pair.sync();
-        if (issuer) {
-            tmem_probability_value<true>(tile, value, first != 0);
-        }
-        if (!softmax && next < end) {
+                                              kv_head, full_end, end, stage);
+            pair_publish<1, tmem_producers, flash_queries>(tmem_smem(&tile.operands_ready[stage]));
+            const int next = first + flash_keys;
+            if (next >= end) {
+                break;
+            }
+            const bool next_page = next % mxfp8_page_size == 0;
             if (next_page && next < full_end) {
                 tmem_copy_wait(copy, 1 - buffer);
             }
+            tmem_mma_wait(tmem_smem(&tile.scores_ready[stage]), phase);
             pair_stage_kv<true, PartialPage>(tile, tile.raw[buffer ^ static_cast<int>(next_page)],
                                             next, rank, request, kv_head, full_end, end);
-            pair_publish_key(key);
+            pair_publish<1, tmem_producers, flash_queries>(key);
             if (next_page && next + mxfp8_page_size < full_end) {
                 pair_prefetch<flash_queries>(tile.raw[buffer], request, maps,
                                              next + mxfp8_page_size, kv_head, rank, copy);
             }
         }
-    }
-    tmem_mma_wait(value, ((end - 1) / flash_keys) & 1);
-    if (softmax) {
-        tmem_store_output(row_address, state, request, row, head);
     }
     pair.sync();
     if (warp == 0) {
@@ -787,7 +844,7 @@ std::optional<cudaError_t> launch_paired_tmem_prefill(
         return status;
     }
     if (properties.sharedMemPerBlockOptin < dynamic_shared + attributes.sharedSizeBytes ||
-        attributes.maxThreadsPerBlock < tmem_threads || attributes.requiredClusterWidth != 2 ||
+        attributes.maxThreadsPerBlock < pair_threads || attributes.requiredClusterWidth != 2 ||
         attributes.requiredClusterHeight != 1 || attributes.requiredClusterDepth != 1) {
         return std::nullopt;
     }
@@ -800,7 +857,7 @@ std::optional<cudaError_t> launch_paired_tmem_prefill(
         return status;
     }
     const dim3 blocks(flash_chunk / flash_rows, mxfp8_query_heads / ordered_heads);
-    const cudaLaunchConfig_t config{blocks, dim3(tmem_threads), dynamic_shared, stream, nullptr, 0};
+    const cudaLaunchConfig_t config{blocks, dim3(pair_threads), dynamic_shared, stream, nullptr, 0};
     int clusters = 0;
     status = cudaOccupancyMaxActiveClusters(&clusters, kernel, &config);
     if (paired_kernel_unavailable(status) || status == cudaErrorInvalidClusterSize ||
@@ -820,7 +877,7 @@ std::optional<cudaError_t> launch_paired_tmem_prefill(
     }
     Attention request{cache, pages.device_pages, position, queries, output};
     void* args[] = {&request, &maps};
-    return cudaLaunchKernel(kernel, blocks, tmem_threads, args, dynamic_shared, stream);
+    return cudaLaunchKernel(kernel, blocks, pair_threads, args, dynamic_shared, stream);
 }
 
 std::optional<cudaError_t> launch_tmem_prefill(

@@ -5,8 +5,10 @@ from contextlib import closing
 import http.client
 import json
 from pathlib import Path
+import select
 import socket
 import struct
+from tempfile import TemporaryDirectory
 import time
 import unittest
 from unittest.mock import patch
@@ -52,6 +54,18 @@ def abort(client):
     client.close()
 
 
+def batch_frame(reply):
+    line = reply.readline()
+    if not line:
+        return None
+    if line == b":\n":
+        assert reply.readline() == b"\n"
+        return "keepalive"
+    assert line.startswith(b"data: ") and line.endswith(b"\n"), line
+    assert reply.readline() == b"\n"
+    return "[DONE]" if line == b"data: [DONE]\n" else json.loads(line[6:])
+
+
 class NativeGenerate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -61,7 +75,7 @@ class NativeGenerate(unittest.TestCase):
         cls.script = [32, *(cls.bytes[byte] for byte in "⛄".encode()), cls.eos, 33, 34]
         scripted = cls.output / "token-ids.txt"
         tokens = " ".join(map(str, cls.script))
-        scripted.write_text(f"-7 {tokens}\n11 32 {cls.eos} 33\n0 32\n")
+        scripted.write_text(f"-7 {tokens}\n11 32 {cls.eos} 33\n-41 32 33\n0 32\n")
         cls.enterClassContext(patch.dict("os.environ", SGLANG_TEST_CHAT_OUTPUT_IDS=str(scripted)))
         cls.log = cls.output / "native.log"
         cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint, cls.log,
@@ -253,7 +267,7 @@ class NativeGenerate(unittest.TestCase):
             ({"input_ids": [[32], [33]], "sampling_params": {"max_new_tokens": 131073}},
              "total"),
             ({"text": ["A"] * 33}, "batch items"),
-            ({"text": ["A"], "stream": True}, "non-streaming"),
+            ({"text": ["A", ""], "stream": True}, "text"),
         ]
         log = self.output / "batch-invalid.log"
         with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
@@ -263,6 +277,166 @@ class NativeGenerate(unittest.TestCase):
                     self.assertEqual(status, 400, result)
                     self.assertIn(field, result["error"]["message"])
                 self.assertNotIn("cpu admit", log.read_text())
+
+    def check_batch_headers(self, reply):
+        reply.begin()
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(reply.headers.get_content_type(), "text/event-stream")
+        self.assertTrue(reply.chunked)
+
+    def check_batch_frame(self, packet, index, text, ids, finish, *, prompt_tokens):
+        self.assertEqual(packet.pop("index"), index)
+        cached = packet["meta_info"]["cached_tokens"]
+        self.assertEqual(cached, 0)
+        if finish is None:
+            del packet["meta_info"]["cached_tokens"]
+        return self.check_packet(packet, text, ids, finish, prompt_tokens=prompt_tokens)
+
+    def test_batch_stream_cumulative_utf8_and_finish(self):
+        log = self.output / "batch-stream.log"
+        payload = {
+            "input_ids": [[32], [33, 33], [34, 34, 34]],
+            "sampling_params": [{"max_new_tokens": 8, "sampling_seed": -7},
+                                {"max_new_tokens": 4, "sampling_seed": 11},
+                                {"max_new_tokens": 0}],
+            "cache_salt": ["first", "second", "third"],
+        }
+        with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
+            plain = self.generate(payload, port=port)
+            with generate_client(port, payload | {"stream": True}) as client, \
+                 http.client.HTTPResponse(client) as reply:
+                self.check_batch_headers(reply)
+                frames = list(iter(lambda: batch_frame(reply), None))
+
+        self.assertEqual(frames.pop(), "[DONE]")
+        self.assertTrue(all(isinstance(frame, dict) for frame in frames), frames)
+        finishes = [frame["index"] for frame in frames if frame["meta_info"]["finish_reason"]]
+        self.assertCountEqual(finishes, (0, 1, 2))
+        self.assertEqual(finishes[0], 1)
+        expected = [
+            (self.script[:5], ("A", "A", "A", "A⛄", "A⛄"),
+             {"type": "stop", "matched": self.eos}),
+            ([32, self.eos], ("A", "A"), {"type": "stop", "matched": self.eos}),
+            ([], ("",), {"type": "length", "length": 0}),
+        ]
+        ids = set()
+        for index, (tokens, texts, finish) in enumerate(expected):
+            items = [frame for frame in frames if frame.get("index") == index]
+            self.assertEqual(len(items), len(texts))
+            lane_ids = set()
+            for count, (item, text) in enumerate(zip(items, texts), 1):
+                terminal = finish if count == len(texts) else None
+                lane_ids.add(self.check_batch_frame(item, index, text, tokens[:count], terminal,
+                                                    prompt_tokens=index + 1))
+            self.assertEqual(len(lane_ids), 1)
+            ids.update(lane_ids)
+            self.assertEqual(items[-1], plain[index] | {
+                "meta_info": plain[index]["meta_info"] | {"id": lane_ids.pop()},
+            })
+        self.assertEqual(len(ids), 3)
+
+    def test_batch_stream_heartbeat_follows_wire_writes(self):
+        log = self.output / "batch-heartbeat.log"
+        controls = Path(self.enterContext(TemporaryDirectory(dir=self.output)))
+        gate = controls / "step"
+        clock = controls / "seconds"
+
+        def tick(seconds):
+            pending = clock.with_suffix(".next")
+            pending.write_text(str(seconds))
+            pending.replace(clock)
+
+        tick(0)
+        payload = {"text": ["A", "B"], "stream": True,
+                   "sampling_params": [{"max_new_tokens": 2, "sampling_seed": -41},
+                                       {"max_new_tokens": 1}]}
+        with patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate),
+                        SGLANG_TEST_STREAM_CLOCK_FILE=str(clock)), \
+             server(self.binary, self.checkpoint, log, "--max-active", "2") as port, \
+             generate_client(port, payload) as client, http.client.HTTPResponse(client) as reply:
+            self.check_batch_headers(reply)
+            fast = batch_frame(reply)
+            self.check_batch_frame(fast, 1, "A", [32], {"type": "length", "length": 1},
+                                   prompt_tokens=1)
+            self.assertFalse(select.select([client], [], [], 0.1)[0])
+            tick(15)
+            self.assertEqual(batch_frame(reply), "keepalive")
+            self.assertFalse(select.select([client], [], [], 0.1)[0])
+            tick(24)
+            gate.with_suffix(".0").touch()
+            first = self.check_batch_frame(batch_frame(reply), 0, "A", [32], None,
+                                           prompt_tokens=1)
+            self.assertFalse(select.select([client], [], [], 0.1)[0])
+            tick(38)
+            self.assertFalse(select.select([client], [], [], 0.1)[0])
+            tick(39)
+            self.assertEqual(batch_frame(reply), "keepalive")
+            gate.with_suffix(".1").touch()
+            last = self.check_batch_frame(batch_frame(reply), 0, "AB", [32, 33],
+                                          {"type": "length", "length": 2}, prompt_tokens=1)
+            self.assertEqual(first, last)
+            self.assertEqual(batch_frame(reply), "[DONE]")
+            self.assertIsNone(batch_frame(reply))
+
+    def test_batch_stream_admission_failure_before_and_after_headers(self):
+        log = self.output / "batch-stream-error.log"
+        with patch.dict("os.environ", SGLANG_TEST_BATCH_ADMISSION_FAILURE="-900"), \
+             server(self.binary, self.checkpoint, log, "--max-active", "2",
+                    "--prefix-cache-entries", "1") as port:
+            failing = {"max_new_tokens": 7, "sampling_seed": -900}
+            early = {"text": ["A"], "stream": True, "sampling_params": failing}
+            status, error = send(port, GENERATE, early)
+            self.assertEqual(status, 503)
+            self.assertEqual(error, {"error": {"message": "Injected batch admission failure"}})
+            self.assertEqual(receipts(log), [])
+            late = {"input_ids": [[32], [33, 33], [34], [35]], "stream": True,
+                    "sampling_params": [{"max_new_tokens": 2048}, {"max_new_tokens": 1},
+                                        failing, {"max_new_tokens": 9}]}
+            with generate_client(port, late) as client, http.client.HTTPResponse(client) as reply:
+                self.check_batch_headers(reply)
+                frames = list(iter(lambda: batch_frame(reply), None))
+            self.assertEqual(frames.pop(), {"error": {"message": "Native decoder failed",
+                                                      "type": "server_error", "code": 500,
+                                                      "retryable": False}})
+            done, = [frame for frame in frames if frame["index"] == 1]
+            self.check_batch_frame(done, 1, "A", [32], {"type": "length", "length": 1},
+                                   prompt_tokens=2)
+            self.assertEqual(sorted(item["budget"] for item in receipts(log)), [1, 2048])
+            admitted, = [line for line in log.read_text().splitlines()
+                         if line.startswith("cpu admit ") and line.endswith(" budget=2048")]
+            self.assertIn(admitted.replace("cpu admit ", "cpu cancel ", 1), log.read_text())
+            self.check_batch_reuse(port)
+
+    def test_batch_stream_disconnect_after_partial_output(self):
+        log = self.output / "batch-stream-disconnect.log"
+        payload = {"input_ids": [[32], [33, 33], [34]], "stream": True,
+                   "sampling_params": {"max_new_tokens": 2048}}
+        with server(self.binary, self.checkpoint, log, "--max-active", "2",
+                    "--prefix-cache-entries", "1") as port, \
+             generate_client(port, payload) as client:
+            with http.client.HTTPResponse(client) as reply:
+                self.check_batch_headers(reply)
+                first = batch_frame(reply)
+                self.assertEqual(first["output_ids"], [32])
+                self.assertIsNone(first["meta_info"]["finish_reason"])
+            with queue_client(port, 1) as scalar:
+                self.wait_queue(port, 2, 0)
+                abort(client)
+                with http.client.HTTPResponse(scalar) as reply:
+                    self.check_batch_headers(reply)
+                    self.check_packet(batch_frame(reply), "A", [32],
+                                      {"type": "length", "length": 1})
+                    self.assertEqual(batch_frame(reply), "[DONE]")
+            self.wait_queue(port, 0, 0)
+            lines = log.read_text().splitlines()
+            admitted = {line for line in lines
+                        if line.startswith("cpu admit ") and line.endswith(" budget=2048")}
+            cancelled = {line for line in lines if line.startswith("cpu cancel ")}
+            self.assertEqual(cancelled, {line.replace("cpu admit ", "cpu cancel ", 1)
+                                         for line in admitted})
+            seen = receipts(log)
+            self.assertEqual([item["budget"] for item in seen], [2048, 2048, 1])
+            self.assertCountEqual([item["prompt_tokens"] for item in seen[:2]], [1, 2])
 
     def check_batch_reuse(self, port):
         self.wait_queue(port, 0, 0)

@@ -648,9 +648,6 @@ GenerateRequests parse_generate_requests(std::string_view body,
             generate_options(params, salt), tokenizer));
         return requests;
     }
-    if (requests.stream) {
-        bad_request("Only non-streaming /generate batches are supported");
-    }
     if (list->empty() || list->size() > decoder_batch_max_lanes) {
         bad_request("Expected 1 to 32 /generate batch items");
     }

@@ -27,15 +27,13 @@ std::string_view finish_type(const DecoderResult& result, const DecoderOptions& 
 
 class GenerateResponse {
 public:
-    GenerateResponse(const Socket& connection, const BatchPrompt& request,
-                     const Tokenizer& tokenizer, bool streaming)
-        : stream(connection), request_(request), tokenizer_(tokenizer), id_(next_id()),
-          streaming_(streaming) {}
+    GenerateResponse(const BatchPrompt& request, const Tokenizer& tokenizer)
+        : request_(request), tokenizer_(tokenizer), id_(next_id()) {}
 
-    bool token(int id);
+    void token(int id);
+    bool stream_token(EventStream& stream, int id);
     std::string finish(const DecoderResult& result);
-
-    EventStream stream;
+    std::string indexed(std::size_t index, const DecoderResult& result, bool terminal);
 
 private:
     static std::string next_id() {
@@ -43,19 +41,20 @@ private:
         return "gen-" + std::to_string(id.fetch_add(1, std::memory_order_relaxed));
     }
 
-    std::string body(const std::vector<int>& ids, const DecoderResult* result) const;
+    std::string body(const std::vector<int>& ids, const DecoderResult* result,
+                     bool terminal) const;
 
     const BatchPrompt& request_;
     const Tokenizer& tokenizer_;
     const std::string id_;
-    const bool streaming_;
     Utf8Stream utf8_;
     std::string text_;
     std::vector<int> streamed_ids_;
+    std::size_t decoded_tokens_ = 0;
 };
 
 std::string GenerateResponse::body(const std::vector<int>& ids,
-                                   const DecoderResult* result) const {
+                                   const DecoderResult* result, bool terminal) const {
     std::string output = R"({"text":)";
     json::append_quoted(output, text_);
     output += R"(,"output_ids":)";
@@ -65,48 +64,82 @@ std::string GenerateResponse::body(const std::vector<int>& ids,
     output += R"(,"prompt_tokens":)" + std::to_string(request_.prompt.size());
     output += R"(,"completion_tokens":)" + std::to_string(ids.size());
     output += R"(,"finish_reason":)";
-    if (!result) {
-        return output + "null}}";
-    }
-    const auto type = finish_type(*result, request_.options);
-    output += R"({"type":)";
-    json::append_quoted(output, type);
-    if (type == "stop") {
-        output += R"(,"matched":)" + std::to_string(ids.back());
+    if (terminal) {
+        const auto type = finish_type(*result, request_.options);
+        output += R"({"type":)";
+        json::append_quoted(output, type);
+        if (type == "stop") {
+            output += R"(,"matched":)" + std::to_string(ids.back());
+        } else {
+            output += R"(,"length":)" + std::to_string(ids.size());
+        }
+        output += '}';
     } else {
-        output += R"(,"length":)" + std::to_string(ids.size());
+        output += "null";
     }
-    output += R"(},"cached_tokens":)" + std::to_string(result->cached_prompt_tokens);
+    if (result) {
+        output += R"(,"cached_tokens":)" + std::to_string(result->cached_prompt_tokens);
+    }
     return output + "}}";
 }
 
-bool GenerateResponse::token(int id) {
-    const bool stop = request_.options.stops_at(id);
-    if (!stop) {
+void GenerateResponse::token(int id) {
+    if (!request_.options.stops_at(id)) {
         text_ += utf8_.push(tokenizer_.piece(id, true));
     }
-    if (!streaming_ || stop) {
+}
+
+bool GenerateResponse::stream_token(EventStream& stream, int id) {
+    token(id);
+    if (request_.options.stops_at(id)) {
         return true;
     }
     streamed_ids_.push_back(id);
     return streamed_ids_.size() == static_cast<std::size_t>(request_.options.max_new_tokens) ||
-        (stream.start() && stream.write(body(streamed_ids_, nullptr)));
+        (stream.start() && stream.write(body(streamed_ids_, nullptr, false)));
 }
 
 std::string GenerateResponse::finish(const DecoderResult& result) {
     text_ += utf8_.finish();
-    return body(result.output_token_ids, &result);
+    return body(result.output_token_ids, &result, true);
+}
+
+std::string GenerateResponse::indexed(std::size_t index, const DecoderResult& result,
+                                      bool terminal) {
+    const auto& ids = result.output_token_ids;
+    while (decoded_tokens_ < ids.size()) {
+        token(ids[decoded_tokens_++]);
+    }
+    auto output = terminal ? finish(result) : body(ids, &result, false);
+    output.pop_back();
+    output += R"(,"index":)" + std::to_string(index) + '}';
+    return output;
+}
+
+void write_stream_error(EventStream& stream, const std::exception& error) {
+    std::cerr << "/generate failed: " << error.what() << '\n';
+    if (stream.write(R"({"error":{"message":"Native decoder failed",)"
+                     R"("type":"server_error","code":500,"retryable":false}})")) {
+        stream.end();
+    }
 }
 
 void complete_single(const Socket& connection, BatchService& service, int slot,
                      const CompletionTokenizer& tokenizer, const BatchPrompt& request,
-                     bool stream) {
-    GenerateResponse response(connection, request, tokenizer.get(), stream);
+                     bool streaming) {
+    GenerateResponse response(request, tokenizer.get());
+    EventStream stream(connection);
     const DecoderCallbacks callbacks{
-        [&](int token) { return response.token(token); },
+        [&](int token) {
+            if (streaming) {
+                return response.stream_token(stream, token);
+            }
+            response.token(token);
+            return true;
+        },
         [&] { return disconnected(connection); },
-        [&] { return !stream || response.stream.start(); },
-        [&] { return response.stream.poll(); },
+        [&] { return !streaming || stream.start(); },
+        [&] { return stream.poll(); },
     };
     try {
         const auto result = service.generate(slot, request.prompt, request.options, callbacks);
@@ -114,29 +147,24 @@ void complete_single(const Socket& connection, BatchService& service, int slot,
             return;
         }
         const auto output = response.finish(result);
-        if (!stream) {
+        if (!streaming) {
             write_json(connection, "200 OK", output);
-        } else if (response.stream.start() && response.stream.write(output) &&
-                   response.stream.write("[DONE]")) {
-            response.stream.end();
+        } else if (stream.start() && stream.write(output) && stream.write("[DONE]")) {
+            stream.end();
         }
     } catch (const std::exception& error) {
-        if (!response.stream.started()) {
+        if (!stream.started()) {
             throw;
         }
-        std::cerr << "/generate failed: " << error.what() << '\n';
-        if (response.stream.write(R"({"error":{"message":"Native decoder failed",)"
-                                  R"("type":"server_error","code":500,"retryable":false}})")) {
-            response.stream.end();
-        }
+        write_stream_error(stream, error);
     }
 }
 
 void complete_batch(const Socket& connection, BatchService& service, int slot,
                     const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items) {
     const auto& pieces = tokenizer.get();
-    const auto results = service.generate_batch(slot, items,
-        [&] { return disconnected(connection); });
+    const BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
+    const auto results = service.generate_batch(slot, items, callbacks);
     if (!results) {
         return;
     }
@@ -145,7 +173,7 @@ void complete_batch(const Socket& connection, BatchService& service, int slot,
         if (disconnected(connection)) {
             return;
         }
-        GenerateResponse response(connection, items[index], pieces, false);
+        GenerateResponse response(items[index], pieces);
         const auto& result = (*results)[index];
         for (int token : result.output_token_ids) {
             response.token(token);
@@ -159,6 +187,35 @@ void complete_batch(const Socket& connection, BatchService& service, int slot,
     write_json(connection, "200 OK", output);
 }
 
+void stream_batch(const Socket& connection, BatchService& service, int slot,
+                  const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items) {
+    const auto& pieces = tokenizer.get();
+    EventStream stream(connection);
+    std::vector<GenerateResponse> responses;
+    responses.reserve(items.size());
+    for (const auto& item : items) {
+        responses.emplace_back(item, pieces);
+    }
+    const BatchCallbacks callbacks{
+        [&] { return disconnected(connection); },
+        [&] { return stream.start(); },
+        [&] { return stream.poll(); },
+        [&](std::size_t index, const DecoderResult& result, bool terminal) {
+            return stream.write(responses[index].indexed(index, result, terminal));
+        },
+    };
+    try {
+        if (service.generate_batch(slot, items, callbacks) && stream.write("[DONE]")) {
+            stream.end();
+        }
+    } catch (const std::exception& error) {
+        if (!stream.started()) {
+            throw;
+        }
+        write_stream_error(stream, error);
+    }
+}
+
 }
 
 void complete_generate(const Socket& connection, BatchService& service, int slot,
@@ -167,7 +224,9 @@ void complete_generate(const Socket& connection, BatchService& service, int slot
         return;
     }
     const auto request = parse_generate_requests(body, tokenizer);
-    if (request.batch) {
+    if (request.batch && request.stream) {
+        stream_batch(connection, service, slot, tokenizer, request.items);
+    } else if (request.batch) {
         complete_batch(connection, service, slot, tokenizer, request.items);
     } else {
         complete_single(connection, service, slot, tokenizer, request.items.front(),

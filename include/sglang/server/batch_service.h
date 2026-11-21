@@ -31,6 +31,13 @@ struct BatchPrompt {
     DecoderOptions options;
 };
 
+struct BatchCallbacks {
+    std::function<bool()> is_cancelled;
+    std::function<bool()> on_admitted;
+    std::function<bool()> on_stream_poll;
+    std::function<bool(std::size_t, const DecoderResult&, bool)> on_output;
+};
+
 class BatchService {
 public:
     BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false, int mtp_steps = 0,
@@ -44,7 +51,7 @@ public:
                            std::size_t expanded_tokens = 0);
     std::optional<std::vector<DecoderResult>>
     generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
-                   const std::function<bool()>& is_cancelled);
+                   const BatchCallbacks& callbacks);
     bool ready() const;
     void rethrow_failure() const;
     BatchMetrics metrics() const;

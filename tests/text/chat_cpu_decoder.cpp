@@ -27,15 +27,24 @@ bool simulate_stream_clock() {
     return std::getenv("SGLANG_TEST_STREAM_CLOCK") != nullptr;
 }
 
+int stream_clock_seconds() {
+    if (const auto* path = std::getenv("SGLANG_TEST_STREAM_CLOCK_FILE")) {
+        int seconds = 0;
+        std::ifstream(path) >> seconds;
+        return seconds;
+    }
+    return simulated_seconds.load();
+}
+
 }
 
 extern "C" Clock::time_point __real__ZNSt6chrono3_V212steady_clock3nowEv() noexcept;
 extern "C" Clock::time_point __wrap__ZNSt6chrono3_V212steady_clock3nowEv() noexcept {
-    if (!simulate_stream_clock()) {
+    if (!simulate_stream_clock() && !std::getenv("SGLANG_TEST_STREAM_CLOCK_FILE")) {
         return __real__ZNSt6chrono3_V212steady_clock3nowEv();
     }
     static const auto start = __real__ZNSt6chrono3_V212steady_clock3nowEv();
-    return start + std::chrono::seconds(simulated_seconds.load());
+    return start + std::chrono::seconds(stream_clock_seconds());
 }
 
 namespace sglang {
@@ -253,6 +262,11 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
         auto& lane = state_->lanes[slot];
         if (!lane) {
             throw std::logic_error("Selected an empty CPU lane");
+        }
+        const auto* gate = std::getenv("SGLANG_TEST_BATCH_STEP_GATE");
+        if (gate && lane->options.seed == -41 &&
+            !std::filesystem::exists(std::string(gate) + "." + std::to_string(lane->tokens))) {
+            continue;
         }
         has_greedy |= !lane->options.samples();
         has_sampled |= lane->options.samples();

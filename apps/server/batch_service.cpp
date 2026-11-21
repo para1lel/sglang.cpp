@@ -116,9 +116,12 @@ struct BatchService::State {
     DecoderResult consume(std::unique_lock<std::mutex>& lock, int slot, Job& job,
                           const DecoderCallbacks& callbacks);
     void cancel_batch(std::unique_lock<std::mutex>& lock, const BatchJobs& active);
+    bool drain_batch(std::unique_lock<std::mutex>& lock, BatchJobs& active,
+                     const BatchCallbacks& callbacks, std::vector<DecoderResult>& results,
+                     std::size_t& completed);
     bool consume_batch(std::unique_lock<std::mutex>& lock, int owner,
-                       const std::vector<BatchPrompt>& prompts,
-                       const std::function<bool()>& is_cancelled, BatchJobs& active,
+                       const std::vector<BatchPrompt>& prompts, const BatchCallbacks& callbacks,
+                       BatchJobs& active,
                        std::vector<DecoderResult>& results);
     void enqueue_batch(int owner, const std::vector<BatchPrompt>& prompts, BatchJobs& active,
                        std::size_t& next);
@@ -531,51 +534,96 @@ void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt
     }
 }
 
+bool BatchService::State::drain_batch(std::unique_lock<std::mutex>& lock, BatchJobs& active,
+                                      const BatchCallbacks& callbacks,
+                                      std::vector<DecoderResult>& results,
+                                      std::size_t& completed) {
+    const DecoderCallbacks collect;
+    for (auto& item : active) {
+        if (!item.job) {
+            continue;
+        }
+        auto& job = *item.job;
+        if (job.error) {
+            std::rethrow_exception(job.error);
+        }
+        const auto finish = job.finish;
+        if (finish == DecoderFinishReason::cancelled) {
+            return false;
+        }
+        if (!job.pending && !finish) {
+            continue;
+        }
+        auto& result = results[item.index];
+        if (job.pending) {
+            emit_step(*job.pending, collect, result);
+        }
+        result.cached_prompt_tokens = job.cached_tokens;
+        if (finish) {
+            result.finish_reason = *finish;
+        }
+        if (callbacks.on_output) {
+            lock.unlock();
+            const bool written = callbacks.on_output(item.index, result, finish.has_value());
+            lock.lock();
+            if (!written) {
+                return false;
+            }
+        }
+        if (job.pending) {
+            job.pending.reset();
+            changed.notify_all();
+        }
+        if (finish) {
+            item.job.reset();
+            ++completed;
+        }
+    }
+    return true;
+}
+
 bool BatchService::State::consume_batch(std::unique_lock<std::mutex>& lock, int owner,
                                         const std::vector<BatchPrompt>& prompts,
-                                        const std::function<bool()>& is_cancelled,
-                                        BatchJobs& active, std::vector<DecoderResult>& results) {
-    const DecoderCallbacks callbacks;
+                                        const BatchCallbacks& callbacks, BatchJobs& active,
+                                        std::vector<DecoderResult>& results) {
     std::size_t next = 0;
     std::size_t completed = 0;
+    bool announced = false;
     while (completed < prompts.size()) {
         lock.unlock();
-        const bool cancelled = is_cancelled && is_cancelled();
+        const bool connected = (!callbacks.is_cancelled || !callbacks.is_cancelled()) &&
+            (!announced || !callbacks.on_stream_poll || callbacks.on_stream_poll());
         lock.lock();
-        if (cancelled) {
+        if (!connected) {
             return false;
         }
         if (failure) {
             std::rethrow_exception(failure);
         }
-        bool drained = false;
-        for (auto& item : active) {
-            if (!item.job) {
-                continue;
+        if (!announced && callbacks.on_admitted) {
+            bool admitted = false;
+            for (const auto& item : active) {
+                if (item.job && item.job->error) {
+                    std::rethrow_exception(item.job->error);
+                }
+                admitted = admitted || (item.job && item.job->admitted);
             }
-            auto& job = *item.job;
-            if (job.error) {
-                std::rethrow_exception(job.error);
-            }
-            auto& result = results[item.index];
-            if (job.pending) {
-                emit_step(*job.pending, callbacks, result);
-                job.pending.reset();
-                drained = true;
-            }
-            if (job.finish) {
-                if (*job.finish == DecoderFinishReason::cancelled) {
+            if (admitted) {
+                lock.unlock();
+                announced = callbacks.on_admitted();
+                lock.lock();
+                if (!announced) {
                     return false;
                 }
-                result.finish_reason = *job.finish;
-                result.cached_prompt_tokens = job.cached_tokens;
-                item.job.reset();
-                ++completed;
             }
+        }
+        if ((announced || !callbacks.on_admitted) &&
+            !drain_batch(lock, active, callbacks, results, completed)) {
+            return false;
         }
         const auto submitted = next;
         enqueue_batch(owner, prompts, active, next);
-        if (drained || next != submitted) {
+        if (next != submitted) {
             changed.notify_all();
         }
         if (completed < prompts.size()) {
@@ -713,7 +761,7 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
 
 std::optional<std::vector<DecoderResult>>
 BatchService::generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
-                             const std::function<bool()>& is_cancelled) {
+                             const BatchCallbacks& callbacks) {
     if (slot < 0 || slot >= state_->max_active) {
         throw std::out_of_range("Invalid decoder batch service slot");
     }
@@ -728,7 +776,7 @@ BatchService::generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
     generating = true;
     bool completed;
     try {
-        completed = state_->consume_batch(lock, slot, prompts, is_cancelled, active, results);
+        completed = state_->consume_batch(lock, slot, prompts, callbacks, active, results);
     } catch (...) {
         if (!lock.owns_lock()) {
             lock.lock();

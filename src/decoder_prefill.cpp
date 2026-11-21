@@ -423,16 +423,24 @@ struct PrefillGroup {
     int rows;
 };
 
-PrefillGroup prefill_group(const PrefillGrant* grants, int count) {
+int aligned_layerwise_rows(int rows) {
+    return (rows + layerwise_row_alignment - 1) / layerwise_row_alignment *
+        layerwise_row_alignment;
+}
+
+PrefillGroup prefill_group(const PrefillGrant* grants, int count, bool mixed) {
     PrefillGroup group{0, 0};
+    int aligned_rows = 0;
     for (int index = 0; index < count; ++index) {
         const auto& grant = grants[index];
+        const int aligned = aligned_layerwise_rows(grant.rows);
         if (grant.rows < 256 || grant.rows != grant.tile_rows ||
-            grant.rows % layerwise_row_alignment || grant.rows > max_layerwise_rows - group.rows) {
+            (!mixed && aligned != grant.rows) || aligned > max_layerwise_rows - aligned_rows) {
             break;
         }
         ++group.grants;
         group.rows += grant.rows;
+        aligned_rows += aligned;
     }
     return group.grants > 1 ? group : PrefillGroup{1, 0};
 }
@@ -506,7 +514,8 @@ void prefill_layerwise(const std::array<Layer, layer_count>& layers,
                     buffers.activation.values + std::size_t(offset) * text_gdn_value_width,
                     buffers.activation.scales + std::size_t(offset) * text_gdn_value_heads,
                 };
-                grouped_recurrence = grouped_recurrence && (grant.position != 0 || bank != 0);
+                grouped_recurrence = grouped_recurrence &&
+                    grant.rows % layerwise_row_alignment == 0 && (grant.position != 0 || bank != 0);
                 segments[index++] = {
                     grant.rows, segment.gdn_qkv, segment.gdn_z, segment.gdn_b, segment.gdn_a,
                     grant.request->states[bank],
@@ -716,7 +725,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
 }
 
 void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaStream_t stream,
-                                   bool tensor_cache, bool layerwise,
+                                   bool tensor_cache, bool layerwise, bool mixed,
                                    DecoderBatchStepStats& stats) const {
     int scalar_capacity = 1;
     for (int index = 0; index < count; ++index) {
@@ -728,7 +737,7 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
     int capacity = scalar_capacity;
     if (layerwise) {
         for (int index = 0; index < count;) {
-            const auto group = prefill_group(grants + index, count - index);
+            const auto group = prefill_group(grants + index, count - index, mixed);
             capacity = std::max(capacity, group.rows);
             index += group.grants;
         }
@@ -743,9 +752,8 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
     }
     stats.prefill_workspace_bytes = workspace->bytes();
     for (int index = 0; index < count;) {
-        const auto group = layerwise && workspace->data() ? prefill_group(grants + index,
-                                                                         count - index)
-                                                        : PrefillGroup{1, 0};
+        const auto group = layerwise && workspace->data()
+            ? prefill_group(grants + index, count - index, mixed) : PrefillGroup{1, 0};
         const auto& grant = grants[index];
         if (group.grants > 1) {
             prefill_layerwise(layers, embedding, grants + index, group, *workspace);

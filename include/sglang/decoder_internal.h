@@ -474,7 +474,8 @@ struct Decoder::Model {
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
                        const decoder::MediaPrefill* media = nullptr) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
-                        bool tensor_cache, bool layerwise, DecoderBatchStepStats& stats) const;
+                        bool tensor_cache, bool layerwise, bool mixed,
+                        DecoderBatchStepStats& stats) const;
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;

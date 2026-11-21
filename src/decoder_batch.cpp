@@ -341,7 +341,8 @@ struct DecoderBatch::State {
     Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats);
     void submit(const Selection& selected, const PrefillRows& decode, Steps& results,
                 DecoderBatchStepStats& stats, bool& contains_mtp);
-    void prefill(const PrefillRows& rows, bool only_prefill, DecoderBatchStepStats& stats);
+    void prefill(const PrefillRows& rows, const Steps& results, bool only_prefill,
+                 bool contains_mtp, DecoderBatchStepStats& stats);
     void score(int slot, Lane& lane, Workspace& work, bool logits_ready);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats);
@@ -708,7 +709,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
                                       {options.cuda_graphs, text_decode && !contains_mtp,
                                        !contains_mtp && max_rows == 0, tensor_core,
                                        greedy_winners, eager_score_rows});
-    if (max_rows) prefill(rows, count == 0 && !contains_mtp, stats);
+    if (max_rows) prefill(rows, results, count == 0, contains_mtp, stats);
     bool submitted = count != 0 || max_rows > 1;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = scoring[slot]) {
@@ -735,8 +736,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     collect_scores(scoring, packed_slots, run, results);
 }
 
-void DecoderBatch::State::prefill(const PrefillRows& rows, bool only_prefill,
-                                  DecoderBatchStepStats& stats) {
+void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results, bool only_prefill,
+                                  bool contains_mtp, DecoderBatchStepStats& stats) {
     const auto stream = execution.stream();
     const int budget = options.max_num_batched_tokens;
     const int cache_tile = tensor_cache && budget ? cache_prefill_tile(budget) : 0;
@@ -745,11 +746,18 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, bool only_prefill,
         model.fp8_prefill() == Fp8PrefillPolicy::tensor_core && sm100_prefill_enabled();
     std::array<PrefillGrant, decoder_batch_max_lanes> grants;
     int count = 0;
+    bool contains_decode = false;
+    bool text_batch = true;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
-        if (rows[slot] == 0) {
+        if (rows[slot] == 0 && !results[slot].decode) {
             continue;
         }
         auto& lane = *storage->slots[slot];
+        contains_decode = contains_decode || results[slot].decode;
+        text_batch = text_batch && !lane.media;
+        if (rows[slot] == 0) {
+            continue;
+        }
         int limit = lane.draft || lane.media ? prefill_chunk_rows : tile_limit;
         if (wide && !lane.draft && !lane.media && lane.prompt.size() <= sm100_prefill_max_visible) {
             limit = serial_prefill_max_rows;
@@ -759,9 +767,11 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, bool only_prefill,
                            std::min(rows[slot], limit), lane.prefill_limit(), lane.draft.get(),
                            lane.media ? &lane.media_prefill : nullptr};
     }
-    const bool layerwise = only_prefill && !tensor_cache && budget > 0 &&
+    const bool mixed = contains_decode && text_batch;
+    const bool layerwise = (only_prefill || mixed) && !contains_mtp && !tensor_cache &&
+        budget > 0 &&
         budget <= decoder_default_max_num_batched_tokens;
-    model.prefill_grants(grants.data(), count, stream, tensor_cache, layerwise, stats);
+    model.prefill_grants(grants.data(), count, stream, tensor_cache, layerwise, mixed, stats);
 }
 
 void DecoderBatch::State::collect_scores(

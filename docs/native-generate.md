@@ -4,11 +4,11 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Validate the request framing and route `POST /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if (request." --> · [Route](../apps/server/prefix_controls.cpp#L301)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
-| Request parser | Validate and prepare every prompt and its generation options. | [Parser](../apps/server/text_request.cpp#L622)<!-- prefix: "GenerateRequ" --> |
-| Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L221)<!-- prefix: "void complet" --> |
-| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L779)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L553)<!-- prefix: "bool BatchSe" --> |
-| Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L56)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L163)<!-- prefix: "void complet" --> · [Batch SSE](../apps/server/native_generate.cpp#L190)<!-- prefix: "void stream_" --> |
+| HTTP transport | Validate the request framing and route `POST /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if (request." --> · [Route](../apps/server/prefix_controls.cpp#L320)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
+| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L622)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L653)<!-- prefix: "std::vector\u003c" --> |
+| Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L251)<!-- prefix: "void complet" --> |
+| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L857)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L610)<!-- prefix: "bool BatchSe" --> |
+| Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L51)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L163)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L193)<!-- prefix: "void stream_" --> |
 
 ## Runtime path
 
@@ -56,7 +56,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/generate \
   }'
 ```
 
-The completion worker parses the body after it claims a queue slot.
+The reader parses the request shape and reserves its effective IDs when the queue has capacity.
 It validates all items and encodes all text prompts before it submits any decoder work.
 Both input forms use the checkpoint tokenizer to render generated IDs.
 
@@ -65,27 +65,27 @@ An item that decodes alone can use [score-backed singleton attention](singleton-
 The batch submits items to its worker's lane and can use available lanes without a reservation.
 If a new completion reserves a borrowed lane, it can use the lane after the current item retires.
 The worker submits remaining items as lanes become available. A batch can therefore contain more items than `--max-active`.
-[Lane selection](../apps/server/batch_service.cpp#L536)<!-- prefix: "void BatchSe" -->
+[Lane selection](../apps/server/batch_service.cpp#L557)<!-- prefix: "void BatchSe" -->
 
 ### JSON and SSE
 
 With `stream` unset or false, HTTP 200 carries one final object for a single prompt or an array for a batch.
 The batch response contains one final object per item in input order, even when items finish in a different order.
 A one-item batch still returns a JSON array. Each item has its own ID and metadata.
-With `stream: true`, one connection opens [chunked HTTP 200 after successful decoder admission](http-server.md#completion-streams).
+With `stream: true`, one connection opens [chunked HTTP 200](http-server.md#completion-streams) after successful decoder admission or when all items have been aborted before admission.
 A single prompt sends result events without `index`. Every batch result event includes a top-level `index`, the zero-based position of its prompt in the request.
 Items can interleave and finish in any order. A one-item batch still sends indexed events.
-[Indexed result](../apps/server/native_generate.cpp#L107)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L601)<!-- prefix: "bool BatchSe" -->
+[Indexed result](../apps/server/native_generate.cpp#L106)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L658)<!-- prefix: "bool BatchSe" -->
 
 | Field | Meaning |
 | --- | --- |
 | `index` | Original prompt position, present on every batch result event. |
 | `text` | Cumulative decoded text. The writer skips tokenizer special tokens and buffers incomplete UTF-8. |
 | `output_ids` | Cumulative array of generated IDs. |
-| `meta_info.id` | Server-assigned ID for the item. It stays constant across that item's events. |
+| `meta_info.id` | Effective item ID, provided by `rid` or generated by the server. It stays constant across that item's events. |
 | `meta_info.prompt_tokens` | Number of prompt IDs. |
 | `meta_info.completion_tokens` | Number of IDs in `output_ids`. |
-| `meta_info.finish_reason` | `null` on intermediate events. The final value is `{"type":"length","length":N}` or `{"type":"stop","matched":ID}`. |
+| `meta_info.finish_reason` | `null` on intermediate events. The final value is `{"type":"length","length":N}`, `{"type":"stop","matched":ID}`, or an [abort result](native-abort.md#runtime-path). |
 | `meta_info.cached_tokens` | Number of reused prompt IDs. Present on every batch result event and in every final object. Single-prompt intermediate events omit it. |
 
 For a batch, keep separate state by `index` and replace that item's text and ID array with each event's values. Text can stay unchanged while IDs grow, and one event can contain several new IDs from a decoder step.
@@ -96,7 +96,7 @@ Each item sends one final object on success. After all items finish, the respons
 The [keepalive timer](http-server.md#completion-streams) applies to the whole connection. Traffic for any item resets it.
 Skip comments and measure each item's TTFT at its first event with output IDs. A zero-budget item has no first-token sample.
 The completion worker writes outside the scheduler mutex. A blocked write can hold the batch's pending results while other ready completions advance.
-[Batch result delivery](../apps/server/batch_service.cpp#L553)<!-- prefix: "bool BatchSe" -->
+[Batch result delivery](../apps/server/batch_service.cpp#L610)<!-- prefix: "bool BatchSe" -->
 
 ## Constraints and failure behavior
 
@@ -109,6 +109,7 @@ Send one JSON object. The parser rejects duplicate keys, nesting beyond 32 conta
 | `text` | A nonempty UTF-8 string or an array of such strings. Each string is at most 1,048,576 bytes. |
 | `input_ids` | A nonempty flat array of IDs or an array of such arrays. Each ID is an integer in `[0, 248320)`. |
 | `stream` | Boolean. Omission or null uses `false`. `true` enables SSE for a single prompt or batch. |
+| `rid` | A string or, for a batch, one string per item in input order. A single batch string gets a zero-based suffix for each item. Omission or null generates IDs. See [abort and ID reuse](native-abort.md). |
 | `sampling_params` | One object or, for a batch, one object per item in input order. A single object applies to every item. Omission or top-level null uses the defaults below. |
 | `cache_salt` | One string or, for a batch, one string per item in input order. A single string applies to every item. Each string is at most 256 UTF-8 bytes. Omission or top-level null uses the empty salt. See [prefix reuse](prefix-cache.md#runtime-path). |
 
@@ -116,7 +117,7 @@ Supply exactly one non-null prompt field. A batch contains 1–32 items of the s
 If you send a parameter array, its length must equal the number of prompts. Each entry must have the type given in the table.
 Missing sampling keys in each object use the native defaults.
 The sum of batch output budgets must be at most 262,144 tokens. Each prompt and its own budget must fit the model context.
-[Batch form](../apps/server/text_request.cpp#L643)<!-- prefix: "requests.bat" --> · [Parameter arrays](../apps/server/text_request.cpp#L607)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L657)<!-- prefix: "int remainin" -->
+[Batch form](../apps/server/text_request.cpp#L642)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/text_request.cpp#L607)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L668)<!-- prefix: "int remainin" -->
 
 | Sampling field | Accepted values and default |
 | --- | --- |
@@ -135,7 +136,7 @@ Other fields return HTTP 400, including `model`, `messages`, string stops, and o
 
 | Result | Behavior |
 | --- | --- |
-| Invalid headers, JSON, or request options | HTTP 400. |
+| Invalid headers, JSON, request options, or duplicate live IDs | HTTP 400. |
 | Missing length or media type | HTTP 411 for missing `Content-Length`. HTTP 415 for missing or unsupported `Content-Type`. |
 | Oversized request | HTTP 413 for an oversized body. HTTP 431 for oversized headers. |
 | Decoder capacity failure | HTTP 413 if the request exceeds total [resident capacity](batch-graphs.md#resident-memory-admission). HTTP 503 if capacity is temporarily unavailable. |
@@ -148,9 +149,10 @@ The error event applies to the stream and has no item index. Previously delivere
 On a generation failure, disconnect, or failed write, the worker discards unsubmitted items, cancels the active jobs still owned by the batch, and waits for their retirement before releasing the slot.
 Decoder effects already published, such as prefix-cache entries, can remain.
 The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
-[Batch cancellation](../apps/server/batch_service.cpp#L515)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L34)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L119)<!-- prefix: "void write_s" -->
+[Batch cancellation](../apps/server/batch_service.cpp#L536)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L36)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L118)<!-- prefix: "void write_s" -->
 After successful HTTP parsing, a method other than POST at `/generate` returns HTTP 404.
 A disconnected client can cancel queued or active work through the [shared transport](http-server.md#http-admission-and-shutdown).
+Send [`POST /abort_request`](native-abort.md) from a second connection to cancel by ID.
 
 ## Verification
 

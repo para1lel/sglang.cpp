@@ -214,6 +214,7 @@ int main(int argc, char** argv) {
         }
         const auto model_info = model_info_json(arguments);
         const auto listener = listen(arguments);
+        NativeGenerate native_generate(service, tokenizer);
         serve_connections(listener, service, arguments.max_active,
             [&](const Socket& connection, int slot, std::string_view body, bool chat) {
                 if (chat) {
@@ -222,11 +223,13 @@ int main(int argc, char** argv) {
                     complete(connection, service, slot, tokenizer, body);
                 }
             }, health, arguments.prefix_cache_entries != 0,
-            [&](const Socket& connection, int slot, std::string_view body) {
-                complete_generate(connection, service, slot, tokenizer, body);
+            [&](std::string_view body) {
+                return native_generate.prepare(body);
             }, [&](const Socket& connection, TokenizationRoute route, std::string_view body) {
                 serve_tokenization(connection, route, tokenizer, body);
-            }, model_info);
+            }, model_info, [&](const Socket& connection, std::string_view body) {
+                native_generate.abort(connection, body);
+            });
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';
         return 1;

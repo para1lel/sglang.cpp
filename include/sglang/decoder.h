@@ -73,6 +73,7 @@ enum class DecoderFinishReason {
     stop,
     cancelled,
     constraint,
+    aborted,
 };
 
 struct DecoderCallbacks {

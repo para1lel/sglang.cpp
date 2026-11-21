@@ -3,6 +3,8 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_media.h"
 
+#include <atomic>
+
 namespace sglang::server {
 
 struct BatchMetrics {
@@ -26,9 +28,68 @@ struct BatchProfile {
     std::vector<BatchProfileStep> steps;
 };
 
+class BatchRequestId {
+public:
+    explicit BatchRequestId(std::string value) : value(std::move(value)) {}
+
+    bool dispatch() {
+        auto expected = State::waiting;
+        return state_.compare_exchange_strong(expected, State::dispatched);
+    }
+
+    bool abort(bool dispatched_only = false) {
+        auto expected = state_.load();
+        while (expected == State::dispatched ||
+               (!dispatched_only && expected == State::waiting)) {
+            const auto target = expected == State::waiting ? State::aborted_waiting :
+                                                             State::aborted_running;
+            if (state_.compare_exchange_weak(expected, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool finish() {
+        auto expected = State::dispatched;
+        return state_.compare_exchange_strong(expected, State::finished);
+    }
+
+    void finish_abort() {
+        const auto state = state_.load();
+        state_.store(state == State::aborted_waiting ? State::finished_waiting_abort :
+                                                       State::finished_running_abort);
+    }
+
+    bool finished() const {
+        const auto state = state_.load();
+        return state == State::finished || state == State::finished_waiting_abort ||
+               state == State::finished_running_abort;
+    }
+    bool aborted() const {
+        const auto state = state_.load();
+        return state == State::aborted_waiting || state == State::aborted_running ||
+               state == State::finished_waiting_abort || state == State::finished_running_abort;
+    }
+    bool aborted_waiting() const {
+        const auto state = state_.load();
+        return state == State::aborted_waiting || state == State::finished_waiting_abort;
+    }
+
+    const std::string value;
+
+private:
+    enum class State {
+        waiting, dispatched, aborted_waiting, aborted_running, finished,
+        finished_waiting_abort, finished_running_abort,
+    };
+    std::atomic<State> state_{State::waiting};
+};
+
 struct BatchPrompt {
     std::vector<int> prompt;
     DecoderOptions options;
+    BatchRequestId* request_id = nullptr;
 };
 
 struct BatchCallbacks {
@@ -48,10 +109,12 @@ public:
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
                            const DecoderCallbacks& callbacks,
                            std::vector<DecoderMedia> media = std::vector<DecoderMedia>(),
-                           std::size_t expanded_tokens = 0);
+                           std::size_t expanded_tokens = 0,
+                           BatchRequestId* request_id = nullptr);
     std::optional<std::vector<DecoderResult>>
     generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
                    const BatchCallbacks& callbacks);
+    void notify_abort();
     bool ready() const;
     void rethrow_failure() const;
     BatchMetrics metrics() const;

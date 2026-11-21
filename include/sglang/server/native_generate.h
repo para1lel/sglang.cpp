@@ -1,23 +1,47 @@
 #pragma once
 
+#include "sglang/json.h"
 #include "sglang/server/batch_service.h"
+#include "sglang/server/prefix_controls.h"
 
-#include <string_view>
+#include <map>
+#include <memory>
+#include <mutex>
 
 namespace sglang::server {
 
 class CompletionTokenizer;
 class Socket;
 
-struct GenerateRequests {
-    std::vector<BatchPrompt> items;
+struct GenerateInput {
+    json::Object fields;
+    std::size_t count = 1;
     bool stream = false;
     bool batch = false;
+    bool text = false;
 };
 
-GenerateRequests parse_generate_requests(std::string_view body,
-                                         const CompletionTokenizer& tokenizer);
-void complete_generate(const Socket& connection, BatchService& service, int slot,
-                       const CompletionTokenizer& tokenizer, std::string_view body);
+GenerateInput parse_generate_input(std::string_view body);
+std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
+                                               const CompletionTokenizer& tokenizer);
+
+class NativeGenerate {
+public:
+    NativeGenerate(BatchService& service, const CompletionTokenizer& tokenizer)
+        : service_(service), tokenizer_(tokenizer) {}
+
+    QueuedGenerate prepare(std::string_view body);
+    void abort(const Socket& connection, std::string_view body);
+
+private:
+    struct Registration;
+    std::shared_ptr<Registration> register_ids(std::vector<std::optional<std::string>> ids);
+
+    BatchService& service_;
+    const CompletionTokenizer& tokenizer_;
+    std::mutex mutex_;
+    std::map<std::string, BatchRequestId*, std::less<>> ids_;
+    std::uint64_t next_id_ = 1;
+};
 
 }

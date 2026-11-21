@@ -6,6 +6,7 @@
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <ctime>
 #include <exception>
@@ -21,6 +22,7 @@ namespace {
 struct Completion {
     Socket connection;
     std::optional<HttpRequest> request;
+    QueuedGenerate generate = QueuedGenerate{};
 };
 
 bool chat_route(const HttpRequest& request) { return request.path == "/v1/chat/completions"; }
@@ -139,13 +141,15 @@ class ConnectionQueue {
 public:
     ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete,
                     std::string_view health, bool prefix_controls, const BatchGenerate& generate,
-                    const Tokenization& tokenize, std::string_view model_info)
+                    const Tokenization& tokenize, std::string_view model_info,
+                    const NativeAbort& abort)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
-          tokenize_(tokenize), health_(health), model_info_(model_info),
+          tokenize_(tokenize), abort_(abort), health_(health), model_info_(model_info),
           prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
+    void run_aborted();
     void stop();
 
 private:
@@ -167,11 +171,13 @@ private:
     const BatchCompletion& complete_;
     const BatchGenerate& generate_;
     const Tokenization& tokenize_;
+    const NativeAbort& abort_;
     const std::string_view health_;
     const std::string_view model_info_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
+    std::condition_variable abort_ready_;
     std::list<Completion> pending_;
     std::optional<Socket> reset_;
     int running_ = 0;
@@ -231,6 +237,16 @@ void write_models(const Socket& connection) {
 }
 
 void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& request) {
+    if (abort_ && request.method == "POST" && request.path == "/abort_request") {
+        {
+            const std::lock_guard lock(mutex_);
+            discard_disconnected();
+        }
+        abort_(connection, request.body);
+        const std::lock_guard lock(mutex_);
+        abort_ready_.notify_one();
+        return;
+    }
     if (!model_info_.empty() &&
         (request.path == "/model_info" || request.path == "/get_model_info")) {
         if (request.method != "GET") {
@@ -292,6 +308,9 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
     if (generate_) {
         routes += " or /generate";
     }
+    if (abort_) {
+        routes += " or /abort_request";
+    }
     if (tokenize_) {
         routes += " or /tokenize or /detokenize";
     }
@@ -323,7 +342,11 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
             }
             throw HttpError("503 Service Unavailable", "Native completion queue is full");
         }
-        pending_.push_back({std::move(connection), std::move(request)});
+        auto prepared = generate ? generate_(request.body) : QueuedGenerate{};
+        if (prepared.complete) {
+            request.body = std::string{};
+        }
+        pending_.push_back({std::move(connection), std::move(request), std::move(prepared)});
     }
     changed_.notify_one();
 }
@@ -375,11 +398,39 @@ void ConnectionQueue::run(int slot) {
                 const auto tokenize = tokenization_route(request);
                 if (tokenize != TokenizationRoute::none) {
                     tokenize_(work->connection, tokenize, request.body);
-                } else if (request.path == "/generate") {
-                    generate_(work->connection, slot, request.body);
+                } else if (work->generate.complete) {
+                    const auto generate = std::move(work->generate);
+                    generate.complete(work->connection, slot);
                 } else {
                     complete_(work->connection, slot, request.body, chat_route(request));
                 }
+            });
+        }
+    }
+}
+
+void ConnectionQueue::run_aborted() {
+    for (;;) {
+        std::unique_lock lock(mutex_);
+        const auto find_aborted = [&] {
+            return std::find_if(pending_.begin(), pending_.end(), [](const auto& item) {
+                return item.generate.aborted && item.generate.aborted();
+            });
+        };
+        auto found = pending_.end();
+        abort_ready_.wait(lock, [&] {
+            return closing_ || (found = find_aborted()) != pending_.end();
+        });
+        if (closing_) {
+            return;
+        }
+        auto work = std::move(*found);
+        pending_.erase(found);
+        lock.unlock();
+        if (!disconnected(work.connection)) {
+            handle_errors(work.connection, [&] {
+                const auto generate = std::move(work.generate);
+                generate.complete(work.connection, std::nullopt);
             });
         }
     }
@@ -393,6 +444,7 @@ void ConnectionQueue::stop() {
         reset_.reset();
     }
     changed_.notify_all();
+    abort_ready_.notify_one();
 }
 
 }
@@ -400,14 +452,15 @@ void ConnectionQueue::stop() {
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
                        bool prefix_controls, const BatchGenerate& generate,
-                       const Tokenization& tokenize, std::string_view model_info) {
+                       const Tokenization& tokenize, std::string_view model_info,
+                       const NativeAbort& abort) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
-                          tokenize, model_info);
+                          tokenize, model_info, abort);
     std::vector<std::thread> workers;
-    workers.reserve(max_active);
+    workers.reserve(max_active + (abort ? 1 : 0));
     std::mutex failure_mutex;
     std::exception_ptr failure;
     const auto stop_on_error = [&] {
@@ -418,6 +471,15 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
         stop_serving();
     };
     try {
+        if (abort) {
+            workers.emplace_back([&] {
+                try {
+                    queue.run_aborted();
+                } catch (...) {
+                    stop_on_error();
+                }
+            });
+        }
         for (int slot = 0; slot < max_active; ++slot) {
             workers.emplace_back([&, slot] {
                 try {

@@ -525,7 +525,7 @@ void set_cache_salt_value(const json::Value& value, DecoderOptions& options) {
 void validate_generate_fields(const json::Object& object) {
     for (const auto& [key, value] : object) {
         if (key == "text" || key == "input_ids" || key == "sampling_params" ||
-            key == "stream" || key == "cache_salt") {
+            key == "stream" || key == "cache_salt" || key == "rid") {
             continue;
         }
         if (((key == "return_logprob" || key == "return_routed_experts") &&
@@ -619,17 +619,16 @@ const json::Array* generate_parameter_list(const json::Value* value, std::size_t
 
 }
 
-GenerateRequests parse_generate_requests(std::string_view body,
-                                         const CompletionTokenizer& tokenizer) {
-    const auto parsed = parse_body(body, json::Syntax::strict);
-    const auto* object = parsed.object();
+GenerateInput parse_generate_input(std::string_view body) {
+    auto parsed = parse_body(body, json::Syntax::strict);
+    auto* object = parsed.object();
     if (!object) {
         bad_request("Expected a JSON object for /generate");
     }
     validate_generate_fields(*object);
-    GenerateRequests requests;
+    GenerateInput input;
     if (const auto* stream = json::get(*object, "stream"); stream && !stream->is_null()) {
-        requests.stream = read_bool(*object, "stream");
+        input.stream = read_bool(*object, "stream");
     }
     const auto* text = json::get(*object, "text");
     const auto* ids = json::get(*object, "input_ids");
@@ -638,34 +637,45 @@ GenerateRequests parse_generate_requests(std::string_view body,
     if (has_text == has_ids) {
         bad_request("Provide exactly one of text or input_ids");
     }
-    const auto& input = has_text ? *text : *ids;
-    const auto* list = input.array();
-    requests.batch = list && (has_text || (!list->empty() && list->front().array()));
-    const auto* params = json::get(*object, "sampling_params");
-    const auto* salt = json::get(*object, "cache_salt");
-    if (!requests.batch) {
-        requests.items.push_back(generate_prompt(input, has_text,
-            generate_options(params, salt), tokenizer));
-        return requests;
+    const auto* list = (has_text ? text : ids)->array();
+    input.text = has_text;
+    input.batch = list && (has_text || (!list->empty() && list->front().array()));
+    if (input.batch) {
+        if (list->empty() || list->size() > decoder_batch_max_lanes) {
+            bad_request("Expected 1 to 32 /generate batch items");
+        }
+        input.count = list->size();
     }
-    if (list->empty() || list->size() > decoder_batch_max_lanes) {
-        bad_request("Expected 1 to 32 /generate batch items");
+    input.fields = std::move(*object);
+    return input;
+}
+
+std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
+                                               const CompletionTokenizer& tokenizer) {
+    const auto& prompt = *json::get(input.fields, input.text ? "text" : "input_ids");
+    const auto* params = json::get(input.fields, "sampling_params");
+    const auto* salt = json::get(input.fields, "cache_salt");
+    std::vector<BatchPrompt> items;
+    items.reserve(input.count);
+    if (!input.batch) {
+        items.push_back(generate_prompt(prompt, input.text,
+                                       generate_options(params, salt), tokenizer));
+        return items;
     }
-    const auto* param_list = generate_parameter_list(params, list->size(), false);
-    const auto* salt_list = generate_parameter_list(salt, list->size(), true);
-    requests.items.reserve(list->size());
+    const auto& list = *prompt.array();
+    const auto* param_list = generate_parameter_list(params, input.count, false);
+    const auto* salt_list = generate_parameter_list(salt, input.count, true);
     int remaining = checkpoint_context;
-    for (std::size_t index = 0; index < list->size(); ++index) {
+    for (std::size_t index = 0; index < input.count; ++index) {
         auto options = generate_options(param_list ? &(*param_list)[index] : params,
                                         salt_list ? &(*salt_list)[index] : salt);
         remaining -= options.max_new_tokens;
         if (remaining < 0) {
             bad_request("Batch output budgets must total at most 262144 tokens");
         }
-        requests.items.push_back(generate_prompt((*list)[index], has_text,
-                                                 std::move(options), tokenizer));
+        items.push_back(generate_prompt(list[index], input.text, std::move(options), tokenizer));
     }
-    return requests;
+    return items;
 }
 
 void set_cache_salt(const json::Object& object, DecoderOptions& options) {

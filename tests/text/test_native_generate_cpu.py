@@ -19,6 +19,9 @@ from test_sampling_routes_cpu import CHAT, MODELS, TEXT, body, receipts, send, s
 
 
 GENERATE = "/generate"
+ABORT_REQUEST = "/abort_request"
+ABORTED = {"type": "abort", "message": "Aborted", "status_code": None, "err_type": None}
+ABORTED_WAITING = {"type": "abort", "message": "Abort in waiting queue"}
 
 
 def get(port, path):
@@ -47,6 +50,13 @@ def queue_client(port, budget):
     return generate_client(port, {
         "input_ids": [32], "stream": True, "sampling_params": {"max_new_tokens": budget},
     })
+
+
+def named(rid, *, budget=2, stream=True, seed=-41):
+    return {
+        "input_ids": [32], "rid": rid, "stream": stream,
+        "sampling_params": {"max_new_tokens": budget, "sampling_seed": seed},
+    }
 
 
 def abort(client):
@@ -168,7 +178,7 @@ class NativeGenerate(unittest.TestCase):
             *[({"input_ids": [token]}, "input_ids") for token in (-1, 248320, True, 1.5)],
             *[({"text": "A", key: value}, key) for key, value in (
                 ("model", MODEL), ("stream", 1), ("lora_path", "adapter"), ("return_logprob", True),
-                ("return_routed_experts", True), ("logprob_start_len", 0), ("rid", "x"),
+                ("return_routed_experts", True), ("logprob_start_len", 0),
                 ("image_data", []), ("sampling_params", [{}]), ("cache_salt", "x" * 257),
             )],
             *[({"text": "A", "sampling_params": {key: value}}, key) for key, value in (
@@ -529,6 +539,312 @@ class NativeGenerate(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail(f"Queue did not reach {running} running and {waiting} waiting: {data!r}")
+
+    def start_abort_server(self, *, active=1, fail=False):
+        controls = Path(self.enterContext(TemporaryDirectory(dir=self.output)))
+        gate = controls / "step"
+        log = self.output / f"{self._testMethodName}.log"
+        environment = {"SGLANG_TEST_BATCH_STEP_GATE": str(gate)}
+        if fail:
+            environment["SGLANG_TEST_BATCH_ADMISSION_FAILURE"] = "-900"
+        self.enterContext(patch.dict("os.environ", environment))
+        port = self.enterContext(server(self.binary, self.checkpoint, log,
+                                        "--max-active", str(active),
+                                        "--prefix-cache-entries", "1"))
+        return port, gate, log
+
+    def abort_request(self, port, payload, *, status=200):
+        with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
+            wire = payload if isinstance(payload, bytes) else json.dumps(payload)
+            connection.request("POST", ABORT_REQUEST, wire, HEADERS)
+            with connection.getresponse() as reply:
+                body = reply.read()
+                self.assertEqual(reply.status, status, body)
+                if status == 200:
+                    self.assertEqual(body, b"")
+                else:
+                    self.assertIn("error", json.loads(body))
+
+    def check_named_finish(self, packet, rid, tokens, reason, *, index=None):
+        text = "AB"[:len(tokens)]
+        if index is None:
+            checked = self.check_packet(packet, text, tokens, reason)
+        else:
+            checked = self.check_batch_frame(packet, index, text, tokens, reason, prompt_tokens=1)
+        self.assertEqual(checked, rid)
+
+    def check_aborted_stream(self, reply, rid, tokens, *, waiting=False):
+        self.check_batch_headers(reply)
+        self.check_named_finish(batch_frame(reply), rid, tokens,
+                                ABORTED_WAITING if waiting else ABORTED)
+        self.assertEqual(batch_frame(reply), "[DONE]")
+        self.assertIsNone(batch_frame(reply))
+
+    def check_reused_ids(self, port, ids):
+        values = self.generate({"input_ids": [[32]] * len(ids), "rid": ids,
+                                "sampling_params": {"max_new_tokens": 0}}, port=port)
+        for packet, rid in zip(values, ids, strict=True):
+            self.check_named_finish(packet, rid, [], {"type": "length", "length": 0})
+
+    def test_request_id_shapes_and_abort_body(self):
+        port, _, log = self.start_abort_server()
+        zero = named(None, budget=0, seed=None, stream=False)
+        omitted = {key: value for key, value in zero.items() if key != "rid"}
+        allocated = [self.generate(payload, port=port)["meta_info"]["id"]
+                     for payload in (zero, omitted)]
+        self.assertEqual(len(set(allocated)), 2)
+        self.assertTrue(all(isinstance(rid, str) and rid for rid in allocated))
+        for rid, expected in (("caller", ["caller_0", "caller_1"]),
+                              ([" exact ", "ʀid"], [" exact ", "ʀid"])):
+            result = self.generate({"input_ids": [[32], [33]], "rid": rid,
+                                    "sampling_params": {"max_new_tokens": 0}}, port=port)
+            self.assertEqual([row["meta_info"]["id"] for row in result], expected)
+        for rid in (3, True, {}, [], [""], ["only"], ["dup", "dup"], ["valid", 42]):
+            with self.subTest(rid=rid):
+                status, result = send(port, GENERATE, named(rid) | {"input_ids": [[32], [33]]})
+                self.assertEqual(status, 400, result)
+                self.assertRegex(result["error"]["message"], "rid|request ID")
+        for payload in ([], {"rid": 3}, {"abort_all": 1}, {"abort_all": "yes"},
+                        b'{"rid":"invalid",}'):
+            with self.subTest(payload=payload):
+                self.abort_request(port, payload, status=400)
+        for payload in ({}, {"rid": None}, {"rid": ""}, {"rid": "unknown"},
+                        {"abort_all": False}):
+            self.abort_request(port, payload)
+        self.assertFalse([row for row in receipts(log) if row["budget"]])
+
+    def test_named_abort_bypasses_full_queue_and_keeps_partial_sse(self):
+        port, gate, log = self.start_abort_server()
+        gate.with_suffix(".0").touch()
+        with generate_client(port, named("Active")) as active, \
+             http.client.HTTPResponse(active) as stream:
+            self.check_batch_headers(stream)
+            self.check_named_finish(batch_frame(stream), "Active", [32], None)
+            with generate_client(port, named("waiting", budget=77)) as queued, \
+                 http.client.HTTPResponse(queued) as waiting:
+                self.wait_queue(port, 1, 1)
+                status, error = send(port, GENERATE, named("overflow", budget=0, stream=False))
+                self.assertEqual(status, 503, error)
+                for rid in ("unknown", "active", ""):
+                    self.abort_request(port, {"rid": rid})
+                self.wait_queue(port, 1, 1)
+                self.abort_request(port, {"rid": "waiting"})
+                self.abort_request(port, {"rid": "Active"})
+                self.abort_request(port, {"rid": "Active"})
+                self.check_aborted_stream(stream, "Active", [32])
+                self.check_aborted_stream(waiting, "waiting", [], waiting=True)
+        self.wait_queue(port, 0, 0)
+        self.abort_request(port, {"rid": "Active"})
+        self.check_reused_ids(port, ["Active", "waiting"])
+        self.assertEqual([row["budget"] for row in receipts(log) if row["budget"]], [2])
+        self.assertIn("cpu cancel slot=0 prompt=1 budget=2", log.read_text())
+
+    def test_partially_aborted_http_batch_keeps_its_live_sibling(self):
+        port, gate, log = self.start_abort_server()
+        gate.with_suffix(".0").touch()
+        ids = ["live", "queued-item"]
+        payload = named(ids) | {"input_ids": [[32], [33]]}
+        with generate_client(port, named("active")) as active, \
+             http.client.HTTPResponse(active) as stream:
+            self.check_batch_headers(stream)
+            self.check_named_finish(batch_frame(stream), "active", [32], None)
+            with generate_client(port, payload) as queued, \
+                 http.client.HTTPResponse(queued) as batch:
+                self.wait_queue(port, 1, 1)
+                self.abort_request(port, {"rid": ids[1]})
+                self.wait_queue(port, 1, 1)
+                self.abort_request(port, {"rid": "active"})
+                self.check_aborted_stream(stream, "active", [32])
+                self.check_batch_headers(batch)
+                first = [batch_frame(batch), batch_frame(batch)]
+                for index, packet in enumerate(sorted(first, key=lambda item: item["index"])):
+                    tokens, reason = ([32], None) if index == 0 else ([], ABORTED_WAITING)
+                    self.check_named_finish(packet, ids[index], tokens, reason, index=index)
+                gate.with_suffix(".1").touch()
+                finish = {"type": "length", "length": 2}
+                self.check_named_finish(batch_frame(batch), ids[0], [32, 33], finish, index=0)
+                self.assertEqual(batch_frame(batch), "[DONE]")
+                self.assertIsNone(batch_frame(batch))
+        self.assertEqual([row["budget"] for row in receipts(log)], [2, 2])
+
+    def test_aborted_http_queue_entry_releases_capacity_while_active_request_runs(self):
+        port, gate, _ = self.start_abort_server()
+        gate.with_suffix(".0").touch()
+        with generate_client(port, named("active")) as active, \
+             http.client.HTTPResponse(active) as stream:
+            self.check_batch_headers(stream)
+            self.check_named_finish(batch_frame(stream), "active", [32], None)
+            with generate_client(port, named("queued", budget=77)) as queued, \
+                 http.client.HTTPResponse(queued) as waiting:
+                self.wait_queue(port, 1, 1)
+                self.abort_request(port, {"rid": "queued"})
+                self.wait_queue(port, 1, 0)
+                self.check_aborted_stream(waiting, "queued", [], waiting=True)
+            self.abort_request(port, {"rid": "active"})
+            self.check_aborted_stream(stream, "active", [32])
+
+    def test_live_collision_does_not_reserve_other_batch_ids(self):
+        port, gate, log = self.start_abort_server(active=2)
+        gate.with_suffix(".0").touch()
+        held = "gen-1"
+        with generate_client(port, named(held)) as client, \
+             http.client.HTTPResponse(client) as reply:
+            self.check_batch_headers(reply)
+            self.check_named_finish(batch_frame(reply), held, [32], None)
+            for colliding in (held, ["new", held], [held, "new"]):
+                prompts = [[32], [33]] if isinstance(colliding, list) else [32]
+                status, result = send(port, GENERATE, named(colliding) | {"input_ids": prompts})
+                self.assertEqual(status, 400, result)
+                self.assertRegex(result["error"]["message"], "rid|request ID")
+            auto = self.generate(named(None, budget=0, seed=None, stream=False), port=port)
+            self.check_named_finish(auto, "gen-2", [], {"type": "length", "length": 0})
+            self.check_reused_ids(port, ["new"])
+            self.abort_request(port, {"rid": held})
+            self.check_aborted_stream(reply, held, [32])
+        self.wait_queue(port, 0, 0)
+        self.check_reused_ids(port, [held, "new"])
+        admitted = [row["budget"] for row in receipts(log) if row["budget"]]
+        self.assertEqual(admitted, [2])
+
+    def test_batch_item_abort_and_abort_all(self):
+        port, gate, _ = self.start_abort_server(active=2)
+        gate.with_suffix(".0").touch()
+        request_body = named("batch") | {"input_ids": [[32], [33], [34]]}
+        with generate_client(port, request_body) as client, \
+             http.client.HTTPResponse(client) as stream:
+            self.check_batch_headers(stream)
+            first = [batch_frame(stream), batch_frame(stream)]
+            for index, packet in enumerate(sorted(first, key=lambda item: item["index"])):
+                self.check_named_finish(packet, f"batch_{index}", [32], None, index=index)
+            self.abort_request(port, {"rid": "batch_2"})
+            self.check_named_finish(batch_frame(stream), "batch_2", [], ABORTED_WAITING, index=2)
+            self.abort_request(port, {"rid": "batch_0"})
+            lane = batch_frame(stream)
+            self.check_named_finish(lane, "batch_0", [32], ABORTED, index=0)
+            self.abort_request(port, {"rid": "missing", "abort_all": True})
+            lane = batch_frame(stream)
+            self.check_named_finish(lane, "batch_1", [32], ABORTED, index=1)
+            self.assertEqual(batch_frame(stream), "[DONE]")
+            self.assertIsNone(batch_frame(stream))
+        self.wait_queue(port, 0, 0)
+        self.check_reused_ids(port, ["batch_0", "batch_1", "batch_2"])
+
+    def test_named_prefix_abort_only_matches_dispatched_siblings(self):
+        port, gate, _ = self.start_abort_server(active=2)
+        gate.with_suffix(".0").touch()
+        ids = ["prefix", "prefix-running", "prefix-waiting"]
+        payload = named(ids) | {"input_ids": [[32], [33], [34]]}
+        with generate_client(port, payload) as client, http.client.HTTPResponse(client) as reply:
+            self.check_batch_headers(reply)
+            first = [batch_frame(reply), batch_frame(reply)]
+            self.assertCountEqual([packet["meta_info"]["id"] for packet in first], ids[:2])
+            self.abort_request(port, {"rid": "pre"})
+            self.abort_request(port, {"rid": ids[0]})
+            terminal = [batch_frame(reply) for _ in ids]
+            for index, packet in enumerate(sorted(terminal, key=lambda item: item["index"])):
+                self.check_named_finish(packet, ids[index], [32],
+                                        ABORTED if index < 2 else None, index=index)
+            gate.with_suffix(".1").touch()
+            finish = {"type": "length", "length": 2}
+            self.check_named_finish(batch_frame(reply), ids[2], [32, 33], finish, index=2)
+            self.assertEqual(batch_frame(reply), "[DONE]")
+            self.assertIsNone(batch_frame(reply))
+
+    def test_finished_batch_item_reuse_survives_old_request_cleanup(self):
+        port, gate, _ = self.start_abort_server(active=3)
+        gate.with_suffix(".0").touch()
+        payload = named(["reusable", "old-sibling"]) | {
+            "input_ids": [[32], [33]],
+            "sampling_params": [{"max_new_tokens": 1}, named("old")["sampling_params"]],
+        }
+        with generate_client(port, payload) as old, http.client.HTTPResponse(old) as stream:
+            self.check_batch_headers(stream)
+            first = [batch_frame(stream), batch_frame(stream)]
+            for packet in first:
+                if packet["index"] == 0:
+                    finish = {"type": "length", "length": 1}
+                    self.check_named_finish(packet, "reusable", [32], finish, index=0)
+                else:
+                    self.check_named_finish(packet, "old-sibling", [32], None, index=1)
+            new_batch = named(["reusable"]) | {"input_ids": [[32]]}
+            with generate_client(port, new_batch) as new, \
+                 http.client.HTTPResponse(new) as reply:
+                self.check_batch_headers(reply)
+                self.check_named_finish(batch_frame(reply), "reusable", [32], None, index=0)
+                self.abort_request(port, {"rid": "old-sibling"})
+                self.check_named_finish(batch_frame(stream), "old-sibling", [32], ABORTED,
+                                        index=1)
+                self.assertEqual(batch_frame(stream), "[DONE]")
+                self.assertIsNone(batch_frame(stream))
+                self.wait_queue(port, 1, 0)
+                self.abort_request(port, {"rid": "reusable"})
+                self.check_named_finish(batch_frame(reply), "reusable", [32], ABORTED, index=0)
+                self.assertEqual(batch_frame(reply), "[DONE]")
+                self.assertIsNone(batch_frame(reply))
+
+    def test_ids_released_after_batch_failure(self):
+        port, _, log = self.start_abort_server(active=2, fail=True)
+        ids = ["running", "done", "failed", "tail"]
+        options = [{"max_new_tokens": 20, "sampling_seed": -41}, {"max_new_tokens": 1},
+                   {"max_new_tokens": 7, "sampling_seed": -900}, {"max_new_tokens": 9}]
+        invalid = named(ids) | {"input_ids": [[32], [33], [34], [-1]]}
+        status, result = send(port, GENERATE, invalid)
+        self.assertEqual(status, 400, result)
+        self.wait_queue(port, 0, 0)
+        self.check_reused_ids(port, ids)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                payload = {"input_ids": [[32], [33], [34], [35]], "rid": ids, "stream": stream,
+                           "sampling_params": options}
+                with generate_client(port, payload) as client, \
+                     http.client.HTTPResponse(client) as reply:
+                    reply.begin()
+                    if stream:
+                        self.assertEqual(reply.status, 200)
+                        lane = batch_frame(reply)
+                        finish = {"type": "length", "length": 1}
+                        self.check_named_finish(lane, "done", [32], finish, index=1)
+                        self.assertIn("error", batch_frame(reply))
+                        self.assertIsNone(batch_frame(reply))
+                    else:
+                        self.assertEqual(reply.status, 503)
+                        self.assertIn("Injected batch admission failure", reply.read().decode())
+                self.wait_queue(port, 0, 0)
+                self.check_reused_ids(port, ids)
+        log_text = log.read_text()
+        self.assertEqual(log_text.count("cpu reject seed=-900"), 2)
+        cancelled = [line for line in log_text.splitlines() if line.startswith("cpu cancel ")]
+        self.assertEqual(len(cancelled), 2)
+        self.assertTrue(all(line.endswith(" prompt=1 budget=20") for line in cancelled))
+        self.assertNotIn(" budget=9\n", log_text)
+
+    def test_ids_released_after_queued_and_stream_disconnect(self):
+        port, gate, log = self.start_abort_server(active=2)
+        gate.with_suffix(".0").touch()
+        ids = ["disconnected-0", "disconnected-1", "disconnected-2"]
+        payload = named(ids, budget=20) | {"input_ids": [[32], [33], [34]]}
+        with generate_client(port, payload) as client:
+            with http.client.HTTPResponse(client) as reply:
+                self.check_batch_headers(reply)
+                first = [batch_frame(reply), batch_frame(reply)]
+                self.assertCountEqual([frame["meta_info"]["id"] for frame in first], ids[:2])
+            with generate_client(port, named("slot-drop", budget=76)) as slot:
+                self.wait_queue(port, 2, 0)
+                with generate_client(port, named("queued-drop", budget=77)) as queued:
+                    self.wait_queue(port, 2, 1)
+                    abort(queued)
+                self.wait_queue(port, 2, 0)
+                abort(slot)
+            self.wait_queue(port, 1, 0)
+            abort(client)
+        self.wait_queue(port, 0, 0)
+        self.check_reused_ids(port, ids + ["slot-drop", "queued-drop"])
+        seen = [row["budget"] for row in receipts(log) if row["budget"]]
+        self.assertEqual(seen, [20, 20])
+        cancelled = [line for line in log.read_text().splitlines()
+                     if line.startswith("cpu cancel ")]
+        self.assertCountEqual(cancelled, [f"cpu cancel slot={slot} prompt=1 budget=20"
+                                         for slot in (0, 1)])
 
     def test_queue_overflow_disconnect_and_reuse(self):
         log = self.output / "queue.log"

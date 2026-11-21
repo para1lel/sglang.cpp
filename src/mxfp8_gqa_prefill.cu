@@ -217,20 +217,32 @@ __global__ void multirow_prefill_attention(Attention request, int rows) {
     }
 }
 
-constexpr int flash_threads = channels;
 constexpr int flash_mma_rows = 16;
 constexpr int flash_stride = channels + 8;
-constexpr int flash_score_stride = flash_keys + 8;
-static_assert(flash_queries == flash_threads / 32 * flash_mma_rows);
+constexpr int flash_wide_rows = 88;
 
+template <int Rows>
+constexpr int flash_threads = Rows * ordered_heads / flash_mma_rows * 32;
+
+template <int Rows>
 struct FlashTile {
-    alignas(16) std::uint16_t query[flash_queries][flash_stride];
+    static_assert(Rows * ordered_heads % flash_mma_rows == 0);
+    alignas(16) std::uint16_t query[Rows * ordered_heads][flash_stride];
     alignas(16) std::uint16_t key[flash_keys][flash_stride];
     alignas(16) std::uint16_t value[flash_keys][flash_stride];
-    alignas(16) std::uint16_t probability[flash_queries][flash_score_stride];
-    int bad_query[flash_queries];
+    int bad_query[Rows * ordered_heads];
     int bad_key;
 };
+
+struct FlashPayload {
+    alignas(16) std::uint8_t key[flash_keys][channels];
+    alignas(16) std::uint8_t value[flash_keys][channels];
+    alignas(8) std::uint8_t key_scale[flash_keys][mxfp8_groups];
+    alignas(8) std::uint8_t value_scale[flash_keys][mxfp8_groups];
+};
+
+constexpr int flash_vector_elements = 16;
+constexpr int flash_token_lanes = channels / flash_vector_elements;
 
 struct FragmentA {
     Word words[4];
@@ -286,20 +298,62 @@ __device__ __forceinline__ void flash_decode_vector(std::uint16_t* destination,
     }
 }
 
-__device__ void flash_stage_kv(FlashTile& tile, Attention request, int first,
-                               int visible, int kv_head) {
-    constexpr int vector_elements = 16;
-    constexpr int token_lanes = channels / vector_elements;
-    const int channel = (threadIdx.x % token_lanes) * vector_elements;
+template <int Bytes>
+__device__ __forceinline__ void flash_copy(std::uint8_t* destination,
+                                          const std::uint8_t* source, bool active) {
+    const auto address = static_cast<Word>(__cvta_generic_to_shared(destination));
+    const int source_bytes = active ? Bytes : 0;
+    if constexpr (Bytes == 16) {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+            :: "r"(address), "l"(source), "r"(source_bytes) : "memory");
+    } else {
+        static_assert(Bytes == 8);
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;"
+            :: "r"(address), "l"(source), "r"(source_bytes) : "memory");
+    }
+}
+
+template <int Rows>
+__device__ __forceinline__ void flash_prefetch(FlashPayload& raw, Attention request, int first,
+                                               int visible, int kv_head) {
+    const int channel = (threadIdx.x % flash_token_lanes) * flash_vector_elements;
     const int page = request.pages[first / mxfp8_page_size];
     const auto cache = request.cache;
-    for (int index = threadIdx.x / token_lanes; index < flash_keys;
-         index += flash_threads / token_lanes) {
+    #pragma unroll
+    for (int index = threadIdx.x / flash_token_lanes; index < flash_keys;
+         index += flash_threads<Rows> / flash_token_lanes) {
+        const int token = (first + index) % mxfp8_page_size;
+        const auto payload = payload_offset(page, token, kv_head) + channel;
+        flash_copy<16>(&raw.key[index][channel], cache.key_payload + payload, index < visible);
+        flash_copy<16>(&raw.value[index][channel], cache.value_payload + payload, index < visible);
+        if (channel == 0) {
+            const auto scale = scale_offset(page, token, kv_head);
+            flash_copy<8>(raw.key_scale[index], cache.key_scales + scale, index < visible);
+            flash_copy<8>(raw.value_scale[index], cache.value_scales + scale, index < visible);
+        }
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+template <bool Async, int Rows>
+__device__ void flash_stage_kv(FlashTile<Rows>& tile, const FlashPayload* raw, Attention request,
+                               int first, int visible, int kv_head) {
+    const int channel = (threadIdx.x % flash_token_lanes) * flash_vector_elements;
+    const int group = channel / mxfp8_group_size;
+    const int page = Async ? 0 : request.pages[first / mxfp8_page_size];
+    const auto cache = request.cache;
+    for (int index = threadIdx.x / flash_token_lanes; index < flash_keys;
+         index += flash_threads<Rows> / flash_token_lanes) {
         bool bad = false;
-        if (index < visible) {
+        if constexpr (Async) {
+            flash_decode_vector(&tile.key[index][channel], &raw->key[index][channel],
+                                raw->key_scale[index][group], bad);
+            flash_decode_vector(&tile.value[index][channel], &raw->value[index][channel],
+                                raw->value_scale[index][group], bad);
+        } else if (index < visible) {
             const int token = (first + index) % mxfp8_page_size;
             const auto payload = payload_offset(page, token, kv_head) + channel;
-            const auto scale = scale_offset(page, token, kv_head) + channel / mxfp8_group_size;
+            const auto scale = scale_offset(page, token, kv_head) + group;
             flash_decode_vector(&tile.key[index][channel], cache.key_payload + payload,
                                 cache.key_scales[scale], bad);
             flash_decode_vector(&tile.value[index][channel], cache.value_payload + payload,
@@ -317,15 +371,15 @@ __device__ void flash_stage_kv(FlashTile& tile, Attention request, int first,
     }
 }
 
-template <bool Partial>
-__device__ void flash_stage_query(FlashTile& tile, Attention request, int row, int head,
+template <bool Partial, int Rows>
+__device__ void flash_stage_query(FlashTile<Rows>& tile, Attention request, int row, int head,
                                    int active_rows) {
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     if (threadIdx.x == 0) {
         tile.bad_key = INT_MAX;
     }
-    for (int member = warp; member < flash_queries; member += flash_threads / 32) {
+    for (int member = warp; member < Rows * ordered_heads; member += flash_threads<Rows> / 32) {
         const bool active = !Partial || member / ordered_heads < active_rows;
         const auto offset = row_offset(row + member / ordered_heads, head + member % ordered_heads);
         bool bad = false;
@@ -345,8 +399,10 @@ __device__ void flash_stage_query(FlashTile& tile, Attention request, int row, i
 }
 
 constexpr int flash_score_fragments = flash_keys / 8;
+constexpr int flash_value_fragments = flash_keys / 16;
 
-__device__ __forceinline__ void flash_scores(const FlashTile& tile, int query, int lane,
+template <int Rows>
+__device__ __forceinline__ void flash_scores(const FlashTile<Rows>& tile, int query, int lane,
                                             Accumulator (&scores)[flash_score_fragments]) {
     #pragma unroll 4
     for (int dim = 0; dim < channels; dim += 16) {
@@ -362,8 +418,8 @@ __device__ __forceinline__ void flash_scores(const FlashTile& tile, int query, i
 
 template <int Half>
 __device__ __forceinline__ float flash_softmax(
-    FlashTile& tile, int row, int column, int count,
-    Accumulator (&scores)[flash_score_fragments], FlashSoftmax& state) {
+    int column, int count, Accumulator (&scores)[flash_score_fragments],
+    FragmentA (&probabilities)[flash_value_fragments], FlashSoftmax& state) {
     float maximum = state.maximum;
     #pragma unroll
     for (int group = 0; group < flash_score_fragments; ++group) {
@@ -381,15 +437,16 @@ __device__ __forceinline__ float flash_softmax(
     float mass = 0.0f;
     #pragma unroll
     for (int group = 0; group < flash_score_fragments; ++group) {
+        float pair[2];
         #pragma unroll
         for (int item = 0; item < 2; ++item) {
             const float score = scores[group].values[Half * 2 + item];
-            const float probability = maximum == -CUDART_INF_F ? 0.0f
-                                                                : __expf(score - maximum);
-            tile.probability[row][group * 8 + column + item] =
-                __bfloat16_as_ushort(__float2bfloat16_rn(probability));
-            mass += probability;
+            pair[item] = maximum == -CUDART_INF_F ? 0.0f : __expf(score - maximum);
+            mass += pair[item];
         }
+        auto& word = probabilities[group / 2].words[(group % 2) * 2 + Half];
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;"
+            : "=r"(word) : "f"(pair[0]), "f"(pair[1]));
     }
     mass += __shfl_xor_sync(warp_mask, mass, 2, 4);
     mass += __shfl_xor_sync(warp_mask, mass, 1, 4);
@@ -398,9 +455,11 @@ __device__ __forceinline__ float flash_softmax(
     return history;
 }
 
-__device__ __forceinline__ void flash_values(const FlashTile& tile, int query, int lane,
-                                            float top, float bottom,
-                                            Accumulator (&numerator)[channels / 8]) {
+template <int Rows>
+__device__ __forceinline__ void flash_values(
+    const FlashTile<Rows>& tile, int lane, float top, float bottom,
+    const FragmentA (&probabilities)[flash_value_fragments],
+    Accumulator (&numerator)[channels / 8]) {
     #pragma unroll
     for (auto& accumulator : numerator) {
         accumulator.values[0] *= top;
@@ -408,13 +467,13 @@ __device__ __forceinline__ void flash_values(const FlashTile& tile, int query, i
         accumulator.values[2] *= bottom;
         accumulator.values[3] *= bottom;
     }
-    #pragma unroll 1
-    for (int key = 0; key < flash_keys; key += 16) {
-        const auto p = load_flash_a(&tile.probability[query + lane % 16][key + lane / 16 * 8]);
+    #pragma unroll
+    for (int fragment = 0; fragment < flash_value_fragments; ++fragment) {
+        const int key = fragment * 16;
         #pragma unroll
         for (int column = 0; column < channels; column += 8) {
             const auto v = load_flash_b<true>(&tile.value[key + lane % 16][column]);
-            flash_mma(numerator[column / 8], p, v);
+            flash_mma(numerator[column / 8], probabilities[fragment], v);
         }
     }
 }
@@ -445,13 +504,14 @@ __device__ void flash_store(Attention request, int row, int head, int active_row
     }
 }
 
-template <bool Partial>
-__launch_bounds__(flash_threads, 1)
+template <int Rows, bool Partial, bool Async>
+__launch_bounds__(flash_threads<Rows>, 1)
 __global__ void flash_prefill_attention(Attention request, int rows) {
-    extern __shared__ FlashTile shared[];
-    auto& tile = shared[0];
+    alignas(16) extern __shared__ unsigned char shared[];
+    auto& tile = *reinterpret_cast<FlashTile<Rows>*>(shared);
+    auto* raw = Async ? reinterpret_cast<FlashPayload*>(&tile + 1) : nullptr;
     __shared__ OrderedScratch fallback;
-    const int row = blockIdx.x * flash_rows;
+    const int row = blockIdx.x * Rows;
     const int head = blockIdx.y * ordered_heads;
     const int position = request.position + row;
     const int warp = threadIdx.x / 32;
@@ -459,31 +519,53 @@ __global__ void flash_prefill_attention(Attention request, int rows) {
     const int query = warp * flash_mma_rows;
     const int member = query + lane / 4;
     const int column = (lane % 4) * 2;
-    const int active_rows = Partial ? min(flash_rows, rows - row) : flash_rows;
+    const int active_rows = Partial ? min(Rows, rows - row) : Rows;
     const int last = position + active_rows;
     Accumulator numerator[channels / 8]{};
     FlashSoftmax state[2]{{-CUDART_INF_F, 0.0f}, {-CUDART_INF_F, 0.0f}};
+    if constexpr (Async) {
+        flash_prefetch<Rows>(*raw, request, 0, min(flash_keys, last), head / ratio);
+    }
     flash_stage_query<Partial>(tile, request, row, head, active_rows);
+    if constexpr (Async) {
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+    }
     __syncthreads();
     for (int first = 0; first < last; first += flash_keys) {
-        flash_stage_kv(tile, request, first, min(flash_keys, last - first), head / ratio);
+        flash_stage_kv<Async>(tile, raw, request, first, min(flash_keys, last - first),
+                              head / ratio);
         __syncthreads();
+        const int next = first + flash_keys;
+        if constexpr (Async) {
+            if (next < last) {
+                flash_prefetch<Rows>(*raw, request, next, min(flash_keys, last - next),
+                                     head / ratio);
+            }
+        }
         Accumulator scores[flash_score_fragments]{};
         flash_scores(tile, query, lane, scores);
         const int visible = position + member / ordered_heads - first + 1;
         const int top_visible = !Partial || member / ordered_heads < active_rows ? visible : 0;
         const int bottom_visible = !Partial || (member + 8) / ordered_heads < active_rows
             ? visible + 8 / ordered_heads : 0;
-        const auto top = flash_softmax<0>(tile, member, column, top_visible, scores, state[0]);
-        const auto bottom = flash_softmax<1>(tile, member + 8, column, bottom_visible,
-                                             scores, state[1]);
-        __syncwarp();
-        flash_values(tile, query, lane, top, bottom, numerator);
+        FragmentA probabilities[flash_value_fragments];
+        const auto top = flash_softmax<0>(column, top_visible, scores, probabilities, state[0]);
+        const auto bottom = flash_softmax<1>(column, bottom_visible, scores, probabilities,
+                                             state[1]);
+        flash_values(tile, lane, top, bottom, probabilities, numerator);
+        if constexpr (Async) {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        }
         __syncthreads();
     }
     flash_store<Partial>(request, row, head, active_rows, query, lane, state, numerator);
-    if (__syncthreads_or(threadIdx.x < flash_queries && tile.bad_query[threadIdx.x]) ||
+    if (__syncthreads_or(threadIdx.x < Rows * ordered_heads && tile.bad_query[threadIdx.x]) ||
         tile.bad_key < last) {
+        if constexpr (Rows > flash_rows) {
+            if (threadIdx.x >= channels) {
+                return;
+            }
+        }
         for (int offset = 0; offset < active_rows; ++offset) {
             if (position + offset >= tile.bad_key ||
                 tile.bad_query[offset * ordered_heads] ||
@@ -506,24 +588,50 @@ std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
     if (status != cudaSuccess) {
         return status;
     }
-    cudaFuncAttributes attributes{};
-    const auto kernel = rows % flash_rows == 0 ? flash_prefill_attention<false> :
-                                                flash_prefill_attention<true>;
-    status = cudaFuncGetAttributes(&attributes, kernel);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    if (static_cast<std::size_t>(shared_limit) < sizeof(FlashTile) + attributes.sharedSizeBytes) {
-        return std::nullopt;
-    }
-    status = cudaFuncSetAttribute(kernel,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(FlashTile));
-    if (status != cudaSuccess) {
-        return status;
-    }
-    const dim3 blocks((rows + flash_rows - 1) / flash_rows, mxfp8_query_heads / ordered_heads);
     void* args[] = {&request, &rows};
-    return cudaLaunchKernel(kernel, blocks, flash_threads, args, sizeof(FlashTile), stream);
+    const bool partial = rows % flash_rows != 0;
+    const bool aligned_scales =
+        (reinterpret_cast<std::uintptr_t>(request.cache.key_scales) |
+         reinterpret_cast<std::uintptr_t>(request.cache.value_scales)) % 8 == 0;
+    const auto launch = [&](auto kernel, int tile_rows, int threads,
+                            std::size_t bytes) -> std::optional<cudaError_t> {
+        cudaFuncAttributes attributes{};
+        status = cudaFuncGetAttributes(&attributes, kernel);
+        if (status != cudaSuccess) {
+            return status;
+        }
+        if (static_cast<std::size_t>(shared_limit) < bytes + attributes.sharedSizeBytes) {
+            return std::nullopt;
+        }
+        status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        if (status != cudaSuccess) {
+            return status;
+        }
+        const dim3 blocks((rows + tile_rows - 1) / tile_rows, mxfp8_query_heads / ordered_heads);
+        return cudaLaunchKernel(kernel, blocks, threads, args, bytes, stream);
+    };
+    if (aligned_scales && rows == flash_chunk && request.position >= flash_chunk) {
+        if (const auto wide = launch(flash_prefill_attention<flash_wide_rows, true, true>,
+                                     flash_wide_rows, flash_threads<flash_wide_rows>,
+                                     sizeof(FlashTile<flash_wide_rows>) + sizeof(FlashPayload))) {
+            return wide;
+        }
+    }
+    for (bool async : {true, false}) {
+        if (async && !aligned_scales) {
+            continue;
+        }
+        const auto kernel = async
+            ? (partial ? flash_prefill_attention<flash_rows, true, true>
+                       : flash_prefill_attention<flash_rows, false, true>)
+            : (partial ? flash_prefill_attention<flash_rows, true, false>
+                       : flash_prefill_attention<flash_rows, false, false>);
+        const auto bytes = sizeof(FlashTile<flash_rows>) + (async ? sizeof(FlashPayload) : 0);
+        if (const auto regular = launch(kernel, flash_rows, flash_threads<flash_rows>, bytes)) {
+            return regular;
+        }
+    }
+    return std::nullopt;
 }
 
 }

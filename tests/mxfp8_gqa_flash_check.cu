@@ -227,7 +227,7 @@ struct Dispatch {
     unsigned block_width = 0;
 };
 
-constexpr Dispatch flash{"flash_prefill_attention", rows / 64};
+constexpr Dispatch flash{"flash_prefill_attentionILi88ELb1ELb1EE", 12, head_blocks, 1, 352};
 constexpr Dispatch tmem_split{"tmem_flash_attention", rows / 64, head_blocks, 3, 384};
 constexpr Dispatch tmem_merge{"tmem_merge", rows, head_blocks, 1, channels};
 constexpr Dispatch exact{"attention_kernel", rows, mxfp8_query_heads};
@@ -235,7 +235,8 @@ constexpr Dispatch multirow{"multirow_prefill_attention", rows / 4};
 constexpr Dispatch protected_rows{"protected_prefill_attention", rows};
 
 constexpr Dispatch flash_dispatch(int count) {
-    return {count % 64 == 0 ? "flash_prefill_attentionILb0EE" : "flash_prefill_attentionILb1EE",
+    return {count % 64 == 0 ? "flash_prefill_attentionILi64ELb0E"
+                           : "flash_prefill_attentionILi64ELb1E",
             static_cast<unsigned>((count + 63) / 64)};
 }
 
@@ -441,6 +442,8 @@ struct RunOptions {
     int count = rows;
     int key_offset = 0;
     int value_offset = 0;
+    int key_scale_offset = 0;
+    int value_scale_offset = 0;
     bool use_exact = false;
     bool repeat_graph = false;
 };
@@ -453,7 +456,7 @@ struct DeviceInput {
 
     explicit DeviceInput(const Input& input)
         : keys(input.keys.size() + 1), values(input.values.size() + 1),
-          key_scales(input.key_scales.size()), value_scales(input.value_scales.size()),
+          key_scales(input.key_scales.size() + 1), value_scales(input.value_scales.size() + 1),
           pages(input.pages.size()), queries(input.queries.size()) {}
 
     std::vector<BFloat> run(const char* label, const Input& input, int position, Dispatch expected,
@@ -461,16 +464,18 @@ struct DeviceInput {
                             RunOptions options = RunOptions()) {
         keys.upload(input.keys, stream, options.key_offset);
         values.upload(input.values, stream, options.value_offset);
-        key_scales.upload(input.key_scales, stream);
-        value_scales.upload(input.value_scales, stream);
+        key_scales.upload(input.key_scales, stream, options.key_scale_offset);
+        value_scales.upload(input.value_scales, stream, options.value_scale_offset);
         pages.upload(input.pages, stream);
         queries.upload(input.queries, stream);
         constexpr auto output_bytes = (output_elements + 2 * guard) * sizeof(BFloat);
         check_cuda(cudaMemsetAsync(output.get(), 0xff, output_bytes, stream),
                    "Poison Flash check output");
         const Mxfp8KvCache cache{keys.get() + options.key_offset,
-                                 values.get() + options.value_offset, key_scales.get(),
-                                 value_scales.get(), input.physical_pages};
+                                 values.get() + options.value_offset,
+                                 key_scales.get() + options.key_scale_offset,
+                                 value_scales.get() + options.value_scale_offset,
+                                 input.physical_pages};
         const Mxfp8PageTable page_table{pages.get(), static_cast<int>(input.pages.size())};
         Graph graph;
         check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
@@ -573,7 +578,15 @@ void check_long_flash(cudaStream_t stream) {
         const int position = visible - rows;
         const auto label = std::to_string(visible) + " visible";
         const auto samples = attention_samples(input, position);
-        device.run(label.c_str(), input, position, flash, samples, stream);
+        const auto baseline = device.run(label.c_str(), input, position, flash, samples, stream);
+        if (visible == ordered_visible) {
+            constexpr Dispatch sync{"flash_prefill_attentionILi64ELb0ELb0EE", rows / 64};
+            const auto unaligned = device.run("32768 unaligned key scales", input, position,
+                                              sync, samples, stream, {.key_scale_offset = 1});
+            if (std::memcmp(unaligned.data(), baseline.data(), baseline.size() * sizeof(BFloat))) {
+                throw std::runtime_error("Unaligned Flash scales changed the wide tile output");
+            }
+        }
         if (visible == ordered_visible + 1) {
             device.run("32769 unaligned key", input, position, protected_rows, samples, stream,
                        {.key_offset = 1});
@@ -617,12 +630,26 @@ void check_partial_boundaries(cudaStream_t stream) {
         const auto samples = attention_samples(input, position, count);
         const auto label = std::to_string(count) + " query rows";
         const auto expected = count == 143 ? ordered_dispatch(count) : flash_dispatch(count);
-        device.run(label.c_str(), input, position, expected, samples, stream, {.count = count});
+        const auto baseline = device.run(label.c_str(), input, position, expected, samples,
+                                         stream, {.count = count});
         if (count == 144) {
             device.run("144 rows unaligned key", input, position, ordered_dispatch(count),
                        samples, stream, {.count = count, .key_offset = 1});
             device.run("144 rows unaligned value", input, position, ordered_dispatch(count),
                        samples, stream, {.count = count, .value_offset = 1});
+        }
+        if (count == 193) {
+            constexpr Dispatch sync{"flash_prefill_attentionILi64ELb1ELb0EE", 4};
+            const auto key = device.run("193 rows unaligned key scales", input, position, sync,
+                                        samples, stream, {.count = count, .key_scale_offset = 1});
+            const auto value = device.run("193 rows unaligned value scales", input, position,
+                                          sync, samples, stream,
+                                          {.count = count, .value_scale_offset = 1});
+            const auto bytes = baseline.size() * sizeof(BFloat);
+            if (std::memcmp(key.data(), baseline.data(), bytes) != 0 ||
+                std::memcmp(value.data(), baseline.data(), bytes) != 0) {
+                throw std::runtime_error("Unaligned Flash scales changed the output");
+            }
         }
     }
 }
@@ -675,6 +702,7 @@ void check_flash_prefill(cudaStream_t stream) {
     check_partial_boundaries(stream);
     check_partial_recovery(stream);
     constexpr int position = 61;
+    constexpr auto early = flash_dispatch(rows);
     {
         Input input(position + rows);
         input.add_causal_marker(position, 1);
@@ -684,13 +712,13 @@ void check_flash_prefill(cudaStream_t stream) {
         input.add_causal_marker(position, rows - 1);
         const auto samples = attention_samples(input, position);
         DeviceInput device(input);
-        device.run("aligned causal tail", input, position, flash, samples, stream);
+        device.run("aligned causal tail", input, position, early, samples, stream);
         device.run("aligned exact", input, position, exact, samples, stream, {.use_exact = true});
         device.run("unaligned key", input, position, multirow, samples, stream, {.key_offset = 1});
         device.run("unaligned value", input, position, multirow, samples, stream,
                    {.value_offset = 1});
         input.add_score_overflow(position);
-        device.run("Flash score overflow recovery", input, position, flash,
+        device.run("Flash score overflow recovery", input, position, early,
                    attention_samples(input, position), stream);
     }
     check_long_flash(stream);

@@ -29,6 +29,8 @@ struct HttpRequest {
     std::string body;
 };
 
+enum class TokenizationRoute { none, tokenize, detokenize };
+
 struct HttpError : std::runtime_error {
     HttpError(std::string_view status, const char* message)
         : std::runtime_error(message), status(status) {}
@@ -41,9 +43,12 @@ void stop_serving();
 bool stopping();
 Socket listen_loopback(int port);
 bool disconnected(const Socket& connection);
+TokenizationRoute tokenization_route(const HttpRequest& request);
 void read_connections(const Socket& listener, int capacity,
                       const std::function<void(Socket&, HttpRequest)>& handle);
 bool write_json(const Socket& connection, std::string_view status, std::string_view json);
+void write_tokenization_error(const Socket& connection, std::string_view status,
+                              std::string_view type, std::string_view message);
 void write_readiness(const Socket& connection, bool ready);
 bool write_metrics(const Socket& connection, std::string_view body);
 

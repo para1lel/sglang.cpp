@@ -1,4 +1,6 @@
 #include "sglang/server/http.h"
+
+#include "sglang/json.h"
 #include "sglang/server/completions.h"
 
 #include <algorithm>
@@ -187,6 +189,12 @@ std::size_t content_length(std::string_view headers, const HttpRequest& request)
             throw HttpError("415 Unsupported Media Type", "Expected application/json");
         }
     }
+    if (tokenization_route(request) != TokenizationRoute::none &&
+        (!content_type ||
+         !ascii_case_equal(content_type->substr(0, content_type->find(';')), "application/json"))) {
+        throw HttpError("400 Bad Request",
+                        "Unsupported Media Type: Only 'application/json' is allowed");
+    }
     return length.value_or(0);
 }
 
@@ -253,7 +261,12 @@ bool read_pending(IncomingRequest& incoming, short events,
         }
         handle(incoming.socket, std::move(*incoming.request));
     } catch (const HttpError& error) {
-        write_error(incoming.socket, error.status, error.what());
+        if (incoming.request && tokenization_route(*incoming.request) != TokenizationRoute::none) {
+            write_tokenization_error(incoming.socket, error.status, error.status.substr(4),
+                                     error.what());
+        } else {
+            write_error(incoming.socket, error.status, error.what());
+        }
     }
     return false;
 }
@@ -280,6 +293,18 @@ void install_shutdown_handlers() {
 void stop_serving() { stop_requested.store(true, std::memory_order_relaxed); }
 
 bool stopping() { return stop_requested.load(std::memory_order_relaxed); }
+
+TokenizationRoute tokenization_route(const HttpRequest& request) {
+    if (request.method == "POST") {
+        if (request.path == "/tokenize" || request.path == "/v1/tokenize") {
+            return TokenizationRoute::tokenize;
+        }
+        if (request.path == "/detokenize" || request.path == "/v1/detokenize") {
+            return TokenizationRoute::detokenize;
+        }
+    }
+    return TokenizationRoute::none;
+}
 
 Socket listen_loopback(int port) {
     Socket listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
@@ -416,6 +441,18 @@ static bool write_response(const Socket& connection, std::string_view status,
 
 bool write_json(const Socket& connection, std::string_view status, std::string_view json) {
     return write_response(connection, status, "application/json", json);
+}
+
+void write_tokenization_error(const Socket& connection, std::string_view status,
+                              std::string_view type, std::string_view message) {
+    std::string body = R"({"object":"error","message":)";
+    json::append_quoted(body, message);
+    body += R"(,"type":)";
+    json::append_quoted(body, type);
+    body += R"(,"param":null,"code":)";
+    body += status.substr(0, 3);
+    body += '}';
+    write_json(connection, status, body);
 }
 
 void write_readiness(const Socket& connection, bool ready) {

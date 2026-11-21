@@ -7,6 +7,7 @@
 #include "sglang/server/http.h"
 #include "sglang/server/native_generate.h"
 #include "sglang/server/prefix_controls.h"
+#include "sglang/server/tokenization.h"
 #include "sglang/server/vision_completion.h"
 
 #include <charconv>
@@ -198,6 +199,8 @@ int main(int argc, char** argv) {
             }, health, arguments.prefix_cache_entries != 0,
             [&](const Socket& connection, int slot, std::string_view body) {
                 complete_generate(connection, service, slot, tokenizer, body);
+            }, [&](const Socket& connection, TokenizationRoute route, std::string_view body) {
+                serve_tokenization(connection, route, tokenizer, body);
             });
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';

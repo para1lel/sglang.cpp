@@ -46,6 +46,6 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     ./build/bin/mxfp8-gqa-sm100-check
 ```
 
-Require exit zero and rising-max absolute error below 0.00002. For the page-128 graph regression, require a 576-thread TMA producer on the aligned tile at position 8,192. Require a 544-thread original split producer for `sm100` and for the misaligned-scale fallback under `sm100-tma`. Compare all BF16 outputs after poisoned-output replay. [Build target](../xmake.lua#L202)<!-- prefix: "target(\"mxfp" --> · [Rising-max assertion](../tests/prefill/mxfp8_gqa_sm100_check.cpp#L144)<!-- prefix: "require(maxi" -->
+Require exit zero and rising-max absolute error below 0.00002. For the page-128 graph regression, require a 576-thread TMA producer on the aligned tile at position 8,192. Require a 544-thread original split producer for `sm100` and for the misaligned-scale fallback under `sm100-tma`. Compare all BF16 outputs after poisoned-output replay. [Build target](../xmake.lua#L203)<!-- prefix: "target(\"mxfp" --> · [Rising-max assertion](../tests/prefill/mxfp8_gqa_sm100_check.cpp#L144)<!-- prefix: "require(maxi" -->
 
 Use a separate fault probe for TMA setup rejection. Check split selection for a known descriptor or TMA attribute rejection. Check that an unexpected error or pending execution failure returns before allocation or launch. The alignment regression only exercises preflight eligibility.

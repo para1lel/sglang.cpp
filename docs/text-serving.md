@@ -1,6 +1,6 @@
 # Native text completions
 
-Send `POST /v1/completions` with `model` set to `Qwen3.8-27B-FP8` and `prompt` set to a UTF-8 string. The same endpoint serves the frozen `benchmark` model with a [prompt ID array and token-ID SSE](../benchmarks/streaming/README.md#wire-contract). Use [native chat](chat-serving.md) to render conversation history. Use [`POST /generate`](native-generate.md) for raw text or prompt IDs with native sampling parameters and cumulative output.
+Send `POST /v1/completions` with `model` set to `Qwen3.8-27B-FP8` and `prompt` set to a UTF-8 string. The same endpoint serves the frozen `benchmark` model with a [prompt ID array and token-ID SSE](../benchmarks/streaming/README.md#wire-contract). Use [native chat](chat-serving.md) to render conversation history. Use [`POST /generate`](native-generate.md) for raw text or prompt IDs with native sampling parameters and cumulative output. Use [native tokenization](native-tokenization.md) to convert between raw text and IDs on the CPU.
 
 ## Send a request
 

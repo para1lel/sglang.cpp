@@ -138,9 +138,10 @@ void stop_profile(const Socket& connection, BatchService& service, const HttpReq
 class ConnectionQueue {
 public:
     ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete,
-                    std::string_view health, bool prefix_controls, const BatchGenerate& generate)
+                    std::string_view health, bool prefix_controls, const BatchGenerate& generate,
+                    const Tokenization& tokenize)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
-          health_(health), prefix_controls_(prefix_controls) {}
+          tokenize_(tokenize), health_(health), prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -164,6 +165,7 @@ private:
     const int capacity_;
     const BatchCompletion& complete_;
     const BatchGenerate& generate_;
+    const Tokenization& tokenize_;
     const std::string_view health_;
     const bool prefix_controls_;
     std::mutex mutex_;
@@ -273,23 +275,35 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
     if (generate_) {
         routes += " or /generate";
     }
+    if (tokenize_) {
+        routes += " or /tokenize or /detokenize";
+    }
     throw HttpError("404 Not Found", routes.c_str());
 }
 
 void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     const bool generate = generate_ && request.method == "POST" && request.path == "/generate";
-    if (!generate && !completion_route(request)) {
+    const bool tokenize = tokenize_ && tokenization_route(request) != TokenizationRoute::none;
+    if (!generate && !tokenize && !completion_route(request)) {
         serve_control(connection, request);
         return;
     }
-    service_.rethrow_failure();
+    if (!tokenize) {
+        service_.rethrow_failure();
+    }
     {
-        const std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         if (closing_) {
             return;
         }
         discard_disconnected();
         if (pending_.size() >= static_cast<std::size_t>(capacity_)) {
+            if (tokenize) {
+                lock.unlock();
+                write_tokenization_error(connection, "503 Service Unavailable",
+                                         "ServiceUnavailableError", "Native request queue is full");
+                return;
+            }
             throw HttpError("503 Service Unavailable", "Native completion queue is full");
         }
         pending_.push_back({std::move(connection), std::move(request)});
@@ -341,7 +355,10 @@ void ConnectionQueue::run(int slot) {
         } else if (!disconnected(work->connection)) {
             const auto& request = *work->request;
             handle_errors(work->connection, [&] {
-                if (request.path == "/generate") {
+                const auto tokenize = tokenization_route(request);
+                if (tokenize != TokenizationRoute::none) {
+                    tokenize_(work->connection, tokenize, request.body);
+                } else if (request.path == "/generate") {
                     generate_(work->connection, slot, request.body);
                 } else {
                     complete_(work->connection, slot, request.body, chat_route(request));
@@ -365,11 +382,13 @@ void ConnectionQueue::stop() {
 
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
-                       bool prefix_controls, const BatchGenerate& generate) {
+                       bool prefix_controls, const BatchGenerate& generate,
+                       const Tokenization& tokenize) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
-    ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate);
+    ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
+                          tokenize);
     std::vector<std::thread> workers;
     workers.reserve(max_active);
     std::mutex failure_mutex;

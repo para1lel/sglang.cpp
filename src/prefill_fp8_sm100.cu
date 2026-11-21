@@ -13,7 +13,7 @@ namespace {
 constexpr int group_size = text_fp8_group_size;
 constexpr int warp_size = 32;
 constexpr int accum_stages = 2;
-constexpr int packed_qkv_tile_cols = 256;
+constexpr int packed_wide_tile_cols = 256;
 
 template <int Rows, int Cols, int Copies, int Batch, int Resident>
 struct Tile {
@@ -22,7 +22,7 @@ struct Tile {
     static constexpr int copies = Copies;
     static constexpr int batch = Batch;
     static constexpr int resident = Resident;
-    static constexpr bool wide = Cols == packed_qkv_tile_cols;
+    static constexpr bool wide = Cols == packed_wide_tile_cols;
     static constexpr int warp_cols = wide ? group_size : (Cols < 64 ? Cols : 64);
     static constexpr int partial_cols = wide ? 16 : warp_cols;
     static constexpr int consumers = Rows * Cols / (warp_size * warp_cols);
@@ -435,7 +435,8 @@ std::optional<cudaError_t> tensor_map_failure(CUresult status) {
 template <class Config, class Output>
 std::optional<cudaError_t> launch_tma(
     const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
-    int rows, int out_width, int in_width, Output output, cudaStream_t stream, int device) {
+    int rows, int out_width, int in_width, Output output, cudaStream_t stream, int device,
+    int row_tile_group = 1) {
     constexpr int shared_bytes = Config::copies * Config::stage_bytes;
     const auto kernel = fp8_tma<Config, Output>;
     cudaFuncAttributes attributes{};
@@ -478,10 +479,10 @@ std::optional<cudaError_t> launch_tma(
         return status;
     }
     int groups = in_width / group_size;
-    int row_tile_group = 1;
     void* args[] = {&activation_map, &weight_map, &input.scales, &weight_scales,
                     &rows, &out_width, &groups, &row_tile_group, &output};
-    const dim3 grid(1 + (out_width - 1) / Config::cols, 1 + (rows - 1) / Config::rows);
+    const dim3 grid((1 + (out_width - 1) / Config::cols) * row_tile_group,
+                    1 + (rows - 1) / (Config::rows * row_tile_group));
     return cudaLaunchKernel(kernel, grid, Config::threads, args, shared_bytes, stream);
 }
 
@@ -580,7 +581,7 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
             reinterpret_cast<std::uintptr_t>(projection.scales) != scales.end) {
             return std::nullopt;
         }
-        wide_slices &= projection.width % packed_qkv_tile_cols == 0;
+        wide_slices &= projection.width % packed_wide_tile_cols == 0;
         output.slices[index++] = {projection.output, projection.width};
         total_width += projection.width;
     }
@@ -603,10 +604,14 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
     if (status != cudaSuccess) {
         return status;
     }
+    const bool packed_mlp_chunk = projections.size() == 2 &&
+                                  output.slices[0].width == 17408 &&
+                                  output.slices[1].width == 17408;
     if (rows == 1024 && in_width == 5120 && wide_slices &&
-        (total_width == 16384 || total_width == 14336)) {
-        const auto wide = launch_tma<Tile<128, packed_qkv_tile_cols, 4, 1, 1>>(
-            first.weight, first.scales, input, rows, total_width, in_width, output, stream, device);
+        (packed_mlp_chunk || total_width == 16384 || total_width == 14336)) {
+        const auto wide = launch_tma<Tile<128, packed_wide_tile_cols, 4, 1, 1>>(
+            first.weight, first.scales, input, rows, total_width, in_width, output, stream, device,
+            packed_mlp_chunk ? 8 : 1);
         if (wide) {
             return wide;
         }

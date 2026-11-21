@@ -255,18 +255,19 @@ void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& b
         const auto* position = &binding->position;
         auto& work = workspace(lane);
         check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
-                                    layer.key_norm, work.rope_queries, work.rope_keys,
-                                    batch.stream), "Normalize and rotate bound decode Q/K");
+                                   layer.key_norm, work.rope_queries, work.rope_keys,
+                                   batch.stream), "Normalize and rotate bound decode Q/K");
         check(decode_kv_append(&binding->caches[cache_index], &binding->pages, position,
-                               work.rope_keys, work.values, batch.stream), "Append bound MXFP8 KV");
+                              work.rope_keys, work.values, batch.stream),
+              "Append bound decode MXFP8 KV");
         reads[index] = {&binding->caches[cache_index], &binding->pages, position,
-                         &binding->scores, paged_gqa_buffers(work)};
+                        &binding->scores, paged_gqa_buffers(work)};
     }
     if (batch.single_decode()) {
         const auto& read = reads[0];
         check(exact_decode_gqa_attention(read.cache, read.pages, read.position,
-                                          read.buffers.queries, read.buffers.output, read.scores,
-                                          batch.stream, vocab_size * sizeof(Bf16)),
+                                         read.buffers.queries, read.buffers.output, read.scores,
+                                         batch.stream, vocab_size * sizeof(Bf16)),
               "Read bound singleton MXFP8 attention");
     } else {
         check(paged_decode_gqa(reads.data(), batch.count, batch.stream),

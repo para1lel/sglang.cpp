@@ -251,14 +251,13 @@ def check_cli(args):
              ["--max-active", "1", "--eager"], ["--max-active", "4", "--mtp-steps", "1"],
              ["--max-active", "4", "--mtp-steps", "1", "--eager"],
              ["--mtp-steps", "1"], ["--max-active", str(DEFAULT_ACTIVE), "--mtp-steps", "1"],
+             ["--mtp-steps", "1", "--prefix-cache-entries", "2"],
              ["--max-active", str(DEFAULT_ACTIVE), "--mtp-k", "4"]]
     invalid = [([TOKEN_OPTION, value], TOKEN_OPTION)
                for value in ("0", "-1", "wide", str(DEFAULT_TOKENS + 1), "2147483648")]
     invalid.extend([(["--max-active", "33"], "--max-active"),
                     (["--mtp-steps", "5"], "--mtp-steps"),
                     (["--mtp-k", "5"], "--mtp-steps"),
-                    (["--mtp-steps", "1", "--prefix-cache-entries", "2"],
-                     "--prefix-cache-entries"),
                     (["--eager", "--prefix-cache-entries", "2"], "--prefix-cache-entries")])
     command = [str(args.binary), "--checkpoint", str(args.evidence / "no-checkpoint")]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")

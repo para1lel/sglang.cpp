@@ -97,7 +97,7 @@ On B200 GPU 6, the four-row W2 candidate matched the base's 512 full BF16 score 
 
 Match native control IDs and full BF16 logits on W1 and W2 with the same checkpoint, precision, and [GQA path](batch-graphs.md#page-parallel-gqa-decode). Check eager decode and fresh and reused graphs. Exercise exact and direct GQA at their [dispatch bounds](development.md#runtime-path). Run the [prefill](development.md#chunked-prefill-verification), [streaming](development.md#streaming-verification), and [MTP](mtp.md#verification) checks.
 
-Trace actual forward group sizes and row modes. Confirm fused launches for an eligible single target decode row. Check packed projections for eligible groups of two through five rows. Include a group containing decode and single-row prefill. Compare shape and alignment fallbacks with the separate native operations. For steady decode timing, match execution mode, context length, and KV capacity. Record graph captures and replays.
+Verify fused projections for eligible singleton decode and legacy groups of two through five, including mixed decode and single-row prefill. Check [packed K0 decode](batch-graphs.md#packed-paged-gqa-decode) by bucket. Compare shape and alignment fallbacks against separate native ops. Match execution mode, context, and KV capacity for timing. Record row modes, group sizes, captures, and replays.
 
 Compare fused SwiGLU BF16 results with identical and disjoint gate and up output spans. Require `cudaErrorInvalidValue` before launch for identical gate and up spans in fallback, partial output overlaps, and output overlaps with inputs.
 
@@ -176,6 +176,8 @@ GPU5 operator median GQA fell from 222.465 to 101.679 ms for 1,024 rows at 32,76
 
 [Wide long decode checks](long-paged-decode.md#verification) cover direct controls and HTTP cohorts.
 
+[Candidate B evidence](long-paged-decode.md#candidate-b-evidence) includes paired W3 timing. Full performance qualification remains open.
+
 See [W6 prefill diagnostics](flash-prefill.md#w6-warmups-and-diagnostics), [experimental TMEM quality limits](flash-prefill.md#tmem-checkpoint-verification), and the [TMEM prototype](flash-prefill.md#double-buffered-tmem-prototype).
 
 ### Native MTP
@@ -186,13 +188,13 @@ To isolate layer-major verification, compare with row-wise MTP at the same depth
 
 Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. [W3-MTP](../benchmarks/variants/README.md) uses four 8,192-token prompts with 1,024 outputs each. K1 starts beyond the [graph limit](mtp.md#target-verification-graph). The matched run remains pending. Use `--max-active 32 --max-num-batched-tokens 32768`.
 
-Positive depth adds counters for the generator's first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L130)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L971)<!-- prefix: "result.mtp_r" -->
+Positive depth adds counters for the generator's first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L130)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L930)<!-- prefix: "result.mtp_r" -->
 
 Use `--trace-batches` at any capacity in a separate run. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder_verify.cpp#L180)<!-- prefix: "bool MtpRoun" -->
 
 Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../apps/server/batch_service.cpp#L55)<!-- prefix: "void trace_v" -->
 
-See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L968)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L891)<!-- prefix: "current.peak" -->
+See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L927)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L850)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

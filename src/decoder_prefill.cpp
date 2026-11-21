@@ -3,6 +3,7 @@
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/prefill_fp8.h"
+#include "sglang/text/prefill_attn_sm100.h"
 
 #include <algorithm>
 #include <atomic>
@@ -216,6 +217,20 @@ struct Chunk : PrefillProjections {
     int position;
     const MropePosition* mrope;
 
+    bool project_packed(TextFp8ActivationView input,
+                        std::initializer_list<PrefillFp8Projection> projections) const {
+        if (!tensor_core_fp8) {
+            return false;
+        }
+        const auto status = try_prefill_fp8_packed_sm100(input, rows, hidden_size,
+                                                         projections, stream);
+        if (!status) {
+            return false;
+        }
+        check(*status, "Run packed FP8 prefill projections");
+        return true;
+    }
+
     void seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
                     const Bf16* final_norm) const {
         static_assert(intermediate_size >= 2 * hidden_size);
@@ -231,8 +246,13 @@ struct Chunk : PrefillProjections {
 
     void gdn(const GdnLayer& layer, TextGdnState state, int bank) const {
         const TextFp8ActivationView input{activation.values, activation.scales};
-        project(layer.qkv, input, work.gdn_qkv);
-        project(layer.z, input, work.gdn_z);
+        if (!project_packed(input, {
+                {layer.qkv.values, layer.qkv.scales, work.gdn_qkv, layer.qkv.rows},
+                {layer.z.values, layer.z.scales, work.gdn_z, layer.z.rows},
+            })) {
+            project(layer.qkv, input, work.gdn_qkv);
+            project(layer.z, input, work.gdn_z);
+        }
         project(layer.b, work.normalized, work.gdn_b);
         project(layer.a, work.normalized, work.gdn_a);
         static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
@@ -253,9 +273,15 @@ struct Chunk : PrefillProjections {
 
     void gqa(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages) const {
         const TextFp8ActivationView input{activation.values, activation.scales};
-        project(layer.q_gate, input, work.q_gate);
-        project(layer.key, input, work.keys);
-        project(layer.value, input, work.values);
+        if (!project_packed(input, {
+                {layer.q_gate.values, layer.q_gate.scales, work.q_gate, layer.q_gate.rows},
+                {layer.key.values, layer.key.scales, work.keys, layer.key.rows},
+                {layer.value.values, layer.value.scales, work.values, layer.value.rows},
+            })) {
+            project(layer.q_gate, input, work.q_gate);
+            project(layer.key, input, work.keys);
+            project(layer.value, input, work.values);
+        }
         const auto rotation = mrope
             ? mrope_gqa_preprocess(mrope, rows, work.q_gate, work.keys, layer.query_norm,
                                     layer.key_norm, work.rope_queries, work.rope_keys, stream)
@@ -265,8 +291,8 @@ struct Chunk : PrefillProjections {
         check(mxfp8_kv_append(cache, pages, position, rows, work.rope_keys, work.values, stream),
               "Append prefill MXFP8 KV");
         const auto status = tensor_core_fp8
-            ? tensor_core_multirow_prefill_gqa(cache, pages, position, rows, work.rope_queries,
-                                               work.attention, stream)
+            ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
+                                            work.attention, stream)
             : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
                                    work.attention, stream);
         check(status, "Read causal prefill MXFP8 attention");
@@ -277,8 +303,13 @@ struct Chunk : PrefillProjections {
 
     void mlp(const Layer& layer) const {
         const TextFp8ActivationView input{activation.values, activation.scales};
-        project(layer.mlp_gate, input, work.mlp_gate);
-        project(layer.mlp_up, input, work.mlp_up);
+        if (!project_packed(input, {
+                {layer.mlp_gate.values, layer.mlp_gate.scales, work.mlp_gate, layer.mlp_gate.rows},
+                {layer.mlp_up.values, layer.mlp_up.scales, work.mlp_up, layer.mlp_up.rows},
+            })) {
+            project(layer.mlp_gate, input, work.mlp_gate);
+            project(layer.mlp_up, input, work.mlp_up);
+        }
         if (tensor_core_fp8) {
             check(tensor_core_prefill_swiglu_quantize(work.mlp_gate, work.mlp_up,
                                                       intermediate_size, rows, activation, stream),

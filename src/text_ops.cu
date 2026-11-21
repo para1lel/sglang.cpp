@@ -1,7 +1,9 @@
 #include "sglang/text_ops.h"
 
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/decoder_internal.h"
 
+#include "sglang/text/decode_proj.h"
 #include "sglang/text/text_cuda_primitives.cuh"
 
 #include <algorithm>
@@ -204,6 +206,45 @@ __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
         output.values[col] = __nv_cvt_float_to_fp8(value * reciprocal_scale, __NV_SATFINITE,
                                                    __NV_E4M3);
     }
+}
+
+__global__ void prefill_swiglu_quantize_warp(const __nv_bfloat16* gate,
+                                            const __nv_bfloat16* up, int width,
+                                            TextFp8Activation output) {
+    static_assert(text_fp8_group_size == warp_width * 4);
+    const int groups = width / text_fp8_group_size;
+    const int group = blockIdx.x * block_warps + threadIdx.x / warp_width;
+    if (group >= groups) {
+        return;
+    }
+    const int lane = threadIdx.x % warp_width;
+    const auto offset = static_cast<std::size_t>(blockIdx.y) * width +
+                        group * text_fp8_group_size + lane * 4;
+    const auto* gate_pairs = reinterpret_cast<const __nv_bfloat162*>(gate + offset);
+    const auto* up_pairs = reinterpret_cast<const __nv_bfloat162*>(up + offset);
+    const auto gate_first = gate_pairs[0];
+    const auto gate_second = gate_pairs[1];
+    const auto up_first = up_pairs[0];
+    const auto up_second = up_pairs[1];
+    const float4 values{
+        __bfloat162float(swiglu(gate_first.x, up_first.x)),
+        __bfloat162float(swiglu(gate_first.y, up_first.y)),
+        __bfloat162float(swiglu(gate_second.x, up_second.x)),
+        __bfloat162float(swiglu(gate_second.y, up_second.y)),
+    };
+    const float maximum = fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)),
+                                fmaxf(fabsf(values.z), fabsf(values.w)));
+    const float warp_maximum = warp_max(maximum);
+    float reciprocal = 0.0f;
+    if (lane == 0) {
+        const float scale = __fdiv_rn(fmaxf(quant_epsilon, warp_maximum), fp8_max);
+        output.scales[static_cast<std::size_t>(blockIdx.y) * groups + group] = scale;
+        reciprocal = __fdiv_rn(1.0f, scale);
+    }
+    reciprocal = __shfl_sync(warp_mask, reciprocal, 0);
+    const float4 scaled{values.x * reciprocal, values.y * reciprocal,
+                        values.z * reciprocal, values.w * reciprocal};
+    *reinterpret_cast<__nv_fp8x4_storage_t*>(output.values + offset) = __nv_fp8x4_e4m3(scaled).__x;
 }
 
 __device__ float decode_fp8(std::uint8_t bits) {
@@ -666,6 +707,14 @@ cudaError_t decoder::tensor_core_prefill_swiglu_quantize(
     const __nv_bfloat16* gate, const __nv_bfloat16* up, int width, int rows,
     TextFp8Activation activation, cudaStream_t stream) {
     void* args[] = {&gate, &width, &activation, &up};
+    if (rows >= 256 && width % text_fp8_group_size == 0 &&
+        aligned(gate, alignof(__nv_bfloat162)) && aligned(up, alignof(__nv_bfloat162)) &&
+        aligned(activation.values, alignof(__nv_fp8x4_storage_t))) {
+        const dim3 grid(divide_up(width / text_fp8_group_size, block_warps), rows);
+        void* warp_args[] = {&gate, &up, &width, &activation};
+        return cudaLaunchKernel(prefill_swiglu_quantize_warp, grid, block_threads,
+                                warp_args, 0, stream);
+    }
     const dim3 grid(text_fp8_group_count(width), rows);
     return cudaLaunchKernel(quantize_fp8_kernel<true, true>, grid,
                             text_fp8_group_size, args, 0, stream);
@@ -786,6 +835,87 @@ cudaError_t text_argmax(const __nv_bfloat16* logits, int vocab_size, TextLogitCa
     }
     void* finish_args[] = {&scratch, &count, &output};
     return cudaLaunchKernel(argmax_finish_kernel, 1, block_threads, finish_args, 0, stream);
+}
+
+cudaError_t text_fp8_decode_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+                                 TextFp8ActivationView input, int out_width, int in_width,
+                                 int rows, __nv_bfloat16* output, cudaStream_t stream) {
+    if (!weight || !weight_scales || !input.values || !input.scales || !output ||
+        out_width <= 0 || in_width <= 0 || rows <= 0 || rows > 65535) {
+        return cudaErrorInvalidValue;
+    }
+    const TextFp8DecodeTarget target{weight, weight_scales, out_width, output};
+    return text_fp8_decode_rows_fused(&target, 1, input, in_width, rows, stream);
+}
+
+cudaError_t text_fp8_decode_rows_fused(const TextFp8DecodeTarget* targets, int count,
+                                       TextFp8ActivationView input, int in_width, int rows,
+                                       cudaStream_t stream) {
+    if (!targets || count < 1 || count > text_decode_max_targets || !input.values ||
+        !input.scales || in_width <= 0 || rows <= 0 || rows > 65535) {
+        return cudaErrorInvalidValue;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& target = targets[index];
+        if (!target.weight || !target.weight_scales || !target.output || target.out_width <= 0) {
+            return cudaErrorInvalidValue;
+        }
+    }
+    if (const auto status = try_text_fp8_decode_sm100(targets, count, input, in_width, rows,
+                                                      stream)) {
+        return *status;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& target = targets[index];
+        const auto status = text_fp8_gemv_rows(target.weight, target.weight_scales, input,
+                                               target.out_width, in_width, rows, target.output,
+                                               stream);
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
+}
+
+cudaError_t text_bf16_decode_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,
+                                  int out_width, int in_width, int rows, __nv_bfloat16* output,
+                                  cudaStream_t stream) {
+    if (!weight || !input || !output || out_width <= 0 || in_width <= 0 ||
+        rows <= 0 || rows > 65535) {
+        return cudaErrorInvalidValue;
+    }
+    if (out_width == text_gdn_value_heads && in_width == decoder::hidden_size) {
+        if (const auto status = try_text_bf16_decode_gates(weight, nullptr, input, rows,
+                                                          output, nullptr, stream)) {
+            return *status;
+        }
+    }
+    if (const auto status = try_text_bf16_decode_sm100(weight, input, out_width, in_width, rows,
+                                                       output, stream)) {
+        return *status;
+    }
+    return text_bf16_gemv_rows(weight, input, out_width, in_width, rows, output, stream);
+}
+
+cudaError_t text_bf16_decode_gates(const __nv_bfloat16* weight_b,
+                                   const __nv_bfloat16* weight_a,
+                                   const __nv_bfloat16* input, int rows,
+                                   __nv_bfloat16* output_b, __nv_bfloat16* output_a,
+                                   cudaStream_t stream) {
+    if (!weight_b || !weight_a || !input || !output_b || !output_a ||
+        rows <= 0 || rows > 64) {
+        return cudaErrorInvalidValue;
+    }
+    if (const auto status = try_text_bf16_decode_gates(weight_b, weight_a, input, rows,
+                                                       output_b, output_a, stream)) {
+        return *status;
+    }
+    const auto status = text_bf16_decode_rows(weight_b, input, text_gdn_value_heads,
+                                              decoder::hidden_size, rows, output_b, stream);
+    return status == cudaSuccess
+        ? text_bf16_decode_rows(weight_a, input, text_gdn_value_heads, decoder::hidden_size,
+                                 rows, output_a, stream)
+        : status;
 }
 
 }

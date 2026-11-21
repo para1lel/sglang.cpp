@@ -32,15 +32,45 @@ public:
         return {values, scales, rows, columns};
     }
 
+    template <int... Widths>
+    std::array<Fp8Weight, sizeof...(Widths)> packed_fp8(
+        const std::array<std::string, sizeof...(Widths)>& stems, int columns) {
+        static_assert(((Widths > 0 && Widths % text_fp8_group_size == 0) && ...));
+        constexpr int total_rows = (Widths + ...);
+        constexpr std::array rows{Widths...};
+        const int scale_columns = text_fp8_group_count(columns);
+        auto* values = memory_.allocate<std::uint8_t>(std::size_t(total_rows) * columns);
+        auto* scales = memory_.allocate<Bf16>(std::size_t(text_fp8_group_count(total_rows)) *
+                                             scale_columns);
+        std::array<Fp8Weight, sizeof...(Widths)> weights;
+        for (std::size_t index = 0; index < rows.size(); ++index) {
+            const int width = rows[index];
+            const int scale_rows = text_fp8_group_count(width);
+            const auto& stem = stems[index];
+            upload(stem + ".weight", TensorDtype::F8_E4M3, {extent(width), extent(columns)},
+                   values);
+            upload(stem + ".weight_scale_inv", TensorDtype::BF16,
+                   {extent(scale_rows), extent(scale_columns)},
+                   reinterpret_cast<std::uint8_t*>(scales));
+            weights[index] = {values, scales, width, columns};
+            values += std::size_t(width) * columns;
+            scales += std::size_t(scale_rows) * scale_columns;
+        }
+        return weights;
+    }
+
 private:
     static std::uint64_t extent(int size) {
         return static_cast<std::uint64_t>(size);
     }
 
     const std::uint8_t* upload(const std::string& name, TensorDtype dtype,
-                               std::initializer_list<std::uint64_t> shape) {
+                               std::initializer_list<std::uint64_t> shape,
+                               std::uint8_t* destination = nullptr) {
         const auto& tensor = checkpoint_.tensor(name, dtype, shape);
-        auto* destination = memory_.allocate<std::uint8_t>(tensor.size_bytes);
+        if (!destination) {
+            destination = memory_.allocate<std::uint8_t>(tensor.size_bytes);
+        }
         check(cudaMemcpyAsync(destination, tensor.data, tensor.size_bytes,
                               cudaMemcpyHostToDevice, stream_), name.c_str());
         return destination;
@@ -52,9 +82,10 @@ private:
 };
 
 GdnLayer load_gdn(WeightUpload& weights, const std::string& prefix) {
+    const auto [qkv, z] = weights.packed_fp8<text_gdn_qkv_width, text_gdn_value_width>(
+        {prefix + "in_proj_qkv", prefix + "in_proj_z"}, hidden_size);
     return {
-        weights.fp8_matrix(prefix + "in_proj_qkv", text_gdn_qkv_width, hidden_size),
-        weights.fp8_matrix(prefix + "in_proj_z", text_gdn_value_width, hidden_size),
+        qkv, z,
         weights.bf16_matrix(prefix + "in_proj_b.weight", text_gdn_value_heads, hidden_size),
         weights.bf16_matrix(prefix + "in_proj_a.weight", text_gdn_value_heads, hidden_size),
         {
@@ -69,10 +100,11 @@ GdnLayer load_gdn(WeightUpload& weights, const std::string& prefix) {
 }
 
 GqaLayer load_gqa(WeightUpload& weights, const std::string& prefix) {
+    const auto [q_gate, key, value] =
+        weights.packed_fp8<text_gqa_q_gate_width, text_gqa_kv_width, text_gqa_kv_width>(
+            {prefix + "q_proj", prefix + "k_proj", prefix + "v_proj"}, hidden_size);
     return {
-        weights.fp8_matrix(prefix + "q_proj", text_gqa_q_gate_width, hidden_size),
-        weights.fp8_matrix(prefix + "k_proj", text_gqa_kv_width, hidden_size),
-        weights.fp8_matrix(prefix + "v_proj", text_gqa_kv_width, hidden_size),
+        q_gate, key, value,
         weights.bf16(prefix + "q_norm.weight", {mxfp8_head_dim}),
         weights.bf16(prefix + "k_norm.weight", {mxfp8_head_dim}),
         weights.fp8_matrix(prefix + "o_proj", hidden_size, text_gqa_q_width),
@@ -88,8 +120,10 @@ void load_layer(WeightUpload& weights, Layer& layer, int index, const std::strin
     } else {
         layer.gdn = load_gdn(weights, prefix + "linear_attn.");
     }
-    layer.mlp_gate = weights.fp8_matrix(prefix + "mlp.gate_proj", intermediate_size, hidden_size);
-    layer.mlp_up = weights.fp8_matrix(prefix + "mlp.up_proj", intermediate_size, hidden_size);
+    const auto [gate, up] = weights.packed_fp8<intermediate_size, intermediate_size>(
+        {prefix + "mlp.gate_proj", prefix + "mlp.up_proj"}, hidden_size);
+    layer.mlp_gate = gate;
+    layer.mlp_up = up;
     layer.mlp_down = weights.fp8_matrix(prefix + "mlp.down_proj", hidden_size, intermediate_size);
 }
 

@@ -162,7 +162,8 @@ struct Allocations::State {
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
-    std::array<BatchGraph, decoder_batch_max_graph_lanes + 1> batch_graphs{};
+    std::array<BatchGraph, decoder_batch_max_graph_lanes + 1 + packed_decode_buckets.size()>
+        batch_graphs{};
     bool verification_graph_incomplete = false;
     bool uncertain_stream = false;
     bool uncertain_graph = false;
@@ -414,6 +415,22 @@ bool Allocations::replay_batch_graph(int width, const std::function<void()>& pre
                                      const std::function<void()>& capture_nodes,
                                      const std::function<bool()>& bind, bool target_verify) {
     const int index = target_verify ? decoder_batch_max_graph_lanes : width - 1;
+    return replay_graph_slot(index, width, prepare, capture_nodes, bind, target_verify);
+}
+
+bool Allocations::replay_packed_graph(int bucket, int rows, const std::function<void()>& prepare,
+                                      const std::function<void()>& capture_nodes,
+                                      const std::function<bool()>& bind) {
+    if (bucket < 0 || bucket >= static_cast<int>(packed_decode_buckets.size())) {
+        throw std::out_of_range("Invalid packed decode graph bucket");
+    }
+    return replay_graph_slot(decoder_batch_max_graph_lanes + 1 + bucket, rows, prepare,
+                             capture_nodes, bind, false);
+}
+
+bool Allocations::replay_graph_slot(int index, int width, const std::function<void()>& prepare,
+                                    const std::function<void()>& capture_nodes,
+                                    const std::function<bool()>& bind, bool target_verify) {
     auto& batch = state_->batch_graphs.at(index);
     if (batch.disabled) {
         return false;

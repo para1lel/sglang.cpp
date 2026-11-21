@@ -10,6 +10,7 @@
 namespace {
 
 FILE* trace;
+bool record_kernels;
 
 void check(CUptiResult result) {
     if (result != CUPTI_SUCCESS) {
@@ -57,7 +58,8 @@ void complete_buffer(CUcontext context, std::uint32_t stream, std::uint8_t* buff
             const char* name = nullptr;
             check(cuptiGetCallbackName(runtime ? CUPTI_CB_DOMAIN_RUNTIME_API
                                               : CUPTI_CB_DOMAIN_DRIVER_API, api.cbid, &name));
-            if (name && (std::strstr(name, "Graph") || std::strstr(name, "Capture"))) {
+            if (name && (std::strstr(name, "Graph") || std::strstr(name, "Capture") ||
+                         (record_kernels && std::strstr(name, "LaunchKernel")))) {
                 std::fprintf(trace, "%s\t%s\t%u\t%u\t%llu\t%llu\n",
                              runtime ? "runtime" : "driver", name, api.correlationId,
                              api.returnValue, static_cast<unsigned long long>(api.start),
@@ -84,6 +86,7 @@ __attribute__((constructor)) void enable() {
     if (!path) {
         return;
     }
+    record_kernels = std::getenv("BATCH_KERNEL_ACTIVITY") != nullptr;
     trace = std::fopen(path, "w");
     if (!trace) {
         std::perror(path);

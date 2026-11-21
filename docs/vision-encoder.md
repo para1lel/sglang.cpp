@@ -71,7 +71,7 @@ host=/data1/shared/dongwu.chen
 
 The static library uses native SM100 CUDA kernels. Its XMake target links `sglang_checkpoint` and CUDA Runtime.
 The checkpoint target also links `sglang_json`. The runtime uses C++ and CUDA libraries.
-[Vision target](../xmake.lua#L98)<!-- prefix: "target(\"sgla" --> · [Checkpoint target](../xmake.lua#L90)<!-- prefix: "target(\"sgla" -->
+[Vision target](../xmake.lua#L103)<!-- prefix: "target(\"sgla" --> · [Checkpoint target](../xmake.lua#L95)<!-- prefix: "target(\"sgla" -->
 
 On a reserved B200, feed the same pinned FP32 patch fixtures to the public API and the independent reference.
 Use FP64 affine, LayerNorm, and attention reductions with BF16 activation boundaries in the reference.

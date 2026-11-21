@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L455)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L267)<!-- prefix: "const auto s" --> |
+| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L486)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L293)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, ordered multirow, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L540)<!-- prefix: "cudaError_t " --> |
 | Long-tile pipeline | Partition the visible prefix and merge the partial softmax results. | [TMEM attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L321)<!-- prefix: "__global__ v" --> · [Merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L421)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
@@ -13,13 +13,15 @@
 
 The CLI and C++ default policy is `exact`. Its original MXFP8 attention path retains the exact prefill contract. With `tensor-core`, the decoder selects regular Flash for eligible multirow tiles on the SM100 build. Set `SGLANG_EXPERIMENTAL_TMEM_PREFILL=1` before starting the process to enable experimental TMEM for eligible full 1,024-row tiles. Unset and other values keep regular Flash. The 128-row media, MTP, and tensor-core prefix-cache tile limits keep those routes outside TMEM.
 
+On SM100, `SGLANG_PREFILL_ATTN=sm100` makes the model's tensor-core prefill try experimental split attention before the portable dispatcher. The launcher accepts up to 8,192 query rows and 262,144 visible tokens. It requires at least 144 rows through 32,768 visible tokens, 16-byte alignment for Q and output, and 32-byte alignment for K and V payloads. On B200, the batch can use 2,048-row tiles for text prompts of at most 32,768 tokens when the tensor-core prefix-cache tile planner is inactive and the request has no MTP draft. The kernel rescales the online softmax whenever its maximum increases and waits for PV completion before accumulator reuse. Checkpoint quality and serving speed still need separate acceptance. [Model dispatch](../include/sglang/text/prefill_attn_sm100.h#L22)<!-- prefix: "inline cudaE" --> · [SM100 launcher](../src/text/prefill_attn_sm100.cu#L710)<!-- prefix: "std::optiona" --> · [Batch tile cap](../src/decoder_batch.cpp#L699)<!-- prefix: "const bool w" -->
+
 Both Flash paths follow the logical page table. Each work group covers up to 64 query rows and two query heads that share a KV head. It processes 64-key tiles and masks each query at its own position. QK and PV use BF16 Tensor Core products with FP32 accumulators. Online softmax keeps FP32 normalization and rounds the probabilities used by PV to BF16.
 
 When a regular Flash block has fewer than 64 rows, it stages zeros for inactive queries. It masks their scores and skips their output stores and repair work. Multiples of 64 use the specialization for complete blocks. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L450)<!-- prefix: "__global__ v" -->
 
 ### Long-tile TMEM pipeline
 
-For each query block and head pair, three CTAs handle contiguous partitions of the visible prefix, with boundaries at 64-key tiles. The last tile uses a causal mask for each query. The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for scores and FP32 value accumulators. Regular Flash stays in the `sm_100` target. [TMEM build target](../xmake.lua#L65)<!-- prefix: "target(\"sgla" -->
+For each query block and head pair, three CTAs handle contiguous partitions of the visible prefix, with boundaries at 64-key tiles. The last tile uses a causal mask for each query. The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for scores and FP32 value accumulators. Regular Flash stays in the `sm_100` target. [TMEM build target](../xmake.lua#L67)<!-- prefix: "target(\"sgla" -->
 
 Tensor Memory Accelerator (TMA) copies raw K and V from the physical pages into two alternating shared-memory buffers. Producer warps convert scaled MXFP8 to BF16. Packed conversion handles finite payloads and scale exponents 15–148. Other values use the scalar conversion and its range checks.
 
@@ -29,9 +31,9 @@ Each launch uses 76,087,296 bytes of stream-ordered scratch. Each of the three p
 
 ## Constraints and failure behavior
 
-Flash accepts 144–1,023 query rows through 32,768 visible tokens and 1,024 query rows through 131,072 visible tokens. Both limits include the final query token. Both K and V payload bases must be 16-byte aligned. [Eligibility](../src/mxfp8_gqa_prefill.cu#L550)<!-- prefix: "constexpr in" -->
+Regular Flash accepts 144–1,024 query rows through 32,768 visible tokens. From 32,769 through 131,072 visible tokens, it accepts only full 1,024-row tiles. Visible tokens include the final query and equal the zero-based start position plus the row count. Both K and V payload bases must be 16-byte aligned. Regular Flash requires 154,128 dynamic shared-memory bytes plus static allocation. The decoder handles a one-row prompt tile through its ordinary forward path. [Eligibility](../src/mxfp8_gqa_prefill.cu#L554)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L466)<!-- prefix: "if (rows == " -->
 
-With the opt-in, TMEM requires exactly 1,024 query rows and a zero-based start at or above 32,768 that is divisible by 64. It also requires compute capability 10.0, CUDA memory pools, and a K/V pool addressable by signed 32-bit TMA token coordinates. The launch needs opt-in shared memory for 214,016 dynamic bytes plus static allocation. A known resource or device mismatch, or a successful driver lookup without a tensor-map encoder, selects regular Flash. Regular Flash requires 154,128 dynamic bytes plus static allocation.
+With the opt-in, TMEM requires exactly 1,024 query rows and at most 131,072 visible tokens. The zero-based start must be at least 32,768 and divisible by 64. TMEM also requires compute capability 10.0, CUDA memory pools, and a K/V pool addressable by signed 32-bit TMA token coordinates. The launch needs opt-in shared memory for 214,016 dynamic bytes plus static allocation. A known resource or device mismatch, or a successful driver lookup without a tensor-map encoder, selects regular Flash when eligible. [TMEM eligibility](../src/mxfp8_gqa_prefill.cu#L557)<!-- prefix: "if (rows == " -->
 
 Other valid shapes, unaligned payloads, and a known regular Flash shared memory shortfall use the [ordered fallback dispatch](development.md#ordered-multirow-gqa-prefill). Above 32,768 visible tokens, that dispatch uses protected single-row attention. CUDA discovery, configuration, and launch errors propagate.
 
@@ -43,11 +45,13 @@ If a query or visible KV value falls outside Flash's numerical range, protected 
 
 For the explicit tensor-core policy, prioritize measured efficiency over bitwise parity with ordered attention. Flash can change BF16 results, logits, and generated IDs. Compare flash with an independent FP64 reference over the same represented inputs. Check causality, page remaps, output guards, repaired rows, and eager versus CUDA Graph replay. Trace dispatch at the eligibility bounds and through alignment and capacity fallback.
 
-Run [`mxfp8-gqa-check`](development.md#p2-gqa-verification) on a reserved B200 with the setting unset and again with `SGLANG_EXPERIMENTAL_TMEM_PREFILL=1`. The [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L673)<!-- prefix: "void check_f" --> checks capture and replay, sampled FP64 outputs, exact dispatch, and unaligned K and V separately.
+Run [`mxfp8-gqa-check`](development.md#p2-gqa-verification) on a reserved B200 with the TMEM setting unset. Repeat with `SGLANG_EXPERIMENTAL_TMEM_PREFILL=1`. Require both runs to pass. The [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L673)<!-- prefix: "void check_f" --> checks capture and replay, exact dispatch, and unaligned K and V separately. Require sampled maximum absolute error below 0.08 and normalized RMSE below 0.005 against FP64. [FP64 limits](../tests/mxfp8_gqa_flash_check.cu#L435)<!-- prefix: "if (!(max_ab" -->
 
 The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L611)<!-- prefix: "void check_p" --> check the 143/144-row floor and the 191/192/193-row block boundary. The [partial recovery case](../tests/mxfp8_gqa_flash_check.cu#L630)<!-- prefix: "void check_p" --> checks score overflow and limits nonfinite outputs to the affected channels of the final active row.
 
-The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L562)<!-- prefix: "void check_l" --> require regular Flash at 32,768 and 32,769 visible tokens. At 65,536, 98,304, and 131,072, they require regular Flash by default and TMEM with the opt-in. At 131,073 they require protected attention. At 1,023 rows, they require regular Flash at 32,768 visible tokens and protected attention at 32,769. The upper-bound cases check the exact route, causality, and score overflow recovery.
+The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L562)<!-- prefix: "void check_l" --> require regular Flash for aligned 1,023- and 1,024-row tiles at 32,768 visible tokens. At 32,769, the full tile uses Flash and the partial tile uses protected attention. At 65,536, 98,304, and 131,072 visible tokens, full tiles require regular Flash by default and TMEM with the opt-in. At 131,073 and 131,136, full tiles require protected attention in both modes. The 131,072-token cases also check the exact route, causality, and score overflow recovery.
+
+Build `mxfp8-gqa-sm100-check` with `--mxfp8-gqa-check=y` in the SM100 Release build and run it on the reserved B200. The check enables the experimental launcher itself. The rising-max control requires maximum absolute error below 0.00002. The Candidate B rerun measured 2.12333e-06 in that control. See `artifacts/coding-fix-a/final-mxfp8-gqa-sm100.log`. [Build target](../xmake.lua#L202)<!-- prefix: "target(\"mxfp" --> · [Rising-max assertion](../tests/prefill/mxfp8_gqa_sm100_check.cpp#L144)<!-- prefix: "require(maxi" -->
 
 Check ordered and protected fallback bitwise against the ordered FP32 reference for finite scores and quotients. Check FP64 recovery independently. Use the [exact prefill runbook](../tests/prefill/README.md) for the separate `exact` contract.
 

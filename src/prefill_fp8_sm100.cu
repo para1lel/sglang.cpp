@@ -224,12 +224,33 @@ __device__ void accumulate(Pipeline<Config>& pipe, const float* activation,
     }
 }
 
-template <class Config>
+struct OutputSlice {
+    __nv_bfloat16* values;
+    int width;
+};
+
+struct SplitOutput {
+    OutputSlice slices[3];
+};
+
+__device__ OutputSlice locate_output(__nv_bfloat16* output, int width, int&) {
+    return {output, width};
+}
+
+__device__ OutputSlice locate_output(SplitOutput output, int, int& col) {
+    int index = 0;
+    while (index < 2 && col >= output.slices[index].width) {
+        col -= output.slices[index++].width;
+    }
+    return output.slices[index];
+}
+
+template <class Config, class Output>
 __global__ __launch_bounds__(Config::threads, Config::resident)
 void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
               const __grid_constant__ CUtensorMap weight_map, const float* activation_scales,
               const __nv_bfloat16* weight_scales, int rows, int cols, int groups,
-              int row_tile_group, __nv_bfloat16* output) {
+              int row_tile_group, Output output) {
     alignas(1024) extern __shared__ unsigned char tiles[];
     __shared__ Pipeline<Config> pipe;
     auto* epilogue = reinterpret_cast<__nv_bfloat16 (*)[Config::cols + Config::store_width]>(tiles);
@@ -291,13 +312,15 @@ void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
                      :: "r"(pipe.tmem), "r"(Config::tmem_cols) : "memory");
     }
     __syncthreads();
-    if (cols % Config::store_width == 0 && reinterpret_cast<std::uintptr_t>(output) % 16 == 0) {
+    int column = col_base;
+    const auto [values, width] = locate_output(output, cols, column);
+    if (width % Config::store_width == 0 && reinterpret_cast<std::uintptr_t>(values) % 16 == 0) {
         for (int index = threadIdx.x * Config::store_width; index < Config::rows * Config::cols;
              index += Config::threads * Config::store_width) {
             const int row = index / Config::cols;
             const int col = index % Config::cols;
-            if (row_base + row < rows && col_base + col < cols) {
-                auto* destination = output + std::size_t(row_base + row) * cols + col_base + col;
+            if (row_base + row < rows && column + col < width) {
+                auto* destination = values + std::size_t(row_base + row) * width + column + col;
                 *reinterpret_cast<uint4*>(destination) =
                     *reinterpret_cast<const uint4*>(&epilogue[row][col]);
             }
@@ -307,8 +330,8 @@ void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
              index += Config::threads) {
             const int row = index / Config::cols;
             const int col = index % Config::cols;
-            if (row_base + row < rows && col_base + col < cols) {
-                output[std::size_t(row_base + row) * cols + col_base + col] = epilogue[row][col];
+            if (row_base + row < rows && column + col < width) {
+                values[std::size_t(row_base + row) * width + column + col] = epilogue[row][col];
             }
         }
     }
@@ -346,13 +369,13 @@ ByteSpan byte_span(const Element* pointer, std::size_t count) {
 
 bool valid_buffers(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
                    TextFp8ActivationView input, int rows, int out_width, int in_width,
-                   __nv_bfloat16* output) {
+                   __nv_bfloat16* output, int destination_width) {
     static_assert(std::numeric_limits<std::size_t>::digits >=
                   2 * std::numeric_limits<int>::digits);
     const auto activations = static_cast<std::size_t>(rows);
     const auto channels = static_cast<std::size_t>(out_width);
     const auto groups = static_cast<std::size_t>(text_fp8_group_count(in_width));
-    const ByteSpan destination = byte_span(output, activations * channels);
+    const ByteSpan destination = byte_span(output, activations * destination_width);
     const ByteSpan sources[]{
         byte_span(weight, channels * in_width),
         byte_span(weight_scales, text_fp8_group_count(out_width) * groups),
@@ -394,12 +417,12 @@ std::optional<cudaError_t> tensor_map_failure(CUresult status) {
     }
 }
 
-template <class Config>
+template <class Config, class Output>
 std::optional<cudaError_t> launch_tma(
     const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
-    int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream, int device) {
+    int rows, int out_width, int in_width, Output output, cudaStream_t stream, int device) {
     constexpr int shared_bytes = Config::copies * Config::stage_bytes;
-    const auto kernel = fp8_tma<Config>;
+    const auto kernel = fp8_tma<Config, Output>;
     cudaFuncAttributes attributes{};
     auto status = cudaFuncGetAttributes(&attributes, kernel);
     if (status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice) {
@@ -447,30 +470,7 @@ std::optional<cudaError_t> launch_tma(
     return cudaLaunchKernel(kernel, grid, Config::threads, args, shared_bytes, stream);
 }
 
-}
-
-std::optional<cudaError_t> try_text_fp8_gemm_sm100(
-    const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
-    int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream) {
-    return try_text_fp8_gemm_sm100(weight, weight_scales, input, rows, out_width, in_width,
-                                   output, stream, false);
-}
-
-std::optional<cudaError_t> try_text_fp8_gemm_sm100(
-    const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
-    int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream,
-    bool allow_large_rows) {
-    if (rows <= 0 || out_width <= 0 || in_width <= 0 ||
-        !valid_buffers(weight, weight_scales, input, rows, out_width, in_width, output)) {
-        return cudaErrorInvalidValue;
-    }
-    const int max_rows = allow_large_rows ? serial_prefill_max_rows : text_embedding_max_rows;
-    if (rows < 3 || rows > max_rows || in_width % group_size != 0 ||
-        reinterpret_cast<std::uintptr_t>(weight) % 16 != 0 ||
-        reinterpret_cast<std::uintptr_t>(input.values) % 16 != 0) {
-        return std::nullopt;
-    }
-    int device = 0;
+std::optional<cudaError_t> tma_device(cudaStream_t stream, int& device) {
     auto status = current_stream_device(stream, device);
     if (status != cudaSuccess) {
         return status;
@@ -485,6 +485,38 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
     }
     if (major != 10 || minor != 0) {
         return std::nullopt;
+    }
+    return cudaSuccess;
+}
+
+}
+
+std::optional<cudaError_t> try_text_fp8_gemm_sm100(
+    const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
+    int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream) {
+    return try_text_fp8_gemm_sm100(weight, weight_scales, input, rows, out_width, in_width,
+                                   output, stream, false);
+}
+
+std::optional<cudaError_t> try_text_fp8_gemm_sm100(
+    const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
+    int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream,
+    bool allow_large_rows) {
+    if (rows <= 0 || out_width <= 0 || in_width <= 0 ||
+        !valid_buffers(weight, weight_scales, input, rows, out_width, in_width,
+                       output, out_width)) {
+        return cudaErrorInvalidValue;
+    }
+    const int max_rows = allow_large_rows ? serial_prefill_max_rows : text_embedding_max_rows;
+    if (rows < 3 || rows > max_rows || in_width % group_size != 0 ||
+        reinterpret_cast<std::uintptr_t>(weight) % 16 != 0 ||
+        reinterpret_cast<std::uintptr_t>(input.values) % 16 != 0) {
+        return std::nullopt;
+    }
+    int device = 0;
+    const auto status = tma_device(stream, device);
+    if (status != cudaSuccess) {
+        return status;
     }
     const bool narrow_high_k = in_width >= 8192 && rows < 1024;
     if ((rows <= 64 && out_width >= 4096) || narrow_high_k) {
@@ -501,6 +533,61 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
     }
     return launch_tma<Tile<128, 64, 4, 1, 2>>(weight, weight_scales, input, rows,
                                              out_width, in_width, output, stream, device);
+}
+
+std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
+    TextFp8ActivationView input, int rows, int in_width,
+    std::initializer_list<PrefillFp8Projection> projections, cudaStream_t stream) {
+    if (rows <= 0 || in_width <= 0 || projections.size() < 2 || projections.size() > 3) {
+        return cudaErrorInvalidValue;
+    }
+    const auto& first = *projections.begin();
+    if (rows < 256 || rows > serial_prefill_max_rows || in_width % group_size != 0 ||
+        reinterpret_cast<std::uintptr_t>(input.values) % 16 != 0 ||
+        reinterpret_cast<std::uintptr_t>(first.weight) % 16 != 0) {
+        return std::nullopt;
+    }
+    const auto scale_width = static_cast<std::size_t>(in_width / group_size);
+    int total_width = 0;
+    SplitOutput output{};
+    int index = 0;
+    for (const auto& projection : projections) {
+        if (projection.width <= 0 ||
+            projection.width > std::numeric_limits<int>::max() - total_width) {
+            return cudaErrorInvalidValue;
+        }
+        const auto weights = byte_span(first.weight, std::size_t(total_width) * in_width);
+        const auto scales = byte_span(first.scales,
+                                      std::size_t(total_width / group_size) * scale_width);
+        if (projection.width % group_size != 0 ||
+            reinterpret_cast<std::uintptr_t>(projection.weight) != weights.end ||
+            reinterpret_cast<std::uintptr_t>(projection.scales) != scales.end) {
+            return std::nullopt;
+        }
+        output.slices[index++] = {projection.output, projection.width};
+        total_width += projection.width;
+    }
+    for (int slice = 0; slice < index; ++slice) {
+        const auto [values, width] = output.slices[slice];
+        if (!valid_buffers(first.weight, first.scales, input, rows, total_width, in_width,
+                           values, width)) {
+            return cudaErrorInvalidValue;
+        }
+        const auto span = byte_span(values, std::size_t(rows) * width);
+        for (int previous = 0; previous < slice; ++previous) {
+            const auto [other, other_width] = output.slices[previous];
+            if (span.overlaps(byte_span(other, std::size_t(rows) * other_width))) {
+                return cudaErrorInvalidValue;
+            }
+        }
+    }
+    int device = 0;
+    const auto status = tma_device(stream, device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    return launch_tma<Tile<128, 128, 6, 2, 1>>(first.weight, first.scales, input, rows,
+                                              total_width, in_width, output, stream, device);
 }
 
 }

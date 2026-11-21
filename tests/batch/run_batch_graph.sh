@@ -11,6 +11,12 @@ gpu=${GPU_UUID:?Set GPU_UUID to the reserved B200 device UUID}
 toolkit="${CONDA_PREFIX:?Activate the managed Pixi default environment}/targets/x86_64-linux"
 cxx=${CXX:-g++}
 mode=${4:-all}
+layout=${5:-packed}
+
+case "$layout" in
+    legacy|packed) ;;
+    *) echo "Expected layout legacy or packed" >&2; exit 2 ;;
+esac
 
 case "$mode" in
     all)
@@ -18,7 +24,7 @@ case "$mode" in
         test -x "$build/bin/mxfp8-gqa-check"
         ;;
     admission) test -x "$build/bin/sglang-server" ;;
-    boundary|singleton) ;;
+    boundary|packed-setup|singleton) ;;
     k1) test -x "$build/bin/sglang-server" ;;
     *) exit 2 ;;
 esac
@@ -28,7 +34,7 @@ fi
 test -z "$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader)"
 mkdir "$out"
 python3 -IB "$tests/check_graph_evidence.py" --check-slot-mask >"$out/slot-mask.log"
-export CUDA_VISIBLE_DEVICES="$gpu" CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$gpu}" CUDA_DEVICE_ORDER=PCI_BUS_ID
 nvidia-smi -i "$gpu" --query-gpu=uuid,name,driver_version,memory.free --format=csv \
     >"$out/device-before.csv"
 
@@ -63,15 +69,35 @@ run_lanes() {
         preload="$preload:$out/$addon.so"
     fi
     LD_PRELOAD="$preload" BATCH_SCORE_OUTPUT="$out/$name.scores" \
+        BATCH_PACKED_OUTPUT="$out/$name.packed" \
         BATCH_GRAPH_ACTIVITY="$out/$name.cupti.tsv" BATCH_GRAPH_FAILURE="$fault" \
         "$build/bin/batch-graph-lanes" "$checkpoint" "$role" "$policy" ${scenario:+"$scenario"} \
         >"$out/$name.lanes" 2>"$out/$name.log"
 }
 
 run_boundary() {
-    run_lanes boundary-eager eager tensor-core '' '' boundary
-    run_lanes boundary-graph graph tensor-core '' '' boundary
-    run_lanes boundary-score-oom score-oom tensor-core score-oom oom boundary
+    run_lanes boundary-eager eager exact '' '' boundary
+    run_lanes boundary-graph graph exact '' '' boundary
+    run_lanes boundary-score-oom score-oom exact score-oom oom boundary
+    if [[ "$layout" == packed ]]; then
+        run_lanes packed-boundary-eager eager tensor-core '' '' packed-boundary
+        run_lanes packed-boundary graph tensor-core packed-boundary oom packed-boundary
+        run_packed_oom
+    fi
+}
+
+run_packed_oom() {
+    run_lanes packed-oom-eager eager-oom tensor-core packed-oom oom packed-boundary
+    run_lanes packed-oom packed-oom tensor-core packed-oom oom packed-boundary
+}
+
+run_packed_setup() {
+    compile_observer setup -ldl -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcupti
+    BATCH_KERNEL_ACTIVITY=1 run_lanes packed-setup-terminal graph tensor-core '' setup packed-setup
+    for role in prefill mixed; do
+        run_lanes "packed-setup-$role-control" "$role" tensor-core '' '' packed-setup
+        run_lanes "packed-setup-$role-armed" "$role" tensor-core '' setup packed-setup
+    done
 }
 
 run_singleton() {
@@ -115,16 +141,26 @@ if [[ "$mode" == k1 ]]; then
 fi
 
 compile_observer oom -ldl
+if [[ "$mode" == packed-setup ]]; then
+    test "$layout" = packed
+    run_packed_oom
+    run_packed_setup
+    finish_device
+    python3 -IB "$tests/check_graph_evidence.py" "$out" --packed-setup-only
+    exit
+fi
+
 if [[ "$mode" == boundary ]]; then
     run_boundary
     finish_device
-    python3 -IB "$tests/check_graph_evidence.py" "$out" --boundary-only
+    python3 -IB "$tests/check_graph_evidence.py" "$out" --layout "$layout" --boundary-only
     exit
 fi
 
 compile_observer failure -ldl
 LD_PRELOAD="$out/activity.so" BATCH_GRAPH_ACTIVITY="$out/operators.cupti.tsv" \
-    "$build/bin/mxfp8-gqa-check" >"$out/operators.log" 2>&1
+    "$build/bin/mxfp8-gqa-check" >"$out/operators.log" 2>&1 ||
+    echo "mxfp8-gqa-check exited $?" | tee "$out/operators.failure" >&2
 
 for policy in exact tensor-core; do
     for route in eager graph; do
@@ -150,7 +186,12 @@ for policy in exact tensor-core; do
 done
 
 run_boundary
+if [[ "$layout" == packed ]]; then
+    run_packed_setup
+    run_lanes packed-buckets-eager eager tensor-core '' '' packed-buckets
+    run_lanes packed-buckets-graph graph tensor-core '' '' packed-buckets
+fi
 run_singleton
 run_k1
 finish_device
-python3 -IB "$tests/check_graph_evidence.py" "$out"
+python3 -IB "$tests/check_graph_evidence.py" "$out" --layout "$layout"

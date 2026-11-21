@@ -142,7 +142,7 @@ xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release --long-decode-check=y
 xmake build -P "$PWD" long-decode-check long-decode-routes
 python3 -c 'import json, sys; print(*json.load(open(sys.argv[1]))["prompt"])' \
     tests/prefix/route-cases.json >"$out/prompt.ids"
-for mode in full recovery small unaligned; do
+for mode in full recovery small unaligned graph; do
     CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
         "$out/bin/long-decode-check" "$mode"
 done
@@ -152,19 +152,19 @@ for policy in exact tensor-core; do
 done
 ```
 
-The operator check verifies Tensor Core launch geometry at packed widths five and 32.
-Width one and independent K and V misalignment exercise the paired split. The fixtures
-cover shuffled pages, lengths from 32,768 through 262,144, FP64 recovery, guard bytes,
-rejected arguments and injected launch failures. Recovery checks affected heads and
-compares finite outputs to an independent FP64 reference. The full run also checks
-the public ordered route. Use `paired` in place of `full` with the earlier paired build.
+The operator check verifies split and combine launch geometry, shuffled pages,
+contexts through 262,144 tokens, FP64 recovery, guard bytes, rejected arguments,
+and injected launch failures. The graph mode rebinds page tables, positions, and
+output buffers across replays, including padded lanes.
 
 The checkpoint check uses sparse slots, mixed long and short lengths, fixed-seed
-sampling, slot reuse, and short and long graph replay. Five long lanes exercise
-the Tensor Core split. Three long lanes at the same scheduler width exercise the
-paired split. The exact arm uses short prompts. Select `paired` instead of
-`candidate` to run the same prompts on the earlier paired build.
-An optional `LOGITS` path records raw BF16 logits for the eager width-five steps.
-An optional `TEACHER` path after `LOGITS` supplies 15 whitespace-delimited IDs for
-the last three steps, in step and ascending-slot order. The check verifies that
-each teacher ID reaches its slot.
+sampling, slot reuse, and short and long graph replay. Under `tensor-core`, five
+long lanes use the padded width-eight bucket. The `exact` policy uses short prompts.
+Use `paired` or `legacy-tensor` with the corresponding historical libraries to
+check their launch sequences.
+
+An optional `LOGITS` path records raw BF16 logits for two groups of three
+width-five steps. An optional `TEACHER` file after `LOGITS` supplies 15
+whitespace-delimited IDs for the final three steps, ordered by step and ascending
+slot. To align the histories from the start of decode, put one additional ID at the
+beginning of the file. The check forces that ID as the first output in all five lanes.

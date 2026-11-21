@@ -144,6 +144,28 @@ cudaError_t decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                        TextGdnWeights weights, const TextGdnState* state,
                        __nv_bfloat16* workspace, __nv_bfloat16* output, cudaStream_t stream);
 
+// Contiguous [rows, width] decode rows for one token per lane. Lanes at or past *active are
+// padding and are skipped. Per lane the result and state update equal decode_gdn bitwise.
+struct PackedGdnRows {
+    const __nv_bfloat16* qkv;
+    const __nv_bfloat16* z;
+    const __nv_bfloat16* b;
+    const __nv_bfloat16* a;
+    __nv_bfloat16* convolved;
+    __nv_bfloat16* observable;
+    __nv_bfloat16* output;
+};
+
+cudaError_t packed_decode_gdn(int rows, const int* active, PackedGdnRows inputs,
+                              TextGdnWeights weights, const TextGdnState* states,
+                              cudaStream_t stream);
+cudaError_t packed_decode_embedding(const __nv_bfloat16* embedding, int vocab_size, int width,
+                                    const int* tokens, int rows, __nv_bfloat16* output,
+                                    cudaStream_t stream);
+cudaError_t packed_decode_argmax(const __nv_bfloat16* logits, int vocab_size, int rows,
+                                 const int* active, TextLogitCandidate* scratch,
+                                 TextLogitCandidate* output, cudaStream_t stream);
+
 cudaError_t decode_verify_gdn(int rows, TextGdnReplayRows inputs, const __nv_bfloat16* z,
                               TextGdnWeights weights, const TextGdnState* initial,
                               const TextGdnState* tail, __nv_bfloat16* observable,

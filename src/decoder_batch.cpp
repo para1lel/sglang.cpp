@@ -7,6 +7,8 @@
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
 #include "sglang/decoder_prefix_cache.h"
+#include "sglang/prefill_fp8.h"
+#include "sglang/text/prefill_attn_sm100.h"
 
 #include <algorithm>
 #include <utility>
@@ -92,7 +94,7 @@ struct Lane {
 struct BatchStorage {
     std::shared_ptr<const Allocations> weights;
     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
-    std::unique_ptr<BatchGraphScratch> graph_scratch;
+    DecodeGraphs decode_graphs;
     std::optional<VerificationGraph> verification_graph;
     std::optional<PrefixCache> prefix_cache;
 };
@@ -336,7 +338,6 @@ struct DecoderBatch::State {
     }
 
     Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats);
-    bool replay(const ForwardLane* lanes, int count);
     void submit(const Selection& selected, const PrefillRows& decode, Steps& results,
                 DecoderBatchStepStats& stats, bool& contains_mtp);
     void prefill(const PrefillRows& rows, int max_rows, DecoderBatchStepStats& stats);
@@ -386,7 +387,7 @@ struct DecoderBatch::State {
             return;
         }
         storage->slots = {};
-        storage->graph_scratch.reset();
+        storage->decode_graphs = {};
         storage->verification_graph.reset();
         storage->prefix_cache.reset();
     }
@@ -399,7 +400,6 @@ struct DecoderBatch::State {
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;
     std::size_t resident_capacity = 0;
-    std::array<bool, decoder_batch_max_graph_lanes> graph_warmed{};
     int prefill_cursor = 0;
     bool failed = false;
     SerialOutput* output = nullptr;
@@ -582,50 +582,6 @@ void DecoderBatch::reset_prefix_cache() {
 
 bool DecoderBatch::available() const { return !state_->failed; }
 
-bool DecoderBatch::State::replay(const ForwardLane* lanes, int count) {
-    if (count == 1 && lanes[0].position >=
-        lanes[0].request->work.gqa_scores(text_attention_max_tokens).capacity) {
-        return false;
-    }
-    auto& warmed = graph_warmed[count - 1];
-    if (!std::exchange(warmed, true)) {
-        return false;
-    }
-    return execution.replay_batch_graph(count, [&] {
-        if (!storage->graph_scratch) {
-            storage->graph_scratch = std::make_unique<BatchGraphScratch>(model.device);
-        }
-    }, [&] {
-        auto& scratch = *storage->graph_scratch;
-        std::array<BatchGraphLane, decoder_batch_max_graph_lanes> capture;
-        for (int index = 0; index < count; ++index) {
-            capture[index] = {&*scratch.work[index], scratch.device_bindings + index};
-        }
-        model.capture_batch_decode(capture.data(), count, execution.stream());
-    }, [&] {
-        auto& scratch = *storage->graph_scratch;
-        for (int index = 0; index < count; ++index) {
-            const auto& lane = lanes[index];
-            auto& request = *lane.request;
-            auto scores = scratch.work[index]->gqa_scores(text_attention_max_tokens);
-            if (paged_decode_position(lane.position)) {
-                scores = {};
-            } else if (lane.position >= scores.capacity) {
-                scores = request.batch_graph_scores();
-                if (lane.position >= scores.capacity) {
-                    return false;
-                }
-            }
-            scratch.bindings[index] = {{0.0f, lane.token_id}, lane.position, scores,
-                                       request.pages, request.caches, request.states};
-        }
-        check(cudaMemcpyAsync(scratch.device_bindings, scratch.bindings.data(),
-                              count * sizeof(BatchDecodeBinding), cudaMemcpyHostToDevice,
-                              execution.stream()), "Upload batch decode bindings");
-        return true;
-    });
-}
-
 void DecoderBatch::State::score(Lane& lane, Request& request, Workspace& work, bool logits_ready) {
     const auto stream = execution.stream();
     if (!logits_ready) {
@@ -648,7 +604,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     auto& slots = storage->slots;
     std::array<ForwardLane, decoder_batch_max_lanes> work;
     std::array<Request*, decoder_batch_max_lanes> scoring{};
-    std::array<int, decoder_batch_max_lanes> packed_slots{};
+    std::array<int, decoder_batch_max_lanes> packed_slots;
+    packed_slots.fill(-1);
     PrefillRows speculative{};
     const int max_rows = *std::max_element(rows.begin(), rows.end());
     bool text_decode = max_rows == 0;
@@ -688,33 +645,30 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         if (rows[slot] <= 1) {
             packed_slots[slot] = count;
             work[count++] = lane.input();
-            work[count - 1].long_gqa = results[slot].decode && !lane.draft && !lane.media &&
-                model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+            const bool plain = results[slot].decode && !lane.draft && !lane.media;
+            work[count - 1].packed = plain;
+            work[count - 1].long_gqa =
+                plain && model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
         }
         if (rows[slot] == remaining) {
             scoring[slot] = lane.request.get();
         }
     }
-    const bool graph = options.cuda_graphs && text_decode && !contains_mtp && count > 0 &&
-        count <= decoder_batch_max_graph_lanes && replay(work.data(), count);
-    if (count != 0 && !graph) {
-        work[0].narrow_gqa = count == 1 && !contains_mtp && max_rows == 0 &&
-            work[0].rotary_position == -1;
-        model.forward(work.data(), count, stream);
-    }
+    const auto run = run_decode_lanes(model, execution, storage->decode_graphs, work.data(), count,
+                                      {options.cuda_graphs, text_decode && !contains_mtp,
+                                       !contains_mtp && max_rows == 0,
+                                       !contains_mtp &&
+                                           model.fp8_prefill() == Fp8PrefillPolicy::tensor_core});
     prefill(rows, max_rows, stats);
-    const bool grouped_head = !graph && text_decode && !contains_mtp &&
-        model.compute_eager_decode_logits(work.data(), count, stream);
     bool submitted = count != 0 || max_rows > 1;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = scoring[slot]) {
             auto& lane = *slots[slot];
-            const bool packed = graph && !lane.restored_prompt;
-            auto& workspace = packed ? *storage->graph_scratch->work[packed_slots[slot]]
-                                     : request->work;
-            score(lane, *request, workspace, (graph || grouped_head) && !lane.restored_prompt);
+            const int index = lane.restored_prompt ? -1 : packed_slots[slot];
+            auto* ready = index < 0 ? nullptr : run.ready[index];
+            score(lane, *request, ready ? *ready : request->work, ready != nullptr);
             submitted = true;
-            if (packed) {
+            if (index >= 0 && (run.graphed >> index & 1) != 0) {
                 stats.graph_slots |= std::uint32_t{1} << slot;
             }
         }
@@ -742,8 +696,13 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, int max_rows,
     const int budget = options.max_num_batched_tokens;
     const int cache_tile = tensor_cache && budget ? cache_prefill_tile(budget) : 0;
     const int tile_limit = cache_tile ? cache_tile : batch_prefill_tile_rows;
+    const bool wide = !cache_tile && model.is_b200() &&
+        model.fp8_prefill() == Fp8PrefillPolicy::tensor_core && sm100_prefill_enabled();
     const auto tile_rows = [&](const Lane& lane, int count) {
-        const int limit = lane.draft || lane.media ? prefill_chunk_rows : tile_limit;
+        int limit = lane.draft || lane.media ? prefill_chunk_rows : tile_limit;
+        if (wide && !lane.draft && !lane.media && lane.prompt.size() <= sm100_prefill_max_visible) {
+            limit = serial_prefill_max_rows;
+        }
         return std::min(count, limit);
     };
     int capacity = 1;

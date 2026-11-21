@@ -49,8 +49,9 @@ environment. Run it with a reserved SM100 device visible.
 ```sh
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
 c++ -std=c++17 -O3 -I include -isystem "$toolkit/include" \
-    tests/prefill/tensor_core_check.cpp build/lib/libsglang_prefill_fp8_sm100.a \
-    build/lib/libsglang_cuda.a \
+    tests/prefill/tensor_core_check.cpp \
+    -Wl,--start-group build/lib/libsglang_prefill_fp8_sm100.a \
+    build/lib/libsglang_cuda.a -Wl,--end-group \
     -L "$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -o build/tensor-core-check
 build/tensor-core-check
 ```
@@ -58,3 +59,9 @@ build/tensor-core-check
 The operator check verifies FP64-derived BF16 output and output guards for 197 channels
 and 1,024 inputs. It covers tensor-core launches at 3, 127, and 128 rows and exact fallback
 at 2 and 129 rows. It also checks alignment, odd input widths, and invalid arguments.
+
+Configure the release build with `--mxfp8-gqa-check=y` and build
+`mxfp8-gqa-sm100-check` to check the experimental SM100 prefill attention. Run
+`build/bin/mxfp8-gqa-sm100-check` on the reserved GPU. It enables the experimental
+route internally, compares sampled output against FP64 attention, checks graph
+replay, and verifies rejection of undersized page tables and unaligned queries.

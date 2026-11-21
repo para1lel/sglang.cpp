@@ -56,11 +56,13 @@ target("sglang_cuda")
     add_syslinks("cudart", {public = true})
     add_deps("sglang_prefill_fp8_sm100")
     add_files("src/mxfp8_gqa.cu", "src/text_decode_fp8.cu")
+    add_files("src/text/gqa_decode_prepare.cu")
     add_files("src/mxfp8_gqa_prefill.cu")
     add_files("src/text_decode_bandwidth.cu")
     add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
     add_files("src/text_normalization.cu")
     add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu")
+    add_files("src/text/decoder_graph_ops.cu")
 
 target("sglang_prefill_fp8_sm100")
     set_kind("static")
@@ -71,6 +73,9 @@ target("sglang_prefill_fp8_sm100")
     add_cuflags("--dependency-target-name=", {force = true})
     add_includedirs("include", path.join(toolkit, "include"))
     add_files("src/prefill_fp8_sm100.cu", "src/text/mxfp8_gqa_prefill_tmem.cu")
+    add_files("src/text/prefill_attn_sm100.cu", "src/text/gqa_decode_split.cu")
+    add_files("src/text/decode_proj_fp8.cu", "src/text/decode_proj_bf16.cu",
+              "src/text/decode_proj_host.cu")
 
 target("sglang_json")
     set_kind("static")
@@ -120,6 +125,7 @@ target("sglang_decoder")
               "src/decoder_mtp.cpp", "src/decoder_prefill.cpp", "src/decoder_verify.cpp",
               "src/decoder_constraint.cpp", "src/media/decoder_media.cpp",
               "src/media/multimodal_prompt.cpp")
+    add_files("src/text/decoder_graph_packed.cpp")
 
 target("sglang-generate")
     set_kind("binary")
@@ -191,6 +197,14 @@ if has_config("mxfp8-gqa-check") then
         add_syslinks("cudart")
         add_files("tests/mxfp8_gqa_check.cu", "tests/mxfp8_gqa_prefill_check.cu")
         add_files("tests/mxfp8_gqa_flash_check.cu")
+    target_end()
+
+    target("mxfp8-gqa-sm100-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_cuda")
+        add_files("tests/prefill/mxfp8_gqa_sm100_check.cpp")
     target_end()
 end
 
@@ -298,6 +312,14 @@ option("long-decode-check")
 option_end()
 
 if has_config("long-decode-check") then
+    target("gqa-split-fp64-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_cuda")
+        add_files("tests/decoder/gqa_split_fp64_check.cpp")
+    target_end()
+
     target("long-decode-check")
         set_kind("binary")
         set_toolchains("host-pixi")
@@ -316,8 +338,9 @@ if has_config("long-decode-check") then
         add_deps("sglang_decoder")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
-        add_ldflags("-Wl,--wrap=_ZN6sglang11text_argmaxEPK13__nv_bfloat16i" ..
-                    "PNS_18TextLogitCandidateES4_P11CUstream_st", {force = true})
+        add_ldflags("-Wl,--wrap=_ZN6sglang7decoder15RequestProgress6selectERNS0_7RequestERNS0_" ..
+                    "9WorkspaceERKNS_14DecoderOptionsERKNS0_19ConstraintWorkspaceEPKNS0_" ..
+                    "18SamplingParametersEPvP11CUstream_st", {force = true})
         add_files("tests/decoder/long_decode_routes.cpp")
     target_end()
 end

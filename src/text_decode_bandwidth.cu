@@ -1,5 +1,6 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_internal.h"
+#include "sglang/text/decode_proj.h"
 #include "sglang/text_ops.h"
 
 #include <cstddef>
@@ -97,6 +98,35 @@ __global__ void bf16_gdn_gates_kernel(const __nv_bfloat16* weight_b,
     }
 }
 
+__global__ void bf16_gdn_decode_shared(const __nv_bfloat16* weight_b,
+                                       const __nv_bfloat16* weight_a,
+                                       const __nv_bfloat16* input, int rows,
+                                       __nv_bfloat16* output_b, __nv_bfloat16* output_a) {
+    constexpr int width = decoder::hidden_size;
+    constexpr int packs = width / 8;
+    __shared__ uint4 row_weight[packs];
+    const bool gate_b = blockIdx.x < text_gdn_value_heads;
+    const int channel = blockIdx.x % text_gdn_value_heads;
+    const auto* weight = (gate_b ? weight_b : weight_a) + channel * width;
+    auto* output = gate_b ? output_b : output_a;
+    for (int pack = threadIdx.x; pack < packs; pack += blockDim.x) {
+        row_weight[pack] = load_128(weight + pack * 8);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x % warp_width;
+    for (int row = threadIdx.x / warp_width; row < rows; row += blockDim.x / warp_width) {
+        Bf16Dot dot;
+#pragma unroll 4
+        for (int pack = lane; pack < packs; pack += warp_width) {
+            dot.accumulate(row_weight[pack], load_128(input + row * width + pack * 8));
+        }
+        const auto result = warp_sum(dot.sum());
+        if (lane == 0) {
+            output[row * text_gdn_value_heads + channel] = __float2bfloat16_rn(result);
+        }
+    }
+}
+
 __global__ void bf16_lm_head_pair_kernel(const __nv_bfloat16* weight,
                                         const __nv_bfloat16* input, int rows,
                                         __nv_bfloat16* output) {
@@ -189,6 +219,24 @@ __global__ void quantize_fp8_warp(const __nv_bfloat16* input, TextFp8Activation 
         lower | (std::uint32_t(upper) << 16);
 }
 
+}
+
+std::optional<cudaError_t> try_text_bf16_decode_gates(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const __nv_bfloat16* input, int rows, __nv_bfloat16* output_b,
+    __nv_bfloat16* output_a, cudaStream_t stream) {
+    if (!aligned(weight_b, 16) || !aligned(weight_a, 16) || !aligned(input, 16)) {
+        return std::nullopt;
+    }
+    const int channels = (weight_a ? 2 : 1) * text_gdn_value_heads;
+    if (rows == 1) {
+        void* args[] = {&weight_b, &weight_a, &input, &output_b, &output_a};
+        return cudaLaunchKernel(bf16_gdn_gates_kernel, channels, warp_width, args, 0, stream);
+    }
+    void* args[] = {&weight_b, &weight_a, &input, &rows, &output_b, &output_a};
+    const int row_warps = rows <= 8 ? 8 : (rows <= 16 ? 16 : 32);
+    return cudaLaunchKernel(bf16_gdn_decode_shared, channels, row_warps * warp_width,
+                            args, 0, stream);
 }
 
 cudaError_t decoder::decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,

@@ -9,6 +9,7 @@ namespace sglang {
 
 inline constexpr int text_fp8_group_size = 128;
 inline constexpr int text_fp8_max_batch = 5;
+inline constexpr int text_decode_max_targets = 3;
 
 constexpr int text_fp8_group_count(int width) {
     return width / text_fp8_group_size + (width % text_fp8_group_size != 0);
@@ -26,6 +27,13 @@ struct TextFp8ActivationView {
 
 struct TextFp8Projection {
     TextFp8ActivationView input;
+    __nv_bfloat16* output;
+};
+
+struct TextFp8DecodeTarget {
+    const std::uint8_t* weight;
+    const __nv_bfloat16* weight_scales;
+    int out_width;
     __nv_bfloat16* output;
 };
 
@@ -97,6 +105,31 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
 cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
                                TextFp8ActivationView input, int out_width, int in_width, int rows,
                                __nv_bfloat16* output, cudaStream_t stream);
+
+/// Decode projections for 1..64 contiguous rows with the same layouts and
+/// per-group FP32 scale semantics as the gemv_rows variants. Each output row
+/// is bitwise independent of the row count. The arithmetic may differ from
+/// the exact gemv_rows path, which stays the prefill reference.
+cudaError_t text_fp8_decode_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+                                 TextFp8ActivationView input, int out_width, int in_width,
+                                 int rows, __nv_bfloat16* output, cudaStream_t stream);
+
+/// Projects one activation batch through up to text_decode_max_targets weights
+/// in a single launch. A row's result depends on the target set and not on the
+/// row count, so each weight must use the same target set in every route.
+cudaError_t text_fp8_decode_rows_fused(const TextFp8DecodeTarget* targets, int count,
+                                       TextFp8ActivationView input, int in_width, int rows,
+                                       cudaStream_t stream);
+
+cudaError_t text_bf16_decode_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,
+                                  int out_width, int in_width, int rows, __nv_bfloat16* output,
+                                  cudaStream_t stream);
+
+cudaError_t text_bf16_decode_gates(const __nv_bfloat16* weight_b,
+                                   const __nv_bfloat16* weight_a,
+                                   const __nv_bfloat16* input, int rows,
+                                   __nv_bfloat16* output_b, __nv_bfloat16* output_a,
+                                   cudaStream_t stream);
 
 /// Computes RMSNorm with eps 1e-6 and FP32 (1 + weight). A null residual
 /// selects standalone normalization. A nonnull residual_output receives the

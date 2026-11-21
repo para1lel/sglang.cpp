@@ -2,6 +2,8 @@
 
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/text/gqa_decode_prepare.cuh"
+#include "sglang/text/gqa_decode_split.cuh"
 
 #include <algorithm>
 #include <limits>
@@ -794,6 +796,7 @@ __global__ void replay_paged_decode(PagedDecodeBatch<Lane> batch) {
     }
 }
 #include "sglang/text/mxfp8_gqa_decode.cuh"
+#include "sglang/text/gqa_decode_combine.cuh"
 
 int score_grid_capacity(decoder::ExactGqaWorkspace workspace) {
     return workspace.scores ? workspace.capacity : 0;
@@ -962,6 +965,11 @@ cudaError_t decoder::paged_decode_gqa(const PagedDecodeLane* lanes, int count,
 cudaError_t decoder::paged_decode_gqa(
     const BoundPagedDecodeLane* lanes, int count, cudaStream_t stream) {
     return launch_paged_decode(lanes, count, stream);
+}
+
+cudaError_t gqa_decode::decode(const decoder::BoundPagedDecodeLane* lanes,
+                              const __nv_bfloat16* const* gates, int count, cudaStream_t stream) {
+    return launch_split_decode(lanes, count, stream, gates);
 }
 
 cudaError_t decoder::long_paged_decode_gqa(const PagedDecodeLane* lanes, int count,

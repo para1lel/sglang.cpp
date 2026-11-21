@@ -136,7 +136,7 @@ A TCP reset or failed write cancels the request. The server discards pending UTF
 
 Use `--sampling-defaults openai` for `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Model mode uses the same fallback for a missing file or omitted sampling fields. A missing or null request control inherits its default. The checkpoint does not supply the request seed. Raw text defaults are independent of this option. [Server option](../apps/sglang-server.cpp#L23)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L482)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L321)<!-- prefix: "} else if ((" -->
 
-If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L247)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L538)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L327)<!-- prefix: "int limit_re" -->
+If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L247)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L538)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L328)<!-- prefix: "int limit_re" -->
 
 ### Image and video inputs
 
@@ -208,7 +208,7 @@ Verify HTTP rejection before SSE for malformed media. Cancel a live stream and c
 
 ### Codec checks
 
-For compressed media, configure an absolute `codec_prefix` containing libpng and FFmpeg headers and libraries. The server links `png16`, `avformat`, `avcodec`, `swscale`, and `avutil`. The default build accepts decoded RGB8. [Build option](../xmake.lua#L132)<!-- prefix: "option(\"medi" --> · [Codec setup](../xmake.lua#L138)<!-- prefix: "local functi" -->
+For compressed media, configure an absolute `codec_prefix` containing libpng and FFmpeg headers and libraries. The server links `png16`, `avformat`, `avcodec`, `swscale`, and `avutil`. The default build accepts decoded RGB8. [Build option](../xmake.lua#L138)<!-- prefix: "option(\"medi" --> · [Codec setup](../xmake.lua#L144)<!-- prefix: "local functi" -->
 
 ```bash
 xmake f -P . -m release --media-codec-prefix="$codec_prefix" -o build/media-server

@@ -38,11 +38,43 @@ The initial correction used a reader pool. At width one, a CPU loopback regressi
 
 The [current HTTP reader](http-server.md#http-admission-and-shutdown) advances multiple incomplete requests from one poll loop.
 
+## L006 · FP16 operand loss in split GQA
+
+**Correction verified in Candidate B.** Candidate A divided Q by its largest channel and narrowed to FP16. With Q channels `1` and `2^-40`, and K nonzero only in the second channel at `±448 × 2^33`, the scaled scores are `±0.21875`. The split returned zero instead of the FP64 result `tanh(0.21875) = 0.215326`. Ordered BF16 returned `0.214844`. The well-conditioned `2^-16` control used K at `±448 × 2^9` and returned `0.215820` in the split. PV had a second loss when narrowing probability times relative V scale to FP16.
+
+The repair preserves Q in BF16, expands unscaled E4M3 K and V exactly to BF16, and rounds the weighted V operands to BF16. It uses FP32 accumulation and sends a flagged head to FP64 replay when range checks fire. The corrected split returns `0.215820` for both Q controls. Run from the repository root in the managed environment on a reserved B200. [Query load](../src/text/gqa_decode_split.cu#L165)<!-- prefix: "__device__ Q" --> · [Regression cases](../tests/decoder/gqa_split_fp64_check.cpp#L149)<!-- prefix: "int main() t" -->
+
+```bash
+out="$PWD/build/long-decode"
+xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release --long-decode-check=y
+xmake build -P "$PWD" gqa-split-fp64-check
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" \
+    "$out/bin/gqa-split-fp64-check"
+```
+
+The test compares well-conditioned, query-range, and weighted-value cases with FP64. The `packed_fp64.cpp` probe under `artifacts/coding-fix-a/` exercises the same cases through the production fused step, with three live lanes, one padded lane, KV append, and a gate of 0.5. Candidate A returned zero in eager and replay for the two range cases with gated FP64 references `0.107663` and `0.000162406`. Candidate B passed all three in both modes. Use the probe's `packed-fp64-{fixed,frozen}-build.log` and corresponding run logs. See [matched-history evidence](long-paged-decode.md#candidate-b-evidence) for drift that remained after the operand repair.
+
+## L007 · Singleton route parity
+
+**Correction verified in Candidate B.** Candidate A changed tensor-core singleton graph attention to the fused split and kept legacy attention in eager. On identical token histories, all 78 eager rows matched HEAD bitwise and 274 replay rows differed. A link-only control restored legacy attention and recovered all 44 sampled rows. Candidate B keeps legacy singleton attention in eager, capture, replay, and eager continuation after an eligible launch rejection. The checkpoint rerun recovered all 352 decode logit rows bitwise. [Bound attention](../src/decoder_forward.cpp#L248)<!-- prefix: "void attend_" -->
+
+Build using the [batch graph runbook](../tests/batch/README.md). Set `out` to the Release build directory, `checkpoint` to the local checkpoint, and `GPU_UUID` to a reserved B200. Use a fresh `$out/singleton` directory.
+
+```bash
+GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
+    bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/singleton" singleton
+python3 -IB tests/batch/check_graph_evidence.py "$out/singleton" --singleton-only
+```
+
+Check slot 31, replacement, injected graph launch failure, and subsequent width-two replay. The initial Candidate B verifier saw 13 of 17 BF16 rows per arm because it missed four packed-pair rows. The fixed observer records packed winner rows. The final verifier matched all 17 complete BF16 rows across eager, graph, and launch-rejection arms. The checkpoint route rerun separately observed zero fused attention launches in each singleton phase. [Singleton assertions](../tests/batch/check_graph_evidence.py#L383)<!-- prefix: "def verify_s" -->
+
+The source records are `artifacts/test-accept-a/report.md` for Candidate A, `artifacts/coding-fix-a/report.md` for the Candidate B rebuild and initial verifier, and `artifacts/resume-verifier/evidence/final-check.log` for the final verifier. Candidate B is based on `aa4ec04b63c381cf11fdb4a3801fb925bacb5135`. Its tracked patch SHA-256 is `ba9502803ff42da44100f1e71e4ba37485ca1b7b79b2332f6775dc646beb986d`, and its untracked archive SHA-256 is `565193d94d7a562257733ad810bbab1f60aec7e44513fe8e345cfcfcf6b5e7aa`.
+
 ## L008 · Buffered tokens suppress SSE keepalives
 
 The original batch consumer deferred keepalives when a decoder step was pending and reset the timer when it handled that step. Stop matching or chat parsing can accept a token without writing an SSE frame. One B200 probe delivered six decode steps about three seconds apart. A partial stop string held all six tokens until completion. The first data frame arrived 18.349 seconds after the HTTP 200 headers, with zero comments. The no-step control saw a comment near 15 seconds on benchmark, text, and chat streams.
 
-The [corrected writer](http-server.md#completion-streams) measures 15 seconds from the last successful header, data, or comment write. A step that only buffers tokens leaves the deadline unchanged. The coding rerun sent a comment after 15.006 seconds, then delivered all six exclamation marks, finish, usage, and `[DONE]`. The no-step controls and first-token timing checks also passed. Independent acceptance is in progress.
+The [corrected writer](http-server.md#completion-streams) measures 15 seconds from the last successful header, data, or comment write. A step that only buffers tokens leaves the deadline unchanged. The coding rerun sent a comment after 15.006 seconds, then delivered all six exclamation marks, finish, usage, and `[DONE]`. The no-step controls and first-token timing checks also passed on the standalone fix.
 
 Run the scripted CPU regression from the repository root in the managed environment. Set `out` to an existing output directory and `checkpoint` to the local Qwen3.8-27B-FP8 checkpoint. Use a fresh `$out/keepalive` directory. [Scripted regression](../tests/text/check_stream_keepalive_cpu.py#L58)<!-- prefix: "def main():" -->
 
@@ -53,3 +85,21 @@ python3 -IB tests/text/check_stream_keepalive_cpu.py \
 ```
 
 The scripted clock advances by three seconds per decode step. Both text and chat must send two comments, including one after the deadline restarts on visible data. The test also checks role, content, finish, usage, and `[DONE]`. The matched build and wire evidence are in `artifacts/resume-stream-fix/handoff.md` in the scheduler worktree.
+
+## L009 · Terminal error during first packed decode setup
+
+The original first-use handler caught every CUDA error from packed setup. An injected illegal-address status at setup synchronization reached legacy dispatch. The repair permits legacy dispatch only for packed scratch allocation OOM after the CUDA error check and release of partial allocations. A terminal status reaches the batch handler and disables the batch before any legacy submission or decode publication. [Batch error handler](../src/decoder_batch.cpp#L908)<!-- prefix: "} catch (con" -->
+
+The initial repair still attempted setup for two one-row prefills or one decode with one one-row prefill. The independent fault probe disabled the batch in both cases. The second repair selects at least two packable lanes and a bucket before requesting scratch. It uses the same plan for binding. Both corrected controls published their expected results without hitting the fault. [Setup order](../src/text/decoder_graph_packed.cpp#L452)<!-- prefix: "if (!PackedD" -->
+
+Use the [batch graph runbook](../tests/batch/README.md) to build Release tests in the managed environment. Set `out` to that build, `checkpoint` to the local checkpoint, and `GPU_UUID` to a reserved B200. Use a fresh evidence directory.
+
+```bash
+GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
+    bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/packed-setup" packed-setup
+python3 -IB tests/batch/check_graph_evidence.py "$out/packed-setup" --packed-setup-only
+```
+
+The eligible terminal arm requires two prefill score rows, no decode result, and rejection of later decode and admission. CUPTI must show no launches after the fault and no graph lifecycle calls. The OOM arm requires full BF16 parity with eager, sparse legacy replay after slot reuse, and zero request bytes at cleanup. Ineligible arms require full BF16 parity with their healthy controls and no injection, packed submission, or graph activity. [Terminal assertions](../tests/batch/check_graph_evidence.py#L409)<!-- prefix: "def verify_p" --> · [Eligibility assertions](../tests/batch/check_graph_evidence.py#L430)<!-- prefix: "def verify_p" -->
+
+The independent `artifacts/resume-verifier/packed-fix-accept/report.md` records the terminal, OOM, and eligibility failures and controls. The OOM arm replayed sparse masks `0x5` and `0x6` after cleanup and retired with zero request bytes. The corrected eligibility reruns are in `artifacts/resume-packed-repair/eligibility-fix/report.md`. They identify the corrected source by SHA-256 `05b30ab632f7cd615379ea485126675774dda197b6b767c7ae332135f4460cef`.

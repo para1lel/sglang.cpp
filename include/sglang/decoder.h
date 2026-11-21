@@ -127,6 +127,7 @@ public:
 private:
     friend class DecoderBatch;
     friend class MediaDecoderCheck;
+    friend struct DecoderModelAccess;
     DecoderResult generate_multimodal_impl(const std::vector<int>& template_token_ids,
                                            const std::vector<DecoderMedia>& media,
                                            const DecoderOptions& options,

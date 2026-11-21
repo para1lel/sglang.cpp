@@ -21,6 +21,8 @@ GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
 The runner uses fresh processes for eager and graph under both exact and tensor-core
 prefill. It leaves the command inputs, HTTP SSE, full BF16 scores, scheduler traces,
 and CUPTI runtime/device records in the evidence directory.
+Pass `all legacy` as the fourth and fifth arguments when verifying a build
+from before packed decode.
 
 - The CUDA operator probe rebinds distinct MXFP8 cache and page-table addresses,
   crosses positions 127 and 128, and checks KV bytes, inactive storage, and BF16
@@ -31,7 +33,13 @@ and CUPTI runtime/device records in the evidence directory.
   and complete BF16 scores against eager. Each graph mask must equal the slots
   with a decode result. Within this short scenario, once a width has replayed,
   each subsequent decode-only step at that width must replay. CUPTI must record
-  one actual CUDA graph per width through capture, launch, and destruction.
+  one CUDA graph per legacy width or packed bucket through capture, launch,
+  and destruction. Packed widths three and four must share the four-row graph.
+- The packed sweep exercises every logical width from two through 32 across
+  all seven physical buckets. The observer records device positions, checks
+  negative padding, and associates every emitted token and complete BF16
+  score row with its actual packed winner row. Eager and graph scores must
+  match bit for bit.
 - Fault probes inject unsupported capture, failed instantiation, replay rejection,
   scratch and instantiation allocation failures, and an uncertain post-launch
   synchronization. They check eager fallback, graph cleanup, continued replay at
@@ -41,11 +49,18 @@ and CUPTI runtime/device records in the evidence directory.
   the inline score limit, and width-local launch rejection. CUPTI pairs each
   reported mask with a device launch. The full BF16 score comparison includes
   both ends of the 1,536–2,560 visible-token page-parallel attention window.
-- The long-score probe crosses positions 5,119–5,121 with tensor-core prefill.
+- The legacy long-score probe crosses positions 5,119–5,121 with exact prefill.
   It checks lazy allocation, changing score strides, mixed steps, score
   allocation failure, cancellation, and slot reuse. It matches greedy IDs and
-  complete BF16 rows to eager, correlates masks with CUPTI launches, and
-  requires zero request bytes at cleanup.
+  complete BF16 rows to eager. The packed probe uses tensor-core prefill and
+  crosses 8,192 visible tokens with steady request and device allocation.
+  It checks mixed-length slot reuse and falls back to narrow replay after an
+  injected packed allocation failure. Both probes correlate masks with CUPTI
+  launches and require zero request bytes at cleanup.
+- The first-use packed setup probe injects an illegal-address status at
+  setup synchronization. It requires the batch to reject further decode and
+  admission, with neither a CUDA kernel launch nor a published result after
+  the fault. The allocation failure control checks fallback and slot reuse.
 - The K1 target verification probe distinguishes two-row target launches from K0
   replay. It checks sparse slots, request replacement, mixed K0 and K1 decode,
   and eager execution for verifier groups with multiple lanes, more than two
@@ -67,12 +82,23 @@ Expect `Batch CUDA Graph operator, lane, fault and HTTP checks passed`. The
 [evidence checker](check_graph_evidence.py#L1)<!-- prefix: "\"\"\"Check rea" -->
 can be run again against an existing evidence directory.
 
-Run the long-score boundary with a fresh evidence destination.
+Run both score-scratch boundaries with a fresh evidence destination.
 
 ```bash
 GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
     bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/boundary" boundary
 python3 -IB tests/batch/check_graph_evidence.py "$out/boundary" --boundary-only
+```
+
+Run the packed setup terminal fault, allocation failure and eligibility controls.
+Two one-row prefills and a mixed decode and one-row prefill must bypass packed
+setup. Each case runs both with and without the setup fault interposer and must
+publish identical full BF16 score rows.
+
+```bash
+GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
+    bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/packed-setup" packed-setup
+python3 -IB tests/batch/check_graph_evidence.py "$out/packed-setup" --packed-setup-only
 ```
 
 Run the singleton regression with a fresh evidence destination.

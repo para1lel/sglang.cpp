@@ -99,8 +99,8 @@ struct Instance {
         }
     }
 
-    void prefill(unsigned bits, int slot) {
-        for (int index = 0; index < 100; ++index) {
+    void prefill(unsigned bits, int slot, int step_limit = 100) {
+        for (int index = 0; index < step_limit; ++index) {
             if (step(bits)[slot].token) {
                 return;
             }
@@ -223,6 +223,81 @@ void score_boundary(const Decoder& decoder, std::string_view role) {
     run.check_step(15, 0);
 }
 
+void packed_boundary(const Decoder& decoder, bool graphs) {
+    Instance run(decoder, graphs);
+    run.admit(0, 8189, 12);
+    run.admit(2, 8189, 14);
+    const auto before_prefill = run.batch.request_device_allocation_bytes();
+    run.prefill(5, 0, 130);
+    require(run.batch.request_device_allocation_bytes() == before_prefill,
+            "Prefill allocated request-local decode scores");
+    run.check_step(5, 0);
+    run.check_step(5, graphs ? 5 : 0);
+    std::cerr << "packed steady replay begin\n";
+    for (int position = 8191; position <= 8194; ++position) {
+        run.check_step(5, graphs ? 5 : 0);
+    }
+    std::cerr << "packed steady replay end\n";
+
+    run.cancel(0);
+    run.admit(0, 27, 12);
+    run.prefill(1, 0);
+    run.check_step(5, graphs ? 5 : 0);
+    run.admit(1, 63, 6);
+    run.prefill(2, 1);
+    run.check_step(7, 0);
+    run.check_step(7, graphs ? 7 : 0);
+    run.cancel(2);
+    run.check_step(3, graphs ? 3 : 0);
+    run.drain();
+    run.check_step(15, 0);
+}
+
+void packed_oom(const Decoder& decoder, bool graphs) {
+    Instance run(decoder, graphs);
+    run.admit(0, 19, 6);
+    run.admit(2, 21, 8);
+    run.prefill(5, 2);
+    run.check_step(5, 0);
+    run.check_step(5, graphs ? 5 : 0);
+    run.cancel(0);
+    run.admit(1, 13, 5);
+    run.prefill(2, 1);
+    run.check_step(6, graphs ? 6 : 0);
+    run.drain();
+    run.check_step(15, 0);
+}
+
+void packed_buckets(const Decoder& decoder, bool graphs) {
+    constexpr unsigned all_slots = ~0u;
+    constexpr int slots = decoder_batch_max_lanes;
+    static_assert(slots == 32);
+    Instance run(decoder, graphs, slots);
+    for (int slot = 0; slot < slots; ++slot) {
+        run.admit(slot, 5 + slot % 4, 96);
+    }
+    for (int tick = 0; tick < 4; ++tick) {
+        run.step(all_slots);
+    }
+    for (int width = 2; width <= slots; ++width) {
+        const unsigned low = all_slots >> (slots - width);
+        const unsigned high = all_slots << (slots - width);
+        for (const auto bits : {low, high, low}) {
+            const auto result = run.step(bits);
+            for (int slot = 0; slot < slots; ++slot) {
+                if (bits & (1u << slot)) {
+                    require(result[slot].decode && !result[slot].finish_reason,
+                            "Packed width sweep lost a selected decode lane");
+                }
+            }
+        }
+    }
+    for (int slot = 0; slot < slots; ++slot) {
+        run.cancel(slot);
+    }
+    run.check_step(all_slots, 0);
+}
+
 void singleton(const Decoder& decoder, std::string_view role) {
     constexpr int far_slot = decoder_batch_max_lanes - 1;
     constexpr unsigned far_mask = 1u << far_slot;
@@ -294,6 +369,39 @@ void expect_unavailable_admission(DecoderBatch& batch) {
         return;
     }
     require(false, "Failed K1 batch accepted another request");
+}
+
+void packed_setup_terminal(const Decoder& decoder) {
+    Instance run(decoder, true);
+    run.admit(0, 19, 6);
+    run.admit(2, 21, 8);
+    run.prefill(5, 2);
+    require(run.steps == 1, "Expected packed setup on the first decode step");
+    try {
+        run.step(5);
+        require(false, "Packed setup returned decode results after a terminal CUDA error");
+    } catch (const std::runtime_error& error) {
+        require(std::string_view(error.what()).find("Prepare packed decode rows") !=
+                std::string_view::npos, error.what());
+    }
+    require(!run.batch.available(), "Terminal packed setup left the batch available");
+    expect_verification_error(run.batch, 5, "Decoder batch is unavailable");
+    expect_unavailable_admission(run.batch);
+    std::cout << "failed-closed\n";
+}
+
+void packed_setup_ineligible(const Decoder& decoder, bool mixed) {
+    Instance run(decoder, true);
+    run.admit(0, 1, 6);
+    if (mixed) {
+        const auto first = run.step(1);
+        require(first[0].token && !first[0].decode, "Initial one-row prefill did not complete");
+    }
+    run.admit(2, 1, 6);
+    const auto step = run.step(5);
+    require(step[0].token && step[0].decode == mixed && step[2].token && !step[2].decode,
+            "Ineligible packed step did not publish both results");
+    require(run.batch.available(), "Ineligible packed step left the batch unavailable");
 }
 
 void verify_failure(DecoderBatch& batch, unsigned selected, std::string_view message,
@@ -554,9 +662,12 @@ void verify_wide(const Decoder& decoder) {
 int main(int argc, char** argv) {
     try {
         require(argc == 4 || argc == 5,
-                "Expected CHECKPOINT ROLE FP8_PREFILL [boundary|singleton|verify]");
+                "Expected CHECKPOINT ROLE FP8_PREFILL "
+                "[boundary|packed-boundary|packed-buckets|packed-setup|singleton|verify]");
         const std::string_view test = argc == 5 ? argv[4] : "";
-        require(test.empty() || test == "boundary" || test == "singleton" || test == "verify",
+        require(test.empty() || test == "boundary" || test == "packed-boundary" ||
+                test == "packed-buckets" || test == "packed-setup" ||
+                test == "singleton" || test == "verify",
                 "Unexpected graph test scenario");
         const std::string_view role = argv[2];
         const std::string_view policy = argv[3];
@@ -566,6 +677,8 @@ int main(int argc, char** argv) {
              role == "launch" || role == "submitted" || role == "cleanup" ||
              role == "exec-cleanup" || role == "hard" || role == "hard-drain");
         require(wide || verify_fault || role == "eager" || role == "graph" ||
+                (test == "packed-boundary" && (role == "packed-oom" || role == "eager-oom")) ||
+                (test == "packed-setup" && (role == "prefill" || role == "mixed")) ||
                 role == (test == "boundary" ? "score-oom" :
                          test == "singleton" ? "launch" : "hard"),
                 "Unexpected graph test role");
@@ -576,6 +689,24 @@ int main(int argc, char** argv) {
             verify_wide(decoder);
         } else if (test == "boundary") {
             score_boundary(decoder, role);
+        } else if (test == "packed-boundary") {
+            require(policy == "tensor-core", "Packed boundary requires tensor-core");
+            if (role == "packed-oom" || role == "eager-oom") {
+                packed_oom(decoder, role != "eager-oom");
+            } else {
+                packed_boundary(decoder, role != "eager");
+            }
+        } else if (test == "packed-buckets") {
+            require(policy == "tensor-core", "Packed buckets require tensor-core");
+            packed_buckets(decoder, role != "eager");
+        } else if (test == "packed-setup") {
+            require(policy == "tensor-core", "Packed setup requires tensor-core");
+            if (role == "graph") {
+                packed_setup_terminal(decoder);
+            } else {
+                require(role == "prefill" || role == "mixed", "Unexpected packed setup role");
+                packed_setup_ineligible(decoder, role == "mixed");
+            }
         } else if (test == "singleton") {
             singleton(decoder, role);
         } else if (test == "verify") {

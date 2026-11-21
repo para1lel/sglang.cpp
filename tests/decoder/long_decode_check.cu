@@ -1,7 +1,11 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/text/gqa_decode_split.cuh"
+#include "sglang/text/gqa_decode_step.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <array>
@@ -30,8 +34,8 @@ constexpr int guard = 32;
 constexpr std::size_t scratch_stride = paged_decode_scratch_bytes + 2 * guard;
 constexpr unsigned char poison = 0xa5;
 
-enum class Kind { paired, tensor, merge, replay, other };
-enum class Mode { full, paired, small, recovery, unaligned };
+enum class Kind { split, combine, prepare, other };
+enum class Mode { full, small, recovery, unaligned };
 struct Launch {
     Kind kind;
     dim3 grid;
@@ -126,36 +130,65 @@ double reference(int lane, int tokens, int head, int channel, int marker, int ph
     return numerator / mass;
 }
 
-void expect_launches(int count, Kind split) {
-    check(observed == 3, "Expected split, merge and replay launches");
-    const std::array kinds{split, Kind::merge, Kind::replay};
-    for (int index = 0; index < observed; ++index) {
-        const auto launch = launches[index];
-        const bool tensor = kinds[index] == Kind::tensor;
-        check(launch.kind == kinds[index] && launch.grid.x == (index == 0 ? 16 : 24)
-                  && launch.grid.y == (tensor ? 4 : index == 0 ? 12 : 1)
-                  && launch.grid.z == count && launch.block.x == (tensor ? 128 : dim)
-                  && launch.block.y == 1 && launch.block.z == 1,
-              "Unexpected grouped kernel or geometry");
-    }
-    std::cout << "split=" << (split == Kind::tensor ? "tensor" : "paired")
-              << " grid=16x" << launches[0].grid.y << 'x' << count
-              << " block=" << launches[0].block.x << '\n';
+void expect_launch(const Launch& launch, Kind kind, dim3 grid, unsigned int threads) {
+    check(launch.kind == kind && launch.grid.x == grid.x && launch.grid.y == grid.y &&
+              launch.grid.z == grid.z && launch.block.x == threads &&
+              launch.block.y == 1 && launch.block.z == 1,
+          "Unexpected grouped kernel or geometry");
 }
 
-cudaError_t invoke(const PagedDecodeLane* inputs, int count, cudaStream_t stream,
-                   int fault = 0) {
+void expect_launches(int count, bool fused = false) {
+    check(observed == (fused ? 3 : 2), "Expected split and combine/replay launches");
+    int index = 0;
+    if (fused) {
+        expect_launch(launches[index++], Kind::prepare, dim3(heads + mxfp8_kv_heads, count), dim);
+    }
+    expect_launch(launches[index++], Kind::split, dim3(16, mxfp8_kv_heads, count), 128);
+    expect_launch(launches[index], Kind::combine, dim3(heads, count), dim);
+    std::cout << "launches=" << observed << " width=" << count << " fused=" << fused << '\n';
+}
+
+cudaError_t invoke_legacy(const PagedDecodeLane* inputs, int count, cudaStream_t stream,
+                          bool narrow = false) {
     observed = 0;
-    fail_at = fault;
+    fail_at = 0;
     watching = true;
-    const auto result = long_paged_decode_gqa(inputs, count, stream);
+    const auto result = narrow ? paged_decode_gqa(inputs, count, stream)
+                              : long_paged_decode_gqa(inputs, count, stream);
     watching = false;
     return result;
 }
 
+cudaError_t invoke(const PagedDecodeLane* inputs, int count, cudaStream_t stream, int fault = 0) {
+    Buffer<PagedDecodeLane> device(count);
+    std::vector<BoundPagedDecodeLane> bound;
+    for (int index = 0; index < count; ++index) {
+        auto* lane = device.data + index;
+        bound.push_back({&lane->cache, &lane->pages, &lane->position, nullptr,
+                         inputs[index].buffers});
+    }
+    cuda_check(cudaMemcpyAsync(device.data, inputs, count * sizeof(*inputs),
+                               cudaMemcpyHostToDevice, stream));
+    observed = 0;
+    fail_at = fault;
+    watching = true;
+    const auto result = gqa_decode::decode(bound.data(), nullptr, count, stream);
+    watching = false;
+    cuda_check(cudaStreamSynchronize(stream));
+    return result;
+}
+
 void invalid(const PagedDecodeLane* inputs, int count, cudaStream_t stream) {
-    check(invoke(inputs, count, stream) == cudaErrorInvalidValue && observed == 0,
+    check(invoke_legacy(inputs, count, stream) == cudaErrorInvalidValue && observed == 0,
           "Invalid grouped input must fail before launch");
+}
+
+void check_launch_failure(cudaError_t result, int fault) {
+    if (result != cudaErrorInvalidValue || observed != fault) {
+        std::cerr << "fault=" << fault << " launches=" << observed
+                  << " status=" << cudaGetErrorName(result) << '\n';
+        check(false, "CUDA launch error changed or a later pass was submitted");
+    }
 }
 
 void check_guards(const std::vector<unsigned char>& bytes, std::size_t stride, int count) {
@@ -194,14 +227,22 @@ void check_errors(std::vector<PagedDecodeLane> inputs, unsigned char* scratch,
     inputs[1].buffers.queries = nullptr;
     invalid(inputs.data(), 2, stream);
     inputs[1] = original;
-    for (int count : {2, 5}) {
-        for (int fault = 1; fault <= 3; ++fault) {
-            check(invoke(inputs.data(), count, stream, fault) == cudaErrorLaunchFailure &&
-                      observed == fault, "Launch error changed or a later pass was submitted");
+    for (const int count : {2, 5}) {
+        for (int fault = 1; fault <= 2; ++fault) {
+            check_launch_failure(invoke(inputs.data(), count, stream, fault), fault);
             cuda_check(cudaStreamSynchronize(stream));
         }
     }
-    std::cout << "invalid=10 injected_launch_failures=6\n";
+    inputs[0].position = paged_decode_min_visible - 1;
+    inputs[1].position = paged_decode_min_visible - 2;
+    check(invoke_legacy(inputs.data(), 2, stream, true) == cudaErrorInvalidValue && observed == 0,
+          "Narrow window accepted a short context");
+    inputs[1].position = paged_decode_max_visible;
+    check(invoke_legacy(inputs.data(), 2, stream, true) == cudaErrorInvalidValue && observed == 0,
+          "Narrow window accepted a long context");
+    check(invoke_legacy(inputs.data(), paged_decode_lanes + 1, stream, true) ==
+              cudaErrorInvalidValue && observed == 0, "Narrow window accepted a wide batch");
+    std::cout << "invalid=13 injected_launch_failures=4\n";
 }
 
 constexpr std::size_t output_stride = row_size * sizeof(Bf16) + 2 * guard;
@@ -270,7 +311,8 @@ void check_recovery(const std::vector<unsigned char>& scratch, int count, int ma
         }
         for (int head = 0; head < heads; ++head) {
             const auto offset = lane * scratch_stride + guard +
-                head * paged_decode_scratch_bytes / heads + dim * sizeof(float);
+                head * gqa_decode::max_splits * sizeof(gqa_decode::Partial) +
+                offsetof(gqa_decode::Partial, maximum);
             float maximum;
             std::memcpy(&maximum, scratch.data() + offset, sizeof(maximum));
             const bool expected = (has_marker && head < 12) || (lane == 1 && head == 12);
@@ -282,24 +324,83 @@ void check_recovery(const std::vector<unsigned char>& scratch, int count, int ma
     std::cout << "replayed_heads=" << replayed << " checked_heads=" << count * heads << '\n';
 }
 
-void check_unaligned(std::vector<PagedDecodeLane> inputs, std::size_t bytes,
-                     cudaStream_t stream) {
-    Buffer<std::uint8_t> shifted(bytes + 1);
-    auto& cache = inputs.back().cache;
-    for (auto payload : {&cache.key_payload, &cache.value_payload}) {
-        const auto original = *payload;
-        cuda_check(cudaMemcpyAsync(shifted.data + 1, original, bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
-        *payload = shifted.data + 1;
-        cuda_check(invoke(inputs.data(), inputs.size(), stream));
-        expect_launches(inputs.size(), Kind::paired);
-        cuda_check(cudaStreamSynchronize(stream));
-        *payload = original;
+void expect_poison(const unsigned char* bytes, std::size_t size, const char* message) {
+    check(std::all_of(bytes, bytes + size, [](auto value) { return value == poison; }), message);
+}
+
+void collect_outputs(unsigned char* output, unsigned char* scratch,
+                     std::vector<unsigned char>& host_output,
+                     std::vector<unsigned char>& host_scratch, cudaStream_t stream) {
+    cuda_check(cudaMemcpyAsync(host_output.data(), output, host_output.size(),
+                               cudaMemcpyDeviceToHost, stream));
+    cuda_check(cudaMemcpyAsync(host_scratch.data(), scratch, host_scratch.size(),
+                               cudaMemcpyDeviceToHost, stream));
+    cuda_check(cudaStreamSynchronize(stream));
+}
+
+void check_unaligned(std::vector<PagedDecodeLane> inputs, int physical_pages,
+                     unsigned char* output, unsigned char* scratch, cudaStream_t stream) {
+    const auto payload_bytes = physical_pages * mxfp8_payload_bytes_per_page;
+    const auto scale_bytes = physical_pages * mxfp8_scale_bytes_per_page;
+    Buffer<std::uint8_t> shifted(payload_bytes + 1);
+    Buffer<Bf16> shifted_queries(row_size + 1);
+    const int count = inputs.size();
+    auto& lane = inputs.back();
+    const auto original = lane;
+    std::vector<unsigned char> host_output(count * output_stride);
+    std::vector<unsigned char> host_scratch(count * scratch_stride);
+    const std::array pointers{&lane.cache.key_payload, &lane.cache.value_payload,
+                              &lane.cache.key_scales, &lane.cache.value_scales};
+    for (std::size_t index = 0; index <= pointers.size(); ++index) {
+        if (index == pointers.size()) {
+            cuda_check(cudaMemcpyAsync(shifted_queries.data + 1, original.buffers.queries,
+                                       row_size * sizeof(Bf16), cudaMemcpyDeviceToDevice, stream));
+            lane.buffers.queries = shifted_queries.data + 1;
+        } else {
+            auto* pointer = pointers[index];
+            const auto bytes = index < 2 ? payload_bytes : scale_bytes;
+            cuda_check(cudaMemcpyAsync(shifted.data + 1, *pointer, bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+            *pointer = shifted.data + 1;
+        }
+        cuda_check(cudaMemsetAsync(output, poison, host_output.size(), stream));
+        cuda_check(cudaMemsetAsync(scratch, poison, host_scratch.size(), stream));
+        cuda_check(invoke(inputs.data(), count, stream));
+        expect_launches(count);
+        collect_outputs(output, scratch, host_output, host_scratch, stream);
+        check_guards(host_output, output_stride, count);
+        check_guards(host_scratch, scratch_stride, count);
+        expect_poison(host_scratch.data() + (count - 1) * scratch_stride, scratch_stride,
+                      "Unaligned lane wrote split scratch");
+        check(host_scratch[guard] != poison, "Aligned neighbor did not write split scratch");
+        check_outputs(inputs, host_output, -1, physical_pages);
+        lane = original;
     }
+    std::cout << "unaligned_cases=5\n";
+}
+
+void check_narrow(std::vector<PagedDecodeLane> inputs, int physical_pages,
+                  unsigned char* output, unsigned char* scratch, cudaStream_t stream) {
+    constexpr std::array lengths{8192, 8193, 12345, 16384};
+    inputs.resize(lengths.size());
+    for (std::size_t index = 0; index < lengths.size(); ++index) {
+        inputs[index].position = lengths[index] - 1;
+        inputs[index].pages.page_count = (lengths[index] + page_size - 1) / page_size;
+    }
+    std::vector<unsigned char> host_output(inputs.size() * output_stride);
+    std::vector<unsigned char> host_scratch(inputs.size() * scratch_stride);
+    cuda_check(cudaMemsetAsync(output, poison, host_output.size(), stream));
+    cuda_check(cudaMemsetAsync(scratch, poison, host_scratch.size(), stream));
+    cuda_check(invoke(inputs.data(), inputs.size(), stream));
+    expect_launches(inputs.size());
+    collect_outputs(output, scratch, host_output, host_scratch, stream);
+    check_guards(host_output, output_stride, inputs.size());
+    check_guards(host_scratch, scratch_stride, inputs.size());
+    check_outputs(inputs, host_output, -1, physical_pages);
 }
 
 void run(Mode mode) {
-    const bool full = mode == Mode::full || mode == Mode::paired;
+    const bool full = mode == Mode::full;
     const bool recovery = mode == Mode::recovery;
     const int count = full ? width : mode == Mode::small ? 1 : 5;
     const int physical_pages = full ? pages : 512;
@@ -347,17 +448,16 @@ void run(Mode mode) {
     cuda_check(cudaMemsetAsync(output.data, poison, count * output_stride, stream));
     cuda_check(cudaMemsetAsync(scratch.data, poison, count * scratch_stride, stream));
     if (full) check_errors(inputs, scratch.data, stream);
-    if (mode == Mode::unaligned) check_unaligned(inputs, slots, stream);
+    if (mode == Mode::unaligned) {
+        check_unaligned(inputs, physical_pages, output.data, scratch.data, stream);
+    }
+    cuda_check(cudaMemsetAsync(output.data, poison, count * output_stride, stream));
+    cuda_check(cudaMemsetAsync(scratch.data, poison, count * scratch_stride, stream));
     cuda_check(invoke(inputs.data(), count, stream));
-    expect_launches(count, mode == Mode::full || recovery || mode == Mode::unaligned
-                              ? Kind::tensor : Kind::paired);
+    expect_launches(count);
     std::vector<unsigned char> host_output(count * output_stride);
     std::vector<unsigned char> host_scratch(count * scratch_stride);
-    cuda_check(cudaMemcpyAsync(host_output.data(), output.data, host_output.size(),
-                               cudaMemcpyDeviceToHost, stream));
-    cuda_check(cudaMemcpyAsync(host_scratch.data(), scratch.data, host_scratch.size(),
-                               cudaMemcpyDeviceToHost, stream));
-    cuda_check(cudaStreamSynchronize(stream));
+    collect_outputs(output.data, scratch.data, host_output, host_scratch, stream);
     check_guards(host_output, output_stride, count);
     check_guards(host_scratch, scratch_stride, count);
     if (full) {
@@ -367,9 +467,296 @@ void run(Mode mode) {
     }
     if (recovery) check_recovery(host_scratch, count, marker, physical_pages);
     check_outputs(inputs, host_output, marker, physical_pages);
+    if (full) check_narrow(inputs, physical_pages, output.data, scratch.data, stream);
     cuda_check(cudaStreamDestroy(stream));
 }
 
+constexpr int graph_width = 3;
+constexpr int graph_pages = 5;
+constexpr int kv_row = mxfp8_kv_heads * dim;
+using StepLanes = std::array<GqaDecodeStepLane, graph_width>;
+
+struct GraphCache {
+    Buffer<std::uint8_t> keys{graph_pages * mxfp8_payload_bytes_per_page};
+    Buffer<std::uint8_t> values{graph_pages * mxfp8_payload_bytes_per_page};
+    Buffer<std::uint8_t> key_scales{graph_pages * mxfp8_scale_bytes_per_page};
+    Buffer<std::uint8_t> value_scales{graph_pages * mxfp8_scale_bytes_per_page};
+    Mxfp8KvCache view{keys.data, values.data, key_scales.data, value_scales.data, graph_pages};
+};
+
+struct GraphInputs {
+    std::array<int, graph_width> positions;
+    std::array<int, graph_width * 2> mapping;
+    int bank;
+    int padded;
+    int invalid_case;
+};
+
+template <typename Value>
+void upload(Value* device, const Value* host, std::size_t count, cudaStream_t stream) {
+    cuda_check(cudaMemcpyAsync(device, host, count * sizeof(Value), cudaMemcpyHostToDevice,
+                               stream));
+}
+
+cudaError_t invoke_step(const GqaDecodeStepLane* lanes, int count, const Bf16* norm,
+                        cudaStream_t stream, int fault = 0) {
+    observed = 0;
+    fail_at = fault;
+    watching = true;
+    const auto result = decode_gqa_step(lanes, count, norm, norm, stream);
+    watching = false;
+    return result;
+}
+
+void check_step_errors(StepLanes lanes, const Bf16* norm, cudaStream_t stream) {
+    const auto invalid_step = [&](const auto* descriptors, int count, const Bf16* weights) {
+        check(invoke_step(descriptors, count, weights, stream) == cudaErrorInvalidValue &&
+                  observed == 0, "Invalid fused host input launched work");
+    };
+    invalid_step(static_cast<const GqaDecodeStepLane*>(nullptr), graph_width, norm);
+    invalid_step(lanes.data(), 0, norm);
+    invalid_step(lanes.data(), gqa_decode_step_max_lanes + 1, norm);
+    invalid_step(lanes.data(), graph_width, nullptr);
+    const auto original = lanes.back();
+    lanes.back().read.position = nullptr;
+    invalid_step(lanes.data(), graph_width, norm);
+    lanes.back() = original;
+    lanes.back().read.cache = nullptr;
+    invalid_step(lanes.data(), graph_width, norm);
+    lanes.back() = original;
+    lanes.back().read.pages = nullptr;
+    invalid_step(lanes.data(), graph_width, norm);
+    lanes.back() = original;
+    lanes.back().rope_queries += 1;
+    invalid_step(lanes.data(), graph_width, norm);
+    lanes.back() = original;
+    lanes.back().read.buffers.scratch =
+        static_cast<unsigned char*>(original.read.buffers.scratch) + 1;
+    invalid_step(lanes.data(), graph_width, norm);
+    lanes.back() = original;
+    for (int fault = 1; fault <= 3; ++fault) {
+        check_launch_failure(invoke_step(lanes.data(), graph_width, norm, stream, fault), fault);
+        cuda_check(cudaStreamSynchronize(stream));
+    }
+    std::cout << "fused_invalid=9 injected_launch_failures=3\n";
+}
+
+void check_graph_plane(const std::uint8_t* device, std::size_t bytes, const GraphInputs& input,
+                       bool scales, bool keys, cudaStream_t stream) {
+    const std::uint8_t history = scales ? 127 : keys ? 0x38 : input.bank ? 0xc0 : 0x38;
+    const std::uint8_t tail = scales ? keys ? 19 : 121 : keys ? 0 : input.bank ? 0xf8 : 0x78;
+    std::vector<std::uint8_t> expected(bytes, history);
+    for (int lane = 0; lane < graph_width; ++lane) {
+        if (lane == input.padded) continue;
+        const int position = input.positions[lane];
+        const int page = input.mapping[lane * 2 + position / page_size];
+        const int slot = position % page_size;
+        if (scales) {
+            for (int head = 0; head < mxfp8_kv_heads; ++head) {
+                const int row = ((page * mxfp8_kv_heads + head) * 32 + slot % 32) * 4 + slot / 32;
+                std::fill_n(expected.begin() + row * mxfp8_groups, mxfp8_groups, tail);
+            }
+        } else {
+            std::fill_n(expected.begin() + (page * page_size + slot) * kv_row, kv_row, tail);
+        }
+    }
+    std::vector<std::uint8_t> actual(bytes);
+    cuda_check(cudaMemcpyAsync(actual.data(), device, bytes, cudaMemcpyDeviceToHost, stream));
+    cuda_check(cudaStreamSynchronize(stream));
+    const auto mismatch = std::mismatch(
+        actual.begin(), actual.end(), expected.begin(),
+        [=](auto observed_byte, auto expected_byte) {
+            return observed_byte == expected_byte ||
+                (keys && !scales && expected_byte == 0 && observed_byte == 0x80);
+        });
+    if (mismatch.first != actual.end()) {
+        std::cerr << "cache_bank=" << input.bank << " keys=" << keys << " scales=" << scales
+                  << " offset=" << (mismatch.first - actual.begin())
+                  << " actual=" << unsigned(*mismatch.first)
+                  << " expected=" << unsigned(*mismatch.second) << '\n';
+        check(false, "Graph append changed the wrong token or encoded the wrong K/V");
+    }
+}
+
+void check_graph_output(const GraphInputs& input, const std::vector<unsigned char>& output,
+                        const std::vector<unsigned char>& scratch) {
+    check_guards(output, output_stride, graph_width);
+    check_guards(scratch, scratch_stride, graph_width);
+    const float history = input.bank ? -2.0f : 1.0f;
+    const float tail = input.bank ? -4.0f : 4.0f;
+    const float gate = 1.0f / (1.0f + std::exp(float(-input.bank)));
+    for (int lane = 0; lane < graph_width; ++lane) {
+        const auto* row = output.data() + lane * output_stride;
+        const auto* partials = scratch.data() + lane * scratch_stride;
+        if (lane == input.padded) {
+            expect_poison(row, output_stride, "Unreadable graph lane changed output");
+            expect_poison(partials, scratch_stride, "Unreadable graph lane changed scratch");
+            continue;
+        }
+        const int position = input.positions[lane];
+        const float attention = (history * position + tail) / (position + 1);
+        const float expected = __bfloat162float(__float2bfloat16(
+            __bfloat162float(__float2bfloat16(attention)) * gate));
+        for (int index = 0; index < row_size; ++index) {
+            Bf16 decoded;
+            std::memcpy(&decoded, row + guard + index * sizeof(Bf16), sizeof(Bf16));
+            check(std::abs(__bfloat162float(decoded) - expected) <= 0.004f * std::abs(expected),
+                  "Rebound graph output disagrees with the uniform-attention reference");
+        }
+        float maximum;
+        std::memcpy(&maximum, partials + guard + offsetof(gqa_decode::Partial, maximum),
+                    sizeof(maximum));
+        check(maximum == 0.0f, "Readable graph lane did not write its split maximum");
+    }
+}
+
+struct GraphFixture {
+    std::array<GraphCache, 2> cache;
+    Buffer<Mxfp8KvCache> caches{graph_width};
+    Buffer<Mxfp8PageTable> tables{graph_width};
+    Buffer<int> positions{graph_width};
+    Buffer<int> mappings{graph_width * 4};
+    Buffer<Bf16> norm{dim};
+    Buffer<Bf16> q_gate{graph_width * 2 * row_size};
+    Buffer<Bf16> queries{graph_width * row_size};
+    Buffer<Bf16> keys{graph_width * kv_row};
+    Buffer<Bf16> values{graph_width * kv_row};
+    Buffer<Bf16> rope_keys{graph_width * kv_row};
+    Buffer<unsigned char> output{graph_width * output_stride};
+    Buffer<unsigned char> scratch{graph_width * scratch_stride};
+    std::vector<unsigned char> host_output =
+        std::vector<unsigned char>(graph_width * output_stride);
+    std::vector<unsigned char> host_scratch =
+        std::vector<unsigned char>(graph_width * scratch_stride);
+
+    StepLanes lanes() const {
+        StepLanes descriptors;
+        for (int lane = 0; lane < graph_width; ++lane) {
+            auto* const row = output.data + lane * output_stride + guard;
+            auto* const query = queries.data + lane * row_size;
+            descriptors[lane] = {{caches.data + lane, tables.data + lane, positions.data + lane,
+                nullptr, {query, reinterpret_cast<Bf16*>(row),
+                          scratch.data + lane * scratch_stride + guard}},
+                query, q_gate.data + lane * 2 * row_size, keys.data + lane * kv_row,
+                values.data + lane * kv_row, rope_keys.data + lane * kv_row};
+        }
+        return descriptors;
+    }
+
+    void bind(const GraphInputs& input, cudaStream_t stream) {
+        const auto& view = cache[input.bank].view;
+        const auto payload_bytes = graph_pages * mxfp8_payload_bytes_per_page;
+        const auto scale_bytes = graph_pages * mxfp8_scale_bytes_per_page;
+        cuda_check(cudaMemsetAsync(view.key_payload, 0x38, payload_bytes, stream));
+        cuda_check(cudaMemsetAsync(view.value_payload, input.bank ? 0xc0 : 0x38, payload_bytes,
+                                   stream));
+        cuda_check(cudaMemsetAsync(view.key_scales, 127, scale_bytes, stream));
+        cuda_check(cudaMemsetAsync(view.value_scales, 127, scale_bytes, stream));
+        std::array<Mxfp8KvCache, graph_width> host_caches;
+        host_caches.fill(view);
+        auto* const mapping = mappings.data + input.bank * graph_width * 2;
+        std::array<Mxfp8PageTable, graph_width> host_tables;
+        for (int lane = 0; lane < graph_width; ++lane) {
+            host_tables[lane] = {mapping + lane * 2, 2};
+        }
+        if (input.invalid_case == 1) host_tables[input.padded].page_count = 0;
+        if (input.invalid_case == 2) host_caches[input.padded].page_count = 0;
+        if (input.invalid_case == 3) host_tables[input.padded].device_pages = nullptr;
+        if (input.invalid_case == 4) host_caches[input.padded].value_scales = nullptr;
+        upload(caches.data, host_caches.data(), host_caches.size(), stream);
+        upload(tables.data, host_tables.data(), host_tables.size(), stream);
+        upload(positions.data, input.positions.data(), input.positions.size(), stream);
+        upload(mapping, input.mapping.data(), input.mapping.size(), stream);
+        std::vector<Bf16> host_q_gate(graph_width * 2 * row_size, __float2bfloat16(0));
+        const auto gate = __float2bfloat16(input.bank);
+        for (int head = 0; head < graph_width * heads; ++head) {
+            std::fill_n(host_q_gate.begin() + (2 * head + 1) * dim, dim, gate);
+        }
+        std::vector<Bf16> host_values(graph_width * kv_row, __float2bfloat16(input.bank ? -4 : 4));
+        upload(q_gate.data, host_q_gate.data(), host_q_gate.size(), stream);
+        upload(values.data, host_values.data(), host_values.size(), stream);
+        cuda_check(cudaMemsetAsync(norm.data, 0, dim * sizeof(Bf16), stream));
+        cuda_check(cudaMemsetAsync(keys.data, 0, graph_width * kv_row * sizeof(Bf16), stream));
+        cuda_check(cudaMemsetAsync(output.data, poison, host_output.size(), stream));
+        cuda_check(cudaMemsetAsync(scratch.data, poison, host_scratch.size(), stream));
+        cuda_check(cudaStreamSynchronize(stream));
+    }
+
+    void verify(const GraphInputs& input, cudaStream_t stream) {
+        collect_outputs(output.data, scratch.data, host_output, host_scratch, stream);
+        check_graph_output(input, host_output, host_scratch);
+        const auto& view = cache[input.bank].view;
+        const auto payload_bytes = graph_pages * mxfp8_payload_bytes_per_page;
+        const auto scale_bytes = graph_pages * mxfp8_scale_bytes_per_page;
+        check_graph_plane(view.key_payload, payload_bytes, input, false, true, stream);
+        check_graph_plane(view.value_payload, payload_bytes, input, false, false, stream);
+        check_graph_plane(view.key_scales, scale_bytes, input, true, true, stream);
+        check_graph_plane(view.value_scales, scale_bytes, input, true, false, stream);
+    }
+};
+
+void run_graph() {
+    GraphFixture fixture;
+    const auto lanes = fixture.lanes();
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    constexpr GraphInputs initial{{64, 127, -1}, {1, 3, 2, 4, 0, 0}, 0, 2, 0};
+    constexpr GraphInputs rebound{{128, 0, 16}, {4, 0, 2, 2, 3, 1}, 1, 1, 1};
+    fixture.bind(initial, stream);
+    check_step_errors(lanes, fixture.norm.data, stream);
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    const auto capture_result = invoke_step(lanes.data(), graph_width, fixture.norm.data, stream);
+    cudaGraph_t graph = nullptr;
+    cuda_check(cudaStreamEndCapture(stream, &graph));
+    cuda_check(capture_result);
+    expect_launches(graph_width, true);
+    std::size_t nodes = 0;
+    cuda_check(cudaGraphGetNodes(graph, nullptr, &nodes));
+    check(nodes == 3, "Unexpected captured node count");
+    cudaGraphExec_t executable = nullptr;
+    cuda_check(cudaGraphInstantiate(&executable, graph, 0));
+    for (int run = 0; run < 6; ++run) {
+        auto input = run == 0 ? initial : rebound;
+        if (run > 0) input.invalid_case = run;
+        if (run == 5) input.positions[input.padded] = max_tokens;
+        fixture.bind(input, stream);
+        cuda_check(cudaGraphLaunch(executable, stream));
+        fixture.verify(input, stream);
+        std::cout << "graph_run=" << run << " padded=" << input.padded
+                  << " bank=" << input.bank << " cache_and_output=pass\n";
+    }
+    cuda_check(cudaGraphExecDestroy(executable));
+    cuda_check(cudaGraphDestroy(graph));
+    cuda_check(cudaStreamDestroy(stream));
+}
+
+void record_launch(std::string_view name, dim3 grid, dim3& block) {
+    const auto type = name.find("split_kernel") != name.npos ? Kind::split
+        : name.find("combine_replay") != name.npos ? Kind::combine
+        : name.find("prepare_kernel") != name.npos ? Kind::prepare : Kind::other;
+    check(observed < int(launches.size()), "Too many grouped launches");
+    launches[observed++] = {type, grid, block};
+    if (observed == fail_at) block.x = 1025;
+}
+
+}
+
+extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 block,
+                                          void** args, std::size_t shared, cudaStream_t stream) {
+    static const auto launch = reinterpret_cast<decltype(&__cudaLaunchKernel)>(
+        dlsym(RTLD_NEXT, "__cudaLaunchKernel"));
+    check(launch != nullptr, "Cannot resolve CUDA kernel launch");
+    if (watching) {
+        static void* const driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+        check(driver != nullptr, "Cannot load the CUDA driver");
+        static const auto get_name = reinterpret_cast<decltype(&cuKernelGetName)>(
+            dlsym(driver, "cuKernelGetName"));
+        const char* name = nullptr;
+        check(get_name && get_name(&name, kernel) == CUDA_SUCCESS,
+              "Cannot identify compiler-generated CUDA launch");
+        record_launch(name, grid, block);
+    }
+    return launch(kernel, grid, block, args, shared, stream);
 }
 
 extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, std::size_t,
@@ -380,26 +767,19 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
     if (watching) {
         const char* name = nullptr;
         cuda_check(cudaFuncGetName(&name, function));
-        const std::string_view symbol(name);
-        const auto type = symbol.find("split_long_decode_attention") != symbol.npos ? Kind::paired
-            : symbol.find("split_long_decode_tensor") != symbol.npos ? Kind::tensor
-            : symbol.find("merge_decode_attention") != symbol.npos ? Kind::merge
-            : symbol.find("replay_long_paged_decode") != symbol.npos ? Kind::replay : Kind::other;
-        check(observed < int(launches.size()), "Too many grouped launches");
-        launches[observed++] = {type, grid, block};
-        if (observed == fail_at) return cudaErrorLaunchFailure;
+        record_launch(name, grid, block);
     }
     return __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
 }
 
 int main(int argc, char** argv) try {
-    check(argc <= 2, "Usage: long-decode-check [full|paired|small|recovery|unaligned]");
+    check(argc <= 2, "Usage: long-decode-check [full|small|recovery|unaligned|graph]");
     const std::string_view mode = argc == 2 ? argv[1] : "full";
     if (mode == "full") run(Mode::full);
-    else if (mode == "paired") run(Mode::paired);
     else if (mode == "small") run(Mode::small);
     else if (mode == "recovery") run(Mode::recovery);
     else if (mode == "unaligned") run(Mode::unaligned);
+    else if (mode == "graph") run_graph();
     else check(false, "Invalid operator test mode");
     return 0;
 } catch (const std::exception& error) {

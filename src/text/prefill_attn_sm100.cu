@@ -557,7 +557,8 @@ __device__ void merge_head(const AttnPlan& plan, int token, int head) {
         const float2 stats = plan.stats[static_cast<std::size_t>(unit) * members + member];
         maximum = stats.y > 0.0f ? fmaxf(maximum, stats.x) : maximum;
     }
-    float numerator = 0.0f;
+    const int channel = (threadIdx.x % (channels / ordered_heads)) * ordered_heads;
+    float2 numerator = make_float2(0.0f, 0.0f);
     float denominator = 0.0f;
     for (int split = 0; split < plan.splits; ++split) {
         const int unit = unit_index(plan.ctas_per_kv, plan.splits, local, kv, split);
@@ -565,12 +566,19 @@ __device__ void merge_head(const AttnPlan& plan, int token, int head) {
         const float2 stats = plan.stats[part];
         if (stats.y > 0.0f) {
             const float weight = exp2f(stats.x - maximum);
-            numerator += weight * plan.partial[part * channels + threadIdx.x];
+            const auto* partial = reinterpret_cast<const float2*>(
+                plan.partial + part * channels + channel);
+            const float2 values = *partial;
+            numerator.x += weight * values.x;
+            numerator.y += weight * values.y;
             denominator += weight * stats.y;
         }
     }
-    plan.request.output[row_offset(token, head) + threadIdx.x] =
-        __float2bfloat16(denominator > 0.0f ? numerator / denominator : 0.0f);
+    auto* output = reinterpret_cast<__nv_bfloat162*>(
+        plan.request.output + row_offset(token, head) + channel);
+    *output = denominator > 0.0f ?
+        __floats2bfloat162_rn(numerator.x / denominator, numerator.y / denominator) :
+        __floats2bfloat162_rn(0.0f, 0.0f);
 }
 
 __global__ void __launch_bounds__(channels)
@@ -584,8 +592,7 @@ prefill_attn_finish(const __grid_constant__ AttnPlan plan) {
     if (repair) {
         protected_attention(scratch, plan.request, token, head);
     } else if (plan.splits > 1) {
-        merge_head(plan, token, head);
-        merge_head(plan, token, head + 1);
+        merge_head(plan, token, head + threadIdx.x / (channels / ordered_heads));
     }
 }
 

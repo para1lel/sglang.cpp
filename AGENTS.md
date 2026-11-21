@@ -45,6 +45,6 @@ Start E2E only when prior evidence makes success highly likely, and stop at the 
 gate (W5 before W6).
 
 Commit each independently verified change using Conventional Commits. Push each commit to
-the private `origin` before starting the next change. Check the remote branch SHA against
+`origin` before starting the next change. Check the remote branch SHA against
 local `HEAD` and resolve a rejected push before continuing. Keep the frozen adoption baseline
 and limits from `.agents/gates.json` fixed through ordinary changes.

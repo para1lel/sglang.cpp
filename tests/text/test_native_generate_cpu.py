@@ -186,7 +186,7 @@ class NativeGenerate(unittest.TestCase):
             )],
             *[({"text": "A", "sampling_params": {key: value}}, key) for key, value in (
                 ("max_new_tokens", None), ("max_new_tokens", -1), ("max_new_tokens", 1.5),
-                ("n", 2), ("top_p", 0), ("temperature", -1), ("min_p", 2), ("top_k", 0),
+                ("n", 0), ("top_p", 0), ("temperature", -1), ("min_p", 2), ("top_k", 0),
                 ("sampling_seed", 2**63), ("ignore_eos", "yes"),
                 ("stop", ["X", 1]), ("stop_regex", "X"), ("regex", 1),
                 ("frequency_penalty", 2.01), ("repetition_penalty", 0),

@@ -16,12 +16,17 @@ class Socket;
 struct GenerateInput {
     json::Object fields;
     std::size_t count = 1;
+    std::size_t samples = 1;
     bool stream = false;
     bool batch = false;
     bool text = false;
+
+    std::size_t item_count() const { return count * samples; }
+    bool indexed() const { return batch || samples > 1; }
 };
 
 GenerateInput parse_generate_input(std::string_view body);
+std::size_t generate_sample_count(const GenerateInput& input, const json::Array* params);
 void set_generate_constraint(const json::Object& sampling, const Tokenizer& tokenizer,
                              DecoderOptions& options);
 std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
@@ -37,7 +42,7 @@ public:
 
 private:
     struct Registration;
-    std::shared_ptr<Registration> register_ids(std::vector<std::optional<std::string>> ids);
+    std::shared_ptr<Registration> register_ids(const GenerateInput& input);
 
     BatchService& service_;
     const CompletionTokenizer& tokenizer_;

@@ -204,12 +204,20 @@ mkdir -p "$out"
 bash tests/text/build_chat_cpu.sh "$PWD" - "$out/server"
 CUDA_VISIBLE_DEVICES='' python3 -B tests/text/test_native_generate_cpu.py \
     --binary "$out/server" --checkpoint "$checkpoint" --output "$out/evidence"
+CUDA_VISIBLE_DEVICES='' python3 -B tests/text/test_native_parallel_sampling_cpu.py \
+    --binary "$out/server" --checkpoint "$checkpoint" --output "$out/parallel"
 ```
 
 The suite checks raw text and token ID inputs, cumulative SSE, sampling defaults,
 validation, model discovery, and shared queue overflow. It disconnects a queued
 client and an active stream over TCP and checks that a waiting request and a
 subsequent request reuse the released slot.
+
+The parallel suite uses a step gate to hold two active samples and one waiting
+sample from one request. It checks indexed output, admission limits, seed
+forwarding, fresh IDs and pre-admission duplicate checks. It aborts an active
+sample using its observed SSE ID and checks disconnect cleanup with a sample
+still waiting.
 
 ## Sparse logit bias
 

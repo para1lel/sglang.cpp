@@ -9,6 +9,8 @@
 #include <charconv>
 #include <iostream>
 #include <iterator>
+#include <random>
+#include <set>
 
 namespace sglang::server {
 namespace {
@@ -314,7 +316,7 @@ void complete_aborted(const Socket& connection, const Tokenizer& tokenizer,
     for (const auto& item : items) {
         item.request_id->finish_abort();
     }
-    if (!input.stream && input.batch) {
+    if (!input.stream && input.indexed()) {
         write_batch(connection, tokenizer, items, std::vector<DecoderResult>(items.size(), result));
         return;
     }
@@ -325,7 +327,7 @@ void complete_aborted(const Socket& connection, const Tokenizer& tokenizer,
             write_json(connection, "200 OK", response.finish(result));
             return;
         }
-        const auto output = response.frame(input.batch ? std::optional{index} : std::nullopt,
+        const auto output = response.frame(input.indexed() ? std::optional{index} : std::nullopt,
                                            result, true);
         if (!stream.start() || !stream.write(output)) {
             return;
@@ -354,33 +356,33 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
     }
     if (!slot) {
         complete_aborted(connection, tokenizer.get(), input, items);
-    } else if (!input.batch && !items.front().text_stops && !scored &&
+    } else if (!input.indexed() && !items.front().text_stops && !scored &&
                !items.front().options.constraint) {
         complete_single(connection, service, *slot, tokenizer, items.front(), input.stream);
     } else if (input.stream) {
-        stream_batch(connection, service, *slot, tokenizer, items, input.batch);
+        stream_batch(connection, service, *slot, tokenizer, items, input.indexed());
     } else {
-        complete_batch(connection, service, *slot, tokenizer, items, input.batch);
+        complete_batch(connection, service, *slot, tokenizer, items, input.indexed());
     }
 }
 
 std::vector<std::optional<std::string>> generate_ids(const GenerateInput& input) {
-    std::vector<std::optional<std::string>> ids(input.count);
+    std::vector<std::optional<std::string>> ids(input.item_count());
     const auto* rid = json::get(input.fields, "rid");
     if (!rid || rid->is_null()) {
         return ids;
     }
     if (const auto value = rid->string()) {
-        for (std::size_t index = 0; index < input.count; ++index) {
+        for (std::size_t index = 0; index < ids.size(); ++index) {
             ids[index] = std::string(*value);
-            if (input.batch) {
+            if (input.indexed()) {
                 *ids[index] += '_' + std::to_string(index);
             }
         }
         return ids;
     }
     const auto* list = rid->array();
-    if (!input.batch || !list || list->size() != input.count) {
+    if (!input.indexed() || !list || list->size() != input.count) {
         throw std::invalid_argument("Expected a rid string or one rid string per batch item");
     }
     for (std::size_t index = 0; index < input.count; ++index) {
@@ -391,6 +393,21 @@ std::vector<std::optional<std::string>> generate_ids(const GenerateInput& input)
         ids[index] = std::string(*value);
     }
     return ids;
+}
+
+std::string sample_id(std::random_device& random) {
+    constexpr std::string_view hex = "0123456789abcdef";
+    std::string id(32, '0');
+    for (std::size_t offset = 0; offset < id.size(); offset += 8) {
+        auto bits = static_cast<std::uint32_t>(random());
+        for (std::size_t digit = 0; digit < 8; ++digit) {
+            id[offset + digit] = hex[bits & 15];
+            bits >>= 4;
+        }
+    }
+    id[12] = '4';
+    id[16] = hex[8 + (hex.find(id[16]) & 3)];
+    return id;
 }
 
 }
@@ -412,12 +429,27 @@ struct NativeGenerate::Registration {
 };
 
 std::shared_ptr<NativeGenerate::Registration>
-NativeGenerate::register_ids(std::vector<std::optional<std::string>> ids) {
+NativeGenerate::register_ids(const GenerateInput& input) {
+    auto ids = generate_ids(input);
     auto registration = std::make_shared<Registration>(*this);
     registration->items.reserve(ids.size());
     const std::lock_guard lock(mutex_);
+    std::set<std::string, std::less<>> normalized;
+    std::optional<std::random_device> random;
+    if (input.samples > 1) {
+        for (const auto& id : ids) {
+            if (id && (ids_.count(*id) || !normalized.insert(*id).second)) {
+                throw std::invalid_argument("Duplicate request ID detected: " + *id);
+            }
+        }
+        random.emplace();
+    }
     for (auto& id : ids) {
-        if (!id) {
+        if (random) {
+            do {
+                id = sample_id(*random);
+            } while (ids_.count(*id) || normalized.count(*id));
+        } else if (!id) {
             do {
                 id = "gen-" + std::to_string(next_id_++);
             } while (ids_.count(*id));
@@ -435,7 +467,7 @@ NativeGenerate::register_ids(std::vector<std::optional<std::string>> ids) {
 
 QueuedGenerate NativeGenerate::prepare(std::string_view body) {
     auto input = parse_generate_input(body);
-    auto registration = register_ids(generate_ids(input));
+    auto registration = register_ids(input);
     return {
         [this, input = std::move(input), registration](
             const Socket& connection, std::optional<int> slot) {
@@ -541,6 +573,40 @@ void set_generate_constraint(const json::Object& sampling, const Tokenizer& toke
         const auto target = kind == "ebnf" ? "an ebnf choice" : "the " + std::string(name);
         throw std::invalid_argument("max_new_tokens cannot complete " + target);
     }
+}
+
+std::size_t generate_sample_count(const GenerateInput& input, const json::Array* params) {
+    const auto read_count = [](const json::Value* params) -> std::size_t {
+        const auto* object = params ? params->object() : nullptr;
+        const auto* value = object ? json::get(*object, "n") : nullptr;
+        if (!value || value->is_null()) {
+            return 1;
+        }
+        const auto count = value->unsigned_integer();
+        if (!count || *count == 0 || *count > decoder_batch_max_lanes) {
+            throw std::invalid_argument("Expected an integer sampling_params.n in [1, 32]");
+        }
+        return static_cast<std::size_t>(*count);
+    };
+    const auto samples = read_count(params ? &params->front()
+                                          : json::get(input.fields, "sampling_params"));
+    if (params && std::any_of(params->begin(), params->end(), [&](const auto& item) {
+            return read_count(&item) != samples;
+        })) {
+        throw std::invalid_argument("sampling_params.n must be the same for all batch items");
+    }
+    if (samples > decoder_batch_max_lanes / input.count) {
+        throw std::invalid_argument("Expanded /generate batch must have at most 32 items");
+    }
+    if (samples > 1) {
+        for (const auto* key : {"return_logprob", "logprob_start_len", "top_logprobs_num"}) {
+            const auto* value = json::get(input.fields, key);
+            if (value && value->array()) {
+                throw std::invalid_argument(std::string(key) + " must be scalar when n > 1");
+            }
+        }
+    }
+    return samples;
 }
 
 }

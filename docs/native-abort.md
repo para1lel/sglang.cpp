@@ -4,21 +4,23 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Native generation | Assign one request ID per prompt and track which item owns each ID. | [ID input](../apps/server/native_generate.cpp#L367)<!-- prefix: "std::vector\u003c" --> · [Registration](../apps/server/native_generate.cpp#L415)<!-- prefix: "NativeGenera" --> |
+| Native generation | Assign one request ID per generated item and track its owner. | [ID input](../apps/server/native_generate.cpp#L369)<!-- prefix: "std::vector\u003c" --> · [Registration](../apps/server/native_generate.cpp#L432)<!-- prefix: "NativeGenera" --> |
 | HTTP control | Dispatch `POST /abort_request` on the reader and release fully aborted queue entries. | [Control route](../apps/server/prefix_controls.cpp#L252)<!-- prefix: "void Connect" --> · [Queue cleanup](../apps/server/prefix_controls.cpp#L429)<!-- prefix: "void Connect" --> |
 | Decoder service | Skip waiting items, retire running items, and apply abort delivery according to the job's overlap history. | [ID state](../include/sglang/server/batch_service.h#L34)<!-- prefix: "class BatchR" --> · [Retirement](../apps/server/batch_service.cpp#L256)<!-- prefix: "bool BatchSe" --> · [Waiting items](../apps/server/batch_service.cpp#L612)<!-- prefix: "bool BatchSe" --> · [Abort delivery](../apps/server/batch_service.cpp#L44)<!-- prefix: "bool has_out" --> |
-| Native response | Report each item's terminal abort on its original generation connection. | [Finish metadata](../apps/server/native_generate.cpp#L122)<!-- prefix: "if (terminal" --> · [Pre-admission response](../apps/server/native_generate.cpp#L310)<!-- prefix: "void complet" --> |
+| Native response | Report each item's terminal abort on its original generation connection. | [Finish metadata](../apps/server/native_generate.cpp#L124)<!-- prefix: "if (terminal" --> · [Pre-admission response](../apps/server/native_generate.cpp#L312)<!-- prefix: "void complet" --> |
 
 ## Runtime path
 
-Supply `rid` with [`POST /generate`](native-generate.md) if you need to abort before the first result. The response reports the effective ID in `meta_info.id`.
+With `n: 1`, supply `rid` in [`POST /generate`](native-generate.md) to name an item before its first result. The response reports the effective ID in `meta_info.id`.
 
-| `rid` in `/generate` | Effective IDs |
+| `rid` in `/generate` with `n: 1` | Effective IDs |
 | --- | --- |
 | Omitted or null | The server generates an ID for each prompt. |
 | String with one scalar prompt | The item uses that string. The server preserves whitespace and UTF-8. |
 | String with a batch | Each item uses the string followed by `_` and its unpadded zero-based index. This also applies to a one-item batch. |
 | Array of strings with a batch | Each item uses the string at its input position. The array length must equal the prompt count. |
+
+With `n > 1`, every sample gets an independent UUID. Read its `meta_info.id` from SSE before making a named abort. To abandon the whole request before any frame arrives, close its generation connection. `abort_all` also reaches waiting samples.
 
 Once the HTTP queue has capacity, the reader checks the prompt shape and reserves all effective IDs before it queues the request. The worker validates the remaining generation options and prepares all prompts before decoder submission.
 
@@ -32,12 +34,12 @@ curl --fail-with-body -i http://127.0.0.1:17384/abort_request \
 
 HTTP 200 has an empty body. It acknowledges receipt of the control request. Use the original `/generate` response to observe completion.
 
-- A named abort targets an exact live ID. If it changes that item's state, it also marks already-dispatched items whose IDs start with the same string. A batch string such as `job` produces IDs such as `job_0`. Aborting `job` has no effect unless `job` itself is also a live item.
+- A named abort targets an exact live ID. If it changes that item's state, it also marks already-dispatched items whose IDs start with the same string.
 - `abort_all: true` marks all currently registered native generation items, including items with server-assigned IDs and items still waiting. The `rid` value has no effect in this mode.
 - An item aborted before decoder submission produces empty `output_ids` and a finish reason of `{"type":"abort","message":"Abort in waiting queue"}`.
 - An item aborted after submission returns `{"type":"abort","message":"Aborted","status_code":null,"err_type":null}` as its finish reason. Its output IDs follow the delivery rules below.
 
-The scheduler observes the abort at its next cancellation check. Work already in flight can finish its current step. A normal terminal result, including a [native text stop](native-generate.md#text-stops), stays final if it wins the state transition. [Matching](../apps/server/native_generate.cpp#L469)<!-- prefix: "bool changed" --> · [Publish](../apps/server/batch_service.cpp#L305)<!-- prefix: "bool BatchSe" -->
+The scheduler observes the abort at its next cancellation check. Work already in flight can finish its current step. A normal terminal result, including a [native text stop](native-generate.md#text-stops), stays final if it wins the state transition. [Matching](../apps/server/native_generate.cpp#L501)<!-- prefix: "bool changed" --> · [Publish](../apps/server/batch_service.cpp#L305)<!-- prefix: "bool BatchSe" -->
 
 If a job has never published a step while another is pending, an abort still delivers any single already-published step before the terminal result. Once a job has published overlapping steps through [bounded decode output](http-server.md#bounded-decode-output), an abort winner discards every unclaimed step, even after ordinary scheduling resumes. A callback already claimed can finish. The abort terminal includes the IDs accepted by the writer. [Overlap history](../apps/server/batch_service.cpp#L323)<!-- prefix: "job.output_o" --> · [Single-item delivery](../apps/server/batch_service.cpp#L44)<!-- prefix: "bool has_out" --> · [Batch delivery](../apps/server/batch_service.cpp#L655)<!-- prefix: "const bool h" -->
 
@@ -47,7 +49,9 @@ An abort terminal uses the regular JSON or SSE result shape. Batch JSON retains 
 
 Duplicate effective IDs within a batch or against live items return HTTP 400. A failed registration releases its reservations. A finished item can reuse its ID while siblings from its previous batch are still running. Cleanup removes a registration only when it still owns that ID.
 
-If a request disconnects or fails, reuse its IDs after the associated work and queue entry have been cleaned up. A late named abort targets whichever live item currently owns that ID. Use distinct caller IDs when late control requests can overlap a replacement. [Cleanup](../apps/server/native_generate.cpp#L400)<!-- prefix: "~Registratio" --> · [Terminal state](../include/sglang/server/batch_service.h#L67)<!-- prefix: "bool finishe" -->
+For `n > 1`, the server validates caller-supplied IDs before assigning UUIDs. A string is checked as `rid_0` through `rid_<expanded_count - 1>`. An array supplies one ID per original prompt. Duplicate IDs in that array or IDs already registered on the server return HTTP 400. The server registers only the generated child IDs, so a caller can reuse the same base for independent parallel requests.
+
+If a request disconnects or fails, reuse its IDs after the associated work and queue entry have been cleaned up. A late named abort targets whichever live item currently owns that ID. Use distinct caller IDs when late control requests can overlap a replacement. [Cleanup](../apps/server/native_generate.cpp#L417)<!-- prefix: "~Registratio" --> · [Terminal state](../include/sglang/server/batch_service.h#L67)<!-- prefix: "bool finishe" -->
 
 ### Capacity
 
@@ -69,6 +73,8 @@ One additional CPU worker removes a fully aborted pending request from the compl
 ### Pinned SGLang reference
 
 SGLang commit `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8` defines `POST /abort_request` and an empty HTTP 200 response. It expands a batch string ID with the same unpadded suffix. With one tokenizer worker, a named abort needs a known exact ID before dispatch. Its scheduler then searches dispatched requests by prefix.
+
+For `n > 1`, upstream checks normalized IDs against its request registry, uses those IDs for prefix warmup, then regenerates each sample ID with `uuid4().hex`. The native server checks the same caller ID forms against its registry and admits the UUID children directly. [Duplicate check](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/tokenizer_manager.py#L4119)<!-- prefix: "rids = set()" --> · [Sample expansion](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/tokenizer_manager.py#L2468)<!-- prefix: "for i in ran" --> · [UUID generation](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/io_struct.py#L434)<!-- prefix: "def regenera" -->
 
 [HTTP route](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L1727)<!-- prefix: "@app.post(\"/" --> · [Batch IDs](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/io_struct.py#L884)<!-- prefix: "def _normali" --> · [Tokenizer dispatch](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/tokenizer_manager.py#L2544)<!-- prefix: "def abort_re" --> · [Scheduler matching](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/io_struct.py#L2538)<!-- prefix: "def matches(" -->
 

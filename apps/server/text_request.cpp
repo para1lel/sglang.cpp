@@ -763,11 +763,7 @@ DecoderOptions generate_options(const json::Value* params, const CompletionToken
                     options.min_new_tokens = text_budget(parameter,
                         "Expected a nonnegative integer sampling_params.min_new_tokens");
                 }
-            } else if (key == "n") {
-                if (!parameter.is_null() && parameter.unsigned_integer() != 1) {
-                    bad_request("Only sampling_params.n = 1 is supported");
-                }
-            } else if (key == "stop") {
+            } else if (key == "n" || key == "stop") {
                 continue;
             } else if (key == "temperature" || key == "top_p" || key == "top_k" ||
                        key == "min_p" || key == "sampling_seed" || key == "ignore_eos" ||
@@ -908,6 +904,12 @@ GenerateInput parse_generate_input(std::string_view body) {
         input.count = list->size();
     }
     input.fields = std::move(*object);
+    const auto* params = json::get(input.fields, "sampling_params");
+    const auto* param_list = generate_parameter_list(params, input.count, false);
+    input.samples = generate_sample_count(input, param_list);
+    if (param_list && !input.indexed()) {
+        bad_request("Expected one sampling_params object");
+    }
     return input;
 }
 
@@ -917,12 +919,14 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
     const auto* params = json::get(input.fields, "sampling_params");
     const auto* salt = json::get(input.fields, "cache_salt");
     const auto* list = input.batch ? prompt.array() : nullptr;
-    const auto* param_list = list ? generate_parameter_list(params, input.count, false) : nullptr;
-    const auto* salt_list = list ? generate_parameter_list(salt, input.count, true) : nullptr;
+    const auto* param_list = params ? params->array() : nullptr;
+    const auto* salt_list = input.indexed() ? generate_parameter_list(salt, input.count, true)
+                                            : nullptr;
     const auto broadcast = param_list ? DecoderOptions{} : generate_options(params, tokenizer);
     const auto broadcast_stops = param_list ? nullptr : generate_stops(params, tokenizer);
     std::vector<BatchPrompt> items;
-    items.reserve(input.count);
+    items.reserve(input.item_count());
+    const int samples = static_cast<int>(input.samples);
     int remaining = checkpoint_context;
     for (std::size_t index = 0; index < input.count; ++index) {
         auto options = param_list ? generate_options(&(*param_list)[index], tokenizer) : broadcast;
@@ -930,15 +934,16 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
         if (item_salt && !item_salt->is_null()) {
             set_cache_salt_value(*item_salt, options);
         }
-        remaining -= options.max_new_tokens;
-        if (remaining < 0) {
+        if (options.max_new_tokens > remaining / samples) {
             bad_request("Batch output budgets must total at most 262144 tokens");
         }
+        remaining -= options.max_new_tokens * samples;
         const auto stops = param_list ? generate_stops(&(*param_list)[index], tokenizer)
                                       : broadcast_stops;
         items.push_back(generate_prompt(list ? (*list)[index] : prompt, input.text,
                                         std::move(options), tokenizer, stops));
         generate_logprob_options(input, index, items.back());
+        items.insert(items.end(), input.samples - 1, items.back());
     }
     return items;
 }

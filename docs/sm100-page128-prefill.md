@@ -10,7 +10,7 @@
 
 ## Runtime path
 
-Set `SGLANG_PREFILL_ATTN` with the model's `tensor-core` prefill policy to try the SM100 launcher. When the launcher declines, including with the selector unset, the model uses [portable dispatch](flash-prefill.md#runtime-path). The page-128 selectors are independent of the 64-key TMEM selectors.
+Set `SGLANG_PREFILL_ATTN` with the model's `tensor-core` prefill policy to try the experimental SM100 launcher. When the launcher declines, including with the selector unset, the model uses [native Flash dispatch](flash-prefill.md#runtime-path). That dispatcher applies its own paired ordered TMEM guard and overrides.
 
 | Setting | SM100 route | Batch planner |
 | --- | --- | --- |

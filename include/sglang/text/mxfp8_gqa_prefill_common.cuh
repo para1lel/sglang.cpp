@@ -13,6 +13,10 @@ std::optional<cudaError_t> launch_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream, bool ordered);
 
+std::optional<cudaError_t> launch_paired_tmem_prefill(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream);
+
 namespace {
 
 using Bf16 = __nv_bfloat16;

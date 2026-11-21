@@ -225,9 +225,11 @@ struct Dispatch {
     unsigned grid_height = head_blocks;
     unsigned grid_depth = 1;
     unsigned block_width = 0;
+    int cluster_width = 0;
 };
 
 constexpr Dispatch flash{"flash_prefill_attentionILi88ELb1ELb1EE", 12, head_blocks, 1, 352};
+constexpr Dispatch tmem_paired{"tmem_pair_attention", rows / 64, head_blocks, 1, 384, 2};
 constexpr Dispatch tmem_ordered{"tmem_flash_attentionILb1EE", rows / 64, head_blocks, 1, 384};
 constexpr Dispatch tmem_split{"tmem_flash_attentionILb0EE", rows / 64, head_blocks, 3, 384};
 constexpr Dispatch tmem_merge{"tmem_merge", rows, head_blocks, 1, channels};
@@ -259,7 +261,7 @@ struct Graph {
     }
 };
 
-void check_dispatch_errors(cudaStream_t stream) {
+void check_dispatch_errors(cudaStream_t stream, bool paired) {
     struct Case {
         const char* label;
         int position;
@@ -274,12 +276,14 @@ void check_dispatch_errors(cudaStream_t stream) {
              cudaErrorInvalidValue},
         Case{"first overflowing visible length", std::numeric_limits<int>::max() - rows + 1,
              rows, cudaErrorInvalidValue},
+        Case{"paired missing cache and page table", 8192, rows, cudaErrorInvalidValue},
     };
+    const auto case_count = paired ? cases.size() : cases.size() - 1;
     std::array<cudaError_t, cases.size()> statuses{};
     Graph graph;
     check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
                "Begin invalid prefill capture");
-    for (std::size_t index = 0; index < cases.size(); ++index) {
+    for (std::size_t index = 0; index < case_count; ++index) {
         const auto& request = cases[index];
         statuses[index] = decoder::tensor_core_multirow_prefill_gqa(
             {}, {}, request.position, request.count, nullptr, nullptr, stream);
@@ -290,7 +294,7 @@ void check_dispatch_errors(cudaStream_t stream) {
     if (count != 0) {
         throw std::runtime_error("Empty or invalid prefill dispatched a kernel");
     }
-    for (std::size_t index = 0; index < cases.size(); ++index) {
+    for (std::size_t index = 0; index < case_count; ++index) {
         const auto& request = cases[index];
         if (statuses[index] != request.expected) {
             throw std::runtime_error(std::string(request.label) + ": expected " +
@@ -319,6 +323,14 @@ void check_kernel(const char* label, cudaGraphNode_t node, Dispatch expected) {
                                  " grid=" + std::to_string(expected.grid_width) + "x" +
                                  std::to_string(expected.grid_height) + "x" +
                                  std::to_string(expected.grid_depth));
+    }
+    if (expected.cluster_width) {
+        cudaFuncAttributes attributes{};
+        check_cuda(cudaFuncGetAttributes(&attributes, params.func), "Read prefill cluster shape");
+        if (attributes.requiredClusterWidth != expected.cluster_width ||
+            attributes.requiredClusterHeight != 1 || attributes.requiredClusterDepth != 1) {
+            throw std::runtime_error(std::string(label) + ": unexpected prefill cluster shape");
+        }
     }
 }
 
@@ -457,7 +469,7 @@ struct DeviceInput {
 
     explicit DeviceInput(const Input& input)
         : keys(input.keys.size() + 1), values(input.values.size() + 1),
-          key_scales(input.key_scales.size() + 1), value_scales(input.value_scales.size() + 1),
+          key_scales(input.key_scales.size() + 1), value_scales(input.value_scales.size() + 8),
           pages(input.pages.size()), queries(input.queries.size()) {}
 
     std::vector<BFloat> run(const char* label, const Input& input, int position, Dispatch expected,
@@ -515,19 +527,18 @@ struct DeviceInput {
     }
 };
 
-void check_long_causality(Input& input, DeviceInput& device, int position,
-                          const std::vector<BFloat>& baseline, Dispatch dispatch,
-                          cudaStream_t stream) {
-    constexpr int first_changed_row = 65;
-    for (int row = first_changed_row; row < first_changed_row + 64; ++row) {
+void check_future_values(const char* label, Input& input, DeviceInput& device, int position,
+                         int first_changed_row, const std::vector<BFloat>& baseline,
+                         Dispatch dispatch, cudaStream_t stream) {
+    for (int row = first_changed_row; row < std::min(rows, first_changed_row + 64); ++row) {
         const auto payload = input.payload_offset(position + row, 0);
         const auto scale = input.scale_offset(position + row, 0);
         std::fill_n(input.values.begin() + payload, channels, 0x48);
         std::fill_n(input.value_scales.begin() + scale, mxfp8_groups, 127);
     }
-    const auto changed = device.run("131072 future value perturbation", input, position,
-                                    dispatch, attention_samples(input, position), stream);
-    constexpr std::size_t prefix = first_changed_row * row_width;
+    const auto changed = device.run(label, input, position, dispatch,
+                                    attention_samples(input, position), stream);
+    const auto prefix = static_cast<std::size_t>(first_changed_row) * row_width;
     std::size_t suffix_differences = 0;
     for (std::size_t index = 0; index < output_elements; ++index) {
         if (__bfloat16_as_ushort(baseline[guard + index]) ==
@@ -535,15 +546,45 @@ void check_long_causality(Input& input, DeviceInput& device, int position,
             continue;
         }
         if (index < prefix) {
-            throw std::runtime_error("Long Flash changed an output before the future value range");
+            throw std::runtime_error(std::string(label) + ": changed a causally masked row");
         }
         ++suffix_differences;
     }
     if (suffix_differences == 0) {
-        throw std::runtime_error("Long Flash ignored the future value range in visible rows");
+        throw std::runtime_error(std::string(label) + ": visible rows ignored the changed values");
     }
-    std::printf("MXFP8 prefill long causality unchanged_prefix=%zu changed_suffix=%zu\n",
-                prefix, suffix_differences);
+    std::printf("MXFP8 prefill %s unchanged_prefix=%zu changed_suffix=%zu\n",
+                label, prefix, suffix_differences);
+}
+
+void check_paired_prefill(cudaStream_t stream, bool default_mode) {
+    constexpr int position = 8192;
+    constexpr int partial = rows - 1;
+    constexpr Dispatch synchronous{"flash_prefill_attentionILi64ELb0ELb0EE", rows / 64};
+    Input input(position + rows + mxfp8_page_size);
+    input.add_causal_marker(position, 64);
+    input.add_causal_marker(position, rows - 1);
+    DeviceInput device(input);
+    const auto samples = attention_samples(input, position);
+    const auto baseline = device.run(
+        default_mode ? "default paired start" : "explicit paired start",
+        input, position, tmem_paired, samples, stream,
+        {.repeat_graph = true});
+    device.run("paired value scales aligned to eight bytes", input, position, flash,
+               samples, stream, {.value_scale_offset = 8});
+    device.run("paired unaligned value scales", input, position, synchronous, samples, stream,
+               {.value_scale_offset = 1});
+    device.run("paired below lower bound", input, position - mxfp8_page_size, flash,
+               attention_samples(input, position - mxfp8_page_size), stream);
+    device.run("paired half-page start", input, position + mxfp8_page_size / 2, flash,
+               attention_samples(input, position + mxfp8_page_size / 2), stream);
+    device.run("paired page-aligned nonchunk start", input, position + mxfp8_page_size,
+               default_mode ? flash : tmem_paired,
+               attention_samples(input, position + mxfp8_page_size), stream);
+    device.run("paired partial tile", input, position, flash_dispatch(partial),
+               attention_samples(input, position, partial), stream, {.count = partial});
+    check_future_values("paired final page causality", input, device, position,
+                        rows - mxfp8_page_size / 2, baseline, tmem_paired, stream);
 }
 
 void check_tmem_lower_edge(Input& input, DeviceInput& device, int first, Dispatch eligible,
@@ -575,14 +616,17 @@ void check_long_flash(cudaStream_t stream) {
     const std::string_view mode = setting ? setting : "";
     const bool ordered = mode == "ordered";
     const auto eligible = ordered ? tmem_ordered : (mode == "1" ? tmem_split : flash);
-    const int wide_scale_control = ordered ? ordered_visible + 1 : ordered_visible;
+    const int wide_scale_control = !setting || ordered ? ordered_visible + 1 : ordered_visible;
     Input input(aligned_above_limit);
     DeviceInput device(input);
     for (int visible : {ordered_visible, ordered_visible + 1}) {
         const int position = visible - rows;
         const auto label = std::to_string(visible) + " visible";
         const auto samples = attention_samples(input, position);
-        const auto expected = ordered && visible == ordered_visible ? tmem_ordered : flash;
+        auto expected = flash;
+        if (visible == ordered_visible) {
+            expected = !setting ? tmem_paired : (ordered ? tmem_ordered : flash);
+        }
         const auto baseline = device.run(label.c_str(), input, position, expected, samples, stream);
         if (visible == wide_scale_control) {
             constexpr Dispatch sync{"flash_prefill_attentionILi64ELb0ELb0EE", rows / 64};
@@ -629,7 +673,8 @@ void check_long_flash(cudaStream_t stream) {
                attention_samples(input, position + 1), stream);
     device.run("TMEM aligned end above upper bound", input, aligned_above_limit - rows,
                protected_rows, attention_samples(input, aligned_above_limit - rows), stream);
-    check_long_causality(input, device, position, baseline, eligible, stream);
+    check_future_values("131072 future value perturbation", input, device, position, 65,
+                        baseline, eligible, stream);
     input.add_score_overflow(position);
     device.run("131072 score overflow recovery", input, position, eligible,
                attention_samples(input, position), stream);
@@ -668,23 +713,20 @@ void check_partial_boundaries(cudaStream_t stream) {
     }
 }
 
-void check_partial_recovery(cudaStream_t stream) {
-    constexpr int position = 61;
-    constexpr int count = 193;
-    constexpr int last = count - 1;
+void check_tail_recovery(cudaStream_t stream, int position, int count, Dispatch expected) {
+    const int last = count - 1;
     Input input(position + count, count);
     DeviceInput device(input);
-    const auto expected = flash_dispatch(count);
     const RunOptions options{.count = count};
     input.add_score_overflow(position, last);
-    const auto baseline = device.run("partial final row score overflow", input, position,
+    const auto baseline = device.run("final row score overflow", input, position,
                                      expected, attention_samples(input, position, count),
                                      stream, options);
     const auto changed_value = input.payload_offset(position + last, 0);
     input.values[changed_value] = 0x7f;
     input.queries[last * row_width + 2 * queries_per_kv * channels] =
         __ushort_as_bfloat16(0x7f80);
-    const auto changed = device.run("partial final row nonfinite inputs", input, position,
+    const auto changed = device.run("final row nonfinite inputs", input, position,
                                     expected, {}, stream, options);
     const auto last_offset = static_cast<std::size_t>(last) * row_width;
     for (std::size_t index = 0; index < last_offset; ++index) {
@@ -705,16 +747,26 @@ void check_partial_recovery(cudaStream_t stream) {
             nonfinite += static_cast<std::size_t>(poisoned);
         }
     }
-    std::printf("MXFP8 prefill partial nonfinite causal_prefix=%zu nonfinite_outputs=%zu\n",
+    std::printf("MXFP8 prefill tail nonfinite causal_prefix=%zu nonfinite_outputs=%zu\n",
                 last_offset, nonfinite);
 }
 
 }
 
 void check_flash_prefill(cudaStream_t stream) {
-    check_dispatch_errors(stream);
+    const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
+    const bool explicit_paired = setting && std::string_view(setting) == "paired";
+    const bool paired = !setting || explicit_paired;
+    check_dispatch_errors(stream, paired);
+    if (paired) {
+        check_paired_prefill(stream, !setting);
+        check_tail_recovery(stream, 8192, rows, tmem_paired);
+    }
+    if (explicit_paired) {
+        return;
+    }
     check_partial_boundaries(stream);
-    check_partial_recovery(stream);
+    check_tail_recovery(stream, 61, 193, flash_dispatch(193));
     constexpr int position = 61;
     constexpr auto early = flash_dispatch(rows);
     {

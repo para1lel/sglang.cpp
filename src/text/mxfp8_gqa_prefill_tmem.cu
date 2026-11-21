@@ -3,6 +3,8 @@
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <climits>
+#include <cstddef>
+#include <cooperative_groups.h>
 
 namespace sglang {
 namespace {
@@ -62,7 +64,8 @@ __device__ __forceinline__ int tmem_swizzled(int row, int channel) {
     return channel ^ ((row & 7) * 8);
 }
 
-__device__ void tmem_stage_query(TmemFlashTile& tile, Attention request, int row, int head) {
+template <typename Tile>
+__device__ void tmem_stage_query(Tile& tile, Attention request, int row, int head) {
     const int lane = threadIdx.x % 32;
     for (int member = threadIdx.x / 32; member < flash_queries; member += tmem_threads / 32) {
         const auto offset = row_offset(row + member / ordered_heads, head + member % ordered_heads);
@@ -154,22 +157,39 @@ __device__ __forceinline__ std::uint64_t tmem_descriptor(const void* pointer) {
     return swizzle | version | stride | leading | (tmem_smem(pointer) >> 4);
 }
 
-template <int Columns, bool MnMajor = false>
+template <int Columns, bool MnMajor = false, bool Paired = false>
 __device__ __forceinline__ void tmem_mma(Word destination, std::uint64_t lhs,
                                       std::uint64_t rhs, bool accumulate) {
     constexpr Word format = (1u << 4) | (1u << 7) | (1u << 10);
-    constexpr Word instruction = ((flash_queries / 16) << 24) |
+    constexpr Word instruction = ((flash_queries * (Paired ? 2 : 1) / 16) << 24) |
                                  ((Columns / 8) << 17) | (MnMajor << 16) | format;
-    asm volatile("{ .reg .pred accum;\n"
-                 "setp.ne.u32 accum, %4, 0;\n"
-                 "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%5,%5,%5,%5}, accum; }"
-                 :: "r"(destination), "l"(lhs), "l"(rhs), "r"(instruction),
-                    "r"(static_cast<int>(accumulate)), "r"(0) : "memory");
+    if constexpr (Paired) {
+        asm volatile("{ .reg .pred accum;\n"
+                     "setp.ne.u32 accum, %4, 0;\n"
+                     "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, "
+                     "{%5,%5,%5,%5,%5,%5,%5,%5}, accum; }"
+                     :: "r"(destination), "l"(lhs), "l"(rhs), "r"(instruction),
+                        "r"(static_cast<int>(accumulate)), "r"(0) : "memory");
+    } else {
+        asm volatile("{ .reg .pred accum;\n"
+                     "setp.ne.u32 accum, %4, 0;\n"
+                     "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
+                     "{%5,%5,%5,%5}, accum; }"
+                     :: "r"(destination), "l"(lhs), "l"(rhs), "r"(instruction),
+                        "r"(static_cast<int>(accumulate)), "r"(0) : "memory");
+    }
 }
 
+template <bool Paired = false>
 __device__ __forceinline__ void tmem_commit(Word barrier) {
-    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
-                 :: "r"(barrier) : "memory");
+    if constexpr (Paired) {
+        asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster."
+                     "multicast::cluster.b64 [%0], %1;"
+                     :: "r"(barrier), "h"(static_cast<unsigned short>(3)) : "memory");
+    } else {
+        asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
+                     :: "r"(barrier) : "memory");
+    }
 }
 
 __device__ __forceinline__ void tmem_mma_wait(Word barrier, Word phase) {
@@ -230,8 +250,8 @@ __device__ __forceinline__ Word tmem_pack(float low, float high) {
     return packed;
 }
 
-template <bool Historical, bool Ordered>
-__device__ float tmem_probabilities(TmemFlashTile& tile, Word row_address, int member,
+template <bool Historical, bool Ordered, typename Tile>
+__device__ float tmem_probabilities(Tile& tile, Word row_address, int member,
                                      int visible, FlashSoftmax& state) {
     float scores[2][32];
     tmem_load(row_address + tmem_scores, scores[0]);
@@ -274,28 +294,31 @@ __device__ float tmem_probabilities(TmemFlashTile& tile, Word row_address, int m
     return history;
 }
 
-__device__ __forceinline__ void tmem_query_key(TmemFlashTile& tile, Word mma) {
+template <bool Paired = false, typename Tile>
+__device__ __forceinline__ void tmem_query_key(Tile& tile, Word mma) {
     #pragma unroll
     for (int dimension = 0; dimension < channels; dimension += 16) {
         const int sub = dimension / tmem_swizzle;
         const int offset = dimension % tmem_swizzle;
-        tmem_mma<flash_keys>(tile.tmem + tmem_scores,
-                             tmem_descriptor(&tile.query[sub][0][offset]),
-                             tmem_descriptor(&tile.key[sub][0][offset]), dimension != 0);
+        tmem_mma<flash_keys, false, Paired>(tile.tmem + tmem_scores,
+                                           tmem_descriptor(&tile.query[sub][0][offset]),
+                                           tmem_descriptor(&tile.key[sub][0][offset]),
+                                           dimension != 0);
     }
-    tmem_commit(mma);
+    tmem_commit<Paired>(mma);
 }
 
+template <bool Paired = false, typename Tile>
 __device__ __forceinline__ void tmem_probability_value(
-    TmemFlashTile& tile, Word mma, bool history) {
+    Tile& tile, Word mma, bool history) {
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     #pragma unroll
     for (int token = 0; token < flash_keys; token += 16) {
-        tmem_mma<channels, true>(tile.tmem, tmem_descriptor(&tile.probability[0][token]),
-                                tmem_descriptor<true>(&tile.value[0][token][0]),
-                                history || token != 0);
+        tmem_mma<channels, true, Paired>(tile.tmem, tmem_descriptor(&tile.probability[0][token]),
+                                        tmem_descriptor<true>(&tile.value[0][token][0]),
+                                        history || token != 0);
     }
-    tmem_commit(mma);
+    tmem_commit<Paired>(mma);
 }
 
 __device__ __forceinline__ void tmem_store_partial(
@@ -336,7 +359,8 @@ __device__ __forceinline__ void tmem_store_output(
     }
 }
 
-__device__ __forceinline__ void tmem_initialize(TmemFlashTile& tile, int warp,
+template <bool Paired = false, typename Tile>
+__device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
                                                Word copy, Word mma) {
     if (threadIdx.x == 0) {
         tile.bad_key = INT_MAX;
@@ -344,16 +368,26 @@ __device__ __forceinline__ void tmem_initialize(TmemFlashTile& tile, int warp,
                      "mbarrier.init.shared::cta.b64 [%1], 1;\n"
                      "fence.proxy.async.shared::cta;"
                      :: "r"(copy), "r"(mma) : "memory");
+        if constexpr (Paired) {
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        }
     }
-    if (warp == 0) {
+    if constexpr (Paired) {
+        cooperative_groups::this_cluster().sync();
+        if (warp == 0) {
+            asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;\n"
+                         "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;"
+                         :: "r"(tmem_smem(&tile.tmem)), "r"(tmem_cols) : "memory");
+        }
+    } else if (warp == 0) {
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
                      "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;"
                      :: "r"(tmem_smem(&tile.tmem)), "r"(tmem_cols) : "memory");
     }
 }
 
-template <bool Ordered>
-__device__ __forceinline__ void tmem_softmax_tile(TmemFlashTile& tile, Word row_address, Word mma,
+template <bool Ordered, typename Tile>
+__device__ __forceinline__ void tmem_softmax_tile(Tile& tile, Word row_address, Word mma,
                                                  int position, int first, int begin,
                                                  FlashSoftmax& state) {
     tmem_mma_wait(mma, 0);
@@ -471,6 +505,213 @@ __global__ void tmem_flash_attention(Attention request,
     }
 }
 
+constexpr int pair_key_rows = flash_keys / 2;
+constexpr int pair_value_channels = channels / 2;
+constexpr int pair_page_halves = mxfp8_page_size / flash_keys;
+constexpr int pair_scale_bytes = mxfp8_page_size * mxfp8_groups;
+
+struct alignas(128) PairPayload {
+    uint4 key[pair_page_halves][pair_key_rows][channels / sizeof(uint4)];
+    uint4 value[pair_page_halves][flash_keys][pair_value_channels / sizeof(uint4)];
+    std::uint8_t key_scales[pair_scale_bytes];
+    std::uint8_t value_scales[pair_scale_bytes];
+};
+
+struct alignas(1024) PairTile {
+    std::uint16_t query[channels / tmem_swizzle][flash_queries][tmem_swizzle];
+    std::uint16_t key[channels / tmem_swizzle][pair_key_rows][tmem_swizzle];
+    std::uint16_t value[pair_value_channels / tmem_swizzle][flash_keys][tmem_swizzle];
+    std::uint16_t probability[flash_queries][flash_keys];
+    PairPayload raw[2];
+    int bad_query[flash_queries];
+    int bad_key;
+    Word tmem;
+    alignas(8) unsigned long long copy_ready;
+    alignas(8) unsigned long long mma_ready;
+};
+
+struct PairMaps {
+    CUtensorMap keys;
+    CUtensorMap values;
+    CUtensorMap key_scales;
+    CUtensorMap value_scales;
+};
+
+static_assert(mxfp8_page_size == 2 * flash_keys && mxfp8_page_size == 2 * flash_rows);
+static_assert(flash_chunk % mxfp8_page_size == 0);
+static_assert(sizeof(PairPayload) ==
+              pair_page_halves * (pair_key_rows * channels + flash_keys * pair_value_channels) +
+                  2 * pair_scale_bytes);
+static_assert(offsetof(PairPayload, key) % 128 == 0 &&
+              offsetof(PairPayload, value) % 128 == 0 &&
+              offsetof(PairPayload, key_scales) % 128 == 0 &&
+              offsetof(PairPayload, value_scales) % 128 == 0);
+static_assert(offsetof(PairTile, raw) % alignof(PairPayload) == 0 &&
+              offsetof(PairTile, query) % 1024 == 0 && offsetof(PairTile, key) % 1024 == 0 &&
+              offsetof(PairTile, value) % 1024 == 0 &&
+              offsetof(PairTile, probability) % 1024 == 0);
+static_assert(alignof(PairMaps) >= 64 && sizeof(CUtensorMap) % 64 == 0);
+
+__device__ void pair_copy_payload(const CUtensorMap* map, void* destination, Word barrier,
+                                  int channel, int token, int page) {
+    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3, %4}], [%5];"
+                 :: "r"(tmem_smem(destination)), "l"(map), "r"(channel), "r"(token),
+                    "r"(page * pair_page_halves), "r"(barrier) : "memory");
+}
+
+__device__ void pair_prefetch(PairPayload& raw, Attention request, const PairMaps& maps,
+                              int first, int kv_head, int rank, Word barrier) {
+    if (threadIdx.x == 0) {
+        const int page = request.pages[first / mxfp8_page_size];
+        const int head = kv_head * channels;
+        const int scales = page * mxfp8_kv_heads + kv_head;
+        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                     :: "r"(barrier), "r"(static_cast<Word>(sizeof(PairPayload))) : "memory");
+        pair_copy_payload(&maps.keys, raw.key, barrier, head, rank * pair_key_rows, page);
+        pair_copy_payload(&maps.values, raw.value, barrier, head + rank * pair_value_channels,
+                          0, page);
+        flash_tma_copy(&maps.key_scales, raw.key_scales, barrier, 0, scales);
+        flash_tma_copy(&maps.value_scales, raw.value_scales, barrier, 0, scales);
+    }
+}
+
+template <bool Key>
+__device__ void pair_stage_kv(PairTile& tile, const PairPayload& payload, int first, int rank) {
+    constexpr int vector_elements = 16;
+    constexpr int width = Key ? channels : pair_value_channels;
+    constexpr int row_count = Key ? pair_key_rows : flash_keys;
+    constexpr int token_lanes = width / vector_elements;
+    const int producer = threadIdx.x - flash_queries;
+    const int vector = producer % token_lanes;
+    const int channel = vector * vector_elements;
+    const int scale_channel = channel + (Key ? 0 : rank * pair_value_channels);
+    const int half = (first / flash_keys) % pair_page_halves;
+    const auto* scales = Key ? payload.key_scales : payload.value_scales;
+    for (int index = producer / token_lanes; index < row_count;
+         index += tmem_producers / token_lanes) {
+        const int sub = channel / tmem_swizzle;
+        const int column = channel % tmem_swizzle;
+        const int low = tmem_swizzled(index, column);
+        const int high = tmem_swizzled(index, column + 8);
+        const int logical = first + index + (Key ? rank * pair_key_rows : 0);
+        const int token = logical % mxfp8_page_size;
+        const int scale = (token % mxfp8_group_size) * (pair_scale_bytes / mxfp8_group_size)
+                         + (token / mxfp8_group_size) * mxfp8_groups
+                         + scale_channel / mxfp8_group_size;
+        bool bad = false;
+        uint4 packed[2];
+        const uint4 data = Key ? payload.key[half][index][vector] :
+                                 payload.value[half][index][vector];
+        tmem_decode(reinterpret_cast<std::uint16_t*>(packed), data, scales[scale], bad);
+        if constexpr (Key) {
+            *reinterpret_cast<uint4*>(&tile.key[sub][index][low]) = packed[0];
+            *reinterpret_cast<uint4*>(&tile.key[sub][index][high]) = packed[1];
+        } else {
+            *reinterpret_cast<uint4*>(&tile.value[sub][index][low]) = packed[0];
+            *reinterpret_cast<uint4*>(&tile.value[sub][index][high]) = packed[1];
+        }
+        const Word active = __ballot_sync(warp_mask, bad);
+        const int lane_base = (producer % 32) & ~(token_lanes - 1);
+        if (vector == 0 && ((active >> lane_base) & ((1u << token_lanes) - 1))) {
+            atomicMin(&tile.bad_key, logical);
+        }
+    }
+}
+
+__device__ void pair_repair(PairTile& tile, Attention request,
+                            cooperative_groups::cluster_group pair, int row, int head) {
+    __shared__ OrderedScratch fallback;
+    const int peer_key = *pair.map_shared_rank(&tile.bad_key, 1 - pair.block_rank());
+    const int bad_key = min(tile.bad_key, peer_key);
+    pair.sync();
+    const int position = request.position + row;
+    if (!__syncthreads_or(threadIdx.x < flash_queries && tile.bad_query[threadIdx.x]) &&
+        bad_key >= position + flash_rows) {
+        return;
+    }
+    if (threadIdx.x >= channels) {
+        return;
+    }
+    for (int offset = 0; offset < flash_rows; ++offset) {
+        if (position + offset >= bad_key || tile.bad_query[offset * ordered_heads] ||
+            tile.bad_query[offset * ordered_heads + 1]) {
+            protected_attention(fallback, request, row + offset, head);
+        }
+    }
+}
+
+__launch_bounds__(tmem_threads, 1) __attribute__((cluster_dims(2, 1, 1)))
+__global__ void tmem_pair_attention(Attention request, const __grid_constant__ PairMaps maps) {
+    extern __shared__ PairTile shared_pair[];
+    auto& tile = shared_pair[0];
+    const auto pair = cooperative_groups::this_cluster();
+    const int rank = pair.block_rank();
+    const int row = blockIdx.x * flash_rows;
+    const int head = blockIdx.y * ordered_heads;
+    const int kv_head = head / ratio;
+    const int position = request.position + row;
+    const int end = position + (2 - rank) * flash_rows;
+    const int warp = threadIdx.x / 32;
+    const bool softmax = warp < flash_queries / 32;
+    const bool issuer = rank == 0 && threadIdx.x == 0;
+    const Word copy = tmem_smem(&tile.copy_ready);
+    const Word mma = tmem_smem(&tile.mma_ready);
+    tmem_initialize<true>(tile, warp, copy, mma);
+    tmem_stage_query(tile, request, row, head);
+    __syncthreads();
+    pair_prefetch(tile.raw[0], request, maps, 0, kv_head, rank, copy);
+    if (!softmax) {
+        tmem_copy_wait(copy, 0);
+        pair_stage_kv<true>(tile, tile.raw[0], 0, rank);
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    pair.sync();
+    const Word row_address = tile.tmem + ((warp * 32) << 16);
+    FlashSoftmax state{-CUDART_INF_F, 0.0f};
+    for (int first = 0; first < end; first += flash_keys) {
+        const int page = first / mxfp8_page_size;
+        const int buffer = page & 1;
+        const int next = first + flash_keys;
+        const bool next_page = next % mxfp8_page_size == 0;
+        if (!next_page && first + mxfp8_page_size < end) {
+            pair_prefetch(tile.raw[1 - buffer], request, maps, first + mxfp8_page_size,
+                          kv_head, rank, copy);
+        }
+        if (issuer) {
+            tmem_query_key<true>(tile, mma);
+        }
+        if (softmax) {
+            tmem_softmax_tile<true>(tile, row_address, mma, position, first, 0, state);
+        } else {
+            pair_stage_kv<false>(tile, tile.raw[buffer], first, rank);
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        pair.sync();
+        if (issuer) {
+            tmem_probability_value<true>(tile, mma, first != 0);
+        }
+        if (!softmax && next < end) {
+            if (next_page) {
+                tmem_copy_wait(copy, 1 - buffer);
+            }
+            pair_stage_kv<true>(tile, tile.raw[buffer ^ static_cast<int>(next_page)], next, rank);
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        tmem_mma_wait(mma, 1);
+        pair.sync();
+    }
+    if (softmax) {
+        tmem_store_output(row_address, state, request, row, head);
+    }
+    pair.sync();
+    if (warp == 0) {
+        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+                     :: "r"(tile.tmem), "r"(tmem_cols) : "memory");
+    }
+    pair_repair(tile, request, pair, row, head);
+}
+
 __global__ void tmem_merge(Attention request, const float* partial, const float2* statistics) {
     __shared__ OrderedScratch fallback;
     const int row = blockIdx.x;
@@ -511,6 +752,150 @@ __global__ void tmem_merge(Attention request, const float* partial, const float2
     }
 }
 
+std::optional<cudaError_t> encode_pair_maps(Mxfp8KvCache cache, PairMaps& maps) {
+    void* entry = nullptr;
+    cudaDriverEntryPointQueryResult query{};
+    const auto status = cudaGetDriverEntryPointByVersion(
+        "cuTensorMapEncodeTiled", &entry, 12000, cudaEnableDefault, &query);
+    if (status == cudaErrorNotSupported || status == cudaErrorSymbolNotFound) {
+        return std::nullopt;
+    }
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (!entry || query != cudaDriverEntryPointSuccess) {
+        return std::nullopt;
+    }
+    const auto encode = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(entry);
+    constexpr cuuint64_t width = mxfp8_kv_heads * channels;
+    constexpr cuuint64_t strides[] = {width, width * flash_keys};
+    const cuuint64_t shape[] = {width, flash_keys,
+                               static_cast<cuuint64_t>(cache.page_count) * pair_page_halves};
+    constexpr cuuint32_t elements[] = {1, 1, 1};
+    constexpr cuuint32_t key_box[] = {channels, pair_key_rows, pair_page_halves};
+    constexpr cuuint32_t value_box[] = {pair_value_channels, flash_keys, pair_page_halves};
+    constexpr cuuint64_t scale_stride[] = {pair_scale_bytes};
+    const cuuint64_t scale_shape[] = {pair_scale_bytes / 4,
+                                    static_cast<cuuint64_t>(cache.page_count) * mxfp8_kv_heads};
+    constexpr cuuint32_t scale_box[] = {pair_scale_bytes / 4, 1};
+    const auto encode_map = [&](CUtensorMap& map, void* source, CUtensorMapDataType type,
+                                unsigned rank, const cuuint64_t* dimensions,
+                                const cuuint64_t* steps, const cuuint32_t* box) {
+        return encode(&map, type, rank, source, dimensions, steps, box, elements,
+                      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    };
+    auto result = encode_map(maps.keys, cache.key_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                             3, shape, strides, key_box);
+    if (result == CUDA_SUCCESS) {
+        result = encode_map(maps.values, cache.value_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                            3, shape, strides, value_box);
+    }
+    if (result == CUDA_SUCCESS) {
+        result = encode_map(maps.key_scales, cache.key_scales, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                            2, scale_shape, scale_stride, scale_box);
+    }
+    if (result == CUDA_SUCCESS) {
+        result = encode_map(maps.value_scales, cache.value_scales, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                            2, scale_shape, scale_stride, scale_box);
+    }
+    switch (result) {
+    case CUDA_SUCCESS: return cudaSuccess;
+    case CUDA_ERROR_INVALID_VALUE:
+    case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
+    case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
+    case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
+    case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
+    default: return cudaErrorUnknown;
+    }
+}
+
+bool paired_kernel_unavailable(cudaError_t status) {
+    return status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice ||
+           status == cudaErrorNotSupported;
+}
+
+}
+
+std::optional<cudaError_t> launch_paired_tmem_prefill(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
+    const Bf16* queries, Bf16* output, cudaStream_t stream) {
+    constexpr auto dynamic_shared = sizeof(PairTile);
+    if (position < 0 || position > INT_MAX - flash_chunk ||
+        position % mxfp8_page_size != 0) {
+        return std::nullopt;
+    }
+    const int required_pages = (position + flash_chunk) / mxfp8_page_size;
+    if (pages.page_count < required_pages || cache.page_count < required_pages ||
+        !pages.device_pages || !cache.key_payload || !cache.value_payload ||
+        !cache.key_scales || !cache.value_scales || !queries || !output) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr auto tma_alignment = 16;
+    if (cache.page_count > INT_MAX / mxfp8_page_size ||
+        reinterpret_cast<std::uintptr_t>(cache.key_payload) % tma_alignment != 0 ||
+        reinterpret_cast<std::uintptr_t>(cache.value_payload) % tma_alignment != 0 ||
+        reinterpret_cast<std::uintptr_t>(cache.key_scales) % tma_alignment != 0 ||
+        reinterpret_cast<std::uintptr_t>(cache.value_scales) % tma_alignment != 0) {
+        return std::nullopt;
+    }
+    int device = 0;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    cudaDeviceProp properties{};
+    status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (properties.major != 10 || properties.minor != 0 || !properties.clusterLaunch) {
+        return std::nullopt;
+    }
+    cudaFuncAttributes attributes{};
+    status = cudaFuncGetAttributes(&attributes, tmem_pair_attention);
+    if (paired_kernel_unavailable(status)) {
+        return std::nullopt;
+    }
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (properties.sharedMemPerBlockOptin < dynamic_shared + attributes.sharedSizeBytes ||
+        attributes.maxThreadsPerBlock < tmem_threads || attributes.requiredClusterWidth != 2 ||
+        attributes.requiredClusterHeight != 1 || attributes.requiredClusterDepth != 1) {
+        return std::nullopt;
+    }
+    status = cudaFuncSetAttribute(tmem_pair_attention, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  dynamic_shared);
+    if (paired_kernel_unavailable(status) || status == cudaErrorInvalidValue) {
+        return std::nullopt;
+    }
+    if (status != cudaSuccess) {
+        return status;
+    }
+    const dim3 blocks(flash_chunk / flash_rows, mxfp8_query_heads / ordered_heads);
+    const cudaLaunchConfig_t config{blocks, dim3(tmem_threads), dynamic_shared, stream, nullptr, 0};
+    int clusters = 0;
+    status = cudaOccupancyMaxActiveClusters(&clusters, tmem_pair_attention, &config);
+    if (paired_kernel_unavailable(status) || status == cudaErrorInvalidClusterSize ||
+        status == cudaErrorInvalidConfiguration || status == cudaErrorInvalidValue) {
+        return std::nullopt;
+    }
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (clusters == 0) {
+        return std::nullopt;
+    }
+    PairMaps maps{};
+    const auto encoded = encode_pair_maps(cache, maps);
+    if (!encoded || *encoded != cudaSuccess) {
+        return encoded;
+    }
+    Attention request{cache, pages.device_pages, position, queries, output};
+    void* args[] = {&request, &maps};
+    return cudaLaunchKernel(tmem_pair_attention, blocks, tmem_threads, args, dynamic_shared,
+                            stream);
 }
 
 std::optional<cudaError_t> launch_tmem_prefill(

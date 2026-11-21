@@ -726,6 +726,15 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
         if (rows == flash_chunk && position >= 8192 && position % flash_keys == 0) {
             const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
             const std::string_view mode = setting ? setting : "";
+            constexpr int max_default_paired_position = 31744;
+            const bool default_paired = !setting && position <= max_default_paired_position &&
+                                        position % flash_chunk == 0;
+            if (default_paired || (mode == "paired" && position % mxfp8_page_size == 0)) {
+                if (const auto status = launch_paired_tmem_prefill(cache, pages, position, queries,
+                                                                  output, stream)) {
+                    return *status;
+                }
+            }
             const bool ordered = mode == "ordered";
             if (ordered || (mode == "1" && position >= max_multirow_visible_tokens)) {
                 if (const auto status = launch_tmem_prefill(cache, pages, position, queries,

@@ -117,7 +117,7 @@ __global__ void gdn_prefill_prepare(const __nv_bfloat16* qkv, const __nv_bfloat1
     convolved[static_cast<std::size_t>(row) * text_gdn_qkv_width + channel] = mixed;
 }
 
-__global__ void gdn_prefill_prepare_grouped(
+__device__ __forceinline__ void gdn_prepare_aligned_rows(
     const __nv_bfloat16* qkv, const __nv_bfloat16* history, TextGdnWeights weights,
     const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* convolved, float2* gates) {
     constexpr int blocks_per_group = conv_blocks_per_token + 1;
@@ -189,6 +189,12 @@ __global__ void gdn_prefill_prepare_grouped(
         convolved[static_cast<std::size_t>(first + row) * text_gdn_qkv_width + channel] =
             mixed[row];
     }
+}
+
+__global__ void gdn_prefill_prepare_grouped(
+    const __nv_bfloat16* qkv, const __nv_bfloat16* history, TextGdnWeights weights,
+    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* convolved, float2* gates) {
+    gdn_prepare_aligned_rows(qkv, history, weights, a, b, convolved, gates);
 }
 
 __global__ void gdn_prefill_recur(int rows, const __nv_bfloat16* convolved, const float2* gates,
@@ -519,9 +525,14 @@ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv
 constexpr int finish_heads_per_block = 4;
 constexpr int finish_threads = finish_heads_per_block * warp_size;
 
-__global__ void gdn_finish_quantized(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
-                                     const __nv_bfloat16* norm, const __nv_bfloat16* observable,
-                                     TextGdnState state, TextFp8Activation output) {
+__host__ __device__ constexpr int quantized_finish_blocks(int rows) {
+    return rows * (text_gdn_value_heads / finish_heads_per_block) +
+           text_gdn_qkv_width / finish_threads;
+}
+
+__device__ __forceinline__ void gdn_write_quantized(
+    int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* norm,
+    const __nv_bfloat16* observable, TextGdnState state, TextFp8Activation output) {
     static_assert(text_gdn_head_dim == text_fp8_group_size);
     static_assert(text_gdn_value_heads % finish_heads_per_block == 0);
     constexpr int parts = text_gdn_head_dim / warp_size;
@@ -566,6 +577,37 @@ __global__ void gdn_finish_quantized(int rows, const __nv_bfloat16* qkv, const _
     for (int part = 0; part < parts; ++part) {
         output.values[offset + part * warp_size] = __nv_cvt_float_to_fp8(
             values[part] * reciprocal, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+__global__ void gdn_finish_quantized(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
+                                     const __nv_bfloat16* norm, const __nv_bfloat16* observable,
+                                     TextGdnState state, TextFp8Activation output) {
+    gdn_write_quantized(rows, qkv, z, norm, observable, state, output);
+}
+
+struct GdnPrefillSegments {
+    decoder::GdnPrefillSegment values[decoder::max_gdn_prefill_segments];
+};
+
+__global__ void gdn_prepare_segments(const __grid_constant__ GdnPrefillSegments segments,
+                                     TextGdnWeights weights) {
+    const auto& segment = segments.values[blockIdx.z];
+    constexpr int blocks_per_row_group = conv_blocks_per_token + 1;
+    if (blockIdx.x < segment.rows / prefill_rows_per_block * blocks_per_row_group) {
+        gdn_prepare_aligned_rows(segment.qkv, segment.state.history, weights, segment.a, segment.b,
+                                 segment.workspace, segment.gates);
+    }
+}
+
+__global__ void gdn_finish_segments(const __grid_constant__ GdnPrefillSegments segments,
+                                    const __nv_bfloat16* norm) {
+    const auto& segment = segments.values[blockIdx.z];
+    if (blockIdx.x < quantized_finish_blocks(segment.rows)) {
+        const auto* observable = segment.workspace +
+                                 static_cast<std::size_t>(segment.rows) * text_gdn_qkv_width;
+        gdn_write_quantized(segment.rows, segment.qkv, segment.z, norm, observable,
+                            segment.state, segment.output);
     }
 }
 
@@ -640,8 +682,7 @@ cudaError_t prefill_gdn(
         return status;
     }
     if constexpr (std::is_same_v<Output, TextFp8Activation>) {
-        const int blocks = rows * (text_gdn_value_heads / finish_heads_per_block) +
-                           text_gdn_qkv_width / finish_threads;
+        const int blocks = quantized_finish_blocks(rows);
         void* arguments[] = {&rows, &qkv, &z, &weights.norm, &observable, &state, &output};
         return cudaLaunchKernel(gdn_finish_quantized, dim3(blocks), dim3(finish_threads),
                                 arguments, 0, stream);
@@ -720,6 +761,61 @@ cudaError_t decoder::tensor_core_prefill_gdn(
     }
     return prefill_gdn(rows, qkv, z, b, a, weights, state, workspace, gates, output, stream,
                        chunk_scratch, chunk_bytes);
+}
+
+std::optional<cudaError_t> decoder::tensor_core_prefill_gdn_group(
+    const GdnPrefillSegment* input, int count, TextGdnWeights weights, cudaStream_t stream) {
+    if (!input || count < 2 || count > max_gdn_prefill_segments || !weights.convolution ||
+        !weights.a_log || !weights.dt_bias || !weights.norm) {
+        return cudaErrorInvalidValue;
+    }
+    GdnPrefillSegments segments{};
+    gdn_chunk::Segments chunk{};
+    int max_rows = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& segment = input[index];
+        const auto rows = segment.rows;
+        if (text_gdn_workspace_bytes(rows) == 0 || rows % prefill_rows_per_block ||
+            !segment.qkv || !segment.z || !segment.b || !segment.a || !segment.workspace ||
+            reinterpret_cast<std::uintptr_t>(segment.workspace) % alignof(uint4) ||
+            !segment.gates || !segment.state.history || !segment.state.recurrent ||
+            !segment.output.values || !segment.output.scales ||
+            !gdn_chunk::eligible(rows, segment.chunk_scratch, segment.chunk_bytes)) {
+            return cudaErrorInvalidValue;
+        }
+        if (rows > max_rows) {
+            max_rows = rows;
+        }
+        segments.values[index] = segment;
+        chunk.values[index] = {
+            rows, segment.workspace, segment.gates,
+            static_cast<gdn_chunk::Matrices*>(segment.chunk_scratch), segment.state.recurrent,
+            segment.workspace + static_cast<std::size_t>(rows) * text_gdn_qkv_width,
+        };
+    }
+
+    bool supported = true;
+    auto status = gdn_chunk::configure(supported, true);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (!supported) {
+        return std::nullopt;
+    }
+    void* prepare_args[] = {&segments, &weights};
+    const int prepare_blocks = max_rows / prefill_rows_per_block * (conv_blocks_per_token + 1);
+    status = cudaLaunchKernel(gdn_prepare_segments, dim3(prepare_blocks, 1, count),
+                              dim3(conv_threads), prepare_args, 0, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    status = gdn_chunk::launch_segments(chunk, count, max_rows, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    void* finish_args[] = {&segments, &weights.norm};
+    return cudaLaunchKernel(gdn_finish_segments, dim3(quantized_finish_blocks(max_rows), 1, count),
+                            dim3(finish_threads), finish_args, 0, stream);
 }
 
 cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,

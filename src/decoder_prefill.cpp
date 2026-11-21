@@ -407,6 +407,8 @@ void stage_prefill_row(Request& request, const TileBuffers& work, int row, cudaS
 
 constexpr int layerwise_row_alignment = 128;
 constexpr int max_layerwise_rows = 1023;
+static_assert(max_layerwise_rows / 256 <= max_gdn_prefill_segments);
+static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
 
 struct PrefillGroup {
     int grants;
@@ -466,13 +468,37 @@ void prefill_layerwise(const std::array<Layer, layer_count>& layers,
         },
         [&](const GdnLayer& layer, int bank) {
             chunk.gdn_input(layer);
+            GdnPrefillSegment segments[max_gdn_prefill_segments]{};
+            bool grouped_recurrence = true;
+            int index = 0;
             each_segment([&](const PrefillGrant& grant, int offset) {
+                const auto segment = buffers.attention_segment(offset);
                 const TextFp8Activation fp8{
                     buffers.activation.values + std::size_t(offset) * text_gdn_value_width,
                     buffers.activation.scales + std::size_t(offset) * text_gdn_value_heads,
                 };
-                attention(grant, offset).gdn_recur(layer, grant.request->states[bank], bank, fp8);
+                grouped_recurrence = grouped_recurrence && (grant.position != 0 || bank != 0);
+                segments[index++] = {
+                    grant.rows, segment.gdn_qkv, segment.gdn_z, segment.gdn_b, segment.gdn_a,
+                    grant.request->states[bank],
+                    buffers.gdn_scratch + text_gdn_workspace_bytes(offset) / sizeof(Bf16),
+                    reinterpret_cast<float2*>(segment.keys), fp8,
+                    buffers.mlp_gate + offset * intermediate_size,
+                    std::size_t(grant.rows) * intermediate_size * sizeof(Bf16),
+                };
             });
+            const auto status = grouped_recurrence
+                ? tensor_core_prefill_gdn_group(segments, group.grants, layer.recurrent, stream)
+                : std::nullopt;
+            if (status) {
+                check(*status, "Advance grouped prefill Gated DeltaNet");
+            } else {
+                index = 0;
+                each_segment([&](const PrefillGrant& grant, int offset) {
+                    const auto& segment = segments[index++];
+                    attention(grant, offset).gdn_recur(layer, segment.state, bank, segment.output);
+                });
+            }
             chunk.project(layer.output, {buffers.activation.values, buffers.activation.scales},
                           buffers.projected_attention);
         },

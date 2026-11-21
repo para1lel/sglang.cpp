@@ -28,6 +28,19 @@ struct alignas(32) Matrices {
     float beta[rows];
 };
 
+struct Segment {
+    int count;
+    const Bf16* convolved;
+    const float2* gates;
+    Matrices* matrices;
+    float* recurrent;
+    Bf16* observable;
+};
+
+struct Segments {
+    Segment values[decoder::max_gdn_prefill_segments];
+};
+
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 using ARow = mma::fragment<mma::matrix_a, tile, tile, tile, Bf16, mma::row_major>;
 using BCol = mma::fragment<mma::matrix_b, tile, tile, tile, Bf16, mma::col_major>;
@@ -51,15 +64,18 @@ __device__ __forceinline__ void stage_qk(Bf16* target, const Bf16* convolved,
     }
 }
 
-__global__ void prepare(int count, const Bf16* convolved, const float2* gates,
-                        Matrices* matrices) {
+__device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved,
+                                                 const float2* gates, Matrices* matrices) {
+    const int first = blockIdx.y * rows;
+    if (first >= count) {
+        return;
+    }
     __shared__ alignas(32) Bf16 qk[2 * rows * key_stride];
     __shared__ alignas(32) float dots[2 * rows * rows];
     __shared__ float lower[rows * rows];
     __shared__ float decay[rows];
     __shared__ float beta[rows];
     const int head = blockIdx.x;
-    const int first = blockIdx.y * rows;
     const int valid = min(count - first, rows);
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -131,8 +147,21 @@ __global__ void prepare(int count, const Bf16* convolved, const float2* gates,
         matrix.inverse[lane * rows + column] = __float2bfloat16(inverse);
     }
 }
+
+__global__ void prepare(int count, const Bf16* convolved, const float2* gates,
+                        Matrices* matrices) {
+    prepare_segment(count, convolved, gates, matrices);
+}
+
+__global__ void prepare_segments(const __grid_constant__ Segments segments) {
+    const auto& segment = segments.values[blockIdx.z];
+    prepare_segment(segment.count, segment.convolved, segment.gates, segment.matrices);
+}
 #else
 __global__ void prepare(int, const Bf16*, const float2*, Matrices*) {
+    __trap();
+}
+__global__ void prepare_segments(Segments) {
     __trap();
 }
 #endif
@@ -152,7 +181,7 @@ inline bool eligible(int count, const void* scratch, std::size_t bytes) {
            reinterpret_cast<std::uintptr_t>(scratch) % alignof(Matrices) == 0;
 }
 
-inline cudaError_t configure(bool& enabled) {
+inline cudaError_t configure(bool& enabled, bool grouped = false) {
     int device = 0, major = 0, minor = 0;
     auto status = cudaGetDevice(&device);
     if (status == cudaSuccess) {
@@ -168,8 +197,12 @@ inline cudaError_t configure(bool& enabled) {
     if (!enabled) {
         return cudaSuccess;
     }
-    return cudaFuncSetAttribute(warp_mma::recur_warp,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, warp_mma::dynamic_bytes);
+    if (grouped) {
+        return cudaFuncSetAttribute(warp_mma::recur_segments,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, warp_mma::dynamic_bytes);
+    }
+    return cudaFuncSetAttribute(warp_mma::recur_warp, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                warp_mma::dynamic_bytes);
 }
 
 inline cudaError_t launch(int count, const Bf16* convolved, const float2* gates,
@@ -184,6 +217,21 @@ inline cudaError_t launch(int count, const Bf16* convolved, const float2* gates,
     void* recur_args[] = {&count, &convolved, &matrices, &recurrent, &observable};
     return cudaLaunchKernel(warp_mma::recur_warp, dim3(heads, warp_mma::warp_value_tiles),
                             dim3(warp_mma::block_threads), recur_args, warp_mma::dynamic_bytes,
+                            stream);
+}
+
+inline cudaError_t launch_segments(Segments segments, int count, int max_rows,
+                                   cudaStream_t stream) {
+    void* args[] = {&segments};
+    const auto chunks = (max_rows + rows - 1) / rows;
+    const auto status = cudaLaunchKernel(prepare_segments, dim3(heads, chunks, count),
+                                         dim3(threads), args, 0, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    return cudaLaunchKernel(warp_mma::recur_segments,
+                            dim3(heads, warp_mma::warp_value_tiles, count),
+                            dim3(warp_mma::block_threads), args, warp_mma::dynamic_bytes,
                             stream);
 }
 

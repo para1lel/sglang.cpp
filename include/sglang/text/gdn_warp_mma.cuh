@@ -199,8 +199,9 @@ __device__ __forceinline__ void advance_state(const Bf16* scaled_keys, const Bf1
     }
 }
 
-__global__ void recur_warp(int count, const Bf16* convolved, const Matrices* matrices,
-                           float* recurrent, Bf16* observable) {
+__device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
+                                              const Matrices* matrices, float* recurrent,
+                                              Bf16* observable) {
     alignas(32) extern __shared__ unsigned char dynamic_frames[];
     auto* frames = reinterpret_cast<Stage*>(dynamic_frames);
     __shared__ alignas(32) Bf16 scaled_keys[rows * key_stride];
@@ -296,10 +297,24 @@ __global__ void recur_warp(int count, const Bf16* convolved, const Matrices* mat
         }
     }
 }
+
+__global__ void recur_warp(int count, const Bf16* convolved, const Matrices* matrices,
+                           float* recurrent, Bf16* observable) {
+    recur_segment(count, convolved, matrices, recurrent, observable);
+}
+
+__global__ void recur_segments(const __grid_constant__ Segments segments) {
+    const auto& segment = segments.values[blockIdx.z];
+    recur_segment(segment.count, segment.convolved, segment.matrices, segment.recurrent,
+                  segment.observable);
+}
 #else
 constexpr int dynamic_bytes = 0;
 
 __global__ void recur_warp(int, const Bf16*, const Matrices*, float*, Bf16*) {
+    __trap();
+}
+__global__ void recur_segments(Segments) {
     __trap();
 }
 #endif

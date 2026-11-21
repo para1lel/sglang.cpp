@@ -5,6 +5,7 @@
 #include "sglang/text_ops.h"
 
 #include <array>
+#include <optional>
 
 namespace sglang::decoder {
 
@@ -44,6 +45,25 @@ cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __
                                     __nv_bfloat16* workspace, float2* gates,
                                     TextFp8Activation output, cudaStream_t stream,
                                     void* chunk_scratch = nullptr, std::size_t chunk_bytes = 0);
+
+inline constexpr int max_gdn_prefill_segments = 3;
+
+struct GdnPrefillSegment {
+    int rows;
+    const __nv_bfloat16* qkv;
+    const __nv_bfloat16* z;
+    const __nv_bfloat16* b;
+    const __nv_bfloat16* a;
+    TextGdnState state;
+    __nv_bfloat16* workspace;
+    float2* gates;
+    TextFp8Activation output;
+    void* chunk_scratch;
+    std::size_t chunk_bytes;
+};
+
+std::optional<cudaError_t> tensor_core_prefill_gdn_group(
+    const GdnPrefillSegment* segments, int count, TextGdnWeights weights, cudaStream_t stream);
 
 cudaError_t tensor_core_prefill_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
                                     int rows, const __nv_bfloat16* queries,

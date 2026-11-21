@@ -3,7 +3,10 @@
 namespace sglang::gdn_chunk::warp_mma {
 
 constexpr int columns = 8;
-constexpr int warp_value_tiles = dimension / (columns * warps);
+constexpr int block_warps = 8;
+constexpr int block_threads = block_warps * 32;
+constexpr int warp_value_tiles = dimension / (columns * block_warps);
+constexpr int matrix_stride = rows + vector_elements;
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 struct OperandA {
@@ -99,7 +102,8 @@ __device__ __forceinline__ void solve(const Bf16* matrix, const Bf16* operand, i
         const auto rhs = load_b(operand + step * tile * columns, columns, lane);
         #pragma unroll
         for (int task = step; task < time_tiles; ++task) {
-            const auto lhs = load_a<false>(matrix + task * tile * rows + step * tile, rows, lane);
+            const auto lhs = load_a<false>(
+                matrix + task * tile * matrix_stride + step * tile, matrix_stride, lane);
             accumulate(result[task], lhs, rhs);
         }
     }
@@ -107,8 +111,8 @@ __device__ __forceinline__ void solve(const Bf16* matrix, const Bf16* operand, i
 
 struct Stage {
     alignas(32) Bf16 qk[2 * rows * key_stride];
-    alignas(32) Bf16 inverse[rows * rows];
-    alignas(32) Bf16 scores[rows * rows];
+    alignas(32) Bf16 inverse[rows * matrix_stride];
+    alignas(32) Bf16 scores[rows * matrix_stride];
     float initial[rows];
     float tail[rows];
     float beta[rows];
@@ -123,7 +127,7 @@ __device__ __forceinline__ void copy_async(Bf16* target, const Bf16* source, int
 __device__ __forceinline__ void prefetch(Stage& target, const Matrices& matrix,
                                          const Bf16* convolved, int first, int valid, int head) {
     constexpr int vectors_per_row = dimension / vector_elements;
-    for (int vector = threadIdx.x; vector < 2 * rows * vectors_per_row; vector += threads) {
+    for (int vector = threadIdx.x; vector < 2 * rows * vectors_per_row; vector += block_threads) {
         const int row = vector / vectors_per_row;
         const int position = row % rows;
         const int column = vector % vectors_per_row * vector_elements;
@@ -135,9 +139,10 @@ __device__ __forceinline__ void prefetch(Stage& target, const Matrices& matrix,
                    position < valid ? sizeof(uint4) : 0);
     }
     for (int index = threadIdx.x * vector_elements; index < rows * rows;
-         index += threads * vector_elements) {
-        copy_async(target.inverse + index, matrix.inverse + index, sizeof(uint4));
-        copy_async(target.scores + index, matrix.scores + index, sizeof(uint4));
+         index += block_threads * vector_elements) {
+        const int offset = index / rows * matrix_stride + index % rows;
+        copy_async(target.inverse + offset, matrix.inverse + index, sizeof(uint4));
+        copy_async(target.scores + offset, matrix.scores + index, sizeof(uint4));
     }
     if (threadIdx.x < rows) {
         target.initial[threadIdx.x] = matrix.initial[threadIdx.x];
@@ -199,12 +204,12 @@ __global__ void recur_warp(int count, const Bf16* convolved, const Matrices* mat
     alignas(32) extern __shared__ unsigned char dynamic_frames[];
     auto* frames = reinterpret_cast<Stage*>(dynamic_frames);
     __shared__ alignas(32) Bf16 scaled_keys[rows * key_stride];
-    __shared__ alignas(32) Bf16 states[warps][dimension * columns];
-    __shared__ alignas(32) Bf16 workspace[warps][rows * columns];
+    __shared__ alignas(32) Bf16 states[block_warps][dimension * columns];
+    __shared__ alignas(32) Bf16 workspace[block_warps][rows * columns];
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int head = blockIdx.x;
-    const int feature = head * dimension + (blockIdx.y * warps + warp) * columns;
+    const int feature = head * dimension + (blockIdx.y * block_warps + warp) * columns;
     auto* carry = recurrent + feature * dimension;
     auto* state = states[warp];
     auto* work = workspace[warp];
@@ -232,7 +237,7 @@ __global__ void recur_warp(int count, const Bf16* convolved, const Matrices* mat
                      first + rows, min(count - first - rows, rows), head);
         }
 
-        for (int index = threadIdx.x; index < rows * dimension; index += threads) {
+        for (int index = threadIdx.x; index < rows * dimension; index += block_threads) {
             const int position = index / dimension;
             const int offset = position * key_stride + index % dimension;
             scaled_keys[offset] =

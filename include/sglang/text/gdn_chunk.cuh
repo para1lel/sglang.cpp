@@ -183,7 +183,8 @@ inline cudaError_t launch(int count, const Bf16* convolved, const float2* gates,
     }
     void* recur_args[] = {&count, &convolved, &matrices, &recurrent, &observable};
     return cudaLaunchKernel(warp_mma::recur_warp, dim3(heads, warp_mma::warp_value_tiles),
-                            dim3(threads), recur_args, warp_mma::dynamic_bytes, stream);
+                            dim3(warp_mma::block_threads), recur_args, warp_mma::dynamic_bytes,
+                            stream);
 }
 
 }

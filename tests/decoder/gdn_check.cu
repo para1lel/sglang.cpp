@@ -474,7 +474,7 @@ ChunkResult launch_chunk(const PrefillCase& gpu, const Rows& rows, unsigned char
         const auto chunks = static_cast<unsigned>((rows.count + chunk_rows - 1) / chunk_rows);
         if (!recurrent_launches.empty() ||
             chunk_launches != std::vector<std::array<unsigned int, 4>>{
-                {0, value_heads, chunks, 128}, {1, value_heads, 4, 128}}) {
+                {0, value_heads, chunks, 128}, {1, value_heads, 2, 256}}) {
             throw std::runtime_error("Expected V9 matrix preparation and warp MMA recurrence");
         }
     } else {

@@ -244,9 +244,19 @@ __device__ __forceinline__ float load_cluster(const float* local, unsigned rank)
     return value;
 }
 
+struct ContiguousOutput {
+    __nv_bfloat16* data;
+    int width;
+    int first;
+
+    __device__ __forceinline__ __nv_bfloat16* operator()(int col) const {
+        return data + std::size_t(first + col) * width;
+    }
+};
+
+template <typename Output>
 __device__ __forceinline__ void reduce_store(const float* partials, int splits, int active,
-                                             int row_base, int out_width, int act_row,
-                                             __nv_bfloat16* output) {
+                                             int row_base, int out_width, Output output) {
     const int elements = active * tile_rows;
     const int rank = blockIdx.x;
     const int first = rank * elements / splits;
@@ -259,16 +269,15 @@ __device__ __forceinline__ void reduce_store(const float* partials, int splits, 
         const int col = index / tile_rows;
         const int row = row_base + index % tile_rows;
         if (row < out_width) {
-            output[std::size_t(act_row + col) * out_width + row] = __float2bfloat16_rn(sum);
+            output(col)[row] = __float2bfloat16_rn(sum);
         }
     }
 }
 
-template <int Columns>
+template <int Columns, typename Output>
 __device__ __forceinline__ void store_result(const float (&result)[Columns], float* partials,
                                              int splits, int active, int row_base,
-                                             int out_width, int act_row,
-                                             __nv_bfloat16* output) {
+                                             int out_width, Output output) {
     const int warp = threadIdx.x / warp_size;
     const int local_row = threadIdx.x % tile_rows;
     if (splits == 1) {
@@ -277,8 +286,7 @@ __device__ __forceinline__ void store_result(const float (&result)[Columns], flo
             #pragma unroll
             for (int col = 0; col < Columns; ++col) {
                 if (col < active) {
-                    output[std::size_t(act_row + col) * out_width + row] =
-                        __float2bfloat16_rn(result[col]);
+                    output(col)[row] = __float2bfloat16_rn(result[col]);
                 }
             }
         }
@@ -293,8 +301,17 @@ __device__ __forceinline__ void store_result(const float (&result)[Columns], flo
         }
     }
     cluster_sync();
-    reduce_store(partials, splits, active, row_base, out_width, act_row, output);
+    reduce_store(partials, splits, active, row_base, out_width, output);
     cluster_sync();
+}
+
+template <int Columns>
+__device__ __forceinline__ void store_result(const float (&result)[Columns], float* partials,
+                                             int splits, int active, int row_base,
+                                             int out_width, int act_row,
+                                             __nv_bfloat16* output) {
+    store_result(result, partials, splits, active, row_base, out_width,
+                 ContiguousOutput{output, out_width, act_row});
 }
 
 }

@@ -2,6 +2,7 @@
 #include "sglang/text/decode_proj_sm100.cuh"
 
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace sglang {
 namespace {
@@ -29,17 +30,36 @@ struct Fp8Job {
     int rows;
 };
 
-template <int Columns>
-__device__ void load_scales(const Fp8Job& job, float* scales, const float* source,
+struct Fp8RowPointers {
+    __nv_bfloat16* output[text_fp8_max_batch];
+    const float* scales[text_fp8_max_batch];
+
+    __device__ __forceinline__ __nv_bfloat16* operator()(int col) const {
+        return output[col];
+    }
+};
+
+struct Fp8RowJob : Fp8Job {
+    Fp8RowPointers lanes;
+};
+
+template <int Columns, typename Job>
+__device__ void load_scales(const Job& job, float* scales,
                             int act_row, int first, int count, int active) {
     constexpr int fragment = Columns == 8 ? 8 : 16;
     const int padded = active == 1 ? 1 : (active + fragment - 1) / fragment * fragment;
     for (int index = threadIdx.x; index < count * padded; index += tile_rows) {
         const int col = index / count;
         const int group = index % count;
-        scales[group * Columns + col] =
-            col < active ? source[std::size_t(act_row + col) * job.groups + first + group]
-                         : 0.0f;
+        float value = 0.0f;
+        if (col < active) {
+            if constexpr (std::is_same_v<Job, Fp8RowJob>) {
+                value = job.lanes.scales[col][first + group];
+            } else {
+                value = job.act_scales[std::size_t(act_row + col) * job.groups + first + group];
+            }
+        }
+        scales[group * Columns + col] = value;
     }
     consumer_sync();
 }
@@ -102,9 +122,9 @@ __device__ void consume(DecodePipeline<Slots>& pipe, const float* scales,
     }
 }
 
-template <int Columns, int Slots = stages>
+template <int Columns, int Slots = stages, typename Job = Fp8Job>
 __global__ __launch_bounds__(threads, 1)
-void fp8_decode(const __grid_constant__ Fp8Job job) {
+void fp8_decode(const __grid_constant__ Job job) {
     constexpr unsigned instruction =
         ((tile_rows / 16) << 24) | ((Columns / 8) << 17) | (1u << 4);
     alignas(1024) extern __shared__ unsigned char tiles[];
@@ -140,7 +160,7 @@ void fp8_decode(const __grid_constant__ Fp8Job job) {
             weight_scales[index] = __bfloat162float(source[first + index]);
         }
         wait_dependencies();
-        load_scales<Columns>(job, scales, job.act_scales, act_row, first, count, active);
+        load_scales<Columns>(job, scales, act_row, first, count, active);
         consume(pipe, scales, weight_scales, count, active, result);
     } else if (warp == mma_warp && threadIdx.x % warp_size == 0) {
         multiply<instruction, true, Columns>(pipe, shared, count);
@@ -153,8 +173,13 @@ void fp8_decode(const __grid_constant__ Fp8Job job) {
     if (warp == mma_warp) {
         free_tmem<Columns>(pipe);
     }
-    store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
-                 job.out_width[target], act_row, job.output[target]);
+    if constexpr (std::is_same_v<Job, Fp8RowJob>) {
+        store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
+                     job.out_width[target], job.lanes);
+    } else {
+        store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
+                     job.out_width[target], act_row, job.output[target]);
+    }
 }
 
 std::optional<cudaError_t> encode_job(const LaunchTarget& target,
@@ -206,6 +231,58 @@ bool use_mlp_pipeline(const TextFp8DecodeTarget* targets, int count, int in_widt
            targets[1].out_width == intermediate_width;
 }
 
+cudaError_t plan_fp8_splits(const LaunchTarget& target, int blocks, int groups, SplitPlan& plan) {
+    return plan_splits(reinterpret_cast<const void*>(fp8_decode<tile_cols>), 0, target,
+                       blocks, groups, stages * stage_bytes<tile_cols>,
+                       scale_bytes<tile_cols>, plan);
+}
+
+}
+
+std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
+    const TextFp8DecodeTarget& projection, const std::uint8_t* packed_values, int in_width,
+    const TextFp8Projection* rows, int count, cudaStream_t stream) {
+    const TextFp8ActivationView input{packed_values, nullptr};
+    if (count < 2 || count > text_fp8_max_batch ||
+        !supported_targets(&projection, 1, in_width, input)) {
+        return std::nullopt;
+    }
+    LaunchTarget target{};
+    if (auto prepared = prepare_launch(stream, target); !prepared || *prepared != cudaSuccess) {
+        return prepared;
+    }
+    constexpr int columns = 8;
+    static_assert(text_fp8_max_batch <= columns);
+    Fp8RowJob job{};
+    int blocks = 0;
+    if (auto encoded = encode_job(target, &projection, 1, input, in_width, count, columns,
+                                  job, blocks);
+        !encoded || *encoded != cudaSuccess) {
+        return encoded;
+    }
+    for (int row = 0; row < count; ++row) {
+        job.lanes.output[row] = rows[row].output;
+        job.lanes.scales[row] = rows[row].input.scales;
+    }
+    SplitPlan plan{};
+    auto status = plan_fp8_splits(target, blocks, job.groups, plan);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (plan.splits == 0) {
+        return std::nullopt;
+    }
+    const auto* kernel = reinterpret_cast<const void*>(fp8_decode<columns, stages, Fp8RowJob>);
+    int limit = 0;
+    status = configure(kernel, 9, target.device, limit);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    const int shared = stages * stage_bytes<columns> +
+                       ((job.groups - 1) / plan.splits + 1) * scale_bytes<columns>;
+    const dim3 grid(plan.splits, blocks, 1);
+    void* args[] = {&job};
+    return launch_split(kernel, grid, shared, args, stream, grid.x);
 }
 
 std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* targets,
@@ -230,8 +307,7 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* 
     }
     const void* full_kernel = reinterpret_cast<const void*>(fp8_decode<tile_cols>);
     SplitPlan plan{};
-    auto status = plan_splits(full_kernel, 0, target, blocks, job.groups,
-                              stages * stage_bytes<tile_cols>, scale_bytes<tile_cols>, plan);
+    auto status = plan_fp8_splits(target, blocks, job.groups, plan);
     if (status != cudaSuccess) {
         return status;
     }

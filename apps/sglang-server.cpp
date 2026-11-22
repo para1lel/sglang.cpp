@@ -157,6 +157,9 @@ Arguments parse_arguments(int argc, char** argv) {
         append_launch_option(arguments.launch_command, option, value);
     }
     if (arguments.prefix_cache_entries != 0) {
+        if (sglang::token_ordered_decode(arguments.fp8_prefill)) {
+            throw std::invalid_argument("Selected FP8 policy requires prefix cache off");
+        }
         if (arguments.eager) {
             throw std::invalid_argument("--prefix-cache-entries requires omitting --eager");
         }
@@ -217,8 +220,7 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += R"(,"mtp_steps":)" + std::to_string(arguments.mtp_steps);
     body += R"(,"prefix_cache_entries":)" + std::to_string(arguments.prefix_cache_entries);
     body += R"(,"fp8_prefill":)";
-    body += arguments.fp8_prefill == sglang::Fp8PrefillPolicy::exact
-        ? "\"exact\"" : "\"tensor-core\"";
+    sglang::json::append_quoted(body, sglang::cli::fp8_prefill_name(arguments.fp8_prefill));
     body += R"(,"sampling_defaults":)";
     body += arguments.sampling == SamplingDefaults::model ? "\"model\"" : "\"openai\"";
     body += R"(,"reasoning_parser":)";
@@ -254,7 +256,8 @@ int main(int argc, char** argv) {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
                      " [--max-active N] [--mtp-steps N] [--eager] [--batch-cuda-graphs]\n"
                      "                     [--max-num-batched-tokens N] [--trace-batches]\n"
-                     "                     [--fp8-prefill exact|tensor-core]\n"
+                     "                     [--fp8-prefill exact|tensor-core|tensor-core-mtp|\n"
+                     "                      tensor-core-target|tensor-core-mtp-target]\n"
                      "                     [--prefix-cache-entries 0..4]\n"
                      "                     [--reasoning-parser qwen3]\n"
                      "                     [--tool-call-parser qwen3_coder]\n"

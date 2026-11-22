@@ -63,13 +63,18 @@ def check_policy(args):
             continue
         executable = executable.resolve(strict=True)
         cases = [
-            (["--help"], 0, "--fp8-prefill exact|tensor-core"),
-            (["--fp8-prefill", "auto"], 1, "Expected --fp8-prefill exact or tensor-core"),
-            (["--fp8-prefill", ""], 1, "Expected --fp8-prefill exact or tensor-core"),
+            (["--help"], 0, "tensor-core-target|tensor-core-mtp-target"),
+            (["--fp8-prefill", "auto"], 1, "Expected --fp8-prefill exact, tensor-core"),
+            (["--fp8-prefill", ""], 1, "Expected --fp8-prefill exact, tensor-core"),
         ]
         missing = "value" if serving else "argument"
         cases.append((["--fp8-prefill"], 1, f"Missing {missing} for --fp8-prefill"))
         if serving:
+            for policy in ("tensor-core-mtp", "tensor-core-target", "tensor-core-mtp-target"):
+                cases.append((
+                    ["--fp8-prefill", policy, "--prefix-cache-entries", "1"],
+                    1, "Selected FP8 policy requires prefix cache off",
+                ))
             cases.append((
                 ["--fp8-prefill", "tensor-core", "--max-active", "2", "--mtp-steps", "5"],
                 1, "Expected --mtp-steps in [0, 4]",

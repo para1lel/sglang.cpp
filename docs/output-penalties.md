@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Request options | Validate the wire values and populate `DecoderOptions`. | [HTTP validation](../apps/server/text_request.cpp#L175)<!-- prefix: "double sampl" --> · [Native defaults](../apps/server/text_request.cpp#L751)<!-- prefix: "const auto* " --> · [C++ options](../include/sglang/decoder.h#L49)<!-- prefix: "double frequ" --> |
-| Decoder | Keep each item's history and choose its execution path. | [Batch depth](../src/decoder_batch.cpp#L455)<!-- prefix: "if (options." --> · [Direct execution](../src/decoder.cpp#L565)<!-- prefix: "const Reques" --> |
+| Decoder | Keep each item's history and choose its execution path. | [Batch depth](../src/decoder_batch.cpp#L456)<!-- prefix: "if (options." --> · [Direct execution](../src/decoder.cpp#L570)<!-- prefix: "const Reques" --> |
 | CUDA score adjustment | Update history and rank the adjusted scores. | [History update](../src/decoder_sampling.cu#L414)<!-- prefix: "__device__ f" --> · [Repetition selection](../src/decoder_sampling.cu#L871)<!-- prefix: "cudaError_t " --> |
 
 ## Runtime path
@@ -18,7 +18,7 @@ Repetition scaling uses FP64 and preserves a zero score. Ordinary rows rank the 
 
 CUDA applies any output constraint mask and then adds [logit bias](serving/openai-logprobs.md#logit-bias). For extreme rows, ranking and normalization subtract the repetition-adjusted bases before applying the bias difference. This preserves a small bias between equal large scores. Direct C++ `top_logits` reports ranked scores before constraint masking. For extreme rows with a finite maximum, the readback subtracts that maximum and limits the reported difference to the finite FP32 range. Reported logprobs also use a finite FP32 lower bound. Selection and normalization use the scores before either reporting limit. [Direct score readback](../src/decoder.cpp#L318)<!-- prefix: "if (adjusted" -->
 
-An item with an active penalty uses target-only decoding. Eligible peers in the same batch can use MTP. Batch adjustment runs after eager scoring or eligible K0 graph replay. Direct C++ generation with an active penalty uses eager decoding. A neutral repetition value leaves the ordinary path eligible. [Batch selection](../src/decoder_batch.cpp#L575)<!-- prefix: "auto* adjust" -->
+An item with an active penalty uses target-only decoding. Eligible peers in the same batch can use MTP. Batch adjustment runs after eager scoring or eligible K0 graph replay. Direct C++ generation with an active penalty uses eager decoding. A neutral repetition value leaves the ordinary path eligible. [Batch selection](../src/decoder_batch.cpp#L576)<!-- prefix: "auto* adjust" -->
 
 ## Constraints and failure behavior
 

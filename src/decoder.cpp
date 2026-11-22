@@ -461,7 +461,8 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
 
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
                  Fp8PrefillPolicy fp8_prefill) {
-    if (fp8_prefill != Fp8PrefillPolicy::exact && fp8_prefill != Fp8PrefillPolicy::tensor_core) {
+    if (fp8_prefill != Fp8PrefillPolicy::exact && fp8_prefill != Fp8PrefillPolicy::tensor_core &&
+        !token_ordered_decode(fp8_prefill)) {
         throw std::invalid_argument("Invalid FP8 prefill policy");
     }
     model_ = std::make_unique<Model>(checkpoint, cuda_device, fp8_prefill);
@@ -484,9 +485,13 @@ bool Decoder::Model::prefill_serial(Request& request, RequestProgress& progress,
                                     int step_budget) const {
     const int count = static_cast<int>(prompt.size());
     const auto stream = request.memory.stream();
-    const int aligned = count / prefill_chunk_rows * prefill_chunk_rows;
+    const bool shared_tiles = !media && mtp_tensor_core_prefill(fp8_prefill());
+    const int aligned = shared_tiles ? count : count / prefill_chunk_rows * prefill_chunk_rows;
     std::optional<PrefillWorkspace> tiled;
-    if (!media && fp8_prefill() == Fp8PrefillPolicy::tensor_core) {
+    if (shared_tiles) {
+        const int limit = step_budget ? step_budget : batch_prefill_tile_rows;
+        tiled.emplace(stream, std::min({count, limit, batch_prefill_tile_rows}));
+    } else if (!media && fp8_prefill() == Fp8PrefillPolicy::tensor_core) {
         const int configured = serial_prefill_rows(b200_, count);
         const int limit = step_budget ? step_budget / prefill_chunk_rows * prefill_chunk_rows
                                       : configured;
@@ -674,8 +679,10 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     if (proposals == 0) {
         model_->generate_serial(prompt_token_ids, options, callbacks, result);
     } else {
+        const int tile = mtp_tensor_core_prefill(model_->fp8_prefill())
+            ? batch_prefill_tile_rows : prefill_chunk_rows;
         const int limit = options.max_num_batched_tokens
-            ? std::min(options.max_num_batched_tokens, prefill_chunk_rows) : prefill_chunk_rows;
+            ? std::min(options.max_num_batched_tokens, tile) : tile;
         DecoderBatch batch(*this, DecoderBatchOptions{false, 1, 0, limit});
         SerialOutput output(callbacks, options.top_logits, result);
         batch.generate_mtp(prompt_token_ids, options, output, result);

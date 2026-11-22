@@ -146,7 +146,24 @@ struct DecoderResult {
 enum class Fp8PrefillPolicy {
     exact,
     tensor_core,
+    tensor_core_mtp,
+    tensor_core_target,
+    tensor_core_mtp_target,
 };
+
+inline constexpr bool mtp_tensor_core_prefill(Fp8PrefillPolicy policy) {
+    return policy == Fp8PrefillPolicy::tensor_core_mtp ||
+           policy == Fp8PrefillPolicy::tensor_core_mtp_target;
+}
+
+inline constexpr bool tensor_core_target(Fp8PrefillPolicy policy) {
+    return policy == Fp8PrefillPolicy::tensor_core_target ||
+           policy == Fp8PrefillPolicy::tensor_core_mtp_target;
+}
+
+inline constexpr bool token_ordered_decode(Fp8PrefillPolicy policy) {
+    return mtp_tensor_core_prefill(policy) || tensor_core_target(policy);
+}
 
 class Decoder {
 public:

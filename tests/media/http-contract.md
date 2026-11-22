@@ -16,7 +16,15 @@ Invalid dimensions, RGB8 and video metadata, unsupported options and compressed 
 HTTP 400. The test sends malformed media after a valid attachment and checks that none of the
 rejected requests or the zero-budget request starts decode. It resets a live streaming socket
 and a pending connection, then checks that the surviving request returns identical IDs. Plain
-chat and text completions remain usable. Continuous and cache-enabled servers reject media.
+chat and text completions remain usable. Continuous and cache-enabled servers also serve
+media, with zero cached media tokens.
+
+Append `--ordered-fp8` and use a fresh evidence directory to test each ordered text policy.
+The suite compares real image and video outputs and pointwise label scores with exact.
+It also checks that the combined policy changes the frozen W1 text continuation and that
+concurrent media, text, and score responses match their serial controls. For the serial C++
+contract, run `media-contract "$checkpoint" --ordered-fp8` to compare BF16-derived top scores
+for mixed features across prefill chunks.
 
 ## Optional codecs
 

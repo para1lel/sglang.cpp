@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L843)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L301)<!-- prefix: "const bool c" --> |
+| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L848)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L306)<!-- prefix: "const bool c" --> |
 | GDN operator | Prepare rows, advance each layer's recurrent state, and finish output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L647)<!-- prefix: "cudaError_t " --> |
 | Verification | Check ordered parity, chunked numerical error, and causal continuation. | [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Batch route](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_t" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L101)<!-- prefix: "int main(int" --> |
 
@@ -26,7 +26,7 @@ The ordered tensor-core fallback uses the paired kernel for at least 32 rows wit
 
 ## Constraints and failure behavior
 
-The fused B/A projection requires `tensor_core_fp8` and two BF16 weight matrices of 48 rows by 5,120 columns each. The input row count must be a multiple of four between 16 and 65,535 inclusive. Both weights, the input, and both outputs must have nonnull pointers. Both weight bases and the input base require 16-byte alignment. If a guard fails, the decoder uses the existing separate projections in B then A order. A fused launch error propagates to the caller. [Policy and shapes](../src/decoder_prefill.cpp#L283)<!-- prefix: "if (tensor_c" --> · [Launch guards](../src/text_decode_bandwidth.cu#L305)<!-- prefix: "if (rows < 1" --> · [Fallback](../src/decoder_prefill.cpp#L294)<!-- prefix: "project(laye" -->
+The fused B/A projection requires `tensor_core_fp8` and two BF16 weight matrices of 48 rows by 5,120 columns each. The input row count must be a multiple of four between 16 and 65,535 inclusive. Both weights, the input, and both outputs must have nonnull pointers. Both weight bases and the input base require 16-byte alignment. If a guard fails, the decoder uses the existing separate projections in B then A order. A fused launch error propagates to the caller. [Policy and shapes](../src/decoder_prefill.cpp#L288)<!-- prefix: "if (tensor_c" --> · [Launch guards](../src/text_decode_bandwidth.cu#L305)<!-- prefix: "if (rows < 1" --> · [Fallback](../src/decoder_prefill.cpp#L299)<!-- prefix: "project(laye" -->
 
 The first GDN layer uses ordered recurrence for a tile that starts at prompt position zero. Later GDN layers in that tile and all GDN layers in subsequent tiles may use chunked recurrence. A tile that resumes a saved prefix uses the absolute restored position. An earlier recurrence experiment on W2 found that reordering only the first GDN call could change later model scores. The guard preserves that call's update order.
 

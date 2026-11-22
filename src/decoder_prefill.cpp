@@ -262,13 +262,18 @@ struct Chunk : PrefillProjections {
                     const Bf16* final_norm) const {
         static_assert(intermediate_size >= 2 * hidden_size);
         static_assert(std::max(text_gdn_value_width, text_gqa_q_width) >= hidden_size);
-        check(text_rms_norm_rows(work.hidden, work.residual, final_norm, hidden_size, seed_rows,
-                                 work.normalized, nullptr, stream),
-              "Normalize target prompt rows for MTP");
-        const PrefillProjections projections{activation, seed_rows, stream};
-        draft.seed_prefill(position, shifted_tokens, work.normalized, projections,
-                           {work.projected_attention, work.mlp_gate, work.attention,
-                            work.keys, work.values, work.rope_keys});
+        for (int offset = 0; offset < seed_rows; offset += prefill_chunk_rows) {
+            const int count = std::min(prefill_chunk_rows, seed_rows - offset);
+            const int hidden_offset = offset * hidden_size;
+            check(text_rms_norm_rows(work.hidden + hidden_offset, work.residual + hidden_offset,
+                                     final_norm, hidden_size, count, work.normalized, nullptr,
+                                     stream), "Normalize target prompt rows for MTP");
+            const PrefillProjections projections{activation, count, stream};
+            draft.seed_prefill(position + offset, shifted_tokens + offset, work.normalized,
+                               projections,
+                               {work.projected_attention, work.mlp_gate, work.attention,
+                                work.keys, work.values, work.rope_keys});
+        }
     }
 
     void gdn_input(const GdnLayer& layer) const {
@@ -840,7 +845,8 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
     const TileBuffers buffers(layout, workspace.capacity());
-    const bool tensor_core = !exact && !draft && fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+    const bool tensor_core = !exact && ((!media && mtp_tensor_core_prefill(fp8_prefill())) ||
+        (!draft && fp8_prefill() == Fp8PrefillPolicy::tensor_core));
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
                       media ? media->positions + position : nullptr};
     const auto& work = chunk.work;

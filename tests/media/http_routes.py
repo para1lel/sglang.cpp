@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from copy import deepcopy
 import http.client
@@ -41,12 +42,12 @@ def wait_ready(process, port):
 
 
 @contextmanager
-def serve(args, label, *options):
+def serve(args, label, *options, policy="exact"):
     with closing(socket.socket()) as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     command = [str(args.server.resolve()), "--checkpoint", str(args.checkpoint.resolve()),
-               "--device", "0", "--port", str(port), "--fp8-prefill", "exact",
+               "--device", "0", "--port", str(port), "--fp8-prefill", policy,
                "--trace-batches", *options]
     log = args.evidence / f"{label}.server.log"
     (args.evidence / f"{label}.argv.json").write_text(json.dumps(command) + "\n")
@@ -282,9 +283,58 @@ def main(args):
     print("Decoded media HTTP route contract passed.")
 
 
+def ordered_fp8(args):
+    args.evidence.mkdir()
+    prompt = json.loads((Path(__file__).parents[2] / "benchmarks/streaming/W1.json").read_text())[
+        "prompt_token_ids"]
+    description = {"type": "text", "text": "Describe the visual content in detail. " * 16}
+    queries = {
+        "image": (CHAT, chat([visual("image_url"), description])),
+        "video": (CHAT, chat([visual("video_url"), description])),
+        "text": ("/generate", {"input_ids": prompt, "sampling_params": {
+            "max_new_tokens": 32, "temperature": 0, "ignore_eos": True}}),
+        "score": ("/v1/score", {"query": prompt[:127], "items": [[17], [24, 31]],
+                                "label_token_ids": [17, 23, 31], "return_token_logprobs": True}),
+    }
+
+    def observe(port, label, name):
+        route, request = queries[name]
+        reply = capture(args, f"{label}-{name}", port, route, request)
+        if name in ("image", "video"):
+            result = received(reply, 4)
+            assert result[1]["prompt_tokens"] > 128
+            return result, reply["prompt_token_ids"]
+        if name == "text":
+            assert len(reply["output_ids"]) == 32
+            return reply["output_ids"]
+        assert len(reply["scores"]) == 2 and reply["usage"]["completion_tokens"] == 0
+        return reply
+
+    exact = "exact"
+    combined = "tensor-core-mtp-target"
+    controls = {}
+    for policy in (exact, "tensor-core-mtp", "tensor-core-target", combined):
+        with serve(args, policy, "--max-active", "4", policy=policy) as (port, _):
+            observed = {name: observe(port, policy, name) for name in queries}
+            if policy == exact:
+                controls = observed
+                continue
+            for name in ("image", "video", "score"):
+                assert observed[name] == controls[name], (policy, name)
+            if policy == combined:
+                assert observed["text"] != controls["text"]
+                with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+                    concurrent = list(executor.map(
+                        lambda name: observe(port, "combined-concurrent", name), queries))
+                assert dict(zip(queries, concurrent)) == observed
+    print("Ordered FP8 media, text, and exact label-score route contract passed.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("server", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("evidence", type=Path)
-    main(parser.parse_args())
+    parser.add_argument("--ordered-fp8", action="store_true")
+    args = parser.parse_args()
+    (ordered_fp8 if args.ordered_fp8 else main)(args)

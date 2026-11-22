@@ -24,6 +24,10 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* 
                                                      const Fp8DecodeInputProducer* producer =
                                                          nullptr);
 
+std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
+    const TextFp8DecodeTarget& target, const std::uint8_t* packed_values, int in_width,
+    const TextFp8Projection* rows, int count, cudaStream_t stream);
+
 std::optional<cudaError_t> try_text_bf16_decode_sm100(
     const __nv_bfloat16* weight, const __nv_bfloat16* input, int out_width, int in_width,
     int rows, __nv_bfloat16* output, cudaStream_t stream);

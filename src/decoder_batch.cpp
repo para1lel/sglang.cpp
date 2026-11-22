@@ -269,7 +269,6 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
     }
     return plan_budget_step(work, lanes, budget, cursor, tile);
 }
-
 }
 
 struct DecoderBatch::State {
@@ -280,6 +279,8 @@ struct DecoderBatch::State {
                        model.fp8_prefill() == Fp8PrefillPolicy::tensor_core),
           execution(model.device) {
         validate_batch_options(options);
+        if (options.prefix_cache_entries && token_ordered_decode(model.fp8_prefill()))
+            throw std::invalid_argument("Selected FP8 policy requires prefix cache off");
         DeviceScope device(model.device);
         if (options.prefix_cache_entries != 0) {
             storage->prefix_cache.emplace(model.device, options.prefix_cache_entries,
@@ -605,6 +606,8 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     const auto stream = execution.stream();
     const auto& rows = stats.prefill_rows;
     auto& slots = storage->slots;
+    const bool legacy_tensor_core = model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+    const bool ordered = token_ordered_decode(model.fp8_prefill());
     std::array<ForwardLane, decoder_batch_max_lanes> work;
     std::array<Request*, decoder_batch_max_lanes> scoring{};
     std::array<int, decoder_batch_max_lanes> packed_slots;
@@ -652,8 +655,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             work[count++] = lane.input();
             const bool plain = results[slot].decode && !lane.draft && !lane.media;
             work[count - 1].packed = plain;
-            work[count - 1].long_gqa =
-                plain && model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+            work[count - 1].long_gqa = plain && legacy_tensor_core;
             const bool final_text = rows[slot] == 1 && remaining == 1 && !lane.media;
             final_text_rows |= std::uint64_t{final_text} << packed_slots[slot];
             if (plain && !lane.sampling && !lane.options.adjusts_logits(lane.progress.generated) &&
@@ -665,14 +667,13 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             scoring[slot] = lane.request.get();
         }
     }
-    const bool tensor_core = !contains_mtp &&
-        model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
-    const auto eager_score_rows = tensor_core && max_rows > 0
-        ? final_text_rows | (count == 1 && work[0].packed ? std::uint64_t{1} : 0)
-        : 0;
+    const bool tensor_core = !contains_mtp && legacy_tensor_core;
+    const auto eager_score_rows = tensor_core && max_rows > 0 ?
+        final_text_rows | (count == 1 && work[0].packed ? std::uint64_t{1} : 0) : 0;
+    const bool regular_graph = text_decode && !contains_mtp && (!ordered || count == 1);
     const auto run = run_decode_lanes(model, execution, storage->decode_graphs, work.data(), count,
-                                      {options.cuda_graphs, text_decode && !contains_mtp,
-                                       !contains_mtp && max_rows == 0, tensor_core,
+                                      {options.cuda_graphs, regular_graph,
+                                       !ordered && !contains_mtp && max_rows == 0, tensor_core,
                                        greedy_winners, eager_score_rows});
     if (max_rows) prefill(rows, results, count == 0, contains_mtp, stats);
     bool submitted = count != 0 || max_rows != 0;
@@ -734,7 +735,9 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
                 nullptr, nullptr};
             continue;
         }
-        int limit = lane.draft || lane.media ? prefill_chunk_rows : tile_limit;
+        int limit = tile_limit;
+        if (lane.media || (lane.draft && !mtp_tensor_core_prefill(model.fp8_prefill())))
+            limit = prefill_chunk_rows;
         if (wide && !lane.draft && !lane.media && lane.prompt.size() <= sm100_prefill_max_visible) {
             limit = serial_prefill_max_rows;
         }

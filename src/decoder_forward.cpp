@@ -3,6 +3,7 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_verify.h"
+#include "sglang/text/target_fp8.h"
 
 #include <algorithm>
 #include <type_traits>
@@ -47,6 +48,16 @@ struct LayerBatch {
     const Lane* lanes;
     int count;
     cudaStream_t stream;
+    bool ordered_attention = false;
+    bool target_tc = false;
+
+    bool tensor_core_lane(int index) const {
+        if constexpr (std::is_same_v<Lane, ForwardLane>) {
+            return target_tc && lanes[index].mode == TextGdnMode::decode &&
+                !lanes[index].mrope && lanes[index].rotary_position < 0;
+        }
+        return target_tc;
+    }
 
     bool single_decode() const {
         if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
@@ -102,6 +113,13 @@ struct LayerBatch {
     }
 
     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
+        if (target_tc && (count > 1 || tensor_core_lane(0)) &&
+            weight.rows <= intermediate_size &&
+            weight.columns <= intermediate_size && weight.rows % text_fp8_group_size == 0 &&
+            weight.columns % text_fp8_group_size == 0) {
+            project_target(weight, output);
+            return;
+        }
         if (count == 1) {
             const auto& work = workspace(lanes[0]);
             const TextFp8ActivationView input{work.activation.values, work.activation.scales};
@@ -123,6 +141,30 @@ struct LayerBatch {
             }
             check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
                                 projections.data(), rows, stream), "Run batched FP8 projection");
+            first += rows;
+        }
+    }
+
+    void project_target(Fp8Weight weight, Bf16* Workspace::*output) const {
+        std::array<TextFp8Projection, text_fp8_max_batch> projections;
+        for (int first = 0, group = 0; first < count; ++group) {
+            constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
+            const int rows = verification ? projection_rows(group) : 1;
+            for (int index = 0; index < rows; ++index) {
+                const auto& work = workspace(lanes[first + index]);
+                projections[index] = {{work.activation.values, work.activation.scales},
+                                      work.*output};
+            }
+            const TextFp8DecodeTarget target{
+                weight.values, weight.scales, weight.rows, projections[0].output};
+            auto* scratch = workspace(lanes[first]).logits;
+            static_assert(text_fp8_max_batch * intermediate_size <= vocab_size * sizeof(Bf16));
+            const auto status = tensor_core_lane(first)
+                ? try_target_fp8_tc(target, weight.columns, projections.data(), rows, scratch,
+                                    stream)
+                : std::nullopt;
+            check(status ? *status : text_fp8_gemm(weight.values, weight.scales, weight.rows,
+                  weight.columns, projections.data(), rows, stream), "Run target FP8 projection");
             first += rows;
         }
     }
@@ -292,7 +334,8 @@ void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& b
         const auto& read = reads[0];
         check(exact_decode_gqa_attention(read.cache, read.pages, read.position,
                                          read.buffers.queries, read.buffers.output, read.scores,
-                                         batch.stream, vocab_size * sizeof(Bf16)),
+                                         batch.stream,
+                                         batch.ordered_attention ? 0 : vocab_size * sizeof(Bf16)),
               "Read bound singleton MXFP8 attention");
     } else {
         check(paged_decode_gqa(reads.data(), batch.count, batch.stream),
@@ -334,7 +377,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         const MropePosition* mrope = nullptr;
         int rotary_position = -1;
         if constexpr (!std::is_same_v<Lane, VerificationRow>) {
-            narrow_gqa = lane.narrow_gqa;
+            narrow_gqa = lane.narrow_gqa && !batch.ordered_attention;
         }
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
             mrope = lane.mrope;
@@ -344,7 +387,8 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
                    rotary_position);
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
-            if (lane.mode == TextGdnMode::decode && (wide
+            const bool ordered = batch.ordered_attention && rotary_position < 0;
+            if (!ordered && lane.mode == TextGdnMode::decode && (wide
                     ? lane.long_gqa && long_paged_decode_position(lane.position)
                     : batch.count > 1 && paged_decode_position(lane.position))) {
                 reads[count] = {cache, request.pages, lane.position, paged_gqa_buffers(work)};
@@ -371,7 +415,8 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     if (!batch.fuse_verify_activation()) {
         batch.quantize(&Workspace::normalized, hidden_size);
     }
-    if (batch.single_decode() && layer.q_gate.columns == hidden_size &&
+    if (!batch.tensor_core_lane(0) && batch.single_decode() &&
+        layer.q_gate.columns == hidden_size &&
         layer.key.columns == hidden_size && layer.value.columns == hidden_size) {
         const auto& work = workspace(batch.lanes[0]);
         check(decode_fp8_qkv({work.activation.values, work.activation.scales},
@@ -409,7 +454,8 @@ void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
         return;
     }
     batch.quantize(&Workspace::normalized, hidden_size);
-    if (batch.single_decode() && layer.mlp_gate.columns == hidden_size &&
+    if (!batch.tensor_core_lane(0) && batch.single_decode() &&
+        layer.mlp_gate.columns == hidden_size &&
         layer.mlp_up.columns == hidden_size) {
         const auto& work = workspace(batch.lanes[0]);
         check(decode_fp8_gate_up({work.activation.values, work.activation.scales},
@@ -598,7 +644,8 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
 
 template <typename Lane>
 void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream) const {
-    const LayerBatch<Lane> batch{lanes, count, stream};
+    const LayerBatch<Lane> batch{lanes, count, stream, token_ordered_decode(fp8_prefill()),
+                                 is_b200() && tensor_core_target(fp8_prefill())};
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
         if (batch.fuse_verify_activation()) {
             VerifyRmsQuantizeRows rows;

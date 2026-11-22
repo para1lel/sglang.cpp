@@ -32,8 +32,9 @@ Use `host ./build/bin/sglang-generate --help` for token-ID generation options.
 Both executables default to four MTP draft steps. Pass `--mtp-steps 0` or `--mtp-k 0`
 to disable draft generation. On a default server launch, requests for logprobs use zero
 draft steps, and a Tensor Core prefix cache resolves the server default to zero steps.
-An explicit positive server depth requires `--fp8-prefill exact` with prefix caching
-and rejects requests for logprobs.
+An explicit positive server depth rejects requests for logprobs. With prefix
+caching enabled, positive depth requires `--fp8-prefill exact`.
+The default FP8 policy is `exact`. See the [opt-in Tensor Core policies](docs/fp8-prefill-projections.md#tensor-core-projections) for precision and cache requirements.
 
 The HTTP server enables CUDA Graph replay for eligible decode steps by default.
 `--batch-cuda-graphs` remains accepted. Pass `--eager` to disable graph replay,

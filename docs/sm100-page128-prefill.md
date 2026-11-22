@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Model | Try the page-128 launcher under the tensor-core prefill policy. | [Model dispatch](../include/sglang/text/prefill_attn_sm100.h#L46)<!-- prefix: "inline cudaE" --> |
-| Batch planner | Select the tile row count. | [Batch tile cap](../src/decoder_batch.cpp#L710)<!-- prefix: "const bool w" --> |
+| Batch planner | Select the tile row count. | [Batch tile cap](../src/decoder_batch.cpp#L711)<!-- prefix: "const bool w" --> |
 | SM100 launcher | Check eligibility, select staging, and submit stream work. | [Launcher](../src/text/prefill_attn_sm100.cu#L914)<!-- prefix: "std::optiona" --> |
 
 ## Runtime path
@@ -46,6 +46,6 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     ./build/bin/mxfp8-gqa-sm100-check
 ```
 
-Require exit zero and rising-max absolute error below 0.00002. For the page-128 graph regression, require a 576-thread TMA producer on the aligned tile at position 8,192. Require a 544-thread original split producer for `sm100` and for the misaligned-scale fallback under `sm100-tma`. Compare all BF16 outputs after poisoned-output replay. [Build target](../xmake.lua#L210)<!-- prefix: "target(\"mxfp" --> · [Rising-max assertion](../tests/prefill/mxfp8_gqa_sm100_check.cpp#L144)<!-- prefix: "require(maxi" -->
+Require exit zero and rising-max absolute error below 0.00002. For the page-128 graph regression, require a 576-thread TMA producer on the aligned tile at position 8,192. Require a 544-thread original split producer for `sm100` and for the misaligned-scale fallback under `sm100-tma`. Compare all BF16 outputs after poisoned-output replay. [Build target](../xmake.lua#L211)<!-- prefix: "target(\"mxfp" --> · [Rising-max assertion](../tests/prefill/mxfp8_gqa_sm100_check.cpp#L144)<!-- prefix: "require(maxi" -->
 
 Use a separate fault probe for TMA setup rejection. Check split selection for a known descriptor or TMA attribute rejection. Check that an unexpected error or pending execution failure returns before allocation or launch. The alignment regression only exercises preflight eligibility.

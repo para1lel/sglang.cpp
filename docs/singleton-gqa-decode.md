@@ -34,11 +34,13 @@ Batch graph replay checks each live position on device. The standalone generator
 
 On the same hardware and FP8 policy, `SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=long`
 extends the window to 262,144 visible tokens and reports
-`experimental_long_target_split_gqa: true` in `/server_info`. It groups the split
-and combine launches for verification rows. Each row keeps its own causal
-position and scratch. The split count is capped at 16 per row, so scratch size
-is independent of context length. The FP64 head fallback can dominate latency
-when inputs fall outside the split kernel's numerical range.
+`experimental_long_target_split_gqa: true` in `/server_info`. Eager verification
+groups 10–20 rows when every row's Tensor Core inputs are aligned and its work
+averages at most 10 chunks per split. Smaller groups, unaligned inputs, higher
+split work, and bound graph replay use groups of at most five. Each row keeps
+its own causal position and scratch. The split count is capped at 16 per row,
+so scratch size is independent of context length. FP64 head fallback still
+applies when inputs fall outside the split kernel's numerical range.
 
 ## Constraints and failure behavior
 

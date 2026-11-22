@@ -259,6 +259,7 @@ struct BoundPagedDecodeLane {
 
 inline constexpr int target_split_first_position = 2047;
 inline constexpr int target_split_end_position = 4096;
+inline constexpr int target_split_eager_max_rows = 4 * text_gdn_max_verify_rows;
 
 #ifdef __CUDACC__
 __host__ __device__ inline constexpr bool target_split_position(

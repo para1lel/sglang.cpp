@@ -68,7 +68,7 @@ __host__ __device__ inline bool readable(const decoder::PagedDecodeLane& lane) {
            lane.cache.key_scales && lane.cache.value_scales;
 }
 
-__device__ inline bool tensor_aligned(const decoder::PagedDecodeLane& lane) {
+__host__ __device__ inline bool tensor_aligned(const decoder::PagedDecodeLane& lane) {
     const auto addresses = reinterpret_cast<std::uintptr_t>(lane.buffers.queries) |
         reinterpret_cast<std::uintptr_t>(lane.cache.key_payload) |
         reinterpret_cast<std::uintptr_t>(lane.cache.value_payload) |
@@ -98,7 +98,7 @@ struct TargetBatch {
 };
 
 struct EagerTargetBatch {
-    decoder::PagedDecodeLane lanes[text_gdn_max_verify_rows];
+    decoder::PagedDecodeLane lanes[decoder::target_split_eager_max_rows];
     int end;
 };
 

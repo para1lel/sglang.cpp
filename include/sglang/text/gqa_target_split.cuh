@@ -45,6 +45,23 @@ bool valid_target_binding(const decoder::BoundPagedDecodeLane& lane) {
            gqa_decode::valid_buffers(lane.buffers);
 }
 
+int eager_target_batch_width(const decoder::PagedDecodeLane* lanes, int count, int end) {
+    constexpr int reference_width = text_gdn_max_verify_rows;
+    constexpr int max_average_chunks_per_split = 10;
+    if (end != text_attention_max_tokens || count < 2 * reference_width) {
+        return reference_width;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& lane = lanes[index];
+        const int chunks = lane.position / gqa_decode::split_chunk_tokens + 1;
+        if (!gqa_decode::tensor_aligned(lane) ||
+            chunks > max_average_chunks_per_split * gqa_decode::split_count(lane.position)) {
+            return reference_width;
+        }
+    }
+    return count;
+}
+
 cudaError_t launch_target_fallback(decoder::BoundPagedDecodeLane lane, int end,
                                    cudaStream_t stream) {
     return launch_exact_attention<false, false, true, true>(
@@ -90,15 +107,24 @@ cudaError_t decoder::target_split_gqa(const BoundPagedDecodeLane* lanes, int cou
 
 cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, int end,
                                      cudaStream_t stream) {
-    if (!lanes || count < 1 || count > text_gdn_max_verify_rows) {
+    if (!lanes || count < 1 || count > target_split_eager_max_rows ||
+        (count > text_gdn_max_verify_rows && end != text_attention_max_tokens)) {
         return cudaErrorInvalidValue;
     }
-    gqa_decode::EagerTargetBatch batch{{}, end};
     for (int index = 0; index < count; ++index) {
         if (!valid_target_lane(lanes[index], end)) {
             return cudaErrorInvalidValue;
         }
-        batch.lanes[index] = lanes[index];
     }
-    return launch_target_batch(batch, count, stream);
+    const int width = eager_target_batch_width(lanes, count, end);
+    for (int offset = 0; offset < count; offset += width) {
+        const int size = std::min(width, count - offset);
+        gqa_decode::EagerTargetBatch batch{{}, end};
+        std::copy_n(lanes + offset, size, batch.lanes);
+        const auto status = launch_target_batch(batch, size, stream);
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
 }

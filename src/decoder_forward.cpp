@@ -531,8 +531,8 @@ template <typename Lane>
 void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
     std::array<PagedDecodeLane, decoder_batch_max_lanes> reads;
     std::array<Workspace*, decoder_batch_max_lanes> pending;
-    std::array<PagedDecodeLane, target_verify_max_rows> split_reads;
-    std::array<Workspace*, target_verify_max_rows> split_pending;
+    std::array<PagedDecodeLane, target_split_eager_max_rows> split_reads;
+    std::array<Workspace*, target_split_eager_max_rows> split_pending;
     const bool wide = batch.count > paged_decode_lanes;
     const bool grouped = std::is_same_v<Lane, VerificationRow> &&
                          batch.target_split_end == text_attention_max_tokens && batch.count > 1;
@@ -585,7 +585,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
                 if (grouped) {
                     split_reads[split_count] = read;
                     split_pending[split_count++] = &work;
-                    if (split_count == target_verify_max_rows) {
+                    if (split_count == target_split_eager_max_rows) {
                         flush_split();
                     }
                     return;

@@ -43,6 +43,7 @@ inline constexpr std::string_view anthropic_messages_route = "/v1/messages";
 inline constexpr std::string_view responses_route = "/v1/responses";
 inline constexpr std::string_view score_route = "/v1/score";
 inline constexpr std::string_view decisions_route = "/v1/decisions";
+inline constexpr std::string_view systemone_route = "/v1/systemone";
 
 enum class GenerateRoute { none, allowed, method_not_allowed };
 enum class TokenizationRoute { none, tokenize, detokenize, anthropic_count };

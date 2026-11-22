@@ -25,7 +25,7 @@ using ServerInfo = std::function<std::string()>;
 using BatchScore = std::function<void(const Socket&, int, std::string_view)>;
 using BatchMessages = BatchScore;
 using BatchResponses = BatchScore;
-using BatchDecisions = BatchScore;
+using BatchDecisions = std::function<void(const Socket&, int, std::string_view, bool)>;
 
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,

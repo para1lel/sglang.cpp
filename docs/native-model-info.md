@@ -8,7 +8,7 @@
 | Model discovery | List or retrieve the served model card. | [List dispatch](../apps/server/prefix_controls.cpp#L560)<!-- prefix: "if (path == " --> · [Retrieval dispatch](../apps/server/prefix_controls.cpp#L547)<!-- prefix: "if (model_re" --> · [Shared card writer](../apps/server/prefix_controls.cpp#L482)<!-- prefix: "std::string " --> |
 | Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L201)<!-- prefix: "std::string " --> |
 | Checkpoint | Supply the supported model type and architecture. | [Checkpoint identity](../include/sglang/checkpoint.h#L47)<!-- prefix: "inline const" --> |
-| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L705)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L343)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L223)<!-- prefix: "std::string " --> |
+| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L706)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L343)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L223)<!-- prefix: "std::string " --> |
 | Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L69)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L314)<!-- prefix: "BatchService" --> |
 | Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L834)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L346)<!-- prefix: "counters.gen" --> |
 
@@ -39,7 +39,7 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 
 ### Server information
 
-`GET /server_info` and its alias `GET /get_server_info` return the same JSON schema. Upstream deprecates the alias. The reader calls the batch service directly, even with all generation lanes occupied or prefix reuse disabled. Each call returns the startup configuration and a fresh scheduler snapshot. [Reader dispatch](../apps/server/prefix_controls.cpp#L707)<!-- prefix: "write_json(c" -->
+`GET /server_info` and its alias `GET /get_server_info` return the same JSON schema. Upstream deprecates the alias. The reader calls the batch service directly, even with all generation lanes occupied or prefix reuse disabled. Each call returns the startup configuration and a fresh scheduler snapshot. [Reader dispatch](../apps/server/prefix_controls.cpp#L708)<!-- prefix: "write_json(c" -->
 
 | Top-level field | JSON type and meaning |
 | --- | --- |

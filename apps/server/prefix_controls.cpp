@@ -619,7 +619,8 @@ ConnectionQueue::NativeRoute ConnectionQueue::native_route(std::string_view path
         return {"POST, PUT", method == "POST" || method == "PUT"};
     }
     if ((tokenize_ && path == anthropic_count_route) ||
-        (messages_ && path == anthropic_messages_route)) {
+        (messages_ && path == anthropic_messages_route) ||
+        (decisions_ && path == systemone_route)) {
         return {"POST", method == "POST", true};
     }
     if (path == "/health" || path == "/health_generate" || path == "/ready" ||
@@ -678,11 +679,11 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         else write_method_not_allowed(connection, "POST", request.method == "HEAD");
         return;
     }
-    const bool score = score_ && request.route_path() == score_route;
-    const bool decisions = decisions_ && request.route_path() == decisions_route;
-    const bool count = tokenize_ && request.route_path() == anthropic_count_route;
-    const bool messages = messages_ && request.route_path() == anthropic_messages_route;
-    const bool responses = responses_ && request.route_path() == responses_route;
+    const bool score = score_ && path == score_route;
+    const bool decisions = decisions_ && (path == decisions_route || path == systemone_route);
+    const bool count = tokenize_ && path == anthropic_count_route;
+    const bool messages = messages_ && path == anthropic_messages_route;
+    const bool responses = responses_ && path == responses_route;
     if (responses_ && !native.allow.empty() && response_store_ &&
         response_store_->serve_state(connection, request))
         return;
@@ -821,8 +822,10 @@ void ConnectionQueue::run(int slot) {
                     messages_(work->connection, slot, request.body);
                 } else if (responses_ && request.route_path() == responses_route) {
                     responses_(work->connection, slot, request.body);
-                } else if (decisions_ && request.route_path() == decisions_route) {
-                    decisions_(work->connection, slot, request.body);
+                } else if (decisions_ && (request.route_path() == decisions_route ||
+                                          request.route_path() == systemone_route)) {
+                    decisions_(work->connection, slot, request.body,
+                               request.route_path() == systemone_route);
                 } else {
                     complete_(work->connection, slot, request.body, chat_route(request));
                 }

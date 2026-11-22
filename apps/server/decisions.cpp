@@ -30,6 +30,7 @@ struct Question {
     std::vector<std::string> names;
     std::vector<std::string> details;
     std::vector<std::string> labels;
+    OrderedObject legend;
 };
 
 struct Request {
@@ -236,6 +237,102 @@ Request parse_request(std::string_view body) {
     return output;
 }
 
+bool blank(const Value* value) {
+    return !value || value->is_null() ||
+        (value->string() && stripped(read_utf8(*value->string())).empty()) ||
+        (value->array() && value->array()->empty()) ||
+        (value->ordered_object() && value->ordered_object()->empty());
+}
+
+Question parse_systemone_question(std::string_view id, const Value& value) {
+    const auto& fields_value = object(&value, "question");
+    fields(fields_value, {"type", "instructions", "criteria"});
+    Question question;
+    question.id = id;
+    question.kind = string(get(fields_value, "type"), "type");
+    const auto* instructions = get(fields_value, "instructions");
+    const auto instruction_text = text(instructions, "instructions", false);
+    if (!blank(instructions)) question.text = instruction_text;
+    const auto* criteria = get(fields_value, "criteria");
+    if (question.kind == "choice") {
+        const auto& options = object(criteria, "criteria");
+        if (options.empty() || options.size() > 255) {
+            invalid("choice criteria must contain between 1 and 255 options");
+        }
+        std::set<std::u32string> seen;
+        for (const auto& [name, detail] : options) {
+            option_name(name, seen);
+            question.names.push_back(name);
+            question.details.push_back(text(&detail, "criterion", false));
+        }
+        if (options.size() <= 26) {
+            for (std::size_t index = 0; index < options.size(); ++index) {
+                question.labels.emplace_back(1, static_cast<char>('A' + index));
+            }
+        }
+    } else if (question.kind == "score") {
+        for (const auto& level : list(criteria, "criteria", 1, 10)) {
+            auto index = std::to_string(question.names.size());
+            question.names.push_back(index);
+            question.details.push_back(text(&level, "criterion"));
+            question.legend.emplace_back(std::move(index), level);
+        }
+        question.labels = question.names;
+    } else if (question.kind == "noul") {
+        const OrderedObject empty;
+        const auto& conditions = !criteria || criteria->is_null()
+            ? empty : object(criteria, "criteria");
+        fields(conditions, {"true", "false"});
+        const auto* positive = get(conditions, "true");
+        const auto* negative = get(conditions, "false");
+        question.details = {text(positive, "true", false), text(negative, "false", false)};
+        if (blank(instructions) && blank(positive) && blank(negative)) {
+            invalid("a noul question needs instructions or a true or false description");
+        }
+        question.kind = "yes_no";
+        question.names = question.labels = {"yes", "no"};
+    } else {
+        invalid("type must be choice, score, or noul");
+    }
+    return question;
+}
+
+Request parse_systemone(std::string_view body, std::string_view model) {
+    const auto root = json::parse(body, json::Syntax::ordered_last_key_wins);
+    const auto& request = object(&root, "request");
+    for (const auto key : {"temperature", "prompt_format_version", "return_prompt_token_ids"}) {
+        if (const auto* field = get(request, key); field && !field->is_null()) {
+            invalid(std::string(key) + " is not part of this API, use /v1/decisions for it");
+        }
+    }
+    string(get(request, "model"), "model");
+    const auto* state = get(request, "state");
+    if (!state || state->is_null()) invalid("state must be text, an object, or an array");
+    Request output;
+    output.model = model;
+    output.input = text(state, "state", false);
+    const auto& questions = object(get(request, "questions"), "questions");
+    if (questions.empty() || questions.size() > max_score_items) {
+        invalid("questions has an invalid number of entries");
+    }
+    output.questions.reserve(questions.size());
+    for (const auto& [id, question] : questions) {
+        try {
+            output.questions.push_back(parse_systemone_question(id, question));
+        } catch (const ScoreValidationError& error) {
+            invalid("question '" + id + "': " + error.what());
+        }
+    }
+    if (const auto* images = get(request, "images")) {
+        if (!images->array()) invalid("images must be an array");
+        if (!images->array()->empty()) {
+            throw std::invalid_argument("Vision decision inputs are unavailable");
+        }
+    }
+    parse_template(get(request, "chat_template_kwargs"), output);
+    return output;
+}
+
 std::string render_question(std::string_view input, const Question& question) {
     std::string output(input);
     output += "\n\n";
@@ -264,47 +361,79 @@ std::string render_question(std::string_view input, const Question& question) {
     return output;
 }
 
-std::string render_prompt(const CompletionTokenizer& tokenizer, const Request& request,
-                          const Question& question) {
-    Array messages{OrderedObject{{"role", "user"},
-                                 {"content", render_question(request.input, question)}}};
+std::string render_prompt(const CompletionTokenizer& tokenizer, std::string content,
+                          bool vision_ids) {
+    Array messages{OrderedObject{{"role", "user"}, {"content", std::move(content)}}};
     return tokenizer.chat_template().render(
         {{"messages", std::move(messages)}, {"enable_thinking", false},
-         {"add_generation_prompt", true}, {"add_vision_id", request.vision_ids}}, ChatInput::http);
+         {"add_generation_prompt", true}, {"add_vision_id", vision_ids}}, ChatInput::http);
 }
 
-std::vector<int> encode_labels(const Tokenizer& tokenizer, std::string_view prompt,
-                               const std::vector<TokenId>& ids, const Question& question) {
+constexpr auto label_suffix = "\n\n"sv;
+
+bool label_suffix_matches(const Tokenizer& tokenizer, std::string_view prompt,
+                          const std::vector<TokenId>& ids,
+                          const std::vector<TokenId>& suffix_ids) {
     constexpr auto terminator = "</think>"sv;
-    constexpr auto suffix = "\n\n"sv;
     const auto marker_ids = tokenizer.encode(terminator);
-    const auto suffix_ids = tokenizer.encode(suffix);
-    const bool split = prompt.size() >= terminator.size() + suffix.size() &&
-        prompt.substr(prompt.size() - suffix.size() - terminator.size()) == "</think>\n\n" &&
+    return prompt.size() >= terminator.size() + label_suffix.size() &&
+        prompt.substr(prompt.size() - label_suffix.size() - terminator.size()) == "</think>\n\n" &&
         marker_ids.size() == 1 && marker_ids.front() >= checkpoint_base_vocab_size &&
         ids.size() >= 1 + suffix_ids.size() &&
         ids[ids.size() - suffix_ids.size() - 1] == marker_ids.front() &&
         std::equal(suffix_ids.rbegin(), suffix_ids.rend(), ids.rbegin());
+}
+
+std::optional<int> encode_label(const Tokenizer& tokenizer, std::string_view base,
+                                const std::vector<TokenId>& ids, const std::string& label) {
+    const auto candidate = tokenizer.encode(std::string(base) + label, ids.size() + 2);
+    if (candidate.size() != ids.size() + 1 ||
+        !std::equal(ids.begin(), ids.end(), candidate.begin()) ||
+        candidate.back() >= checkpoint_base_vocab_size) return std::nullopt;
+    return static_cast<int>(candidate.back());
+}
+
+std::vector<int> encode_labels(const Tokenizer& tokenizer, std::string_view prompt,
+                               const std::vector<TokenId>& ids, const Question& question) {
+    const auto suffix_ids = tokenizer.encode(label_suffix);
+    const bool split = label_suffix_matches(tokenizer, prompt, ids, suffix_ids);
     const auto& base_ids = split ? suffix_ids : ids;
-    const auto base_text = split ? suffix : prompt;
+    const auto base_text = split ? label_suffix : prompt;
     std::vector<int> labels;
     labels.reserve(question.labels.size());
     for (const auto& label : question.labels) {
-        auto candidate = tokenizer.encode(std::string(base_text) + label, base_ids.size() + 2);
-        if (candidate.size() != base_ids.size() + 1 ||
-            !std::equal(base_ids.begin(), base_ids.end(), candidate.begin()) ||
-            candidate.back() >= checkpoint_base_vocab_size ||
-            std::find(labels.begin(), labels.end(), static_cast<int>(candidate.back()))
-                != labels.end()) {
+        const auto candidate = encode_label(tokenizer, base_text, base_ids, label);
+        if (!candidate || std::find(labels.begin(), labels.end(), *candidate) != labels.end()) {
             throw std::invalid_argument("question '" + question.id + "': the answer label '" +
                 label + "' is not one distinct token after the chat prompt");
         }
-        labels.push_back(static_cast<int>(candidate.back()));
+        labels.push_back(*candidate);
     }
     return labels;
 }
 
-std::vector<BatchPrompt> prepare(const Request& request, const CompletionTokenizer& completion,
+std::vector<std::string> pair_labels(const CompletionTokenizer& completion, bool vision_ids) {
+    const auto& tokenizer = completion.get();
+    const auto suffix_ids = tokenizer.encode(label_suffix);
+    for (const auto content : {"x", "y"}) {
+        const auto prompt = render_prompt(completion, content, vision_ids);
+        if (!label_suffix_matches(tokenizer, prompt, tokenizer.encode(prompt), suffix_ids)) {
+            throw std::invalid_argument("More than 26 options require a stable chat prompt suffix");
+        }
+    }
+    std::set<int> seen;
+    std::vector<std::string> labels;
+    for (const char first : "ABCDEFGHIJKLMNOPQRSTUVWXYZ"sv) {
+        for (const char second : "ABCDEFGHIJKLMNOPQRSTUVWXYZ"sv) {
+            std::string label{first, second};
+            const auto id = encode_label(tokenizer, label_suffix, suffix_ids, label);
+            if (id && seen.insert(*id).second) labels.push_back(std::move(label));
+        }
+    }
+    return labels;
+}
+
+std::vector<BatchPrompt> prepare(Request& request, const CompletionTokenizer& completion,
                                  const BatchCallbacks& callbacks) {
     auto bytes = max_score_text_bytes;
     auto tokens = max_score_prompt_tokens;
@@ -315,9 +444,18 @@ std::vector<BatchPrompt> prepare(const Request& request, const CompletionTokeniz
     std::vector<BatchPrompt> batch;
     batch.reserve(request.questions.size());
     const auto& tokenizer = completion.get();
-    for (const auto& question : request.questions) {
+    std::optional<std::vector<std::string>> pairs;
+    for (auto& question : request.questions) {
         if (callbacks.is_cancelled()) return {};
-        const auto prompt = render_prompt(completion, request, question);
+        if (question.labels.empty()) {
+            if (!pairs) pairs = pair_labels(completion, request.vision_ids);
+            if (question.names.size() > pairs->size()) {
+                throw std::invalid_argument("Too many options for distinct two-letter labels");
+            }
+            question.labels.assign(pairs->begin(), pairs->begin() + question.names.size());
+        }
+        const auto prompt = render_prompt(completion, render_question(request.input, question),
+                                          request.vision_ids);
         if (!consume(bytes, prompt.size()) || !consume(labels, question.labels.size())) {
             throw std::length_error("Decision request exceeds the aggregate score budget");
         }
@@ -386,22 +524,98 @@ std::string response(const Request& request, const std::vector<BatchPrompt>& pro
         {"usage", std::move(usage)}}, true);
 }
 
+Value systemone_answer(const Question& question, const DecoderResult& result) {
+    if (!result.label_logprobs || result.label_logprobs->size() != question.labels.size()) {
+        throw std::logic_error("Missing System One result");
+    }
+    const auto& logs = *result.label_logprobs;
+    const auto values = probabilities(logs, 1, true);
+    long double mass = 0;
+    for (const auto logprob : logs) mass += std::exp(logprob);
+    if (question.kind == "yes_no") {
+        return OrderedObject{{"type", "noul"}, {"noul", values.front()},
+                             {"x_label_mass", static_cast<double>(mass)}};
+    }
+    const auto best = std::max_element(values.begin(), values.end()) - values.begin();
+    const auto count = values.size();
+    OrderedObject options;
+    long double total = 0;
+    long double score = 0;
+    long double spread = 0;
+    long double uniform_spread = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto value = values[index];
+        options.emplace_back(question.names[index], value);
+        total += value;
+        score += index * value;
+        spread += value * std::abs(static_cast<double>(index) - best);
+        uniform_spread += std::abs(static_cast<double>(index) - (count - 1) / 2.0);
+    }
+    OrderedObject output{{"type", question.kind}, {"probabilities", std::move(options)},
+                         {"x_label_mass", static_cast<double>(mass)}};
+    double confidence = 1;
+    if (question.kind == "choice") {
+        output.emplace_back("choice", question.names[best]);
+        if (count > 1) {
+            confidence = std::clamp(static_cast<double>(
+                (count * (values[best] / total) - 1) / (count - 1)), 0.0, 1.0);
+        }
+    } else {
+        output.emplace_back("score", static_cast<double>(score));
+        output.emplace_back("legend", question.legend);
+        if (count > 1) {
+            confidence = std::max(0.0, static_cast<double>(
+                1 - (spread / total) / (uniform_spread / count)));
+        }
+    }
+    output.emplace_back("confidence", confidence);
+    return output;
 }
 
-void serve_decisions(const Socket& connection, BatchService& service, int slot,
-                     const CompletionTokenizer& tokenizer, std::string_view body) {
+std::string systemone_response(const Request& request, const std::vector<BatchPrompt>& prompts,
+                               const std::vector<DecoderResult>& results) {
+    if (results.size() != prompts.size()) throw std::logic_error("Incomplete System One batch");
+    OrderedObject answers;
+    std::uint64_t tokens = 0;
+    for (std::size_t index = 0; index < prompts.size(); ++index) {
+        const auto& question = request.questions[index];
+        answers.emplace_back(question.id, systemone_answer(question, results[index]));
+        tokens += prompts[index].prompt.size();
+    }
+    return chat_template_json(OrderedObject{
+        {"model", request.model}, {"answers", std::move(answers)},
+        {"usage", OrderedObject{{"input_tokens", tokens}, {"output_tokens", 0}}}}, true);
+}
+
+void schema_error(const Socket& connection, bool systemone, std::string_view message) {
+    if (!systemone) {
+        write_tokenization_error(connection, "400 Bad Request", "Bad Request", message);
+        return;
+    }
+    OrderedObject error{{"type", "value_error"}, {"loc", Array{"body"}},
+                        {"msg", std::string(message)}};
+    write_json(connection, "422 Unprocessable Entity",
+               chat_template_json(OrderedObject{{"detail", Array{std::move(error)}}}, true));
+}
+
+void serve(const Socket& connection, BatchService& service, int slot,
+           const CompletionTokenizer& tokenizer, std::string_view body,
+           std::optional<std::string_view> model) {
     try {
-        const auto request = parse_request(body);
+        auto request = model ? parse_systemone(body, *model) : parse_request(body);
         BatchCallbacks callbacks;
         callbacks.is_cancelled = [&] { return disconnected(connection); };
         auto prompts = prepare(request, tokenizer, callbacks);
         if (prompts.empty()) return;
         const auto results = service.generate_batch(slot, prompts, callbacks);
-        if (results) write_json(connection, "200 OK", response(request, prompts, *results));
+        if (results) {
+            write_json(connection, "200 OK", model ? systemone_response(request, prompts, *results)
+                                                   : response(request, prompts, *results));
+        }
     } catch (const ScoreValidationError& error) {
-        write_tokenization_error(connection, "400 Bad Request", "Bad Request", error.what());
+        schema_error(connection, model.has_value(), error.what());
     } catch (const json::ParseError& error) {
-        write_tokenization_error(connection, "400 Bad Request", "Bad Request", error.what());
+        schema_error(connection, model.has_value(), error.what());
     } catch (const std::invalid_argument& error) {
         write_tokenization_error(connection, "400 Bad Request", "BadRequestError", error.what());
     } catch (const std::length_error& error) {
@@ -410,6 +624,19 @@ void serve_decisions(const Socket& connection, BatchService& service, int slot,
         write_tokenization_error(connection, "500 Internal Server Error", "InternalServerError",
                                  "Decision request failed");
     }
+}
+
+}
+
+void serve_decisions(const Socket& connection, BatchService& service, int slot,
+                     const CompletionTokenizer& tokenizer, std::string_view body) {
+    serve(connection, service, slot, tokenizer, body, std::nullopt);
+}
+
+void serve_systemone(const Socket& connection, BatchService& service, int slot,
+                     const CompletionTokenizer& tokenizer, std::string_view body,
+                     std::string_view model) {
+    serve(connection, service, slot, tokenizer, body, model);
 }
 
 }

@@ -502,14 +502,15 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
                                            Job& job, const DecoderCallbacks& callbacks) {
     DecoderResult result;
     bool announced = false;
+    const bool notify_admission = callbacks.on_admitted || callbacks.on_prompt_admitted;
     for (;;) {
-        const bool announce = job.admitted && !job.error && callbacks.on_admitted && !announced;
-        const bool poll_stream = announced && callbacks.on_stream_poll && !job.error &&
-            !job.finish;
+        const bool announce = job.admitted && !job.error && notify_admission && !announced;
+        const auto cached = announce ? job.cached_tokens : 0;
+        const bool poll = announced && callbacks.on_stream_poll && !job.error && !job.finish;
         lock.unlock();
         const bool connected = (!callbacks.is_cancelled || !callbacks.is_cancelled()) &&
-            (!announce || callbacks.on_admitted()) &&
-            (!poll_stream || callbacks.on_stream_poll());
+            (!announce || (callbacks.on_prompt_admitted ? callbacks.on_prompt_admitted(cached) :
+                callbacks.on_admitted())) && (!poll || callbacks.on_stream_poll());
         lock.lock();
         announced = announced || announce;
         if (!connected) {
@@ -517,9 +518,8 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
             result.finish_reason = DecoderFinishReason::cancelled;
             return result;
         }
-        const bool can_emit = announced || !job.admitted || !callbacks.on_admitted;
-        const bool has_output = job.has_output();
-        if (has_output && can_emit) {
+        const bool can_emit = announced || !job.admitted || !notify_admission;
+        if (job.has_output() && can_emit) {
             const auto step = job.pending.front();
             lock.unlock();
             const bool accepted = emit_step(step, callbacks, result);
@@ -537,7 +537,7 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
         } else if (job.finish && can_emit) {
             result.finish_reason = *job.finish;
             return result;
-        } else if (!has_output && !job.finish) {
+        } else if (!job.has_output() && !job.finish) {
             changed.wait_for(lock, disconnect_poll);
         }
     }

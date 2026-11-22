@@ -16,6 +16,7 @@ struct TextRequest {
     bool include_usage = false;
     bool return_token_ids = false;
     bool chat = false;
+    bool anthropic = false;
     std::vector<std::string> stop_text;
     std::optional<MediaPrompt> media;
     ChatOutputOptions chat_output;
@@ -35,6 +36,9 @@ using MediaGenerator = std::function<DecoderResult(const MediaPrompt&, const Dec
 
 TextCompletionRequest parse_text_request(const json::Object& body,
                                          const CompletionTokenizer& tokenizer);
+TextRequest parse_chat_request(const json::OrderedObject& chat,
+                               const CompletionTokenizer& tokenizer,
+                               bool media_enabled = false);
 TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer,
                                bool media_enabled = false);
 void set_cache_salt(const json::Object& object, DecoderOptions& options);
@@ -49,6 +53,7 @@ void complete_text_batch(const Socket& connection, TextCompletionRequest complet
                          const CompletionTokenizer& tokenizer, BatchService& service, int slot);
 void complete_chat_request(const Socket& connection, std::string_view body,
                            const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                           const MediaGenerator& generate_media, BatchService& service, int slot);
+                           const MediaGenerator& generate_media, BatchService& service, int slot,
+                           bool anthropic = false);
 
 }

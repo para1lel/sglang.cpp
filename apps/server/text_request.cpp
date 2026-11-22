@@ -958,15 +958,11 @@ void set_cache_salt(const json::Object& object, DecoderOptions& options) {
     }
 }
 
-TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer,
+TextRequest parse_chat_request(const json::OrderedObject& chat,
+                               const CompletionTokenizer& tokenizer,
                                bool media_enabled) {
-    const auto parsed = parse_body(body, json::Syntax::ordered);
-    const auto* chat = parsed.ordered_object();
-    if (!chat) {
-        bad_request("Expected a JSON object for a chat request");
-    }
-    auto media = parse_chat_media(*chat, media_enabled);
-    auto normalized = media ? std::move(media->chat) : *chat;
+    auto media = parse_chat_media(chat, media_enabled);
+    auto normalized = media ? std::move(media->chat) : chat;
     normalize_template_options(normalized);
     const auto options = chat_text_options(normalized, media.has_value());
     auto request = text_options(options, tokenizer, true);

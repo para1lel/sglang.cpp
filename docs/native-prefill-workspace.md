@@ -35,7 +35,7 @@ Unexpected CUDA failures return to the caller. After predecode submission succee
 
 ## Tiled prefill under saturation
 
-The tiled planner applies to chunked B200 `tensor-core` prefill with a positive step cap, prefix caching off, and the wide SM100 prefill opt-in off. Selected media, draft, or restored-prefix lanes disable tiling. [Route selection](../src/decoder_batch.cpp#L870)<!-- prefix: "const bool t" --> · [Lane checks](../src/decoder_batch.cpp#L260)<!-- prefix: "if (lane-\u003edr" -->
+The tiled planner applies to chunked B200 `tensor-core` prefill with a positive step cap, prefix caching off, and the wide SM100 prefill opt-in off. Selected media, draft, or restored-prefix lanes disable tiling. [Route selection](../src/decoder_batch.cpp#L870)<!-- prefix: "const bool t" --> · [Lane checks](../src/decoder_batch.cpp#L260)<!-- prefix: "if (lane->dr" -->
 
 The planner reserves one row per ready decode lane. It uses tiled scheduling when the remaining budget can fit at least one full tile. More lanes must be ready to supply full tiles than the budget can fit. The planner scans from the rotating cursor and grants one full tile or finishing tail per lane when the rows fit. The next step starts at the first deferred lane. Other capped steps use fair share or the existing cache planner. [Tiled planner](../include/sglang/text/decoder_batch_plan.h#L24)<!-- prefix: "inline std::" --> · [Fair share](../include/sglang/text/decoder_batch_plan.h#L52)<!-- prefix: "inline StepP" -->
 
@@ -63,7 +63,7 @@ The step reuses one 487.44 MiB arena across all pairs. A 1,024-row arena uses 24
 
 ## Verification
 
-The `decoder-batch-plan-check` CPU target checks the step budget, decode reservations, finishing tails, rotation under replenished load, and fair-share fallback. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner test target](../xmake.lua#L281)<!-- prefix: "target(\"deco" -->
+The `decoder-batch-plan-check` CPU target checks the step budget, decode reservations, finishing tails, rotation under replenished load, and fair-share fallback. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner test target](../xmake.lua#L282)<!-- prefix: "target(\"deco" -->
 
 On one reserved B200, replay identical checkpoint Q, MXFP8 payloads and scales, and remapped page tables. Exercise both bounds and nonzero page offsets. Compare full BF16 output with raw paired and archived wide Flash. Include a short tail, causal masks, invalid full- and partial-page V, and repair.
 

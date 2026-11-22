@@ -337,6 +337,11 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
         if (!lane) {
             throw std::logic_error("Selected an empty CPU lane");
         }
+        const auto* failure = std::getenv("SGLANG_TEST_MESSAGES_FAILURE_AFTER");
+        if (failure && std::to_string(lane->tokens) == failure) {
+            state_->available = false;
+            throw std::runtime_error("Injected Messages decoder failure");
+        }
         if (lane->health && !health_control("release")) {
             continue;
         }
@@ -391,6 +396,10 @@ DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {
 }
 
 void DecoderBatch::reset_prefix_cache() {}
+
+#ifdef SGLANG_TEST_RETIRED_ALLOCATIONS
+void DecoderBatch::release_retired_allocations() {}
+#endif
 
 struct VisionEncoder::Impl {};
 

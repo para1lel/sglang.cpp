@@ -2,6 +2,8 @@
 #include "sglang/server/text_stop.h"
 
 #include "sglang/json.h"
+#include "sglang/server/anthropic_count.h"
+#include "sglang/server/anthropic_messages.h"
 #include "sglang/server/http.h"
 #include "sglang/utf8.h"
 
@@ -265,6 +267,9 @@ public:
           prompt_(prompt), index_(index),
           echo_(echo ? echo : request.echo ? &*request.echo : nullptr),
           prefix_(response_prefix(request)) {
+        if (request.anthropic) {
+            anthropic_.emplace(connection, stream, request.stream, prompt.size());
+        }
         if (request.chat_output.enabled()) {
             parser_.emplace(request.chat_output);
         }
@@ -277,6 +282,10 @@ public:
     bool token(int id, const ScoreRow* score = nullptr);
     bool start() {
         return !request_.stream || stream_.start();
+    }
+    bool admit_messages(std::size_t cached) { anthropic_->admit(cached); return true; }
+    void fail_messages(std::string_view type, const char* message) {
+        anthropic_->fail(type, message);
     }
     bool poll() { return stream_.poll(); }
     void finish(const DecoderResult& result, std::size_t count);
@@ -297,6 +306,7 @@ private:
     bool event(std::string_view data);
     bool accept(const ChatOutputEvent& delta, const int* id);
     bool project(std::string_view text, const int* id = nullptr, const ScoreRow* score = nullptr);
+    const char* finish_output(const DecoderResult& result);
     void finish_stream(const std::string& choice, std::size_t count, std::size_t cached_tokens);
 
     const Socket& connection_;
@@ -310,6 +320,7 @@ private:
     const std::string prefix_;
     Utf8Stream utf8_;
     std::optional<ChatOutputParser> parser_;
+    std::optional<AnthropicMessages> anthropic_;
     std::string text_;
     std::string reasoning_;
     std::vector<ToolCall> tool_calls_;
@@ -475,6 +486,10 @@ std::string TextResponse::filter_stop(std::string_view delta, bool final) {
 }
 
 bool TextResponse::accept(const ChatOutputEvent& delta, const int* id) {
+    if (anthropic_) {
+        write_failed_ = !anthropic_->accept(delta);
+        return !write_failed_;
+    }
     std::string call_id;
     if (delta.kind == ChatOutputKind::tool_call) {
         static std::atomic<std::uint64_t> next_call_id{1};
@@ -512,6 +527,8 @@ bool TextResponse::project(std::string_view text, const int* id, const ScoreRow*
         if (request_.stream && request_.return_token_ids && id) {
             return event(choice_chunk(prefix_, choice({}, id, 1)));
         }
+    } else if (anthropic_) {
+        return accept({ChatOutputKind::content, text, 0, {}}, id) && !disconnected(connection_);
     } else if (!request_.stream) {
         text_ += text;
     } else if (!text.empty() || (id && request_.return_token_ids) || score) {
@@ -549,23 +566,29 @@ void TextResponse::finish_stream(const std::string& choice, std::size_t count,
     }
 }
 
-std::optional<std::string> TextResponse::finish_choice(const DecoderResult& result,
-                                                       std::size_t count) {
+const char* TextResponse::finish_output(const DecoderResult& result) {
     const auto tail = filter_stop(utf8_.finish(), true);
     auto reason = text_stopped_ ? "stop" : finish_reason(request_, result);
     if (!project(tail)) {
-        return std::nullopt;
+        return nullptr;
     }
     if (parser_) {
         const bool stopped = std::string_view(reason) == "stop";
         if (!parser_->finish(stopped ? ChatEnd::stop : ChatEnd::length,
                             [&](const auto& delta) { return accept(delta, nullptr); })) {
-            return std::nullopt;
+            return nullptr;
         }
         if (stopped && parser_->calls()) {
             reason = "tool_calls";
         }
     }
+    return reason;
+}
+
+std::optional<std::string> TextResponse::finish_choice(const DecoderResult& result,
+                                                       std::size_t count) {
+    const auto* reason = finish_output(result);
+    if (!reason) return std::nullopt;
     if (request_.stream) {
         return choice({}, nullptr, 0, reason);
     }
@@ -574,6 +597,12 @@ std::optional<std::string> TextResponse::finish_choice(const DecoderResult& resu
 }
 
 void TextResponse::finish(const DecoderResult& result, std::size_t count) {
+    if (anthropic_) {
+        if (const auto* reason = finish_output(result)) {
+            anthropic_->finish(reason, count, result.cached_prompt_tokens);
+        }
+        return;
+    }
     const auto final = finish_choice(result, count);
     if (!final) {
         return;
@@ -640,12 +669,18 @@ void complete_text(const Socket& connection, const TextRequest& request,
     }
     EventStream stream(connection);
     TextResponse response(connection, stream, tokenizer.get(), request, request.prompt);
-    const DecoderCallbacks callbacks{
+    DecoderCallbacks callbacks{
         [&](int token) { return response.token(token); },
         [&] { return disconnected(connection); },
         [&] { return response.start(); },
         [&] { return response.poll(); },
     };
+    if (request.anthropic && request.stream) {
+        callbacks.on_admitted = {};
+        callbacks.on_prompt_admitted = [&](std::size_t cached) {
+            return response.admit_messages(cached);
+        };
+    }
     try {
         const auto result = generate(request.prompt, request.options, callbacks);
         const bool complete = result.finish_reason != DecoderFinishReason::cancelled;
@@ -653,6 +688,15 @@ void complete_text(const Socket& connection, const TextRequest& request,
             response.finish(result, result.output_token_ids.size());
         }
     } catch (const std::exception& error) {
+        if (request.anthropic && request.stream) {
+            std::cerr << "Messages generation failed: " << error.what() << '\n';
+            if (dynamic_cast<const std::invalid_argument*>(&error)) {
+                response.fail_messages("invalid_request_error", error.what());
+            } else {
+                response.fail_messages("api_error", "Internal server error");
+            }
+            return;
+        }
         completion_failure(stream, error);
     }
 }
@@ -766,13 +810,33 @@ void complete_text_batch(const Socket& connection, TextCompletionRequest complet
     }
 }
 
+TextRequest parse_chat_request(std::string_view body, const CompletionTokenizer& tokenizer,
+                               bool media_enabled) {
+    json::Value parsed;
+    try {
+        parsed = json::parse(body, json::Syntax::ordered);
+    } catch (const json::ParseError&) {
+        throw HttpError("400 Bad Request", "Invalid JSON request body");
+    }
+    if (!parsed.ordered_object()) {
+        throw HttpError("400 Bad Request", "Expected a JSON object for a chat request");
+    }
+    return parse_chat_request(*parsed.ordered_object(), tokenizer, media_enabled);
+}
+
 void complete_chat_request(const Socket& connection, std::string_view body,
                            const CompletionTokenizer& tokenizer, const TextGenerator& generate,
-                           const MediaGenerator& generate_media, BatchService& service, int slot) {
+                           const MediaGenerator& generate_media, BatchService& service, int slot,
+                           bool anthropic) {
     if (disconnected(connection)) {
         return;
     }
-    const auto request = parse_chat_request(body, tokenizer, bool(generate_media));
+    auto request = anthropic ? parse_chat_request(
+        anthropic_messages_chat(json::parse(body, json::Syntax::python_request),
+                               tokenizer.chat_parsers()), tokenizer, bool(generate_media)) :
+        parse_chat_request(body, tokenizer, bool(generate_media));
+    request.anthropic = anthropic;
+    if (anthropic) request.chat_output.complete_truncated_calls = false;
     if (request.options.generated_top_logprobs >= 0) {
         complete_scored_text(connection, request, tokenizer, service, slot);
         return;

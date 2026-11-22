@@ -209,7 +209,8 @@ json::Value parse_completion_body(std::string_view body, bool allow_text) {
 
 void dispatch_completion(const Socket& connection, BatchService& service, int slot,
                          const CompletionTokenizer* tokenizer, std::string_view body,
-                         bool chat = false, VisionCompletion* vision = nullptr) {
+                         bool chat = false, VisionCompletion* vision = nullptr,
+                         bool anthropic = false) {
     service.rethrow_failure();
     const TextGenerator generate = [&](const auto& prompt, const auto& options,
                                        const auto& callbacks) {
@@ -223,7 +224,7 @@ void dispatch_completion(const Socket& connection, BatchService& service, int sl
             };
         }
         complete_chat_request(connection, body, *tokenizer, generate, generate_media,
-                              service, slot);
+                              service, slot, anthropic);
         return;
     }
     json::Value parsed;
@@ -265,6 +266,27 @@ void complete_chat(const Socket& connection, BatchService& service, int slot,
                    const CompletionTokenizer& tokenizer, std::string_view body,
                    VisionCompletion* vision) {
     dispatch_completion(connection, service, slot, &tokenizer, body, true, vision);
+}
+
+void complete_messages(const Socket& connection, BatchService& service, int slot,
+                       const CompletionTokenizer& tokenizer, std::string_view body,
+                       VisionCompletion* vision) {
+    constexpr auto bad_request = "400 Bad Request";
+    constexpr auto invalid = "invalid_request_error";
+    try {
+        if (body.empty()) throw std::invalid_argument("Field required");
+        dispatch_completion(connection, service, slot, &tokenizer, body, true, vision, true);
+    } catch (const HttpError& error) {
+        write_anthropic_error(connection, error.status, invalid, error.what());
+    } catch (const json::ParseError&) {
+        write_anthropic_error(connection, bad_request, invalid, "Invalid JSON request body");
+    } catch (const std::invalid_argument& error) {
+        write_anthropic_error(connection, bad_request, invalid, error.what());
+    } catch (const std::exception& error) {
+        std::cerr << "Messages request failed: " << error.what() << '\n';
+        write_anthropic_error(connection, "500 Internal Server Error", "api_error",
+                              "Internal server error");
+    }
 }
 
 }

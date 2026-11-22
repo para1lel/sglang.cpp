@@ -9,7 +9,7 @@ output=$(realpath -m -- "${3:?Pass the output executable path}")
 sources=("$source/apps/sglang-server.cpp")
 for name in batch_service completions flush_cache http text_request text_completion chat_template \
     chat_media chat_output chat_tool_constraints native_generate ollama_discovery ollama_generate \
-    parse_function_call prefix_controls anthropic_count score tokenization \
+    parse_function_call prefix_controls anthropic_count anthropic_messages score tokenization \
     tokenization_validation tool_literal tool_union; do
     file="$source/apps/server/$name.cpp"
     if [[ -f "$file" ]]; then
@@ -36,8 +36,12 @@ if [[ -n ${CONDA_PREFIX:-} ]]; then
 fi
 
 media_api=()
-if [[ $(<"$source/include/sglang/decoder_batch.h") == *admit_multimodal* ]]; then
+batch_header=$(<"$source/include/sglang/decoder_batch.h")
+if [[ "$batch_header" == *admit_multimodal* ]]; then
     media_api=(-DSGLANG_TEST_BATCH_MEDIA)
+fi
+if [[ "$batch_header" == *release_retired_allocations* ]]; then
+    media_api+=(-DSGLANG_TEST_RETIRED_ALLOCATIONS)
 fi
 vision_header="$source/include/sglang/server/vision_completion.h"
 if [[ -f "$vision_header" && $(<"$vision_header") == *'generate(const Decoder&'* ]]; then

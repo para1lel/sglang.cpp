@@ -1,5 +1,6 @@
 #include "sglang/server/anthropic_count.h"
 
+#include "sglang/server/completions.h"
 #include "sglang/server/tokenization_validation.h"
 #include "sglang/utf8.h"
 
@@ -199,9 +200,18 @@ Value text_part(std::string value) {
     return OrderedObject{{"type", "text"}, {"text", std::move(value)}};
 }
 
-std::optional<Value> image_part(const OrderedObject& block) {
+std::optional<Value> image_part(const OrderedObject& block, bool generation) {
     const auto* value = supplied(block, "source");
     const auto* source = value ? value->ordered_object() : nullptr;
+    if (generation) {
+        if (!source || text(*source, "type") != "base64" ||
+            text(*source, "media_type") != "image/png" || text(*source, "data").empty()) {
+            invalid("image.source", "Native Messages requires inline base64 image/png");
+        }
+        return OrderedObject{{"type", "image_url"},
+            {"image_url", OrderedObject{
+                {"url", "data:image/png;base64," + std::string(text(*source, "data"))}}}};
+    }
     if (!source) return std::nullopt;
     const bool base64 = text(*source, "type") == "base64";
     const auto* payload = supplied(*source, base64 ? "data" : "url");
@@ -315,7 +325,7 @@ struct ToolResult {
     std::string text;
 };
 
-ToolResult tool_result(const Value* content, bool forward_parts) {
+ToolResult tool_result(const Value* content, bool forward_parts, bool generation) {
     if (!content || content->string()) {
         std::string text(content ? *content->string() : "");
         return {{Value(text)}, std::move(text)};
@@ -335,14 +345,15 @@ ToolResult tool_result(const Value* content, bool forward_parts) {
                 if (forward_parts) part = text_part(string);
             }
         } else if (forward_parts && kind == "image") {
-            part = image_part(block);
+            part = image_part(block, generation);
         } else if (forward_parts && kind == "tool_reference") {
+            if (generation) invalid("tool_reference", "Deferred tool references are unsupported");
             auto name = text(block, "tool_name");
             if (name.empty()) name = text(block, "name");
             if (!name.empty()) {
                 part = OrderedObject{{"type", "tool_reference"}, {"name", std::string(name)}};
             }
-        }
+        } else if (generation) invalid(kind, "Unsupported tool result content block");
         if (!part) continue;
         const bool reference = kind == "tool_reference";
         if (!group.empty() && references != reference) {
@@ -383,7 +394,7 @@ std::string history_thinking(const Array& blocks, bool reasoning_parser) {
 }
 
 void convert_turn(Array& messages, std::string_view role, const Value& content,
-                  bool reasoning_parser) {
+                  bool reasoning_parser, bool generation) {
     if (content.string()) {
         emit(messages, role, content);
         return;
@@ -401,23 +412,36 @@ void convert_turn(Array& messages, std::string_view role, const Value& content,
         if (kind == "text") {
             parts.emplace_back(text_part(std::string(text(block, "text"))));
         } else if (kind == "image") {
-            if (auto part = image_part(block)) parts.push_back(std::move(*part));
+            if (auto part = image_part(block, generation)) parts.push_back(std::move(*part));
         } else if (kind == "search_result") {
             auto search = search_text(block);
             if (!search.empty()) parts.emplace_back(text_part(std::move(search)));
         } else if (kind == "tool_use") {
+            if (generation && role != "assistant") {
+                invalid(kind, "Tool calls require an assistant turn");
+            }
             calls.emplace_back(tool_call(block));
         } else if (kind == "tool_result") {
-            auto result = tool_result(supplied(block, "content"), role == "user");
+            auto result = tool_result(supplied(block, "content"), role == "user", generation);
             if (role == "user") {
                 if (!parts.empty()) emit(messages, role, collapse(std::move(parts)));
                 parts.clear();
                 for (auto& result_content : result.contents) {
                     emit(messages, "tool", std::move(result_content));
+                    if (generation) {
+                        auto id = text(block, "tool_use_id");
+                        if (id.empty()) id = text(block, "id");
+                        messages.back().ordered_object()->emplace_back("tool_call_id",
+                                                                       std::string(id));
+                    }
                 }
             } else {
                 parts.emplace_back(text_part("Tool result: " + result.text));
             }
+        } else if (generation && kind != "thinking") {
+            invalid(kind, "Unsupported Messages content block");
+        } else if (generation && (role != "assistant" || !reasoning_parser)) {
+            invalid(kind, "Thinking history requires an assistant turn and a reasoning parser");
         }
     }
     if (role == "user") {
@@ -521,7 +545,7 @@ bool server_tool(const OrderedObject& tool, std::string_view field) {
     return false;
 }
 
-ChatTools convert_tools(const OrderedObject& request) {
+ChatTools convert_tools(const OrderedObject& request, bool generation) {
     struct NamedTool {
         std::string_view name;
         Value value;
@@ -537,6 +561,7 @@ ChatTools convert_tools(const OrderedObject& request) {
             const auto* defer = supplied(tool, "defer_loading");
             const auto deferred = optional_bool(defer, field + ".defer_loading");
             if (server_tool(tool, field)) continue;
+            if (generation && deferred) invalid(field, "Deferred custom tools are unsupported");
             const auto name = required_text(tool, "name", field + ".name");
             if (const auto* type = supplied(tool, "type"); type && type->string() != "custom") {
                 invalid(field + ".custom.type", "Input should be 'custom'");
@@ -564,8 +589,9 @@ ChatTools convert_tools(const OrderedObject& request) {
             invalid("tool_choice.type", "Input should be 'auto', 'any', 'tool' or 'none'");
         }
         optional_text(object, "name");
-        optional_bool(json::get(object, "disable_parallel_tool_use"),
-                      "tool_choice.disable_parallel_tool_use");
+        const auto parallel = json::get(object, "disable_parallel_tool_use");
+        const bool disabled = optional_bool(parallel, "tool_choice.disable_parallel_tool_use");
+        if (generation) selected.parallel = !disabled;
         if (kind == "none") return selected;
         if ((kind == "any" || kind == "tool") && tools.empty()) {
             throw std::invalid_argument("tool_choice='" + std::string(kind) +
@@ -582,8 +608,12 @@ ChatTools convert_tools(const OrderedObject& request) {
                 "(server-side Anthropic tools cannot be selected)");
         }
     }
+    if (generation && kind == "any") selected.choice = ChatToolChoice::required;
+    if (generation && kind == "tool") selected.choice = ChatToolChoice::named;
     for (auto& tool : tools) {
-        if (kind != "tool" || tool.name == name) selected.tools.push_back(std::move(tool.value));
+        if (generation || kind != "tool" || tool.name == name) {
+            selected.tools.push_back(std::move(tool.value));
+        }
     }
     return selected;
 }
@@ -660,9 +690,7 @@ std::string_view output_effort(const OrderedObject& request) {
     return effort == "xhigh" ? "max" : effort;
 }
 
-}
-
-AnthropicCountChat anthropic_count_chat(const Value& value, bool reasoning_parser) {
+AnthropicCountChat convert_chat(const Value& value, bool reasoning_parser, bool generation) {
     const auto* object = value.ordered_object();
     if (!object) {
         throw std::invalid_argument(value.is_null() ? "Field required"
@@ -677,7 +705,8 @@ AnthropicCountChat anthropic_count_chat(const Value& value, bool reasoning_parse
         const auto& turn = *value.ordered_object();
         const auto role = text(turn, "role");
         if (role != "system") {
-            convert_turn(messages, role, *json::get(turn, "content"), reasoning_parser);
+            convert_turn(messages, role, *json::get(turn, "content"), reasoning_parser,
+                         generation);
         }
     }
     if (const auto* betas = supplied(request, "betas")) {
@@ -687,10 +716,85 @@ AnthropicCountChat anthropic_count_chat(const Value& value, bool reasoning_parse
     }
     const bool thinking = thinking_enabled(request, reasoning_parser);
     const auto effort = output_effort(request);
-    auto tools = convert_tools(request);
+    auto tools = convert_tools(request, generation);
     OrderedObject options{{"chat_template_kwargs", OrderedObject{{"enable_thinking", thinking}}}};
     if (!effort.empty()) options.emplace_back("reasoning_effort", std::string(effort));
     return {std::move(messages), std::move(tools), std::move(options)};
+}
+
+void add_generation_options(OrderedObject& chat, const OrderedObject& request) {
+    const auto* budget = json::get(request, "max_tokens");
+    if (!budget) invalid("max_tokens", "Field required");
+    const auto maximum = integer(*budget, "max_tokens");
+    if (maximum <= 0) invalid("max_tokens", "Value error, max_tokens must be positive");
+    if (maximum > 262144) invalid("max_tokens", "Expected at most 262144");
+    chat.emplace_back("max_tokens", static_cast<int>(maximum));
+    const auto stream = optional_bool(supplied(request, "stream"), "stream");
+    chat.emplace_back("stream", stream);
+    for (const auto key : {"temperature"sv, "top_p"sv}) {
+        if (const auto* value = supplied(request, key)) {
+            const auto number = value->boolean() ? std::optional<double>(*value->boolean())
+                                                 : chat_number(*value);
+            if (!number) invalid(key, "Input should be a valid number");
+            chat.emplace_back(key, *number);
+        }
+    }
+    if (const auto* value = supplied(request, "top_k")) {
+        const auto number = integer(*value, "top_k");
+        if (number < -1 || number >= 0x1p63) invalid("top_k", "Expected a supported top_k");
+        chat.emplace_back("top_k", static_cast<std::int64_t>(number));
+    }
+    if (const auto* stops = supplied(request, "stop_sequences")) {
+        for (const auto& stop : structure<Array>(stops, "stop_sequences")) {
+            if (!stop.string()) invalid("stop_sequences", "Input should be a valid string");
+        }
+        chat.emplace_back("stop", *stops);
+    }
+    if (const auto* metadata = supplied(request, "metadata")) {
+        structure<OrderedObject>(metadata, "metadata");
+    }
+    optional_text(request, "cache_salt");
+    if (const auto* salt = supplied(request, "cache_salt")) chat.emplace_back("cache_salt", *salt);
+    for (const auto key : {"bootstrap_host"sv, "bootstrap_port"sv, "bootstrap_room"sv}) {
+        if (supplied(request, key)) invalid(key, "Disaggregated routing is unsupported");
+    }
+    const auto* config = supplied(request, "output_config");
+    const auto* format = config ? supplied(*config->ordered_object(), "format") : nullptr;
+    if (format) {
+        chat.emplace_back("response_format", OrderedObject{
+            {"type", "json_schema"}, {"json_schema", OrderedObject{
+                {"name", "response"}, {"strict", true},
+                {"schema", *json::get(*format->ordered_object(), "schema")}}}});
+    }
+}
+
+}
+
+AnthropicCountChat anthropic_count_chat(const Value& value, bool reasoning_parser) {
+    return convert_chat(value, reasoning_parser, false);
+}
+
+OrderedObject anthropic_messages_chat(const Value& value, ChatParsers parsers) {
+    auto converted = convert_chat(value, parsers.qwen3_reasoning, true);
+    if (converted.messages.empty()) throw std::invalid_argument("Messages cannot be empty.");
+    const auto& request = *value.ordered_object();
+    auto& chat = converted.options;
+    chat.emplace_back("model", *json::get(request, "model"));
+    chat.emplace_back("messages", std::move(converted.messages));
+    add_generation_options(chat, request);
+    if (!converted.tools.tools.empty()) {
+        if (!parsers.qwen3_coder_tools) invalid("tools", "Requires --tool-call-parser qwen3_coder");
+        chat.emplace_back("tools", std::move(converted.tools.tools));
+        chat.emplace_back("parallel_tool_calls", converted.tools.parallel);
+        if (converted.tools.choice == ChatToolChoice::required) {
+            chat.emplace_back("tool_choice", "required");
+        } else if (converted.tools.choice == ChatToolChoice::named) {
+            const auto name = text(*supplied(request, "tool_choice")->ordered_object(), "name");
+            chat.emplace_back("tool_choice", OrderedObject{{"type", "function"},
+                {"function", OrderedObject{{"name", std::string(name)}}}});
+        }
+    }
+    return std::move(chat);
 }
 
 }

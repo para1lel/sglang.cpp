@@ -218,6 +218,8 @@ std::size_t content_length(std::string_view headers, HttpRequest& request,
     }
     if (content_type) {
         request.body_is_json = json_media_type(*content_type);
+        request.body_is_application_json =
+            ascii_case_equal(content_type->substr(0, content_type->find(';')), "application/json");
     }
     const auto path = request.route_path();
     if (request.method == "POST" &&
@@ -637,14 +639,18 @@ void write_tokenization_error(const Socket& connection, std::string_view status,
     write_json(connection, status, body);
 }
 
-void write_anthropic_error(const Socket& connection, std::string_view status,
-                           std::string_view type, std::string_view message) {
+std::string anthropic_error_body(std::string_view type, std::string_view message) {
     std::string body = R"({"type":"error","error":{"type":)";
     json::append_quoted(body, type);
     body += R"(,"message":)";
     json::append_quoted(body, message);
     body += "}}";
-    write_json(connection, status, body);
+    return body;
+}
+
+void write_anthropic_error(const Socket& connection, std::string_view status,
+                           std::string_view type, std::string_view message) {
+    write_json(connection, status, anthropic_error_body(type, message));
 }
 
 void write_internal_server_error(const Socket& connection) {
@@ -697,12 +703,20 @@ bool EventStream::poll() {
         send("3\r\n:\n\n\r\n");
 }
 
-bool EventStream::write(std::string_view data) {
+bool EventStream::write(std::string_view data, std::string_view event) {
     const bool sse = format_ == Format::sse;
+    const auto event_size = event.empty() ? 0 : event.size() + 8;
     char size[2 * sizeof(std::size_t)];
-    const auto encoded = std::to_chars(size, size + sizeof(size), data.size() + (sse ? 8 : 1), 16);
+    const auto length = data.size() + (sse ? 8 + event_size : 1);
+    const auto encoded = std::to_chars(size, size + sizeof(size), length, 16);
     std::string chunk(size, encoded.ptr);
-    chunk += sse ? "\r\ndata: " : "\r\n";
+    chunk += "\r\n";
+    if (sse && !event.empty()) {
+        chunk += "event: ";
+        chunk += event;
+        chunk += '\n';
+    }
+    if (sse) chunk += "data: ";
     chunk += data;
     chunk += sse ? "\n\n\r\n" : "\n\r\n";
     return send(chunk);

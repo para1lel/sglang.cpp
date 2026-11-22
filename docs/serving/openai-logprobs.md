@@ -16,7 +16,7 @@ In OpenAI completions and native `/generate`, `logit_bias` maps decimal token ID
 
 Set integer `logprobs` from `0` through `20` on any of the [four prompt forms](../text-serving.md#send-a-request). `0` returns selected token scores and an empty `top_logprobs` array. Values `1`–`20` add a token-string-to-score map for each selected token. When ranked IDs map to the same string, the last ranked entry supplies that key's score. Omission or null leaves the response field absent. The [frozen benchmark request](../../benchmarks/streaming/README.md#wire-contract) rejects `logprobs`.
 
-JSON includes `logprobs` inside each choice, with `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset`. Offsets are `-1`. Score token strings preserve valid UTF-8 and map invalid byte fragments through Latin-1. In SSE, collect new scores by choice index. [Completion score writer](../../apps/server/text_completion.cpp#L90)<!-- prefix: "void append_" -->
+JSON includes `logprobs` inside each choice, with `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset`. Offsets are `-1`. Score token strings preserve valid UTF-8 and map invalid byte fragments through Latin-1. In SSE, collect new scores by choice index. [Completion score writer](../../apps/server/text_completion.cpp#L92)<!-- prefix: "void append_" -->
 
 With `echo: true` and `logprobs` from `1` through `20`, prompt scores precede generated scores in JSON and appear in the first SSE choice event for each index. The first prompt token has a null score and null alternatives. The remaining prompt tokens use the full-vocabulary target scores from their preceding prompt positions, before generation penalties and logit bias. This works with `max_tokens: 0`. At `logprobs: 0`, scores cover generated tokens only. A zero-budget choice with requested scores but no prompt scores has empty arrays in JSON and `logprobs: null` in SSE.
 
@@ -24,11 +24,11 @@ With `echo: true` and `logprobs` from `1` through `20`, prompt scores precede ge
 
 Set `logprobs: true` and optionally an integer `top_logprobs` from `0` through `20`. Omit the top count or set it to null for zero alternatives. Omission or `false` for `logprobs` leaves scores absent even with a valid top count. An explicit `logprobs: null` returns HTTP 400.
 
-The choice's `logprobs.content` contains one object per committed token. Each object has `token`, `bytes`, `logprob`, and a `top_logprobs` array. The `token` string uses replacement characters for invalid UTF-8. The `bytes` array contains the original unsigned bytes. A zero-budget JSON choice has empty `content`. The SSE role choice carries `logprobs: null`. [Chat score writer](../../apps/server/text_completion.cpp#L147)<!-- prefix: "void append_" -->
+The choice's `logprobs.content` contains one object per committed token. Each object has `token`, `bytes`, `logprob`, and a `top_logprobs` array. The `token` string uses replacement characters for invalid UTF-8. The `bytes` array contains the original unsigned bytes. A zero-budget JSON choice has empty `content`. The SSE role choice carries `logprobs: null`. [Chat score writer](../../apps/server/text_completion.cpp#L149)<!-- prefix: "void append_" -->
 
 ## Streaming and stops
 
-SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L524)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L602)<!-- prefix: "bool consume" -->
+SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L541)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L631)<!-- prefix: "bool consume" -->
 
 ## Verification
 

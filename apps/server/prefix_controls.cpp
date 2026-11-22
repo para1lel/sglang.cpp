@@ -287,10 +287,11 @@ public:
                     std::string_view health, bool prefix_controls, const BatchGenerate& generate,
                     const Tokenization& tokenize, std::string_view model_info,
                     const NativeAbort& abort, const ServerInfo& server_info,
-                    const BatchScore& score, const OllamaDiscovery* discovery)
+                    const BatchScore& score, const OllamaDiscovery* discovery,
+                    const BatchMessages& messages)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
           tokenize_(tokenize), abort_(abort), health_(health), model_info_(model_info),
-          server_info_(server_info), score_(score), discovery_(discovery),
+          server_info_(server_info), score_(score), discovery_(discovery), messages_(messages),
           prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
@@ -346,6 +347,7 @@ private:
     const ServerInfo& server_info_;
     const BatchScore& score_;
     const OllamaDiscovery* discovery_;
+    const BatchMessages& messages_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -606,7 +608,8 @@ ConnectionQueue::NativeRoute ConnectionQueue::native_route(std::string_view path
     if (generate_ && path == "/generate") {
         return {"POST, PUT", method == "POST" || method == "PUT"};
     }
-    if (tokenize_ && path == anthropic_count_route) {
+    if ((tokenize_ && path == anthropic_count_route) ||
+        (messages_ && path == anthropic_messages_route)) {
         return {"POST", method == "POST", true};
     }
     if (path == "/health" || path == "/health_generate" || path == "/ready" ||
@@ -679,8 +682,14 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     }
     const bool score = score_ && request.route_path() == score_route;
     const bool count = tokenize_ && request.route_path() == anthropic_count_route;
-    if ((count || score) && request.method != "POST") {
+    const bool messages = messages_ && request.route_path() == anthropic_messages_route;
+    if ((count || score || messages) && request.method != "POST") {
         write_method_not_allowed(connection, "POST", request.method == "HEAD");
+        return;
+    }
+    if (messages && !request.body_is_application_json) {
+        write_anthropic_error(connection, "400 Bad Request", "invalid_request_error",
+            "header.content-type: Unsupported Media Type: Only 'application/json' is allowed");
         return;
     }
     if (server_info_route(request.route_path())) {
@@ -698,11 +707,11 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     }
     const bool generate = generate_ && native_route == GenerateRoute::allowed;
     const bool tokenize = tokenize_ && tokenization_route(request) != TokenizationRoute::none;
-    if (!generate && !tokenize && !score && !completion_route(request)) {
+    if (!generate && !tokenize && !score && !messages && !completion_route(request)) {
         serve_control(connection, request);
         return;
     }
-    enqueue(connection, std::move(request), generate, tokenize || score, QueuedGenerate{});
+    enqueue(connection, std::move(request), generate, tokenize || score || messages, {});
 }
 
 void ConnectionQueue::enqueue(Socket& connection, HttpRequest request, bool generate,
@@ -719,7 +728,8 @@ void ConnectionQueue::enqueue(Socket& connection, HttpRequest request, bool gene
         if (pending_.size() >= static_cast<std::size_t>(capacity_)) {
             if (auxiliary) {
                 lock.unlock();
-                if (request.route_path() == anthropic_count_route) {
+                if (request.route_path() == anthropic_count_route ||
+                    request.route_path() == anthropic_messages_route) {
                     write_anthropic_error(connection, "503 Service Unavailable", "api_error",
                                           "Internal server error");
                 } else {
@@ -795,6 +805,8 @@ void ConnectionQueue::run(int slot) {
                     tokenize_(work->connection, tokenize, request.body);
                 } else if (score_ && request.route_path() == score_route) {
                     score_(work->connection, slot, request.body);
+                } else if (messages_ && request.route_path() == anthropic_messages_route) {
+                    messages_(work->connection, slot, request.body);
                 } else {
                     complete_(work->connection, slot, request.body, chat_route(request));
                 }
@@ -896,12 +908,13 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        bool prefix_controls, const BatchGenerate& generate,
                        const Tokenization& tokenize, std::string_view model_info,
                        const NativeAbort& abort, const ServerInfo& server_info,
-                       const BatchScore& score, const OllamaDiscovery* discovery) {
+                       const BatchScore& score, const OllamaDiscovery* discovery,
+                       const BatchMessages& messages) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
-                          tokenize, model_info, abort, server_info, score, discovery);
+                          tokenize, model_info, abort, server_info, score, discovery, messages);
     std::vector<std::thread> workers;
     workers.reserve(max_active + (abort ? 3 : 2));
     std::mutex failure_mutex;

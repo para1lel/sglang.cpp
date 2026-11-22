@@ -315,7 +315,9 @@ int main(int argc, char** argv) {
                 return server_info_json(arguments, startup.count(), service.runtime_state());
             }, [&](const Socket& connection, int slot, std::string_view body) {
                 serve_score(connection, service, slot, tokenizer.get(), body);
-            }, &discovery);
+            }, &discovery, [&](const Socket& connection, int slot, std::string_view body) {
+                complete_messages(connection, service, slot, tokenizer, body, &vision);
+            });
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';
         return 1;

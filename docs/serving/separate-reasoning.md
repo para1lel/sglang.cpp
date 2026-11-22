@@ -6,7 +6,7 @@ Send `POST /separate_reasoning` with text that already contains model output. Th
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP reader | Match the path, check the media type, and dispatch the request. | [Path match](../../apps/server/prefix_controls.cpp#L664)<!-- prefix: "if (request." --> · [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L666)<!-- prefix: "separate_rea" --> |
+| HTTP reader | Match the path, check the media type, and dispatch the request. | [Path match](../../apps/server/prefix_controls.cpp#L667)<!-- prefix: "if (request." --> · [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L669)<!-- prefix: "separate_rea" --> |
 | Request and response | Validate the input, select the parser, and serialize the result. | [Request validation](../../apps/server/prefix_controls.cpp#L94)<!-- prefix: "void separat" --> · [Response writer](../../apps/server/prefix_controls.cpp#L68)<!-- prefix: "void write_s" --> |
 | Qwen3 parser | Split the supplied text at literal reasoning and tool markers. | [Text split](../../apps/server/chat_output.cpp#L753)<!-- prefix: "SeparatedRea" --> · [Pinned SGLang Qwen3 detector](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/parser/reasoning_parser.py#L447)<!-- prefix: "class Qwen3D" --> |
 

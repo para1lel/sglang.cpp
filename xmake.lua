@@ -166,7 +166,8 @@ target("sglang-server")
               "apps/server/prefix_controls.cpp",
               "apps/server/text_request.cpp", "apps/server/text_completion.cpp",
               "apps/server/chat_media.cpp", "apps/server/vision_completion.cpp")
-    add_files("apps/server/anthropic_count.cpp", "apps/server/chat_tool_constraints.cpp",
+    add_files("apps/server/anthropic_count.cpp", "apps/server/anthropic_messages.cpp",
+              "apps/server/chat_tool_constraints.cpp",
               "apps/server/native_generate.cpp", "apps/server/ollama_discovery.cpp",
               "apps/server/ollama_generate.cpp",
               "apps/server/parse_function_call.cpp", "apps/server/score.cpp",

@@ -22,6 +22,7 @@ using NativeAbort = std::function<void(const Socket&, std::string_view)>;
 using Tokenization = std::function<void(const Socket&, TokenizationRoute, std::string_view)>;
 using ServerInfo = std::function<std::string()>;
 using BatchScore = std::function<void(const Socket&, int, std::string_view)>;
+using BatchMessages = BatchScore;
 
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
@@ -31,6 +32,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const NativeAbort& abort = NativeAbort{},
                        const ServerInfo& server_info = ServerInfo{},
                        const BatchScore& score = BatchScore{},
-                       const OllamaDiscovery* discovery = nullptr);
+                       const OllamaDiscovery* discovery = nullptr,
+                       const BatchMessages& messages = BatchMessages{});
 
 }

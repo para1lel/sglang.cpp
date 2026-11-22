@@ -69,6 +69,9 @@ void complete(const Socket& connection, BatchService& service, int slot,
 void complete_chat(const Socket& connection, BatchService& service, int slot,
                    const CompletionTokenizer& tokenizer, std::string_view body,
                    VisionCompletion* vision = nullptr);
+void complete_messages(const Socket& connection, BatchService& service, int slot,
+                       const CompletionTokenizer& tokenizer, std::string_view body,
+                       VisionCompletion* vision);
 void write_error(const Socket& connection, std::string_view status, const char* message);
 
 }

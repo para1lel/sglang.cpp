@@ -412,6 +412,7 @@ cudaError_t launch_fp8_batch(const std::uint8_t* weight, const __nv_bfloat16* we
 }
 
 #include "sglang/text/prefill_fp8_exact.cuh"
+#include "sglang/text/fp8_mlp_verify.cuh"
 
 __global__ void swiglu_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,
                               __nv_bfloat16* output) {
@@ -678,11 +679,10 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
         }
         wide = wide && supports_wide_fp8(weight, entry.input, in_width);
     }
-    if (wide && count == 5) {
-        static_assert(decoder::intermediate_size % 2 == 0);
-        if (out_width == decoder::intermediate_size && in_width == decoder::hidden_size) {
-            return launch_fp8_batch<5, 2>(weight, weight_scales, out_width, in_width, projections,
-                                          stream);
+    if (wide && count == mlp_verify_rows) {
+        if (is_fp8_mlp_shape(out_width, in_width)) {
+            return launch_fp8_mlp_staged(weight, weight_scales, out_width, in_width, projections,
+                                        stream);
         }
         return launch_fp8_batch<5>(weight, weight_scales, out_width, in_width, projections, stream);
     }

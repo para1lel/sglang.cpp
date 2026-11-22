@@ -93,3 +93,25 @@ The receipts are on the benchmark host. The paths below are relative to `artifac
 | `session-1122-mtp4-bench/campaigns/release-mtp4-v3/W1/vllm/w1-qualification.json` | `b7ae0ecaf3147a799239104699bba093741f831835ba346ae180e690d13bd5b4` |
 | `session-1122-default-live/cli-summary.json` | `0538c989b9b4213884ed2fd589fd94b97ac94263ee1b28ba6af92a0aab05694a` |
 | `session-1122-default-live/http-omitted-depth/qualification.json` | `c550d3ee63ad246b19d6f74e4ba4e67f98bac88615b0158ea158870905896832` |
+
+### Combined native W1 follow-up
+
+On B200 GPU7, four fresh Release servers ran in base, combined, combined, base order. Each server ran three warmups and three timed requests. All 24 requests, including warmups, matched the frozen sequence of 128 output IDs. Both arms used exact FP8 prefill, default K4, CUDA graphs, 32 slots, and an 8,192-token step budget.
+
+| Native arm | Timed requests | E2E median (range), ms | TTFT median, ms | TPOT median, ms/ID |
+| --- | ---: | ---: | ---: | ---: |
+| Base | 6 | 1,852.73 (1,842.65–1,975.96) | 382.38 | 11.58 |
+| Combined | 6 | 1,758.35 (1,754.28–1,784.02) | 382.37 | 10.83 |
+
+The combined E2E median was 5.09% lower. The client measures E2E from submission to a valid SSE `[DONE]`. This focused native-only result sits outside the formal paired gate. The archived vLLM run used GPU2 and failed K0/K4 ID parity. Its 638.06 ms median serves as context only.
+
+The measured source used base `d4388852209908d988907deffbfed9192b2f25a1` plus the two patches below. The five changed source files match the shipped attention and MLP commits `2b698a6518d2585185b92d559f86d7f31eac84af` and `dc9d7da1afd1dbbadab273c160cc95a9cea6dc99`. Independent operator checks are in `artifacts/mtp4-draft-attention-test/qualification-report.md` and `artifacts/mtp4-op-test/DISPOSITION.md`.
+
+| Evidence path under `artifacts/mtp4-combined-test/` | SHA-256 |
+| --- | --- |
+| `draft.patch` | `0468e504fd721c10c46be452a952dd6970e0afd950b539f491f03469eaf05819` |
+| `mlp.patch` | `22df57ae2fd0b8e8e4169d4771ddbcf83673e8a3712328b6b353fa403c4fd72d` |
+| `base/build/bin/sglang-server` | `36c2f8bb31921848fb5896e3694f3c257655123c29b16d557aa44bff3ba86b42` |
+| `combined/build/bin/sglang-server` | `cbd5aeee399a226018e36f1cfe68c6f96d4456aeb859e76810f85017b8492da3` |
+| `run.LBHOaZYi/DISPOSITION.md` | `33fda44aeacce93a28abfa3a0555d0f2ffcb166ab43c7e12d0db9d7dfb56e3c7` |
+| `run.LBHOaZYi/summary.json` | `786f6d24b2238b7310d7bd80239329c08fb7d74325bd51c84c0ec16add883c15` |

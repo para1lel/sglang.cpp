@@ -7,6 +7,7 @@
 namespace sglang::tokenizer {
 
 std::string normalize_nfc(std::string_view bytes);
+std::u32string casefold(std::u32string_view text);
 void split_pieces(std::string_view bytes,
                   const std::function<void(std::string_view)>& consume);
 

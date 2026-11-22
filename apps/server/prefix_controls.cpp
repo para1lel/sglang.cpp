@@ -290,12 +290,12 @@ public:
                     const NativeAbort& abort, const ServerInfo& server_info,
                     const BatchScore& score, const OllamaDiscovery* discovery,
                     const BatchMessages& messages, const BatchResponses& responses,
-                    ResponseStore* response_store)
+                    ResponseStore* response_store, const BatchDecisions& decisions)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
           tokenize_(tokenize), abort_(abort), health_(health), model_info_(model_info),
           server_info_(server_info), score_(score), discovery_(discovery), messages_(messages),
           responses_(responses), response_store_(response_store),
-          prefix_controls_(prefix_controls) {}
+          decisions_(decisions), prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -353,6 +353,7 @@ private:
     const BatchMessages& messages_;
     const BatchResponses& responses_;
     ResponseStore* response_store_;
+    const BatchDecisions& decisions_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -630,6 +631,7 @@ ConnectionQueue::NativeRoute ConnectionQueue::native_route(std::string_view path
     if (path == "/v1/completions" || path == "/v1/chat/completions" ||
         path == separate_reasoning_route || path == parse_function_call_route ||
         (abort_ && path == "/abort_request") || (score_ && path == score_route) ||
+        (decisions_ && path == decisions_route) ||
         (tokenize_ && (path == "/tokenize" || path == "/v1/tokenize" ||
                        path == "/detokenize" || path == "/v1/detokenize")) ||
         (prefix_controls_ && (path == "/reset_prefix_cache" ||
@@ -651,9 +653,8 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         case OllamaDiscovery::Route::chat:
         case OllamaDiscovery::Route::generate: {
             auto prepared = discovery_->prepare_generate(connection, request, route);
-            if (prepared.complete) {
+            if (prepared.complete)
                 enqueue(connection, std::move(request), false, false, std::move(prepared));
-            }
             return;
         }
         case OllamaDiscovery::Route::unmatched:
@@ -661,54 +662,44 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         }
     }
     if (native.allow.empty()) {
-        const std::string_view path = request.path;
-        if (!path.empty() && path.back() == '/') {
+        if (const std::string_view path = request.path; !path.empty() && path.back() == '/') {
             const auto canonical = path.substr(0, path.find_last_not_of('/') + 1);
             if (!native_route(matchable_route_path(canonical), request.method).allow.empty()) {
                 write_redirect(connection, request, canonical);
                 return;
             }
         }
-        if (discovery_ && discovery_->respond_unmatched(connection, request)) {
-            return;
-        }
+        if (discovery_ && discovery_->respond_unmatched(connection, request)) return;
     }
-    if (request.route_path() == separate_reasoning_route) {
-        if (request.method == "POST") {
-            separate_reasoning(connection, request.body);
-        } else {
-            write_method_not_allowed(connection, "POST", request.method == "HEAD");
-        }
-        return;
-    }
-    if (request.route_path() == parse_function_call_route) {
-        if (request.method == "POST") {
-            parse_function_call(connection, request.body);
-        } else {
-            write_method_not_allowed(connection, "POST", request.method == "HEAD");
-        }
+    const auto path = request.route_path();
+    if (const auto parser = path == separate_reasoning_route ? separate_reasoning
+                          : path == parse_function_call_route ? parse_function_call : nullptr) {
+        if (request.method == "POST") parser(connection, request.body);
+        else write_method_not_allowed(connection, "POST", request.method == "HEAD");
         return;
     }
     const bool score = score_ && request.route_path() == score_route;
+    const bool decisions = decisions_ && request.route_path() == decisions_route;
     const bool count = tokenize_ && request.route_path() == anthropic_count_route;
     const bool messages = messages_ && request.route_path() == anthropic_messages_route;
     const bool responses = responses_ && request.route_path() == responses_route;
     if (responses_ && !native.allow.empty() && response_store_ &&
-        response_store_->serve_state(connection, request)) {
+        response_store_->serve_state(connection, request))
         return;
-    }
-    if ((count || score || messages || responses) && request.method != "POST") {
+    if ((count || score || messages || responses || decisions) && request.method != "POST") {
         write_method_not_allowed(connection, "POST", request.method == "HEAD");
         return;
     }
-    if (responses && !request.body_is_application_json) {
-        responses_error(connection, 400, "Unsupported Media Type: Only 'application/json' "
-                                        "is allowed");
-        return;
-    }
-    if (messages && !request.body_is_application_json) {
-        write_anthropic_error(connection, "400 Bad Request", "invalid_request_error",
-            "header.content-type: Unsupported Media Type: Only 'application/json' is allowed");
+    if (!request.body_is_application_json && (responses || messages || decisions)) {
+        constexpr auto reason = "Unsupported Media Type: Only 'application/json' is allowed";
+        if (responses) {
+            responses_error(connection, 400, reason);
+        } else if (messages) {
+            write_anthropic_error(connection, "400 Bad Request", "invalid_request_error",
+                                  std::string("header.content-type: ") + reason);
+        } else {
+            write_tokenization_error(connection, "400 Bad Request", "Bad Request", reason);
+        }
         return;
     }
     if (server_info_route(request.route_path())) {
@@ -727,11 +718,12 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     const bool generate = generate_ && native_route == GenerateRoute::allowed;
     const bool tokenize = tokenize_ && tokenization_route(request) != TokenizationRoute::none;
     if (!generate && !tokenize && !score && !messages && !responses &&
-        !completion_route(request)) {
+        !decisions && !completion_route(request)) {
         serve_control(connection, request);
         return;
     }
-    enqueue(connection, std::move(request), generate, tokenize || score || messages, {});
+    enqueue(connection, std::move(request), generate, tokenize || score || messages || decisions,
+            {});
 }
 
 void ConnectionQueue::enqueue(Socket& connection, HttpRequest request, bool generate,
@@ -829,6 +821,8 @@ void ConnectionQueue::run(int slot) {
                     messages_(work->connection, slot, request.body);
                 } else if (responses_ && request.route_path() == responses_route) {
                     responses_(work->connection, slot, request.body);
+                } else if (decisions_ && request.route_path() == decisions_route) {
+                    decisions_(work->connection, slot, request.body);
                 } else {
                     complete_(work->connection, slot, request.body, chat_route(request));
                 }
@@ -932,13 +926,13 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const NativeAbort& abort, const ServerInfo& server_info,
                        const BatchScore& score, const OllamaDiscovery* discovery,
                        const BatchMessages& messages, const BatchResponses& responses,
-                       ResponseStore* response_store) {
+                       ResponseStore* response_store, const BatchDecisions& decisions) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
                           tokenize, model_info, abort, server_info, score, discovery, messages,
-                          responses, response_store);
+                          responses, response_store, decisions);
     std::vector<std::thread> workers;
     workers.reserve(max_active + (abort ? 3 : 2));
     std::mutex failure_mutex;

@@ -12,6 +12,7 @@
 #include "sglang/server/prefix_controls.h"
 #include "sglang/server/responses.h"
 #include "sglang/server/score.h"
+#include "sglang/server/decisions.h"
 #include "sglang/server/tokenization.h"
 #include "sglang/server/vision_completion.h"
 
@@ -346,7 +347,9 @@ int main(int argc, char** argv) {
                 complete_messages(connection, service, slot, tokenizer, body, &vision);
             }, [&](const Socket& connection, int slot, std::string_view body) {
                 complete_responses(connection, service, slot, tokenizer, body, response_store);
-            }, &response_store);
+            }, &response_store, [&](const Socket& connection, int slot, std::string_view body) {
+                serve_decisions(connection, service, slot, tokenizer, body);
+            });
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';
         return 1;

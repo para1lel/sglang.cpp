@@ -33,6 +33,13 @@ struct Mapping {
 #include "sglang/tokenizer/unicode/canonical_decompositions_9.h"
 #include "sglang/tokenizer/unicode/canonical_compositions_9.h"
 
+struct CaseFold {
+    char32_t key;
+    std::array<char32_t, 3> value;
+};
+
+#include "sglang/tokenizer/unicode/casefold_15.h"
+
 constexpr unsigned letter = 1;
 constexpr unsigned mark = 2;
 constexpr unsigned number = 4;
@@ -233,6 +240,21 @@ std::string normalize_nfc(std::string_view bytes) {
     output.reserve(bytes.size());
     for (const auto scalar : normalized_scalars(bytes)) {
         append_utf8(output, scalar);
+    }
+    return output;
+}
+
+std::u32string casefold(std::u32string_view text) {
+    std::u32string output;
+    output.reserve(text.size());
+    for (const auto point : text) {
+        if (const auto* mapping = lookup(casefold_15, point, &CaseFold::key)) {
+            for (const auto folded : mapping->value) {
+                if (folded) output += folded;
+            }
+        } else {
+            output += point;
+        }
     }
     return output;
 }

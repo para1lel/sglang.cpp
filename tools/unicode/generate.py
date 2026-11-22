@@ -115,13 +115,30 @@ def write_table(directory, stem, *tables):
             emit(output, kind, name, rows)
 
 
+def write_python_casefold(directory):
+    import unicodedata
+
+    if unicodedata.unidata_version != "15.0.0":
+        raise ValueError("Decision option case folding uses Python Unicode 15.0.0")
+    rows = []
+    for point in range(0x110000):
+        mapping = [ord(char) for char in chr(point).casefold()]
+        if mapping != [point]:
+            rows.append((point, *mapping, *([0] * (3 - len(mapping)))))
+    write_table(directory, "casefold_15", ("CaseFold", "casefold_15", rows))
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("sources", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--python-casefold-only", action="store_true")
     args = parser.parse_args()
+    if args.python_casefold_only:
+        write_python_casefold(args.output)
+        return
     with open_ucd(args.sources, "16.0.0") as recent, open_ucd(args.sources, "9.0.0") as old:
         classes, decompositions, compositions = nfc_tables(old)
         args.output.mkdir(parents=True, exist_ok=True)

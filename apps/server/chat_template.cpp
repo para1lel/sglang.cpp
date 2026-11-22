@@ -225,16 +225,16 @@ void append_float(std::string& output, double number) {
     }
 }
 
-void append_template_json(std::string& output, const Value& value) {
+void append_template_json(std::string& output, const Value& value, bool compact = false) {
     if (const auto* object = value.ordered_object()) {
         output += '{';
         std::string_view separator;
         for (const auto& [key, field] : *object) {
             output += separator;
             json::append_quoted(output, key, true);
-            output += ": ";
-            append_template_json(output, field);
-            separator = ", ";
+            output += compact ? ":" : ": ";
+            append_template_json(output, field, compact);
+            separator = compact ? "," : ", ";
         }
         output += '}';
     } else if (const auto* array = value.array()) {
@@ -242,8 +242,8 @@ void append_template_json(std::string& output, const Value& value) {
         std::string_view separator;
         for (const auto& item : *array) {
             output += separator;
-            append_template_json(output, item);
-            separator = ", ";
+            append_template_json(output, item, compact);
+            separator = compact ? "," : ", ";
         }
         output += ']';
     } else if (const auto text = value.string()) {
@@ -487,9 +487,9 @@ std::string_view trim_chat_text(std::string_view text) {
     return trim(text);
 }
 
-std::string chat_template_json(const json::Value& value) {
+std::string chat_template_json(const json::Value& value, bool compact) {
     std::string serialized;
-    append_template_json(serialized, value);
+    append_template_json(serialized, value, compact);
     return serialized;
 }
 

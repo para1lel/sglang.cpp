@@ -193,6 +193,14 @@ struct Lane {
                                  std::getenv("SGLANG_TEST_SCRIPTED_MTP");
         auto result = step();
         result.prompt_logprobs = std::exchange(prompt_scores, nullptr);
+        if (options.label_token_ids) {
+            std::vector<double> scores;
+            scores.reserve(options.label_token_ids->size());
+            for (std::size_t index = 0; index < options.label_token_ids->size(); ++index) {
+                scores.push_back(-2.0 - static_cast<double>(index));
+            }
+            result.label_logprobs = std::make_shared<const std::vector<double>>(std::move(scores));
+        }
         if (!speculative || !result.token || result.finish_reason) {
             return result;
         }

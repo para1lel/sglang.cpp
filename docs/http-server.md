@@ -1,12 +1,12 @@
 # Native HTTP transport
 
-The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L327)<!-- prefix: "serve_connec" -->
+The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L328)<!-- prefix: "serve_connec" -->
 
 ## Request targets and redirects
 
 The reader splits the HTTP/1.1 origin-form target at the first literal `?`, then percent-decodes the path once. It preserves `+` and replaces invalid UTF-8. `%2F` becomes `/`, `%252F` becomes `%2F`, and `%3F` becomes path data. Fixed routes match case-sensitively and allow one final decoded line feed. Framing checks use the same path. [Target split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Decoder](../apps/server/http.cpp#L346)<!-- prefix: "std::string " --> · [Route matching](../apps/server/http.cpp#L372)<!-- prefix: "std::string_" -->
 
-The reader checks exact routes before trying a slash redirect. A slash variant that matches an enabled route returns an empty HTTP 307. Both server-info aliases redirect when their callback is installed. Metrics, reset, and profile paths require prefix reuse. `/v1/models/` retrieves the empty ID, and `/v1/models/name/` retrieves `name/`. [Dispatch](../apps/server/prefix_controls.cpp#L642)<!-- prefix: "void Connect" --> · [Enabled routes](../apps/server/prefix_controls.cpp#L608)<!-- prefix: "ConnectionQu" -->
+The reader checks exact routes before trying a slash redirect. A slash variant that matches an enabled route returns an empty HTTP 307. Both server-info aliases redirect when their callback is installed. Metrics, reset, and profile paths require prefix reuse. `/v1/models/` retrieves the empty ID, and `/v1/models/name/` retrieves `name/`. [Dispatch](../apps/server/prefix_controls.cpp#L644)<!-- prefix: "void Connect" --> · [Enabled routes](../apps/server/prefix_controls.cpp#L609)<!-- prefix: "ConnectionQu" -->
 
 [Ollama](serving/ollama.md) covers model discovery, text generation, chat, and route overrides.
 
@@ -16,16 +16,17 @@ See [cache flush](prefix-cache.md#cache-flush) for `/flush_cache` methods, timeo
 See [Anthropic Messages](serving/anthropic-messages.md) and
 [Anthropic token counting](native-tokenization.md#count-anthropic-prompt-tokens).
 See [OpenAI Responses](serving/openai-responses.md) for text, reasoning, and optional state.
+See [Decisions](serving/decisions.md) for zero-output categorical scoring of text.
 
 ## Health and readiness
 
-Send an empty GET request for each check. All three checks bypass the completion queue and work with prefix reuse off or on.
+All three health checks accept empty GET requests and bypass the completion queue.
 
 | Route | Responsibility | Response |
 | --- | --- | --- |
-| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L195)<!-- prefix: "std::string " --> |
+| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L196)<!-- prefix: "std::string " --> |
 | `/ready` | The HTTP reader checks the permanent decoder worker failure flag. | HTTP 200 with `{"ready":true}` while the worker has no permanent failure. After failure, HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. [Readiness response](../apps/server/http.cpp#L661)<!-- prefix: "void write_r" --> · [Worker flag](../apps/server/batch_service.cpp#L775)<!-- prefix: "bool BatchSe" --> |
-| `/health_generate` | A dedicated HTTP worker asks the batch scheduler for generation progress. | HTTP 200 for progress within the probe window. HTTP 503 for queue overload, probe failure, timeout, permanent worker failure, or shutdown. Both statuses carry `Content-Length: 0` and `Connection: close`. [Dispatch](../apps/server/prefix_controls.cpp#L511)<!-- prefix: "void Connect" --> · [Reply](../apps/server/http.cpp#L670)<!-- prefix: "void write_g" --> |
+| `/health_generate` | A dedicated HTTP worker asks the batch scheduler for generation progress. | HTTP 200 for progress within the probe window. HTTP 503 for queue overload, probe failure, timeout, permanent worker failure, or shutdown. Both statuses carry `Content-Length: 0` and `Connection: close`. [Dispatch](../apps/server/prefix_controls.cpp#L512)<!-- prefix: "void Connect" --> · [Reply](../apps/server/http.cpp#L670)<!-- prefix: "void write_g" --> |
 
 A permanent worker failure also causes new completions to return HTTP 500. A generation health timeout leaves the readiness flag unchanged. [Batch failure](../apps/server/batch_service.cpp#L185)<!-- prefix: "void BatchSe" -->
 
@@ -33,7 +34,7 @@ The scheduler defaults to 32 active requests and an aggregate budget of 8,192 to
 
 ### Generation probe lifecycle
 
-The HTTP reader starts a 20-second monotonic deadline when it dispatches the parsed request. The deadline includes time in the health FIFO. The FIFO holds up to `--max-active` waiting probes in addition to the one claimed by its worker. The reader removes disconnected waiters before testing capacity. The health worker owns the claimed socket until it attempts the reply. [Deadline](../apps/server/prefix_controls.cpp#L31)<!-- prefix: "constexpr au" --> · [Health admission](../apps/server/prefix_controls.cpp#L870)<!-- prefix: "void Connect" --> · [Health worker](../apps/server/prefix_controls.cpp#L894)<!-- prefix: "void Connect" -->
+The HTTP reader starts a 20-second monotonic deadline when it dispatches the parsed request. The deadline includes time in the health FIFO. The FIFO holds up to `--max-active` waiting probes in addition to the one claimed by its worker. The reader removes disconnected waiters before testing capacity. The health worker owns the claimed socket until it attempts the reply. [Deadline](../apps/server/prefix_controls.cpp#L31)<!-- prefix: "constexpr au" --> · [Health admission](../apps/server/prefix_controls.cpp#L864)<!-- prefix: "void Connect" --> · [Health worker](../apps/server/prefix_controls.cpp#L888)<!-- prefix: "void Connect" -->
 
 The scheduler can use its latest successful token publication if it occurred after the probe started and by its deadline. Otherwise it registers one waiter for subsequent publication. While user jobs occupy decoder lanes, they can satisfy the probe without reserving a lane for health. Admission, prefill without a token, cancellation, and failed steps do not satisfy the probe. Publication is independent of when a client receives the token. [Waiter and timestamp](../apps/server/batch_service.cpp#L778)<!-- prefix: "bool BatchSe" --> · [Token publication](../apps/server/batch_service.cpp#L364)<!-- prefix: "void BatchSe" -->
 
@@ -41,9 +42,9 @@ When all decoder lanes become idle and no prefix reset is pending, the scheduler
 
 ### Request, failure, and shutdown behavior
 
-After HTTP parsing, a GET with a nonempty body returns a JSON HTTP 404 error. Other methods receive HTTP 405, `Allow: GET`, and a JSON method error. `HEAD` omits the body. These requests do not enter the health FIFO. [Input checks](../apps/server/prefix_controls.cpp#L870)<!-- prefix: "void Connect" --> · [Method response](../apps/server/http.cpp#L626)<!-- prefix: "void write_g" -->
+After HTTP parsing, a GET with a nonempty body returns a JSON HTTP 404 error. Other methods receive HTTP 405, `Allow: GET`, and a JSON method error. `HEAD` omits the body. These requests do not enter the health FIFO. [Input checks](../apps/server/prefix_controls.cpp#L864)<!-- prefix: "void Connect" --> · [Method response](../apps/server/http.cpp#L626)<!-- prefix: "void write_g" -->
 
-The scheduler wakes the health worker on progress and checks for a disconnect at intervals of up to 10 milliseconds while waiting. A disconnected client can lose the reply. On shutdown, the health worker leaves the active wait and drains the queued health checks. It attempts an empty HTTP 503 on each remaining socket before the transport joins the workers. The 20-second deadline bounds the progress window. The HTTP read and response write have separate I/O limits. [Wait loop](../apps/server/batch_service.cpp#L799)<!-- prefix: "while (!stat" --> · [Disconnect detection](../apps/server/http.cpp#L438)<!-- prefix: "bool disconn" --> · [Queue stop](../apps/server/prefix_controls.cpp#L912)<!-- prefix: "void Connect" --> · [Worker join](../apps/server/prefix_controls.cpp#L990)<!-- prefix: "queue.stop()" -->
+The scheduler wakes the health worker on progress and checks for a disconnect at intervals of up to 10 milliseconds while waiting. A disconnected client can lose the reply. On shutdown, the health worker leaves the active wait and drains the queued health checks. It attempts an empty HTTP 503 on each remaining socket before the transport joins the workers. The 20-second deadline bounds the progress window. The HTTP read and response write have separate I/O limits. [Wait loop](../apps/server/batch_service.cpp#L799)<!-- prefix: "while (!stat" --> · [Disconnect detection](../apps/server/http.cpp#L438)<!-- prefix: "bool disconn" --> · [Queue stop](../apps/server/prefix_controls.cpp#L906)<!-- prefix: "void Connect" --> · [Worker join](../apps/server/prefix_controls.cpp#L984)<!-- prefix: "queue.stop()" -->
 
 ### Differences from pinned SGLang
 
@@ -65,13 +66,13 @@ Let `A` be `--max-active`. The nonblocking loopback listener uses a TCP backlog 
 
 When a connection is waiting and the reader is full, the reader looks for the oldest eligible incomplete socket. A socket is eligible if it has no readable data and has been idle for at least 250 milliseconds since acceptance or its last successful read. The reader defers acceptance if no socket is eligible. It closes the eligible socket after accepting the new one. During replacement, the socket count can briefly exceed the reader limit by one. [Socket replacement](../apps/server/http.cpp#L447)<!-- prefix: "static void " -->
 
-After HTTP parsing, completions, [native generation](native-generate.md), [pointwise scoring](serving/pointwise-score.md), and [tokenization](native-tokenization.md) enter one FIFO. Up to `A` requests can wait, and up to `A` workers can claim requests. The queue removes disconnected waiters before checking capacity. It returns a JSON HTTP 503 response when `A` requests are still waiting, even if some workers are idle. The reader checks the shape of `/generate` and reserves its IDs after this capacity check. Workers validate the prompts and options. A normally claimed request holds its HTTP worker slot until its response socket closes. [Queue admission](../apps/server/prefix_controls.cpp#L642)<!-- prefix: "void Connect" --> · [Worker](../apps/server/prefix_controls.cpp#L807)<!-- prefix: "void Connect" -->
+After HTTP parsing, completions, [native generation](native-generate.md), [pointwise scoring](serving/pointwise-score.md), and [tokenization](native-tokenization.md) enter one FIFO. Up to `A` requests can wait, and up to `A` workers can claim requests. The queue removes disconnected waiters before checking capacity. It returns a JSON HTTP 503 response when `A` requests are still waiting, even if some workers are idle. The reader checks the shape of `/generate` and reserves its IDs after this capacity check. Workers validate the prompts and options. A normally claimed request holds its HTTP worker slot until its response socket closes. [Queue admission](../apps/server/prefix_controls.cpp#L644)<!-- prefix: "void Connect" --> · [Worker](../apps/server/prefix_controls.cpp#L799)<!-- prefix: "void Connect" -->
 
 A [text completion batch](text-serving.md#send-a-request) or [native generation batch](native-generate.md#runtime-path) counts as one request for HTTP admission. Multi-item batches share eligible decoder lanes and give the longest-waiting ready batch first use of a free lane. Admitting an item moves that batch behind other waiters. Scalar requests and one-item batches reserve their worker's lane. Tokenization uses an HTTP worker and runs on the CPU, including after permanent decoder worker failure. For generation, a TCP reset or failed write cancels unfinished items. The batch retires active lanes before slot reuse, and ready peers can advance while a writer blocks. [Cancellation](../apps/server/batch_service.cpp#L492)<!-- prefix: "void BatchSe" -->
 
-[`POST /abort_request`](native-abort.md) runs on the reader after HTTP parsing. It bypasses the completion queue and works when every generation slot is occupied. It shares the same incomplete-request capacity, replacement policy, and deadlines as other controls. A separate CPU worker can remove a fully aborted generation request from the FIFO and send its result without a generation slot. Partially aborted batches stay in the FIFO. [Control route](../apps/server/prefix_controls.cpp#L524)<!-- prefix: "if (abort_ &" --> · [Abort worker](../apps/server/prefix_controls.cpp#L840)<!-- prefix: "void Connect" -->
+[`POST /abort_request`](native-abort.md) runs on the reader after HTTP parsing. It bypasses the completion queue and works when every generation slot is occupied. It shares the same incomplete-request capacity, replacement policy, and deadlines as other controls. A separate CPU worker can remove a fully aborted generation request from the FIFO and send its result without a generation slot. Partially aborted batches stay in the FIFO. [Control route](../apps/server/prefix_controls.cpp#L525)<!-- prefix: "if (abort_ &" --> · [Abort worker](../apps/server/prefix_controls.cpp#L834)<!-- prefix: "void Connect" -->
 
-On shutdown, the reader closes incomplete sockets. The queue discards pending work and joins the HTTP workers before the batch service is destroyed. The server then propagates the first error that escapes the transport reader or workers. [Shutdown](../apps/server/prefix_controls.cpp#L990)<!-- prefix: "queue.stop()" -->
+On shutdown, the reader closes incomplete sockets. The queue discards pending work and joins the HTTP workers before the batch service is destroyed. The server then propagates the first error that escapes the transport reader or workers. [Shutdown](../apps/server/prefix_controls.cpp#L984)<!-- prefix: "queue.stop()" -->
 
 ## Completion streams
 

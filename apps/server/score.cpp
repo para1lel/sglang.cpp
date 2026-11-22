@@ -17,10 +17,7 @@ using json::Array;
 using json::Object;
 using json::Value;
 
-constexpr std::size_t max_score_items = 1024;
-constexpr std::size_t max_score_prompt_tokens = 4 * checkpoint_context;
-constexpr std::size_t max_score_text_bytes = 8 * 1024 * 1024;
-constexpr std::size_t max_score_response_values = checkpoint_context;
+using namespace score_detail;
 
 bool flag(const Object& fields, std::string_view name) {
     const auto* field = json::get(fields, name);
@@ -230,21 +227,24 @@ std::vector<int> score_prompt(const ScoreItems& items, std::size_t index, bool i
     }
 }
 
-std::vector<double> probabilities(const std::vector<double>& logprobs,
-                                  const ScoreRequest& request) {
+}
+
+std::vector<double> score_detail::probabilities(const std::vector<double>& logprobs,
+                                                double temperature, bool normalize) {
     std::vector<double> values;
     values.reserve(logprobs.size());
-    const double center = request.apply_softmax
-        ? *std::max_element(logprobs.begin(), logprobs.end()) : 0;
+    const double center = normalize ? *std::max_element(logprobs.begin(), logprobs.end()) : 0;
     for (double logprob : logprobs) {
-        values.push_back(std::exp((logprob - center) / request.temperature));
+        values.push_back(std::exp((logprob - center) / temperature));
     }
-    if (request.apply_softmax) {
+    if (normalize) {
         const double total = std::accumulate(values.begin(), values.end(), 0.0);
         for (auto& value : values) value /= total;
     }
     return values;
 }
+
+namespace {
 
 void append_row(std::string& output, const std::vector<double>& row) {
     output += '[';
@@ -338,7 +338,7 @@ std::string score_response(const ScoreRequest& request, const std::vector<Decode
         }
         prompt_tokens += prompt.prompt.size();
         if (index) response += ',';
-        append_row(response, probabilities(*row, request));
+        append_row(response, probabilities(*row, request.temperature, request.apply_softmax));
     }
     response += R"(],"pooled_hidden_states":null,"token_logprobs":)";
     if (request.return_token_logprobs) {

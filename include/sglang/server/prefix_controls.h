@@ -25,6 +25,7 @@ using ServerInfo = std::function<std::string()>;
 using BatchScore = std::function<void(const Socket&, int, std::string_view)>;
 using BatchMessages = BatchScore;
 using BatchResponses = BatchScore;
+using BatchDecisions = BatchScore;
 
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
@@ -37,6 +38,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const OllamaDiscovery* discovery = nullptr,
                        const BatchMessages& messages = BatchMessages{},
                        const BatchResponses& responses = BatchResponses{},
-                       ResponseStore* response_store = nullptr);
+                       ResponseStore* response_store = nullptr,
+                       const BatchDecisions& decisions = BatchDecisions{});
 
 }

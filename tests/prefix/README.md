@@ -12,7 +12,8 @@ mkdir -p "$out"
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
 "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
     -Iinclude -I"$toolkit/include" tests/prefix/reader_queue.cpp \
-    apps/server/{prefix_controls,chat_output,flush_cache,http,completions}.cpp src/{json,utf8}.cpp \
+    apps/server/{prefix_controls,chat_output,flush_cache,http,loads,completions}.cpp \
+    src/{json,utf8}.cpp \
     -Wl,--gc-sections \
     -Wl,--wrap=accept4 -o "$out/reader-queue"
 for mode in --cache-off --cache-on --reader-failure --worker-failure --flush; do

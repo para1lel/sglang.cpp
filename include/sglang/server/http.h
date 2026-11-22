@@ -69,7 +69,8 @@ void read_connections(const Socket& listener, int capacity,
                       const AnthropicCountOverride& overrides_count);
 bool write_json(const Socket& connection, std::string_view status, std::string_view json,
                 bool head_only = false);
-void write_raw_response(const Socket& connection, std::string_view status, std::string_view body);
+void write_raw_response(const Socket& connection, std::string_view status, std::string_view body,
+                        std::string_view content_type = std::string_view{});
 void write_method_not_allowed(const Socket& connection, std::string_view methods, bool head_only);
 void write_redirect(const Socket& connection, const HttpRequest& request, std::string_view path);
 void write_get_only(const Socket& connection, bool head_only);

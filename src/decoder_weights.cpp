@@ -137,7 +137,8 @@ Decoder::Model::Model(const std::filesystem::path& directory, int cuda_device)
     if (properties.major != 10 || properties.minor != 0) {
         throw std::invalid_argument("The decoder requires an sm_100 CUDA device");
     }
-    b200_ = std::string_view(properties.name) == "NVIDIA B200";
+    accelerator_name = properties.name;
+    b200_ = accelerator_name == "NVIDIA B200";
     auto& checkpoint = memory->transfers().checkpoint;
     checkpoint = std::make_unique<Checkpoint>(directory);
     memory->open_stream();

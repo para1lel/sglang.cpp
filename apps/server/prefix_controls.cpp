@@ -2,12 +2,12 @@
 #include "sglang/server/responses.h"
 
 #include "sglang/json.h"
-#include "sglang/mxfp8_gqa.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/chat_output.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/flush_cache.h"
 #include "sglang/server/http.h"
+#include "sglang/server/loads.h"
 #include "sglang/server/ollama_discovery.h"
 #include "sglang/server/parse_function_call.h"
 #include "sglang/utf8.h"
@@ -194,38 +194,6 @@ void handle_errors(const Socket& connection, const Handle& handle) {
     }
 }
 
-std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t waiting) {
-    std::string text = "# Native sglang.cpp metrics with frozen W3-prefix compatibility names\n";
-    const auto emit = [&text](std::string_view name, auto value) {
-        text += name;
-        text += "{engine=\"0\"} ";
-        text += std::to_string(value);
-        text += '\n';
-    };
-    const int capacity = metrics.cache_capacity * (decoder_batch_prefix_max_tokens /
-                                                   mxfp8_page_size);
-    emit("vllm:num_requests_running", running);
-    emit("vllm:num_requests_waiting", waiting);
-    emit("vllm:kv_cache_usage_perc", capacity ? double(metrics.cache.pages) / capacity : 0.0);
-    emit("vllm:prompt_tokens_total", metrics.prompt_tokens);
-    emit("vllm:generation_tokens_total", metrics.generation_tokens);
-    emit("vllm:external_prefix_cache_hits_total", 0);
-    emit("vllm:prefix_cache_hits_total", metrics.cache.cached_tokens);
-    emit("vllm:request_prefill_kv_computed_tokens_count", metrics.prefill_requests);
-    emit("vllm:request_prefill_kv_computed_tokens_sum", metrics.cache.prefill_tokens);
-    emit("sglang_cpp:prefix_cache_entries", metrics.cache.entries);
-    emit("sglang_cpp:prefix_cache_pages", metrics.cache.pages);
-    emit("sglang_cpp:prefix_cache_device_bytes", metrics.cache.device_bytes);
-    emit("sglang_cpp:prefix_cache_hits_total", metrics.cache.hits);
-    emit("sglang_cpp:prefix_cache_stores_total", metrics.cache.stores);
-    emit("sglang_cpp:prefix_cache_evictions_total", metrics.cache.evictions);
-    emit("sglang_cpp:prefix_cache_draft_device_bytes", metrics.cache.draft_device_bytes);
-    emit("sglang_cpp:prefix_cache_draft_cached_rows_total", metrics.cache.draft_cached_rows);
-    emit("sglang_cpp:prefix_cache_draft_prefill_rows_total", metrics.cache.draft_prefill_rows);
-    emit("sglang_cpp:prefix_cache_draft_misses_total", metrics.cache.draft_misses);
-    return text;
-}
-
 json::Value control_body(const HttpRequest& request) {
     try {
         return json::parse(request.body);
@@ -290,12 +258,13 @@ public:
                     const NativeAbort& abort, const ServerInfo& server_info,
                     const BatchScore& score, const OllamaDiscovery* discovery,
                     const BatchMessages& messages, const BatchResponses& responses,
-                    ResponseStore* response_store, const BatchDecisions& decisions)
+                    ResponseStore* response_store, const BatchDecisions& decisions,
+                    std::string_view accelerator)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
           tokenize_(tokenize), abort_(abort), health_(health), model_info_(model_info),
           server_info_(server_info), score_(score), discovery_(discovery), messages_(messages),
           responses_(responses), response_store_(response_store),
-          decisions_(decisions), prefix_controls_(prefix_controls) {}
+          decisions_(decisions), accelerator_(accelerator), prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -354,6 +323,7 @@ private:
     const BatchResponses& responses_;
     ResponseStore* response_store_;
     const BatchDecisions& decisions_;
+    const std::string_view accelerator_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -624,7 +594,8 @@ ConnectionQueue::NativeRoute ConnectionQueue::native_route(std::string_view path
         return {"POST", method == "POST", true};
     }
     if (path == "/health" || path == "/health_generate" || path == "/ready" ||
-        path == "/v1/models" || model_retrieval_route(path) || server_info_route(path) ||
+        path == "/v1/models" || path == loads_route ||
+        model_retrieval_route(path) || server_info_route(path) ||
         (!model_info_.empty() && (path == "/model_info" || path == "/get_model_info")) ||
         (prefix_controls_ && path == "/metrics")) {
         return {"GET", method == "GET"};
@@ -673,6 +644,14 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         if (discovery_ && discovery_->respond_unmatched(connection, request)) return;
     }
     const auto path = request.route_path();
+    if (path == loads_route) {
+        std::unique_lock lock(mutex_);
+        discard_disconnected();
+        const LoadSnapshot snapshot{running_, pending_.size(), capacity_, accelerator_};
+        lock.unlock();
+        write_loads(connection, request, snapshot);
+        return;
+    }
     if (const auto parser = path == separate_reasoning_route ? separate_reasoning
                           : path == parse_function_call_route ? parse_function_call : nullptr) {
         if (request.method == "POST") parser(connection, request.body);
@@ -929,13 +908,14 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const NativeAbort& abort, const ServerInfo& server_info,
                        const BatchScore& score, const OllamaDiscovery* discovery,
                        const BatchMessages& messages, const BatchResponses& responses,
-                       ResponseStore* response_store, const BatchDecisions& decisions) {
+                       ResponseStore* response_store, const BatchDecisions& decisions,
+                       std::string_view accelerator) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
                           tokenize, model_info, abort, server_info, score, discovery, messages,
-                          responses, response_store, decisions);
+                          responses, response_store, decisions, accelerator);
     std::vector<std::thread> workers;
     workers.reserve(max_active + (abort ? 3 : 2));
     std::mutex failure_mutex;

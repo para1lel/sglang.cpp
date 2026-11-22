@@ -557,6 +557,7 @@ struct Decoder::Model {
     void forward_layers(const Lane* lanes, int count, cudaStream_t stream) const;
 
     int device;
+    std::string accelerator_name;
     std::shared_ptr<decoder::Allocations> memory;
     std::array<decoder::Layer, decoder::layer_count> layers{};
     const decoder::Bf16* embedding = nullptr;

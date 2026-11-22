@@ -484,6 +484,10 @@ std::size_t Decoder::model_device_allocation_bytes() const {
                                      model_->mtp_weights->device_allocation_bytes() : 0);
 }
 
+std::string_view Decoder::accelerator_name() const {
+    return model_->accelerator_name;
+}
+
 bool Decoder::Model::prefill_serial(Request& request, RequestProgress& progress,
                                     const std::vector<int>& prompt, const SerialOutput& output,
                                     DecoderResult& result, const MediaPrefill* media,

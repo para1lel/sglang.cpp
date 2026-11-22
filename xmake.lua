@@ -163,7 +163,7 @@ target("sglang-server")
     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
               "apps/server/chat_template.cpp", "apps/server/chat_output.cpp",
               "apps/server/completions.cpp",
-              "apps/server/flush_cache.cpp", "apps/server/http.cpp",
+              "apps/server/flush_cache.cpp", "apps/server/http.cpp", "apps/server/loads.cpp",
               "apps/server/prefix_controls.cpp",
               "apps/server/text_request.cpp", "apps/server/text_completion.cpp",
               "apps/server/chat_media.cpp", "apps/server/vision_completion.cpp")

@@ -548,8 +548,9 @@ bool write_json(const Socket& connection, std::string_view status, std::string_v
     return write_response(connection, status, "application/json", json, {}, head_only);
 }
 
-void write_raw_response(const Socket& connection, std::string_view status, std::string_view body) {
-    write_response(connection, status, {}, body);
+void write_raw_response(const Socket& connection, std::string_view status, std::string_view body,
+                        std::string_view content_type) {
+    write_response(connection, status, content_type, body);
 }
 
 void write_method_not_allowed(const Socket& connection, std::string_view methods, bool head_only) {

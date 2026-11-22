@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -187,6 +188,7 @@ public:
                                       const DecoderOptions& options = DecoderOptions{},
                                       const DecoderCallbacks& callbacks = DecoderCallbacks{}) const;
     std::size_t model_device_allocation_bytes() const;
+    std::string_view accelerator_name() const;
 
 private:
     friend class DecoderBatch;

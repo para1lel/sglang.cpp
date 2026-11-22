@@ -39,6 +39,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const BatchMessages& messages = BatchMessages{},
                        const BatchResponses& responses = BatchResponses{},
                        ResponseStore* response_store = nullptr,
-                       const BatchDecisions& decisions = BatchDecisions{});
+                       const BatchDecisions& decisions = BatchDecisions{},
+                       std::string_view accelerator = std::string_view{});
 
 }

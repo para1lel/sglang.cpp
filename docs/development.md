@@ -110,7 +110,7 @@ Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for
 | --- | --- | --- |
 | `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L283)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L168)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L266)<!-- prefix: "void execute" --> |
+| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L169)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L266)<!-- prefix: "void execute" --> |
 
 Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L96)<!-- prefix: "target(\"sgla" -->
 
@@ -118,13 +118,13 @@ Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves histo
 
 The decoder validates tensor names, dtypes, and shapes before upload. Upload retains mappings and allocations until completion. Deferred cleanup retains shared weights. FP8 projections quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L132)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L227)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L163)<!-- prefix: "__global__ v" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L562)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L976)<!-- prefix: "void Request" -->
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L566)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L976)<!-- prefix: "void Request" -->
 
 One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L861)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L740)<!-- prefix: "void Decoder" -->
 
 Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L807)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L701)<!-- prefix: "void Decoder" -->
 
-Set the [FP8 policy](fp8-prefill-projections.md#tensor-core-projections) with `--fp8-prefill` or the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L146)<!-- prefix: "enum class F" -->
+Set the [FP8 policy](fp8-prefill-projections.md#tensor-core-projections) with `--fp8-prefill` or the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L147)<!-- prefix: "enum class F" -->
 
 See [FP8 prefill projections](fp8-prefill-projections.md) for SM100 eligibility, tile selection, and fallback.
 
@@ -166,7 +166,7 @@ The decoder retains CUDA resources and transfer buffers while completion is unce
 
 Private CUDA pools separate workspaces at or below 128 rows from larger ones. One pool per device and class can set a release threshold. The thresholds are 32 MiB and 512 MiB respectively. Other pools use CUDA defaults. [Retention](../src/decoder_prefill.cpp#L46)<!-- prefix: "void configu" -->
 
-Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L682)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L493)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L694)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L749)<!-- prefix: "cudaError_t " -->
+Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L686)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L493)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L694)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L749)<!-- prefix: "cudaError_t " -->
 
 `--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L249)<!-- prefix: "void write_r" -->
 

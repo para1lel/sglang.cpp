@@ -6,7 +6,7 @@ Send `POST /parse_function_call` to extract function calls from supplied Qwen-st
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP reader | Check the media type and dispatch the request. | [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L677)<!-- prefix: ": path == pa" --> |
+| HTTP reader | Check the media type and dispatch the request. | [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L656)<!-- prefix: ": path == pa" --> |
 | Native parser | Validate the request, select the detector, and return the parsed text and calls. | [Request handler](../../apps/server/parse_function_call.cpp#L543)<!-- prefix: "void parse_f" --> · [Text parser](../../apps/server/parse_function_call.cpp#L506)<!-- prefix: "std::string " --> |
 | SGLang reference | Define the upstream route and detector aliases. | [Pinned route](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L1739)<!-- prefix: "@app.post(\"/" --> · [Pinned detector registry](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/function_call/function_call_parser.py#L110)<!-- prefix: "\"qwen3_coder" --> |
 

@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L199)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L645)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
+| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L199)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L616)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
 | Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L882)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L919)<!-- prefix: "std::vector<" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L382)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L960)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L645)<!-- prefix: "bool BatchSe" --> |
@@ -209,7 +209,7 @@ Decoder effects already published, such as prefix-cache entries, can remain.
 The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
 [Batch cancellation](../apps/server/batch_service.cpp#L545)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L181)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L243)<!-- prefix: "void write_s" -->
 
-The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L381)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L555)<!-- prefix: "void write_m" -->
+The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L381)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L556)<!-- prefix: "void write_m" -->
 
 A disconnected client can cancel queued or active work through the [shared transport](http-server.md#http-admission-and-shutdown).
 Send [`POST /abort_request`](native-abort.md) from a second connection to cancel by ID.

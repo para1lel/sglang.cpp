@@ -244,6 +244,10 @@ Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy) {}
 Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy, bool) {}
 Decoder::~Decoder() = default;
 
+std::string_view Decoder::accelerator_name() const {
+    return {};
+}
+
 DecoderResult Decoder::generate(const std::vector<int>& prompt, const DecoderOptions& options,
                                 const DecoderCallbacks& callbacks) const {
     validate_token_ids(prompt, options);

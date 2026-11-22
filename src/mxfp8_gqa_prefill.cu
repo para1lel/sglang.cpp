@@ -933,7 +933,8 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     if (rows >= min_flash_rows && rows <= flash_chunk && visible <= flash_limit &&
         (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
         (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
-        if (rows == flash_chunk && position >= 8192) {
+        if (rows == flash_chunk && (position >= 8192 ||
+            (!setting && position >= 4096 && position % flash_chunk == 0))) {
             constexpr int max_default_paired_position = 31744;
             const bool default_paired = (!setting || mode == "ragged") &&
                 position <= max_default_paired_position &&
@@ -996,5 +997,4 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
                                                 multirow_prefill_attention<paired_rows, 3>;
     return cudaLaunchKernel(kernel, blocks, channels, args, 0, stream);
 }
-
 }

@@ -5,12 +5,12 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder prefill | Own the arena and lend two scratch spans during GQA. | [Tile layout](../src/decoder_prefill.cpp#L175)<!-- prefix: "TileBuffers(" --> · [Scratch view](../src/decoder_prefill.cpp#L197)<!-- prefix: "PairedPrefil" --> |
-| Native Flash dispatcher | Try staged attention within the default paired route. | [Selection](../src/mxfp8_gqa_prefill.cu#L938)<!-- prefix: "const bool d" --> |
+| Native Flash dispatcher | Try staged attention within the default paired route. | [Selection](../src/mxfp8_gqa_prefill.cu#L939)<!-- prefix: "const bool d" --> |
 | Paired launcher | Check bounds and capture state, then submit predecode and attention on the caller's stream. | [Staged launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L389)<!-- prefix: "std::optiona" --> |
 
 ## Runtime path
 
-Under `tensor-core`, the native dispatcher can stage a 1,024-row tile at starts 8,192 through 31,744 inclusive. The start must be a multiple of 1,024 or have a nonzero offset within a 128-token page. This uses the default paired selection with `SGLANG_EXPERIMENTAL_TMEM_PREFILL` unset or set to `ragged`. The [SM100 page-128 opt-ins](sm100-page128-prefill.md) run before native dispatch. [Decoder call](../src/decoder_prefill.cpp#L368)<!-- prefix: "const auto s" -->
+Under `tensor-core`, the native dispatcher can stage a 1,024-row tile at starts 8,192 through 31,744 inclusive. The start must be a multiple of 1,024 or have a nonzero offset within a 128-token page. This uses the default paired selection with `SGLANG_EXPERIMENTAL_TMEM_PREFILL` unset or set to `ragged`. With the variable unset, 1,024-aligned starts from 4,096 through 7,168 select raw paired attention and leave staging scratch unused. The [SM100 page-128 opt-ins](sm100-page128-prefill.md) run before native dispatch. [Decoder call](../src/decoder_prefill.cpp#L368)<!-- prefix: "const auto s" -->
 
 The decoder lends two disjoint spans of its existing `PrefillWorkspace` allocation. The first address is inclusive and the end address is exclusive. These capacities apply to a 1,024-row arena.
 

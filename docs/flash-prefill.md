@@ -15,8 +15,9 @@ The CLI, server, and C++ default to `exact`. [Full-tile `tensor-core` dispatch](
 
 | Setting | TMEM route | Start position for 1,024 query rows |
 | --- | --- | --- |
+| Unset | Raw paired ordered | 4,096–7,168, at 1,024-token boundaries |
 | Unset or `ragged` | Staged or raw paired ordered | 8,192–31,744, at 1,024-token boundaries or inside a 128-token page |
-| Unset | [Raw paired ordered](../src/mxfp8_gqa_prefill.cu#L948)<!-- prefix: "if (default_" --> | 32,768–130,048, at 1,024-token boundaries |
+| Unset | [Raw paired ordered](../src/mxfp8_gqa_prefill.cu#L949)<!-- prefix: "if (default_" --> | 32,768–130,048, at 1,024-token boundaries |
 | `paired` | Paired ordered | Any start from 8,192 through 130,048 |
 | `ordered` | Single-CTA ordered | At least 8,192, divisible by 64 |
 | `1` | Three-part split | At least 32,768, divisible by 64 |
@@ -24,9 +25,9 @@ The CLI, server, and C++ default to `exact`. [Full-tile `tensor-core` dispatch](
 
 With the variable unset, 148-SM SM100 devices try ordered TMEM for 256–512 rows, start ≥8,192, and visibility ≤32,768. Both scale bases need eight-byte alignment. `ragged` lowers the start to 4,096 under explicit TMEM resource checks. [Partial TMEM selection](../src/mxfp8_gqa_prefill.cu#L923)<!-- prefix: "const bool d" -->
 
-The [SM100 page-128 opt-ins](sm100-page128-prefill.md) precede native dispatch. Media, MTP, and tensor-core prefix-cache tiles cap at 128 rows. The [workspace](native-prefill-workspace.md) reuses paired staging.
+The [SM100 page-128 opt-ins](sm100-page128-prefill.md) run first. Media and tensor-core prefix-cache tiles cap at 128 rows. Ordered tensor-core text with MTP can use 1,024-row tiles.
 
-Flash and TMEM follow the logical page table and process causal 64-key tiles. QK and PV use BF16 products, FP32 accumulation, and online normalization.
+Flash and TMEM follow the page table and process causal 64-key tiles using BF16 products, FP32 accumulation, and online normalization.
 
 Regular Flash packs BF16 probabilities into PV registers in reduction order. `cp.async` overlaps the next tile's KV loads with computation. Partial blocks stage zeros, mask scores, and skip output and repair for inactive queries. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L674)<!-- prefix: "__global__ v" -->
 
@@ -40,7 +41,7 @@ The 32-, 48-, and 88-row variants use `ldmatrix.x4` to load two BF16 K or V frag
 
 The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for scores and FP32 value accumulators. Regular Flash stays in the `sm_100` target. [TMEM build target](../xmake.lua#L68)<!-- prefix: "target(\"sgla" -->
 
-TMA double-buffers raw KV. Producers convert finite MXFP8 to packed BF16 at scale exponents 15–148 and use scalar range checks elsewhere.
+TMA double-buffers raw KV. Producers pack finite MXFP8 into BF16 at scale exponents 15–148 and check other scales individually.
 
 In the 64-query TMEM tile, four warps compute softmax and eight convert V. PV overlaps the next K conversion. [Pipeline](../src/text/mxfp8_gqa_prefill_tmem.cu#L545)<!-- prefix: "__global__ v" --> · [Conversion](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L74)<!-- prefix: "__device__ _" -->
 
@@ -50,7 +51,7 @@ The automatic lane-local 256-row route uses 32 queries per head pair and alterna
 
 Each paired cluster handles 128 queries and one head pair. TMA refills released full pages. Partial loads zero out-of-bounds operands. [Tail staging](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L135)<!-- prefix: "if (tail) {" --> · [Page transition](../src/text/mxfp8_gqa_prefill_tmem.cu#L729)<!-- prefix: "const bool n" -->
 
-Paired full pages use a 128-byte TMA swizzle for raw V. Remapping token rows and 16-byte vectors limits bank conflicts on raw loads and BF16 stores. E8M0 scales cover 32 E4M3 channels per token and KV head. [V map](../src/text/mxfp8_gqa_prefill_tmem.cu#L828)<!-- prefix: "result = enc" --> · [Producer mapping](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L115)<!-- prefix: "const int fi" --> · [Scale indexing](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L78)<!-- prefix: "__device__ s" -->
+Paired full pages use a 128-byte TMA swizzle for V. Token and vector remapping limits load and store bank conflicts. E8M0 scales cover 32 E4M3 channels per token and KV head. [V map](../src/text/mxfp8_gqa_prefill_tmem.cu#L828)<!-- prefix: "result = enc" --> · [Producer mapping](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L115)<!-- prefix: "const int fi" --> · [Scale indexing](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L78)<!-- prefix: "__device__ s" -->
 
 Two stages alternate scores, BF16 probabilities, and V. Producers await QK before reusing decoded K. Once both CTAs publish K, a rank-zero warp issues the next QK during softmax. [Stages](../include/sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh#L25)<!-- prefix: "struct align" --> · [Issuer](../src/text/mxfp8_gqa_prefill_tmem.cu#L633)<!-- prefix: "__device__ _" --> · [K handoff](../src/text/mxfp8_gqa_prefill_tmem.cu#L736)<!-- prefix: "pair_publish" -->
 

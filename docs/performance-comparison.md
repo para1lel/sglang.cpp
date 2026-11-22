@@ -1,58 +1,27 @@
 # Fixed W1–W6 serving comparison
 
-Native passed the paired makespan gate for W1–W5 at 8,192 scheduled tokens. Formal W6 is pending. Under the historical 32,768-token cap, native passed W1, missed the TTFT gate on W2, and missed all speed gates on W3 and W4. Native W5 and W6 timed out in the first warmup. [Paired protocol](../benchmarks/paired/README.md)
+On November 22, 2026, the measured native builds passed the paired makespan gate on all six fixed workloads. Each workload used a limit of 8,192 scheduled tokens per step. The [measurement ledger](serving/paired-measurement-ledger.md) identifies the build for each row and records the timing ranges, diagnostics, and evidence.
 
-## Matched W1–W3 at 8,192 tokens
+## Matched W1–W6 at 8,192 tokens
 
-On November 22, 2026, vLLM ran first and native ran second in each pair on B200 `GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`. Both used driver 590.48.01, server CPUs 24–33, client CPUs 34–35, local NUMA allocation, and the Qwen3.8-27B-FP8 checkpoint. The checkpoint manifest SHA-256 was `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303`.
+Each pair ran without profiling on B200 GPU 2 (`GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`), with vLLM first. Both arms used driver 590.48.01, server CPUs 24–33, client CPUs 34–35, and local NUMA allocation. The Qwen3.8-27B-FP8 checkpoint manifest SHA-256 was `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303`.
 
-Native used revision `919885edc1b70937915ca6894a40f5f98ec3f202` and binary SHA-256 `03cf404e719d03c60dec21e100212c4af75e68ba8fe97e6632322820d4d3abf8`. vLLM used revision `81a8cb063e6247fe254d7caf7e98a6691d71022a`, PyTorch 2.14.0+cu132, and FlashInfer 0.7.4.
+Both arms allowed up to 32 active requests and disabled MTP and prefix reuse. Native requested batch CUDA graphs and used tensor-core FP8 prefill. vLLM used revision `81a8cb063e6247fe254d7caf7e98a6691d71022a`, PyTorch 2.14.0+cu132, and FlashInfer 0.7.4. It used asynchronous scheduling, chunked prefill, and full and piecewise CUDA graphs. Its context and KV limits were 2,560 tokens and 10 GiB for W1–W2, and 132,096 tokens and 128 GiB for W3–W6. It used BF16 queries and E4M3 KV, with BF16 GDN convolution history and FP32 recurrence.
 
-Both arms had an effective cap of 8,192 scheduled tokens and 32 active slots, with MTP and prefix reuse disabled. Native requested batch CUDA graphs and used tensor-core FP8 prefill. vLLM used asynchronous scheduling, chunked prefill, and full and piecewise CUDA graphs. Its context limit and KV budget were 2,560 tokens and 10 GiB for W1/W2, and 132,096 tokens and 128 GiB for W3. vLLM used FlashInfer with BF16 queries and E4M3 KV. Its GDN layers used BF16 convolution history and FP32 recurrence.
+Makespan runs from the earliest client submit to the last valid `[DONE]`. Native passed when its median across measured cohorts was strictly lower than the paired vLLM median. The reduction is `100 × (1 − native median / vLLM median)`. [Paired timing and gate](../benchmarks/paired/README.md#observe-and-compare)
 
-Makespan is the last valid `[DONE]` timestamp minus the earliest client submit timestamp in a cohort. Each arm ran three warmups and nine measured single-request cohorts for each of W1 and W2. For W3, each arm ran two warmups and five measured four-request cohorts. The median uses only measured cohorts. The reduction is `100 × (1 − native median / vLLM median)`. [Paired timing and gate](../benchmarks/paired/README.md#observe-and-compare)
+| Row (lanes × prompt IDs → output IDs per lane) | Native median (s) | vLLM median (s) | Native reduction |
+| --- | ---: | ---: | ---: |
+| W1 (1 × 128 → 128) | 1.026 | 1.237 | 17.02% |
+| W2 (1 × 2,048 → 512) | 4.132 | 5.002 | 17.38% |
+| W3 (4 × 8,192 → 1,024) | 10.536 | 12.379 | 14.89% |
+| W4 (16 × 32,768 → 1,024) | 41.147 | 46.368 | 11.26% |
+| W5 (32 × 32,768 → 4,096) | 125.918 | 154.131 | 18.30% |
+| W6 (4 × 131,072 → 1,024) | 68.811 | 87.358 | 21.23% |
 
-| Row (lanes × prompt IDs → output IDs per lane) | Timed cohorts, native / vLLM | Native median (ms) | vLLM median (ms) | Native reduction |
-| --- | ---: | ---: | ---: | ---: |
-| W1 (1 × 128 → 128) | 9 / 9 | 1,026.356508 | 1,236.829263 | 17.02% |
-| W2 (1 × 2,048 → 512) | 9 / 9 | 4,132.415844 | 5,001.674231 | 17.38% |
-| W3 (4 × 8,192 → 1,024) | 5 / 5 | 10,535.815360 | 12,379.453933 | 14.89% |
+Native median time to first token (TTFT) was higher on every row. Native p95 TTFT was higher on W1–W3 and lower on W4–W6. TTFT is a diagnostic. [Per-workload diagnostics](serving/paired-measurement-ledger.md#measured-results)
 
-Replay verified the wire contract and repeat output IDs within each arm. Cross-engine ID agreement was outside the replay scope. W1, W2, and W3 each qualified under the paired makespan gate.
-
-The benchmark host retains the W1/W2 samples and replay verdict at `artifacts/takeover-baseline/paired-w1w2.FrMn3y/native/W1-W2/comparison.json`. The W3 receipt is at `artifacts/takeover-baseline/paired-w3.XFQMl5fD/native/W3/comparison.json`.
-
-## W4 and W5 at 8,192 tokens
-
-### Formal W4 result
-
-On November 22, 2026, the combined native candidate passed the W4 paired gate with **41.147 s** median makespan, **11.26%** below pinned vLLM's **46.368 s**. Native used tiled prefill scheduling, whole-tile FP8 projection pairs, and the [decode mailbox policy](http-server.md#bounded-decode-output). Both arms used the same B200 GPU 2 and CPU placement as W1–W3. Both used 8,192 scheduled tokens, 32 slots, and disabled MTP and prefix reuse. Native used tensor-core FP8 prefill and batch CUDA graphs. Pinned vLLM retained the W3 context and KV settings.
-
-Each arm ran two warmups and five measured cohorts of 16 lanes × 32,768 prompt IDs → 1,024 output IDs. Replay verified all 112 streams and repeat IDs in each arm. The formal replay did not compare IDs between engines. The native binary SHA-256 was `0871bbd2a6035c63220634ef58824b8d52b45cba31b9f893096ebd47920cbe97`. The receipt and diagnostics are under `artifacts/takeover-baseline/paired-w4.XUPFw89u/` in `native/W4/comparison.json` and `diagnostics.json`. The pinned vLLM arm ran first and is saved at `artifacts/takeover-baseline/vllm-w4.t17EISjA/reference.json`.
-
-| Diagnostic | Native | Pinned vLLM |
-| --- | ---: | ---: |
-| Median output IDs/s | 398.180 | 353.347 |
-| Request TTFT p50 / p95 (s) | 28.978 / 29.264 | 17.239 / 31.914 |
-| Request TPOT p95 (ms/ID) | 12.736 | 42.637 |
-| Request end-to-end latency p95 (s) | 41.127 | 46.365 |
-
-Native TTFT p50 was 11.739 s higher and p95 was 2.650 s lower. The paired gate measures cohort makespan. [Gate and diagnostics](../benchmarks/paired/README.md#observe-and-compare)
-
-### Formal W5 result
-
-On November 22, 2026, fresh pinned vLLM ran first. Both arms reused W4's B200, CPU placement, checkpoint, and launch settings.
-
-Each arm ran two warmups and five unprofiled measured cohorts of 32 lanes × 32,768 prompt IDs → 4,096 output IDs. Independent replay verified 224 SSE streams and exact per-lane repeats per arm. The native binary matched W4 (SHA-256 `0871bbd2a6035c63220634ef58824b8d52b45cba31b9f893096ebd47920cbe97`).
-
-| Metric | Native | Fresh pinned vLLM |
-| --- | ---: | ---: |
-| Median cohort makespan (s) | 125.917998486 | 154.131408909 |
-| Request TTFT p50 / p95 (s) | 57.577365 / 58.698938 | 33.506564 / 62.863195 |
-
-Native passed the paired gate with **18.30%** lower median makespan. Native TTFT p50 was 24.071 s higher and p95 was 4.164 s lower. TTFT is diagnostic. [Gate and diagnostics](../benchmarks/paired/README.md#observe-and-compare)
-
-The benchmark host retains the fresh `reference.json`, `native/W5/comparison.json`, and `independent-test/replay.json` at `artifacts/takeover-baseline/paired-w5.oSXO12wz/`.
+## W4 and W5 development pilots
 
 ### Earlier probes
 
@@ -80,6 +49,8 @@ The W4 scheduler-only projection was 47.603–48.500 s at 1,024 outputs per lane
 These pilots used different output caps and GPU placements. The formal W4 result measures the three changes together.
 
 ## Historical matched conditions
+
+At the historical 32,768-token cap, native passed W1, missed the TTFT gate on W2, and missed all speed gates on W3 and W4. Native W5 and W6 timed out in the first warmup.
 
 The two engines ran sequentially on the same physical B200 for each pair, with vLLM first in every pair. Both used the local Qwen3.8-27B-FP8 checkpoint, 32,768 scheduled tokens per step, 32 service slots, no MTP, and no prefix reuse. The checkpoint manifest SHA-256 was `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303`. The vLLM revision was `81a8cb063e6247fe254d7caf7e98a6691d71022a`, with PyTorch 2.14.0+cu132 and FlashInfer 0.7.4. Runs used driver 590.48.01. Host load and peer GPU activity differed between sessions. See the [benchmark agreement](performance.md#implementations-and-controls).
 

@@ -323,3 +323,6 @@ The raw receipts are in the same campaign's `W2/` directory. The SHA-256 of
 `ea445344d76449dca202e78642ad70044f5603824cf91becbf87ab251ae07015`.
 See `independent-sse-replay.json`, `exact-k0-compatibility.json`, and
 `vllm-k4/mtp-activity.json`.
+
+See the [matched split-attention K4 campaign](paired-split-attention-results.md)
+for the subsequent W1 and W2 comparison.

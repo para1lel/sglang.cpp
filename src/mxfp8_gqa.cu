@@ -524,6 +524,7 @@ __global__ void exact_replay_kernel(
 }
 
 #include "sglang/text/gqa_prefill_replay.cuh"
+#include "sglang/text/ordered_gqa_vector.cuh"
 
 constexpr int decode_splits = decoder::paged_decode_partitions;
 constexpr int split_tokens = decoder::paged_decode_max_visible / decode_splits;
@@ -808,37 +809,7 @@ int score_grid_capacity(const decoder::ExactGqaWorkspace* workspace) {
     return workspace ? text_attention_max_tokens : 0;
 }
 
-template <bool Narrow = false, bool Prefill = false, typename Position, typename Cache,
-          typename Pages, typename Scores>
-cudaError_t launch_exact_attention(
-    Cache cache, Pages pages, Position position, const __nv_bfloat16* queries,
-    __nv_bfloat16* output, Scores workspace, cudaStream_t stream) {
-    const int capacity = score_grid_capacity(workspace);
-    if (!queries || !output || capacity <= 0 || capacity > text_attention_max_tokens) {
-        return cudaErrorInvalidValue;
-    }
-    constexpr int max_score_blocks = 32;
-    const int blocks = std::min(max_score_blocks, (capacity + score_warps - 1) / score_warps);
-    void* score_arguments[] = {&cache, &pages, &position, &queries, &workspace};
-    const auto status = cudaLaunchKernel(
-        exact_scores_kernel<Narrow, Position, Cache, Pages, Scores>,
-        dim3(blocks, mxfp8_query_heads), score_warps * mxfp8_group_size, score_arguments,
-        0, stream);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    if constexpr (Prefill) {
-        void* replay_arguments[] = {&cache, &pages, &position, &workspace, &output};
-        return cudaLaunchKernel(prefill_replay_kernel,
-            dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
-            prefill_replay_threads, replay_arguments, 0, stream);
-    }
-    void* replay_arguments[] = {&cache, &pages, &position, &workspace, &queries, &output};
-    return cudaLaunchKernel(exact_replay_kernel<Narrow, Position, Cache, Pages, Scores>,
-                            dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
-                            replay_threads,
-                            replay_arguments, 0, stream);
-}
+#include "sglang/text/gqa_ordered_launch.cuh"
 
 }
 
@@ -960,6 +931,28 @@ cudaError_t decoder::exact_decode_gqa_attention(
     return workspace_bytes >= narrow_workspace_bytes
         ? launch_exact_attention<true>(cache, pages, position, queries, output, workspace, stream)
         : launch_exact_attention(cache, pages, position, queries, output, workspace, stream);
+}
+
+cudaError_t decoder::vector_decode_gqa_attention(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,
+    __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream) {
+    if (position < 0 || position >= workspace.capacity ||
+        !cache_covers(cache, pages, workspace.capacity)) {
+        return cudaErrorInvalidValue;
+    }
+    return launch_exact_attention<false, false, true>(
+        cache, pages.device_pages, position, queries, output, workspace, stream);
+}
+
+cudaError_t decoder::vector_decode_gqa_attention(
+    const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, const ExactGqaWorkspace* workspace,
+    cudaStream_t stream) {
+    if (!cache || !pages || !position) {
+        return cudaErrorInvalidValue;
+    }
+    return launch_exact_attention<false, false, true>(
+        cache, pages, position, queries, output, workspace, stream);
 }
 
 cudaError_t decoder::paged_decode_gqa(const PagedDecodeLane* lanes, int count,

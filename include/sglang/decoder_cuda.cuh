@@ -163,6 +163,13 @@ cudaError_t exact_decode_gqa_attention(
     const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
     const __nv_bfloat16* queries, __nv_bfloat16* output, const ExactGqaWorkspace* workspace,
     cudaStream_t stream, std::size_t workspace_bytes = 0);
+cudaError_t vector_decode_gqa_attention(
+    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,
+    __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream);
+cudaError_t vector_decode_gqa_attention(
+    const Mxfp8KvCache* cache, const Mxfp8PageTable* pages, const int* position,
+    const __nv_bfloat16* queries, __nv_bfloat16* output, const ExactGqaWorkspace* workspace,
+    cudaStream_t stream);
 
 inline constexpr int paged_decode_lanes = 4;
 inline constexpr int paged_decode_partitions = 16;

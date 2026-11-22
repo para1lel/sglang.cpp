@@ -56,6 +56,7 @@ struct LayerBatch {
     cudaStream_t stream;
     bool ordered_attention = false;
     bool target_tc = false;
+    bool vector_attention = false;
 
     bool tensor_core_lane(int index) const {
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
@@ -341,7 +342,7 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
 template <typename Position>
 cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
                      Position position, TextGdnMode mode, bool narrow_gqa,
-                     ExactGqaWorkspace singleton_scores, cudaStream_t stream) {
+                     ExactGqaWorkspace singleton_scores, bool vector, cudaStream_t stream) {
     const int capacity = pages.page_count * mxfp8_page_size;
     const auto scores = work.gqa_scores(capacity);
     if constexpr (std::is_same_v<Position, int>) {
@@ -352,6 +353,10 @@ cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
         if (mode == TextGdnMode::prefill || position >= scores.capacity) {
             return mxfp8_gqa_attention(cache, pages, position + 1, position, 1,
                                        work.rope_queries, work.attention, stream);
+        }
+        if (vector) {
+            return vector_decode_gqa_attention(cache, pages, position, work.rope_queries,
+                                               work.attention, scores, stream);
         }
     } else {
         if (capacity > scores.capacity) {
@@ -416,11 +421,13 @@ void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& b
     }
     if (batch.single_decode()) {
         const auto& read = reads[0];
-        check(exact_decode_gqa_attention(read.cache, read.pages, read.position,
-                                         read.buffers.queries, read.buffers.output, read.scores,
-                                         batch.stream,
-                                         batch.ordered_attention ? 0 : vocab_size * sizeof(Bf16)),
-              "Read bound singleton MXFP8 attention");
+        const auto status = batch.vector_attention
+            ? vector_decode_gqa_attention(read.cache, read.pages, read.position,
+                read.buffers.queries, read.buffers.output, read.scores, batch.stream)
+            : exact_decode_gqa_attention(read.cache, read.pages, read.position,
+                read.buffers.queries, read.buffers.output, read.scores, batch.stream,
+                batch.ordered_attention ? 0 : vocab_size * sizeof(Bf16));
+        check(status, "Read bound singleton MXFP8 attention");
     } else {
         check(paged_decode_gqa(reads.data(), batch.count, batch.stream),
               "Read bound causal MXFP8 attention");
@@ -440,9 +447,12 @@ void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>&
                                     batch.stream), "Normalize and rotate bound verification Q/K");
         check(decode_kv_append(cache, &binding.pages, position, work.rope_keys, work.values,
                                batch.stream), "Append bound verification MXFP8 KV");
-        check(exact_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
-                                          work.attention, &binding.scores[index], batch.stream),
-              "Read bound verification MXFP8 attention");
+        const auto status = batch.vector_attention
+            ? vector_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
+                work.attention, &binding.scores[index], batch.stream)
+            : exact_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
+                work.attention, &binding.scores[index], batch.stream);
+        check(status, "Read bound verification MXFP8 attention");
         gate_gqa(work, batch.stream);
     }
 }
@@ -480,8 +490,9 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
                 return;
             }
         }
+        const bool vector = batch.vector_attention && !mrope && rotary_position < 0;
         check(read_gqa(work, request.pages, cache, lane.position, lane.mode, narrow_gqa,
-                       singleton_scores, batch.stream), "Read causal MXFP8 attention");
+                       singleton_scores, vector, batch.stream), "Read causal MXFP8 attention");
         gate_gqa(work, batch.stream);
     });
     if (count > 0) {
@@ -727,8 +738,10 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
 
 template <typename Lane>
 void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream) const {
-    const LayerBatch<Lane> batch{lanes, count, stream, token_ordered_decode(fp8_prefill()),
-                                 is_b200() && tensor_core_target(fp8_prefill())};
+    const auto policy = fp8_prefill();
+    const LayerBatch<Lane> batch{lanes, count, stream, token_ordered_decode(policy),
+                                 is_b200() && tensor_core_target(policy),
+                                 is_b200() && policy == Fp8PrefillPolicy::tensor_core_mtp_target};
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
         if (batch.fuse_verify_activation()) {
             VerifyRmsQuantizeRows rows;

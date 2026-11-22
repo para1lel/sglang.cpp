@@ -36,8 +36,7 @@ cudaError_t decoder::mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages,
         return mxfp8_gqa_attention(cache, pages, static_cast<int>(visible), position, 1,
                                   queries, output, stream);
     }
-    void* arguments[] = {&cache, &pages.device_pages, &position, &queries, &output};
-    return cudaLaunchKernel(recompute_replay_kernel,
-                            dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
-                            replay_threads, arguments, 0, stream);
+    return launch_gqa_kernel(recompute_replay_kernel,
+        dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
+        replay_threads, stream, cache, pages.device_pages, position, queries, output);
 }

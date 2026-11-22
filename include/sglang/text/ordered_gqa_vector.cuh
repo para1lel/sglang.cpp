@@ -59,7 +59,7 @@ __device__ float replay_vector_channel(
 
 template <bool SkipTargetSplit, typename Position, typename Cache, typename Pages, typename Scores>
 __global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Position position,
-                                     Scores score_binding, __nv_bfloat16* output) {
+                                     Scores score_binding, __nv_bfloat16* output, int split_end) {
     __shared__ alignas(16) float values[replay_tile][vector_replay_channels];
     __shared__ float2 weights[replay_tile];
     __shared__ float denominator;
@@ -68,7 +68,7 @@ __global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Po
     const auto* pages = page_values(page_binding);
     const int last = decoder::position_value(position);
     if constexpr (SkipTargetSplit) {
-        if (decoder::target_split_position(last)) {
+        if (decoder::target_split_position(last, split_end)) {
             return;
         }
     }

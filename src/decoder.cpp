@@ -451,10 +451,12 @@ Decoder::Model::Model(const std::filesystem::path& checkpoint, int cuda_device,
                       Fp8PrefillPolicy fp8_prefill)
     : Model(checkpoint, cuda_device) {
     fp8_prefill_ = fp8_prefill;
-    const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA");
-    target_split_attention_ = is_b200() &&
-        fp8_prefill == Fp8PrefillPolicy::tensor_core_mtp_target &&
-        setting && std::string_view(setting) == "1";
+    if (is_b200() && fp8_prefill == Fp8PrefillPolicy::tensor_core_mtp_target) {
+        const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA");
+        const std::string_view mode = setting ? setting : "";
+        target_split_end_ = mode == "long" ? text_attention_max_tokens
+                         : mode == "1" ? target_split_end_position : 0;
+    }
 }
 
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device)
@@ -484,7 +486,11 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
 Decoder::~Decoder() = default;
 
 bool Decoder::experimental_target_split_gqa() const {
-    return model_->target_split_attention();
+    return model_->target_split_end() == target_split_end_position;
+}
+
+bool Decoder::experimental_long_target_split_gqa() const {
+    return model_->target_split_end() == text_attention_max_tokens;
 }
 
 std::size_t Decoder::model_device_allocation_bytes() const {
@@ -573,8 +579,8 @@ void Decoder::Model::advance_serial(Request& request, RequestProgress& progress,
 
 bool Decoder::Model::serial_graph(const DecoderOptions& options, bool media, int prompt_count,
                                   int limit) const {
-    const bool split_decode = target_split_attention_ && limit > target_split_first_position &&
-                              prompt_count < target_split_end_position;
+    const bool split_decode = target_split_end_ && limit > target_split_first_position &&
+                              prompt_count < target_split_end_;
     return !options.eager && !media && !options.requires_target_only() && !split_decode;
 }
 

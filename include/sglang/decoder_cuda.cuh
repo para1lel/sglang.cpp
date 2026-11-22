@@ -225,17 +225,24 @@ inline constexpr int target_split_first_position = 2047;
 inline constexpr int target_split_end_position = 4096;
 
 #ifdef __CUDACC__
-__host__ __device__ inline constexpr bool target_split_position(int position) {
-    return position >= target_split_first_position && position < target_split_end_position;
+__host__ __device__ inline constexpr bool target_split_position(
+    int position, int end = target_split_end_position) {
+    return position >= target_split_first_position && position < end;
 }
 #else
-inline constexpr bool target_split_position(int position) {
-    return position >= target_split_first_position && position < target_split_end_position;
+inline constexpr bool target_split_position(int position, int end = target_split_end_position) {
+    return position >= target_split_first_position && position < end;
 }
 #endif
 
-cudaError_t target_split_gqa(PagedDecodeLane lane, cudaStream_t stream);
-cudaError_t target_split_gqa(BoundPagedDecodeLane lane, cudaStream_t stream);
+cudaError_t target_split_gqa(PagedDecodeLane lane, cudaStream_t stream,
+                            int end = target_split_end_position);
+cudaError_t target_split_gqa(BoundPagedDecodeLane lane, cudaStream_t stream,
+                            int end = target_split_end_position);
+cudaError_t target_split_gqa(const BoundPagedDecodeLane* lanes, int count, int end,
+                            cudaStream_t stream);
+cudaError_t target_split_gqa(const PagedDecodeLane* lanes, int count, int end,
+                            cudaStream_t stream);
 
 cudaError_t paged_decode_gqa(const PagedDecodeLane* lanes, int count, cudaStream_t stream);
 cudaError_t paged_decode_gqa(const BoundPagedDecodeLane* lanes, int count, cudaStream_t stream);

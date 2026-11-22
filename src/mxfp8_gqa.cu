@@ -390,10 +390,10 @@ template <bool Narrow, bool SkipTargetSplit, typename Position, typename Cache, 
           typename Scores>
 __global__ void exact_scores_kernel(
     Cache cache_binding, Pages page_binding, Position position,
-    const __nv_bfloat16* queries, Scores score_binding) {
+    const __nv_bfloat16* queries, Scores score_binding, int split_end) {
     const int last = decoder::position_value(position);
     if constexpr (SkipTargetSplit) {
-        if (decoder::target_split_position(last)) {
+        if (decoder::target_split_position(last, split_end)) {
             return;
         }
     }
@@ -830,10 +830,9 @@ cudaError_t mxfp8_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, int first_
         || !cache_covers(cache, pages, end)) {
         return cudaErrorInvalidValue;
     }
-    void* arguments[] = {&cache, &pages.device_pages, &first_position, &keys, &values};
     const auto kernel = append_kernel<int, Mxfp8KvCache, const std::int32_t*>;
-    return cudaLaunchKernel(kernel, dim3(token_count, mxfp8_kv_heads),
-                            dim3(mxfp8_head_dim), arguments, 0, stream);
+    return launch_gqa_kernel(kernel, dim3(token_count, mxfp8_kv_heads), mxfp8_head_dim, stream,
+                             cache, pages.device_pages, first_position, keys, values);
 }
 
 cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int valid_tokens,
@@ -848,26 +847,25 @@ cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int va
         || !cache_covers(cache, pages, valid_tokens)) {
         return cudaErrorInvalidValue;
     }
-    void* arguments[] = {&cache, &pages.device_pages, &first_query_position, &queries, &output};
-    return cudaLaunchKernel(attention_kernel<int>, dim3(query_count, mxfp8_query_heads),
-                            dim3(mxfp8_head_dim), arguments, 0, stream);
+    return launch_gqa_kernel(attention_kernel<int>, dim3(query_count, mxfp8_query_heads),
+                             mxfp8_head_dim, stream,
+                             cache, pages.device_pages, first_query_position, queries, output);
 }
 
 cudaError_t decoder::decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages,
                                       const int* position, const __nv_bfloat16* keys,
                                       const __nv_bfloat16* values, cudaStream_t stream) {
-    void* arguments[] = {&cache, &pages.device_pages, &position, &keys, &values};
     const auto kernel = append_kernel<const int*, Mxfp8KvCache, const std::int32_t*>;
-    return cudaLaunchKernel(kernel, dim3(1, mxfp8_kv_heads),
-                            dim3(mxfp8_head_dim), arguments, 0, stream);
+    return launch_gqa_kernel(kernel, dim3(1, mxfp8_kv_heads), mxfp8_head_dim, stream,
+                             cache, pages.device_pages, position, keys, values);
 }
 
 cudaError_t decoder::decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages,
                                           const int* position, const __nv_bfloat16* queries,
                                           __nv_bfloat16* output, cudaStream_t stream) {
-    void* arguments[] = {&cache, &pages.device_pages, &position, &queries, &output};
-    return cudaLaunchKernel(attention_kernel<const int*>, dim3(1, mxfp8_query_heads),
-                            dim3(mxfp8_head_dim), arguments, 0, stream);
+    return launch_gqa_kernel(attention_kernel<const int*>, dim3(1, mxfp8_query_heads),
+                             mxfp8_head_dim, stream, cache, pages.device_pages, position,
+                             queries, output);
 }
 
 cudaError_t decoder::exact_decode_gqa_attention(
@@ -915,9 +913,9 @@ cudaError_t decoder::exact_decode_gqa_attention(
 cudaError_t decoder::decode_kv_append(const Mxfp8KvCache* cache, const Mxfp8PageTable* pages,
                                       const int* position, const __nv_bfloat16* keys,
                                       const __nv_bfloat16* values, cudaStream_t stream) {
-    void* arguments[] = {&cache, &pages, &position, &keys, &values};
     const auto kernel = append_kernel<const int*, const Mxfp8KvCache*, const Mxfp8PageTable*>;
-    return cudaLaunchKernel(kernel, dim3(1, mxfp8_kv_heads), mxfp8_head_dim, arguments, 0, stream);
+    return launch_gqa_kernel(kernel, dim3(1, mxfp8_kv_heads), mxfp8_head_dim, stream,
+                             cache, pages, position, keys, values);
 }
 
 cudaError_t decoder::exact_decode_gqa_attention(

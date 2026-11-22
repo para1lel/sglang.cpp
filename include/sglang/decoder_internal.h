@@ -506,7 +506,7 @@ struct Decoder::Model {
 
     Fp8PrefillPolicy fp8_prefill() const { return fp8_prefill_; }
     bool is_b200() const { return b200_; }
-    bool target_split_attention() const { return target_split_attention_; }
+    int target_split_end() const { return target_split_end_; }
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     bool verify_mtp(decoder::MtpRound* rounds, int count,
@@ -574,7 +574,7 @@ private:
     Model(const std::filesystem::path& checkpoint, int cuda_device);
 
     Fp8PrefillPolicy fp8_prefill_ = Fp8PrefillPolicy::exact;
-    bool target_split_attention_ = false;
+    int target_split_end_ = 0;
     bool b200_ = false;
 };
 

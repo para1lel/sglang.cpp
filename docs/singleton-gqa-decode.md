@@ -26,11 +26,19 @@ On B200, `tensor-core-mtp-target` uses vectorized V loads for score-backed text 
 
 ## Experimental split-KV target attention
 
-On B200, setting `SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=1` with `tensor-core-mtp-target` selects split-KV target attention at 2,048–4,096 visible tokens. The effective server reports `experimental_target_split_gqa: true` in `/server_info`. This combination defines a separate numerical policy. Unset the environment variable or set it to `0` to use the published ordered arithmetic with the same FP8 flag. [Split target dispatch](../include/sglang/text/gqa_target_split.cuh#L5)<!-- prefix: "__global__ v" -->
+On B200, setting `SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=1` with `tensor-core-mtp-target` selects split-KV target attention at 2,048–4,096 visible tokens. The effective server reports `experimental_target_split_gqa: true` in `/server_info`. This combination defines a separate numerical policy. Unset the environment variable or set it to `0` to use the published ordered arithmetic with the same FP8 flag. [Split target dispatch](../include/sglang/text/gqa_target_split.cuh#L6)<!-- prefix: "__global__ v" -->
 
 Each verification row uses its own causal position. The kernel reads paged MXFP8 K/V, decodes it to BF16 for Tensor Core attention, and merges splits in FP32 before rounding to BF16. Ineligible heads in the window use the existing wide FP64 replay. The changed dot-product and softmax reductions can change target scores and greedy token IDs. Outside the window, rows use ordered attention on the current request state. Earlier split rows can affect that state.
 
 Batch graph replay checks each live position on device. The standalone generator uses eager decode if the request can enter the window. Prefill, draft attention, media, and pointwise scoring use their existing paths. The experiment uses the existing checkpoint, KV capacity, and logits scratch.
+
+On the same hardware and FP8 policy, `SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=long`
+extends the window to 262,144 visible tokens and reports
+`experimental_long_target_split_gqa: true` in `/server_info`. It groups the split
+and combine launches for verification rows. Each row keeps its own causal
+position and scratch. The split count is capped at 16 per row, so scratch size
+is independent of context length. The FP64 head fallback can dominate latency
+when inputs fall outside the split kernel's numerical range.
 
 ## Constraints and failure behavior
 

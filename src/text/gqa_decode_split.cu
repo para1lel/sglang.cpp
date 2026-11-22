@@ -93,9 +93,10 @@ __device__ decoder::PagedDecodeLane resolve_input(const Batch& batch) {
     return resolve(batch.lanes[blockIdx.z]);
 }
 
-__device__ decoder::PagedDecodeLane resolve_input(TargetLane input) {
+template <typename Target>
+__device__ decoder::PagedDecodeLane resolve_input(const Target& input) {
     auto lane = resolve(input);
-    if (!decoder::target_split_position(lane.position)) {
+    if (!decoder::target_split_position(lane.position, input.end)) {
         lane.position = -1;
     }
     return lane;
@@ -527,6 +528,14 @@ cudaError_t launch(const Batch& batch, int count, cudaStream_t stream) {
 
 cudaError_t launch(TargetLane lane, cudaStream_t stream) {
     return launch_split(lane, 1, stream);
+}
+
+cudaError_t launch(const TargetBatch& batch, int count, cudaStream_t stream) {
+    return launch_split(batch, count, stream);
+}
+
+cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream) {
+    return launch_split(batch, count, stream);
 }
 
 }

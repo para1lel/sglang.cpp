@@ -11,7 +11,7 @@
 
 ## Runtime path
 
-Use `--prefix-cache-entries 1` through `4` for native prefix reuse. The default `0` disables reuse. Omit `--eager`. The default `exact` prefill policy supports prefix reuse at MTP depths 0–4. With tensor-core prefill and prefix reuse, the server uses K0 if you omit the depth option. If you set a depth with tensor-core prefix reuse, use `--mtp-steps 0`. The server rejects explicit positive depths for this combination. Prefix reuse works at every server capacity, including `--max-active 1`. The [default graph policy](batch-graphs.md) applies to eligible decode steps. [CLI validation](../apps/sglang-server.cpp#L88)<!-- prefix: "void configu" --> · [Control flag](../apps/sglang-server.cpp#L338)<!-- prefix: "}, health, a" -->
+Use `--prefix-cache-entries 1` through `4` for native prefix reuse. The default `0` disables reuse. Omit `--eager`. The default `exact` prefill policy supports prefix reuse at MTP depths 0–4. With tensor-core prefill and prefix reuse, the server uses K0 if you omit the depth option. If you set a depth with tensor-core prefix reuse, use `--mtp-steps 0`. The server rejects explicit positive depths for this combination. Prefix reuse works at every server capacity, including `--max-active 1`. The [default graph policy](batch-graphs.md) applies to eligible decode steps. [CLI validation](../apps/sglang-server.cpp#L88)<!-- prefix: "void configu" --> · [Control flag](../apps/sglang-server.cpp#L342)<!-- prefix: "}, health, a" -->
 
 The three [ordered text policies](fp8-prefill-projections.md#tensor-core-projections) require prefix reuse off. Media requests bypass prefix reuse under every policy.
 

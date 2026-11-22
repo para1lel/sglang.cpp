@@ -97,24 +97,20 @@ cudaError_t launch_long_draft_attention(
     workspace.capacity = draft_score_chunk;
     for (int first = 0; first < visible; first += draft_score_chunk) {
         const auto* range_pages = pages + first / mxfp8_page_size;
-        int count = std::min(draft_score_chunk, visible - first);
-        int last = count - 1;
+        const int count = std::min(draft_score_chunk, visible - first);
         const int blocks = std::min(32, (count + score_warps - 1) / score_warps);
         const auto scores = exact_scores_kernel<
             false, false, int, Mxfp8KvCache, const std::int32_t*, decoder::ExactGqaWorkspace>;
-        void* score_arguments[] = {&cache, &range_pages, &last, &queries, &workspace};
-        auto status = cudaLaunchKernel(scores, dim3(blocks, mxfp8_query_heads),
-                                       score_warps * mxfp8_group_size, score_arguments, 0, stream);
+        auto status = launch_gqa_kernel(scores, dim3(blocks, mxfp8_query_heads),
+            score_warps * mxfp8_group_size, stream, cache, range_pages, count - 1,
+            queries, workspace, 0);
         if (status != cudaSuccess) {
             return status;
         }
-        bool initial = first == 0;
-        bool last_range = count == visible - first;
-        void* replay_arguments[] = {&cache, &range_pages, &count, &workspace.scores, &carry,
-                                    &initial, &last_range, &output};
-        status = cudaLaunchKernel(
+        status = launch_gqa_kernel(
             draft_range_replay_kernel, dim3(mxfp8_query_heads, draft_replay_groups),
-            vector_replay_threads, replay_arguments, 0, stream);
+            vector_replay_threads, stream, cache, range_pages, count, workspace.scores, carry,
+            first == 0, count == visible - first, output);
         if (status != cudaSuccess) {
             return status;
         }

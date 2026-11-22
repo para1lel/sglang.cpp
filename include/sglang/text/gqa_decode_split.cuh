@@ -1,13 +1,28 @@
 #pragma once
 
 #include "sglang/decoder_cuda.cuh"
+
+#include <type_traits>
 #include "sglang/mxfp8_gqa.h"
 
 #include <cstdint>
 
 #include <cuda_bf16.h>
-#include <cuda_runtime_api.h>
+#include <cuda_runtime.h>
 #include <math_constants.h>
+
+namespace sglang {
+
+template <typename... Parameters>
+cudaError_t launch_gqa_kernel(void (*kernel)(Parameters...), dim3 grid, dim3 block,
+                              cudaStream_t stream,
+                              std::enable_if_t<std::is_trivially_copyable_v<Parameters>,
+                                               Parameters>... arguments) {
+    void* packed[] = {&arguments...};
+    return cudaLaunchKernel(kernel, grid, block, packed, 0, stream);
+}
+
+}
 
 namespace sglang::gqa_decode {
 
@@ -74,6 +89,17 @@ struct Batch {
 struct TargetLane {
     decoder::PagedDecodeLane eager;
     decoder::BoundPagedDecodeLane bound;
+    int end = decoder::target_split_end_position;
+};
+
+struct TargetBatch {
+    decoder::BoundPagedDecodeLane lanes[text_gdn_max_verify_rows];
+    int end;
+};
+
+struct EagerTargetBatch {
+    decoder::PagedDecodeLane lanes[text_gdn_max_verify_rows];
+    int end;
 };
 
 /// Copies `count` lanes into `batch` after checking buffer pointers and alignment.
@@ -96,6 +122,8 @@ inline cudaError_t make_batch(const decoder::BoundPagedDecodeLane* lanes, int co
 /// writes one Partial per query head and split; combine_head finishes the head.
 cudaError_t launch(const Batch& batch, int count, cudaStream_t stream);
 cudaError_t launch(TargetLane lane, cudaStream_t stream);
+cudaError_t launch(const TargetBatch& batch, int count, cudaStream_t stream);
+cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream);
 
 /// Split-KV attention, combine, FP64 replay of flagged heads, and optional output gates.
 /// Null gates leave the attention values ungated.
@@ -107,6 +135,14 @@ __device__ inline decoder::PagedDecodeLane resolve(TargetLane lane) {
     const auto& bound = lane.bound;
     return bound.position ? decoder::PagedDecodeLane{*bound.cache, *bound.pages, *bound.position,
                                                       bound.buffers} : lane.eager;
+}
+
+__device__ inline decoder::PagedDecodeLane resolve(const TargetBatch& batch) {
+    return resolve(TargetLane{{}, batch.lanes[blockIdx.z], batch.end});
+}
+
+__device__ inline decoder::PagedDecodeLane resolve(const EagerTargetBatch& batch) {
+    return batch.lanes[blockIdx.z];
 }
 
 /// Combines the splits of one head with 256 threads (one channel each) and writes the output.

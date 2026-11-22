@@ -398,20 +398,19 @@ cudaError_t launch_long_paged_decode(const decoder::PagedDecodeLane* lanes, int 
         tensor &= (key | value) % alignof(uint4) == 0;
         batch.lanes[index] = lane;
     }
-    void* arguments[] = {&batch};
-    auto status = cudaLaunchKernel(
+    auto status = launch_gqa_kernel(
         tensor ? split_long_decode_tensor : split_long_decode_attention,
         dim3(decode_splits, tensor ? mxfp8_kv_heads : mxfp8_query_heads / split_query_heads, count),
-        tensor ? wide_warps * 32 : mxfp8_head_dim, arguments, 0, stream);
+        tensor ? wide_warps * 32 : mxfp8_head_dim, stream, batch);
     if (status != cudaSuccess) {
         return status;
     }
     const dim3 grid(mxfp8_query_heads, 1, count);
-    status = cudaLaunchKernel(
+    status = launch_gqa_kernel(
         merge_decode_attention<decoder::PagedDecodeLane, decoder_batch_max_lanes>,
-        grid, mxfp8_head_dim, arguments, 0, stream);
+        grid, mxfp8_head_dim, stream, batch);
     if (status != cudaSuccess) {
         return status;
     }
-    return cudaLaunchKernel(replay_long_paged_decode, grid, mxfp8_head_dim, arguments, 0, stream);
+    return launch_gqa_kernel(replay_long_paged_decode, grid, mxfp8_head_dim, stream, batch);
 }

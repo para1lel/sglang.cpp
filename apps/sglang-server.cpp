@@ -221,7 +221,8 @@ std::string model_info_json(const Arguments& arguments) {
 }
 
 std::string server_info_json(const Arguments& arguments, double startup_seconds,
-                             const BatchRuntimeState& state, bool experimental_target_split_gqa) {
+                             const BatchRuntimeState& state, bool experimental_target_split_gqa,
+                             bool experimental_long_target_split_gqa) {
     std::string body = R"({"frontend":"cpp","version":null,"supports_inline_system":false)";
     body += R"(,"host":"127.0.0.1","dp_size":1,"tp_size":1,"pp_size":1)";
     body += R"(,"launch_command":)";
@@ -244,6 +245,9 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     sglang::json::append_quoted(body, sglang::cli::fp8_prefill_name(arguments.fp8_prefill));
     if (experimental_target_split_gqa) {
         body += R"(,"experimental_target_split_gqa":true)";
+    }
+    if (experimental_long_target_split_gqa) {
+        body += R"(,"experimental_long_target_split_gqa":true)";
     }
     body += R"(,"sampling_defaults":)";
     body += arguments.sampling == SamplingDefaults::model ? "\"model\"" : "\"openai\"";
@@ -344,7 +348,8 @@ int main(int argc, char** argv) {
                 native_generate.abort(connection, body);
             }, [&] {
                 return server_info_json(arguments, startup.count(), service.runtime_state(),
-                                        decoder.experimental_target_split_gqa());
+                                        decoder.experimental_target_split_gqa(),
+                                        decoder.experimental_long_target_split_gqa());
             }, [&](const Socket& connection, int slot, std::string_view body) {
                 serve_score(connection, service, slot, tokenizer.get(), body);
             }, &discovery, [&](const Socket& connection, int slot, std::string_view body) {

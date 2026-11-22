@@ -14,14 +14,15 @@ struct QueuedGenerate;
 
 class OllamaDiscovery {
 public:
-    enum class Route { unmatched, responded, generate };
+    enum class Route { unmatched, responded, chat, generate };
 
     explicit OllamaDiscovery(NativeGenerate& native_generate);
     bool overrides_count(const HttpRequest& request) const;
     Route respond_exact(const Socket& connection, const HttpRequest& request,
                         bool later_full, std::string_view earlier_allow) const;
     bool respond_unmatched(const Socket& connection, const HttpRequest& request) const;
-    QueuedGenerate prepare_generate(const Socket& connection, const HttpRequest& request) const;
+    QueuedGenerate prepare_generate(const Socket& connection, const HttpRequest& request,
+                                    Route route) const;
 
 private:
     struct Path {
@@ -37,6 +38,7 @@ private:
     NativeGenerate& native_generate_;
     bool ollama_root_;
     Path root_;
+    Path chat_;
     Path generate_;
     Path tags_;
     Path show_;

@@ -1,4 +1,5 @@
 #include "sglang/decoder_constraint.h"
+#include "sglang/server/chat_template.h"
 #include "sglang/server/native_generate.h"
 #include "sglang/server/http.h"
 #include "sglang/server/ollama_generate.h"
@@ -407,7 +408,8 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
 }
 
 void stream_ollama(EventStream& stream, const Socket& connection, BatchService& service, int slot,
-                   const Tokenizer& tokenizer, const std::vector<BatchPrompt>& items) {
+                   const Tokenizer& tokenizer, const std::vector<BatchPrompt>& items,
+                   OllamaCompletion completion) {
     GenerateResponse response(items.front(), tokenizer);
     std::size_t emitted = 0;
     const BatchCallbacks callbacks{
@@ -417,7 +419,7 @@ void stream_ollama(EventStream& stream, const Socket& connection, BatchService& 
                 return false;
             }
             if (terminal) {
-                return stream.write(ollama_generate_frame("", true));
+                return stream.write(ollama_frame(completion, "", true));
             }
             const auto text = response.decoded_text(result, false);
             if (response.holds_stop_prefix()) {
@@ -425,7 +427,7 @@ void stream_ollama(EventStream& stream, const Socket& connection, BatchService& 
             }
             const auto delta = text.substr(emitted);
             emitted = text.size();
-            return stream.write(ollama_generate_frame(delta, false));
+            return stream.write(ollama_frame(completion, delta, false));
         },
     };
     if (service.generate_batch(slot, items, callbacks)) {
@@ -433,8 +435,20 @@ void stream_ollama(EventStream& stream, const Socket& connection, BatchService& 
     }
 }
 
-std::vector<BatchPrompt> ollama_prompts(OllamaGenerateRequest& request,
-                                        const CompletionTokenizer& tokenizer) {
+std::string ollama_chat_prompt(json::Array messages, const CompletionTokenizer& tokenizer) {
+    for (const auto& item : messages) {
+        const auto role = json::get(*item.ordered_object(), "role")->string();
+        if (role == "root" || role == "developer") {
+            throw std::invalid_argument("Unexpected message role.");
+        }
+    }
+    return tokenizer.chat_template().render(
+        {{"messages", std::move(messages)}, {"add_generation_prompt", true}},
+        ChatInput::checkpoint_template);
+}
+
+std::vector<BatchPrompt> ollama_prompts(OllamaRequest& request,
+                                       const CompletionTokenizer& tokenizer) {
     auto sampling = ollama_sampling(request.options);
     const bool bounded = !sampling.at("max_new_tokens").is_null();
     if (!bounded) {
@@ -453,13 +467,19 @@ std::vector<BatchPrompt> ollama_prompts(OllamaGenerateRequest& request,
 }
 
 void complete_ollama(const Socket& connection, BatchService& service, std::optional<int> slot,
-                     const CompletionTokenizer& tokenizer, OllamaGenerateRequest& request,
+                     const CompletionTokenizer& tokenizer, OllamaRequest& request,
                      BatchRequestId& id) {
     EventStream stream(connection, EventStream::Format::ndjson);
-    if (disconnected(connection) || (request.stream && !stream.start())) {
+    if (disconnected(connection)) {
         return;
     }
     try {
+        if (request.completion == OllamaCompletion::chat) {
+            request.prompt = ollama_chat_prompt(std::move(request.messages), tokenizer);
+        }
+        if (request.stream && !stream.start()) {
+            return;
+        }
         if (!slot) {
             id.finish_abort();
             throw std::runtime_error("Request aborted in waiting queue");
@@ -469,7 +489,8 @@ void complete_ollama(const Socket& connection, BatchService& service, std::optio
         auto& item = items.front();
         item.request_id = &id;
         if (request.stream) {
-            stream_ollama(stream, connection, service, *slot, tokenizer.get(), items);
+            stream_ollama(stream, connection, service, *slot, tokenizer.get(), items,
+                          request.completion);
             return;
         }
         const BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
@@ -481,7 +502,7 @@ void complete_ollama(const Socket& connection, BatchService& service, std::optio
             const auto elapsed = std::chrono::steady_clock::now() - start;
             const OllamaGenerateUsage usage{elapsed, item.prompt.size(),
                                             result.output_token_ids.size()};
-            write_json(connection, "200 OK", ollama_generate_result(text, usage));
+            write_json(connection, "200 OK", ollama_result(request.completion, text, usage));
         }
     } catch (const std::exception& error) {
         std::cerr << "Ollama generation failed: " << error.what() << '\n';
@@ -611,22 +632,31 @@ QueuedGenerate NativeGenerate::prepare(std::string_view body) {
 }
 
 QueuedGenerate NativeGenerate::prepare_ollama(const Socket& connection, std::string_view body,
-                                             bool json_body) {
-    OllamaGenerateRequest request;
+                                             bool json_body, OllamaCompletion completion,
+                                             bool anthropic_errors) {
+    const auto invalid_request = [&](std::string_view message) {
+        constexpr std::string_view status = "400 Bad Request";
+        if (anthropic_errors) {
+            write_anthropic_error(connection, status, "invalid_request_error", message);
+        } else {
+            write_tokenization_error(connection, status, "Bad Request", message);
+        }
+    };
+    OllamaRequest request;
     try {
         if (!json_body) {
             throw std::invalid_argument("body: Input should be a valid dictionary");
         }
-        request = parse_ollama_generate(body);
+        request = parse_ollama_request(body, completion);
     } catch (const std::invalid_argument& error) {
-        write_tokenization_error(connection, "400 Bad Request", "Bad Request", error.what());
+        invalid_request(error.what());
         return {};
     } catch (const json::ParseError& error) {
-        write_tokenization_error(connection, "400 Bad Request", "Bad Request", error.what());
+        invalid_request(error.what());
         return {};
     }
-    if (request.prompt.empty()) {
-        const auto result = ollama_generate_result("");
+    if (completion == OllamaCompletion::generate && request.prompt.empty()) {
+        const auto result = ollama_result(completion, "");
         if (!request.stream) {
             write_json(connection, "200 OK", result);
         } else {

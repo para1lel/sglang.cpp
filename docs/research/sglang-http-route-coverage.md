@@ -1,6 +1,6 @@
 # SGLang HTTP route coverage
 
-Native dispatch overlaps 21 of 92 default Python SGLang paths for Qwen3.8-27B-FP8 on one B200. With native prefix reuse enabled, the overlap is 23. These are registry counts. The tables record method, launch and model limits, and the observations report the HTTP cases exercised.
+The baseline native dispatch overlaps 21 of 92 default Python SGLang paths for Qwen3.8-27B-FP8 on one B200. With native prefix reuse enabled, the baseline overlap is 23. The baseline tables record method, launch and model limits, and the observations report the HTTP cases exercised. Native has since added [pointwise scoring](../serving/pointwise-score.md) and [five Ollama paths](../serving/ollama.md), taking the default overlap to 27 of 92, or 29 with prefix reuse.
 
 ## Source and scope
 
@@ -60,7 +60,7 @@ Table line numbers refer to upstream `http_server.py`. `G/P/U/D/H/W` denote GET/
 | P `/invocations` | — | 2221. SageMaker dispatch order `messages`, `prompt`, `input`. |
 | P `/vertex_generate` | — | 2256. Vertex instances/parameters wrapper for generation; `AIP_PREDICT_ROUTE` overrides path. |
 
-See native [generation](../native-generate.md), [abort](../native-abort.md), [text](../text-serving.md), [chat](../chat-serving.md), [tokenization](../native-tokenization.md), [metadata](../native-model-info.md), [reasoning split](../serving/separate-reasoning.md), and [parser limits](../serving/parse-function-call.md). [Parser dispatch](../../apps/server/prefix_controls.cpp#L669)<!-- prefix: "if (request." --> · [Parser handler](../../apps/server/parse_function_call.cpp#L543)<!-- prefix: "void parse_f" -->
+See native [generation](../native-generate.md), [abort](../native-abort.md), [text](../text-serving.md), [chat](../chat-serving.md), [tokenization](../native-tokenization.md), [metadata](../native-model-info.md), [reasoning split](../serving/separate-reasoning.md), and [parser limits](../serving/parse-function-call.md). [Parser dispatch](../../apps/server/prefix_controls.cpp#L672)<!-- prefix: "if (request." --> · [Parser handler](../../apps/server/parse_function_call.cpp#L543)<!-- prefix: "void parse_f" -->
 
 ## Gaps by workload
 

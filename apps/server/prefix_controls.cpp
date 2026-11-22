@@ -631,11 +631,14 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     const auto native = native_route(request.route_path(), request.method);
     if (discovery_ && (!native.full || native.after_discovery)) {
         const auto earlier_allow = native.after_discovery ? std::string_view{} : native.allow;
-        switch (discovery_->respond_exact(connection, request, native.full, earlier_allow)) {
+        const auto route =
+            discovery_->respond_exact(connection, request, native.full, earlier_allow);
+        switch (route) {
         case OllamaDiscovery::Route::responded:
             return;
+        case OllamaDiscovery::Route::chat:
         case OllamaDiscovery::Route::generate: {
-            auto prepared = discovery_->prepare_generate(connection, request);
+            auto prepared = discovery_->prepare_generate(connection, request, route);
             if (prepared.complete) {
                 enqueue(connection, std::move(request), false, false, std::move(prepared));
             }

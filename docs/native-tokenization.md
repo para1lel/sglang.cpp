@@ -168,7 +168,7 @@ the trailing-slash form receives HTTP 307. Other methods on the canonical
 path receive HTTP 405 with `Allow: POST`. Malformed content or invalid fields
 receive HTTP 400 with an `invalid_request_error`. For example, omit `model`
 to receive this body.
-[Method check](../apps/server/prefix_controls.cpp#L679)<!-- prefix: "if ((count |" --> ·
+[Method check](../apps/server/prefix_controls.cpp#L682)<!-- prefix: "if ((count |" --> ·
 [Anthropic error body](../apps/server/http.cpp#L640)<!-- prefix: "void write_a" -->
 
 ```json

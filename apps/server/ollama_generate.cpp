@@ -84,7 +84,30 @@ bool context_integer(const json::Value& value) {
         std::abs(*number) < 9223372036854775808.0;
 }
 
-void validate_unused(const json::OrderedObject& object) {
+void validate_images(const json::OrderedObject& object) {
+    if (const auto* value = supplied(object, "images")) {
+        const auto* list = value->array();
+        if (!list || !std::all_of(list->begin(), list->end(), [](const auto& item) {
+                return item.string().has_value();
+            })) {
+            invalid("images", "Input should be a list of strings");
+        }
+    }
+}
+
+void validate_common(const json::OrderedObject& object) {
+    if (const auto* value = supplied(object, "format");
+        value && !value->ordered_object() && value->string() != "json") {
+        invalid("format", "Expected 'json' or a dictionary");
+    }
+    if (const auto* value = supplied(object, "keep_alive");
+        value && !value->string() && !value->number() && !value->boolean() &&
+        !value->wide_integer()) {
+        invalid("keep_alive", "Expected a number or a string");
+    }
+}
+
+void validate_generate(const json::OrderedObject& object) {
     optional_text(object, "suffix");
     optional_text(object, "template");
     read_flag(json::get(object, "raw"), "raw", false);
@@ -95,23 +118,57 @@ void validate_unused(const json::OrderedObject& object) {
             invalid("context", "Input should be a list of integers");
         }
     }
-    if (const auto* value = supplied(object, "images")) {
-        const auto* list = value->array();
-        if (!list || !std::all_of(list->begin(), list->end(), [](const auto& item) {
-                return item.string().has_value();
-            })) {
-            invalid("images", "Input should be a list of strings");
-        }
+    validate_images(object);
+}
+
+void require_text(const json::OrderedObject& object, std::string_view key) {
+    const auto* value = json::get(object, key);
+    if (!value) invalid(key, "Field required");
+    if (!value->string()) invalid(key, "Input should be a valid string");
+}
+
+json::Array chat_messages(const json::OrderedObject& object) {
+    const auto* value = json::get(object, "messages");
+    if (!value) invalid("messages", "Field required");
+    const auto* messages = value->array();
+    if (!messages) invalid("messages", "Input should be a valid list");
+    json::Array output;
+    output.reserve(messages->size());
+    for (const auto& item : *messages) {
+        const auto* message = item.ordered_object();
+        if (!message) invalid("messages", "Input should be a valid dictionary");
+        require_text(*message, "role");
+        require_text(*message, "content");
+        validate_images(*message);
+        output.emplace_back(json::OrderedObject{
+            {"role", *json::get(*message, "role")}, {"content", *json::get(*message, "content")},
+        });
     }
-    if (const auto* value = supplied(object, "format");
-        value && !value->ordered_object() && value->string() != "json") {
-        invalid("format", "Expected 'json' or a dictionary");
+    return output;
+}
+
+void validate_chat(const json::OrderedObject& object) {
+    const auto* think = supplied(object, "think");
+    if (think && think->string() != "low" && think->string() != "medium" &&
+        think->string() != "high") {
+        read_flag(think, "think", false);
     }
-    if (const auto* value = supplied(object, "keep_alive");
-        value && !value->string() && !value->number() && !value->boolean() &&
-        !value->wide_integer()) {
-        invalid("keep_alive", "Expected a number or a string");
+}
+
+std::string plain_prompt(const json::OrderedObject& object) {
+    require_text(object, "prompt");
+    validate_generate(object);
+    std::string prompt;
+    if (const auto system = optional_text(object, "system"); !system.empty()) {
+        prompt = system;
+        prompt += "\n\n";
     }
+    prompt += *json::get(object, "prompt")->string();
+    const auto characters = read_utf8(prompt);
+    if (std::all_of(characters.begin(), characters.end(), python_whitespace)) {
+        prompt.clear();
+    }
+    return prompt;
 }
 
 std::string timestamp() {
@@ -129,27 +186,21 @@ std::string timestamp() {
 
 }
 
-OllamaGenerateRequest parse_ollama_generate(std::string_view body) {
+OllamaRequest parse_ollama_request(std::string_view body, OllamaCompletion completion) {
     auto parsed = json::parse(body, json::Syntax::python_request);
     auto* object = parsed.ordered_object();
     if (!object) invalid("body", "Input should be a valid dictionary");
-    for (const auto* field : {"model", "prompt"}) {
-        const auto* value = json::get(*object, field);
-        if (!value) invalid(field, "Field required");
-        if (!value->string()) invalid(field, "Input should be a valid string");
+    require_text(*object, "model");
+    OllamaRequest request;
+    request.completion = completion;
+    if (completion == OllamaCompletion::chat) {
+        request.messages = chat_messages(*object);
+        validate_chat(*object);
+    } else {
+        request.prompt = plain_prompt(*object);
     }
-    validate_unused(*object);
-    OllamaGenerateRequest request;
+    validate_common(*object);
     request.stream = read_flag(json::get(*object, "stream"), "stream", true);
-    if (const auto system = optional_text(*object, "system"); !system.empty()) {
-        request.prompt = system;
-        request.prompt += "\n\n";
-    }
-    request.prompt += *json::get(*object, "prompt")->string();
-    const auto characters = read_utf8(request.prompt);
-    if (std::all_of(characters.begin(), characters.end(), python_whitespace)) {
-        request.prompt.clear();
-    }
     for (auto& [key, value] : *object) {
         if (key == "options" && !value.is_null()) {
             auto* options = value.ordered_object();
@@ -184,23 +235,26 @@ json::Object ollama_sampling(const json::OrderedObject& options) {
     return sampling;
 }
 
-std::string ollama_generate_frame(std::string_view text, bool done) {
+std::string ollama_frame(OllamaCompletion completion, std::string_view text, bool done) {
     std::string output = R"({"model":)";
     json::append_quoted(output, model_name);
     output += R"(,"created_at":)";
     json::append_quoted(output, timestamp());
-    output += R"(,"response":)";
+    const bool chat = completion == OllamaCompletion::chat;
+    output += chat ? R"(,"message":{"role":"assistant","content":)" : R"(,"response":)";
     json::append_quoted(output, text);
+    if (chat) output += R"(,"images":null})";
     output += done ? R"(,"done":true,"done_reason":"stop"})"
                    : R"(,"done":false,"done_reason":null})";
     return output;
 }
 
-std::string ollama_generate_result(std::string_view text,
-                                  std::optional<OllamaGenerateUsage> usage) {
-    auto output = ollama_generate_frame(text, true);
+std::string ollama_result(OllamaCompletion completion, std::string_view text,
+                          std::optional<OllamaGenerateUsage> usage) {
+    auto output = ollama_frame(completion, text, true);
     output.pop_back();
-    output += R"(,"context":null,"total_duration":)";
+    if (completion == OllamaCompletion::generate) output += R"(,"context":null)";
+    output += R"(,"total_duration":)";
     output += usage ? std::to_string(usage->duration.count()) : "null";
     output += R"(,"load_duration":null,"prompt_eval_count":)";
     output += usage ? std::to_string(usage->prompt_tokens) : "null";

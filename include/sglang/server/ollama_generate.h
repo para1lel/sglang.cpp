@@ -6,8 +6,12 @@
 
 namespace sglang::server {
 
-struct OllamaGenerateRequest {
+enum class OllamaCompletion { generate, chat };
+
+struct OllamaRequest {
+    OllamaCompletion completion = OllamaCompletion::generate;
     std::string prompt;
+    json::Array messages;
     json::OrderedObject options;
     bool stream = true;
 };
@@ -18,10 +22,10 @@ struct OllamaGenerateUsage {
     std::size_t output_tokens;
 };
 
-OllamaGenerateRequest parse_ollama_generate(std::string_view body);
+OllamaRequest parse_ollama_request(std::string_view body, OllamaCompletion completion);
 json::Object ollama_sampling(const json::OrderedObject& options);
-std::string ollama_generate_frame(std::string_view text, bool done);
-std::string ollama_generate_result(std::string_view text,
-                                  std::optional<OllamaGenerateUsage> usage = std::nullopt);
+std::string ollama_frame(OllamaCompletion completion, std::string_view text, bool done);
+std::string ollama_result(OllamaCompletion completion, std::string_view text,
+                          std::optional<OllamaGenerateUsage> usage = std::nullopt);
 
 }

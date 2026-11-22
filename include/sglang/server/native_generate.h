@@ -16,6 +16,7 @@ namespace sglang::server {
 
 class CompletionTokenizer;
 class Socket;
+enum class OllamaCompletion;
 
 struct GenerateInput {
     json::Object fields;
@@ -42,7 +43,8 @@ public:
         : service_(service), tokenizer_(tokenizer) {}
 
     QueuedGenerate prepare(std::string_view body);
-    QueuedGenerate prepare_ollama(const Socket& connection, std::string_view body, bool json_body);
+    QueuedGenerate prepare_ollama(const Socket& connection, std::string_view body, bool json_body,
+                                  OllamaCompletion completion, bool anthropic_errors);
     void abort(const Socket& connection, std::string_view body);
 
 private:

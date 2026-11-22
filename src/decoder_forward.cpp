@@ -4,6 +4,7 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_verify.h"
 #include "sglang/text/target_fp8.h"
+#include "sglang/text/mtp/tc_vocab.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -709,7 +710,7 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
 
 bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
                                 void* sampling_scratch, cudaStream_t stream,
-                                VerificationGraph* graph) const {
+                                VerificationGraph* graph, const TcVocabScratch* vocabulary) const {
     std::array<VerificationSequence, decoder_batch_max_mtp_lanes> sequences;
     std::array<TargetVerification*, decoder_batch_max_mtp_lanes> verifiers;
     if (count < 1 || count > decoder_batch_max_mtp_lanes) {
@@ -721,8 +722,12 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
         verifiers[index] = round.target;
         sequences[index] = {round.target, round.position, round.tokens.data(), rows,
                             round.constraint != nullptr};
+        if (round.constraint || round.sampling || round.target->needs_logits() ||
+            rows != target_verify_max_rows) {
+            vocabulary = nullptr;
+        }
     }
-    const bool replayed = forward_verify(sequences.data(), count, stream, graph);
+    const bool replayed = forward_verify(sequences.data(), count, stream, graph, vocabulary);
     for (int index = 0; index < count; ++index) {
         const auto& round = rounds[index];
         if (round.constraint) {
@@ -737,7 +742,8 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
 }
 
 bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int count,
-                                    cudaStream_t stream, VerificationGraph* graph) const {
+                                    cudaStream_t stream, VerificationGraph* graph,
+                                    const TcVocabScratch* vocabulary) const {
     if (!sequences || count < 1 || count > decoder_batch_max_mtp_lanes) {
         throw std::invalid_argument("Invalid number of verification sequences");
     }
@@ -794,15 +800,26 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
             }
         }
     }
-    enqueue_verification(rows.data(), total, stream);
+    enqueue_verification(rows.data(), total, stream, vocabulary);
     return false;
 }
 
 void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count,
-                                          cudaStream_t stream) const {
+                                          cudaStream_t stream,
+                                          const TcVocabScratch* vocabulary) const {
     forward_layers(rows, count, stream);
     const LayerBatch<VerificationRow> batch{rows, count, stream};
     batch.each([&](const VerificationRow&, Workspace& work) { normalize_final(work, stream); });
+    if (vocabulary && count == tc_vocab_rows) {
+        std::array<TcVocabRow, tc_vocab_rows> projection;
+        for (int index = 0; index < count; ++index) {
+            const auto& work = *rows[index].work;
+            projection[index] = {work.normalized, work.argmax};
+        }
+        if (try_tc_vocab(*tc_vocab, *vocabulary, projection, stream)) {
+            return;
+        }
+    }
     project(lm_head, batch, &Workspace::logits);
     batch.each([&](const VerificationRow& row, Workspace& work) {
         if (!row.constrained) {

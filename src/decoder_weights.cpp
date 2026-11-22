@@ -1,6 +1,7 @@
 #include "sglang/decoder_internal.h"
 
 #include "sglang/checkpoint.h"
+#include "sglang/text/mtp/tc_vocab.h"
 
 #include <string>
 #include <string_view>

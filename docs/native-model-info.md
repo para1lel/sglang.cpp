@@ -71,17 +71,35 @@ Pinned SGLang exposes resolved settings and a launch command at the top level, w
 
 ### INT8 draft head
 
-`--mtp-int8-head` opts into signed INT8 scoring for unconstrained draft proposals. BF16 remains the default and serves the target and constrained drafts. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive and the selected FP8 target policy still applies. [Weight preparation](../src/decoder_mtp.cpp#L186)<!-- prefix: "if (int8_hea" -->
+`--mtp-int8-head` opts into signed INT8 scoring for unconstrained draft proposals. BF16 remains the default and serves the target and constrained drafts. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive and the selected FP8 target policy still applies. [Weight preparation](../src/decoder_mtp.cpp#L187)<!-- prefix: "if (int8_hea" -->
 
-Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L651)<!-- prefix: "bool MtpDraf" -->
+Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L661)<!-- prefix: "bool MtpDraf" -->
+
+### Experimental Tensor Core target head
+
+Set `SGLANG_EXPERIMENTAL_VERIFY_SHARED_INT8_VOCAB=1` before starting the server to request the
+certified greedy vocabulary head. The default is off. The provider requires MTP,
+`--mtp-int8-head`, an NVIDIA B200 and the approved cuBLASLt 13.8 algorithm.
+The fast path serves eager batches of four greedy lanes with five rows each and
+no constraints or complete-logit consumers. Other shapes and K0 use the original head.
+
+The verifier reads the existing draft INT8 weights and adds 3,973,120 model bytes
+for statistics and 21,544,480 workspace bytes per decoder batch before allocator rounding.
+These allocations apply whenever the provider starts, including batches of ineligible requests.
+
+The Tensor Core dot accumulates signed INT8 products exactly in INT32. The interval
+includes FP32 subnormal rounding error in the original BF16 head. Refinement repeats
+the ordered FMA reduction and BF16 rounding, skips NaN scores and chooses the lowest
+token ID on ties. Nonfinite or oversized operands get unbounded intervals. Empty
+or overflowing candidate lists trigger a complete original-order scan.
 
 ### Draft attention
 
 Draft forwards use tiled MXFP8 attention for 8–256 visible tokens, including the current token. At 257–5,173 tokens, they compute exact scores in parallel and replay values in position order. Longer contexts through 262,144 tokens score 4,096 positions at a time and carry the FP32 replay maximum, denominator, and weighted sum between chunks. Both ordered paths load V in four-byte groups when the payload base permits it and assemble the same values from individual bytes otherwise. Direct attention covers lengths below eight and calls with insufficient scratch. [Draft dispatch](../include/sglang/text/mtp/gqa_attention.cuh#L18)<!-- prefix: "constexpr in" --> · [Chunked replay](../include/sglang/text/mtp/gqa_long.cuh#L151)<!-- prefix: "cudaError_t " -->
 
-Each draft lane already reserves 496,640 bytes for vocabulary logits. Long attention uses 419,328 of those bytes for scores and carry, with zero added bytes in the resident request estimate. Each attention call initializes its carry, and the lane stream orders its score and replay launches before vocabulary scoring overwrites the scratch. The draft KV and target admission limits still determine how many long requests fit. [Score storage](../src/decoder_mtp.cpp#L116)<!-- prefix: "ExactGqaWork" -->
+Each draft lane already reserves 496,640 bytes for vocabulary logits. Long attention uses 419,328 of those bytes for scores and carry, with zero added bytes in the resident request estimate. Each attention call initializes its carry, and the lane stream orders its score and replay launches before vocabulary scoring overwrites the scratch. The draft KV and target admission limits still determine how many long requests fit. [Score storage](../src/decoder_mtp.cpp#L117)<!-- prefix: "ExactGqaWork" -->
 
-Up to four unconstrained lanes share projection and vocabulary weight reads at each proposal depth. Long draft attention groups lanes with private page tables, scores, and replay carry. Each lane keeps its own position and ordered arithmetic. After verification, continuing lanes batch the KV-only repairs at each accepted depth. Single-lane and constrained requests retain their existing paths. [Proposal waves](../src/decoder_mtp.cpp#L485)<!-- prefix: "void MtpDraf" --> · [Repair waves](../src/decoder_mtp.cpp#L572)<!-- prefix: "void repair_" -->
+Up to four unconstrained lanes share projection and vocabulary weight reads at each proposal depth. Long draft attention groups lanes with private page tables, scores, and replay carry. Each lane keeps its own position and ordered arithmetic. After verification, continuing lanes batch the KV-only repairs at each accepted depth. Single-lane and constrained requests retain their existing paths. [Proposal waves](../src/decoder_mtp.cpp#L495)<!-- prefix: "void MtpDraf" --> · [Repair waves](../src/decoder_mtp.cpp#L582)<!-- prefix: "void repair_" -->
 
 Verify opt-in runs against a fresh K0 control with the same FP8 target policy. The frozen comparison uses an exact target and exact K0. Use a separate campaign for `tensor-core-mtp-target`.
 

@@ -3,6 +3,7 @@
 #include "sglang/checkpoint.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_prefill.h"
+#include "sglang/text/mtp/tc_vocab.h"
 
 #include <cmath>
 #include <cstdio>
@@ -152,7 +153,7 @@ void project(Fp8Weight weight, const DraftWorkspace& work, Bf16* output, cudaStr
 struct MtpDraftWeights::State {
     State(const std::filesystem::path& directory, int device,
           std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-          Bf16Weight lm_head, bool int8_head)
+          Bf16Weight lm_head, bool int8_head, bool prepare_shared_vocab)
         : device(device), target_weights(std::move(target_weights)), memory(device),
           embedding(embedding), lm_head(lm_head) {
         if (!this->target_weights || !embedding || !lm_head.values ||
@@ -191,6 +192,9 @@ struct MtpDraftWeights::State {
                                           memory.stream()), "Quantize MTP vocabulary head");
             quantized_head = values;
             quantized_head_maxima = maxima;
+            if (prepare_shared_vocab) {
+                shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
+            }
         }
         memory.close_stream();
         if (int8_head) {
@@ -214,6 +218,7 @@ struct MtpDraftWeights::State {
     Bf16Weight lm_head;
     const std::uint8_t* quantized_head = nullptr;
     const float* quantized_head_maxima = nullptr;
+    std::shared_ptr<const TcVocabWeights> shared_vocab;
     const Bf16* embedding_norm;
     const Bf16* hidden_norm;
     Bf16Weight fc;
@@ -416,13 +421,18 @@ void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStre
 
 MtpDraftWeights::MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
                                  std::shared_ptr<const Allocations> target_weights,
-                                 const Bf16* embedding, Bf16Weight lm_head, bool int8_head)
+                                 const Bf16* embedding, Bf16Weight lm_head, bool int8_head,
+                                 bool prepare_shared_vocab)
     : state_(std::make_unique<State>(checkpoint, device, std::move(target_weights), embedding,
-                                     lm_head, int8_head)) {}
+                                     lm_head, int8_head, prepare_shared_vocab)) {}
 
 MtpDraftWeights::~MtpDraftWeights() = default;
 
 std::size_t MtpDraftWeights::device_allocation_bytes() const { return state_->memory.bytes(); }
+
+std::shared_ptr<const TcVocabWeights> MtpDraftWeights::shared_vocab() const {
+    return state_->shared_vocab;
+}
 
 MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
                                  RequestBlockCache* cache) {

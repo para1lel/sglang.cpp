@@ -1,5 +1,4 @@
 #include "sglang/decoder_internal.h"
-
 #include "sglang/decoder_batch.h"
 #include "sglang/text/decoder_batch_plan.h"
 #include "sglang/text/decoder_logprobs.h"
@@ -12,6 +11,7 @@
 #include "sglang/decoder_prefix_cache.h"
 #include "sglang/prefill_fp8.h"
 #include "sglang/text/prefill_attn_sm100.h"
+#include "sglang/text/mtp/tc_vocab.h"
 #include <algorithm>
 #include <utility>
 namespace sglang {
@@ -106,8 +106,8 @@ struct BatchStorage {
     DecodeGraphs decode_graphs;
     std::optional<VerificationGraph> verification_graph;
     std::optional<PrefixCache> prefix_cache;
+    std::shared_ptr<const TcVocabScratch> tc_vocab;
 };
-
 void retire(std::optional<Lane>& lane) {
     if (lane && lane->request) lane->request->memory.recycle_after_completion();
     if (lane && lane->draft && lane->resident_bytes) lane->draft->recycle_after_completion();
@@ -291,6 +291,8 @@ struct DecoderBatch::State {
             storage->verification_graph.emplace(execution);
         }
         execution.open_stream(storage);
+        storage->tc_vocab = model.tc_vocab && options.max_lanes >= 4
+            ? prepare_tc_vocab_scratch(execution) : nullptr;
         if (options.resident_memory_limit) {
             const auto free = available_device_bytes();
             resident_capacity = std::min(*options.resident_memory_limit,
@@ -834,9 +836,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                          lane.remaining_output(), rows - 1};
         slots[count++] = slot;
     }
-    if (count == 0) {
-        return;
-    }
+    if (count == 0) return;
     const auto& cancel = cancel_probe();
     if (!MtpRound::propose_all(rounds.data(), count, constraint_workspace, stream, cancel)) {
         check(cudaStreamSynchronize(stream), "Complete cancelled MTP draft wave");
@@ -849,7 +849,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     }
     auto* graph = storage->verification_graph ? &*storage->verification_graph : nullptr;
     if (model.verify_mtp(rounds.data(), count, constraint_workspace, sampling_workspace,
-                         stream, graph)) {
+                         stream, graph, storage->tc_vocab.get())) {
         stats.verification_graph_slots |= std::uint32_t{1} << slots[0];
     }
     std::array<DraftRepairs, decoder_batch_max_mtp_lanes> repairs{};

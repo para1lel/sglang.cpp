@@ -32,6 +32,8 @@ struct PromptLogprobCapture;
 struct MediaPrefill;
 struct MultimodalInput;
 class TargetVerification;
+struct TcVocabWeights;
+struct TcVocabScratch;
 struct VerificationSequence;
 struct VerificationRow;
 struct VerificationGraph;
@@ -511,11 +513,14 @@ struct Decoder::Model {
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     bool verify_mtp(decoder::MtpRound* rounds, int count,
                     const decoder::ConstraintWorkspace& scratch, void* sampling_scratch,
-                    cudaStream_t stream, decoder::VerificationGraph* graph = nullptr) const;
+                    cudaStream_t stream, decoder::VerificationGraph* graph,
+                    const decoder::TcVocabScratch* vocabulary) const;
     bool forward_verify(const decoder::VerificationSequence* sequences, int count,
-                        cudaStream_t stream, decoder::VerificationGraph* graph = nullptr) const;
+                        cudaStream_t stream, decoder::VerificationGraph* graph,
+                        const decoder::TcVocabScratch* vocabulary) const;
     void enqueue_verification(const decoder::VerificationRow* rows, int count,
-                              cudaStream_t stream) const;
+                              cudaStream_t stream,
+                              const decoder::TcVocabScratch* vocabulary = nullptr) const;
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
                        decoder::PrefillWorkspace& workspace,
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
@@ -567,6 +572,7 @@ struct Decoder::Model {
     const decoder::Bf16* final_norm = nullptr;
     decoder::Bf16Weight lm_head{};
     std::shared_ptr<const decoder::MtpDraftWeights> mtp_weights;
+    std::shared_ptr<const decoder::TcVocabWeights> tc_vocab;
     mutable std::atomic_flag request_in_use = ATOMIC_FLAG_INIT;
     mutable std::unique_ptr<decoder::Request> decode_request;
 

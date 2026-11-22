@@ -31,10 +31,11 @@ class MtpDraftWeights {
 public:
     MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
                     std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-                    Bf16Weight lm_head, bool int8_head);
+                    Bf16Weight lm_head, bool int8_head, bool prepare_shared_vocab = false);
     ~MtpDraftWeights();
 
     std::size_t device_allocation_bytes() const;
+    std::shared_ptr<const TcVocabWeights> shared_vocab() const;
 
 private:
     struct State;

@@ -145,6 +145,7 @@ public:
     void commit(int count);
 
     int winner(int index, bool sampled = false, bool constrained = false) const;
+    bool needs_logits() const { return host_logits_ != nullptr; }
     const Bf16* logits(int index) const;
 
 private:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+import sys
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -14,7 +15,8 @@ from benchmarks.concurrent import client as concurrent
 from benchmarks.streaming import check_vllm, client as streaming
 from identity import verify_stream_end
 from makespan import cohort_makespan_ns, compare, validate_cohort
-from saved_evidence import device, digest, fields, load, native_process, require, saved_worker
+from saved_evidence import check_native_dispatch, device, digest, fields, load
+from saved_evidence import native_process, read_native_dispatch, require, saved_worker
 
 
 ROWS = (*streaming.SHAPES, *concurrent.ROWS)
@@ -24,6 +26,7 @@ ARM_ORDER = ("native-k0", "native-k4-trace", "native-k4", "vllm-k4")
 EXACT_CONTROL = "native-exact-k0"
 ORDERED_PROFILE = "ordered-tc-int8"
 SPLIT_PROFILE = "ordered-tc-int8-split-gqa"
+LONG_SPLIT_PROFILE = "ordered-tc-int8-long-split-gqa"
 SPLIT_FIELD = "experimental_target_split_gqa"
 LONG_SPLIT_FIELD = "experimental_long_target_split_gqa"
 TRACE_INTEGER = r"(0|[1-9][0-9]*)"
@@ -110,20 +113,26 @@ def campaign(directory):
     raw = path.read_bytes()
     identity = json.loads(raw)
     if identity["protocol"] == PROTOCOL:
+        require("native_profile" not in identity and "native_config" not in identity,
+                "Exact campaign cannot select an opt-in native configuration")
         return None
     profile = identity["native_profile"]
     config = identity["native_config"]
     expected = {"fp8_prefill": "tensor-core-mtp-target", "mtp_steps": 4, "mtp_int8_head": True}
     if profile == SPLIT_PROFILE:
         expected[SPLIT_FIELD] = True
+    if profile == LONG_SPLIT_PROFILE:
+        expected[LONG_SPLIT_FIELD] = True
     require(identity["protocol"] == OPT_IN_PROTOCOL
-            and profile in (ORDERED_PROFILE, SPLIT_PROFILE)
+            and profile in (ORDERED_PROFILE, SPLIT_PROFILE, LONG_SPLIT_PROFILE)
             and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
                              identity["campaign_id"])
             and config.keys() == expected.keys()
             and all(type(config[key]) is type(value) and config[key] == value
                     for key, value in expected.items()),
             "Unknown opt-in native campaign configuration")
+    if profile == LONG_SPLIT_PROFILE:
+        require(receipt_version(identity) == 2, "Long split requires live dispatch receipts")
     return identity, hashlib.sha256(raw).hexdigest()
 
 
@@ -134,36 +143,42 @@ def receipt_identity(directory, selected):
     return load(path) if path.exists() else {}
 
 
-def require_receipts(identity):
+def receipt_version(identity):
     version = identity.get("replay_receipts", 0)
-    require(type(version) is int and version in (0, 1), "Unknown K4 replay receipt version")
-    return version == 1
+    require(type(version) is int and version in (0, 1, 2), "Unknown K4 replay receipt version")
+    return version
 
 
-def arm_binding(directory, arm, selected, required):
+def arm_binding(directory, arm, selected, version):
     run = directory.parent
     require(selected is not None or arm != EXACT_CONTROL,
             "Exact diagnostic belongs to an opt-in campaign")
-    if selected is None and not required:
+    if selected is None and not version:
         return None
+    split_mode = ""
     if selected is not None and arm != "vllm-k4":
-        native_info(run, selected[0], opt_in=True)
+        _, split_mode = native_info(run, selected[0], opt_in=True)
     fingerprint = selected[1] if selected else digest(run.parent / "identity.json")
     binding = {"campaign_sha256": fingerprint, "arm": arm}
-    if required and arm != "vllm-k4":
+    if version and arm != "vllm-k4":
         binding["native_argv_sha256"] = digest(run / "live-argv.bin")
+        if version == 2:
+            dispatch = run / "live-dispatch.bin"
+            check_native_dispatch(dispatch, split_mode)
+            binding["native_dispatch_sha256"] = digest(dispatch)
     return binding
 
 
 def native_info(run, identity, *, opt_in):
     arm = run.name
     info = load(run / "server-info.json")
-    config = dict(identity.get("native_config", {"fp8_prefill": "exact", "mtp_steps": 4,
-                                                "mtp_int8_head": False}))
+    config = (dict(identity["native_config"]) if opt_in else
+              {"fp8_prefill": "exact", "mtp_steps": 4, "mtp_int8_head": False})
     config.update(trace_batches=arm == "native-k4-trace", max_running_requests=32,
                   max_num_batched_tokens=8192, prefix_cache_entries=0, batch_cuda_graphs=True,
                   eager=False, host="127.0.0.1", device=0)
     split = config.pop(SPLIT_FIELD, False) and arm != EXACT_CONTROL
+    long_split = config.pop(LONG_SPLIT_FIELD, False) and arm != EXACT_CONTROL
     if arm in ("native-k0", EXACT_CONTROL):
         config.update(mtp_steps=0, mtp_int8_head=False)
     if arm == EXACT_CONTROL:
@@ -172,11 +187,11 @@ def native_info(run, identity, *, opt_in):
         info.setdefault("mtp_int8_head", False)
     require(all(type(info.get(key)) is type(value) and info[key] == value
                 for key, value in config.items()) and info.get(SPLIT_FIELD, False) is split
-            and info.get(LONG_SPLIT_FIELD, False) is False,
+            and info.get(LONG_SPLIT_FIELD, False) is long_split,
             f"{arm}: wrong native server configuration")
     require((run / "running-binary.sha256").read_text().split()[0]
             == identity["native_binary_sha256"], f"{arm}: wrong running native binary")
-    return info, split
+    return info, "long" if long_split else "1" if split else ""
 
 
 def capture(row, arm, endpoint, fixtures, directory, native_control=None):
@@ -188,13 +203,13 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
     policy = concurrent.reference()["policy"]
     row_directory = directory.parent.parent
     selected = campaign(row_directory)
-    required = require_receipts(receipt_identity(row_directory, selected))
-    binding = arm_binding(directory, arm, selected, required)
+    version = receipt_version(receipt_identity(row_directory, selected))
+    binding = arm_binding(directory, arm, selected, version)
     expected = None
     if arm in ("native-k4", "native-k4-trace", EXACT_CONTROL):
         require(native_control is not None, "Provide the native K0 control")
         verify_request_files(native_control, lanes)
-        control_binding = arm_binding(native_control, "native-k0", selected, required)
+        control_binding = arm_binding(native_control, "native-k0", selected, version)
         _, expected = replay(read_raw(native_control, "control"), row, "control", lanes, policy,
                              control_binding)
     directory.mkdir()
@@ -224,7 +239,7 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
 
 
 def exact_compatibility(expected, exact, profile):
-    id_key = "policy_id" if profile == SPLIT_PROFILE else "ordered_id"
+    id_key = "ordered_id" if profile == ORDERED_PROFILE else "policy_id"
     lanes = []
     for policy_ids, exact_ids in zip(expected, exact, strict=True):
         differences = [index for index, (policy_id, exact_id) in
@@ -238,7 +253,8 @@ def exact_compatibility(expected, exact, profile):
     return {"diagnostic_only": True, "all_ids_match": expected == exact, "lanes": lanes}
 
 
-def verify_arm_receipts(run, identity, *, opt_in, required):
+def verify_arm_receipts(run, identity, *, opt_in, version):
+    required = version > 0
     status = run / "client-exit-code.txt"
     if required or status.exists():
         require(status.read_text().strip() == "0", f"{run.name}: client did not succeed")
@@ -251,9 +267,10 @@ def verify_arm_receipts(run, identity, *, opt_in, required):
     have_argv = required or (run / "live-argv.bin").exists()
     have_info = identity and (run / "server-info.json").exists()
     if have_argv or (have_info and not opt_in):
-        info, split = native_info(run, identity, opt_in=opt_in)
+        info, split_mode = native_info(run, identity, opt_in=opt_in)
         if have_argv:
-            native_process(run, identity, info, opt_in=opt_in, split=split)
+            native_process(run, identity, info, opt_in=opt_in, split_mode=split_mode,
+                           dispatch_required=version == 2)
     if run.name == "native-k4-trace":
         saved_activity(run, "native", ("server.log",), required)
 
@@ -274,7 +291,7 @@ def assess(row, fixtures, directory):
     policy = concurrent.reference()["policy"]
     selected = campaign(directory)
     identity = receipt_identity(directory, selected)
-    required = require_receipts(identity)
+    version = receipt_version(identity)
     samples = {"native-k4": [], "vllm-k4": []}
     expected = None
     exact = None
@@ -284,8 +301,8 @@ def assess(row, fixtures, directory):
             continue
         measurement = directory / arm / "measurement"
         verify_arm_receipts(measurement.parent, identity, opt_in=selected is not None,
-                            required=required)
-        binding = arm_binding(measurement, arm, selected, required)
+                            version=version)
+        binding = arm_binding(measurement, arm, selected, version)
         verify_request_files(measurement, lanes)
         tags = schedule(row, arm)
         require({path.name for path in measurement.glob("*.json.gz")}
@@ -309,7 +326,7 @@ def assess(row, fixtures, directory):
                       native_k0_parity=True,
                       exact_k0_compatibility=exact_compatibility(
                           expected, exact, identity["native_profile"]))
-    verify_row_status(directory, result, required)
+    verify_row_status(directory, result, version > 0)
     return result
 
 
@@ -462,6 +479,8 @@ def main():
     cache = modes.add_parser("cubins")
     cache.add_argument("cache", type=Path)
     cache.add_argument("directory", type=Path)
+    dispatch = modes.add_parser("native-dispatch")
+    dispatch.add_argument("pid", type=int)
     args = parser.parse_args()
     try:
         if args.mode == "capture":
@@ -478,6 +497,8 @@ def main():
             check_vllm_worker(args.row, args.directory, args.reservation, args.checkpoint)
         elif args.mode == "cubins":
             cubins(args.cache, args.directory)
+        elif args.mode == "native-dispatch":
+            sys.stdout.buffer.write(read_native_dispatch(args.pid))
         else:
             activity(args.directory, args.engine)
     except (OSError, ValueError, KeyError, TypeError, IndexError) as error:

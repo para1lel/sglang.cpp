@@ -11,6 +11,7 @@ from pathlib import Path
 
 UUID = re.compile(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
 SHA256 = re.compile(r"[0-9a-f]{64}")
+TARGET_SPLIT_ENV = "SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA"
 
 
 def require(condition, message):
@@ -67,14 +68,33 @@ def command(run, name, cpus):
     return args[offset + 5:]
 
 
-def native_process(run, identity, info, *, opt_in, split):
+def read_native_dispatch(pid):
+    require(pid > 0, "Invalid native server PID")
+    entries = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    prefix = os.fsencode(TARGET_SPLIT_ENV + "=")
+    return b"".join(entry + b"\0" for entry in entries if entry.startswith(prefix))
+
+
+def native_dispatch_entry(split_mode):
+    return f"{TARGET_SPLIT_ENV}={split_mode}" if split_mode else ""
+
+
+def check_native_dispatch(path, split_mode):
+    entry = native_dispatch_entry(split_mode)
+    expected = os.fsencode(entry) + b"\0" if entry else b""
+    require(path.read_bytes() == expected,
+            f"{path}: live native dispatch differs from the campaign")
+
+
+def native_process(run, identity, info, *, opt_in, split_mode, dispatch_required):
     cpus = {"server": identity["server_cpus"], "memory": identity["memory"]}
     wrapper = command(run, "server", cpus)
     require(wrapper[0] == "env" and wrapper[1].startswith("CUDA_CACHE_PATH="),
             f"{run.name}: wrong native command wrapper")
-    expected_env = ["SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=1"] if split else []
+    expected_env = [native_dispatch_entry(split_mode)] if split_mode else []
     argv = wrapper[2 + len(expected_env):]
-    require(wrapper[2:2 + len(expected_env)] == expected_env and Path(argv[0]).is_absolute(),
+    require(wrapper[2:2 + len(expected_env)] == expected_env and argv
+            and Path(argv[0]).is_absolute(),
             f"{run.name}: wrong native dispatch environment")
     port = info["port"]
     require(type(port) is int and 1 <= port <= 65535 and Path(info["model_path"]).is_absolute(),
@@ -98,6 +118,9 @@ def native_process(run, identity, info, *, opt_in, split):
     require(pid.isdecimal() and int(pid) > 0
             and binary == [identity["native_binary_sha256"], f"/proc/{pid}/exe"],
             f"{run.name}: executable receipt differs from the native server PID")
+    if dispatch_required:
+        check_native_dispatch(run / "live-dispatch.bin", split_mode)
+        check_native_dispatch(run / "live-dispatch-end.bin", split_mode)
     client = run / "client-command.sh"
     if client.exists():
         args = shlex.split(client.read_text())

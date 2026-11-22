@@ -79,7 +79,9 @@ Replay a saved row with `python benchmarks/paired/k4.py assess Wn FIXTURES ROW_D
 from the repository root with `PYTHONPATH=.`. New rows require saved native process
 arguments, the W1 native trace, raw vLLM activity counters, and successful client
 statuses. Replay verifies these against the launch, server settings, and activity
-summaries. Native cohorts carry the digest of their process argument receipt.
+summaries. Version 2 rows also capture the native split dispatch setting from the
+live process at readiness and after measurement. Native cohorts bind the digests
+of their process arguments and readiness dispatch receipts.
 The native trace must contain a complete depth-four event. Verification headers
 and their lane and row counts must agree with the trace events.
 Replay also checks any saved comparison and final row exit status. Older rows remain
@@ -105,8 +107,9 @@ same profile and directory for each subsequent row.
 
 Set `PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-split-gqa` in a fresh campaign
 directory and use a Release server that implements split target attention.
-Use this same profile for W1 through W6. The launcher sets the split experiment
-for both native policy arms and the W1 native trace. It requires
+Use this same profile for W1 through W6. The launcher sets
+`SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=1` for both native policy arms and the W1
+native trace. It requires
 `experimental_target_split_gqa: true` in their live server information.
 The exact K0 diagnostic runs with split disabled. Caller-supplied dispatch
 overrides are rejected.
@@ -117,6 +120,22 @@ diagnostic measures compatibility, and the pinned vLLM K4 arm measures timing.
 Neither establishes equivalence to the published ordered profile. The
 campaign binds the split policy and the fixed native settings to all receipts,
 including rows where attention falls back to the ordered implementation.
+
+### Ordered Tensor Core with long split target attention and INT8 draft
+
+Set `PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-long-split-gqa` in a fresh campaign
+directory for W1 through W6. Use a Release server with the long split path.
+The native K4 timing and W1 trace arms select `--mtp-steps 4`,
+`--fp8-prefill tensor-core-mtp-target` and `--mtp-int8-head`. Both K4 arms
+and the depth-zero native policy control use
+`SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=long`. The effective server information
+must report `experimental_long_target_split_gqa: true`, with bounded split
+disabled. The separately reported exact K0 diagnostic disables both split modes.
+
+Long split extends eligible target attention through the model's supported
+text context. All native K4 captures must match their own long-split K0
+control. The pinned vLLM K4 arm supplies the paired timing observations.
+Campaign metadata and version 2 evidence distinguish long and bounded split.
 
 ## Replay the historical GPU 2 arm
 

@@ -6,7 +6,8 @@ usage() {
     echo "ROW must be W1, W2, W3, W4, W5, or W6."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
     echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8 selects the opt-in native profile."
-    echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-split-gqa also enables split target attention."
+    echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-split-gqa enables bounded split attention."
+    echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-long-split-gqa enables long split attention."
     echo "The default profile is exact."
 }
 
@@ -28,22 +29,23 @@ native_sha=${PAIRED_NATIVE_SHA256:-}
 manifest=${PAIRED_CHECKPOINT_MANIFEST:-}
 native_profile=${PAIRED_K4_NATIVE_PROFILE-exact}
 native_fp8=exact
-native_split=false
+native_split_mode=
 case "$native_profile" in
     exact) ;;
-    ordered-tc-int8|ordered-tc-int8-split-gqa) native_fp8=tensor-core-mtp-target ;;
+    ordered-tc-int8) ;;
+    ordered-tc-int8-split-gqa) native_split_mode=1 ;;
+    ordered-tc-int8-long-split-gqa) native_split_mode=long ;;
     *) echo "Unknown PAIRED_K4_NATIVE_PROFILE: $native_profile" >&2; exit 2 ;;
 esac
-if [[ $native_profile == ordered-tc-int8-split-gqa ]]; then
-    native_split=true
-fi
 if [[ $native_profile != exact ]]; then
+    native_fp8=tensor-core-mtp-target
     overrides=$(compgen -e | sed -nE '/^SGLANG_(EXPERIMENTAL_|PREFILL_|DECODE_|SERIAL_)/p')
     if [[ -n $overrides ]]; then
         printf 'Unset native dispatch overrides for %s:\n%s\n' "$native_profile" "$overrides" >&2
         exit 2
     fi
 fi
+unset SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA
 if ! [[ -x $binary && $native_source =~ ^[a-f0-9]{40}$ &&
         $native_sha =~ ^[a-f0-9]{64}$ && -f $manifest ]]; then
     usage >&2
@@ -103,7 +105,7 @@ identity=$(jq -nc --arg source "$native_source" --arg binary "$native_sha" \
     --arg gpu "$uuid" --arg checkpoint "$model_sha" --arg vllm "$pin" \
     --arg protocol_sha "${protocol_sha%% *}" \
     --arg server "$server_cpus" --arg client "$client_cpus" \
-    '{protocol:"matched-k4-v1",replay_receipts:1,protocol_sha256:$protocol_sha,
+    '{protocol:"matched-k4-v1",replay_receipts:2,protocol_sha256:$protocol_sha,
       native_source:$source,native_binary_sha256:$binary,gpu_uuid:$gpu,
       checkpoint_sha256:$checkpoint,vllm_commit:$vllm,
       server_cpus:$server,client_cpus:$client,memory:"localalloc"}')
@@ -115,10 +117,12 @@ if [[ $native_profile != exact ]]; then
     fi
     [[ $campaign_id =~ ^[0-9a-f-]{36}$ ]]
     identity=$(jq -c --arg profile "$native_profile" --arg fp8 "$native_fp8" \
-        --arg campaign_id "$campaign_id" --argjson split "$native_split" \
+        --arg campaign_id "$campaign_id" --arg split_mode "$native_split_mode" \
         '. + {protocol:"matched-k4-opt-in-v1",campaign_id:$campaign_id,native_profile:$profile,
               native_config:{fp8_prefill:$fp8,mtp_steps:4,mtp_int8_head:true}}
-         | if $split then .native_config.experimental_target_split_gqa = true else . end' \
+         | if $split_mode == "1" then .native_config.experimental_target_split_gqa = true
+           elif $split_mode == "long" then .native_config.experimental_long_target_split_gqa = true
+           else . end' \
         <<<"$identity")
 fi
 if [[ $row == W1 && ! -e $root/identity.json ]]; then
@@ -262,10 +266,28 @@ start_vllm() {
         --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
 }
 
+check_native_info() {
+    local depth=$1 traced=$2 fp8=$3 int8=$4 split_mode=$5
+    jq -e --argjson depth "$depth" --argjson traced "$traced" --arg path "$checkpoint" \
+        --arg profile "$native_profile" --arg fp8 "$fp8" --argjson int8 "$int8" \
+        --arg split_mode "$split_mode" \
+        '.mtp_steps == $depth and .model_path == $path and .max_running_requests == 32
+         and .max_num_batched_tokens == 8192 and .prefix_cache_entries == 0
+         and .batch_cuda_graphs == true and .eager == false and .trace_batches == $traced
+         and .fp8_prefill == $fp8 and .host == "127.0.0.1" and .device == 0
+         and (if has("experimental_target_split_gqa") then .experimental_target_split_gqa
+              else false end) == ($split_mode == "1")
+         and (if has("experimental_long_target_split_gqa") then .experimental_long_target_split_gqa
+              else false end) == ($split_mode == "long")
+         and (if $profile == "exact" then (.mtp_int8_head // false) == false
+              else .mtp_int8_head == $int8 end)' \
+        server-info.json >server-check.txt
+}
+
 run_arm() {
     local arm=$1 run=$directory/$1 depth=4 traced=false int8=false client_status=0
     local fp8=$native_fp8
-    local split=$native_split
+    local split_mode=$native_split_mode
     local flags=() options=() dispatch=()
     mkdir -- "$run"
     cd -- "$run"
@@ -283,7 +305,7 @@ run_arm() {
             native-exact-k0)
                 depth=0
                 fp8=exact
-                split=false
+                split_mode=
                 flags+=(--mtp-steps 0)
                 options+=(--native-control "$directory/native-k0/measurement")
                 ;;
@@ -296,8 +318,8 @@ run_arm() {
                 int8=true
             fi
         fi
-        if [[ $split == true ]]; then
-            dispatch+=(SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=1)
+        if [[ -n $split_mode ]]; then
+            dispatch+=("SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=$split_mode")
         fi
         mkdir cuda-cache
         start_group "$run" env "CUDA_CACHE_PATH=$run/cuda-cache" "${dispatch[@]}" \
@@ -308,21 +330,9 @@ run_arm() {
         check_digest "$native_sha" "/proc/$server_pid/exe"
         sha256sum "/proc/$server_pid/exe" >running-binary.sha256
         cat "/proc/$server_pid/cmdline" >live-argv.bin
+        "${client[@]}" native-dispatch "$server_pid" >live-dispatch.bin
         "${fetch[@]}" "$url/server_info" >server-info.json
-        jq -e --argjson depth "$depth" --argjson traced "$traced" --arg path "$checkpoint" \
-            --arg profile "$native_profile" --arg fp8 "$fp8" --argjson int8 "$int8" \
-            --argjson split "$split" \
-            '.mtp_steps == $depth and .model_path == $path and .max_running_requests == 32
-             and .max_num_batched_tokens == 8192 and .prefix_cache_entries == 0
-             and .batch_cuda_graphs == true and .eager == false and .trace_batches == $traced
-             and .fp8_prefill == $fp8 and .host == "127.0.0.1" and .device == 0
-             and (if has("experimental_target_split_gqa") then .experimental_target_split_gqa
-                  else false end) == $split
-             and (if has("experimental_long_target_split_gqa")
-                  then .experimental_long_target_split_gqa else false end) == false
-             and (if $profile == "exact" then (.mtp_int8_head // false) == false
-                  else .mtp_int8_head == $int8 end)' \
-            server-info.json >server-check.txt
+        check_native_info "$depth" "$traced" "$fp8" "$int8" "$split_mode"
     fi
     ss -Hlnpt "sport = :$port" >listener.txt
     awk -v pid="pid=$server_pid," -v address="127.0.0.1:$port" \
@@ -341,6 +351,8 @@ run_arm() {
         "${client[@]}" activity "$run" vllm
     else
         cat "/proc/$server_pid/cmdline" | cmp -s -- live-argv.bin -
+        "${client[@]}" native-dispatch "$server_pid" >live-dispatch-end.bin
+        cmp -s -- live-dispatch.bin live-dispatch-end.bin
         for receipt in compute-ready.csv compute-measurement-end.csv; do
             awk -F', *' -v uuid="$gpu_uuid" -v pid="$server_pid" \
                 '$1 == uuid {count++; if ($2 == pid) owned++}

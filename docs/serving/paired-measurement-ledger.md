@@ -80,9 +80,11 @@ The `measurement/summary.json` files supply the rates and latency distributions.
 
 The November 22, 2026 W1 run checked native release `dce521eaecabfca707b6a3e6d72547ac4699b3af` and the pinned vLLM revision above. Native default K4 matched all 128 IDs from explicit K0 with exact prefill. Separate live checks confirmed the same IDs for default K4, explicit K4, and exact K0 in the generator and HTTP server. The historical native tensor-core K0 continuation first differed from the exact K0 control at output token 29.
 
-Live vLLM K0 and K4 matched for 28 output tokens. At token 29, K0 selected ID `524` with a 0.125 logprob lead over ID `321`. K4 reported equal logprobs for those IDs and selected `321`. W1 failed the exact-ID requirement.
+Live vLLM K0 and K4 matched for 28 output tokens. At token 29, K0 selected ID `524` with a 0.125 logprob lead over ID `321`. K4 reported equal logprobs for those IDs and selected `321`. This mismatch failed the v4 campaign's then-required vLLM K0/K4 ID check.
 
-The v4 campaign measured nine W1 cohorts per arm. The median makespan was 1.930878220 s for native and 0.638064157 s for vLLM. The native median was 3.026 times the vLLM median, so W1 also failed the timing requirement. The timing results are descriptive only. The K4 campaign stopped at W1.
+The [maintained matched K4 protocol](../../benchmarks/paired/README.md#matched-k4-timing-protocol) supersedes that v4 ID check. It requires strict native exact-K0 parity and valid streams from both arms. vLLM serves as a timing reference, and valid K4 streams qualify regardless of their output ID values. The archived v4 receipts retain their original checks and results.
+
+The v4 campaign measured nine W1 cohorts per arm. The median makespan was 1.930878220 s for native and 0.638064157 s for vLLM. The native median was 3.026 times the vLLM median, so W1 missed the strict timing gate on its own. The campaign stopped at W1.
 
 The receipts are on the benchmark host. The paths below are relative to `artifacts/`.
 
@@ -103,7 +105,7 @@ On B200 GPU7, four fresh Release servers ran in base, combined, combined, base o
 | Base | 6 | 1,852.73 (1,842.65–1,975.96) | 382.38 | 11.58 |
 | Combined | 6 | 1,758.35 (1,754.28–1,784.02) | 382.37 | 10.83 |
 
-The combined E2E median was 5.09% lower. The client measures E2E from submission to a valid SSE `[DONE]`. This focused native-only result sits outside the formal paired gate. The archived vLLM run used GPU2 and failed K0/K4 ID parity. Its 638.06 ms median serves as context only.
+The combined E2E median was 5.09% lower. The client measures E2E from submission to a valid SSE `[DONE]`. This focused native-only result sits outside the formal paired gate. The archived 638.06 ms vLLM median came from GPU2 and serves as context only.
 
 The measured source used base `d4388852209908d988907deffbfed9192b2f25a1` plus the two patches below. The five changed source files match the shipped attention and MLP commits `2b698a6518d2585185b92d559f86d7f31eac84af` and `dc9d7da1afd1dbbadab273c160cc95a9cea6dc99`. Independent operator checks are in `artifacts/mtp4-draft-attention-test/qualification-report.md` and `artifacts/mtp4-op-test/DISPOSITION.md`.
 

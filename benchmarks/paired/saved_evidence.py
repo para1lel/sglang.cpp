@@ -92,7 +92,7 @@ def artifact_hashes(path):
     return values
 
 
-def vllm_settings(run, args, group):
+def vllm_settings(run, args, group, *, speculative=False):
     workers = load(run / "effective-worker.json")["results"]
     require(len(workers) == 1, f"{run}: expected one observed vLLM worker")
     worker = workers[0]
@@ -130,7 +130,7 @@ def vllm_settings(run, args, group):
     require(worker["parallel"] == {"tp": 1, "dp": 1, "pp": 1}
             and worker["model_dtype"] == "torch.bfloat16" and worker["quantization"] == "fp8"
             and worker["flashinfer"] == "0.7.4"
-            and worker["enforce_eager"] is False and worker["speculative"] is False
+            and worker["enforce_eager"] is False and worker["speculative"] is speculative
             and worker["skip_tokenizer_init"] is True and worker["kv_transfer"] is False
             and worker["kv_offloading_size"] is None
             and "cpu_offload_gb=0.0," in worker["cpu_offload"]
@@ -152,7 +152,7 @@ def vllm_settings(run, args, group):
     return worker
 
 
-def saved_worker(capture, run, cpus, uuid, group):
+def saved_worker(capture, run, cpus, uuid, group, *, speculative=False):
     args = command(run, "server", cpus)
     log = (run / "server.log").read_text()
     api_pid = (run / "server-pid.txt").read_text().strip()
@@ -168,4 +168,4 @@ def saved_worker(capture, run, cpus, uuid, group):
     require(environment["CUDA_VISIBLE_DEVICES"].lower() == uuid,
             f"{run}: CUDA visibility conflicts with observed UUID")
     return {"worker_pid": int(pid), "model_path": model,
-            "effective": vllm_settings(run, args, group)}
+            "effective": vllm_settings(run, args, group, speculative=speculative)}

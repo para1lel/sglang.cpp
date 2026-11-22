@@ -40,6 +40,41 @@ checks the fixture and request bytes. Both arms record resolved settings before 
 | `PAIRED_CHECKPOINT_MANIFEST` | The saved `checkpoint.sha256` or `meta/checkpoint.sha256` in matched mode. Supply the published manifest explicitly in frozen mode. |
 | `PAIRED_ALLOW_COUNT_MISMATCH` | `0`. Set to `1` to label an otherwise verified comparison exploratory when cohort counts differ. |
 
+## Matched K4 timing protocol
+
+Run the opt-in protocol one row at a time on the same reserved B200. Use a Release
+binary with a verified source revision and binary digest, the published checkpoint
+manifest, and the pinned vLLM environment and FlashInfer cubin cache.
+
+```bash
+export PAIRED_CHECKPOINT_MANIFEST=/path/to/published/checkpoint.sha256
+export PAIRED_NATIVE_SOURCE='verified-40-character-source-revision'
+export PAIRED_NATIVE_SHA256='verified-64-character-binary-digest'
+bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4 W1
+```
+
+Supply W2 through W6 in order after each prior row passes. A row starts fresh servers
+for both timed arms. The vLLM arm goes first on W1, W3 and W5. Both K4 arms use
+the same checkpoint files, physical GPU, CPU placement, request bytes, cohort
+counts, and client clock. The clients drain each SSE response after measuring
+from the earliest submit to the last valid `[DONE]`. The runner uses port 17424
+on loopback by default and holds the campaign, port, and both GPU coordination
+locks. `PAIRED_VLLM_SEED_CACHE` can point to the retained cache seed used for v4.
+
+Each native K4 output must match the same lane in a fresh native exact-FP8 K0
+control. A separate W1 native trace checks depth-four verification. The timed
+native arm uses default K4 with tracing disabled. The vLLM arm uses explicit MTP
+depth four on the pinned revision, with its resolved worker configuration and
+fresh verification counters recorded. Its streams must pass the full wire,
+length, usage, and drain checks. vLLM output IDs may vary across valid streams
+and may differ from native and archived IDs. The runner launches only K4 on vLLM.
+
+`Wn/comparison.json` records the strict median makespan gate. A slower or tied
+native median records a timing miss and returns status 1. Invalid evidence stops
+the row before comparison. The campaign retains its raw captures and exits at
+the first failure. The K0 commands and historical receipts retain their
+original contracts.
+
 ## Replay the historical GPU 2 arm
 
 On the benchmark host, `artifacts/test-bench-baseline` holds the saved 32,768-token vLLM arm

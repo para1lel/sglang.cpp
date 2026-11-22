@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "benchmarks" / "paired"))
 import identity
+import k4
 
 
 GPU = "GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c"
@@ -233,6 +234,90 @@ def stream_record(case, request_hash, name, phase, cohort, stamps=(20, 50, 60, 7
                         "output_tokens_per_second": len(tokens) * 1e9 / duration,
                         "requests_per_second": 1e9 / duration,
                         "aggregate_tokens_per_second": aggregate_rate}}
+
+
+def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None):
+    row = "W1"
+    (lane, body, case), = k4.fixture(row, directory)
+    for arm in k4.ARM_ORDER:
+        measurement = directory / arm / "measurement"
+        measurement.mkdir(parents=True)
+        (measurement / "00.request.json").write_bytes(body)
+        for index, tag in enumerate(k4.schedule(row, arm)):
+            duration = 80 if arm == "vllm-k4" else native_ns
+            record = stream_record(case, lane["request_sha256"], row, arm, index,
+                                   (20, 50, 60, duration))
+            record["response_headers"] = [["Content-Type", "text/event-stream"],
+                                          ["Transfer-Encoding", "chunked"]]
+            record.update(finish_reason="length", done_ns=duration,
+                          usage=json.loads(record["events"][2]["lines"][0][6:])["usage"],
+                          token_chunks=[[20, 1], [50, case["output_tokens"] - 1]])
+            if arm == "vllm-k4" or (fault == "native-drift" and arm == "native-k4"):
+                record["output_ids"] = [token + index + 1 for token in record["output_ids"]]
+                for event, tokens in zip(record["events"][:2],
+                                         (record["output_ids"][:1], record["output_ids"][1:])):
+                    payload = json.loads(event["lines"][0][6:])
+                    payload["choices"][0]["token_ids"] = tokens
+                    event["lines"] = ["data: " + json.dumps(payload)]
+            if arm == "vllm-k4" and tag == "measured-01":
+                if trailing_line is not None:
+                    record["events"].append({"lines": [trailing_line], "ns": duration + 1,
+                                             "read": record["events"][-1]["read"] + 1})
+                if fault == "missing-done":
+                    record["events"].pop()
+                if fault == "missing-drain":
+                    del record["response_end"]
+                if fault == "short":
+                    payload = json.loads(record["events"][1]["lines"][0][6:])
+                    payload["choices"][0]["token_ids"].pop()
+                    record["events"][1]["lines"] = ["data: " + json.dumps(payload)]
+                if fault == "malformed":
+                    record["events"][1]["lines"] = ["data: {not JSON}"]
+            raw = {"row": row, "tag": tag, "requests": [record]}
+            with gzip.open(measurement / f"{tag}.json.gz", "wt") as stream:
+                json.dump(raw, stream)
+
+
+@pytest.mark.parametrize(("native_ns", "passed"), [(70, True), (80, False), (90, False)])
+def test_k4_timing_gate_with_different_valid_ids(tmp_path, monkeypatch, native_ns, passed):
+    write_k4_row(tmp_path, native_ns)
+    monkeypatch.setattr(sys, "argv", ["k4.py", "assess", "W1", str(tmp_path), str(tmp_path)])
+    assert k4.main() == int(not passed)
+    result = json.loads((tmp_path / "comparison.json").read_bytes())
+    assert result["passed"] is passed
+    assert result["workloads"]["W1"]["native"]["samples_ns"] == [native_ns] * 9
+    assert result["workloads"]["W1"]["vllm"]["samples_ns"] == [80] * 9
+
+
+@pytest.mark.parametrize(("fault", "message"), [
+    ("missing-done", "Stream ended before"),
+    ("missing-drain", "HTTP response end"),
+    ("short", "Expected length completion"),
+    ("malformed", "Expecting property name"),
+    ("native-drift", "native K4 differs from native K0"),
+])
+def test_k4_rejects_invalid_evidence(tmp_path, fault, message):
+    write_k4_row(tmp_path, fault=fault)
+    with pytest.raises(ValueError, match=message):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+@pytest.mark.parametrize("trailing_line", ["data:", "data: ", "data", "data: [DONE]"])
+def test_k4_rejects_trailing_data_frames(tmp_path, trailing_line):
+    write_k4_row(tmp_path, trailing_line=trailing_line)
+    with pytest.raises(ValueError, match=r"Data after \[DONE\]"):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+def test_k4_concurrent_rejects_empty_data_after_done():
+    raw, lanes = synthetic_cohort()
+    policy = identity.concurrent.reference()["policy"]
+    assert k4.replay(raw, "W3", "measured-01", lanes, policy)[0] == 95
+    events = raw["requests"][1]["events"]
+    events.append({"lines": ["data:"], "ns": events[-1]["ns"] + 1,
+                   "read": events[-1]["read"] + 1})
+    with pytest.raises(ValueError, match=r"Data after \[DONE\]"):
+        k4.replay(raw, "W3", "measured-01", lanes, policy)
 
 
 def write_measurement(run, hashes, freeze_baseline=True, stamps_by_name=None):

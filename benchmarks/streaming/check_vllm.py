@@ -23,7 +23,7 @@ GDN_PREFILL_PREFIX = (
 GDN_DECODE = "fused_recurrent_gated_delta_rule_packed_decode_kernel"
 
 
-def audit(snapshot):
+def audit(snapshot, *, speculative=False):
     state, = snapshot["results"]
     gqa = state["gqa"].values()
     gdn = state["gdn"].values()
@@ -31,7 +31,7 @@ def audit(snapshot):
     assert state["cache"]["cache_dtype"] == "fp8_e4m3"
     assert not state["cache"]["enable_prefix_caching"]
     assert state["attention"]["disable_flashinfer_q_quantization"]
-    assert not state["enforce_eager"] and not state["speculative"]
+    assert not state["enforce_eager"] and bool(state["speculative"]) is speculative
     assert len(gqa) == 16 and len(gdn) == 48
     for layer in gqa:
         assert layer["backend"] == "FLASHINFER", layer

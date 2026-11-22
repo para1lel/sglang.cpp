@@ -268,7 +268,7 @@ void append_arguments(std::string& output, const Value* value, ChatInput input) 
     const auto* args = value->ordered_object();
     if (input == ChatInput::http && value->string()) {
         try {
-            parsed = json::parse(*value->string(), json::Syntax::ordered);
+            parsed = parse_chat_arguments(*value->string(), json::Syntax::ordered);
             args = parsed.ordered_object();
         } catch (const json::ParseError&) {
             throw std::invalid_argument("Tool-call arguments must contain a JSON object");
@@ -468,6 +468,18 @@ ChatToolChoice read_tool_choice(const Value* selector, std::string_view& selecte
     return ChatToolChoice::named;
 }
 
+}
+
+json::Value parse_chat_arguments(std::string_view arguments, json::Syntax syntax) {
+    auto parsed = json::parse(arguments, syntax);
+    if (!parsed.ordered_object()) {
+        throw std::invalid_argument("Tool-call arguments must be an object");
+    }
+    return parsed;
+}
+
+std::string_view trim_chat_text(std::string_view text) {
+    return trim(text);
 }
 
 ChatTools chat_tools(const OrderedObject& chat) {

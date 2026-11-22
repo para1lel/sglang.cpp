@@ -62,7 +62,8 @@ void Parser::literal(std::string_view word) {
 }
 
 Value Parser::document() {
-    auto result = value(0, syntax_ == Syntax::ordered || syntax_ == Syntax::ordered_last_key_wins);
+    auto result = value(0, syntax_ == Syntax::ordered || syntax_ == Syntax::ordered_last_key_wins ||
+                           syntax_ == Syntax::tool_history || syntax_ == Syntax::chat_tokenization);
     whitespace();
     if (!input_.empty()) {
         fail("Unexpected data after JSON document");
@@ -125,7 +126,8 @@ Value Parser::object(std::size_t depth, bool ordered) {
                 const auto [position, inserted] = positions.try_emplace(key, entries.size());
                 if (inserted) {
                     entries.emplace_back(std::move(key), std::move(entry));
-                } else if (syntax_ == Syntax::ordered_last_key_wins) {
+                } else if (syntax_ == Syntax::ordered_last_key_wins ||
+                           syntax_ == Syntax::tool_history) {
                     entries[position->second].second = std::move(entry);
                 } else {
                     fail("duplicate JSON object key");
@@ -206,7 +208,7 @@ Value Parser::number() {
         }
     }
     if ((syntax_ == Syntax::ordered || syntax_ == Syntax::completion ||
-         syntax_ == Syntax::ordered_last_key_wins) &&
+         syntax_ == Syntax::ordered_last_key_wins || syntax_ == Syntax::chat_tokenization) &&
         text.find_first_of(".eE") == std::string_view::npos) {
         if (text.size() > 4300 + static_cast<std::size_t>(text.front() == '-')) {
             fail("JSON integer exceeds the digit limit");
@@ -219,7 +221,8 @@ Value Parser::number() {
         return result;
     }
     if (parsed.ec == std::errc::result_out_of_range && parsed.ptr == end) {
-        if (syntax_ == Syntax::benchmark || syntax_ == Syntax::checkpoint) {
+        if (syntax_ == Syntax::benchmark || syntax_ == Syntax::checkpoint ||
+            syntax_ == Syntax::tool_history || syntax_ == Syntax::chat_tokenization) {
             const auto ranged = ranged_number(text);
             if (ranged && (syntax_ == Syntax::checkpoint || *ranged == 0.0)) {
                 return *ranged;

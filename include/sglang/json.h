@@ -23,7 +23,7 @@ struct WideInteger {
 
 enum class Syntax {
     strict, ordered, benchmark, checkpoint, completion, native_generate, last_key_wins,
-    ordered_last_key_wins
+    ordered_last_key_wins, tool_history, chat_tokenization
 };
 
 class Value {
@@ -43,7 +43,9 @@ public:
 
     Object* object() { return std::get_if<Object>(&data_); }
     const Object* object() const { return std::get_if<Object>(&data_); }
+    OrderedObject* ordered_object() { return std::get_if<OrderedObject>(&data_); }
     const OrderedObject* ordered_object() const { return std::get_if<OrderedObject>(&data_); }
+    Array* array() { return std::get_if<Array>(&data_); }
     const Array* array() const { return std::get_if<Array>(&data_); }
     const WideInteger* wide_integer() const { return std::get_if<WideInteger>(&data_); }
     bool is_null() const { return std::holds_alternative<std::monostate>(data_); }

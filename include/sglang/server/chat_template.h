@@ -22,6 +22,8 @@ struct ChatTools {
 };
 
 ChatTools chat_tools(const json::OrderedObject& chat);
+json::Value parse_chat_arguments(std::string_view arguments, json::Syntax syntax);
+std::string_view trim_chat_text(std::string_view text);
 
 class ChatTemplate {
 public:

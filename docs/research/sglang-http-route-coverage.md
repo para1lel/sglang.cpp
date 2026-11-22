@@ -4,7 +4,7 @@ Native dispatch overlaps 20 of 92 default Python SGLang paths for Qwen3.8-27B-FP
 
 ## Source and scope
 
-Accessed November 22, 2026. Native is `bd55e77edd926e4db9a8e2a115b54b6d773eb879`. SGLang is `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`, read from the local pinned tree at `cache/research-src/sglang-f04d886bf79aa3d6237cbb12a3311838eb9f9bd8` under the shared user directory. The count covers the default Python autoregressive app. Ray reuses that app. `SGLANG_RUST_SERVER=1` selects the Rust listener, and `sgl-router` has its own registry. [Launch](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/launch_server.py#L17)<!-- prefix: "def run_serv" --> · [Rust selection](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L3275)<!-- prefix: "if envs.SGLA" --> · [Native startup](../../apps/sglang-server.cpp#L291)<!-- prefix: "serve_connec" -->
+Accessed November 22, 2026. The native registry baseline is `bd55e77edd926e4db9a8e2a115b54b6d773eb879`. The tokenization row includes the current chat input contract. SGLang is `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`, read from the local pinned tree at `cache/research-src/sglang-f04d886bf79aa3d6237cbb12a3311838eb9f9bd8` under the shared user directory. The count covers the default Python autoregressive app. Ray reuses that app. `SGLANG_RUST_SERVER=1` selects the Rust listener, and `sgl-router` has its own registry. [Launch](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/launch_server.py#L17)<!-- prefix: "def run_serv" --> · [Rust selection](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L3275)<!-- prefix: "if envs.SGLA" --> · [Native startup](../../apps/sglang-server.cpp#L291)<!-- prefix: "serve_connec" -->
 
 ## Registry counts
 
@@ -36,7 +36,7 @@ Table line numbers refer to upstream `http_server.py`. `G/P/U/D/H/W` denote GET/
 | P `/separate_reasoning` | ✓ | 1779. Standalone `reasoning_text` and `text` split with optional blocks. Native supports `qwen3`, `qwen3-thinking`, `dots`, `interns1`, `nanbeige` and `minimax`. |
 | P `/v1/completions` | ✓ | 1863. Scalar and batched text/IDs, JSON/SSE, echo and logprobs. Upstream supports multiple choices with `n`; native allows only `n=1` and serves a private benchmark token-ID format on this path. |
 | P `/v1/chat/completions` | ✓ | 1873. Native Qwen templating, JSON/SSE, optional reasoning/tool parsers, inline image/video data URLs; narrower options, parser and media handling. |
-| P `/v1/tokenize`, `/tokenize` | ✓ | 1911. Upstream accepts text or chat. Native accepts raw text or batches of text and rejects chat `messages`. |
+| P `/v1/tokenize`, `/tokenize` | ✓ | 1911. Both accept raw text, text batches, or one chat conversation. The [native chat path](../native-tokenization.md#encode-chat) uses the checkpoint template and encodes media placeholders as token IDs. Native normalizes common tool schema aliases. Its schema validation and template support cover fewer cases. |
 | P `/v1/detokenize`, `/detokenize` | ✓ | 1929. IDs to text; native errors and queue limits apply. |
 | P `/v1/embeddings` | — | 1885. OpenAI embedding response; generation launch rejects embedding requests. |
 | P `/v1/classify` | — | 1899. Labels/scores from a classification-model handler. |

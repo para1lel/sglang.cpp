@@ -6,6 +6,7 @@
 #include "sglang/text/target_fp8.h"
 
 #include <algorithm>
+#include <initializer_list>
 #include <type_traits>
 #include <utility>
 
@@ -29,6 +30,11 @@ struct GraphLane {
 DecodeFp8Projection decode_projection(Fp8Weight weight, Bf16* output) {
     return {weight.values, weight.scales, output, weight.rows};
 }
+
+struct LayerProjection {
+    Fp8Weight weight;
+    decltype(&Workspace::hidden) output;
+};
 
 template <typename Lane>
 Workspace& workspace(const Lane& lane) {
@@ -113,11 +119,8 @@ struct LayerBatch {
     }
 
     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
-        if (target_tc && (count > 1 || tensor_core_lane(0)) &&
-            weight.rows <= intermediate_size &&
-            weight.columns <= intermediate_size && weight.rows % text_fp8_group_size == 0 &&
-            weight.columns % text_fp8_group_size == 0) {
-            project_target(weight, output);
+        if (target_tc && (count > 1 || tensor_core_lane(0)) && target_shape(weight)) {
+            project_target({{weight, output}});
             return;
         }
         if (count == 1) {
@@ -145,26 +148,61 @@ struct LayerBatch {
         }
     }
 
-    void project_target(Fp8Weight weight, Bf16* Workspace::*output) const {
-        std::array<TextFp8Projection, text_fp8_max_batch> projections;
+    static bool target_shape(Fp8Weight weight) {
+        return weight.rows > 0 && weight.rows <= intermediate_size &&
+               weight.columns > 0 && weight.columns <= intermediate_size &&
+               weight.rows % text_fp8_group_size == 0 &&
+               weight.columns % text_fp8_group_size == 0;
+    }
+
+    void project_group(std::initializer_list<LayerProjection> layers) const {
+        const int columns = layers.begin()->weight.columns;
+        if (target_tc && (count > 1 || tensor_core_lane(0)) &&
+            std::all_of(layers.begin(), layers.end(), [columns](const auto& layer) {
+                return target_shape(layer.weight) && layer.weight.columns == columns;
+            })) {
+            project_target(layers);
+            return;
+        }
+        for (const auto& layer : layers) {
+            project(layer.weight, layer.output);
+        }
+    }
+
+    void project_target(std::initializer_list<LayerProjection> layers) const {
+        std::array<TextFp8Projection, text_decode_max_targets * text_fp8_max_batch> projections;
+        std::array<TextFp8DecodeTarget, text_decode_max_targets> targets;
+        const int columns = layers.begin()->weight.columns;
         for (int first = 0, group = 0; first < count; ++group) {
             constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
             const int rows = verification ? projection_rows(group) : 1;
-            for (int index = 0; index < rows; ++index) {
-                const auto& work = workspace(lanes[first + index]);
-                projections[index] = {{work.activation.values, work.activation.scales},
-                                      work.*output};
+            int target = 0;
+            for (const auto& layer : layers) {
+                auto* entries = projections.data() + target * rows;
+                for (int index = 0; index < rows; ++index) {
+                    const auto& work = workspace(lanes[first + index]);
+                    entries[index] = {{work.activation.values, work.activation.scales},
+                                      work.*layer.output};
+                }
+                const auto weight = layer.weight;
+                targets[target++] = {weight.values, weight.scales, weight.rows, entries[0].output};
             }
-            const TextFp8DecodeTarget target{
-                weight.values, weight.scales, weight.rows, projections[0].output};
             auto* scratch = workspace(lanes[first]).logits;
             static_assert(text_fp8_max_batch * intermediate_size <= vocab_size * sizeof(Bf16));
             const auto status = tensor_core_lane(first)
-                ? try_target_fp8_tc(target, weight.columns, projections.data(), rows, scratch,
-                                    stream)
+                ? try_target_fp8_tc(targets.data(), target, columns, projections.data(),
+                                    rows, scratch, stream)
                 : std::nullopt;
-            check(status ? *status : text_fp8_gemm(weight.values, weight.scales, weight.rows,
-                  weight.columns, projections.data(), rows, stream), "Run target FP8 projection");
+            if (status) {
+                check(*status, "Run target FP8 projection");
+            } else {
+                for (int index = 0; index < target; ++index) {
+                    const auto& split = targets[index];
+                    check(text_fp8_gemm(split.weight, split.weight_scales, split.out_width, columns,
+                                        projections.data() + index * rows, rows, stream),
+                          "Run fallback target FP8 projection");
+                }
+            }
             first += rows;
         }
     }
@@ -188,8 +226,7 @@ void project(Bf16Weight weight, const LayerBatch<VerificationRow>& batch,
 template <typename Lane>
 void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_index) {
     batch.quantize(&Workspace::normalized, hidden_size);
-    batch.project(layer.qkv, &Workspace::gdn_qkv);
-    batch.project(layer.z, &Workspace::gdn_z);
+    batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
     batch.each([&](const Lane& lane, Workspace& work) {
         const auto stream = batch.stream;
         if (batch.single_decode() && layer.b.rows == layer.a.rows &&
@@ -231,8 +268,7 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
     if (!batch.fuse_verify_activation()) {
         batch.quantize(&Workspace::normalized, hidden_size);
     }
-    batch.project(layer.qkv, &Workspace::gdn_qkv);
-    batch.project(layer.z, &Workspace::gdn_z);
+    batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
     project(layer.b, batch, &Workspace::gdn_b);
     project(layer.a, batch, &Workspace::gdn_a);
     if (first.binding) {
@@ -425,9 +461,8 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
                              decode_projection(layer.value, work.values), hidden_size,
                              batch.stream), "Run decode QKV projections");
     } else {
-        batch.project(layer.q_gate, &Workspace::q_gate);
-        batch.project(layer.key, &Workspace::keys);
-        batch.project(layer.value, &Workspace::values);
+        batch.project_group({{layer.q_gate, &Workspace::q_gate}, {layer.key, &Workspace::keys},
+                             {layer.value, &Workspace::values}});
     }
     if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
         attend_bound_gqa(layer, batch, cache_index);
@@ -447,8 +482,8 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
 template <typename Lane>
 void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
     if (batch.fuse_verify_activation()) {
-        batch.project(layer.mlp_gate, &Workspace::mlp_gate);
-        batch.project(layer.mlp_up, &Workspace::mlp_up);
+        batch.project_group({{layer.mlp_gate, &Workspace::mlp_gate},
+                             {layer.mlp_up, &Workspace::mlp_up}});
         batch.quantize_verification(&Workspace::mlp_gate, intermediate_size, &Workspace::mlp_up);
         batch.project(layer.mlp_down, &Workspace::hidden);
         return;
@@ -463,8 +498,8 @@ void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
                                  decode_projection(layer.mlp_up, work.mlp_up), hidden_size,
                                  batch.stream), "Run decode gate and up projections with SwiGLU");
     } else {
-        batch.project(layer.mlp_gate, &Workspace::mlp_gate);
-        batch.project(layer.mlp_up, &Workspace::mlp_up);
+        batch.project_group({{layer.mlp_gate, &Workspace::mlp_gate},
+                             {layer.mlp_up, &Workspace::mlp_up}});
         batch.each([&](const Lane&, Workspace& work) {
             check(text_swiglu(work.mlp_gate, work.mlp_up, intermediate_size, work.mlp_gate,
                               batch.stream), "Apply SwiGLU");

@@ -56,7 +56,7 @@ The test compares well-conditioned, query-range, and weighted-value cases with F
 
 ## L007 · Singleton route parity
 
-**Correction verified in Candidate B.** Candidate A changed tensor-core singleton graph attention to the fused split and kept legacy attention in eager. On identical token histories, all 78 eager rows matched HEAD bitwise and 274 replay rows differed. A link-only control restored legacy attention and recovered all 44 sampled rows. Candidate B keeps legacy singleton attention in eager, capture, replay, and eager continuation after an eligible launch rejection. The checkpoint rerun recovered all 352 decode logit rows bitwise. [Bound attention](../src/decoder_forward.cpp#L315)<!-- prefix: "void attend_" -->
+**Correction verified in Candidate B.** Candidate A changed tensor-core singleton graph attention to the fused split and kept legacy attention in eager. On identical token histories, all 78 eager rows matched HEAD bitwise and 274 replay rows differed. A link-only control restored legacy attention and recovered all 44 sampled rows. Candidate B keeps legacy singleton attention in eager, capture, replay, and eager continuation after an eligible launch rejection. The checkpoint rerun recovered all 352 decode logit rows bitwise. [Bound attention](../src/decoder_forward.cpp#L351)<!-- prefix: "void attend_" -->
 
 Build using the [batch graph runbook](../tests/batch/README.md). Set `out` to the Release build directory, `checkpoint` to the local checkpoint, and `GPU_UUID` to a reserved B200. Use a fresh `$out/singleton` directory.
 

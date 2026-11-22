@@ -146,6 +146,4 @@ private:
     std::unique_ptr<State> state_;
 };
 
-void trace_batch_step(int width, int decode, std::size_t request_bytes);
-
 }

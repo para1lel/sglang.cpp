@@ -10,7 +10,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
-#include <iostream>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -72,8 +71,8 @@ struct BatchJob {
 using BatchJobs = std::array<BatchJob, decoder_batch_max_lanes>;
 constexpr auto disconnect_poll = std::chrono::milliseconds(10);
 constexpr auto mailbox_grace = std::chrono::milliseconds(1);
+constexpr int mailbox_min_lanes = 16;
 constexpr int wide_decode_min_ready = 25;
-
 }
 
 struct BatchService::State {
@@ -87,6 +86,7 @@ struct BatchService::State {
     std::optional<Work> wait_for_jobs();
     bool idle_for_health() const;
     bool wide_decode_ready(bool buffered) const;
+    bool decode_mailboxes_ready(bool require_all) const;
     bool prepare(DecoderBatch& batch, int slot, const std::shared_ptr<Job>& job, bool buffered);
     bool publish(int slot, Job& job, const DecoderBatchStep& step);
     void publish_steps(const Jobs& snapshot, const Selection& selected, const Steps& steps);
@@ -219,6 +219,27 @@ bool BatchService::State::wide_decode_ready(bool buffered) const {
     return ready >= wide_decode_min_ready;
 }
 
+bool BatchService::State::decode_mailboxes_ready(bool require_all) const {
+    if (!cuda_graphs || mtp_steps != 0 || max_active < mailbox_min_lanes) {
+        return false;
+    }
+    int live = 0;
+    int ready = 0;
+    for (const auto& job : jobs) {
+        if (!job) {
+            continue;
+        }
+        if (job->cancelled || job->aborted() || !job->prefill_completed ||
+            !job->buffer_decode_output || !job->output_started) {
+            return false;
+        }
+        ++live;
+        ready += job->ready(true);
+    }
+    return live >= mailbox_min_lanes && live < decoder_batch_max_lanes &&
+        (require_all ? ready == live : ready > 0);
+}
+
 bool BatchService::State::idle_for_health() const {
     return health_probe && !reset_pending && Clock::now() < health_probe->deadline &&
            !health_probe->progressed && !health_probe->job->finish && !health_probe->job->error &&
@@ -230,7 +251,8 @@ std::optional<Work> BatchService::State::wait_for_jobs() {
     std::unique_lock lock(mutex);
     const auto end = jobs.begin() + max_active;
     changed.wait(lock, [&] {
-        return closing || reset_pending || wide_decode_ready(true) || idle_for_health() ||
+        return closing || reset_pending || wide_decode_ready(true) ||
+               decode_mailboxes_ready(false) || idle_for_health() ||
                std::any_of(jobs.begin(), end, [](const auto& job) {
                    return job && job->ready();
                });
@@ -240,6 +262,7 @@ std::optional<Work> BatchService::State::wait_for_jobs() {
     });
     changed.wait_for(lock, mailbox_grace, [&] {
         return closing || reset_pending || wide_decode_ready(true) || wide_decode_ready(false) ||
+               decode_mailboxes_ready(true) ||
                std::all_of(jobs.begin(), end, [admitting](const auto& job) {
                    return job ? job->ready() : !admitting;
                });
@@ -250,7 +273,7 @@ std::optional<Work> BatchService::State::wait_for_jobs() {
     if (idle_for_health()) {
         jobs.front() = health_probe->job;
     }
-    return Work{jobs, wide_decode_ready(true)};
+    return Work{jobs, wide_decode_ready(true) || decode_mailboxes_ready(false)};
 }
 
 bool BatchService::State::prepare(DecoderBatch& batch, int slot,
@@ -362,22 +385,6 @@ void BatchService::State::record_profile(std::uint64_t epoch, std::uint64_t elap
                                     [](const auto& step) { return step.decode; });
     const int rows = std::accumulate(stats.prefill_rows.begin(), stats.prefill_rows.end(), 0);
     profile->steps.push_back({elapsed, width, rows, decode, stats.graph_slots});
-}
-
-void trace_batch_step(int width, int decode, std::size_t request_bytes) {
-    std::cerr << ("batch width=" + std::to_string(width) + " decode=" + std::to_string(decode) +
-                  " request_bytes=" + std::to_string(request_bytes) + '\n');
-}
-
-void trace_prefix_cache(const DecoderPrefixCacheStats& stats) {
-    std::cerr << ("prefix cache entries=" + std::to_string(stats.entries) +
-                  " pages=" + std::to_string(stats.pages) +
-                  " device_bytes=" + std::to_string(stats.device_bytes) +
-                  " hits=" + std::to_string(stats.hits) +
-                  " cached_tokens=" + std::to_string(stats.cached_tokens) +
-                  " prefill_tokens=" + std::to_string(stats.prefill_tokens) +
-                  " stores=" + std::to_string(stats.stores) +
-                  " evictions=" + std::to_string(stats.evictions) + '\n');
 }
 
 std::optional<std::uint64_t> BatchService::State::begin_iteration(DecoderBatch& batch) {

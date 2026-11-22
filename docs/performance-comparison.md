@@ -1,6 +1,6 @@
 # Fixed W1–W6 serving comparison
 
-Under the historical 32,768-token scheduling cap, native passed W1 and missed only the time-to-first-token gate on W2. It missed all four speed gates on W3 and W4. W5 and W6 stopped in the first warmup before any HTTP headers or output IDs arrived. For new formal results, follow the [paired 8,192-token protocol](../benchmarks/paired/README.md).
+Native passed the paired makespan gate for W1–W4 at 8,192 scheduled tokens. W5 is underway. Under the historical 32,768-token cap, native passed W1, missed the TTFT gate on W2, and missed all speed gates on W3 and W4. Native W5 and W6 timed out in the first warmup. [Paired protocol](../benchmarks/paired/README.md)
 
 ## Matched W1–W3 at 8,192 tokens
 
@@ -24,15 +24,26 @@ The benchmark host retains the W1/W2 samples and replay verdict at `artifacts/ta
 
 ## W4 and W5 at 8,192 tokens
 
-**W4 vLLM reference.** On November 22, 2026, pinned vLLM `81a8cb063e6247fe254d7caf7e98a6691d71022a` ran on B200 GPU 2 (`GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`, PCI `00000000:4B:00.0`). It used 8,192 scheduled tokens, 32 slots, a 132,096-token context limit, and 128 GiB of KV. Two warmups and five measured cohorts of 16 lanes × 32,768 prompt IDs → 1,024 output IDs completed all 112 streams. Median makespan was **46.368 s** (46.365–46.386 s across measured cohorts). Replay verified the wire contract and repeat IDs. The receipt at `artifacts/takeover-baseline/vllm-w4.t17EISjA/reference.json` covers vLLM only. The frozen W4 reference remains 46.130 s. [Frozen GPU 2 reference](../benchmarks/concurrent/gpu2-reference.json#L401)<!-- prefix: "\"p50\": 355.1" -->
+### Formal W4 result
 
-**W4 native probe.** The native revision and binary in the W1–W3 section ran on B200 GPU 6 (`GPU-d4d87d81-ea84-5dd0-7167-3e1c48fde29b`, PCI `00000000:CA:00.0`). The native W4 and W5 probes used the W1–W3 scheduling cap, slot count, FP8 prefill, and graph settings. On the 16 frozen W4 prompts, two untraced cohorts ended at 32 output IDs per lane in **44.450 s** and **44.850 s**. Both cohorts matched the corresponding frozen output prefixes. A separate trace yielded a median of 13.158 ms over five width-16 graph steps. Adding 992 steps at that cadence to the untraced mean projects **57.703 s**. This estimate is about **11.335 s (24.4%)** slower than the fresh full vLLM median. At 12–25 ms per step, the estimates span 56.354–69.650 s. The full native decode tail is unmeasured. The cards and their PCI and CPU placement differ. Evidence is in `artifacts/takeover-w4-probe/run.ExkiZELV/summary.md` and `artifacts/takeover-w4-probe/run.ExkiZELV/projection.json`.
+On November 22, 2026, the combined native candidate passed the W4 paired gate with **41.147 s** median makespan, **11.26%** below pinned vLLM's **46.368 s**. Native used tiled prefill scheduling, whole-tile FP8 projection pairs, and the [decode mailbox policy](http-server.md#bounded-decode-output). Both arms used the same B200 GPU 2 and CPU placement as W1–W3. Both used 8,192 scheduled tokens, 32 slots, and disabled MTP and prefix reuse. Native used tensor-core FP8 prefill and batch CUDA graphs. Pinned vLLM retained the W3 context and KV settings.
 
-**W4 Nsight Systems capture.** A separate GPU 6 short cohort took 44.836 s, with 43.963 s from first submit to the last prefill step. FP8 projections took 18.248 s and paged GQA with pair preparation took 16.104 s. Together they accounted for 79.2% of the 43.386 s of captured prefill kernel time. CUPTI warned that some CUDA events might be missing. The kernel totals attribute captured work. End-to-end savings require a separate measurement. Evidence is in `artifacts/takeover-w4-probe/nsys.LbMaudSg/summary.md` and `artifacts/takeover-w4-probe/nsys.LbMaudSg/attribution.json`.
+Each arm ran two warmups and five measured cohorts of 16 lanes × 32,768 prompt IDs → 1,024 output IDs. Replay verified all 112 streams and repeat IDs in each arm. The formal replay did not compare IDs between engines. The native binary SHA-256 was `0871bbd2a6035c63220634ef58824b8d52b45cba31b9f893096ebd47920cbe97`. The receipt and diagnostics are under `artifacts/takeover-baseline/paired-w4.XUPFw89u/` in `native/W4/comparison.json` and `diagnostics.json`. The pinned vLLM arm ran first and is saved at `artifacts/takeover-baseline/vllm-w4.t17EISjA/reference.json`.
 
-**W5 native probe.** On B200 GPU 5 (`GPU-b79a7675-b3d5-9a92-e2c5-fa4769d6d281`, PCI `00000000:BA:00.0`), one traced cohort of 32 lanes × 32,768 prompt IDs → 32 output IDs took **65.421 s**. All 1,024 output IDs matched the frozen prefixes. The last prefill step completed at 64.425 s. The median of 26 intervals between width-32 graph completions was 15.979 ms. Extending this cadence over 4,064 remaining steps projects **130.360 s**. At 18, 20, and 22 ms per step, the projections are 138.573, 146.701, and 154.829 s. The frozen GPU 2 median is 149.329 s. Its archived throughput threshold requires a makespan below 147.850 s. In this projection, that requires an average remaining cadence below 20.283 ms. The full decode tail and same-card comparison remain open. Evidence is in `artifacts/takeover-w5-probe/projection.json` and `artifacts/takeover-w5-probe/traced/scheduler-summary.json`. [Frozen gates](../benchmarks/concurrent/README.md#conditions-and-gates)
+| Diagnostic | Native | Pinned vLLM |
+| --- | ---: | ---: |
+| Median output IDs/s | 398.180 | 353.347 |
+| Request TTFT p50 / p95 (s) | 28.978 / 29.264 | 17.239 / 31.914 |
+| Request TPOT p95 (ms/ID) | 12.736 | 42.637 |
+| Request end-to-end latency p95 (s) | 41.127 | 46.365 |
 
-Formal native W4 and W5 comparisons and the W6 run remain outstanding. W5 is queued conditionally on evidence supporting a full run. Run W6 only after W5 passes. [Paired protocol](../benchmarks/paired/README.md#observe-and-compare)
+Native TTFT p50 was 11.739 s higher and p95 was 2.650 s lower. The paired gate measures cohort makespan. [Gate and diagnostics](../benchmarks/paired/README.md#observe-and-compare)
+
+### Earlier probes
+
+**W4 stock native.** Two 32-output GPU 6 cohorts took 44.450 s and 44.850 s and matched frozen prefixes. A five-step width-16 graph sample implied a 57.703 s full-length projection, 11.335 s above the GPU 2 vLLM median. A separate GPU 6 profile attributed 79.2% of captured prefill kernel time to FP8 projections and paged GQA with pair preparation. CUPTI warned of possible missing events. See `artifacts/takeover-w4-probe/run.ExkiZELV/summary.md` and `artifacts/takeover-w4-probe/nsys.LbMaudSg/summary.md`.
+
+**W5 stock native.** One traced 32-lane GPU 5 cohort took 65.421 s for 32 outputs per lane. All 1,024 IDs matched frozen prefixes. The 15.979 ms width-32 graph cadence projected 130.360 s at 4,096 outputs per lane. The frozen GPU 2 median is 149.329 s. See `artifacts/takeover-w5-probe/projection.json`. W6 remains pending.
 
 ### Tiled prefill scheduler pilots
 
@@ -45,9 +56,15 @@ Each pilot compared one traced stock cohort with one traced [tiled scheduler](na
 
 The IDs matched frozen native stock and historical vLLM prefixes. W4 traces showed 60 stock steps at 16 × 512 and 59 tiled steps at 8 × 1,024 during pure prefill. W5 showed 124 stock steps at 32 × 256 and 125 tiled steps at 8 × 1,024. W5 dispatched 1,024 versus 4,065 prefill grants. Its median width-32 graph step stayed near 16 ms.
 
-Adding 768 W4 decode intervals at the observed client and graph cadences projects 47.603–48.500 s, above the measured vLLM median of 46.368 s. Full-length parity, logits, repeatability, and formal W4–W6 gates remain unverified. Evidence is in `artifacts/takeover-w4-scheduler/tail256/summary.md` and `artifacts/takeover-w4-scheduler/w5-guard/summary.md`.
+The W4 scheduler-only projection was 47.603–48.500 s at 1,024 outputs per lane. See `artifacts/takeover-w4-scheduler/tail256/summary.md` and `artifacts/takeover-w4-scheduler/w5-guard/summary.md`.
 
-## Matched conditions
+**Projection pairing.** In two mirrored 512-output W4 comparisons on GPU 7, both arms used the tiled scheduler. Pairing advanced last prefill by 2.176 s and 1.261 s and reduced makespan by 0.178 s and 1.110 s. All returned IDs matched the frozen prefixes. See the [workspace checks](native-prefill-workspace.md#verification).
+
+**Decode mailboxes.** Two 256-output W4 runs per arm on GPU 6 held both prefill changes fixed. The mailbox reduced median makespan by 1.483 s. Partial pure-decode passes fell from 252–254 to 4–5 per run. Median all-live decode throughput rose from 984.53 to 1,370.86 IDs/s, measured from last prefill until the first lane completed. Median consecutive width-16 graph intervals fell from 14.675–15.505 ms to 11.460–11.469 ms across runs. All IDs matched frozen native and pinned vLLM prefixes. GPU timing covers width 16. See `artifacts/takeover-w4-mailbox/summary.md`.
+
+These pilots used different output caps and GPU placements. The formal W4 result measures the three changes together.
+
+## Historical matched conditions
 
 The two engines ran sequentially on the same physical B200 for each pair, with vLLM first in every pair. Both used the local Qwen3.8-27B-FP8 checkpoint, 32,768 scheduled tokens per step, 32 service slots, no MTP, and no prefix reuse. The checkpoint manifest SHA-256 was `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303`. The vLLM revision was `81a8cb063e6247fe254d7caf7e98a6691d71022a`, with PyTorch 2.14.0+cu132 and FlashInfer 0.7.4. Runs used driver 590.48.01. Host load and peer GPU activity differed between sessions. See the [benchmark agreement](performance.md#implementations-and-controls).
 
@@ -114,7 +131,7 @@ W6 reproduced in a process without prior W5 work or allocations. Both diagnostic
 | BF16 GDN gates | 2.104 | 0.576 | 7.393 | 0.332 |
 | LM head | 0.476 | 0.362 | 6.066 | 0.368 |
 
-Projection and paged GQA show the largest duration differences. W4 used 1,600 native grouped projections and 16 separate LM heads per full eager step. The vLLM graph used 256 fused or differently tiled projections and one head. Concurrent kernel durations can overlap, and CUDA API elapsed time can include already queued device work. The differences do not estimate independent latency savings. Comparing current native W4 with archived vLLM showed similar projection and GQA differences. That comparison spans GPU 6 at 32,768 scheduled tokens and GPU 2 at 8,192.
+Projection and paged GQA show the largest duration differences. W4 used 1,600 native grouped projections and 16 separate LM heads per full eager step. The vLLM graph used 256 fused or differently tiled projections and one head. Concurrent kernel durations can overlap, and CUDA API elapsed time can include already queued device work. The differences do not estimate independent latency savings. Comparing historical native W4 with archived vLLM showed similar projection and GQA differences. That comparison spans GPU 6 at 32,768 scheduled tokens and GPU 2 at 8,192.
 
 **W4 prefill.** In two native trace windows of about 2.5 s each, flash attention rose from 42.6% to 64.8% of summed GPU kernel durations. Mean time per flash attention launch rose from 2.975 to 7.369 ms as visible context grew. A full diagnostic totaled 35.659 s of native flash attention across 16 prompts. At equal useful causal work, median native flash time per prompt was 2.225 s. The vLLM trace captured one complete prefill. Its attention kernels totaled 1.004 s. That comparison covers attention only and changes the KV format and kernel layout. It gives no timing for W5 or W6 kernels.
 

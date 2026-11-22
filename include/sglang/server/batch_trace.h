@@ -65,4 +65,20 @@ inline void trace_batch_details(const std::array<DecoderBatchStep, decoder_batch
     }
 }
 
+inline void trace_batch_step(int width, int decode, std::size_t request_bytes) {
+    std::cerr << ("batch width=" + std::to_string(width) + " decode=" + std::to_string(decode) +
+                  " request_bytes=" + std::to_string(request_bytes) + '\n');
+}
+
+inline void trace_prefix_cache(const DecoderPrefixCacheStats& stats) {
+    std::cerr << ("prefix cache entries=" + std::to_string(stats.entries) +
+                  " pages=" + std::to_string(stats.pages) +
+                  " device_bytes=" + std::to_string(stats.device_bytes) +
+                  " hits=" + std::to_string(stats.hits) +
+                  " cached_tokens=" + std::to_string(stats.cached_tokens) +
+                  " prefill_tokens=" + std::to_string(stats.prefill_tokens) +
+                  " stores=" + std::to_string(stats.stores) +
+                  " evictions=" + std::to_string(stats.evictions) + '\n');
+}
+
 }

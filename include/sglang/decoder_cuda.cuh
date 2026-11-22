@@ -66,13 +66,27 @@ struct VerifyQuantizeRows {
     VerifyQuantizeRow entries[fused_verify_rows];
 };
 
+struct WideVerifyQuantizeRows {
+    static constexpr int capacity = 20;
+    VerifyQuantizeRow entries[capacity];
+};
+
 struct VerifyRmsQuantizeRows {
     VerifyRmsQuantizeRow entries[fused_verify_rows];
 };
 
+struct WideVerifyRmsQuantizeRows {
+    static constexpr int capacity = 20;
+    VerifyRmsQuantizeRow entries[capacity];
+};
+
 cudaError_t verify_quantize_fp8(VerifyQuantizeRows rows, int width, cudaStream_t stream);
+cudaError_t verify_quantize_fp8_wide(WideVerifyQuantizeRows rows, int count, int width,
+                                     cudaStream_t stream);
 cudaError_t verify_rms_quantize(VerifyRmsQuantizeRows rows, const __nv_bfloat16* weight,
                                 cudaStream_t stream);
+cudaError_t verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, int count,
+                                     const __nv_bfloat16* weight, cudaStream_t stream);
 
 std::optional<cudaError_t> try_prefill_bf16_gdn_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,

@@ -79,6 +79,12 @@ struct LayerBatch {
         return std::is_same_v<Lane, VerificationRow> && count == fused_verify_rows;
     }
 
+    bool fuse_wide_verify_norm() const {
+        static_assert(WideVerifyRmsQuantizeRows::capacity ==
+                      target_verify_max_rows * decoder_batch_max_mtp_lanes);
+        return std::is_same_v<Lane, VerificationRow> && count > fused_verify_rows;
+    }
+
     TextFp8Activation verification_activation(int index, int width) const {
         auto activation = workspace(lanes[index]).activation;
         if (target_tc) {
@@ -107,6 +113,10 @@ struct LayerBatch {
             quantize_verification(source, width);
             return;
         }
+        if (fuse_wide_verify_norm() && width % text_fp8_group_size == 0) {
+            quantize_wide_verification(source, width);
+            return;
+        }
         if constexpr (!std::is_same_v<Lane, VerificationRow>) {
             if (single_decode()) {
                 auto& work = workspace(lanes[0]);
@@ -130,6 +140,19 @@ struct LayerBatch {
                 work.*source, up ? work.*up : nullptr, verification_activation(index, width)};
         }
         check(verify_quantize_fp8(rows, width, stream), "Quantize five verification rows");
+    }
+
+    void quantize_wide_verification(Bf16* Workspace::*source, int width,
+                                    Bf16* Workspace::*up = nullptr) const {
+        static_assert(WideVerifyQuantizeRows::capacity ==
+                      target_verify_max_rows * decoder_batch_max_mtp_lanes);
+        WideVerifyQuantizeRows rows{};
+        for (int index = 0; index < count; ++index) {
+            auto& work = workspace(lanes[index]);
+            rows.entries[index] = {work.*source, up ? work.*up : nullptr, work.activation};
+        }
+        check(verify_quantize_fp8_wide(rows, count, width, stream),
+              "Quantize wide verification rows");
     }
 
     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
@@ -184,41 +207,63 @@ struct LayerBatch {
         }
     }
 
-    void project_target(std::initializer_list<LayerProjection> layers) const {
-        std::array<TextFp8Projection, text_decode_max_targets * text_fp8_max_batch> projections;
+    bool project_target_chunk(std::initializer_list<LayerProjection> layers, int first,
+                              int rows, bool allow_fallback) const {
+        std::array<TextFp8Projection, text_decode_max_targets * text_target_fp8_max_rows> operands;
         std::array<TextFp8DecodeTarget, text_decode_max_targets> targets;
         const int columns = layers.begin()->weight.columns;
-        for (int first = 0, group = 0; first < count; ++group) {
-            constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
-            const int rows = verification ? projection_rows(group) : 1;
-            int target = 0;
-            for (const auto& layer : layers) {
-                auto* entries = projections.data() + target * rows;
-                for (int index = 0; index < rows; ++index) {
-                    const auto& work = workspace(lanes[first + index]);
-                    const auto activation = fuse_verify_activation()
-                        ? verification_activation(first + index, columns) : work.activation;
-                    entries[index] = {{activation.values, activation.scales}, work.*layer.output};
-                }
-                const auto weight = layer.weight;
-                targets[target++] = {weight.values, weight.scales, weight.rows, entries[0].output};
+        int target = 0;
+        for (const auto& layer : layers) {
+            auto* entries = operands.data() + target * rows;
+            for (int index = 0; index < rows; ++index) {
+                const auto& work = workspace(lanes[first + index]);
+                const auto activation = fuse_verify_activation()
+                    ? verification_activation(first + index, columns) : work.activation;
+                entries[index] = {{activation.values, activation.scales}, work.*layer.output};
             }
-            auto* scratch = workspace(lanes[first]).logits;
-            static_assert(text_fp8_max_batch * intermediate_size <= vocab_size * sizeof(Bf16));
-            const auto status = tensor_core_lane(first)
-                ? try_target_fp8_tc(targets.data(), target, columns, projections.data(),
-                                    rows, scratch, stream)
-                : std::nullopt;
-            if (status) {
-                check(*status, "Run target FP8 projection");
-            } else {
-                for (int index = 0; index < target; ++index) {
-                    const auto& split = targets[index];
-                    check(text_fp8_gemm(split.weight, split.weight_scales, split.out_width, columns,
-                                        projections.data() + index * rows, rows, stream),
-                          "Run fallback target FP8 projection");
+            const auto weight = layer.weight;
+            targets[target++] = {weight.values, weight.scales, weight.rows, entries[0].output};
+        }
+        auto* scratch = workspace(lanes[first]).logits;
+        static_assert(text_target_fp8_max_rows * intermediate_size <= vocab_size * sizeof(Bf16));
+        const auto status = tensor_core_lane(first)
+            ? try_target_fp8_tc(targets.data(), target, columns, operands.data(),
+                                rows, scratch, stream)
+            : std::nullopt;
+        if (status) {
+            check(*status, "Run target FP8 projection");
+            return true;
+        }
+        if (!allow_fallback) {
+            return false;
+        }
+        for (int index = 0; index < target; ++index) {
+            const auto& split = targets[index];
+            check(text_fp8_gemm(split.weight, split.weight_scales, split.out_width, columns,
+                                operands.data() + index * rows, rows, stream),
+                  "Run fallback target FP8 projection");
+        }
+        return true;
+    }
+
+    void project_target(std::initializer_list<LayerProjection> layers) const {
+        constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
+        int first = 0;
+        if constexpr (verification) {
+            const int groups = (count - 1) / text_target_fp8_max_rows + 1;
+            for (int group = 0; group < groups && count > text_fp8_max_batch; ++group) {
+                const int rows = count / groups + (group < count % groups);
+                if (!project_target_chunk(layers, first, rows, false)) {
+                    break;
                 }
+                first += rows;
             }
+        }
+        const int remaining = count - first;
+        const int groups = (remaining + text_fp8_max_batch - 1) / text_fp8_max_batch;
+        for (int group = 0; first < count; ++group) {
+            const int rows = verification ? remaining / groups + (group < remaining % groups) : 1;
+            project_target_chunk(layers, first, rows, true);
             first += rows;
         }
     }
@@ -316,7 +361,7 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
             row.verification->bind_gdn(state_index);
         }
     });
-    if (!batch.fuse_verify_activation()) {
+    if (!batch.fuse_verify_activation() && !batch.fuse_wide_verify_norm()) {
         batch.quantize(&Workspace::normalized, hidden_size);
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
@@ -568,7 +613,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
 
 template <typename Lane>
 void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
-    if (!batch.fuse_verify_activation()) {
+    if (!batch.fuse_verify_activation() && !batch.fuse_wide_verify_norm()) {
         batch.quantize(&Workspace::normalized, hidden_size);
     }
     if (!batch.tensor_core_lane(0) && batch.single_decode() &&
@@ -601,10 +646,18 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
 
 template <typename Lane>
 void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
-    if (batch.fuse_verify_activation()) {
+    const bool five = batch.fuse_verify_activation();
+    const bool wide = batch.fuse_wide_verify_norm();
+    if (five || wide) {
         batch.project_group({{layer.mlp_gate, &Workspace::mlp_gate},
                              {layer.mlp_up, &Workspace::mlp_up}});
-        batch.quantize_verification(&Workspace::mlp_gate, intermediate_size, &Workspace::mlp_up);
+        if (five) {
+            batch.quantize_verification(&Workspace::mlp_gate, intermediate_size,
+                                        &Workspace::mlp_up);
+        } else {
+            batch.quantize_wide_verification(&Workspace::mlp_gate, intermediate_size,
+                                             &Workspace::mlp_up);
+        }
         batch.project(layer.mlp_down, &Workspace::hidden);
         return;
     }
@@ -815,6 +868,16 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
                     batch.verification_activation(index, hidden_size)};
             }
             check(verify_rms_quantize(rows, weight, stream), operation);
+            return;
+        }
+        if (batch.fuse_wide_verify_norm()) {
+            WideVerifyRmsQuantizeRows rows{};
+            for (int index = 0; index < count; ++index) {
+                auto& work = workspace(lanes[index]);
+                const auto [branch, residual] = residuals(work);
+                rows.entries[index] = {branch, residual, work.normalized, work.activation};
+            }
+            check(verify_rms_quantize_wide(rows, count, weight, stream), operation);
             return;
         }
         batch.each([&](const Lane&, Workspace& work) {

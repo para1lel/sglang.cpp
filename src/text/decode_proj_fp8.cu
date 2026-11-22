@@ -1,5 +1,6 @@
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/decode_proj_sm100.cuh"
+#include "sglang/text/target_fp8.h"
 
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -30,17 +31,19 @@ struct Fp8Job {
     int rows;
 };
 
+template <int Capacity>
 struct Fp8RowPointers {
-    __nv_bfloat16* output[text_fp8_max_batch];
+    __nv_bfloat16* output[Capacity];
 
     __device__ __forceinline__ __nv_bfloat16* operator()(int col) const {
         return output[col];
     }
 };
 
+template <int Capacity>
 struct Fp8RowJob : Fp8Job {
-    Fp8RowPointers lanes[max_targets];
-    const float* scales[text_fp8_max_batch];
+    Fp8RowPointers<Capacity> lanes[max_targets];
+    const float* scales[Capacity];
 };
 
 template <int Columns, typename Job>
@@ -53,7 +56,7 @@ __device__ void load_scales(const Job& job, float* scales,
         const int group = index % count;
         float value = 0.0f;
         if (col < active) {
-            if constexpr (std::is_same_v<Job, Fp8RowJob>) {
+            if constexpr (!std::is_same_v<Job, Fp8Job>) {
                 value = job.scales[col][first + group];
             } else {
                 value = job.act_scales[std::size_t(act_row + col) * job.groups + first + group];
@@ -173,7 +176,7 @@ void fp8_decode(const __grid_constant__ Job job) {
     if (warp == mma_warp) {
         free_tmem<Columns>(pipe);
     }
-    if constexpr (std::is_same_v<Job, Fp8RowJob>) {
+    if constexpr (!std::is_same_v<Job, Fp8Job>) {
         store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
                      job.out_width[target], job.lanes[target]);
     } else {
@@ -237,26 +240,17 @@ cudaError_t plan_fp8_splits(const LaunchTarget& target, int blocks, int groups, 
                        scale_bytes<tile_cols>, plan);
 }
 
-}
-
-std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
-    const TextFp8DecodeTarget* projections, int target_count, const std::uint8_t* packed_values,
-    int in_width, const TextFp8Projection* rows, int count, cudaStream_t stream) {
-    const TextFp8ActivationView input{packed_values, nullptr};
-    if (count < 2 || count > text_fp8_max_batch ||
-        !supported_targets(projections, target_count, in_width, input)) {
-        return std::nullopt;
-    }
-    LaunchTarget target{};
-    if (auto prepared = prepare_launch(stream, target); !prepared || *prepared != cudaSuccess) {
-        return prepared;
-    }
-    constexpr int columns = 8;
-    static_assert(text_fp8_max_batch <= columns);
-    Fp8RowJob job{};
+template <int Columns, int Slots, int Capacity>
+std::optional<cudaError_t> launch_rows(
+    const LaunchTarget& target, const TextFp8DecodeTarget* projections, int target_count,
+    TextFp8ActivationView input, int in_width, const TextFp8Projection* rows, int count,
+    int slot, cudaStream_t stream) {
+    static_assert(Capacity <= Columns);
+    using Job = Fp8RowJob<Capacity>;
+    Job job{};
     int blocks = 0;
     if (auto encoded = encode_job(target, projections, target_count, input, in_width, count,
-                                  columns, job, blocks);
+                                  Columns, job, blocks);
         !encoded || *encoded != cudaSuccess) {
         return encoded;
     }
@@ -274,17 +268,54 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
     if (plan.splits == 0) {
         return std::nullopt;
     }
-    const auto* kernel = reinterpret_cast<const void*>(fp8_decode<columns, stages, Fp8RowJob>);
+    const auto* kernel = reinterpret_cast<const void*>(fp8_decode<Columns, Slots, Job>);
     int limit = 0;
-    status = configure(kernel, 9, target.device, limit);
+    status = configure(kernel, slot, target.device, limit);
     if (status != cudaSuccess) {
         return status;
     }
-    const int shared = stages * stage_bytes<columns> +
-                       ((job.groups - 1) / plan.splits + 1) * scale_bytes<columns>;
+    const int shared = Slots * stage_bytes<Columns> +
+                       ((job.groups - 1) / plan.splits + 1) * scale_bytes<Columns>;
+    if (shared > limit) {
+        return std::nullopt;
+    }
     const dim3 grid(plan.splits, blocks, 1);
     void* args[] = {&job};
     return launch_split(kernel, grid, shared, args, stream, grid.x);
+}
+
+}
+
+std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
+    const TextFp8DecodeTarget* projections, int target_count, const std::uint8_t* packed_values,
+    int in_width, const TextFp8Projection* rows, int count, cudaStream_t stream) {
+    const TextFp8ActivationView input{packed_values, nullptr};
+    if (count < 2 || count > text_target_fp8_max_rows ||
+        !supported_targets(projections, target_count, in_width, input)) {
+        return std::nullopt;
+    }
+    LaunchTarget target{};
+    if (auto prepared = prepare_launch(stream, target); !prepared || *prepared != cudaSuccess) {
+        return prepared;
+    }
+    if (count <= text_fp8_max_batch) {
+        return launch_rows<8, stages, text_fp8_max_batch>(
+            target, projections, target_count, input, in_width, rows, count, 9, stream);
+    }
+    if (count <= 8) {
+        return launch_rows<8, stages, 8>(
+            target, projections, target_count, input, in_width, rows, count, 11, stream);
+    }
+    if (count <= 16) {
+        return launch_rows<16, stages, 16>(
+            target, projections, target_count, input, in_width, rows, count, 12, stream);
+    }
+    if (use_mlp_pipeline(projections, target_count, in_width, count)) {
+        return launch_rows<32, mlp_slots, text_target_fp8_max_rows>(
+            target, projections, target_count, input, in_width, rows, count, 13, stream);
+    }
+    return launch_rows<32, stages, text_target_fp8_max_rows>(
+        target, projections, target_count, input, in_width, rows, count, 14, stream);
 }
 
 std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* targets,

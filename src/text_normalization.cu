@@ -316,36 +316,61 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
         normalized + offset, activation);
 }
 
-template <bool HasResidual>
-__global__ void verify_rms_kernel(const __grid_constant__ decoder::VerifyRmsQuantizeRows rows,
+template <bool HasResidual, typename Rows>
+__global__ void verify_rms_kernel(const __grid_constant__ Rows rows,
                                   const __nv_bfloat16* weight) {
     const auto& row = rows.entries[blockIdx.x];
     rms_quantize<HasResidual, true>(row.branch, row.residual, weight, row.normalized, row.output);
 }
 
-template <bool ApplySwiglu>
-__global__ void verify_quantize_kernel(const __grid_constant__ decoder::VerifyQuantizeRows rows,
-                                       int width) {
+template <bool ApplySwiglu, typename Rows>
+__global__ void verify_quantize_kernel(const __grid_constant__ Rows rows, int width) {
     const auto& row = rows.entries[blockIdx.y];
     quantize_warp<ApplySwiglu>(row.input, row.up, width, row.output);
+}
+
+template <typename Rows>
+cudaError_t launch_verify_quantize(Rows rows, int count, int width, cudaStream_t stream) {
+    const int groups = width / text_fp8_group_size;
+    const dim3 grid((groups + block_warps - 1) / block_warps, count);
+    void* args[] = {&rows, &width};
+    const auto kernel = rows.entries[0].up ? verify_quantize_kernel<true, Rows>
+                                           : verify_quantize_kernel<false, Rows>;
+    return cudaLaunchKernel(kernel, grid, block_threads, args, 0, stream);
 }
 }
 
 cudaError_t decoder::verify_quantize_fp8(VerifyQuantizeRows rows, int width, cudaStream_t stream) {
-    const int groups = width / text_fp8_group_size;
-    const dim3 grid((groups + block_warps - 1) / block_warps, fused_verify_rows);
-    void* args[] = {&rows, &width};
-    const auto kernel = rows.entries[0].up ? verify_quantize_kernel<true>
-                                           : verify_quantize_kernel<false>;
-    return cudaLaunchKernel(kernel, grid, block_threads, args, 0, stream);
+    return launch_verify_quantize(rows, fused_verify_rows, width, stream);
+}
+
+cudaError_t decoder::verify_quantize_fp8_wide(WideVerifyQuantizeRows rows, int count, int width,
+                                             cudaStream_t stream) {
+    if (count <= fused_verify_rows || count > WideVerifyQuantizeRows::capacity ||
+        width <= 0 || width % text_fp8_group_size != 0) {
+        return cudaErrorInvalidValue;
+    }
+    return launch_verify_quantize(rows, count, width, stream);
 }
 
 cudaError_t decoder::verify_rms_quantize(VerifyRmsQuantizeRows rows, const __nv_bfloat16* weight,
                                         cudaStream_t stream) {
     void* args[] = {&rows, &weight};
-    const auto kernel = rows.entries[0].residual ? verify_rms_kernel<true>
-                                                 : verify_rms_kernel<false>;
+    const auto kernel = rows.entries[0].residual ? verify_rms_kernel<true, VerifyRmsQuantizeRows>
+                                                 : verify_rms_kernel<false, VerifyRmsQuantizeRows>;
     return cudaLaunchKernel(kernel, fused_verify_rows, block_threads, args, 0, stream);
+}
+
+cudaError_t decoder::verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, int count,
+                                             const __nv_bfloat16* weight, cudaStream_t stream) {
+    if (count <= fused_verify_rows || count > WideVerifyRmsQuantizeRows::capacity) {
+        return cudaErrorInvalidValue;
+    }
+    void* args[] = {&rows, &weight};
+    const auto kernel = rows.entries[0].residual
+        ? verify_rms_kernel<true, WideVerifyRmsQuantizeRows>
+        : verify_rms_kernel<false, WideVerifyRmsQuantizeRows>;
+    return cudaLaunchKernel(kernel, count, block_threads, args, 0, stream);
 }
 
 cudaError_t decoder::tensor_core_prefill_rms_quantize(

@@ -10,7 +10,7 @@ namespace {
 constexpr int group_size = text_fp8_group_size;
 
 struct Operands {
-    const std::uint8_t* values[text_fp8_max_batch];
+    const std::uint8_t* values[text_target_fp8_max_rows];
 };
 
 __global__ void pack_input(Operands operands, std::uint8_t* packed, int width) {
@@ -30,7 +30,7 @@ std::optional<cudaError_t> try_target_fp8_tc(const TextFp8DecodeTarget* targets,
                                            __nv_bfloat16* scratch, cudaStream_t stream) {
     if (!rows || !targets || target_count < 1 || target_count > text_decode_max_targets ||
         in_width < group_size || in_width % group_size || count < 1 ||
-        count > text_fp8_max_batch) {
+        count > text_target_fp8_max_rows) {
         return std::nullopt;
     }
     for (int index = 0; index < target_count; ++index) {
@@ -50,7 +50,7 @@ std::optional<cudaError_t> try_target_fp8_tc(const TextFp8DecodeTarget* targets,
     if (count == 1) {
         return try_text_fp8_decode_sm100(targets, target_count, rows[0].input, in_width, 1, stream);
     }
-    if (!decode_proj::aligned16(scratch)) {
+    if (!scratch || !decode_proj::aligned16(scratch)) {
         return std::nullopt;
     }
     Operands operands{};

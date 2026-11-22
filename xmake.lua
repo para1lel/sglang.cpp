@@ -169,7 +169,8 @@ target("sglang-server")
               "apps/server/chat_media.cpp", "apps/server/vision_completion.cpp")
     add_files("apps/server/anthropic_count.cpp", "apps/server/anthropic_messages.cpp",
               "apps/server/chat_tool_constraints.cpp", "apps/server/decisions.cpp",
-              "apps/server/native_generate.cpp", "apps/server/ollama_discovery.cpp",
+              "apps/server/native_generate.cpp", "apps/server/native_sessions.cpp",
+              "apps/server/ollama_discovery.cpp",
               "apps/server/ollama_generate.cpp",
               "apps/server/parse_function_call.cpp", "apps/server/responses.cpp",
               "apps/server/score.cpp",

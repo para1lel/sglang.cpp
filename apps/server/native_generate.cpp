@@ -248,9 +248,11 @@ void write_stream_error(EventStream& stream, const std::exception& error) {
     }
 }
 
+using RecordTurn = std::function<void(const DecoderResult&)>;
+
 void complete_single(const Socket& connection, BatchService& service, int slot,
                      const CompletionTokenizer& tokenizer, const BatchPrompt& request,
-                     bool streaming) {
+                     bool streaming, const RecordTurn& record) {
     GenerateResponse response(request, tokenizer.get());
     EventStream stream(connection);
     const DecoderCallbacks callbacks{
@@ -273,6 +275,9 @@ void complete_single(const Socket& connection, BatchService& service, int slot,
             return;
         }
         const auto output = response.finish(result);
+        if (record) {
+            record(result);
+        }
         if (!streaming) {
             write_json(connection, "200 OK", output);
         } else if (stream.start() && stream.write(output) && stream.write("[DONE]")) {
@@ -305,7 +310,7 @@ void write_batch(const Socket& connection, const Tokenizer& tokenizer,
 
 void complete_batch(const Socket& connection, BatchService& service, int slot,
                     const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items,
-                    bool indexed) {
+                    bool indexed, const RecordTurn& record) {
     const auto& pieces = tokenizer.get();
     const BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
     if (const auto results = service.generate_batch(slot, items, callbacks)) {
@@ -313,14 +318,18 @@ void complete_batch(const Socket& connection, BatchService& service, int slot,
             write_batch(connection, pieces, items, *results);
         } else if (!disconnected(connection)) {
             GenerateResponse response(items.front(), pieces);
-            write_json(connection, "200 OK", response.frame(std::nullopt, results->front(), true));
+            const auto output = response.frame(std::nullopt, results->front(), true);
+            if (record) {
+                record(results->front());
+            }
+            write_json(connection, "200 OK", output);
         }
     }
 }
 
 void stream_batch(const Socket& connection, BatchService& service, int slot,
                   const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items,
-                  bool indexed) {
+                  bool indexed, const RecordTurn& record) {
     const auto& pieces = tokenizer.get();
     EventStream stream(connection);
     std::vector<GenerateResponse> responses;
@@ -334,7 +343,11 @@ void stream_batch(const Socket& connection, BatchService& service, int slot,
         [&] { return stream.poll(); },
         [&](std::size_t index, const DecoderResult& result, bool terminal) {
             const auto frame_index = indexed ? std::optional{index} : std::nullopt;
-            return stream.write(responses[index].frame(frame_index, result, terminal));
+            const auto output = responses[index].frame(frame_index, result, terminal);
+            if (terminal && record) {
+                record(result);
+            }
+            return stream.write(output);
         },
         !indexed,
     };
@@ -381,11 +394,9 @@ void complete_aborted(const Socket& connection, const Tokenizer& tokenizer,
 
 void complete_generate(const Socket& connection, BatchService& service, std::optional<int> slot,
                        const CompletionTokenizer& tokenizer, const GenerateInput& input,
-                       const std::vector<std::unique_ptr<BatchRequestId>>& ids) {
-    if (disconnected(connection)) {
-        return;
-    }
-    auto items = parse_generate_prompts(input, tokenizer);
+                       std::vector<BatchPrompt>& items,
+                       const std::vector<std::unique_ptr<BatchRequestId>>& ids,
+                       const RecordTurn& record) {
     const bool scored = std::any_of(items.begin(), items.end(), [](const auto& item) {
         return item.options.generated_top_logprobs >= 0;
     });
@@ -399,11 +410,11 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
         complete_aborted(connection, tokenizer.get(), input, items);
     } else if (!input.indexed() && !items.front().text_stops && !scored &&
                !items.front().options.constraint) {
-        complete_single(connection, service, *slot, tokenizer, items.front(), input.stream);
+        complete_single(connection, service, *slot, tokenizer, items.front(), input.stream, record);
     } else if (input.stream) {
-        stream_batch(connection, service, *slot, tokenizer, items, input.indexed());
+        stream_batch(connection, service, *slot, tokenizer, items, input.indexed(), record);
     } else {
-        complete_batch(connection, service, *slot, tokenizer, items, input.indexed());
+        complete_batch(connection, service, *slot, tokenizer, items, input.indexed(), record);
     }
 }
 
@@ -541,7 +552,9 @@ std::vector<std::optional<std::string>> generate_ids(const GenerateInput& input)
     return ids;
 }
 
-std::string sample_id(std::random_device& random) {
+}
+
+std::string NativeGenerate::random_id(std::random_device& random) {
     constexpr std::string_view hex = "0123456789abcdef";
     std::string id(32, '0');
     for (std::size_t offset = 0; offset < id.size(); offset += 8) {
@@ -554,8 +567,6 @@ std::string sample_id(std::random_device& random) {
     id[12] = '4';
     id[16] = hex[8 + (hex.find(id[16]) & 3)];
     return id;
-}
-
 }
 
 struct NativeGenerate::Registration {
@@ -598,7 +609,7 @@ NativeGenerate::register_ids(const GenerateInput& input) {
     for (auto& id : ids) {
         if (random) {
             do {
-                id = sample_id(*random);
+                id = random_id(*random);
             } while (ids_.count(*id) || normalized.count(*id));
         } else if (!id) {
             do {
@@ -618,11 +629,23 @@ NativeGenerate::register_ids(const GenerateInput& input) {
 
 QueuedGenerate NativeGenerate::prepare(std::string_view body) {
     auto input = parse_generate_input(body);
+    auto session = bind_session(input);
     auto registration = register_ids(input);
     return {
-        [this, input = std::move(input), registration](
+        [this, input = std::move(input), session = std::move(session), registration](
             const Socket& connection, std::optional<int> slot) {
-            complete_generate(connection, service_, slot, tokenizer_, input, registration->items);
+            if (disconnected(connection)) {
+                return;
+            }
+            const auto& ids = registration->items;
+            auto turn = session ? begin_session(input, ids.front()->value, session) : nullptr;
+            auto items = parse_generate_prompts(input, tokenizer_, turn ? &turn->history : nullptr);
+            RecordTurn record;
+            if (turn && slot) {
+                turn->reserve(items.front());
+                record = [&](const DecoderResult& result) { turn->finish(result); };
+            }
+            complete_generate(connection, service_, slot, tokenizer_, input, items, ids, record);
         },
         [registration] {
             return std::all_of(registration->items.begin(), registration->items.end(),
@@ -770,6 +793,20 @@ void set_generate_constraint(const json::Object& sampling, const Tokenizer& toke
         const auto target = kind == "ebnf" ? "an ebnf choice" : "the " + std::string(name);
         throw std::invalid_argument("max_new_tokens cannot complete " + target);
     }
+}
+
+const json::Array* generate_parameter_list(const json::Value* value, std::size_t count,
+                                           bool strings) {
+    const auto* list = value ? value->array() : nullptr;
+    if (list && (list->size() != count ||
+        std::any_of(list->begin(), list->end(), [&](const auto& item) {
+            return strings ? !item.string() : !item.object();
+        }))) {
+        throw HttpError("400 Bad Request",
+                        strings ? "Expected one cache_salt string per batch item"
+                                : "Expected one sampling_params object per batch item");
+    }
+    return list;
 }
 
 std::size_t generate_sample_count(const GenerateInput& input, const json::Array* params) {

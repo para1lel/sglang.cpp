@@ -8,6 +8,7 @@
 #include "sglang/server/flush_cache.h"
 #include "sglang/server/http.h"
 #include "sglang/server/loads.h"
+#include "sglang/server/native_generate.h"
 #include "sglang/server/ollama_discovery.h"
 #include "sglang/server/parse_function_call.h"
 #include "sglang/utf8.h"
@@ -259,12 +260,13 @@ public:
                     const BatchScore& score, const OllamaDiscovery* discovery,
                     const BatchMessages& messages, const BatchResponses& responses,
                     ResponseStore* response_store, const BatchDecisions& decisions,
-                    std::string_view accelerator)
+                    std::string_view accelerator, NativeGenerate* session_control)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
           tokenize_(tokenize), abort_(abort), health_(health), model_info_(model_info),
           server_info_(server_info), score_(score), discovery_(discovery), messages_(messages),
           responses_(responses), response_store_(response_store),
-          decisions_(decisions), accelerator_(accelerator), prefix_controls_(prefix_controls) {}
+          decisions_(decisions), accelerator_(accelerator), session_control_(session_control),
+          prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -324,6 +326,7 @@ private:
     ResponseStore* response_store_;
     const BatchDecisions& decisions_;
     const std::string_view accelerator_;
+    NativeGenerate* session_control_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -582,7 +585,7 @@ ConnectionQueue::NativeRoute ConnectionQueue::native_route(std::string_view path
         !allowed.empty()) {
         return {allowed, method == allowed};
     }
-    if (path == "/flush_cache") {
+    if (path == "/flush_cache" || (session_control_ && session_control_route(path))) {
         return {"GET, POST", method == "GET" || method == "POST"};
     }
     if (generate_ && path == "/generate") {
@@ -644,6 +647,10 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         if (discovery_ && discovery_->respond_unmatched(connection, request)) return;
     }
     const auto path = request.route_path();
+    if (session_control_ && session_control_route(path)) {
+        session_control_->serve_session(connection, request);
+        return;
+    }
     if (path == loads_route) {
         std::unique_lock lock(mutex_);
         discard_disconnected();
@@ -909,13 +916,13 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const BatchScore& score, const OllamaDiscovery* discovery,
                        const BatchMessages& messages, const BatchResponses& responses,
                        ResponseStore* response_store, const BatchDecisions& decisions,
-                       std::string_view accelerator) {
+                       std::string_view accelerator, NativeGenerate* session_control) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
                           tokenize, model_info, abort, server_info, score, discovery, messages,
-                          responses, response_store, decisions, accelerator);
+                          responses, response_store, decisions, accelerator, session_control);
     std::vector<std::thread> workers;
     workers.reserve(max_active + (abort ? 3 : 2));
     std::mutex failure_mutex;

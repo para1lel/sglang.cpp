@@ -359,7 +359,7 @@ int main(int argc, char** argv) {
                 } else {
                     serve_decisions(connection, service, slot, tokenizer, body, vision);
                 }
-            }, decoder.accelerator_name());
+            }, decoder.accelerator_name(), &native_generate);
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';
         return 1;

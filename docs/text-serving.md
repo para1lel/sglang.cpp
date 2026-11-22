@@ -19,7 +19,7 @@ curl --fail-with-body http://127.0.0.1:17384/v1/completions \
 | `["Hello", "World"]` | Two UTF-8 strings |
 | `[[220, 16], [220, 17]]` | Two sequences of token IDs |
 
-Each string must contain 1 to 1,048,576 UTF-8 bytes. Each ID sequence must be nonempty and contain integers in `[0, 248320)`. IDs go directly to the decoder. Each prompt and its output budget must fit 262,144 tokens. A batch contains 1 to 32 prompts of one form and shares request options across all items. The sum of output budgets must be at most 262,144 tokens. Invalid prompts and options return HTTP 400 before decoder admission. [Prompt parsing](../apps/server/text_request.cpp#L460)<!-- prefix: "TextCompleti" --> · [Resident memory admission](batch-graphs.md#resident-memory-admission)
+Each string must contain 1 to 1,048,576 UTF-8 bytes. Each ID sequence must be nonempty and contain integers in `[0, 248320)`. IDs go directly to the decoder. Each prompt and its output budget must fit 262,144 tokens. A batch contains 1 to 32 prompts of one form and shares request options across all items. The sum of output budgets must be at most 262,144 tokens. Invalid prompts and options return HTTP 400 before decoder admission. [Prompt parsing](../apps/server/text_request.cpp#L461)<!-- prefix: "TextCompleti" --> · [Resident memory admission](batch-graphs.md#resident-memory-admission)
 
 HTTP caps headers at 8 KiB (431) and bodies at 2 MiB (413). It rejects malformed JSON, duplicate decoded keys, nesting beyond 32 containers, and floating-point range errors. Oversized integer `top_k` values are clamped after validation. The frozen `benchmark` parser retains signed-zero underflow and fixed fields. [Numeric dispatch](../apps/server/completions.cpp#L175)<!-- prefix: "json::Value " --> · [Benchmark parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" -->
 
@@ -44,7 +44,7 @@ HTTP caps headers at 8 KiB (431) and bodies at 2 MiB (413). It rejects malformed
 
 Echo copies string prompts and decodes ID prompts with special tokens hidden. Each SSE index echoes once, in its first choice. Stops apply to generated output. With `max_tokens: 0`, echo returns the prompt with zero completion tokens.
 
-The text route accepts [output penalties](output-penalties.md), including `repetition_penalty`, and rejects `max_completion_tokens` and unknown options. [Request options](../apps/server/text_request.cpp#L449)<!-- prefix: "bool is_text" -->
+The text route accepts [output penalties](output-penalties.md), including `repetition_penalty`, and rejects `max_completion_tokens` and unknown options. [Request options](../apps/server/text_request.cpp#L450)<!-- prefix: "bool is_text" -->
 
 Text, chat, and `/generate` share the immutable tokenizer. On first use, the server checks the size and SHA-256 of the checkpoint's `tokenizer.json`. A missing, unreadable, or mismatched asset returns HTTP 500 before output starts. Later requests retry the load. The benchmark ID route requires no tokenizer.
 

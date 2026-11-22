@@ -413,9 +413,10 @@ void encode_prompt(std::vector<int>& output, int max_new_tokens, std::string_vie
 }
 
 std::vector<int> token_prompt(const json::Value& input, int max_new_tokens,
-                              const char* shape_error, const char* token_error) {
+                              const char* shape_error, const char* token_error,
+                              bool allow_empty = false) {
     const auto* tokens = input.array();
-    if (!tokens || tokens->empty()) {
+    if (!tokens || (tokens->empty() && !allow_empty)) {
         bad_request(shape_error);
     }
     if (tokens->size() > checkpoint_context - max_new_tokens) {
@@ -728,7 +729,7 @@ void set_cache_salt_value(const json::Value& value, DecoderOptions& options) {
 void validate_generate_fields(const json::Object& object) {
     for (const auto& [key, value] : object) {
         if (key == "text" || key == "input_ids" || key == "sampling_params" ||
-            key == "stream" || key == "cache_salt" || key == "rid" ||
+            key == "stream" || key == "cache_salt" || key == "rid" || key == "session_params" ||
             key == "return_logprob" || key == "logprob_start_len" || key == "top_logprobs_num" ||
             key == "return_text_in_logprobs") {
             continue;
@@ -802,33 +803,34 @@ std::shared_ptr<const NativeTextStops> generate_stops(const json::Value* params,
 
 BatchPrompt generate_prompt(const json::Value& input, bool text, BatchPrompt request,
                             const CompletionTokenizer& tokenizer,
-                            std::shared_ptr<const NativeTextStops> stops) {
+                            std::shared_ptr<const NativeTextStops> stops,
+                            const std::vector<int>* history) {
     request.text_stops = std::move(stops);
+    const auto history_size = history ? history->size() : 0;
+    if (history_size + request.options.max_new_tokens > checkpoint_context) {
+        bad_request("Prompt and output budget must fit the 262144-token context");
+    }
+    const int occupied = request.options.max_new_tokens + static_cast<int>(history_size);
     if (text) {
-        const auto prompt = input.string().value_or("");
-        if (prompt.empty() || prompt.size() > 1024 * 1024) {
+        const auto prompt = input.string();
+        if (!prompt || (prompt->empty() && !history) || prompt->size() > 1024 * 1024) {
             bad_request("Expected one nonempty text string of up to 1048576 bytes");
         }
-        encode_prompt(request.prompt, request.options.max_new_tokens, prompt, tokenizer);
+        if (!prompt->empty()) {
+            encode_prompt(request.prompt, occupied, *prompt, tokenizer);
+        }
     } else {
-        request.prompt = token_prompt(input, request.options.max_new_tokens,
+        request.prompt = token_prompt(input, occupied,
                                       "Expected one nonempty flat array of input_ids",
-                                      "input_ids must contain integers in [0, 248320)");
+                                      "input_ids must contain integers in [0, 248320)", history);
+    }
+    if (history) {
+        request.prompt.insert(request.prompt.begin(), history->begin(), history->end());
+        if (request.prompt.empty()) {
+            bad_request("A session request must contain input tokens after restoring history.");
+        }
     }
     return request;
-}
-
-const json::Array* generate_parameter_list(const json::Value* value, std::size_t count,
-                                           bool strings) {
-    const auto* list = value ? value->array() : nullptr;
-    if (list && (list->size() != count ||
-        std::any_of(list->begin(), list->end(), [&](const auto& item) {
-            return strings ? !item.string() : !item.object();
-        }))) {
-        bad_request(strings ? "Expected one cache_salt string per batch item"
-                            : "Expected one sampling_params object per batch item");
-    }
-    return list;
 }
 
 const json::Value* generate_logprob_field(const GenerateInput& input, std::string_view key,
@@ -917,7 +919,8 @@ GenerateInput parse_generate_input(std::string_view body) {
 }
 
 std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
-                                               const CompletionTokenizer& tokenizer) {
+                                               const CompletionTokenizer& tokenizer,
+                                               const std::vector<int>* history) {
     const auto& prompt = *json::get(input.fields, input.text ? "text" : "input_ids");
     const auto* params = json::get(input.fields, "sampling_params");
     const auto* salt = json::get(input.fields, "cache_salt");
@@ -945,7 +948,7 @@ std::vector<BatchPrompt> parse_generate_prompts(const GenerateInput& input,
         const auto stops = param_list ? generate_stops(&(*param_list)[index], tokenizer)
                                       : broadcast_stops;
         items.push_back(generate_prompt(list ? (*list)[index] : prompt, input.text,
-                                        std::move(item), tokenizer, stops));
+                                        std::move(item), tokenizer, stops, history));
         generate_logprob_options(input, index, items.back());
         items.insert(items.end(), input.samples - 1, items.back());
     }

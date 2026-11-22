@@ -4,7 +4,7 @@ Send `POST /v1/messages` with `Content-Type: application/json` and the served mo
 `Qwen3.8-27B-FP8`. Include `messages` and a positive `max_tokens`. The adapter renders the
 checkpoint's chat template and submits the result through the native chat generation queue.
 Use [`/v1/messages/count_tokens`](../native-tokenization.md#count-anthropic-prompt-tokens) for
-prompt token counts. [Dispatch](../../apps/server/prefix_controls.cpp#L616)<!-- prefix: "void Connect" --> ·
+prompt token counts. [Dispatch](../../apps/server/prefix_controls.cpp#L619)<!-- prefix: "void Connect" --> ·
 [Request adapter](../../apps/server/anthropic_count.cpp#L777)<!-- prefix: "OrderedObjec" --> ·
 [Chat generation](../../apps/server/text_completion.cpp#L867)<!-- prefix: "void complet" -->
 

@@ -8,6 +8,7 @@
 namespace sglang::server {
 
 class BatchService;
+class NativeGenerate;
 class OllamaDiscovery;
 class ResponseStore;
 class Socket;
@@ -40,6 +41,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const BatchResponses& responses = BatchResponses{},
                        ResponseStore* response_store = nullptr,
                        const BatchDecisions& decisions = BatchDecisions{},
-                       std::string_view accelerator = std::string_view{});
+                       std::string_view accelerator = std::string_view{},
+                       NativeGenerate* session_control = nullptr);
 
 }

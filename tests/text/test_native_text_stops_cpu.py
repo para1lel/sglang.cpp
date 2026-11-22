@@ -56,7 +56,7 @@ class NativeTextStops(unittest.TestCase):
                                          SGLANG_TEST_SCRIPTED_MTP="1"))
         cls.log = cls.output / "text-stops.log"
         cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint, cls.log,
-                                               "--max-active", "2"))
+                                               "--max-active", "2", "--mtp-steps", "0"))
 
     def exchange(self, params, stream, *, port=None, inputs=None, expected_status=200, **fields):
         packet = {"input_ids": inputs or [32], "sampling_params": params, "stream": stream,
@@ -370,6 +370,15 @@ class NativeTextStops(unittest.TestCase):
         ):
             with self.subTest(seed=seed, stop=stop, budget=budget):
                 self.check_openai(self.port, seed, stop, text, ids, reason, budget)
+
+    def test_default_mtp_stream_completes_with_coalesced_steps(self):
+        a, b, c, d, e, q, z = self.letters
+        log = self.output / "text-stops-default-mtp.log"
+        with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
+            self.scalar(options(121, 8, stop=["BAB", "ABA"]), "ZA", [z, a, b, a, b],
+                        stopped("BAB"), ["Z"], port=port)
+            self.scalar(options(123, 6, stop="QZ"), "ABCDEQ", [a, b, c, d, e, q],
+                        length(6), ["A"], port=port)
 
     def test_mtp_clips_before_callback_and_delivers_terminal(self):
         a, b, c, d, e, q, _ = self.letters

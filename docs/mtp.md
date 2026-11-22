@@ -42,7 +42,7 @@ Direct `Decoder::generate` verification runs eagerly. Batch verification uses ea
 
 ### Sampled MTP
 
-An item with active [output penalties](output-penalties.md), [logit bias](openai-logprobs.md#logit-bias), or a positive [output minimum](output-penalties.md#minimum-output) uses K0. Eligible peers in the same batch keep their configured depth. [Target-only selection](../include/sglang/decoder.h#L68)<!-- prefix: "bool require" -->
+An item with active [output penalties](output-penalties.md), [logit bias](serving/openai-logprobs.md#logit-bias), or a positive [output minimum](output-penalties.md#minimum-output) uses K0. Eligible peers in the same batch keep their configured depth. [Target-only selection](../include/sglang/decoder.h#L68)<!-- prefix: "bool require" -->
 
 The draft proposes greedy IDs. The target uses the [normal sampler](text-serving.md#sampling) on the first score and each verification row. It keys each draw by the request's resolved seed and the row's prospective output index. Discarded rows leave subsequent output indices available for recomputation on the corrected history. The same index drives the draw on that new row. [Verifier sampler](../src/decoder_verify.cpp#L285)<!-- prefix: "void TargetV" -->
 

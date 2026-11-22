@@ -3,11 +3,13 @@
 #include "sglang/json.h"
 #include "sglang/mxfp8_gqa.h"
 #include "sglang/server/batch_service.h"
+#include "sglang/server/chat_output.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
 #include "sglang/utf8.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -24,6 +26,121 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr auto generation_health_timeout = std::chrono::seconds(20);
+
+std::string lowercase_ascii(std::string_view text) {
+    std::string result(text);
+    for (auto& character : result) {
+        if (character >= 'A' && character <= 'Z') {
+            character += 'a' - 'A';
+        }
+    }
+    return result;
+}
+
+bool return_reasoning_blocks(const json::Value* value) {
+    if (!value) {
+        return false;
+    }
+    if (const auto flag = value->boolean()) {
+        return *flag;
+    }
+    if (const auto number = value->number(); number == 0 || number == 1) {
+        return number == 1;
+    }
+    if (const auto text = value->string()) {
+        const auto flag = lowercase_ascii(*text);
+        if (flag == "1" || flag == "true" || flag == "t" ||
+            flag == "yes" || flag == "y" || flag == "on") {
+            return true;
+        }
+        if (flag == "0" || flag == "false" || flag == "f" ||
+            flag == "no" || flag == "n" || flag == "off") {
+            return false;
+        }
+    }
+    throw std::invalid_argument("return_blocks: Input should be a valid boolean");
+}
+
+void write_separated_reasoning(const Socket& connection, const SeparatedReasoning& parsed,
+                               bool return_blocks) {
+    std::string response = R"({"reasoning_text":)";
+    json::append_quoted(response, parsed.reasoning, true);
+    response += R"(,"text":)";
+    json::append_quoted(response, parsed.text, true);
+    if (return_blocks) {
+        response += R"(,"reasoning_blocks":[)";
+        if (!parsed.reasoning.empty()) {
+            json::append_quoted(response, parsed.reasoning, true);
+        }
+        response += R"(],"text_blocks":[)";
+        json::append_quoted(response, parsed.text, true);
+        response += R"(],"blocks":[)";
+        if (!parsed.reasoning.empty()) {
+            response += R"({"type":"reasoning","text":)";
+            json::append_quoted(response, parsed.reasoning, true);
+            response += "},";
+        }
+        response += R"({"type":"text","text":)";
+        json::append_quoted(response, parsed.text, true);
+        response += "}]";
+    }
+    write_json(connection, "200 OK", response + '}');
+}
+
+void separate_reasoning(const Socket& connection, std::string_view body) {
+    try {
+        if (!valid_utf8(body)) {
+            throw std::invalid_argument("JSON decode error: Invalid UTF-8");
+        }
+        const auto input = body.empty() ? json::Value() :
+            json::parse(body, json::Syntax::last_key_wins);
+        if (input.is_null()) {
+            throw std::invalid_argument("body: Field required");
+        }
+        const auto* object = input.object();
+        if (!object) {
+            throw std::invalid_argument("Input should be a valid dictionary");
+        }
+        for (const auto key : {"rid", "http_worker_ipc", "text", "reasoning_parser"}) {
+            const auto* value = json::get(*object, key);
+            const bool required = std::string_view(key) == "text" ||
+                std::string_view(key) == "reasoning_parser";
+            if (!value && required) {
+                throw std::invalid_argument(std::string(key) + ": Field required");
+            }
+            if (value && !value->string() && (required || !value->is_null())) {
+                throw std::invalid_argument(std::string(key) + ": Input should be a valid string");
+            }
+        }
+        const bool return_blocks = return_reasoning_blocks(json::get(*object, "return_blocks"));
+        const auto parser = *json::get_string(*object, "reasoning_parser");
+        constexpr std::array<std::string_view, 4> adapter_parsers{
+            "deepseek-v4", "deepseekv4", "deepseek-v41", "deepseekv41"};
+        if (std::find(adapter_parsers.begin(), adapter_parsers.end(), parser) !=
+            adapter_parsers.end()) {
+            write_tokenization_error(connection, "400 Bad Request", "400",
+                "'" + std::string(parser) + "' output is parsed with its model's tokenizer; "
+                "this server does not serve that model");
+            return;
+        }
+        const auto name = lowercase_ascii(parser);
+        constexpr std::array<std::string_view, 6> qwen3_parsers{
+            "qwen3", "qwen3-thinking", "dots", "interns1", "minimax", "nanbeige"};
+        if (std::find(qwen3_parsers.begin(), qwen3_parsers.end(), name) == qwen3_parsers.end()) {
+            write_internal_server_error(connection);
+            return;
+        }
+        const auto text = *json::get_string(*object, "text");
+        const bool forced = name == "qwen3-thinking" || name == "minimax";
+        write_separated_reasoning(connection, ChatOutputParser::separate_qwen3(text, forced),
+                                  return_blocks);
+    } catch (const json::ParseError& error) {
+        write_tokenization_error(connection, "400 Bad Request", "Bad Request",
+                                 "JSON decode error: " + std::string(error.what()));
+    } catch (const std::invalid_argument& error) {
+        write_tokenization_error(connection, "400 Bad Request", "Bad Request", error.what());
+    }
+}
 
 struct Completion {
     Socket connection;
@@ -396,6 +513,14 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
 }
 
 void ConnectionQueue::route(Socket& connection, HttpRequest request) {
+    if (separate_reasoning_path(request)) {
+        if (request.method == "POST") {
+            separate_reasoning(connection, request.body);
+        } else {
+            write_post_only(connection, request.method == "HEAD");
+        }
+        return;
+    }
     const auto native_route = generate_route(request);
     if (generate_ && native_route == GenerateRoute::method_not_allowed) {
         write_method_not_allowed(connection, "POST, PUT", request.method == "HEAD");

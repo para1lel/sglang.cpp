@@ -12,10 +12,10 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L39)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L961)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L156)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L961)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L412)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L515)<!-- prefix: "std::string " --> |
 | Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L61)<!-- prefix: "DecoderResul" --> |
-| Chat output parsers | Apply the request options and parse reasoning and tool calls. | [Request options](../apps/server/text_request.cpp#L639)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/chat_output.cpp#L773)<!-- prefix: "bool ChatOut" --> |
+| Chat output parsers | Apply the request options and parse reasoning and tool calls. | [Request options](../apps/server/text_request.cpp#L639)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/chat_output.cpp#L799)<!-- prefix: "bool ChatOut" --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L524)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L535)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
@@ -99,7 +99,7 @@ done
 | `"required"` | Require a call frame for an advertised function. |
 | `{"type":"function","function":{"name":"get_weather"}}` | Advertise only the selected function and require a single call frame for it. |
 
-`parallel_tool_calls` is a boolean and defaults to `true`. With `false`, JSON and SSE expose at most one call. Auto with only non-strict tools leaves later wrappers in `content` after the first accepted call. Named choice always allows one call. Required and named choices need an eligible tool, text-only chat, and the `qwen3_coder` parser. They return HTTP 400 when a prerequisite is missing or `response_format`, `regex`, or `ebnf` is set. Active tool constraints require the model EOS stop set and reject nonempty text stops. [Tool admission](../apps/server/text_request.cpp#L610)<!-- prefix: "void check_t" --> · [Parser dispatch](../apps/server/chat_output.cpp#L773)<!-- prefix: "bool ChatOut" -->
+`parallel_tool_calls` is a boolean and defaults to `true`. With `false`, JSON and SSE expose at most one call. Auto with only non-strict tools leaves later wrappers in `content` after the first accepted call. Named choice always allows one call. Required and named choices need an eligible tool, text-only chat, and the `qwen3_coder` parser. They return HTTP 400 when a prerequisite is missing or `response_format`, `regex`, or `ebnf` is set. Active tool constraints require the model EOS stop set and reject nonempty text stops. [Tool admission](../apps/server/text_request.cpp#L610)<!-- prefix: "void check_t" --> · [Parser dispatch](../apps/server/chat_output.cpp#L799)<!-- prefix: "bool ChatOut" -->
 
 The parser accepts an object schema for `function.parameters`, null, or omission. It reads `properties`, `required`, and `additionalProperties`. It removes up to one line feed from each end of a value. It converts scalars and JSON collections. A strict string parameter with the XML value `null` produces the JSON string `"null"`. A strict null parameter produces JSON null. In a loose tool, bare `null` in any letter case produces JSON null, and declared type alternatives are tried in order for other values. Loose tools allow extra keys by default. Validate loose arguments in the application. [Argument conversion](../apps/server/chat_output.cpp#L406)<!-- prefix: "void ToolFra" --> · [Strict schema limits](output-constraints.md#tool-call-constraints)
 
@@ -119,8 +119,8 @@ The parser accepts an object schema for `function.parameters`, null, or omission
 | `cache_salt` | Optional [prefix cache key](prefix-cache.md#runtime-path) component. |
 | `stream`, `return_token_ids`, `ignore_eos`, `stop_token_ids`, `stop` | Use the [shared text options](text-serving.md#send-a-request). |
 | `stream_options` | With streaming enabled, accepts one boolean member, `include_usage`. The default omits the usage event. |
-| `logprobs`, `top_logprobs` | Optional [generated-token scores](openai-logprobs.md#chat-completions). |
-| `logit_bias` | Optional [per-token logit offsets](openai-logprobs.md#logit-bias). |
+| `logprobs`, `top_logprobs` | Optional [generated-token scores](serving/openai-logprobs.md#chat-completions). |
+| `logit_bias` | Optional [per-token logit offsets](serving/openai-logprobs.md#logit-bias). |
 | `add_generation_prompt`, `add_vision_id` | Booleans. HTTP defaults are `true` and `false`, respectively. |
 | `enable_thinking`, `preserve_thinking` | Booleans that default to `true`. They control rendering of the generation prompt and assistant history. |
 | `separate_reasoning`, `stream_reasoning` | Boolean [reasoning output controls](#qwen-reasoning-and-tool-calls) that default to `true`. |

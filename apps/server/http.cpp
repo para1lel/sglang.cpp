@@ -113,6 +113,17 @@ bool token_character(unsigned char character) {
            std::string_view("!#$%&'*+-.^_`|~").find(character) != std::string_view::npos;
 }
 
+bool json_media_type(std::string_view value) {
+    const auto media = trim(value.substr(0, value.find(';')));
+    const auto slash = media.find('/');
+    if (slash == media.npos || !ascii_case_equal(media.substr(0, slash), "application")) {
+        return false;
+    }
+    const auto subtype = media.substr(slash + 1);
+    return ascii_case_equal(subtype, "json") ||
+        (subtype.size() >= 5 && ascii_case_equal(subtype.substr(subtype.size() - 5), "+json"));
+}
+
 HttpRequest parse_request_line(std::string_view line) {
     const auto first = line.find(' ');
     const auto last = line.rfind(' ');
@@ -195,6 +206,10 @@ std::size_t content_length(std::string_view headers, const HttpRequest& request)
         throw HttpError("400 Bad Request",
                         "Unsupported Media Type: Only 'application/json' is allowed");
     }
+    if (request.method == "POST" && separate_reasoning_path(request) && length.value_or(0) != 0 &&
+        !json_media_type(content_type.value_or(""))) {
+        throw HttpError("400 Bad Request", "Input should be a valid dictionary");
+    }
     return length.value_or(0);
 }
 
@@ -261,7 +276,8 @@ bool read_pending(IncomingRequest& incoming, short events,
         }
         handle(incoming.socket, std::move(*incoming.request));
     } catch (const HttpError& error) {
-        if (incoming.request && tokenization_route(*incoming.request) != TokenizationRoute::none) {
+        if (incoming.request && (tokenization_route(*incoming.request) != TokenizationRoute::none ||
+                                 separate_reasoning_path(*incoming.request))) {
             write_tokenization_error(incoming.socket, error.status, error.status.substr(4),
                                      error.what());
         } else {
@@ -476,6 +492,21 @@ void write_tokenization_error(const Socket& connection, std::string_view status,
     body += status.substr(0, 3);
     body += '}';
     write_json(connection, status, body);
+}
+
+bool separate_reasoning_path(const HttpRequest& request) {
+    const auto path = std::string_view(request.path).substr(0, request.path.find('?'));
+    return path == "/separate_reasoning";
+}
+
+void write_post_only(const Socket& connection, bool head_only) {
+    write_response(connection, "405 Method Not Allowed", "application/json",
+                   R"({"detail":"Method Not Allowed"})", "\r\nAllow: POST", head_only);
+}
+
+void write_internal_server_error(const Socket& connection) {
+    write_response(connection, "500 Internal Server Error", "text/plain; charset=utf-8",
+                   "Internal Server Error");
 }
 
 void write_readiness(const Socket& connection, bool ready) {

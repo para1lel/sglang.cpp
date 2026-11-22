@@ -127,6 +127,8 @@ Value Parser::object(std::size_t depth, bool ordered) {
                     fail("duplicate JSON object key");
                 }
                 entries.emplace_back(std::move(key), std::move(entry));
+            } else if (syntax_ == Syntax::last_key_wins) {
+                result.insert_or_assign(std::move(key), std::move(entry));
             } else if (!result.emplace(std::move(key), std::move(entry)).second) {
                 fail("duplicate JSON object key");
             }

@@ -57,6 +57,9 @@ void write_method_not_allowed(const Socket& connection, std::string_view methods
 void write_get_only(const Socket& connection, bool head_only);
 void write_tokenization_error(const Socket& connection, std::string_view status,
                               std::string_view type, std::string_view message);
+bool separate_reasoning_path(const HttpRequest& request);
+void write_post_only(const Socket& connection, bool head_only);
+void write_internal_server_error(const Socket& connection);
 void write_readiness(const Socket& connection, bool ready);
 void write_generation_health(const Socket& connection, bool healthy);
 bool write_metrics(const Socket& connection, std::string_view body);

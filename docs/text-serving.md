@@ -35,8 +35,8 @@ HTTP caps headers at 8 KiB (431) and bodies at 2 MiB (413). It rejects malformed
 | `stop_token_ids` | Array of explicit stop IDs in `[0, 248320)`. The server validates them even when `ignore_eos` is `true`. |
 | `stop` | One nonempty string or an array of nonempty strings. Omission, null, and an empty array disable text stops. |
 | `return_token_ids` | Boolean, default `false`. Set it to `true` to include diagnostic prompt and output IDs for each choice. |
-| `logprobs` | Integer `0`–`20`. Requests [token scores](openai-logprobs.md#text-completions). |
-| `logit_bias` | Optional [per-token offsets](openai-logprobs.md#logit-bias). |
+| `logprobs` | Integer `0`–`20`. Requests [token scores](serving/openai-logprobs.md#text-completions). |
+| `logit_bias` | Optional [per-token offsets](serving/openai-logprobs.md#logit-bias). |
 | `ebnf` | Optional string that restricts output to [one literal choice](#finite-choice-constraints). |
 | `regex` | Optional [whole-output regular expression](output-constraints.md#regular-expressions). |
 | `response_format` | Optional [bounded JSON Schema](output-constraints.md#json-schema). |

@@ -750,6 +750,32 @@ ChatOutputParser::ChatOutputParser(const ChatOutputOptions& options)
 
 ChatOutputParser::~ChatOutputParser() = default;
 
+SeparatedReasoning ChatOutputParser::separate_qwen3(std::string_view text, bool force_reasoning) {
+    if (!force_reasoning && text.find(think_open) == text.npos) {
+        return {{}, std::string(text)};
+    }
+    while (starts_with(text, think_open)) {
+        text.remove_prefix(think_open.size());
+    }
+    ChatOutputOptions options;
+    options.separate_reasoning = true;
+    options.prompt_has_open_think = true;
+    ChatOutputParser parser(options);
+    SeparatedReasoning result;
+    const auto collect = [&](const ChatOutputEvent& event) {
+        auto& field = event.kind == ChatOutputKind::reasoning ? result.reasoning : result.text;
+        field += event.text;
+        return true;
+    };
+    const auto tool_start = text.find(tool_open);
+    parser.push(text.substr(0, tool_start), collect);
+    parser.finish(ChatEnd::stop, collect);
+    if (tool_start != text.npos) {
+        result.text += text.substr(tool_start);
+    }
+    return result;
+}
+
 bool ChatOutputParser::emit_text(std::string_view text, const ChatOutputSink& sink) {
     if (text.empty()) {
         return true;

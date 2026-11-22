@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L398)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
+| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L194)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L515)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
 | Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L882)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L919)<!-- prefix: "std::vector<" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L370)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L953)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L640)<!-- prefix: "bool BatchSe" --> |
@@ -15,7 +15,7 @@
 
 Use the [standard launch](../README.md#serve-token-ids-over-http) for raw text or prompt IDs. Use [chat completions](chat-serving.md) for conversation history.
 
-`POST` and `PUT` accept the same request fields, validation, queue admission, and JSON or SSE response behavior. [Native route matcher](../apps/server/http.cpp#L297)<!-- prefix: "GenerateRout" --> · [Pinned Python methods](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L963)<!-- prefix: "@app.api_rou" -->
+`POST` and `PUT` accept the same request fields, validation, queue admission, and JSON or SSE response behavior. [Native route matcher](../apps/server/http.cpp#L313)<!-- prefix: "GenerateRout" --> · [Pinned Python methods](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L963)<!-- prefix: "@app.api_rou" -->
 
 Send a text prompt for a JSON response.
 
@@ -173,7 +173,7 @@ The expanded item count is at most 32. The sum of per-prompt output budgets mult
 | `sampling_seed` | Signed 64-bit integer, with no seed by default. |
 | `frequency_penalty`, `presence_penalty` | [Output penalties](output-penalties.md). Omission or null uses zero. |
 | `repetition_penalty` | [Output repetition penalty](output-penalties.md). Omission or null uses one. |
-| `logit_bias` | Optional [per-token logit offsets](openai-logprobs.md#logit-bias). Each item uses its own sampling object. |
+| `logit_bias` | Optional [per-token logit offsets](serving/openai-logprobs.md#logit-bias). Each item uses its own sampling object. |
 | `n` | Integer `1`–`32`, default `1`. The expanded limits apply. |
 | `ignore_eos` | Boolean, default `false`. Set `true` to disable both model and explicit stop IDs. |
 | `stop_token_ids` | Array of at most 248,320 integer IDs in `[0, 248320)`. Without explicit IDs, the model stops on `248044` or `248046` unless `ignore_eos` is true. |
@@ -207,9 +207,9 @@ The error event applies to the stream and has no item index. Previously delivere
 On a generation failure, disconnect, or failed write, the worker discards unsubmitted items, cancels the active jobs still owned by the batch, and waits for their retirement before releasing the slot.
 Decoder effects already published, such as prefix-cache entries, can remain.
 The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
-[Batch cancellation](../apps/server/batch_service.cpp#L541)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L47)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L231)<!-- prefix: "void write_s" -->
+[Batch cancellation](../apps/server/batch_service.cpp#L541)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L164)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L231)<!-- prefix: "void write_s" -->
 
-The route matches the exact `/generate` path and ignores its query suffix. `/generate/` is unmatched. After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L297)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L458)<!-- prefix: "void write_m" -->
+The route matches the exact `/generate` path and ignores its query suffix. `/generate/` is unmatched. After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L313)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L474)<!-- prefix: "void write_m" -->
 
 A disconnected client can cancel queued or active work through the [shared transport](http-server.md#http-admission-and-shutdown).
 Send [`POST /abort_request`](native-abort.md) from a second connection to cancel by ID.

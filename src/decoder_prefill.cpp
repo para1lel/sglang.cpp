@@ -280,6 +280,17 @@ struct Chunk : PrefillProjections {
             project(layer.qkv, input, work.gdn_qkv);
             project(layer.z, input, work.gdn_z);
         }
+        if (tensor_core_fp8 && layer.b.rows == text_gdn_value_heads &&
+            layer.a.rows == text_gdn_value_heads && layer.b.columns == hidden_size &&
+            layer.a.columns == hidden_size) {
+            const auto status = try_prefill_bf16_gdn_gates(
+                layer.b.values, layer.a.values, work.normalized, rows, work.gdn_b, work.gdn_a,
+                stream);
+            if (status) {
+                check(*status, "Project BF16 prefill Gated DeltaNet gates");
+                return;
+            }
+        }
         project(layer.b, work.normalized, work.gdn_b);
         project(layer.a, work.normalized, work.gdn_a);
     }

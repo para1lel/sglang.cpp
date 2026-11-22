@@ -43,7 +43,7 @@ The post-attention RMSNorm that feeds MLP gate and up uses the same trigger poin
 
 ### Legacy wide eager decode
 
-The legacy wide eager forward can still compact long attention reads at widths above four. That operator covers 32,768–262,144 visible tokens including the token being appended. [Legacy dispatch](../src/decoder_forward.cpp#L307)<!-- prefix: "const bool w" --> · [Position check](../include/sglang/decoder_cuda.cuh#L146)<!-- prefix: "inline const" --> · [Context ceiling](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" -->
+The legacy wide eager forward can still compact long attention reads at widths above four. That operator covers 32,768–262,144 visible tokens including the token being appended. [Legacy dispatch](../src/decoder_forward.cpp#L307)<!-- prefix: "const bool w" --> · [Position check](../include/sglang/decoder_cuda.cuh#L150)<!-- prefix: "inline const" --> · [Context ceiling](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" -->
 
 Each layer appends the new KV before submitting that lane's grouped attention read. The tensor-core split requires at least five compacted reads and 16-byte-aligned K and V payloads for every lane in the group. The paired split handles groups of one through four or groups with an unaligned payload. Each split divides the visible sequence into 16 page-aligned partitions and clamps the final interval to the visible length. The paired split shares K and V across two query heads of one KV head. [Compaction and launch](../src/decoder_forward.cpp#L327)<!-- prefix: "if (lane.mod" --> · [Split selection](../include/sglang/text/mxfp8_gqa_decode.cuh#L386)<!-- prefix: "bool tensor " -->
 
@@ -51,7 +51,7 @@ Each tensor-core block serves one lane, one partition, and all six query heads o
 
 Both splits write the same per-head FP32 partials. The common merge rescales the 16 partitions against the global maximum and rounds the quotient to BF16. The recovery launch runs before attention gating on the same stream. [Merge](../src/mxfp8_gqa.cu#L660)<!-- prefix: "__global__ v" --> · [Recovery](../include/sglang/text/mxfp8_gqa_decode.cuh#L332)<!-- prefix: "__global__ v" -->
 
-Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation for partials. The alias requires 16-byte alignment and remains live until the attention launches consume it. The stream orders later scoring writes to that allocation. [Scratch alias](../src/decoder_forward.cpp#L248)<!-- prefix: "PagedDecodeB" --> · [Scratch size](../include/sglang/decoder_cuda.cuh#L131)<!-- prefix: "inline const" -->
+Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation for partials. The alias requires 16-byte alignment and remains live until the attention launches consume it. The stream orders later scoring writes to that allocation. [Scratch alias](../src/decoder_forward.cpp#L248)<!-- prefix: "PagedDecodeB" --> · [Scratch size](../include/sglang/decoder_cuda.cuh#L135)<!-- prefix: "inline const" -->
 
 ## Constraints and failure behavior
 

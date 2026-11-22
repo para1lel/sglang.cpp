@@ -66,6 +66,10 @@ cudaError_t tensor_core_multirow_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream);
 
+cudaError_t mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
+                              const __nv_bfloat16* queries, __nv_bfloat16* output,
+                              cudaStream_t stream);
+
 }
 
 }

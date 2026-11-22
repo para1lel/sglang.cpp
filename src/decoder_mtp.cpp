@@ -257,8 +257,8 @@ void MtpDraftRequest::State::attend(int position, cudaStream_t stream) {
                               work.rope_queries, work.rope_keys, stream), "Rotate MTP Q/K");
     check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values, stream),
           "Append MTP MXFP8 KV");
-    check(mxfp8_gqa_attention(cache, pages, position + 1, position, 1, work.rope_queries,
-                              work.attention, stream), "Read MTP MXFP8 attention");
+    check(mtp_gqa_attention(cache, pages, position, work.rope_queries, work.attention, stream),
+          "Read MTP MXFP8 attention");
     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
           "Gate MTP attention");
     quantize(work.attention, text_gqa_q_width, work, stream);

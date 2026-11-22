@@ -2,6 +2,25 @@
 
 Under the historical 32,768-token scheduling cap, native passed W1 and missed only the time-to-first-token gate on W2. It missed all four speed gates on W3 and W4. W5 and W6 stopped in the first warmup before any HTTP headers or output IDs arrived. For new formal results, follow the [paired 8,192-token protocol](../benchmarks/paired/README.md).
 
+## Matched W1/W2 at 8,192 tokens
+
+On November 22, 2026, vLLM ran first and native ran second on B200 `GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`. Both used driver 590.48.01, server CPUs 24–33, client CPUs 34–35, local NUMA allocation, and the Qwen3.8-27B-FP8 checkpoint. The checkpoint manifest SHA-256 was `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303`.
+
+Native used revision `919885edc1b70937915ca6894a40f5f98ec3f202` and binary SHA-256 `03cf404e719d03c60dec21e100212c4af75e68ba8fe97e6632322820d4d3abf8`. vLLM used revision `81a8cb063e6247fe254d7caf7e98a6691d71022a`, PyTorch 2.14.0+cu132, and FlashInfer 0.7.4.
+
+Both arms had an effective cap of 8,192 scheduled tokens and 32 active slots, with MTP and prefix reuse disabled. Native requested batch CUDA graphs and used tensor-core FP8 prefill. vLLM used asynchronous scheduling, chunked prefill, and full and piecewise CUDA graphs. Its context limit was 2,560 tokens and its KV budget was 10 GiB. It used FlashInfer with BF16 queries, E4M3 KV, BF16 convolution history, and FP32 recurrence.
+
+Makespan is the last valid `[DONE]` timestamp minus the earliest client submit timestamp in a cohort. Each arm ran three warmups and nine measured single-request cohorts per row. The median uses only measured cohorts. The reduction is `100 × (1 − native median / vLLM median)`. [Paired timing and gate](../benchmarks/paired/README.md#observe-and-compare)
+
+| Row (prompt IDs → output IDs) | Timed cohorts, native / vLLM | Native median (ms) | vLLM median (ms) | Native reduction |
+| --- | ---: | ---: | ---: | ---: |
+| W1 (128 → 128) | 9 / 9 | 1,026.356508 | 1,236.829263 | 17.02% |
+| W2 (2,048 → 512) | 9 / 9 | 4,132.415844 | 5,001.674231 | 17.38% |
+
+Replay verified the wire contract and repeat output IDs within each arm. Cross-engine ID agreement was outside the replay scope. W1 and W2 qualified under the paired makespan gate. This pair covered W1 and W2 only.
+
+The benchmark host retains the samples and replay verdict at `artifacts/takeover-baseline/paired-w1w2.FrMn3y/native/W1-W2/comparison.json`.
+
 ## Matched conditions
 
 The two engines ran sequentially on the same physical B200 for each pair, with vLLM first in every pair. Both used the local Qwen3.8-27B-FP8 checkpoint, 32,768 scheduled tokens per step, 32 service slots, no MTP, and no prefix reuse. The checkpoint manifest SHA-256 was `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303`. The vLLM revision was `81a8cb063e6247fe254d7caf7e98a6691d71022a`, with PyTorch 2.14.0+cu132 and FlashInfer 0.7.4. Runs used driver 590.48.01. Host load and peer GPU activity differed between sessions. See the [benchmark agreement](performance.md#implementations-and-controls).

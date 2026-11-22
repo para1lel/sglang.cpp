@@ -25,6 +25,8 @@ def frame(value):
 
 
 class Reads:
+    length = None
+
     def __init__(self, *reads):
         self.reads = iter(reads)
 
@@ -57,6 +59,8 @@ class StreamingClientTest(unittest.TestCase):
                 self.server.received = (self.path, self.rfile.read(size))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
+                length = len(self.server.payload) + self.server.extra
+                self.send_header("Content-Length", str(length))
                 self.end_headers()
                 self.wfile.write(self.server.payload)
 
@@ -68,7 +72,9 @@ class StreamingClientTest(unittest.TestCase):
             worker.start()
             try:
                 origin = urlsplit(f"http://127.0.0.1:{server.server_port}")
-                server.payload = data + b"data: [DONE]\n\n"
+                terminal = b"data: [DONE]\n\n"
+                server.extra = 0
+                server.payload = data + terminal + b": final heartbeat\n\n"
                 result = client.measure(origin, case, request_body)
                 self.assertEqual(server.received, ("/v1/completions", request_body))
                 self.assertNotIn("error", result)
@@ -78,6 +84,26 @@ class StreamingClientTest(unittest.TestCase):
                 self.assertEqual(result["metrics"]["tpot_ms"], (last - first) / 2e6)
                 self.assertEqual(result["metrics"]["e2e_ms"],
                                  (result["done_ns"] - result["submit_ns"]) / 1e6)
+                self.assertEqual(result["done_ns"], result["events"][-2]["ns"])
+                self.assertEqual(result["events"][-1]["lines"], [": final heartbeat"])
+                self.assertEqual(result["response_end"]["body_bytes"], len(server.payload))
+                self.assertGreaterEqual(result["response_end"]["ns"], result["events"][-1]["ns"])
+                server.payload = data + terminal
+                server.extra = 128
+                failed = client.measure(origin, case, request_body)
+                self.assertIn("128 more expected", failed["error"])
+                self.assertIn("done_ns", failed)
+                self.assertNotIn("response_end", failed)
+                self.assertNotIn("metrics", failed)
+                server.extra = 0
+                for tail in (terminal, frame({"error": "failed after DONE"}), b"data:\n\n"):
+                    with self.subTest(tail=tail):
+                        server.payload = data + terminal + tail + b": trailing heartbeat\n\n"
+                        failed = client.measure(origin, case, request_body)
+                        self.assertIn("Data after [DONE]", failed["error"])
+                        self.assertEqual(failed["done_ns"], failed["events"][-3]["ns"])
+                        self.assertEqual(failed["events"][-1]["lines"], [": trailing heartbeat"])
+                        self.assertNotIn("metrics", failed)
                 server.payload = data
                 failed = client.measure(origin, case, request_body)
                 self.assertIn("Stream ended before [DONE]", failed["error"])

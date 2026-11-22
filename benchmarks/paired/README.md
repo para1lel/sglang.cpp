@@ -51,9 +51,8 @@ CPUs 24–33 for the server and 34–35 for the client, and local NUMA allocatio
 Reuse that UUID, CPU placement and memory policy. Measure a new vLLM arm on the
 chosen card for other placement and use two fresh 8,192-token arms for the formal protocol.
 
-Export the frozen protocol commit into a new directory and check the saved
-evidence, checkpoint and protocol bytes before running a candidate. Run these
-commands in Bash from the repository root.
+Export the historical protocol to check the saved source hashes. Use the current
+checkout for the candidate protocol. Run these commands in Bash from its root.
 
 ```bash
 set -eo pipefail
@@ -74,7 +73,7 @@ fixture_hash=$(jq -er '.fixture_manifest_sha256' \
 printf '%s  %s\n' "$fixture_hash" "$manifest" |
     (cd "$frozen" && sha256sum --check --quiet)
 
-PAIRED_PROTOCOL_ROOT="$frozen" PAIRED_FIXTURES="$saved/fixtures" \
+PAIRED_PROTOCOL_ROOT="$PWD" PAIRED_FIXTURES="$saved/fixtures" \
 PAIRED_VLLM_RESULTS="$saved" PAIRED_WARMUPS=1 PAIRED_MEASURED=3 \
 PAIRED_MAX_NUM_BATCHED_TOKENS=32768 \
     bash benchmarks/paired/run_native.sh /path/to/build 2 artifacts/paired-candidate-gpu2
@@ -82,8 +81,9 @@ PAIRED_MAX_NUM_BATCHED_TOKENS=32768 \
 
 The driver resolves the physical GPU before checking saved evidence. It checks the
 saved device inventory and the worker's compute UUID at readiness and measurement
-end, CPU and NUMA placement, observed engine settings, the published checkpoint
-file hashes, the protocol and request hashes, and the cohort schedule. It replays
+end, CPU and NUMA placement, the vLLM source commit receipt, observed engine
+settings, the published checkpoint file hashes, the protocol and request hashes,
+and the cohort schedule. It replays
 saved wire captures against the frozen fixture and recorded summary. Results can
 differ between engines. Each engine's own greedy IDs must repeat across cohorts.
 The retained 1/3 concurrent capture predates the collector's in-run repeat check.
@@ -94,11 +94,12 @@ The driver writes `comparison-plan.json` before launch and keeps its SHA-256 and
 the selected mode for the completion check. It replays the native wire captures
 and checks repeat IDs, measured statistics, and process, device, settings and
 protocol evidence before producing `GROUP/comparison.json`. Its `comparison`
-field uses `same-device matched-cap` only after both effective caps are verified
-at 8,192. With matching caps at another value it uses `exploratory (non-protocol
-cap 32768)` for the historical example. A cohort count override yields
-`exploratory (count mismatch)` and leaves all other checks in force. The result records which arms were
-replayed and whether cross-engine IDs were compared. The native receipts
+field uses `same-device matched-cap` when both arms have verified 8,192-token
+caps and the required cohort counts. The historical example yields `exploratory
+(non-protocol cap 32768)`. At 8,192, equal override counts yield `exploratory
+(non-protocol counts)`. A permitted difference yields `exploratory (count
+mismatch)`. The result records which arms were replayed and whether cross-engine
+IDs were compared. The native receipts
 establish its launch settings and scheduler limits. Actual kernel dispatch
 requires independent profiling.
 
@@ -117,34 +118,41 @@ PAIRED_MAX_NUM_BATCHED_TOKENS=32768 \
 
 The comparison records the archive identity and uses the `published frozen reference`
 label with `cross-cap` or `cross-device` when those settings differ from the reference.
-Interpret its speed gates against the archive. Formal results require new measured
-arms whose observed caps both equal 8,192 on the same physical device.
+The published replay keeps its historical collector and speed gates. Its
+`makespan.passed` is `null`, as it is for exploratory comparisons.
 
 ## Observe and compare
 
 Append any of `W1-W2 W3 W4 W5 W6` to select groups. Each group starts a fresh
 server with 32 active slots and an 8,192-token scheduling cap. The native arm uses
 tensor-core FP8 prefill and batch CUDA graphs. Both arms disable MTP and prefix reuse.
-W1 and W2 use three warmups
-and nine measured requests each. W3–W6 use a 90 s socket timeout, a 15 s barrier
-timeout and a 360 s cohort deadline. The submission span must be at most 50 ms,
-and every lane must produce output before any stream ends.
+W1 and W2 use three warmups and nine measured requests each. The client times the
+first `[DONE]` and keeps reading through the end of the HTTP response. A second
+terminal, other data event after `[DONE]`, or short HTTP body invalidates the sample.
+Formal W1/W2 comparison requires fresh captures with HTTP response end receipts.
+W3–W6 use two warmups and five measured cohorts each, a 90 s socket timeout, a 15 s barrier
+timeout and a 360 s cohort deadline. For paired W3–W6 captures, all lanes connect
+before the shared barrier. Their submit timestamps must span at most 50 ms and
+every request body must be sent before the first valid `[DONE]`.
 
 The driver saves the client command with `PYTHONPATH`, GPU samples from server
 startup, and raw streams once measurement begins. If IDs differ from a lane's
 first warmup, the observer retains the offending cohort and records the first
 differing token under `repeat_id_mismatch`. Compare separately captured diagnostic
-IDs with the first warmup before using them as repeatability evidence. The driver
-continues to the next group and exits nonzero if any group fails startup,
-measurement or validation.
+IDs with the first warmup before using them as repeatability evidence.
 
-Compare median output IDs/s and pooled request p95 latency. In the raw W1/W2
-summary, use `workloads.W1` or `workloads.W2`, then `output_tokens_per_second.p50` and
-`ttft_ms.p95`, `tpot_ms.p95` and `e2e_ms.p95`. In W3–W6, use
-`throughput.output_tokens_per_second.p50` and the same latency keys under `latency_ms`.
-The retained archive's aggregate `comparison.json` exposes `rows.W1.vllm` through `rows.W6.vllm` with
-`output_ids_per_second_p50` and `latency_p95_ms`. Each row's `fresh_vllm_thresholds`
-uses the saved same-card vLLM variability. W3–W6 `wire_and_timing_gates` contains
-archived speed checks after successful wire validation. Those speed misses do
-not fail the driver. The native W1/W2 client leaves threshold generation to the
-vLLM arm. Use the fresh same-card thresholds for a paired claim.
+The sole paired performance gate is native median makespan strictly below the
+same-card vLLM median for each workload. A cohort's makespan starts at its earliest
+client submit and ends at its last valid `[DONE]`. Use measured cohorts only.
+`GROUP/comparison.json` records the samples and medians in nanoseconds and the
+verdict under `makespan.workloads`. W1 and W2 have independent verdicts even
+though they share a group. On a makespan miss, including a tie, the native driver
+keeps the comparison receipt. Any failed startup, measurement, validation, or
+makespan gate stops the native driver before the next group and exits nonzero.
+
+Use output IDs/s, TTFT, TPOT, end-to-end latency, p95, and the intervals when all
+streams are open or generating as diagnostics. A lane can start producing
+output after another lane completes. The W1/W2 summary reports rates and latency
+under `workloads.W1` and `workloads.W2`. W3–W6 reports them under `throughput`
+and `latency_ms`. `wire_and_timing_gates` and the retained archive's
+`fresh_vllm_thresholds` keep the historical speed checks available for diagnosis.

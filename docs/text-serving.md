@@ -90,7 +90,7 @@ Native text requests can use configured [sampled MTP](mtp.md#sampled-mtp), inclu
 
 Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L362)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L906)<!-- prefix: "if (result.s" -->
 
-An unseeded sampled request resolves one seed with `std::random_device`. The frozen benchmark client explicitly sends `temperature: 0`, `seed: 0`, and `ignore_eos: true`. [Benchmark request](../benchmarks/streaming/client.py#L39)<!-- prefix: "def request_" -->
+An unseeded sampled request resolves one seed with `std::random_device`. The frozen benchmark client explicitly sends `temperature: 0`, `seed: 0`, and `ignore_eos: true`. [Benchmark request](../benchmarks/streaming/client.py#L40)<!-- prefix: "def request_" -->
 
 ## Finite-choice constraints
 

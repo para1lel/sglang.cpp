@@ -109,7 +109,7 @@ prepare_run() {
     nvidia-smi --query-gpu=index,uuid,name,pci.bus_id,driver_version,memory.total,power.limit \
         --format=csv >"$output/devices.csv"
     nvidia-smi topo -m >"$output/topology.txt"
-    sha256sum "$paired_dir"/{common.sh,measure_concurrent.py} \
+    sha256sum "$paired_dir"/{common.sh,measure_concurrent.py,makespan.py} \
         "$protocol"/benchmarks/streaming/{client.py,W1.json,W2.json} \
         "$protocol"/benchmarks/concurrent/{client.py,reference.py,freeze_prompts.py} \
         "$protocol"/benchmarks/concurrent/{fixture-manifest.json,gpu2-reference.json} \
@@ -181,6 +181,10 @@ measure_group() {
     local group=$1
     local run=$2
     local arm=${3:-vllm}
+    local collector=makespan.py
+    if [[ ${mode:-} == frozen ]]; then
+        collector=measure_concurrent.py
+    fi
     local command=(env "PYTHONPATH=$protocol" numactl --localalloc
         taskset --cpu-list "$client_cpus" "$client_python" -B)
     if [[ $group == W1-W2 ]]; then
@@ -190,7 +194,7 @@ measure_group() {
             command+=(--freeze-baseline)
         fi
     else
-        command+=("$paired_dir/measure_concurrent.py" "$group" "$url" "$fixtures" "$run/measurement"
+        command+=("$paired_dir/$collector" "$group" "$url" "$fixtures" "$run/measurement"
             --warmups "$warmups" --measured "$measured")
     fi
     write_command "$run/client-command.sh" "${command[@]}"

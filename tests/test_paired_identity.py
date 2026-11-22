@@ -1,7 +1,12 @@
 """Check paired-control receipts offline using the fixed W1 and W2 requests."""
 
+import gzip
+import hashlib
 import json
+import os
+import runpy
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +14,8 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +50,163 @@ def write_compute(run, uuid, pid):
         (run / f"compute-{sample}.csv").write_text(f"{uuid}, {pid}, worker, 80000 MiB\n")
 
 
-def stream_record(case, request_hash, name, phase, cohort):
+def synthetic_cohort():
+    """Send both requests before either completes, with no generating overlap."""
+    lanes, requests = [], []
+    for lane, (submit, sent, headers) in enumerate(((5, 7, 10), (9, 24, 80))):
+        case = {"prompt_token_ids": [100 + lane], "output_tokens": 3}
+        request = identity.streaming.json_bytes(identity.streaming.request_body(case))
+        lane_manifest = {"lane": lane, "request_sha256": hashlib.sha256(request).hexdigest()}
+        stamps = tuple(headers + delta for delta in (10, 12, 14, 20))
+        raw = stream_record(case, lane_manifest["request_sha256"], "W3", "measured", 1, stamps)
+        raw.update(lane=lane, connect_ns=1, submit_ns=submit, sent_ns=sent, headers_ns=headers,
+                   eof_ns=stamps[-1] + 1000,
+                   response_headers=[["Content-Type", "text/event-stream"]])
+        completion = identity.streaming.Completion()
+        identity.concurrent.consume_events(raw["events"], raw, case, completion)
+        identity.concurrent.finish_record(raw, completion)
+        requests.append(raw)
+        lanes.append((lane_manifest, request, case))
+    return {"tag": "measured-01", "row": "W3", "barrier_ns": 4,
+            "instrumentation": {}, "errors": [], "requests": requests}, lanes
+
+
+def test_paired_concurrent_replays_late_headers_and_first_token(tmp_path):
+    raw, lanes = synthetic_cohort()
+    policy = identity.concurrent.reference()["policy"]
+    result = identity.validate_cohort(raw, lanes, policy)
+    assert result["makespan_ns"] == 95
+    assert result["all_streams_overlap_ms"] < 0
+    assert result["all_generating_overlap_ms"] < 0
+    with pytest.raises(ValueError, match="overlap bounds"):
+        identity.concurrent.validate_cohort(raw, lanes, policy)
+
+    measurement = tmp_path / "measurement"
+    measurement.mkdir()
+    measured, outcomes = [], []
+    for tag in ("warmup-01", "measured-01", "measured-02"):
+        path = f"{tag}.json.gz"
+        raw["tag"] = tag
+        with gzip.open(measurement / path, "wt") as stream:
+            json.dump(raw, stream)
+        outcomes.append({"tag": tag, "raw_file": path, "makespan_ns": 95})
+        if tag.startswith("measured"):
+            measured.append(result)
+    report = identity.concurrent.summarize(measured) | {"request_outcomes": outcomes}
+    assert identity.replay_cohorts(tmp_path, "W3", report, lanes, identity.PAIRED_COLLECTOR) == {
+        "W3": [95, 95]}
+    outcomes[-1]["makespan_ns"] += 1
+    with pytest.raises(ValueError, match="recorded makespan differs"):
+        identity.replay_cohorts(tmp_path, "W3", report, lanes, identity.PAIRED_COLLECTOR)
+
+
+@pytest.mark.parametrize(("change", "error"), [
+    ({"submit_ns": 30, "sent_ns": 31}, "overlap bounds"),
+    ({"sent_ns": 30}, "overlap bounds"),
+    ({"request_sha256": "wrong"}, "request identity"),
+    ({"output_ids": [1, 2, 3]}, "output_ids differs"),
+])
+def test_paired_concurrent_rejects_serial_submission_or_corrupt_evidence(change, error):
+    raw, lanes = synthetic_cohort()
+    request = raw["requests"][1]
+    request.update(change)
+    if "submit_ns" in change:
+        request["metrics"]["ttft_ms"] = (request["first_ns"] - request["submit_ns"]) / 1e6
+        request["metrics"]["e2e_ms"] = (request["done_ns"] - request["submit_ns"]) / 1e6
+    with pytest.raises(ValueError, match=error):
+        identity.validate_cohort(raw, lanes, identity.concurrent.reference()["policy"])
+
+
+def test_paired_collector_keeps_diagnostic_failures_out_of_exit_status(tmp_path, monkeypatch):
+    raw, lanes = synthetic_cohort()
+    baseline = identity.concurrent.reference()
+    baseline["rows"]["W3"]["thresholds"]["strict_median_output_tokens_per_second_gt"] = 1e12
+    collector = ROOT / "benchmarks" / "paired" / identity.PAIRED_COLLECTOR
+    destination = tmp_path / "measurement"
+
+    def capture(_url, _name, _lanes, tag, _policy):
+        return raw | {"tag": tag}
+
+    monkeypatch.setattr(identity.concurrent, "reference", lambda: baseline)
+    monkeypatch.setattr(identity.concurrent, "load_lanes", lambda _fixtures, _name: lanes)
+    monkeypatch.setattr(identity.concurrent, "capture_cohort", capture)
+    monkeypatch.setattr(sys, "argv",
+                        [str(collector), "W3", "http://127.0.0.1", str(tmp_path), str(destination)])
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_path(str(collector), run_name="__main__")
+    assert exit_info.value.code == 0
+    report = identity.load(destination / "summary.json")
+    assert report["wire_and_timing_gates"]["throughput"] is False
+    assert identity.replay_cohorts(
+        tmp_path, "W3", report, lanes, identity.PAIRED_COLLECTOR) == {"W3": [95] * 5}
+
+
+def test_paired_comparison_uses_medians_and_rejects_ties_and_slower_workloads():
+    result = identity.compare(
+        {"W3": [30, 10, 12, 9, 8], "W4": [12] * 5, "W5": [13] * 5},
+        {"W3": [10, 11, 12, 11, 11], "W4": [12] * 5, "W5": [12] * 5},
+        eligible=True)
+    assert [row["passed"] for row in result["workloads"].values()] == [True, False, False]
+    assert result["passed"] is False
+    with pytest.raises(ValueError, match="matching workload and measured sample counts"):
+        identity.compare({"W3": [10, 11]}, {"W3": [10, 11, 12]}, eligible=True)
+
+
+@pytest.mark.parametrize(("scenario", "status", "receipt", "next_group"), [
+    ("win", 0, True, True),
+    ("timing-miss", 1, True, False),
+    ("identity-error", 1, False, False),
+    ("measurement-error", 1, False, False),
+    ("health-error", 1, False, False),
+    ("startup-error", 1, False, False),
+])
+def test_native_driver_stops_at_first_failed_gate(tmp_path, scenario, status, receipt, next_group):
+    paired = ROOT / "benchmarks" / "paired"
+    driver = tmp_path / "run_native.sh"
+    driver.write_bytes((paired / driver.name).read_bytes())
+    (tmp_path / "common.sh").write_text(f'source {shlex.quote(str(paired / "common.sh"))}\n' + r"""
+prepare_run() { mkdir "$2"; output=$2; gpu_uuid=mocked; }
+prepare_fixtures() { :; }
+plan_comparison() { comparison_plan_sha256=mocked; }
+start_group() {
+    if [[ ${1##*/} == W5 ]]; then
+        case "$SCENARIO" in
+            startup-error) return 1 ;;
+            health-error) printf '{}\n' >"$1/health.json"; return ;;
+        esac
+    fi
+    printf '{"max_active":32,"max_num_batched_tokens":%s}\n' "$token_budget" >"$1/health.json"
+}
+measure_group() { [[ $1 != W5 || $SCENARIO != measurement-error ]]; }
+comparison_identity() {
+    printf '{"group":"%s"}\n' "$3"
+    if [[ $3 == W5 ]]; then
+        case "$SCENARIO" in
+            timing-miss) return 3 ;;
+            identity-error) return 2 ;;
+        esac
+    fi
+}
+stop_group() { :; }
+record_compute() { : >"$1"; }
+""")
+    binary = tmp_path / "bin" / "sglang-server"
+    binary.parent.mkdir()
+    binary.symlink_to("/bin/true")
+    output = tmp_path / "output"
+    env = dict(os.environ, SCENARIO=scenario, PAIRED_COMPARISON_MODE="matched",
+               PAIRED_VLLM_RESULTS=str(tmp_path), PAIRED_MAX_NUM_BATCHED_TOKENS="8192")
+    result = subprocess.run(["bash", str(driver), str(tmp_path), "7", str(output), "W5", "W6"],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == status, result.stderr
+    assert (output / "finished-utc.txt").is_file()
+    assert (output / "W5" / "compute-after.csv").is_file()
+    assert (output / "W5" / "comparison.json").is_file() == receipt
+    assert not (output / "W5" / "comparison.tmp").exists()
+    assert (output / "W6").exists() == next_group
+
+
+def stream_record(case, request_hash, name, phase, cohort, stamps=(20, 50, 60, 70)):
     tokens = list(range(case["output_tokens"]))
     prompt = case["prompt_token_ids"]
     usage = {"prompt_tokens": len(prompt), "completion_tokens": len(tokens),
@@ -55,22 +218,26 @@ def stream_record(case, request_hash, name, phase, cohort):
     ]
     data = [json.dumps(payload) for payload in payloads] + ["[DONE]"]
     events = [{"lines": ["data: " + payload], "ns": stamp, "read": index}
-              for index, (payload, stamp) in enumerate(zip(data, (20, 50, 60, 70)), start=1)]
-    duration = 70
+              for index, (payload, stamp) in enumerate(zip(data, stamps), start=1)]
+    body_bytes = len("".join("data: " + payload + "\n\n" for payload in data).encode())
+    first, last, _, duration = stamps
     aggregate_rate = (len(tokens) + len(prompt)) * 1e9 / duration
     return {"workload": name, "phase": phase, "cohort": cohort, "http_status": 200,
             "submit_ns": 0, "headers_ns": 10, "request_sha256": request_hash,
+            "response_headers": [["Content-Length", str(body_bytes)]],
+            "response_end": {"ns": duration + 1, "body_bytes": body_bytes},
             "events": events, "output_ids": tokens,
-            "metrics": {"ttft_ms": 20 / 1e6, "tpot_ms": 30 / (len(tokens) - 1) / 1e6,
+            "metrics": {"ttft_ms": first / 1e6,
+                        "tpot_ms": (last - first) / (len(tokens) - 1) / 1e6,
                         "e2e_ms": duration / 1e6,
                         "output_tokens_per_second": len(tokens) * 1e9 / duration,
                         "requests_per_second": 1e9 / duration,
                         "aggregate_tokens_per_second": aggregate_rate}}
 
 
-def write_measurement(run, hashes, freeze_baseline=True):
+def write_measurement(run, hashes, freeze_baseline=True, stamps_by_name=None):
     measurement = run / "measurement"
-    measurement.mkdir()
+    measurement.mkdir(exist_ok=True)
     manifest = identity.stream_identity(ROOT, hashes)
     cases = identity.streaming.load_cases(ROOT / "benchmarks" / "streaming")
     records = {name: [] for name in cases}
@@ -81,8 +248,9 @@ def write_measurement(run, hashes, freeze_baseline=True):
         for phase, count in manifest["schedule"]:
             for cohort in range(1, count + 1):
                 for name, (case, _) in cases.items():
+                    stamps = (stamps_by_name or {}).get(name, (20, 50, 60, 70))
                     record = stream_record(case, manifest["request_sha256"][name],
-                                           name, phase, cohort)
+                                           name, phase, cohort, stamps)
                     events.write(json.dumps(record) + "\n")
                     records[name].append(record)
     write_json(measurement / "summary.json", {"manifest": manifest, "workloads": {
@@ -151,6 +319,7 @@ class PairedIdentityTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         write_receipts(capture, 2, GPU)
         write_receipts(output, 0, GPU)
+        (capture / "vllm-source-commit.txt").write_text(self.reference["vllm_pin"] + "\n")
         (capture / "effective-environment.txt").write_text(f"CUDA_VISIBLE_DEVICES={GPU}\n")
         hashes = identity.current_protocol(GROUP, ROOT)
         (capture / "protocol.sha256").write_text("".join(
@@ -167,6 +336,69 @@ class PairedIdentityTest(unittest.TestCase):
         plan = identity.plan(self.args)
         self.assertEqual(plan["groups"][GROUP]["planned_comparison"], "same-device matched-cap")
         self.assertEqual(plan["groups"][GROUP]["vllm"]["device"]["uuid"], GPU.lower())
+        self.assertEqual(plan["groups"][GROUP]["vllm"]["source_commit"], self.reference["vllm_pin"])
+
+    def test_reject_unverified_vllm_source_commit(self):
+        receipt = self.saved_run.parent / "vllm-source-commit.txt"
+        receipt.write_text("0" * 40 + "\n")
+        with self.assertRaisesRegex(ValueError, "unexpected vLLM source commit"):
+            identity.plan(self.args)
+        receipt.unlink()
+        with self.assertRaisesRegex(ValueError, "missing vLLM source commit receipt"):
+            identity.plan(self.args)
+
+    def test_reject_legacy_stream_capture_for_formal_gate(self):
+        receipt = self.saved_run.parent / "protocol.sha256"
+        current = identity.current_protocol(GROUP, ROOT)
+        legacy = identity.LEGACY_STREAMING_CLIENT
+        receipt.write_text(receipt.read_text().replace(current["streaming/client.py"], legacy))
+        with self.assertRaisesRegex(ValueError, "fresh capture through response end"):
+            identity.plan(self.args)
+
+    def test_replay_rejects_stream_data_after_reported_done(self):
+        path = self.saved_run / "measurement" / "events.jsonl"
+        original = path.read_text().splitlines()
+        for trailing_line in ("data: [DONE]", 'data: {"error":"failed after DONE"}', "data:"):
+            with self.subTest(trailing_line=trailing_line):
+                record = json.loads(original[0])
+                terminal = record["events"][-1]
+                record["events"].append({**terminal, "lines": [trailing_line]})
+                path.write_text("\n".join([json.dumps(record), *original[1:]]) + "\n")
+                with self.assertRaisesRegex(ValueError, r"Data after \[DONE\]"):
+                    identity.plan(self.args)
+
+    def test_replay_requires_complete_http_body(self):
+        path = self.saved_run / "measurement" / "events.jsonl"
+        original = path.read_text().splitlines()
+        for short_body in (False, True):
+            with self.subTest(short_body=short_body):
+                record = json.loads(original[0])
+                if short_body:
+                    record["response_end"]["body_bytes"] -= 1
+                    message = "HTTP response body bytes differ from Content-Length"
+                else:
+                    record.pop("response_end")
+                    message = "Missing or invalid HTTP response end receipt"
+                path.write_text("\n".join([json.dumps(record), *original[1:]]) + "\n")
+                with self.assertRaisesRegex(ValueError, message):
+                    identity.plan(self.args)
+
+    def test_w5_override_counts_cannot_earn_formal_verdict(self):
+        plan = identity.plan(self.args)
+        arm = plan["groups"][GROUP]["vllm"]
+        for counts, expected in (
+            ((1, 2), "exploratory (non-protocol counts)"),
+            ((2, 5), "same-device matched-cap"),
+        ):
+            with self.subTest(counts=counts):
+                label = identity.comparison_label(
+                    "matched", "W5", arm | {"counts": list(counts)}, {}, plan["device"],
+                    counts, 8192)
+                self.assertEqual(label, expected)
+                samples = counts[1]
+                result = identity.compare({"W5": [50] * samples}, {"W5": [60] * samples},
+                                          eligible=label == "same-device matched-cap")
+                self.assertIs(result["passed"], True if counts == (2, 5) else None)
 
     def test_equal_counts_cannot_hide_device_mismatch(self):
         self.args.allow_count_mismatch = True
@@ -292,6 +524,30 @@ class PairedIdentityTest(unittest.TestCase):
         result = identity.finish(self.args)
         self.assertEqual(result["comparison"], "same-device matched-cap")
         self.assertFalse(result["quality"]["cross_engine_ids_compared"])
+
+    def test_finish_uses_each_workload_makespan_and_preserves_tie_receipt(self):
+        run = self.prepare_native()
+        hashes = identity.current_protocol(GROUP, ROOT)
+        write_measurement(run, hashes, freeze_baseline=False,
+                          stamps_by_name={"W1": (40, 50, 60, 65)})
+        result = identity.finish(self.args)
+        makespan = result["makespan"]
+        self.assertFalse(makespan["passed"])
+        self.assertTrue(makespan["workloads"]["W1"]["passed"])
+        self.assertFalse(makespan["workloads"]["W2"]["passed"])
+        self.assertEqual(makespan["workloads"]["W1"]["native"],
+                         {"samples_ns": [65] * 9, "median_ns": 65})
+        argv = ["identity.py", str(ROOT), str(self.args.output), "finish", "matched", GROUP,
+                self.args.plan_sha256]
+        with patch.object(sys, "argv", argv), patch("sys.stdout") as stdout:
+            self.assertEqual(identity.main(), 3)
+        receipt = json.loads(stdout.write.call_args_list[0].args[0])
+        self.assertEqual(receipt["makespan"], makespan)
+        self.assertEqual(receipt["comparison"], "same-device matched-cap")
+
+        write_measurement(run, hashes, freeze_baseline=False,
+                          stamps_by_name={"W1": (40, 50, 60, 65), "W2": (30, 50, 60, 69)})
+        self.assertTrue(identity.finish(self.args)["makespan"]["passed"])
 
     def test_reject_native_health_cap_mismatch(self):
         run = self.prepare_native()

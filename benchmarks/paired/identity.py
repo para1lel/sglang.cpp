@@ -11,6 +11,7 @@ from pathlib import Path
 from benchmarks.concurrent import client as concurrent
 from benchmarks.concurrent.reference import ROWS, load_lanes
 from benchmarks.streaming import client as streaming
+from makespan import cohort_makespan_ns, compare, validate_cohort
 from saved_evidence import (
     arg, artifact_hashes, command, device, digest, fields, load, observed_device, require,
     saved_worker,
@@ -18,19 +19,25 @@ from saved_evidence import (
 
 
 COLLECTOR = "measure_concurrent.py"
+PAIRED_COLLECTOR = "makespan.py"
 LEGACY_COLLECTOR = "00d702fb1efe7749a3bb0b03aa1fd61169d248114283b32145c5304d87e51c05"
+LEGACY_STREAMING_CLIENT = "c8fdfde28f6ce35aaea79fff4c2cac2d386d7be2c611ee8e3660ae11b803afcd"
+DRAINING_STREAMING_CLIENT = "160ec28c95941f3a5d55de4ced6f2470bfc80f9ca0e290dcd5a167fafa5295d9"
 STREAMING = ("streaming/client.py", "streaming/W1.json", "streaming/W2.json")
 CONCURRENT = ("streaming/client.py", "concurrent/client.py", "concurrent/reference.py",
               "concurrent/fixture-manifest.json", "concurrent/gpu2-reference.json", COLLECTOR)
 FROZEN_PROTOCOL = dict(zip(CONCURRENT, (
-    "c8fdfde28f6ce35aaea79fff4c2cac2d386d7be2c611ee8e3660ae11b803afcd",
+    LEGACY_STREAMING_CLIENT,
     "e8f53f54b3135318508eb8052ef015437c508499b3b738632e2fea0e4af66ee8",
     "65aeb33607a74512374c2f4f04fe5d7d408e465762e208613d693b2155e636df",
     "08caa19062d29c896c13e94bda164fbe247daf0735f3a174c6e58e1d2719b44c",
     "8221e70bdda0fd06f8c8a3f3bb4f6fdd274fc1b76380b268b2dcdcd1f7593abe",
     "b9f6699abece4b64de7879880daf42b5172c09f69077467cc386e4a05f963dfe",
 ), strict=True))
+ACTIVE_FROZEN_PROTOCOL = FROZEN_PROTOCOL | {"streaming/client.py": DRAINING_STREAMING_CLIENT}
 DEFAULT_TOKEN_BUDGET = 8192
+STREAMING_COUNTS = (3, 9)
+CONCURRENT_COUNTS = (2, 5)
 
 
 def token_budget(value):
@@ -39,9 +46,11 @@ def token_budget(value):
     return value
 
 
-def current_protocol(group, protocol):
+def current_protocol(group, protocol, *, frozen=False):
     paths = STREAMING if group == "W1-W2" else CONCURRENT
-    return {name: digest(Path(__file__).with_name(name) if name == COLLECTOR
+    if group != "W1-W2" and not frozen:
+        paths += (PAIRED_COLLECTOR,)
+    return {name: digest(Path(__file__).with_name(name) if "/" not in name
                          else protocol / "benchmarks" / name) for name in paths}
 
 
@@ -68,7 +77,7 @@ def summary(run, group, hashes, protocol):
         require(set(report["workloads"]) == {"W1", "W2"} and all(
             row["valid"] is True and row["warmups_successful"] == 3 and row["successful"] == 9
             for row in report["workloads"].values()), f"{run}: incomplete streaming results")
-        return report, (3, 9)
+        return report, STREAMING_COUNTS
     baseline = concurrent.reference()
     require(report["status"] == "complete" and report["row"] == group
             and report["fixture_manifest_sha256"] == hashes["concurrent/fixture-manifest.json"]
@@ -87,24 +96,49 @@ def summary(run, group, hashes, protocol):
     return report, counts
 
 
-def replay_cohorts(run, group, report, lanes):
+def replay_cohorts(run, group, report, lanes, collector):
     policy = concurrent.reference()["policy"]
+    paired = collector == PAIRED_COLLECTOR
+    validate = validate_cohort if paired else concurrent.validate_cohort
     first_outputs = None
     measured = []
+    samples = []
     for outcome in report["request_outcomes"]:
         with gzip.open(run / "measurement" / outcome["raw_file"], "rt") as stream:
             raw = json.load(stream)
         tag = outcome["tag"]
         require(raw["row"] == group and raw["tag"] == tag, f"{run}: wrong raw cohort identity")
-        result = concurrent.validate_cohort(raw, lanes, policy)
+        result = validate(raw, lanes, policy)
+        if paired:
+            require(outcome["makespan_ns"] == result["makespan_ns"],
+                    f"{run}: recorded makespan differs from raw cohort replay at {tag}")
         outputs = [request["output_ids"] for request in raw["requests"]]
         if first_outputs is None:
             first_outputs = outputs
         require(outputs == first_outputs, f"{run}: greedy IDs differ across cohorts at {tag}")
         if tag.startswith("measured-"):
             measured.append(result)
+            samples.append(cohort_makespan_ns(raw["requests"]))
     require(all(report[key] == value for key, value in concurrent.summarize(measured).items()),
             f"{run}: summary metrics differ from raw cohort replay")
+    return {group: samples}
+
+
+def verify_stream_end(record):
+    end = record.get("response_end", {})
+    require(isinstance(end, dict)
+            and type(end.get("ns")) is int and end["ns"] >= record["events"][-1]["ns"]
+            and type(end.get("body_bytes")) is int and end["body_bytes"] > 0,
+            "Missing or invalid HTTP response end receipt")
+    headers = {name.lower(): value for name, value in reversed(record["response_headers"])}
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        return
+    try:
+        length = int(headers.get("content-length", "-1"))
+    except ValueError:
+        return
+    require(length < 0 or length == end["body_bytes"],
+            "HTTP response body bytes differ from Content-Length")
 
 
 def replay_streams(run, report, protocol, freeze_baseline):
@@ -115,6 +149,7 @@ def replay_streams(run, report, protocol, freeze_baseline):
     require(all(digest(measurement / f"{name}.request.json") == requests[name] for name in names),
             f"{run}: saved streaming request digest differs")
     results = {name: [] for name in names}
+    samples = {name: [] for name in names}
     schedule = [(name, phase, cohort) for phase, count in report["manifest"]["schedule"]
                 for cohort in range(1, count + 1) for name in names]
     with (measurement / "events.jsonl").open() as source:
@@ -126,51 +161,61 @@ def replay_streams(run, report, protocol, freeze_baseline):
                     f"{run}: wrong saved streaming request or schedule")
             replay = {"headers_ns": record["headers_ns"], "submit_ns": record["submit_ns"]}
             completion = streaming.Completion()
-            concurrent.consume_events(record["events"], replay, cases[name][0], completion)
+            events = (event for event, _ in streaming.completion_frames(record["events"]))
+            concurrent.consume_events(events, replay, cases[name][0], completion)
             concurrent.finish_record(replay, completion)
-            require(replay["done_ns"] > replay["submit_ns"]
+            if report["manifest"]["client_sha256"] != LEGACY_STREAMING_CLIENT:
+                verify_stream_end(record)
+            require(replay["headers_ns"] >= replay["submit_ns"]
                     and replay["output_ids"] == record["output_ids"]
                     == report["workloads"][name]["greedy_output_ids"]
                     and all(replay["metrics"][key] == record["metrics"][key]
                             for key in concurrent.LATENCIES),
                     f"{run}: streaming record differs from raw wire replay")
-            duration = replay["done_ns"] - replay["submit_ns"]
+            duration = cohort_makespan_ns([replay])
             count = len(completion.ids)
             record["metrics"].update(output_tokens_per_second=count * 1e9 / duration,
                 requests_per_second=1e9 / duration,
                 aggregate_tokens_per_second=(count + len(completion.prompt)) * 1e9 / duration)
             results[name].append(record)
+            if phase == "measured":
+                samples[name].append(duration)
     require(all(streaming.summarize(items, freeze_baseline) == report["workloads"][name]
                 for name, items in results.items()),
             f"{run}: streaming summary differs from replay")
+    return samples
 
 
-def replay_arm(run, group, cpus, counts, report, protocol, lanes, freeze_baseline):
+def replay_arm(run, group, cpus, counts, report, protocol, lanes, hashes, freeze_baseline):
     client_args = command(run, "client", cpus)
     if group == "W1-W2":
         require(("--freeze-baseline" in client_args) == freeze_baseline and any(
             item.endswith("/benchmarks/streaming/client.py") for item in client_args),
             f"{run}: unexpected streaming client")
-        replay_streams(run, report, protocol, freeze_baseline)
-    else:
-        require(any(Path(item).name == COLLECTOR and client_args[index + 1] == group
-                    for index, item in enumerate(client_args[:-1]))
-                and (int(arg(client_args, "--warmups")), int(arg(client_args, "--measured")))
-                == counts, f"{run}: client command differs from reported cohort schedule")
-        replay_cohorts(run, group, report, lanes)
+        return replay_streams(run, report, protocol, freeze_baseline)
+    collector = PAIRED_COLLECTOR if PAIRED_COLLECTOR in hashes else COLLECTOR
+    require(any(Path(item).name == collector and client_args[index + 1] == group
+                for index, item in enumerate(client_args[:-1]))
+            and (int(arg(client_args, "--warmups")), int(arg(client_args, "--measured")))
+            == counts, f"{run}: client command differs from reported cohort schedule")
+    return replay_cohorts(run, group, report, lanes, collector)
 
 
 def saved_arm(args, group, hashes, lanes, native_device, native_cpus):
     capture = args.saved / f"vllm-{group}"
     run = capture / group
+    baseline = concurrent.reference()
     observed = device(capture)
     require(observed == native_device,
             f"{run}: saved device {observed} differs from {native_device}")
     cpus = fields(capture / "cpus.txt")
     require(cpus == native_cpus, f"{run}: CPU/NUMA placement differs from candidate")
+    source_receipt = capture / "vllm-source-commit.txt"
+    require(source_receipt.is_file(), f"{run}: missing vLLM source commit receipt")
+    source_commit = source_receipt.read_text().strip()
+    require(source_commit == baseline["vllm_pin"], f"{run}: unexpected vLLM source commit")
     arm = saved_worker(capture, run, cpus, observed["uuid"], group)
     worker = arm["effective"]
-    baseline = concurrent.reference()
     pinned = baseline["observed_vllm_settings"]
     require(Path(arm["model_path"]).is_absolute()
             and Path(arm["model_path"]).name == baseline["model"],
@@ -181,12 +226,23 @@ def saved_arm(args, group, hashes, lanes, native_device, native_cpus):
             f"{run}: effective vLLM graph configuration differs")
     require(worker["scheduler"]["max_num_batched_tokens"] == args.max_num_batched_tokens,
             f"{run}: saved vLLM scheduler cap differs from {args.max_num_batched_tokens}")
-    report, counts = summary(run, group, hashes, args.protocol)
     recorded = artifact_hashes(capture / "protocol.sha256")
     manifest = "concurrent/fixture-manifest.json"
     reconstructed = []
     if "max_num_scheduled_tokens_effective" not in worker["scheduler"]:
         reconstructed.append("scheduled token cap from pinned scheduler fallback")
+    if group == "W1-W2":
+        if recorded.get("streaming/client.py") == LEGACY_STREAMING_CLIENT:
+            require(args.max_num_batched_tokens != DEFAULT_TOKEN_BUDGET,
+                    f"{run}: formal W1/W2 needs a fresh capture through response end")
+            hashes = hashes | {"streaming/client.py": LEGACY_STREAMING_CLIENT}
+            reconstructed.append("legacy streaming capture ends at first [DONE]")
+    else:
+        if PAIRED_COLLECTOR not in recorded:
+            require(all(hashes[name] == sha for name, sha in ACTIVE_FROZEN_PROTOCOL.items()),
+                    f"{run}: active sources differ from the historical collector protocol")
+            hashes = FROZEN_PROTOCOL
+    report, counts = summary(run, group, hashes, args.protocol)
     if group != "W1-W2":
         if manifest not in recorded:
             recorded[manifest] = report["fixture_manifest_sha256"]
@@ -198,15 +254,18 @@ def saved_arm(args, group, hashes, lanes, native_device, native_cpus):
         if name == COLLECTOR and expected == FROZEN_PROTOCOL[COLLECTOR]:
             acceptable.add(LEGACY_COLLECTOR)
         require(recorded.get(name) in acceptable, f"{run}: protocol digest differs for {name}")
-    replay_arm(run, group, cpus, counts, report, args.protocol, lanes, freeze_baseline=True)
-    arm.update(device=observed, cpus=cpus, counts=counts, summary_sha256=digest(
+    samples = replay_arm(run, group, cpus, counts, report, args.protocol, lanes, hashes,
+                         freeze_baseline=True)
+    arm.update(device=observed, cpus=cpus, counts=counts, source_commit=source_commit,
+               summary_sha256=digest(
         run / "measurement" / "summary.json"), protocol={name: recorded[name] for name in hashes},
-        reconstructed=reconstructed)
+        reconstructed=reconstructed, makespan_samples_ns=samples)
     return arm
 
 
 def frozen_arm(hashes):
-    require(hashes == FROZEN_PROTOCOL, "Active concurrent protocol differs from frozen publication")
+    require(hashes == ACTIVE_FROZEN_PROTOCOL,
+            "Active concurrent protocol differs from frozen publication")
     reference = concurrent.reference()
     policy = reference["policy"]
     return {"device": {"uuid": reference["physical_gpu_uuid"].lower(),
@@ -214,10 +273,10 @@ def frozen_arm(hashes):
             "model_path": reference["model"],
             "effective": reference["observed_vllm_settings"],
             "counts": [policy["warmup_cohorts"], policy["measured_cohorts"]],
-            "archive": reference["archive"], "protocol": hashes}
+            "archive": reference["archive"], "protocol": FROZEN_PROTOCOL}
 
 
-def comparison_label(mode, arm, hashes, native_device, counts, budget):
+def comparison_label(mode, group, arm, hashes, native_device, counts, budget):
     if mode == "frozen":
         require(arm == frozen_arm(hashes) and tuple(arm["counts"]) == tuple(counts),
                 "Frozen comparison arm differs from the published reference")
@@ -229,6 +288,8 @@ def comparison_label(mode, arm, hashes, native_device, counts, budget):
         label = "published frozen reference"
         return label + (" (" + ", ".join(differences) + ")" if differences else "")
     scheduler = arm["effective"]["scheduler"]
+    require(arm["source_commit"] == concurrent.reference()["vllm_pin"],
+            "Matched comparison requires the pinned vLLM source commit")
     require("archive" not in arm and arm["device"] == native_device
             and scheduler["max_num_batched_tokens"] == budget,
             "Matched comparison requires a same-device saved arm with the native scheduler cap")
@@ -236,6 +297,9 @@ def comparison_label(mode, arm, hashes, native_device, counts, budget):
         return "exploratory (count mismatch)"
     if budget != DEFAULT_TOKEN_BUDGET:
         return f"exploratory (non-protocol cap {budget})"
+    required_counts = STREAMING_COUNTS if group == "W1-W2" else CONCURRENT_COUNTS
+    if tuple(counts) != required_counts:
+        return "exploratory (non-protocol counts)"
     require(scheduler["max_num_scheduled_tokens_configured"] == budget
             and scheduler["max_num_scheduled_tokens_effective"] == budget
             and scheduler["async_scheduling"] is True,
@@ -264,9 +328,9 @@ def plan(args):
     rows = {}
     checkpoints = {args.checkpoint.resolve()}
     for group in args.groups:
-        hashes = current_protocol(group, args.protocol)
+        hashes = current_protocol(group, args.protocol, frozen=args.mode == "frozen")
         lanes = None if group == "W1-W2" else load_lanes(args.fixtures, group)
-        expected = (3, 9) if group == "W1-W2" else (args.warmups, args.measured)
+        expected = STREAMING_COUNTS if group == "W1-W2" else (args.warmups, args.measured)
         if args.mode == "matched":
             arm = saved_arm(args, group, hashes, lanes, native_device, cpus)
             checkpoints.add(Path(arm["model_path"]).resolve())
@@ -275,7 +339,7 @@ def plan(args):
         matched_counts = tuple(arm["counts"]) == expected
         require(matched_counts or (args.mode == "matched" and args.allow_count_mismatch),
                 f"{group}: saved warmup/measured counts {arm['counts']} differ from {expected}")
-        label = comparison_label(args.mode, arm, hashes, native_device, expected, budget)
+        label = comparison_label(args.mode, group, arm, hashes, native_device, expected, budget)
         rows[group] = {"planned_comparison": label, "vllm": arm,
                        "protocol": hashes, "counts": expected}
     for checkpoint in sorted(checkpoints):
@@ -318,10 +382,10 @@ def finish(args):
     require(environment["CUDA_VISIBLE_DEVICES"].lower() == planned["device"]["uuid"]
             and not any(key.startswith("SGLANG_") for key in environment),
             f"{run}: unexpected CUDA visibility or native route override")
-    hashes = current_protocol(args.group, args.protocol)
+    hashes = current_protocol(args.group, args.protocol, frozen=args.mode == "frozen")
     require(hashes == row["protocol"], f"{run}: candidate protocol changed during the run")
-    label = comparison_label(args.mode, row["vllm"], hashes, planned["device"], row["counts"],
-                             budget)
+    label = comparison_label(args.mode, args.group, row["vllm"], hashes, planned["device"],
+                             row["counts"], budget)
     require(label == row["planned_comparison"], f"{run}: comparison label disagrees with the arms")
     recorded = artifact_hashes(args.output / "protocol.sha256")
     require(all(recorded.get(name) == sha for name, sha in hashes.items()),
@@ -331,10 +395,13 @@ def finish(args):
             f"{run}: native measurement differs from planned counts")
     lanes = (None if args.group == "W1-W2"
              else load_lanes(Path(planned["fixtures"]), args.group))
-    replay_arm(run, args.group, planned["cpus"], counts, report, args.protocol, lanes,
-               freeze_baseline=False)
+    samples = replay_arm(run, args.group, planned["cpus"], counts, report, args.protocol, lanes,
+                         hashes, freeze_baseline=False)
+    performance = compare(samples, row["vllm"].get("makespan_samples_ns", {}),
+                          eligible=label == "same-device matched-cap")
     return {"comparison": label, "mode": args.mode, "group": args.group,
             "comparison_plan_sha256": args.plan_sha256, "vllm": row["vllm"],
+            "makespan": performance,
             "quality": {"native_wire_and_repeat_ids_replayed": True,
                         "saved_vllm_wire_and_repeat_ids_replayed": args.mode == "matched",
                         "cross_engine_ids_compared": False},
@@ -373,7 +440,7 @@ def main():
         print(f"Paired identity {args.action} failed: {error}", file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, allow_nan=False))
-    return 0
+    return 3 if args.action == "finish" and result["makespan"]["passed"] is False else 0
 
 
 if __name__ == "__main__":

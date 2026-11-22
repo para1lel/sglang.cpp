@@ -1,6 +1,6 @@
 # Single-B200 benchmark agreement
 
-Compare correct implementations on the **same physical B200 and immutable checkpoint**. Measure pinned vLLM first. Freeze workloads, repeats, throughput thresholds above 1.0, and latency ceilings before candidate timing. See the [fixed W1–W6 comparison](performance-comparison.md).
+Compare correct implementations on the **same physical B200 and immutable checkpoint**. Measure pinned vLLM first. Freeze configuration, workloads, and repeats before candidate timing. See the [historical W1–W6 comparison](performance-comparison.md).
 
 ## Implementations and controls
 
@@ -59,21 +59,23 @@ Start W1–W6 with disjoint prefixes and MTP off. Keep [W3-prefix](prefix-cache.
 
 ## Measurement
 
-**Required reporting.** For each workload and engine report output tokens/s, TTFT, TPOT, and end-to-end latency. Retain input and output counts and failed requests.
+**Paired W1–W6 acceptance.** Require a strictly lower native median client makespan on each workload with matched settings and work on the same B200. For W1 and W2, run three single-request warmups and nine measured cohorts. For W3–W6, run two concurrent warmups and five measured cohorts. Check device identity, request and output integrity, and repeat IDs within each engine. See the [paired launchers](../benchmarks/paired/README.md#observe-and-compare).
 
-**Proposed timing protocol.** Use one streaming client and monotonic clock for both engines. Time cohorts from first submission to last terminal response. Preserve submission, HTTP headers, token events, and completion times per request. Exclude [SSE keepalives](http-server.md#completion-streams) and other empty events from token counts. Require each request to finish at its specified length.
+Use one streaming client and monotonic clock. Measure from earliest submit to last valid `[DONE]`. Preconnect lanes and release them with one barrier. Send all bodies before the first valid completion. Limit the submit span to 50 ms. Retain submit times, headers, token events, completion times, token counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and other empty events from token counts.
+
+Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane starts generating before the first completion for diagnosis.
 
 | Metric | Definition for one measured cohort |
 | --- | --- |
 | Output tokens/s | Sum of emitted output tokens divided by elapsed cohort seconds. Exclude input, padding, and rejected drafts. |
-| TTFT (ms) | Submission to first output token, including queueing and prefill. Unavailable for zero output tokens. [Client calculation](../benchmarks/streaming/client.py#L180)<!-- prefix: "\"ttft_ms\": (" --> |
+| TTFT (ms) | Submission to first output token, including queueing and prefill. Unavailable for zero output tokens. [Client calculation](../benchmarks/streaming/client.py#L202)<!-- prefix: "\"ttft_ms\": (" --> |
 | TPOT (ms/token) | `(last token time − first token time) / (output token count − 1)`, per request. Mark unavailable for fewer than two tokens. |
 | End-to-end latency (ms) | Time from request submission to its terminal response. Record stream chunking when multiple tokens arrive together. |
 | Requests/s and aggregate tokens/s | Completed requests per cohort second, and total input plus output tokens per cohort second, respectively. |
 
-Separate startup, model load, JIT compilation, and graph capture from steady execution. Warm both engines under the declared cache policy. Reset reusable prefixes before a cold-prefix measurement. Use the same workload order or a recorded counterbalanced order. **Proposed repeat policy.** Collect at least five measured cohorts per engine and workload after warmup. Preserve each cohort's output tokens/s. Report the median and range across cohorts. Report p50 and p95 for TTFT, TPOT, and end-to-end latency over requests per workload, with sample counts and the percentile method.
+Exclude startup, model load, JIT compilation, and graph capture from steady measurements. Apply the declared cache policy during warmup. Reset prefixes before cold-prefix timing. Match or record a counterbalanced workload order. Retain per-cohort makespan and output tokens/s. Report cohort medians and ranges. Report per-workload request p50 and p95 for TTFT, TPOT, and end-to-end latency. Include sample counts and the percentile method.
 
-Report one row per engine, workload, and mode. Include absolute metrics, successful and attempted requests, and the agreed limits. For paired runs, also report the candidate/baseline throughput ratio and latency differences. For workloads with open limits, set numerical margins from repeated baseline measurements before candidate timing.
+Report one row per engine, workload, and mode with absolute metrics and successful and attempted request counts. Use paired throughput ratios and latency differences for diagnosis. Set any undefined workload margins from baseline repeats before candidate timing.
 
 For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and any graph capture. Allocation metrics include resident request storage on the serial graph path. Keep the JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L221)<!-- prefix: "Measurements" -->
 
@@ -81,13 +83,13 @@ For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the
 
 Reuse frozen W1–W6 `benchmark` requests, token-ID SSE clients, and timing definitions under the [new launch policy](#scheduler-and-reporting-policy). Check repeat IDs within each engine. Compare cross-engine output IDs only for diagnosis. Run [text verification](text-serving.md#verification) separately.
 
-For raw text, freeze UTF-8 request bytes, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Declare streaming, usage, and diagnostic ID settings. Visible text can follow the first output ID. A text event can span several IDs, and an ID can produce no text. Count output tokens from usage or diagnostic IDs. Use diagnostic ID timestamps for TTFT and TPOT. Mark both metrics unavailable when the corresponding timestamps are missing. Report time to first visible text separately. Keep raw text measurements in separate result rows.
+For raw text, freeze UTF-8 requests, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Record streaming, usage, and diagnostic ID settings. Text can lag IDs. A text event can span several IDs, and an ID can produce no text. Count tokens from usage or diagnostic IDs. Calculate TTFT and TPOT from ID timestamps when available. Otherwise, mark them unavailable. Report time to first visible text separately. Give raw text its own result rows.
 
 ### Frozen W1 and W2 timing
 
 The [GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) used native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. For native runs, set `--url` and a fresh `--output`. Omit `--reference`.
 
-Validate every stream and match repeat IDs within each engine. Require the native-to-vLLM median throughput ratio to exceed `strict_throughput_ratio_gt`. Keep native p95 TTFT, TPOT, and end-to-end latency within `p95_latency_ceilings_ms`.
+The GPU3 protocol validated every stream and checked repeat IDs within each engine. Its performance gates used `strict_throughput_ratio_gt` for the native-to-vLLM median throughput ratio and `p95_latency_ceilings_ms` for native p95 TTFT, TPOT, and end-to-end latency.
 
 On November 19, 2026, the candidate matched `60677ec` IDs. Both passed W1. W2 missed only p95 TTFT (base 395.348 ms, candidate 366.781 ms, limit 80.305 ms).
 

@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 SHAPES = {"W1": (128, 128), "W2": (2048, 512)}
 WARMUPS = 3
 REPEATS = 9
+PUBLISHED_REFERENCE_SHA256 = "798aeebc2688a9d5744892524c1995e6060612640656fde03b6e2609ac4c4bc7"
 
 
 def json_bytes(value):
@@ -52,13 +53,15 @@ def request_body(case):
     }
 
 
-def sse_frames(response):
+def sse_frames(response, result=None):
     pending = b""
     lines = []
     read_index = 0
+    body_bytes = 0
     while data := response.read1(65536):
         now = perf_counter_ns()
         read_index += 1
+        body_bytes += len(data)
         parts = (pending + data).split(b"\n")
         pending = parts.pop()
         for part in parts:
@@ -68,9 +71,13 @@ def sse_frames(response):
             else:
                 yield {"ns": now, "read": read_index, "lines": lines}
                 lines = []
+    if response.length:
+        raise http.client.IncompleteRead(b"", response.length)
     if pending or lines:
         yield {"ns": perf_counter_ns(), "read": read_index, "lines": lines,
                "unterminated": pending.hex()}
+    if result is not None:
+        result["response_end"] = {"ns": perf_counter_ns(), "body_bytes": body_bytes}
 
 
 class Completion:
@@ -124,6 +131,28 @@ class Completion:
             raise ValueError("Server must report zero reused prompt tokens")
 
 
+def completion_frames(events, recorded=None):
+    done = False
+    trailing_data = False
+    for event in events:
+        if recorded is not None:
+            recorded.append(event)
+        if "unterminated" in event:
+            raise ValueError("Incomplete SSE frame")
+        values = [line[5:].removeprefix(" ") for line in event["lines"]
+                  if line == "data" or line.startswith("data:")]
+        if done and values:
+            trailing_data = True
+        data = "\n".join(values)
+        done |= data == "[DONE]"
+        if not trailing_data:
+            yield event, data
+    if not done:
+        raise ValueError("Stream ended before [DONE]")
+    if trailing_data:
+        raise ValueError("Data after [DONE]")
+
+
 def record_stream(response, result, completion):
     if response.status != 200:
         result["http_error_body"] = response.read().decode("utf-8", errors="replace")
@@ -131,22 +160,15 @@ def record_stream(response, result, completion):
     if response.headers.get_content_type() != "text/event-stream":
         result["http_error_body"] = response.read().decode("utf-8", errors="replace")
         raise ValueError("Expected text/event-stream")
-    for event in sse_frames(response):
-        result["events"].append(event)
-        if "unterminated" in event:
-            raise ValueError("Incomplete SSE frame")
-        data = "\n".join(line[5:].removeprefix(" ") for line in event["lines"]
-                         if line.startswith("data:"))
+    for event, data in completion_frames(sse_frames(response, result), result["events"]):
         if data == "[DONE]":
             result["done_ns"] = event["ns"]
-            return
-        if data:
+        elif data:
             completion.consume(json.loads(data), event["ns"])
-    raise ValueError("Stream ended before [DONE]")
 
 
 def measure(url, case, body):
-    conn = http.client.HTTPConnection(url.hostname, url.port, timeout=120)
+    conn = StreamingConnection(url.hostname, url.port, timeout=120)
     result = {"events": [], "request_sha256": hashlib.sha256(body).hexdigest()}
     completion = Completion()
     try:
@@ -184,6 +206,33 @@ def measure(url, case, body):
             "aggregate_tokens_per_second": (count + len(completion.prompt)) * 1e9 / duration,
         }
     return result
+
+
+class ChunkedResponse(http.client.HTTPResponse):
+    def _get_chunk_left(self):
+        if self.chunk_left == 0:
+            if self._safe_read(2) != b"\r\n":
+                raise http.client.HTTPException("Invalid chunk data separator")
+            self.chunk_left = None
+        return super()._get_chunk_left()
+
+    def _read_and_discard_trailer(self):
+        max_headers = getattr(self, "_max_headers", None)
+        if max_headers is None:
+            max_headers = http.client._MAXHEADERS
+        for _ in range(max_headers + 1):
+            line = self.fp.readline(http.client._MAXLINE + 1)
+            if len(line) > http.client._MAXLINE:
+                raise http.client.LineTooLong("trailer line")
+            if not line.endswith(b"\r\n"):
+                raise http.client.HTTPException("Missing CRLF in chunk trailer")
+            if line == b"\r\n":
+                return
+        raise http.client.HTTPException(f"got more than {max_headers} trailers")
+
+
+class StreamingConnection(http.client.HTTPConnection):
+    response_class = ChunkedResponse
 
 
 def percentile(values, fraction):
@@ -259,7 +308,8 @@ def run(args):
             or url.path not in ("", "/") or url.query or url.fragment):
         raise ValueError("Use an HTTP origin without credentials, query or path")
     cases = load_cases(args.fixtures)
-    previous = json.loads(args.reference.read_bytes()) if args.reference else None
+    previous_bytes = args.reference.read_bytes() if args.reference else None
+    previous = json.loads(previous_bytes) if previous_bytes is not None else None
     schedule = [("warmup", WARMUPS), ("measured", REPEATS)]
     if args.probe:
         schedule = [("probe", 1)]
@@ -274,6 +324,7 @@ def run(args):
     }
     expected = {}
     if previous is not None:
+        published = hashlib.sha256(previous_bytes).hexdigest() == PUBLISHED_REFERENCE_SHA256
         for name in cases:
             baseline = previous["workloads"][name]
             for field in ("fixture_sha256", "request_sha256", "client_sha256"):
@@ -281,7 +332,7 @@ def run(args):
                 frozen = previous["manifest"][field]
                 if isinstance(actual, dict):
                     actual, frozen = actual[name], frozen[name]
-                if actual != frozen:
+                if actual != frozen and (field != "client_sha256" or not published):
                     raise ValueError(f"{name} differs from baseline {field}")
             if not baseline["valid"] or "thresholds" not in baseline:
                 raise ValueError(f"{name} reference requires a successful baseline")

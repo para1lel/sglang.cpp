@@ -79,6 +79,7 @@ for group in "${groups[@]}"; do
     run=$output/$group
     mkdir "$run"
     echo "$group on $gpu_uuid"
+    comparison_status=0
     if start_group "$run" "$binary" --checkpoint "$checkpoint" --device 0 --port "$port" \
         --fp8-prefill tensor-core --batch-cuda-graphs --mtp-steps 0 --prefix-cache-entries 0 \
         --max-active 32 --max-num-batched-tokens "$token_budget" &&
@@ -88,11 +89,14 @@ for group in "${groups[@]}"; do
         if ! measure_group "$group" "$run" native; then
             exit_code=1
         elif [[ -n $mode ]]; then
-            if comparison_identity finish "$mode" "$group" "$comparison_plan_sha256" \
-                >"$run/comparison.tmp"; then
+            comparison_identity finish "$mode" "$group" "$comparison_plan_sha256" \
+                >"$run/comparison.tmp" || comparison_status=$?
+            if (( comparison_status == 0 || comparison_status == 3 )); then
                 mv -- "$run/comparison.tmp" "$run/comparison.json"
             else
                 rm -- "$run/comparison.tmp"
+            fi
+            if (( comparison_status != 0 )); then
                 exit_code=1
             fi
         fi
@@ -101,6 +105,9 @@ for group in "${groups[@]}"; do
     fi
     stop_group
     record_compute "$run/compute-after.csv"
+    if (( exit_code != 0 )); then
+        break
+    fi
 done
 date -u +%FT%TZ >"$output/finished-utc.txt"
 exit "$exit_code"

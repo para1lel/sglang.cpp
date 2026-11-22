@@ -1,6 +1,6 @@
 # OpenAI token logprobs
 
-Both `/v1/completions` and `/v1/chat/completions` can return the score of each committed output token and a bounded list of alternatives. Scored calls use the same full-vocabulary target log-softmax as [native `/generate`](native-generate.md#generated-token-logprobs).
+Both `/v1/completions` and `/v1/chat/completions` can return the score of each committed output token and a bounded list of alternatives. Scored calls use the same full-vocabulary target log-softmax as [native `/generate`](native-generate.md#token-logprobs).
 
 ## Request requirements
 

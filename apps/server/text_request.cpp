@@ -851,9 +851,6 @@ void generate_logprob_options(const GenerateInput& input, std::size_t index, Bat
     if (enabled && !enabled->is_null() && !enabled->boolean()) {
         bad_request("Expected boolean return_logprob");
     }
-    if (start && !start->is_null() && start->signed_integer() != -1) {
-        bad_request("Only logprob_start_len = -1 is supported");
-    }
     const auto count = top && !top->is_null() ? top->unsigned_integer()
                                              : std::optional<std::uint64_t>{0};
     if (!count || *count > decoder_max_generated_top_logprobs) {
@@ -863,6 +860,12 @@ void generate_logprob_options(const GenerateInput& input, std::size_t index, Bat
         bad_request("Expected boolean return_text_in_logprobs");
     }
     if (enabled && enabled->boolean() == true) {
+        if (start && !start->is_null() && start->signed_integer() != -1) {
+            const auto offset = start->unsigned_integer();
+            if (!offset || *offset > item.prompt.size()) bad_request("Invalid logprob_start_len");
+            item.options.score_prompt = *offset < item.prompt.size();
+            item.options.prompt_logprob_start = static_cast<int>(*offset);
+        }
         if (item.options.constraint) {
             bad_request("Generated logprobs do not support response constraints");
         }

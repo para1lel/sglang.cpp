@@ -419,9 +419,10 @@ void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant
                             const TileBuffers* buffers, int offset, cudaStream_t stream) {
     if (!grant.scores) return;
     const auto& capture = *grant.scores;
-    const int scored = capture.scored_rows(grant.position, grant.rows);
-    for (int start = 0; start < scored; start += decoder_batch_max_lanes) {
-        const int count = std::min(scored - start, decoder_batch_max_lanes);
+    const int first = std::max(0, capture.start - grant.position);
+    const int end = capture.score_end(grant.position, grant.rows) - grant.position;
+    for (int start = first; start < end; start += decoder_batch_max_lanes) {
+        const int count = std::min(end - start, decoder_batch_max_lanes);
         for (int index = 0; index < count; ++index) {
             const int row = start + index;
             auto work = grant.request->work;
@@ -745,8 +746,8 @@ void Decoder::Model::seed_draft(Workspace& work, MtpDraftRequest& draft, int pos
     draft.enqueue(position, shifted_token, work.normalized, false, stream);
 }
 
-int PromptLogprobCapture::scored_rows(int position, int rows) const {
-    return std::min(rows, static_cast<int>(prompt->size()) - position - 1);
+int PromptLogprobCapture::score_end(int position, int rows) const {
+    return std::min(position + rows, static_cast<int>(prompt->size()) - 1);
 }
 
 void PromptLogprobCapture::enqueue(const DecoderModel& model, Workspace& work, int position,
@@ -796,7 +797,8 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
             throw std::invalid_argument("Invalid decoder prefill token");
         }
         int pending = 0;
-        const int scored = scores ? scores->scored_rows(position, rows) : 0;
+        const int first = scores ? scores->start : position;
+        const int end = scores ? scores->score_end(position, rows) : position;
         for (int row = 0; row < rows; ++row) {
             const int token_position = position + row;
             const ForwardLane lane{
@@ -804,7 +806,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                 media ? media->feature(token_position) : nullptr,
                 media ? media->positions + token_position : nullptr};
             forward(&lane, 1, stream);
-            if (row < scored) {
+            if (token_position >= first && token_position < end) {
                 scores->enqueue(*this, request.work, token_position, pending++, stream);
                 if (pending == decoder_batch_max_lanes) {
                     scores->collect(std::exchange(pending, 0), stream);

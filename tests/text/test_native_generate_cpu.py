@@ -181,7 +181,7 @@ class NativeGenerate(unittest.TestCase):
             *[({"input_ids": [token]}, "input_ids") for token in (-1, 248320, True, 1.5)],
             *[({"text": "A", key: value}, key) for key, value in (
                 ("model", MODEL), ("stream", 1), ("lora_path", "adapter"), ("return_logprob", True),
-                ("return_routed_experts", True), ("logprob_start_len", 0),
+                ("return_routed_experts", True),
                 ("image_data", []), ("sampling_params", [{}]), ("cache_salt", "x" * 257),
             )],
             *[({"text": "A", "sampling_params": {key: value}}, key) for key, value in (

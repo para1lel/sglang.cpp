@@ -16,8 +16,9 @@ struct PromptLogprobCapture {
     GeneratedLogprobReadback* readback;
     void* workspace;
     int top;
+    int start;
 
-    int scored_rows(int position, int rows) const;
+    int score_end(int position, int rows) const;
     void enqueue(const DecoderModelAccess::Model& model, Workspace& work, int position,
                  int index, cudaStream_t stream) const;
     void collect(int rows, cudaStream_t stream) const;

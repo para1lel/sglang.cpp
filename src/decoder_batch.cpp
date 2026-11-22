@@ -458,11 +458,10 @@ void DecoderBatch::State::initialize(Lane& lane) {
         lane.media_prefill = upload_media_positions(*lane.request, *lane.media, stream);
     } else if (auto& cache = storage->prefix_cache) {
         lane.checkpoint = PrefixCache::checkpoint(prompt);
-        if (!opts.score_prompt) {
-            lane.progress.advance(cache->restore(*lane.request, lane.prompt, opts.prefix_cache_salt,
-                                                 stream, lane.draft.get()));
-            lane.counted_draft_rows = lane.draft ? lane.draft->valid_prefix() : 0;
-        }
+        const int cache_limit = opts.score_prompt ? opts.prompt_logprob_start : prompt;
+        lane.progress.advance(cache->restore(*lane.request, lane.prompt, opts.prefix_cache_salt,
+                                             stream, lane.draft.get(), cache_limit));
+        lane.counted_draft_rows = lane.draft ? lane.draft->valid_prefix() : 0;
     }
     if (lane.progress.position == 0) {
         lane.request->reset(stream);
@@ -498,7 +497,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     validate_request(prompt, options, !media);
     if (options.requires_target_only()) options.mtp_steps = 0;
     const int top = options.generated_top_logprobs;
-    if ((options.score_prompt && top <= 0) ||
+    if ((options.score_prompt && top < 0) ||
         top < -1 || top > decoder_max_generated_top_logprobs ||
         (top >= 0 && (media || options.samples() || options.constraint || options.mtp_steps ||
                       options.top_logits || state_->output))) {
@@ -758,7 +757,8 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
         const int position = lane.progress.position;
         if (lane.options.score_prompt) {
             captures[count] = {&lane.prompt, &lane.prompt_logprobs, logprob_readback,
-                               logprob_workspace, lane.options.generated_top_logprobs};
+                               logprob_workspace, lane.options.generated_top_logprobs,
+                               lane.options.prompt_logprob_start};
         }
         grants[count] = {lane.request.get(), lane.prompt.data() + position, position, rows[slot],
                          std::min(rows[slot], limit), lane.prefill_limit(), lane.draft.get(),

@@ -35,19 +35,53 @@ std::string_view finish_type(const DecoderResult& result, const DecoderOptions& 
     throw std::logic_error("Decoder returned an inconsistent /generate result");
 }
 
-void append_logprob(std::string& output, const DecoderLogprob& score, const Tokenizer* tokenizer) {
-    char number[32];
-    const auto formatted = std::to_chars(number, number + sizeof(number), score.value);
+void append_logprob(std::string& output, int id, std::optional<float> value,
+                    const Tokenizer* tokenizer) {
     output += '[';
-    output.append(number, formatted.ptr);
-    output += ',' + std::to_string(score.token_id) + ',';
+    if (value) {
+        char number[32];
+        const auto formatted = std::to_chars(number, number + sizeof(number), *value);
+        output.append(number, formatted.ptr);
+    } else {
+        output += "null";
+    }
+    output += ',' + std::to_string(id) + ',';
     if (tokenizer) {
         Utf8Stream utf8;
-        auto text = utf8.push(tokenizer->piece(score.token_id, false));
+        auto text = utf8.push(tokenizer->piece(id, false));
         text += utf8.finish();
         json::append_quoted(output, text);
     } else {
         output += "null";
+    }
+    output += ']';
+}
+
+void append_score_rows(std::string& output, const DecoderPromptLogprobs& scores,
+                       const Tokenizer* tokenizer, bool top,
+                       std::optional<int> first = std::nullopt) {
+    output += '[';
+    if (first) {
+        if (top) {
+            output += "null";
+        } else {
+            append_logprob(output, *first, std::nullopt, tokenizer);
+        }
+    }
+    for (std::size_t index = 0; index < scores.size(); ++index) {
+        if (first || index) output += ',';
+        const auto& row = *scores[index];
+        if (top) {
+            output += '[';
+            for (std::size_t rank = 0; rank < row.alternatives.size(); ++rank) {
+                if (rank) output += ',';
+                const auto& score = row.alternatives[rank];
+                append_logprob(output, score.token_id, score.value, tokenizer);
+            }
+            output += ']';
+        } else {
+            append_logprob(output, row.selected.token_id, row.selected.value, tokenizer);
+        }
     }
     output += ']';
 }
@@ -59,27 +93,21 @@ void append_logprobs(std::string& output, const BatchPrompt& request, const Toke
         throw std::logic_error("Generated logprob count differs from output token count");
     }
     const auto* pieces = request.return_text_in_logprobs ? &tokenizer : nullptr;
-    output += R"(,"input_token_logprobs":[],"output_token_logprobs":[)";
-    for (std::size_t index = 0; index < scores.size(); ++index) {
-        if (index) output += ',';
-        append_logprob(output, scores[index]->selected, pieces);
+    const DecoderPromptLogprobs empty;
+    const auto& prompt = result.prompt_logprobs ? *result.prompt_logprobs : empty;
+    const auto first = result.prompt_logprobs
+        ? std::optional{request.prompt[request.options.prompt_logprob_start]} : std::nullopt;
+    output += R"(,"input_token_logprobs":)";
+    append_score_rows(output, prompt, pieces, false, first);
+    output += R"(,"output_token_logprobs":)";
+    append_score_rows(output, scores, pieces, false);
+    output += R"(,"output_token_logprobs_length":)" + std::to_string(scores.size());
+    if (request.options.generated_top_logprobs > 0) {
+        output += R"(,"input_top_logprobs":)";
+        append_score_rows(output, prompt, pieces, true, first);
+        output += R"(,"output_top_logprobs":)";
+        append_score_rows(output, scores, pieces, true);
     }
-    output += R"(],"output_token_logprobs_length":)" + std::to_string(scores.size());
-    if (request.options.generated_top_logprobs == 0) {
-        return;
-    }
-    output += R"(,"input_top_logprobs":[],"output_top_logprobs":[)";
-    for (std::size_t index = 0; index < scores.size(); ++index) {
-        if (index) output += ',';
-        output += '[';
-        const auto& alternatives = scores[index]->alternatives;
-        for (std::size_t rank = 0; rank < alternatives.size(); ++rank) {
-            if (rank) output += ',';
-            append_logprob(output, alternatives[rank], pieces);
-        }
-        output += ']';
-    }
-    output += ']';
 }
 
 class GenerateResponse {

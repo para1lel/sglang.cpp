@@ -149,8 +149,9 @@ void PrefixCache::touch(int index) {
 }
 
 int PrefixCache::restore(Request& request, const std::vector<int>& prompt, std::string_view salt,
-                         cudaStream_t stream, MtpDraftRequest* draft) {
-    const int limit = checkpoint(static_cast<int>(prompt.size()));
+                         cudaStream_t stream, MtpDraftRequest* draft, int max_tokens) {
+    const int limit = checkpoint(std::min(static_cast<int>(prompt.size()), max_tokens));
+    if (!limit) return 0;
     const int index = find(prompt, salt, limit, draft != nullptr);
     if (index == -1) {
         if (draft && find(prompt, salt, limit) != -1) {

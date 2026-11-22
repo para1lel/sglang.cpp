@@ -211,11 +211,11 @@ struct Lane {
 };
 
 std::shared_ptr<const DecoderPromptLogprobs> scripted_prompt_scores(
-    const std::vector<int>& prompt, int top) {
+    const std::vector<int>& prompt, const DecoderOptions& options) {
     auto scores = std::make_shared<DecoderPromptLogprobs>();
-    for (std::size_t index = 1; index < prompt.size(); ++index) {
+    for (std::size_t index = options.prompt_logprob_start + 1; index < prompt.size(); ++index) {
         DecoderTokenLogprobs row{{prompt[index], -1.5f * index}, {}};
-        for (int rank = 0; rank < top; ++rank) {
+        for (int rank = 0; rank < options.generated_top_logprobs; ++rank) {
             row.alternatives.push_back({32 + rank, -0.125f * (rank + 1)});
         }
         scores->push_back(std::make_shared<const DecoderTokenLogprobs>(std::move(row)));
@@ -297,7 +297,7 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     lane.emplace(Lane{options, prompt.size()});
     lane->health = health;
     if (options.score_prompt) {
-        lane->prompt_scores = scripted_prompt_scores(prompt, options.generated_top_logprobs);
+        lane->prompt_scores = scripted_prompt_scores(prompt, options);
     }
     record_sampling(options, prompt.size());
     std::cerr << ("cpu admit slot=" + std::to_string(slot) +

@@ -77,6 +77,10 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
     if (prompt.empty() || !std::all_of(prompt.begin(), prompt.end(), valid_token)) {
         throw std::invalid_argument("Prompt must contain token IDs in [0, 248320)");
     }
+    if (options.score_prompt && (options.prompt_logprob_start < 0 ||
+                                 options.prompt_logprob_start >= int(prompt.size()))) {
+        throw std::invalid_argument("Prompt logprob start falls outside the prompt");
+    }
     if ((options.stop_token_id && !valid_token(*options.stop_token_id)) ||
         !std::all_of(options.additional_stop_token_ids.begin(),
                      options.additional_stop_token_ids.end(), valid_token)) {

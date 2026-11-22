@@ -52,6 +52,7 @@ struct DecoderOptions {
     int min_new_tokens = 0;
     bool ignore_eos = false;
     bool score_prompt = false;
+    int prompt_logprob_start = 0;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 

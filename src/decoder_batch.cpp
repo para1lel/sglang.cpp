@@ -1,6 +1,7 @@
 #include "sglang/decoder_internal.h"
 
 #include "sglang/decoder_batch.h"
+#include "sglang/text/decoder_batch_plan.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
@@ -121,7 +122,6 @@ std::size_t request_bytes(const BatchStorage& storage) {
 
 using Selection = std::array<bool, decoder_batch_max_lanes>;
 using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
-using PrefillRows = std::array<int, decoder_batch_max_lanes>;
 constexpr int batch_prefill_tile_rows = 1024;
 constexpr std::size_t decoder_shared_reserve = std::size_t{2} * 1024 * 1024 * 1024;
 static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
@@ -198,11 +198,6 @@ PrefillRows plan_tensor_cache_prefill(const BatchStorage& storage, const Selecti
     return rows;
 }
 
-struct StepPlan {
-    PrefillRows prefill{};
-    PrefillRows decode{};
-};
-
 int cache_prefill_tile(int budget) {
     int tile = prefill_chunk_rows;
     while (tile > budget) {
@@ -251,53 +246,24 @@ StepPlan plan_cached_step(const BatchStorage& storage, const Selection& selected
 }
 
 StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int lanes,
-                   int unused, int& cursor, bool chunked) {
-    StepPlan plan;
-    PrefillRows limits{};
-    const int start = cursor;
-    for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-        const int slot = (start + offset) % lanes;
+                   int budget, int& cursor, bool chunked, int tile) {
+    BudgetLanes work{};
+    for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
-        if (!selected[slot] || !lane || !lane->request || lane->restored_prompt) {
+        if (!selected[slot] || !lane || !lane->request) {
             continue;
         }
-        if (lane->remaining_prompt() == 0) {
-            plan.decode[slot] = 1;
-        } else {
-            limits[slot] = chunked ? lane->prefill_limit() : 1;
-            plan.prefill[slot] = 1;
+        if (lane->draft || lane->media || lane->restored_prompt) {
+            tile = 0;
         }
-        --unused;
-        cursor = (slot + 1) % lanes;
+        if (lane->restored_prompt) {
+            continue;
+        }
+        work[slot] = lane->remaining_prompt()
+            ? BudgetLane{chunked ? lane->prefill_limit() : 1}
+            : BudgetLane{0, lane->proposals(), true};
     }
-    if (unused > 0) {
-        cursor = (start + 1) % lanes;
-    }
-    for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-        const int slot = (start + offset) % lanes;
-        if (plan.decode[slot]) {
-            const int extra = std::min(unused, storage.slots[slot]->proposals());
-            plan.decode[slot] += extra;
-            unused -= extra;
-        }
-    }
-    while (unused > 0) {
-        int unfinished = 0;
-        for (int slot = 0; slot < lanes; ++slot) {
-            unfinished += plan.prefill[slot] < limits[slot];
-        }
-        if (unfinished == 0) {
-            break;
-        }
-        const int share = std::max(1, unused / unfinished);
-        for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-            const int slot = (start + offset) % lanes;
-            const int extra = std::min({unused, share, limits[slot] - plan.prefill[slot]});
-            plan.prefill[slot] += extra;
-            unused -= extra;
-        }
-    }
-    return plan;
+    return plan_budget_step(work, lanes, budget, cursor, tile);
 }
 
 }
@@ -867,19 +833,20 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
 Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
                                    DecoderBatchStepStats* stats) {
     require_ready();
-    bool contains_mtp = false;
-    bool publishing_prefix = false;
+    bool contains_mtp = false, publishing_prefix = false;
     try {
         DeviceScope device(model.device);
         auto& slots = storage->slots;
         Steps results{};
         DecoderBatchStepStats current;
         PrefillRows decode{};
-        if (options.max_num_batched_tokens) {
-            const int budget = options.max_num_batched_tokens;
+        if (const int budget = options.max_num_batched_tokens; budget) {
+            const bool tiled = chunked && !storage->prefix_cache && model.is_b200() &&
+                model.fp8_prefill() == Fp8PrefillPolicy::tensor_core && !sm100_prefill_enabled();
             const auto plan = tensor_cache
                 ? plan_cached_step(*storage, selected, options.max_lanes, budget, prefill_cursor)
-                : plan_step(*storage, selected, options.max_lanes, budget, prefill_cursor, chunked);
+                : plan_step(*storage, selected, options.max_lanes, budget, prefill_cursor, chunked,
+                            tiled ? batch_prefill_tile_rows : 0);
             current.prefill_rows = plan.prefill;
             decode = plan.decode;
         } else if (tensor_cache) {

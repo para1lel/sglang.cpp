@@ -55,7 +55,7 @@ Two stages alternate scores, BF16 probabilities, and V. Producers await QK befor
 
 PV awaits both CTAs' BF16 probabilities and V, then releases operands. Softmax preserves 64-key reduction order and rescales the FP32 accumulator after the preceding PV. The final wait precedes output, deallocation, and repair. [Operand wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L646)<!-- prefix: "pair_wait(tm" --> · [Correction](../src/text/mxfp8_gqa_prefill_tmem.cu#L705)<!-- prefix: "tmem_correct" --> · [Final wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L711)<!-- prefix: "tmem_mma_wai" --> · [Repair](../src/text/mxfp8_gqa_prefill_tmem.cu#L590)<!-- prefix: "__device__ v" -->
 
-Capture records one node with maps by value and zero global scratch. Keep KV, pages, queries, and output valid through replay. Intermediate prefill can skip scoring. [Arguments](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Batch scoring](../src/decoder_batch.cpp#L750)<!-- prefix: "if (rows[slo" -->
+Capture records one node with maps by value and zero global scratch. Keep KV, pages, queries, and output valid through replay. Intermediate prefill can skip scoring. [Arguments](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Batch scoring](../src/decoder_batch.cpp#L716)<!-- prefix: "if (rows[slo" -->
 
 Split TMEM uses three contiguous partitions per query block and head pair. Its 76,087,296 scratch bytes hold FP32 numerators, maxima, and masses. Merge rescales, combines, normalizes, and rounds to BF16. Allocation and release share one stream. [Scratch allocation](../src/text/mxfp8_gqa_prefill_tmem.cu#L973)<!-- prefix: "status = cud" -->
 

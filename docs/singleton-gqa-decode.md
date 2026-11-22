@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L699)<!-- prefix: "const auto r" --> · [Lane selection](../src/text/decoder_graph_packed.cpp#L486)<!-- prefix: "first.narrow" --> |
+| Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L665)<!-- prefix: "const auto r" --> · [Lane selection](../src/text/decoder_graph_packed.cpp#L486)<!-- prefix: "first.narrow" --> |
 | Batch execution owner | Allocates and releases the shared score buffer. | [Allocation](../src/decoder_resources.cpp#L471)<!-- prefix: "ExactGqaWork" --> · [Device release](../src/decoder_resources.cpp#L263)<!-- prefix: "CleanupError" --> |
 | Exact attention | Computes FP32 scores and consumes them in token order. | [Score and replay launches](../src/mxfp8_gqa.cu#L813)<!-- prefix: "cudaError_t " --> |
 
@@ -12,7 +12,7 @@
 
 The batch selects this path for one ordinary text decode row with 32,768–36,864 visible tokens, including the current token. The step needs zero prefill rows, no MTP work, and no rotary position override. Both FP8 prefill policies support it. Independent full-prefix-hit scoring can share the step. The standalone serial decoder and the eager remainder of a packed group keep their existing attention paths. [Window](../include/sglang/decoder_internal.h#L431)<!-- prefix: "inline const" --> · [Packed remainder](../src/text/decoder_graph_packed.cpp#L573)<!-- prefix: "if (remainin" -->
 
-With tensor-core prefill and no MTP work, a prefill step can reuse the buffer for an ordinary text lane's final one-row prompt grant. It can also reuse it for an ordinary decode row when all other work in the step consists of multi-row prefill or cache-hit scoring. These eager rows qualify above their inline score capacity and through 36,864 visible tokens. Each layer's score and replay launches run in stream order before the next row uses the buffer. [Batch selection](../src/decoder_batch.cpp#L696)<!-- prefix: "const auto e" --> · [Eager binding](../src/text/decoder_graph_packed.cpp#L421)<!-- prefix: "void prepare" -->
+With tensor-core prefill and no MTP work, a prefill step can reuse the buffer for an ordinary text lane's final one-row prompt grant. It can also reuse it for an ordinary decode row when all other work in the step consists of multi-row prefill or cache-hit scoring. These eager rows qualify above their inline score capacity and through 36,864 visible tokens. Each layer's score and replay launches run in stream order before the next row uses the buffer. [Batch selection](../src/decoder_batch.cpp#L662)<!-- prefix: "const auto e" --> · [Eager binding](../src/text/decoder_graph_packed.cpp#L421)<!-- prefix: "void prepare" -->
 
 The batch stream owner allocates one buffer on first eligible use. It allocates before graph capture or eager submission. The bound is 3,538,944 device bytes (3.375 MiB) for 24 FP32 scores per position across 36,864 positions. All GQA layers and later requests share the buffer in stream order. It adds zero request-owned bytes. Request KV and existing graph scratch have separate allocations. [Query heads](../include/sglang/mxfp8_gqa.h#L11)<!-- prefix: "inline const" --> · [Resident admission](batch-graphs.md#resident-memory-admission)
 

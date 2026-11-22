@@ -34,6 +34,19 @@ The benchmark host retains the W1/W2 samples and replay verdict at `artifacts/ta
 
 Formal native W4 and W5 comparisons and the W6 run remain outstanding. W5 is queued conditionally on evidence supporting a full run. Run W6 only after W5 passes. [Paired protocol](../benchmarks/paired/README.md#observe-and-compare)
 
+### Tiled prefill scheduler pilots
+
+Each pilot compared one traced stock cohort with one traced [tiled scheduler](native-prefill-workspace.md#tiled-prefill-under-saturation) cohort on B200 GPU 2. Both arms used 32 slots, an 8,192-row cap, tensor-core prefill, and batch graphs. Prefix caching and MTP were off. All prompts contained 32,768 frozen IDs. Makespan ends at the final client `[DONE]`.
+
+| Pilot (lanes × output IDs per lane) | p95 TTFT, stock → tiled | Makespan, stock → tiled | Exact greedy IDs |
+| --- | ---: | ---: | ---: |
+| W4 (16 × 256) | 44.898 → 31.087 s | 49.702 → 36.752 s | 4,096 |
+| W5 (32 × 32) | 66.034 → 61.991 s | 71.971 → 63.480 s | 1,024 |
+
+The IDs matched frozen native stock and historical vLLM prefixes. W4 traces showed 60 stock steps at 16 × 512 and 59 tiled steps at 8 × 1,024 during pure prefill. W5 showed 124 stock steps at 32 × 256 and 125 tiled steps at 8 × 1,024. W5 dispatched 1,024 versus 4,065 prefill grants. Its median width-32 graph step stayed near 16 ms.
+
+Adding 768 W4 decode intervals at the observed client and graph cadences projects 47.603–48.500 s, above the measured vLLM median of 46.368 s. Full-length parity, logits, repeatability, and formal W4–W6 gates remain unverified. Evidence is in `artifacts/takeover-w4-scheduler/tail256/summary.md` and `artifacts/takeover-w4-scheduler/w5-guard/summary.md`.
+
 ## Matched conditions
 
 The two engines ran sequentially on the same physical B200 for each pair, with vLLM first in every pair. Both used the local Qwen3.8-27B-FP8 checkpoint, 32,768 scheduled tokens per step, 32 service slots, no MTP, and no prefix reuse. The checkpoint manifest SHA-256 was `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303`. The vLLM revision was `81a8cb063e6247fe254d7caf7e98a6691d71022a`, with PyTorch 2.14.0+cu132 and FlashInfer 0.7.4. Runs used driver 590.48.01. Host load and peer GPU activity differed between sessions. See the [benchmark agreement](performance.md#implementations-and-controls).

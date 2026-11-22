@@ -270,6 +270,20 @@ if has_config("batch-graph-lanes") then
     target_end()
 end
 
+option("decoder-batch-plan-check")
+    set_default(false)
+option_end()
+
+if has_config("decoder-batch-plan-check") then
+    target("decoder-batch-plan-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_includedirs("include")
+        add_files("tests/decoder/decoder_batch_plan_check.cpp")
+    target_end()
+end
+
 option("constraint-check")
     set_default(false)
 option_end()

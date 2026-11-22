@@ -29,7 +29,7 @@ __device__ bool draft_replay_weights(
     return false;
 }
 
-__global__ void draft_range_replay_kernel(
+__device__ void draft_range_replay(
     Mxfp8KvCache cache, const std::int32_t* pages, int count, const float* scores,
     float* state, bool initial, bool last_range, __nv_bfloat16* output) {
     __shared__ alignas(16) float values[replay_tile][vector_replay_channels];
@@ -88,6 +88,64 @@ __global__ void draft_range_replay_kernel(
             }
         }
     }
+}
+
+__global__ void draft_range_replay_kernel(
+    Mxfp8KvCache cache, const std::int32_t* pages, int count, const float* scores,
+    float* state, bool initial, bool last_range, __nv_bfloat16* output) {
+    draft_range_replay(cache, pages, count, scores, state, initial, last_range, output);
+}
+
+struct DraftAttentionBatch {
+    decoder::DraftAttentionRow rows[decoder::draft_wave_rows];
+};
+
+__global__ void draft_range_scores_batch(
+    const __grid_constant__ DraftAttentionBatch batch, int first) {
+    const auto& row = batch.rows[blockIdx.z];
+    const int count = min(draft_score_chunk, row.position + 1 - first);
+    exact_scores(row.cache, row.pages.device_pages + first / mxfp8_page_size, count - 1,
+                 row.queries, {row.workspace.scores, draft_score_chunk});
+}
+
+__global__ void draft_range_replay_batch(
+    const __grid_constant__ DraftAttentionBatch batch, int first) {
+    const auto& row = batch.rows[blockIdx.z];
+    const int remaining = row.position + 1 - first;
+    const int count = min(draft_score_chunk, remaining);
+    float* scores = row.workspace.scores;
+    draft_range_replay(row.cache, row.pages.device_pages + first / mxfp8_page_size, count,
+                       scores, scores + mxfp8_query_heads * draft_score_chunk, first == 0,
+                       count == remaining, row.output);
+}
+
+cudaError_t launch_long_draft_batch(
+    const decoder::DraftAttentionRow* rows, int size, int visible, cudaStream_t stream) {
+    for (int first = 0; first < visible; first += draft_score_chunk) {
+        DraftAttentionBatch batch{};
+        int active = 0;
+        for (int index = 0; index < size; ++index) {
+            if (rows[index].position >= first) {
+                batch.rows[active++] = rows[index];
+            }
+        }
+        const int count = std::min(draft_score_chunk, visible - first);
+        const int blocks = std::min(32, (count + score_warps - 1) / score_warps);
+        void* arguments[] = {&batch, &first};
+        auto status = cudaLaunchKernel(
+            draft_range_scores_batch, dim3(blocks, mxfp8_query_heads, active),
+            score_warps * mxfp8_group_size, arguments, 0, stream);
+        if (status != cudaSuccess) {
+            return status;
+        }
+        status = cudaLaunchKernel(
+            draft_range_replay_batch, dim3(mxfp8_query_heads, draft_replay_groups, active),
+            vector_replay_threads, arguments, 0, stream);
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
 }
 
 cudaError_t launch_long_draft_attention(

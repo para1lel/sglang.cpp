@@ -88,7 +88,7 @@ The scripted clock advances by three seconds per decode step. Both text and chat
 
 ## L009 · Terminal error during first packed decode setup
 
-The original first-use handler caught every CUDA error from packed setup. An injected illegal-address status at setup synchronization reached legacy dispatch. The repair permits legacy dispatch only for packed scratch allocation OOM after the CUDA error check and release of partial allocations. A terminal status reaches the batch handler and disables the batch before any legacy submission or decode publication. [Batch error handler](../src/decoder_batch.cpp#L954)<!-- prefix: "} catch (con" -->
+The original first-use handler caught every CUDA error from packed setup. An injected illegal-address status at setup synchronization reached legacy dispatch. The repair permits legacy dispatch only for packed scratch allocation OOM after the CUDA error check and release of partial allocations. A terminal status reaches the batch handler and disables the batch before any legacy submission or decode publication. [Batch error handler](../src/decoder_batch.cpp#L958)<!-- prefix: "} catch (con" -->
 
 The initial repair still attempted setup for two one-row prefills or one decode with one one-row prefill. The independent fault probe disabled the batch in both cases. The second repair selects at least two packable lanes and a bucket before requesting scratch. It uses the same plan for binding. Both corrected controls published their expected results without hitting the fault. [Setup order](../src/text/decoder_graph_packed.cpp#L524)<!-- prefix: "if (!PackedD" -->
 
@@ -147,7 +147,7 @@ In the unpublished long-target composition, `exact_scores_kernel` gained a
 sixth parameter, `split_end`. The chunked draft path still packed five arguments
 and crashed after one token per lane. The selected repair derives the host
 argument pack from the kernel function pointer and passes `0` explicitly for
-the chunked draft path. [Typed launcher](../include/sglang/text/gqa_decode_split.cuh#L17)<!-- prefix: "cudaError_t " --> · [Draft call](../include/sglang/text/mtp/gqa_long.cuh#L104)<!-- prefix: "auto status " -->
+the chunked draft path. [Typed launcher](../include/sglang/text/gqa_decode_split.cuh#L17)<!-- prefix: "cudaError_t " --> · [Draft call](../include/sglang/text/mtp/gqa_long.cuh#L162)<!-- prefix: "auto status " -->
 
 Keep the launch typed when changing a migrated kernel signature. In the selected
 `8e4f210b` verification, removing the sixth argument failed NVCC compilation

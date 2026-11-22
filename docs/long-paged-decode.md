@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder batch | Mark K0 text decode lanes under the tensor-core policy. | [Lane eligibility](../src/decoder_batch.cpp#L656)<!-- prefix: "const bool p" --> |
+| Decoder batch | Mark K0 text decode lanes under the tensor-core policy. | [Lane eligibility](../src/decoder_batch.cpp#L657)<!-- prefix: "const bool p" --> |
 | Packed input projection | Pair layer-input RMSNorm and FP8 quantization with the GDN or GQA input projection. | [Packed call](../src/text/decoder_graph_packed.cpp#L278)<!-- prefix: "void PackedD" --> · [Projection API](../src/text_ops.cu#L860)<!-- prefix: "cudaError_t " --> |
 | Eager forward | Compact eligible attention reads and order KV append, attention, and gating on the batch stream. | [Forward dispatch](../src/decoder_forward.cpp#L531)<!-- prefix: "void attend_" --> |
 | CUDA operator | Validate the group, select a split, merge partials, and recover individual heads. | [Launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L380)<!-- prefix: "cudaError_t " --> · [Tensor-core split](../include/sglang/text/mxfp8_gqa_wide_tc.cuh#L178)<!-- prefix: "__global__ v" --> · [Paired split](../include/sglang/text/mxfp8_gqa_decode.cuh#L274)<!-- prefix: "__global__ v" --> · [Merge](../src/mxfp8_gqa.cu#L667)<!-- prefix: "__global__ v" --> · [Recovery](../include/sglang/text/mxfp8_gqa_decode.cuh#L332)<!-- prefix: "__global__ v" --> |
@@ -43,7 +43,7 @@ The post-attention RMSNorm that feeds MLP gate and up uses the same trigger poin
 
 ### Legacy wide eager decode
 
-The legacy wide eager forward can still compact long attention reads at widths above four. That operator covers 32,768–262,144 visible tokens including the token being appended. [Legacy dispatch](../src/decoder_forward.cpp#L536)<!-- prefix: "const bool w" --> · [Position check](../include/sglang/decoder_cuda.cuh#L213)<!-- prefix: "inline const" --> · [Context ceiling](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" -->
+The legacy wide eager forward can still compact long attention reads at widths above four. That operator covers 32,768–262,144 visible tokens including the token being appended. [Legacy dispatch](../src/decoder_forward.cpp#L536)<!-- prefix: "const bool w" --> · [Position check](../include/sglang/decoder_cuda.cuh#L235)<!-- prefix: "inline const" --> · [Context ceiling](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" -->
 
 Each layer appends the new KV before submitting that lane's grouped attention read. The tensor-core split requires at least five compacted reads and 16-byte-aligned K and V payloads for every lane in the group. The paired split handles groups of one through four or groups with an unaligned payload. Each split divides the visible sequence into 16 page-aligned partitions and clamps the final interval to the visible length. The paired split shares K and V across two query heads of one KV head. [Compaction and launch](../src/decoder_forward.cpp#L571)<!-- prefix: "if (!ordered" --> · [Split selection](../include/sglang/text/mxfp8_gqa_decode.cuh#L386)<!-- prefix: "bool tensor " -->
 
@@ -51,11 +51,11 @@ Each tensor-core block serves one lane, one partition, and all six query heads o
 
 Both splits write the same per-head FP32 partials. The common merge rescales the 16 partitions against the global maximum and rounds the quotient to BF16. The recovery launch runs before attention gating on the same stream. [Merge](../src/mxfp8_gqa.cu#L667)<!-- prefix: "__global__ v" --> · [Recovery](../include/sglang/text/mxfp8_gqa_decode.cuh#L332)<!-- prefix: "__global__ v" -->
 
-Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation for partials. The alias requires 16-byte alignment and remains live until the attention launches consume it. The stream orders later scoring writes to that allocation. [Scratch alias](../src/decoder_forward.cpp#L445)<!-- prefix: "PagedDecodeB" --> · [Scratch size](../include/sglang/decoder_cuda.cuh#L198)<!-- prefix: "inline const" -->
+Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation for partials. The alias requires 16-byte alignment and remains live until the attention launches consume it. The stream orders later scoring writes to that allocation. [Scratch alias](../src/decoder_forward.cpp#L445)<!-- prefix: "PagedDecodeB" --> · [Scratch size](../include/sglang/decoder_cuda.cuh#L220)<!-- prefix: "inline const" -->
 
 ## Constraints and failure behavior
 
-Default `exact` policy, media, MTP, and prefill rows retain their legacy routes. Out-of-window lanes in the legacy wide forward use the row dispatch. The legacy long primitive accepts one through 32 descriptors, independently of the serving width requirement. [Eligibility](../src/decoder_batch.cpp#L656)<!-- prefix: "const bool p" --> · [Row dispatch](../src/decoder_forward.cpp#L599)<!-- prefix: "check(read_g" --> · [Primitive](../src/mxfp8_gqa.cu#L987)<!-- prefix: "cudaError_t " -->
+Default `exact` policy, media, MTP, and prefill rows retain their legacy routes. Out-of-window lanes in the legacy wide forward use the row dispatch. The legacy long primitive accepts one through 32 descriptors, independently of the serving width requirement. [Eligibility](../src/decoder_batch.cpp#L657)<!-- prefix: "const bool p" --> · [Row dispatch](../src/decoder_forward.cpp#L599)<!-- prefix: "check(read_g" --> · [Primitive](../src/mxfp8_gqa.cu#L987)<!-- prefix: "cudaError_t " -->
 
 The launcher checks the complete group before submission. An invalid count, null required pointer, unaligned scratch address, out-of-window position, or insufficient declared cache or page-table capacity returns `cudaErrorInvalidValue`. The caller supplies valid device page entries and enough scratch for each lane. The launcher stops at the first synchronous CUDA launch error. Earlier launches can still be in flight. The forward propagates the error through the batch execution path. [Validation and launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L380)<!-- prefix: "cudaError_t " --> · [Cache coverage](../src/mxfp8_gqa.cu#L158)<!-- prefix: "bool cache_c" --> · [Forward error](../src/decoder_forward.cpp#L607)<!-- prefix: "check(status" -->
 

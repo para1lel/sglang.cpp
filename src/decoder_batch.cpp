@@ -64,7 +64,8 @@ struct Lane {
     }
 
     void finish_round(MtpRound& round, DecoderBatchStep& result, cudaStream_t stream,
-                      SerialOutput* output, const MtpRound::Cancel& cancel) {
+                      SerialOutput* output, const MtpRound::Cancel& cancel,
+                      MtpDraftInput* repair) {
         result.mtp_drafted_tokens = round.drafted;
         result.mtp_verified_rows = round.rows();
         try {
@@ -77,7 +78,7 @@ struct Lane {
                 result.mtp_accepted_tokens += accepted;
                 result.finish_reason = progress.commit(options, token, logits, output);
                 return !result.finish_reason;
-            }, stream, cancel);
+            }, stream, cancel, repair);
             if (!completed) {
                 result.finish_reason = DecoderFinishReason::cancelled;
             }
@@ -851,11 +852,14 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                          stream, graph)) {
         stats.verification_graph_slots |= std::uint32_t{1} << slots[0];
     }
+    std::array<DraftRepairs, decoder_batch_max_mtp_lanes> repairs{};
     for (int index = 0; index < count; ++index) {
-        const auto slot = slots[index];
         stats.verification_rows += rounds[index].rows();
-        storage->slots[slot]->finish_round(rounds[index], results[slot], stream, output, cancel);
+        auto* repair = count > 1 && !rounds[index].constraint ? repairs[index].data() : nullptr;
+        storage->slots[slots[index]]->finish_round(
+            rounds[index], results[slots[index]], stream, output, cancel, repair);
     }
+    repair_draft_wave(repairs, count, stream);
     check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
     stats.verification_lanes += count;
 }

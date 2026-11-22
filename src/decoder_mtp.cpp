@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -227,11 +228,20 @@ struct MtpDraftWeights::State {
 
 struct MtpDraftRequest::State {
     State(std::shared_ptr<const MtpDraftWeights> weights, int capacity, RequestBlockCache* cache);
-    void prepare(int shifted_token, const Bf16* hidden, cudaStream_t stream);
-    void attend(int position, bool score, cudaStream_t stream);
-    void run_mlp(cudaStream_t stream);
+    void validate(int position, int token, const Bf16* hidden) const;
+    void embed(int shifted_token, const Bf16* hidden, cudaStream_t stream);
+    void prepare_attention(cudaStream_t stream);
+    void append(int position, bool score, cudaStream_t stream);
+    DraftAttentionRow attention_row(int position);
+    void gate_attention(cudaStream_t stream);
+    void prepare_mlp(cudaStream_t stream);
+    void activate_mlp(cudaStream_t stream);
+    void normalize_output(cudaStream_t stream);
     void score(cudaStream_t stream, const ConstraintWorkspace* scratch,
                const ConstraintCandidates* allowed);
+    void select_score(cudaStream_t stream, const ConstraintWorkspace* scratch,
+                      const ConstraintCandidates* allowed);
+    static void score_wave(State* const* batch, int count, cudaStream_t stream);
 
     std::shared_ptr<const MtpDraftWeights> weights;
     Allocations memory;
@@ -270,7 +280,16 @@ MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, in
     memory.close_stream();
 }
 
-void MtpDraftRequest::State::prepare(int shifted_token, const Bf16* hidden, cudaStream_t stream) {
+void MtpDraftRequest::State::validate(int position, int token, const Bf16* hidden) const {
+    if (failed) {
+        throw std::logic_error("MTP draft request failed");
+    }
+    if (position != prefix || position >= capacity || token < 0 || token >= vocab_size || !hidden) {
+        throw std::invalid_argument("Invalid MTP draft input");
+    }
+}
+
+void MtpDraftRequest::State::embed(int shifted_token, const Bf16* hidden, cudaStream_t stream) {
     const auto& model = *weights->state_;
     check(text_embedding(model.embedding, vocab_size, hidden_size, shifted_token,
                          work.embedding, stream), "Look up shifted MTP token");
@@ -278,21 +297,17 @@ void MtpDraftRequest::State::prepare(int shifted_token, const Bf16* hidden, cuda
                         work.concatenated, nullptr, stream), "Normalize MTP embedding");
     check(text_rms_norm(hidden, nullptr, model.hidden_norm, hidden_size,
                         work.concatenated + hidden_size, nullptr, stream), "Normalize MTP hidden");
-    check(text_bf16_gemv(model.fc.values, work.concatenated, model.fc.rows, model.fc.columns,
-                         work.residual, stream), "Run BF16 MTP FC");
-    check(text_rms_norm(work.residual, nullptr, model.input_norm, hidden_size, work.normalized,
-                        nullptr, stream), "Normalize MTP layer input");
 }
 
-void MtpDraftRequest::State::attend(int position, bool score, cudaStream_t stream) {
+void MtpDraftRequest::State::prepare_attention(cudaStream_t stream) {
     const auto& model = *weights->state_;
-    const auto& gqa = model.gqa;
+    check(text_rms_norm(work.residual, nullptr, model.input_norm, hidden_size, work.normalized,
+                        nullptr, stream), "Normalize MTP layer input");
     quantize(work.normalized, hidden_size, work, stream);
-    if (score) {
-        project(gqa.q_gate, work, work.q_gate, stream);
-    }
-    project(gqa.key, work, work.keys, stream);
-    project(gqa.value, work, work.values, stream);
+}
+
+void MtpDraftRequest::State::append(int position, bool score, cudaStream_t stream) {
+    const auto& gqa = weights->state_->gqa;
     if (score) {
         check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, gqa.query_norm,
                                   gqa.key_norm, work.rope_queries, work.rope_keys, stream),
@@ -303,30 +318,34 @@ void MtpDraftRequest::State::attend(int position, bool score, cudaStream_t strea
     }
     check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values, stream),
           "Append MTP MXFP8 KV");
-    if (!score) {
-        return;
-    }
-    check(mtp_gqa_attention(cache, pages, position, work.rope_queries, work.attention,
-                            work.attention_scores(), stream),
-          "Read MTP MXFP8 attention");
+}
+
+DraftAttentionRow MtpDraftRequest::State::attention_row(int position) {
+    return {cache, pages, position, work.rope_queries, work.attention, work.attention_scores()};
+}
+
+void MtpDraftRequest::State::gate_attention(cudaStream_t stream) {
     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
           "Gate MTP attention");
     quantize(work.attention, text_gqa_q_width, work, stream);
-    project(gqa.output, work, work.branch, stream);
+}
+
+void MtpDraftRequest::State::prepare_mlp(cudaStream_t stream) {
+    const auto& model = *weights->state_;
     check(text_rms_norm(work.branch, work.residual, model.attention_norm, hidden_size,
                         work.normalized, work.residual, stream),
           "Normalize MTP post-attention residual");
+    quantize(work.normalized, hidden_size, work, stream);
 }
 
-void MtpDraftRequest::State::run_mlp(cudaStream_t stream) {
-    const auto& model = *weights->state_;
-    quantize(work.normalized, hidden_size, work, stream);
-    project(model.mlp_gate, work, work.gate, stream);
-    project(model.mlp_up, work, work.up, stream);
+void MtpDraftRequest::State::activate_mlp(cudaStream_t stream) {
     check(text_swiglu(work.gate, work.up, intermediate_size, work.gate, stream),
           "Apply MTP SwiGLU");
     quantize(work.gate, intermediate_size, work, stream);
-    project(model.mlp_down, work, work.branch, stream);
+}
+
+void MtpDraftRequest::State::normalize_output(cudaStream_t stream) {
+    const auto& model = *weights->state_;
     check(text_rms_norm(work.branch, work.residual, model.final_norm, hidden_size, work.normalized,
                         nullptr, stream), "Normalize MTP output");
 }
@@ -335,9 +354,7 @@ void MtpDraftRequest::State::score(cudaStream_t stream, const ConstraintWorkspac
                                   const ConstraintCandidates* allowed) {
     const auto& model = *weights->state_;
     const auto& head = model.lm_head;
-    int8_score = model.quantized_head && !allowed;
-    retried_score = false;
-    if (int8_score) {
+    if (model.quantized_head && !allowed) {
         check(decode_draft_head_int8(model.quantized_head, model.quantized_head_maxima,
                                      work.normalized, work.activation.values,
                                      work.activation.scales, work.logits, stream),
@@ -346,6 +363,13 @@ void MtpDraftRequest::State::score(cudaStream_t stream, const ConstraintWorkspac
         check(text_bf16_gemv(head.values, work.normalized, head.rows, head.columns,
                              work.logits, stream), "Run shared LM head for MTP");
     }
+    select_score(stream, scratch, allowed);
+}
+
+void MtpDraftRequest::State::select_score(cudaStream_t stream, const ConstraintWorkspace* scratch,
+                                         const ConstraintCandidates* allowed) {
+    int8_score = weights->state_->quantized_head && !allowed;
+    retried_score = false;
     if (allowed) {
         select_constrained({work.logits, work.argmax_scratch, work.argmax}, *scratch, *allowed,
                            nullptr, 0, nullptr, stream);
@@ -361,6 +385,33 @@ void MtpDraftRequest::State::score(cudaStream_t stream, const ConstraintWorkspac
     check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner), cudaMemcpyDeviceToHost,
                           stream), "Copy MTP token");
     scored = true;
+}
+
+void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStream_t stream) {
+    const auto& model = *batch[0]->weights->state_;
+    if (model.quantized_head) {
+        std::array<DraftInt8Projection, draft_wave_rows> projections;
+        for (int index = 0; index < count; ++index) {
+            const auto& work = batch[index]->work;
+            projections[index] = {work.normalized, work.activation.values,
+                                  work.activation.scales, work.logits};
+        }
+        check(decode_draft_head_int8_batch(model.quantized_head, model.quantized_head_maxima,
+                                           projections.data(), count, stream),
+              "Run batched INT8 MTP vocabulary head");
+    } else {
+        std::array<TextBf16Projection, draft_wave_rows> projections;
+        for (int index = 0; index < count; ++index) {
+            const auto& work = batch[index]->work;
+            projections[index] = {work.normalized, work.logits};
+        }
+        const auto& head = model.lm_head;
+        check(text_bf16_gemm(head.values, head.rows, head.columns, projections.data(),
+                             count, stream), "Run batched BF16 MTP vocabulary head");
+    }
+    for (int index = 0; index < count; ++index) {
+        batch[index]->select_score(stream, nullptr, nullptr);
+    }
 }
 
 MtpDraftWeights::MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
@@ -394,18 +445,33 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
                                     const ConstraintWorkspace* scratch,
                                     const ConstraintCandidates* allowed) {
     auto& request = *state_;
-    if (request.failed) {
-        throw std::logic_error("MTP draft request failed");
-    }
-    if (position != request.prefix || position >= request.capacity || shifted_token < 0 ||
-        shifted_token >= vocab_size || !hidden) {
-        throw std::invalid_argument("Invalid MTP draft input");
-    }
+    request.validate(position, shifted_token, hidden);
+    auto& work = request.work;
+    const auto& model = *request.weights->state_;
+    const auto& gqa = model.gqa;
     try {
-        request.prepare(shifted_token, hidden, stream);
-        request.attend(position, score, stream);
+        request.embed(shifted_token, hidden, stream);
+        check(text_bf16_gemv(model.fc.values, work.concatenated, model.fc.rows, model.fc.columns,
+                             work.residual, stream), "Run BF16 MTP FC");
+        request.prepare_attention(stream);
         if (score) {
-            request.run_mlp(stream);
+            project(gqa.q_gate, work, work.q_gate, stream);
+        }
+        project(gqa.key, work, work.keys, stream);
+        project(gqa.value, work, work.values, stream);
+        request.append(position, score, stream);
+        if (score) {
+            check(mtp_gqa_attention(request.cache, request.pages, position, work.rope_queries,
+                                    work.attention, work.attention_scores(), stream),
+                  "Read MTP MXFP8 attention");
+            request.gate_attention(stream);
+            project(gqa.output, work, work.branch, stream);
+            request.prepare_mlp(stream);
+            project(model.mlp_gate, work, work.gate, stream);
+            project(model.mlp_up, work, work.up, stream);
+            request.activate_mlp(stream);
+            project(model.mlp_down, work, work.branch, stream);
+            request.normalize_output(stream);
             request.score(stream, scratch, allowed);
         }
     } catch (...) {
@@ -414,6 +480,110 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
     }
     ++request.prefix;
     return score ? request.work.normalized : nullptr;
+}
+
+void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
+                                   cudaStream_t stream) {
+    if (count == 0) {
+        return;
+    }
+    static_assert(draft_wave_rows == decoder_batch_max_mtp_lanes);
+    if (!rows || count < 0 || count > draft_wave_rows) {
+        throw std::invalid_argument("Invalid MTP draft wave size");
+    }
+    if (count == 1) {
+        auto& row = rows[0];
+        row.hidden = row.request->enqueue(row.position, row.token, row.hidden, score, stream);
+        return;
+    }
+    std::array<State*, draft_wave_rows> states{};
+    const auto weights = rows[0].request->state_->weights.get();
+    std::array<TextBf16Projection, draft_wave_rows> fc;
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        auto& request = *row.request->state_;
+        request.validate(row.position, row.token, row.hidden);
+        if (request.weights.get() != weights ||
+            std::find(states.begin(), states.begin() + index, &request) != states.begin() + index) {
+            throw std::invalid_argument("Invalid MTP draft wave lanes");
+        }
+        states[index] = &request;
+        fc[index] = {request.work.concatenated, request.work.residual};
+    }
+    const auto& model = *weights->state_;
+    const auto project_wave = [&](Fp8Weight weight, Bf16* DraftWorkspace::* output) {
+        std::array<TextFp8Projection, draft_wave_rows> projections;
+        for (int index = 0; index < count; ++index) {
+            const auto& work = states[index]->work;
+            projections[index] = {{work.activation.values, work.activation.scales}, work.*output};
+        }
+        check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
+                             projections.data(), count, stream), "Run batched MTP FP8");
+    };
+    const auto apply = [&](void (State::* function)(cudaStream_t)) {
+        for (int index = 0; index < count; ++index) {
+            std::invoke(function, states[index], stream);
+        }
+    };
+    try {
+        for (int index = 0; index < count; ++index) {
+            states[index]->embed(rows[index].token, rows[index].hidden, stream);
+        }
+        check(text_bf16_gemm(model.fc.values, model.fc.rows, model.fc.columns, fc.data(),
+                             count, stream), "Run batched BF16 MTP FC");
+        apply(&State::prepare_attention);
+        if (score) {
+            project_wave(model.gqa.q_gate, &DraftWorkspace::q_gate);
+        }
+        project_wave(model.gqa.key, &DraftWorkspace::keys);
+        project_wave(model.gqa.value, &DraftWorkspace::values);
+        for (int index = 0; index < count; ++index) {
+            states[index]->append(rows[index].position, score, stream);
+        }
+        if (score) {
+            std::array<DraftAttentionRow, draft_wave_rows> attention;
+            for (int index = 0; index < count; ++index) {
+                attention[index] = states[index]->attention_row(rows[index].position);
+            }
+            check(mtp_gqa_attention_batch(attention.data(), count, stream),
+                  "Read batched MTP MXFP8 attention");
+            apply(&State::gate_attention);
+            project_wave(model.gqa.output, &DraftWorkspace::branch);
+            apply(&State::prepare_mlp);
+            project_wave(model.mlp_gate, &DraftWorkspace::gate);
+            project_wave(model.mlp_up, &DraftWorkspace::up);
+            apply(&State::activate_mlp);
+            project_wave(model.mlp_down, &DraftWorkspace::branch);
+            apply(&State::normalize_output);
+            State::score_wave(states.data(), count, stream);
+        }
+    } catch (...) {
+        for (int index = 0; index < count; ++index) {
+            states[index]->failed = true;
+        }
+        throw;
+    }
+    for (int index = 0; index < count; ++index) {
+        ++states[index]->prefix;
+        rows[index].hidden = score ? states[index]->work.normalized : nullptr;
+    }
+}
+
+void repair_draft_wave(const std::array<DraftRepairs, decoder_batch_max_mtp_lanes>& repairs,
+                       int count, cudaStream_t stream) {
+    std::array<MtpDraftInput, decoder_batch_max_mtp_lanes> rows;
+    for (int depth = 0; depth < decoder_batch_max_mtp_steps; ++depth) {
+        int size = 0;
+        for (int index = 0; index < count; ++index) {
+            if (const auto& row = repairs[index][depth]; row.request) {
+                rows[size++] = row;
+            }
+        }
+        if (size == 0) {
+            break;
+        }
+        MtpDraftRequest::enqueue_wave(rows.data(), size, false, stream);
+    }
 }
 
 void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,

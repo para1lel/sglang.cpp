@@ -3,6 +3,7 @@
 #include "sglang/text/decode_proj.h"
 #include "sglang/text_ops.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -141,17 +142,10 @@ __device__ uint4 load_streaming_128(const void* address) {
     return bits;
 }
 
-__global__ void quantize_draft_head_rows(const __nv_bfloat16* input, int rows,
-                                        std::uint8_t* values, float* maxima) {
+__device__ void quantize_draft_head_row(const __nv_bfloat16* source, std::uint8_t* values,
+                                        float* maximum_out, int lane) {
     constexpr int width = decoder::hidden_size;
-    const int lane = threadIdx.x % warp_width;
-    const int row = blockIdx.x * (blockDim.x / warp_width) + threadIdx.x / warp_width;
-    if (row >= rows) {
-        return;
-    }
-    const auto offset = static_cast<std::size_t>(row) * width;
-    const auto* source = input + offset;
-    auto* destination = reinterpret_cast<std::int8_t*>(values + offset);
+    auto* destination = reinterpret_cast<std::int8_t*>(values);
     float maximum = 0;
     bool invalid = false;
     for (int column = lane; column < width; column += warp_width) {
@@ -173,8 +167,29 @@ __global__ void quantize_draft_head_rows(const __nv_bfloat16* input, int rows,
         destination[column] = quantized;
     }
     if (lane == 0) {
-        maxima[row] = invalid ? CUDART_NAN_F : maximum;
+        *maximum_out = invalid ? CUDART_NAN_F : maximum;
     }
+}
+
+__global__ void quantize_draft_head_rows(const __nv_bfloat16* input, int rows,
+                                        std::uint8_t* values, float* maxima) {
+    const int row = blockIdx.x * (blockDim.x / warp_width) + threadIdx.x / warp_width;
+    if (row < rows) {
+        const auto offset = static_cast<std::size_t>(row) * decoder::hidden_size;
+        quantize_draft_head_row(input + offset, values + offset, maxima + row,
+                                threadIdx.x % warp_width);
+    }
+}
+
+template <int Count>
+struct DraftHeadArguments {
+    decoder::DraftInt8Projection rows[Count];
+};
+
+template <int Count>
+__global__ void quantize_draft_head_batch(const __grid_constant__ DraftHeadArguments<Count> args) {
+    const auto& row = args.rows[threadIdx.x / warp_width];
+    quantize_draft_head_row(row.input, row.values, row.maximum, threadIdx.x % warp_width);
 }
 
 __device__ int dot_signed_bytes(uint4 weight, uint4 input, int sum) {
@@ -213,6 +228,57 @@ __global__ void draft_head_int8_kernel(const std::uint8_t* weights, const float*
         output[row] = draft_head_logit(first, weight_maxima[row], maximum);
         output[row + 1] = draft_head_logit(second, weight_maxima[row + 1], maximum);
     }
+}
+
+template <int Count>
+__global__ void draft_head_int8_batch_kernel(
+    const std::uint8_t* weights, const float* weight_maxima,
+    const __grid_constant__ DraftHeadArguments<Count> args) {
+    constexpr int width = decoder::hidden_size;
+    const int lane = threadIdx.x % warp_width;
+    const int row = 2 * (blockIdx.x * block_warps + threadIdx.x / warp_width);
+    const auto* weight = weights + static_cast<std::size_t>(row) * width;
+    int first[Count]{};
+    int second[Count]{};
+    for (int column = lane * 16; column < width; column += warp_width * 16) {
+        const auto lhs = load_streaming_128(weight + column);
+        const auto rhs = load_streaming_128(weight + width + column);
+        #pragma unroll
+        for (int index = 0; index < Count; ++index) {
+            const auto input = load_128(args.rows[index].values + column);
+            first[index] = dot_signed_bytes(lhs, input, first[index]);
+            second[index] = dot_signed_bytes(rhs, input, second[index]);
+        }
+    }
+    #pragma unroll
+    for (int index = 0; index < Count; ++index) {
+        const int sum_first = __reduce_add_sync(warp_mask, first[index]);
+        const int sum_second = __reduce_add_sync(warp_mask, second[index]);
+        if (lane == 0) {
+            const auto& projection = args.rows[index];
+            const float maximum = *projection.maximum;
+            projection.output[row] = draft_head_logit(sum_first, weight_maxima[row], maximum);
+            projection.output[row + 1] =
+                draft_head_logit(sum_second, weight_maxima[row + 1], maximum);
+        }
+    }
+}
+
+template <int Count>
+cudaError_t launch_draft_head_batch(const std::uint8_t* weights, const float* weight_maxima,
+                                    const decoder::DraftInt8Projection* rows, cudaStream_t stream) {
+    DraftHeadArguments<Count> batch;
+    std::copy_n(rows, Count, batch.rows);
+    void* quantize[] = {&batch};
+    const auto status = cudaLaunchKernel(quantize_draft_head_batch<Count>, 1, Count * warp_width,
+                                         quantize, 0, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    void* score[] = {&weights, &weight_maxima, &batch};
+    return cudaLaunchKernel(draft_head_int8_batch_kernel<Count>,
+                            decoder::vocab_size / (2 * block_warps), block_threads,
+                            score, 0, stream);
 }
 
 __global__ void bf16_gdn_gates_kernel(const __nv_bfloat16* weight_b,
@@ -498,6 +564,29 @@ cudaError_t decoder::decode_draft_head_int8(const std::uint8_t* weight, const fl
     void* args[] = {&weight, &weight_maxima, &input_values, &input_maximum, &output};
     return cudaLaunchKernel(draft_head_int8_kernel, vocab_size / (2 * block_warps),
                             block_threads, args, 0, stream);
+}
+
+cudaError_t decoder::decode_draft_head_int8_batch(
+    const std::uint8_t* weight, const float* weight_maxima, const DraftInt8Projection* rows,
+    int count, cudaStream_t stream) {
+    if (!weight || !weight_maxima || !rows || count < 1 || count > draft_wave_rows ||
+        !aligned(weight, 16)) {
+        return cudaErrorInvalidValue;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        if (!row.input || !row.values || !row.maximum || !row.output || !aligned(row.values, 16)) {
+            return cudaErrorInvalidValue;
+        }
+    }
+    switch (count) {
+    case 4: return launch_draft_head_batch<4>(weight, weight_maxima, rows, stream);
+    case 3: return launch_draft_head_batch<3>(weight, weight_maxima, rows, stream);
+    case 2: return launch_draft_head_batch<2>(weight, weight_maxima, rows, stream);
+    default:
+        return decode_draft_head_int8(weight, weight_maxima, rows[0].input, rows[0].values,
+                                     rows[0].maximum, rows[0].output, stream);
+    }
 }
 
 cudaError_t decoder::decode_bf16_lm_head_batch(const __nv_bfloat16* weight, int rows, int width,

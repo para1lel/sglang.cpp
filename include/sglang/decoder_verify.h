@@ -4,6 +4,7 @@
 
 namespace sglang::decoder {
 
+struct MtpDraftInput;
 struct SamplingParameters;
 struct VerificationGraphBinding;
 struct VerificationWorkspace;
@@ -120,7 +121,8 @@ struct MtpRound {
     int rows() const;
     static bool propose_all(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
                             cudaStream_t stream, const Cancel& cancel);
-    bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel);
+    bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
+                MtpDraftInput* repair);
 };
 
 class TargetVerification {

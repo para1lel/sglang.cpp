@@ -127,34 +127,59 @@ int MtpRound::rows() const {
     return constraint ? constraint->rows() : std::min(drafted + 1, remaining);
 }
 
+namespace {
+
+bool enqueue_proposal_wave(MtpRound* rounds, int count, int wave,
+                           const ConstraintWorkspace& scratch, cudaStream_t stream) {
+    std::array<MtpDraftInput, decoder_batch_max_mtp_lanes> rows;
+    std::array<MtpRound*, decoder_batch_max_mtp_lanes> batched;
+    int size = 0;
+    bool submitted = false;
+    for (int index = 0; index < count; ++index) {
+        auto& round = rounds[index];
+        if (wave >= round.proposal_limit) {
+            continue;
+        }
+        const int position = round.position - 1 + wave;
+        if (round.constraint) {
+            round.draft_hidden = round.draft->enqueue(
+                position, round.tokens[wave], round.draft_hidden, true, stream, &scratch,
+                &round.constraint->candidates(wave));
+            submitted = true;
+        } else {
+            rows[size] = {round.draft, position, round.tokens[wave], round.draft_hidden};
+            batched[size++] = &round;
+        }
+    }
+    MtpDraftRequest::enqueue_wave(rows.data(), size, true, stream);
+    for (int index = 0; index < size; ++index) {
+        batched[index]->draft_hidden = rows[index].hidden;
+    }
+    return submitted || size != 0;
+}
+
+}
+
 bool MtpRound::propose_all(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
                            cudaStream_t stream, const Cancel& cancel) {
+    std::array<MtpDraftInput, decoder_batch_max_mtp_lanes> unscored;
+    int unscored_count = 0;
     int longest = 0;
     for (int index = 0; index < count; ++index) {
         auto& round = rounds[index];
         round.draft_hidden = round.request->work.normalized;
         longest = std::max(longest, round.proposal_limit);
         if (round.proposal_limit == 0) {
-            round.draft->enqueue(round.position - 1, round.tokens.front(), round.draft_hidden,
-                                 false, stream);
+            unscored[unscored_count++] = {
+                round.draft, round.position - 1, round.tokens.front(), round.draft_hidden};
         }
     }
+    MtpDraftRequest::enqueue_wave(unscored.data(), unscored_count, false, stream);
     for (int wave = 0; wave < longest; ++wave) {
         if (cancel && cancel()) {
             return false;
         }
-        bool submitted = false;
-        for (int index = 0; index < count; ++index) {
-            auto& round = rounds[index];
-            if (wave < round.proposal_limit) {
-                const auto* allowed = round.constraint ? &round.constraint->candidates(wave)
-                                                       : nullptr;
-                round.draft_hidden = round.draft->enqueue(round.position - 1 + wave,
-                    round.tokens[wave], round.draft_hidden, true, stream, &scratch, allowed);
-                submitted = true;
-            }
-        }
-        if (!submitted) {
+        if (!enqueue_proposal_wave(rounds, count, wave, scratch, stream)) {
             break;
         }
         check(cudaStreamSynchronize(stream), "Complete MTP draft wave");
@@ -187,7 +212,8 @@ bool MtpRound::propose_all(MtpRound* rounds, int count, const ConstraintWorkspac
     return !cancel || !cancel();
 }
 
-bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel) {
+bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
+                      MtpDraftInput* repair) {
     if (draft->valid_prefix() > position) {
         draft->rewind(position);
     }
@@ -206,7 +232,11 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
             break;
         }
         const auto row = target->row(index);
-        draft->enqueue(row.position, token, row.work->normalized, false, stream);
+        if (!repair) {
+            draft->enqueue(row.position, token, row.work->normalized, false, stream);
+        } else {
+            repair[index] = {draft, row.position, token, row.work->normalized};
+        }
     }
     if (continuing) {
         const auto* hidden = target->row(consumed - 1).work->normalized;

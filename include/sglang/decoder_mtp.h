@@ -15,6 +15,18 @@ struct MtpPrefillBuffers {
     Bf16* rope_keys;
 };
 
+struct MtpDraftInput {
+    MtpDraftRequest* request;
+    int position;
+    int token;
+    const Bf16* hidden;
+};
+
+using DraftRepairs = std::array<MtpDraftInput, decoder_batch_max_mtp_steps>;
+
+void repair_draft_wave(const std::array<DraftRepairs, decoder_batch_max_mtp_lanes>& repairs,
+                       int count, cudaStream_t stream);
+
 class MtpDraftWeights {
 public:
     MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
@@ -44,6 +56,7 @@ public:
     const Bf16* enqueue(int position, int shifted_token, const Bf16* hidden, bool score,
                         cudaStream_t stream, const ConstraintWorkspace* scratch = nullptr,
                         const ConstraintCandidates* allowed = nullptr);
+    static void enqueue_wave(MtpDraftInput* rows, int count, bool score, cudaStream_t stream);
 
     void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                       const PrefillProjections& projections, MtpPrefillBuffers buffers);

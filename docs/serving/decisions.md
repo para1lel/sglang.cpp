@@ -47,7 +47,7 @@ also bound Decisions requests.
 ## System One
 
 Send `POST /v1/systemone` with a `model` string, a `state` string, object or array, and a
-`questions` object keyed by question ID. The generic text adapter reports the path of the
+`questions` object keyed by question ID. The generic adapter reports the path of the
 loaded checkpoint in `model`. The `state` can be blank. Each question specifies a `type`
 and optional `instructions`. A `choice` takes `criteria` as a mapping of option names to
 descriptions or null. A `score` takes `criteria` as an ordered list of level descriptions.
@@ -61,6 +61,7 @@ in the full vocabulary. Usage counts input tokens and reports zero output tokens
 
 Choices support 1–255 entries, subject to the distinct single-token label budget of the
 loaded tokenizer and the shared pointwise budgets. Scores support 1–10 levels. Invalid
-request fields return a 422 `detail` array. Text inputs support an empty `images` array.
-Nonempty images return 400. The route uses generic checkpoint scoring. An Ollama route
-configured to the same path takes precedence.
+request fields return a 422 `detail` array. The `images` array uses the same inline PNG
+and native RGB8 inputs, automatic detail, and four-image limit as Decisions. Usage
+includes expanded visual tokens. The route uses generic checkpoint scoring. An Ollama
+route configured to the same path takes precedence.

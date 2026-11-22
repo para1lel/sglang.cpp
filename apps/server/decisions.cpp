@@ -363,12 +363,7 @@ Request parse_systemone(std::string_view body, std::string_view model) {
             invalid("question '" + id + "': " + error.what());
         }
     }
-    if (const auto* images = get(request, "images")) {
-        if (!images->array()) invalid("images must be an array");
-        if (!images->array()->empty()) {
-            throw std::invalid_argument("Vision decision inputs are unavailable");
-        }
-    }
+    output.image_parts = parse_images(get(request, "images"));
     parse_template(get(request, "chat_template_kwargs"), output);
     return output;
 }
@@ -643,7 +638,7 @@ std::string systemone_response(const Request& request, const std::vector<BatchPr
     for (std::size_t index = 0; index < prompts.size(); ++index) {
         const auto& question = request.questions[index];
         answers.emplace_back(question.id, systemone_answer(question, results[index]));
-        tokens += prompts[index].prompt.size();
+        tokens += prompts[index].prompt_tokens();
     }
     return chat_template_json(OrderedObject{
         {"model", request.model}, {"answers", std::move(answers)},

@@ -8,6 +8,7 @@
 namespace sglang::server {
 
 class BatchService;
+class OllamaDiscovery;
 class Socket;
 enum class TokenizationRoute;
 
@@ -29,6 +30,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        std::string_view model_info = std::string_view{},
                        const NativeAbort& abort = NativeAbort{},
                        const ServerInfo& server_info = ServerInfo{},
-                       const BatchScore& score = BatchScore{});
+                       const BatchScore& score = BatchScore{},
+                       const OllamaDiscovery* discovery = nullptr);
 
 }

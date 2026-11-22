@@ -10,9 +10,9 @@ prompt for the configured Qwen checkpoint.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L373)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L207)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L605)<!-- prefix: "void Connect" --> |
+| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L385)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L628)<!-- prefix: "void Connect" --> |
 | Tokenization worker | Validate inputs and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L900)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_completion.cpp#L18)<!-- prefix: "const Tokeni" --> |
-| Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector\u003c" --> · [Renderer](../apps/server/chat_template.cpp#L538)<!-- prefix: "std::string " --> |
+| Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" --> · [Renderer](../apps/server/chat_template.cpp#L538)<!-- prefix: "std::string " --> |
 
 ## Runtime path
 
@@ -69,7 +69,7 @@ For top-level `continue_final_message: true`, send a final assistant string
 after at least one earlier message. The server encodes that string separately.
 It appends the resulting IDs to the open assistant turn. Use
 `add_generation_prompt: true` or the default for this setting.
-[Chat normalization and encoding](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector\u003c" -->
+[Chat normalization and encoding](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" -->
 
 Set `add_generation_prompt: false` to continue a message within the template.
 Set `chat_template_kwargs.continue_final_message` to `true` to end the prompt
@@ -168,8 +168,8 @@ the trailing-slash form receives HTTP 307. Other methods on the canonical
 path receive HTTP 405 with `Allow: POST`. Malformed content or invalid fields
 receive HTTP 400 with an `invalid_request_error`. For example, omit `model`
 to receive this body.
-[Method check](../apps/server/prefix_controls.cpp#L632)<!-- prefix: "if ((count |" --> ·
-[Anthropic error body](../apps/server/http.cpp#L624)<!-- prefix: "void write_a" -->
+[Method check](../apps/server/prefix_controls.cpp#L667)<!-- prefix: "if ((count |" --> ·
+[Anthropic error body](../apps/server/http.cpp#L638)<!-- prefix: "void write_a" -->
 
 ```json
 {"type":"error","error":{"type":"invalid_request_error","message":"model: Field required"}}
@@ -221,7 +221,7 @@ Validation diagnostics can differ from pinned Python.
 Encode and decode route errors return a JSON object with `object: "error"`, `message`, `type`,
 `param: null`, and an integer `code` matching the HTTP status. For example,
 detokenizing `{"tokens":[248320]}` returns HTTP 400 with this body.
-[Error writer](../apps/server/http.cpp#L612)<!-- prefix: "void write_t" -->
+[Error writer](../apps/server/http.cpp#L626)<!-- prefix: "void write_t" -->
 
 ```json
 {"object":"error","message":"Invalid input: token id 248320 is out of vocabulary; valid range is [0, 248320).","type":"BadRequestError","param":null,"code":400}

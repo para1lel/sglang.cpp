@@ -29,6 +29,7 @@ struct HttpRequest {
     std::string body;
     std::string host;
     std::string query;
+    bool body_is_json = false;
 
     std::string_view route_path() const;
 };
@@ -57,9 +58,12 @@ bool disconnected(const Socket& connection);
 std::string decode_url(std::string_view text, bool form = false);
 GenerateRoute generate_route(const HttpRequest& request);
 TokenizationRoute tokenization_route(const HttpRequest& request);
+using AnthropicCountOverride = std::function<bool(const HttpRequest&)>;
 void read_connections(const Socket& listener, int capacity,
-                      const std::function<void(Socket&, HttpRequest)>& handle);
-bool write_json(const Socket& connection, std::string_view status, std::string_view json);
+                      const std::function<void(Socket&, HttpRequest)>& handle,
+                      const AnthropicCountOverride& overrides_count);
+bool write_json(const Socket& connection, std::string_view status, std::string_view json,
+                bool head_only = false);
 void write_raw_response(const Socket& connection, std::string_view status, std::string_view body);
 void write_method_not_allowed(const Socket& connection, std::string_view methods, bool head_only);
 void write_redirect(const Socket& connection, const HttpRequest& request, std::string_view path);

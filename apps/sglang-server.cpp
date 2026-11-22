@@ -8,6 +8,7 @@
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
 #include "sglang/server/native_generate.h"
+#include "sglang/server/ollama_discovery.h"
 #include "sglang/server/prefix_controls.h"
 #include "sglang/server/score.h"
 #include "sglang/server/tokenization.h"
@@ -273,6 +274,7 @@ int main(int argc, char** argv) {
     try {
         const auto started = std::chrono::steady_clock::now();
         const auto arguments = parse_arguments(argc, argv);
+        const OllamaDiscovery discovery;
         install_shutdown_handlers();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
                                       arguments.mtp_steps != 0, arguments.fp8_prefill);
@@ -313,7 +315,7 @@ int main(int argc, char** argv) {
                 return server_info_json(arguments, startup.count(), service.runtime_state());
             }, [&](const Socket& connection, int slot, std::string_view body) {
                 serve_score(connection, service, slot, tokenizer.get(), body);
-            });
+            }, &discovery);
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';
         return 1;

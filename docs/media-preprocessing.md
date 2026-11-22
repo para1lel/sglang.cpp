@@ -11,7 +11,7 @@ Pass the patches to the [standalone vision encoder](vision-encoder.md) to produc
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Caller | Decode media to RGB8 and provide displayed dimensions and source video metadata. | [Input view](../include/sglang/media_preprocess.h#L10)<!-- prefix: "struct Decod" --> · [Video metadata](../include/sglang/media_preprocess.h#L20)<!-- prefix: "struct Video" --> |
-| Preprocessor | Select frames, resize, normalize, and pack patches. | [Public functions](../include/sglang/media_preprocess.h#L35)<!-- prefix: "std::vector\u003c" --> · [Library target](../xmake.lua#L306)<!-- prefix: "target(\"sgla" --> |
+| Preprocessor | Select frames, resize, normalize, and pack patches. | [Public functions](../include/sglang/media_preprocess.h#L35)<!-- prefix: "std::vector<" --> · [Library target](../xmake.lua#L306)<!-- prefix: "target(\"sgla" --> |
 | Consumer | Read the owned patch buffer, grid, and video metadata. | [Result](../include/sglang/media_preprocess.h#L26)<!-- prefix: "struct Media" --> |
 
 ## Runtime path
@@ -44,7 +44,7 @@ Call `preprocess_video` with `DecodedRgb`, `VideoMetadata`, and one of these pro
 `sample_video_frames` targets two frames per second and at least four frames when available.
 It caps the count at the source length or 768, whichever is smaller, and rounds down to an even count.
 It spaces indices from the first to the last source frame and truncates interior positions to integers.
-[Sampler](../src/media_preprocess.cpp#L177)<!-- prefix: "std::vector\u003c" -->
+[Sampler](../src/media_preprocess.cpp#L177)<!-- prefix: "std::vector<" -->
 
 The checkpoint video sizing rule adjusts a short edge below 32 before it computes the final dimensions.
 It aligns each axis to 32 and uses targets of 4,096 and 25,165,824 pixel-frames.
@@ -71,7 +71,7 @@ An odd video selection repeats the last frame in the final temporal pair.
 For source indices `a` and `b`, the center is `(a / source_fps + b / source_fps) / 2`.
 The final odd pair uses the same source index twice.
 These centers use source FPS and frame ordinals. A caller that needs container timestamps must track them separately.
-[Timestamp centers](../src/media_preprocess.cpp#L165)<!-- prefix: "std::vector\u003c" -->
+[Timestamp centers](../src/media_preprocess.cpp#L165)<!-- prefix: "std::vector<" -->
 
 ## Constraints and failure behavior
 

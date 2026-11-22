@@ -147,7 +147,8 @@ HttpRequest parse_request_line(std::string_view line) {
             std::string(query)};
 }
 
-std::size_t content_length(std::string_view headers, HttpRequest& request) {
+std::size_t content_length(std::string_view headers, HttpRequest& request,
+                           TokenizationRoute tokenization) {
     std::optional<std::size_t> length;
     std::optional<std::string_view> content_type;
     while (!headers.empty()) {
@@ -204,21 +205,22 @@ std::size_t content_length(std::string_view headers, HttpRequest& request) {
             throw HttpError("415 Unsupported Media Type", "Expected application/json");
         }
     }
-    if ((tokenization_route(request) != TokenizationRoute::none ||
+    if ((tokenization != TokenizationRoute::none ||
          (request.method == "POST" && request.route_path() == score_route)) &&
         (!content_type ||
          !ascii_case_equal(content_type->substr(0, content_type->find(';')), "application/json"))) {
-        if (request.route_path() == anthropic_count_route) {
+        if (tokenization == TokenizationRoute::anthropic_count) {
             throw HttpError("400 Bad Request",
                 "header.content-type: Unsupported Media Type: Only 'application/json' is allowed");
         }
         throw HttpError("400 Bad Request",
                         "Unsupported Media Type: Only 'application/json' is allowed");
     }
+    request.body_is_json = json_media_type(content_type.value_or(""));
     const auto path = request.route_path();
     if (request.method == "POST" &&
         (path == separate_reasoning_route || path == parse_function_call_route) &&
-        length.value_or(0) != 0 && !json_media_type(content_type.value_or(""))) {
+        length.value_or(0) != 0 && !request.body_is_json) {
         throw HttpError("400 Bad Request", "Input should be a valid dictionary");
     }
     return length.value_or(0);
@@ -231,10 +233,12 @@ struct IncomingRequest {
     Clock::time_point last_read = Clock::now();
     const Clock::time_point deadline = last_read + io_timeout;
     std::optional<HttpRequest> request;
+    TokenizationRoute tokenization = TokenizationRoute::none;
+    bool count_overridden = false;
 
     Clock::time_point replace_after() const { return last_read + reader_idle_grace; }
 
-    bool read_chunk();
+    bool read_chunk(const AnthropicCountOverride& overrides_count);
     bool complete() const { return request && request->body.size() == length; }
 
 private:
@@ -242,7 +246,7 @@ private:
     std::size_t length = 0;
 };
 
-bool IncomingRequest::read_chunk() {
+bool IncomingRequest::read_chunk(const AnthropicCountOverride& overrides_count) {
     char buffer[16 * 1024];
     auto& bytes = request ? request->body : headers;
     const auto limit = request ? length : max_header_bytes;
@@ -263,7 +267,13 @@ bool IncomingRequest::read_chunk() {
         }
         std::string_view fields(headers.data(), end + 2);
         request.emplace(parse_request_line(take_line(fields)));
-        length = content_length(fields, *request);
+        tokenization = tokenization_route(*request);
+        count_overridden = tokenization == TokenizationRoute::anthropic_count &&
+            overrides_count && overrides_count(*request);
+        if (count_overridden) {
+            tokenization = TokenizationRoute::none;
+        }
+        length = content_length(fields, *request, tokenization);
         request->body = headers.substr(end + 4, length);
         headers.clear();
     }
@@ -271,7 +281,8 @@ bool IncomingRequest::read_chunk() {
 }
 
 bool read_pending(IncomingRequest& incoming, short events,
-                  const std::function<void(Socket&, HttpRequest)>& handle) {
+                  const std::function<void(Socket&, HttpRequest)>& handle,
+                  const AnthropicCountOverride& overrides_count) {
     if (stopping() || incoming.deadline <= Clock::now() || (events & terminal_events)) {
         return false;
     }
@@ -279,7 +290,7 @@ bool read_pending(IncomingRequest& incoming, short events,
         return true;
     }
     try {
-        if (!incoming.read_chunk()) {
+        if (!incoming.read_chunk(overrides_count)) {
             return false;
         }
         if (!incoming.complete()) {
@@ -287,11 +298,12 @@ bool read_pending(IncomingRequest& incoming, short events,
         }
         handle(incoming.socket, std::move(*incoming.request));
     } catch (const HttpError& error) {
-        if (incoming.request && incoming.request->route_path() == anthropic_count_route) {
+        if (incoming.request && !incoming.count_overridden &&
+            incoming.request->route_path() == anthropic_count_route) {
             write_anthropic_error(incoming.socket, error.status, "invalid_request_error",
                                   error.what());
         } else if (incoming.request &&
-                   (tokenization_route(*incoming.request) != TokenizationRoute::none ||
+                   (incoming.tokenization != TokenizationRoute::none ||
                                  incoming.request->route_path() == separate_reasoning_route ||
                                  incoming.request->route_path() == parse_function_call_route ||
                                  incoming.request->route_path() == score_route)) {
@@ -454,7 +466,8 @@ static void accept_next(const Socket& listener, std::list<IncomingRequest>& inco
 }
 
 void read_connections(const Socket& listener, int capacity,
-                      const std::function<void(Socket&, HttpRequest)>& handle) {
+                      const std::function<void(Socket&, HttpRequest)>& handle,
+                      const AnthropicCountOverride& overrides_count) {
     const auto limit = static_cast<std::size_t>(capacity);
     std::list<IncomingRequest> incoming;
     std::vector<pollfd> sockets;
@@ -493,7 +506,7 @@ void read_connections(const Socket& listener, int capacity,
         }
         std::size_t index = 1;
         for (auto it = incoming.begin(); it != incoming.end();) {
-            if (read_pending(*it, sockets[index++].revents, handle)) {
+            if (read_pending(*it, sockets[index++].revents, handle, overrides_count)) {
                 ++it;
             } else {
                 it = incoming.erase(it);
@@ -526,8 +539,9 @@ static bool write_response(const Socket& connection, std::string_view status,
     return send_all(connection, response);
 }
 
-bool write_json(const Socket& connection, std::string_view status, std::string_view json) {
-    return write_response(connection, status, "application/json", json);
+bool write_json(const Socket& connection, std::string_view status, std::string_view json,
+                bool head_only) {
+    return write_response(connection, status, "application/json", json, {}, head_only);
 }
 
 void write_raw_response(const Socket& connection, std::string_view status, std::string_view body) {

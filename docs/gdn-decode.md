@@ -8,7 +8,7 @@ Packed gated delta network (GDN) decode updates recurrent state and convolution 
 | --- | --- | --- |
 | Batch graph | Bind each row to its request's state. | [Batch runtime](batch-graphs.md#runtime-path) |
 | Scratch | Own normalized vectors and gate values for the batch. | [Scratch allocation](../src/text/decoder_graph_packed.cpp#L187)<!-- prefix: "rows_.normal" --> |
-| Dispatch | Select the three launches by submitted width. | [GDN dispatch](../src/text/decoder_graph_ops.cu#L403)<!-- prefix: "if (rows \u003e= " --> |
+| Dispatch | Select the three launches by submitted width. | [GDN dispatch](../src/text/decoder_graph_ops.cu#L403)<!-- prefix: "if (rows >= " --> |
 | Convolution | Prepare the inputs to recurrence and advance wide-path history. | [Packed convolution](../src/text/decoder_graph_ops.cu#L63)<!-- prefix: "__global__ v" --> |
 | Recurrence | Update each request's FP32 state and write the BF16 observable. | [Scalar recurrence](../src/text/decoder_graph_ops.cu#L121)<!-- prefix: "__global__ v" --> · [Streaming recurrence](../src/text/decoder_graph_ops.cu#L181)<!-- prefix: "__global__ v" --> |
 | Finish | Apply gated RMS normalization and advance narrow-path history. | [Packed finish](../src/text/decoder_graph_ops.cu#L259)<!-- prefix: "__global__ v" --> |

@@ -6,13 +6,13 @@ Multi-token prediction (MTP) drafts candidates and verifies them in order agains
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L286)<!-- prefix: "BatchService" --> |
+| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L288)<!-- prefix: "BatchService" --> |
 | MTP round | Draft proposals and commit target outputs in order. | [Proposals](../src/decoder_verify.cpp#L130)<!-- prefix: "bool MtpRoun" --> · [Commit](../src/decoder_verify.cpp#L180)<!-- prefix: "bool MtpRoun" --> |
 | Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_forward.cpp#L485)<!-- prefix: "bool Decoder" --> · [State commit](../src/decoder_verify.cpp#L344)<!-- prefix: "void TargetV" --> |
 
 ## Runtime path
 
-`sglang-server` and `sglang-generate` default to MTP depth four (K4). Use `--mtp-steps 0` to disable MTP (K0). Values `1`–`4` limit draft proposals per round. Both commands accept `--mtp-k` as an alias. C++ `DecoderOptions` defaults to K0. [Depth option](../apps/sglang-server.cpp#L146)<!-- prefix: "} else if (o" --> · [Server default](../apps/sglang-server.cpp#L36)<!-- prefix: "int mtp_step" --> · [Generator default](../apps/sglang-generate.cpp#L128)<!-- prefix: "arguments.op" --> · [C++ options](../include/sglang/decoder.h#L35)<!-- prefix: "int mtp_step" -->
+`sglang-server` and `sglang-generate` default to MTP depth four (K4). Use `--mtp-steps 0` to disable MTP (K0). Values `1`–`4` limit draft proposals per round. Both commands accept `--mtp-k` as an alias. C++ `DecoderOptions` defaults to K0. [Depth option](../apps/sglang-server.cpp#L147)<!-- prefix: "} else if (o" --> · [Server default](../apps/sglang-server.cpp#L37)<!-- prefix: "int mtp_step" --> · [Generator default](../apps/sglang-generate.cpp#L128)<!-- prefix: "arguments.op" --> · [C++ options](../include/sglang/decoder.h#L35)<!-- prefix: "int mtp_step" -->
 
 At capacities 1–32, the server supports MTP for text completions, text-only chat, and native prompts, including sampling and [constraints](output-constraints.md). If you omit the depth option, jobs with [token logprobs](native-generate.md#token-logprobs) use K0. At explicit positive depth, these requests return HTTP 400. [Media requests](multimodal-decoder.md) use K0. [Tensor-core prefix reuse](prefix-cache.md#runtime-path) uses K0 server-wide. `Decoder::generate` uses one batch lane for MTP. [Logprob policy](../include/sglang/server/batch_service.h#L122)<!-- prefix: "bool support" --> · [Single-prompt selection](../apps/server/batch_service.cpp#L894)<!-- prefix: "job-\u003eoptions" --> · [Batch selection](../apps/server/batch_service.cpp#L598)<!-- prefix: "job-\u003eoptions" -->
 

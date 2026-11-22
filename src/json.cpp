@@ -135,7 +135,7 @@ Value Parser::object(std::size_t depth, bool ordered) {
                 } else {
                     fail("duplicate JSON object key");
                 }
-            } else if (syntax_ == Syntax::last_key_wins) {
+            } else if (syntax_ == Syntax::last_key_wins || syntax_ == Syntax::http_body) {
                 result.insert_or_assign(std::move(key), std::move(entry));
             } else if (!result.emplace(std::move(key), std::move(entry)).second) {
                 fail("duplicate JSON object key");
@@ -227,7 +227,7 @@ Value Parser::number() {
     if (parsed.ec == std::errc::result_out_of_range && parsed.ptr == end) {
         if (syntax_ == Syntax::benchmark || syntax_ == Syntax::checkpoint ||
             syntax_ == Syntax::tool_history || syntax_ == Syntax::chat_tokenization ||
-            syntax_ == Syntax::anthropic_count) {
+            syntax_ == Syntax::anthropic_count || syntax_ == Syntax::http_body) {
             const auto ranged = ranged_number(text);
             if (ranged && (syntax_ == Syntax::checkpoint || syntax_ == Syntax::anthropic_count ||
                            *ranged == 0.0)) {

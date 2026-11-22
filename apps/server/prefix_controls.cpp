@@ -7,6 +7,7 @@
 #include "sglang/server/completions.h"
 #include "sglang/server/flush_cache.h"
 #include "sglang/server/http.h"
+#include "sglang/server/ollama_discovery.h"
 #include "sglang/server/parse_function_call.h"
 #include "sglang/utf8.h"
 
@@ -286,10 +287,11 @@ public:
                     std::string_view health, bool prefix_controls, const BatchGenerate& generate,
                     const Tokenization& tokenize, std::string_view model_info,
                     const NativeAbort& abort, const ServerInfo& server_info,
-                    const BatchScore& score)
+                    const BatchScore& score, const OllamaDiscovery* discovery)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
           tokenize_(tokenize), abort_(abort), health_(health), model_info_(model_info),
-          server_info_(server_info), score_(score), prefix_controls_(prefix_controls) {}
+          server_info_(server_info), score_(score), discovery_(discovery),
+          prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -315,7 +317,13 @@ private:
     bool server_info_route(std::string_view path) const {
         return server_info_ && (path == "/server_info" || path == "/get_server_info");
     }
-    bool redirects_to(std::string_view path) const;
+    struct NativeRoute {
+        std::string_view allow;
+        bool full = false;
+        bool after_discovery = false;
+    };
+
+    NativeRoute native_route(std::string_view path, std::string_view method) const;
     void serve_control(Socket& connection, const HttpRequest& request);
     void queue_health(Socket& connection, const HttpRequest& request);
     void queue_reset(Socket& connection, const HttpRequest& request);
@@ -335,6 +343,7 @@ private:
     const std::string_view model_info_;
     const ServerInfo& server_info_;
     const BatchScore& score_;
+    const OllamaDiscovery* discovery_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -587,27 +596,53 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
     throw HttpError("404 Not Found", routes.c_str());
 }
 
-bool ConnectionQueue::redirects_to(std::string_view path) const {
-    return path == "/flush_cache" || path == "/health" || path == "/health_generate" ||
-           path == "/ready" || path == "/v1/completions" || path == "/v1/chat/completions" ||
-           path == "/v1/models" || model_retrieval_route(path) ||
-           (generate_ && path == "/generate") || (abort_ && path == "/abort_request") ||
-           (tokenize_ && (path == "/tokenize" || path == "/v1/tokenize" ||
-                          path == "/detokenize" || path == "/v1/detokenize" ||
-                          path == anthropic_count_route)) ||
-           (!model_info_.empty() && (path == "/model_info" || path == "/get_model_info")) ||
-           path == separate_reasoning_route || path == parse_function_call_route ||
-           server_info_route(path) || (score_ && path == score_route) ||
-           (prefix_controls_ && (path == "/metrics" || path == "/reset_prefix_cache" ||
-                                  path == "/start_profile" || path == "/stop_profile"));
+ConnectionQueue::NativeRoute ConnectionQueue::native_route(std::string_view path,
+                                                           std::string_view method) const {
+    if (path == "/flush_cache") {
+        return {"GET, POST", method == "GET" || method == "POST"};
+    }
+    if (generate_ && path == "/generate") {
+        return {"POST, PUT", method == "POST" || method == "PUT"};
+    }
+    if (tokenize_ && path == anthropic_count_route) {
+        return {"POST", method == "POST", true};
+    }
+    if (path == "/health" || path == "/health_generate" || path == "/ready" ||
+        path == "/v1/models" || model_retrieval_route(path) || server_info_route(path) ||
+        (!model_info_.empty() && (path == "/model_info" || path == "/get_model_info")) ||
+        (prefix_controls_ && path == "/metrics")) {
+        return {"GET", method == "GET"};
+    }
+    if (path == "/v1/completions" || path == "/v1/chat/completions" ||
+        path == separate_reasoning_route || path == parse_function_call_route ||
+        (abort_ && path == "/abort_request") || (score_ && path == score_route) ||
+        (tokenize_ && (path == "/tokenize" || path == "/v1/tokenize" ||
+                       path == "/detokenize" || path == "/v1/detokenize")) ||
+        (prefix_controls_ && (path == "/reset_prefix_cache" ||
+                              path == "/start_profile" || path == "/stop_profile"))) {
+        return {"POST", method == "POST"};
+    }
+    return {};
 }
 
 void ConnectionQueue::route(Socket& connection, HttpRequest request) {
-    const std::string_view path = request.path;
-    if (!path.empty() && path.back() == '/' && !model_retrieval_route(path)) {
-        const auto canonical = path.substr(0, path.find_last_not_of('/') + 1);
-        if (redirects_to(matchable_route_path(canonical))) {
-            write_redirect(connection, request, canonical);
+    const auto native = native_route(request.route_path(), request.method);
+    if (discovery_ && (!native.full || native.after_discovery)) {
+        const auto earlier_allow = native.after_discovery ? std::string_view{} : native.allow;
+        if (discovery_->respond_exact(connection, request, native.full, earlier_allow)) {
+            return;
+        }
+    }
+    if (native.allow.empty()) {
+        const std::string_view path = request.path;
+        if (!path.empty() && path.back() == '/') {
+            const auto canonical = path.substr(0, path.find_last_not_of('/') + 1);
+            if (!native_route(matchable_route_path(canonical), request.method).allow.empty()) {
+                write_redirect(connection, request, canonical);
+                return;
+            }
+        }
+        if (discovery_ && discovery_->respond_unmatched(connection, request)) {
             return;
         }
     }
@@ -687,6 +722,8 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
 void ConnectionQueue::read(const Socket& listener) {
     read_connections(listener, capacity_ + 1, [&](Socket& connection, HttpRequest request) {
         handle_errors(connection, [&] { route(connection, std::move(request)); });
+    }, [&](const HttpRequest& request) {
+        return discovery_ && discovery_->matches_show(request);
     });
 }
 
@@ -837,12 +874,12 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        bool prefix_controls, const BatchGenerate& generate,
                        const Tokenization& tokenize, std::string_view model_info,
                        const NativeAbort& abort, const ServerInfo& server_info,
-                       const BatchScore& score) {
+                       const BatchScore& score, const OllamaDiscovery* discovery) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
-                          tokenize, model_info, abort, server_info, score);
+                          tokenize, model_info, abort, server_info, score, discovery);
     std::vector<std::thread> workers;
     workers.reserve(max_active + (abort ? 3 : 2));
     std::mutex failure_mutex;

@@ -77,3 +77,21 @@ Require bitwise BF16 parity and the 320×1 CTA grid for the paired shape. Check 
 For attention output quantization, compare every E4M3 byte and FP32 scale with the scalar control in eager and graph replay. Check the warp grid at 1,024×6,144. Check the scalar grid for neighboring shapes, partial groups, and misaligned vector inputs or outputs. Include a scale buffer shifted by one float, which must retain the warp grid. Replay checkpoint GDN outputs to check bitwise parity through the output projection and measure isolated quantization time.
 
 For fused RMSNorm parity, compare BF16 rows, E4M3 bytes, and FP32 scales bitwise in eager and graph replay. Exercise the packed buckets and shape and alignment fallbacks. The operator timing probe uses graph replay with checkpoint gains and fixed synthetic activation buffers. Use the [serving workloads](performance.md#native-concurrent-workloads) to measure request-level performance.
+
+### Held-out model quality
+
+The native study exercised `exact` and explicit `tensor-core-mtp-target` at K0 and K4. It used the Qwen3.8-27B-FP8 checkpoint on one B200, with graphs enabled, prefix reuse off, 32 slots, and an 8,192-token step cap. It compared the shared text and JSON-schema cases with full-checkpoint SGLang `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. SGLang used deterministic eager execution, Triton kernels, FP32 recurrent state, and no speculation.
+
+| Check | Native exact | Native tensor-core target | SGLang |
+| --- | ---: | ---: | ---: |
+| Correct unconstrained visible answers | 10/17 | 11/17 | 11/17 |
+| Correct visible answers with thinking enabled | 4/4 | 4/4 | 4/4 |
+| Correct typed JSON under a schema | 2/2 | 2/2 | 2/2 |
+| Mean teacher NLL at the first answer token (17 rows, nats) | 1.23333 | 1.14192 | 1.09220 |
+| Mean teacher NLL during decode (64 rows, nats) | 0.25424 | 0.22718 | 0.23879 |
+
+Both native K4 policies matched their own K0 on 29 greedy cases and nine seeded cases. The seeded cases used temperature 0.85, top-k 32, and top-p 1. CPU replay matched 144 draws per native K0 policy and 144 SGLang draws under their respective sampler rules. Direct kernel traces confirmed tensor-core dispatch for native constrained generation, chat with a schema, thinking chat, and K0 generated logprobs.
+
+The 17 authored prompts span language, math, code, and five non-English languages. The base prompts used 26–67 input IDs, and the four thinking variants used 70–93. Fixed-history comparisons used one canonical answer per prompt and included terminal IDs. The study graded visible answers and counted latent reasoning IDs separately. It leaves broader reasoning quality, long contexts, and other sampling settings unmeasured.
+
+The measured native tree `c6ef0daf79e2f4f4a495d338dc96bfb81f5bc43d` is the tree of `904e1a12ea45d1696128b6b36160367c9a4f85f7`. Its target forward and prefill sources match publication `99c523d95c47788f6c872c6c5428c28418d395eb`. The study predates the optional INT8 draft head and OpenAI Responses. The server default remains `exact`, with the INT8 draft head opt-in. [Target selection](../src/decoder_forward.cpp#L743)<!-- prefix: "is_b200() &&" --> · [FP8 default](../apps/sglang-server.cpp#L31)<!-- prefix: "sglang::Fp8P" --> · [INT8 default](../apps/sglang-server.cpp#L41)<!-- prefix: "bool mtp_int" -->

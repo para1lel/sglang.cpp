@@ -107,6 +107,24 @@ class OpenAILogprobs(unittest.TestCase):
                 self.assertEqual(many["usage"]["prompt_tokens"], expected_usage)
                 self.assertEqual(many["usage"]["completion_tokens"], 10)
 
+    def test_indexed_choices_share_prompt_usage(self):
+        for route in (TEXT, CHAT):
+            scalar = self.exchange(route, self.payload(route, seed=11, max_tokens=3))
+            reference = scalar["choices"][0]
+            prompt_tokens = scalar["usage"]["prompt_tokens"]
+            for count in (2, 4):
+                with self.subTest(route=route, n=count):
+                    answer, grouped = self.pair(
+                        route, self.payload(route, seed=11, max_tokens=3, n=count))
+                    self.assertEqual([choice["index"] for choice in answer["choices"]],
+                                     list(range(count)))
+                    self.assertEqual(answer["usage"]["prompt_tokens"], prompt_tokens)
+                    self.assertEqual(answer["usage"]["completion_tokens"], 3 * count)
+                    self.assertEqual(answer["usage"]["total_tokens"], prompt_tokens + 3 * count)
+                    for choice in answer["choices"]:
+                        self.assertEqual(choice, reference | {"index": choice["index"]})
+                        self.assertGreater(len(grouped[choice["index"]]), 1)
+
     def test_chat_and_completion_bytes_and_stops(self):
         for route in (TEXT, CHAT):
             with self.subTest(route=route):
@@ -210,10 +228,11 @@ class OpenAILogprobs(unittest.TestCase):
     def test_validation_opt_out_and_frozen_legacy(self):
         for route, invalid in (
             (TEXT, ({"logprobs": False}, {"logprobs": -1}, {"logprobs": 21},
-                    {"logprobs": 1.5}, {"echo": "true"}, {"n": 2}, {"regex": "A+"},
+                    {"logprobs": 1.5}, {"echo": "true"}, {"n": 0}, {"n": 5}, {"regex": "A+"},
                     {"temperature": .5})),
             (CHAT, ({"logprobs": 1}, {"top_logprobs": -1}, {"top_logprobs": 21},
-                    {"top_logprobs": 1.5}, {"n": 2}, {"regex": "A+"}, {"temperature": .5})),
+                    {"top_logprobs": 1.5}, {"n": 0}, {"n": 5}, {"regex": "A+"},
+                    {"temperature": .5})),
         ):
             for options in invalid:
                 with self.subTest(route=route, options=options):

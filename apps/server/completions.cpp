@@ -235,7 +235,7 @@ void dispatch_completion(const Socket& connection, BatchService& service, int sl
     }
     if (const auto* text = tokenizer ? native_text_body(parsed) : nullptr) {
         auto completion = parse_text_request(*text, *tokenizer);
-        if (!completion.batch.empty()) {
+        if (!completion.batch.empty() || completion.request.choices > 1) {
             complete_text_batch(connection, std::move(completion), *tokenizer, service, slot);
         } else if (completion.request.options.generated_top_logprobs >= 0) {
             complete_scored_text(connection, completion.request, *tokenizer, service, slot);

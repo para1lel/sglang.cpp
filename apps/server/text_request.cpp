@@ -341,6 +341,10 @@ TextRequest text_options(const json::Object& object, const CompletionTokenizer& 
                          bool chat) {
     TextRequest request;
     request.chat = chat;
+    const auto* choices = json::get(object, "n");
+    const auto count = choices ? choices->unsigned_integer().value_or(0) : 1;
+    if (count < 1 || count > 4) bad_request("Expected n between 1 and 4");
+    request.choices = count;
     request.stream = read_bool(object, "stream");
     request.return_token_ids = read_bool(object, "return_token_ids");
     request.options.temperature = 1.0;
@@ -471,9 +475,6 @@ TextCompletionRequest parse_text(const json::Object& object,
         }
         bad_request("Expected model Qwen3.8-27B-FP8");
     }
-    if (const auto* count = json::get(object, "n"); count && count->unsigned_integer() != 1) {
-        bad_request("Expected n to be 1");
-    }
     const auto* prompt = json::get(object, "prompt");
     const auto* list = prompt ? prompt->array() : nullptr;
     if (!prompt || (!prompt->string() && (!list || list->empty()))) {
@@ -492,6 +493,7 @@ TextCompletionRequest parse_text(const json::Object& object,
         finish_options(request, object, tokenizer);
         return completion;
     }
+    if (request.choices > 1) bad_request("Multiple choices require a single completion prompt");
     if (list->size() > decoder_batch_max_lanes) {
         bad_request("Expected 1 to 32 completion batch items");
     }
@@ -534,15 +536,11 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
         } else if ((key == "temperature" || key == "top_p" || key == "top_k" ||
                     key == "min_p" || key == "seed") && value.is_null()) {
             continue;
-        } else if (is_text_option(key) || key == "top_logprobs") {
+        } else if (is_text_option(key) || key == "top_logprobs" || key == "n") {
             options.emplace(key, value);
         } else if (key == "max_completion_tokens") {
             if (!value.is_null()) {
                 options.insert_or_assign("max_tokens", value);
-            }
-        } else if (key == "n") {
-            if (value.unsigned_integer() != 1) {
-                bad_request("Only n=1 is supported");
             }
         } else if (media && key == "add_special_tokens") {
             if (value.boolean() != false) {
@@ -973,6 +971,9 @@ TextRequest parse_chat_request(const json::OrderedObject& chat,
         bad_request("Generated logprobs do not support decoded media chat");
     }
     const auto tools = chat_tools(normalized);
+    if (request.choices > 1 && (media || !tools.tools.empty())) {
+        bad_request("Multiple chat choices support text without tools");
+    }
     const auto prompt = tokenizer.chat_template().render(normalized, ChatInput::http, tools);
     validate_prompt(prompt);
     encode_prompt(request.prompt, request.options.max_new_tokens, prompt, tokenizer);

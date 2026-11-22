@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L199)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L619)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
-| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L884)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L921)<!-- prefix: "std::vector<" --> |
+| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L882)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L919)<!-- prefix: "std::vector<" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L395)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L960)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L645)<!-- prefix: "bool BatchSe" --> |
 | Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L144)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L294)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L330)<!-- prefix: "void stream_" --> |
@@ -123,7 +123,7 @@ An unscored and unconstrained scalar prompt with `n: 1` and no text stops uses I
 ### Token logprobs
 
 Set top-level `return_logprob: true` and `sampling_params.temperature: 0`. Scoring uses unconstrained greedy decoding. Batches can mix scored and unscored items. See the [server MTP policy](mtp.md#runtime-path) for scored items.
-[Validation](../apps/server/text_request.cpp#L848)<!-- prefix: "void generat" --> · [MTP check](../apps/server/native_generate.cpp#L403)<!-- prefix: "if (scored &" -->
+[Validation](../apps/server/text_request.cpp#L846)<!-- prefix: "void generat" --> · [MTP check](../apps/server/native_generate.cpp#L403)<!-- prefix: "if (scored &" -->
 
 | Top-level field | Accepted values |
 | --- | --- |
@@ -163,7 +163,7 @@ Send one JSON object. The parser rejects duplicate keys, nesting beyond 32 conta
 Supply exactly one non-null prompt field. A prompt array uses one prompt form. An indexed request has a prompt array, `n > 1`, or both.
 Parameter arrays have one entry per original prompt. Missing sampling keys use the defaults.
 The expanded item count is at most 32. The sum of per-prompt output budgets multiplied by `n` is at most 262,144 tokens. Each prompt plus its own budget must fit the model context. The route validates these limits before decoder admission.
-[Batch form](../apps/server/text_request.cpp#L904)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/native_generate.cpp#L798)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L936)<!-- prefix: "int remainin" -->
+[Batch form](../apps/server/text_request.cpp#L902)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/native_generate.cpp#L798)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L934)<!-- prefix: "int remainin" -->
 
 | Sampling field | Accepted values and default |
 | --- | --- |
@@ -187,7 +187,7 @@ The expanded item count is at most 32. The sum of per-prompt output budgets mult
 Null uses the sampling defaults except for `max_new_tokens`. Explicit stop IDs are always validated.
 `stop` belongs inside `sampling_params`. A nested list or a non-string list element returns HTTP 400.
 The empty stop matches at the first generated step if selected by the configured order. It retains the first generated ID and returns empty text. Zero output budget still yields a length finish.
-[Stop parser](../apps/server/text_request.cpp#L79)<!-- prefix: "std::vector<" --> · [Batch options](../apps/server/text_request.cpp#L932)<!-- prefix: "const auto b" -->
+[Stop parser](../apps/server/text_request.cpp#L79)<!-- prefix: "std::vector<" --> · [Batch options](../apps/server/text_request.cpp#L930)<!-- prefix: "const auto b" -->
 Client compatibility fields accept only disabled values.
 Use `false` or null for `return_routed_experts`, and null for `lora_path`.
 Other fields return HTTP 400, including `model`, `messages`, and top-level sampling fields.

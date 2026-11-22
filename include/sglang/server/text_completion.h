@@ -14,6 +14,7 @@ struct ResponsesRequest;
 struct TextRequest {
     std::vector<int> prompt;
     DecoderOptions options;
+    std::size_t choices = 1;
     bool stream = false;
     bool include_usage = false;
     bool return_token_ids = false;

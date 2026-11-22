@@ -36,11 +36,11 @@ C++ callers consume `token`, then the first `extra_token_count` entries of `extr
 
 ### Target verification graph
 
-With `--batch-cuda-graphs`, the server can replay target verification for one unconstrained text lane with two target rows. Both zero-based positions must fit inline GQA scores. The last eligible pair is 5,118 and 5,119. Both rows use ordered exact GQA and the same two-row projection grouping as eager verification. The first eligible group runs eagerly. The next captures the verifier on the batch stream. [Group dispatch](../src/decoder_forward.cpp#L475)<!-- prefix: "if (graph &&" --> · [Row eligibility](../src/decoder_verify.cpp#L250)<!-- prefix: "bool TargetV" --> · [Capture](../src/decoder_forward.cpp#L476)<!-- prefix: "std::exchang" -->
+The default [graph policy](batch-graphs.md) permits verification replay for one unconstrained text lane with two target rows. Both positions must fit inline GQA scores. The last eligible pair is 5,118 and 5,119 (zero-based). Replay and eager verification share ordered exact GQA and two-row projection grouping. The first eligible group runs eagerly. The next captures the verifier on the batch stream. [Group dispatch](../src/decoder_forward.cpp#L475)<!-- prefix: "if (graph &&" --> · [Row eligibility](../src/decoder_verify.cpp#L250)<!-- prefix: "bool TargetV" --> · [Capture](../src/decoder_forward.cpp#L476)<!-- prefix: "std::exchang" -->
 
 Each launch refreshes tokens, positions, KV page-table descriptors and cache pointers, GDN bank pointers, and GQA score bindings. The executable reuses fixed batch-owned scratch. Draft proposals, sampling, result readback, acceptance, and state commit run outside it. C++ reports replayed slots in `verification_graph_slots`. The HTTP `graph_slots` trace reports K0 replay. [Bindings](../src/decoder_verify.cpp#L67)<!-- prefix: "void Verific" --> · [Slot mask](../include/sglang/decoder_batch.h#L48)<!-- prefix: "std::uint32_" --> · [HTTP trace](../include/sglang/server/batch_trace.h#L49)<!-- prefix: "if (stats.gr" -->
 
-Direct `Decoder::generate` verification runs eagerly. Batch verification uses eager execution for constrained requests, groups with multiple lanes, and groups with a different row count. A lane with one output token left uses ordinary eager decode. A pair starting at or beyond position 5,119 uses eager verification. Other groups in the same step can still qualify.
+Direct `Decoder::generate` verification runs eagerly. Ineligible batch groups run eagerly. A K4 round with four proposals has five target rows and runs eagerly. With one output token left, the lane uses ordinary eager decode. Other groups in the step can still qualify. `--eager` disables replay for all groups.
 
 ### Sampled MTP
 

@@ -268,9 +268,7 @@ struct DecoderBatch::State {
 
 DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
     : state_(std::make_unique<State>()) {
-    if (options.cuda_graphs) {
-        throw std::invalid_argument("The CPU decoder has no CUDA graphs");
-    }
+    std::cerr << (options.cuda_graphs ? "cpu batch cuda_graphs=1\n" : "cpu batch cuda_graphs=0\n");
 }
 
 DecoderBatch::~DecoderBatch() = default;

@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Validate graph options, construct the batch service, and report batch steps. | [CLI option](../apps/sglang-server.cpp#L91)<!-- prefix: "if (option =" --> · [Batch service](../apps/sglang-server.cpp#L285)<!-- prefix: "BatchService" --> · [Trace](../include/sglang/server/batch_trace.h#L68)<!-- prefix: "inline void " --> |
+| Server | Set graph policy, construct the batch service, and report batch steps. | [Default](../apps/sglang-server.cpp#L40)<!-- prefix: "bool batch_c" --> · [Effective policy](../apps/sglang-server.cpp#L42)<!-- prefix: "bool enable_" --> · [Batch service](../apps/sglang-server.cpp#L285)<!-- prefix: "BatchService" --> · [Trace](../include/sglang/server/batch_trace.h#L68)<!-- prefix: "inline void " --> |
 | Decoder batch | Select eligible decode steps, bind lane state, and return winners by slot. | [Batch options](../include/sglang/decoder_batch.h#L53)<!-- prefix: "struct Decod" --> · [Dispatch](../src/decoder_batch.cpp#L664)<!-- prefix: "const auto r" --> · [Readback](../src/decoder_batch.cpp#L741)<!-- prefix: "void Decoder" --> |
 | CUDA resources | Recover from eligible pre-submission failures and retain resources while completion is uncertain. | [Fallback](../src/decoder_resources.cpp#L515)<!-- prefix: "bool Allocat" --> · [Cleanup](../src/decoder_resources.cpp#L229)<!-- prefix: "CleanupError" --> |
 
@@ -14,11 +14,15 @@ The [step cap](development.md#native-streaming-server) covers prefill and decode
 
 `--trace-batches` reports `target_rows` and `step_budget`. The total charges executed prompt rows, including the first-output row, one row per ordinary decode lane, and computed target verification rows for MTP. Prefix restores, score-only full hits, draft seeding and proposals, commit replays, vision encoding, and emitted IDs stay outside the total. `prefill_rows` lists configured slots in order, with at least four entries. `width` counts selected lanes, including lanes assigned no rows. `decode` counts executed decode lanes. K0 reports `peak_request_bytes` on active steps. [Step trace](../include/sglang/server/batch_trace.h#L42)<!-- prefix: "std::cerr \u003c\u003c" -->
 
-Batch execution defaults to eager. Add `--batch-cuda-graphs` to enable replay at any [server capacity](development.md#native-streaming-server). Use `--eager` to force eager execution when prefix reuse is off. Both [prefix prefill policies](prefix-cache.md#tensor-core-scheduling) support K0 decode replay. Steps that execute MTP work suppress K0 replay. Eligible [verification groups](mtp.md#target-verification-graph) use a separate executable. [Batch construction](../apps/server/batch_service.cpp#L170)<!-- prefix: "batch = std:" -->
+`sglang-server` enables CUDA graphs by default. It still accepts `--batch-cuda-graphs`. `--eager` disables replay and requires prefix reuse off. The C++ option `DecoderBatchOptions::cuda_graphs` defaults to `false`. [CLI flags](../apps/sglang-server.cpp#L91)<!-- prefix: "if (option =" --> · [Batch options](../include/sglang/decoder_batch.h#L53)<!-- prefix: "struct Decod" -->
+
+K0 replay requires text decode without prefill rows or MTP work. Eligible [MTP groups](mtp.md#target-verification-graph) use a separate executable. [Step selection](../src/decoder_batch.cpp#L664)<!-- prefix: "const auto r" -->
 
 Each shape runs eagerly before thread-local capture on the batch stream. Each step uploads tokens, positions, and KV and GDN bindings to fixed addresses. Page tables reside on the device. Replay runs embedding, decoder layers, and scoring. Greedy, sampled, and [constrained selection](text-serving.md#finite-choice-constraints) share per-row logits. [Packed dispatch](../src/text/decoder_graph_packed.cpp#L521)<!-- prefix: "bool run_pac" -->
 
-Tensor-core K0 selects at least two eligible text decode lanes and a bucket before allocating packed scratch. Binding uses that selection. Padding preserves KV and [GDN state](gdn-decode.md). Eager and replay share [projections](long-paged-decode.md#packed-fp8-projections), GQA, and BF16 vocabulary scoring. Exact policy, MTP, and singletons use narrow or legacy dispatch. [Row selection](../src/text/decoder_graph_packed.cpp#L223)<!-- prefix: "bool PackedD" --> · [Setup order](../src/text/decoder_graph_packed.cpp#L524)<!-- prefix: "if (!PackedD" --> · [Legacy dispatch](../src/text/decoder_graph_packed.cpp#L481)<!-- prefix: "DecodeRun ru" -->
+Tensor-core prefill permits packed K0 replay for 2–32 eligible lanes. The batch selects the smallest fitting bucket (2, 4, 8, 12, 16, 24, or 32) before allocating scratch. Padding preserves KV and [GDN state](gdn-decode.md). Unpacked lanes run eagerly. [Selection](../src/text/decoder_graph_packed.cpp#L223)<!-- prefix: "bool PackedD" --> · [Remainder](../src/text/decoder_graph_packed.cpp#L573)<!-- prefix: "if (remainin" -->
+
+Both prefill policies support legacy widths 1–4. Width one has [score limits](singleton-gqa-decode.md#constraints-and-failure-behavior). Wider legacy steps run eagerly. [Legacy dispatch](../src/text/decoder_graph_packed.cpp#L481)<!-- prefix: "DecodeRun ru" -->
 
 On K0 steps without prefill rows, a packed group can read its greedy winners together. Every active packed row must use greedy selection without a constraint or requested logits transfer. Otherwise, the group keeps per-lane readback. After eager enqueue or graph replay, one asynchronous device-to-host copy transfers only active `TextLogitCandidate` records to pinned host storage. The copy runs outside capture. The batch uses the packed row order to find each request's result. It validates the token IDs after stream synchronization, before publication or retirement. Unpacked lanes keep per-lane scoring and readback. [Eligibility](../src/text/decoder_graph_packed.cpp#L531)<!-- prefix: "const bool r" --> · [Copy](../src/text/decoder_graph_packed.cpp#L388)<!-- prefix: "check(cudaMe" --> · [Slot mapping](../src/text/decoder_graph_packed.cpp#L556)<!-- prefix: "const int in" --> · [Synchronization](../src/decoder_batch.cpp#L690)<!-- prefix: "check(cudaSt" -->
 
@@ -86,7 +90,7 @@ Run the singleton probe for slot 31 warmup, replacement, and launch rejection. R
 
 Follow the [score-backed singleton checks](singleton-gqa-decode.md#verification).
 
-Set `--mtp-steps 0` for the K0 graph checks. Run the [streaming fixtures](development.md#streaming-verification) and [text checks](text-serving.md#verification) with graphs off and on. Match IDs, finish reasons, and usage. Correlate K0 masks with CUDA graph launches and batch-stream device activity. Require one executable per eligible bucket or narrow width and zero graph launches on eager steps. Check singleton decode at capacity one and at wider capacities. Check positive depths and follow the [verification graph checks](mtp.md#verification-graph-checks).
+Set `--mtp-steps 0` for the [streaming fixtures](development.md#streaming-verification) and [text checks](text-serving.md#verification). Compare default selection with `--eager`. Match IDs, finish reasons, and usage. Correlate K0 masks with CUDA graph launches and batch-stream activity. Require one executable per eligible bucket or narrow width and zero launches on eager steps. Check singleton decode at capacity one and wider capacities. For positive depths, follow the [verification graph checks](mtp.md#verification-graph-checks).
 
 Follow the [wide K0 runbook](../tests/batch/README.md#wide-k0-serving). Check full-width eager decode and narrower replay after slot reuse at capacities 16 and 32. Require a replay with logical slot 31 in the mask at capacity 32.
 
@@ -108,7 +112,7 @@ The earlier post-loader smoke used B200 GPU1 and four frozen 8,192-token W3 prom
 
 ## Timing
 
-Compare graph opt-in with batch eager on the same binary and prefill policy. To compare releases, enable batch graphs in both arms and match prefill policy. Freeze requests, arrivals, device, and warmups. Record cold capture separately and verify actual decode widths in a separate trace. Disable observers and trace output for timing. Frozen W3 and W6 begin decode above the inline score capacity.
+Compare default graph selection with `--eager` on one binary. Keep prefill policy fixed and prefix reuse off. Match graph and prefill policies across releases. Freeze requests, arrivals, device, and warmups. Record cold capture separately. Verify widths in a separate trace. Disable observers and tracing for timing. Measure whole-request latency separately from replay. Frozen W3 and W6 begin decode above inline score capacity.
 
 A GPU4 decoder diagnostic compared `8b0da1a` with packed paged decode under the same tensor-core prefill policy. The median of 29 steady width-four graph steps fell from 102.799 to 27.890 ms. All 128 IDs matched. Timing excluded prefill, warmup, and graph capture. The [strict W3 timing](performance.md#native-concurrent-workloads) measures HTTP serving.
 

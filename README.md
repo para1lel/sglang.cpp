@@ -35,6 +35,10 @@ draft steps, and a Tensor Core prefix cache resolves the server default to zero 
 An explicit positive server depth requires `--fp8-prefill exact` with prefix caching
 and rejects requests for logprobs.
 
+The HTTP server enables CUDA Graph replay for eligible decode steps by default.
+`--batch-cuda-graphs` remains accepted. Pass `--eager` to disable graph replay,
+even when `--batch-cuda-graphs` is also present. Prefix caching requires omitting `--eager`.
+
 ## Serve token IDs over HTTP
 
 In the same shell, select the UUID of your reserved B200 and start the server.

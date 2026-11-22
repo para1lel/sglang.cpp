@@ -65,7 +65,7 @@ def request(port, log, output, name, route, body):
 
 def exercise(args, arm, graphs, clock=lambda: 0):
     output = args.evidence / arm
-    flags = ("--batch-cuda-graphs",) if graphs else ()
+    flags = ("--batch-cuda-graphs",) if graphs else ("--eager",)
     cases = {
         "warm": (http.TEXT, benchmark(4, 4)),
         "cross-page": (http.TEXT, benchmark(127, 32)),

@@ -67,6 +67,8 @@ def server(binary, checkpoint, out, width, *, graph=False, mtp=False, observer=N
     ]
     if graph:
         command.append("--batch-cuda-graphs")
+    elif mtp:
+        command.append("--eager")
     command.extend(("--mtp-steps", "4" if mtp else "0"))
     environment = os.environ.copy()
     if observer:

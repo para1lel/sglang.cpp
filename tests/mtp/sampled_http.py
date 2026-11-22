@@ -298,8 +298,8 @@ def check_configuration(args, width, prefill, mode, depths, flags=(), exact=None
                 if match and int(match[1]) > 1:
                     require(not GRAPH.search(step), "Multiple verifier lanes replayed a graph")
             summary["concurrent_verifiers"] = lanes
-        if mode != "graph" or depth == 0:
-            require(bool(graph_steps) == (mode == "graph"), summary)
+        if mode == "eager" or depth == 0:
+            require(bool(graph_steps) == (mode != "eager"), summary)
         print(json.dumps(summary), flush=True)
     return observed
 
@@ -392,16 +392,18 @@ def main():
     args.evidence.mkdir(parents=True)
     check_startup(args)
     graph_flag = ("--batch-cuda-graphs",)
+    eager_flag = ("--eager",)
     singleton = check_configuration(args, 1, "exact", "default", range(5))
-    eager = check_configuration(args, 1, "exact", "eager", (0, 4), (*graph_flag, "--eager"))
+    eager = check_configuration(args, 1, "exact", "eager", (0, 4), (*graph_flag, *eager_flag))
     for depth in eager:
         require(singleton[depth] == eager[depth], f"Explicit eager changed capacity-one K{depth}")
     depths = (0, 1, 4)
     exact_graph = check_configuration(args, 4, "exact", "graph", range(5), graph_flag)
-    exact_eager = check_configuration(args, 4, "exact", "eager", depths)
+    exact_eager = check_configuration(args, 4, "exact", "eager", depths, eager_flag)
     tensor_graph = check_configuration(args, 4, "tensor-core", "graph", depths,
                                        graph_flag, exact=exact_graph)
-    tensor_eager = check_configuration(args, 4, "tensor-core", "eager", depths, exact=exact_eager)
+    tensor_eager = check_configuration(args, 4, "tensor-core", "eager", depths,
+                                       eager_flag, exact=exact_eager)
     for depth in depths:
         require(exact_graph[depth] == exact_eager[depth], f"Exact graph/eager K{depth} differs")
         require(tensor_graph[depth] == tensor_eager[depth], f"Tensor graph/eager K{depth} differs")

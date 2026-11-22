@@ -242,8 +242,7 @@ def server(args):
                "--fp8-prefill", args.policy, "--mtp-steps", "0", "--trace-batches"]
     if getattr(args, "max_num_batched_tokens", None) is not None:
         command += ["--max-num-batched-tokens", str(args.max_num_batched_tokens)]
-    if args.route == "graph":
-        command.append("--batch-cuda-graphs")
+    command.append("--batch-cuda-graphs" if args.route == "graph" else "--eager")
     environment = dict(os.environ, LD_PRELOAD=str(args.activity.resolve()),
                        BATCH_GRAPH_ACTIVITY=str((args.output / "cupti.tsv").resolve()))
     log_path = args.output / "server.log"

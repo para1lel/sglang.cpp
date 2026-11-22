@@ -52,7 +52,7 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 | `mtp_steps`, `prefix_cache_entries` | Integer [server draft depth](mtp.md#runtime-path) and prefix entry capacity. Zero disables the corresponding feature. |
 | `fp8_prefill`, `sampling_defaults` | Strings selecting the prefill policy (`"exact"` or `"tensor-core"`) and sampling defaults (`"model"` or `"openai"`). |
 | `reasoning_parser`, `tool_call_parser` | JSON `null` when disabled. Enabled values are `"qwen3"` and `"qwen3_coder"`, respectively. |
-| `eager`, `trace_batches`, `batch_cuda_graphs` | Booleans for eager execution, batch tracing, and batch graph eligibility. `--eager` disables batch graphs even when the command includes `--batch-cuda-graphs`. |
+| `eager`, `trace_batches`, `batch_cuda_graphs` | Booleans for eager execution, batch tracing, and the effective [batch graph policy](batch-graphs.md). `batch_cuda_graphs` defaults to `true`. It is `false` with `--eager`, including when the command also includes `--batch-cuda-graphs`. |
 | `startup_time` | Object with one numeric field, `server_e2e`. It gives elapsed monotonic seconds from before argument parsing through listener creation, fixed for the process lifetime. |
 | `internal_states` | Array with one object for the native scheduler rank. |
 

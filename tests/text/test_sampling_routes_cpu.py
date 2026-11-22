@@ -510,6 +510,37 @@ class Routes(unittest.TestCase):
                 status, headers, data = self.wire(self.port, "HEAD", encoded)
                 self.assertEqual((status, headers["Allow"], data), (405, "GET", b""))
 
+    def test_cuda_graph_launch_defaults_and_eager_override(self):
+        graph = ("--batch-cuda-graphs",)
+        eager = ("--eager",)
+        prefix = ("--prefix-cache-entries", "1")
+        cases = (
+            ("default", (), True, 0),
+            ("legacy", graph, True, 0),
+            ("eager", eager, False, 0),
+            ("legacy-then-eager", (*graph, *eager), False, 0),
+            ("eager-then-legacy", (*eager, *graph), False, 0),
+            ("prefix", prefix, True, 1),
+        )
+        for name, flags, graphs, entries in cases:
+            with self.subTest(name=name):
+                log = self.output / f"graphs-launch-{name}.log"
+                with server(self.binary, self.checkpoint, log, *flags) as port:
+                    info = self.control(port, "/server_info")
+                    self.assertIs(info["batch_cuda_graphs"], graphs)
+                    self.assertIs(info["eager"], not graphs)
+                    self.assertEqual(info["prefix_cache_entries"], entries)
+                    expected_receipt = f"cpu batch cuda_graphs={int(graphs)}"
+                    self.assertIn(expected_receipt, log.read_text().splitlines())
+
+        for flags in (eager, (*graph, *eager), (*eager, *graph)):
+            with self.subTest(prefix=flags):
+                result = subprocess.run([str(self.binary), *prefix, *flags],
+                                        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("--prefix-cache-entries requires omitting --eager", result.stderr)
+
     def test_mtp_launch_depth_with_prefix_cache(self):
         prefix = ("--prefix-cache-entries", "1")
         tensor = (*prefix, "--fp8-prefill", "tensor-core")

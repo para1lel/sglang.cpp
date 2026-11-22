@@ -37,7 +37,7 @@ struct Arguments {
     bool mtp_steps_explicit = false;
     bool eager = false;
     bool trace_batches = false;
-    bool batch_cuda_graphs = false;
+    bool batch_cuda_graphs = true;
 
     bool enable_batch_cuda_graphs() const { return batch_cuda_graphs && !eager; }
 };
@@ -262,7 +262,7 @@ int main(int argc, char** argv) {
                   << " by default, range 1-32768.\n"
                      "MTP steps: 4 by default, range 0-4. --mtp-k is an alias.\n"
                      "Default MTP uses 0 steps for logprobs and with a Tensor Core prefix cache.\n"
-                     "Batch graphs: enable graph replay for eligible decode steps.\n"
+                     "Batch graphs: enabled by default for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
                      "Prefix cache: disabled by default. Omit --eager. MTP requires exact.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n"

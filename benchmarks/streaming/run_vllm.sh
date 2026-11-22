@@ -84,7 +84,7 @@ export CUDA_HOME=/usr/local/cuda-13.2
 export PATH="$root/venv/bin:$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$base/software/cuda-compat-13.4/usr/local/cuda-13.4/compat"
 export CC=/usr/bin/gcc CXX=/usr/bin/g++ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$run
-export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890
+export http_proxy=http://127.0.0.1:12233 https_proxy=http://127.0.0.1:12233
 export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy ALL_PROXY=$https_proxy
 export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
 unset PYTHONHOME CFLAGS CXXFLAGS CPPFLAGS LDFLAGS

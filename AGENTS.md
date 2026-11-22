@@ -29,8 +29,8 @@ Keep Python packages in Pixi, executables under the user's `bin`, runtimes in `s
 configuration in `config` and disposable output in `cache` or ignored project `artifacts/`.
 Use the configured centralized directory for additional Pixi environments and the existing npm
 prefix for global Node tools. Use the host driver and user CUDA 13.4 compatibility libraries.
-For network operations use the local Mihomo mixed proxy at `127.0.0.1:7890` with its existing
-rule-mode routing. Keep weights at `/data0/shared/Qwen3.8-27B-FP8`.
+Use the local HTTP proxy at `127.0.0.1:12233` for network operations.
+Keep weights at `/data0/shared/Qwen3.8-27B-FP8`.
 
 ## Integrating changes
 

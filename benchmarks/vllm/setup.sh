@@ -12,7 +12,7 @@ index=https://wheels.vllm.ai/$pin/cu132/vllm/
 url=https://wheels.vllm.ai/$pin/${name/+/%2B}
 torch_name=torch-2.14.0+cu132-cp312-cp312-manylinux_2_28_x86_64.whl
 torch_url=https://download-r2.pytorch.org/whl/cu132/${torch_name/+/%2B}
-export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890
+export http_proxy=http://127.0.0.1:12233 https_proxy=http://127.0.0.1:12233
 export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy ALL_PROXY=$https_proxy
 export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
 export CUDA_VISIBLE_DEVICES="" UV_CONCURRENT_DOWNLOADS=4

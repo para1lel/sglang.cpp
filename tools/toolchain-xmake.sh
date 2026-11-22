@@ -20,7 +20,7 @@ case "$#:${1:-}" in
             bundle=$(mktemp "${program}.XXXXXXXX")
             trap 'rm -f -- "$bundle"' EXIT
             curl --fail --location --silent --show-error --retry 2 --proto '=https' \
-                --proxy http://127.0.0.1:7890 --noproxy '' --output "$bundle" \
+                --proxy http://127.0.0.1:12233 --noproxy '' --output "$bundle" \
                 "$upstream/$version/xmake-bundle-$version.linux.x86_64"
             verify "$bundle"
             chmod 755 "$bundle"

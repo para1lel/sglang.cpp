@@ -606,7 +606,7 @@ void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, cons
         check(text_rms_norm_pair_rows(buffers.embedding, hidden, model.embedding_norm,
                                       model.hidden_norm, hidden_size, rows, buffers.concatenated,
                                       stream), "Normalize and concatenate MTP prefill inputs");
-        projections.project(model.fc, buffers.concatenated, buffers.embedding);
+        projections.project_seed_fc(model.fc, buffers.concatenated, buffers.embedding);
         check(text_rms_norm_rows(buffers.embedding, nullptr, model.input_norm, hidden_size, rows,
                                  buffers.layer_input, nullptr, stream),
               "Normalize MTP prefill layer input");

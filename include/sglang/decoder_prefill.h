@@ -47,10 +47,12 @@ struct PrefillProjections {
     cudaStream_t stream;
     bool tensor_core_fp8 = false;
     bool grouped_projection = false;
+    bool wmma_draft_seed = false;
 
     TextFp8ActivationView quantize(const Bf16* input, int width) const;
     void project(Fp8Weight weight, TextFp8ActivationView input, Bf16* output) const;
     void project(Bf16Weight weight, const Bf16* input, Bf16* output) const;
+    void project_seed_fc(Bf16Weight weight, const Bf16* input, Bf16* output) const;
 };
 
 class PrefillWorkspace {

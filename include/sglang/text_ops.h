@@ -76,6 +76,9 @@ cudaError_t text_bf16_gemv(const __nv_bfloat16* weight, const __nv_bfloat16* inp
 cudaError_t text_bf16_gemv_rows(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                                 int out_width, int in_width, int rows, __nv_bfloat16* output,
                                 cudaStream_t stream);
+cudaError_t text_bf16_seed_fc(const __nv_bfloat16* weight, const __nv_bfloat16* input,
+                             int out_width, int in_width, int rows, __nv_bfloat16* output,
+                             cudaStream_t stream);
 cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_width,
                            const TextBf16Projection* projections, int count, cudaStream_t stream);
 

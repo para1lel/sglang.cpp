@@ -259,7 +259,7 @@ struct Chunk : PrefillProjections {
     }
 
     void seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
-                    const Bf16* final_norm) const {
+                    const Bf16* final_norm, bool wmma) const {
         static_assert(intermediate_size >= 2 * hidden_size);
         static_assert(std::max(text_gdn_value_width, text_gqa_q_width) >= hidden_size);
         for (int offset = 0; offset < seed_rows; offset += prefill_chunk_rows) {
@@ -268,7 +268,7 @@ struct Chunk : PrefillProjections {
             check(text_rms_norm_rows(work.hidden + hidden_offset, work.residual + hidden_offset,
                                      final_norm, hidden_size, count, work.normalized, nullptr,
                                      stream), "Normalize target prompt rows for MTP");
-            const PrefillProjections projections{activation, count, stream};
+            const PrefillProjections projections{activation, count, stream, false, false, wmma};
             draft.seed_prefill(position + offset, shifted_tokens + offset, work.normalized,
                                projections,
                                {work.projected_attention, work.mlp_gate, work.attention,
@@ -871,7 +871,10 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                    },
                    [&](const Layer& layer) { chunk.mlp(layer); });
     if (draft && prompt_remaining > 1) {
-        chunk.seed_draft(*draft, tokens + 1, std::min(rows, prompt_remaining - 1), final_norm);
+        const bool wmma = tensor_core && target_split_end() == text_attention_max_tokens &&
+                          position + prompt_remaining >= wmma_seed_min_prompt_tokens;
+        chunk.seed_draft(*draft, tokens + 1, std::min(rows, prompt_remaining - 1),
+                         final_norm, wmma);
     }
     if (scores) {
         const PrefillGrant grant{&request, tokens, position, rows, rows, 0, nullptr, nullptr,
@@ -941,6 +944,16 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
         index += group.grants;
     }
     workspace->close();
+}
+
+void PrefillProjections::project_seed_fc(
+    Bf16Weight weight, const Bf16* input, Bf16* output) const {
+    if (!wmma_draft_seed) {
+        project(weight, input, output);
+        return;
+    }
+    check(text_bf16_seed_fc(weight.values, input, weight.rows, weight.columns, rows, output,
+                            stream), "Run MTP prefill seed FC");
 }
 
 }

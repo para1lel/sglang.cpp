@@ -205,4 +205,12 @@ private:
     std::unique_ptr<Model> model_;
 };
 
+namespace decoder {
+
+inline constexpr int wmma_seed_min_prompt_tokens = 4096;
+inline constexpr int wmma_seed_min_rows = 64;
+inline constexpr int wmma_seed_max_rows = 128;
+
+}
+
 }

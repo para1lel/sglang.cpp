@@ -219,7 +219,7 @@ std::string model_info_json(const Arguments& arguments) {
     body += "]}";
     return body;
 }
-
+std::string draft_seed_fc_json(const Arguments& arguments, bool wmma);
 std::string server_info_json(const Arguments& arguments, double startup_seconds,
                              const BatchRuntimeState& state, bool experimental_target_split_gqa,
                              bool experimental_long_target_split_gqa) {
@@ -268,7 +268,7 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += state.ready ? "true" : "false";
     body += R"(,"num_running_reqs":)" + std::to_string(state.running_requests);
     body += R"(,"generation_tokens_total":)" + std::to_string(state.generation_tokens);
-    return body + "}]}";
+    return body + "}]" + draft_seed_fc_json(arguments, experimental_long_target_split_gqa) + "}";
 }
 
 Socket listen(const Arguments& arguments) {
@@ -370,4 +370,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     return 0;
+}
+
+namespace {
+
+std::string draft_seed_fc_json(const Arguments& arguments, bool wmma) {
+    using namespace sglang::decoder;
+    const std::string field = R"(,"mtp_seed_fc":)";
+    if (!arguments.mtp_steps) return field + "null";
+    if (!wmma) return field + R"({"preferred":"simt_bf16_fp32"})";
+    return field + R"({"preferred":"wmma_bf16_fp32","fallback":"simt_bf16_fp32",)"
+        R"("min_prompt_tokens":)" + std::to_string(wmma_seed_min_prompt_tokens) +
+        R"(,"min_rows":)" + std::to_string(wmma_seed_min_rows) +
+        R"(,"max_rows":)" + std::to_string(wmma_seed_max_rows) + "}";
+}
+
 }

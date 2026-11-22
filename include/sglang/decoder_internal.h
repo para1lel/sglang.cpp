@@ -139,6 +139,7 @@ struct DeviceBlock {
 };
 
 class RequestBlockCache;
+class RetiredBlockReclaimer;
 
 class Allocations {
 public:
@@ -191,13 +192,14 @@ private:
 
 class RequestBlockCache {
 public:
-    explicit RequestBlockCache(int device);
+    explicit RequestBlockCache(int device, bool resident = false);
     ~RequestBlockCache();
     RequestBlockCache(const RequestBlockCache&) = delete;
     RequestBlockCache& operator=(const RequestBlockCache&) = delete;
 
     std::size_t bytes() const;
     std::size_t unavailable_bytes() const;
+    std::size_t pending_bytes() const;
     void clear();
 
 private:
@@ -207,9 +209,13 @@ private:
     bool retain(DeviceBlock block);
     void quarantine(Allocations::State& state);
 
+    void release_blocks(Allocations::State& state, bool keep);
+    std::size_t resident_bytes_limit() const;
+    std::size_t resident_blocks_limit() const;
     static constexpr std::size_t max_bytes = 768 * 1024 * 1024;
     static constexpr std::size_t max_blocks = 384;
     std::unique_ptr<Allocations::State> state_;
+    std::unique_ptr<RetiredBlockReclaimer> reclaimer_;
     std::size_t quarantined_bytes_ = 0;
     bool reusable_ = true;
 };
@@ -629,5 +635,23 @@ struct DecodeRunOptions {
 DecodeRun run_decode_lanes(const DecoderModel& model, Allocations& execution,
                            DecodeGraphs& graphs, ForwardLane* lanes, int count,
                            DecodeRunOptions options);
+
+class RetiredBlockReclaimer {
+public:
+    static constexpr std::size_t byte_limit = 3ULL * 1024 * 1024 * 1024;
+    static constexpr std::size_t block_limit = 1024;
+
+    static std::unique_ptr<RetiredBlockReclaimer> create(int device);
+    ~RetiredBlockReclaimer();
+    bool submit(DeviceBlock block);
+    std::size_t unavailable_bytes() const;
+    std::size_t pending_bytes() const;
+    void drain();
+
+private:
+    struct State;
+    RetiredBlockReclaimer(int device, cudaStream_t stream);
+    std::unique_ptr<State> state_;
+};
 
 }

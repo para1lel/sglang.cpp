@@ -2,6 +2,7 @@
 
 #include "sglang/checkpoint.h"
 #include "sglang/decoder_batch.h"
+
 #include "sglang/text/decoder_logprobs.h"
 
 #include <algorithm>
@@ -393,37 +394,6 @@ int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t
     return output;
 }
 
-std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request,
-                                   int prompt, std::size_t capacity, std::size_t charged,
-                                   std::size_t extra_bytes) {
-    const auto request_headroom = [&] {
-        const auto unavailable = retired.unavailable_bytes();
-        return capacity - std::min(capacity, charged + unavailable);
-    };
-    const auto after_reserve = [](std::size_t free) {
-        return free - std::min(free, decoder_shared_reserve);
-    };
-    const auto free = available_device_bytes();
-    const auto retained = retired.bytes();
-    const auto headroom = request_headroom();
-    request.max_new_tokens = limit_resident_output(
-        prompt, request, capacity, std::min(headroom, after_reserve(free + retained)), extra_bytes);
-    request.min_new_tokens = std::min(request.min_new_tokens, request.max_new_tokens);
-    request.incremental_kv = false;
-    const auto reserved = extra_bytes + request_resident_bytes(
-        RequestProgress::capacity(prompt, request),
-        reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
-        request.mtp_steps != 0);
-    if (reserved > after_reserve(free) || retained > headroom - reserved) {
-        retired.clear();
-        if (reserved > request_headroom() || reserved > after_reserve(available_device_bytes())) {
-            throw DecoderCapacityError("Insufficient free resident decoder memory. Retry later.",
-                                       true);
-        }
-    }
-    return reserved;
-}
-
 DeviceScope::DeviceScope(int device) {
     check(cudaGetDevice(&previous_), "Get current CUDA device");
     changed_ = device != previous_;
@@ -445,13 +415,19 @@ void DeviceScope::restore() {
     }
 }
 
-RequestBlockCache::RequestBlockCache(int device)
-    : state_(std::make_unique<Allocations::State>(device, nullptr, true)) {
-    state_->blocks.reserve(max_blocks);
+RequestBlockCache::RequestBlockCache(int device, bool resident)
+    : state_(std::make_unique<Allocations::State>(device, nullptr, true)),
+      reclaimer_(resident ? RetiredBlockReclaimer::create(device) : nullptr) {
+    state_->blocks.reserve(resident_blocks_limit());
 }
 
 RequestBlockCache::~RequestBlockCache() {
     std::shared_ptr<const void> drained_owners;
+    try {
+        clear();
+    } catch (const CudaError& error) {
+        report_cleanup(error.status, "Drain retired decoder allocations during shutdown");
+    }
     const auto error = state_->release(drained_owners);
     report_cleanup(error.status, error.operation);
     if (state_->owns_cuda()) {
@@ -467,7 +443,12 @@ std::size_t RequestBlockCache::bytes() const {
 }
 
 std::size_t RequestBlockCache::unavailable_bytes() const {
-    return quarantined_bytes_ + (state_->bytes - bytes());
+    return quarantined_bytes_ + (state_->bytes - bytes()) +
+        (reclaimer_ ? reclaimer_->unavailable_bytes() : 0);
+}
+
+std::size_t RequestBlockCache::pending_bytes() const {
+    return reclaimer_ ? reclaimer_->pending_bytes() : 0;
 }
 
 void* RequestBlockCache::take(std::size_t bytes) {
@@ -486,13 +467,32 @@ void* RequestBlockCache::take(std::size_t bytes) {
 
 bool RequestBlockCache::retain(DeviceBlock block) {
     auto& state = *state_;
-    if (!block.pointer || !reusable_ || state.blocks.size() == max_blocks ||
-        block.bytes > max_bytes - state.bytes) {
+    if (!block.pointer || !reusable_ || state.blocks.size() == resident_blocks_limit() ||
+        block.bytes > resident_bytes_limit() - state.bytes) {
         return false;
     }
     state.blocks.push_back(block);
     state.bytes += block.bytes;
     return true;
+}
+
+std::size_t RequestBlockCache::resident_bytes_limit() const {
+    return reclaimer_ ? RetiredBlockReclaimer::byte_limit : max_bytes;
+}
+
+std::size_t RequestBlockCache::resident_blocks_limit() const {
+    return reclaimer_ ? RetiredBlockReclaimer::block_limit : max_blocks;
+}
+
+void RequestBlockCache::release_blocks(Allocations::State& state, bool keep) {
+    for (std::size_t count = state.blocks.size(); count > state.uncertain_blocks; --count) {
+        const auto block = state.blocks[count - 1];
+        if ((keep && retain(block)) || (reclaimer_ && reclaimer_->submit(block))) {
+            state.blocks[count - 1] = state.blocks.back();
+            state.blocks.pop_back();
+            state.bytes -= block.bytes;
+        }
+    }
 }
 
 void RequestBlockCache::quarantine(Allocations::State& state) {
@@ -502,6 +502,8 @@ void RequestBlockCache::quarantine(Allocations::State& state) {
 }
 
 void RequestBlockCache::clear() {
+    if (!state_->uncertain && !state_->terminal) release_blocks(*state_, false);
+    if (reclaimer_) reclaimer_->drain();
     if (!state_->terminal && state_->uncertain_blocks == state_->blocks.size()) return;
     std::shared_ptr<const void> drained_owners;
     const auto error = state_->release(drained_owners);
@@ -759,13 +761,7 @@ void Allocations::recycle_after_completion() {
         return;
     }
     if (!state.uncertain && !state.terminal) {
-        auto& blocks = state.blocks;
-        const auto remaining = std::remove_if(blocks.begin(), blocks.end(), [&](DeviceBlock block) {
-            if (!state.cache->retain(block)) return false;
-            state.bytes -= block.bytes;
-            return true;
-        });
-        blocks.erase(remaining, blocks.end());
+        state.cache->release_blocks(state, true);
     }
     std::shared_ptr<const void> drained_owners;
     const auto error = state.release(drained_owners);

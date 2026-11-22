@@ -248,7 +248,8 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
 }
 
 TargetVerification::TargetVerification(Request& request, int capacity, int prefix, int rows,
-                                       bool logits, cudaStream_t stream)
+                                       bool logits, cudaStream_t stream,
+                                       std::shared_ptr<TextLogitCandidate> winners)
     : request_(request), stream_(stream ? stream : request.memory.stream()),
       capacity_(capacity), valid_prefix_(prefix) {
     auto& memory = request.memory;
@@ -263,6 +264,12 @@ TargetVerification::TargetVerification(Request& request, int capacity, int prefi
     allocate_gdn(memory, tail_);
     eager_workspace_.emplace(memory, rows);
 
+    if (winners && !logits) {
+        host_winners_ = winners.get();
+        host_owner = std::move(winners);
+        host_logits_ = nullptr;
+        return;
+    }
     const auto winner_bytes = rows * sizeof(TextLogitCandidate);
     const auto logits_bytes = logits ? rows * vocab_size * sizeof(Bf16) : 0;
     void* host = nullptr;
@@ -409,6 +416,20 @@ int TargetVerification::winner(int index, bool sampled, bool constrained) const 
 
 const Bf16* TargetVerification::logits(int index) const {
     return host_logits_ ? host_logits_ + index * vocab_size : nullptr;
+}
+
+std::shared_ptr<TextLogitCandidate> prepare_verification_winners(int slots) {
+    check(cudaPeekAtLastError(), "Check CUDA status before allocating batch verifier results");
+    void* pinned = nullptr;
+    const auto bytes = slots * target_verify_max_rows * sizeof(TextLogitCandidate);
+    const auto status = cudaMallocHost(&pinned, bytes);
+    if (status == cudaErrorMemoryAllocation) {
+        const auto pending = cudaGetLastError();
+        if (pending != status) check(pending, "Check CUDA status before verifier fallback");
+        return {};
+    }
+    check(status, "Allocate batch verifier results");
+    return {static_cast<TextLogitCandidate*>(pinned), free_pinned};
 }
 
 }

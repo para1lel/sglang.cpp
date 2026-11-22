@@ -128,7 +128,8 @@ struct MtpRound {
 class TargetVerification {
 public:
     TargetVerification(Request& request, int capacity, int prefix, int rows, bool logits,
-                       cudaStream_t stream = nullptr);
+                       cudaStream_t stream = nullptr,
+                       std::shared_ptr<TextLogitCandidate> winners = nullptr);
 
     void begin(int position, int count, cudaStream_t stream);
     VerificationRow row(int index);
@@ -164,5 +165,7 @@ private:
     TextLogitCandidate* host_winners_;
     Bf16* host_logits_;
 };
+
+std::shared_ptr<TextLogitCandidate> prepare_verification_winners(int slots);
 
 }

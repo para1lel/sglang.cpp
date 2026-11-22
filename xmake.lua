@@ -127,7 +127,7 @@ target("sglang_decoder")
               "src/decoder_mtp.cpp", "src/decoder_prefill.cpp", "src/decoder_verify.cpp",
               "src/decoder_constraint.cpp", "src/media/decoder_media.cpp",
               "src/media/multimodal_prompt.cpp")
-    add_files("src/text/decoder_graph_packed.cpp")
+    add_files("src/text/decoder_graph_packed.cpp", "src/text/retired_request_blocks.cpp")
 
 target("sglang-generate")
     set_kind("binary")

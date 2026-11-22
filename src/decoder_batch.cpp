@@ -98,8 +98,8 @@ struct Lane {
 };
 
 struct BatchStorage {
-    BatchStorage(int device, std::shared_ptr<const Allocations> memory)
-        : weights(std::move(memory)), retired(device) {}
+    BatchStorage(int device, std::shared_ptr<const Allocations> memory, bool resident)
+        : weights(std::move(memory)), retired(device, resident) {}
     std::shared_ptr<const Allocations> weights;
     RequestBlockCache retired;
     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
@@ -107,6 +107,7 @@ struct BatchStorage {
     std::optional<VerificationGraph> verification_graph;
     std::optional<PrefixCache> prefix_cache;
     std::shared_ptr<const TcVocabScratch> tc_vocab;
+    std::shared_ptr<TextLogitCandidate> verification_winners;
 };
 void retire(std::optional<Lane>& lane) {
     if (lane && lane->request) lane->request->memory.recycle_after_completion();
@@ -271,11 +272,11 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
     return plan_budget_step(work, lanes, budget, cursor, tile);
 }
 }
-
 struct DecoderBatch::State {
     State(const Decoder::Model& owner, DecoderBatchOptions options)
         : model(owner), options(options),
-          storage(std::make_shared<BatchStorage>(owner.device, owner.memory)),
+          storage(std::make_shared<BatchStorage>(owner.device, owner.memory,
+                                                 options.resident_memory_limit.has_value())),
           tensor_cache(options.prefix_cache_entries > 0 &&
                        model.fp8_prefill() == Fp8PrefillPolicy::tensor_core),
           execution(model.device) {
@@ -287,9 +288,9 @@ struct DecoderBatch::State {
             storage->prefix_cache.emplace(model.device, options.prefix_cache_entries,
                                           !tensor_cache && model.mtp_weights != nullptr);
         }
-        if (options.cuda_graphs) {
-            storage->verification_graph.emplace(execution);
-        }
+        if (options.cuda_graphs) storage->verification_graph.emplace(execution);
+        if (options.resident_memory_limit && model.mtp_weights)
+            storage->verification_winners = prepare_verification_winners(options.max_lanes);
         execution.open_stream(storage);
         storage->tc_vocab = model.tc_vocab && options.max_lanes >= 4
             ? prepare_tc_vocab_scratch(execution) : nullptr;
@@ -313,7 +314,7 @@ struct DecoderBatch::State {
                         const std::array<int, decoder_batch_max_lanes>& packed_slots,
                         const DecodeRun& run, const PrefillRows& rows, Steps& results);
     std::size_t reserve(DecoderOptions& request, int prompt, std::size_t extra_bytes) const;
-    void initialize(Lane& lane);
+    void initialize(Lane& lane, int slot);
     void drain(const char* operation, std::optional<Lane>* lane = nullptr) {
         try {
             DeviceScope device(model.device);
@@ -404,7 +405,7 @@ std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
                                   charged, extra_bytes);
 }
 
-void DecoderBatch::State::initialize(Lane& lane) {
+void DecoderBatch::State::initialize(Lane& lane, int slot) {
     const auto& opts = lane.options;
     const auto stream = execution.stream();
     const int prompt = static_cast<int>(lane.prompt.size());
@@ -430,19 +431,19 @@ void DecoderBatch::State::initialize(Lane& lane) {
     lane.restored_prompt = lane.remaining_prompt() == 0;
     if (lane.resident_bytes) {
         if (const int rows = reserved_verification_rows(opts.max_new_tokens, opts.mtp_steps)) {
+            const auto& winners = storage->verification_winners;
+            const auto readback = winners ? winners.get() + slot * target_verify_max_rows : nullptr;
             lane.verification = std::make_unique<TargetVerification>(
-                *lane.request, lane.capacity(), prompt, rows, false, stream);
+                *lane.request, lane.capacity(), prompt, rows, false, stream,
+                std::shared_ptr<TextLogitCandidate>(winners, readback));
         }
-        if (lane.sampling && !opts.requires_target_only() && !sampling_workspace) {
+        if (lane.sampling && !opts.requires_target_only() && !sampling_workspace)
             sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
-        }
-        if (opts.constraint && !opts.requires_target_only()) {
+        if (opts.constraint && !opts.requires_target_only())
             constraint_workspace.allocate(execution, opts.constraint->uses_wide_mask());
-        }
     }
     check(cudaStreamSynchronize(stream), "Initialize decoder batch slot");
 }
-
 int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& requested,
                              const std::vector<DecoderMedia>* media) {
     state_->require_ready();
@@ -509,7 +510,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         if (options.samples()) lane->sampling = request_sampling(options);
         lane->media = std::move(input);
         lane->resident_bytes = resident;
-        state_->initialize(*lane);
+        state_->initialize(*lane, slot);
         device.restore();
         return lane->progress.position;
     } catch (const CudaError& error) {
@@ -996,5 +997,4 @@ Steps DecoderBatch::advance(const Selection& selected) {
 Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats* stats) {
     return state_->advance(selected, true, stats);
 }
-
 }

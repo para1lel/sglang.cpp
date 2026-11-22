@@ -2,9 +2,11 @@
 
 import argparse
 from contextlib import closing
+from email.parser import BytesHeaderParser
 import http.client
 import json
 from pathlib import Path
+import socket
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -100,6 +102,27 @@ class NativeTokenization(unittest.TestCase):
                              "valid range is [0, 248320).")
         self.check_error(post(self.port, TOKENIZE[0], {"prompt": "x", "stream": True}),
                          501, "NotImplementedError")
+
+    def test_score_methods_on_wire(self):
+        body = b'{"detail":"Method Not Allowed"}'
+        for method in ("GET", "PUT", "OPTIONS", "HEAD"):
+            with self.subTest(method=method):
+                request = (f"{method} /v1/score HTTP/1.1\r\n"
+                           f"Host: 127.0.0.1:{self.port}\r\nConnection: close\r\n\r\n")
+                with socket.create_connection(("127.0.0.1", self.port), timeout=5) as client:
+                    client.sendall(request.encode("ascii"))
+                    with client.makefile("rb") as stream:
+                        head, boundary, data = stream.read().partition(b"\r\n\r\n")
+                self.assertTrue(boundary)
+                status_line, fields = head.split(b"\r\n", 1)
+                headers = BytesHeaderParser().parsebytes(fields)
+                self.assertEqual(int(status_line.split()[1]), 405)
+                self.assertEqual(headers.get_all("Allow"), ["POST"])
+                self.assertEqual(headers.get_content_type(), "application/json")
+                self.assertEqual(headers["Content-Length"], str(len(body)))
+                self.assertEqual(data, b"" if method == "HEAD" else body)
+        status, scores = post(self.port, "/v1/score", {"items": [], "label_token_ids": [32]})
+        self.assertEqual((status, scores["scores"]), (200, []))
 
     def test_missing_tokenizer_errors_and_retry(self):
         with TemporaryDirectory(dir=self.output) as directory:

@@ -626,6 +626,13 @@ void Decoder::Model::compute_prefill_logits(Workspace& work, cudaStream_t stream
     project(lm_head, work.normalized, work.logits, stream);
 }
 
+void Decoder::Model::enqueue_label_logits(Request& request, cudaStream_t stream) const {
+    compute_prefill_logits(request.work, stream);
+    auto& logits = request.memory.transfers().logits;
+    check(cudaMemcpyAsync(logits.data(), request.work.logits, logits.size() * sizeof(logits[0]),
+                          cudaMemcpyDeviceToHost, stream), "Read final prompt logits");
+}
+
 void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode) const {
     if (decode) {
         normalize_final(work, stream);

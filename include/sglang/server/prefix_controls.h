@@ -20,6 +20,7 @@ using BatchGenerate = std::function<QueuedGenerate(std::string_view)>;
 using NativeAbort = std::function<void(const Socket&, std::string_view)>;
 using Tokenization = std::function<void(const Socket&, TokenizationRoute, std::string_view)>;
 using ServerInfo = std::function<std::string()>;
+using BatchScore = std::function<void(const Socket&, int, std::string_view)>;
 
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
@@ -27,6 +28,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const Tokenization& tokenize = Tokenization{},
                        std::string_view model_info = std::string_view{},
                        const NativeAbort& abort = NativeAbort{},
-                       const ServerInfo& server_info = ServerInfo{});
+                       const ServerInfo& server_info = ServerInfo{},
+                       const BatchScore& score = BatchScore{});
 
 }

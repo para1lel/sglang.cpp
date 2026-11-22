@@ -204,7 +204,8 @@ std::size_t content_length(std::string_view headers, HttpRequest& request) {
             throw HttpError("415 Unsupported Media Type", "Expected application/json");
         }
     }
-    if (tokenization_route(request) != TokenizationRoute::none &&
+    if ((tokenization_route(request) != TokenizationRoute::none ||
+         (request.method == "POST" && request.route_path() == score_route)) &&
         (!content_type ||
          !ascii_case_equal(content_type->substr(0, content_type->find(';')), "application/json"))) {
         if (request.route_path() == anthropic_count_route) {
@@ -292,7 +293,8 @@ bool read_pending(IncomingRequest& incoming, short events,
         } else if (incoming.request &&
                    (tokenization_route(*incoming.request) != TokenizationRoute::none ||
                                  incoming.request->route_path() == separate_reasoning_route ||
-                                 incoming.request->route_path() == parse_function_call_route)) {
+                                 incoming.request->route_path() == parse_function_call_route ||
+                                 incoming.request->route_path() == score_route)) {
             write_tokenization_error(incoming.socket, error.status, error.status.substr(4),
                                      error.what());
         } else {

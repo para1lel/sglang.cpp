@@ -333,7 +333,7 @@ bool BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& st
         jobs[slot].reset();
         return false;
     }
-    const bool published = (step.token || step.prompt_logprobs) &&
+    const bool published = (step.token || step.prompt_logprobs || step.label_logprobs) &&
         !step.sampling_failed && !job.cancelled && !job.aborted();
     if (published) {
         const bool first_token = !std::exchange(job.prefill_completed, true);

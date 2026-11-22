@@ -363,8 +363,9 @@ std::size_t request_resident_bytes(int capacity, int verification_rows, bool dra
 int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t total_bytes,
                           std::size_t free_bytes, std::size_t extra_bytes) {
     const auto fits = [&](int output, std::size_t bytes) {
+        const bool scoring = options.score_prompt || bool(options.label_token_ids);
         const auto resident = request_resident_bytes(
-            prompt + std::max(output, int(options.score_prompt)) - 1,
+            prompt + std::max(output, int(scoring)) - 1,
             reserved_verification_rows(output, options.mtp_steps),
             options.mtp_steps != 0);
         return resident + extra_bytes <= bytes;
@@ -381,7 +382,8 @@ int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t
             }
         }
     }
-    if ((output == 0 && (!options.score_prompt || options.max_new_tokens > 0)) ||
+    if ((output == 0 && ((!options.score_prompt && !options.label_token_ids) ||
+                        options.max_new_tokens > 0)) ||
         !fits(output, total_bytes)) {
         throw DecoderCapacityError("Prompt and output budget exceed resident decoder capacity",
                                    false);

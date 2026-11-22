@@ -285,10 +285,11 @@ public:
     ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete,
                     std::string_view health, bool prefix_controls, const BatchGenerate& generate,
                     const Tokenization& tokenize, std::string_view model_info,
-                    const NativeAbort& abort, const ServerInfo& server_info)
+                    const NativeAbort& abort, const ServerInfo& server_info,
+                    const BatchScore& score)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
           tokenize_(tokenize), abort_(abort), health_(health), model_info_(model_info),
-          server_info_(server_info), prefix_controls_(prefix_controls) {}
+          server_info_(server_info), score_(score), prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -333,6 +334,7 @@ private:
     const std::string_view health_;
     const std::string_view model_info_;
     const ServerInfo& server_info_;
+    const BatchScore& score_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -595,7 +597,7 @@ bool ConnectionQueue::redirects_to(std::string_view path) const {
                           path == anthropic_count_route)) ||
            (!model_info_.empty() && (path == "/model_info" || path == "/get_model_info")) ||
            path == separate_reasoning_route || path == parse_function_call_route ||
-           server_info_route(path) ||
+           server_info_route(path) || (score_ && path == score_route) ||
            (prefix_controls_ && (path == "/metrics" || path == "/reset_prefix_cache" ||
                                   path == "/start_profile" || path == "/stop_profile"));
 }
@@ -625,7 +627,9 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         }
         return;
     }
-    if (tokenize_ && request.route_path() == anthropic_count_route && request.method != "POST") {
+    const bool score = score_ && request.route_path() == score_route;
+    const bool count = tokenize_ && request.route_path() == anthropic_count_route;
+    if ((count || score) && request.method != "POST") {
         write_method_not_allowed(connection, "POST", request.method == "HEAD");
         return;
     }
@@ -644,11 +648,11 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     }
     const bool generate = generate_ && native_route == GenerateRoute::allowed;
     const bool tokenize = tokenize_ && tokenization_route(request) != TokenizationRoute::none;
-    if (!generate && !tokenize && !completion_route(request)) {
+    if (!generate && !tokenize && !score && !completion_route(request)) {
         serve_control(connection, request);
         return;
     }
-    if (!tokenize) {
+    if (!tokenize && !score) {
         service_.rethrow_failure();
     }
     {
@@ -658,7 +662,7 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         }
         discard_disconnected();
         if (pending_.size() >= static_cast<std::size_t>(capacity_)) {
-            if (tokenize) {
+            if (tokenize || score) {
                 lock.unlock();
                 if (request.route_path() == anthropic_count_route) {
                     write_anthropic_error(connection, "503 Service Unavailable", "api_error",
@@ -727,6 +731,8 @@ void ConnectionQueue::run(int slot) {
                 const auto tokenize = tokenization_route(request);
                 if (tokenize != TokenizationRoute::none) {
                     tokenize_(work->connection, tokenize, request.body);
+                } else if (score_ && request.route_path() == score_route) {
+                    score_(work->connection, slot, request.body);
                 } else if (work->generate.complete) {
                     const auto generate = std::move(work->generate);
                     generate.complete(work->connection, slot);
@@ -830,12 +836,13 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const BatchCompletion& complete, std::string_view health,
                        bool prefix_controls, const BatchGenerate& generate,
                        const Tokenization& tokenize, std::string_view model_info,
-                       const NativeAbort& abort, const ServerInfo& server_info) {
+                       const NativeAbort& abort, const ServerInfo& server_info,
+                       const BatchScore& score) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
-                          tokenize, model_info, abort, server_info);
+                          tokenize, model_info, abort, server_info, score);
     std::vector<std::thread> workers;
     workers.reserve(max_active + (abort ? 3 : 2));
     std::mutex failure_mutex;

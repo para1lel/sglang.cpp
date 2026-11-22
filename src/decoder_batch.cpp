@@ -3,6 +3,7 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/text/decoder_batch_plan.h"
 #include "sglang/text/decoder_logprobs.h"
+#include "sglang/text/label_logprobs.h"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_prefill.h"
@@ -38,6 +39,9 @@ struct Lane {
     DecoderPromptLogprobs prompt_logprobs{};
 
     int remaining_prompt() const { return progress.remaining_prompt(int(prompt.size())); }
+    bool finishes_label_prefill(int rows) const {
+        return options.label_token_ids && rows == remaining_prompt();
+    }
     int prefill_limit() const {
         return checkpoint > progress.position ? checkpoint - progress.position
                                               : remaining_prompt();
@@ -302,7 +306,7 @@ struct DecoderBatch::State {
                          DecoderBatchStepStats& stats);
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring,
                         const std::array<int, decoder_batch_max_lanes>& packed_slots,
-                        const DecodeRun& run, Steps& results);
+                        const DecodeRun& run, const PrefillRows& rows, Steps& results);
     std::size_t reserve(DecoderOptions& request, int prompt, std::size_t extra_bytes) const;
     void initialize(Lane& lane);
     void drain(const char* operation, std::optional<Lane>* lane = nullptr) {
@@ -421,7 +425,7 @@ void DecoderBatch::State::initialize(Lane& lane) {
     }
     if (lane.media) {
         lane.media_prefill = upload_media_positions(*lane.request, *lane.media, stream);
-    } else if (auto& cache = storage->prefix_cache) {
+    } else if (auto& cache = storage->prefix_cache; cache && !opts.label_token_ids) {
         lane.checkpoint = PrefixCache::checkpoint(prompt);
         const int cache_limit = opts.score_prompt ? opts.prompt_logprob_start : prompt;
         lane.progress.advance(cache->restore(*lane.request, lane.prompt, opts.prefix_cache_salt,
@@ -460,8 +464,16 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         prompt = std::move(input->prompt.token_ids);
     }
     validate_request(prompt, options, !media);
-    if (options.requires_target_only()) options.mtp_steps = 0;
+    if (options.requires_target_only() || options.label_token_ids) options.mtp_steps = 0;
     const int top = options.generated_top_logprobs;
+    if (const auto& labels = options.label_token_ids;
+        labels && (media || options.max_new_tokens != 0 || options.score_prompt || top != -1 ||
+                   options.top_logits || labels->empty() ||
+                   std::any_of(labels->begin(), labels->end(), [](int label) {
+                       return label < 0 || label >= vocab_size;
+                   }))) {
+        throw std::invalid_argument("Label scoring requires text prefill and valid label IDs");
+    }
     if ((options.score_prompt && top < 0) ||
         top < -1 || top > decoder_max_generated_top_logprobs ||
         (top >= 0 && (media || options.samples() || options.constraint || options.mtp_steps ||
@@ -477,7 +489,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     if (options.mtp_steps != 0 && !state_->model.mtp_weights) {
         throw std::invalid_argument("Decoder batch requires draft weights for MTP");
     }
-    if (options.max_new_tokens == 0 && !options.score_prompt) {
+    if (options.max_new_tokens == 0 && !options.score_prompt && !options.label_token_ids) {
         lane.emplace(Lane{nullptr, std::move(prompt), options});
         return 0;
     }
@@ -498,7 +510,9 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         }
         auto request = std::make_unique<Request>(state_->model.device);
         lane.emplace(Lane{std::move(request), std::move(prompt), options});
-        if (options.top_logits > 0) lane->request->memory.transfers().logits.resize(vocab_size);
+        if (options.top_logits > 0 || options.label_token_ids) {
+            lane->request->memory.transfers().logits.resize(vocab_size);
+        }
         if (options.samples()) lane->sampling = request_sampling(options);
         lane->media = std::move(input);
         lane->resident_bytes = resident;
@@ -638,7 +652,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             continue;
         }
         results[slot].mtp_boundary = results[slot].decode && lane.draft != nullptr;
-        if (rows[slot] <= 1) {
+        if (rows[slot] <= 1 && !lane.options.label_token_ids) {
             packed_slots[slot] = count;
             work[count++] = lane.input();
             const bool plain = results[slot].decode && !lane.draft && !lane.media;
@@ -666,7 +680,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
                                        !contains_mtp && max_rows == 0, tensor_core,
                                        greedy_winners, eager_score_rows});
     if (max_rows) prefill(rows, results, count == 0, contains_mtp, stats);
-    bool submitted = count != 0 || max_rows > 1;
+    bool submitted = count != 0 || max_rows != 0;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = scoring[slot]) {
             auto& lane = *slots[slot];
@@ -689,7 +703,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     if (stats.verification_lanes == 0 && submitted) {
         check(cudaStreamSynchronize(stream), "Complete decoder batch step");
     }
-    collect_scores(scoring, packed_slots, run, results);
+    collect_scores(scoring, packed_slots, run, rows, results);
 }
 
 void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results, bool only_prefill,
@@ -701,8 +715,10 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
     const bool wide = !cache_tile && model.is_b200() &&
         model.fp8_prefill() == Fp8PrefillPolicy::tensor_core && sm100_prefill_enabled();
     std::array<PrefillGrant, decoder_batch_max_lanes> grants;
+    std::array<PrefillGrant, decoder_batch_max_lanes> labels;
     std::array<PromptLogprobCapture, decoder_batch_max_lanes> captures;
     int count = 0;
+    int label_count = 0;
     bool contains_decode = false;
     bool text_batch = true;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
@@ -715,11 +731,18 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
         if (rows[slot] == 0) {
             continue;
         }
+        const int position = lane.progress.position;
+        if (lane.options.label_token_ids) {
+            labels[label_count++] = {
+                lane.request.get(), lane.prompt.data() + position, position, rows[slot],
+                std::min(rows[slot], batch_prefill_tile_rows), lane.remaining_prompt(),
+                nullptr, nullptr};
+            continue;
+        }
         int limit = lane.draft || lane.media ? prefill_chunk_rows : tile_limit;
         if (wide && !lane.draft && !lane.media && lane.prompt.size() <= sm100_prefill_max_visible) {
             limit = serial_prefill_max_rows;
         }
-        const int position = lane.progress.position;
         if (lane.options.score_prompt) {
             captures[count] = {&lane.prompt, &lane.prompt_logprobs, logprob_readback,
                                logprob_workspace, lane.options.generated_top_logprobs,
@@ -735,13 +758,18 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
     const bool layerwise = (only_prefill || mixed) && !contains_mtp && !tensor_cache &&
         budget > 0 &&
         budget <= decoder_default_max_num_batched_tokens;
-    model.prefill_grants(grants.data(), count, stream, tensor_cache, layerwise, mixed, stats);
+    if (count) {
+        model.prefill_grants(grants.data(), count, stream, tensor_cache, layerwise, mixed, stats);
+    }
+    if (label_count) {
+        model.prefill_grants(labels.data(), label_count, stream, false, false, false, stats, true);
+    }
 }
 
 void DecoderBatch::State::collect_scores(
     const std::array<Request*, decoder_batch_max_lanes>& scoring,
     const std::array<int, decoder_batch_max_lanes>& packed_slots, const DecodeRun& run,
-    Steps& results) {
+    const PrefillRows& rows, Steps& results) {
     const auto& slots = storage->slots;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (scoring[slot]) {
@@ -766,6 +794,10 @@ void DecoderBatch::State::collect_scores(
             } catch (const DecoderConstraintError&) {
                 results[slot].constraint_failed = true;
             }
+        } else if (rows[slot] && slots[slot]->finishes_label_prefill(rows[slot])) {
+            const auto& lane = *slots[slot];
+            collect_label_score(lane.request->memory.transfers().logits,
+                                *lane.options.label_token_ids, results[slot]);
         }
     }
 }
@@ -881,7 +913,8 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             } else if (result.mtp_verified_rows == 0 &&
                        (result.decode || current.prefill_rows[slot] != 0)) {
                 const int rows = current.prefill_rows[slot];
-                if (auto& cache = storage->prefix_cache; cache && rows != 0 && !lane->media) {
+                if (auto& cache = storage->prefix_cache;
+                    cache && rows != 0 && !lane->media && !lane->options.label_token_ids) {
                     const int draft_rows = lane->draft ? lane->draft->valid_prefix() : 0;
                     cache->count_prefill(rows, draft_rows - lane->counted_draft_rows);
                     lane->counted_draft_rows = draft_rows;
@@ -906,9 +939,7 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
                     finish_prompt_logprobs(lane->options, lane->prompt_logprobs, result);
                 }
             }
-            if (result.finish_reason) {
-                retire(lane);
-            }
+            if (result.finish_reason) retire(lane);
         }
         device.restore();
         if (stats) {

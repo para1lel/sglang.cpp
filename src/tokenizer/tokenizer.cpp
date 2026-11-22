@@ -20,7 +20,6 @@ namespace {
 constexpr std::size_t file_size = 12809320;
 constexpr std::string_view file_sha256 =
     "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3";
-constexpr TokenId base_vocab_size = 248044;
 constexpr TokenId mapped_vocab_size = 248077;
 
 json::Value read_checkpoint(const std::filesystem::path& path) {
@@ -60,7 +59,7 @@ struct Tokenizer::Model {
     void bpe(std::string_view bytes, std::vector<TokenId>& output, std::size_t limit) const;
 
     std::vector<std::string> pieces{mapped_vocab_size};
-    std::array<bool, mapped_vocab_size - base_vocab_size> special{};
+    std::array<bool, mapped_vocab_size - checkpoint_base_vocab_size> special{};
     std::array<TokenId, 256> byte_ids{};
     std::vector<TokenId> added;
     std::unordered_map<std::uint64_t, Merge> merges;
@@ -88,7 +87,7 @@ Tokenizer::Model::Model(const json::Object& root) {
     for (const auto& value : *root.at("added_tokens").array()) {
         const auto& entry = *value.object();
         const auto id = static_cast<TokenId>(*entry.at("id").unsigned_integer());
-        special[id - base_vocab_size] = *entry.at("special").boolean();
+        special[id - checkpoint_base_vocab_size] = *entry.at("special").boolean();
         pieces[id] = *entry.at("content").string();
         added.push_back(id);
     }
@@ -212,7 +211,8 @@ std::vector<TokenId> Tokenizer::encode(std::string_view input, std::size_t limit
 
 std::string_view Tokenizer::piece(TokenId id, bool skip_special) const {
     if (id >= mapped_vocab_size ||
-        (skip_special && id >= base_vocab_size && model_->special[id - base_vocab_size])) {
+        (skip_special && id >= checkpoint_base_vocab_size &&
+         model_->special[id - checkpoint_base_vocab_size])) {
         return {};
     }
     return model_->pieces[id];

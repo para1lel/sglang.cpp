@@ -802,7 +802,7 @@ void decoder::finish_prompt_logprobs(const DecoderOptions& options, DecoderPromp
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
                                    PrefillWorkspace& workspace, MtpDraftRequest* draft,
                                    int prompt_remaining, const MediaPrefill* media,
-                                   const PromptLogprobCapture* scores) const {
+                                   const PromptLogprobCapture* scores, bool exact) const {
     const auto stream = workspace.stream();
     if (!stream || !tokens || rows < 1 || rows > workspace.capacity() || position < 0 ||
         position > text_attention_max_tokens - rows ||
@@ -840,7 +840,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
     const TileBuffers buffers(layout, workspace.capacity());
-    const bool tensor_core = !draft && fp8_prefill() == Fp8PrefillPolicy::tensor_core;
+    const bool tensor_core = !exact && !draft && fp8_prefill() == Fp8PrefillPolicy::tensor_core;
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
                       media ? media->positions + position : nullptr};
     const auto& work = chunk.work;
@@ -877,7 +877,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
 
 void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaStream_t stream,
                                    bool tensor_cache, bool layerwise, bool mixed,
-                                   DecoderBatchStepStats& stats) const {
+                                   DecoderBatchStepStats& stats, bool label_scores) const {
     int scalar_capacity = 1;
     int total_rows = 0;
     for (int index = 0; index < count; ++index) {
@@ -906,7 +906,7 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
     if (tensor_cache && scalar_capacity > 1 && !workspace->data()) {
         throw std::runtime_error("Tensor-core prefix cache requires a prefill workspace");
     }
-    stats.prefill_workspace_bytes = workspace->bytes();
+    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
     for (int index = 0; index < count;) {
         const auto group = layerwise && workspace->data()
             ? projection_group(grants + index, count - index, max_rows, mixed) : PrefillGroup{1, 0};
@@ -917,16 +917,20 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
             stats.layerwise_prefill_rows += group.rows;
         } else if (grant.rows == 1 && grant.draft && grant.prompt_remaining > 1) {
             seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1], stream);
-        } else if (grant.rows == 1) {
+        } else if (grant.rows == 1 && !label_scores) {
             capture_prefill_scores(*this, grant, nullptr, 0, stream);
         } else {
             for (int offset = 0; offset < grant.rows;) {
                 const int count = std::min(grant.tile_rows, grant.rows - offset);
                 prefill_chunk(*grant.request, grant.tokens + offset, count,
                               grant.position + offset, *workspace, grant.draft,
-                              grant.prompt_remaining - offset, grant.media, grant.scores);
+                              grant.prompt_remaining - offset, grant.media, grant.scores,
+                              label_scores);
                 offset += count;
             }
+        }
+        if (label_scores && grant.rows == grant.prompt_remaining) {
+            enqueue_label_logits(*grant.request, stream);
         }
         index += group.grants;
     }

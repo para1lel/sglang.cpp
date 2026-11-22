@@ -9,6 +9,7 @@
 #include "sglang/server/http.h"
 #include "sglang/server/native_generate.h"
 #include "sglang/server/prefix_controls.h"
+#include "sglang/server/score.h"
 #include "sglang/server/tokenization.h"
 #include "sglang/server/vision_completion.h"
 
@@ -310,6 +311,8 @@ int main(int argc, char** argv) {
                 native_generate.abort(connection, body);
             }, [&] {
                 return server_info_json(arguments, startup.count(), service.runtime_state());
+            }, [&](const Socket& connection, int slot, std::string_view body) {
+                serve_score(connection, service, slot, tokenizer.get(), body);
             });
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';

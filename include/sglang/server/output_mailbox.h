@@ -32,6 +32,9 @@ inline bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& call
     if (step.prompt_logprobs) {
         result.prompt_logprobs = step.prompt_logprobs;
     }
+    if (step.label_logprobs) {
+        result.label_logprobs = step.label_logprobs;
+    }
     if (!step.token) return true;
     result.mtp_rounds += step.mtp_drafted_tokens != 0;
     result.mtp_drafted_tokens += step.mtp_drafted_tokens;

@@ -14,6 +14,7 @@ inline constexpr TokenId model_vocab_size = 248320;
 inline constexpr TokenId end_of_text = 248044;
 inline constexpr TokenId end_of_message = 248046;
 inline constexpr std::size_t checkpoint_context = 262144;
+inline constexpr TokenId checkpoint_base_vocab_size = 248044;
 inline constexpr std::string_view model_name = "Qwen3.8-27B-FP8";
 
 class Tokenizer {

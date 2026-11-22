@@ -33,6 +33,7 @@ struct DecoderBatchStep {
     int mtp_verified_rows = 0;
     std::shared_ptr<const DecoderTokenLogprobs> generated_logprobs = nullptr;
     std::shared_ptr<const DecoderPromptLogprobs> prompt_logprobs = nullptr;
+    std::shared_ptr<const std::vector<double>> label_logprobs = nullptr;
 };
 
 struct DecoderBatchStepStats {

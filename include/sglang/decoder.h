@@ -53,6 +53,7 @@ struct DecoderOptions {
     bool ignore_eos = false;
     bool score_prompt = false;
     int prompt_logprob_start = 0;
+    std::shared_ptr<const std::vector<int>> label_token_ids = nullptr;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 
@@ -138,6 +139,7 @@ struct DecoderResult {
     std::optional<std::size_t> matched_text_stop = std::nullopt;
     std::vector<std::shared_ptr<const DecoderTokenLogprobs>> generated_logprobs{};
     std::shared_ptr<const DecoderPromptLogprobs> prompt_logprobs = nullptr;
+    std::shared_ptr<const std::vector<double>> label_logprobs = nullptr;
 };
 
 enum class Fp8PrefillPolicy {

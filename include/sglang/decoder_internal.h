@@ -386,7 +386,8 @@ struct RequestProgress {
     ConstraintCursor constraint{};
 
     static int capacity(int prompt, const DecoderOptions& options) {
-        return prompt + std::max(options.max_new_tokens, int(options.score_prompt)) - 1;
+        return prompt + std::max(options.max_new_tokens,
+                                 int(options.score_prompt || options.label_token_ids)) - 1;
     }
     int remaining_prompt(int prompt) const { return position < prompt ? prompt - position : 0; }
     int remaining_output(const DecoderOptions& options) const {
@@ -478,10 +479,11 @@ struct Decoder::Model {
                        decoder::PrefillWorkspace& workspace,
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
                        const decoder::MediaPrefill* media = nullptr,
-                       const decoder::PromptLogprobCapture* scores = nullptr) const;
+                       const decoder::PromptLogprobCapture* scores = nullptr,
+                       bool exact = false) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
                         bool tensor_cache, bool layerwise, bool mixed,
-                        DecoderBatchStepStats& stats) const;
+                        DecoderBatchStepStats& stats, bool label_scores = false) const;
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;
@@ -493,6 +495,7 @@ struct Decoder::Model {
                     int shifted_token, cudaStream_t stream) const;
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_prefill_logits(decoder::Workspace& work, cudaStream_t stream) const;
+    void enqueue_label_logits(decoder::Request& request, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request, bool decode = false) const;
     void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;
     bool prefill_serial(decoder::Request& request, decoder::RequestProgress& progress,

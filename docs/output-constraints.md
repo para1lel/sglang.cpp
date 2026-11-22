@@ -73,7 +73,7 @@ Use model EOS handling and omit `stop_token_ids` when a pattern is active. An in
 
 ### JSON Schema
 
-Send `response_format` with `POST /v1/chat/completions`. For `POST /v1/completions`, replace `messages` with `prompt`. Chat returns the generated JSON as a string in `message.content`. Text returns it in `choices[0].text`. For SSE, join the text deltas before parsing the JSON.
+Send `response_format` with `POST /v1/chat/completions`. For `POST /v1/completions`, replace `messages` with `prompt`. Chat returns the generated JSON as a string in `message.content`. Text returns it in `choices[0].text`. For SSE, join the text deltas before parsing the JSON. The [Responses route](serving/openai-responses.md#json-schema-output) uses the same schema subset with a flat `text.format` descriptor.
 
 ```json
 {

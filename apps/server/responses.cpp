@@ -355,16 +355,52 @@ void validate_text_options(const OrderedObject& fields) {
     }
 }
 
-Value text_options(const Value& text) {
+OrderedObject schema_descriptor(const OrderedObject& format) {
+    const auto name = field(format, "name").string();
+    constexpr std::string_view name_characters =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    if (!name || name->empty() || name->size() > 64 ||
+        name->find_first_not_of(name_characters) != std::string_view::npos) {
+        throw RequestError(400, "Expected a JSON Schema name of 1 to 64 letters, digits, "
+                                 "underscores or hyphens", "text.format.name");
+    }
+    object(field(format, "schema"), "text.format.schema");
+    if (const auto* strict = json::get(format, "strict"); strict && strict->boolean() != true) {
+        throw RequestError(400, "Only strict:true is supported", "text.format.strict");
+    }
+    if (const auto* description = json::get(format, "description");
+        description && (!description->string() || description->string()->size() > 256)) {
+        throw RequestError(400, "Expected a string of at most 256 bytes",
+                           "text.format.description");
+    }
+    OrderedObject descriptor;
+    for (const auto& [key, value] : format) {
+        if (key == "type") continue;
+        if (key != "name" && key != "schema" && key != "strict" && key != "description") {
+            throw RequestError(400, "Unsupported JSON Schema format field: " + key, "text.format");
+        }
+        descriptor.emplace_back(key, value);
+    }
+    return descriptor;
+}
+
+Value text_options(const Value& text, Value& response_format) {
     if (text.is_null()) return {};
     const auto& config = object(text, "text");
     OrderedObject options;
     const auto& format = field(config, "format");
     if (!format.is_null()) {
-        if (field(object(format, "text.format"), "type").string() != "text") {
-            throw RequestError(400, "Only plain text output is supported", "text");
+        const auto& fields = object(format, "text.format");
+        const auto type = field(fields, "type").string();
+        if (type == "json_schema") {
+            response_format = OrderedObject{{"type", "json_schema"},
+                                            {"json_schema", schema_descriptor(fields)}};
+            options.emplace_back("format", format);
+        } else if (type == "text") {
+            options.emplace_back("format", OrderedObject{{"type", "text"}});
+        } else {
+            throw RequestError(400, "Expected text or json_schema format", "text.format.type");
         }
-        options.emplace_back("format", OrderedObject{{"type", "text"}});
     }
     const auto& verbosity = field(config, "verbosity");
     if (!verbosity.is_null()) {
@@ -454,7 +490,8 @@ ResponsesRequest parse_responses_request(std::string_view body, ResponseStore& s
     const auto stream = flag(fields, "stream", false);
     const auto& instructions = field(fields, "instructions");
     const auto& metadata = field(fields, "metadata");
-    auto text = text_options(field(fields, "text"));
+    Value response_format;
+    auto text = text_options(field(fields, "text"), response_format);
     const auto& user = field(fields, "user");
     const auto& limit = field(fields, "max_output_tokens");
     const auto& reason = field(fields, "reasoning");
@@ -481,6 +518,9 @@ ResponsesRequest parse_responses_request(std::string_view body, ResponseStore& s
     OrderedObject chat{{"model", std::string(model_name)}, {"messages", std::move(prompt)},
                        {"stream", stream},
                        {"chat_template_kwargs", std::move(thinking)}};
+    if (!response_format.is_null()) {
+        chat.emplace_back("response_format", std::move(response_format));
+    }
     if (!limit.is_null()) {
         const auto tokens = limit.unsigned_integer();
         if (!tokens) {

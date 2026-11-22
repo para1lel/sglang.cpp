@@ -117,3 +117,44 @@ The measured source used base `d4388852209908d988907deffbfed9192b2f25a1` plus th
 | `combined/build/bin/sglang-server` | `cbd5aeee399a226018e36f1cfe68c6f96d4456aeb859e76810f85017b8492da3` |
 | `run.LBHOaZYi/DISPOSITION.md` | `33fda44aeacce93a28abfa3a0555d0f2ffcb166ab43c7e12d0db9d7dfb56e3c7` |
 | `run.LBHOaZYi/summary.json` | `786f6d24b2238b7310d7bd80239329c08fb7d74325bd51c84c0ec16add883c15` |
+
+### Native W1 K4 pilot with exact prefill tiling and verifier fusion
+
+On November 22, 2026, both Release builds ran on B200 GPU6 (`GPU-d4d87d81-ea84-5dd0-7167-3e1c48fde29b`). The candidate includes pointwise score, wide exact FP8 prefill tiles, and five-row verifier fusion. Both arms used exact FP8 prefill, default K4 and graphs, 32 maximum active requests, and an 8,192-token step budget. Both disabled prefix reuse.
+
+Four fresh K4 servers ran in baseline, candidate, candidate, baseline order. Each server ran three warmups and three measured requests, with one request in flight. The two explicit K0 controls established the reference for each arm. All 24 unprofiled K4 streams matched their own arm's K0 control and all 128 frozen native output IDs. All 26 streams returned HTTP 200 and passed the ordinary SSE checks for prompt echo, single-ID deltas, and `length` finish. Each reported 128 prompt and 128 completion tokens, then sent one `[DONE]` and drained without trailing data.
+
+The client measured E2E from submission to `[DONE]` and TTFT from submission to the first output ID. TPOT divides the first-to-last-ID span by 127. Percentiles use linear interpolation as described above. Each arm contributed six measured requests.
+
+| Metric | Baseline p50 / p95 | Candidate p50 / p95 | Baseline range | Candidate range |
+| --- | ---: | ---: | ---: | ---: |
+| E2E, ms | 1,805.96 / 1,915.52 | 1,528.47 / 3,386.75 | 1,780.07–1,945.71 | 1,502.54–3,983.29 |
+| TTFT, ms | 404.80 / 492.29 | 293.79 / 352.23 | 388.83–518.07 | 283.42–362.29 |
+| TPOT, ms/ID | 11.063 / 11.214 | 9.768 / 23.969 | 10.952–11.241 | 9.385–28.511 |
+
+The candidate E2E median fell 15.37%, and p95 increased. One measured candidate stream took 3,983.29 ms, including a 2,467.83 ms gap before the 127th output ID. It completed the exact sequence and remains in all measured summaries. The cause of the gap remains unknown.
+
+Separate CUDA captures used one profiled request per arm after three warmups. Both captured requests matched the frozen IDs and completed 52 decode rounds, with 205 proposals, 75 accepted drafts, and 257 target verification rows. GPU-active time counts overlapping kernel, copy, and memset intervals once within each phase.
+
+| Phase | Baseline GPU-active time, ms | Candidate GPU-active time, ms |
+| --- | ---: | ---: |
+| Prefill through winner readback | 379.21 | 260.75 |
+| Draft waves | 124.42 | 124.40 |
+| Target verification | 1,150.10 | 964.09 |
+| Commit and repair | 34.23 | 34.27 |
+
+The archived v4 vLLM W1 median of 638.064 ms came from B200 GPU2 and serves only as historical timing context. The candidate median was 890.41 ms higher, or 2.395 times that value. The [formal matched K4 gate](../../benchmarks/paired/README.md#matched-k4-timing-protocol) remains open.
+
+| Arm | Measured source | Measured tree | Release server SHA-256 |
+| --- | --- | --- | --- |
+| Baseline | `5b4c370e730afb0b67394a8ed62ca55696aaf305` | `c01b246cee463111b65e299ae73cdc73aebef3d1` | `d9ee4550bb69c14fbd23b898faa429857001f7f4f27c3a32100a8dc1f06989f4` |
+| Candidate | `0f0e77413bc06b4daa8ea0e162d69e4c81b9d900` plus the eight patches in `inputs/patches.sha256` | `77d4778ab1bdb3a3524fc043c8a87083d23d9192` | `fa6f515400d375cbf38374066c0806da862b06c4fc00ad742f833a9fecb93f52` |
+
+The original receipts are under `artifacts/continue-combined-test/` on the benchmark host. Retain a copy with the matching manifest to recover the original bytes from another checkout.
+
+| Evidence path | SHA-256 |
+| --- | --- |
+| `REPORT.md` | `e14894a0676744158d4976498fe1c8bf45e0da9059056bc1f06159f0cf5b081d` |
+| `inputs/patches.sha256` | `ab649303dcd5ffcffb21965b23c41109c75474de6d3801c9e7179d2f1f204f84` |
+| `run.zsDDGo49/summary.json` | `edc0a11ff5eb46e8b3efa2c557460530fe5e762fb2ed8cedf6508869ada4cac0` |
+| `SHA256SUMS` | `efeee1f19bbe43e85a4e1432137e4a8b971bf2f7e7617ed962ffee274e1dc27e` |

@@ -1,5 +1,48 @@
 constexpr int vector_replay_threads = 4 * mxfp8_group_size;
 constexpr int vector_replay_channels = mxfp8_group_size;
+static_assert(mxfp8_payload_bytes_per_page % alignof(std::uint32_t) == 0 &&
+              mxfp8_head_dim % alignof(std::uint32_t) == 0 &&
+              vector_replay_channels % alignof(std::uint32_t) == 0);
+
+__device__ bool replay_values_aligned(Mxfp8KvCache cache) {
+    return reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(std::uint32_t) == 0;
+}
+
+__device__ __forceinline__ std::uint32_t replay_value_word(
+    const std::uint8_t* source, bool aligned_values) {
+    if (aligned_values) {
+        return *reinterpret_cast<const std::uint32_t*>(source);
+    }
+    return static_cast<std::uint32_t>(source[0]) |
+           (static_cast<std::uint32_t>(source[1]) << 8) |
+           (static_cast<std::uint32_t>(source[2]) << 16) |
+           (static_cast<std::uint32_t>(source[3]) << 24);
+}
+
+__device__ __forceinline__ void load_replay_values(
+    Mxfp8KvCache cache, int page, int token, int kv_head, int group, int count,
+    bool aligned_values, float (&values)[replay_tile][vector_replay_channels]) {
+    constexpr int vectors = vector_replay_channels / 4;
+    constexpr int payload_stride = mxfp8_kv_heads * mxfp8_head_dim;
+    constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
+    const auto payload = payload_offset(page, token, kv_head) + group * vector_replay_channels;
+    const auto scale = scale_offset(page, token, kv_head, group);
+    const int vector = threadIdx.x % vectors;
+    #pragma unroll
+    for (int index = threadIdx.x / vectors; index < replay_tile;
+         index += vector_replay_threads / vectors) {
+        if (index < count) {
+            const auto* source = cache.value_payload + payload + index * payload_stride +
+                                 vector * 4;
+            const auto packed = replay_value_word(source, aligned_values);
+            const auto exponent = cache.value_scales[scale + index * scale_stride];
+            *reinterpret_cast<float4*>(&values[index][vector * 4]) =
+                make_float4(decode_e8m0(packed, exponent), decode_e8m0(packed >> 8, exponent),
+                            decode_e8m0(packed >> 16, exponent),
+                            decode_e8m0(packed >> 24, exponent));
+        }
+    }
+}
 
 template <bool Unit>
 __device__ float replay_vector_channel(
@@ -40,30 +83,13 @@ __global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Po
     float maximum = -CUDART_INF_F;
     float mass = 0.0f;
     float weighted = 0.0f;
-    constexpr int vectors = vector_replay_channels / 4;
-    constexpr int payload_stride = mxfp8_kv_heads * mxfp8_head_dim;
-    constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
+    const bool aligned_values = replay_values_aligned(cache);
     for (int first = 0; first <= last; first += replay_tile) {
         const int count = min(replay_tile, last - first + 1);
         const int physical_page = pages[first / mxfp8_page_size];
         const int token = first % mxfp8_page_size;
-        const auto payload = payload_offset(physical_page, token, kv_head) + column;
-        const auto scale = scale_offset(physical_page, token, kv_head, group);
-        const int vector = thread % vectors;
-        #pragma unroll
-        for (int index = thread / vectors; index < replay_tile;
-             index += vector_replay_threads / vectors) {
-            if (index < count) {
-                const auto* source = cache.value_payload + payload + index * payload_stride +
-                                     vector * 4;
-                const auto packed = *reinterpret_cast<const std::uint32_t*>(source);
-                const auto exponent = cache.value_scales[scale + index * scale_stride];
-                *reinterpret_cast<float4*>(&values[index][vector * 4]) =
-                    make_float4(decode_e8m0(packed, exponent), decode_e8m0(packed >> 8, exponent),
-                                decode_e8m0(packed >> 16, exponent),
-                                decode_e8m0(packed >> 24, exponent));
-            }
-        }
+        load_replay_values(cache, physical_page, token, kv_head, group, count, aligned_values,
+                           values);
         if (thread < mxfp8_group_size) {
             const float score = lane < count ? scores[first + lane] : -CUDART_INF_F;
             const bool unit = isfinite(maximum) && __all_sync(warp_mask, score <= maximum);

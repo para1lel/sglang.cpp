@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -49,6 +51,65 @@ Output replay(Mxfp8KvCache cache, Mxfp8PageTable pages, int last, const Bf16* qu
         throw std::runtime_error("Short prefill output or canaries were incomplete");
     }
     return host;
+}
+
+void check_draft_replay(Mxfp8KvCache cache, Mxfp8PageTable pages, const Bf16* query,
+                        Bf16* output, float* scores, cudaStream_t stream) {
+    constexpr int short_capacity = 5173;
+    constexpr int chunk_capacity = 4368;
+    constexpr std::array<std::uint8_t, 4> codes{0x34, 0xb0, 0x39, 0x42};
+    std::vector<std::uint8_t> varied_values(payload_bytes);
+    for (std::size_t index = 0; index < varied_values.size(); ++index) {
+        varied_values[index] = codes[index % codes.size()];
+    }
+    check(cudaMemcpyAsync(cache.value_payload, varied_values.data(), payload_bytes,
+                          cudaMemcpyHostToDevice, stream));
+    const auto download = [&] {
+        Output host;
+        check(cudaMemcpyAsync(host.data(), output, sizeof(host), cudaMemcpyDeviceToHost, stream));
+        check(cudaStreamSynchronize(stream));
+        if (host.front() != 0xa5a5 || host.back() != 0xa5a5 ||
+            std::any_of(host.begin() + 1, host.end() - 1,
+                        [](auto value) { return value == 0xa5a5; })) {
+            throw std::runtime_error("Draft replay output or canaries were incomplete");
+        }
+        return host;
+    };
+    DeviceBuffer<std::uint8_t> offset_values(payload_bytes + 3);
+    for (const int visible : {5174, 5173, 257, 256, 8, 7, 8192}) {
+        check(cudaMemsetAsync(output, 0xa5, sizeof(Output), stream));
+        check(mxfp8_gqa_attention(cache, pages, visible, visible - 1, 1, query, output + 1,
+                                  stream));
+        const auto expected = download();
+        for (const int offset : {0, 1, 2, 3}) {
+            auto variant = cache;
+            if (offset != 0) {
+                variant.value_payload = offset_values.data + offset;
+                check(cudaMemcpyAsync(variant.value_payload, cache.value_payload, payload_bytes,
+                                      cudaMemcpyDeviceToDevice, stream));
+            }
+            for (const int capacity : {short_capacity, chunk_capacity, chunk_capacity - 1}) {
+                const decoder::ExactGqaWorkspace workspace{scores, capacity};
+                check(cudaMemsetAsync(output, 0xa5, sizeof(Output), stream));
+                std::printf("Draft V alignment visible=%d capacity=%d offset=%d\n",
+                            visible, capacity, offset);
+                std::fflush(stdout);
+                check(decoder::mtp_gqa_attention(variant, pages, visible - 1, query, output + 1,
+                                                 workspace, stream));
+                if (download() != expected) {
+                    throw std::runtime_error("Draft replay differs bitwise from direct attention");
+                }
+            }
+            if (visible == 257) {
+                check(cudaMemsetAsync(output, 0xa5, sizeof(Output), stream));
+                check(decoder::vector_decode_gqa_attention(
+                    variant, pages, visible - 1, query, output + 1, {scores, visible}, stream));
+                if (download() != expected) {
+                    throw std::runtime_error("Vector decode differs bitwise from direct attention");
+                }
+            }
+        }
+    }
 }
 
 }
@@ -102,6 +163,7 @@ void check_short_prefill_replay(cudaStream_t stream) {
             }
         }
     }
+    check_draft_replay(unaligned_scales, pages, query.data, output.data, scores.data, stream);
 }
 
 }

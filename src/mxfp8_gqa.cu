@@ -991,7 +991,7 @@ cudaError_t decoder::long_paged_decode_gqa(const PagedDecodeLane* lanes, int cou
     return launch_long_paged_decode(lanes, count, stream);
 }
 
-#include "sglang/text/gqa_mtp_attention.cuh"
+#include "sglang/text/mtp/gqa_attention.cuh"
 #include "sglang/text/gqa_target_split.cuh"
 
 }

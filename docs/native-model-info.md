@@ -77,7 +77,9 @@ Quantization uses the maximum absolute value per weight row and activation. Zero
 
 ### Draft attention
 
-Draft forwards use tiled MXFP8 attention for 8–256 visible tokens, including the current token. At 257–5,173 tokens, they compute exact scores in parallel and replay values in position order. The lane stream reuses the draft logits allocation for scores before vocabulary scoring. Other valid lengths use direct attention. [Dispatch](../include/sglang/text/gqa_mtp_attention.cuh#L16)<!-- prefix: "constexpr in" --> · [Score storage](../src/decoder_mtp.cpp#L115)<!-- prefix: "ExactGqaWork" -->
+Draft forwards use tiled MXFP8 attention for 8–256 visible tokens, including the current token. At 257–5,173 tokens, they compute exact scores in parallel and replay values in position order. Longer contexts through 262,144 tokens score 4,096 positions at a time and carry the FP32 replay maximum, denominator, and weighted sum between chunks. Both ordered paths load V in four-byte groups when the payload base permits it and assemble the same values from individual bytes otherwise. Direct attention covers lengths below eight and calls with insufficient scratch. [Draft dispatch](../include/sglang/text/mtp/gqa_attention.cuh#L18)<!-- prefix: "constexpr in" --> · [Chunked replay](../include/sglang/text/mtp/gqa_long.cuh#L93)<!-- prefix: "cudaError_t " -->
+
+Each draft lane already reserves 496,640 bytes for vocabulary logits. Long attention uses 419,328 of those bytes for scores and carry, with zero added bytes in the resident request estimate. Each attention call initializes its carry, and the lane stream orders its score and replay launches before vocabulary scoring overwrites the scratch. The draft KV and target admission limits still determine how many long requests fit. [Score storage](../src/decoder_mtp.cpp#L115)<!-- prefix: "ExactGqaWork" -->
 
 Verify opt-in runs against a fresh K0 control with the same FP8 target policy. The frozen comparison uses an exact target and exact K0. Use a separate campaign for `tensor-core-mtp-target`.
 

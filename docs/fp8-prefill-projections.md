@@ -6,10 +6,16 @@
 | --- | --- | --- |
 | Decoder | Select the prefill policy and supply activation and output buffers. | [Packed call](../src/decoder_prefill.cpp#L247)<!-- prefix: "bool project" --> |
 | Fused RMSNorm | Produce BF16 normalized values, E4M3 activations, and FP32 activation scales for prefill and packed decode. | [Launcher](../src/text_normalization.cu#L312)<!-- prefix: "cudaError_t " --> |
-| Attention output quantizer | Convert BF16 GDN and GQA output rows for their FP8 output projections. | [Row launcher](../src/text_ops.cu#L712)<!-- prefix: "cudaError_t " --> |
+| Attention output quantizer | Convert BF16 GDN and GQA output rows for their FP8 output projections. | [Row launcher](../src/text_ops.cu#L645)<!-- prefix: "cudaError_t " --> |
 | SM100 operator | Select the tile, manage CTA-local storage, and write BF16 outputs. | [Separate dispatch](../src/prefill_fp8_sm100.cu#L561)<!-- prefix: "if (rows > 1" --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L661)<!-- prefix: "if (rows \u003c 1" --> |
 
 ## Runtime path
+
+### Exact SIMT projections
+
+For eligible wide inputs, the exact projection selects the eight-row launcher at 64 or more prompt rows and more than 1,024 output channels. The launcher can assign up to four prompt rows and four adjacent output channels to each warp. This tile requires 5,120, 6,144, or 17,408 input channels. It requires an output width divisible by four and at most 65,535. It shares activation values, activation scales, and weight scales. Each result keeps its own ordered FP32 sum and BF16 rounding. Other eligible shapes keep the existing row tiles. [Row dispatch](../src/text_ops.cu#L749)<!-- prefix: "if (rows \u003e 1" --> · [Tile selection](../include/sglang/text/prefill_fp8_exact.cuh#L77)<!-- prefix: "if constexpr" --> · [Activation loads](../include/sglang/text/prefill_fp8_exact.cuh#L43)<!-- prefix: "const auto r" -->
+
+### Tensor-core projections
 
 Separate tensor-core K0 projections require at least three rows, input widths divisible by 128, and contiguous, 16-byte-aligned E4M3 payloads. The output can end in a partial tile. At 129–1,023 rows, projections with at least 8,192 output channels or 6,144 input channels first try a paired-TMA 128×128 tile. The launch places the row tiles for each column tile next to one another to improve weight cache reuse. [Eligibility](../src/prefill_fp8_sm100.cu#L542)<!-- prefix: "const int ma" --> · [Separate projection tiles](../src/prefill_fp8_sm100.cu#L561)<!-- prefix: "if (rows > 1" -->
 
@@ -27,7 +33,7 @@ The separate down projection tries paired TMA at exactly 1,024 rows, 17,408 inpu
 
 For ordinary tensor-core text prefill, GDN combines gated RMSNorm with FP8 quantization. Each warp rounds one head to BF16 in registers before quantization. The output projection consumes the E4M3 values and FP32 scales directly. In grouped prefill, each grant writes its own rows in the shared activation buffer. Gated GQA and the BF16 GDN prefill path pass 6,144 channels per row to `text_quantize_fp8_rows`. [Fused finish](../src/text_attention_gdn.cu#L583)<!-- prefix: "__global__ v" --> · [GDN call](../src/decoder_prefill.cpp#L864)<!-- prefix: "chunk.gdn_at" --> · [GQA call](../src/decoder_prefill.cpp#L860)<!-- prefix: "chunk.attent" -->
 
-For exactly 1,024 rows and 6,144 channels, the launcher uses the warp kernel if the BF16 input and E4M3 output are both 4-byte aligned. A 256-thread CTA handles eight 128-channel groups in one row. Each warp owns one group and each lane processes four values. The grid has six CTAs per row. The warp reduces the absolute maximum and broadcasts the reciprocal without CTA barriers. [Dispatch](../src/text_ops.cu#L718)<!-- prefix: "if (rows == " --> · [Warp kernel](../src/text_ops.cu#L212)<!-- prefix: "__global__ v" -->
+For exactly 1,024 rows and 6,144 channels, the launcher uses the warp kernel if the BF16 input and E4M3 output are both 4-byte aligned. A 256-thread CTA handles eight 128-channel groups in one row. Each warp owns one group and each lane processes four values. The grid has six CTAs per row. The warp reduces the absolute maximum and broadcasts the reciprocal without CTA barriers. [Dispatch](../src/text_ops.cu#L651)<!-- prefix: "if (rows == " --> · [Warp kernel](../src/text_ops.cu#L212)<!-- prefix: "__global__ v" -->
 
 The kernel writes row-major E4M3 values and 48 row-major FP32 scales per row. It floors the absolute maximum at `1e-10`, then divides by 448 in FP32 with round-to-nearest. It computes the reciprocal with FP32 round-to-nearest division, multiplies each value by it, and converts with saturated E4M3 rounding. The projection reads the same scale stride. [Scale and conversion](../src/text_ops.cu#L242)<!-- prefix: "const float " --> · [Projection scale row](../src/prefill_fp8_sm100.cu#L321)<!-- prefix: "const auto* " -->
 
@@ -43,7 +49,7 @@ The specialization keeps the FP32 RMS accumulation order and produces BF16 resid
 
 The `sm_100a` build uses TMA, TMEM, and `tcgen05`. It requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Output slices must be disjoint from all inputs and each other. If the preferred separate tile is unavailable, the launcher tries the ordinary tile selected by shape. If the preferred packed choices are unavailable, the launcher tries the ordinary 128×128 tile. If packing is unavailable, the decoder projects each slice separately. Ineligible tensor-core projections use SIMT. CUDA errors propagate. [Build](../xmake.lua#L67)<!-- prefix: "target(\"sgla" --> · [Narrow packed launch](../src/prefill_fp8_sm100.cu#L674)<!-- prefix: "return launc" --> · [Separate projection](../src/decoder_prefill.cpp#L658)<!-- prefix: "void Prefill" -->
 
-Attention output quantization requires a valid FP32 scale buffer with ordinary float alignment. Other valid shapes or alignments use the scalar kernel, which supports partial groups. The row launcher rejects null pointers, nonpositive widths, and row counts outside 1 through 65,535. The selected launch returns its CUDA status. Fused SwiGLU shares the warp kernel and retains its own dispatch and BF16 rounding. [Row launcher](../src/text_ops.cu#L712)<!-- prefix: "cudaError_t " --> · [SwiGLU dispatch](../src/text_ops.cu#L731)<!-- prefix: "cudaError_t " -->
+Attention output quantization requires a valid FP32 scale buffer with ordinary float alignment. Other valid shapes or alignments use the scalar kernel, which supports partial groups. The row launcher rejects null pointers, nonpositive widths, and row counts outside 1 through 65,535. The selected launch returns its CUDA status. Fused SwiGLU shares the warp kernel and retains its own dispatch and BF16 rounding. [Row launcher](../src/text_ops.cu#L645)<!-- prefix: "cudaError_t " --> · [SwiGLU dispatch](../src/text_ops.cu#L664)<!-- prefix: "cudaError_t " -->
 
 ## Verification
 

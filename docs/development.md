@@ -122,9 +122,9 @@ The decoder validates tensor names, dtypes, and shapes before upload. Upload ret
 
 Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L588)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L972)<!-- prefix: "void Request" -->
 
-One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L861)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L893)<!-- prefix: "void Decoder" -->
+One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L901)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L893)<!-- prefix: "void Decoder" -->
 
-Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L807)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L854)<!-- prefix: "void Decoder" -->
+Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L847)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L854)<!-- prefix: "void Decoder" -->
 
 Set the [FP8 policy](fp8-prefill-projections.md#tensor-core-projections) with `--fp8-prefill` or the fourth `Decoder` argument. Default `exact` preserves SIMT arithmetic. Tensor cores can change logits and greedy IDs. [Policy](../include/sglang/decoder.h#L147)<!-- prefix: "enum class F" -->
 
@@ -133,7 +133,7 @@ See [FP8 prefill projections](fp8-prefill-projections.md) for SM100 eligibility,
 Multirow K0 tensor-core prefill keeps these operators during projection fallback.
 
 - [GDN prefill](gdn-prefill.md) prepares convolution, Q/K, and gates before ordered or chunked recurrence. [Preparation dispatch](../src/text_attention_gdn.cu#L660)<!-- prefix: "const bool g" -->
-- [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L368)<!-- prefix: "const auto s" -->
+- [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L370)<!-- prefix: "const auto s" -->
 - [Fused residual RMSNorm](fp8-prefill-projections.md#fused-activation-quantization) and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L376)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L648)<!-- prefix: "cudaError_t " -->
 
 Other target prefill uses direct attention. Long wide decode requires the tensor-core policy. Eager decode and serial graphs use exact attention when their workspace fits. Serial decode falls back to direct attention. [Row dispatch](../src/decoder_forward.cpp#L412)<!-- prefix: "cudaError_t " --> · [Draft attention](native-model-info.md#draft-attention)
@@ -166,9 +166,9 @@ The CLI defaults to greedy selection, with ties going to the lowest ID. It uses 
 
 The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/decoder_resources.cpp#L108)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L517)<!-- prefix: "Allocations:" -->
 
-Private CUDA pools separate workspaces at or below 128 rows from larger ones. One pool per device and class can set a release threshold. The thresholds are 32 MiB and 512 MiB respectively. Other pools use CUDA defaults. [Retention](../src/decoder_prefill.cpp#L46)<!-- prefix: "void configu" -->
+Private CUDA pools separate workspaces at or below 128 rows from larger ones. One pool per device and class can set a release threshold. The thresholds are 32 MiB and 512 MiB respectively. Other pools use CUDA defaults. [Retention](../src/decoder_prefill.cpp#L48)<!-- prefix: "void configu" -->
 
-Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L708)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L497)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L694)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L749)<!-- prefix: "cudaError_t " -->
+Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L708)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L497)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L734)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L789)<!-- prefix: "cudaError_t " -->
 
 `--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L249)<!-- prefix: "void write_r" -->
 

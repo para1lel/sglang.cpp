@@ -80,4 +80,31 @@ private:
     std::unique_ptr<PrefillPool> pool_;
 };
 
+inline bool pairable_prefill_grants(const PrefillGrant* grants, int count) {
+    if (count < 2 || count % 2 != 0 ||
+        grants[0].rows > decoder_default_max_num_batched_tokens / count) {
+        return false;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        if (grant.tile_rows != batch_prefill_tile_rows || grant.rows != grants[0].rows ||
+            grant.rows % batch_prefill_tile_rows != 0 || !grant.draft || grant.media ||
+            grant.scores) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline PrefillGrant prefill_tile(PrefillGrant grant, int offset) {
+    grant.tokens += offset;
+    grant.position += offset;
+    grant.prompt_remaining -= offset;
+    grant.rows = batch_prefill_tile_rows;
+    return grant;
+}
+
+bool try_prefill_projection_pairs(const DecoderModel& model, const PrefillGrant* grants,
+                                  int count, cudaStream_t stream, DecoderBatchStepStats& stats);
+
 }

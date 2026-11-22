@@ -758,10 +758,10 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
         ++count;
     }
     const bool mixed = contains_decode && text_batch;
-    const bool layerwise = (only_prefill || mixed) && !contains_mtp && !tensor_cache &&
-        budget > 0 &&
-        budget <= decoder_default_max_num_batched_tokens;
-    if (count) {
+    const bool bounded = budget > 0 && budget <= decoder_default_max_num_batched_tokens;
+    const bool layerwise = (only_prefill || mixed) && !contains_mtp && !tensor_cache && bounded;
+    if (count && !(only_prefill && bounded && !tensor_cache &&
+                   try_prefill_projection_pairs(model, grants.data(), count, stream, stats))) {
         model.prefill_grants(grants.data(), count, stream, tensor_cache, layerwise, mixed, stats);
     }
     if (label_count) {

@@ -20,7 +20,7 @@ MTP loads its draft weights once and shares the target embedding and LM head. Ea
 
 The server supports opt-in [INT8 draft scoring](native-model-info.md#int8-draft-head).
 
-MTP prompt tiles hold 128 rows by default or 1,024 under [tensor-core policies](fp8-prefill-projections.md#tensor-core-projections). Draft seeding pairs each final-normalized target row with the next prompt token embedding. Single rows or unavailable scratch use scalar prefill. [Tile cap](../src/decoder_batch.cpp#L743)<!-- prefix: "int limit = " --> · [Row alignment](../src/decoder_prefill.cpp#L876)<!-- prefix: "chunk.seed_d" -->
+MTP prompt tiles hold 128 rows by default or 1,024 under [tensor-core policies](fp8-prefill-projections.md#tensor-core-projections). Draft seeding pairs each final-normalized target row with the next prompt token embedding. Single rows or unavailable scratch use scalar prefill. [Tile cap](../src/decoder_batch.cpp#L743)<!-- prefix: "int limit = " --> · [Row alignment](../src/decoder_prefill.cpp#L916)<!-- prefix: "chunk.seed_d" -->
 
 On B200, `tensor-core-mtp-target` with `SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=long` enables WMMA seed FC for text prompts ≥4,096 tokens and aligned chunks of 64–128 rows. BF16 inputs accumulate in FP32 and round to BF16. Accumulation order can change draft KV and proposals. `/server_info` reports this preference and SIMT fallback in `mtp_seed_fc`.
 

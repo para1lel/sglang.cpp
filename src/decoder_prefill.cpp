@@ -11,7 +11,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <string_view>
 #include <utility>
 
 namespace sglang::decoder {
@@ -636,6 +638,17 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         },
         [&](const Layer& layer) { chunk.mlp(layer); });
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
+        if (grant.draft && grant.prompt_remaining > 1) {
+            auto seed = chunk;
+            seed.position = grant.position;
+            seed.work.hidden += offset * hidden_size;
+            seed.work.residual += offset * hidden_size;
+            const bool wmma = model.target_split_end() == text_attention_max_tokens &&
+                grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
+            seed.seed_draft(*grant.draft, grant.tokens + 1,
+                            std::min(grant.rows, grant.prompt_remaining - 1),
+                            model.final_norm, wmma);
+        }
         capture_prefill_scores(model, grant, &buffers, offset, stream);
         stage_prefill_row(*grant.request, buffers, offset + grant.rows - 1, stream);
     });
@@ -652,6 +665,33 @@ int prefill_capacity(const PrefillGrant* grants, int count, int scalar_capacity,
     return capacity;
 }
 
+}
+
+bool decoder::try_prefill_projection_pairs(
+    const DecoderModel& model, const PrefillGrant* grants, int count, cudaStream_t stream,
+    DecoderBatchStepStats& stats) {
+    const char* value = std::getenv("SGLANG_EXPERIMENTAL_BULK_PREFILL");
+    if (!value || std::string_view(value) != "1" || !model.is_b200() ||
+        model.fp8_prefill() != Fp8PrefillPolicy::tensor_core_mtp_target ||
+        !pairable_prefill_grants(grants, count)) {
+        return false;
+    }
+    PrefillWorkspace workspace(stream, 2 * batch_prefill_tile_rows);
+    if (!workspace.data()) {
+        return false;
+    }
+    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
+    for (int offset = 0; offset < grants[0].rows; offset += batch_prefill_tile_rows) {
+        for (int index = 0; index < count; index += 2) {
+            const PrefillGrant pair[] = {prefill_tile(grants[index], offset),
+                                         prefill_tile(grants[index + 1], offset)};
+            prefill_layerwise(model, pair, {2, 2 * batch_prefill_tile_rows}, workspace, false);
+            ++stats.layerwise_prefill_groups;
+            stats.layerwise_prefill_rows += 2 * batch_prefill_tile_rows;
+        }
+    }
+    workspace.close();
+    return true;
 }
 
 TextFp8ActivationView PrefillProjections::quantize(const Bf16* input, int width) const {

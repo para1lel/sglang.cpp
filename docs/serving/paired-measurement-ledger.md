@@ -225,3 +225,35 @@ probes for each trial.
 | `continue-exact-mlp-test/profile.NLGh9LQn/profile-baseline/analysis-summary.json` | `43696966fd9d032adfb40593096fe3440839b28fafe5d29f187211ede63e2640` |
 | `continue-exact-mlp-test/profile.NLGh9LQn/profile-candidate/analysis-summary.json` | `fc96d99558eeadb53d7cbf14310557aa98d045e74500d395e5ac36a7e43a799f` |
 | `continue-wide-next-test/summary.json` | `e599ed16d86fed9149a471443049eba607542a77c018f18d0e836d0b483d6053` |
+
+### Cumulative native W1 K4 pilot
+
+The build combines draft KV-only repair, five-row verifier MLP, wide 4×8
+exact FP8 prefill, and Ollama chat compatibility. On B200 GPU7, four
+servers ran three warmups and five timed W1 requests each in ABBA order.
+All 34 streams, including two K0 controls, matched the 128 frozen output
+IDs, usage, and length finish.
+
+| HTTP metric, ms | Control | Cumulative |
+| --- | ---: | ---: |
+| Median E2E | 1,476.372 | 1,283.083 |
+| E2E range | 1,427.502–2,163.835 | 1,278.761–1,306.611 |
+| Median TTFT | 264.036 | 200.004 |
+| Median TPOT, ms/ID | 9.346 | 8.520 |
+
+Median E2E fell 13.09% overall and fell in both orderings. The control
+range includes a 716.840 ms gap before output ID 127 of unknown cause.
+Separate CUDA captures, one request per arm, measured active prefill at
+260.623 → 196.649 ms and active verify at 963.610 → 894.408 ms. Both
+recorded 52 rounds, 205 drafted IDs, 75 accepted IDs, and 257 verify rows.
+
+The control was commit `267d1ded2adc7c26f0d467e16673859802b64c5c`. The
+cumulative build used tree `0a86c34dc38ce3764dc6bc543ff6f13caf776a18`.
+The archived vLLM median of 638.064 ms used a different B200. The
+[formal matched K4 gate](../../benchmarks/paired/README.md#matched-k4-timing-protocol)
+remains open.
+
+| Receipt under `artifacts/continue-cumulative-w1/` | SHA-256 |
+| --- | --- |
+| `REPORT.md` | `5c849ff2ddfeaa7374390164152eec817e768d6c6d1b06786e829086d330f2e3` |
+| `run.wtALVRtm/summary.json` | `64b8999a4173eff1c49045c7cbc89224f6be563f33c67c144846114f46ee1e68` |

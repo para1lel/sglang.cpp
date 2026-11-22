@@ -91,7 +91,7 @@ __device__ void accumulate_bf16_pair(float& first, float& second,
           "r"(rhs0 & 0xffff0000u), "r"(rhs1 & 0xffff0000u));
 }
 
-__device__ void accumulate_prefill_gate(Bf16Dot& dot, uint4 weight, uint4 input) {
+__device__ void accumulate_packed_gate(Bf16Dot& dot, uint4 weight, uint4 input) {
     accumulate_bf16_pair(dot.first, dot.second, weight.x, weight.y, input.x, input.y);
     accumulate_bf16_pair(dot.first, dot.second, weight.z, weight.w, input.z, input.w);
 }
@@ -115,8 +115,8 @@ __global__ void bf16_gdn_prefill_gates(const __nv_bfloat16* weight_b,
 #pragma unroll
         for (int item = 0; item < prefill_gate_tile_rows; ++item) {
             const uint4 packed_input = load_128(input + (first_row + item) * width + col);
-            accumulate_prefill_gate(dots_b[item], packed_b, packed_input);
-            accumulate_prefill_gate(dots_a[item], packed_a, packed_input);
+            accumulate_packed_gate(dots_b[item], packed_b, packed_input);
+            accumulate_packed_gate(dots_a[item], packed_a, packed_input);
         }
     }
 #pragma unroll
@@ -184,6 +184,35 @@ __global__ void bf16_gdn_decode_shared(const __nv_bfloat16* weight_b,
         if (lane == 0) {
             output[row * text_gdn_value_heads + channel] = __float2bfloat16_rn(result);
         }
+    }
+}
+
+struct VerifyGdnGateArguments {
+    decoder::VerifyGdnGateRow rows[text_fp8_max_batch];
+};
+
+__global__ void bf16_gdn_verify_gates(const __nv_bfloat16* weight_b,
+                                     const __nv_bfloat16* weight_a,
+                                     const __grid_constant__ VerifyGdnGateArguments arguments) {
+    constexpr int packs = decoder::hidden_size / 8;
+    __shared__ uint4 row_weight[packs];
+    const bool gate_b = blockIdx.x < text_gdn_value_heads;
+    const int channel = blockIdx.x % text_gdn_value_heads;
+    const auto* weight = (gate_b ? weight_b : weight_a) + channel * decoder::hidden_size;
+    for (int pack = threadIdx.x; pack < packs; pack += blockDim.x) {
+        row_weight[pack] = load_128(weight + pack * 8);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x % warp_width;
+    const auto row = arguments.rows[threadIdx.x / warp_width];
+    Bf16Dot dot;
+#pragma unroll 4
+    for (int pack = lane; pack < packs; pack += warp_width) {
+        accumulate_packed_gate(dot, row_weight[pack], load_128(row.input + pack * 8));
+    }
+    const float result = warp_sum(dot.sum());
+    if (lane == 0) {
+        (gate_b ? row.output_b : row.output_a)[channel] = __float2bfloat16_rn(result);
     }
 }
 
@@ -333,6 +362,26 @@ cudaError_t decoder::decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
     void* args[] = {&weight_b, &weight_a, &input, &output_b, &output_a};
     return cudaLaunchKernel(bf16_gdn_gates_kernel, 2 * text_gdn_value_heads, warp_width,
                             args, 0, stream);
+}
+
+std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
+    if (count < 2 || count > text_fp8_max_batch || !rows || !weight_b || !weight_a ||
+        !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
+        return std::nullopt;
+    }
+    VerifyGdnGateArguments arguments{};
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        if (!row.input || !row.output_b || !row.output_a || !aligned(row.input, 16)) {
+            return std::nullopt;
+        }
+        arguments.rows[index] = row;
+    }
+    void* args[] = {&weight_b, &weight_a, &arguments};
+    return cudaLaunchKernel(bf16_gdn_verify_gates, 2 * text_gdn_value_heads,
+                            count * warp_width, args, 0, stream);
 }
 
 cudaError_t decoder::decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,

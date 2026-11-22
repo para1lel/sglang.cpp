@@ -223,6 +223,41 @@ void project(Bf16Weight weight, const LayerBatch<VerificationRow>& batch,
     }
 }
 
+void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch) {
+    if (!batch.target_tc || batch.count < 2 ||
+        layer.b.rows != text_gdn_value_heads || layer.a.rows != text_gdn_value_heads ||
+        layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
+        project(layer.b, batch, &Workspace::gdn_b);
+        project(layer.a, batch, &Workspace::gdn_a);
+        return;
+    }
+    std::array<VerifyGdnGateRow, text_fp8_max_batch> gates;
+    std::array<TextBf16Projection, text_fp8_max_batch> gate_b, gate_a;
+    for (int first = 0, group = 0; first < batch.count; ++group) {
+        const int rows = batch.projection_rows(group);
+        for (int index = 0; index < rows; ++index) {
+            const auto& work = workspace(batch.lanes[first + index]);
+            gates[index] = {work.normalized, work.gdn_b, work.gdn_a};
+        }
+        const auto status = try_verify_bf16_gdn_gates(layer.b.values, layer.a.values, gates.data(),
+                                                      rows, batch.stream);
+        if (status) {
+            check(*status, "Run grouped BF16 verification GDN gate projections");
+        } else {
+            for (int index = 0; index < rows; ++index) {
+                const auto& gate = gates[index];
+                gate_b[index] = {gate.input, gate.output_b};
+                gate_a[index] = {gate.input, gate.output_a};
+            }
+            check(text_bf16_gemm(layer.b.values, layer.b.rows, layer.b.columns, gate_b.data(),
+                                rows, batch.stream), "Run batched BF16 GDN b projection");
+            check(text_bf16_gemm(layer.a.values, layer.a.rows, layer.a.columns, gate_a.data(),
+                                rows, batch.stream), "Run batched BF16 GDN a projection");
+        }
+        first += rows;
+    }
+}
+
 template <typename Lane>
 void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_index) {
     batch.quantize(&Workspace::normalized, hidden_size);
@@ -269,8 +304,7 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
         batch.quantize(&Workspace::normalized, hidden_size);
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
-    project(layer.b, batch, &Workspace::gdn_b);
-    project(layer.a, batch, &Workspace::gdn_a);
+    project_gdn_gates(layer, batch);
     if (first.binding) {
         auto& scratch = *first.graph_workspace;
         check(decode_verify_gdn(batch.count, scratch.replay[state_index].inputs,

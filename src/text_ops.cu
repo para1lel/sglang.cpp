@@ -20,6 +20,7 @@ namespace {
 using namespace text_kernel;
 
 constexpr int argmax_tile = 4 * block_threads;
+constexpr int nonfinite_token = -2;
 static_assert(text_argmax_scratch_count(argmax_tile) == 1);
 static_assert(text_argmax_scratch_count(argmax_tile + 1) == 2);
 
@@ -422,8 +423,14 @@ __global__ void swiglu_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up
     }
 }
 
+template <bool RequireFinite>
 __device__ TextLogitCandidate best_candidate(TextLogitCandidate first,
                                              TextLogitCandidate second) {
+    if constexpr (RequireFinite) {
+        if (first.token_id == nonfinite_token || second.token_id == nonfinite_token) {
+            return {-CUDART_INF_F, nonfinite_token};
+        }
+    }
     if (second.token_id >= 0 &&
         (first.token_id < 0 || second.score > first.score ||
          (second.score == first.score && second.token_id < first.token_id))) {
@@ -432,27 +439,29 @@ __device__ TextLogitCandidate best_candidate(TextLogitCandidate first,
     return first;
 }
 
+template <bool RequireFinite>
 __device__ TextLogitCandidate warp_best(TextLogitCandidate best) {
     for (int offset = warp_width / 2; offset > 0; offset /= 2) {
         const TextLogitCandidate other{
             __shfl_down_sync(warp_mask, best.score, offset),
             __shfl_down_sync(warp_mask, best.token_id, offset)};
-        best = best_candidate(best, other);
+        best = best_candidate<RequireFinite>(best, other);
     }
     return best;
 }
 
+template <bool RequireFinite>
 __device__ void store_block_best(TextLogitCandidate best, TextLogitCandidate* output) {
     __shared__ TextLogitCandidate warp_candidates[block_warps];
     const int lane = threadIdx.x % warp_width;
     const int warp = threadIdx.x / warp_width;
-    best = warp_best(best);
+    best = warp_best<RequireFinite>(best);
     if (lane == 0) {
         warp_candidates[warp] = best;
     }
     __syncthreads();
     if (warp == 0) {
-        best = warp_best(lane < block_warps ? warp_candidates[lane]
+        best = warp_best<RequireFinite>(lane < block_warps ? warp_candidates[lane]
                                            : TextLogitCandidate{-CUDART_INF_F, -1});
         if (lane == 0) {
             *output = best;
@@ -460,7 +469,7 @@ __device__ void store_block_best(TextLogitCandidate best, TextLogitCandidate* ou
     }
 }
 
-template <typename Score>
+template <typename Score, bool RequireFinite>
 __global__ void argmax_tiles_kernel(const Score* logits, int vocab_size,
                                     TextLogitCandidate* scratch) {
     const unsigned int start = blockIdx.x * argmax_tile;
@@ -469,21 +478,28 @@ __global__ void argmax_tiles_kernel(const Score* logits, int vocab_size,
         const unsigned int token = start + item;
         if (token < static_cast<unsigned int>(vocab_size)) {
             const float score = static_cast<float>(logits[token]);
+            if constexpr (RequireFinite) {
+                if (!isfinite(score)) {
+                    best = {-CUDART_INF_F, nonfinite_token};
+                    break;
+                }
+            }
             if (!isnan(score)) {
-                best = best_candidate(best, {score, static_cast<int>(token)});
+                best = best_candidate<RequireFinite>(best, {score, static_cast<int>(token)});
             }
         }
     }
-    store_block_best(best, scratch + blockIdx.x);
+    store_block_best<RequireFinite>(best, scratch + blockIdx.x);
 }
 
+template <bool RequireFinite>
 __global__ void argmax_finish_kernel(const TextLogitCandidate* scratch, int count,
                                      TextLogitCandidate* output) {
     TextLogitCandidate best{-CUDART_INF_F, -1};
     for (int item = threadIdx.x; item < count; item += block_threads) {
-        best = best_candidate(best, scratch[item]);
+        best = best_candidate<RequireFinite>(best, scratch[item]);
     }
-    store_block_best(best, output);
+    store_block_best<RequireFinite>(best, output);
 }
 
 }
@@ -750,7 +766,7 @@ cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int 
                             args, 0, stream);
 }
 
-template <typename Score>
+template <bool RequireFinite = false, typename Score>
 cudaError_t launch_argmax(const Score* logits, int vocab_size, TextLogitCandidate* scratch,
                           TextLogitCandidate* output, cudaStream_t stream) {
     if (logits == nullptr || scratch == nullptr || output == nullptr || scratch == output ||
@@ -759,13 +775,14 @@ cudaError_t launch_argmax(const Score* logits, int vocab_size, TextLogitCandidat
     }
     int count = text_argmax_scratch_count(vocab_size);
     void* tiles_args[] = {&logits, &vocab_size, &scratch};
-    const cudaError_t status = cudaLaunchKernel(argmax_tiles_kernel<Score>, count, block_threads,
-                                                tiles_args, 0, stream);
+    const cudaError_t status = cudaLaunchKernel(argmax_tiles_kernel<Score, RequireFinite>,
+                                                count, block_threads, tiles_args, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }
     void* finish_args[] = {&scratch, &count, &output};
-    return cudaLaunchKernel(argmax_finish_kernel, 1, block_threads, finish_args, 0, stream);
+    return cudaLaunchKernel(argmax_finish_kernel<RequireFinite>, 1, block_threads, finish_args,
+                            0, stream);
 }
 
 cudaError_t text_argmax(const __nv_bfloat16* logits, int vocab_size, TextLogitCandidate* scratch,
@@ -776,6 +793,12 @@ cudaError_t text_argmax(const __nv_bfloat16* logits, int vocab_size, TextLogitCa
 cudaError_t text_argmax(const float* logits, int vocab_size, TextLogitCandidate* scratch,
                         TextLogitCandidate* output, cudaStream_t stream) {
     return launch_argmax(logits, vocab_size, scratch, output, stream);
+}
+
+cudaError_t text_argmax_finite(const __nv_bfloat16* logits, int vocab_size,
+                               TextLogitCandidate* scratch, TextLogitCandidate* output,
+                               cudaStream_t stream) {
+    return launch_argmax<true>(logits, vocab_size, scratch, output, stream);
 }
 
 cudaError_t text_fp8_decode_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,

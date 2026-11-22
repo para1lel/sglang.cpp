@@ -6,10 +6,10 @@
 | --- | --- | --- |
 | HTTP control | Match `GET /model_info` and its deprecated alias `GET /get_model_info`. | [Control route](../apps/server/prefix_controls.cpp#L534)<!-- prefix: "if (!model_i" --> |
 | Model discovery | List or retrieve the served model card. | [List dispatch](../apps/server/prefix_controls.cpp#L559)<!-- prefix: "if (path == " --> · [Retrieval dispatch](../apps/server/prefix_controls.cpp#L546)<!-- prefix: "if (model_re" --> · [Shared card writer](../apps/server/prefix_controls.cpp#L481)<!-- prefix: "std::string " --> |
-| Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L189)<!-- prefix: "std::string " --> |
+| Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L200)<!-- prefix: "std::string " --> |
 | Checkpoint | Supply the supported model type and architecture. | [Checkpoint identity](../include/sglang/checkpoint.h#L47)<!-- prefix: "inline const" --> |
-| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L714)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L327)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L211)<!-- prefix: "std::string " --> |
-| Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L67)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L298)<!-- prefix: "BatchService" --> |
+| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L714)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L342)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L222)<!-- prefix: "std::string " --> |
+| Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L68)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L313)<!-- prefix: "BatchService" --> |
 | Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L834)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L346)<!-- prefix: "counters.gen" --> |
 
 ## Runtime path
@@ -50,6 +50,7 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 | `launch_command` | String starting with `sglang-server`. It records explicit options in input order, including repeats. |
 | `max_running_requests`, `max_num_batched_tokens` | Integer lane limit from `--max-active` and aggregate target-token budget per scheduler step. Defaults are 32 and 8,192. |
 | `mtp_steps`, `prefix_cache_entries` | Integer [server draft depth](mtp.md#runtime-path) and prefix entry capacity. Zero disables the corresponding feature. |
+| `mtp_int8_head` | Boolean [INT8 draft head](#int8-draft-head) setting. True when `--mtp-int8-head` is present and the effective MTP depth is positive. |
 | `fp8_prefill`, `sampling_defaults` | Strings selecting the prefill policy (`"exact"` or `"tensor-core"`) and sampling defaults (`"model"` or `"openai"`). |
 | `reasoning_parser`, `tool_call_parser` | JSON `null` when disabled. Enabled values are `"qwen3"` and `"qwen3_coder"`, respectively. |
 | `eager`, `trace_batches`, `batch_cuda_graphs` | Booleans for eager execution, batch tracing, and the effective [batch graph policy](batch-graphs.md). `batch_cuda_graphs` defaults to `true`. It is `false` with `--eager`, including when the command also includes `--batch-cuda-graphs`. |
@@ -64,9 +65,17 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 | `num_running_reqs` | Integer count of admitted user generation items still in scheduler slots. It excludes waiting HTTP work and internal health jobs. |
 | `generation_tokens_total` | Cumulative integer count of published user output IDs, including additional MTP IDs. It advances at scheduler publication, independently of socket delivery and prefix reuse. Health generation contributes zero. |
 
-The command retains switches and validated numeric or enumerated operands. It replaces every `--checkpoint` operand, including superseded paths, with `'<redacted>'`. The two public path fields still identify the selected checkpoint. Environment variables, executable paths, HTTP headers, query values, and request bodies do not supply command text. [Argument recording](../apps/sglang-server.cpp#L86)<!-- prefix: "Arguments pa" --> · [Startup interval](../apps/sglang-server.cpp#L286)<!-- prefix: "const auto s" --> · [Listener timestamp](../apps/sglang-server.cpp#L308)<!-- prefix: "const std::c" -->
+The command retains switches and validated numeric or enumerated operands. It replaces every `--checkpoint` operand, including superseded paths, with `'<redacted>'`. The two public path fields still identify the selected checkpoint. Environment variables, executable paths, HTTP headers, query values, and request bodies do not supply command text. [Argument recording](../apps/sglang-server.cpp#L106)<!-- prefix: "Arguments pa" --> · [Startup interval](../apps/sglang-server.cpp#L300)<!-- prefix: "const auto s" --> · [Listener timestamp](../apps/sglang-server.cpp#L323)<!-- prefix: "const std::c" -->
 
 Pinned SGLang exposes resolved settings and a launch command at the top level, with startup durations, per-DP state, version, frontend, and inline-system capability. The native schema reports its own settings and counters. It omits Python-specific options, `kv_events`, and upstream `last_gen_throughput` and `memory_usage` measurements. [Pinned Python routes](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L888)<!-- prefix: "@app.get(\"/g" --> · [Resolved fields](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/server_utils.py#L206)<!-- prefix: "def build_se" --> · [Scheduler measurements](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/scheduler_components/internal_state.py#L75)<!-- prefix: "state[\"last_" -->
+
+### INT8 draft head
+
+`--mtp-int8-head` opts into signed INT8 scoring for unconstrained draft proposals. BF16 remains the default and serves the target and constrained drafts. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive and the selected FP8 target policy still applies. [Weight preparation](../src/decoder_mtp.cpp#L176)<!-- prefix: "if (int8_hea" -->
+
+Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L144)<!-- prefix: "__global__ v" --> · [Retry](../src/decoder_mtp.cpp#L471)<!-- prefix: "bool MtpDraf" -->
+
+Verify opt-in runs against a fresh K0 control with the same FP8 target policy. The frozen comparison uses an exact target and exact K0. Use a separate campaign for `tensor-core-mtp-target`.
 
 ## Constraints and failure behavior
 

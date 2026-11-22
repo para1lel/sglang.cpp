@@ -19,7 +19,7 @@ class MtpDraftWeights {
 public:
     MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
                     std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-                    Bf16Weight lm_head);
+                    Bf16Weight lm_head, bool int8_head);
     ~MtpDraftWeights();
 
     std::size_t device_allocation_bytes() const;
@@ -50,6 +50,7 @@ public:
 
     /// Read the most recent scored enqueue after its stream has completed.
     int read_token() const;
+    bool retry_invalid_int8(cudaStream_t stream);
 
     int valid_prefix() const;
     /// Shorten logical KV coverage. Subsequent enqueues overwrite the suffix.

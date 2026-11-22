@@ -233,6 +233,7 @@ bool health_control(std::string_view name) {
 struct Decoder::Model {};
 
 Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy) {}
+Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy, bool) {}
 Decoder::~Decoder() = default;
 
 DecoderResult Decoder::generate(const std::vector<int>& prompt, const DecoderOptions& options,

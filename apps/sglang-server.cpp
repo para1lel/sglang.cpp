@@ -38,6 +38,7 @@ struct Arguments {
     int mtp_steps = 4;
     int prefix_cache_entries = 0;
     bool mtp_steps_explicit = false;
+    bool mtp_int8_head = false;
     bool eager = false;
     bool trace_batches = false;
     bool batch_cuda_graphs = true;
@@ -83,12 +84,36 @@ void append_launch_option(std::string& command, std::string_view option,
     }
 }
 
+void configure_prefix_cache(Arguments& arguments) {
+    if (arguments.prefix_cache_entries == 0) {
+        return;
+    }
+    if (sglang::token_ordered_decode(arguments.fp8_prefill)) {
+        throw std::invalid_argument("Selected FP8 policy requires prefix cache off");
+    }
+    if (arguments.eager) {
+        throw std::invalid_argument("--prefix-cache-entries requires omitting --eager");
+    }
+    if (arguments.fp8_prefill == sglang::Fp8PrefillPolicy::tensor_core) {
+        if (arguments.mtp_steps_explicit && arguments.mtp_steps != 0) {
+            throw std::invalid_argument(
+                "MTP with --prefix-cache-entries requires --fp8-prefill exact");
+        }
+        arguments.mtp_steps = 0;
+    }
+}
+
 Arguments parse_arguments(int argc, char** argv) {
     Arguments arguments;
     for (int index = 1; index < argc; ++index) {
         const std::string_view option = argv[index];
         if (option == "--trace-batches") {
             arguments.trace_batches = true;
+            append_launch_option(arguments.launch_command, option);
+            continue;
+        }
+        if (option == "--mtp-int8-head") {
+            arguments.mtp_int8_head = true;
             append_launch_option(arguments.launch_command, option);
             continue;
         }
@@ -163,21 +188,7 @@ Arguments parse_arguments(int argc, char** argv) {
         }
         append_launch_option(arguments.launch_command, option, value);
     }
-    if (arguments.prefix_cache_entries != 0) {
-        if (sglang::token_ordered_decode(arguments.fp8_prefill)) {
-            throw std::invalid_argument("Selected FP8 policy requires prefix cache off");
-        }
-        if (arguments.eager) {
-            throw std::invalid_argument("--prefix-cache-entries requires omitting --eager");
-        }
-        if (arguments.fp8_prefill == sglang::Fp8PrefillPolicy::tensor_core) {
-            if (arguments.mtp_steps_explicit && arguments.mtp_steps != 0) {
-                throw std::invalid_argument(
-                    "MTP with --prefix-cache-entries requires --fp8-prefill exact");
-            }
-            arguments.mtp_steps = 0;
-        }
-    }
+    configure_prefix_cache(arguments);
     return arguments;
 }
 
@@ -225,6 +236,8 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += R"(,"max_running_requests":)" + std::to_string(arguments.max_active);
     body += R"(,"max_num_batched_tokens":)" + std::to_string(arguments.max_num_batched_tokens);
     body += R"(,"mtp_steps":)" + std::to_string(arguments.mtp_steps);
+    body += R"(,"mtp_int8_head":)";
+    body += arguments.mtp_int8_head && arguments.mtp_steps != 0 ? "true" : "false";
     body += R"(,"prefix_cache_entries":)" + std::to_string(arguments.prefix_cache_entries);
     body += R"(,"fp8_prefill":)";
     sglang::json::append_quoted(body, sglang::cli::fp8_prefill_name(arguments.fp8_prefill));
@@ -274,6 +287,7 @@ int main(int argc, char** argv) {
                      "Target rows per step: " << sglang::decoder_default_max_num_batched_tokens
                   << " by default, range 1-32768.\n"
                      "MTP steps: 4 by default, range 0-4. --mtp-k is an alias.\n"
+                     "--mtp-int8-head enables an INT8 vocabulary head for MTP proposals.\n"
                      "Default MTP uses 0 steps for logprobs and with a Tensor Core prefix cache.\n"
                      "Batch graphs: enabled by default for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
@@ -287,7 +301,8 @@ int main(int argc, char** argv) {
         const auto arguments = parse_arguments(argc, argv);
         install_shutdown_handlers();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
-                                      arguments.mtp_steps != 0, arguments.fp8_prefill);
+                                      arguments.mtp_steps != 0, arguments.fp8_prefill,
+                                      arguments.mtp_int8_head);
         if (stopping()) {
             return 0;
         }

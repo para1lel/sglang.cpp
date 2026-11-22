@@ -94,6 +94,26 @@ def server(binary, checkpoint, log, *flags, sampling=True, with_process=False):
 
 
 class Routes(unittest.TestCase):
+    def test_draft_head_opt_in_and_k0(self):
+        data = self.control(self.port, "/server_info")
+        self.assertEqual(data["fp8_prefill"], "exact")
+        self.assertEqual(data["mtp_steps"], 4)
+        self.assertIs(data["mtp_int8_head"], False)
+        for depth in (0, 4):
+            with self.subTest(depth=depth):
+                log = self.output / f"draft-head-k{depth}.log"
+                with server(self.binary, self.checkpoint, log, "--mtp-steps", str(depth),
+                            "--fp8-prefill", "tensor-core-mtp-target", "--mtp-int8-head") as port:
+                    data = self.control(port, "/server_info")
+                    self.assertEqual(data["fp8_prefill"], "tensor-core-mtp-target")
+                    self.assertEqual(data["mtp_steps"], depth)
+                    self.assertIs(data["mtp_int8_head"], depth > 0)
+                    response, receipt = self.exchange(
+                        TEXT, body(TEXT, max_tokens=1, temperature=0, ignore_eos=True),
+                        port=port, log=log,
+                    )
+                    self.completion(response, receipt, 1, "length")
+
     def test_scheduler_budget_default_and_override(self):
         for flag, budget in (((), 8192), (("--max-num-batched-tokens", "32768"), 32768)):
             with self.subTest(budget=budget):

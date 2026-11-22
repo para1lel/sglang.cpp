@@ -8,6 +8,7 @@
 
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 namespace sglang {
 namespace {
@@ -138,6 +139,80 @@ __device__ uint4 load_streaming_128(const void* address) {
         : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
         : "l"(global) : "memory");
     return bits;
+}
+
+__global__ void quantize_draft_head_rows(const __nv_bfloat16* input, int rows,
+                                        std::uint8_t* values, float* maxima) {
+    constexpr int width = decoder::hidden_size;
+    const int lane = threadIdx.x % warp_width;
+    const int row = blockIdx.x * (blockDim.x / warp_width) + threadIdx.x / warp_width;
+    if (row >= rows) {
+        return;
+    }
+    const auto offset = static_cast<std::size_t>(row) * width;
+    const auto* source = input + offset;
+    auto* destination = reinterpret_cast<std::int8_t*>(values + offset);
+    float maximum = 0;
+    bool invalid = false;
+    for (int column = lane; column < width; column += warp_width) {
+        const float value = __bfloat162float(source[column]);
+        invalid |= !isfinite(value);
+        maximum = fmaxf(maximum, fabsf(value));
+    }
+    invalid = __any_sync(warp_mask, invalid);
+    maximum = __shfl_sync(warp_mask, warp_max(maximum), 0);
+    const bool use_inverse = maximum >= 0x1p-120f && maximum <= 0x1p120f;
+    const float inverse = use_inverse ? 127.0f / maximum : 0;
+    for (int column = lane; column < width; column += warp_width) {
+        int quantized = 0;
+        if (!invalid && maximum != 0) {
+            const float value = __bfloat162float(source[column]);
+            const float scaled = use_inverse ? value * inverse : 127.0f * (value / maximum);
+            quantized = __float2int_rn(scaled);
+        }
+        destination[column] = quantized;
+    }
+    if (lane == 0) {
+        maxima[row] = invalid ? CUDART_NAN_F : maximum;
+    }
+}
+
+__device__ int dot_signed_bytes(uint4 weight, uint4 input, int sum) {
+    sum = __dp4a(static_cast<int>(weight.x), static_cast<int>(input.x), sum);
+    sum = __dp4a(static_cast<int>(weight.y), static_cast<int>(input.y), sum);
+    sum = __dp4a(static_cast<int>(weight.z), static_cast<int>(input.z), sum);
+    return __dp4a(static_cast<int>(weight.w), static_cast<int>(input.w), sum);
+}
+
+__device__ __nv_bfloat16 draft_head_logit(int sum, float weight_maximum, float input_maximum) {
+    constexpr int quantization_denominator = 127 * 127;
+    return __double2bfloat16(static_cast<double>(sum) * weight_maximum * input_maximum /
+                            quantization_denominator);
+}
+
+__global__ void draft_head_int8_kernel(const std::uint8_t* weights, const float* weight_maxima,
+                                      const std::uint8_t* input, const float* input_maximum,
+                                      __nv_bfloat16* output) {
+    constexpr int width = decoder::hidden_size;
+    static_assert(width * 127 * 127 <= 2147483647);
+    static_assert(decoder::vocab_size % (2 * block_warps) == 0);
+    const int lane = threadIdx.x % warp_width;
+    const int row = 2 * (blockIdx.x * block_warps + threadIdx.x / warp_width);
+    const auto* weight = weights + static_cast<std::size_t>(row) * width;
+    int first = 0;
+    int second = 0;
+    for (int column = lane * 16; column < width; column += warp_width * 16) {
+        const auto vector = load_128(input + column);
+        first = dot_signed_bytes(load_streaming_128(weight + column), vector, first);
+        second = dot_signed_bytes(load_streaming_128(weight + width + column), vector, second);
+    }
+    first = __reduce_add_sync(warp_mask, first);
+    second = __reduce_add_sync(warp_mask, second);
+    if (lane == 0) {
+        const float maximum = *input_maximum;
+        output[row] = draft_head_logit(first, weight_maxima[row], maximum);
+        output[row + 1] = draft_head_logit(second, weight_maxima[row + 1], maximum);
+    }
 }
 
 __global__ void bf16_gdn_gates_kernel(const __nv_bfloat16* weight_b,
@@ -393,6 +468,35 @@ cudaError_t decoder::decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv
     }
     void* args[] = {&weight, &input, &rows, &output};
     return cudaLaunchKernel(bf16_lm_head_pair_kernel, divide_up(rows, 2 * block_warps),
+                            block_threads, args, 0, stream);
+}
+
+cudaError_t decoder::quantize_draft_head_int8(const __nv_bfloat16* input, int rows,
+                                             std::uint8_t* values, float* maxima,
+                                             cudaStream_t stream) {
+    if (!input || rows <= 0 || !values || !maxima) {
+        return cudaErrorInvalidValue;
+    }
+    const int warps = rows == 1 ? 1 : block_warps;
+    void* args[] = {&input, &rows, &values, &maxima};
+    return cudaLaunchKernel(quantize_draft_head_rows, divide_up(rows, warps), warp_width * warps,
+                            args, 0, stream);
+}
+
+cudaError_t decoder::decode_draft_head_int8(const std::uint8_t* weight, const float* weight_maxima,
+                                           const __nv_bfloat16* input,
+                                           std::uint8_t* input_values, float* input_maximum,
+                                           __nv_bfloat16* output, cudaStream_t stream) {
+    if (!weight || !weight_maxima || !output || !input_values ||
+        !aligned(weight, 16) || !aligned(input_values, 16)) {
+        return cudaErrorInvalidValue;
+    }
+    const auto status = quantize_draft_head_int8(input, 1, input_values, input_maximum, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    void* args[] = {&weight, &weight_maxima, &input_values, &input_maximum, &output};
+    return cudaLaunchKernel(draft_head_int8_kernel, vocab_size / (2 * block_warps),
                             block_threads, args, 0, stream);
 }
 

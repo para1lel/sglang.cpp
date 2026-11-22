@@ -1,6 +1,6 @@
 # Native HTTP transport
 
-The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L312)<!-- prefix: "serve_connec" -->
+The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L327)<!-- prefix: "serve_connec" -->
 
 ## Request targets and redirects
 
@@ -23,7 +23,7 @@ Send an empty GET request for each check. All three checks bypass the completion
 
 | Route | Responsibility | Response |
 | --- | --- | --- |
-| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L184)<!-- prefix: "std::string " --> |
+| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L195)<!-- prefix: "std::string " --> |
 | `/ready` | The HTTP reader checks the permanent decoder worker failure flag. | HTTP 200 with `{"ready":true}` while the worker has no permanent failure. After failure, HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. [Readiness response](../apps/server/http.cpp#L661)<!-- prefix: "void write_r" --> · [Worker flag](../apps/server/batch_service.cpp#L775)<!-- prefix: "bool BatchSe" --> |
 | `/health_generate` | A dedicated HTTP worker asks the batch scheduler for generation progress. | HTTP 200 for progress within the probe window. HTTP 503 for queue overload, probe failure, timeout, permanent worker failure, or shutdown. Both statuses carry `Content-Length: 0` and `Connection: close`. [Dispatch](../apps/server/prefix_controls.cpp#L511)<!-- prefix: "void Connect" --> · [Reply](../apps/server/http.cpp#L670)<!-- prefix: "void write_g" --> |
 

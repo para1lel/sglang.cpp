@@ -460,7 +460,11 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
     : Decoder(checkpoint, cuda_device, enable_mtp, Fp8PrefillPolicy::exact) {}
 
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
-                 Fp8PrefillPolicy fp8_prefill) {
+                 Fp8PrefillPolicy fp8_prefill)
+    : Decoder(checkpoint, cuda_device, enable_mtp, fp8_prefill, false) {}
+
+Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
+                 Fp8PrefillPolicy fp8_prefill, bool mtp_int8_head) {
     if (fp8_prefill != Fp8PrefillPolicy::exact && fp8_prefill != Fp8PrefillPolicy::tensor_core &&
         !token_ordered_decode(fp8_prefill)) {
         throw std::invalid_argument("Invalid FP8 prefill policy");
@@ -468,7 +472,8 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
     model_ = std::make_unique<Model>(checkpoint, cuda_device, fp8_prefill);
     if (enable_mtp) {
         model_->mtp_weights = std::make_shared<MtpDraftWeights>(
-            checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head);
+            checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head,
+            mtp_int8_head);
     }
 }
 

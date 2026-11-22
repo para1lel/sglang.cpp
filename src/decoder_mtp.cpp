@@ -1,8 +1,11 @@
 #include "sglang/decoder_mtp.h"
 
 #include "sglang/checkpoint.h"
+#include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_prefill.h"
 
+#include <cmath>
+#include <cstdio>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -139,7 +142,7 @@ void project(Fp8Weight weight, const DraftWorkspace& work, Bf16* output, cudaStr
 struct MtpDraftWeights::State {
     State(const std::filesystem::path& directory, int device,
           std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-          Bf16Weight lm_head)
+          Bf16Weight lm_head, bool int8_head)
         : device(device), target_weights(std::move(target_weights)), memory(device),
           embedding(embedding), lm_head(lm_head) {
         if (!this->target_weights || !embedding || !lm_head.values ||
@@ -170,7 +173,27 @@ struct MtpDraftWeights::State {
         mlp_up = upload.projection(mlp + "up_proj", intermediate_size, hidden_size);
         mlp_down = upload.projection(mlp + "down_proj", hidden_size, intermediate_size);
         final_norm = upload.norm("mtp.norm.weight", hidden_size);
+        if (int8_head) {
+            auto* values = memory.allocate<std::uint8_t>(
+                static_cast<std::size_t>(vocab_size) * hidden_size);
+            auto* maxima = memory.allocate<float>(vocab_size);
+            check(quantize_draft_head_int8(lm_head.values, vocab_size, values, maxima,
+                                          memory.stream()), "Quantize MTP vocabulary head");
+            quantized_head = values;
+            quantized_head_maxima = maxima;
+        }
         memory.close_stream();
+        if (int8_head) {
+            std::vector<float> maxima(vocab_size);
+            check(cudaMemcpy(maxima.data(), quantized_head_maxima, maxima.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost), "Read INT8 MTP vocabulary row maxima");
+            for (int token = 0; token < vocab_size; ++token) {
+                if (!std::isfinite(maxima[token])) {
+                    throw std::runtime_error("Nonfinite INT8 MTP vocabulary weight at token " +
+                                             std::to_string(token));
+                }
+            }
+        }
         selected_device.restore();
     }
 
@@ -179,6 +202,8 @@ struct MtpDraftWeights::State {
     Allocations memory;
     const Bf16* embedding;
     Bf16Weight lm_head;
+    const std::uint8_t* quantized_head = nullptr;
+    const float* quantized_head_maxima = nullptr;
     const Bf16* embedding_norm;
     const Bf16* hidden_norm;
     Bf16Weight fc;
@@ -208,6 +233,9 @@ struct MtpDraftRequest::State {
     int prefix = 0;
     bool scored = false;
     bool constrained_score = false;
+    bool int8_score = false;
+    bool retried_score = false;
+    TextLogitCandidate retry_winner{};
     bool failed = false;
 };
 
@@ -295,12 +323,25 @@ void MtpDraftRequest::State::run_mlp(cudaStream_t stream) {
 
 void MtpDraftRequest::State::score(cudaStream_t stream, const ConstraintWorkspace* scratch,
                                   const ConstraintCandidates* allowed) {
-    const auto& head = weights->state_->lm_head;
-    check(text_bf16_gemv(head.values, work.normalized, head.rows, head.columns,
-                         work.logits, stream), "Run shared LM head for MTP");
+    const auto& model = *weights->state_;
+    const auto& head = model.lm_head;
+    int8_score = model.quantized_head && !allowed;
+    retried_score = false;
+    if (int8_score) {
+        check(decode_draft_head_int8(model.quantized_head, model.quantized_head_maxima,
+                                     work.normalized, work.activation.values,
+                                     work.activation.scales, work.logits, stream),
+              "Run INT8 vocabulary head for MTP");
+    } else {
+        check(text_bf16_gemv(head.values, work.normalized, head.rows, head.columns,
+                             work.logits, stream), "Run shared LM head for MTP");
+    }
     if (allowed) {
         select_constrained({work.logits, work.argmax_scratch, work.argmax}, *scratch, *allowed,
                            nullptr, 0, nullptr, stream);
+    } else if (int8_score) {
+        check(text_argmax_finite(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+              "Select finite INT8 MTP token");
     } else {
         check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
               "Select MTP token");
@@ -314,9 +355,9 @@ void MtpDraftRequest::State::score(cudaStream_t stream, const ConstraintWorkspac
 
 MtpDraftWeights::MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
                                  std::shared_ptr<const Allocations> target_weights,
-                                 const Bf16* embedding, Bf16Weight lm_head)
+                                 const Bf16* embedding, Bf16Weight lm_head, bool int8_head)
     : state_(std::make_unique<State>(checkpoint, device, std::move(target_weights), embedding,
-                                     lm_head)) {}
+                                     lm_head, int8_head)) {}
 
 MtpDraftWeights::~MtpDraftWeights() = default;
 
@@ -408,6 +449,15 @@ int MtpDraftRequest::read_token() const {
     if (state_->failed || !state_->scored) {
         throw std::logic_error("MTP draft has no completed score to read");
     }
+    if (state_->retried_score) {
+        const auto& winner = state_->retry_winner;
+        if (winner.token_id < 0 || winner.token_id >= vocab_size ||
+            !std::isfinite(winner.score)) {
+            std::fputs("INT8 MTP BF16 retry has no finite winner; dropping proposal\n", stderr);
+            return -1;
+        }
+        return winner.token_id;
+    }
     const int token = state_->memory.transfers().winner;
     if (token == -1 && state_->constrained_score) {
         return -1;
@@ -416,6 +466,27 @@ int MtpDraftRequest::read_token() const {
         throw std::runtime_error("MTP argmax did not return a valid token ID");
     }
     return token;
+}
+
+bool MtpDraftRequest::retry_invalid_int8(cudaStream_t stream) {
+    auto& request = *state_;
+    const int token = request.memory.transfers().winner;
+    if (!request.int8_score || (token >= 0 && token < vocab_size)) {
+        return false;
+    }
+    std::fputs("INT8 MTP scores are invalid; retrying draft vocabulary head in BF16\n", stderr);
+    const auto& head = request.weights->state_->lm_head;
+    auto& work = request.work;
+    check(text_bf16_gemv(head.values, work.normalized, head.rows, head.columns,
+                         work.logits, stream),
+          "Retry MTP vocabulary head in BF16");
+    check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+          "Select BF16 MTP retry token");
+    check(cudaMemcpyAsync(&request.retry_winner, work.argmax, sizeof(request.retry_winner),
+                          cudaMemcpyDeviceToHost, stream), "Copy BF16 MTP retry winner");
+    request.int8_score = false;
+    request.retried_score = true;
+    return true;
 }
 
 int MtpDraftRequest::valid_prefix() const { return state_->prefix; }

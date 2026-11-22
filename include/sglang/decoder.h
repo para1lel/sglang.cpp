@@ -171,6 +171,8 @@ public:
     Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp);
     Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
             Fp8PrefillPolicy fp8_prefill);
+    Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
+            Fp8PrefillPolicy fp8_prefill, bool mtp_int8_head);
     ~Decoder();
 
     Decoder(const Decoder&) = delete;

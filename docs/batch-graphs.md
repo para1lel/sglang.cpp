@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Set graph policy, construct the batch service, and report batch steps. | [Default](../apps/sglang-server.cpp#L43)<!-- prefix: "bool batch_c" --> · [Effective policy](../apps/sglang-server.cpp#L46)<!-- prefix: "bool enable_" --> · [Batch service](../apps/sglang-server.cpp#L298)<!-- prefix: "BatchService" --> · [Trace](../include/sglang/server/batch_trace.h#L68)<!-- prefix: "inline void " --> |
+| Server | Set graph policy, construct the batch service, and report batch steps. | [Default](../apps/sglang-server.cpp#L44)<!-- prefix: "bool batch_c" --> · [Effective policy](../apps/sglang-server.cpp#L47)<!-- prefix: "bool enable_" --> · [Batch service](../apps/sglang-server.cpp#L313)<!-- prefix: "BatchService" --> · [Trace](../include/sglang/server/batch_trace.h#L68)<!-- prefix: "inline void " --> |
 | Decoder batch | Select eligible decode steps, bind lane state, and return winners by slot. | [Batch options](../include/sglang/decoder_batch.h#L54)<!-- prefix: "struct Decod" --> · [Dispatch](../src/decoder_batch.cpp#L674)<!-- prefix: "const auto r" --> · [Readback](../src/decoder_batch.cpp#L767)<!-- prefix: "void Decoder" --> |
 | CUDA resources | Recover from eligible pre-submission failures and retain resources while completion is uncertain. | [Fallback](../src/decoder_resources.cpp#L618)<!-- prefix: "bool Allocat" --> · [Cleanup](../src/decoder_resources.cpp#L227)<!-- prefix: "CleanupError" --> |
 
@@ -14,7 +14,7 @@ The [step cap](development.md#native-streaming-server) covers prefill and decode
 
 `--trace-batches` reports `target_rows` and `step_budget`. The total charges executed prompt rows, including the first-output row, one row per ordinary decode lane, and computed target verification rows for MTP. Prefix restores, score-only full hits, draft seeding and proposals, commit replays, vision encoding, and emitted IDs stay outside the total. `prefill_rows` lists configured slots in order, with at least four entries. `width` counts selected lanes, including lanes assigned no rows. `decode` counts executed decode lanes. K0 reports `peak_request_bytes` on active steps. [Step trace](../include/sglang/server/batch_trace.h#L42)<!-- prefix: "std::cerr <<" -->
 
-`sglang-server` enables CUDA graphs by default. It still accepts `--batch-cuda-graphs`. `--eager` disables replay and requires prefix reuse off. The C++ option `DecoderBatchOptions::cuda_graphs` defaults to `false`. [CLI flags](../apps/sglang-server.cpp#L95)<!-- prefix: "if (option =" --> · [Batch options](../include/sglang/decoder_batch.h#L54)<!-- prefix: "struct Decod" -->
+`sglang-server` enables CUDA graphs by default. It still accepts `--batch-cuda-graphs`. `--eager` disables replay and requires prefix reuse off. The C++ option `DecoderBatchOptions::cuda_graphs` defaults to `false`. [CLI flags](../apps/sglang-server.cpp#L120)<!-- prefix: "if (option =" --> · [Batch options](../include/sglang/decoder_batch.h#L54)<!-- prefix: "struct Decod" -->
 
 K0 replay requires text decode without prefill rows or MTP work. Eligible [MTP groups](mtp.md#target-verification-graph) use a separate executable. [Step selection](../src/decoder_batch.cpp#L674)<!-- prefix: "const auto r" -->
 
@@ -70,7 +70,7 @@ Packed buckets bind live positions, KV, and page tables. Negative positions mark
 
 ### Legacy narrow paged GQA decode
 
-The legacy width-two through width-four graph selects split attention per lane at 8,192 through 16,384 visible tokens. It appends the new KV, runs attention, and gates the outputs on the batch stream. Ordered score and replay nodes handle lanes outside the window. Legacy eager forwards group in-window decode lanes after KV append. Other eager rows at those widths follow the row dispatch. [Bounds](../include/sglang/decoder_cuda.cuh#L175)<!-- prefix: "inline const" --> · [Bound forward](../src/decoder_forward.cpp#L404)<!-- prefix: "void attend_" --> · [Eager forward](../src/decoder_forward.cpp#L461)<!-- prefix: "void attend_" --> · [Bound fallback](../src/mxfp8_gqa.cu#L776)<!-- prefix: "__global__ v" -->
+The legacy width-two through width-four graph selects split attention per lane at 8,192 through 16,384 visible tokens. It appends the new KV, runs attention, and gates the outputs on the batch stream. Ordered score and replay nodes handle lanes outside the window. Legacy eager forwards group in-window decode lanes after KV append. Other eager rows at those widths follow the row dispatch. [Bounds](../include/sglang/decoder_cuda.cuh#L181)<!-- prefix: "inline const" --> · [Bound forward](../src/decoder_forward.cpp#L404)<!-- prefix: "void attend_" --> · [Eager forward](../src/decoder_forward.cpp#L461)<!-- prefix: "void attend_" --> · [Bound fallback](../src/mxfp8_gqa.cu#L776)<!-- prefix: "__global__ v" -->
 
 The split assigns 128-token KV pages to 16 partitions. It clamps the last to visible length. Bound width four and eager width four after compaction use a `(16, 12, 4)` grid with 256 threads per block. Blocks share decoded K and V between two adjacent query heads of one KV head. Split widths one through three use one block per query head and partition. [Split launch](../include/sglang/text/mxfp8_gqa_decode.cuh#L214)<!-- prefix: "void launch_" --> · [Paired split](../include/sglang/text/mxfp8_gqa_decode.cuh#L151)<!-- prefix: "__global__ v" -->
 

@@ -4,14 +4,14 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L148)<!-- prefix: "} else if (o" --> · [Salt validation](../apps/server/text_request.cpp#L720)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L50)<!-- prefix: "void append_" --> |
+| Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L173)<!-- prefix: "} else if (o" --> · [Salt validation](../apps/server/text_request.cpp#L720)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L50)<!-- prefix: "void append_" --> |
 | HTTP controls | Dispatch cache reset, metrics, and bounded scheduler profiling. | [Control routes](../apps/server/prefix_controls.cpp#L511)<!-- prefix: "void Connect" --> |
 | Batch | Restore request state, schedule remaining prompt rows, and publish completed checkpoints. | [Admission](../src/decoder_batch.cpp#L384)<!-- prefix: "int DecoderB" --> · [Checkpoint publication](../src/decoder_batch.cpp#L921)<!-- prefix: "cache->store" --> |
 | Cache | Match checkpoint keys and own the copies until eviction or batch teardown. | [Lookup](../src/decoder_prefix_cache.cpp#L130)<!-- prefix: "int PrefixCa" --> · [Restore](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "int PrefixCa" --> · [Store](../src/decoder_prefix_cache.cpp#L185)<!-- prefix: "void PrefixC" --> |
 
 ## Runtime path
 
-Use `--prefix-cache-entries 1` through `4` for native prefix reuse. The default `0` disables reuse. Omit `--eager`. The default `exact` prefill policy supports prefix reuse at MTP depths 0–4. With tensor-core prefill and prefix reuse, the server uses K0 if you omit the depth option. If you set a depth with tensor-core prefix reuse, use `--mtp-steps 0`. The server rejects explicit positive depths for this combination. Prefix reuse works at every server capacity, including `--max-active 1`. The [default graph policy](batch-graphs.md) applies to eligible decode steps. [CLI validation](../apps/sglang-server.cpp#L166)<!-- prefix: "if (argument" --> · [Control flag](../apps/sglang-server.cpp#L319)<!-- prefix: "}, health, a" -->
+Use `--prefix-cache-entries 1` through `4` for native prefix reuse. The default `0` disables reuse. Omit `--eager`. The default `exact` prefill policy supports prefix reuse at MTP depths 0–4. With tensor-core prefill and prefix reuse, the server uses K0 if you omit the depth option. If you set a depth with tensor-core prefix reuse, use `--mtp-steps 0`. The server rejects explicit positive depths for this combination. Prefix reuse works at every server capacity, including `--max-active 1`. The [default graph policy](batch-graphs.md) applies to eligible decode steps. [CLI validation](../apps/sglang-server.cpp#L87)<!-- prefix: "void configu" --> · [Control flag](../apps/sglang-server.cpp#L334)<!-- prefix: "}, health, a" -->
 
 The three [ordered text policies](fp8-prefill-projections.md#tensor-core-projections) require prefix reuse off. Media requests bypass prefix reuse under every policy.
 
@@ -25,7 +25,7 @@ The checkpoint boundary is the largest multiple of 128 within the prompt length 
 
 ### Checkpoint compatibility and resume
 
-For a checkpoint of `P` prompt IDs, target KV covers positions `0` through `P-1`. The entry also stores GDN state and the target hidden and residual rows after position `P-1`. A paired checkpoint contains draft KV for positions `0` through `P-2`. Each draft position needs the next token's embedding, so the checkpoint leaves draft position `P-1` open. [Restore](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "int PrefixCa" --> · [Draft copy](../src/decoder_mtp.cpp#L430)<!-- prefix: "void MtpDraf" -->
+For a checkpoint of `P` prompt IDs, target KV covers positions `0` through `P-1`. The entry also stores GDN state and the target hidden and residual rows after position `P-1`. A paired checkpoint contains draft KV for positions `0` through `P-2`. Each draft position needs the next token's embedding, so the checkpoint leaves draft position `P-1` open. [Restore](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "int PrefixCa" --> · [Draft copy](../src/decoder_mtp.cpp#L501)<!-- prefix: "void MtpDraf" -->
 
 K0 can use either a target-only or a paired entry. Depths 1–4 share paired entries, and lookup skips target-only entries even if they match a longer prefix. If no eligible pair matches, the lane prefills from the start. Publication can fill in the draft state of the same target-only key without an eviction. Publishing K0 state for a key that already has a pair preserves the pair. [Store](../src/decoder_prefix_cache.cpp#L185)<!-- prefix: "void PrefixC" -->
 

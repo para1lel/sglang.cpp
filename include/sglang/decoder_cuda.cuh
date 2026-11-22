@@ -34,6 +34,12 @@ std::optional<cudaError_t> try_verify_bf16_gdn_gates(
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
 cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                                int rows, int width, __nv_bfloat16* output, cudaStream_t stream);
+cudaError_t quantize_draft_head_int8(const __nv_bfloat16* input, int rows,
+                                    std::uint8_t* values, float* maxima, cudaStream_t stream);
+cudaError_t decode_draft_head_int8(const std::uint8_t* weight, const float* weight_maxima,
+                                  const __nv_bfloat16* input, std::uint8_t* input_values,
+                                  float* input_maximum,
+                                  __nv_bfloat16* output, cudaStream_t stream);
 using DecodeHeadProjections = std::array<TextBf16Projection, 4>;
 cudaError_t decode_bf16_lm_head_batch(const __nv_bfloat16* weight, int rows, int width,
                                      const DecodeHeadProjections& projections,

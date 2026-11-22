@@ -158,6 +158,16 @@ bool MtpRound::propose_all(MtpRound* rounds, int count, const ConstraintWorkspac
             break;
         }
         check(cudaStreamSynchronize(stream), "Complete MTP draft wave");
+        bool retried = false;
+        for (int index = 0; index < count; ++index) {
+            auto& round = rounds[index];
+            if (wave < round.proposal_limit && round.draft->retry_invalid_int8(stream)) {
+                retried = true;
+            }
+        }
+        if (retried) {
+            check(cudaStreamSynchronize(stream), "Complete BF16 MTP draft score retries");
+        }
         for (int index = 0; index < count; ++index) {
             auto& round = rounds[index];
             if (wave >= round.proposal_limit) {

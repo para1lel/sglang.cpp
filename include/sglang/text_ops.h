@@ -161,5 +161,8 @@ cudaError_t text_argmax(const __nv_bfloat16* logits, int vocab_size, TextLogitCa
                         TextLogitCandidate* output, cudaStream_t stream);
 cudaError_t text_argmax(const float* logits, int vocab_size, TextLogitCandidate* scratch,
                         TextLogitCandidate* output, cudaStream_t stream);
+cudaError_t text_argmax_finite(const __nv_bfloat16* logits, int vocab_size,
+                               TextLogitCandidate* scratch, TextLogitCandidate* output,
+                               cudaStream_t stream);
 
 }

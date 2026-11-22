@@ -27,8 +27,13 @@ struct HttpRequest {
     std::string method;
     std::string path;
     std::string body;
+
+    std::string_view path_without_query() const {
+        return std::string_view(path).substr(0, path.find('?'));
+    }
 };
 
+enum class GenerateRoute { none, allowed, method_not_allowed };
 enum class TokenizationRoute { none, tokenize, detokenize };
 
 struct HttpError : std::runtime_error {
@@ -43,10 +48,12 @@ void stop_serving();
 bool stopping();
 Socket listen_loopback(int port);
 bool disconnected(const Socket& connection);
+GenerateRoute generate_route(const HttpRequest& request);
 TokenizationRoute tokenization_route(const HttpRequest& request);
 void read_connections(const Socket& listener, int capacity,
                       const std::function<void(Socket&, HttpRequest)>& handle);
 bool write_json(const Socket& connection, std::string_view status, std::string_view json);
+void write_method_not_allowed(const Socket& connection, std::string_view methods, bool head_only);
 void write_get_only(const Socket& connection, bool head_only);
 void write_tokenization_error(const Socket& connection, std::string_view status,
                               std::string_view type, std::string_view message);

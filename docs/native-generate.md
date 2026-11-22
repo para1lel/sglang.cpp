@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Validate the request framing and route `POST /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if (request." --> · [Route](../apps/server/prefix_controls.cpp#L337)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
+| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L389)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
 | Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L882)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L919)<!-- prefix: "std::vector<" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L370)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L946)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L640)<!-- prefix: "bool BatchSe" --> |
@@ -13,7 +13,9 @@
 
 ## Runtime path
 
-Use the [standard launch](../README.md#serve-token-ids-over-http) for raw text or prompt IDs and [chat completions](chat-serving.md) for conversation history.
+Use the [standard launch](../README.md#serve-token-ids-over-http) for raw text or prompt IDs. Use [chat completions](chat-serving.md) for conversation history.
+
+`POST` and `PUT` accept the same request fields, validation, queue admission, and JSON or SSE response behavior. [Native route matcher](../apps/server/http.cpp#L297)<!-- prefix: "GenerateRout" --> · [Pinned Python methods](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L963)<!-- prefix: "@app.api_rou" -->
 
 Send a text prompt for a JSON response.
 
@@ -26,7 +28,7 @@ curl --fail-with-body http://127.0.0.1:17384/generate \
 Send prompt IDs with `stream: true` for an SSE response.
 
 ```bash
-curl --fail-with-body -N http://127.0.0.1:17384/generate \
+curl --fail-with-body -N -X PUT http://127.0.0.1:17384/generate \
   -H 'Content-Type: application/json' \
   --data-binary '{"input_ids":[220],"sampling_params":{"max_new_tokens":2,"temperature":0},"stream":true}'
 ```
@@ -205,18 +207,19 @@ The error event applies to the stream and has no item index. Previously delivere
 On a generation failure, disconnect, or failed write, the worker discards unsubmitted items, cancels the active jobs still owned by the batch, and waits for their retirement before releasing the slot.
 Decoder effects already published, such as prefix-cache entries, can remain.
 The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
-[Batch cancellation](../apps/server/batch_service.cpp#L541)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L45)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L231)<!-- prefix: "void write_s" -->
-After successful HTTP parsing, a method other than POST at `/generate` returns HTTP 404.
+[Batch cancellation](../apps/server/batch_service.cpp#L541)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L47)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L231)<!-- prefix: "void write_s" -->
+
+The route matches the exact `/generate` path and ignores its query suffix. `/generate/` is unmatched. After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L297)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L458)<!-- prefix: "void write_m" -->
+
 A disconnected client can cancel queued or active work through the [shared transport](http-server.md#http-admission-and-shutdown).
 Send [`POST /abort_request`](native-abort.md) from a second connection to cancel by ID.
 
 ## Verification
 
 Start the release server with its pinned checkpoint on a reserved B200. Run the single-prompt examples from [Runtime path](#runtime-path).
-Repeat each single-prompt request with the other response mode. Keep its prompt and sampling options fixed.
-Compare final text, output IDs, token counts, and finish reason across JSON and SSE.
-Require every intermediate ID array to be a prefix of the final array.
-Require exactly one final object and one `[DONE]` on a successful stream.
+For each fixed prompt and sampling configuration, compare final text, IDs, token counts, and finish reason across both methods and response modes. Require cumulative ID prefixes, one final object, and one `[DONE]` per successful stream.
+
+Send malformed JSON with both methods and require the same HTTP 400. With `PUT`, omit the length and require HTTP 411. Send an unsupported media type and require HTTP 415. Check for HTTP 405 and `Allow: POST, PUT` with `curl -I http://127.0.0.1:17384/generate`.
 
 Repeat the ID request with `max_new_tokens: 0`. Require the zero-budget result in both response modes.
 Use the first ID from the greedy request as an explicit stop ID. Require `stop`, the matched ID in `output_ids`, and empty text.
@@ -248,11 +251,9 @@ CUDA_VISIBLE_DEVICES='' /data1/shared/dongwu.chen/.pixi/envs/default/bin/python 
 
 Require exit status zero. The suite checks cumulative scores, mixed opt-in, token text, stops, abort, and validation. It checks that `top_k: 1` stays greedy with positive temperature. [CPU suite](../tests/text/test_native_generated_logprobs_cpu.py#L1)<!-- prefix: "\"\"\"Check nat" -->
 
-Run both batch examples in JSON and SSE with `--max-active 1`. Repeat with `--max-active 2` to allow concurrent items.
-Compare each terminal event with the corresponding final JSON object using the same greedy options and cache state. Event IDs are new for each request.
-Check each index's cumulative ID prefixes, stable ID, terminal event, and token counts. Require one `[DONE]` after both items finish.
-Require zero output IDs for the first nested-ID item. Repeat with a one-item batch and require a one-element JSON array and indexed SSE events.
-Send a streaming batch with a mismatched sampling array or an invalid later prompt. Require JSON HTTP 400 before SSE opens.
+Run both batch examples in JSON and SSE at `--max-active 1` and `2`. Match terminal events to JSON with fixed greedy options and cache state. Check cumulative ID prefixes, per-index token counts, and stable item IDs within each request. Require one `[DONE]` after both items finish.
+Require zero output IDs for the first nested-ID item. Check a one-element JSON array and indexed SSE for a one-item batch.
+Require JSON HTTP 400 before SSE for a mismatched sampling array or invalid later prompt.
 
 Build the [CPU fixture](../tests/text/README.md#native-generate-on-cpu), then run the text-stop suite against that same binary from the repository root.
 
@@ -263,9 +264,9 @@ CUDA_VISIBLE_DEVICES='' python3 -B tests/text/test_native_text_stops_cpu.py \
     --binary "$out/server" --checkpoint "$checkpoint" --output "$out/text-stop-evidence"
 ```
 
-Script a stop inside one token, across two tokens, and across the byte pieces of a UTF-8 character. Compare JSON with the SSE terminal. Check that earlier events never expose a pending stop prefix. Verify the matched string, trimmed text, retained IDs, and completion count.
-Script competing patterns in one decoder step, then reverse their configured order. Test an unmatched partial suffix and an incomplete UTF-8 character at length. Require the suffix and replacement character in the appropriate terminal results.
-Run two indexed items with different text stops. Repeat with a broadcast object, `ignore_eos: true`, and a nested stop array. Check item independence and HTTP 400 for the invalid array.
-With a scripted MTP step, return additional IDs after the match. Require those IDs to be absent from the result and usage. Run a step that reaches the length budget without a match. Require all retained text and IDs in the terminal event and compare it with JSON. Verify lane reuse after the stop and after a client abort.
-Inject a capacity failure before admission and check the mapped JSON error. Inject a failure after an item event and check HTTP 200, one SSE error, and closure without `[DONE]`.
-Use a stalled item to check the 15-second comment and exclude it from TTFT. Disconnect during a batch with an unsubmitted item, check cancellation and retirement of its active jobs, and verify successful reuse by a replacement request.
+Script stops within one token, across two tokens, and across UTF-8 byte pieces. Compare JSON and terminal SSE for the match, trimmed text, retained IDs, and completion count. Check that intermediate events hide pending prefixes.
+Reverse competing patterns in one decoder step. At length, check release of an unmatched suffix and replacement of incomplete UTF-8.
+Check two indexed items with different stops, then broadcast options with `ignore_eos: true`. Require HTTP 400 for a nested stop array.
+Script MTP IDs beyond a match and verify their removal from the result and usage. At length without a match, compare the retained text and IDs across JSON and SSE. Check lane reuse after a stop and client abort.
+Inject a capacity failure before admission and check the mapped JSON error. After an item event, inject a failure and require HTTP 200, one SSE error, and closure without `[DONE]`.
+Check that a stalled item's 15-second comment stays out of TTFT. Disconnect a batch with an unsubmitted item. Verify cancellation, retirement of active jobs, and reuse by a replacement request.

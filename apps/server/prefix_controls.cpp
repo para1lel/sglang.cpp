@@ -5,8 +5,10 @@
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
+#include "sglang/utf8.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <ctime>
@@ -239,14 +241,58 @@ void ConnectionQueue::reset_cache(const Socket& connection) {
     changed_.notify_all();
 }
 
-void write_models(const Socket& connection) {
-    std::string body = R"({"object":"list","data":[{"id":)";
+std::string model_card() {
+    std::string body = R"({"id":)";
     json::append_quoted(body, model_name);
     body += R"(,"object":"model","created":)" + std::to_string(std::time(nullptr));
     body += R"(,"owned_by":"sglang","root":)";
     json::append_quoted(body, model_name);
-    body += R"(,"parent":null,"max_model_len":)" + std::to_string(checkpoint_context) + "}]}";
-    write_json(connection, "200 OK", body);
+    body += R"(,"parent":null,"max_model_len":)" + std::to_string(checkpoint_context) + '}';
+    return body;
+}
+
+void write_models(const Socket& connection) {
+    write_json(connection, "200 OK", R"({"object":"list","data":[)" + model_card() + "]}");
+}
+
+std::string decode_model_id(std::string_view path) {
+    std::string decoded;
+    decoded.reserve(path.size());
+    while (!path.empty()) {
+        if (path.front() == '%' && path.size() >= 3) {
+            unsigned byte = 0;
+            const auto end = path.data() + 3;
+            const auto parsed = std::from_chars(path.data() + 1, end, byte, 16);
+            if (parsed.ec == std::errc{} && parsed.ptr == end) {
+                decoded += static_cast<char>(byte);
+                path.remove_prefix(3);
+                continue;
+            }
+        }
+        decoded += path.front();
+        path.remove_prefix(1);
+    }
+    Utf8Stream utf8;
+    auto model = utf8.push(decoded);
+    model += utf8.finish();
+    return model;
+}
+
+void retrieve_model(const Socket& connection, const HttpRequest& request,
+                    std::string_view model_path) {
+    if (request.method != "GET") {
+        write_get_only(connection, request.method == "HEAD");
+        return;
+    }
+    const auto model = decode_model_id(model_path);
+    if (model == model_name) {
+        write_json(connection, "200 OK", model_card());
+        return;
+    }
+    std::string body = R"({"error":{"message":)";
+    json::append_quoted(body, "The model '" + model + "' does not exist");
+    body += R"(,"type":"invalid_request_error","param":"model","code":"model_not_found"}})";
+    write_json(connection, "404 Not Found", body);
 }
 
 void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& request) {
@@ -274,6 +320,12 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
             throw HttpError("404 Not Found", "Expected an empty model information request");
         }
         write_json(connection, "200 OK", model_info_);
+        return;
+    }
+    constexpr std::string_view model_prefix = "/v1/models/";
+    const auto path = request.path_without_query();
+    if (path.substr(0, model_prefix.size()) == model_prefix) {
+        retrieve_model(connection, request, path.substr(model_prefix.size()));
         return;
     }
     if (request.method == "GET" && request.body.empty()) {
@@ -335,7 +387,12 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
 }
 
 void ConnectionQueue::route(Socket& connection, HttpRequest request) {
-    const bool generate = generate_ && request.method == "POST" && request.path == "/generate";
+    const auto native_route = generate_route(request);
+    if (generate_ && native_route == GenerateRoute::method_not_allowed) {
+        write_method_not_allowed(connection, "POST, PUT", request.method == "HEAD");
+        return;
+    }
+    const bool generate = generate_ && native_route == GenerateRoute::allowed;
     const bool tokenize = tokenize_ && tokenization_route(request) != TokenizationRoute::none;
     if (!generate && !tokenize && !completion_route(request)) {
         serve_control(connection, request);

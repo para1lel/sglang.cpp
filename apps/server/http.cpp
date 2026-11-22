@@ -180,8 +180,8 @@ std::size_t content_length(std::string_view headers, const HttpRequest& request)
     if (length.value_or(0) > max_body_bytes) {
         throw HttpError("413 Content Too Large", "Request body exceeds 2 MiB");
     }
-    if (request.method == "POST" &&
-        (request.path == "/v1/completions" || request.path == "/generate")) {
+    if ((request.method == "POST" && request.path == "/v1/completions") ||
+        generate_route(request) == GenerateRoute::allowed) {
         if (!length) {
             throw HttpError("411 Length Required", "Expected Content-Length");
         }
@@ -293,6 +293,14 @@ void install_shutdown_handlers() {
 void stop_serving() { stop_requested.store(true, std::memory_order_relaxed); }
 
 bool stopping() { return stop_requested.load(std::memory_order_relaxed); }
+
+GenerateRoute generate_route(const HttpRequest& request) {
+    if (request.path_without_query() != "/generate") {
+        return GenerateRoute::none;
+    }
+    return request.method == "POST" || request.method == "PUT"
+        ? GenerateRoute::allowed : GenerateRoute::method_not_allowed;
+}
 
 TokenizationRoute tokenization_route(const HttpRequest& request) {
     if (request.method == "POST") {
@@ -447,9 +455,15 @@ bool write_json(const Socket& connection, std::string_view status, std::string_v
     return write_response(connection, status, "application/json", json);
 }
 
-void write_get_only(const Socket& connection, bool head_only) {
+void write_method_not_allowed(const Socket& connection, std::string_view methods, bool head_only) {
+    std::string header = "\r\nAllow: ";
+    header += methods;
     write_response(connection, "405 Method Not Allowed", "application/json",
-                   R"({"detail":"Method Not Allowed"})", "\r\nAllow: GET", head_only);
+                   R"({"detail":"Method Not Allowed"})", header, head_only);
+}
+
+void write_get_only(const Socket& connection, bool head_only) {
+    write_method_not_allowed(connection, "GET", head_only);
 }
 
 void write_tokenization_error(const Socket& connection, std::string_view status,

@@ -204,7 +204,9 @@ class NativeGenerate(unittest.TestCase):
             ("POST", None, HEADERS, 411),
             ("POST", b'{"text":"A",}', HEADERS, 400),
             ("POST", b'{"text":"A"}', {"Content-Type": "text/plain"}, 415),
-            ("PUT", b'{"text":"A"}', HEADERS, 404),
+            ("PUT", b'{"text":"A"}', {"Content-Type": "text/plain"}, 415),
+            ("PUT", b'{"text":"A","sampling_params":{"max_new_tokens":1,"sampling_seed":0}}',
+             HEADERS, 200),
         ):
             with self.subTest(method=method, headers=headers, wire=wire):
                 with closing(http.client.HTTPConnection("127.0.0.1", self.port,
@@ -221,8 +223,12 @@ class NativeGenerate(unittest.TestCase):
                         data = response.read()
                 self.assertEqual(status, expected, data)
                 self.assertEqual(content_type, "application/json")
-                self.assertIn("message", json.loads(data)["error"])
-        self.assertEqual(len(receipts(self.log)), first)
+                if expected == 200:
+                    self.check_packet(json.loads(data), "A", [32], {"type": "length", "length": 1})
+                else:
+                    self.assertIn("message", json.loads(data)["error"])
+                    self.assertEqual(len(receipts(self.log)), first)
+        self.assertEqual(len(receipts(self.log)), first + 1)
 
     def test_regex_request_validation(self):
         invalid = (

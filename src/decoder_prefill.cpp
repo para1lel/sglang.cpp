@@ -480,6 +480,12 @@ PrefillGroup prefill_group(const PrefillGrant* grants, int count, bool mixed) {
 }
 
 PrefillGroup projection_group(const PrefillGrant* grants, int count, int max_rows, bool mixed) {
+    constexpr int paired_rows = 2 * batch_prefill_tile_rows;
+    if (!mixed && max_rows >= paired_rows && count >= 2 &&
+        grants[0].rows == batch_prefill_tile_rows && grants[0].tile_rows == grants[0].rows &&
+        grants[1].rows == batch_prefill_tile_rows && grants[1].tile_rows == grants[1].rows) {
+        return {2, paired_rows};
+    }
     auto group = prefill_group(grants, count, mixed);
     if (!group.rows || max_rows == max_layerwise_rows) {
         return group;
@@ -510,12 +516,13 @@ void each_attention_group(const PrefillGrant* grants, int count, bool mixed, Run
     for (int index = 0; index < count;) {
         const auto group = prefill_group(grants + index, count - index, mixed);
         run(grants + index, group.grants, offset);
-        offset += group.rows;
+        offset += group.grants == 1 ? grants[index].rows : group.rows;
         index += group.grants;
     }
 }
 
-void read_paged_sequences(const PagedPrefillSequence* sequences, int count, cudaStream_t stream) {
+void read_paged_sequences(const PagedPrefillSequence* sequences, int count, cudaStream_t stream,
+                          PairedPrefillScratch scratch) {
     if (const auto batched = try_batched_paged_prefill(sequences, count, stream)) {
         check(*batched, "Read batched causal prefill MXFP8 attention");
         return;
@@ -524,7 +531,7 @@ void read_paged_sequences(const PagedPrefillSequence* sequences, int count, cuda
         const auto& sequence = sequences[index];
         check(tensor_core_model_prefill_gqa(sequence.cache, sequence.pages, sequence.position,
                                            sequence.rows, sequence.queries, sequence.output,
-                                           stream), "Read causal prefill MXFP8 attention");
+                                           stream, scratch), "Read causal prefill MXFP8 attention");
     }
 }
 
@@ -545,14 +552,15 @@ void prefill_group_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
         sequences[index++] = {cache, pages, grant.position, grant.rows, segment.work.rope_queries,
                               segment.work.attention};
     });
-    read_paged_sequences(sequences.data(), count, chunk.stream);
+    read_paged_sequences(sequences.data(), count, chunk.stream,
+                         count == 1 ? chunk.work.gqa_scratch() : PairedPrefillScratch{});
 }
 
 void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
                        const PrefillGrant* grants, int count, int offset) {
     const auto& buffers = chunk.work;
     GdnPrefillSegment segments[max_gdn_prefill_segments]{};
-    bool grouped_recurrence = true;
+    bool grouped_recurrence = count > 1;
     int index = 0;
     each_prefill_segment(grants, count, offset, [&](const PrefillGrant& grant, int row) {
         const auto segment = buffers.attention_segment(row);

@@ -6,6 +6,8 @@
 
 namespace sglang::decoder {
 
+inline constexpr int batch_prefill_tile_rows = 1024;
+
 struct PrefillPool;
 
 void reclaim_prefill_workspaces(int device);

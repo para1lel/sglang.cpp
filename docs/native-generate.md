@@ -143,7 +143,7 @@ Native input scoring can restore a [matching checkpoint](prefix-cache.md#checkpo
 [Serialization](../apps/server/native_generate.cpp#L89)<!-- prefix: "void append_" --> · [Frame](../apps/server/native_generate.cpp#L178)<!-- prefix: "if (result &" -->
 
 Each scored row adds an FP32 log-softmax reduction outside graph replay. It reads BF16 target logits or FP32 scores adjusted by [output penalties](output-penalties.md) or logit bias. The argmax supplies the selected ID. The score readback transfers the selected record and requested alternatives to pinned host memory. Scratch and readback allocate on first scored admission.
-[Scoring](../src/decoder_batch.cpp#L569)<!-- prefix: "if (lane.opt" --> · [Readback](../src/text/decoder_logprobs.cu#L192)<!-- prefix: "cudaError_t " --> · [Allocation](../src/decoder_batch.cpp#L487)<!-- prefix: "if (top >= 0" -->
+[Scoring](../src/decoder_batch.cpp#L568)<!-- prefix: "if (lane.opt" --> · [Readback](../src/text/decoder_logprobs.cu#L192)<!-- prefix: "cudaError_t " --> · [Allocation](../src/decoder_batch.cpp#L486)<!-- prefix: "if (top >= 0" -->
 
 ## Constraints and failure behavior
 

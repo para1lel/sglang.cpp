@@ -122,7 +122,6 @@ std::size_t request_bytes(const BatchStorage& storage) {
 
 using Selection = std::array<bool, decoder_batch_max_lanes>;
 using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
-constexpr int batch_prefill_tile_rows = 1024;
 constexpr std::size_t decoder_shared_reserve = std::size_t{2} * 1024 * 1024 * 1024;
 static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
 static_assert(prefill_chunk_rows == mxfp8_page_size);

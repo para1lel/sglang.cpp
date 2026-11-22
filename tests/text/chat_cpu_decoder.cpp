@@ -248,6 +248,10 @@ std::string_view Decoder::accelerator_name() const {
     return {};
 }
 
+bool Decoder::experimental_target_split_gqa() const {
+    return false;
+}
+
 DecoderResult Decoder::generate(const std::vector<int>& prompt, const DecoderOptions& options,
                                 const DecoderCallbacks& callbacks) const {
     validate_token_ids(prompt, options);

@@ -89,6 +89,18 @@ __device__ decoder::PagedDecodeLane resolve(const decoder::BoundPagedDecodeLane&
     return {*lane.cache, *lane.pages, *lane.position, lane.buffers};
 }
 
+__device__ decoder::PagedDecodeLane resolve_input(const Batch& batch) {
+    return resolve(batch.lanes[blockIdx.z]);
+}
+
+__device__ decoder::PagedDecodeLane resolve_input(TargetLane input) {
+    auto lane = resolve(input);
+    if (!decoder::target_split_position(lane.position)) {
+        lane.position = -1;
+    }
+    return lane;
+}
+
 __device__ __forceinline__ void copy_16(void* shared, const void* global, bool valid) {
     const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(shared));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
@@ -433,11 +445,11 @@ __device__ void write_partials(const Merge& merge, void* scratch, int kv_head, i
     }
 }
 
-__global__ void __launch_bounds__(threads, 2) split_kernel(
-    const __grid_constant__ Batch batch) {
+template <typename Input>
+__global__ void __launch_bounds__(threads, 2) split_kernel(const __grid_constant__ Input input) {
     alignas(16) extern __shared__ unsigned char shared_raw[];
     auto& shared = *reinterpret_cast<Shared*>(shared_raw);
-    const auto lane = resolve(batch.lanes[blockIdx.z]);
+    const auto lane = resolve_input(input);
     if (!readable(lane) || !tensor_aligned(lane)) {
         return;
     }
@@ -492,20 +504,29 @@ __global__ void __launch_bounds__(threads, 2) split_kernel(
     write_partials(merge, lane.buffers.scratch, kv_head, split);
 }
 
+template <typename Input>
+cudaError_t launch_split(const Input& input, int count, cudaStream_t stream) {
+    const auto status = cudaFuncSetAttribute(split_kernel<Input>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(shared_bytes));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    split_kernel<<<dim3(max_splits, mxfp8_kv_heads, count), threads, shared_bytes, stream>>>(input);
+    return cudaGetLastError();
+}
+
 }
 
 cudaError_t launch(const Batch& batch, int count, cudaStream_t stream) {
     if (count < 1 || count > max_lanes) {
         return cudaErrorInvalidValue;
     }
-    auto status = cudaFuncSetAttribute(split_kernel,
-                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                       static_cast<int>(shared_bytes));
-    if (status != cudaSuccess) {
-        return status;
-    }
-    split_kernel<<<dim3(max_splits, mxfp8_kv_heads, count), threads, shared_bytes, stream>>>(batch);
-    return cudaGetLastError();
+    return launch_split(batch, count, stream);
+}
+
+cudaError_t launch(TargetLane lane, cudaStream_t stream) {
+    return launch_split(lane, 1, stream);
 }
 
 }

@@ -1,6 +1,6 @@
 # Native HTTP transport
 
-The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L328)<!-- prefix: "serve_connec" -->
+The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L331)<!-- prefix: "serve_connec" -->
 
 ## Request targets and redirects
 

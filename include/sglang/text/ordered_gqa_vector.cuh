@@ -14,7 +14,7 @@ __device__ float replay_vector_channel(
     return weighted;
 }
 
-template <typename Position, typename Cache, typename Pages, typename Scores>
+template <bool SkipTargetSplit, typename Position, typename Cache, typename Pages, typename Scores>
 __global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Position position,
                                      Scores score_binding, __nv_bfloat16* output) {
     __shared__ alignas(16) float values[replay_tile][vector_replay_channels];
@@ -24,6 +24,11 @@ __global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Po
     const auto cache = cache_value(cache_binding);
     const auto* pages = page_values(page_binding);
     const int last = decoder::position_value(position);
+    if constexpr (SkipTargetSplit) {
+        if (decoder::target_split_position(last)) {
+            return;
+        }
+    }
     const auto workspace = score_workspace(score_binding);
     const int head = blockIdx.x;
     const int kv_head = head / queries_per_kv_head;

@@ -386,11 +386,17 @@ __device__ void exact_scores(Mxfp8KvCache cache, const std::int32_t* pages, int 
     }
 }
 
-template <bool Narrow, typename Position, typename Cache, typename Pages, typename Scores>
+template <bool Narrow, bool SkipTargetSplit, typename Position, typename Cache, typename Pages,
+          typename Scores>
 __global__ void exact_scores_kernel(
     Cache cache_binding, Pages page_binding, Position position,
     const __nv_bfloat16* queries, Scores score_binding) {
     const int last = decoder::position_value(position);
+    if constexpr (SkipTargetSplit) {
+        if (decoder::target_split_position(last)) {
+            return;
+        }
+    }
     const auto cache = cache_value(cache_binding);
     const auto* pages = page_values(page_binding);
     const auto workspace = score_workspace(score_binding);
@@ -986,5 +992,6 @@ cudaError_t decoder::long_paged_decode_gqa(const PagedDecodeLane* lanes, int cou
 }
 
 #include "sglang/text/gqa_mtp_attention.cuh"
+#include "sglang/text/gqa_target_split.cuh"
 
 }

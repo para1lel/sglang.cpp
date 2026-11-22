@@ -71,6 +71,11 @@ struct Batch {
     decoder::BoundPagedDecodeLane lanes[max_lanes];
 };
 
+struct TargetLane {
+    decoder::PagedDecodeLane eager;
+    decoder::BoundPagedDecodeLane bound;
+};
+
 /// Copies `count` lanes into `batch` after checking buffer pointers and alignment.
 inline cudaError_t make_batch(const decoder::BoundPagedDecodeLane* lanes, int count,
                               Batch& batch) {
@@ -90,6 +95,7 @@ inline cudaError_t make_batch(const decoder::BoundPagedDecodeLane* lanes, int co
 /// Launches the split-KV pass. Each lane reads positions [0, position] of its cache and
 /// writes one Partial per query head and split; combine_head finishes the head.
 cudaError_t launch(const Batch& batch, int count, cudaStream_t stream);
+cudaError_t launch(TargetLane lane, cudaStream_t stream);
 
 /// Split-KV attention, combine, FP64 replay of flagged heads, and optional output gates.
 /// Null gates leave the attention values ungated.
@@ -97,6 +103,12 @@ cudaError_t decode(const decoder::BoundPagedDecodeLane* lanes, const __nv_bfloat
                    int count, cudaStream_t stream);
 
 #ifdef __CUDACC__
+__device__ inline decoder::PagedDecodeLane resolve(TargetLane lane) {
+    const auto& bound = lane.bound;
+    return bound.position ? decoder::PagedDecodeLane{*bound.cache, *bound.pages, *bound.position,
+                                                      bound.buffers} : lane.eager;
+}
+
 /// Combines the splits of one head with 256 threads (one channel each) and writes the output.
 /// Returns false (block-uniform) and marks split 0 nonfinite when the head needs a replay.
 __device__ inline bool combine_head(const decoder::PagedDecodeLane& lane, int head) {

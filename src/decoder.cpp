@@ -451,6 +451,10 @@ Decoder::Model::Model(const std::filesystem::path& checkpoint, int cuda_device,
                       Fp8PrefillPolicy fp8_prefill)
     : Model(checkpoint, cuda_device) {
     fp8_prefill_ = fp8_prefill;
+    const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA");
+    target_split_attention_ = is_b200() &&
+        fp8_prefill == Fp8PrefillPolicy::tensor_core_mtp_target &&
+        setting && std::string_view(setting) == "1";
 }
 
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device)
@@ -478,6 +482,10 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
 }
 
 Decoder::~Decoder() = default;
+
+bool Decoder::experimental_target_split_gqa() const {
+    return model_->target_split_attention();
+}
 
 std::size_t Decoder::model_device_allocation_bytes() const {
     return model_->memory->bytes() + (model_->mtp_weights ?
@@ -563,6 +571,13 @@ void Decoder::Model::advance_serial(Request& request, RequestProgress& progress,
     progress.advance(1);
 }
 
+bool Decoder::Model::serial_graph(const DecoderOptions& options, bool media, int prompt_count,
+                                  int limit) const {
+    const bool split_decode = target_split_attention_ && limit > target_split_first_position &&
+                              prompt_count < target_split_end_position;
+    return !options.eager && !media && !options.requires_target_only() && !split_decode;
+}
+
 void Decoder::Model::generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
                                      const DecoderCallbacks& callbacks,
                                      DecoderResult& result,
@@ -576,7 +591,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
     const auto sampling = options.samples() ? std::optional{request_sampling(options)}
                                             : std::nullopt;
     const bool adjusted = options.requires_target_only();
-    const RequestLease lease(request_in_use, !options.eager && !media && !adjusted);
+    const RequestLease lease(request_in_use, serial_graph(options, !!media, prompt_count, limit));
     std::unique_ptr<Request> eager_request;
     auto& storage = lease.owns_slot() ? decode_request : eager_request;
     try {

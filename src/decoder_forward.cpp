@@ -57,6 +57,7 @@ struct LayerBatch {
     bool ordered_attention = false;
     bool target_tc = false;
     bool vector_attention = false;
+    bool target_split_attention = false;
 
     bool tensor_core_lane(int index) const {
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
@@ -421,12 +422,17 @@ void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& b
     }
     if (batch.single_decode()) {
         const auto& read = reads[0];
-        const auto status = batch.vector_attention
-            ? vector_decode_gqa_attention(read.cache, read.pages, read.position,
-                read.buffers.queries, read.buffers.output, read.scores, batch.stream)
-            : exact_decode_gqa_attention(read.cache, read.pages, read.position,
+        auto status = cudaSuccess;
+        if (batch.target_split_attention) {
+            status = target_split_gqa(read, batch.stream);
+        } else if (batch.vector_attention) {
+            status = vector_decode_gqa_attention(read.cache, read.pages, read.position,
+                read.buffers.queries, read.buffers.output, read.scores, batch.stream);
+        } else {
+            status = exact_decode_gqa_attention(read.cache, read.pages, read.position,
                 read.buffers.queries, read.buffers.output, read.scores, batch.stream,
                 batch.ordered_attention ? 0 : vocab_size * sizeof(Bf16));
+        }
         check(status, "Read bound singleton MXFP8 attention");
     } else {
         check(paged_decode_gqa(reads.data(), batch.count, batch.stream),
@@ -447,11 +453,17 @@ void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>&
                                     batch.stream), "Normalize and rotate bound verification Q/K");
         check(decode_kv_append(cache, &binding.pages, position, work.rope_keys, work.values,
                                batch.stream), "Append bound verification MXFP8 KV");
-        const auto status = batch.vector_attention
-            ? vector_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
-                work.attention, &binding.scores[index], batch.stream)
-            : exact_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
+        auto status = cudaSuccess;
+        if (batch.target_split_attention) {
+            status = target_split_gqa({cache, &binding.pages, position, &binding.scores[index],
+                                       paged_gqa_buffers(work)}, batch.stream);
+        } else if (batch.vector_attention) {
+            status = vector_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
                 work.attention, &binding.scores[index], batch.stream);
+        } else {
+            status = exact_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
+                work.attention, &binding.scores[index], batch.stream);
+        }
         check(status, "Read bound verification MXFP8 attention");
         gate_gqa(work, batch.stream);
     }
@@ -491,6 +503,16 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
             }
         }
         const bool vector = batch.vector_attention && !mrope && rotary_position < 0;
+        if constexpr (std::is_same_v<decltype(lane.position), int>) {
+            if (batch.target_split_attention && vector && lane.mode == TextGdnMode::decode &&
+                target_split_position(lane.position)) {
+                check(target_split_gqa({cache, request.pages, lane.position,
+                                        paged_gqa_buffers(work)}, batch.stream),
+                      "Read split target MXFP8 attention");
+                gate_gqa(work, batch.stream);
+                return;
+            }
+        }
         check(read_gqa(work, request.pages, cache, lane.position, lane.mode, narrow_gqa,
                        singleton_scores, vector, batch.stream), "Read causal MXFP8 attention");
         gate_gqa(work, batch.stream);
@@ -741,7 +763,8 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
     const auto policy = fp8_prefill();
     const LayerBatch<Lane> batch{lanes, count, stream, token_ordered_decode(policy),
                                  is_b200() && tensor_core_target(policy),
-                                 is_b200() && policy == Fp8PrefillPolicy::tensor_core_mtp_target};
+                                 is_b200() && policy == Fp8PrefillPolicy::tensor_core_mtp_target,
+                                 target_split_attention_};
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
         if (batch.fuse_verify_activation()) {
             VerifyRmsQuantizeRows rows;

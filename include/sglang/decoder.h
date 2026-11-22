@@ -189,6 +189,7 @@ public:
                                       const DecoderCallbacks& callbacks = DecoderCallbacks{}) const;
     std::size_t model_device_allocation_bytes() const;
     std::string_view accelerator_name() const;
+    bool experimental_target_split_gqa() const;
 
 private:
     friend class DecoderBatch;

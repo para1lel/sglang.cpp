@@ -506,6 +506,7 @@ struct Decoder::Model {
 
     Fp8PrefillPolicy fp8_prefill() const { return fp8_prefill_; }
     bool is_b200() const { return b200_; }
+    bool target_split_attention() const { return target_split_attention_; }
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     bool verify_mtp(decoder::MtpRound* rounds, int count,
@@ -544,6 +545,8 @@ struct Decoder::Model {
                         int step_budget) const;
     void advance_serial(decoder::Request& request, decoder::RequestProgress& progress,
                         int input, bool media, int rotary_delta) const;
+    bool serial_graph(const DecoderOptions& options, bool media, int prompt_count, int limit)
+        const;
     void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
                          const DecoderCallbacks& callbacks, DecoderResult& result,
                          std::shared_ptr<const decoder::MultimodalInput> media = nullptr,
@@ -571,6 +574,7 @@ private:
     Model(const std::filesystem::path& checkpoint, int cuda_device);
 
     Fp8PrefillPolicy fp8_prefill_ = Fp8PrefillPolicy::exact;
+    bool target_split_attention_ = false;
     bool b200_ = false;
 };
 

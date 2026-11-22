@@ -122,3 +122,35 @@ See the [paired benchmark procedure](../benchmarks/paired/README.md).
 The offline regression runs with `python3 -B -m unittest discover -s tests -p test_paired_identity.py`.
 It uses saved-run receipts and the fixed streaming requests and checks that
 unchanged counts cannot hide identity differences.
+
+Archived K4 timing replay can reproduce all medians with an altered `--mtp-steps 0`
+process receipt, or with every recorded native depth-four round reduced to depth
+three. On the reviewed revision, the replay and the launcher's server-info
+predicate also accepted a copied receipt claiming the distinct long split route.
+The live argv and activity checks caught the first two controls. The formal W1
+and W2 rows retain their original live witnesses. [Paired modes and controls](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+
+Record the strict native-versus-vLLM wall-time result separately from campaign
+qualification. Before publishing a new row or using it as a predecessor, bind
+the campaign, workload, frozen request, executable, physical GPU and arm to
+observed argv, dispatch policy and runtime evidence of depth-four activity in
+both engines. Check both bounded and long route state. Treat a missing long-route
+field as disabled only with an identified pre-long source or receipt contract.
+Reproduce a passing archive and keep negative controls for zero depth, missing
+fourth-position activity, wrong row or profile, and long-route substitution.
+The private reproduction and its output are retained in
+`artifacts/session-1122-batch1-review/check-offline-mode.py` and `offline-mode-negative.log`.
+
+## L012 · Manual CUDA launch arguments drifted from the kernel signature
+
+In the unpublished long-target composition, `exact_scores_kernel` gained a
+sixth parameter, `split_end`. The chunked draft path still packed five arguments
+and crashed after one token per lane. The selected repair derives the host
+argument pack from the kernel function pointer and passes `0` explicitly for
+the chunked draft path. [Typed launcher](../include/sglang/text/gqa_decode_split.cuh#L17)<!-- prefix: "cudaError_t " --> · [Draft call](../include/sglang/text/mtp/gqa_long.cuh#L104)<!-- prefix: "auto status " -->
+
+Keep the launch typed when changing a migrated kernel signature. In the selected
+`8e4f210b` verification, removing the sixth argument failed NVCC compilation
+before an object was emitted. The positive Release exercised the chunked draft
+path and ordinary generation. The retained compile control is
+`artifacts/continue-w3-long-target-independent/main-selected-gate.IahPUCPH/arity/compile.log`.

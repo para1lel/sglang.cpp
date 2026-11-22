@@ -20,7 +20,7 @@ For a continuation, set `session_params.rid` to the ID of a completed turn. The 
 
 Set `drop_previous_output: true` inside `session_params` to take only the parent's prompt. A positive `offset` keeps at most that many preceding IDs. A negative offset removes that many IDs from the end. Zero appends to the selected history. Branches leave the parent available for further turns.
 
-Set `stream: true` on `/generate` for the usual cumulative SSE. A successful turn becomes a usable parent when generation completes. Sessions support single text prompts or flat prompt IDs with `n: 1`. The server rejects `replace: true`, `streaming: true` session opens, media, and batched turns.
+Open a regular session and set `stream: true` on `/generate` for cumulative SSE. A successful turn becomes a usable parent when generation completes. Sessions support single text prompts or flat prompt IDs with `n: 1`. The server rejects `replace: true`, `streaming: true` session opens, media, and batched turns.
 
 Send `GET` or `POST /close_session` with `{"session_id":"geo"}`. The server returns an empty HTTP 200, including for unknown IDs. Closing discards stored turns. An active request can finish on its current connection. A cancelled or aborted turn leaves no history. An optional `timeout` in seconds expires the session based on its most recent admission.
 

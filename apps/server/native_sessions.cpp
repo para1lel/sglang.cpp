@@ -132,8 +132,8 @@ void NativeGenerate::serve_session(const Socket& connection, const HttpRequest& 
     }
     if (streaming) {
         session_error(connection, "400 Bad Request",
-                      "Streaming sessions are disabled. "
-                      "Please relaunch with --enable-streaming-session.");
+                      "Streaming session opens are unsupported. "
+                      "Use stream: true on /generate for SSE.");
         return;
     }
     std::unique_lock lock(sessions_mutex_);

@@ -516,6 +516,23 @@ class Routes(unittest.TestCase):
         self.assertEqual(len(final["output_ids"]), 1)
         self.assertEqual(final["meta_info"]["finish_reason"], {"type": "length", "length": 1})
 
+    def test_streaming_session_open_points_to_generate_sse(self):
+        session = {"session_id": "cpu-sse", "capacity_of_str_len": 16}
+        status, error = send(self.port, "/open_session", session | {"streaming": True})
+        self.assertEqual(status, 400)
+        self.assertEqual(error, {
+            "error": {"message": "Streaming session opens are unsupported. "
+                                 "Use stream: true on /generate for SSE."},
+        })
+        self.assertEqual(send(self.port, "/open_session", session), (200, "cpu-sse"))
+        status, frames = send(self.port, "/generate", {
+            "input_ids": [32], "session_params": {"id": "cpu-sse"}, "stream": True,
+            "sampling_params": {"max_new_tokens": 1},
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(len(frames[-1]["output_ids"]), 1)
+        self.assertEqual(frames[-1]["meta_info"]["finish_reason"], {"type": "length", "length": 1})
+
     def test_server_info_aliases_and_redirects(self):
         expected = self.control(self.port, "/server_info")
         self.assertEqual(expected["port"], self.port)

@@ -17,6 +17,8 @@ The initial `sm_100` probe returned 42 on B200 4 (`GPU-57c04c1a-9ae4-b231-f31a-5
 
 Record verified failures and preventive checks in [development lessons](lessons.md).
 
+Use [isolated XMake builds](serving/isolated-builds.md) for private verification.
+
 **Operator policy.** Production excludes cuBLAS, cuBLASLt, cuDNN, CUTLASS, FlashInfer, and equivalent operator libraries or generators. Record the justification, license, version, and execution path of HTTP, JSON, tokenizer, media, and system dependencies. Reference engines may use their own operators.
 
 **Proposed scope.** Text generation, sampling, stopping, image and video input, MTP4, concurrent scheduling, and MXFP8 grouped-query attention (GQA) KV. Investigate GDN state and Radix prefix reuse. Verify checkpoint and service semantics before accepting OpenAI-compatible endpoints, streaming, cancellation, or JSON Schema, regex, and grammar constraints.

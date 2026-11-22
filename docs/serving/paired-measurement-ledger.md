@@ -297,3 +297,29 @@ The arm directories hold raw SSE under `measurement/`. See
 `identity.json`, `independent-live-audit.json`, `independent-sse-replay.json`,
 `exact-k0-compatibility.json`, `native-k4-trace/mtp-activity.json`, and
 `vllm-k4/mtp-activity.json` for the configuration and correctness receipts.
+
+### Matched W2 K4 with ordered Tensor Core and INT8 draft
+
+W2 used the same campaign identity and GPU, with native first. Each arm ran
+three warmups and nine measured streams of the 2,048-input, 512-output fixture.
+The native median makespan was 3,743.794408 ms (3,731.274364–3,787.751962 ms).
+The pinned vLLM median was 1,740.743117 ms (1,739.599098–1,745.821485 ms).
+Native missed the strict median gate by 2,003.051291 ms. The campaign stopped
+at W2, so W3–W6 did not run.
+
+Independent SSE replay measured median TTFT of 135.070 ms for native and
+76.089 ms for vLLM. Median time from first output to `[DONE]` was
+3,609.546 ms and 1,665.127 ms, respectively. Median TPOT was 7.064 and
+3.258 ms/ID, respectively.
+
+All 26 streams passed the wire, length, usage, and drain checks. Every native
+K4 stream matched all 512 IDs from its own policy's K0 control. The exact K0
+diagnostic differed at 489 of 512 positions, first at zero-based index 13
+(ordered ID `314`, exact ID `440`). The vLLM timing arm recorded 1,656
+fourth-position verifications.
+
+The raw receipts are in the same campaign's `W2/` directory. The SHA-256 of
+`comparison.json` is
+`ea445344d76449dca202e78642ad70044f5603824cf91becbf87ab251ae07015`.
+See `independent-sse-replay.json`, `exact-k0-compatibility.json`, and
+`vllm-k4/mtp-activity.json`.

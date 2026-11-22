@@ -92,7 +92,7 @@ up to 256 UTF-8 bytes. The server validates the descriptor and compiles the
 [native JSON Schema subset](../output-constraints.md#json-schema) with the checkpoint
 tokenizer. Other formats such as `json_object`, unsupported schema keywords, text stops,
 and output budgets below the grammar minimum return HTTP 400 before SSE opens. The explicit
-budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L394)<!-- prefix: "OrderedObjec" -->
+budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L389)<!-- prefix: "OrderedObjec" -->
 
 The response echoes the descriptor in `text.format` and returns the generated JSON as an
 `output_text` string in the assistant message. The schema constrains output from the first
@@ -104,6 +104,52 @@ For streaming, join the `response.output_text.delta` strings and parse the JSON 
 `response.completed`.
 The [checkpoint wire check](../../tests/constraints/responses_schema_http.py#L87)<!-- prefix: "def check_ou" -->
 compares blocking text, streamed deltas and the terminal snapshot.
+
+## Named function tools
+
+Start the server with `--tool-call-parser qwen3_coder`. Declare one flat function in
+`tools` and select it with `tool_choice`. For example, add these fields to a text request
+asking for weather in Paris.
+
+```json
+{
+  "tools": [{
+    "type": "function",
+    "name": "get_weather",
+    "description": "Get weather for a city.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {"city": {"type": "string"}},
+      "required": ["city"],
+      "additionalProperties": false
+    }
+  }],
+  "tool_choice": {"type": "function", "name": "get_weather"}
+}
+```
+
+Use a name of 1 to 64 ASCII letters, digits, underscores or hyphens. Omit `strict` or use
+`true`. The [native chat tool grammar](../output-constraints.md#tool-call-constraints) checks
+the parameter schema. The server emits a single call in `output` with `type:"function_call"`,
+a `call_id`, a function name, and an `arguments` string containing a typed JSON object.
+The client executes the function.
+
+With `stream:true`, the function item is added with empty arguments. The server sends
+`response.function_call_arguments.delta` when the parser has the arguments, then sends
+`response.function_call_arguments.done` and the completed output item. The final response
+snapshot includes the same item and usage. [Checkpoint wire check](../../tests/constraints/responses_named_tool_http.py#L141)<!-- prefix: "def run(args" -->
+
+To return a result, send an `input` item with `type:"function_call_output"`, the matching
+`call_id`, and a string `output`. Supply `previous_response_id` for a stored call. For
+stateless replay, include the original user message and `function_call` item before the
+result. Use a fresh `tools` declaration and named choice if the new response should call
+a function again.
+
+With a declared tool, automatic, required and disabled selection, multiple functions,
+and hosted tools return HTTP 400. Named calls also return HTTP 400 with inline images,
+JSON Schema output, text stops or output logprobs. Requests with an empty tool list accept
+`tool_choice:"auto"` and `tool_choice:"none"`.
 
 ## State and retention
 
@@ -132,6 +178,4 @@ retention. Failure snapshots have an empty `output` and null `usage`, even when 
 already received item events. Internal generation failures use a generic `server_error`.
 
 Responses create, retrieve and cancel take precedence over configured Ollama aliases at the
-same method and path. The adapter accepts `tool_choice` values `auto` and `none`
-with an empty tool list. Named and required tool choices, tool definitions and
-calls, other `include` expansions, and automatic truncation are unsupported.
+same method and path. Other `include` expansions and automatic truncation return HTTP 400.

@@ -175,7 +175,7 @@ target("sglang-server")
               "apps/server/ollama_discovery.cpp",
               "apps/server/ollama_generate.cpp",
               "apps/server/parse_function_call.cpp", "apps/server/responses.cpp",
-              "apps/server/score.cpp",
+              "apps/server/responses_tools.cpp", "apps/server/score.cpp",
               "apps/server/tokenization.cpp",
               "apps/server/tokenization_validation.cpp", "apps/server/tool_literal.cpp",
               "apps/server/tool_union.cpp")

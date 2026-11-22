@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <list>
+#include <map>
 
 namespace sglang::server {
 
@@ -55,6 +56,10 @@ void complete_responses(const Socket& connection, BatchService& service, int slo
                         const CompletionTokenizer& tokenizer, std::string_view body,
                         ResponseStore& store, VisionCompletion* vision = nullptr);
 
+void configure_responses_tool(const json::OrderedObject& fields, json::OrderedObject& chat);
+bool append_responses_tool_history(const json::OrderedObject& item, json::Array& messages,
+                                   std::map<std::string, bool, std::less<>>& calls);
+
 class ResponsesOutput {
 public:
     ResponsesOutput(const Socket& connection, EventStream& stream,
@@ -85,6 +90,7 @@ private:
                    json::Value usage = json::Value(), json::Value error = json::Value());
     bool open_item(bool reasoning);
     bool close_item();
+    bool accept_tool(const ChatOutputEvent& delta);
     void fail(const char* code, const char* message, unsigned status);
     json::OrderedObject part_fields() const;
 

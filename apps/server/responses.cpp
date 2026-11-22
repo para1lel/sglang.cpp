@@ -151,10 +151,12 @@ Value message_content(const OrderedObject& message, std::string_view role) {
 
 Array messages(const Array& input, const Value& instructions) {
     Array result;
+    std::map<std::string, bool, std::less<>> calls;
     std::string system;
     if (const auto text = instructions.string()) system = *text;
     for (const auto& item : input) {
         const auto& message = object(item, "input");
+        if (append_responses_tool_history(message, result, calls)) continue;
         const auto type = field(message, "type").string().value_or("message");
         const auto role = type == "reasoning" ? std::string_view("assistant") :
             field(message, "role").string().value_or("");
@@ -357,13 +359,6 @@ void validate_text_options(const OrderedObject& fields) {
         tier->string() != "scale" && tier->string() != "priority") {
         throw RequestError(400, "Unsupported service tier", "service_tier");
     }
-    const auto& tools = field(fields, "tools");
-    const auto& choice = field(fields, "tool_choice");
-    if ((json::get(fields, "tools") && (!tools.array() || !tools.array()->empty())) ||
-        (json::get(fields, "tool_choice") && choice.string() != "auto" &&
-         choice.string() != "none")) {
-        throw RequestError(400, "Responses tools are unavailable");
-    }
     const auto& truncation = field(fields, "truncation");
     if (!truncation.is_null() && truncation.string() != "disabled") {
         throw RequestError(400, "Only disabled truncation is supported", "truncation");
@@ -554,6 +549,7 @@ ResponsesRequest parse_responses_request(std::string_view body, ResponseStore& s
     OrderedObject chat{{"model", std::string(model_name)}, {"messages", std::move(prompt)},
                        {"stream", stream},
                        {"chat_template_kwargs", std::move(thinking)}};
+    configure_responses_tool(fields, chat);
     if (!response_format.is_null()) {
         chat.emplace_back("response_format", std::move(response_format));
     }
@@ -575,7 +571,8 @@ ResponsesRequest parse_responses_request(std::string_view body, ResponseStore& s
     }
     if (field(fields, "temperature").is_null()) chat.emplace_back("temperature", 0.7);
     OrderedObject echo{{"parallel_tool_calls", flag(fields, "parallel_tool_calls", true)},
-        {"tool_choice", choice.is_null() ? Value("auto") : choice}, {"tools", Array{}},
+        {"tool_choice", choice.is_null() ? Value("auto") : choice},
+        {"tools", field(fields, "tools").is_null() ? Value(Array{}) : field(fields, "tools")},
         {"instructions", instructions}, {"max_output_tokens", limit},
         {"previous_response_id", previous},
         {"reasoning", OrderedObject{{"effort", effort && effort != "none" ?
@@ -762,7 +759,33 @@ bool ResponsesOutput::close_item() {
     return true;
 }
 
+bool ResponsesOutput::accept_tool(const ChatOutputEvent& delta) {
+    if (!close_item()) return false;
+    const auto id = responses_id("fc_");
+    const auto index = count(output_.size());
+    OrderedObject item{{"id", id}, {"type", "function_call"}, {"status", "in_progress"},
+        {"call_id", responses_id("call_")}, {"name", std::string(delta.name)}, {"arguments", ""}};
+    if (text_.stream &&
+        (!event("response.output_item.added", {{"output_index", index}, {"item", item}}) ||
+         !event("response.function_call_arguments.delta",
+            {{"output_index", index}, {"item_id", id}, {"delta", std::string(delta.text)}}) ||
+         !event("response.function_call_arguments.done",
+            {{"output_index", index}, {"item_id", id}, {"name", std::string(delta.name)},
+             {"arguments", std::string(delta.text)}}))) return false;
+    for (auto& [key, value] : item) {
+        if (key == "status") value = "completed";
+        if (key == "arguments") value = std::string(delta.text);
+    }
+    if (text_.stream &&
+        !event("response.output_item.done", {{"output_index", index}, {"item", item}})) {
+        return false;
+    }
+    output_.emplace_back(std::move(item));
+    return true;
+}
+
 bool ResponsesOutput::accept(const ChatOutputEvent& delta) {
+    if (delta.kind == ChatOutputKind::tool_call) return accept_tool(delta);
     if (delta.text.empty()) return true;
     const bool reasoning = delta.kind == ChatOutputKind::reasoning;
     if ((!item_ || item_->reasoning != reasoning) && !open_item(reasoning)) return false;

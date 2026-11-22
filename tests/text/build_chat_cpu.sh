@@ -10,8 +10,8 @@ sources=("$source/apps/sglang-server.cpp")
 for name in batch_service completions flush_cache http loads text_request text_completion \
     chat_template chat_media chat_output chat_tool_constraints native_generate native_sessions \
     ollama_discovery ollama_generate \
-    parse_function_call prefix_controls anthropic_count anthropic_messages decisions responses \
-    score tokenization tokenization_validation tool_literal tool_union; do
+    parse_function_call prefix_controls anthropic_count anthropic_messages decisions \
+    responses responses_tools score tokenization tokenization_validation tool_literal tool_union; do
     file="$source/apps/server/$name.cpp"
     if [[ -f "$file" ]]; then
         sources+=("$file")

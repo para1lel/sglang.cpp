@@ -75,3 +75,21 @@ The `measurement/summary.json` files supply the rates and latency distributions.
 | W4 | `paired-w4.XUPFw89u/diagnostics.json` and `paired-w4.XUPFw89u/evidence.sha256` |
 | W5 | `paired-w5.oSXO12wz/reference.json` and `paired-w5.oSXO12wz/independent-test/replay.json` |
 | W6 | `paired-w6.0f6AV2Ck/native-formal/replay-result.json` and `paired-w6.0f6AV2Ck/native-formal/evidence.sha256` |
+
+## W1 K4 qualification
+
+The November 22, 2026 W1 run checked native release `dce521eaecabfca707b6a3e6d72547ac4699b3af` and the pinned vLLM revision above. Native default K4 matched all 128 IDs from explicit K0 with exact prefill. Separate live checks confirmed the same IDs for default K4, explicit K4, and exact K0 in the generator and HTTP server. The historical native tensor-core K0 continuation first differed from the exact K0 control at output token 29.
+
+Live vLLM K0 and K4 matched for 28 output tokens. At token 29, K0 selected ID `524` with a 0.125 logprob lead over ID `321`. K4 reported equal logprobs for those IDs and selected `321`. W1 failed the exact-ID requirement.
+
+The v4 campaign measured nine W1 cohorts per arm. The median makespan was 1.930878220 s for native and 0.638064157 s for vLLM. The native median was 3.026 times the vLLM median, so W1 also failed the timing requirement. The timing results are descriptive only. The K4 campaign stopped at W1.
+
+The receipts are on the benchmark host. The paths below are relative to `artifacts/`.
+
+| Receipt | SHA-256 |
+| --- | --- |
+| `session-1122-mtp4-bench/campaigns/release-mtp4-v4/W1/comparison.json` | `50009ce7472c62b90b8c93b9343950fe14ad86395f28997a6cb5a85c33b1d616` |
+| `session-1122-mtp4-bench/campaigns/release-mtp4-v3/W1/native/w1-qualification.json` | `bea83bf50bb1892c2a405c4277eae0caf7c9ef9a7304e9d0789db32d4972835a` |
+| `session-1122-mtp4-bench/campaigns/release-mtp4-v3/W1/vllm/w1-qualification.json` | `b7ae0ecaf3147a799239104699bba093741f831835ba346ae180e690d13bd5b4` |
+| `session-1122-default-live/cli-summary.json` | `0538c989b9b4213884ed2fd589fd94b97ac94263ee1b28ba6af92a0aab05694a` |
+| `session-1122-default-live/http-omitted-depth/qualification.json` | `c550d3ee63ad246b19d6f74e4ba4e67f98bac88615b0158ea158870905896832` |

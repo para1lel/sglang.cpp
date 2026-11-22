@@ -16,11 +16,10 @@ public:
 
     DecoderResult generate(BatchService& service, int slot, const MediaPrompt& prompt,
                            const DecoderOptions& options, const DecoderCallbacks& callbacks);
-
-private:
     std::optional<std::vector<DecoderMedia>> encode(const MediaPrompt& prompt,
                                                    const DecoderCallbacks& callbacks);
 
+private:
     std::filesystem::path checkpoint_;
     int device_;
     std::once_flag loaded_;

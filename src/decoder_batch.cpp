@@ -456,12 +456,12 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     if (options.requires_target_only() || options.label_token_ids) options.mtp_steps = 0;
     const int top = options.generated_top_logprobs;
     if (const auto& labels = options.label_token_ids;
-        labels && (media || options.max_new_tokens != 0 || options.score_prompt || top != -1 ||
+        labels && (options.max_new_tokens != 0 || options.score_prompt || top != -1 ||
                    options.top_logits || labels->empty() ||
                    std::any_of(labels->begin(), labels->end(), [](int label) {
                        return label < 0 || label >= vocab_size;
                    }))) {
-        throw std::invalid_argument("Label scoring requires text prefill and valid label IDs");
+        throw std::invalid_argument("Label scoring requires prefill and valid label IDs");
     }
     if ((options.score_prompt && top < 0) ||
         top < -1 || top > decoder_max_generated_top_logprobs ||
@@ -729,10 +729,11 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
         }
         const int position = lane.progress.position;
         if (lane.options.label_token_ids) {
+            const int limit = lane.media ? prefill_chunk_rows : batch_prefill_tile_rows;
             labels[label_count++] = {
                 lane.request.get(), lane.prompt.data() + position, position, rows[slot],
-                std::min(rows[slot], batch_prefill_tile_rows), lane.remaining_prompt(),
-                nullptr, nullptr};
+                std::min(rows[slot], limit), lane.remaining_prompt(),
+                nullptr, lane.media ? &lane.media_prefill : nullptr};
             continue;
         }
         int limit = tile_limit;

@@ -429,6 +429,11 @@ DecoderResult VisionCompletion::generate(const Decoder&, const MediaPrompt&,
 #endif
 
 #ifdef SGLANG_TEST_BATCH_MEDIA
+std::optional<std::vector<DecoderMedia>> VisionCompletion::encode(
+    const MediaPrompt&, const DecoderCallbacks&) {
+    throw std::logic_error("The CPU decoder does not accept media");
+}
+
 DecoderResult VisionCompletion::generate(BatchService&, int, const MediaPrompt&,
                                         const DecoderOptions&, const DecoderCallbacks&) {
     throw std::logic_error("The CPU decoder does not accept media");

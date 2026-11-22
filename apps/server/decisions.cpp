@@ -1,8 +1,10 @@
 #include "sglang/server/decisions.h"
 
+#include "sglang/server/chat_media.h"
 #include "sglang/server/chat_template.h"
 #include "sglang/server/http.h"
 #include "sglang/server/tokenization_validation.h"
+#include "sglang/server/vision_completion.h"
 #include "sglang/tokenizer/unicode.h"
 #include "sglang/utf8.h"
 
@@ -36,6 +38,7 @@ struct Question {
 struct Request {
     std::string model = "default";
     std::string input;
+    Array image_parts;
     std::vector<Question> questions;
     double temperature = 1;
     bool return_ids = false;
@@ -196,6 +199,44 @@ void parse_template(const Value* value, Request& output) {
     }
 }
 
+Array parse_images(const Value* value) {
+    Array images;
+    if (!value) return images;
+    for (const auto& image : list(value, "images", 0, 4)) {
+        OrderedObject payload;
+        if (const auto url = image.string()) {
+            payload.emplace_back("url", std::string(*url));
+        } else {
+            payload = object(&image, "image");
+            string(get(payload, "url"), "image.url");
+            for (const auto name : {"max_dynamic_patch", "min_dynamic_patch",
+                                    "max_long_side_pixel", "content_hash"}) {
+                if (const auto* option = get(payload, name); option && !option->is_null()) {
+                    throw std::invalid_argument("Unsupported decision image option: " +
+                                                std::string(name));
+                }
+            }
+            if (const auto* detail = get(payload, "detail");
+                detail && !detail->is_null() && detail->string() != "auto" &&
+                detail->string() != "default") {
+                if (detail->string() != "low" && detail->string() != "high") {
+                    invalid("image.detail must be auto, low, high, or null");
+                }
+                throw std::invalid_argument("Decision images support automatic detail only");
+            }
+            const auto unsupported = std::remove_if(payload.begin(), payload.end(),
+                                                    [](const auto& field) {
+                return field.first != "url" && field.first != "height" &&
+                       field.first != "width";
+            });
+            payload.erase(unsupported, payload.end());
+        }
+        images.emplace_back(OrderedObject{{"type", "image_url"},
+                                          {"image_url", std::move(payload)}});
+    }
+    return images;
+}
+
 Request parse_request(std::string_view body) {
     const auto root = json::parse(body, json::Syntax::ordered_last_key_wins);
     const auto& request = object(&root, "request");
@@ -222,11 +263,10 @@ Request parse_request(std::string_view body) {
     for (const auto& question : output.questions) {
         if (!ids.insert(question.id).second) invalid("question id repeats another question");
     }
-    if (const auto* images = get(request, "images")) {
-        if (!images->array()) invalid("images must be an array");
-        if (!images->array()->empty()) {
-            throw std::invalid_argument("Vision decision inputs are unavailable");
-        }
+    output.image_parts = parse_images(get(request, "images"));
+    if (!output.image_parts.empty() && output.return_ids) {
+        throw std::invalid_argument(
+            "return_prompt_token_ids cannot replay image inputs through /v1/score");
     }
     if (const auto* format = get(request, "prompt_format_version");
         format && !supported_version(*format)) {
@@ -361,7 +401,7 @@ std::string render_question(std::string_view input, const Question& question) {
     return output;
 }
 
-std::string render_prompt(const CompletionTokenizer& tokenizer, std::string content,
+std::string render_prompt(const CompletionTokenizer& tokenizer, Value content,
                           bool vision_ids) {
     Array messages{OrderedObject{{"role", "user"}, {"content", std::move(content)}}};
     return tokenizer.chat_template().render(
@@ -434,7 +474,7 @@ std::vector<std::string> pair_labels(const CompletionTokenizer& completion, bool
 }
 
 std::vector<BatchPrompt> prepare(Request& request, const CompletionTokenizer& completion,
-                                 const BatchCallbacks& callbacks) {
+                                 const BatchCallbacks& callbacks, VisionCompletion& vision) {
     auto bytes = max_score_text_bytes;
     auto tokens = max_score_prompt_tokens;
     auto labels = max_score_response_values;
@@ -444,6 +484,13 @@ std::vector<BatchPrompt> prepare(Request& request, const CompletionTokenizer& co
     std::vector<BatchPrompt> batch;
     batch.reserve(request.questions.size());
     const auto& tokenizer = completion.get();
+    MediaPrompt media;
+    if (!request.image_parts.empty()) {
+        if (callbacks.is_cancelled()) return {};
+        const OrderedObject chat{{"messages",
+            Array{OrderedObject{{"role", "user"}, {"content", std::move(request.image_parts)}}}}};
+        media.parts = prepare_chat_media(parse_chat_media(chat, true).value().parts, tokenizer);
+    }
     std::optional<std::vector<std::string>> pairs;
     for (auto& question : request.questions) {
         if (callbacks.is_cancelled()) return {};
@@ -454,20 +501,36 @@ std::vector<BatchPrompt> prepare(Request& request, const CompletionTokenizer& co
             }
             question.labels.assign(pairs->begin(), pairs->begin() + question.names.size());
         }
-        const auto prompt = render_prompt(completion, render_question(request.input, question),
-                                          request.vision_ids);
+        Value content = render_question(request.input, question);
+        if (!media.parts.empty()) {
+            Array blocks(media.parts.size(), OrderedObject{{"type", "image"}});
+            blocks.emplace_back(OrderedObject{{"type", "text"}, {"text", std::move(content)}});
+            content = std::move(blocks);
+        }
+        const auto prompt = render_prompt(completion, std::move(content), request.vision_ids);
         if (!consume(bytes, prompt.size()) || !consume(labels, question.labels.size())) {
             throw std::length_error("Decision request exceeds the aggregate score budget");
         }
-        auto ids = tokenizer.encode(prompt, std::min(tokens, checkpoint_context - 1));
-        if (!consume(tokens, ids.size())) {
+        const auto ids = tokenizer.encode(prompt, std::min(tokens, checkpoint_context - 1));
+        std::vector<int> prompt_ids(ids.begin(), ids.end());
+        const auto expanded = media.parts.empty()
+            ? prompt_ids.size() : expand_prepared_chat_media(prompt_ids, media.parts).size();
+        if (expanded >= checkpoint_context || !consume(tokens, expanded)) {
             throw std::length_error("Decision request exceeds the aggregate prompt token budget");
         }
         DecoderOptions options;
         options.max_new_tokens = 0;
         options.label_token_ids = std::make_shared<const std::vector<int>>(
             encode_labels(tokenizer, prompt, ids, question));
-        batch.push_back({std::vector<int>(ids.begin(), ids.end()), std::move(options)});
+        batch.push_back({std::move(prompt_ids), std::move(options)});
+        batch.back().expanded_tokens = expanded;
+    }
+    if (!media.parts.empty()) {
+        DecoderCallbacks media_callbacks;
+        media_callbacks.is_cancelled = callbacks.is_cancelled;
+        const auto features = vision.encode(media, media_callbacks);
+        if (!features) return {};
+        for (auto& prompt : batch) prompt.media = *features;
     }
     return batch;
 }
@@ -515,7 +578,7 @@ std::string response(const Request& request, const std::vector<BatchPrompt>& pro
         const auto& question = request.questions[index];
         answers.emplace_back(question.id,
                              answer(request, question, prompts[index], results[index]));
-        tokens += prompts[index].prompt.size();
+        tokens += prompts[index].prompt_tokens();
     }
     OrderedObject usage{{"prompt_tokens", tokens}, {"total_tokens", tokens},
                         {"completion_tokens", 0}, {"reasoning_tokens", 0}};
@@ -600,12 +663,12 @@ void schema_error(const Socket& connection, bool systemone, std::string_view mes
 
 void serve(const Socket& connection, BatchService& service, int slot,
            const CompletionTokenizer& tokenizer, std::string_view body,
-           std::optional<std::string_view> model) {
+           std::optional<std::string_view> model, VisionCompletion& vision) {
     try {
         auto request = model ? parse_systemone(body, *model) : parse_request(body);
         BatchCallbacks callbacks;
         callbacks.is_cancelled = [&] { return disconnected(connection); };
-        auto prompts = prepare(request, tokenizer, callbacks);
+        auto prompts = prepare(request, tokenizer, callbacks, vision);
         if (prompts.empty()) return;
         const auto results = service.generate_batch(slot, prompts, callbacks);
         if (results) {
@@ -629,14 +692,15 @@ void serve(const Socket& connection, BatchService& service, int slot,
 }
 
 void serve_decisions(const Socket& connection, BatchService& service, int slot,
-                     const CompletionTokenizer& tokenizer, std::string_view body) {
-    serve(connection, service, slot, tokenizer, body, std::nullopt);
+                     const CompletionTokenizer& tokenizer, std::string_view body,
+                     VisionCompletion& vision) {
+    serve(connection, service, slot, tokenizer, body, std::nullopt, vision);
 }
 
 void serve_systemone(const Socket& connection, BatchService& service, int slot,
                      const CompletionTokenizer& tokenizer, std::string_view body,
-                     std::string_view model) {
-    serve(connection, service, slot, tokenizer, body, model);
+                     std::string_view model, VisionCompletion& vision) {
+    serve(connection, service, slot, tokenizer, body, model, vision);
 }
 
 }

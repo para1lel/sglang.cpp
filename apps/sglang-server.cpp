@@ -351,9 +351,9 @@ int main(int argc, char** argv) {
             [&](const Socket& connection, int slot, std::string_view body, bool systemone) {
                 if (systemone) {
                     serve_systemone(connection, service, slot, tokenizer, body,
-                                    arguments.checkpoint.string());
+                                    arguments.checkpoint.string(), vision);
                 } else {
-                    serve_decisions(connection, service, slot, tokenizer, body);
+                    serve_decisions(connection, service, slot, tokenizer, body, vision);
                 }
             });
     } catch (const std::exception& error) {

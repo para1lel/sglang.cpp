@@ -461,9 +461,8 @@ void BatchService::State::process(DecoderBatch& batch) {
         if (match_text) {
             for (int slot = 0; slot < max_active; ++slot) {
                 const auto& job = snapshot->jobs[slot];
-                if (selected[slot] && job->text_stop && job->text_stop->apply(steps[slot])) {
+                if (selected[slot] && job->text_stop && job->text_stop->apply(steps[slot]))
                     batch.cancel(slot);
-                }
             }
         }
         const auto cache = prefix_cache_entries ? batch.prefix_cache_stats()
@@ -593,8 +592,10 @@ void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt
         }
         auto job = std::make_shared<Job>();
         job->prompt = prompts[next].prompt;
-        job->prompt_tokens = job->prompt.size();
-        job->options = mtp.options_for(prompts[next].options);
+        job->media = prompts[next].media;
+        job->prompt_tokens = prompts[next].prompt_tokens();
+        job->options = job->media.empty() ? mtp.options_for(prompts[next].options)
+                                        : prompts[next].options;
         job->request_id = prompts[next].request_id;
         job->buffer_decode_output = buffered && job->can_buffer();
         const auto& text_stops = prompts[next].text_stops;

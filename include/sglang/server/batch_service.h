@@ -103,6 +103,10 @@ struct BatchPrompt {
     bool return_text_in_logprobs = false;
     bool no_stop_trim = false;
     bool skip_special_tokens = true;
+    std::vector<DecoderMedia> media = {};
+    std::size_t expanded_tokens = 0;
+
+    std::size_t prompt_tokens() const { return media.empty() ? prompt.size() : expanded_tokens; }
 };
 
 struct BatchCallbacks {

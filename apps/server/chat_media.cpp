@@ -317,7 +317,7 @@ PreparedMedia prepare(const MediaPart& part, const Tokenizer& tokenizer, int& re
     return result;
 }
 
-void validate_markers(const std::vector<int>& ids, const std::vector<MediaPart>& parts) {
+void validate_markers(const std::vector<int>& ids, const std::vector<DecoderMediaLayout>& parts) {
     std::vector<int> expected;
     for (const auto& part : parts) {
         expected.insert(expected.end(), {vision_start,
@@ -376,19 +376,34 @@ std::optional<ChatMedia> parse_chat_media(const OrderedObject& chat, bool enable
     return result;
 }
 
-std::vector<int> expand_chat_media(MediaPrompt& prompt, const std::vector<MediaPart>& parts,
-                                   const Tokenizer& tokenizer) {
-    validate_markers(prompt.template_ids, parts);
-    std::vector<DecoderMediaLayout> layouts;
+std::vector<PreparedMedia> prepare_chat_media(const std::vector<MediaPart>& parts,
+                                             const Tokenizer& tokenizer) {
+    std::vector<PreparedMedia> prepared;
+    prepared.reserve(parts.size());
     int remaining_patches = max_grid_patches;
     for (const auto& part : parts) {
-        auto prepared = prepare(part, tokenizer, remaining_patches);
-        layouts.push_back(prepared.layout);
-        prompt.parts.push_back(std::move(prepared));
+        prepared.push_back(prepare(part, tokenizer, remaining_patches));
     }
-    auto expanded = prepare_multimodal_prompt(prompt.template_ids, layouts);
-    prompt.expanded_tokens = expanded.token_ids.size();
-    return std::move(expanded.token_ids);
+    return prepared;
+}
+
+std::vector<int> expand_prepared_chat_media(const std::vector<int>& template_ids,
+                                            const std::vector<PreparedMedia>& parts) {
+    std::vector<DecoderMediaLayout> layouts;
+    layouts.reserve(parts.size());
+    for (const auto& part : parts) {
+        layouts.push_back(part.layout);
+    }
+    validate_markers(template_ids, layouts);
+    return prepare_multimodal_prompt(template_ids, layouts).token_ids;
+}
+
+std::vector<int> expand_chat_media(MediaPrompt& prompt, const std::vector<MediaPart>& parts,
+                                   const Tokenizer& tokenizer) {
+    prompt.parts = prepare_chat_media(parts, tokenizer);
+    auto ids = expand_prepared_chat_media(prompt.template_ids, prompt.parts);
+    prompt.expanded_tokens = ids.size();
+    return ids;
 }
 
 }

@@ -1,6 +1,6 @@
 # Fixed W1–W6 serving comparison
 
-Native passed the paired makespan gate for W1–W4 at 8,192 scheduled tokens. W5 is underway. Under the historical 32,768-token cap, native passed W1, missed the TTFT gate on W2, and missed all speed gates on W3 and W4. Native W5 and W6 timed out in the first warmup. [Paired protocol](../benchmarks/paired/README.md)
+Native passed the paired makespan gate for W1–W5 at 8,192 scheduled tokens. Formal W6 is pending. Under the historical 32,768-token cap, native passed W1, missed the TTFT gate on W2, and missed all speed gates on W3 and W4. Native W5 and W6 timed out in the first warmup. [Paired protocol](../benchmarks/paired/README.md)
 
 ## Matched W1–W3 at 8,192 tokens
 
@@ -39,11 +39,26 @@ Each arm ran two warmups and five measured cohorts of 16 lanes × 32,768 prompt 
 
 Native TTFT p50 was 11.739 s higher and p95 was 2.650 s lower. The paired gate measures cohort makespan. [Gate and diagnostics](../benchmarks/paired/README.md#observe-and-compare)
 
+### Formal W5 result
+
+On November 22, 2026, fresh pinned vLLM ran first. Both arms reused W4's B200, CPU placement, checkpoint, and launch settings.
+
+Each arm ran two warmups and five unprofiled measured cohorts of 32 lanes × 32,768 prompt IDs → 4,096 output IDs. Independent replay verified 224 SSE streams and exact per-lane repeats per arm. The native binary matched W4 (SHA-256 `0871bbd2a6035c63220634ef58824b8d52b45cba31b9f893096ebd47920cbe97`).
+
+| Metric | Native | Fresh pinned vLLM |
+| --- | ---: | ---: |
+| Median cohort makespan (s) | 125.917998486 | 154.131408909 |
+| Request TTFT p50 / p95 (s) | 57.577365 / 58.698938 | 33.506564 / 62.863195 |
+
+Native passed the paired gate with **18.30%** lower median makespan. Native TTFT p50 was 24.071 s higher and p95 was 4.164 s lower. TTFT is diagnostic. [Gate and diagnostics](../benchmarks/paired/README.md#observe-and-compare)
+
+The benchmark host retains the fresh `reference.json`, `native/W5/comparison.json`, and `independent-test/replay.json` at `artifacts/takeover-baseline/paired-w5.oSXO12wz/`.
+
 ### Earlier probes
 
 **W4 stock native.** Two 32-output GPU 6 cohorts took 44.450 s and 44.850 s and matched frozen prefixes. A five-step width-16 graph sample implied a 57.703 s full-length projection, 11.335 s above the GPU 2 vLLM median. A separate GPU 6 profile attributed 79.2% of captured prefill kernel time to FP8 projections and paged GQA with pair preparation. CUPTI warned of possible missing events. See `artifacts/takeover-w4-probe/run.ExkiZELV/summary.md` and `artifacts/takeover-w4-probe/nsys.LbMaudSg/summary.md`.
 
-**W5 stock native.** One traced 32-lane GPU 5 cohort took 65.421 s for 32 outputs per lane. All 1,024 IDs matched frozen prefixes. The 15.979 ms width-32 graph cadence projected 130.360 s at 4,096 outputs per lane. The frozen GPU 2 median is 149.329 s. See `artifacts/takeover-w5-probe/projection.json`. W6 remains pending.
+**W5 stock native.** One traced 32-lane GPU 5 cohort took 65.421 s for 32 outputs per lane. All 1,024 IDs matched frozen prefixes. The 15.979 ms width-32 graph cadence projected 130.360 s at 4,096 outputs per lane. The archived GPU 2 reference median was 149.329 s. See `artifacts/takeover-w5-probe/projection.json`.
 
 ### Tiled prefill scheduler pilots
 

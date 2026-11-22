@@ -107,7 +107,7 @@ struct ExactGqaWorkspace {
 cudaError_t exact_decode_gqa_attention(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,
     __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream,
-    std::size_t workspace_bytes = 0);
+    std::size_t workspace_bytes = 0, bool prefill = false);
 cudaError_t exact_decode_gqa_attention(
     Mxfp8KvCache cache, Mxfp8PageTable pages, const int* position, const __nv_bfloat16* queries,
     __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream,

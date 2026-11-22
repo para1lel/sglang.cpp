@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L699)<!-- prefix: "const auto r" --> · [Lane selection](../src/text/decoder_graph_packed.cpp#L486)<!-- prefix: "first.narrow" --> |
 | Batch execution owner | Allocates and releases the shared score buffer. | [Allocation](../src/decoder_resources.cpp#L471)<!-- prefix: "ExactGqaWork" --> · [Device release](../src/decoder_resources.cpp#L263)<!-- prefix: "CleanupError" --> |
-| Exact attention | Computes FP32 scores and consumes them in token order. | [Score and replay launches](../src/mxfp8_gqa.cu#L810)<!-- prefix: "cudaError_t " --> |
+| Exact attention | Computes FP32 scores and consumes them in token order. | [Score and replay launches](../src/mxfp8_gqa.cu#L813)<!-- prefix: "cudaError_t " --> |
 
 ## Runtime path
 
@@ -18,6 +18,8 @@ The batch stream owner allocates one buffer on first eligible use. It allocates 
 
 The step rounds the live visible length up to a 128-token page for the per-head stride. It requires a page table and K/V payload and scale buffers with sufficient declared capacity in every attention layer. Eager decode passes the score descriptor by value. With graphs enabled, the first eligible width-one step warms up eagerly. Replay uploads the live position, page table, KV cache, and score descriptor. The same width-one executable can use short inline scores or the batch buffer. Both score-backed routes round the attention result to BF16. [Eligibility and stride](../src/text/decoder_graph_packed.cpp#L399)<!-- prefix: "ExactGqaWork" --> · [Eager read](../src/decoder_forward.cpp#L202)<!-- prefix: "if (singleto" --> · [Warmup](../src/text/decoder_graph_packed.cpp#L440)<!-- prefix: "auto& warmed" --> · [Replay binding](../src/text/decoder_graph_packed.cpp#L471)<!-- prefix: "scratch.bind" -->
 
+Eager final-prompt replay stages packed V and its scales in two shared-memory buffers at 8,192 or more visible tokens when their bases are 16-byte and 8-byte aligned, respectively. Each CTA handles one query head and 64 value channels. Asynchronous copies follow the page table and zero-fill the invisible part of the last tile. The path reuses the score producer and preserves each channel's token-ordered FP32 recurrence. Eager decode, graph replay, shorter contexts, and misaligned buffers keep the existing replay. [Staged replay](../include/sglang/text/gqa_prefill_replay.cuh#L34)<!-- prefix: "__global__ v" -->
+
 ## Constraints and failure behavior
 
 Short singleton replay remains eligible through 5,120 visible tokens. Decode-only singletons at 5,121–32,767 use direct ordered eager attention. Above 36,864 tokens or when the page table or a layer's buffers lack the required capacity, the new eager binding stays empty and existing dispatch rules apply. The batch buffer stays fixed even if the request reserves more KV. The legacy width-two through width-four graph keeps its separate request-owned long scores. [Replay limit](../src/text/decoder_graph_packed.cpp#L436)<!-- prefix: "if (count ==" --> · [Direct eager read](../src/decoder_forward.cpp#L207)<!-- prefix: "return mxfp8" --> · [Context limit](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" --> · [Legacy scores](batch-graphs.md#constraints-and-failure-behavior)
@@ -27,5 +29,7 @@ After clean score-buffer allocation OOM, the batch remembers the failure for its
 ## Verification
 
 Run the same-input dispatch fixture on a reserved B200. Compare eager and replay BF16 attention bitwise with ordered eager. Exercise 32,767–32,769 and 36,864–36,865 visible tokens. Rebind short and long requests to the same executable. Include a remapped page table and a partial last page. Verify one batch buffer allocation. Verify that request-owned score bytes stay constant.
+
+The [short-prefill checker](../tests/mxfp8_gqa_short_prefill_check.cu#L58)<!-- prefix: "void check_s" --> compares staged and ordered replay at the visibility threshold and on reversed pages, including misaligned V and scales.
 
 Inject score-buffer OOM and a recoverable graph launch rejection in separate runs. Check direct ordered fallback after OOM. Check score-backed eager after graph rejection. Record warm dispatch timing and serving timing as separate measurements. See the [batch graph checks](batch-graphs.md#verification) for HTTP parity and failure recovery.

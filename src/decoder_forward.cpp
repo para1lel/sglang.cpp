@@ -201,7 +201,7 @@ cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
     if constexpr (std::is_same_v<Position, int>) {
         if (singleton_scores.scores) {
             return exact_decode_gqa_attention(cache, pages, position, work.rope_queries,
-                                              work.attention, singleton_scores, stream);
+                work.attention, singleton_scores, stream, 0, mode == TextGdnMode::prefill);
         }
         if (mode == TextGdnMode::prefill || position >= scores.capacity) {
             return mxfp8_gqa_attention(cache, pages, position + 1, position, 1,

@@ -523,6 +523,8 @@ __global__ void exact_replay_kernel(
                           scores, nullptr, output);
 }
 
+#include "sglang/text/gqa_prefill_replay.cuh"
+
 constexpr int decode_splits = decoder::paged_decode_partitions;
 constexpr int split_tokens = decoder::paged_decode_max_visible / decode_splits;
 constexpr int split_warps = 8;
@@ -806,7 +808,8 @@ int score_grid_capacity(const decoder::ExactGqaWorkspace* workspace) {
     return workspace ? text_attention_max_tokens : 0;
 }
 
-template <bool Narrow = false, typename Position, typename Cache, typename Pages, typename Scores>
+template <bool Narrow = false, bool Prefill = false, typename Position, typename Cache,
+          typename Pages, typename Scores>
 cudaError_t launch_exact_attention(
     Cache cache, Pages pages, Position position, const __nv_bfloat16* queries,
     __nv_bfloat16* output, Scores workspace, cudaStream_t stream) {
@@ -823,6 +826,12 @@ cudaError_t launch_exact_attention(
         0, stream);
     if (status != cudaSuccess) {
         return status;
+    }
+    if constexpr (Prefill) {
+        void* replay_arguments[] = {&cache, &pages, &position, &workspace, &output};
+        return cudaLaunchKernel(prefill_replay_kernel,
+            dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
+            prefill_replay_threads, replay_arguments, 0, stream);
     }
     void* replay_arguments[] = {&cache, &pages, &position, &workspace, &queries, &output};
     return cudaLaunchKernel(exact_replay_kernel<Narrow, Position, Cache, Pages, Scores>,
@@ -887,7 +896,7 @@ cudaError_t decoder::decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pag
 cudaError_t decoder::exact_decode_gqa_attention(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,
     __nv_bfloat16* output, ExactGqaWorkspace workspace, cudaStream_t stream,
-    std::size_t workspace_bytes) {
+    std::size_t workspace_bytes, bool prefill) {
     if (position < 0 || position >= workspace.capacity) {
         return cudaErrorInvalidValue;
     }
@@ -897,6 +906,12 @@ cudaError_t decoder::exact_decode_gqa_attention(
     if (workspace_bytes >= narrow_workspace_bytes && narrow_position(position)) {
         return launch_exact_attention<true>(cache, pages.device_pages, position, queries, output,
                                             workspace, stream);
+    }
+    if (prefill && position >= 8191 &&
+        reinterpret_cast<std::uintptr_t>(cache.value_payload) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(cache.value_scales) % 8 == 0) {
+        return launch_exact_attention<false, true>(cache, pages.device_pages, position, queries,
+                                                   output, workspace, stream);
     }
     return launch_exact_attention(cache, pages.device_pages, position, queries, output,
                                   workspace, stream);

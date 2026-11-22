@@ -12,13 +12,13 @@
 #include <string>
 #include <utility>
 #include <vector>
-
 namespace gqa_test {
 std::vector<__nv_bfloat16> make_queries(int start_token, int count);
 double decode_value(std::uint8_t code, std::uint8_t scale);
 void check_bound_gdn(cudaStream_t stream);
 void check_flash_prefill(cudaStream_t stream);
 void check_tiled_prefill_scales(cudaStream_t stream);
+void check_short_prefill_replay(cudaStream_t stream);
 void check_raw_attention(cudaStream_t stream);
 void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
                             sglang::Mxfp8PageTable pages, int first, int rows,
@@ -978,7 +978,6 @@ void check_ordered_prefill_masked_score_overflow(cudaStream_t stream) {
 }
 
 }
-
 int main() {
     try {
         const Stream stream;
@@ -990,6 +989,7 @@ int main() {
         gqa_test::check_raw_attention(stream.get());
         check_finite_range_decode(stream.get());
         check_ordered_prefill_masked_score_overflow(stream.get());
+        gqa_test::check_short_prefill_replay(stream.get());
         gqa_test::check_flash_prefill(stream.get());
         std::puts("MXFP8 GQA check passed");
         return 0;

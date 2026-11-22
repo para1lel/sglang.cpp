@@ -197,7 +197,7 @@ if has_config("mxfp8-gqa-check") then
         add_deps("sglang_cuda")
         add_syslinks("cudart")
         add_files("tests/mxfp8_gqa_check.cu", "tests/mxfp8_gqa_prefill_check.cu")
-        add_files("tests/mxfp8_gqa_flash_check.cu")
+        add_files("tests/mxfp8_gqa_flash_check.cu", "tests/mxfp8_gqa_short_prefill_check.cu")
     target_end()
 
     target("mxfp8-gqa-sm100-check")

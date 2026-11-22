@@ -189,6 +189,16 @@ Value schema_tree(const Value& value) {
 
 }
 
+bool chat_truthy(const Value& value) {
+    if (const auto boolean = value.boolean()) return *boolean;
+    if (const auto number = value.number()) return *number != 0;
+    if (const auto text = value.string()) return !text->empty();
+    if (const auto* array = value.array()) return !array->empty();
+    if (const auto* object = value.object()) return !object->empty();
+    if (const auto* object = value.ordered_object()) return !object->empty();
+    return !value.is_null();
+}
+
 std::optional<bool> chat_boolean(const Value& value) {
     if (const auto flag = value.boolean()) return flag;
     if (const auto number = value.number(); number && (*number == 0 || *number == 1)) {

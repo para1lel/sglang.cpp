@@ -4,6 +4,7 @@
 #include "sglang/utf8.h"
 
 #include <charconv>
+#include <cmath>
 #include <fstream>
 #include <set>
 
@@ -176,6 +177,10 @@ std::string render_content(const OrderedObject& message, VisionCounts& vision,
 }
 
 void append_float(std::string& output, double number) {
+    if (std::isinf(number)) {
+        output += number < 0 ? "-Infinity" : "Infinity";
+        return;
+    }
     char buffer[32];
     const auto converted = std::to_chars(buffer, buffer + sizeof(buffer), number,
                                          std::chars_format::scientific);
@@ -480,6 +485,12 @@ json::Value parse_chat_arguments(std::string_view arguments, json::Syntax syntax
 
 std::string_view trim_chat_text(std::string_view text) {
     return trim(text);
+}
+
+std::string chat_template_json(const json::Value& value) {
+    std::string serialized;
+    append_template_json(serialized, value);
+    return serialized;
 }
 
 ChatTools chat_tools(const OrderedObject& chat) {

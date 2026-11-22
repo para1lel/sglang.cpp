@@ -591,7 +591,8 @@ bool ConnectionQueue::redirects_to(std::string_view path) const {
            path == "/v1/models" || model_retrieval_route(path) ||
            (generate_ && path == "/generate") || (abort_ && path == "/abort_request") ||
            (tokenize_ && (path == "/tokenize" || path == "/v1/tokenize" ||
-                          path == "/detokenize" || path == "/v1/detokenize")) ||
+                          path == "/detokenize" || path == "/v1/detokenize" ||
+                          path == anthropic_count_route)) ||
            (!model_info_.empty() && (path == "/model_info" || path == "/get_model_info")) ||
            path == separate_reasoning_route || path == parse_function_call_route ||
            server_info_route(path) ||
@@ -622,6 +623,10 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         } else {
             write_method_not_allowed(connection, "POST", request.method == "HEAD");
         }
+        return;
+    }
+    if (tokenize_ && request.route_path() == anthropic_count_route && request.method != "POST") {
+        write_method_not_allowed(connection, "POST", request.method == "HEAD");
         return;
     }
     if (server_info_route(request.route_path())) {
@@ -655,8 +660,13 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         if (pending_.size() >= static_cast<std::size_t>(capacity_)) {
             if (tokenize) {
                 lock.unlock();
-                write_tokenization_error(connection, "503 Service Unavailable",
-                                         "ServiceUnavailableError", "Native request queue is full");
+                if (request.route_path() == anthropic_count_route) {
+                    write_anthropic_error(connection, "503 Service Unavailable", "api_error",
+                                          "Internal server error");
+                } else {
+                    write_tokenization_error(connection, "503 Service Unavailable",
+                        "ServiceUnavailableError", "Native request queue is full");
+                }
                 return;
             }
             throw HttpError("503 Service Unavailable", "Native completion queue is full");

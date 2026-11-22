@@ -76,7 +76,7 @@ A nonfinite visible score, visible V scale byte above 160, or invalid partial or
 
 ## Verification
 
-Follow the [batch graph test runbook](../tests/batch/README.md) to build the release server, `mxfp8-gqa-check`, and `batch-graph-lanes`. Enable `--mxfp8-gqa-check=y` and `--batch-graph-lanes=y` in XMake. The runner checks bound operators, lane reuse, fault recovery, and HTTP parity under both prefill policies. Its CPU regression rejects a mask with the correct population count that includes a zero-budget slot. [Test target](../xmake.lua#L263)<!-- prefix: "target(\"batc" -->
+Follow the [batch graph test runbook](../tests/batch/README.md) to build the release server, `mxfp8-gqa-check`, and `batch-graph-lanes`. Enable `--mxfp8-gqa-check=y` and `--batch-graph-lanes=y` in XMake. The runner checks bound operators, lane reuse, fault recovery, and HTTP parity under both prefill policies. Its CPU regression rejects a mask with the correct population count that includes a zero-budget slot. [Test target](../xmake.lua#L264)<!-- prefix: "target(\"batc" -->
 
 On the reserved B200, compare eager and graph greedy IDs and full BF16 rows on identical inputs and routes. Exercise low and high slot masks at widths 2–32, request rebinding, negative padding, and a zero-budget peer. Cross positions 127–129 and check steady request bytes during long packed replay. See [Candidate B replay evidence](long-paged-decode.md#candidate-b-evidence). [Bucket assertions](../tests/batch/check_graph_evidence.py#L367)<!-- prefix: "def verify_p" -->
 

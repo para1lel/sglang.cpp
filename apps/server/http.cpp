@@ -207,6 +207,10 @@ std::size_t content_length(std::string_view headers, HttpRequest& request) {
     if (tokenization_route(request) != TokenizationRoute::none &&
         (!content_type ||
          !ascii_case_equal(content_type->substr(0, content_type->find(';')), "application/json"))) {
+        if (request.route_path() == anthropic_count_route) {
+            throw HttpError("400 Bad Request",
+                "header.content-type: Unsupported Media Type: Only 'application/json' is allowed");
+        }
         throw HttpError("400 Bad Request",
                         "Unsupported Media Type: Only 'application/json' is allowed");
     }
@@ -282,7 +286,11 @@ bool read_pending(IncomingRequest& incoming, short events,
         }
         handle(incoming.socket, std::move(*incoming.request));
     } catch (const HttpError& error) {
-        if (incoming.request && (tokenization_route(*incoming.request) != TokenizationRoute::none ||
+        if (incoming.request && incoming.request->route_path() == anthropic_count_route) {
+            write_anthropic_error(incoming.socket, error.status, "invalid_request_error",
+                                  error.what());
+        } else if (incoming.request &&
+                   (tokenization_route(*incoming.request) != TokenizationRoute::none ||
                                  incoming.request->route_path() == separate_reasoning_route ||
                                  incoming.request->route_path() == parse_function_call_route)) {
             write_tokenization_error(incoming.socket, error.status, error.status.substr(4),
@@ -363,6 +371,9 @@ GenerateRoute generate_route(const HttpRequest& request) {
 TokenizationRoute tokenization_route(const HttpRequest& request) {
     const auto path = request.route_path();
     if (request.method == "POST") {
+        if (path == anthropic_count_route) {
+            return TokenizationRoute::anthropic_count;
+        }
         if (path == "/tokenize" || path == "/v1/tokenize") {
             return TokenizationRoute::tokenize;
         }
@@ -605,6 +616,16 @@ void write_tokenization_error(const Socket& connection, std::string_view status,
     body += R"(,"param":null,"code":)";
     body += status.substr(0, 3);
     body += '}';
+    write_json(connection, status, body);
+}
+
+void write_anthropic_error(const Socket& connection, std::string_view status,
+                           std::string_view type, std::string_view message) {
+    std::string body = R"({"type":"error","error":{"type":)";
+    json::append_quoted(body, type);
+    body += R"(,"message":)";
+    json::append_quoted(body, message);
+    body += "}}";
     write_json(connection, status, body);
 }
 

@@ -6,7 +6,7 @@ Send `POST /parse_function_call` to extract function calls from supplied Qwen-st
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP reader | Check the media type and dispatch the request. | [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L619)<!-- prefix: "if (request." --> |
+| HTTP reader | Check the media type and dispatch the request. | [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L620)<!-- prefix: "if (request." --> |
 | Native parser | Validate the request, select the detector, and return the parsed text and calls. | [Request handler](../../apps/server/parse_function_call.cpp#L543)<!-- prefix: "void parse_f" --> · [Text parser](../../apps/server/parse_function_call.cpp#L506)<!-- prefix: "std::string " --> |
 | SGLang reference | Define the upstream route and detector aliases. | [Pinned route](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L1739)<!-- prefix: "@app.post(\"/" --> · [Pinned detector registry](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/function_call/function_call_parser.py#L110)<!-- prefix: "\"qwen3_coder" --> |
 
@@ -47,7 +47,7 @@ Union conversion accepts JSON input and uses a subset of JSON Schema Draft 2020-
 
 The matcher resolves `$ref` from `function.parameters` using `#` or an object-key JSON Pointer such as `#/$defs/Lookup`. It supports `~0` and `~1` escapes. External references, named anchors, percent-encoded paths, array indexes, and nested `$id` scopes are outside this subset. A value stays a string if the parser cannot confirm a match within its supported rules, depth limit, and work budget. [Reference resolution](../../apps/server/tool_union.cpp#L163)<!-- prefix: "const json::" --> · [Depth and work limits](../../apps/server/tool_union.cpp#L155)<!-- prefix: "Match UnionM" --> · [SGLang union conversion](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/function_call/utils.py#L467)<!-- prefix: "def convert_" -->
 
-The request body rejects bare `NaN` and `Infinity`. Numeric argument text can produce these tokens inside `parameters`, where strict JSON decoders reject them. A floating-point value outside the JSON decoder's range causes HTTP 400 in the request body. If a structured argument contains such a value, the parser keeps the original argument text as a string. [JSON number parser](../../src/json.cpp#L192)<!-- prefix: "Value Parser" --> · [Argument number writer](../../apps/server/parse_function_call.cpp#L257)<!-- prefix: "void append_" -->
+The request body rejects bare `NaN` and `Infinity`. Numeric argument text can produce these tokens inside `parameters`, where strict JSON decoders reject them. A floating-point value outside the JSON decoder's range causes HTTP 400 in the request body. If a structured argument contains such a value, the parser keeps the original argument text as a string. [JSON number parser](../../src/json.cpp#L195)<!-- prefix: "Value Parser" --> · [Argument number writer](../../apps/server/parse_function_call.cpp#L257)<!-- prefix: "void append_" -->
 
 Validation messages can differ from SGLang.
 

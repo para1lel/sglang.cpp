@@ -36,9 +36,10 @@ struct HttpRequest {
 std::string_view matchable_route_path(std::string_view path);
 inline constexpr std::string_view separate_reasoning_route = "/separate_reasoning";
 inline constexpr std::string_view parse_function_call_route = "/parse_function_call";
+inline constexpr std::string_view anthropic_count_route = "/v1/messages/count_tokens";
 
 enum class GenerateRoute { none, allowed, method_not_allowed };
-enum class TokenizationRoute { none, tokenize, detokenize };
+enum class TokenizationRoute { none, tokenize, detokenize, anthropic_count };
 
 struct HttpError : std::runtime_error {
     HttpError(std::string_view status, const char* message)
@@ -64,6 +65,8 @@ void write_redirect(const Socket& connection, const HttpRequest& request, std::s
 void write_get_only(const Socket& connection, bool head_only);
 void write_tokenization_error(const Socket& connection, std::string_view status,
                               std::string_view type, std::string_view message);
+void write_anthropic_error(const Socket& connection, std::string_view status,
+                           std::string_view type, std::string_view message);
 void write_internal_server_error(const Socket& connection);
 void write_readiness(const Socket& connection, bool ready);
 void write_generation_health(const Socket& connection, bool healthy);

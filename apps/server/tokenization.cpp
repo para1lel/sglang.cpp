@@ -1,6 +1,7 @@
 #include "sglang/server/tokenization.h"
 
 #include "sglang/json.h"
+#include "sglang/server/anthropic_count.h"
 #include "sglang/server/chat_template.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
@@ -56,28 +57,6 @@ void append_tokens(std::string& output, const std::vector<TokenId>& tokens) {
         output += std::to_string(token);
     }
     output += ']';
-}
-
-bool truthy(const json::Value& value) {
-    if (const auto boolean = value.boolean()) {
-        return *boolean;
-    }
-    if (const auto number = value.number()) {
-        return *number != 0;
-    }
-    if (const auto text = value.string()) {
-        return !text->empty();
-    }
-    if (const auto* array = value.array()) {
-        return !array->empty();
-    }
-    if (const auto* object = value.object()) {
-        return !object->empty();
-    }
-    if (const auto* object = value.ordered_object()) {
-        return !object->empty();
-    }
-    return !value.is_null();
 }
 
 std::string_view media_part(const json::OrderedObject& part, std::string_view type) {
@@ -194,8 +173,8 @@ json::OrderedObject chat_turn(const json::Value& value) {
         *field->string() != "user") {
         invalid_request("Invalid message role");
     }
-    json::OrderedObject turn{{"role", role},
-                             {"content", chat_content(supplied(*message, "content"), role)}};
+    const auto* content = supplied(*message, "content");
+    json::OrderedObject turn{{"role", role}, {"content", chat_content(content, role)}};
     if (role == "user") return turn;
     validate_turn_fields(*message);
     if (const auto* reasoning = supplied(*message, "reasoning_content")) {
@@ -436,7 +415,7 @@ json::OrderedObject template_options(const json::OrderedObject& body,
             "'messages'");
     }
     const auto* mask = json::get(kwargs, "return_assistant_tokens_mask");
-    if (mask && truthy(*mask)) {
+    if (mask && chat_truthy(*mask)) {
         throw std::invalid_argument(
             "`return_assistant_tokens_mask=True` requires `return_dict=True` and `tokenize=True`");
     }
@@ -451,7 +430,7 @@ json::OrderedObject template_options(const json::OrderedObject& body,
     json::OrderedObject options{{"add_generation_prompt", generation},
                                 {"enable_thinking", enable},
                                 {"preserve_thinking", !preserve || preserve->boolean() == true},
-                                {"add_vision_id", vision && truthy(*vision)}};
+                                {"add_vision_id", vision && chat_truthy(*vision)}};
     if (thinking && !thinking->boolean().has_value()) {
         options.emplace_back("reasoning_effort", "medium");
     } else if (enable) {
@@ -494,7 +473,7 @@ std::optional<std::string> nested_continuation(json::OrderedObject& last,
                                                const json::OrderedObject& kwargs,
                                                bool generation) {
     const auto* setting = json::get(kwargs, "continue_final_message");
-    if (!setting || !truthy(*setting)) return std::nullopt;
+    if (!setting || !chat_truthy(*setting)) return std::nullopt;
     if (generation) {
         throw std::invalid_argument(
             "continue_final_message and add_generation_prompt are not compatible. Use "
@@ -564,30 +543,14 @@ ChatTokenization read_chat_tokenization(const json::OrderedObject& body, const j
     return chat;
 }
 
-std::vector<TokenId> tokenize_chat(const CompletionTokenizer& loader,
-                                    const json::OrderedObject& body, ChatTokenization chat) {
-    if (const auto* stream = json::get(body, "stream"); stream && stream->boolean() != false &&
-        stream->string() != "0" && stream->number() != 0) {
-        throw std::invalid_argument("stream must be a boolean");
-    }
-    const auto effort = resolved_effort(body);
-    if (chat.turns.empty()) throw std::invalid_argument("Messages cannot be empty.");
-    validate_chat_generation(body);
-    const json::OrderedObject defaults;
-    const auto* settings = object_option(body, "chat_template_kwargs");
-    const auto& kwargs = settings ? *settings : defaults;
-    if (json::get(kwargs, "chat_template")) {
-        throw std::invalid_argument(
-            "Request-supplied chat_template is not supported by this server.");
-    }
-    const auto tools = select_tools(std::move(chat.tools), supplied(body, "tool_choice"));
-    if (chat.continuation && chat.generation == false) {
-        throw std::invalid_argument("continue_final_message needs add_generation_prompt "
-                                    "to open the assistant turn.");
-    }
-    if (supplied(body, "input_ids")) {
-        throw std::invalid_argument("Chat tokenization does not support input_ids.");
-    }
+std::vector<TokenId> render_chat_tokens(const CompletionTokenizer& loader,
+                                       const json::OrderedObject& body, ChatTokenization& chat,
+                                       const json::OrderedObject& kwargs,
+                                       const std::optional<json::Value>& effort,
+                                       const ChatTools& tools) {
+    constexpr auto empty_conversation =
+        "Cannot apply chat template to an empty conversation. Provide at least one message.";
+    if (chat.turns.empty()) throw std::invalid_argument(empty_conversation);
     auto& last = chat.turns.back();
     std::string prefix;
     for (auto& turn : chat.turns) {
@@ -608,10 +571,7 @@ std::vector<TokenId> tokenize_chat(const CompletionTokenizer& loader,
             }
         }
     }
-    if (chat.turns.empty()) {
-        throw std::invalid_argument(
-            "Cannot apply chat template to an empty conversation. Provide at least one message.");
-    }
+    if (chat.turns.empty()) throw std::invalid_argument(empty_conversation);
     const bool generation = chat.generation.value_or(true);
     auto options = template_options(body, kwargs, effort, generation);
     const auto continuation = nested_continuation(chat.turns.back(), kwargs, generation);
@@ -635,6 +595,63 @@ std::vector<TokenId> tokenize_chat(const CompletionTokenizer& loader,
     return ids;
 }
 
+std::vector<TokenId> tokenize_chat(const CompletionTokenizer& loader,
+                                  const json::OrderedObject& body, ChatTokenization chat) {
+    if (const auto* stream = json::get(body, "stream"); stream && stream->boolean() != false &&
+        stream->string() != "0" && stream->number() != 0) {
+        throw std::invalid_argument("stream must be a boolean");
+    }
+    const auto effort = resolved_effort(body);
+    if (chat.turns.empty()) throw std::invalid_argument("Messages cannot be empty.");
+    validate_chat_generation(body);
+    const json::OrderedObject defaults;
+    const auto* settings = object_option(body, "chat_template_kwargs");
+    const auto& kwargs = settings ? *settings : defaults;
+    if (json::get(kwargs, "chat_template")) {
+        throw std::invalid_argument(
+            "Request-supplied chat_template is not supported by this server.");
+    }
+    const auto tools = select_tools(std::move(chat.tools), supplied(body, "tool_choice"));
+    if (chat.continuation && chat.generation == false) {
+        throw std::invalid_argument("continue_final_message needs add_generation_prompt "
+                                    "to open the assistant turn.");
+    }
+    if (supplied(body, "input_ids")) {
+        throw std::invalid_argument("Chat tokenization does not support input_ids.");
+    }
+    return render_chat_tokens(loader, body, chat, kwargs, effort, tools);
+}
+
+void serve_anthropic_count(const Socket& connection, const CompletionTokenizer& loader,
+                           std::string_view body) {
+    try {
+        if (body.empty()) throw std::invalid_argument("Field required");
+        const auto request = json::parse(body, json::Syntax::anthropic_count);
+        const auto converted = anthropic_count_chat(request, loader.chat_parsers().qwen3_reasoning);
+        ChatTokenization chat{{}, {}, std::nullopt, false};
+        chat.turns.reserve(converted.messages.size());
+        for (const auto& message : converted.messages) {
+            chat.turns.push_back(chat_turn(message));
+        }
+        const auto& options = converted.options;
+        const auto ids = render_chat_tokens(loader, options, chat,
+            *object_option(options, "chat_template_kwargs"), resolved_effort(options),
+            converted.tools);
+        write_json(connection, "200 OK", "{\"input_tokens\":" + std::to_string(ids.size()) + '}');
+    } catch (const HttpError& error) {
+        write_anthropic_error(connection, error.status, "invalid_request_error", error.what());
+    } catch (const json::ParseError&) {
+        write_anthropic_error(connection, bad_request, "invalid_request_error",
+                              "Invalid JSON request body");
+    } catch (const std::invalid_argument& error) {
+        write_anthropic_error(connection, bad_request, "invalid_request_error", error.what());
+    } catch (const std::exception& error) {
+        std::cerr << "Anthropic token count failed: " << error.what() << '\n';
+        write_anthropic_error(connection, "500 Internal Server Error", "api_error",
+                              "Internal server error");
+    }
+}
+
 void tokenize(const Socket& connection, const CompletionTokenizer& loader,
               const json::OrderedObject& body) {
     const auto* prompt = supplied(body, "prompt");
@@ -650,7 +667,7 @@ void tokenize(const Socket& connection, const CompletionTokenizer& loader,
     }
     boolean_option(json::get(body, "add_special_tokens"), "add_special_tokens");
     auto chat = messages ? std::optional(read_chat_tokenization(body, *messages)) : std::nullopt;
-    if (const auto* stream = json::get(body, "stream"); stream && truthy(*stream)) {
+    if (const auto* stream = json::get(body, "stream"); stream && chat_truthy(*stream)) {
         write_tokenization_error(connection, "501 Not Implemented", "NotImplementedError",
                                  "OpenAIServingTokenize does not support streaming requests");
         return;
@@ -882,6 +899,10 @@ json::Value read_tokenize_body(std::string_view body) {
 
 void serve_tokenization(const Socket& connection, TokenizationRoute route,
                         const CompletionTokenizer& tokenizer, std::string_view body) {
+    if (route == TokenizationRoute::anthropic_count) {
+        serve_anthropic_count(connection, tokenizer, body);
+        return;
+    }
     try {
         const bool encode = route == TokenizationRoute::tokenize;
         const auto value = encode ? read_tokenize_body(body)

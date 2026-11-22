@@ -7,6 +7,7 @@
 #include "sglang/server/completions.h"
 #include "sglang/server/flush_cache.h"
 #include "sglang/server/http.h"
+#include "sglang/server/parse_function_call.h"
 #include "sglang/utf8.h"
 
 #include <algorithm>
@@ -592,7 +593,8 @@ bool ConnectionQueue::redirects_to(std::string_view path) const {
            (tokenize_ && (path == "/tokenize" || path == "/v1/tokenize" ||
                           path == "/detokenize" || path == "/v1/detokenize")) ||
            (!model_info_.empty() && (path == "/model_info" || path == "/get_model_info")) ||
-           path == separate_reasoning_route || server_info_route(path) ||
+           path == separate_reasoning_route || path == parse_function_call_route ||
+           server_info_route(path) ||
            (prefix_controls_ && (path == "/metrics" || path == "/reset_prefix_cache" ||
                                   path == "/start_profile" || path == "/stop_profile"));
 }
@@ -609,6 +611,14 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     if (request.route_path() == separate_reasoning_route) {
         if (request.method == "POST") {
             separate_reasoning(connection, request.body);
+        } else {
+            write_method_not_allowed(connection, "POST", request.method == "HEAD");
+        }
+        return;
+    }
+    if (request.route_path() == parse_function_call_route) {
+        if (request.method == "POST") {
+            parse_function_call(connection, request.body);
         } else {
             write_method_not_allowed(connection, "POST", request.method == "HEAD");
         }

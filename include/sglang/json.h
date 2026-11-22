@@ -22,7 +22,8 @@ struct WideInteger {
 };
 
 enum class Syntax {
-    strict, ordered, benchmark, checkpoint, completion, native_generate, last_key_wins
+    strict, ordered, benchmark, checkpoint, completion, native_generate, last_key_wins,
+    ordered_last_key_wins
 };
 
 class Value {

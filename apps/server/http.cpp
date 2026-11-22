@@ -210,7 +210,9 @@ std::size_t content_length(std::string_view headers, HttpRequest& request) {
         throw HttpError("400 Bad Request",
                         "Unsupported Media Type: Only 'application/json' is allowed");
     }
-    if (request.method == "POST" && request.route_path() == separate_reasoning_route &&
+    const auto path = request.route_path();
+    if (request.method == "POST" &&
+        (path == separate_reasoning_route || path == parse_function_call_route) &&
         length.value_or(0) != 0 && !json_media_type(content_type.value_or(""))) {
         throw HttpError("400 Bad Request", "Input should be a valid dictionary");
     }
@@ -281,7 +283,8 @@ bool read_pending(IncomingRequest& incoming, short events,
         handle(incoming.socket, std::move(*incoming.request));
     } catch (const HttpError& error) {
         if (incoming.request && (tokenization_route(*incoming.request) != TokenizationRoute::none ||
-                                 incoming.request->route_path() == separate_reasoning_route)) {
+                                 incoming.request->route_path() == separate_reasoning_route ||
+                                 incoming.request->route_path() == parse_function_call_route)) {
             write_tokenization_error(incoming.socket, error.status, error.status.substr(4),
                                      error.what());
         } else {

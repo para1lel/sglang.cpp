@@ -35,6 +35,7 @@ struct HttpRequest {
 
 std::string_view matchable_route_path(std::string_view path);
 inline constexpr std::string_view separate_reasoning_route = "/separate_reasoning";
+inline constexpr std::string_view parse_function_call_route = "/parse_function_call";
 
 enum class GenerateRoute { none, allowed, method_not_allowed };
 enum class TokenizationRoute { none, tokenize, detokenize };

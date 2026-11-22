@@ -318,14 +318,19 @@ void TargetVerification::bind_gdn(int layer) {
     workspace().bind_gdn(layer, pending_rows_);
 }
 
-void TargetVerification::advance_gdn(int layer, TextGdnWeights weights) {
+GdnVerificationLane TargetVerification::gdn_lane(int layer, TextGdnWeights weights) {
     auto& scratch = workspace();
     auto& saved = scratch.replay[layer];
     saved.weights = weights;
     const auto& work = scratch.work.front();
-    check(text_gdn_verify_tail(pending_rows_, saved.inputs, work.gdn_z, weights,
-                               request_.states[layer], tail_[layer], scratch.observable,
-                               work.attention, stream_),
+    return {saved.inputs, work.gdn_z, request_.states[layer], tail_[layer],
+            scratch.observable, work.attention};
+}
+
+void TargetVerification::advance_gdn(int layer, TextGdnWeights weights) {
+    const auto lane = gdn_lane(layer, weights);
+    check(text_gdn_verify_tail(pending_rows_, lane.inputs, lane.z, weights, lane.initial,
+                               lane.tail, lane.observable, lane.output, stream_),
           "Advance target GDN and retain its tail");
 }
 

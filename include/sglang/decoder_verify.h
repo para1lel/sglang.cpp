@@ -8,6 +8,7 @@ struct MtpDraftInput;
 struct SamplingParameters;
 struct VerificationGraphBinding;
 struct VerificationWorkspace;
+struct GdnVerificationLane;
 
 inline constexpr int target_verify_max_rows = decoder_max_mtp_steps + 1;
 static_assert(target_verify_max_rows <= text_fp8_max_batch);
@@ -137,6 +138,7 @@ public:
     void bind_graph(VerificationGraphBinding& binding) const;
     void use_graph_workspace(VerificationWorkspace& workspace);
     void bind_gdn(int layer);
+    GdnVerificationLane gdn_lane(int layer, TextGdnWeights weights);
     void advance_gdn(int layer, TextGdnWeights weights);
     void sample(const SamplingParameters& parameters, int first_output, void* scratch);
     void constrain(const MtpConstraintRound& constraint, const ConstraintWorkspace& scratch,

@@ -319,6 +319,24 @@ cudaError_t decode_verify_gdn(int rows, TextGdnReplayRows inputs, const __nv_bfl
                               const TextGdnState* tail, __nv_bfloat16* observable,
                               __nv_bfloat16* output, cudaStream_t stream);
 
+struct GdnVerificationLane {
+    TextGdnReplayRows inputs;
+    const __nv_bfloat16* z;
+    TextGdnState initial;
+    TextGdnState tail;
+    __nv_bfloat16* observable;
+    __nv_bfloat16* output;
+};
+
+struct GdnVerificationBatch {
+    static constexpr int lanes = 4;
+    static constexpr int rows = text_gdn_max_verify_rows;
+    GdnVerificationLane entries[lanes];
+};
+
+cudaError_t decode_verify_gdn_batch(GdnVerificationBatch batch, TextGdnWeights weights,
+                                    cudaStream_t stream);
+
 struct DecodeFp8Projection {
     const std::uint8_t* values;
     const __nv_bfloat16* scales;

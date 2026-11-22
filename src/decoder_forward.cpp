@@ -285,7 +285,12 @@ void project(Bf16Weight weight, const LayerBatch<VerificationRow>& batch,
     }
 }
 
-void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch) {
+constexpr int wide_gdn_rows = GdnVerificationBatch::lanes * GdnVerificationBatch::rows;
+static_assert(GdnVerificationBatch::lanes == decoder_batch_max_mtp_lanes);
+static_assert(GdnVerificationBatch::rows == target_verify_max_rows);
+
+void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
+                       bool batched) {
     if (!batch.target_tc || batch.count < 2 ||
         layer.b.rows != text_gdn_value_heads || layer.a.rows != text_gdn_value_heads ||
         layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
@@ -293,17 +298,25 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
         project(layer.a, batch, &Workspace::gdn_a);
         return;
     }
-    std::array<VerifyGdnGateRow, text_fp8_max_batch> gates;
-    std::array<TextBf16Projection, text_fp8_max_batch> gate_b, gate_a;
-    for (int first = 0, group = 0; first < batch.count; ++group) {
-        const int rows = batch.projection_rows(group);
+    std::array<VerifyGdnGateRow, wide_gdn_rows> gates;
+    const auto fill = [&](int first, int rows) {
         for (int index = 0; index < rows; ++index) {
             const auto& work = workspace(batch.lanes[first + index]);
             gates[index] = {work.normalized, work.gdn_b, work.gdn_a};
         }
-        const auto status = try_verify_bf16_gdn_gates(layer.b.values, layer.a.values, gates.data(),
-                                                      rows, batch.stream);
-        if (status) {
+        return try_verify_bf16_gdn_gates(layer.b.values, layer.a.values, gates.data(),
+                                         rows, batch.stream);
+    };
+    if (batched) {
+        if (const auto status = fill(0, batch.count)) {
+            check(*status, "Run wide verification GDN gate projections");
+            return;
+        }
+    }
+    std::array<TextBf16Projection, text_fp8_max_batch> gate_b, gate_a;
+    for (int first = 0, group = 0; first < batch.count; ++group) {
+        const int rows = batch.projection_rows(group);
+        if (const auto status = fill(first, rows)) {
             check(*status, "Run grouped BF16 verification GDN gate projections");
         } else {
             for (int index = 0; index < rows; ++index) {
@@ -366,7 +379,8 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
         batch.quantize(&Workspace::normalized, hidden_size);
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
-    project_gdn_gates(layer, batch);
+    const bool batched = batch.target_tc && !first.binding && batch.count == wide_gdn_rows;
+    project_gdn_gates(layer, batch, batched);
     if (first.binding) {
         auto& scratch = *first.graph_workspace;
         check(decode_verify_gdn(batch.count, scratch.replay[state_index].inputs,
@@ -375,6 +389,14 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
                                 &first.binding->tail[state_index], scratch.observable,
                                 first.work->attention, batch.stream),
               "Advance bound verification GDN");
+    } else if (batched) {
+        GdnVerificationBatch states;
+        for (int lane = 0; lane < GdnVerificationBatch::lanes; ++lane) {
+            states.entries[lane] = batch.lanes[lane].verification->gdn_lane(state_index,
+                                                                            layer.recurrent);
+        }
+        check(decode_verify_gdn_batch(states, layer.recurrent, batch.stream),
+              "Advance batched target verification GDN");
     } else {
         batch.each([&](const VerificationRow& row, Workspace&) {
             if (row.first) {

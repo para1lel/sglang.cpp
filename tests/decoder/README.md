@@ -1,5 +1,24 @@
 # Decoder CUDA checks
 
+## Batched target GDN
+
+Use the Release decoder libraries, the Qwen3.8-27B-FP8 checkpoint, and a reserved B200.
+Pass four distinct files of whitespace-separated checkpoint token IDs, each with at least 145
+tokens. The check compares score and normalized rows and committed KV and GDN state with
+scalar decode for cuts from zero through five and a replacement token. It also checks
+two-row graph replay and the exact FP8 default.
+
+```bash
+toolkit="$CONDA_PREFIX/targets/x86_64-linux"
+checkpoint=/data0/shared/Qwen3.8-27B-FP8
+"$CXX" -std=c++20 -O3 -pthread -Iinclude -isystem "$toolkit/include" \
+    tests/decoder/gdn_verify_checkpoint.cpp \
+    -Wl,--start-group "$out"/lib/libsglang_*.a -Wl,--end-group \
+    -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -lcuda -lcublasLt -o "$out/gdn-verify-check"
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
+    "$out/gdn-verify-check" "$checkpoint" lane0.txt lane1.txt lane2.txt lane3.txt
+```
+
 ## FP8 projection aliases
 
 From the repository root in the managed Pixi `default` environment, build the native CUDA library and link the check against it. Reserve a B200 and set `GPU_UUID` to its device UUID before running.

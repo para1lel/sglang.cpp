@@ -75,6 +75,16 @@ the row before comparison. The campaign retains its raw captures and exits at
 the first failure. The K0 commands and historical receipts retain their
 original contracts.
 
+Replay a saved row with `python benchmarks/paired/k4.py assess Wn FIXTURES ROW_DIR`
+from the repository root with `PYTHONPATH=.`. New rows require saved native process
+arguments, the W1 native trace, raw vLLM activity counters, and successful client
+statuses. Replay verifies these against the launch, server settings, and activity
+summaries. Native cohorts carry the digest of their process argument receipt.
+The native trace must contain a complete depth-four event. Verification headers
+and their lane and row counts must agree with the trace events.
+Replay also checks any saved comparison and final row exit status. Older rows remain
+replayable and any process or activity receipts they contain are checked.
+
 ### Ordered Tensor Core with INT8 draft
 
 Use a fresh campaign directory and set `PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8`

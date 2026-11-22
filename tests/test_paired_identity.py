@@ -236,7 +236,7 @@ def stream_record(case, request_hash, name, phase, cohort, stamps=(20, 50, 60, 7
                         "aggregate_tokens_per_second": aggregate_rate}}
 
 
-def write_opt_in_identity(directory, profile):
+def write_opt_in_identity(directory, profile, receipt_version=0):
     identity = {
         "protocol": "matched-k4-opt-in-v1",
         "campaign_id": "01234567-89ab-cdef-0123-456789abcdef",
@@ -248,6 +248,9 @@ def write_opt_in_identity(directory, profile):
     }
     if profile == k4.SPLIT_PROFILE:
         identity["native_config"][k4.SPLIT_FIELD] = True
+    if receipt_version:
+        identity["replay_receipts"] = receipt_version
+        identity.update(server_cpus="24-33", memory="localalloc")
     path = directory / "identity.json"
     path.write_text(json.dumps(identity) + "\n")
     return identity, hashlib.sha256(path.read_bytes()).hexdigest()
@@ -279,17 +282,29 @@ def replace_stream_ids(record, offset):
 
 
 def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None, opt_in=False,
-                 profile=k4.ORDERED_PROFILE):
+                 profile=k4.ORDERED_PROFILE, receipt_version=0):
     row = "W1"
     (lane, body, case), = k4.fixture(row, directory)
     arms = (*k4.ARM_ORDER, "native-exact-k0") if opt_in else k4.ARM_ORDER
     if opt_in:
-        identity, fingerprint = write_opt_in_identity(directory, profile)
+        identity, fingerprint = write_opt_in_identity(directory, profile, receipt_version)
+    elif receipt_version:
+        identity = {"protocol": k4.PROTOCOL, "replay_receipts": receipt_version,
+                    "server_cpus": "24-33", "memory": "localalloc",
+                    "native_binary_sha256": "b" * 64}
+        path = directory / "identity.json"
+        write_json(path, identity)
+        fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
+        identity["native_config"] = {"fp8_prefill": "exact", "mtp_steps": 4, "mtp_int8_head": False}
     for arm in arms:
         measurement = directory / arm / "measurement"
         measurement.mkdir(parents=True)
-        if opt_in:
+        if opt_in or receipt_version:
             write_opt_in_arm(measurement.parent, arm, identity)
+    if receipt_version:
+        write_k4_runtime_receipts(directory, arms, opt_in=opt_in)
+    for arm in arms:
+        measurement = directory / arm / "measurement"
         (measurement / "00.request.json").write_bytes(body)
         for index, tag in enumerate(k4.schedule(row, arm)):
             duration = 80 if arm == "vllm-k4" else native_ns
@@ -318,10 +333,96 @@ def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None, opt_in
                 if fault == "malformed":
                     record["events"][1]["lines"] = ["data: {not JSON}"]
             raw = {"row": row, "tag": tag, "requests": [record]}
-            if opt_in:
+            if opt_in or receipt_version:
                 raw["binding"] = {"campaign_sha256": fingerprint, "arm": arm}
+            if receipt_version and arm != "vllm-k4":
+                argv = (measurement.parent / "live-argv.bin").read_bytes()
+                raw["binding"]["native_argv_sha256"] = hashlib.sha256(argv).hexdigest()
             with gzip.open(measurement / f"{tag}.json.gz", "wt") as stream:
                 json.dump(raw, stream)
+
+
+def write_k4_runtime_receipts(directory, arms, *, opt_in):
+    for arm in arms:
+        run = directory / arm
+        (run / "client-exit-code.txt").write_text("0\n")
+        if arm == "vllm-k4":
+            for tag, value in (("before", 17), ("after", 33)):
+                (run / f"metrics-{tag}.txt").write_text(
+                    f'vllm:spec_decode_num_draft_tokens_total{{model="benchmark"}} {value}\n'
+                    f'vllm:spec_decode_num_verified_tokens_per_pos_total{{position="3"}} {value}\n')
+            k4.activity(run, "vllm")
+            continue
+        info_path = run / "server-info.json"
+        info = json.loads(info_path.read_bytes())
+        info.update(model_path="/model", port=17424)
+        write_json(info_path, info)
+        write_json(run / "server-check.txt", True)
+        (run / "server-pid.txt").write_text("123\n")
+        args = ["/bin/sglang-server", "--checkpoint", "/model", "--device", "0",
+                "--port", "17424", "--batch-cuda-graphs", "--prefix-cache-entries", "0",
+                "--fp8-prefill", info["fp8_prefill"],
+                "--max-active", "32", "--max-num-batched-tokens", "8192"]
+        if arm == "native-k4-trace":
+            args += ["--trace-batches"]
+            (run / "server.log").write_text(
+                "batch verify lanes=1 rows=5 peak_request_bytes=4096\n"
+                "batch mtp slot=0 drafted=4 accepted=2 verified=5 replayed=3 boundary=0\n")
+            k4.activity(run, "native")
+        if opt_in or info["mtp_steps"] == 0:
+            args += ["--mtp-steps", str(info["mtp_steps"])]
+        if info["mtp_int8_head"]:
+            args += ["--mtp-int8-head"]
+        env = ["env", "CUDA_CACHE_PATH=/archive/cuda-cache"]
+        if info.get(k4.SPLIT_FIELD):
+            env.append("SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=1")
+        write_command(run, "server", "24-33", [*env, *args])
+        (run / "live-argv.bin").write_bytes(b"\0".join(map(os.fsencode, args)) + b"\0")
+
+
+@pytest.mark.parametrize(("file", "old", "new", "message"), [
+    ("native-k4/live-argv.bin", b"--mtp-steps\0" b"4\0", b"--mtp-steps\0" b"0\0",
+     "live process arguments differ"),
+    ("native-k4/server-command.sh", b"--mtp-steps 4", b"--mtp-steps 0",
+     "command differs from effective native profile"),
+    ("native-k4/server-info.json", b'"port"', b'"experimental_long_target_split_gqa": true, "port"',
+     "wrong native server configuration"),
+    ("native-k4/server-check.txt", b"true", b"false", "server configuration check failed"),
+    ("native-k4-trace/server.log", b"drafted=4", b"drafted=3", "Invalid native MTP round"),
+    ("native-k4-trace/server.log", b"verified=5", b"verified=4", "Incomplete verification group"),
+    ("native-k4-trace/mtp-activity.json", b'"depth_four_rounds": 1',
+     b'"depth_four_rounds": 2', "saved MTP activity differs from raw"),
+    ("vllm-k4/metrics-after.txt", b'position="3"} 33', b'position="3"} 17',
+     "No fresh vLLM K4 activity"),
+    ("native-k4/client-exit-code.txt", b"0", b"2", "client did not succeed"),
+    ("exit-code.txt", b"0", b"1", "Saved row exit status differs from replay"),
+    ("comparison.json", b'"passed": true', b'"passed": false', "Saved comparison differs"),
+])
+def test_k4_replay_rejects_contradictory_saved_receipts(tmp_path, file, old, new, message):
+    write_k4_row(tmp_path, opt_in=True, receipt_version=1)
+    result = k4.assess("W1", tmp_path, tmp_path)
+    write_json(tmp_path / "comparison.json", result)
+    (tmp_path / "exit-code.txt").write_text("0\n")
+    target = tmp_path / file
+    original = target.read_bytes()
+    assert old in original
+    target.write_bytes(original.replace(old, new, 1))
+    with pytest.raises(ValueError, match=message):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_k4_receipt_version_requires_argv_and_activity(tmp_path, opt_in):
+    write_k4_row(tmp_path, opt_in=opt_in, profile=k4.SPLIT_PROFILE, receipt_version=1)
+    assert k4.assess("W1", tmp_path, tmp_path)["passed"]
+    for name in ("native-k4/live-argv.bin", "native-k4-trace/server.log",
+                 "vllm-k4/metrics-after.txt"):
+        path = tmp_path / name
+        original = path.read_bytes()
+        path.unlink()
+        with pytest.raises(FileNotFoundError):
+            k4.assess("W1", tmp_path, tmp_path)
+        path.write_bytes(original)
 
 
 @pytest.mark.parametrize(("native_ns", "passed"), [(70, True), (80, False), (90, False)])

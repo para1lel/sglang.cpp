@@ -103,8 +103,9 @@ identity=$(jq -nc --arg source "$native_source" --arg binary "$native_sha" \
     --arg gpu "$uuid" --arg checkpoint "$model_sha" --arg vllm "$pin" \
     --arg protocol_sha "${protocol_sha%% *}" \
     --arg server "$server_cpus" --arg client "$client_cpus" \
-    '{protocol:"matched-k4-v1",protocol_sha256:$protocol_sha,native_source:$source,
-      native_binary_sha256:$binary,gpu_uuid:$gpu,checkpoint_sha256:$checkpoint,vllm_commit:$vllm,
+    '{protocol:"matched-k4-v1",replay_receipts:1,protocol_sha256:$protocol_sha,
+      native_source:$source,native_binary_sha256:$binary,gpu_uuid:$gpu,
+      checkpoint_sha256:$checkpoint,vllm_commit:$vllm,
       server_cpus:$server,client_cpus:$client,memory:"localalloc"}')
 if [[ $native_profile != exact ]]; then
     if [[ -e $root/identity.json ]]; then
@@ -306,6 +307,7 @@ run_arm() {
             --max-active 32 --max-num-batched-tokens "$token_budget" "${flags[@]}" 6>&- 7>&- 8<&-
         check_digest "$native_sha" "/proc/$server_pid/exe"
         sha256sum "/proc/$server_pid/exe" >running-binary.sha256
+        cat "/proc/$server_pid/cmdline" >live-argv.bin
         "${fetch[@]}" "$url/server_info" >server-info.json
         jq -e --argjson depth "$depth" --argjson traced "$traced" --arg path "$checkpoint" \
             --arg profile "$native_profile" --arg fp8 "$fp8" --argjson int8 "$int8" \
@@ -316,6 +318,8 @@ run_arm() {
              and .fp8_prefill == $fp8 and .host == "127.0.0.1" and .device == 0
              and (if has("experimental_target_split_gqa") then .experimental_target_split_gqa
                   else false end) == $split
+             and (if has("experimental_long_target_split_gqa")
+                  then .experimental_long_target_split_gqa else false end) == false
              and (if $profile == "exact" then (.mtp_int8_head // false) == false
                   else .mtp_int8_head == $int8 end)' \
             server-info.json >server-check.txt
@@ -336,6 +340,7 @@ run_arm() {
         "${client[@]}" worker "$row" "$run" "$directory/reservation" "$checkpoint"
         "${client[@]}" activity "$run" vllm
     else
+        cat "/proc/$server_pid/cmdline" | cmp -s -- live-argv.bin -
         for receipt in compute-ready.csv compute-measurement-end.csv; do
             awk -F', *' -v uuid="$gpu_uuid" -v pid="$server_pid" \
                 '$1 == uuid {count++; if ($2 == pid) owned++}

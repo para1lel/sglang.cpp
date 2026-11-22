@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import json
+import os
 import re
 import shlex
 from pathlib import Path
@@ -64,6 +65,46 @@ def command(run, name, cpus):
     require(cpus["memory"] == "localalloc" and args[offset:offset + 5] == placement,
             f"{run}: {name} CPU/NUMA placement disagrees with cpus.txt")
     return args[offset + 5:]
+
+
+def native_process(run, identity, info, *, opt_in, split):
+    cpus = {"server": identity["server_cpus"], "memory": identity["memory"]}
+    wrapper = command(run, "server", cpus)
+    require(wrapper[0] == "env" and wrapper[1].startswith("CUDA_CACHE_PATH="),
+            f"{run.name}: wrong native command wrapper")
+    expected_env = ["SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=1"] if split else []
+    argv = wrapper[2 + len(expected_env):]
+    require(wrapper[2:2 + len(expected_env)] == expected_env and Path(argv[0]).is_absolute(),
+            f"{run.name}: wrong native dispatch environment")
+    port = info["port"]
+    require(type(port) is int and 1 <= port <= 65535 and Path(info["model_path"]).is_absolute(),
+            f"{run.name}: invalid native endpoint or model")
+    flags = ["--checkpoint", info["model_path"], "--device", "0", "--port", str(port),
+             "--batch-cuda-graphs", "--prefix-cache-entries", "0",
+             "--fp8-prefill", info["fp8_prefill"],
+             "--max-active", "32", "--max-num-batched-tokens", "8192"]
+    if info["trace_batches"]:
+        flags.append("--trace-batches")
+    if info["mtp_steps"] == 0 or opt_in:
+        flags += ["--mtp-steps", str(info["mtp_steps"])]
+    if info.get("mtp_int8_head"):
+        flags.append("--mtp-int8-head")
+    require(argv[1:] == flags, f"{run.name}: command differs from effective native profile")
+    observed = (run / "live-argv.bin").read_bytes()
+    require(observed == b"\0".join(map(os.fsencode, argv)) + b"\0",
+            f"{run.name}: live process arguments differ from its command")
+    pid = (run / "server-pid.txt").read_text().strip()
+    binary = (run / "running-binary.sha256").read_text().split()
+    require(pid.isdecimal() and int(pid) > 0
+            and binary == [identity["native_binary_sha256"], f"/proc/{pid}/exe"],
+            f"{run.name}: executable receipt differs from the native server PID")
+    client = run / "client-command.sh"
+    if client.exists():
+        args = shlex.split(client.read_text())
+        capture = args.index("capture")
+        require(args[capture + 1:capture + 4] ==
+                [run.parent.name, run.name, f"http://127.0.0.1:{port}"],
+                f"{run.name}: client command differs from native endpoint or arm")
 
 
 def arg(args, key):

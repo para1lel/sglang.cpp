@@ -14,7 +14,7 @@ from benchmarks.concurrent import client as concurrent
 from benchmarks.streaming import check_vllm, client as streaming
 from identity import verify_stream_end
 from makespan import cohort_makespan_ns, compare, validate_cohort
-from saved_evidence import device, digest, fields, load, require, saved_worker
+from saved_evidence import device, digest, fields, load, native_process, require, saved_worker
 
 
 ROWS = (*streaming.SHAPES, *concurrent.ROWS)
@@ -25,6 +25,13 @@ EXACT_CONTROL = "native-exact-k0"
 ORDERED_PROFILE = "ordered-tc-int8"
 SPLIT_PROFILE = "ordered-tc-int8-split-gqa"
 SPLIT_FIELD = "experimental_target_split_gqa"
+LONG_SPLIT_FIELD = "experimental_long_target_split_gqa"
+TRACE_INTEGER = r"(0|[1-9][0-9]*)"
+NATIVE_MTP_LINE = re.compile("batch mtp " + " ".join(
+    f"{field}={TRACE_INTEGER}"
+    for field in ("slot", "drafted", "accepted", "verified", "replayed", "boundary")))
+NATIVE_VERIFY_LINE = re.compile("batch verify " + " ".join(
+    f"{field}={TRACE_INTEGER}" for field in ("lanes", "rows", "peak_request_bytes")))
 
 
 def schedule(row, arm):
@@ -120,28 +127,56 @@ def campaign(directory):
     return identity, hashlib.sha256(raw).hexdigest()
 
 
-def arm_binding(directory, arm, selected):
-    if selected is None:
-        require(arm != EXACT_CONTROL, "Exact diagnostic belongs to an opt-in campaign")
+def receipt_identity(directory, selected):
+    if selected:
+        return selected[0]
+    path = directory / "identity.json"
+    return load(path) if path.exists() else {}
+
+
+def require_receipts(identity):
+    version = identity.get("replay_receipts", 0)
+    require(type(version) is int and version in (0, 1), "Unknown K4 replay receipt version")
+    return version == 1
+
+
+def arm_binding(directory, arm, selected, required):
+    run = directory.parent
+    require(selected is not None or arm != EXACT_CONTROL,
+            "Exact diagnostic belongs to an opt-in campaign")
+    if selected is None and not required:
         return None
-    identity, fingerprint = selected
-    if arm != "vllm-k4":
-        run = directory.parent
-        info = load(run / "server-info.json")
-        config = dict(identity["native_config"], trace_batches=arm == "native-k4-trace",
-                      max_running_requests=32, max_num_batched_tokens=8192, prefix_cache_entries=0,
-                      batch_cuda_graphs=True, eager=False, host="127.0.0.1", device=0)
-        split = config.pop(SPLIT_FIELD, False) and arm != EXACT_CONTROL
-        if arm in ("native-k0", EXACT_CONTROL):
-            config.update(mtp_steps=0, mtp_int8_head=False)
-        if arm == EXACT_CONTROL:
-            config["fp8_prefill"] = "exact"
-        require(all(type(info[key]) is type(value) and info[key] == value
-                    for key, value in config.items()) and info.get(SPLIT_FIELD, False) is split,
-                f"{arm}: wrong native server configuration")
-        require((run / "running-binary.sha256").read_text().split()[0]
-                == identity["native_binary_sha256"], f"{arm}: wrong running native binary")
-    return {"campaign_sha256": fingerprint, "arm": arm}
+    if selected is not None and arm != "vllm-k4":
+        native_info(run, selected[0], opt_in=True)
+    fingerprint = selected[1] if selected else digest(run.parent / "identity.json")
+    binding = {"campaign_sha256": fingerprint, "arm": arm}
+    if required and arm != "vllm-k4":
+        binding["native_argv_sha256"] = digest(run / "live-argv.bin")
+    return binding
+
+
+def native_info(run, identity, *, opt_in):
+    arm = run.name
+    info = load(run / "server-info.json")
+    config = dict(identity.get("native_config", {"fp8_prefill": "exact", "mtp_steps": 4,
+                                                "mtp_int8_head": False}))
+    config.update(trace_batches=arm == "native-k4-trace", max_running_requests=32,
+                  max_num_batched_tokens=8192, prefix_cache_entries=0, batch_cuda_graphs=True,
+                  eager=False, host="127.0.0.1", device=0)
+    split = config.pop(SPLIT_FIELD, False) and arm != EXACT_CONTROL
+    if arm in ("native-k0", EXACT_CONTROL):
+        config.update(mtp_steps=0, mtp_int8_head=False)
+    if arm == EXACT_CONTROL:
+        config["fp8_prefill"] = "exact"
+    if not opt_in:
+        info.setdefault("mtp_int8_head", False)
+    require(all(type(info.get(key)) is type(value) and info[key] == value
+                for key, value in config.items()) and info.get(SPLIT_FIELD, False) is split
+            and info.get(LONG_SPLIT_FIELD, False) is False,
+            f"{arm}: wrong native server configuration")
+    require((run / "running-binary.sha256").read_text().split()[0]
+            == identity["native_binary_sha256"], f"{arm}: wrong running native binary")
+    return info, split
 
 
 def capture(row, arm, endpoint, fixtures, directory, native_control=None):
@@ -151,13 +186,15 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
             "Expected a loopback HTTP origin")
     lanes = fixture(row, fixtures)
     policy = concurrent.reference()["policy"]
-    selected = campaign(directory.parent.parent)
-    binding = arm_binding(directory, arm, selected)
+    row_directory = directory.parent.parent
+    selected = campaign(row_directory)
+    required = require_receipts(receipt_identity(row_directory, selected))
+    binding = arm_binding(directory, arm, selected, required)
     expected = None
     if arm in ("native-k4", "native-k4-trace", EXACT_CONTROL):
         require(native_control is not None, "Provide the native K0 control")
         verify_request_files(native_control, lanes)
-        control_binding = arm_binding(native_control, "native-k0", selected)
+        control_binding = arm_binding(native_control, "native-k0", selected, required)
         _, expected = replay(read_raw(native_control, "control"), row, "control", lanes, policy,
                              control_binding)
     directory.mkdir()
@@ -201,10 +238,43 @@ def exact_compatibility(expected, exact, profile):
     return {"diagnostic_only": True, "all_ids_match": expected == exact, "lanes": lanes}
 
 
+def verify_arm_receipts(run, identity, *, opt_in, required):
+    status = run / "client-exit-code.txt"
+    if required or status.exists():
+        require(status.read_text().strip() == "0", f"{run.name}: client did not succeed")
+    if run.name == "vllm-k4":
+        saved_activity(run, "vllm", ("metrics-before.txt", "metrics-after.txt"), required)
+        return
+    checked = run / "server-check.txt"
+    if required or checked.exists():
+        require(load(checked) is True, f"{run.name}: server configuration check failed")
+    have_argv = required or (run / "live-argv.bin").exists()
+    have_info = identity and (run / "server-info.json").exists()
+    if have_argv or (have_info and not opt_in):
+        info, split = native_info(run, identity, opt_in=opt_in)
+        if have_argv:
+            native_process(run, identity, info, opt_in=opt_in, split=split)
+    if run.name == "native-k4-trace":
+        saved_activity(run, "native", ("server.log",), required)
+
+
+def verify_row_status(directory, result, required):
+    comparison = directory / "comparison.json"
+    if comparison.exists():
+        require(json.dumps(load(comparison), sort_keys=True) == json.dumps(result, sort_keys=True),
+                "Saved comparison differs from replay")
+    status = directory / "exit-code.txt"
+    if status.exists() or (required and (directory / "finished-utc.txt").exists()):
+        require(status.read_text().strip() == str(int(not result["passed"])),
+                "Saved row exit status differs from replay")
+
+
 def assess(row, fixtures, directory):
     lanes = fixture(row, fixtures)
     policy = concurrent.reference()["policy"]
     selected = campaign(directory)
+    identity = receipt_identity(directory, selected)
+    required = require_receipts(identity)
     samples = {"native-k4": [], "vllm-k4": []}
     expected = None
     exact = None
@@ -213,7 +283,9 @@ def assess(row, fixtures, directory):
         if arm == "native-k4-trace" and row != "W1":
             continue
         measurement = directory / arm / "measurement"
-        binding = arm_binding(measurement, arm, selected)
+        verify_arm_receipts(measurement.parent, identity, opt_in=selected is not None,
+                            required=required)
+        binding = arm_binding(measurement, arm, selected, required)
         verify_request_files(measurement, lanes)
         tags = schedule(row, arm)
         require({path.name for path in measurement.glob("*.json.gz")}
@@ -237,6 +309,7 @@ def assess(row, fixtures, directory):
                       native_k0_parity=True,
                       exact_k0_compatibility=exact_compatibility(
                           expected, exact, identity["native_profile"]))
+    verify_row_status(directory, result, required)
     return result
 
 
@@ -269,13 +342,57 @@ def check_vllm_worker(row, run, reservation, checkpoint):
     save(run / "worker-identity.json", evidence)
 
 
-def activity(run, engine):
+def native_activity(text, require_groups):
+    lines = text.splitlines()
+    grouped = require_groups or any(line.startswith("batch verify") for line in lines)
+    lanes = rows = 0
+    last_slot = None
+    evidence = {"rounds": 0, "depth_four_rounds": 0}
+    for number, line in enumerate(lines, 1):
+        where = f"native MTP trace line {number}"
+        if line.startswith(("batch width=", "batch verify")):
+            require(lanes == rows == 0, f"Incomplete verification group before {where}")
+            last_slot = None
+            if line.startswith("batch verify"):
+                match = NATIVE_VERIFY_LINE.fullmatch(line)
+                require(match is not None, f"Malformed verification header at {where}")
+                lanes, rows, _ = map(int, match.groups())
+                require(lanes <= 32 and lanes <= rows <= 5 * lanes,
+                        f"Invalid verification header counts at {where}")
+                last_slot = -1
+            continue
+        if not line.startswith("batch mtp"):
+            continue
+        match = NATIVE_MTP_LINE.fullmatch(line)
+        require(match is not None, f"Malformed native MTP event at {where}")
+        slot, drafted, accepted, verified, replayed, boundary = map(int, match.groups())
+        require(slot < 32 and boundary <= 1, f"Invalid native MTP slot or boundary at {where}")
+        if boundary:
+            require(drafted == accepted == verified == replayed == 0,
+                    f"Invalid native MTP boundary counts at {where}")
+        else:
+            require(0 <= accepted <= drafted <= 4 and 1 <= verified <= 5
+                    and drafted <= verified <= drafted + 1
+                    and (replayed == 0 or accepted <= replayed <= accepted + 1)
+                    and replayed < verified, f"Invalid native MTP round counts at {where}")
+        if grouped:
+            require(last_slot is not None and slot > last_slot,
+                    f"Native MTP event has no verification header or repeats a slot at {where}")
+            last_slot = slot
+            if verified:
+                lanes -= 1
+                rows -= verified
+                require(lanes >= 0 and rows >= 0, f"Excess verification events at {where}")
+        evidence["rounds"] += 1
+        evidence["depth_four_rounds"] += drafted == 4 and verified == 5
+    require(lanes == rows == 0, "Incomplete verification group at end of native MTP trace")
+    require(evidence["depth_four_rounds"] > 0, "No native depth-four verification")
+    return evidence
+
+
+def read_activity(run, engine, *, require_groups=False):
     if engine == "native":
-        rounds = re.findall(r"batch mtp slot=\d+ drafted=(\d+) accepted=(\d+) verified=(\d+)",
-                            (run / "server.log").read_text())
-        evidence = {"rounds": len(rounds), "depth_four_rounds":
-                    sum(drafted == "4" and int(verified) >= 4 for drafted, _, verified in rounds)}
-        require(evidence["depth_four_rounds"] > 0, "No native depth-four verification")
+        return native_activity((run / "server.log").read_text(), require_groups)
     else:
         evidence = {}
         for metric, position in (("num_draft_tokens", False),
@@ -290,7 +407,19 @@ def activity(run, engine):
                 counts.append(value)
             evidence[metric] = counts[1] - counts[0]
             require(evidence[metric] > 0, f"No fresh vLLM K4 activity for {metric}")
-    save(run / "mtp-activity.json", evidence)
+    return evidence
+
+
+def saved_activity(run, engine, sources, required):
+    summary = run / "mtp-activity.json"
+    if required or summary.exists() or any((run / name).exists() for name in sources):
+        evidence = read_activity(run, engine, require_groups=required)
+        if required or summary.exists():
+            require(load(summary) == evidence, f"{run.name}: saved MTP activity differs from raw")
+
+
+def activity(run, engine):
+    save(run / "mtp-activity.json", read_activity(run, engine, require_groups=True))
 
 
 def cubins(cache, run):
@@ -340,7 +469,9 @@ def main():
                     args.native_control)
         elif args.mode == "assess":
             result = assess(args.row, args.fixtures, args.directory)
-            save(args.directory / "comparison.json", result)
+            comparison = args.directory / "comparison.json"
+            if not comparison.exists():
+                save(comparison, result)
             print(json.dumps(result, indent=2))
             return int(not result["passed"])
         elif args.mode == "worker":

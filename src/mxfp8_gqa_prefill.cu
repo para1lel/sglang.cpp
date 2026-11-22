@@ -945,7 +945,8 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
                     return *status;
                 }
             }
-            if (default_paired || mode == "paired") {
+            if (default_paired || mode == "paired" || (!setting && position % flash_chunk == 0 &&
+                position >= max_multirow_visible_tokens)) {
                 if (const auto status = launch_paired_tmem_prefill(cache, pages, position, queries,
                                                                   output, stream)) {
                     return *status;

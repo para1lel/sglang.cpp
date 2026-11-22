@@ -11,17 +11,18 @@
 
 ## Runtime path
 
-The CLI, server, and C++ default to `exact`. With `tensor-core`, `SGLANG_EXPERIMENTAL_TMEM_PREFILL` selects full-tile TMEM by zero-based query start. [TMEM selection](../src/mxfp8_gqa_prefill.cu#L936)<!-- prefix: "if (rows == " -->
+The CLI, server, and C++ default to `exact`. [Full-tile `tensor-core` dispatch](../src/mxfp8_gqa_prefill.cu#L936)<!-- prefix: "if (rows == " --> uses `SGLANG_EXPERIMENTAL_TMEM_PREFILL` and the zero-based start.
 
 | Setting | TMEM route | Start position for 1,024 query rows |
 | --- | --- | --- |
-| Unset or `ragged` | Paired ordered | 8,192–31,744 inclusive, at a multiple of 1,024 or inside a 128-token page |
+| Unset or `ragged` | Staged or raw paired ordered | 8,192–31,744, at 1,024-token boundaries or inside a 128-token page |
+| Unset | [Raw paired ordered](../src/mxfp8_gqa_prefill.cu#L948)<!-- prefix: "if (default_" --> | 32,768–130,048, at 1,024-token boundaries |
 | `paired` | Paired ordered | Any start from 8,192 through 130,048 |
 | `ordered` | Single-CTA ordered | At least 8,192, divisible by 64 |
 | `1` | Three-part split | At least 32,768, divisible by 64 |
 | Any other set value, including empty or `wide` | Disabled | Regular Flash and its fallbacks |
 
-With the variable unset, 148-SM SM100 devices try ordered TMEM for 256–512 rows, start ≥8,192, and visibility ≤32,768. Both scale bases need eight-byte alignment. The `ragged` override tries the same row and visibility range from start 4,096 under the explicit TMEM resource checks. All other set values retain their routes. [Partial TMEM selection](../src/mxfp8_gqa_prefill.cu#L923)<!-- prefix: "const bool d" -->
+With the variable unset, 148-SM SM100 devices try ordered TMEM for 256–512 rows, start ≥8,192, and visibility ≤32,768. Both scale bases need eight-byte alignment. `ragged` lowers the start to 4,096 under explicit TMEM resource checks. [Partial TMEM selection](../src/mxfp8_gqa_prefill.cu#L923)<!-- prefix: "const bool d" -->
 
 The [SM100 page-128 opt-ins](sm100-page128-prefill.md) precede native dispatch. Media, MTP, and tensor-core prefix-cache tiles cap at 128 rows. The [workspace](native-prefill-workspace.md) reuses paired staging.
 
@@ -61,15 +62,15 @@ Split TMEM uses three contiguous partitions per query block and head pair. Its 7
 
 ## Constraints and failure behavior
 
-Regular Flash accepts 144–1,024 rows through 32,768 visible tokens and full tiles through 131,072. Visibility equals start plus row count. Both payload bases need 16-byte alignment. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L813)<!-- prefix: "if (rows == " -->
+Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L813)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 
 TMEM requires compute capability 10.0 and signed 32-bit TMA token coordinates. Single-CTA ordered and split TMEM need 214,016 dynamic shared-memory bytes plus static allocation. Split TMEM needs CUDA memory pools. [Resource checks](../src/text/mxfp8_gqa_prefill_tmem.cu#L896)<!-- prefix: "std::optiona" -->
 
-Raw paired TMEM needs 16-byte alignment for all four KV bases. It needs a 416-thread kernel image, a resident two-CTA cluster, and 218,112 dynamic shared-memory bytes plus static allocation. [Paired checks](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L361)<!-- prefix: "std::optiona" -->
+Raw paired TMEM requires four 16-byte-aligned KV bases, a 416-thread kernel, a resident two-CTA cluster, and 218,112 dynamic shared-memory bytes plus static allocation. [Paired checks](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L361)<!-- prefix: "std::optiona" --> · [Device and occupancy](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L311)<!-- prefix: "std::optiona" -->
 
-Unsupported clusters, kernel configurations, encoders, or tensor maps fall through to regular Flash before submission. Missing buffers or too few pages return `cudaErrorInvalidValue`. Unexpected CUDA setup errors and the paired launch status return to the caller. [Encoder](../src/text/mxfp8_gqa_prefill_tmem.cu#L791)<!-- prefix: "std::optiona" --> · [Submission](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L385)<!-- prefix: "return cudaL" -->
+Unsupported clusters, kernel configurations, encoders, or tensor maps fall through to regular Flash before submission. Missing buffers or insufficient pages return `cudaErrorInvalidValue`. Propagate unexpected CUDA setup errors and the launch status. [Encoder](../src/text/mxfp8_gqa_prefill_tmem.cu#L791)<!-- prefix: "std::optiona" --> · [Submission](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L385)<!-- prefix: "return cudaL" -->
 
 Other valid shapes, unaligned payloads, and a known regular Flash shared memory shortfall use the [ordered fallback dispatch](ordered-gqa-prefill.md#constraints-and-failure-behavior). CUDA discovery, configuration, and launch errors propagate.
 
@@ -106,6 +107,8 @@ The [aligned regression](../tests/mxfp8_gqa_flash_check.cu#L676)<!-- prefix: "vo
 For paired changes, replay aligned and unaligned 1,024-row checkpoint captures with remaps. Compare all BF16 outputs with the prior kernel and wide Flash. Require one paired graph node and eager parity. Mutate one visible V on each of a full and partial page. Check earlier rows and unaffected heads. Run memcheck, initcheck, and synccheck on repair with unwritten tails. Record racecheck launch size and repair coverage.
 
 Time raw paired graph replay in A/B/B/A order. Weight starts by launch count. See [eager staging checks](native-prefill-workspace.md#verification) and [serving gates](performance.md#scheduler-and-reporting-policy).
+
+Check starts 31,744 and 32,768, the visibility cap, and off-grid starts with the selector unset.
 
 ### Ordered TMEM operator verification
 
@@ -179,7 +182,9 @@ Earlier regular Flash sped up nine eligible shapes by 8.92–12.77× against ord
 
 ### W6 warmups and diagnostics
 
-The [frozen W6 protocol](../benchmarks/concurrent/README.md#conditions-and-gates) uses four 131,072-token prompts and 1,024 IDs per request. GPU6 used 32,768 tokens per step, 32 slots, disjoint prefixes, GDN, and MTP off. The candidate extended full-tile Flash to 131,072 visible tokens. Both native warmups reached the 90-second socket timeout with zero IDs or scored cohorts. Pinned vLLM's two warmups and five measured cohorts matched all 28 archived streams exactly.
+Bounded W6 with raw paired default matched 128 frozen IDs and lowered latest TTFT and makespan. [Formal acceptance](performance.md#measurement) uses full cohorts.
+
+The [frozen W6 protocol](../benchmarks/concurrent/README.md#conditions-and-gates) uses four 131,072-token prompts and 1,024 IDs per request. Earlier GPU6 warmups used 32,768 tokens per step, 32 slots, disjoint prefixes, GDN, and MTP off. Flash supported full tiles through 131,072 visible tokens. Both native warmups timed out at 90 seconds without IDs. Pinned vLLM matched 28 archived streams across seven cohorts.
 
 | Metric | Pinned vLLM | Frozen W6 gate | Result |
 | --- | ---: | ---: | --- |
@@ -188,7 +193,7 @@ The [frozen W6 protocol](../benchmarks/concurrent/README.md#conditions-and-gates
 | p95 TPOT (ms) | 69.018133 | ≤ 104.925433 | Pass |
 | p95 E2E (ms) | 90,104.907074 | ≤ 85,806.011537 | Fail |
 
-One-lane, two-ID diagnostics used the same builds and 32,768-token cap, a 1,800-second timeout, and a 1,810-second deadline. At 40,960 tokens, both returned `16,25` and TTFT fell from 37.386 to 6.115 s. At 131,072, the candidate alone returned `760,45366` with 45.798 s TTFT. See `artifacts/takeover-w6-flash-selected/report.md`.
+Single-lane two-ID diagnostics reused those builds and cap, with a 1,800-second timeout and 1,810-second deadline. At 40,960 tokens, both returned `16,25` and TTFT fell from 37.386 to 6.115 s. At 131,072, only the candidate returned `760,45366` with 45.798 s TTFT. See `artifacts/takeover-w6-flash-selected/report.md`.
 
 With an 8,192-token cap, both GPU6 warmups stopped with zero IDs across four lanes. Protected prefill took 74.021 of 95.010 attention seconds in a separate profile. See `artifacts/takeover-w6/report.md`.
 

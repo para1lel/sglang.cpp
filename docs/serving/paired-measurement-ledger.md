@@ -204,7 +204,7 @@ predates the five-row MLP layout.
 
 Each comparison uses its own measured control. The combined stack has
 no timing in these trials. The [formal matched K4 gate](../../benchmarks/paired/README.md#matched-k4-timing-protocol)
-remains open.
+for exact FP8 remains open.
 
 | Trial | Measured control | Measured candidate |
 | --- | --- | --- |
@@ -257,3 +257,43 @@ remains open.
 | --- | --- |
 | `REPORT.md` | `5c849ff2ddfeaa7374390164152eec817e768d6c6d1b06786e829086d330f2e3` |
 | `run.wtALVRtm/summary.json` | `64b8999a4173eff1c49045c7cbc89224f6be563f33c67c144846114f46ee1e68` |
+
+### Matched W1 K4 with ordered Tensor Core and INT8 draft
+
+On November 22, 2026 UTC, both timed arms ran on B200 GPU3
+(`GPU-ceeff2f7-3f39-50b4-8d29-576159781b9d`), with vLLM first.
+The Release native source was `99c523d95c47788f6c872c6c5428c28418d395eb`.
+The vLLM arm used the pinned revision above. Both used the same checkpoint,
+32 request slots, and an 8,192-token scheduling cap. The
+[opt-in profile](../../benchmarks/paired/README.md#ordered-tensor-core-with-int8-draft)
+uses `tensor-core-mtp-target` and an INT8 draft head at explicit K4.
+Exact FP8 remains the server default. This campaign has a separate gate from
+the earlier exact K4 and K0 comparisons.
+
+| Workload | Warmups / measured per arm | Native median (range), ms | vLLM median (range), ms | Strict native median gate |
+| --- | ---: | ---: | ---: | --- |
+| W1 | 3 / 9 | 649.368673 (614.321563–1,275.759181) | 726.240970 (725.871508–727.201134) | Pass, 76.872297 ms lower (10.585%) |
+
+Independent replay checked wire format, length, usage, and drain for all 27
+streams, including warmups and controls. Every native K4 stream matched the
+128 output IDs from its own policy's K0 control. The separate native trace
+accepted 77 of 198 proposals and reached depth four in 49 of 50 rounds. The
+vLLM counters recorded 2,544 new draft tokens and 636 fourth-position
+verifications. Four measured native streams took longer than the slowest
+measured vLLM stream.
+
+The ordered K0 and exact K0 controls differed at 62 output positions. The
+first difference was token 67, with ordered ID `9976` and exact ID `19720`.
+This diagnostic sits outside the timing gate. vLLM serves as a timing
+comparator. The stream and parity checks cover this W1 fixture. Independent
+model quality is a separate question, and the held-out target study predates
+the INT8 draft head.
+
+The raw receipts are under
+`artifacts/continue-policy-campaign-test/campaign-published-99c523d-gpu3-retry-1795372885/W1/`
+on the benchmark host. `comparison.json` has SHA-256
+`bb09972e3eba03e29f715fd262c14b15ce2b90c8701939dcb62a3a53c2c1fd8b`.
+The arm directories hold raw SSE under `measurement/`. See
+`identity.json`, `independent-live-audit.json`, `independent-sse-replay.json`,
+`exact-k0-compatibility.json`, `native-k4-trace/mtp-activity.json`, and
+`vllm-k4/mtp-activity.json` for the configuration and correctness receipts.

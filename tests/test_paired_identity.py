@@ -236,12 +236,56 @@ def stream_record(case, request_hash, name, phase, cohort, stamps=(20, 50, 60, 7
                         "aggregate_tokens_per_second": aggregate_rate}}
 
 
-def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None):
+def write_opt_in_identity(directory):
+    identity = {
+        "protocol": "matched-k4-opt-in-v1",
+        "campaign_id": "01234567-89ab-cdef-0123-456789abcdef",
+        "native_profile": "ordered-tc-int8",
+        "native_config": {
+            "fp8_prefill": "tensor-core-mtp-target", "mtp_int8_head": True, "mtp_steps": 4,
+        },
+        "native_binary_sha256": "b" * 64,
+    }
+    path = directory / "identity.json"
+    path.write_text(json.dumps(identity) + "\n")
+    return identity, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_opt_in_arm(run, arm, identity):
+    if arm == "vllm-k4":
+        return
+    info = dict(identity["native_config"], batch_cuda_graphs=True, eager=False, device=0,
+                host="127.0.0.1", trace_batches=arm == "native-k4-trace",
+                max_running_requests=32, max_num_batched_tokens=8192, prefix_cache_entries=0)
+    if arm in ("native-k0", "native-exact-k0"):
+        info.update(mtp_steps=0, mtp_int8_head=False)
+    if arm == "native-exact-k0":
+        info["fp8_prefill"] = "exact"
+    (run / "server-info.json").write_text(json.dumps(info))
+    (run / "running-binary.sha256").write_text(
+        identity["native_binary_sha256"] + "  /proc/123/exe\n")
+
+
+def replace_stream_ids(record, offset):
+    record["output_ids"] = [token + offset for token in record["output_ids"]]
+    for event, tokens in zip(record["events"][:2],
+                             (record["output_ids"][:1], record["output_ids"][1:])):
+        payload = json.loads(event["lines"][0][6:])
+        payload["choices"][0]["token_ids"] = tokens
+        event["lines"] = ["data: " + json.dumps(payload)]
+
+
+def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None, opt_in=False):
     row = "W1"
     (lane, body, case), = k4.fixture(row, directory)
-    for arm in k4.ARM_ORDER:
+    arms = (*k4.ARM_ORDER, "native-exact-k0") if opt_in else k4.ARM_ORDER
+    if opt_in:
+        identity, fingerprint = write_opt_in_identity(directory)
+    for arm in arms:
         measurement = directory / arm / "measurement"
         measurement.mkdir(parents=True)
+        if opt_in:
+            write_opt_in_arm(measurement.parent, arm, identity)
         (measurement / "00.request.json").write_bytes(body)
         for index, tag in enumerate(k4.schedule(row, arm)):
             duration = 80 if arm == "vllm-k4" else native_ns
@@ -252,13 +296,9 @@ def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None):
             record.update(finish_reason="length", done_ns=duration,
                           usage=json.loads(record["events"][2]["lines"][0][6:])["usage"],
                           token_chunks=[[20, 1], [50, case["output_tokens"] - 1]])
-            if arm == "vllm-k4" or (fault == "native-drift" and arm == "native-k4"):
-                record["output_ids"] = [token + index + 1 for token in record["output_ids"]]
-                for event, tokens in zip(record["events"][:2],
-                                         (record["output_ids"][:1], record["output_ids"][1:])):
-                    payload = json.loads(event["lines"][0][6:])
-                    payload["choices"][0]["token_ids"] = tokens
-                    event["lines"] = ["data: " + json.dumps(payload)]
+            if arm in ("vllm-k4", "native-exact-k0") or (
+                    fault == "native-drift" and arm == "native-k4"):
+                replace_stream_ids(record, index + 1)
             if arm == "vllm-k4" and tag == "measured-01":
                 if trailing_line is not None:
                     record["events"].append({"lines": [trailing_line], "ns": duration + 1,
@@ -274,6 +314,8 @@ def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None):
                 if fault == "malformed":
                     record["events"][1]["lines"] = ["data: {not JSON}"]
             raw = {"row": row, "tag": tag, "requests": [record]}
+            if opt_in:
+                raw["binding"] = {"campaign_sha256": fingerprint, "arm": arm}
             with gzip.open(measurement / f"{tag}.json.gz", "wt") as stream:
                 json.dump(raw, stream)
 
@@ -287,6 +329,129 @@ def test_k4_timing_gate_with_different_valid_ids(tmp_path, monkeypatch, native_n
     assert result["passed"] is passed
     assert result["workloads"]["W1"]["native"]["samples_ns"] == [native_ns] * 9
     assert result["workloads"]["W1"]["vllm"]["samples_ns"] == [80] * 9
+
+
+@pytest.mark.parametrize(("native_ns", "passed"), [(70, True), (80, False), (90, False)])
+def test_k4_opt_in_labels_exact_compatibility_separately(tmp_path, native_ns, passed):
+    write_k4_row(tmp_path, native_ns, opt_in=True)
+    result = k4.assess("W1", tmp_path, tmp_path)
+    assert result["protocol"] == "matched-k4-opt-in-v1"
+    assert result["native_profile"] == "ordered-tc-int8"
+    assert result["passed"] is passed
+    assert result["native_k0_parity"] is True
+    assert result["exact_k0_compatibility"]["diagnostic_only"] is True
+    assert result["exact_k0_compatibility"]["all_ids_match"] is False
+    assert result["exact_k0_compatibility"]["lanes"][0]["different_ids"] == 128
+    assert result["workloads"]["W1"]["native"]["samples_ns"] == [native_ns] * 9
+
+
+@pytest.mark.parametrize(("arm", "tag", "other_arm", "other_tag"), [
+    ("native-k0", "control", "native-exact-k0", "control"),
+    ("native-k4", "measured-01", "vllm-k4", "measured-01"),
+    ("native-k4-trace", "control", "native-k0", "control"),
+])
+def test_k4_opt_in_rejects_swapped_arm_receipts(tmp_path, arm, tag, other_arm, other_tag):
+    write_k4_row(tmp_path, opt_in=True)
+    target = tmp_path / arm / "measurement" / f"{tag}.json.gz"
+    foreign = tmp_path / other_arm / "measurement" / f"{other_tag}.json.gz"
+    target.write_bytes(foreign.read_bytes())
+    with pytest.raises(ValueError, match="Wrong raw cohort campaign or arm identity"):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+@pytest.mark.parametrize("replacement", [None, "matched-k4-v1", "foreign-campaign"])
+def test_k4_opt_in_rejects_changed_campaign(tmp_path, replacement):
+    write_k4_row(tmp_path, opt_in=True)
+    path = tmp_path / "identity.json"
+    if replacement is None:
+        path.unlink()
+    else:
+        identity_data = json.loads(path.read_bytes())
+        if replacement == "matched-k4-v1":
+            identity_data["protocol"] = replacement
+        else:
+            identity_data["campaign_id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        path.write_text(json.dumps(identity_data) + "\n")
+    with pytest.raises(ValueError, match="Wrong raw cohort campaign or arm identity"):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+@pytest.mark.parametrize(("arm", "field", "value"), [
+    ("native-k0", "fp8_prefill", "exact"),
+    ("native-k4", "mtp_int8_head", False),
+    ("native-exact-k0", "fp8_prefill", "tensor-core-mtp-target"),
+])
+def test_k4_opt_in_rejects_wrong_live_config(tmp_path, arm, field, value):
+    write_k4_row(tmp_path, opt_in=True)
+    path = tmp_path / arm / "server-info.json"
+    info = json.loads(path.read_bytes())
+    info[field] = value
+    path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match="wrong native server configuration"):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+def test_k4_opt_in_rejects_policy_k4_drift(tmp_path):
+    write_k4_row(tmp_path, fault="native-drift", opt_in=True)
+    with pytest.raises(ValueError, match="native K4 differs from native K0"):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+def test_k4_opt_in_captures_exact_diagnostic_before_timing(tmp_path, monkeypatch):
+    write_k4_row(tmp_path, opt_in=True)
+    directory = tmp_path / "native-exact-k0" / "measurement"
+    receipt = k4.read_raw(directory, "control")["requests"][0]
+    directory.rename(directory.with_name("synthetic-input"))
+    monkeypatch.setattr(k4.streaming, "measure", lambda *_: receipt)
+    k4.capture("W1", "native-exact-k0", "http://127.0.0.1:1", tmp_path, directory,
+               tmp_path / "native-k0" / "measurement")
+    diagnostic = json.loads((tmp_path / "exact-k0-compatibility.json").read_bytes())
+    assert diagnostic["diagnostic_only"] is True
+    assert diagnostic["all_ids_match"] is False
+    assert diagnostic["lanes"][0]["different_ids"] == 128
+    assert diagnostic["campaign_sha256"] == k4.campaign(tmp_path)[1]
+
+
+@pytest.mark.parametrize("fault", [None, "native-drift", "missing-eof", "trailing-data"])
+def test_k4_opt_in_replays_concurrent_lanes(tmp_path, monkeypatch, fault):
+    cohort, lanes = synthetic_cohort()
+    monkeypatch.setattr(k4.concurrent, "load_lanes", lambda *_: lanes)
+    identity_data, fingerprint = write_opt_in_identity(tmp_path)
+    for arm in ("native-k0", "native-exact-k0", "native-k4", "vllm-k4"):
+        directory = tmp_path / arm / "measurement"
+        directory.mkdir(parents=True)
+        write_opt_in_arm(directory.parent, arm, identity_data)
+        for lane, body, _ in lanes:
+            (directory / f'{lane["lane"]:02d}.request.json').write_bytes(body)
+        for tag in k4.schedule("W3", arm):
+            raw = deepcopy(cohort)
+            raw.update(tag=tag, binding={"campaign_sha256": fingerprint, "arm": arm})
+            if arm in ("native-exact-k0", "vllm-k4"):
+                replace_stream_ids(raw["requests"][1], 25)
+            if arm == "native-k4" and tag == "measured-01" and fault == "native-drift":
+                replace_stream_ids(raw["requests"][1], 50)
+            if arm == "vllm-k4" and tag == "measured-01":
+                record = raw["requests"][1]
+                if fault == "missing-eof":
+                    del record["eof_ns"]
+                if fault == "trailing-data":
+                    record["events"].append({"ns": 101, "read": 5, "lines": ["data:"]})
+            with gzip.open(directory / f"{tag}.json.gz", "wt") as stream:
+                json.dump(raw, stream)
+    if fault:
+        errors = {"native-drift": (ValueError, "native K4 differs from native K0"),
+                  "missing-eof": (KeyError, "eof_ns"),
+                  "trailing-data": (ValueError, "Data after")}
+        kind, message = errors[fault]
+        with pytest.raises(kind, match=message):
+            k4.assess("W3", tmp_path, tmp_path)
+        return
+    result = k4.assess("W3", tmp_path, tmp_path)
+    assert result["passed"] is False
+    assert result["workloads"]["W3"]["native"]["median_ns"] == 95
+    assert result["workloads"]["W3"]["vllm"]["median_ns"] == 95
+    lanes = result["exact_k0_compatibility"]["lanes"]
+    assert [lane["different_ids"] for lane in lanes] == [0, 3]
 
 
 @pytest.mark.parametrize(("fault", "message"), [

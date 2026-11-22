@@ -75,6 +75,22 @@ the row before comparison. The campaign retains its raw captures and exits at
 the first failure. The K0 commands and historical receipts retain their
 original contracts.
 
+### Ordered Tensor Core with INT8 draft
+
+Use a fresh campaign directory and set `PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8`
+with a verified Release server that supports `--mtp-int8-head`. The native K4
+arm selects `--fp8-prefill tensor-core-mtp-target --mtp-steps 4 --mtp-int8-head`.
+The native K0 control uses the same FP8 policy with depth zero. The runner
+requires all native K4 IDs to match this control on every lane and capture.
+vLLM still uses the pinned standard K4 worker and has the same stream contract.
+
+A separate fresh exact-FP8 K0 control writes `exact-k0-compatibility.json` before
+timing. It records per-lane mismatch counts and the first differing IDs.
+The comparison also includes this diagnostic. The opt-in timing result applies
+only to the named policy. The exact-FP8 comparison above retains its original
+adoption gate. Each opt-in cohort carries its campaign and arm identity. Use the
+same profile and directory for each subsequent row.
+
 ## Replay the historical GPU 2 arm
 
 On the benchmark host, `artifacts/test-bench-baseline` holds the saved 32,768-token vLLM arm

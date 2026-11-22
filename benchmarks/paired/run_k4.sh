@@ -5,6 +5,8 @@ usage() {
     echo "Usage: bash benchmarks/paired/run_k4.sh NATIVE_BINARY GPU_INDEX CAMPAIGN_DIR ROW"
     echo "ROW must be W1, W2, W3, W4, W5, or W6."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
+    echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8 selects the opt-in native profile."
+    echo "The default profile is exact."
 }
 
 if [[ ${1:-} == --help ]]; then
@@ -23,6 +25,20 @@ row=$4
 native_source=${PAIRED_NATIVE_SOURCE:-}
 native_sha=${PAIRED_NATIVE_SHA256:-}
 manifest=${PAIRED_CHECKPOINT_MANIFEST:-}
+native_profile=${PAIRED_K4_NATIVE_PROFILE-exact}
+native_fp8=exact
+case "$native_profile" in
+    exact) ;;
+    ordered-tc-int8) native_fp8=tensor-core-mtp-target ;;
+    *) echo "Unknown PAIRED_K4_NATIVE_PROFILE: $native_profile" >&2; exit 2 ;;
+esac
+if [[ $native_profile != exact ]]; then
+    overrides=$(compgen -e | sed -nE '/^SGLANG_(EXPERIMENTAL_|PREFILL_|DECODE_|SERIAL_)/p')
+    if [[ -n $overrides ]]; then
+        printf 'Unset native dispatch overrides for %s:\n%s\n' "$native_profile" "$overrides" >&2
+        exit 2
+    fi
+fi
 if ! [[ -x $binary && $native_source =~ ^[a-f0-9]{40}$ &&
         $native_sha =~ ^[a-f0-9]{64}$ && -f $manifest ]]; then
     usage >&2
@@ -85,14 +101,34 @@ identity=$(jq -nc --arg source "$native_source" --arg binary "$native_sha" \
     '{protocol:"matched-k4-v1",protocol_sha256:$protocol_sha,native_source:$source,
       native_binary_sha256:$binary,gpu_uuid:$gpu,checkpoint_sha256:$checkpoint,vllm_commit:$vllm,
       server_cpus:$server,client_cpus:$client,memory:"localalloc"}')
+if [[ $native_profile == ordered-tc-int8 ]]; then
+    if [[ -e $root/identity.json ]]; then
+        campaign_id=$(jq -er '.campaign_id | strings' "$root/identity.json")
+    else
+        read -r campaign_id </proc/sys/kernel/random/uuid
+    fi
+    [[ $campaign_id =~ ^[0-9a-f-]{36}$ ]]
+    identity=$(jq -c --arg profile "$native_profile" --arg fp8 "$native_fp8" \
+        --arg campaign_id "$campaign_id" \
+        '. + {protocol:"matched-k4-opt-in-v1",campaign_id:$campaign_id,native_profile:$profile,
+              native_config:{fp8_prefill:$fp8,mtp_steps:4,mtp_int8_head:true}}' <<<"$identity")
+fi
 if [[ $row == W1 && ! -e $root/identity.json ]]; then
     printf '%s\n' "$identity" >"$root/identity.json"
 fi
-[[ $(cat "$root/identity.json") == "$identity" ]]
+if [[ $(cat "$root/identity.json") != "$identity" ]]; then
+    echo "Campaign identity differs. Use a fresh campaign directory." >&2
+    exit 2
+fi
+campaign_sha=$(sha256sum "$root/identity.json")
+campaign_sha=${campaign_sha%% *}
+protocol_name=$(jq -r '.protocol' <<<"$identity")
 for ((previous = 1; previous < ${row:1}; ++previous)); do
     if ! [[ $(cat "$root/W$previous/exit-code.txt") == 0 ]] ||
-        ! jq -e --arg row "W$previous" \
-            '.protocol == "matched-k4-v1" and .row == $row and .passed == true' \
+        ! cmp -s "$root/identity.json" "$root/W$previous/identity.json" ||
+        ! jq -e --arg row "W$previous" --arg protocol "$protocol_name" --arg sha "$campaign_sha" \
+            '.protocol == $protocol and .row == $row and .passed == true
+             and ($protocol == "matched-k4-v1" or .campaign_sha256 == $sha)' \
             "$root/W$previous/comparison.json" >/dev/null; then
         echo "W$previous must pass in this campaign before $row." >&2
         exit 2
@@ -219,7 +255,8 @@ start_vllm() {
 }
 
 run_arm() {
-    local arm=$1 run=$directory/$1 depth=4 traced=false client_status=0
+    local arm=$1 run=$directory/$1 depth=4 traced=false int8=false client_status=0
+    local fp8=$native_fp8
     local flags=() options=()
     mkdir -- "$run"
     cd -- "$run"
@@ -234,24 +271,38 @@ run_arm() {
     else
         case "$arm" in
             native-k0) depth=0; flags+=(--mtp-steps 0) ;;
+            native-exact-k0)
+                depth=0
+                fp8=exact
+                flags+=(--mtp-steps 0)
+                options+=(--native-control "$directory/native-k0/measurement")
+                ;;
             native-k4-trace) traced=true; flags+=(--trace-batches) ;;
         esac
         if (( depth == 4 )); then
             options+=(--native-control "$directory/native-k0/measurement")
+            if [[ $native_profile == ordered-tc-int8 ]]; then
+                flags+=(--mtp-steps 4 --mtp-int8-head)
+                int8=true
+            fi
         fi
         mkdir cuda-cache
         start_group "$run" env "CUDA_CACHE_PATH=$run/cuda-cache" \
             "$binary" --checkpoint "$checkpoint" --device 0 --port "$port" \
             --batch-cuda-graphs --prefix-cache-entries 0 \
+            --fp8-prefill "$fp8" \
             --max-active 32 --max-num-batched-tokens "$token_budget" "${flags[@]}" 6>&- 7>&- 8<&-
         check_digest "$native_sha" "/proc/$server_pid/exe"
         sha256sum "/proc/$server_pid/exe" >running-binary.sha256
         "${fetch[@]}" "$url/server_info" >server-info.json
         jq -e --argjson depth "$depth" --argjson traced "$traced" --arg path "$checkpoint" \
+            --arg profile "$native_profile" --arg fp8 "$fp8" --argjson int8 "$int8" \
             '.mtp_steps == $depth and .model_path == $path and .max_running_requests == 32
              and .max_num_batched_tokens == 8192 and .prefix_cache_entries == 0
              and .batch_cuda_graphs == true and .eager == false and .trace_batches == $traced
-             and .fp8_prefill == "exact" and .host == "127.0.0.1" and .device == 0' \
+             and .fp8_prefill == $fp8 and .host == "127.0.0.1" and .device == 0
+             and (if $profile == "exact" then (.mtp_int8_head // false) == false
+                  else .mtp_int8_head == $int8 end)' \
             server-info.json >server-check.txt
     fi
     ss -Hlnpt "sport = :$port" >listener.txt
@@ -291,6 +342,9 @@ run_arm() {
 }
 
 run_arm native-k0
+if [[ $native_profile == ordered-tc-int8 ]]; then
+    run_arm native-exact-k0
+fi
 if [[ $row == W1 ]]; then
     run_arm native-k4-trace
 fi

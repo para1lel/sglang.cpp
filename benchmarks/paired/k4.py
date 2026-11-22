@@ -19,11 +19,13 @@ from saved_evidence import device, digest, fields, load, require, saved_worker
 
 ROWS = (*streaming.SHAPES, *concurrent.ROWS)
 PROTOCOL = "matched-k4-v1"
+OPT_IN_PROTOCOL = "matched-k4-opt-in-v1"
 ARM_ORDER = ("native-k0", "native-k4-trace", "native-k4", "vllm-k4")
+EXACT_CONTROL = "native-exact-k0"
 
 
 def schedule(row, arm):
-    if arm in ARM_ORDER[:2]:
+    if arm in (*ARM_ORDER[:2], EXACT_CONTROL):
         return ["control"]
     if row in streaming.SHAPES:
         return concurrent.tags({"warmup_cohorts": streaming.WARMUPS,
@@ -73,8 +75,9 @@ def replay_short(record, item):
     return cohort_makespan_ns([replay]), [replay["output_ids"]]
 
 
-def replay(raw, row, tag, lanes, policy):
+def replay(raw, row, tag, lanes, policy, binding=None):
     require((raw["row"], raw["tag"]) == (row, tag), "Wrong raw cohort row or tag")
+    require(raw.get("binding") == binding, "Wrong raw cohort campaign or arm identity")
     for record in raw["requests"]:
         for _ in streaming.completion_frames(record["events"]):
             pass
@@ -90,6 +93,46 @@ def read_raw(directory, tag):
         return json.load(stream)
 
 
+def campaign(directory):
+    path = directory / "identity.json"
+    if not path.exists():
+        return None
+    raw = path.read_bytes()
+    identity = json.loads(raw)
+    if identity["protocol"] == PROTOCOL:
+        return None
+    require(identity["protocol"] == OPT_IN_PROTOCOL
+            and identity["native_profile"] == "ordered-tc-int8"
+            and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                             identity["campaign_id"])
+            and identity["native_config"] == {
+                "fp8_prefill": "tensor-core-mtp-target", "mtp_steps": 4, "mtp_int8_head": True},
+            "Unknown opt-in native campaign configuration")
+    return identity, hashlib.sha256(raw).hexdigest()
+
+
+def arm_binding(directory, arm, selected):
+    if selected is None:
+        require(arm != EXACT_CONTROL, "Exact diagnostic belongs to an opt-in campaign")
+        return None
+    identity, fingerprint = selected
+    if arm != "vllm-k4":
+        run = directory.parent
+        info = load(run / "server-info.json")
+        config = dict(identity["native_config"], trace_batches=arm == "native-k4-trace",
+                      max_running_requests=32, max_num_batched_tokens=8192, prefix_cache_entries=0,
+                      batch_cuda_graphs=True, eager=False, host="127.0.0.1", device=0)
+        if arm in ("native-k0", EXACT_CONTROL):
+            config.update(mtp_steps=0, mtp_int8_head=False)
+        if arm == EXACT_CONTROL:
+            config["fp8_prefill"] = "exact"
+        require(all(type(info[key]) is type(value) and info[key] == value
+                    for key, value in config.items()), f"{arm}: wrong native server configuration")
+        require((run / "running-binary.sha256").read_text().split()[0]
+                == identity["native_binary_sha256"], f"{arm}: wrong running native binary")
+    return {"campaign_sha256": fingerprint, "arm": arm}
+
+
 def capture(row, arm, endpoint, fixtures, directory, native_control=None):
     url = urlsplit(endpoint)
     require(url.scheme == "http" and url.hostname == "127.0.0.1" and url.port
@@ -97,11 +140,15 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
             "Expected a loopback HTTP origin")
     lanes = fixture(row, fixtures)
     policy = concurrent.reference()["policy"]
+    selected = campaign(directory.parent.parent)
+    binding = arm_binding(directory, arm, selected)
     expected = None
-    if arm in ("native-k4", "native-k4-trace"):
+    if arm in ("native-k4", "native-k4-trace", EXACT_CONTROL):
         require(native_control is not None, "Provide the native K0 control")
         verify_request_files(native_control, lanes)
-        _, expected = replay(read_raw(native_control, "control"), row, "control", lanes, policy)
+        control_binding = arm_binding(native_control, "native-k0", selected)
+        _, expected = replay(read_raw(native_control, "control"), row, "control", lanes, policy,
+                             control_binding)
     directory.mkdir()
     for lane, body, _ in lanes:
         (directory / f'{lane["lane"]:02d}.request.json').write_bytes(body)
@@ -113,35 +160,70 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
             with patch.object(concurrent.http.client, "HTTPConnection",
                               streaming.StreamingConnection):
                 raw = concurrent.capture_cohort(url, row, lanes, tag, policy)
+        if binding is not None:
+            raw["binding"] = binding
         with gzip.open(directory / f"{tag}.json.gz", "wt", compresslevel=3) as stream:
             json.dump(raw, stream, separators=(",", ":"), allow_nan=False)
-        _, outputs = replay(raw, row, tag, lanes, policy)
-        require(expected is None or outputs == expected, f"{tag}: native K4 differs from native K0")
+        _, outputs = replay(raw, row, tag, lanes, policy, binding)
+        if arm == EXACT_CONTROL:
+            diagnostic = {"protocol": OPT_IN_PROTOCOL, "row": row, **binding,
+                          **exact_compatibility(expected, outputs)}
+            save(directory.parent.parent / "exact-k0-compatibility.json", diagnostic)
+        else:
+            require(expected is None or outputs == expected,
+                    f"{tag}: native K4 differs from native K0")
+
+
+def exact_compatibility(expected, exact):
+    lanes = []
+    for policy_ids, exact_ids in zip(expected, exact, strict=True):
+        differences = [index for index, (policy_id, exact_id) in
+                       enumerate(zip(policy_ids, exact_ids, strict=True)) if policy_id != exact_id]
+        first = None
+        if differences:
+            index = differences[0]
+            first = {"output_index": index, "ordered_id": policy_ids[index],
+                     "exact_id": exact_ids[index]}
+        lanes.append({"different_ids": len(differences), "first_difference": first})
+    return {"diagnostic_only": True, "all_ids_match": expected == exact, "lanes": lanes}
 
 
 def assess(row, fixtures, directory):
     lanes = fixture(row, fixtures)
     policy = concurrent.reference()["policy"]
+    selected = campaign(directory)
     samples = {"native-k4": [], "vllm-k4": []}
     expected = None
-    for arm in ARM_ORDER:
+    exact = None
+    arms = (ARM_ORDER[0], EXACT_CONTROL, *ARM_ORDER[1:]) if selected else ARM_ORDER
+    for arm in arms:
         if arm == "native-k4-trace" and row != "W1":
             continue
         measurement = directory / arm / "measurement"
+        binding = arm_binding(measurement, arm, selected)
         verify_request_files(measurement, lanes)
         tags = schedule(row, arm)
         require({path.name for path in measurement.glob("*.json.gz")}
                 == {f"{tag}.json.gz" for tag in tags}, f"{arm}: wrong cohort set")
         for tag in tags:
-            duration, outputs = replay(read_raw(measurement, tag), row, tag, lanes, policy)
+            duration, outputs = replay(read_raw(measurement, tag), row, tag, lanes, policy, binding)
             if arm == "native-k0":
                 expected = outputs
+            elif arm == EXACT_CONTROL:
+                exact = outputs
             elif arm != "vllm-k4":
                 require(outputs == expected, f"{arm} {tag}: native K4 differs from native K0")
             if tag.startswith("measured-"):
                 samples[arm].append(duration)
-    return {"protocol": PROTOCOL, "row": row, **compare(
+    result = {"protocol": PROTOCOL, "row": row, **compare(
         {row: samples["native-k4"]}, {row: samples["vllm-k4"]}, eligible=True)}
+    if selected:
+        identity, fingerprint = selected
+        result.update(protocol=OPT_IN_PROTOCOL, native_profile=identity["native_profile"],
+                      native_config=identity["native_config"], campaign_sha256=fingerprint,
+                      native_k0_parity=True,
+                      exact_k0_compatibility=exact_compatibility(expected, exact))
+    return result
 
 
 def check_vllm_worker(row, run, reservation, checkpoint):
@@ -217,7 +299,7 @@ def main():
     modes = parser.add_subparsers(dest="mode", required=True)
     collect = modes.add_parser("capture")
     collect.add_argument("row", choices=ROWS)
-    collect.add_argument("arm", choices=ARM_ORDER)
+    collect.add_argument("arm", choices=(*ARM_ORDER, EXACT_CONTROL))
     collect.add_argument("endpoint")
     collect.add_argument("fixtures", type=Path)
     collect.add_argument("directory", type=Path)

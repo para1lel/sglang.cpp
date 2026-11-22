@@ -38,8 +38,8 @@ public:
     ~MtpDraftRequest();
 
     /// Append at valid_prefix() using the shifted token and the corresponding
-    /// normalized hidden row. The returned device row survives until the next
-    /// enqueue writes it. The row can also be passed as that enqueue's input.
+    /// normalized hidden row. An unscored enqueue only appends KV and returns nullptr.
+    /// A scored enqueue returns a device row usable as the next enqueue's input.
     const Bf16* enqueue(int position, int shifted_token, const Bf16* hidden, bool score,
                         cudaStream_t stream, const ConstraintWorkspace* scratch = nullptr,
                         const ConstraintCandidates* allowed = nullptr);

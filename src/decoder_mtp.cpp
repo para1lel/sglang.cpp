@@ -194,7 +194,7 @@ struct MtpDraftWeights::State {
 struct MtpDraftRequest::State {
     State(std::shared_ptr<const MtpDraftWeights> weights, int capacity);
     void prepare(int shifted_token, const Bf16* hidden, cudaStream_t stream);
-    void attend(int position, cudaStream_t stream);
+    void attend(int position, bool score, cudaStream_t stream);
     void run_mlp(cudaStream_t stream);
     void score(cudaStream_t stream, const ConstraintWorkspace* scratch,
                const ConstraintCandidates* allowed);
@@ -246,17 +246,28 @@ void MtpDraftRequest::State::prepare(int shifted_token, const Bf16* hidden, cuda
                         nullptr, stream), "Normalize MTP layer input");
 }
 
-void MtpDraftRequest::State::attend(int position, cudaStream_t stream) {
+void MtpDraftRequest::State::attend(int position, bool score, cudaStream_t stream) {
     const auto& model = *weights->state_;
     const auto& gqa = model.gqa;
     quantize(work.normalized, hidden_size, work, stream);
-    project(gqa.q_gate, work, work.q_gate, stream);
+    if (score) {
+        project(gqa.q_gate, work, work.q_gate, stream);
+    }
     project(gqa.key, work, work.keys, stream);
     project(gqa.value, work, work.values, stream);
-    check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, gqa.query_norm, gqa.key_norm,
-                              work.rope_queries, work.rope_keys, stream), "Rotate MTP Q/K");
+    if (score) {
+        check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, gqa.query_norm,
+                                  gqa.key_norm, work.rope_queries, work.rope_keys, stream),
+              "Rotate MTP Q/K");
+    } else {
+        check(text_gqa_preprocess_keys(position, 1, work.keys, gqa.key_norm, work.rope_keys,
+                                      stream), "Rotate MTP key");
+    }
     check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values, stream),
           "Append MTP MXFP8 KV");
+    if (!score) {
+        return;
+    }
     check(mtp_gqa_attention(cache, pages, position, work.rope_queries, work.attention, stream),
           "Read MTP MXFP8 attention");
     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
@@ -335,9 +346,9 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
     }
     try {
         request.prepare(shifted_token, hidden, stream);
-        request.attend(position, stream);
-        request.run_mlp(stream);
+        request.attend(position, score, stream);
         if (score) {
+            request.run_mlp(stream);
             request.score(stream, scratch, allowed);
         }
     } catch (...) {
@@ -345,7 +356,7 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
         throw;
     }
     ++request.prefix;
-    return request.work.normalized;
+    return score ? request.work.normalized : nullptr;
 }
 
 void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,

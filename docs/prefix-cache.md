@@ -23,7 +23,7 @@ The checkpoint boundary is the largest multiple of 128 within the prompt length 
 
 ### Checkpoint compatibility and resume
 
-For a checkpoint of `P` prompt IDs, target KV covers positions `0` through `P-1`. The entry also stores GDN state and the target hidden and residual rows after position `P-1`. A paired checkpoint contains draft KV for positions `0` through `P-2`. Each draft position needs the next token's embedding, so the checkpoint leaves draft position `P-1` open. [Restore](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "int PrefixCa" --> · [Draft copy](../src/decoder_mtp.cpp#L413)<!-- prefix: "void MtpDraf" -->
+For a checkpoint of `P` prompt IDs, target KV covers positions `0` through `P-1`. The entry also stores GDN state and the target hidden and residual rows after position `P-1`. A paired checkpoint contains draft KV for positions `0` through `P-2`. Each draft position needs the next token's embedding, so the checkpoint leaves draft position `P-1` open. [Restore](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "int PrefixCa" --> · [Draft copy](../src/decoder_mtp.cpp#L424)<!-- prefix: "void MtpDraf" -->
 
 K0 can use either a target-only or a paired entry. Depths 1–4 share paired entries, and lookup skips target-only entries even if they match a longer prefix. If no eligible pair matches, the lane prefills from the start. Publication can fill in the draft state of the same target-only key without an eviction. Publishing K0 state for a key that already has a pair preserves the pair. [Store](../src/decoder_prefix_cache.cpp#L185)<!-- prefix: "void PrefixC" -->
 

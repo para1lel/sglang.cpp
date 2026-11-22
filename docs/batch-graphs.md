@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Validate graph options, construct the batch service, and report batch steps. | [CLI option](../apps/sglang-server.cpp#L90)<!-- prefix: "if (option =" --> · [Batch service](../apps/sglang-server.cpp#L280)<!-- prefix: "BatchService" --> · [Trace](../include/sglang/server/batch_trace.h#L68)<!-- prefix: "inline void " --> |
+| Server | Validate graph options, construct the batch service, and report batch steps. | [CLI option](../apps/sglang-server.cpp#L91)<!-- prefix: "if (option =" --> · [Batch service](../apps/sglang-server.cpp#L285)<!-- prefix: "BatchService" --> · [Trace](../include/sglang/server/batch_trace.h#L68)<!-- prefix: "inline void " --> |
 | Decoder batch | Select eligible decode steps, bind lane state, and return winners by slot. | [Batch options](../include/sglang/decoder_batch.h#L53)<!-- prefix: "struct Decod" --> · [Dispatch](../src/decoder_batch.cpp#L664)<!-- prefix: "const auto r" --> · [Readback](../src/decoder_batch.cpp#L741)<!-- prefix: "void Decoder" --> |
 | CUDA resources | Recover from eligible pre-submission failures and retain resources while completion is uncertain. | [Fallback](../src/decoder_resources.cpp#L515)<!-- prefix: "bool Allocat" --> · [Cleanup](../src/decoder_resources.cpp#L229)<!-- prefix: "CleanupError" --> |
 
@@ -86,7 +86,7 @@ Run the singleton probe for slot 31 warmup, replacement, and launch rejection. R
 
 Follow the [score-backed singleton checks](singleton-gqa-decode.md#verification).
 
-Run the [streaming fixtures](development.md#streaming-verification) and [text checks](text-serving.md#verification) with graphs off and on. Match IDs, finish reasons, and usage. Correlate K0 masks with CUDA graph launches and batch-stream device activity. Require one executable per eligible bucket or narrow width and zero graph launches on eager steps. Check singleton decode at capacity one and at wider capacities. Check positive depths and follow the [verification graph checks](mtp.md#verification-graph-checks).
+Set `--mtp-steps 0` for the K0 graph checks. Run the [streaming fixtures](development.md#streaming-verification) and [text checks](text-serving.md#verification) with graphs off and on. Match IDs, finish reasons, and usage. Correlate K0 masks with CUDA graph launches and batch-stream device activity. Require one executable per eligible bucket or narrow width and zero graph launches on eager steps. Check singleton decode at capacity one and at wider capacities. Check positive depths and follow the [verification graph checks](mtp.md#verification-graph-checks).
 
 Follow the [wide K0 runbook](../tests/batch/README.md#wide-k0-serving). Check full-width eager decode and narrower replay after slot reuse at capacities 16 and 32. Require a replay with logical slot 31 in the mask at capacity 32.
 

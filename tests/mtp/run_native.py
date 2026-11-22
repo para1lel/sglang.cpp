@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import http.client
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -131,11 +132,6 @@ def compare(target, candidate, steps, name):
     label = f"{name}: steps={steps}"
     for key in ("output_token_ids", "finish_reason", "step_top_logits"):
         require(candidate[key] == target[key], f"{label}: changed {key}")
-    if not steps:
-        require(all(key not in candidate for key in COUNTERS), f"{label}: draft counters")
-        for key in ("model_device_allocation_bytes", "peak_device_allocation_bytes"):
-            require(candidate[key] == target[key], f"{label}: changed {key}")
-        return
     check_draft_totals(candidate, steps, label)
 
 
@@ -265,8 +261,22 @@ def check_recovery(port, evidence, log_path, prompt, target):
 
 def check_cli_policy(args):
     cases = {}
+    environment = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
     for name, binary, flags in (("generate", args.generate, ["--prompt-ids", "17"]),
                                 ("server", args.server, ["--max-active", "2"])):
+        command = [str(binary), "--help"]
+        help_result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                     timeout=5)
+        help_lines = help_result.stdout.splitlines()
+        require(help_result.returncode == 0 and not help_result.stderr and
+                any(re.search(r"(?:default 4\b|\b4 by default)", line)
+                    for line in help_lines if "--mtp-steps" in line or "MTP steps" in line),
+                f"{name}: help must advertise K4 as the default")
+        require("--mtp-k" in help_result.stdout, f"{name}: help must advertise the depth alias")
+        if name == "server":
+            require(any("0 steps" in line and "logprobs" in line and "prefix cache" in line
+                        for line in help_lines), "server: help must describe K0 fallbacks")
+        cases[f"{name}-help"] = {"command": command, "stdout": help_result.stdout}
         sampling = (
             (("seed", ["--seed", "9223372036854775808"], "Invalid number for --seed"),
              ("temperature", ["--temperature", "-1"], "Expected finite --temperature >= 0"))
@@ -276,11 +286,13 @@ def check_cli_policy(args):
         )
         validations = (
             ("depth", ["--mtp-steps", "5"], "Expected --mtp-steps in [0, 4]"),
+            ("depth-alias", ["--mtp-k", "5"], "Expected --mtp-steps in [0, 4]"),
             *sampling,
         )
         for label, options, diagnostic in validations:
             command = [str(binary), *flags, *options]
-            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                    timeout=5)
             require(result.returncode != 0 and not result.stdout and diagnostic in result.stderr,
                     f"{name} {label}: {result.stderr}")
             cases[f"{name}-{label}"] = {
@@ -498,9 +510,9 @@ def main():
         "silver-key": (silver, 24, None),
         "page-127": (page, 16, None),
     }
-    controls = {name: generate(args, name, case, "default") for name, case in cases.items()}
+    controls = {name: generate(args, name, case, 0) for name, case in cases.items()}
     require(all(key not in record for record in controls.values() for key in COUNTERS),
-            "Default generation reports no MTP work")
+            "Explicit K0 generation reports no MTP work")
     silver_output = controls["silver-key"]["output_token_ids"]
     edges = {
         "length-one": ("capital", 1, None, 3),
@@ -512,12 +524,16 @@ def main():
     }
     require(controls["capital"]["output_token_ids"][:3] == [11751, 13, 198],
             "Capital trace prefill and correction")
-    for name, case in cases.items():
-        compare(controls[name], generate(args, name, case, 0), 0, name)
+    default_candidate = generate(args, "silver-key", cases["silver-key"], "default")
+    compare(controls["silver-key"], default_candidate, max(STEPS), "silver-key default")
     for steps in STEPS:
         for name, case in cases.items():
             candidate = generate(args, name, case, steps)
             compare(controls[name], candidate, steps, name)
+            if name == "silver-key" and steps == max(STEPS):
+                require(all(default_candidate[key] == candidate[key] for key in COUNTERS)
+                        and default_candidate["mtp_rounds"] > 0,
+                        "Default generation matches explicit K4 speculative work")
             if args.reference_generate and name == "silver-key":
                 reference = generate(args, name, case, steps, reference=True)
                 compare_reference(candidate, reference, steps, name)

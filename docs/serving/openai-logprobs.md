@@ -4,7 +4,7 @@ Both `/v1/completions` and `/v1/chat/completions` can return the score of each c
 
 ## Request requirements
 
-Use greedy decoding and disable server MTP. Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Active sampling, output constraints, decoded media, and active chat reasoning or tool output parsers return HTTP 400 before SSE. [Score options](../../apps/server/text_request.cpp#L325)<!-- prefix: "int openai_l" -->
+The [server MTP policy](../mtp.md#runtime-path) uses K0 for scored requests when you omit the depth option. Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Active sampling, output constraints, decoded media, and active chat reasoning or tool output parsers return HTTP 400 before SSE. [Score options](../../apps/server/text_request.cpp#L325)<!-- prefix: "int openai_l" -->
 
 Generated logprobs use the scores after [output penalties](../output-penalties.md) and logit bias.
 
@@ -32,7 +32,7 @@ SSE delivers each score once. A scored event can have empty visible text while t
 
 ## Verification
 
-With server MTP disabled, compare JSON with the concatenated SSE scores for the same greedy requests. Check selected-only and top-20 responses, batch choices by index, zero-budget responses, stop IDs, cross-token text stops, and split UTF-8. Repeat on eager and graph decode. Require HTTP 400 before SSE for active sampling, MTP, and output constraints. Run the [native CUDA and CPU score checks](../native-generate.md#verification) for the shared reducer and native score delivery.
+With `--mtp-steps 0`, compare JSON with the concatenated SSE scores for the same greedy requests. Check selected-only and top-20 responses, batch choices by index, zero-budget responses, stop IDs, cross-token text stops, and split UTF-8. Repeat on eager and graph decode. With the default depth, compare scored requests with the K0 control. Require HTTP 400 before SSE for active sampling, output constraints, and scoring with explicit positive MTP depth. Run the [native CUDA and CPU score checks](../native-generate.md#verification) for the shared reducer and native score delivery.
 
 Build the [CPU fixture](../../tests/text/README.md#native-generate-on-cpu), then run the OpenAI wire suite from the repository root in the managed Pixi environment.
 

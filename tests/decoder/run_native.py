@@ -151,8 +151,8 @@ def run_case(args, request, env, evidence, warmup, repeats, with_scores):
     case = request["case"]
     prompt = ",".join(map(str, case["prompt_token_ids"]))
     command = [str(args.binary), "--checkpoint", str(args.checkpoint), "--device", "0",
-               "--max-new-tokens", str(case["max_tokens"]), "--warmup", str(warmup),
-               "--repeats", str(repeats)]
+               "--mtp-steps", "0", "--max-new-tokens", str(case["max_tokens"]),
+               "--warmup", str(warmup), "--repeats", str(repeats)]
     if case["name"] == "alternate":
         prompt_file = evidence / "alternate.prompt"
         prompt_file.write_text(" ".join(map(str, case["prompt_token_ids"])) + "\n")

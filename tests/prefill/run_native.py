@@ -91,7 +91,7 @@ def check_cli(args, cases):
         command = [
             str(args.generate), "--checkpoint", str(args.checkpoint), "--device", str(args.device),
             "--prompt-ids", ",".join(map(str, prompt)), "--max-new-tokens", str(case["max_tokens"]),
-            "--top-logits", "64",
+            "--top-logits", "64", "--mtp-steps", "0",
         ]
         write_json(evidence / "command.json", command)
         output_path = evidence / "stdout.json"

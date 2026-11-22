@@ -32,8 +32,9 @@ struct Arguments {
     int port = 17384;
     int max_active = sglang::decoder_batch_max_lanes;
     int max_num_batched_tokens = sglang::decoder_default_max_num_batched_tokens;
-    int mtp_steps = 0;
+    int mtp_steps = 4;
     int prefix_cache_entries = 0;
+    bool mtp_steps_explicit = false;
     bool eager = false;
     bool trace_batches = false;
     bool batch_cuda_graphs = false;
@@ -144,6 +145,7 @@ Arguments parse_arguments(int argc, char** argv) {
         } else if (option == "--mtp-steps" || option == "--mtp-k") {
             const auto error = "Expected --mtp-steps in [0, 4]";
             arguments.mtp_steps = parse_integer(value, error);
+            arguments.mtp_steps_explicit = true;
             if (arguments.mtp_steps > sglang::decoder_max_mtp_steps) {
                 throw std::invalid_argument(error);
             }
@@ -156,10 +158,12 @@ Arguments parse_arguments(int argc, char** argv) {
         if (arguments.eager) {
             throw std::invalid_argument("--prefix-cache-entries requires omitting --eager");
         }
-        if (arguments.mtp_steps != 0 && arguments.fp8_prefill ==
-            sglang::Fp8PrefillPolicy::tensor_core) {
-            throw std::invalid_argument(
-                "MTP with --prefix-cache-entries requires --fp8-prefill exact");
+        if (arguments.fp8_prefill == sglang::Fp8PrefillPolicy::tensor_core) {
+            if (arguments.mtp_steps_explicit && arguments.mtp_steps != 0) {
+                throw std::invalid_argument(
+                    "MTP with --prefix-cache-entries requires --fp8-prefill exact");
+            }
+            arguments.mtp_steps = 0;
         }
     }
     return arguments;
@@ -256,7 +260,8 @@ int main(int argc, char** argv) {
                      "Waiting completions: up to --max-active. Full queue returns HTTP 503.\n"
                      "Target rows per step: " << sglang::decoder_default_max_num_batched_tokens
                   << " by default, range 1-32768.\n"
-                     "MTP steps: 0 by default, up to 4. --mtp-k is an alias.\n"
+                     "MTP steps: 4 by default, range 0-4. --mtp-k is an alias.\n"
+                     "Default MTP uses 0 steps for logprobs and with a Tensor Core prefix cache.\n"
                      "Batch graphs: enable graph replay for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
                      "Prefix cache: disabled by default. Omit --eager. MTP requires exact.\n"
@@ -279,7 +284,8 @@ int main(int argc, char** argv) {
         VisionCompletion vision(arguments.checkpoint, arguments.device);
         BatchService service(decoder, arguments.trace_batches,
                              arguments.enable_batch_cuda_graphs(),
-                             arguments.mtp_steps, arguments.max_active,
+                             {arguments.mtp_steps, !arguments.mtp_steps_explicit},
+                             arguments.max_active,
                              arguments.prefix_cache_entries, arguments.max_num_batched_tokens);
         if (stopping()) {
             return 0;

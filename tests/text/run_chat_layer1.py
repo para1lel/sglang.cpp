@@ -67,8 +67,7 @@ def server(binary, checkpoint, out, width, *, graph=False, mtp=False, observer=N
     ]
     if graph:
         command.append("--batch-cuda-graphs")
-    if mtp:
-        command.extend(("--mtp-steps", "4"))
+    command.extend(("--mtp-steps", "4" if mtp else "0"))
     environment = os.environ.copy()
     if observer:
         environment["LD_PRELOAD"] = str(observer)

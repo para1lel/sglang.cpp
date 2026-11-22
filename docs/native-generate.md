@@ -7,7 +7,7 @@
 | HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L198)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L603)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
 | Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L882)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L919)<!-- prefix: "std::vector\u003c" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L370)<!-- prefix: "void complet" --> |
-| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L960)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L647)<!-- prefix: "bool BatchSe" --> |
+| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L960)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L645)<!-- prefix: "bool BatchSe" --> |
 | Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L140)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L277)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L309)<!-- prefix: "void stream_" --> |
 | Text stops | Select stops before token publication and hold ambiguous text. | [Worker match](../include/sglang/server/text_stop.h#L156)<!-- prefix: "bool apply(D" --> · [Response frame](../apps/server/native_generate.cpp#L205)<!-- prefix: "std::string " --> |
 
@@ -63,7 +63,7 @@ A batch shares one HTTP queue entry, worker and [decoder scheduler](http-server.
 An item that decodes alone can use [score-backed singleton attention](singleton-gqa-decode.md).
 Multi-item batches submit in input order, scanning from lane zero. Items beyond `--max-active` wait.
 A one-item request waits for its worker's lane even if another lane is free.
-[Lane selection](../apps/server/batch_service.cpp#L569)<!-- prefix: "void BatchSe" -->
+[Lane selection](../apps/server/batch_service.cpp#L568)<!-- prefix: "void BatchSe" -->
 
 ### Parallel sampling
 
@@ -77,7 +77,7 @@ Results are prompt-major. SSE uses `index = prompt_position * n + sample_positio
 
 HTTP 200 JSON returns one object for scalar `n: 1` and an ordered array for indexed requests, including one-item batches.
 SSE opens [chunked HTTP 200](http-server.md#completion-streams) after admission or if all items were aborted while waiting. Indexed events can interleave and carry their zero-based result positions. Scalar `n: 1` omits `index`.
-[Indexed result](../apps/server/native_generate.cpp#L205)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L702)<!-- prefix: "bool BatchSe" -->
+[Indexed result](../apps/server/native_generate.cpp#L205)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L700)<!-- prefix: "bool BatchSe" -->
 
 | Field | Meaning |
 | --- | --- |
@@ -98,7 +98,7 @@ Any item traffic resets the connection's [keepalive timer](http-server.md#comple
 Measure TTFT at each item's first event with output IDs. Zero-budget items have no first-token sample.
 The completion worker writes outside the scheduler mutex. A blocked write can hold the batch's pending results while other ready completions advance.
 Single-prompt streams can use [bounded decode output](http-server.md#bounded-decode-output) on an eligible cohort. Cumulative IDs, terminal metadata, and keepalives follow the same response contract.
-[Batch result delivery](../apps/server/batch_service.cpp#L647)<!-- prefix: "bool BatchSe" -->
+[Batch result delivery](../apps/server/batch_service.cpp#L645)<!-- prefix: "bool BatchSe" -->
 
 ### Text stops
 
@@ -108,7 +108,7 @@ The worker checks each decoder step for a match. If several strings match within
 [Match order](../include/sglang/server/text_stop.h#L67)<!-- prefix: "std::optiona" --> · [Step finish](../include/sglang/server/text_stop.h#L173)<!-- prefix: "matched = ma" -->
 
 For a text stop, the final object contains `{"type":"stop","matched":"…"}` with the exact configured string. IDs and usage include the token that completed it, even if the match starts inside that token. The worker drops any later MTP IDs before publishing and cancels the lane if it is still live. Other items keep running.
-[Finish serialization](../apps/server/native_generate.cpp#L160)<!-- prefix: "if (type == " --> · [Clipping](../include/sglang/server/text_stop.h#L177)<!-- prefix: "const auto e" --> · [Lane retirement](../apps/server/batch_service.cpp#L466)<!-- prefix: "if (selected" -->
+[Finish serialization](../apps/server/native_generate.cpp#L160)<!-- prefix: "if (type == " --> · [Clipping](../include/sglang/server/text_stop.h#L177)<!-- prefix: "const auto e" --> · [Lane retirement](../apps/server/batch_service.cpp#L465)<!-- prefix: "if (selected" -->
 
 The response searches rendered `text` for the matched string. By default it trims from the first occurrence. Set `sampling_params.no_stop_trim` to `true` to keep text through the end of that occurrence. For example, stopping on `ll` in the token `hello` returns `hell`. If the matched string is absent after special token filtering, both settings return all rendered text through the matching token. IDs, usage, finish metadata, and optional token logprobs follow the same rules with either setting.
 
@@ -122,7 +122,7 @@ An unscored and unconstrained scalar prompt with `n: 1` and no text stops uses I
 
 ### Token logprobs
 
-Set top-level `return_logprob: true` and `sampling_params.temperature: 0`. The server requires MTP disabled. Every scored item uses unconstrained greedy decoding. A batch can mix scored and unscored items.
+Set top-level `return_logprob: true` and `sampling_params.temperature: 0`. Scoring uses unconstrained greedy decoding. Batches can mix scored and unscored items. See the [server MTP policy](mtp.md#runtime-path) for scored items.
 [Validation](../apps/server/text_request.cpp#L846)<!-- prefix: "void generat" --> · [MTP check](../apps/server/native_generate.cpp#L380)<!-- prefix: "if (scored &" -->
 
 | Top-level field | Accepted values |
@@ -207,7 +207,7 @@ The error event applies to the stream and has no item index. Previously delivere
 On a generation failure, disconnect, or failed write, the worker discards unsubmitted items, cancels the active jobs still owned by the batch, and waits for their retirement before releasing the slot.
 Decoder effects already published, such as prefix-cache entries, can remain.
 The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
-[Batch cancellation](../apps/server/batch_service.cpp#L548)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L179)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L231)<!-- prefix: "void write_s" -->
+[Batch cancellation](../apps/server/batch_service.cpp#L547)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L179)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L231)<!-- prefix: "void write_s" -->
 
 The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L363)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L535)<!-- prefix: "void write_m" -->
 
@@ -226,7 +226,7 @@ Use the first ID from the greedy request as an explicit stop ID. Require `stop`,
 Send both prompt fields with `stream: true`. Require a JSON HTTP 400 before SSE opens.
 Use the [shared transport checks](http-server.md#verification) for keepalives, cancellation, and failures after admission.
 
-With MTP disabled, compare JSON and SSE using greedy scoring, top three, and both text settings. Check score prefixes and IDs. Repeat with top zero, zero budget, a stop ID, and mixed lanes. Verify full prompt scores and an interior suffix. Reject offsets past the prompt, requested-ID scoring, sampling, and MTP with HTTP 400.
+With `--mtp-steps 0`, compare greedy JSON and SSE scores with top three and both text settings. Check score prefixes and IDs. Repeat with top zero, zero budget, a stop ID, and mixed lanes. Verify full prompt scores and an interior suffix. Compare default-depth scores with K0. Require HTTP 400 for offsets past prompt length, requested-ID scoring, active sampling, and explicit positive depth with scoring.
 
 In the managed Pixi environment, build the score check from the repository root. Run it on a reserved B200.
 

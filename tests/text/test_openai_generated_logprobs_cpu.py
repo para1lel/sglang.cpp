@@ -23,7 +23,7 @@ class OpenAILogprobs(unittest.TestCase):
                                          SGLANG_TEST_SCRIPTED_MTP="1"))
         cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint,
                                                cls.output / "scores.log", "--max-active", "4",
-                                               sampling=False))
+                                               "--mtp-steps", "0", sampling=False))
 
     def payload(self, route, top=3, **options):
         score = {"logprobs": top} if route == TEXT else {
@@ -229,7 +229,27 @@ class OpenAILogprobs(unittest.TestCase):
         rejected = self.exchange(TEXT, legacy([32, 33], 2, logprobs=0), status=400)
         self.assertIn("frozen benchmark", rejected["error"]["message"])
 
-    def test_speculative_boundary(self):
+    def test_implicit_mtp_falls_back_for_logprobs(self):
+        log = self.output / "scores-default.log"
+        with server(self.binary, self.checkpoint, log, "--max-active", "2",
+                    sampling=False) as port:
+            for route in (TEXT, CHAT):
+                with self.subTest(route=route):
+                    payload = self.payload(route, seed=11)
+                    offset = log.stat().st_size
+                    result, _ = self.pair(route, payload, port)
+                    choice, = result["choices"]
+                    self.assertEqual(choice["token_ids"], [32, 33, 34, 35, 36])
+                    self.assertEqual(self.selected(route, choice), [-0.25, -0.5, -0.75, -1, -1.25])
+                    self.assertNotIn(b"cpu scripted mtp tokens=", log.read_bytes()[offset:])
+                    plain = payload | {"logprobs": None if route == TEXT else False}
+                    result = self.exchange(route, plain, port)
+                    unscored, = result["choices"]
+                    self.assertEqual(unscored["token_ids"], choice["token_ids"])
+                    self.assertNotIn("logprobs", unscored)
+                    self.assertIn(b"cpu scripted mtp tokens=", log.read_bytes()[offset:])
+
+    def test_explicit_speculative_boundary(self):
         log = self.output / "scores-mtp.log"
         with server(self.binary, self.checkpoint, log, "--max-active", "2", "--mtp-steps", "3",
                     sampling=False) as port:

@@ -29,6 +29,12 @@ host xmake build -P . -y sglang-generate
 The executables are `./build/bin/sglang-server` and `./build/bin/sglang-generate`.
 Use `host ./build/bin/sglang-generate --help` for token-ID generation options.
 
+Both executables default to four MTP draft steps. Pass `--mtp-steps 0` or `--mtp-k 0`
+to disable draft generation. On a default server launch, requests for logprobs use zero
+draft steps, and a Tensor Core prefix cache resolves the server default to zero steps.
+An explicit positive server depth requires `--fp8-prefill exact` with prefix caching
+and rejects requests for logprobs.
+
 ## Serve token IDs over HTTP
 
 In the same shell, select the UUID of your reserved B200 and start the server.

@@ -133,7 +133,7 @@ The rendered prompt and its output budget share the 262,144-token context. The r
 
 The first request that reaches rendering loads the pinned `tokenizer_config.json` and `chat_template.jinja` from the checkpoint directory. A missing, unreadable, or mismatched chat asset returns HTTP 500 before output starts. Later chat requests retry a failed load. Raw text can still load `tokenizer.json` independently. The benchmark ID route requires neither tokenizer nor chat assets.
 
-Chat and completion routes share [resident memory admission](batch-graphs.md#resident-memory-admission) and [batch graph eligibility](batch-graphs.md). Text-only chat uses the configured [MTP depth](mtp.md#runtime-path), including requests with an output constraint. Media chat uses K0.
+Chat and completion routes share [resident memory admission](batch-graphs.md#resident-memory-admission) and [batch graph eligibility](batch-graphs.md). See the [server MTP policy](mtp.md#runtime-path) for text-only chat, including requests with constraints or token logprobs. Media chat uses K0.
 
 A TCP reset or failed write cancels the request. The server discards pending UTF-8 bytes, buffered reasoning, and incomplete tool calls. It retires the lane before it reuses the slot. See [completion streams](http-server.md#completion-streams) for errors before and after headers. [Request lifecycle](../apps/server/text_completion.cpp#L636)<!-- prefix: "void complet" -->
 
@@ -147,7 +147,7 @@ If both budgets are absent or null, the output limit is 262,142 minus the final 
 
 ### Image and video inputs
 
-Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Each media lane uses private eager K0 state. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Media depth selection](../apps/server/batch_service.cpp#L893)<!-- prefix: "if (media.em" -->
+Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Each media lane uses private eager K0 state. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Media depth selection](../apps/server/batch_service.cpp#L894)<!-- prefix: "job-\u003eoptions" -->
 
 Omit `add_special_tokens` or set it to `false`. Set `enable_thinking` at the top level or as the only member of `chat_template_kwargs`.
 
@@ -170,7 +170,7 @@ Requests must fit the 2 MiB HTTP body limit and the context and vision limits. T
 
 ## Verification
 
-Build the release server. Reserve a B200. Start the server with the pinned checkpoint, `--max-active 1`, and MTP off. Follow the [chat fixture runbook](../tests/text/README.md).
+Build the release server. Reserve a B200. Start the server with the pinned checkpoint and `--max-active 1 --mtp-steps 0`. Follow the [chat fixture runbook](../tests/text/README.md).
 
 ```bash
 python3 -B tests/text/test_native_chat.py --port 17384 -v

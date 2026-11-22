@@ -34,7 +34,7 @@ struct Arguments {
 void usage(std::ostream& output) {
     output << "Usage: sglang-generate (--prompt-ids ID,ID,... | --prompt-file FILE)\n"
            << "                       [--max-new-tokens N] [--stop-token ID] [--top-logits N]\n"
-           << "                       [--mtp-steps N] (0–4, default 0)\n"
+           << "                       [--mtp-steps N | --mtp-k N] (0–4, default 4)\n"
            << "                       [--temperature T] [--top-p P] [--top-k K]\n"
            << "                       [--min-p P] [--seed INTEGER]\n"
            << "                       [--fp8-prefill exact|tensor-core]\n"
@@ -125,6 +125,7 @@ std::vector<int> read_prompt(const std::filesystem::path& path) {
 
 Arguments parse_arguments(int argc, char** argv) {
     Arguments arguments;
+    arguments.options.mtp_steps = 4;
     bool have_prompt = false;
     for (int index = 1; index < argc; ++index) {
         const std::string_view option = argv[index];
@@ -152,7 +153,7 @@ Arguments parse_arguments(int argc, char** argv) {
             arguments.options.stop_token_id = positive_or_zero(value, option);
         } else if (option == "--top-logits") {
             arguments.options.top_logits = positive_or_zero(value, option);
-        } else if (option == "--mtp-steps") {
+        } else if (option == "--mtp-steps" || option == "--mtp-k") {
             arguments.options.mtp_steps = positive_or_zero(value, option);
             if (arguments.options.mtp_steps > sglang::decoder_max_mtp_steps) {
                 throw std::invalid_argument("Expected --mtp-steps in [0, 4]");

@@ -108,7 +108,7 @@ Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L281)<!-- prefix: "int main(int" --> |
+| `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L282)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
 | `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L148)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L226)<!-- prefix: "void execute" --> |
 
@@ -156,7 +156,7 @@ The [width-four batch route](batch-graphs.md#runtime-path) uses a paired BF16 LM
 
 Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decimal IDs with commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus budget must fit 262,144 tokens. The default budget is one. Zero budget returns no tokens and `length`. [CLI options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L75)<!-- prefix: "void validat" -->
 
-The CLI defaults to greedy selection, with ties going to the lowest ID. `--stop-token` emits a match and returns `stop`, even at the budget. Exhaustion returns `length`. There is no implicit EOS. Failures print to stderr and exit 1. See [sampling](text-serving.md#sampling) and [C++ and HTTP constraints](text-serving.md#finite-choice-constraints). [Greedy selection](../src/text_ops.cu#L510)<!-- prefix: "__device__ T" -->
+The CLI defaults to greedy selection, with ties going to the lowest ID. It uses the [K4 default](mtp.md#runtime-path). `--stop-token` emits a match and returns `stop`, even at the budget. Exhaustion returns `length`. There is no implicit EOS. Failures print to stderr and exit 1. See [sampling](text-serving.md#sampling) and [C++ and HTTP constraints](text-serving.md#finite-choice-constraints). [Greedy selection](../src/text_ops.cu#L510)<!-- prefix: "__device__ T" -->
 
 The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/decoder_resources.cpp#L117)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/decoder_resources.cpp#L418)<!-- prefix: "Allocations:" -->
 
@@ -164,7 +164,7 @@ Private CUDA pools separate workspaces at or below 128 rows from larger ones. On
 
 Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L672)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L492)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L689)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L744)<!-- prefix: "cudaError_t " -->
 
-`--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L247)<!-- prefix: "void write_r" -->
+`--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L248)<!-- prefix: "void write_r" -->
 
 #### Verification
 
@@ -177,7 +177,7 @@ Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     "${SGLANG_GENERATE:?set the printed generator path}" \
-    --device 0 --prompt-ids 760,6511,314,9338,369 --max-new-tokens 8 --repeats 2
+    --device 0 --prompt-ids 760,6511,314,9338,369 --max-new-tokens 8 --repeats 2 --mtp-steps 0
 ```
 
 Check the prompt echo, eight in-range IDs, and `length`. Require identical IDs and finish reasons across runs. At budget one, set `--stop-token` to the first native ID. Require one ID and `stop`. At zero budget, require no IDs and `length`. Check reset by repeating the prompt after another request on the same decoder.
@@ -196,7 +196,7 @@ See [MTP](mtp.md) for exact tiled seeding, joint target verification, and per-la
 
 ### Native streaming server
 
-See [native HTTP transport](http-server.md) for admission, overload, health, readiness, and shutdown. `--max-active` accepts 1–32 and defaults to 32. `--max-num-batched-tokens` accepts 1–32,768 and defaults to 8,192. [MTP](mtp.md#runtime-path) supports [exact prefix reuse](prefix-cache.md). Graph replay is [opt-in](batch-graphs.md). [CLI limits](../apps/sglang-server.cpp#L129)<!-- prefix: "} else if (o" -->
+See [native HTTP transport](http-server.md) for admission, overload, health, readiness, and shutdown. `--max-active` accepts 1–32 and defaults to 32. `--max-num-batched-tokens` accepts 1–32,768 and defaults to 8,192. The server uses the [K4 default](mtp.md#runtime-path) and supports [exact prefix reuse](prefix-cache.md). Graph replay is [opt-in](batch-graphs.md). [CLI limits](../apps/sglang-server.cpp#L130)<!-- prefix: "} else if (o" -->
 
 Lanes share weights and own KV, GDN state, and outputs. [Resident memory admission](batch-graphs.md#resident-memory-admission) applies at every capacity.
 

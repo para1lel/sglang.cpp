@@ -6,11 +6,11 @@
 | --- | --- | --- |
 | HTTP control | Match `GET /model_info` and its deprecated alias `GET /get_model_info`. | [Control route](../apps/server/prefix_controls.cpp#L514)<!-- prefix: "if (!model_i" --> |
 | Model discovery | List or retrieve the served model card. | [List dispatch](../apps/server/prefix_controls.cpp#L539)<!-- prefix: "if (path == " --> · [Retrieval dispatch](../apps/server/prefix_controls.cpp#L526)<!-- prefix: "if (model_re" --> · [Shared card writer](../apps/server/prefix_controls.cpp#L461)<!-- prefix: "std::string " --> |
-| Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L173)<!-- prefix: "std::string " --> |
+| Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L177)<!-- prefix: "std::string " --> |
 | Checkpoint | Supply the supported model type and architecture. | [Checkpoint identity](../include/sglang/checkpoint.h#L47)<!-- prefix: "inline const" --> |
-| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L632)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L306)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L195)<!-- prefix: "std::string " --> |
-| Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L62)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L280)<!-- prefix: "BatchService" --> |
-| Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L832)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L345)<!-- prefix: "counters.gen" --> |
+| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L632)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L312)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L199)<!-- prefix: "std::string " --> |
+| Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L63)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L285)<!-- prefix: "BatchService" --> |
+| Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L835)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L345)<!-- prefix: "counters.gen" --> |
 
 ## Runtime path
 
@@ -49,7 +49,7 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 | `model_path`, `tokenizer_path`, `served_model_name` | Strings. Both paths expose the effective checkpoint directory. The served ID is `"Qwen3.8-27B-FP8"`. |
 | `launch_command` | String starting with `sglang-server`. It records explicit options in input order, including repeats. |
 | `max_running_requests`, `max_num_batched_tokens` | Integer lane limit from `--max-active` and aggregate target-token budget per scheduler step. Defaults are 32 and 8,192. |
-| `mtp_steps`, `prefix_cache_entries` | Integer configured draft depth and prefix entry capacity, respectively. Zero disables the corresponding feature. |
+| `mtp_steps`, `prefix_cache_entries` | Integer [server draft depth](mtp.md#runtime-path) and prefix entry capacity. Zero disables the corresponding feature. |
 | `fp8_prefill`, `sampling_defaults` | Strings selecting the prefill policy (`"exact"` or `"tensor-core"`) and sampling defaults (`"model"` or `"openai"`). |
 | `reasoning_parser`, `tool_call_parser` | JSON `null` when disabled. Enabled values are `"qwen3"` and `"qwen3_coder"`, respectively. |
 | `eager`, `trace_batches`, `batch_cuda_graphs` | Booleans for eager execution, batch tracing, and batch graph eligibility. `--eager` disables batch graphs even when the command includes `--batch-cuda-graphs`. |
@@ -64,7 +64,7 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 | `num_running_reqs` | Integer count of admitted user generation items still in scheduler slots. It excludes waiting HTTP work and internal health jobs. |
 | `generation_tokens_total` | Cumulative integer count of published user output IDs, including additional MTP IDs. It advances at scheduler publication, independently of socket delivery and prefix reuse. Health generation contributes zero. |
 
-The command retains switches and validated numeric or enumerated operands. It replaces every `--checkpoint` operand, including superseded paths, with `'<redacted>'`. The two public path fields still identify the selected checkpoint. Environment variables, executable paths, HTTP headers, query values, and request bodies do not supply command text. [Argument recording](../apps/sglang-server.cpp#L81)<!-- prefix: "Arguments pa" --> · [Startup interval](../apps/sglang-server.cpp#L268)<!-- prefix: "const auto s" --> · [Listener timestamp](../apps/sglang-server.cpp#L289)<!-- prefix: "const std::c" -->
+The command retains switches and validated numeric or enumerated operands. It replaces every `--checkpoint` operand, including superseded paths, with `'<redacted>'`. The two public path fields still identify the selected checkpoint. Environment variables, executable paths, HTTP headers, query values, and request bodies do not supply command text. [Argument recording](../apps/sglang-server.cpp#L82)<!-- prefix: "Arguments pa" --> · [Startup interval](../apps/sglang-server.cpp#L273)<!-- prefix: "const auto s" --> · [Listener timestamp](../apps/sglang-server.cpp#L295)<!-- prefix: "const std::c" -->
 
 Pinned SGLang exposes resolved settings and a launch command at the top level, with startup durations, per-DP state, version, frontend, and inline-system capability. The native schema reports its own settings and counters. It omits Python-specific options, `kv_events`, and upstream `last_gen_throughput` and `memory_usage` measurements. [Pinned Python routes](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L888)<!-- prefix: "@app.get(\"/g" --> · [Resolved fields](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/server_utils.py#L206)<!-- prefix: "def build_se" --> · [Scheduler measurements](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/scheduler_components/internal_state.py#L75)<!-- prefix: "state[\"last_" -->
 
@@ -84,7 +84,7 @@ Retrieval ignores the query and any successfully parsed body. After shared path 
 
 ### Server-info targets
 
-Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L535)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L773)<!-- prefix: "bool BatchSe" -->
+Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L535)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L776)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 

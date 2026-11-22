@@ -239,7 +239,7 @@ def server(args):
     port = native.choose_port()
     command = [str(args.binary.resolve()), "--checkpoint", str(args.checkpoint.resolve()),
                "--device", "0", "--port", str(port), "--max-active", str(args.width),
-               "--fp8-prefill", args.policy, "--trace-batches"]
+               "--fp8-prefill", args.policy, "--mtp-steps", "0", "--trace-batches"]
     if getattr(args, "max_num_batched_tokens", None) is not None:
         command += ["--max-num-batched-tokens", str(args.max_num_batched_tokens)]
     if args.route == "graph":

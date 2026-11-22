@@ -20,7 +20,8 @@ The 511-token policy probe uses explicit `exact` at `5c5281f11a5ba5a25950f84cbf8
 Each score digest covers the little-endian 32-bit token ID and IEEE 754 binary32 logit for
 each ranked score, in output step and rank order.
 
-The HTTP check starts one server with its default capacity, token budget, and FP8 prefill policy.
+The CLI and HTTP checks set `--mtp-steps 0` for the row-wise oracle. The first HTTP server keeps
+the default capacity, token budget, and FP8 prefill policy.
 It verifies the advertised capacity of 32 and budget of 8,192, then checks complete streams
 against the frozen oracle. The 511-token probe distinguishes `exact` from `tensor-core` by the
 first generated token. A separate server runs the same prompts and generation budgets with

@@ -211,7 +211,7 @@ def server(args, evidence, width, profile=False, *, flags=(), expected_health=No
     evidence.mkdir()
     port = choose_port()
     command = [str(args.binary), "--checkpoint", str(args.checkpoint), "--device",
-               str(args.device), "--port", str(port)]
+               str(args.device), "--port", str(port), "--mtp-steps", "0"]
     if width is not None:
         command += ["--max-active", width]
     if width in ("2", "4"):

@@ -122,7 +122,7 @@ def check_ordinary(port, log, out, width, tokens, label, cases):
 
 def check_bounded(args):
     cap = args.small_tokens
-    flags = ["--max-active", "4", TOKEN_OPTION, str(cap)]
+    flags = ["--max-active", "4", "--mtp-steps", "0", TOKEN_OPTION, str(cap)]
     with server(args, "bounded", flags) as (port, log, out, health):
         check_caps(health, 4, cap)
         for length in (cap - 1, cap, cap + 1):
@@ -157,7 +157,7 @@ def check_mixed(port, log, out, cap):
 
 
 def check_default(args):
-    with server(args, "default", []) as (port, log, out, health):
+    with server(args, "default", ["--mtp-steps", "0"]) as (port, log, out, health):
         check_caps(health, DEFAULT_ACTIVE, DEFAULT_TOKENS)
         cases = http.FIXTURES
         offset = log.stat().st_size
@@ -186,7 +186,7 @@ def check_default_media(port, log, out, fixture):
 
 
 def check_pressure(args):
-    with server(args, "pressure", []) as (port, log, out, health):
+    with server(args, "pressure", ["--mtp-steps", "0"]) as (port, log, out, health):
         check_caps(health, DEFAULT_ACTIVE, DEFAULT_TOKENS)
         count = DEFAULT_TOKENS // DEFAULT_ACTIVE
         cases = [prompt_case(f"lane-{lane}", count + (lane == 0), lane)
@@ -195,7 +195,8 @@ def check_pressure(args):
 
 
 def check_explicit(args, width):
-    with server(args, f"width-{width}", ["--max-active", str(width)]) as (port, log, out, health):
+    flags = ["--max-active", str(width), "--mtp-steps", "0"]
+    with server(args, f"width-{width}", flags) as (port, log, out, health):
         check_caps(health, width, DEFAULT_TOKENS)
         cases = http.FIXTURES
         if width == 1:
@@ -395,7 +396,8 @@ def check_fault(port, evidence, marker, log, case):
 def check_kv_fault(args, case):
     marker = args.evidence / case / "armed"
     environment = {**os.environ, "BATCH_KV_FAULT_MARKER": str(marker), "BATCH_KV_FAULT_MODE": case}
-    with server(args, case, [], binary=args.fault_binary, environment=environment) as (
+    flags = ["--mtp-steps", "0"]
+    with server(args, case, flags, binary=args.fault_binary, environment=environment) as (
         port, log, evidence, health
     ):
         check_caps(health, DEFAULT_ACTIVE, DEFAULT_TOKENS)

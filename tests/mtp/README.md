@@ -9,8 +9,8 @@ python tests/mtp/run_native.py \
   --evidence artifacts/mtp-native/run
 ```
 
-The runner compares explicit MTP steps 0 through 4 with the same binary’s default
-target-only path. Native generation checks greedy IDs, ordered top-64 BF16 logits,
+The runner uses explicit `--mtp-steps 0` as its target-only control and compares
+the default generator run with explicit K4. Native generation checks greedy IDs, ordered top-64 BF16 logits,
 stop and length trimming, the 128-token KV page boundary, and MTP counters.
 Single-request HTTP compares token streams. Batch bursts check exact token events,
 finish reasons, usage, and joint target rows at widths 2 through 4 and depths 1

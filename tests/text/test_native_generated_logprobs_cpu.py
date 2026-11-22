@@ -33,10 +33,11 @@ class NativeGeneratedLogprobs(unittest.TestCase):
         cls.gate = cls.output / "generated-logprobs-gate"
         Path(f"{cls.gate}.0").touch()
         cls.enterClassContext(patch.dict("os.environ", SGLANG_TEST_CHAT_OUTPUT_IDS=str(script),
-                                         SGLANG_TEST_BATCH_STEP_GATE=str(cls.gate)))
+                                         SGLANG_TEST_BATCH_STEP_GATE=str(cls.gate),
+                                         SGLANG_TEST_SCRIPTED_MTP="1"))
         cls.log = cls.output / "generated-logprobs.log"
         cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint, cls.log,
-                                               "--max-active", "2"))
+                                               "--max-active", "2", "--mtp-steps", "0"))
 
     def exchange(self, payload, expected=200, *, port=None):
         connection, response = request(port or self.port, GENERATE, payload)
@@ -231,6 +232,34 @@ class NativeGeneratedLogprobs(unittest.TestCase):
                                           "stream": False})
         self.assertEqual(reused["output_ids"], [self.hello])
         self.scores(reused, 2, prompt=payload["input_ids"], start=1)
+
+    def test_implicit_mtp_falls_back_for_logprobs(self):
+        log = self.output / "generated-logprobs-default.log"
+        payload = prompts(5) | {"input_ids": [32, 33], "return_logprob": True,
+                                "top_logprobs_num": 2, "logprob_start_len": 0}
+        with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
+            final = self.exchange(payload, port=port)
+            self.assertEqual(final["output_ids"], [self.hello, *self.snow, self.stop_id])
+            self.scores(final, 2, prompt=payload["input_ids"])
+            frames = self.exchange(payload | {"stream": True}, port=port)
+            self.assertEqual([len(frame["output_ids"]) for frame in frames], [1, 2, 3, 4, 5])
+            for frame in frames:
+                self.scores(frame, 2, prompt=payload["input_ids"])
+            self.assertNotIn("cpu scripted mtp tokens=", log.read_text())
+            plain = self.exchange(payload | {"return_logprob": False}, port=port)
+            self.assertEqual(plain["output_ids"], final["output_ids"])
+            self.scores(plain, None)
+            self.assertIn("cpu scripted mtp tokens=", log.read_text())
+            offset = log.stat().st_size
+            mixed = self.exchange(payload | {
+                "input_ids": [payload["input_ids"], payload["input_ids"]],
+                "return_logprob": [True, False],
+            }, port=port)
+            self.assertEqual([result["output_ids"] for result in mixed],
+                             [final["output_ids"], final["output_ids"]])
+            self.scores(mixed[0], 2, prompt=payload["input_ids"])
+            self.scores(mixed[1], None)
+            self.assertEqual(log.read_bytes()[offset:].count(b"cpu scripted mtp tokens="), 1)
 
     def test_validation_before_any_admission(self):
         start = len(receipts(self.log))

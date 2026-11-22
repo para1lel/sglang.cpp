@@ -510,6 +510,30 @@ class Routes(unittest.TestCase):
                 status, headers, data = self.wire(self.port, "HEAD", encoded)
                 self.assertEqual((status, headers["Allow"], data), (405, "GET", b""))
 
+    def test_mtp_launch_depth_with_prefix_cache(self):
+        prefix = ("--prefix-cache-entries", "1")
+        tensor = (*prefix, "--fp8-prefill", "tensor-core")
+        cases = (
+            ("default", (), 4, 0),
+            ("target-only", ("--mtp-steps", "0"), 0, 0),
+            ("exact-prefix", prefix, 4, 1),
+            ("tensor-prefix", tensor, 0, 1),
+            ("tensor-prefix-target-only", (*tensor, "--mtp-k", "0"), 0, 1),
+        )
+        for name, flags, depth, entries in cases:
+            with self.subTest(name=name):
+                log = self.output / f"mtp-launch-{name}.log"
+                with server(self.binary, self.checkpoint, log, *flags) as port:
+                    info = self.control(port, "/server_info")
+                    self.assertEqual(info["mtp_steps"], depth)
+                    self.assertEqual(info["prefix_cache_entries"], entries)
+
+        result = subprocess.run([str(self.binary), *tensor, "--mtp-k", "4"],
+                                env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("requires --fp8-prefill exact", result.stderr)
+
     def test_flush_cache_methods_and_timeout(self):
         flushed = (b"Cache flushed.\nPlease check backend logs for more details. "
                    b"(When there are running or waiting requests, the operation will not be "

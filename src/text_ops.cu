@@ -680,7 +680,7 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
         wide = wide && supports_wide_fp8(weight, entry.input, in_width);
     }
     if (wide && count == mlp_verify_rows) {
-        if (is_fp8_mlp_shape(out_width, in_width)) {
+        if (is_fp8_mlp_or_gdn_shape(out_width, in_width)) {
             return launch_fp8_mlp_staged(weight, weight_scales, out_width, in_width, projections,
                                         stream);
         }

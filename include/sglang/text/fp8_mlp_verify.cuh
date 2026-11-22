@@ -11,13 +11,17 @@ static_assert(decoder::hidden_size % mlp_verify_outputs == 0 &&
               decoder::intermediate_size % mlp_verify_outputs == 0);
 static_assert(decoder::hidden_size % (mlp_verify_groups * text_fp8_group_size) == 0 &&
               decoder::intermediate_size % (mlp_verify_groups * text_fp8_group_size) == 0);
+static_assert(text_gdn_qkv_width % mlp_verify_outputs == 0 &&
+              text_gdn_value_width % mlp_verify_outputs == 0 &&
+              text_gdn_value_width % (mlp_verify_groups * text_fp8_group_size) == 0);
 
-bool is_fp8_mlp_shape(int out_width, int in_width) {
-    const bool gate_or_up =
-        out_width == decoder::intermediate_size && in_width == decoder::hidden_size;
-    const bool down =
-        out_width == decoder::hidden_size && in_width == decoder::intermediate_size;
-    return gate_or_up || down;
+bool is_fp8_mlp_or_gdn_shape(int out_width, int in_width) {
+    if (in_width == decoder::hidden_size) {
+        return out_width == decoder::intermediate_size || out_width == text_gdn_qkv_width ||
+               out_width == text_gdn_value_width;
+    }
+    return out_width == decoder::hidden_size &&
+           (in_width == decoder::intermediate_size || in_width == text_gdn_value_width);
 }
 
 struct Fp8MlpStage {

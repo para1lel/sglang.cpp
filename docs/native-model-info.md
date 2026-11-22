@@ -4,11 +4,11 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP control | Match `GET /model_info` and its deprecated alias `GET /get_model_info`. | [Control route](../apps/server/prefix_controls.cpp#L431)<!-- prefix: "if (!model_i" --> |
-| Model discovery | List or retrieve the served model card. | [List dispatch](../apps/server/prefix_controls.cpp#L458)<!-- prefix: "if (request." --> · [Retrieval dispatch](../apps/server/prefix_controls.cpp#L443)<!-- prefix: "constexpr st" --> · [Shared card writer](../apps/server/prefix_controls.cpp#L362)<!-- prefix: "std::string " --> |
+| HTTP control | Match `GET /model_info` and its deprecated alias `GET /get_model_info`. | [Control route](../apps/server/prefix_controls.cpp#L513)<!-- prefix: "if (!model_i" --> |
+| Model discovery | List or retrieve the served model card. | [List dispatch](../apps/server/prefix_controls.cpp#L538)<!-- prefix: "if (path == " --> · [Retrieval dispatch](../apps/server/prefix_controls.cpp#L525)<!-- prefix: "if (model_re" --> · [Shared card writer](../apps/server/prefix_controls.cpp#L460)<!-- prefix: "std::string " --> |
 | Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L173)<!-- prefix: "std::string " --> |
 | Checkpoint | Supply the supported model type and architecture. | [Checkpoint identity](../include/sglang/checkpoint.h#L47)<!-- prefix: "inline const" --> |
-| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L487)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L306)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L195)<!-- prefix: "std::string " --> |
+| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L617)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L306)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L195)<!-- prefix: "std::string " --> |
 | Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L62)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L280)<!-- prefix: "BatchService" --> |
 | Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L825)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L322)<!-- prefix: "counters.gen" --> |
 
@@ -39,7 +39,7 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 
 ### Server information
 
-`GET /server_info` and its alias `GET /get_server_info` return the same JSON schema. Upstream deprecates the alias. The reader calls the batch service directly, even with all generation lanes occupied or prefix reuse disabled. Each call returns the startup configuration and a fresh scheduler snapshot. [Reader dispatch](../apps/server/prefix_controls.cpp#L531)<!-- prefix: "if (!generat" -->
+`GET /server_info` and its alias `GET /get_server_info` return the same JSON schema. Upstream deprecates the alias. The reader calls the batch service directly, even with all generation lanes occupied or prefix reuse disabled. Each call returns the startup configuration and a fresh scheduler snapshot. [Reader dispatch](../apps/server/prefix_controls.cpp#L619)<!-- prefix: "write_json(c" -->
 
 | Top-level field | JSON type and meaning |
 | --- | --- |
@@ -72,19 +72,19 @@ Pinned SGLang exposes resolved settings and a launch command at the top level, w
 
 ### Model-info targets
 
-Send an empty GET to the exact target. A query, trailing slash, or other unmatched target returns HTTP 404. An exact GET with a body also returns HTTP 404. An exact target with a different valid method returns HTTP 405 and `Allow: GET`. The response is `{"detail":"Method Not Allowed"}`. For HEAD, the server sends only the headers. Malformed HTTP still fails in the reader. [Method response](../apps/server/http.cpp#L481)<!-- prefix: "void write_g" --> · [Request line](../apps/server/http.cpp#L127)<!-- prefix: "HttpRequest " -->
+Send an empty GET to either model-info path. Both ignore the query and follow the [shared redirect rules](http-server.md#request-targets-and-redirects). A GET with a body or an unknown path returns HTTP 404. Other valid methods on either model-info path return HTTP 405 and `Allow: GET`. The response is `{"detail":"Method Not Allowed"}`. For HEAD, the server sends only the headers. Malformed HTTP still fails in the reader. [Method response](../apps/server/http.cpp#L592)<!-- prefix: "void write_g" --> · [Request line](../apps/server/http.cpp#L128)<!-- prefix: "HttpRequest " -->
 
 Use [`/ready`](http-server.md) to check the decoder worker. Use a [tokenization request](native-tokenization.md#verification) to check tokenizer access.
 
 ### Discovery targets and errors
 
-After HTTP parsing, the list route returns HTTP 404 for other methods, a nonempty body, or a query suffix.
+The list route ignores the query. After HTTP parsing, methods other than GET or a nonempty body return HTTP 404.
 
-Retrieval ignores the query and any successfully parsed body. The ID is the entire path suffix after `/v1/models/`. The server percent-decodes it once, keeps literal `+` and slashes, and replaces invalid UTF-8. IDs match case-sensitively. An empty or unknown ID returns HTTP 404 with an `error` object. It contains `message` (`The model '<id>' does not exist`), `type` (`invalid_request_error`), `param` (`model`), and `code` (`model_not_found`). Other methods return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the reader sends only the headers. [ID decoding](../apps/server/prefix_controls.cpp#L376)<!-- prefix: "std::string " --> · [Lookup and errors](../apps/server/prefix_controls.cpp#L399)<!-- prefix: "void retriev" --> · [Method response](../apps/server/http.cpp#L474)<!-- prefix: "void write_m" -->
+Retrieval ignores the query and any successfully parsed body. After shared path decoding and route matching, the ID is the entire suffix after `/v1/models/`, including any trailing slashes. An interior line feed prevents the retrieval route from matching. IDs match case-sensitively. An empty or unknown ID returns HTTP 404 with an `error` object. It contains `message` (`The model '<id>' does not exist`), `type` (`invalid_request_error`), `param` (`model`), and `code` (`model_not_found`). Other methods return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the reader sends only the headers. [ID decoding](../apps/server/http.cpp#L317)<!-- prefix: "std::string " --> · [Lookup and errors](../apps/server/prefix_controls.cpp#L474)<!-- prefix: "void retriev" --> · [Method response](../apps/server/http.cpp#L521)<!-- prefix: "void write_m" -->
 
 ### Server-info targets
 
-Both paths match case-sensitively through the first `?`. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash or misspelled path returns HTTP 404. Other valid methods on either path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../include/sglang/server/http.h#L31)<!-- prefix: "std::string_" --> · [Method reply](../apps/server/http.cpp#L474)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L766)<!-- prefix: "bool BatchSe" -->
+Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L521)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L766)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 
@@ -158,7 +158,14 @@ jq -e '.port == 17384 and .device == 0 and .max_running_requests == 2 and
     .startup_time.server_e2e > 0 and (.internal_states | length) == 1 and
     (.internal_states[0] | .ready and .effective_max_running_requests_per_dp == 2 and
     .num_running_reqs == 0 and .generation_tokens_total == 0)' "$samples/server_info"
-test "$(curl -sS -o /dev/null -w '%{http_code}' "$base/server_info/")" = 404
+for route in server_info get_server_info; do
+    status=$(curl -sS -X PUT -D "$samples/headers" -o "$samples/body" \
+        -w '%{http_code}' "$base/$route//?test=1")
+    test "$status" = 307
+    test ! -s "$samples/body"
+    tr -d '\r' < "$samples/headers" | grep -Fxi "Location: $base/$route?test=1"
+done
+test "$(curl -sS -o /dev/null -w '%{http_code}' "$base/server_info_unknown")" = 404
 curl -fsS "$base/health_generate"
 curl -fsS "$base/server_info" | jq -S . | diff - "$samples/server_info"
 ```

@@ -2,6 +2,7 @@
 
 #include "sglang/json.h"
 #include "sglang/server/completions.h"
+#include "sglang/utf8.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -132,20 +133,23 @@ HttpRequest parse_request_line(std::string_view line) {
         !std::all_of(method.begin(), method.end(), token_character)) {
         throw HttpError("400 Bad Request", "Expected an HTTP/1.1 request line");
     }
-    const auto path = line.substr(first + 1, last - first - 1);
-    if (path.empty() || path.front() != '/' ||
-        std::any_of(path.begin(), path.end(), [](unsigned char character) {
+    const auto target = line.substr(first + 1, last - first - 1);
+    if (target.empty() || target.front() != '/' ||
+        std::any_of(target.begin(), target.end(), [](unsigned char character) {
             return character <= 32 || character >= 127;
         })) {
         throw HttpError("400 Bad Request", "Expected an HTTP origin-form request target");
     }
-    return {std::string(method), std::string(path), {}};
+    const auto separator = target.find('?');
+    const auto query = separator == std::string_view::npos
+        ? std::string_view{} : target.substr(separator + 1);
+    return {std::string(method), decode_url(target.substr(0, separator)), {}, {},
+            std::string(query)};
 }
 
-std::size_t content_length(std::string_view headers, const HttpRequest& request) {
+std::size_t content_length(std::string_view headers, HttpRequest& request) {
     std::optional<std::size_t> length;
     std::optional<std::string_view> content_type;
-    bool host = false;
     while (!headers.empty()) {
         const auto line = take_line(headers);
         const auto colon = line.find(':');
@@ -161,10 +165,10 @@ std::size_t content_length(std::string_view headers, const HttpRequest& request)
             throw HttpError("400 Bad Request", "Invalid HTTP header value");
         }
         if (ascii_case_equal(name, "Host")) {
-            if (host || value.empty()) {
+            if (!request.host.empty() || value.empty()) {
                 throw HttpError("400 Bad Request", "Expected one nonempty Host header");
             }
-            host = true;
+            request.host = value;
         } else if (ascii_case_equal(name, "Content-Length")) {
             if (length || value.empty()) {
                 throw HttpError("400 Bad Request", "Invalid Content-Length");
@@ -185,13 +189,13 @@ std::size_t content_length(std::string_view headers, const HttpRequest& request)
             throw HttpError("400 Bad Request", "Unsupported HTTP request encoding or expectation");
         }
     }
-    if (!host) {
+    if (request.host.empty()) {
         throw HttpError("400 Bad Request", "Missing Host header");
     }
     if (length.value_or(0) > max_body_bytes) {
         throw HttpError("413 Content Too Large", "Request body exceeds 2 MiB");
     }
-    if ((request.method == "POST" && request.path == "/v1/completions") ||
+    if ((request.method == "POST" && request.route_path() == "/v1/completions") ||
         generate_route(request) == GenerateRoute::allowed) {
         if (!length) {
             throw HttpError("411 Length Required", "Expected Content-Length");
@@ -206,8 +210,8 @@ std::size_t content_length(std::string_view headers, const HttpRequest& request)
         throw HttpError("400 Bad Request",
                         "Unsupported Media Type: Only 'application/json' is allowed");
     }
-    if (request.method == "POST" && separate_reasoning_path(request) && length.value_or(0) != 0 &&
-        !json_media_type(content_type.value_or(""))) {
+    if (request.method == "POST" && request.route_path() == separate_reasoning_route &&
+        length.value_or(0) != 0 && !json_media_type(content_type.value_or(""))) {
         throw HttpError("400 Bad Request", "Input should be a valid dictionary");
     }
     return length.value_or(0);
@@ -277,7 +281,7 @@ bool read_pending(IncomingRequest& incoming, short events,
         handle(incoming.socket, std::move(*incoming.request));
     } catch (const HttpError& error) {
         if (incoming.request && (tokenization_route(*incoming.request) != TokenizationRoute::none ||
-                                 separate_reasoning_path(*incoming.request))) {
+                                 incoming.request->route_path() == separate_reasoning_route)) {
             write_tokenization_error(incoming.socket, error.status, error.status.substr(4),
                                      error.what());
         } else {
@@ -310,8 +314,43 @@ void stop_serving() { stop_requested.store(true, std::memory_order_relaxed); }
 
 bool stopping() { return stop_requested.load(std::memory_order_relaxed); }
 
+std::string decode_url(std::string_view text, bool form) {
+    std::string decoded;
+    decoded.reserve(text.size());
+    while (!text.empty()) {
+        if (text.front() == '%' && text.size() >= 3) {
+            unsigned byte = 0;
+            const auto end = text.data() + 3;
+            const auto parsed = std::from_chars(text.data() + 1, end, byte, 16);
+            if (parsed.ec == std::errc{} && parsed.ptr == end) {
+                decoded += static_cast<char>(byte);
+                text.remove_prefix(3);
+                continue;
+            }
+        }
+        decoded += form && text.front() == '+' ? ' ' : text.front();
+        text.remove_prefix(1);
+    }
+    if (valid_utf8(decoded)) {
+        return decoded;
+    }
+    Utf8Stream utf8;
+    auto repaired = utf8.push(decoded);
+    repaired += utf8.finish();
+    return repaired;
+}
+
+std::string_view matchable_route_path(std::string_view path) {
+    if (!path.empty() && path.back() == '\n') {
+        path.remove_suffix(1);
+    }
+    return path;
+}
+
+std::string_view HttpRequest::route_path() const { return matchable_route_path(path); }
+
 GenerateRoute generate_route(const HttpRequest& request) {
-    if (request.path_without_query() != "/generate") {
+    if (request.route_path() != "/generate") {
         return GenerateRoute::none;
     }
     return request.method == "POST" || request.method == "PUT"
@@ -319,11 +358,12 @@ GenerateRoute generate_route(const HttpRequest& request) {
 }
 
 TokenizationRoute tokenization_route(const HttpRequest& request) {
+    const auto path = request.route_path();
     if (request.method == "POST") {
-        if (request.path == "/tokenize" || request.path == "/v1/tokenize") {
+        if (path == "/tokenize" || path == "/v1/tokenize") {
             return TokenizationRoute::tokenize;
         }
-        if (request.path == "/detokenize" || request.path == "/v1/detokenize") {
+        if (path == "/detokenize" || path == "/v1/detokenize") {
             return TokenizationRoute::detokenize;
         }
     }
@@ -455,8 +495,11 @@ static bool write_response(const Socket& connection, std::string_view status,
                            std::string_view header = std::string_view{}, bool head_only = false) {
     std::string response = "HTTP/1.1 ";
     response += status;
-    response += "\r\nConnection: close\r\nContent-Type: ";
-    response += content_type;
+    response += "\r\nConnection: close";
+    if (!content_type.empty()) {
+        response += "\r\nContent-Type: ";
+        response += content_type;
+    }
     response += header;
     response += "\r\nContent-Length: ";
     response += std::to_string(body.size());
@@ -471,11 +514,79 @@ bool write_json(const Socket& connection, std::string_view status, std::string_v
     return write_response(connection, status, "application/json", json);
 }
 
+void write_raw_response(const Socket& connection, std::string_view status, std::string_view body) {
+    write_response(connection, status, {}, body);
+}
+
 void write_method_not_allowed(const Socket& connection, std::string_view methods, bool head_only) {
     std::string header = "\r\nAllow: ";
     header += methods;
     write_response(connection, "405 Method Not Allowed", "application/json",
                    R"({"detail":"Method Not Allowed"})", header, head_only);
+}
+
+static bool valid_redirect_host(std::string_view authority) {
+    const auto end = authority.find(':', authority.front() == '[' ? authority.find(']') : 0);
+    const auto host = authority.substr(0, end);
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        in6_addr address{};
+        const std::string literal(host.substr(1, host.size() - 2));
+        if (inet_pton(AF_INET6, literal.c_str(), &address) != 1) {
+            return false;
+        }
+    } else if (host.empty() || std::any_of(host.begin(), host.end(), [](unsigned char character) {
+        return !ascii_alphanumeric(character) &&
+               std::string_view("._~%!$&'()*+,;=-").find(character) == std::string_view::npos;
+    })) {
+        return false;
+    }
+    if (end == std::string_view::npos) {
+        return true;
+    }
+    unsigned port = 0;
+    const auto last = authority.data() + authority.size();
+    const auto parsed = std::from_chars(authority.data() + end + 1, last, port);
+    return parsed.ec == std::errc{} && parsed.ptr == last && port <= 65535;
+}
+
+static std::string redirect_host(const Socket& connection, std::string_view host) {
+    if (!host.empty() && valid_redirect_host(host)) {
+        return std::string(host);
+    }
+    sockaddr_in address{};
+    socklen_t length = sizeof(address);
+    if (getsockname(connection.get(), reinterpret_cast<sockaddr*>(&address), &length) == 0 &&
+        address.sin_family == AF_INET) {
+        const auto port = ntohs(address.sin_port);
+        if (port != 80) {
+            return "127.0.0.1:" + std::to_string(port);
+        }
+    }
+    return "127.0.0.1";
+}
+
+static void append_redirect_url(std::string& header, std::string_view text) {
+    constexpr std::string_view safe = "-._~:/%#?=@[]!$&'()*+,;";
+    constexpr std::string_view hex = "0123456789ABCDEF";
+    for (const unsigned char byte : text) {
+        if (ascii_alphanumeric(byte) || safe.find(byte) != std::string_view::npos) {
+            header += static_cast<char>(byte);
+        } else {
+            header += '%';
+            header += hex[byte >> 4];
+            header += hex[byte & 0xf];
+        }
+    }
+}
+
+void write_redirect(const Socket& connection, const HttpRequest& request, std::string_view path) {
+    std::string header = "\r\nLocation: http://" + redirect_host(connection, request.host);
+    append_redirect_url(header, path);
+    if (!request.query.empty()) {
+        header += '?';
+        append_redirect_url(header, request.query);
+    }
+    write_response(connection, "307 Temporary Redirect", {}, {}, header);
 }
 
 void write_get_only(const Socket& connection, bool head_only) {
@@ -492,16 +603,6 @@ void write_tokenization_error(const Socket& connection, std::string_view status,
     body += status.substr(0, 3);
     body += '}';
     write_json(connection, status, body);
-}
-
-bool separate_reasoning_path(const HttpRequest& request) {
-    const auto path = std::string_view(request.path).substr(0, request.path.find('?'));
-    return path == "/separate_reasoning";
-}
-
-void write_post_only(const Socket& connection, bool head_only) {
-    write_response(connection, "405 Method Not Allowed", "application/json",
-                   R"({"detail":"Method Not Allowed"})", "\r\nAllow: POST", head_only);
 }
 
 void write_internal_server_error(const Socket& connection) {

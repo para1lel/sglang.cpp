@@ -6,13 +6,15 @@ Send `POST /separate_reasoning` with text that already contains model output. Th
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP reader | Match the path, check the media type, and dispatch the request. | [Path match](../../apps/server/http.cpp#L497)<!-- prefix: "bool separat" --> · [Media types](../../apps/server/http.cpp#L116)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L516)<!-- prefix: "if (separate" --> |
-| Request and response | Validate the input, select the parser, and serialize the result. | [Request validation](../../apps/server/prefix_controls.cpp#L90)<!-- prefix: "void separat" --> · [Response writer](../../apps/server/prefix_controls.cpp#L64)<!-- prefix: "void write_s" --> |
+| HTTP reader | Match the path, check the media type, and dispatch the request. | [Path match](../../apps/server/prefix_controls.cpp#L609)<!-- prefix: "if (request." --> · [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L611)<!-- prefix: "separate_rea" --> |
+| Request and response | Validate the input, select the parser, and serialize the result. | [Request validation](../../apps/server/prefix_controls.cpp#L92)<!-- prefix: "void separat" --> · [Response writer](../../apps/server/prefix_controls.cpp#L66)<!-- prefix: "void write_s" --> |
 | Qwen3 parser | Split the supplied text at literal reasoning and tool markers. | [Text split](../../apps/server/chat_output.cpp#L753)<!-- prefix: "SeparatedRea" --> · [Pinned SGLang Qwen3 detector](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/parser/reasoning_parser.py#L447)<!-- prefix: "class Qwen3D" --> |
 
 ## Runtime path
 
-The HTTP reader handles the exact `/separate_reasoning` path with or without a query string. It reads the supplied body under the ordinary [HTTP limits](../http-server.md#http-admission-and-shutdown). Parsing runs on the reader without a completion slot, tokenizer call, or model inference. The request selects its parser independently of the [chat output parser](../chat-serving.md#qwen-reasoning-and-tool-calls).
+The HTTP reader splits the raw target at the first literal `?`, then percent-decodes the path once. For example, `POST /separate%5Freasoning?x=1` reaches `/separate_reasoning` and ignores the query. A trailing slash follows the [shared redirect rules](../http-server.md#request-targets-and-redirects).
+
+The reader reads the supplied body under the ordinary [HTTP limits](../http-server.md#http-admission-and-shutdown). Parsing runs on the reader without a completion slot, tokenizer call, or model inference. The request selects its parser independently of the [chat output parser](../chat-serving.md#qwen-reasoning-and-tool-calls).
 
 `qwen3`, `dots`, `interns1`, and `nanbeige` return the whole input as ordinary text if it has no literal `<think>`. `qwen3-thinking` and `minimax` start in reasoning even without that marker. Parser names are case-insensitive for ASCII and must match without leading or trailing spaces.
 
@@ -34,7 +36,8 @@ Unknown fields are ignored. If a key appears more than once, its last value appl
 
 | Condition | Response |
 | --- | --- |
-| Method other than POST | HTTP 405 with `Allow: POST` and `{"detail":"Method Not Allowed"}`. HEAD omits the body. |
+| Trailing slash, including with an unsupported method | HTTP 307 with an empty body. `Location` uses the canonical path and preserves the original nonempty query with URL quoting. |
+| Method other than POST on the canonical path | HTTP 405 with `Allow: POST` and `{"detail":"Method Not Allowed"}`. HEAD omits the body. |
 | Invalid JSON, request shape, field, or media type | HTTP 400 with JSON fields `object: "error"`, `message`, `type: "Bad Request"`, `param: null`, and `code: 400`. |
 | `deepseek-v4`, `deepseekv4`, `deepseek-v41`, or `deepseekv41` in exact lowercase | HTTP 400 with the same fields and `type: "400"`. These names require a model adapter. |
 | Any other parser name outside the supported set | HTTP 500 with plain text `Internal Server Error`. |
@@ -67,3 +70,5 @@ Require HTTP 200 and the following JSON values.
 ```
 
 Repeat with omitted `return_blocks` and require only the two strings. With `qwen3-thinking`, check an input that begins with reasoning and has only a closing marker. Check an incomplete marker and a tool suffix for exact text preservation. For an invalid field or method, require the status and response shape in the failure table.
+
+Repeat the POST at `/separate%5Freasoning?tag=a%2Fb` and require the same JSON. Send GET to that target and require HTTP 405 with `Allow: POST`. Send GET to `/separate%5Freasoning/?tag=a%2Fb` and require HTTP 307 with `Location: http://127.0.0.1:17384/separate_reasoning?tag=a%2Fb`.

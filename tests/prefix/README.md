@@ -12,9 +12,10 @@ mkdir -p "$out"
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
 "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
     -Iinclude -I"$toolkit/include" tests/prefix/reader_queue.cpp \
-    apps/server/{prefix_controls,http,completions}.cpp src/{json,utf8}.cpp -Wl,--gc-sections \
+    apps/server/{prefix_controls,chat_output,flush_cache,http,completions}.cpp src/{json,utf8}.cpp \
+    -Wl,--gc-sections \
     -Wl,--wrap=accept4 -o "$out/reader-queue"
-for mode in --cache-off --cache-on --reader-failure --worker-failure; do
+for mode in --cache-off --cache-on --reader-failure --worker-failure --flush; do
     timeout 20s "$out/reader-queue" "$mode"
 done
 ```
@@ -30,6 +31,9 @@ respond while reset acknowledgement is held, and the queued completion starts af
 Shutdown closes active, queued, and partial connections. The failure modes inject a fatal accept
 error and an unavailable decoder worker, and check error propagation, readiness, and descriptor
 cleanup.
+
+The flush mode holds a completion at its final response. It checks ordered timeout budgets,
+busy replies, reader responsiveness, and separate reset acknowledgements after the lane is idle.
 
 ## CUDA state and routes
 

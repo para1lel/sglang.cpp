@@ -106,6 +106,7 @@ struct BufferedBurst {
 Gates gates;
 Gate reset_ack;
 std::atomic<bool> delay_reset{false};
+std::atomic<int> cache_resets{0};
 std::atomic<bool> worker_failed{false};
 std::atomic<bool> fail_accept{false};
 std::atomic<BufferedBurst*> buffered_burst{nullptr};
@@ -150,6 +151,7 @@ BatchMetrics BatchService::metrics() const {
 
 bool BatchService::reset_prefix_cache() {
     rethrow_failure();
+    ++cache_resets;
     if (delay_reset.exchange(false)) {
         gates.enter(reset_ack);
     }
@@ -378,6 +380,58 @@ void require_completion(const Socket& client, RequestId id) {
     require(response.size() >= body.size() &&
             response.compare(response.size() - body.size(), body.size(), body) == 0,
             "Completion response reached the wrong client");
+}
+
+void require_flush(const Socket& client, std::string_view status, std::string_view body) {
+    const auto response = read_closed(client);
+    require_status(response, status);
+    const auto headers = response.find("\r\n\r\n");
+    require(headers != std::string::npos && response.substr(headers + 4) == body,
+            "Incorrect flush result");
+}
+
+void check_flush_queue(Server& server) {
+    const auto active = server.completion(terminal);
+    gates.wait_entered(server.gate(terminal));
+    const auto initial_resets = cache_resets.load();
+    const auto started = Clock::now();
+    const auto first = server.submit(request("POST", "/flush_cache?timeout=.45"));
+    server.control("/health");
+    const auto second = server.submit(request("GET", "/flush_cache?timeout=.25"));
+    server.control("/ready");
+    const auto third = server.submit(request("GET", "/flush_cache"));
+    require_status(read_closed(server.reset_request()), "409");
+    pollfd pending[] = {{first.get(), POLLIN, 0}, {second.get(), POLLIN, 0},
+                        {third.get(), POLLIN, 0}};
+    constexpr std::string_view expired = "Timed out waiting for idle state.";
+    constexpr int timeout_ms = std::chrono::milliseconds(timeout).count();
+    require(poll(pending, 3, timeout_ms) > 0 && (pending[0].revents & POLLIN),
+            "A flush bypassed the busy FIFO head or the head did not expire");
+    require_flush(first, "400", expired);
+    require(Clock::now() - started >= 450ms, "First flush expired early");
+    require(poll(pending + 1, 2, timeout_ms) > 0 && (pending[1].revents & POLLIN),
+            "The zero-timeout flush bypassed the second waiter or the waiter did not expire");
+    require_flush(second, "400", expired);
+    require(Clock::now() - started >= 700ms, "Second timeout overlapped the first budget");
+    require_flush(third, "400", "Flush cache failed.\n");
+    require(cache_resets == initial_resets, "A busy flush reached the cache");
+
+    const auto waiting = server.submit(request("GET", "/flush_cache?timeout=60"));
+    server.control("/health");
+    const auto following = server.submit(request("POST", "/flush_cache"));
+    server.control("/ready");
+    pollfd deferred[] = {{waiting.get(), POLLIN, 0}, {following.get(), POLLIN, 0}};
+    require(poll(deferred, 2, 50) == 0, "A deferred flush completed before idle");
+    gates.release(server.gate(terminal));
+    require_completion(active, terminal);
+    constexpr std::string_view flushed = "Cache flushed.\nPlease check backend logs for more "
+        "details. (When there are running or waiting requests, the operation will not be "
+        "performed.)\n";
+    require_flush(waiting, "200", flushed);
+    require_flush(following, "200", flushed);
+    require(cache_resets == initial_resets + 2, "Deferred flushes did not each reset the cache");
+    require_status(read_closed(server.reset_request()), "200");
+    require(cache_resets == initial_resets + 3, "Legacy reset did not reach the cache");
 }
 
 constexpr std::string_view incomplete_header = "GET /ready HTTP/1.1\r\nHost: localhost\r\n";
@@ -619,12 +673,12 @@ extern "C" int __wrap_accept4(int listener, sockaddr* address, socklen_t* length
 int main(int argc, char** argv) {
     const char* phase = "configuration";
     try {
-        require(argc == 2,
-                "Expected --cache-off, --cache-on, --reader-failure or --worker-failure");
+        require(argc == 2, "Expected a reader queue test mode");
         const std::string_view mode = argv[1];
         const bool reader_failure = mode == "--reader-failure";
         const bool broken_worker = mode == "--worker-failure";
-        const bool cached = mode == "--cache-on" || reader_failure;
+        const bool flush = mode == "--flush";
+        const bool cached = mode == "--cache-on" || reader_failure || flush;
         require(cached || broken_worker || mode == "--cache-off", "Unknown transport test mode");
         const auto descriptors = fd_count();
         const sglang::Decoder decoder(std::filesystem::path{});
@@ -640,7 +694,14 @@ int main(int argc, char** argv) {
         }
         {
             Server server(service, cached ? 2 : 0);
-            if (broken_worker) {
+            if (flush) {
+                phase = "ordered cache flush";
+                server.control("/server_info/", "404");
+                server.control("/get_server_info/", "404");
+                check_flush_queue(server);
+                stop_serving();
+                server.join();
+            } else if (broken_worker) {
                 phase = "worker failure";
                 worker_failed = true;
                 server.control("/health");

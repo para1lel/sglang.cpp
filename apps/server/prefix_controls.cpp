@@ -5,12 +5,12 @@
 #include "sglang/server/batch_service.h"
 #include "sglang/server/chat_output.h"
 #include "sglang/server/completions.h"
+#include "sglang/server/flush_cache.h"
 #include "sglang/server/http.h"
 #include "sglang/utf8.h"
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <ctime>
@@ -26,6 +26,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr auto generation_health_timeout = std::chrono::seconds(20);
+constexpr auto flush_probe_retry = std::chrono::milliseconds(10);
+constexpr std::string_view model_prefix = "/v1/models/";
 
 std::string lowercase_ascii(std::string_view text) {
     std::string result(text);
@@ -153,11 +155,23 @@ struct HealthCheck {
     Clock::time_point started;
 };
 
-bool chat_route(const HttpRequest& request) { return request.path == "/v1/chat/completions"; }
+struct FlushCache {
+    Socket connection;
+    double timeout;
+};
+
+bool chat_route(const HttpRequest& request) {
+    return request.route_path() == "/v1/chat/completions";
+}
 
 bool completion_route(const HttpRequest& request) {
     return request.method == "POST" &&
-           (request.path == "/v1/completions" || chat_route(request));
+           (request.route_path() == "/v1/completions" || chat_route(request));
+}
+
+bool model_retrieval_route(std::string_view path) {
+    return path.substr(0, model_prefix.size()) == model_prefix &&
+           path.find('\n') == std::string_view::npos;
 }
 
 template <typename Handle>
@@ -279,6 +293,7 @@ public:
     void run(int slot);
     void run_aborted();
     void run_health();
+    void run_flushes();
     void stop();
 
 private:
@@ -288,12 +303,24 @@ private:
         ~Lease();
     };
 
+    struct CacheReset {
+        ConnectionQueue& queue;
+        ~CacheReset();
+    };
+
     void route(Socket& connection, HttpRequest request);
     std::optional<Completion> take(Lease& lease);
+    bool server_info_route(std::string_view path) const {
+        return server_info_ && (path == "/server_info" || path == "/get_server_info");
+    }
+    bool redirects_to(std::string_view path) const;
     void serve_control(Socket& connection, const HttpRequest& request);
     void queue_health(Socket& connection, const HttpRequest& request);
     void queue_reset(Socket& connection, const HttpRequest& request);
+    bool idle_for_cache_reset();
     void reset_cache(const Socket& connection);
+    void queue_flush(Socket& connection, double timeout);
+    FlushCacheResult flush_cache(double timeout);
     void discard_disconnected();
 
     BatchService& service_;
@@ -310,8 +337,10 @@ private:
     std::condition_variable changed_;
     std::condition_variable abort_ready_;
     std::condition_variable health_ready_;
+    std::condition_variable cache_ready_;
     std::list<Completion> pending_;
     std::list<HealthCheck> health_checks_;
+    std::list<FlushCache> flushes_;
     std::optional<Socket> reset_;
     int running_ = 0;
     bool resetting_ = false;
@@ -321,20 +350,39 @@ private:
 ConnectionQueue::Lease::~Lease() {
     if (active) {
         const std::lock_guard lock(queue.mutex_);
-        --queue.running_;
+        if (--queue.running_ == 0) {
+            queue.cache_ready_.notify_one();
+        }
     }
 }
 
 void ConnectionQueue::discard_disconnected() {
+    const bool had_pending = !pending_.empty();
     pending_.remove_if([](const auto& job) { return disconnected(job.connection); });
+    if (had_pending && pending_.empty()) {
+        cache_ready_.notify_one();
+    }
+}
+
+bool ConnectionQueue::idle_for_cache_reset() {
+    discard_disconnected();
+    return pending_.empty() && running_ == 0 && !resetting_;
+}
+
+ConnectionQueue::CacheReset::~CacheReset() {
+    {
+        const std::lock_guard lock(queue.mutex_);
+        queue.resetting_ = false;
+    }
+    queue.changed_.notify_all();
+    queue.cache_ready_.notify_one();
 }
 
 void ConnectionQueue::queue_reset(Socket& connection, const HttpRequest& request) {
     require_empty_body(request);
     {
         const std::lock_guard lock(mutex_);
-        discard_disconnected();
-        if (!pending_.empty() || running_ != 0 || resetting_) {
+        if (!idle_for_cache_reset()) {
             throw HttpError("409 Conflict", "Cannot reset prefix cache with active requests");
         }
         reset_.emplace(std::move(connection));
@@ -344,6 +392,7 @@ void ConnectionQueue::queue_reset(Socket& connection, const HttpRequest& request
 }
 
 void ConnectionQueue::reset_cache(const Socket& connection) {
+    const CacheReset reset{*this};
     handle_errors(connection, [&] {
         if (!disconnected(connection)) {
             if (!service_.reset_prefix_cache()) {
@@ -352,11 +401,60 @@ void ConnectionQueue::reset_cache(const Socket& connection) {
             write_json(connection, "200 OK", R"({"success":true})");
         }
     });
+}
+
+void ConnectionQueue::queue_flush(Socket& connection, double timeout) {
     {
         const std::lock_guard lock(mutex_);
-        resetting_ = false;
+        flushes_.push_back({std::move(connection), timeout});
     }
-    changed_.notify_all();
+    cache_ready_.notify_one();
+}
+
+FlushCacheResult ConnectionQueue::flush_cache(double timeout) {
+    using Seconds = std::chrono::duration<double>;
+    const auto started = Clock::now();
+    std::unique_lock lock(mutex_);
+    while (!closing_ && !stopping()) {
+        const bool idle = idle_for_cache_reset();
+        if (idle) {
+            resetting_ = true;
+            lock.unlock();
+            {
+                const CacheReset reset{*this};
+                if (service_.reset_prefix_cache()) {
+                    return FlushCacheResult::flushed;
+                }
+            }
+            lock.lock();
+        }
+        if (timeout == 0.0) {
+            return FlushCacheResult::busy;
+        }
+        const auto remaining = Seconds(timeout) - Seconds(Clock::now() - started);
+        if (remaining <= Seconds::zero()) {
+            return FlushCacheResult::timed_out;
+        }
+        const auto wait_limit = idle ? Seconds(flush_probe_retry) : Seconds(60);
+        cache_ready_.wait_for(lock, std::min(remaining, wait_limit));
+    }
+    return FlushCacheResult::busy;
+}
+
+void ConnectionQueue::run_flushes() {
+    for (;;) {
+        std::unique_lock lock(mutex_);
+        cache_ready_.wait(lock, [&] { return closing_ || !flushes_.empty(); });
+        if (closing_) {
+            return;
+        }
+        auto work = std::move(flushes_.front());
+        flushes_.pop_front();
+        lock.unlock();
+        handle_errors(work.connection, [&] {
+            write_flush_cache(work.connection, flush_cache(work.timeout));
+        });
+    }
 }
 
 std::string model_card() {
@@ -373,52 +471,36 @@ void write_models(const Socket& connection) {
     write_json(connection, "200 OK", R"({"object":"list","data":[)" + model_card() + "]}");
 }
 
-std::string decode_model_id(std::string_view path) {
-    std::string decoded;
-    decoded.reserve(path.size());
-    while (!path.empty()) {
-        if (path.front() == '%' && path.size() >= 3) {
-            unsigned byte = 0;
-            const auto end = path.data() + 3;
-            const auto parsed = std::from_chars(path.data() + 1, end, byte, 16);
-            if (parsed.ec == std::errc{} && parsed.ptr == end) {
-                decoded += static_cast<char>(byte);
-                path.remove_prefix(3);
-                continue;
-            }
-        }
-        decoded += path.front();
-        path.remove_prefix(1);
-    }
-    Utf8Stream utf8;
-    auto model = utf8.push(decoded);
-    model += utf8.finish();
-    return model;
-}
-
 void retrieve_model(const Socket& connection, const HttpRequest& request,
-                    std::string_view model_path) {
+                    std::string_view model) {
     if (request.method != "GET") {
         write_get_only(connection, request.method == "HEAD");
         return;
     }
-    const auto model = decode_model_id(model_path);
     if (model == model_name) {
         write_json(connection, "200 OK", model_card());
         return;
     }
     std::string body = R"({"error":{"message":)";
-    json::append_quoted(body, "The model '" + model + "' does not exist");
+    json::append_quoted(body, "The model '" + std::string(model) + "' does not exist");
     body += R"(,"type":"invalid_request_error","param":"model","code":"model_not_found"}})";
     write_json(connection, "404 Not Found", body);
 }
 
 void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& request) {
-    if (request.path == "/health_generate") {
+    const auto flush = read_flush_cache(connection, request);
+    if (flush.matched) {
+        if (flush.timeout) {
+            queue_flush(connection, *flush.timeout);
+        }
+        return;
+    }
+    const auto path = request.route_path();
+    if (path == "/health_generate") {
         queue_health(connection, request);
         return;
     }
-    if (abort_ && request.method == "POST" && request.path == "/abort_request") {
+    if (abort_ && request.method == "POST" && path == "/abort_request") {
         {
             const std::lock_guard lock(mutex_);
             discard_disconnected();
@@ -429,7 +511,7 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
         return;
     }
     if (!model_info_.empty() &&
-        (request.path == "/model_info" || request.path == "/get_model_info")) {
+        (path == "/model_info" || path == "/get_model_info")) {
         if (request.method != "GET") {
             write_get_only(connection, request.method == "HEAD");
             return;
@@ -440,26 +522,24 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
         write_json(connection, "200 OK", model_info_);
         return;
     }
-    constexpr std::string_view model_prefix = "/v1/models/";
-    const auto path = request.path_without_query();
-    if (path.substr(0, model_prefix.size()) == model_prefix) {
+    if (model_retrieval_route(path)) {
         retrieve_model(connection, request, path.substr(model_prefix.size()));
         return;
     }
     if (request.method == "GET" && request.body.empty()) {
-        if (request.path == "/health") {
+        if (path == "/health") {
             write_json(connection, "200 OK", health_);
             return;
         }
-        if (request.path == "/ready") {
+        if (path == "/ready") {
             write_readiness(connection, service_.ready());
             return;
         }
-        if (request.path == "/v1/models") {
+        if (path == "/v1/models") {
             write_models(connection);
             return;
         }
-        if (prefix_controls_ && request.path == "/metrics") {
+        if (prefix_controls_ && path == "/metrics") {
             std::string body;
             {
                 const std::lock_guard lock(mutex_);
@@ -471,26 +551,18 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
         }
     }
     if (prefix_controls_ && request.method == "POST") {
-        if (request.path == "/reset_prefix_cache") {
+        if (path == "/reset_prefix_cache") {
             queue_reset(connection, request);
             return;
         }
-        if (request.path == "/start_profile") {
+        if (path == "/start_profile") {
             start_profile(connection, service_, request);
             return;
         }
-        if (request.path == "/stop_profile") {
+        if (path == "/stop_profile") {
             stop_profile(connection, service_, request);
             return;
         }
-    }
-    if (server_info_ && (path == "/server_info" || path == "/get_server_info")) {
-        if (request.method == "GET") {
-            write_json(connection, "200 OK", server_info_());
-        } else {
-            write_get_only(connection, request.method == "HEAD");
-        }
-        return;
     }
     if (prefix_controls_) {
         throw HttpError("404 Not Found", "Unknown native server route");
@@ -512,12 +584,41 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
     throw HttpError("404 Not Found", routes.c_str());
 }
 
+bool ConnectionQueue::redirects_to(std::string_view path) const {
+    return path == "/flush_cache" || path == "/health" || path == "/health_generate" ||
+           path == "/ready" || path == "/v1/completions" || path == "/v1/chat/completions" ||
+           path == "/v1/models" || model_retrieval_route(path) ||
+           (generate_ && path == "/generate") || (abort_ && path == "/abort_request") ||
+           (tokenize_ && (path == "/tokenize" || path == "/v1/tokenize" ||
+                          path == "/detokenize" || path == "/v1/detokenize")) ||
+           (!model_info_.empty() && (path == "/model_info" || path == "/get_model_info")) ||
+           path == separate_reasoning_route || server_info_route(path) ||
+           (prefix_controls_ && (path == "/metrics" || path == "/reset_prefix_cache" ||
+                                  path == "/start_profile" || path == "/stop_profile"));
+}
+
 void ConnectionQueue::route(Socket& connection, HttpRequest request) {
-    if (separate_reasoning_path(request)) {
+    const std::string_view path = request.path;
+    if (!path.empty() && path.back() == '/' && !model_retrieval_route(path)) {
+        const auto canonical = path.substr(0, path.find_last_not_of('/') + 1);
+        if (redirects_to(matchable_route_path(canonical))) {
+            write_redirect(connection, request, canonical);
+            return;
+        }
+    }
+    if (request.route_path() == separate_reasoning_route) {
         if (request.method == "POST") {
             separate_reasoning(connection, request.body);
         } else {
-            write_post_only(connection, request.method == "HEAD");
+            write_method_not_allowed(connection, "POST", request.method == "HEAD");
+        }
+        return;
+    }
+    if (server_info_route(request.route_path())) {
+        if (request.method == "GET") {
+            write_json(connection, "200 OK", server_info_());
+        } else {
+            write_get_only(connection, request.method == "HEAD");
         }
         return;
     }
@@ -634,6 +735,9 @@ void ConnectionQueue::run_aborted() {
         }
         auto work = std::move(*found);
         pending_.erase(found);
+        if (pending_.empty()) {
+            cache_ready_.notify_one();
+        }
         lock.unlock();
         if (!disconnected(work.connection)) {
             handle_errors(work.connection, [&] {
@@ -691,11 +795,13 @@ void ConnectionQueue::stop() {
         const std::lock_guard lock(mutex_);
         closing_ = true;
         pending_.clear();
+        flushes_.clear();
         reset_.reset();
     }
     changed_.notify_all();
     abort_ready_.notify_one();
     health_ready_.notify_one();
+    cache_ready_.notify_one();
 }
 
 }
@@ -711,7 +817,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
                           tokenize, model_info, abort, server_info);
     std::vector<std::thread> workers;
-    workers.reserve(max_active + (abort ? 2 : 1));
+    workers.reserve(max_active + (abort ? 3 : 2));
     std::mutex failure_mutex;
     std::exception_ptr failure;
     const auto stop_on_error = [&] {
@@ -725,6 +831,13 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
         workers.emplace_back([&] {
             try {
                 queue.run_health();
+            } catch (...) {
+                stop_on_error();
+            }
+        });
+        workers.emplace_back([&] {
+            try {
+                queue.run_flushes();
             } catch (...) {
                 stop_on_error();
             }

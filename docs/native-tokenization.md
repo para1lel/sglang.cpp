@@ -7,7 +7,7 @@ checkpoint token IDs. `/v1/tokenize` and `/v1/detokenize` are aliases.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L321)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L203)<!-- prefix: "if (tokeniza" --> · [Queue admission](../apps/server/prefix_controls.cpp#L515)<!-- prefix: "void Connect" --> |
+| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L360)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L207)<!-- prefix: "if (tokeniza" --> · [Queue admission](../apps/server/prefix_controls.cpp#L600)<!-- prefix: "void Connect" --> |
 | Tokenization worker | Validate request fields and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L300)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_completion.cpp#L18)<!-- prefix: "const Tokeni" --> |
 
 ## Runtime path
@@ -71,12 +71,12 @@ Boolean spellings such as `"false"` and `"yes"`, and rejects `null`.
 `max_model_len` reports the checkpoint context of 262,144 tokens. The routes
 apply the HTTP limits of 8 KiB for headers and 2 MiB for bodies
 without a generation context budget. The JSON parser rejects duplicate
-keys and nesting beyond 32 containers. [Vocabulary](../include/sglang/tokenizer/tokenizer.h#L13)<!-- prefix: "inline const" --> · [Context](../include/sglang/tokenizer/tokenizer.h#L16)<!-- prefix: "inline const" --> · [HTTP limits](../apps/server/http.cpp#L29)<!-- prefix: "constexpr st" --> · [JSON depth](../src/json.cpp#L83)<!-- prefix: "if (depth ==" -->
+keys and nesting beyond 32 containers. [Vocabulary](../include/sglang/tokenizer/tokenizer.h#L13)<!-- prefix: "inline const" --> · [Context](../include/sglang/tokenizer/tokenizer.h#L16)<!-- prefix: "inline const" --> · [HTTP limits](../apps/server/http.cpp#L30)<!-- prefix: "constexpr st" --> · [JSON depth](../src/json.cpp#L83)<!-- prefix: "if (depth ==" -->
 
 Route errors return a JSON object with `object: "error"`, `message`, `type`,
 `param: null`, and an integer `code` matching the HTTP status. For example,
 detokenizing `{"tokens":[248320]}` returns HTTP 400 with this body.
-[Error writer](../apps/server/http.cpp#L485)<!-- prefix: "void write_t" -->
+[Error writer](../apps/server/http.cpp#L596)<!-- prefix: "void write_t" -->
 
 ```json
 {"object":"error","message":"Invalid input: token id 248320 is out of vocabulary; valid range is [0, 248320).","type":"BadRequestError","param":null,"code":400}

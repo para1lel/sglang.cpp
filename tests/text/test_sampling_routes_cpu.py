@@ -327,16 +327,19 @@ class Routes(unittest.TestCase):
         self.assertEqual(seen["prompt_tokens"], prompt_tokens)
         self.assertEqual(seen["budget"], self.context - CHAT_CONTEXT_RESERVE - prompt_tokens)
 
+    def wire(self, port, method, path, payload=None, headers=None):
+        with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
+            connection.request(method, path, payload, headers or {})
+            with connection.getresponse() as response:
+                return response.status, response.headers, response.read()
+
     def control(self, port, path, *, method="GET", payload=None, status=200,
                 content_type="application/json"):
-        with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
-            connection.request(method, path, payload)
-            with connection.getresponse() as response:
-                data = response.read()
-                self.assertEqual(response.status, status, (method, path, data))
-                self.assertEqual(response.headers.get_content_type(), content_type)
-                self.assertEqual(response.getheader("Content-Length"), str(len(data)))
-                return json.loads(data) if content_type == "application/json" else data
+        actual, headers, data = self.wire(port, method, path, payload)
+        self.assertEqual(actual, status, (method, path, data))
+        self.assertEqual(headers.get_content_type(), content_type)
+        self.assertEqual(headers["Content-Length"], str(len(data)))
+        return json.loads(data) if content_type == "application/json" else data
 
     def check_model_discovery(self, port, log, *, prefix_controls):
         started = int(time.time())
@@ -429,9 +432,11 @@ class Routes(unittest.TestCase):
 
     def test_model_info_http_routing(self):
         for path in MODEL_INFO:
-            for suffix in ("/", "?x=1", "_extra"):
-                with self.subTest(target=path + suffix):
-                    self.assertIn("error", self.control(self.port, path + suffix, status=404))
+            with self.subTest(path=path):
+                self.assert_redirect("GET", path + "/?x=1", path + "?x=1")
+                self.assertEqual(self.control(self.port, path + "?x=1"),
+                                 self.control(self.port, path))
+                self.assertIn("error", self.control(self.port, path + "_extra", status=404))
             self.assertIn("error", self.control(self.port, path, payload=b"{}", status=404))
             for method in ("POST", "PUT", "HEAD", "OPTIONS", "GE(T"):
                 with self.subTest(path=path, method=method):
@@ -451,6 +456,91 @@ class Routes(unittest.TestCase):
                             self.assertEqual(data, b"")
                         else:
                             self.assertEqual(json.loads(data), {"detail": "Method Not Allowed"})
+
+    def assert_redirect(self, method, target, location):
+        status, headers, body = self.wire(self.port, method, target)
+        self.assertEqual(status, 307, (target, body))
+        self.assertEqual(headers["Location"], f"http://127.0.0.1:{self.port}{location}")
+        self.assertEqual((headers["Content-Length"], body), ("0", b""))
+
+    def test_model_path_decoded_once_after_raw_query_split(self):
+        card = self.control(self.port, f"/v1/%6dodels%2F{MODEL}?q=%3F?tail")
+        self.assertEqual((card["id"], card["object"]), (MODEL, "model"))
+        for suffix, model in (
+            ("%2551wen3.8-27B-FP8", "%51wen3.8-27B-FP8"),
+            ("a%2Fb%3F%23+c?ignored=%2F", "a/b?#+c"), ("", ""), (MODEL + "/", MODEL + "/"),
+        ):
+            with self.subTest(suffix=suffix):
+                result = self.control(self.port, f"/v1/models/{suffix}", status=404)
+                self.assertEqual(result["error"], {
+                    "message": f"The model '{model}' does not exist",
+                    "type": "invalid_request_error", "param": "model", "code": "model_not_found",
+                })
+        self.assertEqual(self.wire(self.port, "GET", f"/v1/models%252F{MODEL}")[0], 404)
+
+    def test_encoded_put_and_redirect(self):
+        self.assert_redirect("PUT", "/%67enerate%2F?x=%23?y", "/generate?x=%23?y")
+        target = "/%67enerate?stream=false&trace=%2F"
+        status, headers, data = self.wire(self.port, "DELETE", target)
+        self.assertEqual((status, set(headers["Allow"].split(", "))), (405, {"POST", "PUT"}))
+        self.assertEqual(json.loads(data), {"detail": "Method Not Allowed"})
+        payload = {"input_ids": [32], "stream": True,
+                   "sampling_params": {"max_new_tokens": 1, "temperature": 0}}
+        status, headers, data = self.wire(self.port, "PUT", target, json.dumps(payload),
+                                          {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        frames = data.split(b"\n\n")
+        self.assertEqual(frames[-2:], [b"data: [DONE]", b""])
+        final = json.loads(frames[-3].removeprefix(b"data: "))
+        self.assertEqual(len(final["output_ids"]), 1)
+        self.assertEqual(final["meta_info"]["finish_reason"], {"type": "length", "length": 1})
+
+    def test_server_info_aliases_and_redirects(self):
+        expected = self.control(self.port, "/server_info")
+        self.assertEqual(expected["port"], self.port)
+        self.assertEqual(expected["internal_states"][0]["num_running_reqs"], 0)
+        for path in ("/server_info", "/get_server_info"):
+            with self.subTest(path=path):
+                self.exchange(TEXT, body(TEXT, max_tokens=1, ignore_eos=True))
+                expected["internal_states"][0]["generation_tokens_total"] += 1
+                encoded = path.replace("_info", "%5finfo")
+                self.assertEqual(self.control(self.port, encoded + "?query=%3f"), expected)
+                self.assert_redirect("GET", encoded + "%2f?q=%252F", path + "?q=%252F")
+                status, headers, data = self.wire(self.port, "HEAD", encoded)
+                self.assertEqual((status, headers["Allow"], data), (405, "GET", b""))
+
+    def test_flush_cache_methods_and_timeout(self):
+        flushed = (b"Cache flushed.\nPlease check backend logs for more details. "
+                   b"(When there are running or waiting requests, the operation will not be "
+                   b"performed.)\n")
+        for method, query in (("GET", ""), ("POST", "?timeout=bad&time%6Fut=0"),
+                              ("GET", "?timeout=1e%2B3")):
+            with self.subTest(method=method, query=query):
+                status, headers, data = self.wire(self.port, method, "/flush%5fcache" + query)
+                self.assertEqual((status, data), (200, flushed))
+                self.assertEqual(headers["Content-Length"], str(len(flushed)))
+                self.assertIsNone(headers["Content-Type"])
+        self.assert_redirect("POST", "/flush_cache%2F?timeout=%FF", "/flush_cache?timeout=%FF")
+        status, headers, data = self.wire(self.port, "HEAD", "/flush_cache")
+        self.assertEqual((status, set(headers["Allow"].split(", ")), data),
+                         (405, {"GET", "POST"}, b""))
+        for method, value, decoded, diagnostic in (
+            ("GET", "1e+3", "1e 3", "valid number"),
+            ("POST", "-1", "-1", "greater than or equal to 0"),
+            ("GET", "NaN", "NaN", "greater than or equal to 0"),
+            ("POST", "0&timeout=%FF", "\ufffd", "valid number"),
+        ):
+            with self.subTest(method=method, value=value):
+                error = self.control(self.port, "/flush_cache?timeout=" + value,
+                                     method=method, status=400)
+                message = error.pop("message")
+                self.assertEqual(error, {
+                    "object": "error", "type": "Bad Request", "param": None, "code": 400,
+                })
+                self.assertIn("query.timeout", message)
+                self.assertIn(diagnostic, message)
+                self.assertIn(decoded, message)
 
     def test_text_omitted_sampling_and_budget(self):
         packet, seen = self.exchange(TEXT, body(TEXT, ignore_eos=True))

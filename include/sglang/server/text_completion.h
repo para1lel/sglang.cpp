@@ -9,6 +9,8 @@
 
 namespace sglang::server {
 
+struct ResponsesRequest;
+
 struct TextRequest {
     std::vector<int> prompt;
     DecoderOptions options;
@@ -17,6 +19,7 @@ struct TextRequest {
     bool return_token_ids = false;
     bool chat = false;
     bool anthropic = false;
+    const ResponsesRequest* responses = nullptr;
     std::vector<std::string> stop_text;
     std::optional<MediaPrompt> media;
     ChatOutputOptions chat_output;

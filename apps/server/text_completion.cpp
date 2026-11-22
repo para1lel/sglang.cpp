@@ -1,10 +1,10 @@
-#include "sglang/server/text_completion.h"
-#include "sglang/server/text_stop.h"
-
 #include "sglang/json.h"
 #include "sglang/server/anthropic_count.h"
 #include "sglang/server/anthropic_messages.h"
 #include "sglang/server/http.h"
+#include "sglang/server/responses.h"
+#include "sglang/server/text_completion.h"
+#include "sglang/server/text_stop.h"
 #include "sglang/utf8.h"
 
 #include <algorithm>
@@ -270,6 +270,9 @@ public:
         if (request.anthropic) {
             anthropic_.emplace(connection, stream, request.stream, prompt.size());
         }
+        if (request.responses) {
+            responses_.emplace(connection, stream, *request.responses, request);
+        }
         if (request.chat_output.enabled()) {
             parser_.emplace(request.chat_output);
         }
@@ -281,12 +284,16 @@ public:
 
     bool token(int id, const ScoreRow* score = nullptr);
     bool start() {
+        if (responses_) return responses_->start();
         return !request_.stream || stream_.start();
     }
     bool admit_messages(std::size_t cached) { anthropic_->admit(cached); return true; }
     void fail_messages(std::string_view type, const char* message) {
         anthropic_->fail(type, message);
     }
+    void fail_responses() { responses_->fail(); }
+    bool queue_responses() { return responses_->queue(); }
+    bool responses_cancelled() const { return responses_->cancelled(); }
     bool poll() { return stream_.poll(); }
     void finish(const DecoderResult& result, std::size_t count);
     std::optional<std::string> finish_choice(const DecoderResult& result, std::size_t count);
@@ -321,6 +328,7 @@ private:
     Utf8Stream utf8_;
     std::optional<ChatOutputParser> parser_;
     std::optional<AnthropicMessages> anthropic_;
+    std::optional<ResponsesOutput> responses_;
     std::string text_;
     std::string reasoning_;
     std::vector<ToolCall> tool_calls_;
@@ -490,6 +498,10 @@ bool TextResponse::accept(const ChatOutputEvent& delta, const int* id) {
         write_failed_ = !anthropic_->accept(delta);
         return !write_failed_;
     }
+    if (responses_) {
+        write_failed_ = !responses_->accept(delta);
+        return !write_failed_;
+    }
     std::string call_id;
     if (delta.kind == ChatOutputKind::tool_call) {
         static std::atomic<std::uint64_t> next_call_id{1};
@@ -527,19 +539,25 @@ bool TextResponse::project(std::string_view text, const int* id, const ScoreRow*
         if (request_.stream && request_.return_token_ids && id) {
             return event(choice_chunk(prefix_, choice({}, id, 1)));
         }
-    } else if (anthropic_) {
-        return accept({ChatOutputKind::content, text, 0, {}}, id) && !disconnected(connection_);
+    } else if (anthropic_ || responses_) {
+        if (!accept({ChatOutputKind::content, text, 0, {}}, id)) {
+            return false;
+        }
     } else if (!request_.stream) {
         text_ += text;
     } else if (!text.empty() || (id && request_.return_token_ids) || score) {
         return event(choice_chunk(prefix_, choice(text, id, id ? 1 : 0, nullptr, nullptr, {},
                                                   score)));
     }
+    if (responses_ && request_.responses->background) {
+        return !stopping() && !responses_cancelled();
+    }
     return !disconnected(connection_);
 }
 
 bool TextResponse::token(int id, const ScoreRow* score) {
     std::string delta;
+    if (responses_) responses_->token(tokenizer_.piece(id, false));
     if (!request_.options.stops_at(id)) {
         delta = utf8_.push(tokenizer_.piece(id, true));
     }
@@ -600,6 +618,12 @@ void TextResponse::finish(const DecoderResult& result, std::size_t count) {
     if (anthropic_) {
         if (const auto* reason = finish_output(result)) {
             anthropic_->finish(reason, count, result.cached_prompt_tokens);
+        }
+        return;
+    }
+    if (responses_) {
+        if (const auto* reason = finish_output(result)) {
+            responses_->finish(reason, count, result.cached_prompt_tokens);
         }
         return;
     }
@@ -669,11 +693,17 @@ void complete_text(const Socket& connection, const TextRequest& request,
     }
     EventStream stream(connection);
     TextResponse response(connection, stream, tokenizer.get(), request, request.prompt);
+    const bool background = request.responses && request.responses->background;
+    if (background && !response.queue_responses()) return;
+    const auto cancelled = [&] {
+        return background ? stopping() || response.responses_cancelled() :
+            disconnected(connection);
+    };
     DecoderCallbacks callbacks{
         [&](int token) { return response.token(token); },
-        [&] { return disconnected(connection); },
+        cancelled,
         [&] { return response.start(); },
-        [&] { return response.poll(); },
+        [&] { return background ? !cancelled() : response.poll(); },
     };
     if (request.anthropic && request.stream) {
         callbacks.on_admitted = {};
@@ -684,10 +714,20 @@ void complete_text(const Socket& connection, const TextRequest& request,
     try {
         const auto result = generate(request.prompt, request.options, callbacks);
         const bool complete = result.finish_reason != DecoderFinishReason::cancelled;
-        if ((complete || response.stopped()) && !disconnected(connection)) {
+        if ((complete || response.stopped()) && !cancelled()) {
             response.finish(result, result.output_token_ids.size());
         }
     } catch (const std::exception& error) {
+        if (request.responses) {
+            if (!background && !stream.started() &&
+                dynamic_cast<const std::invalid_argument*>(&error)) {
+                responses_error(connection, 400, error.what());
+            } else {
+                std::cerr << "Responses generation failed: " << error.what() << '\n';
+                response.fail_responses();
+            }
+            return;
+        }
         if (request.anthropic && request.stream) {
             std::cerr << "Messages generation failed: " << error.what() << '\n';
             if (dynamic_cast<const std::invalid_argument*>(&error)) {

@@ -10,7 +10,7 @@ prompt for the configured Qwen checkpoint.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L389)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L633)<!-- prefix: "void Connect" --> |
+| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L389)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L642)<!-- prefix: "void Connect" --> |
 | Tokenization worker | Validate inputs and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L900)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_completion.cpp#L20)<!-- prefix: "const Tokeni" --> |
 | Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" --> · [Renderer](../apps/server/chat_template.cpp#L538)<!-- prefix: "std::string " --> |
 
@@ -168,7 +168,7 @@ the trailing-slash form receives HTTP 307. Other methods on the canonical
 path receive HTTP 405 with `Allow: POST`. Malformed content or invalid fields
 receive HTTP 400 with an `invalid_request_error`. For example, omit `model`
 to receive this body.
-[Method check](../apps/server/prefix_controls.cpp#L686)<!-- prefix: "if ((count |" --> ·
+[Method check](../apps/server/prefix_controls.cpp#L700)<!-- prefix: "if ((count |" --> ·
 [Anthropic error body](../apps/server/http.cpp#L651)<!-- prefix: "void write_a" -->
 
 ```json

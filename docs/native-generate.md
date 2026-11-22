@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L199)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L633)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
+| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L199)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L642)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
 | Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L882)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L919)<!-- prefix: "std::vector<" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L382)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L959)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L644)<!-- prefix: "bool BatchSe" --> |
@@ -207,7 +207,7 @@ The error event applies to the stream and has no item index. Previously delivere
 On a generation failure, disconnect, or failed write, the worker discards unsubmitted items, cancels the active jobs still owned by the batch, and waits for their retirement before releasing the slot.
 Decoder effects already published, such as prefix-cache entries, can remain.
 The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
-[Batch cancellation](../apps/server/batch_service.cpp#L546)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L180)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L243)<!-- prefix: "void write_s" -->
+[Batch cancellation](../apps/server/batch_service.cpp#L546)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L181)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L243)<!-- prefix: "void write_s" -->
 
 The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L381)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L555)<!-- prefix: "void write_m" -->
 
@@ -237,7 +237,7 @@ xmake build -P . generated-logprobs-check
 ./build/bin/generated-logprobs-check "$checkpoint"
 ```
 
-Require exit status zero for reducer and checkpoint cases. On captured target rows, compare selected and ranked scores against an independent full-vocabulary log-softmax. [Build target](../xmake.lua#L376)<!-- prefix: "target(\"gene" --> · [Checkpoint check](../tests/text/generated_logprobs_check.cpp#L248)<!-- prefix: "int main(int" -->
+Require exit status zero for reducer and checkpoint cases. On captured target rows, compare selected and ranked scores against an independent full-vocabulary log-softmax. [Build target](../xmake.lua#L377)<!-- prefix: "target(\"gene" --> · [Checkpoint check](../tests/text/generated_logprobs_check.cpp#L248)<!-- prefix: "int main(int" -->
 
 Build the [CPU fixture](../tests/text/README.md#native-generate-on-cpu). Run the score suite against that binary.
 

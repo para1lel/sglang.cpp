@@ -28,7 +28,7 @@ The choice's `logprobs.content` contains one object per committed token. Each ob
 
 ## Streaming and stops
 
-SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L541)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L631)<!-- prefix: "bool consume" -->
+SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L558)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L655)<!-- prefix: "bool consume" -->
 
 ## Verification
 

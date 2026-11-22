@@ -9,6 +9,7 @@ namespace sglang::server {
 
 class BatchService;
 class OllamaDiscovery;
+class ResponseStore;
 class Socket;
 enum class TokenizationRoute;
 
@@ -23,6 +24,7 @@ using Tokenization = std::function<void(const Socket&, TokenizationRoute, std::s
 using ServerInfo = std::function<std::string()>;
 using BatchScore = std::function<void(const Socket&, int, std::string_view)>;
 using BatchMessages = BatchScore;
+using BatchResponses = BatchScore;
 
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
@@ -33,6 +35,8 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const ServerInfo& server_info = ServerInfo{},
                        const BatchScore& score = BatchScore{},
                        const OllamaDiscovery* discovery = nullptr,
-                       const BatchMessages& messages = BatchMessages{});
+                       const BatchMessages& messages = BatchMessages{},
+                       const BatchResponses& responses = BatchResponses{},
+                       ResponseStore* response_store = nullptr);
 
 }

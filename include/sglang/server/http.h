@@ -40,6 +40,7 @@ inline constexpr std::string_view separate_reasoning_route = "/separate_reasonin
 inline constexpr std::string_view parse_function_call_route = "/parse_function_call";
 inline constexpr std::string_view anthropic_count_route = "/v1/messages/count_tokens";
 inline constexpr std::string_view anthropic_messages_route = "/v1/messages";
+inline constexpr std::string_view responses_route = "/v1/responses";
 inline constexpr std::string_view score_route = "/v1/score";
 
 enum class GenerateRoute { none, allowed, method_not_allowed };

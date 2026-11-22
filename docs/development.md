@@ -200,7 +200,7 @@ See [MTP](mtp.md) for exact tiled seeding, joint target verification, and per-la
 
 ### Native streaming server
 
-See [native HTTP transport](http-server.md) for admission, overload, health, readiness, and shutdown. `--max-active` accepts 1–32 and defaults to 32. `--max-num-batched-tokens` accepts 1–32,768 and defaults to 8,192. The server uses the [K4 default](mtp.md#runtime-path) and supports [exact prefix reuse](prefix-cache.md). [Batch graphs](batch-graphs.md) are enabled by default for eligible steps. Use `--eager` to disable replay. [CLI limits](../apps/sglang-server.cpp#L132)<!-- prefix: "} else if (o" -->
+See [native HTTP transport](http-server.md) for admission, overload, health, readiness, and shutdown. `--max-active` accepts 1–32 and defaults to 32. `--max-num-batched-tokens` accepts 1–32,768 and defaults to 8,192. The server uses the [K4 default](mtp.md#runtime-path) and supports [exact prefix reuse](prefix-cache.md). [Batch graphs](batch-graphs.md) are enabled by default for eligible steps. Use `--eager` to disable replay. [CLI limits](../apps/sglang-server.cpp#L139)<!-- prefix: "} else if (o" -->
 
 Lanes share weights and own KV, GDN state, and outputs. [Resident memory admission](batch-graphs.md#resident-memory-admission) applies at every capacity.
 

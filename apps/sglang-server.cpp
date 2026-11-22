@@ -10,6 +10,7 @@
 #include "sglang/server/native_generate.h"
 #include "sglang/server/ollama_discovery.h"
 #include "sglang/server/prefix_controls.h"
+#include "sglang/server/responses.h"
 #include "sglang/server/score.h"
 #include "sglang/server/tokenization.h"
 #include "sglang/server/vision_completion.h"
@@ -40,6 +41,7 @@ struct Arguments {
     bool eager = false;
     bool trace_batches = false;
     bool batch_cuda_graphs = true;
+    bool enable_response_store = false;
 
     bool enable_batch_cuda_graphs() const { return batch_cuda_graphs && !eager; }
 };
@@ -92,6 +94,11 @@ Arguments parse_arguments(int argc, char** argv) {
         }
         if (option == "--batch-cuda-graphs") {
             arguments.batch_cuda_graphs = true;
+            append_launch_option(arguments.launch_command, option);
+            continue;
+        }
+        if (option == "--enable-response-store") {
+            arguments.enable_response_store = true;
             append_launch_option(arguments.launch_command, option);
             continue;
         }
@@ -261,6 +268,7 @@ int main(int argc, char** argv) {
                      "                     [--prefix-cache-entries 0..4]\n"
                      "                     [--reasoning-parser qwen3]\n"
                      "                     [--tool-call-parser qwen3_coder]\n"
+                     "                     [--enable-response-store]\n"
                      "Active requests: 32 by default, range 1-32.\n"
                      "Waiting completions: up to --max-active. Full queue returns HTTP 503.\n"
                      "Target rows per step: " << sglang::decoder_default_max_num_batched_tokens
@@ -300,6 +308,7 @@ int main(int argc, char** argv) {
         const std::chrono::duration<double> startup = std::chrono::steady_clock::now() - started;
         NativeGenerate native_generate(service, tokenizer);
         const OllamaDiscovery discovery(native_generate);
+        ResponseStore response_store(arguments.enable_response_store);
         serve_connections(listener, service, arguments.max_active,
             [&](const Socket& connection, int slot, std::string_view body, bool chat) {
                 if (chat) {
@@ -320,7 +329,9 @@ int main(int argc, char** argv) {
                 serve_score(connection, service, slot, tokenizer.get(), body);
             }, &discovery, [&](const Socket& connection, int slot, std::string_view body) {
                 complete_messages(connection, service, slot, tokenizer, body, &vision);
-            });
+            }, [&](const Socket& connection, int slot, std::string_view body) {
+                complete_responses(connection, service, slot, tokenizer, body, response_store);
+            }, &response_store);
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';
         return 1;

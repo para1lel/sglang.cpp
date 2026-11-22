@@ -158,3 +158,70 @@ The original receipts are under `artifacts/continue-combined-test/` on the bench
 | `inputs/patches.sha256` | `ab649303dcd5ffcffb21965b23c41109c75474de6d3801c9e7179d2f1f204f84` |
 | `run.zsDDGo49/summary.json` | `edc0a11ff5eb46e8b3efa2c557460530fe5e762fb2ed8cedf6508869ada4cac0` |
 | `SHA256SUMS` | `efeee1f19bbe43e85a4e1432137e4a8b971bf2f7e7617ed962ffee274e1dc27e` |
+
+### Native W1 K4 component trials
+
+The HTTP trials used the Qwen3.8-27B-FP8 checkpoint, exact FP8 prefill,
+K4, CUDA graphs, and no prefix reuse. Each trial used one B200 for both arms.
+The W1 request used 128 prompt IDs and generated 128 output IDs. Each trial
+checked the frozen native output sequence. Each ran four fresh servers in
+control, candidate, candidate, control order.
+
+| Change | Warmups / timed requests per arm | Median TTFT, ms, control → candidate | Median TPOT, ms/ID, control → candidate | Median E2E, ms, control → candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Draft KV-only repair | 2 / 8 | 277.818 → 264.403 | 9.483 → 9.140 | 1,492.579 → 1,436.429 |
+| Five-row verifier MLP | 6 / 6 | 264.261 → 264.127 | 9.535 → 8.672 | 1,476.946 → 1,365.444 |
+| Wide 4×8 exact FP8 prefill | 4 / 10 | 290.189 → 234.490 | 9.338 → 9.358 | 1,479.418 → 1,427.579 |
+
+**Draft KV-only repair.** A CUDA-event trial on a different B200 measured
+all 75 repairs per request. Across eight timed requests per arm, the median
+total repair time fell from 17.083 to 4.526 ms. The W1 state capture
+matched 593,600 bytes across 205 scored appends and 75 repair appends.
+The HTTP E2E median fell 56.150 ms. Variation across server starts and
+the change in TTFT limit attribution of that difference to repair.
+The independent checkpoint probe matched 2,351,040 state bytes across six
+seed, repair, and continuation cases.
+
+**Five-row verifier MLP.** The separate CUDA captures used one profiled
+request per arm after three warmups. Verifier GPU-active time fell from
+965.746 to 895.643 ms. The summed gate/up kernel time fell from 247.860
+to 211.001 ms, and down kernel time fell from 169.869 to 129.793 ms.
+The 51 five-row rounds used eager execution. The final two-row round
+replayed a graph. The E2E median fell 7.55% in this sample of six timed
+requests per arm. This trial predates draft KV-only repair. The selected
+MLP layout reproduced the measured verifier instructions and resource
+counts in an offline SM100 build.
+
+**Wide 4×8 exact FP8 prefill.** Both orderings showed lower median TTFT,
+with a pooled decrease of 19.2%. One ordering showed higher median E2E.
+The candidate's 2,161.410 ms request retains its place in the sample.
+In one separate profiled request per arm, 368 of 402 exact projection
+launches switched to 4×8. Summed projection kernel time fell from
+242.127 to 178.153 ms. Active prefill GPU time fell from 260.672 to
+196.662 ms. The held-out checkpoint probes matched 1,599,842,260 state
+bytes per arm. The timing trial includes draft KV-only repair and
+predates the five-row MLP layout.
+
+Each comparison uses its own measured control. The combined stack has
+no timing in these trials. The [formal matched K4 gate](../../benchmarks/paired/README.md#matched-k4-timing-protocol)
+remains open.
+
+| Trial | Measured control | Measured candidate |
+| --- | --- | --- |
+| Draft KV-only repair | `e44330fce30bb913ebb53e73d57b56822185651f` plus verifier fusion | Same control plus KV-only repair |
+| Five-row verifier MLP | Tree `549a14d6b022ecf3491c149063f1d8870dfeb96c` | Tree `8c82c3784cab1a0cc3e545811c6f7f249312e9da` |
+| Wide 4×8 exact FP8 prefill | Tree `a0fd6dd13a6468571a18a959556da8dfc6c5fbb7` | Tree `0667a21ed646ca745f247897bf00158ff7ab1e5f` |
+
+The receipt paths are relative to `artifacts/` on the benchmark host.
+For the repair trial, `continue-draft-audit/source-provenance.txt` identifies
+the verifier fusion patch and `continue-draft-audit/handoff.md` identifies
+the repair patch. The reports identify the binaries and qualification
+probes for each trial.
+
+| Receipt | SHA-256 |
+| --- | --- |
+| `continue-draft-audit/summary.json` | `08ced9565e4b06e453538e8cac0fe2012ea2157f255729d01341ee87ef310333` |
+| `continue-exact-mlp-test/run.WvqYCkH6/summary.json` | `c95b57cc7ea9dfd90865a5ac75d3cd43aa7b31d7c15dd39eaa4d1b32034ea58e` |
+| `continue-exact-mlp-test/profile.NLGh9LQn/profile-baseline/analysis-summary.json` | `43696966fd9d032adfb40593096fe3440839b28fafe5d29f187211ede63e2640` |
+| `continue-exact-mlp-test/profile.NLGh9LQn/profile-candidate/analysis-summary.json` | `fc96d99558eeadb53d7cbf14310557aa98d045e74500d395e5ac36a7e43a799f` |
+| `continue-wide-next-test/summary.json` | `e599ed16d86fed9149a471443049eba607542a77c018f18d0e836d0b483d6053` |

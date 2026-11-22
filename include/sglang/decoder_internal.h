@@ -76,6 +76,7 @@ struct CudaError : std::runtime_error {
     CudaError(cudaError_t status, const char* operation);
     static bool terminal(cudaError_t error) {
         switch (error) {
+            case cudaErrorCudartUnloading:
             case cudaErrorECCUncorrectable:
             case cudaErrorIllegalAddress:
             case cudaErrorLaunchTimeout:
@@ -96,6 +97,7 @@ struct CudaError : std::runtime_error {
 };
 
 std::size_t available_device_bytes();
+inline constexpr std::size_t decoder_shared_reserve = std::size_t{2} * 1024 * 1024 * 1024;
 void validate_batch_options(const DecoderBatchOptions& options);
 int reserved_verification_rows(int output, int mtp_steps);
 std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft);
@@ -129,9 +131,16 @@ struct TransferBuffers {
     std::shared_ptr<void> mtp_constraint_inputs;
 };
 
+struct DeviceBlock {
+    void* pointer;
+    std::size_t bytes;
+};
+
+class RequestBlockCache;
+
 class Allocations {
 public:
-    explicit Allocations(int device);
+    explicit Allocations(int device, RequestBlockCache* cache = nullptr);
     ~Allocations();
     Allocations(const Allocations&) = delete;
     Allocations& operator=(const Allocations&) = delete;
@@ -165,8 +174,10 @@ public:
     void open_stream(std::shared_ptr<const void> owners = nullptr);
     void close_stream();
     void close();
+    void recycle_after_completion();
 
 private:
+    friend class RequestBlockCache;
     struct State;
     void* allocate_bytes(std::size_t bytes);
     bool replay_graph_slot(int index, int width, const std::function<void()>& prepare,
@@ -175,6 +186,35 @@ private:
 
     std::unique_ptr<State> state_;
 };
+
+class RequestBlockCache {
+public:
+    explicit RequestBlockCache(int device);
+    ~RequestBlockCache();
+    RequestBlockCache(const RequestBlockCache&) = delete;
+    RequestBlockCache& operator=(const RequestBlockCache&) = delete;
+
+    std::size_t bytes() const;
+    std::size_t unavailable_bytes() const;
+    void clear();
+
+private:
+    friend class Allocations;
+    bool accepts(int device) const;
+    void* take(std::size_t bytes);
+    bool retain(DeviceBlock block);
+    void quarantine(Allocations::State& state);
+
+    static constexpr std::size_t max_bytes = 768 * 1024 * 1024;
+    static constexpr std::size_t max_blocks = 384;
+    std::unique_ptr<Allocations::State> state_;
+    std::size_t quarantined_bytes_ = 0;
+    bool reusable_ = true;
+};
+
+std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request,
+                                   int prompt, std::size_t capacity, std::size_t charged,
+                                   std::size_t extra_bytes);
 
 struct Fp8Weight {
     const std::uint8_t* values;
@@ -324,7 +364,7 @@ void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
                         int position, void* sampling_workspace, cudaStream_t stream);
 
 struct Request {
-    explicit Request(int device, bool reusable = false);
+    explicit Request(int device, bool reusable = false, RequestBlockCache* cache = nullptr);
     Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false,
             int kv_limit = 0);
 

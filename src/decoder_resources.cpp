@@ -18,6 +18,7 @@ namespace {
 struct CleanupError {
     cudaError_t status = cudaSuccess;
     const char* operation = "";
+    bool restore_failed = false;
 
     explicit operator bool() const { return status != cudaSuccess; }
     void raise() const { check(status, operation); }
@@ -35,24 +36,13 @@ void report_cleanup(cudaError_t status, const char* operation) {
     }
 }
 
-bool terminal_context_error(cudaError_t status) {
-    switch (status) {
-    case cudaErrorCudartUnloading:
-    case cudaErrorContextIsDestroyed:
-    case cudaErrorECCUncorrectable:
-    case cudaErrorIllegalAddress:
-    case cudaErrorLaunchTimeout:
-    case cudaErrorAssert:
-    case cudaErrorHardwareStackError:
-    case cudaErrorIllegalInstruction:
-    case cudaErrorMisalignedAddress:
-    case cudaErrorInvalidAddressSpace:
-    case cudaErrorInvalidPc:
-    case cudaErrorLaunchFailure:
-        return true;
-    default:
-        return false;
-    }
+void finish_retired_cleanup(CleanupError error) {
+    if (!error) return;
+    if (error.restore_failed || CudaError::terminal(error.status)) error.raise();
+    const auto pending = cudaGetLastError();
+    report_cleanup(error.status, error.operation);
+    if (CudaError::terminal(pending)) check(pending, "Check CUDA error after retirement");
+    if (pending != error.status) report_cleanup(pending, "Check CUDA error after retirement");
 }
 
 template <typename Element>
@@ -123,7 +113,7 @@ struct Allocations::State {
             {
                 const std::lock_guard lock(queue.mutex);
                 auto* pending = &queue.first;
-                while (*pending && (*pending)->device != device) {
+                while (*pending && ((*pending)->device != device || (*pending)->quarantined)) {
                     pending = &(*pending)->next;
                 }
                 if (!*pending) {
@@ -148,7 +138,13 @@ struct Allocations::State {
         queue.first = std::move(entry);
     }
 
-    explicit State(int owner) : device(owner) { reclaim(owner); }
+    State(int owner, RequestBlockCache* cache = nullptr, bool retired = false)
+        : device(owner), cache(cache) {
+        if (cache && !cache->accepts(owner)) {
+            throw std::invalid_argument("Decoder request cache device mismatch");
+        }
+        if (!retired) reclaim(owner);
+    }
 
     bool owns_cuda() const {
         return stream || packed_winners || generated_logprobs || !blocks.empty();
@@ -171,6 +167,7 @@ struct Allocations::State {
     }
 
     int device;
+    RequestBlockCache* cache;
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
@@ -179,9 +176,10 @@ struct Allocations::State {
     bool verification_graph_incomplete = false;
     bool uncertain_stream = false;
     bool uncertain_graph = false;
-    std::vector<void*> blocks;
+    std::vector<DeviceBlock> blocks;
     std::size_t uncertain_blocks = 0;
     std::size_t bytes = 0;
+    bool quarantined = false;
     CleanupError uncertain;
     CleanupError terminal;
     TransferBuffers transfers;
@@ -194,7 +192,7 @@ struct Allocations::State {
 };
 
 CleanupError Allocations::State::failure(CleanupError error) {
-    if (terminal_context_error(error.status)) {
+    if (CudaError::terminal(error.status)) {
         terminal = error;
     }
     return error;
@@ -270,8 +268,9 @@ CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& d
     const auto logprobs = release_pinned(generated_logprobs, "Free generated logprob readback");
     if (terminal) return terminal;
     while (blocks.size() > uncertain_blocks) {
-        const CleanupError freed{cudaFree(blocks.back()), "Free decoder allocation"};
+        const CleanupError freed{cudaFree(blocks.back().pointer), "Free decoder allocation"};
         if (!freed) {
+            bytes -= blocks.back().bytes;
             blocks.pop_back();
             continue;
         }
@@ -305,12 +304,12 @@ CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_ow
         return failure(select);
     }
     const auto error = release_selected(drained_owners);
-    const CleanupError restore{cudaSetDevice(previous), "Restore CUDA device after cleanup"};
-    if (error) {
-        report_cleanup(restore.status, restore.operation);
-        return error;
+    const CleanupError restore{cudaSetDevice(previous), "Restore CUDA device after cleanup", true};
+    if (restore) {
+        report_cleanup(error.status, error.operation);
+        return failure(restore);
     }
-    return restore;
+    return error;
 }
 
 void check(cudaError_t status, const char* operation) {
@@ -394,6 +393,37 @@ int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t
     return output;
 }
 
+std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request,
+                                   int prompt, std::size_t capacity, std::size_t charged,
+                                   std::size_t extra_bytes) {
+    const auto request_headroom = [&] {
+        const auto unavailable = retired.unavailable_bytes();
+        return capacity - std::min(capacity, charged + unavailable);
+    };
+    const auto after_reserve = [](std::size_t free) {
+        return free - std::min(free, decoder_shared_reserve);
+    };
+    const auto free = available_device_bytes();
+    const auto retained = retired.bytes();
+    const auto headroom = request_headroom();
+    request.max_new_tokens = limit_resident_output(
+        prompt, request, capacity, std::min(headroom, after_reserve(free + retained)), extra_bytes);
+    request.min_new_tokens = std::min(request.min_new_tokens, request.max_new_tokens);
+    request.incremental_kv = false;
+    const auto reserved = extra_bytes + request_resident_bytes(
+        RequestProgress::capacity(prompt, request),
+        reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
+        request.mtp_steps != 0);
+    if (reserved > after_reserve(free) || retained > headroom - reserved) {
+        retired.clear();
+        if (reserved > request_headroom() || reserved > after_reserve(available_device_bytes())) {
+            throw DecoderCapacityError("Insufficient free resident decoder memory. Retry later.",
+                                       true);
+        }
+    }
+    return reserved;
+}
+
 DeviceScope::DeviceScope(int device) {
     check(cudaGetDevice(&previous_), "Get current CUDA device");
     changed_ = device != previous_;
@@ -415,12 +445,83 @@ void DeviceScope::restore() {
     }
 }
 
-Allocations::Allocations(int device) : state_(std::make_unique<State>(device)) {}
+RequestBlockCache::RequestBlockCache(int device)
+    : state_(std::make_unique<Allocations::State>(device, nullptr, true)) {
+    state_->blocks.reserve(max_blocks);
+}
 
-Allocations::~Allocations() {
+RequestBlockCache::~RequestBlockCache() {
     std::shared_ptr<const void> drained_owners;
     const auto error = state_->release(drained_owners);
     report_cleanup(error.status, error.operation);
+    if (state_->owns_cuda()) {
+        state_->quarantined = true;
+        Allocations::State::retain(std::move(state_));
+    }
+}
+
+bool RequestBlockCache::accepts(int device) const { return state_->device == device; }
+
+std::size_t RequestBlockCache::bytes() const {
+    return reusable_ ? state_->bytes : 0;
+}
+
+std::size_t RequestBlockCache::unavailable_bytes() const {
+    return quarantined_bytes_ + (state_->bytes - bytes());
+}
+
+void* RequestBlockCache::take(std::size_t bytes) {
+    if (!this->bytes()) return nullptr;
+    auto& blocks = state_->blocks;
+    const auto block = std::find_if(blocks.begin(), blocks.end(), [bytes](DeviceBlock block) {
+        return block.bytes == bytes;
+    });
+    if (block == blocks.end()) return nullptr;
+    const auto pointer = block->pointer;
+    *block = blocks.back();
+    blocks.pop_back();
+    state_->bytes -= bytes;
+    return pointer;
+}
+
+bool RequestBlockCache::retain(DeviceBlock block) {
+    auto& state = *state_;
+    if (!block.pointer || !reusable_ || state.blocks.size() == max_blocks ||
+        block.bytes > max_bytes - state.bytes) {
+        return false;
+    }
+    state.blocks.push_back(block);
+    state.bytes += block.bytes;
+    return true;
+}
+
+void RequestBlockCache::quarantine(Allocations::State& state) {
+    quarantined_bytes_ += state.bytes;
+    state.quarantined = true;
+    state.cache = nullptr;
+}
+
+void RequestBlockCache::clear() {
+    if (!state_->terminal && state_->uncertain_blocks == state_->blocks.size()) return;
+    std::shared_ptr<const void> drained_owners;
+    const auto error = state_->release(drained_owners);
+    if (error) reusable_ = false;
+    finish_retired_cleanup(error);
+}
+
+Allocations::Allocations(int device, RequestBlockCache* cache)
+    : state_(std::make_unique<State>(device, cache)) {}
+
+Allocations::~Allocations() {
+    std::shared_ptr<const void> drained_owners;
+    if (!state_->quarantined) {
+        const auto error = state_->release(drained_owners);
+        report_cleanup(error.status, error.operation);
+        if (error && state_->cache && !state_->stream && state_->owns_cuda()) {
+            state_->transfers = {};
+            state_->cache->quarantine(*state_);
+        }
+    }
     if (state_->owns_cuda()) {
         State::retain(std::move(state_));
     }
@@ -651,6 +752,30 @@ void Allocations::close() {
     state_->release(drained_owners).raise();
 }
 
+void Allocations::recycle_after_completion() {
+    auto& state = *state_;
+    if (!state.cache || state.stream) {
+        close();
+        return;
+    }
+    if (!state.uncertain && !state.terminal) {
+        auto& blocks = state.blocks;
+        const auto remaining = std::remove_if(blocks.begin(), blocks.end(), [&](DeviceBlock block) {
+            if (!state.cache->retain(block)) return false;
+            state.bytes -= block.bytes;
+            return true;
+        });
+        blocks.erase(remaining, blocks.end());
+    }
+    std::shared_ptr<const void> drained_owners;
+    const auto error = state.release(drained_owners);
+    if (error && state.owns_cuda()) {
+        state.transfers = {};
+        state.cache->quarantine(state);
+    }
+    finish_retired_cleanup(error);
+}
+
 void Allocations::discard_graph() {
     state_->destroy_executable(state_->graph).raise();
     state_->destroy_capture(state_->capture).raise();
@@ -658,7 +783,10 @@ void Allocations::discard_graph() {
 
 void Allocations::free_block(void* pointer, std::size_t bytes) {
     auto& blocks = state_->blocks;
-    const auto block = std::find(blocks.begin() + state_->uncertain_blocks, blocks.end(), pointer);
+    const auto block = std::find_if(blocks.begin() + state_->uncertain_blocks, blocks.end(),
+                                    [pointer](DeviceBlock block) {
+        return block.pointer == pointer;
+    });
     if (block == blocks.end()) {
         throw std::logic_error("Unknown decoder allocation");
     }
@@ -677,14 +805,30 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
         throw std::overflow_error("CUDA allocation total overflow");
     }
     auto& blocks = state_->blocks;
-    blocks.push_back(nullptr);
-    const auto status = cudaMalloc(&blocks.back(), bytes);
-    if (status != cudaSuccess) {
-        blocks.pop_back();
+    blocks.push_back({nullptr, bytes});
+    auto& pointer = blocks.back().pointer;
+    auto* cache = state_->cache;
+    if (cache) pointer = cache->take(bytes);
+    try {
+        auto status = pointer ? cudaSuccess : cudaMalloc(&pointer, bytes);
+        if (status == cudaErrorMemoryAllocation && cache && cache->bytes()) {
+            const auto pending = cudaGetLastError();
+            if (pending != cudaSuccess && pending != status) {
+                check(pending, "Check CUDA error before cache release");
+            }
+            cache->clear();
+            const auto free = available_device_bytes();
+            if (bytes <= free - std::min(free, decoder_shared_reserve)) {
+                status = cudaMalloc(&pointer, bytes);
+            }
+        }
         check(status, "Allocate CUDA memory");
+    } catch (...) {
+        blocks.pop_back();
+        throw;
     }
     state_->bytes += bytes;
-    return blocks.back();
+    return pointer;
 }
 
 Workspace::Workspace(Allocations& allocations, Bf16* verification_attention,
@@ -768,8 +912,9 @@ void allocate_gdn(Allocations& memory, GdnBank& states) {
     }
 }
 
-Request::Request(int device, bool reusable)
-    : memory(device), work(memory), decode_position(reusable ? memory.allocate<int>(1) : nullptr) {}
+Request::Request(int device, bool reusable, RequestBlockCache* cache)
+    : memory(device, cache), work(memory),
+      decode_position(reusable ? memory.allocate<int>(1) : nullptr) {}
 
 Request::Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable,
                  int maximum_kv)

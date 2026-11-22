@@ -192,7 +192,7 @@ struct MtpDraftWeights::State {
 };
 
 struct MtpDraftRequest::State {
-    State(std::shared_ptr<const MtpDraftWeights> weights, int capacity);
+    State(std::shared_ptr<const MtpDraftWeights> weights, int capacity, RequestBlockCache* cache);
     void prepare(int shifted_token, const Bf16* hidden, cudaStream_t stream);
     void attend(int position, bool score, cudaStream_t stream);
     void run_mlp(cudaStream_t stream);
@@ -211,8 +211,9 @@ struct MtpDraftRequest::State {
     bool failed = false;
 };
 
-MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, int capacity)
-    : weights(std::move(weights)), memory(this->weights->state_->device), work(memory),
+MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
+                              RequestBlockCache* block_cache)
+    : weights(std::move(weights)), memory(this->weights->state_->device, block_cache), work(memory),
       capacity(capacity) {
     const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     const auto payload = page_count * mxfp8_payload_bytes_per_page;
@@ -321,16 +322,21 @@ MtpDraftWeights::~MtpDraftWeights() = default;
 
 std::size_t MtpDraftWeights::device_allocation_bytes() const { return state_->memory.bytes(); }
 
-MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity) {
+MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
+                                 RequestBlockCache* cache) {
     if (!weights || capacity < 1 || capacity > text_attention_max_tokens) {
         throw std::invalid_argument("Invalid MTP draft weights or capacity");
     }
     DeviceScope selected_device(weights->state_->device);
-    state_ = std::make_unique<State>(std::move(weights), capacity);
+    state_ = std::make_unique<State>(std::move(weights), capacity, cache);
     selected_device.restore();
 }
 
 MtpDraftRequest::~MtpDraftRequest() = default;
+
+void MtpDraftRequest::recycle_after_completion() {
+    state_->memory.recycle_after_completion();
+}
 
 const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16* hidden,
                                     bool score, cudaStream_t stream,

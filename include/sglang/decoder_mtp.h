@@ -34,7 +34,8 @@ private:
 /// Serialize use on one stream and select the weights' CUDA device before enqueueing.
 class MtpDraftRequest {
 public:
-    MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity);
+    MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
+                    RequestBlockCache* cache = nullptr);
     ~MtpDraftRequest();
 
     /// Append at valid_prefix() using the shifted token and the corresponding
@@ -54,6 +55,7 @@ public:
     /// Shorten logical KV coverage. Subsequent enqueues overwrite the suffix.
     void rewind(int valid_tokens);
     std::size_t device_allocation_bytes() const;
+    void recycle_after_completion();
 
 private:
     friend class PrefixCache;

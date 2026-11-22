@@ -74,7 +74,6 @@ constexpr auto mailbox_grace = std::chrono::milliseconds(1);
 constexpr int mailbox_min_lanes = 16;
 constexpr int wide_decode_min_ready = 25;
 }
-
 struct BatchService::State {
     State(const Decoder& decoder, bool trace, bool cuda_graphs, MtpPolicy mtp, int max_active,
           int prefix_cache_entries, int max_num_batched_tokens);
@@ -83,7 +82,7 @@ struct BatchService::State {
     void run(const Decoder& decoder, std::promise<void> started);
     void process(DecoderBatch& batch);
     std::optional<std::uint64_t> begin_iteration(DecoderBatch& batch);
-    std::optional<Work> wait_for_jobs();
+    std::optional<Work> wait_for_jobs(DecoderBatch& batch);
     bool idle_for_health() const;
     bool wide_decode_ready(bool buffered) const;
     bool decode_mailboxes_ready(bool require_all) const;
@@ -247,16 +246,23 @@ bool BatchService::State::idle_for_health() const {
            std::none_of(generating.begin(), generating.end(), [](bool active) { return active; });
 }
 
-std::optional<Work> BatchService::State::wait_for_jobs() {
+std::optional<Work> BatchService::State::wait_for_jobs(DecoderBatch& batch) {
     std::unique_lock lock(mutex);
     const auto end = jobs.begin() + max_active;
-    changed.wait(lock, [&] {
+    const auto ready = [&] {
         return closing || reset_pending || wide_decode_ready(true) ||
                decode_mailboxes_ready(false) || idle_for_health() ||
                std::any_of(jobs.begin(), end, [](const auto& job) {
                    return job && job->ready();
                });
-    });
+    };
+    if (std::none_of(jobs.begin(), end, [](const auto& job) { return bool(job); }) &&
+        !changed.wait_for(lock, std::chrono::seconds(5), ready)) {
+        lock.unlock();
+        batch.release_retired_allocations();
+        lock.lock();
+    }
+    changed.wait(lock, ready);
     const bool admitting = std::any_of(jobs.begin(), end, [](const auto& job) {
         return job && !job->admitted && !job->cancelled && !job->aborted();
     });
@@ -267,15 +273,10 @@ std::optional<Work> BatchService::State::wait_for_jobs() {
                    return job ? job->ready() : !admitting;
                });
     });
-    if (closing) {
-        return std::nullopt;
-    }
-    if (idle_for_health()) {
-        jobs.front() = health_probe->job;
-    }
+    if (closing) return std::nullopt;
+    if (idle_for_health()) jobs.front() = health_probe->job;
     return Work{jobs, wide_decode_ready(true) || decode_mailboxes_ready(false)};
 }
-
 bool BatchService::State::prepare(DecoderBatch& batch, int slot,
                                   const std::shared_ptr<Job>& job, bool buffered) {
     bool cancelled;
@@ -406,10 +407,8 @@ void BatchService::State::process(DecoderBatch& batch) {
     std::size_t traced_bytes = 0;
     const bool trace_cache = trace && prefix_cache_entries != 0;
     auto traced_cache = batch.prefix_cache_stats();
-    if (trace_cache) {
-        trace_prefix_cache(traced_cache);
-    }
-    while (const auto snapshot = wait_for_jobs()) {
+    if (trace_cache) trace_prefix_cache(traced_cache);
+    while (const auto snapshot = wait_for_jobs(batch)) {
         const auto iteration = begin_iteration(batch);
         if (!iteration) {
             continue;

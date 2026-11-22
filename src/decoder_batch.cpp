@@ -97,7 +97,10 @@ struct Lane {
 };
 
 struct BatchStorage {
+    BatchStorage(int device, std::shared_ptr<const Allocations> memory)
+        : weights(std::move(memory)), retired(device) {}
     std::shared_ptr<const Allocations> weights;
+    RequestBlockCache retired;
     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
     DecodeGraphs decode_graphs;
     std::optional<VerificationGraph> verification_graph;
@@ -105,9 +108,8 @@ struct BatchStorage {
 };
 
 void retire(std::optional<Lane>& lane) {
-    if (lane && lane->request) {
-        lane->request->memory.close();
-    }
+    if (lane && lane->request) lane->request->memory.recycle_after_completion();
+    if (lane && lane->draft && lane->resident_bytes) lane->draft->recycle_after_completion();
     lane.reset();
 }
 
@@ -126,7 +128,6 @@ std::size_t request_bytes(const BatchStorage& storage) {
 
 using Selection = std::array<bool, decoder_batch_max_lanes>;
 using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
-constexpr std::size_t decoder_shared_reserve = std::size_t{2} * 1024 * 1024 * 1024;
 static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
 static_assert(prefill_chunk_rows == mxfp8_page_size);
 
@@ -273,13 +274,13 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
 
 struct DecoderBatch::State {
     State(const Decoder::Model& owner, DecoderBatchOptions options)
-        : model(owner), options(options), storage(std::make_shared<BatchStorage>()),
+        : model(owner), options(options),
+          storage(std::make_shared<BatchStorage>(owner.device, owner.memory)),
           tensor_cache(options.prefix_cache_entries > 0 &&
                        model.fp8_prefill() == Fp8PrefillPolicy::tensor_core),
           execution(model.device) {
         validate_batch_options(options);
         DeviceScope device(model.device);
-        storage->weights = model.memory;
         if (options.prefix_cache_entries != 0) {
             storage->prefix_cache.emplace(model.device, options.prefix_cache_entries,
                                           !tensor_cache && model.mtp_weights != nullptr);
@@ -373,14 +374,12 @@ struct DecoderBatch::State {
     bool cancelled() const { return output && output->cancelled(); }
 };
 
-DecoderBatch::DecoderBatch(const Decoder& decoder)
-    : DecoderBatch(decoder, {}) {}
+DecoderBatch::DecoderBatch(const Decoder& decoder) : DecoderBatch(decoder, {}) {}
 
 DecoderBatch::DecoderBatch(const Decoder& decoder, DecoderBatchOptions options)
     : state_(std::make_unique<State>(*decoder.model_, options)) {}
 
 DecoderBatch::~DecoderBatch() = default;
-
 int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
     return admit_impl(slot, std::move(prompt), options, nullptr);
 }
@@ -392,32 +391,21 @@ int DecoderBatch::admit_multimodal(int slot, std::vector<int> prompt, const Deco
 
 std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
                                          std::size_t extra_bytes) const {
-    if (!options.resident_memory_limit) {
-        return 0;
-    }
+    if (!options.resident_memory_limit) return 0;
     std::size_t charged = 0;
     for (const auto& lane : storage->slots) {
         charged += lane ? lane->resident_bytes : 0;
     }
-    const auto free = available_device_bytes();
-    const auto unreserved = free - std::min(free, decoder_shared_reserve);
-    request.max_new_tokens = limit_resident_output(
-        prompt, request, resident_capacity, std::min(unreserved, resident_capacity - charged),
-        extra_bytes);
-    request.min_new_tokens = std::min(request.min_new_tokens, request.max_new_tokens);
-    request.incremental_kv = false;
-    return extra_bytes + request_resident_bytes(RequestProgress::capacity(prompt, request),
-        reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
-        request.mtp_steps != 0);
+    return reserve_request_memory(storage->retired, request, prompt, resident_capacity,
+                                  charged, extra_bytes);
 }
 
 void DecoderBatch::State::initialize(Lane& lane) {
     const auto& opts = lane.options;
     const auto stream = execution.stream();
     const int prompt = static_cast<int>(lane.prompt.size());
-    if (opts.mtp_steps != 0) {
-        lane.draft = std::make_unique<MtpDraftRequest>(model.mtp_weights, lane.capacity());
-    }
+    if (opts.mtp_steps != 0) lane.draft = std::make_unique<MtpDraftRequest>(
+        model.mtp_weights, lane.capacity(), lane.resident_bytes ? &storage->retired : nullptr);
     lane.request->initialize(opts.incremental_kv ? prompt : lane.capacity(), stream,
                              opts.incremental_kv ? lane.capacity() : 0);
     if (opts.requires_target_only()) {
@@ -508,7 +496,8 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         if (options.max_new_tokens != requested.max_new_tokens) {
             validate_request(prompt, options, !media);
         }
-        auto request = std::make_unique<Request>(state_->model.device);
+        auto request = std::make_unique<Request>(
+            state_->model.device, false, resident ? &state_->storage->retired : nullptr);
         lane.emplace(Lane{std::move(request), std::move(prompt), options});
         if (options.top_logits > 0 || options.label_token_ids) {
             lane->request->memory.transfers().logits.resize(vocab_size);
@@ -553,6 +542,12 @@ void DecoderBatch::cancel(int slot) {
 
 std::size_t DecoderBatch::request_device_allocation_bytes() const {
     return request_bytes(*state_->storage);
+}
+void DecoderBatch::release_retired_allocations() try {
+    state_->storage->retired.clear();
+} catch (...) {
+    state_->disable();
+    throw;
 }
 
 DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {

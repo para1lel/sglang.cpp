@@ -106,6 +106,7 @@ public:
                     DecoderBatchStepStats* stats = nullptr);
 
     std::size_t request_device_allocation_bytes() const;
+    void release_retired_allocations();
     DecoderPrefixCacheStats prefix_cache_stats() const;
     void reset_prefix_cache();
     bool available() const;

@@ -32,6 +32,33 @@ cudaError_t decode_bf16_lm_head_batch(const __nv_bfloat16* weight, int rows, int
 cudaError_t decode_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
                                 cudaStream_t stream);
 
+struct VerifyQuantizeRow {
+    const __nv_bfloat16* input;
+    const __nv_bfloat16* up;
+    TextFp8Activation output;
+};
+
+struct VerifyRmsQuantizeRow {
+    const __nv_bfloat16* branch;
+    __nv_bfloat16* residual;
+    __nv_bfloat16* normalized;
+    TextFp8Activation output;
+};
+
+inline constexpr int fused_verify_rows = 5;
+
+struct VerifyQuantizeRows {
+    VerifyQuantizeRow entries[fused_verify_rows];
+};
+
+struct VerifyRmsQuantizeRows {
+    VerifyRmsQuantizeRow entries[fused_verify_rows];
+};
+
+cudaError_t verify_quantize_fp8(VerifyQuantizeRows rows, int width, cudaStream_t stream);
+cudaError_t verify_rms_quantize(VerifyRmsQuantizeRows rows, const __nv_bfloat16* weight,
+                                cudaStream_t stream);
+
 std::optional<cudaError_t> try_prefill_bf16_gdn_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
     int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream);

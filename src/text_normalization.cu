@@ -3,6 +3,7 @@
 #include "sglang/decoder_cuda.cuh"
 
 #include "sglang/text/text_cuda_primitives.cuh"
+#include "sglang/text/quantize_warp.cuh"
 
 #include <cuda_fp8.h>
 
@@ -179,7 +180,7 @@ __device__ __nv_fp8x4_storage_t rms_quant_pack(float4 values, float reciprocal) 
 }
 
 __device__ void rms_quantize_subwarps(const __nv_bfloat16* normalized,
-                                      TextFp8Activation activation, std::size_t offset) {
+                                      TextFp8Activation activation) {
     constexpr int lanes = 8;
     constexpr int half_group = text_fp8_group_size / 2;
     constexpr int groups = rms_hidden_width / text_fp8_group_size;
@@ -204,11 +205,11 @@ __device__ void rms_quantize_subwarps(const __nv_bfloat16* normalized,
         float reciprocal = 0.0f;
         if (lane == 0) {
             const float scale = __fdiv_rn(fmaxf(quant_epsilon, maximum), fp8_max);
-            activation.scales[static_cast<std::size_t>(blockIdx.x) * groups + group] = scale;
+            activation.scales[group] = scale;
             reciprocal = __fdiv_rn(1.0f, scale);
         }
         reciprocal = __shfl_sync(warp_mask, reciprocal, 0, lanes);
-        auto* packed = reinterpret_cast<uint2*>(activation.values + offset + col);
+        auto* packed = reinterpret_cast<uint2*>(activation.values + col);
         *packed = {rms_quant_pack(first, reciprocal), rms_quant_pack(second, reciprocal)};
         packed[half_group / sizeof(uint2)] =
             {rms_quant_pack(third, reciprocal), rms_quant_pack(fourth, reciprocal)};
@@ -216,7 +217,7 @@ __device__ void rms_quantize_subwarps(const __nv_bfloat16* normalized,
 }
 
 template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false>
-__global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
+__device__ __forceinline__ void rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
                                      const __nv_bfloat16* weight, __nv_bfloat16* normalized,
                                      TextFp8Activation activation) {
     constexpr int values_per_thread = rms_hidden_width / block_threads;
@@ -226,17 +227,13 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
     __shared__ alignas(16) __nv_bfloat16 branch_values[rms_hidden_width];
     __shared__ alignas(16) __nv_bfloat16 residual_values[HasResidual ? rms_hidden_width : 1];
     __shared__ alignas(16) __nv_bfloat16 gains[rms_hidden_width];
-    const auto offset = static_cast<std::size_t>(blockIdx.x) * rms_hidden_width;
-    branch += offset;
-    normalized += offset;
-    if constexpr (HasResidual) {
-        residual += offset;
-    }
     for (int col = threadIdx.x * vector_width; col < rms_hidden_width;
          col += block_threads * vector_width) {
         if constexpr (PackedGroups) {
             stage_rms_vector_async(branch + col, branch_values + col);
-            stage_rms_vector_async(residual + col, residual_values + col);
+            if constexpr (HasResidual) {
+                stage_rms_vector_async(residual + col, residual_values + col);
+            }
             stage_rms_vector_async(weight + col, gains + col);
         } else {
             stage_rms_vector(branch + col, branch_values + col);
@@ -279,7 +276,7 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
     }
     __syncthreads();
     if constexpr (PackedGroups) {
-        rms_quantize_subwarps(branch_values, activation, offset);
+        rms_quantize_subwarps(branch_values, activation);
         return;
     }
     const int lane = threadIdx.x % warp_width;
@@ -297,16 +294,58 @@ __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16*
         const float scale = __fdiv_rn(amax, fp8_max);
         const float reciprocal = __fdiv_rn(1.0f, scale);
         if (lane == 0) {
-            activation.scales[static_cast<std::size_t>(blockIdx.x) * groups + group] = scale;
+            activation.scales[group] = scale;
         }
 #pragma unroll
         for (int part = 0; part < values_per_lane; ++part) {
-            activation.values[offset + col + part * warp_width] =
+            activation.values[col + part * warp_width] =
                 __nv_cvt_float_to_fp8(elements[part] * reciprocal, __NV_SATFINITE, __NV_E4M3);
         }
     }
 }
 
+template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false>
+__global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
+                                     const __nv_bfloat16* weight, __nv_bfloat16* normalized,
+                                     TextFp8Activation activation) {
+    const auto offset = static_cast<std::size_t>(blockIdx.x) * rms_hidden_width;
+    activation.values += offset;
+    activation.scales += offset / text_fp8_group_size;
+    rms_quantize<HasResidual, PackedGroups, LaunchDependents>(
+        branch + offset, HasResidual ? residual + offset : nullptr, weight,
+        normalized + offset, activation);
+}
+
+template <bool HasResidual>
+__global__ void verify_rms_kernel(const __grid_constant__ decoder::VerifyRmsQuantizeRows rows,
+                                  const __nv_bfloat16* weight) {
+    const auto& row = rows.entries[blockIdx.x];
+    rms_quantize<HasResidual, true>(row.branch, row.residual, weight, row.normalized, row.output);
+}
+
+template <bool ApplySwiglu>
+__global__ void verify_quantize_kernel(const __grid_constant__ decoder::VerifyQuantizeRows rows,
+                                       int width) {
+    const auto& row = rows.entries[blockIdx.y];
+    quantize_warp<ApplySwiglu>(row.input, row.up, width, row.output);
+}
+}
+
+cudaError_t decoder::verify_quantize_fp8(VerifyQuantizeRows rows, int width, cudaStream_t stream) {
+    const int groups = width / text_fp8_group_size;
+    const dim3 grid((groups + block_warps - 1) / block_warps, fused_verify_rows);
+    void* args[] = {&rows, &width};
+    const auto kernel = rows.entries[0].up ? verify_quantize_kernel<true>
+                                           : verify_quantize_kernel<false>;
+    return cudaLaunchKernel(kernel, grid, block_threads, args, 0, stream);
+}
+
+cudaError_t decoder::verify_rms_quantize(VerifyRmsQuantizeRows rows, const __nv_bfloat16* weight,
+                                        cudaStream_t stream) {
+    void* args[] = {&rows, &weight};
+    const auto kernel = rows.entries[0].residual ? verify_rms_kernel<true>
+                                                 : verify_rms_kernel<false>;
+    return cudaLaunchKernel(kernel, fused_verify_rows, block_threads, args, 0, stream);
 }
 
 cudaError_t decoder::tensor_core_prefill_rms_quantize(

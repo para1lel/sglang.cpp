@@ -56,6 +56,10 @@ struct LayerBatch {
         }
     }
 
+    bool fuse_verify_activation() const {
+        return std::is_same_v<Lane, VerificationRow> && count == fused_verify_rows;
+    }
+
     int projection_rows(int group) const {
         const int groups = (count + text_fp8_max_batch - 1) / text_fp8_max_batch;
         return count / groups + (group < count % groups);
@@ -69,6 +73,10 @@ struct LayerBatch {
     }
 
     void quantize(Bf16* Workspace::*source, int width) const {
+        if (fuse_verify_activation() && width % text_fp8_group_size == 0) {
+            quantize_verification(source, width);
+            return;
+        }
         if constexpr (!std::is_same_v<Lane, VerificationRow>) {
             if (single_decode()) {
                 auto& work = workspace(lanes[0]);
@@ -81,6 +89,16 @@ struct LayerBatch {
             check(text_quantize_fp8(work.*source, width, work.activation, stream),
                   "Quantize projection input");
         });
+    }
+
+    void quantize_verification(Bf16* Workspace::*source, int width,
+                               Bf16* Workspace::*up = nullptr) const {
+        VerifyQuantizeRows rows;
+        for (int index = 0; index < fused_verify_rows; ++index) {
+            auto& work = workspace(lanes[index]);
+            rows.entries[index] = {work.*source, up ? work.*up : nullptr, work.activation};
+        }
+        check(verify_quantize_fp8(rows, width, stream), "Quantize five verification rows");
     }
 
     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
@@ -168,7 +186,9 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
             row.verification->bind_gdn(state_index);
         }
     });
-    batch.quantize(&Workspace::normalized, hidden_size);
+    if (!batch.fuse_verify_activation()) {
+        batch.quantize(&Workspace::normalized, hidden_size);
+    }
     batch.project(layer.qkv, &Workspace::gdn_qkv);
     batch.project(layer.z, &Workspace::gdn_z);
     project(layer.b, batch, &Workspace::gdn_b);
@@ -348,7 +368,9 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
 
 template <typename Lane>
 void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
-    batch.quantize(&Workspace::normalized, hidden_size);
+    if (!batch.fuse_verify_activation()) {
+        batch.quantize(&Workspace::normalized, hidden_size);
+    }
     if (batch.single_decode() && layer.q_gate.columns == hidden_size &&
         layer.key.columns == hidden_size && layer.value.columns == hidden_size) {
         const auto& work = workspace(batch.lanes[0]);
@@ -379,6 +401,13 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
 
 template <typename Lane>
 void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
+    if (batch.fuse_verify_activation()) {
+        batch.project(layer.mlp_gate, &Workspace::mlp_gate);
+        batch.project(layer.mlp_up, &Workspace::mlp_up);
+        batch.quantize_verification(&Workspace::mlp_gate, intermediate_size, &Workspace::mlp_up);
+        batch.project(layer.mlp_down, &Workspace::hidden);
+        return;
+    }
     batch.quantize(&Workspace::normalized, hidden_size);
     if (batch.single_decode() && layer.mlp_gate.columns == hidden_size &&
         layer.mlp_up.columns == hidden_size) {
@@ -571,6 +600,16 @@ template <typename Lane>
 void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream) const {
     const LayerBatch<Lane> batch{lanes, count, stream};
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
+        if (batch.fuse_verify_activation()) {
+            VerifyRmsQuantizeRows rows;
+            for (int index = 0; index < fused_verify_rows; ++index) {
+                auto& work = workspace(lanes[index]);
+                const auto [branch, residual] = residuals(work);
+                rows.entries[index] = {branch, residual, work.normalized, work.activation};
+            }
+            check(verify_rms_quantize(rows, weight, stream), operation);
+            return;
+        }
         batch.each([&](const Lane&, Workspace& work) {
             const auto [branch, residual] = residuals(work);
             check(text_rms_norm(branch, residual, weight, hidden_size, work.normalized,

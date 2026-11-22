@@ -9,6 +9,10 @@ the pinned vLLM revision in its separate environment. Verify checkpoint semantic
 Invoke [main-mode](.agents/skills/main-mode/SKILL.md) explicitly for ongoing work.
 Main owns the development branch and index. Start its session review, give workers a fixed
 input and disjoint write scopes, and pass each worker the path to its local `SKILL.md`.
+Return all worker reports to Main through native agent results using the worker's final response.
+Never use `codex queue --message` or any user-input queue to contact Main.
+Main's input is reserved for the user.
+
 The following roles and their resources are bundled with this checkout.
 
 - [Research](.agents/skills/research-mode/SKILL.md) verifies unknowns under `docs/research/`.

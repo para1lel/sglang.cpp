@@ -2,6 +2,8 @@
 
 #include "sglang/server/chat_template.h"
 #include "sglang/server/http.h"
+#include "sglang/server/vision_completion.h"
+#include "sglang/utf8.h"
 
 #include <algorithm>
 #include <ctime>
@@ -104,21 +106,38 @@ std::string reasoning_text(const OrderedObject& item) {
     return {};
 }
 
-Value message_content(const OrderedObject& message, bool developer) {
+Value message_content(const OrderedObject& message, std::string_view role) {
     auto content = field(message, "content");
     constexpr auto label = "Developer instructions:";
+    const bool developer = role == "developer";
     if (const auto text = content.string()) {
         return developer ? Value(std::string(label) + '\n' + std::string(*text)) : content;
     }
     const auto* parts = content.array();
-    if (!parts) throw RequestError(400, "Expected text message content", "input");
+    if (!parts) throw RequestError(400, "Expected message content", "input");
     Array translated;
     for (const auto& part : *parts) {
         const auto& values = object(part, "input");
         const auto kind = field(values, "type").string().value_or("");
+        if (kind == "input_image") {
+            const auto url = field(values, "image_url").string();
+            const auto& detail = field(values, "detail");
+            if (role != "user" || !url || url->find("data:image/png;base64,") != 0 ||
+                !field(values, "file_id").is_null() ||
+                (!detail.is_null() && detail.string() != "auto") ||
+                !field(values, "min_dynamic_patch").is_null() ||
+                !field(values, "max_dynamic_patch").is_null() ||
+                !field(values, "max_long_side_pixel").is_null()) {
+                throw RequestError(400, "Expected a user inline PNG image with automatic detail",
+                                   "input");
+            }
+            translated.emplace_back(OrderedObject{{"type", "image_url"},
+                {"image_url", OrderedObject{{"url", std::string(*url)}}}});
+            continue;
+        }
         const auto text = field(values, "text").string();
         if ((kind != "input_text" && kind != "output_text") || !text) {
-            throw RequestError(400, "Only text content parts are supported", "input");
+            throw RequestError(400, "Expected a text or inline PNG content part", "input");
         }
         auto value = developer && translated.empty() ?
             std::string(label) + '\n' + std::string(*text) : std::string(*text);
@@ -145,7 +164,7 @@ Array messages(const Array& input, const Value& instructions) {
         }
         const char* key = type == "reasoning" ? "reasoning_content" : "content";
         auto content = type == "reasoning" ? Value(reasoning_text(message)) :
-            message_content(message, role == "developer");
+            message_content(message, role);
         if (type == "reasoning" && content.string() == "") continue;
         if (role == "system" || role == "developer") {
             if (!system.empty()) system += "\n\n";
@@ -339,20 +358,37 @@ void validate_text_options(const OrderedObject& fields) {
         throw RequestError(400, "Unsupported service tier", "service_tier");
     }
     const auto& tools = field(fields, "tools");
-    const auto& include = field(fields, "include");
-    const auto& logprobs = field(fields, "top_logprobs");
     const auto& choice = field(fields, "tool_choice");
     if ((json::get(fields, "tools") && (!tools.array() || !tools.array()->empty())) ||
-        (!include.is_null() && (!include.array() || !include.array()->empty())) ||
-        (!logprobs.is_null() && logprobs.unsigned_integer() != 0) ||
         (json::get(fields, "tool_choice") && choice.string() != "auto" &&
          choice.string() != "none")) {
-        throw RequestError(400, "Responses tools, includes and output logprobs are unavailable");
+        throw RequestError(400, "Responses tools are unavailable");
     }
     const auto& truncation = field(fields, "truncation");
     if (!truncation.is_null() && truncation.string() != "disabled") {
         throw RequestError(400, "Only disabled truncation is supported", "truncation");
     }
+}
+
+int responses_logprob_count(const OrderedObject& fields, bool stream) {
+    const auto& top = field(fields, "top_logprobs");
+    const auto width = top.is_null() ? std::optional<std::uint64_t>(0) : top.unsigned_integer();
+    if (!width || *width > decoder_max_generated_top_logprobs) {
+        throw RequestError(400, "Expected an integer top_logprobs from 0 to 20", "top_logprobs");
+    }
+    const auto& include = field(fields, "include");
+    if (include.is_null()) return -1;
+    const auto* expansions = include.array();
+    if (!expansions || std::any_of(expansions->begin(), expansions->end(), [](const auto& key) {
+            return key.string() != "message.output_text.logprobs";
+        })) {
+        throw RequestError(400, "Unsupported Responses include expansion", "include");
+    }
+    if (expansions->empty()) return -1;
+    if (stream) {
+        throw RequestError(400, "logprobs are not supported in streaming mode");
+    }
+    return static_cast<int>(*width);
 }
 
 OrderedObject schema_descriptor(const OrderedObject& format) {
@@ -551,7 +587,8 @@ ResponsesRequest parse_responses_request(std::string_view body, ResponseStore& s
         {"user", user}, {"metadata", metadata.is_null() ? Value(OrderedObject{}) : metadata}};
     ResponsesRequest request{std::move(chat), std::move(echo), std::move(history),
                              store.enabled() && persist ? &store : nullptr,
-                             background && !stream, summary, request_id(fields)};
+                             background && !stream, summary, request_id(fields),
+                             responses_logprob_count(fields, stream)};
     validate_storage(request);
     return request;
 }
@@ -560,14 +597,33 @@ ResponsesRequest parse_responses_request(std::string_view body, ResponseStore& s
 
 void complete_responses(const Socket& connection, BatchService& service, int slot,
                         const CompletionTokenizer& tokenizer, std::string_view body,
-                        ResponseStore& store) {
+                        ResponseStore& store, VisionCompletion* vision) {
     try {
         const auto envelope = parse_responses_request(body, store);
-        auto request = parse_chat_request(envelope.chat, tokenizer);
+        auto request = parse_chat_request(envelope.chat, tokenizer, vision != nullptr);
+        if (envelope.top_logprobs >= 0) {
+            if (request.options.samples() || request.options.constraint) {
+                throw RequestError(400, "Output logprobs require unconstrained greedy generation",
+                                   "include");
+            }
+            if (!request.media && !service.supports_generated_logprobs()) {
+                throw RequestError(400, "Output logprobs require MTP disabled or logprob fallback",
+                                   "include");
+            }
+            constexpr std::size_t score_budget = 8192;
+            if (request.options.max_new_tokens >
+                score_budget / static_cast<std::size_t>(envelope.top_logprobs + 1)) {
+                throw RequestError(400, "Output logprobs exceed the 8192-score budget",
+                                   "max_output_tokens");
+            }
+            request.options.generated_top_logprobs = envelope.top_logprobs;
+        }
         request.responses = &envelope;
         complete_text(connection, request, tokenizer, [&](const auto& prompt, const auto& options,
                                                           const auto& callbacks) {
-            return service.generate(slot, prompt, options, callbacks);
+            return request.media ? vision->generate(service, slot, *request.media, options,
+                                                      callbacks) :
+                service.generate(slot, prompt, options, callbacks);
         });
     } catch (const RequestError& error) {
         responses_error(connection, error.code, error.what(), error.parameter);
@@ -616,7 +672,7 @@ OrderedObject ResponsesOutput::part(const Item& item, bool summary) const {
         return {{"type", summary ? "summary_text" : "reasoning_text"}, {"text", item.text}};
     }
     return {{"type", "output_text"}, {"text", item.text}, {"annotations", Array{}},
-            {"logprobs", {}}};
+            {"logprobs", item.logprobs}};
 }
 
 OrderedObject ResponsesOutput::item_json(const Item& item, bool ready) const {
@@ -727,14 +783,73 @@ void ResponsesOutput::token(std::string_view piece) {
     if (piece == "</think>") reasoning_ = false;
 }
 
-void ResponsesOutput::finish(const char* reason, std::size_t tokens, std::size_t cached) {
+namespace {
+
+struct OutputScore {
+    std::string token;
+    float value;
+};
+
+OutputScore output_score(const Tokenizer& tokenizer, const DecoderLogprob& score) {
+    Utf8Stream utf8;
+    auto token = utf8.push(tokenizer.piece(score.token_id, false));
+    token += utf8.finish();
+    return {std::move(token), score.value};
+}
+
+OrderedObject score_fields(OutputScore score) {
+    Array bytes;
+    bytes.reserve(score.token.size());
+    for (unsigned char byte : score.token) bytes.emplace_back(static_cast<int>(byte));
+    return {{"token", std::move(score.token)}, {"bytes", std::move(bytes)},
+            {"logprob", static_cast<double>(score.value)}};
+}
+
+Array output_logprobs(const Tokenizer& tokenizer, const DecoderResult& result) {
+    if (result.generated_logprobs.size() != result.output_token_ids.size()) {
+        throw std::logic_error("Generated logprob count differs from output token count");
+    }
+    Array scores;
+    scores.reserve(result.output_token_ids.size());
+    for (std::size_t index = 0; index < result.output_token_ids.size(); ++index) {
+        const auto& row = result.generated_logprobs[index];
+        if (!row || row->selected.token_id != result.output_token_ids[index]) {
+            throw std::logic_error("Generated logprob ID differs from output token ID");
+        }
+        std::vector<OutputScore> distinct;
+        distinct.reserve(row->alternatives.size());
+        for (const auto& alternative : row->alternatives) {
+            auto candidate = output_score(tokenizer, alternative);
+            const auto existing = std::find_if(distinct.begin(), distinct.end(),
+                [&](const auto& entry) { return entry.token == candidate.token; });
+            if (existing == distinct.end()) distinct.push_back(std::move(candidate));
+            else existing->value = candidate.value;
+        }
+        Array alternatives;
+        alternatives.reserve(distinct.size());
+        for (auto& score : distinct) alternatives.emplace_back(score_fields(std::move(score)));
+        auto selected = score_fields(output_score(tokenizer, row->selected));
+        selected.emplace_back("top_logprobs", std::move(alternatives));
+        scores.emplace_back(std::move(selected));
+    }
+    return scores;
+}
+
+}
+
+void ResponsesOutput::finish(const char* reason, std::size_t tokens, const DecoderResult& result,
+                             const Tokenizer& tokenizer) {
+    if (request_.top_logprobs >= 0 && item_ && !item_->reasoning) {
+        item_->logprobs = output_logprobs(tokenizer, result);
+    }
     if (cancelled() || !start() || !close_item()) return;
     const auto prompt = text_.prompt.size();
     const auto incomplete = std::string_view(reason) == "length";
     const auto status = incomplete ? "incomplete" : "completed";
     OrderedObject usage{{"input_tokens", count(prompt)}, {"output_tokens", count(tokens)},
         {"total_tokens", count(prompt + tokens)}, {"input_tokens_details",
-            OrderedObject{{"cached_tokens", count(cached)}, {"cache_write_tokens", 0}}},
+            OrderedObject{{"cached_tokens", count(result.cached_prompt_tokens)},
+                          {"cache_write_tokens", 0}}},
         {"output_tokens_details", OrderedObject{{"reasoning_tokens", count(reasoning_tokens_)}}}};
     const auto finished = envelope(status, usage);
     const auto serialized = chat_template_json(finished);

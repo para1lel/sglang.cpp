@@ -466,8 +466,8 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     }
     if ((options.score_prompt && top < 0) ||
         top < -1 || top > decoder_max_generated_top_logprobs ||
-        (top >= 0 && (media || options.samples() || options.constraint || options.mtp_steps ||
-                      options.top_logits || state_->output))) {
+        (top >= 0 && ((media && options.score_prompt) || options.samples() || options.constraint ||
+                      options.mtp_steps || options.top_logits || state_->output))) {
         throw std::invalid_argument("Generated logprobs require unconstrained greedy batch K=0");
     }
     if (options.prefix_cache_salt.size() > decoder_prefix_max_salt_bytes) {

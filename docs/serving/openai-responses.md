@@ -34,9 +34,33 @@ JSON keys are ignored.
 `request_id` can supply the response ID. Use `resp_` followed by letters, digits, underscores
 or hyphens, up to 128 characters total. Otherwise the server supplies an ID.
 
+## Inline images
+
+User messages can include an `input_image` part with an `image_url` such as
+`data:image/png;base64,...` alongside `input_text`. Omit `detail` or use `null` or `auto`. A
+codec-enabled build uses the [native chat media limits](../chat-serving.md) and reports
+expanded prompt tokens in `usage.input_tokens`. Blocking, SSE, and stored follow-ups use
+the same media path. External URLs, file IDs, video and image detail or resizing overrides
+return HTTP 400. [Image translation](../../apps/server/responses.cpp#L109)<!-- prefix: "Value messag" -->
+
+## Output logprobs
+
+For buffered greedy output from a text or inline PNG prompt, include
+`["message.output_text.logprobs"]` and set `temperature:0`. `top_logprobs` accepts 0
+through 20 and defaults to 0. The output text part then carries selected token
+scores with UTF-8 bytes and alternatives.
+The score rows cover all generated IDs, including reasoning IDs when the reasoning
+parser emits a separate item. Without the include, the `logprobs` field remains null.
+The effective generation budget, after the two-token reservation for explicit budgets,
+times `1 + top_logprobs` may be at most 8,192.
+Inline PNG requests use target-only decoding. Text requests use the
+[existing logprob fallback policy](openai-logprobs.md). Requests for output
+logprobs with streaming, sampling or a response constraint return HTTP 400.
+Stored scored responses use the same retention limit as other responses.
+
 ## JSON Schema output
 
-Set `text.format` to a flat JSON Schema descriptor.
+For text requests, set `text.format` to a flat JSON Schema descriptor.
 
 ```json
 {
@@ -68,7 +92,7 @@ up to 256 UTF-8 bytes. The server validates the descriptor and compiles the
 [native JSON Schema subset](../output-constraints.md#json-schema) with the checkpoint
 tokenizer. Other formats such as `json_object`, unsupported schema keywords, text stops,
 and output budgets below the grammar minimum return HTTP 400 before SSE opens. The explicit
-budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L358)<!-- prefix: "OrderedObjec" -->
+budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L394)<!-- prefix: "OrderedObjec" -->
 
 The response echoes the descriptor in `text.format` and returns the generated JSON as an
 `output_text` string in the assistant message. The schema constrains output from the first
@@ -108,5 +132,6 @@ retention. Failure snapshots have an empty `output` and null `usage`, even when 
 already received item events. Internal generation failures use a generic `server_error`.
 
 Responses create, retrieve and cancel take precedence over configured Ollama aliases at the
-same method and path. Hosted tools, tool calls, media input, output logprobs, requested
-`include` expansions and automatic truncation are outside the text adapter.
+same method and path. The adapter accepts `tool_choice` values `auto` and `none`
+with an empty tool list. Named and required tool choices, tool definitions and
+calls, other `include` expansions, and automatic truncation are unsupported.

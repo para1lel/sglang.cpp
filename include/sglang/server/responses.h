@@ -46,13 +46,14 @@ struct ResponsesRequest {
     bool background = false;
     bool summary = false;
     std::optional<std::string> id;
+    int top_logprobs = -1;
 };
 
 void responses_error(const Socket& connection, unsigned code, std::string_view message,
                      const char* parameter = nullptr);
 void complete_responses(const Socket& connection, BatchService& service, int slot,
                         const CompletionTokenizer& tokenizer, std::string_view body,
-                        ResponseStore& store);
+                        ResponseStore& store, VisionCompletion* vision = nullptr);
 
 class ResponsesOutput {
 public:
@@ -63,7 +64,8 @@ public:
     bool cancelled() const;
     bool accept(const ChatOutputEvent& delta);
     void token(std::string_view piece);
-    void finish(const char* reason, std::size_t count, std::size_t cached);
+    void finish(const char* reason, std::size_t count, const DecoderResult& result,
+                const Tokenizer& tokenizer);
     void fail();
 
 private:
@@ -71,6 +73,7 @@ private:
         std::string id;
         std::string text;
         bool reasoning;
+        json::Value logprobs{};
     };
 
     json::OrderedObject envelope(const char* status, json::Value usage = json::Value(),

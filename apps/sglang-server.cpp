@@ -355,7 +355,8 @@ int main(int argc, char** argv) {
             }, &discovery, [&](const Socket& connection, int slot, std::string_view body) {
                 complete_messages(connection, service, slot, tokenizer, body, &vision);
             }, [&](const Socket& connection, int slot, std::string_view body) {
-                complete_responses(connection, service, slot, tokenizer, body, response_store);
+                complete_responses(connection, service, slot, tokenizer, body, response_store,
+                                   &vision);
             }, &response_store,
             [&](const Socket& connection, int slot, std::string_view body, bool systemone) {
                 if (systemone) {

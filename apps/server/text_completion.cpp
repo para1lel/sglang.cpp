@@ -630,7 +630,7 @@ void TextResponse::finish(const DecoderResult& result, std::size_t count) {
     }
     if (responses_) {
         if (const auto* reason = finish_output(result)) {
-            responses_->finish(reason, count, result.cached_prompt_tokens);
+            responses_->finish(reason, count, result, tokenizer_);
         }
         return;
     }

@@ -46,7 +46,7 @@ Table line numbers refer to upstream `http_server.py`. `G/P/U/D/H/W` denote GET/
 | P `/v1/systemone` | — | 2186. System One prompt and decision layout over candidate scoring. Validation returns 422, an exception to the app's usual 400. |
 | P `/v1/audio/transcriptions` | — | 1947. Multipart audio; JSON/text/verbose JSON; needs transcription adapter. |
 | W `/v1/realtime` | — | 1987. Transcription sessions only; requires a supported audio model. |
-| P `/v1/responses` | — | 2071. JSON/SSE create, with optional background processing and tool support. Native added [plain text and reasoning](../serving/openai-responses.md) after this baseline. |
+| P `/v1/responses` | — | 2071. JSON/SSE create, with optional background processing and tool support. Since this baseline, native added [text, reasoning, JSON Schema, inline PNG and buffered output logprobs](../serving/openai-responses.md). Named tool choice is unsupported. |
 | G `/v1/responses/{response_id}` | — | 2090. Retrieve stored response by ID. Native added opt-in retrieval after this baseline. |
 | P `/v1/responses/{response_id}/cancel` | — | 2098. Cancel a background response. All three paths register even if handler initialization fails at 402–424. Native added opt-in cancellation after this baseline. |
 | G/H `/` | — | 2121–2133. JSON greeting; `SGLANG_OLLAMA_ROOT_ROUTE` replaces the path and greeting. |

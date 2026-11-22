@@ -6,7 +6,7 @@ Multi-token prediction (MTP) drafts candidates and verifies them in order agains
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L288)<!-- prefix: "BatchService" --> |
+| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L34)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L287)<!-- prefix: "BatchService" --> |
 | MTP round | Draft proposals and commit target outputs in order. | [Proposals](../src/decoder_verify.cpp#L130)<!-- prefix: "bool MtpRoun" --> · [Commit](../src/decoder_verify.cpp#L180)<!-- prefix: "bool MtpRoun" --> |
 | Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_forward.cpp#L485)<!-- prefix: "bool Decoder" --> · [State commit](../src/decoder_verify.cpp#L344)<!-- prefix: "void TargetV" --> |
 

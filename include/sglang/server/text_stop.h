@@ -118,6 +118,7 @@ public:
     }
 
     std::optional<std::size_t> match() const { return matcher_.match(false); }
+    bool pending() const { return offset_ < pending_.size(); }
 
     std::string take(bool final, std::optional<std::size_t> match, bool include_match = false) {
         auto end = final ? matcher_.bytes() : matcher_.safe_end();

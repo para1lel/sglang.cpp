@@ -274,7 +274,6 @@ int main(int argc, char** argv) {
     try {
         const auto started = std::chrono::steady_clock::now();
         const auto arguments = parse_arguments(argc, argv);
-        const OllamaDiscovery discovery;
         install_shutdown_handlers();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
                                       arguments.mtp_steps != 0, arguments.fp8_prefill);
@@ -297,6 +296,7 @@ int main(int argc, char** argv) {
         const auto listener = listen(arguments);
         const std::chrono::duration<double> startup = std::chrono::steady_clock::now() - started;
         NativeGenerate native_generate(service, tokenizer);
+        const OllamaDiscovery discovery(native_generate);
         serve_connections(listener, service, arguments.max_active,
             [&](const Socket& connection, int slot, std::string_view body, bool chat) {
                 if (chat) {

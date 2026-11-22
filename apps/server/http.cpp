@@ -216,11 +216,13 @@ std::size_t content_length(std::string_view headers, HttpRequest& request,
         throw HttpError("400 Bad Request",
                         "Unsupported Media Type: Only 'application/json' is allowed");
     }
-    request.body_is_json = json_media_type(content_type.value_or(""));
+    if (content_type) {
+        request.body_is_json = json_media_type(*content_type);
+    }
     const auto path = request.route_path();
     if (request.method == "POST" &&
         (path == separate_reasoning_route || path == parse_function_call_route) &&
-        length.value_or(0) != 0 && !request.body_is_json) {
+        length.value_or(0) != 0 && !request.body_is_json.value_or(false)) {
         throw HttpError("400 Bad Request", "Input should be a valid dictionary");
     }
     return length.value_or(0);
@@ -679,24 +681,30 @@ bool EventStream::send(std::string_view bytes) {
 }
 
 bool EventStream::start() {
+    if (format_ == Format::ndjson) {
+        return started() ||
+            send("HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                 "Content-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n");
+    }
     return started() ||
         send("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\n"
              "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n");
 }
 
 bool EventStream::poll() {
-    return !last_write_ ||
+    return format_ == Format::ndjson || !last_write_ ||
         std::chrono::steady_clock::now() - *last_write_ < std::chrono::seconds(15) ||
         send("3\r\n:\n\n\r\n");
 }
 
 bool EventStream::write(std::string_view data) {
+    const bool sse = format_ == Format::sse;
     char size[2 * sizeof(std::size_t)];
-    const auto encoded = std::to_chars(size, size + sizeof(size), data.size() + 8, 16);
+    const auto encoded = std::to_chars(size, size + sizeof(size), data.size() + (sse ? 8 : 1), 16);
     std::string chunk(size, encoded.ptr);
-    chunk += "\r\ndata: ";
+    chunk += sse ? "\r\ndata: " : "\r\n";
     chunk += data;
-    chunk += "\n\n\r\n";
+    chunk += sse ? "\n\n\r\n" : "\n\r\n";
     return send(chunk);
 }
 

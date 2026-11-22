@@ -23,7 +23,7 @@ struct WideInteger {
 
 enum class Syntax {
     strict, ordered, benchmark, checkpoint, completion, native_generate, last_key_wins,
-    ordered_last_key_wins, tool_history, chat_tokenization, anthropic_count, http_body
+    ordered_last_key_wins, tool_history, chat_tokenization, python_request, http_body
 };
 
 class Value {

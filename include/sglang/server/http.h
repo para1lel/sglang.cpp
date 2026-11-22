@@ -29,7 +29,7 @@ struct HttpRequest {
     std::string body;
     std::string host;
     std::string query;
-    bool body_is_json = false;
+    std::optional<bool> body_is_json = std::nullopt;
 
     std::string_view route_path() const;
 };
@@ -79,7 +79,10 @@ bool write_metrics(const Socket& connection, std::string_view body);
 
 class EventStream {
 public:
-    explicit EventStream(const Socket& connection) : connection_(connection) {}
+    enum class Format { sse, ndjson };
+
+    explicit EventStream(const Socket& connection, Format format = Format::sse)
+        : connection_(connection), format_(format) {}
 
     bool started() const { return last_write_.has_value(); }
     bool start();
@@ -91,6 +94,7 @@ private:
     bool send(std::string_view bytes);
 
     const Socket& connection_;
+    const Format format_;
     std::optional<std::chrono::steady_clock::time_point> last_write_;
 };
 

@@ -2,6 +2,7 @@
 
 #include "sglang/json.h"
 #include "sglang/server/http.h"
+#include "sglang/server/native_generate.h"
 #include "sglang/tokenizer/tokenizer.h"
 #include "sglang/utf8.h"
 
@@ -17,6 +18,7 @@ namespace sglang::server {
 namespace {
 
 constexpr std::string_view default_root = "/";
+constexpr std::string_view default_generate = "/api/generate";
 constexpr std::string_view default_tags = "/api/tags";
 constexpr std::string_view default_show = "/api/show";
 constexpr auto root_variable = "SGLANG_OLLAMA_ROOT_ROUTE";
@@ -115,7 +117,7 @@ void show(const Socket& connection, const HttpRequest& request) {
     std::string_view error = "body: Field required";
     if (!request.body.empty()) {
         error = dictionary;
-        if (request.body_is_json) {
+        if (request.body_is_json.value_or(false)) {
             try {
                 if (!valid_utf8(request.body)) {
                     throw json::ParseError("Invalid UTF-8 input");
@@ -209,43 +211,58 @@ bool OllamaDiscovery::Path::matches(std::string_view path) const {
     return path == literal;
 }
 
-OllamaDiscovery::OllamaDiscovery()
-    : ollama_root_(std::getenv(root_variable) != nullptr),
+OllamaDiscovery::OllamaDiscovery(NativeGenerate& native_generate)
+    : native_generate_(native_generate), ollama_root_(std::getenv(root_variable) != nullptr),
       root_(route_env(root_variable, default_root)),
+      generate_(route_env("SGLANG_OLLAMA_GENERATE_ROUTE", default_generate)),
       tags_(route_env("SGLANG_OLLAMA_TAGS_ROUTE", default_tags)),
       show_(route_env("SGLANG_OLLAMA_SHOW_ROUTE", default_show)) {}
 
 bool OllamaDiscovery::matches(std::string_view path) const {
-    return root_.matches(path) || tags_.matches(path) || show_.matches(path);
+    return root_.matches(path) || generate_.matches(path) || tags_.matches(path) ||
+        show_.matches(path);
 }
 
-bool OllamaDiscovery::matches_show(const HttpRequest& request) const {
-    return show_.matches(request.route_path()) || show_.matches(request.path);
+bool OllamaDiscovery::matches(const Path& route, const HttpRequest& request) {
+    return route.matches(request.route_path()) || route.matches(request.path);
 }
 
-bool OllamaDiscovery::respond_exact(const Socket& connection, const HttpRequest& request,
-                                    bool later_full, std::string_view earlier_allow) const {
+bool OllamaDiscovery::overrides_count(const HttpRequest& request) const {
+    return matches(generate_, request) || matches(show_, request);
+}
+
+QueuedGenerate OllamaDiscovery::prepare_generate(const Socket& connection,
+                                                  const HttpRequest& request) const {
+    return native_generate_.prepare_ollama(connection, request.body,
+                                           request.body_is_json.value_or(true));
+}
+
+OllamaDiscovery::Route OllamaDiscovery::respond_exact(const Socket& connection,
+    const HttpRequest& request, bool later_full, std::string_view earlier_allow) const {
     const auto head = request.method == "HEAD";
     const auto get = request.method == "GET";
-    const auto path = request.route_path();
-    const auto root = root_.matches(path) || root_.matches(request.path);
-    const auto tags = tags_.matches(path) || tags_.matches(request.path);
-    const auto metadata = matches_show(request);
+    const auto post = request.method == "POST";
+    const auto root = matches(root_, request);
+    const auto generate = matches(generate_, request);
+    const auto tags = matches(tags_, request);
+    const auto metadata = matches(show_, request);
     if (root && (head || get)) {
         write_json(connection, "200 OK",
                    ollama_root_ ? R"("Ollama is running")" : R"("SGLang is running")", head);
+    } else if (generate && post) {
+        return Route::generate;
     } else if (tags && get) {
         write_json(connection, "200 OK", tags_json());
-    } else if (metadata && request.method == "POST") {
+    } else if (metadata && post) {
         show(connection, request);
-    } else if (!later_full && (root || tags || metadata)) {
+    } else if (!later_full && (root || generate || tags || metadata)) {
         const auto allow = earlier_allow.empty() ?
-            (root ? "HEAD" : tags ? "GET" : "POST") : earlier_allow;
+            (root ? "HEAD" : generate ? "POST" : tags ? "GET" : "POST") : earlier_allow;
         write_method_not_allowed(connection, allow, head);
     } else {
-        return false;
+        return Route::unmatched;
     }
-    return true;
+    return Route::responded;
 }
 
 bool OllamaDiscovery::respond_unmatched(const Socket& connection,
@@ -261,7 +278,8 @@ bool OllamaDiscovery::respond_unmatched(const Socket& connection,
         }
     }
     const auto base = matchable_route_path(slash_alternate(path));
-    if (path == default_root || base.empty() || base == default_tags || base == default_show) {
+    if (path == default_root || base.empty() || base == default_generate ||
+        base == default_tags || base == default_show) {
         write_json(connection, "404 Not Found", R"({"detail":"Not Found"})",
                    request.method == "HEAD");
         return true;

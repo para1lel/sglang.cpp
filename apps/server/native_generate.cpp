@@ -1,6 +1,7 @@
 #include "sglang/decoder_constraint.h"
 #include "sglang/server/native_generate.h"
 #include "sglang/server/http.h"
+#include "sglang/server/ollama_generate.h"
 #include "sglang/server/text_completion.h"
 #include "sglang/server/text_stop.h"
 #include "sglang/utf8.h"
@@ -123,6 +124,8 @@ public:
     bool stream_token(EventStream& stream, int id);
     std::string finish(const DecoderResult& result);
     std::string frame(std::optional<std::size_t> index, const DecoderResult& result, bool terminal);
+    std::string_view decoded_text(const DecoderResult& result, bool terminal);
+    bool holds_stop_prefix() const { return stop_buffer_ && stop_buffer_->pending(); }
 
 private:
     std::string body(const std::vector<int>& ids, const DecoderResult* result,
@@ -202,8 +205,7 @@ std::string GenerateResponse::finish(const DecoderResult& result) {
     return body(result.output_token_ids, &result, true);
 }
 
-std::string GenerateResponse::frame(std::optional<std::size_t> index,
-                                    const DecoderResult& result, bool terminal) {
+std::string_view GenerateResponse::decoded_text(const DecoderResult& result, bool terminal) {
     const auto& ids = result.output_token_ids;
     while (decoded_tokens_ < ids.size()) {
         const int id = ids[decoded_tokens_++];
@@ -220,7 +222,16 @@ std::string GenerateResponse::frame(std::optional<std::size_t> index,
         }
         text_ += stop_buffer_->take(terminal, result.matched_text_stop, request_.no_stop_trim);
     }
-    auto output = terminal ? finish(result) : body(ids, &result, false, index.has_value());
+    if (terminal) {
+        text_ += utf8_.finish();
+    }
+    return text_;
+}
+
+std::string GenerateResponse::frame(std::optional<std::size_t> index,
+                                    const DecoderResult& result, bool terminal) {
+    decoded_text(result, terminal);
+    auto output = body(result.output_token_ids, &result, terminal, terminal || index.has_value());
     if (index) {
         output.pop_back();
         output += R"(,"index":)" + std::to_string(*index) + '}';
@@ -395,6 +406,91 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
     }
 }
 
+void stream_ollama(EventStream& stream, const Socket& connection, BatchService& service, int slot,
+                   const Tokenizer& tokenizer, const std::vector<BatchPrompt>& items) {
+    GenerateResponse response(items.front(), tokenizer);
+    std::size_t emitted = 0;
+    const BatchCallbacks callbacks{
+        [&] { return disconnected(connection); }, {}, {},
+        [&](std::size_t, const DecoderResult& result, bool terminal) {
+            if (result.finish_reason == DecoderFinishReason::aborted) {
+                return false;
+            }
+            if (terminal) {
+                return stream.write(ollama_generate_frame("", true));
+            }
+            const auto text = response.decoded_text(result, false);
+            if (response.holds_stop_prefix()) {
+                return true;
+            }
+            const auto delta = text.substr(emitted);
+            emitted = text.size();
+            return stream.write(ollama_generate_frame(delta, false));
+        },
+    };
+    if (service.generate_batch(slot, items, callbacks)) {
+        stream.end();
+    }
+}
+
+std::vector<BatchPrompt> ollama_prompts(OllamaGenerateRequest& request,
+                                        const CompletionTokenizer& tokenizer) {
+    auto sampling = ollama_sampling(request.options);
+    const bool bounded = !sampling.at("max_new_tokens").is_null();
+    if (!bounded) {
+        sampling.insert_or_assign("max_new_tokens", 0);
+    }
+    GenerateInput input;
+    input.text = true;
+    input.fields.emplace("text", std::move(request.prompt));
+    input.fields.emplace("sampling_params", std::move(sampling));
+    auto items = parse_generate_prompts(input, tokenizer);
+    if (!bounded) {
+        const auto available = checkpoint_context - items.front().prompt.size();
+        items.front().options.max_new_tokens = static_cast<int>(available);
+    }
+    return items;
+}
+
+void complete_ollama(const Socket& connection, BatchService& service, std::optional<int> slot,
+                     const CompletionTokenizer& tokenizer, OllamaGenerateRequest& request,
+                     BatchRequestId& id) {
+    EventStream stream(connection, EventStream::Format::ndjson);
+    if (disconnected(connection) || (request.stream && !stream.start())) {
+        return;
+    }
+    try {
+        if (!slot) {
+            id.finish_abort();
+            throw std::runtime_error("Request aborted in waiting queue");
+        }
+        const auto start = std::chrono::steady_clock::now();
+        auto items = ollama_prompts(request, tokenizer);
+        auto& item = items.front();
+        item.request_id = &id;
+        if (request.stream) {
+            stream_ollama(stream, connection, service, *slot, tokenizer.get(), items);
+            return;
+        }
+        const BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
+        if (const auto results = service.generate_batch(*slot, items, callbacks)) {
+            const auto& result = results->front();
+            finish_type(result, item.options);
+            GenerateResponse response(item, tokenizer.get());
+            const auto text = response.decoded_text(result, true);
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            const OllamaGenerateUsage usage{elapsed, item.prompt.size(),
+                                            result.output_token_ids.size()};
+            write_json(connection, "200 OK", ollama_generate_result(text, usage));
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "Ollama generation failed: " << error.what() << '\n';
+        if (!stream.started() && !disconnected(connection)) {
+            write_internal_server_error(connection);
+        }
+    }
+}
+
 std::vector<std::optional<std::string>> generate_ids(const GenerateInput& input) {
     std::vector<std::optional<std::string>> ids(input.item_count());
     const auto* rid = json::get(input.fields, "rid");
@@ -511,6 +607,43 @@ QueuedGenerate NativeGenerate::prepare(std::string_view body) {
             return std::all_of(registration->items.begin(), registration->items.end(),
                                [](const auto& item) { return item->aborted_waiting(); });
         },
+    };
+}
+
+QueuedGenerate NativeGenerate::prepare_ollama(const Socket& connection, std::string_view body,
+                                             bool json_body) {
+    OllamaGenerateRequest request;
+    try {
+        if (!json_body) {
+            throw std::invalid_argument("body: Input should be a valid dictionary");
+        }
+        request = parse_ollama_generate(body);
+    } catch (const std::invalid_argument& error) {
+        write_tokenization_error(connection, "400 Bad Request", "Bad Request", error.what());
+        return {};
+    } catch (const json::ParseError& error) {
+        write_tokenization_error(connection, "400 Bad Request", "Bad Request", error.what());
+        return {};
+    }
+    if (request.prompt.empty()) {
+        const auto result = ollama_generate_result("");
+        if (!request.stream) {
+            write_json(connection, "200 OK", result);
+        } else {
+            EventStream stream(connection, EventStream::Format::ndjson);
+            if (stream.start() && stream.write(result)) {
+                stream.end();
+            }
+        }
+        return {};
+    }
+    auto registration = register_ids(GenerateInput{});
+    return {
+        [this, request = std::move(request), registration](
+            const Socket& socket, std::optional<int> slot) mutable {
+            complete_ollama(socket, service_, slot, tokenizer_, request, *registration->items[0]);
+        },
+        [registration] { return registration->items[0]->aborted_waiting(); },
     };
 }
 

@@ -8,6 +8,10 @@
 #include <memory>
 #include <mutex>
 
+namespace sglang {
+class Tokenizer;
+}
+
 namespace sglang::server {
 
 class CompletionTokenizer;
@@ -38,6 +42,7 @@ public:
         : service_(service), tokenizer_(tokenizer) {}
 
     QueuedGenerate prepare(std::string_view body);
+    QueuedGenerate prepare_ollama(const Socket& connection, std::string_view body, bool json_body);
     void abort(const Socket& connection, std::string_view body);
 
 private:

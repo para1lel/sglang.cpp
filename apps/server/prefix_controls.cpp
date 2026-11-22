@@ -324,6 +324,8 @@ private:
     };
 
     NativeRoute native_route(std::string_view path, std::string_view method) const;
+    void enqueue(Socket& connection, HttpRequest request, bool generate, bool auxiliary,
+                 QueuedGenerate prepared);
     void serve_control(Socket& connection, const HttpRequest& request);
     void queue_health(Socket& connection, const HttpRequest& request);
     void queue_reset(Socket& connection, const HttpRequest& request);
@@ -629,8 +631,18 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
     const auto native = native_route(request.route_path(), request.method);
     if (discovery_ && (!native.full || native.after_discovery)) {
         const auto earlier_allow = native.after_discovery ? std::string_view{} : native.allow;
-        if (discovery_->respond_exact(connection, request, native.full, earlier_allow)) {
+        switch (discovery_->respond_exact(connection, request, native.full, earlier_allow)) {
+        case OllamaDiscovery::Route::responded:
             return;
+        case OllamaDiscovery::Route::generate: {
+            auto prepared = discovery_->prepare_generate(connection, request);
+            if (prepared.complete) {
+                enqueue(connection, std::move(request), false, false, std::move(prepared));
+            }
+            return;
+        }
+        case OllamaDiscovery::Route::unmatched:
+            break;
         }
     }
     if (native.allow.empty()) {
@@ -687,7 +699,12 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         serve_control(connection, request);
         return;
     }
-    if (!tokenize && !score) {
+    enqueue(connection, std::move(request), generate, tokenize || score, QueuedGenerate{});
+}
+
+void ConnectionQueue::enqueue(Socket& connection, HttpRequest request, bool generate,
+                              bool auxiliary, QueuedGenerate prepared) {
+    if (!auxiliary) {
         service_.rethrow_failure();
     }
     {
@@ -697,7 +714,7 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         }
         discard_disconnected();
         if (pending_.size() >= static_cast<std::size_t>(capacity_)) {
-            if (tokenize || score) {
+            if (auxiliary) {
                 lock.unlock();
                 if (request.route_path() == anthropic_count_route) {
                     write_anthropic_error(connection, "503 Service Unavailable", "api_error",
@@ -710,7 +727,9 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
             }
             throw HttpError("503 Service Unavailable", "Native completion queue is full");
         }
-        auto prepared = generate ? generate_(request.body) : QueuedGenerate{};
+        if (generate) {
+            prepared = generate_(request.body);
+        }
         if (prepared.complete) {
             request.body = std::string{};
         }
@@ -723,7 +742,7 @@ void ConnectionQueue::read(const Socket& listener) {
     read_connections(listener, capacity_ + 1, [&](Socket& connection, HttpRequest request) {
         handle_errors(connection, [&] { route(connection, std::move(request)); });
     }, [&](const HttpRequest& request) {
-        return discovery_ && discovery_->matches_show(request);
+        return discovery_ && discovery_->overrides_count(request);
     });
 }
 
@@ -766,13 +785,13 @@ void ConnectionQueue::run(int slot) {
             const auto& request = *work->request;
             handle_errors(work->connection, [&] {
                 const auto tokenize = tokenization_route(request);
-                if (tokenize != TokenizationRoute::none) {
+                if (work->generate.complete) {
+                    const auto generate = std::move(work->generate);
+                    generate.complete(work->connection, slot);
+                } else if (tokenize != TokenizationRoute::none) {
                     tokenize_(work->connection, tokenize, request.body);
                 } else if (score_ && request.route_path() == score_route) {
                     score_(work->connection, slot, request.body);
-                } else if (work->generate.complete) {
-                    const auto generate = std::move(work->generate);
-                    generate.complete(work->connection, slot);
                 } else {
                     complete_(work->connection, slot, request.body, chat_route(request));
                 }

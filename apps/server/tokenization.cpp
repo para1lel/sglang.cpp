@@ -626,7 +626,7 @@ void serve_anthropic_count(const Socket& connection, const CompletionTokenizer& 
                            std::string_view body) {
     try {
         if (body.empty()) throw std::invalid_argument("Field required");
-        const auto request = json::parse(body, json::Syntax::anthropic_count);
+        const auto request = json::parse(body, json::Syntax::python_request);
         const auto converted = anthropic_count_chat(request, loader.chat_parsers().qwen3_reasoning);
         ChatTokenization chat{{}, {}, std::nullopt, false};
         chat.turns.reserve(converted.messages.size());

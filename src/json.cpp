@@ -65,7 +65,7 @@ Value Parser::document() {
     const bool ordered = syntax_ == Syntax::ordered ||
                          syntax_ == Syntax::ordered_last_key_wins ||
                          syntax_ == Syntax::tool_history || syntax_ == Syntax::chat_tokenization ||
-                         syntax_ == Syntax::anthropic_count;
+                         syntax_ == Syntax::python_request;
     auto result = value(0, ordered);
     whitespace();
     if (!input_.empty()) {
@@ -130,7 +130,7 @@ Value Parser::object(std::size_t depth, bool ordered) {
                 if (inserted) {
                     entries.emplace_back(std::move(key), std::move(entry));
                 } else if (syntax_ == Syntax::ordered_last_key_wins ||
-                           syntax_ == Syntax::tool_history || syntax_ == Syntax::anthropic_count) {
+                           syntax_ == Syntax::tool_history || syntax_ == Syntax::python_request) {
                     entries[position->second].second = std::move(entry);
                 } else {
                     fail("duplicate JSON object key");
@@ -212,7 +212,7 @@ Value Parser::number() {
     }
     if ((syntax_ == Syntax::ordered || syntax_ == Syntax::completion ||
          syntax_ == Syntax::ordered_last_key_wins || syntax_ == Syntax::chat_tokenization ||
-         syntax_ == Syntax::anthropic_count) &&
+         syntax_ == Syntax::python_request) &&
         text.find_first_of(".eE") == std::string_view::npos) {
         if (text.size() > 4300 + static_cast<std::size_t>(text.front() == '-')) {
             fail("JSON integer exceeds the digit limit");
@@ -227,9 +227,9 @@ Value Parser::number() {
     if (parsed.ec == std::errc::result_out_of_range && parsed.ptr == end) {
         if (syntax_ == Syntax::benchmark || syntax_ == Syntax::checkpoint ||
             syntax_ == Syntax::tool_history || syntax_ == Syntax::chat_tokenization ||
-            syntax_ == Syntax::anthropic_count || syntax_ == Syntax::http_body) {
+            syntax_ == Syntax::python_request || syntax_ == Syntax::http_body) {
             const auto ranged = ranged_number(text);
-            if (ranged && (syntax_ == Syntax::checkpoint || syntax_ == Syntax::anthropic_count ||
+            if (ranged && (syntax_ == Syntax::checkpoint || syntax_ == Syntax::python_request ||
                            *ranged == 0.0)) {
                 return *ranged;
             }

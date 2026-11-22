@@ -236,16 +236,18 @@ def stream_record(case, request_hash, name, phase, cohort, stamps=(20, 50, 60, 7
                         "aggregate_tokens_per_second": aggregate_rate}}
 
 
-def write_opt_in_identity(directory):
+def write_opt_in_identity(directory, profile):
     identity = {
         "protocol": "matched-k4-opt-in-v1",
         "campaign_id": "01234567-89ab-cdef-0123-456789abcdef",
-        "native_profile": "ordered-tc-int8",
+        "native_profile": profile,
         "native_config": {
             "fp8_prefill": "tensor-core-mtp-target", "mtp_int8_head": True, "mtp_steps": 4,
         },
         "native_binary_sha256": "b" * 64,
     }
+    if profile == k4.SPLIT_PROFILE:
+        identity["native_config"][k4.SPLIT_FIELD] = True
     path = directory / "identity.json"
     path.write_text(json.dumps(identity) + "\n")
     return identity, hashlib.sha256(path.read_bytes()).hexdigest()
@@ -261,6 +263,7 @@ def write_opt_in_arm(run, arm, identity):
         info.update(mtp_steps=0, mtp_int8_head=False)
     if arm == "native-exact-k0":
         info["fp8_prefill"] = "exact"
+        info.pop(k4.SPLIT_FIELD, None)
     (run / "server-info.json").write_text(json.dumps(info))
     (run / "running-binary.sha256").write_text(
         identity["native_binary_sha256"] + "  /proc/123/exe\n")
@@ -275,12 +278,13 @@ def replace_stream_ids(record, offset):
         event["lines"] = ["data: " + json.dumps(payload)]
 
 
-def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None, opt_in=False):
+def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None, opt_in=False,
+                 profile=k4.ORDERED_PROFILE):
     row = "W1"
     (lane, body, case), = k4.fixture(row, directory)
     arms = (*k4.ARM_ORDER, "native-exact-k0") if opt_in else k4.ARM_ORDER
     if opt_in:
-        identity, fingerprint = write_opt_in_identity(directory)
+        identity, fingerprint = write_opt_in_identity(directory, profile)
     for arm in arms:
         measurement = directory / arm / "measurement"
         measurement.mkdir(parents=True)
@@ -332,16 +336,21 @@ def test_k4_timing_gate_with_different_valid_ids(tmp_path, monkeypatch, native_n
 
 
 @pytest.mark.parametrize(("native_ns", "passed"), [(70, True), (80, False), (90, False)])
-def test_k4_opt_in_labels_exact_compatibility_separately(tmp_path, native_ns, passed):
-    write_k4_row(tmp_path, native_ns, opt_in=True)
+@pytest.mark.parametrize("profile", [k4.ORDERED_PROFILE, k4.SPLIT_PROFILE])
+def test_k4_opt_in_labels_exact_compatibility_separately(tmp_path, native_ns, passed, profile):
+    write_k4_row(tmp_path, native_ns, opt_in=True, profile=profile)
     result = k4.assess("W1", tmp_path, tmp_path)
     assert result["protocol"] == "matched-k4-opt-in-v1"
-    assert result["native_profile"] == "ordered-tc-int8"
+    assert result["native_profile"] == profile
+    assert (k4.SPLIT_FIELD in result["native_config"]) is (profile == k4.SPLIT_PROFILE)
     assert result["passed"] is passed
     assert result["native_k0_parity"] is True
     assert result["exact_k0_compatibility"]["diagnostic_only"] is True
     assert result["exact_k0_compatibility"]["all_ids_match"] is False
     assert result["exact_k0_compatibility"]["lanes"][0]["different_ids"] == 128
+    first = result["exact_k0_compatibility"]["lanes"][0]["first_difference"]
+    assert first == {"output_index": 0, "exact_id": 1,
+                     ("policy_id" if profile == k4.SPLIT_PROFILE else "ordered_id"): 0}
     assert result["workloads"]["W1"]["native"]["samples_ns"] == [native_ns] * 9
 
 
@@ -391,8 +400,38 @@ def test_k4_opt_in_rejects_wrong_live_config(tmp_path, arm, field, value):
         k4.assess("W1", tmp_path, tmp_path)
 
 
-def test_k4_opt_in_rejects_policy_k4_drift(tmp_path):
-    write_k4_row(tmp_path, fault="native-drift", opt_in=True)
+@pytest.mark.parametrize(("profile", "arm", "active"), [
+    (k4.ORDERED_PROFILE, "native-k4", True),
+    (k4.SPLIT_PROFILE, "native-k0", None),
+    (k4.SPLIT_PROFILE, "native-k4-trace", False),
+    (k4.SPLIT_PROFILE, "native-k4", 1),
+    (k4.SPLIT_PROFILE, "native-exact-k0", True),
+])
+def test_k4_split_rejects_wrong_live_policy(tmp_path, profile, arm, active):
+    write_k4_row(tmp_path, opt_in=True, profile=profile)
+    path = tmp_path / arm / "server-info.json"
+    info = json.loads(path.read_bytes())
+    if active is None:
+        del info[k4.SPLIT_FIELD]
+    else:
+        info[k4.SPLIT_FIELD] = active
+    write_json(path, info)
+    with pytest.raises(ValueError, match=f"{arm}: wrong native server configuration"):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+@pytest.mark.parametrize("active", [False, 1, "true"])
+def test_k4_split_requires_boolean_activation_in_campaign(tmp_path, active):
+    config, _ = write_opt_in_identity(tmp_path, k4.SPLIT_PROFILE)
+    config["native_config"][k4.SPLIT_FIELD] = active
+    write_json(tmp_path / "identity.json", config)
+    with pytest.raises(ValueError, match="Unknown opt-in native campaign configuration"):
+        k4.campaign(tmp_path)
+
+
+@pytest.mark.parametrize("profile", [k4.ORDERED_PROFILE, k4.SPLIT_PROFILE])
+def test_k4_opt_in_rejects_policy_k4_drift(tmp_path, profile):
+    write_k4_row(tmp_path, fault="native-drift", opt_in=True, profile=profile)
     with pytest.raises(ValueError, match="native K4 differs from native K0"):
         k4.assess("W1", tmp_path, tmp_path)
 
@@ -413,10 +452,11 @@ def test_k4_opt_in_captures_exact_diagnostic_before_timing(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("fault", [None, "native-drift", "missing-eof", "trailing-data"])
-def test_k4_opt_in_replays_concurrent_lanes(tmp_path, monkeypatch, fault):
+@pytest.mark.parametrize("profile", [k4.ORDERED_PROFILE, k4.SPLIT_PROFILE])
+def test_k4_opt_in_replays_concurrent_lanes(tmp_path, monkeypatch, fault, profile):
     cohort, lanes = synthetic_cohort()
     monkeypatch.setattr(k4.concurrent, "load_lanes", lambda *_: lanes)
-    identity_data, fingerprint = write_opt_in_identity(tmp_path)
+    identity_data, fingerprint = write_opt_in_identity(tmp_path, profile)
     for arm in ("native-k0", "native-exact-k0", "native-k4", "vllm-k4"):
         directory = tmp_path / arm / "measurement"
         directory.mkdir(parents=True)

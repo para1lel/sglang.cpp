@@ -91,6 +91,23 @@ only to the named policy. The exact-FP8 comparison above retains its original
 adoption gate. Each opt-in cohort carries its campaign and arm identity. Use the
 same profile and directory for each subsequent row.
 
+### Ordered Tensor Core with split target attention and INT8 draft
+
+Set `PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-split-gqa` in a fresh campaign
+directory and use a Release server that implements split target attention.
+Use this same profile for W1 through W6. The launcher sets the split experiment
+for both native policy arms and the W1 native trace. It requires
+`experimental_target_split_gqa: true` in their live server information.
+The exact K0 diagnostic runs with split disabled. Caller-supplied dispatch
+overrides are rejected.
+
+The split policy changes target attention arithmetic at eligible visible
+lengths. Native K4 must match split K0 on every lane. The separate exact K0
+diagnostic measures compatibility, and the pinned vLLM K4 arm measures timing.
+Neither establishes equivalence to the published ordered profile. The
+campaign binds the split policy and the fixed native settings to all receipts,
+including rows where attention falls back to the ordered implementation.
+
 ## Replay the historical GPU 2 arm
 
 On the benchmark host, `artifacts/test-bench-baseline` holds the saved 32,768-token vLLM arm

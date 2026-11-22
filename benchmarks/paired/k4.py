@@ -22,6 +22,9 @@ PROTOCOL = "matched-k4-v1"
 OPT_IN_PROTOCOL = "matched-k4-opt-in-v1"
 ARM_ORDER = ("native-k0", "native-k4-trace", "native-k4", "vllm-k4")
 EXACT_CONTROL = "native-exact-k0"
+ORDERED_PROFILE = "ordered-tc-int8"
+SPLIT_PROFILE = "ordered-tc-int8-split-gqa"
+SPLIT_FIELD = "experimental_target_split_gqa"
 
 
 def schedule(row, arm):
@@ -101,12 +104,18 @@ def campaign(directory):
     identity = json.loads(raw)
     if identity["protocol"] == PROTOCOL:
         return None
+    profile = identity["native_profile"]
+    config = identity["native_config"]
+    expected = {"fp8_prefill": "tensor-core-mtp-target", "mtp_steps": 4, "mtp_int8_head": True}
+    if profile == SPLIT_PROFILE:
+        expected[SPLIT_FIELD] = True
     require(identity["protocol"] == OPT_IN_PROTOCOL
-            and identity["native_profile"] == "ordered-tc-int8"
+            and profile in (ORDERED_PROFILE, SPLIT_PROFILE)
             and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
                              identity["campaign_id"])
-            and identity["native_config"] == {
-                "fp8_prefill": "tensor-core-mtp-target", "mtp_steps": 4, "mtp_int8_head": True},
+            and config.keys() == expected.keys()
+            and all(type(config[key]) is type(value) and config[key] == value
+                    for key, value in expected.items()),
             "Unknown opt-in native campaign configuration")
     return identity, hashlib.sha256(raw).hexdigest()
 
@@ -122,12 +131,14 @@ def arm_binding(directory, arm, selected):
         config = dict(identity["native_config"], trace_batches=arm == "native-k4-trace",
                       max_running_requests=32, max_num_batched_tokens=8192, prefix_cache_entries=0,
                       batch_cuda_graphs=True, eager=False, host="127.0.0.1", device=0)
+        split = config.pop(SPLIT_FIELD, False) and arm != EXACT_CONTROL
         if arm in ("native-k0", EXACT_CONTROL):
             config.update(mtp_steps=0, mtp_int8_head=False)
         if arm == EXACT_CONTROL:
             config["fp8_prefill"] = "exact"
         require(all(type(info[key]) is type(value) and info[key] == value
-                    for key, value in config.items()), f"{arm}: wrong native server configuration")
+                    for key, value in config.items()) and info.get(SPLIT_FIELD, False) is split,
+                f"{arm}: wrong native server configuration")
         require((run / "running-binary.sha256").read_text().split()[0]
                 == identity["native_binary_sha256"], f"{arm}: wrong running native binary")
     return {"campaign_sha256": fingerprint, "arm": arm}
@@ -166,15 +177,17 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
             json.dump(raw, stream, separators=(",", ":"), allow_nan=False)
         _, outputs = replay(raw, row, tag, lanes, policy, binding)
         if arm == EXACT_CONTROL:
+            identity, _ = selected
             diagnostic = {"protocol": OPT_IN_PROTOCOL, "row": row, **binding,
-                          **exact_compatibility(expected, outputs)}
+                          **exact_compatibility(expected, outputs, identity["native_profile"])}
             save(directory.parent.parent / "exact-k0-compatibility.json", diagnostic)
         else:
             require(expected is None or outputs == expected,
                     f"{tag}: native K4 differs from native K0")
 
 
-def exact_compatibility(expected, exact):
+def exact_compatibility(expected, exact, profile):
+    id_key = "policy_id" if profile == SPLIT_PROFILE else "ordered_id"
     lanes = []
     for policy_ids, exact_ids in zip(expected, exact, strict=True):
         differences = [index for index, (policy_id, exact_id) in
@@ -182,7 +195,7 @@ def exact_compatibility(expected, exact):
         first = None
         if differences:
             index = differences[0]
-            first = {"output_index": index, "ordered_id": policy_ids[index],
+            first = {"output_index": index, id_key: policy_ids[index],
                      "exact_id": exact_ids[index]}
         lanes.append({"different_ids": len(differences), "first_difference": first})
     return {"diagnostic_only": True, "all_ids_match": expected == exact, "lanes": lanes}
@@ -222,7 +235,8 @@ def assess(row, fixtures, directory):
         result.update(protocol=OPT_IN_PROTOCOL, native_profile=identity["native_profile"],
                       native_config=identity["native_config"], campaign_sha256=fingerprint,
                       native_k0_parity=True,
-                      exact_k0_compatibility=exact_compatibility(expected, exact))
+                      exact_k0_compatibility=exact_compatibility(
+                          expected, exact, identity["native_profile"]))
     return result
 
 

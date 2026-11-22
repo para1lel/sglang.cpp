@@ -54,19 +54,23 @@ std::optional<cudaError_t> try_target_fp8_tc(const TextFp8DecodeTarget* targets,
         return std::nullopt;
     }
     Operands operands{};
+    auto* packed_input = reinterpret_cast<std::uint8_t*>(scratch);
+    bool already_packed = true;
     for (int row = 0; row < count; ++row) {
         if (!rows[row].input.values || !decode_proj::aligned16(rows[row].input.values) ||
             !rows[row].input.scales) {
             return std::nullopt;
         }
         operands.values[row] = rows[row].input.values;
+        already_packed &= operands.values[row] == packed_input + row * in_width;
     }
-    auto* packed_input = reinterpret_cast<std::uint8_t*>(scratch);
-    constexpr int threads = 128;
-    pack_input<<<dim3((in_width / 16 + threads - 1) / threads, count), threads, 0, stream>>>(
-        operands, packed_input, in_width);
-    if (const auto status = cudaGetLastError(); status != cudaSuccess) {
-        return status;
+    if (!already_packed) {
+        constexpr int threads = 128;
+        pack_input<<<dim3((in_width / 16 + threads - 1) / threads, count), threads, 0, stream>>>(
+            operands, packed_input, in_width);
+        if (const auto status = cudaGetLastError(); status != cudaSuccess) {
+            return status;
+        }
     }
     return try_text_fp8_decode_sm100_rows(
         targets, target_count, packed_input, in_width, rows, count, stream);

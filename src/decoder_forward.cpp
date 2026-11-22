@@ -77,6 +77,17 @@ struct LayerBatch {
         return std::is_same_v<Lane, VerificationRow> && count == fused_verify_rows;
     }
 
+    TextFp8Activation verification_activation(int index, int width) const {
+        auto activation = workspace(lanes[index]).activation;
+        if (target_tc) {
+            static_assert(fused_verify_rows == text_fp8_max_batch);
+            static_assert(fused_verify_rows * intermediate_size <= vocab_size * sizeof(Bf16));
+            auto* packed = reinterpret_cast<std::uint8_t*>(workspace(lanes[0]).logits);
+            activation.values = packed + index * width;
+        }
+        return activation;
+    }
+
     int projection_rows(int group) const {
         const int groups = (count + text_fp8_max_batch - 1) / text_fp8_max_batch;
         return count / groups + (group < count % groups);
@@ -113,7 +124,8 @@ struct LayerBatch {
         VerifyQuantizeRows rows;
         for (int index = 0; index < fused_verify_rows; ++index) {
             auto& work = workspace(lanes[index]);
-            rows.entries[index] = {work.*source, up ? work.*up : nullptr, work.activation};
+            rows.entries[index] = {
+                work.*source, up ? work.*up : nullptr, verification_activation(index, width)};
         }
         check(verify_quantize_fp8(rows, width, stream), "Quantize five verification rows");
     }
@@ -139,8 +151,9 @@ struct LayerBatch {
             const int rows = projection_rows(group);
             for (int index = 0; index < rows; ++index) {
                 const auto& work = workspace(lanes[first + index]);
-                projections[index] = {{work.activation.values, work.activation.scales},
-                                      work.*output};
+                const auto activation = fuse_verify_activation()
+                    ? verification_activation(first + index, weight.columns) : work.activation;
+                projections[index] = {{activation.values, activation.scales}, work.*output};
             }
             check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
                                 projections.data(), rows, stream), "Run batched FP8 projection");
@@ -181,8 +194,9 @@ struct LayerBatch {
                 auto* entries = projections.data() + target * rows;
                 for (int index = 0; index < rows; ++index) {
                     const auto& work = workspace(lanes[first + index]);
-                    entries[index] = {{work.activation.values, work.activation.scales},
-                                      work.*layer.output};
+                    const auto activation = fuse_verify_activation()
+                        ? verification_activation(first + index, columns) : work.activation;
+                    entries[index] = {{activation.values, activation.scales}, work.*layer.output};
                 }
                 const auto weight = layer.weight;
                 targets[target++] = {weight.values, weight.scales, weight.rows, entries[0].output};
@@ -721,7 +735,9 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
             for (int index = 0; index < fused_verify_rows; ++index) {
                 auto& work = workspace(lanes[index]);
                 const auto [branch, residual] = residuals(work);
-                rows.entries[index] = {branch, residual, work.normalized, work.activation};
+                rows.entries[index] = {
+                    branch, residual, work.normalized,
+                    batch.verification_activation(index, hidden_size)};
             }
             check(verify_rms_quantize(rows, weight, stream), operation);
             return;

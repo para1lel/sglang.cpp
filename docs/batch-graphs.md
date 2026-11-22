@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Validate graph options, construct the batch service, and report batch steps. | [CLI option](../apps/sglang-server.cpp#L66)<!-- prefix: "if (option =" --> · [Batch service](../apps/sglang-server.cpp#L209)<!-- prefix: "BatchService" --> · [Trace](../apps/server/batch_service.cpp#L367)<!-- prefix: "void trace_b" --> |
+| Server | Validate graph options, construct the batch service, and report batch steps. | [CLI option](../apps/sglang-server.cpp#L90)<!-- prefix: "if (option =" --> · [Batch service](../apps/sglang-server.cpp#L280)<!-- prefix: "BatchService" --> · [Trace](../apps/server/batch_service.cpp#L367)<!-- prefix: "void trace_b" --> |
 | Decoder batch | Select eligible decode steps, bind lane state, and return winners by slot. | [Batch options](../include/sglang/decoder_batch.h#L53)<!-- prefix: "struct Decod" --> · [Dispatch](../src/decoder_batch.cpp#L699)<!-- prefix: "const auto r" --> · [Readback](../src/decoder_batch.cpp#L776)<!-- prefix: "void Decoder" --> |
 | CUDA resources | Recover from eligible pre-submission failures and retain resources while completion is uncertain. | [Fallback](../src/decoder_resources.cpp#L515)<!-- prefix: "bool Allocat" --> · [Cleanup](../src/decoder_resources.cpp#L229)<!-- prefix: "CleanupError" --> |
 

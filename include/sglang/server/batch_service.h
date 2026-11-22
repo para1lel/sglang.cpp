@@ -18,6 +18,12 @@ struct BatchMetrics {
     std::uint64_t prefill_requests = 0;
 };
 
+struct BatchRuntimeState {
+    bool ready;
+    int running_requests;
+    std::uint64_t generation_tokens;
+};
+
 struct BatchProfileStep {
     std::uint64_t elapsed_ns = 0;
     int width = 0;
@@ -130,6 +136,7 @@ public:
                              const std::function<bool()>& cancelled);
     void rethrow_failure() const;
     BatchMetrics metrics() const;
+    BatchRuntimeState runtime_state() const;
     bool reset_prefix_cache();
     bool start_profile(std::string name, std::size_t iterations);
     std::optional<BatchProfile> stop_profile();

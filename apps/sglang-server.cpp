@@ -13,6 +13,7 @@
 #include "sglang/server/vision_completion.h"
 
 #include <charconv>
+#include <chrono>
 #include <exception>
 #include <iostream>
 #include <string_view>
@@ -23,6 +24,7 @@ using namespace sglang::server;
 
 struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
+    std::string launch_command = "sglang-server";
     sglang::Fp8PrefillPolicy fp8_prefill = sglang::Fp8PrefillPolicy::exact;
     SamplingDefaults sampling = SamplingDefaults::model;
     ChatParsers chat_parsers;
@@ -35,6 +37,8 @@ struct Arguments {
     bool eager = false;
     bool trace_batches = false;
     bool batch_cuda_graphs = false;
+
+    bool enable_batch_cuda_graphs() const { return batch_cuda_graphs && !eager; }
 };
 
 int parse_integer(std::string_view value, const char* error) {
@@ -55,20 +59,42 @@ int parse_target_rows(std::string_view value) {
     return rows;
 }
 
+void append_launch_option(std::string& command, std::string_view option,
+                          std::string_view value = std::string_view{}) {
+    command += ' ';
+    command += option;
+    if (value.empty()) {
+        return;
+    }
+    command += ' ';
+    if (option == "--sampling-defaults" || option == "--reasoning-parser" ||
+        option == "--tool-call-parser" || option == "--fp8-prefill" ||
+        option == "--device" || option == "--port" || option == "--max-active" ||
+        option == "--max-num-batched-tokens" || option == "--prefix-cache-entries" ||
+        option == "--mtp-steps" || option == "--mtp-k") {
+        command += value;
+    } else {
+        command += "'<redacted>'";
+    }
+}
+
 Arguments parse_arguments(int argc, char** argv) {
     Arguments arguments;
     for (int index = 1; index < argc; ++index) {
         const std::string_view option = argv[index];
         if (option == "--trace-batches") {
             arguments.trace_batches = true;
+            append_launch_option(arguments.launch_command, option);
             continue;
         }
         if (option == "--batch-cuda-graphs") {
             arguments.batch_cuda_graphs = true;
+            append_launch_option(arguments.launch_command, option);
             continue;
         }
         if (option == "--eager") {
             arguments.eager = true;
+            append_launch_option(arguments.launch_command, option);
             continue;
         }
         if (++index == argc) {
@@ -124,6 +150,7 @@ Arguments parse_arguments(int argc, char** argv) {
         } else {
             throw std::invalid_argument("Invalid argument " + std::string(option));
         }
+        append_launch_option(arguments.launch_command, option, value);
     }
     if (arguments.prefix_cache_entries != 0) {
         if (arguments.eager) {
@@ -165,6 +192,49 @@ std::string model_info_json(const Arguments& arguments) {
     return body;
 }
 
+std::string server_info_json(const Arguments& arguments, double startup_seconds,
+                             const BatchRuntimeState& state) {
+    std::string body = R"({"frontend":"cpp","version":null,"supports_inline_system":false)";
+    body += R"(,"host":"127.0.0.1","dp_size":1,"tp_size":1,"pp_size":1)";
+    body += R"(,"launch_command":)";
+    sglang::json::append_quoted(body, arguments.launch_command);
+    body += R"(,"model_path":)";
+    sglang::json::append_quoted(body, arguments.checkpoint.string());
+    body += R"(,"tokenizer_path":)";
+    sglang::json::append_quoted(body, arguments.checkpoint.string());
+    body += R"(,"served_model_name":)";
+    sglang::json::append_quoted(body, sglang::model_name);
+    body += R"(,"port":)" + std::to_string(arguments.port);
+    body += R"(,"device":)" + std::to_string(arguments.device);
+    body += R"(,"max_running_requests":)" + std::to_string(arguments.max_active);
+    body += R"(,"max_num_batched_tokens":)" + std::to_string(arguments.max_num_batched_tokens);
+    body += R"(,"mtp_steps":)" + std::to_string(arguments.mtp_steps);
+    body += R"(,"prefix_cache_entries":)" + std::to_string(arguments.prefix_cache_entries);
+    body += R"(,"fp8_prefill":)";
+    body += arguments.fp8_prefill == sglang::Fp8PrefillPolicy::exact
+        ? "\"exact\"" : "\"tensor-core\"";
+    body += R"(,"sampling_defaults":)";
+    body += arguments.sampling == SamplingDefaults::model ? "\"model\"" : "\"openai\"";
+    body += R"(,"reasoning_parser":)";
+    body += arguments.chat_parsers.qwen3_reasoning ? "\"qwen3\"" : "null";
+    body += R"(,"tool_call_parser":)";
+    body += arguments.chat_parsers.qwen3_coder_tools ? "\"qwen3_coder\"" : "null";
+    body += R"(,"eager":)";
+    body += arguments.eager ? "true" : "false";
+    body += R"(,"trace_batches":)";
+    body += arguments.trace_batches ? "true" : "false";
+    body += R"(,"batch_cuda_graphs":)";
+    body += arguments.enable_batch_cuda_graphs() ? "true" : "false";
+    body += R"(,"startup_time":{"server_e2e":)" + std::to_string(startup_seconds) + '}';
+    body += R"(,"internal_states":[{"dp_rank":0,"world_size":1)";
+    body += R"(,"effective_max_running_requests_per_dp":)" + std::to_string(arguments.max_active);
+    body += R"(,"ready":)";
+    body += state.ready ? "true" : "false";
+    body += R"(,"num_running_reqs":)" + std::to_string(state.running_requests);
+    body += R"(,"generation_tokens_total":)" + std::to_string(state.generation_tokens);
+    return body + "}]}";
+}
+
 Socket listen(const Arguments& arguments) {
     auto listener = listen_loopback(arguments.port);
     std::cerr << "Listening on http://127.0.0.1:" << arguments.port << '\n';
@@ -195,6 +265,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     try {
+        const auto started = std::chrono::steady_clock::now();
         const auto arguments = parse_arguments(argc, argv);
         install_shutdown_handlers();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
@@ -207,7 +278,7 @@ int main(int argc, char** argv) {
         const auto health = health_json(arguments);
         VisionCompletion vision(arguments.checkpoint, arguments.device);
         BatchService service(decoder, arguments.trace_batches,
-                             arguments.batch_cuda_graphs && !arguments.eager,
+                             arguments.enable_batch_cuda_graphs(),
                              arguments.mtp_steps, arguments.max_active,
                              arguments.prefix_cache_entries, arguments.max_num_batched_tokens);
         if (stopping()) {
@@ -215,6 +286,7 @@ int main(int argc, char** argv) {
         }
         const auto model_info = model_info_json(arguments);
         const auto listener = listen(arguments);
+        const std::chrono::duration<double> startup = std::chrono::steady_clock::now() - started;
         NativeGenerate native_generate(service, tokenizer);
         serve_connections(listener, service, arguments.max_active,
             [&](const Socket& connection, int slot, std::string_view body, bool chat) {
@@ -230,6 +302,8 @@ int main(int argc, char** argv) {
                 serve_tokenization(connection, route, tokenizer, body);
             }, model_info, [&](const Socket& connection, std::string_view body) {
                 native_generate.abort(connection, body);
+            }, [&] {
+                return server_info_json(arguments, startup.count(), service.runtime_state());
             });
     } catch (const std::exception& error) {
         std::cerr << "sglang-server: " << error.what() << '\n';

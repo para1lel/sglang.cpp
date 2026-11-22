@@ -314,7 +314,7 @@ bool BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& st
         !step.sampling_failed && !job.cancelled && !job.aborted();
     if (published) {
         const bool first_token = !std::exchange(job.prefill_completed, true);
-        if (counters.cache_capacity != 0 && !job.health_check) {
+        if (!job.health_check) {
             if (first_token) {
                 counters.prompt_tokens += job.prompt_tokens;
                 ++counters.prefill_requests;
@@ -820,6 +820,13 @@ void BatchService::rethrow_failure() const {
 BatchMetrics BatchService::metrics() const {
     const std::lock_guard lock(state_->mutex);
     return state_->counters;
+}
+
+BatchRuntimeState BatchService::runtime_state() const {
+    const std::lock_guard lock(state_->mutex);
+    const int running = std::count_if(state_->jobs.begin(), state_->jobs.end(),
+        [](const auto& job) { return job && job->admitted && !job->health_check; });
+    return {ready(), running, state_->counters.generation_tokens};
 }
 
 bool BatchService::reset_prefix_cache() {

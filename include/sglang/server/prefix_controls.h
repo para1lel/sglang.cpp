@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace sglang::server {
@@ -18,12 +19,14 @@ struct QueuedGenerate {
 using BatchGenerate = std::function<QueuedGenerate(std::string_view)>;
 using NativeAbort = std::function<void(const Socket&, std::string_view)>;
 using Tokenization = std::function<void(const Socket&, TokenizationRoute, std::string_view)>;
+using ServerInfo = std::function<std::string()>;
 
 void serve_connections(const Socket& listener, BatchService& service, int max_active,
                        const BatchCompletion& complete, std::string_view health,
                        bool prefix_controls, const BatchGenerate& generate = BatchGenerate{},
                        const Tokenization& tokenize = Tokenization{},
                        std::string_view model_info = std::string_view{},
-                       const NativeAbort& abort = NativeAbort{});
+                       const NativeAbort& abort = NativeAbort{},
+                       const ServerInfo& server_info = ServerInfo{});
 
 }

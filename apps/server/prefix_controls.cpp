@@ -153,10 +153,10 @@ public:
     ConnectionQueue(BatchService& service, int capacity, const BatchCompletion& complete,
                     std::string_view health, bool prefix_controls, const BatchGenerate& generate,
                     const Tokenization& tokenize, std::string_view model_info,
-                    const NativeAbort& abort)
+                    const NativeAbort& abort, const ServerInfo& server_info)
         : service_(service), capacity_(capacity), complete_(complete), generate_(generate),
           tokenize_(tokenize), abort_(abort), health_(health), model_info_(model_info),
-          prefix_controls_(prefix_controls) {}
+          server_info_(server_info), prefix_controls_(prefix_controls) {}
 
     void read(const Socket& listener);
     void run(int slot);
@@ -187,6 +187,7 @@ private:
     const NativeAbort& abort_;
     const std::string_view health_;
     const std::string_view model_info_;
+    const ServerInfo& server_info_;
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -365,6 +366,14 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
             stop_profile(connection, service_, request);
             return;
         }
+    }
+    if (server_info_ && (path == "/server_info" || path == "/get_server_info")) {
+        if (request.method == "GET") {
+            write_json(connection, "200 OK", server_info_());
+        } else {
+            write_get_only(connection, request.method == "HEAD");
+        }
+        return;
     }
     if (prefix_controls_) {
         throw HttpError("404 Not Found", "Unknown native server route");
@@ -570,12 +579,12 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                        const BatchCompletion& complete, std::string_view health,
                        bool prefix_controls, const BatchGenerate& generate,
                        const Tokenization& tokenize, std::string_view model_info,
-                       const NativeAbort& abort) {
+                       const NativeAbort& abort, const ServerInfo& server_info) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid HTTP completion capacity");
     }
     ConnectionQueue queue(service, max_active, complete, health, prefix_controls, generate,
-                          tokenize, model_info, abort);
+                          tokenize, model_info, abort, server_info);
     std::vector<std::thread> workers;
     workers.reserve(max_active + (abort ? 2 : 1));
     std::mutex failure_mutex;

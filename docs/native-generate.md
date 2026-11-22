@@ -4,10 +4,10 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L389)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
+| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L183)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L398)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
 | Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L882)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L919)<!-- prefix: "std::vector<" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L370)<!-- prefix: "void complet" --> |
-| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L946)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L640)<!-- prefix: "bool BatchSe" --> |
+| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L953)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L640)<!-- prefix: "bool BatchSe" --> |
 | Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L140)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L277)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L309)<!-- prefix: "void stream_" --> |
 | Text stops | Select stops before token publication and hold ambiguous text. | [Worker match](../include/sglang/server/text_stop.h#L156)<!-- prefix: "bool apply(D" --> · [Response frame](../apps/server/native_generate.cpp#L205)<!-- prefix: "std::string " --> |
 

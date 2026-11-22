@@ -87,6 +87,9 @@ void copy_draft_prefix(Mxfp8KvCache dst, Mxfp8KvCache src, int rows, cudaStream_
 }
 
 struct DraftWorkspace {
+    static constexpr int score_storage_count = vocab_size * sizeof(Bf16) / sizeof(float);
+    static_assert(score_storage_count * sizeof(float) == vocab_size * sizeof(Bf16));
+
     explicit DraftWorkspace(Allocations& memory)
         : embedding(memory.allocate<Bf16>(hidden_size)),
           concatenated(memory.allocate<Bf16>(2 * hidden_size)),
@@ -101,12 +104,17 @@ struct DraftWorkspace {
           attention(memory.allocate<Bf16>(text_gqa_q_width)),
           gate(memory.allocate<Bf16>(intermediate_size)),
           up(memory.allocate<Bf16>(intermediate_size)),
-          logits(memory.allocate<Bf16>(vocab_size)),
+          score_storage(memory.allocate<float>(score_storage_count)),
+          logits(reinterpret_cast<Bf16*>(score_storage)),
           activation{memory.allocate<std::uint8_t>(intermediate_size),
                      memory.allocate<float>(text_fp8_group_count(intermediate_size))},
           argmax_scratch(
               memory.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
           argmax(memory.allocate<TextLogitCandidate>(1)) {}
+
+    ExactGqaWorkspace attention_scores() const {
+        return {score_storage, score_storage_count / mxfp8_query_heads};
+    }
 
     Bf16* embedding;
     Bf16* concatenated;
@@ -121,6 +129,7 @@ struct DraftWorkspace {
     Bf16* attention;
     Bf16* gate;
     Bf16* up;
+    float* score_storage;
     Bf16* logits;
     TextFp8Activation activation;
     TextLogitCandidate* argmax_scratch;
@@ -297,7 +306,8 @@ void MtpDraftRequest::State::attend(int position, bool score, cudaStream_t strea
     if (!score) {
         return;
     }
-    check(mtp_gqa_attention(cache, pages, position, work.rope_queries, work.attention, stream),
+    check(mtp_gqa_attention(cache, pages, position, work.rope_queries, work.attention,
+                            work.attention_scores(), stream),
           "Read MTP MXFP8 attention");
     check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
           "Gate MTP attention");

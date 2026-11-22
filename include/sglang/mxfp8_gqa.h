@@ -59,6 +59,8 @@ cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int va
 
 namespace decoder {
 
+struct ExactGqaWorkspace;
+
 /// Tensor-core precision policy. Eligible tiles share decoded KV across adjacent rows.
 /// Shared and single-row paths replay nonfinite FP32 scores by head and
 /// nonfinite FP32 quotients by channel in FP64, using finite FP32 dequantization.
@@ -68,7 +70,7 @@ cudaError_t tensor_core_multirow_prefill_gqa(
 
 cudaError_t mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
                               const __nv_bfloat16* queries, __nv_bfloat16* output,
-                              cudaStream_t stream);
+                              ExactGqaWorkspace workspace, cudaStream_t stream);
 
 }
 

@@ -71,9 +71,13 @@ Pinned SGLang exposes resolved settings and a launch command at the top level, w
 
 ### INT8 draft head
 
-`--mtp-int8-head` opts into signed INT8 scoring for unconstrained draft proposals. BF16 remains the default and serves the target and constrained drafts. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive and the selected FP8 target policy still applies. [Weight preparation](../src/decoder_mtp.cpp#L176)<!-- prefix: "if (int8_hea" -->
+`--mtp-int8-head` opts into signed INT8 scoring for unconstrained draft proposals. BF16 remains the default and serves the target and constrained drafts. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive and the selected FP8 target policy still applies. [Weight preparation](../src/decoder_mtp.cpp#L185)<!-- prefix: "if (int8_hea" -->
 
-Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L144)<!-- prefix: "__global__ v" --> · [Retry](../src/decoder_mtp.cpp#L471)<!-- prefix: "bool MtpDraf" -->
+Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L144)<!-- prefix: "__global__ v" --> · [Retry](../src/decoder_mtp.cpp#L481)<!-- prefix: "bool MtpDraf" -->
+
+### Draft attention
+
+Draft forwards use tiled MXFP8 attention for 8–256 visible tokens, including the current token. At 257–5,173 tokens, they compute exact scores in parallel and replay values in position order. The lane stream reuses the draft logits allocation for scores before vocabulary scoring. Other valid lengths use direct attention. [Dispatch](../include/sglang/text/gqa_mtp_attention.cuh#L16)<!-- prefix: "constexpr in" --> · [Score storage](../src/decoder_mtp.cpp#L115)<!-- prefix: "ExactGqaWork" -->
 
 Verify opt-in runs against a fresh K0 control with the same FP8 target policy. The frozen comparison uses an exact target and exact K0. Use a separate campaign for `tensor-core-mtp-target`.
 

@@ -134,7 +134,7 @@ Multirow K0 tensor-core prefill keeps these operators during projection fallback
 - [Flash or ordered GQA](flash-prefill.md#runtime-path) follows KV append. [Call](../src/decoder_prefill.cpp#L368)<!-- prefix: "const auto s" -->
 - [Fused residual RMSNorm](fp8-prefill-projections.md#fused-activation-quantization) and SwiGLU round to BF16 before FP8 quantization. [RMSNorm](../src/text_normalization.cu#L351)<!-- prefix: "cudaError_t " --> · [SwiGLU](../src/text_ops.cu#L648)<!-- prefix: "cudaError_t " -->
 
-Other target prefill and draft decode use direct attention. Wide long decode requires the tensor-core policy. Eager decode can use exact attention within inline score capacity. Serial graphs use exact attention when page-rounded KV slots fit. Serial decode uses direct attention beyond these limits. [Row dispatch](../src/decoder_forward.cpp#L343)<!-- prefix: "cudaError_t " -->
+Other target prefill uses direct attention. Long wide decode requires the tensor-core policy. Eager decode and serial graphs use exact attention when their workspace fits. Serial decode falls back to direct attention. [Row dispatch](../src/decoder_forward.cpp#L343)<!-- prefix: "cudaError_t " --> · [Draft attention](native-model-info.md#draft-attention)
 
 The lane stream orders append, attention, and gating. Logits storage holds scores for 5,120 positions. See the [batch attention routes](batch-graphs.md#constraints-and-failure-behavior) for score-backed singleton decode and multi-lane score allocation. [Workspace](../src/decoder_resources.cpp#L865)<!-- prefix: "ExactGqaWork" -->
 

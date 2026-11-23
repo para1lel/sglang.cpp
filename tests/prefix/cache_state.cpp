@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string_view>
@@ -181,8 +182,8 @@ void restore_state(int pages, bool remap_seed, bool remap_restored) {
     const int tokens = pages * page;
     const std::vector<int> prompt(tokens, 17);
     const std::string_view salt("a\0b", 3);
-    Request seed(0, (pages + 3) * page, {});
-    Request restored(0, (pages + 5) * page, {});
+    Request seed(0, (pages + 3) * page, std::shared_ptr<const void>{});
+    Request restored(0, (pages + 5) * page, std::shared_ptr<const void>{});
     PrefixCache cache(0, 1);
     const auto source_map = page_map(seed, remap_seed ? 2 : 0, false);
     const auto destination_map = page_map(restored, remap_restored ? 1 : 0, remap_restored);
@@ -235,7 +236,7 @@ void restore_state(int pages, bool remap_seed, bool remap_restored) {
 }
 
 void eviction() {
-    Request request(0, 3 * page, {});
+    Request request(0, 3 * page, std::shared_ptr<const void>{});
     fill_kv(request, page_map(request, 0, false));
     check_state(request, true, true);
     PrefixCache cache(0, 2);
@@ -267,7 +268,7 @@ void expect_throw(Operation operation, std::string_view message) {
 }
 
 void invalid_mappings() {
-    Request request(0, 4 * page, {});
+    Request request(0, 4 * page, std::shared_ptr<const void>{});
     const auto identity = page_map(request, 0, false);
     const auto stream = request.memory.stream();
     const std::vector<int> prompt(2 * page, 17);
@@ -321,8 +322,8 @@ void invalid_mappings() {
 }
 
 void copy_failures() {
-    Request seed(0, 3 * page, {});
-    Request request(0, 4 * page, {});
+    Request seed(0, 3 * page, std::shared_ptr<const void>{});
+    Request request(0, 4 * page, std::shared_ptr<const void>{});
     const auto source = page_map(seed, 1, false);
     const auto destination = page_map(request, 1, true);
     const auto stream = request.memory.stream();

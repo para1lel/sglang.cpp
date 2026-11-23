@@ -1,18 +1,20 @@
 #include "sglang/runtime/execution/decoder_execution_policy.h"
 
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/runtime/backend/cuda_backend_policy.h"
 
 namespace sglang::decoder {
 
-DecoderExecutionPolicy DecoderExecutionPolicy::for_capabilities(bool ordered_attention,
-                                                                const Limits& limits) {
+DecoderExecutionPolicy DecoderExecutionPolicy::for_backend(const CudaBackendPolicy& backend,
+                                                           const Limits& limits) {
     return {
-        ordered_attention,
-        !ordered_attention,
+        backend.ordered_attention,
+        !backend.ordered_attention,
+        backend.tensor_core_prefill,
         limits.tensor_prefill_rows,
         limits.fallback_prefill_rows,
         limits.ordered_graph_lanes,
-        limits.target_split_end,
+        backend.target_split_end,
     };
 }
 
@@ -22,8 +24,8 @@ bool DecoderExecutionPolicy::regular_decode_graph(bool text_decode, bool contain
 }
 
 int DecoderExecutionPolicy::prefill_limit(bool media, bool draft, bool prefix_cache) const {
-    return media || (draft && (!ordered_attention || prefix_cache)) ? fallback_prefill_rows
-                                                                    : tensor_prefill_rows;
+    return media || (draft && (!tensor_core_prefill || prefix_cache)) ? fallback_prefill_rows
+                                                                      : tensor_prefill_rows;
 }
 
 int DecoderExecutionPolicy::label_scoring_limit(bool media) const {

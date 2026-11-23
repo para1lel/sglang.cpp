@@ -274,8 +274,8 @@ def check_cli_policy(args):
                 f"{name}: help must advertise K4 as the default")
         require("--mtp-k" in help_result.stdout, f"{name}: help must advertise the depth alias")
         if name == "server":
-            require(any("0 steps" in line and "logprobs" in line and "prefix cache" in line
-                        for line in help_lines), "server: help must describe K0 fallbacks")
+            require(any("0 steps" in line and "logprobs" in line for line in help_lines),
+                    "server: help must describe the K0 fallback for logprobs")
         cases[f"{name}-help"] = {"command": command, "stdout": help_result.stdout}
         sampling = (
             (("seed", ["--seed", "9223372036854775808"], "Invalid number for --seed"),

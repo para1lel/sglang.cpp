@@ -2,16 +2,17 @@
 
 namespace sglang::decoder {
 
+struct CudaBackendPolicy;
+
 struct DecoderExecutionPolicy {
     struct Limits {
         int ordered_graph_lanes;
         int tensor_prefill_rows;
         int fallback_prefill_rows;
-        int target_split_end;
     };
 
-    static DecoderExecutionPolicy for_capabilities(bool ordered_attention,
-                                                   const Limits& limits);
+    static DecoderExecutionPolicy for_backend(const CudaBackendPolicy& backend,
+                                              const Limits& limits);
 
     bool regular_decode_graph(bool text_decode, bool contains_mtp, int count) const;
     int prefill_limit(bool media, bool draft, bool prefix_cache) const;
@@ -20,6 +21,7 @@ struct DecoderExecutionPolicy {
 
     bool ordered_attention;
     bool narrow_eager_decode;
+    bool tensor_core_prefill;
     int tensor_prefill_rows;
     int fallback_prefill_rows;
     int ordered_graph_lanes;

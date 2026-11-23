@@ -74,7 +74,7 @@ Exclude startup, model load, JIT compilation, and graph capture from steady meas
 
 Report one row per engine, workload, and mode with absolute metrics and successful and attempted request counts. Use paired throughput ratios and latency differences for diagnosis. Set any undefined workload margins from baseline repeats before candidate timing.
 
-For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident request storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L215)<!-- prefix: "Measurements" -->
+For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident request storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L216)<!-- prefix: "Measurements" -->
 
 ### Native text completions
 
@@ -145,7 +145,7 @@ To isolate layer-major verification, compare with row-wise MTP at the same depth
 
 Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. The W3-MTP variant uses four 8,192-token prompts with 1,024 outputs each. Its K1 start exceeds the verification graph's visible limit. [W3-MTP fixture](../benchmarks/variants/README.md) · [Graph limit](mtp.md#target-verification-graph)
 
-Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L241)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L868)<!-- prefix: "result.mtp_r" -->
+Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L242)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L868)<!-- prefix: "result.mtp_r" -->
 
 Use `--trace-batches` at any capacity in a separate run. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder_verify.cpp#L215)<!-- prefix: "bool MtpRoun" -->
 

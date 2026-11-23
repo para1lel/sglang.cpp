@@ -2,10 +2,49 @@
 
 #include <future>
 #include <limits>
-#include <memory>
+#include <optional>
 #include <utility>
 
 namespace sglang::server {
+namespace {
+
+class SingleDeviceBatchSession final : public BatchSession {
+public:
+    SingleDeviceBatchSession(const Decoder& decoder, const DecoderBatchOptions& options)
+        : batch_(decoder, options) {}
+
+    int admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options) override {
+        return batch_.admit(slot, std::move(prompt), options);
+    }
+
+    void admit_multimodal(int slot, std::vector<int>&& prompt, const DecoderOptions& options,
+                          const std::vector<DecoderMedia>& media) override {
+        batch_.admit_multimodal(slot, std::move(prompt), options, media);
+    }
+
+    void cancel(int slot) override { batch_.cancel(slot); }
+
+    Steps advance_chunked(const Selection& selected, DecoderBatchStepStats* stats) override {
+        return batch_.advance_chunked(selected, stats);
+    }
+
+    bool available() const override { return batch_.available(); }
+    DecoderPrefixCacheStats prefix_cache_stats() const override {
+        return batch_.prefix_cache_stats();
+    }
+    void reset_prefix_cache() override { batch_.reset_prefix_cache(); }
+
+    std::size_t request_device_allocation_bytes() const override {
+        return batch_.request_device_allocation_bytes();
+    }
+
+    void release_retired_allocations() override { batch_.release_retired_allocations(); }
+
+private:
+    DecoderBatch batch_;
+};
+
+}
 
 SingleDeviceBatchExecutor::SingleDeviceBatchExecutor(const Decoder& decoder, Options options,
                                                      Ready ready, Process process)
@@ -32,16 +71,16 @@ void SingleDeviceBatchExecutor::stop() {
     }
 }
 
+BatchTopology SingleDeviceBatchExecutor::topology() const noexcept { return {1, 1, 1}; }
+
 void SingleDeviceBatchExecutor::run(std::promise<void> started) {
-    std::unique_ptr<DecoderBatch> batch;
+    std::optional<SingleDeviceBatchSession> session;
     try {
-        batch = std::make_unique<DecoderBatch>(decoder_,
-            DecoderBatchOptions{options_.cuda_graphs, options_.max_active,
-                                options_.prefix_cache_entries,
-                                options_.max_num_batched_tokens,
-                                std::numeric_limits<std::size_t>::max()});
+        session.emplace(decoder_, DecoderBatchOptions{
+            options_.cuda_graphs, options_.max_active, options_.prefix_cache_entries,
+            options_.max_num_batched_tokens, std::numeric_limits<std::size_t>::max()});
         if (ready_) {
-            ready_(*batch);
+            ready_(*session);
         }
     } catch (...) {
         started.set_exception(std::current_exception());
@@ -49,7 +88,7 @@ void SingleDeviceBatchExecutor::run(std::promise<void> started) {
     }
     started.set_value();
     if (process_) {
-        process_(*batch);
+        process_(*session);
     }
 }
 

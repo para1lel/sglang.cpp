@@ -1,5 +1,7 @@
 #pragma once
 
+#include "sglang/runtime/model/qwen_text_model.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -29,6 +31,9 @@ public:
     Checkpoint(const Checkpoint&) = delete;
     Checkpoint& operator=(const Checkpoint&) = delete;
 
+    /// The supported text model identified and validated before opening the weight index.
+    const decoder::QwenTextModel& text_model() const;
+
     /// Throws on missing names or an unexpected dtype or shape.
     /// The view and its bytes remain valid until checkpoint destruction.
     /// Keep the checkpoint alive through completion of any asynchronous copy.
@@ -44,7 +49,7 @@ private:
     std::unique_ptr<Storage> storage_;
 };
 
-inline constexpr std::string_view checkpoint_model_type = "qwen3_5";
-inline constexpr std::string_view checkpoint_architecture = "Qwen3_5ForConditionalGeneration";
+inline constexpr std::string_view checkpoint_model_type = decoder::QwenTextModel::model_type;
+inline constexpr std::string_view checkpoint_architecture = decoder::QwenTextModel::architecture;
 
 }

@@ -1,6 +1,6 @@
 # Native HTTP transport
 
-The loopback server uses one HTTP reader and one batch scheduler at every capacity. [Launch options](../README.md#serve-token-ids-over-http) · [Startup](../apps/sglang-server.cpp#L308)<!-- prefix: "serve_connec" -->
+The loopback server uses one HTTP reader and one batch scheduler at every capacity. [Launch options](../README.md#serve-token-ids-over-http) · [Startup](../apps/sglang-server.cpp#L317)<!-- prefix: "serve_connec" -->
 
 ## Request targets and redirects
 
@@ -20,13 +20,13 @@ Health checks accept empty GET requests and bypass the completion queue.
 
 | Route | Responsibility | Response |
 | --- | --- | --- |
-| `/health` | Reports liveness and scheduler limits. | HTTP 200 with `max_active` and `max_num_batched_tokens`, even after permanent worker failure. [Health response](../apps/sglang-server.cpp#L167)<!-- prefix: "std::string " --> |
+| `/health` | Reports liveness and scheduler limits. | HTTP 200 with `max_active` and `max_num_batched_tokens`, even after permanent worker failure. [Health response](../apps/sglang-server.cpp#L168)<!-- prefix: "std::string " --> |
 | `/ready` | Checks for permanent decoder worker failure. | HTTP 200 with `{"ready":true}` or HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. [Readiness response](../apps/server/http.cpp#L662)<!-- prefix: "void write_r" --> · [Worker flag](../apps/server/batch_service.cpp#L757)<!-- prefix: "bool BatchSe" --> |
 | `/health_generate` | A dedicated HTTP worker probes generation progress. | HTTP 200 for progress before timeout. HTTP 503 for queue overload, probe failure, timeout, permanent worker failure, or shutdown. Both carry `Content-Length: 0` and `Connection: close`. [Dispatch](../apps/server/prefix_controls.cpp#L485)<!-- prefix: "void Connect" --> · [Reply](../apps/server/http.cpp#L671)<!-- prefix: "void write_g" --> |
 
 Permanent worker failure also makes new completions return HTTP 500. Generation health timeout leaves readiness unchanged. [Batch failure](../apps/server/batch_service.cpp#L166)<!-- prefix: "void BatchSe" -->
 
-Defaults are 32 active requests and 8,192 aggregate tokens per step. Set the token budget with `--max-num-batched-tokens` (1–32,768) and verify it at `/health`. [Default budget](../include/sglang/decoder.h#L23)<!-- prefix: "inline const" -->
+Defaults are 32 active requests and 8,192 aggregate tokens per step. Set the token budget with `--max-num-batched-tokens` (1–32,768) and verify it at `/health`. [Default budget](../include/sglang/decoder.h#L27)<!-- prefix: "inline const" -->
 
 ### Generation probe lifecycle
 
@@ -34,7 +34,7 @@ The HTTP reader starts a 20-second monotonic deadline when it dispatches the par
 
 The scheduler can use its latest successful token publication if it occurred after the probe started and by its deadline. Otherwise it registers one waiter for subsequent publication. While user jobs occupy decoder lanes, they can satisfy the probe without reserving a lane for health. Admission, prefill without a token, cancellation, and failed steps do not satisfy the probe. Publication is independent of when a client receives the token. [Waiter and timestamp](../apps/server/batch_service.cpp#L760)<!-- prefix: "bool BatchSe" --> · [Token publication](../apps/server/batch_service.cpp#L345)<!-- prefix: "void BatchSe" -->
 
-When all decoder lanes become idle and no prefix reset is pending, the scheduler can install an internal job in the first lane. It submits prompt IDs `[0]` and generates at most one greedy token with MTP disabled. The scheduler removes the waiter on return and marks any internal job cancelled. It retains a still-installed job until the decoder worker can retire it. An installed health job makes prefix reset return HTTP 409. User request and token counters exclude the probe. Lower-level cache counters and native step profiles can include its decoder work. [Idle eligibility](../apps/server/batch_service.cpp#L223)<!-- prefix: "bool BatchSe" --> · [Job creation](../apps/server/batch_service.cpp#L774)<!-- prefix: "auto job = s" --> · [Probe options](../include/sglang/decoder.h#L32)<!-- prefix: "struct Decod" --> · [Waiter cleanup](../apps/server/batch_service.cpp#L798)<!-- prefix: "job-\u003ecancell" --> · [Lane retirement](../apps/server/batch_service.cpp#L271)<!-- prefix: "if (cancelle" --> · [Reset exclusion](../apps/server/batch_service.cpp#L823)<!-- prefix: "bool BatchSe" -->
+When all decoder lanes become idle and no prefix reset is pending, the scheduler can install an internal job in the first lane. It submits prompt IDs `[0]` and generates at most one greedy token with MTP disabled. The scheduler removes the waiter on return and marks any internal job cancelled. It retains a still-installed job until the decoder worker can retire it. An installed health job makes prefix reset return HTTP 409. User request and token counters exclude the probe. Lower-level cache counters and native step profiles can include its decoder work. [Idle eligibility](../apps/server/batch_service.cpp#L223)<!-- prefix: "bool BatchSe" --> · [Job creation](../apps/server/batch_service.cpp#L774)<!-- prefix: "auto job = s" --> · [Probe options](../include/sglang/decoder.h#L36)<!-- prefix: "struct Decod" --> · [Waiter cleanup](../apps/server/batch_service.cpp#L798)<!-- prefix: "job-\u003ecancell" --> · [Lane retirement](../apps/server/batch_service.cpp#L271)<!-- prefix: "if (cancelle" --> · [Reset exclusion](../apps/server/batch_service.cpp#L823)<!-- prefix: "bool BatchSe" -->
 
 ### Request, failure, and shutdown behavior
 
@@ -91,13 +91,13 @@ Ready lanes wait up to 1 millisecond for peers. With CUDA graphs on and MTP off,
 
 The worker rechecks selected lanes before dispatch. Later acknowledgements
 can produce a separate step. See the [graph eligibility rules](batch-graphs.md#runtime-path)
-for the selected width. [Readiness check](../apps/server/batch_service.cpp#L261)<!-- prefix: "bool BatchSe" -->
+for the selected width. [Readiness check](../apps/server/batch_service.cpp#L266)<!-- prefix: "if (!job || " -->
 
 ### Bounded decode output
 
-The benchmark ID stream on `/v1/completions` and eligible single-prompt `/generate` streams opt in through `DecoderCallbacks::buffer_decode_output`. The callback flag defaults to false. OpenAI text completions in all prompt forms, chat completions, step-delivered or batch `/generate`, and nonstreaming generation use ordinary readiness. [Callback flag](../include/sglang/decoder.h#L111)<!-- prefix: "bool buffer_" --> · [Benchmark stream](../apps/server/completions.cpp#L135)<!-- prefix: "void stream_" --> · [Single-prompt stream](../apps/server/native_generate.cpp#L253)<!-- prefix: "void complet" --> · [Native dispatch](../apps/server/native_generate.cpp#L395)<!-- prefix: "void complet" -->
+The benchmark ID stream on `/v1/completions` and eligible single-prompt `/generate` streams opt in through `DecoderCallbacks::buffer_decode_output`. The callback flag defaults to false. OpenAI text completions in all prompt forms, chat completions, step-delivered or batch `/generate`, and nonstreaming generation use ordinary readiness. [Callback flag](../include/sglang/decoder.h#L115)<!-- prefix: "bool buffer_" --> · [Benchmark stream](../apps/server/completions.cpp#L135)<!-- prefix: "void stream_" --> · [Single-prompt stream](../apps/server/native_generate.cpp#L253)<!-- prefix: "void complet" --> · [Native dispatch](../apps/server/native_generate.cpp#L395)<!-- prefix: "void complet" -->
 
-Buffering requires server MTP depth zero and [batch graphs](batch-graphs.md) enabled. Set `--mtp-steps 0` for a K0 launch. Every live job must opt in, complete prefill, and acknowledge its first output. Each prompt must contain at least 32,768 IDs and use greedy selection. Media, constraints, forced eager execution, and top-logit requests exclude the job. A cancelled or aborted job also prevents buffered dispatch while it occupies a lane. [Dispatch guard](../apps/server/batch_service.cpp#L203)<!-- prefix: "if (!cuda_gr" --> · [Job eligibility](../apps/server/batch_service.cpp#L45)<!-- prefix: "bool can_buf" --> · [Greedy selection](../include/sglang/decoder.h#L59)<!-- prefix: "bool samples" -->
+Buffering requires server MTP depth zero and [batch graphs](batch-graphs.md) enabled. Set `--mtp-steps 0` for a K0 launch. Every live job must opt in, complete prefill, and acknowledge its first output. Each prompt must contain at least 32,768 IDs and use greedy selection. Media, constraints, forced eager execution, and top-logit requests exclude the job. A cancelled or aborted job also prevents buffered dispatch while it occupies a lane. [Dispatch guard](../apps/server/batch_service.cpp#L203)<!-- prefix: "if (!cuda_gr" --> · [Job eligibility](../apps/server/batch_service.cpp#L45)<!-- prefix: "bool can_buf" --> · [Greedy selection](../include/sglang/decoder.h#L63)<!-- prefix: "bool samples" -->
 
 With 16–31 live lanes, the worker can dispatch immediately when every mailbox has room. If only some have room, it can wait up to 1 millisecond before dispatching ready lanes. With 32 live lanes, at least 25 mailboxes must have room. Below 16 live lanes or with mixed eligibility, ordinary scheduling applies. The worker rechecks readiness and cancellation before dispatch. [16–31 lane condition](../apps/server/batch_service.cpp#L202)<!-- prefix: "bool BatchSe" --> · [32-lane condition](../apps/server/batch_service.cpp#L185)<!-- prefix: "bool BatchSe" --> · [Grace wait](../apps/server/batch_service.cpp#L250)<!-- prefix: "changed.wait" -->
 

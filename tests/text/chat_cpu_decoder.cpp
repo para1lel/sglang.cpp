@@ -1,4 +1,7 @@
 #include "sglang/decoder_batch.h"
+#ifdef SGLANG_TEST_BACKEND_POLICY
+#include "sglang/runtime/backend/cuda_backend_policy.h"
+#endif
 #include "sglang/server/vision_completion.h"
 #include "sglang/tokenizer/tokenizer.h"
 #include "sglang/vision.h"
@@ -246,6 +249,13 @@ Decoder::~Decoder() = default;
 std::string_view Decoder::accelerator_name() const {
     return {};
 }
+
+#ifdef SGLANG_TEST_BACKEND_POLICY
+const decoder::CudaBackendPolicy& Decoder::backend_policy() const {
+    static const decoder::CudaBackendPolicy backend{};
+    return backend;
+}
+#endif
 
 bool Decoder::uses_b200_operators() const {
     return false;

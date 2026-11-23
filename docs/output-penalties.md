@@ -4,8 +4,8 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Request options | Validate the wire values and populate `DecoderOptions`. | [HTTP validation](../apps/server/text_request.cpp#L175)<!-- prefix: "double sampl" --> · [Native defaults](../apps/server/text_request.cpp#L750)<!-- prefix: "const auto* " --> · [C++ options](../include/sglang/decoder.h#L50)<!-- prefix: "double frequ" --> |
-| Decoder | Keep each item's history and choose its execution path. | [Batch depth](../src/decoder_batch.cpp#L385)<!-- prefix: "if (options." --> · [Direct execution](../src/decoder.cpp#L531)<!-- prefix: "return !opti" --> |
+| Request options | Validate the wire values and populate `DecoderOptions`. | [HTTP validation](../apps/server/text_request.cpp#L175)<!-- prefix: "double sampl" --> · [Native defaults](../apps/server/text_request.cpp#L750)<!-- prefix: "const auto* " --> · [C++ options](../include/sglang/decoder.h#L54)<!-- prefix: "double frequ" --> |
+| Decoder | Keep each item's history and choose its execution path. | [Batch depth](../src/decoder_batch.cpp#L385)<!-- prefix: "if (options." --> · [Direct execution](../src/decoder.cpp#L535)<!-- prefix: "return !opti" --> |
 | CUDA score adjustment | Update history and rank the adjusted scores. | [History update](../src/decoder_sampling.cu#L414)<!-- prefix: "__device__ f" --> · [Repetition selection](../src/decoder_sampling.cu#L871)<!-- prefix: "cudaError_t " --> |
 
 ## Runtime path

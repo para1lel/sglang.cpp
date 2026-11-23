@@ -4,21 +4,27 @@ typedef struct cudaDeviceProp cudaDeviceProp;
 
 namespace sglang::decoder {
 
-struct CudaBackendCapabilities {
-    bool tensor_core_prefill;
-    int target_split_end;
+struct DraftOperatorCapabilities {
+    bool int8_head;
+    bool online_attention;
+    bool grouped_argmax;
+    bool paired_seed_kv;
+    bool wmma_seed_fc;
 };
 
 struct CudaBackendPolicy {
     static CudaBackendPolicy for_device(const cudaDeviceProp& properties);
-    static CudaBackendPolicy from_capabilities(const CudaBackendCapabilities& capabilities);
 
     bool uses_b200_operators;
     bool ordered_attention;
+    bool tensor_core_decode;
+    bool vector_decode_attention;
+    bool grouped_target_attention;
+    bool paired_prefill;
     bool tensor_core_prefill;
-    bool int8_draft_head;
     int target_split_end;
     int prefill_tile_rows;
+    DraftOperatorCapabilities draft;
 };
 
 }

@@ -46,7 +46,7 @@ out="$PWD/build/prefix-checks"
 xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release
 xmake build -P "$PWD" sglang-server
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
-"$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
+"$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -pthread -Iinclude -I"$toolkit/include" \
     tests/prefix/cache_state.cpp -L"$out/lib" -L"$toolkit/lib" \
     -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaMemcpy2DAsync \
     -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
@@ -118,27 +118,34 @@ invalid grammar followed by a successful hit. It repeats the choices across conc
 warm and cold lanes. The test compares output IDs, decoded choices, finish reasons, and
 reported cache hits.
 
-For tensor-core cache parity, prepare the frozen W3 variant fixtures described in
-[the variant benchmark](../../benchmarks/variants/README.md) and run the following
-with the same release build, checkpoint, and reserved B200.
+### Historical Tensor Core cache parity
+
+On B200, the current probe's cache-disabled oracle can use Tensor Core prefill. The
+cache-enabled candidate uses exact prefill. Its byte comparisons therefore span two
+prefill backends. [Probe setup](tensor_state.cpp#L226)<!-- prefix: "DecoderBatch" --> · [Prefill dispatch](../../src/decoder_prefill.cpp#L954)<!-- prefix: "label_scores" -->
+
+To reproduce the Tensor Core parity check, use revision
+`39ecda9f370d0c3605296e6a028ef3561294d6e7` for both the release build and the test runner.
+Prepare that revision's frozen W3 variant fixtures and use the same checkpoint and reserved
+B200. [W3 fixture preparation](https://github.com/para1lel/sglang.cpp/blob/39ecda9f370d0c3605296e6a028ef3561294d6e7/benchmarks/variants/README.md)
 
 ```bash
 GPU_UUID="$GPU_UUID" bash tests/prefix/run_tensor_state.sh \
     "$out" "$checkpoint" "$fixtures" "$out/tensor-prefix-state"
 ```
 
-The probe compares a cache-disabled width-one `DecoderBatch` oracle with a restore
-alongside a decoding peer. It runs page boundaries and the frozen 6,400-token checkpoint
-with an 8,192-token request, remaps source and destination pages independently, and
-cancels before an incomplete prefix can publish. It compares active KV payloads and
-scales, GDN history and recurrence, hidden and residual vectors, the seeded first ID,
-and every BF16 logit.
+On that revision, both batches select Tensor Core prefill. The probe compares a fresh
+width-one request with a restored request alongside a decoding peer. It checks page
+boundaries and an 8,192-token request with a 6,400-token checkpoint. It remaps source and
+destination pages independently and checks that canceling incomplete prefill leaves no entry.
+It compares active KV payloads and scales, GDN history and recurrence, hidden and residual
+vectors, the seeded first ID, and every BF16 logit.
 
 ## Prefix cache with MTP
 
-Use an exact-prefill release build and a reserved B200. Supply the frozen 257- and 8192-ID
-files used by the matching-prefix checks. Run from the repository root with the managed
-Pixi default environment active.
+Use a release build and a reserved B200. Supply the frozen 257- and 8192-ID files used by
+the matching-prefix checks. Run from the repository root with the managed Pixi default
+environment active.
 
 ```bash
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
@@ -155,13 +162,17 @@ CUDA_VISIBLE_DEVICES="$GPU_UUID" python3 -B tests/prefix/mtp_routes.py \
     --server "$out/bin/sglang-server" --checkpoint "$checkpoint" --output "$out/mtp-routes"
 ```
 
-The native check compares exact target KV, GDN state, and full first logits against fresh
-requests. It checks a K0 prime followed by a positive-depth miss and same-key enrichment,
-K1–K4 consumers, K0 full and partial hits on a paired entry, and a changed suffix that shifts
-prefill tiles. The link observer checks the first rebuilt draft row against the new prompt
-suffix on a partial hit and the current selected first token on a full hit. Draft-side copy
-faults exercise interrupted publication, restore, and retry. Cache accounting checks the
-combined resident charge at capacities one and four.
+Both native batches enable the prefix cache to select exact prefill. The test resets the
+cold batch's cache before each reference admission. It checks that the cold batch computes
+the entire prompt without restoring any target or draft rows. The native check compares target KV,
+GDN state, and full first logits byte for byte.
+
+The fixture checks a K0 prime followed by a positive-depth miss and same-key enrichment.
+It covers K1–K4 consumers, K0 full and partial hits on a paired entry, and a changed suffix
+that shifts prefill tiles. The link observer checks the first rebuilt draft row against
+the new prompt suffix on a partial hit and the current selected first token on a full hit.
+Draft-side copy faults exercise interrupted publication, restore, and retry. Cache
+accounting checks the combined resident charge at capacities one and four.
 
 The HTTP check compares seeded, constrained text and chat requests at depths one and four
 with fresh depth-zero controls. It checks the IDs, stop, usage, draft metrics, real verifier

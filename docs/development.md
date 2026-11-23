@@ -5,13 +5,14 @@ The supported deployment uses one physical NVIDIA B200 and the Qwen3.8-27B-FP8 c
 <a id="scope-at-adoption"></a>
 ## Current architecture and scope
 
-The CUDA backend accepts `sm_100` devices. Only the exact `NVIDIA B200` device name enables the B200 operator set. Project headers belong in `include/sglang/`. [Repository rules](../AGENTS.md)
+The CUDA backend accepts `sm_100` devices. The exact `NVIDIA B200` name enables the B200 operator set. Project headers belong in `include/sglang/`. [Device resolution](../src/runtime/backend/cuda_backend_policy.cpp#L11)<!-- prefix: "CudaBackendP" --> · [Repository rules](../AGENTS.md)
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model | Qwen3.8-27B-FP8 text and multimodal decoding with native MTP4. | [Qwen model](../include/sglang/runtime/model/qwen_text_model.h#L5)<!-- prefix: "struct QwenT" --> |
-| Backend | Derive B200 operators, prefill, graph, split, and residency policy. | [Backend policy](../include/sglang/runtime/backend/cuda_backend_policy.h#L12)<!-- prefix: "struct CudaB" --> · [Execution policy](../include/sglang/runtime/execution/decoder_execution_policy.h#L5)<!-- prefix: "struct Decod" --> · [Residency policy](../include/sglang/runtime/cache/kv_residency_policy.h#L15)<!-- prefix: "class KvResi" --> |
-| Service | The single-device executor owns the decoder batch on its worker thread. The HTTP transport and scheduler own HTTP admission, publication, and shutdown. | [Executor](../include/sglang/runtime/server/single_device_batch_executor.h#L12)<!-- prefix: "class Single" --> · [HTTP transport](http-server.md) · [Batch state and limits](batch-graphs.md) |
+| Model | `QwenTextModel` defines checkpoint identity, geometry, and the attention layer types used by validation and target weight loading. | [Model descriptor](../include/sglang/runtime/model/qwen_text_model.h#L7)<!-- prefix: "struct QwenT" --> |
+| Backend | `CudaBackendPolicy` resolves device operator capabilities. `DecoderExecutionPolicy` uses them to select graph, prefill, and split execution within request limits. | [Backend capabilities](../include/sglang/runtime/backend/cuda_backend_policy.h#L15)<!-- prefix: "struct CudaB" --> · [Execution policy](../include/sglang/runtime/execution/decoder_execution_policy.h#L7)<!-- prefix: "struct Decod" --> |
+| Service | The scheduler owns admission and publication and calls a worker-owned `BatchSession` for decoder operations. The executor reports topology to server metadata. | [Session contract](../include/sglang/runtime/server/batch_session.h#L14)<!-- prefix: "class BatchS" --> · [Topology](../include/sglang/server/batch_service.h#L161)<!-- prefix: "BatchTopolog" --> · [HTTP transport](http-server.md) |
+| Prefix cache | The host `PrefixIndex` tracks keys and coverage by slot. `PrefixCache` coordinates publication and restore with `GpuPrefixSnapshotStore`, which owns the GPU payloads and transfers. `KvResidencyPolicy` sizes request reservations separately. | [Prefix cache contract](prefix-cache.md#responsibilities-and-sources-of-truth) · [Request residency](../include/sglang/runtime/cache/kv_residency_policy.h#L15)<!-- prefix: "class KvResi" --> |
 | Build | Use XMake, default Pixi, user CUDA 13.4 compatibility libraries, and the host driver. Use private output and cache directories for concurrent work. | [Host build](../README.md#build-on-the-project-host) · [Isolated XMake builds](serving/isolated-builds.md) |
 
 Production CUDA operators must use kernels authored in this project or open-source components distributed with the CUDA Toolkit. The native runtime excludes cuBLAS, cuBLASLt, and cuDNN. Reference engines may use their own operators. Record the justification, license, version, and execution path of HTTP, JSON, tokenizer, media, and system dependencies. Record verified failures and preventive checks in [development lessons](lessons.md).
@@ -67,13 +68,13 @@ Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for
 
 ## Native text decoder
 
-The [checkpoint loader](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> validates config, index, and immutable safetensors views. Metadata parsing preserves underflow to signed zero and overflow to signed infinity, including in ignored fields. Required values, shapes, and offsets are validated independently. The decoder validates expected tensor names, shapes, and dtypes before upload and keeps weights and mappings live through asynchronous use. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Weight upload](../src/runtime/model/decoder_weights.cpp#L140)<!-- prefix: "Decoder::Mod" -->
+The [checkpoint loader](../include/sglang/checkpoint.h#L24)<!-- prefix: "class Checkp" --> validates text config before opening the tensor index and shards. Use `Checkpoint::text_model()` for validated model geometry. Metadata parsing preserves underflow to signed zero and overflow to signed infinity, including in ignored fields. Required values, shapes, and offsets are validated independently. The decoder validates tensor names, shapes, and dtypes before upload and keeps weights and mappings live through asynchronous use. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Weight upload](../src/runtime/model/decoder_weights.cpp#L140)<!-- prefix: "Decoder::Mod" -->
 
 ### Runtime path
 
-One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, and the MLP. It tracks separate KV and GDN state indexes. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer order](../include/sglang/decoder_internal.h#L273)<!-- prefix: "void execute" --> · [Tile adapter](../src/decoder_prefill.cpp#L903)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L897)<!-- prefix: "void Decoder" -->
+One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, and the MLP. The loop uses the model mapping to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../include/sglang/runtime/model/qwen_text_model.h#L40)<!-- prefix: "constexpr La" --> · [Execution bank selection](../include/sglang/decoder_internal.h#L286)<!-- prefix: "const auto [" --> · [Tile adapter](../src/decoder_prefill.cpp#L903)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L898)<!-- prefix: "void Decoder" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L534)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L937)<!-- prefix: "void Request" -->
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L538)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L937)<!-- prefix: "void Request" -->
 
 Use the feature contracts for dispatch and numerical details.
 
@@ -86,7 +87,7 @@ Use the feature contracts for dispatch and numerical details.
 
 ### Constraints and failure behavior
 
-Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decimal IDs with commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus budget must fit 262,144 tokens. The default budget is one. Zero budget returns no tokens and `length`. [CLI options](../apps/sglang-generate.cpp#L31)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L52)<!-- prefix: "void validat" -->
+Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decimal IDs with commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus budget must fit 262,144 tokens. The default budget is one. Zero budget returns no tokens and `length`. [CLI options](../apps/sglang-generate.cpp#L32)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L52)<!-- prefix: "void validat" -->
 
 The CLI defaults to greedy selection, with ties going to the lowest ID. It uses the [K4 default](mtp.md#runtime-path). `--stop-token` emits a match and returns `stop`, even at the budget. Exhaustion returns `length`. There is no implicit EOS. Failures print to stderr and exit 1. See [sampling](text-serving.md#sampling) and [C++ and HTTP constraints](text-serving.md#finite-choice-constraints). [Greedy selection](../src/text_ops.cu#L427)<!-- prefix: "__device__ T" -->
 
@@ -94,7 +95,7 @@ The decoder retains CUDA resources and transfer buffers while completion is unce
 
 Workspace sizing, row-wise fallback, and pool retention are documented with the prefill allocation contract. [Prefill workspace](native-prefill-workspace.md#constraints-and-failure-behavior)
 
-`--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L241)<!-- prefix: "void write_r" -->
+`--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L242)<!-- prefix: "void write_r" -->
 
 ### Verification
 
@@ -122,9 +123,9 @@ Run the [prefill checks](../tests/prefill/README.md). Compare exact scoring and 
 
 ## Native streaming server
 
-Use `--max-active` for the 1–32 HTTP lane limit and `--max-num-batched-tokens` for the 1–32,768 aggregate step budget. Verify the effective values at `/health` and the resolved graph and MTP settings at `/server_info`. See the transport guide for admission, overload, readiness, and shutdown. [CLI limits](../apps/sglang-server.cpp#L134)<!-- prefix: "} else if (o" --> · [HTTP transport](http-server.md) · [Server information](native-model-info.md#server-information)
+Use `--max-active` for the 1–32 HTTP lane limit and `--max-num-batched-tokens` for the 1–32,768 aggregate step budget. Verify the effective values at `/health` and the resolved graph and MTP settings at `/server_info`. See the transport guide for admission, overload, readiness, and shutdown. [CLI limits](../apps/sglang-server.cpp#L135)<!-- prefix: "} else if (o" --> · [HTTP transport](http-server.md) · [Server information](native-model-info.md#server-information)
 
-The single-device executor constructs `DecoderBatch` on its worker thread and propagates startup failures. Lanes share device weights and own request KV, GDN state, and output. The [resident-memory limit](batch-graphs.md#resident-memory-admission) applies separately from row and lane limits. [Executor](../src/runtime/server/single_device_batch_executor.cpp#L35)<!-- prefix: "void SingleD" -->
+The single-device executor creates and destroys `DecoderBatch` on its worker thread and propagates startup failures. The scheduler uses the session for admission, cancellation, and whole batch steps. Keep operator dispatch within those steps. Lanes share device weights and own request KV, GDN state, and output. The [resident-memory limit](batch-graphs.md#resident-memory-admission) applies separately from row and lane limits. [Executor lifecycle](../src/runtime/server/single_device_batch_executor.cpp#L76)<!-- prefix: "void SingleD" --> · [Scheduler loop](../apps/server/batch_service.cpp#L387)<!-- prefix: "void BatchSe" -->
 
 Use the serving contracts for [native generation](native-generate.md), [text](text-serving.md), [chat](chat-serving.md), [benchmark token-ID streams](../benchmarks/streaming/README.md#wire-contract), and [launch migration](native-model-info.md#migrate-old-launch-commands).
 

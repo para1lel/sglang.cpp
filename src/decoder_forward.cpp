@@ -59,6 +59,7 @@ struct LayerBatch {
     bool ordered_attention = false;
     bool target_tc = false;
     bool vector_attention = false;
+    bool grouped_target_attention = false;
     int target_split_end = 0;
 
     bool tensor_core_lane(int index) const {
@@ -509,7 +510,7 @@ void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>&
                        int cache_index) {
     const auto& binding = *batch.lanes[0].binding;
     const auto* cache = &binding.caches[cache_index];
-    const bool grouped = batch.target_split_end == text_attention_max_tokens && batch.count > 1;
+    const bool grouped = batch.grouped_target_attention && batch.count > 1;
     std::array<BoundPagedDecodeLane, target_verify_max_rows> reads;
     for (int index = 0; index < batch.count; ++index) {
         auto& work = workspace(batch.lanes[index]);
@@ -553,7 +554,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
     std::array<PagedDecodeLane, target_split_eager_max_rows> split_reads;
     std::array<Workspace*, target_split_eager_max_rows> split_pending;
     const bool grouped = std::is_same_v<Lane, VerificationRow> &&
-                         batch.target_split_end == text_attention_max_tokens && batch.count > 1;
+                         batch.grouped_target_attention && batch.count > 1;
     int count = 0;
     int split_count = 0;
     const auto flush_split = [&] {
@@ -896,9 +897,14 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
 template <typename Lane>
 void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream,
                                     bool exact) const {
-    const bool optimized = backend.uses_b200_operators && !exact;
-    const LayerBatch<Lane> batch{lanes, count, stream, optimized, optimized,
-                                 optimized, optimized ? backend.target_split_end : 0};
+    const LayerBatch<Lane> batch{
+        lanes, count, stream,
+        backend.ordered_attention && !exact,
+        backend.tensor_core_decode && !exact,
+        backend.vector_decode_attention && !exact,
+        backend.grouped_target_attention && !exact,
+        exact ? 0 : backend.target_split_end,
+    };
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
         if (batch.fuse_verify_activation()) {
             VerifyRmsQuantizeRows rows;
@@ -934,65 +940,4 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
                    [&](const Layer& layer) { run_mlp(layer, batch); });
 }
 
-void Decoder::Model::compute_logits(Request& request, bool decode) const {
-    compute_logits(request.work, request.memory.stream(), decode);
-}
-
-void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream) const {
-    check(text_rms_norm(work.hidden, work.residual, final_norm, hidden_size,
-                        work.normalized, nullptr, stream), "Normalize final residual");
-}
-
-bool Decoder::Model::compute_eager_decode_logits(const ForwardLane* lanes, int count,
-                                                cudaStream_t stream) const {
-    DecodeHeadRows rows;
-    if (count != static_cast<int>(rows.size())) {
-        return false;
-    }
-    for (int index = 0; index < count; ++index) {
-        rows[index] = &lanes[index].request->work;
-    }
-    compute_decode_logits(rows, stream);
-    return true;
-}
-
-void Decoder::Model::compute_decode_logits(const DecodeHeadRows& rows, cudaStream_t stream) const {
-    DecodeHeadProjections projections;
-    static_assert(std::tuple_size_v<DecodeHeadRows> == std::tuple_size_v<DecodeHeadProjections>);
-    for (std::size_t index = 0; index < rows.size(); ++index) {
-        auto& work = *rows[index];
-        normalize_final(work, stream);
-        projections[index] = {work.normalized, work.logits};
-    }
-    check(decode_bf16_lm_head_batch(lm_head.values, lm_head.rows, lm_head.columns, projections,
-                                   stream), "Run grouped decode LM head");
-    for (auto* work : rows) {
-        check(text_argmax(work->logits, vocab_size, work->argmax_scratch, work->argmax, stream),
-              "Select greedy token");
-    }
-}
-
-void Decoder::Model::compute_prefill_logits(Workspace& work, cudaStream_t stream) const {
-    normalize_final(work, stream);
-    project(lm_head, work.normalized, work.logits, stream);
-}
-
-void Decoder::Model::enqueue_label_logits(Request& request, cudaStream_t stream) const {
-    compute_prefill_logits(request.work, stream);
-    auto& logits = request.memory.transfers().logits;
-    check(cudaMemcpyAsync(logits.data(), request.work.logits, logits.size() * sizeof(logits[0]),
-                          cudaMemcpyDeviceToHost, stream), "Read final prompt logits");
-}
-
-void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode) const {
-    if (decode) {
-        normalize_final(work, stream);
-        check(decode_bf16_lm_head(lm_head.values, work.normalized, lm_head.rows, lm_head.columns,
-                                  work.logits, stream), "Run decode LM head");
-    } else {
-        compute_prefill_logits(work, stream);
-    }
-    check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
-          "Select greedy token");
-}
 }

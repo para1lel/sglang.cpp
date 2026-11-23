@@ -1,4 +1,5 @@
 #include "sglang/decoder.h"
+#include "sglang/runtime/backend/cuda_backend_policy.h"
 
 #include <algorithm>
 #include <charconv>
@@ -244,6 +245,7 @@ void write_result(const Arguments& arguments, const Measurements& measured,
     const bool stopped = result.finish_reason == sglang::DecoderFinishReason::stop;
     const double rate = measured.elapsed_ms == 0 ? 0 :
         measured.output_tokens * (1000.0 / measured.elapsed_ms);
+    const bool tc_prefill = decoder.backend_policy().tensor_core_prefill;
     auto& output = std::cout;
     output.imbue(std::locale::classic());
     output << std::setprecision(12);
@@ -263,7 +265,7 @@ void write_result(const Arguments& arguments, const Measurements& measured,
     }
     output << ",\"device\":" << arguments.device << ",\"warmup\":" << arguments.warmup
            << ",\"repeats\":" << arguments.repeats << ",\"load_ms\":" << load_ms
-           << ",\"fp8_prefill\":\"" << (decoder.uses_b200_operators() ? "tensor-core" : "exact")
+           << ",\"fp8_prefill\":\"" << (tc_prefill ? "tensor-core" : "exact")
            << "\",\"mtp_int8_head\":" << (decoder.has_int8_draft_head() ? "true" : "false")
            << ",\"certified_int8_verify_head\":"
            << (decoder.has_certified_vocab() ? "true" : "false")

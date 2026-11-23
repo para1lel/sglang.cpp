@@ -64,6 +64,9 @@ void check_charge(const DecoderBatch& warm, int capacity) {
 void check_pair(DecoderBatch& cold, DecoderBatch& warm, const std::vector<int>& prompt,
                 int depth, int restored, std::string salt = "shared") {
     const auto consume = mtp_options(depth, std::move(salt));
+    // Enable the same exact prefill route as the warm batch, with no reusable entry.
+    cold.reset_prefix_cache();
+    const auto cold_before = cold.prefix_cache_stats();
     require(cold.admit(0, prompt, consume) == 0, "Cold oracle unexpectedly restored");
     const auto before = warm.prefix_cache_stats();
     require(warm.admit(1, prompt, consume) == restored, "Warm target restore length");
@@ -75,6 +78,12 @@ void check_pair(DecoderBatch& cold, DecoderBatch& warm, const std::vector<int>& 
         require(!warm_lane.draft, "K0 restored a draft request");
     }
     const int expected = score_prompt(cold, 0);
+    const auto cold_after = cold.prefix_cache_stats();
+    require(cold_after.hits == cold_before.hits &&
+            cold_after.cached_tokens == cold_before.cached_tokens &&
+            cold_after.draft_cached_rows == cold_before.draft_cached_rows &&
+            cold_after.prefill_tokens - cold_before.prefill_tokens == prompt.size(),
+            "Cold oracle did not compute the entire prompt without reuse");
     require(score_prompt(warm, 1) == expected, "Warm first selected token differs");
     compare_state(request(cold, 0), request(warm, 1), prompt.size(), true);
     const auto after = warm.prefix_cache_stats();
@@ -108,7 +117,7 @@ void check_pair(DecoderBatch& cold, DecoderBatch& warm, const std::vector<int>& 
 }
 
 void enrichment(Decoder& decoder, const std::vector<int>& tokens) {
-    DecoderBatch cold(decoder, {false, 2, 0, page});
+    DecoderBatch cold(decoder, {false, 2, 1, page});
     DecoderBatch warm(decoder, {false, 2, 1, page});
     check_charge(warm, 1);
     const auto shared = head(tokens, page);
@@ -142,7 +151,7 @@ void changed_tiles(Decoder& decoder, const std::vector<int>& tokens) {
     const int boundary = 3 * page;
     auto producer = head(prompt, boundary + 1);
     producer.back() = (producer.back() + 1) % vocab_size;
-    DecoderBatch cold(decoder, {false, 2, 0, 1024});
+    DecoderBatch cold(decoder, {false, 2, 1, 1024});
     DecoderBatch warm(decoder, {false, 2, 1, 1024});
     require(warm.admit(0, producer, mtp_options(3)) == 0, "Unexpected larger prime hit");
     score_prompt(warm, 0);
@@ -297,7 +306,7 @@ int main(int argc, char** argv) {
         enrichment(decoder, tokens);
         changed_tiles(decoder, long_tokens);
         changed_first_token(decoder, tokenizer, tokens);
-        DecoderBatch cold(decoder, {false, 2, 0, page});
+        DecoderBatch cold(decoder, {false, 2, 1, page});
         DecoderBatch warm(decoder, {false, 2, 4, page});
         check_charge(warm, 4);
         const auto prompt = head(tokens, page);

@@ -4,6 +4,7 @@
 
 namespace sglang::decoder {
 
+struct DraftOperatorCapabilities;
 struct PrefillProjections;
 
 struct MtpPrefillBuffers {
@@ -32,7 +33,7 @@ class MtpDraftWeights {
 public:
     MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
                     std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-                    Bf16Weight lm_head, bool b200);
+                    Bf16Weight lm_head, DraftOperatorCapabilities capabilities);
     ~MtpDraftWeights();
 
     std::size_t device_allocation_bytes() const;
@@ -75,7 +76,7 @@ public:
     void recycle_after_completion();
 
 private:
-    friend class PrefixCache;
+    friend class GpuPrefixSnapshotStore;
     void snapshot_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream) const;
     void restore_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream);
 

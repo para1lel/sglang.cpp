@@ -51,6 +51,9 @@ fi
 if [[ $(<"$source/include/sglang/decoder.h") == *paired_prefill_threshold* ]]; then
     media_api+=(-DSGLANG_TEST_PAIRED_PREFILL_THRESHOLD)
 fi
+if [[ $(<"$source/include/sglang/decoder.h") == *backend_policy* ]]; then
+    media_api+=(-DSGLANG_TEST_BACKEND_POLICY)
+fi
 vision_header="$source/include/sglang/server/vision_completion.h"
 if [[ -f "$vision_header" && $(<"$vision_header") == *'generate(const Decoder&'* ]]; then
     media_api+=(-DSGLANG_TEST_SERIAL_MEDIA)

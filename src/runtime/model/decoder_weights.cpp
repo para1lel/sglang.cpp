@@ -122,7 +122,7 @@ void load_layer(WeightUpload& weights, const QwenTextModel& model, Layer& layer,
     const auto prefix = root + "layers." + std::to_string(index) + ".";
     layer.input_norm = weights.bf16(prefix + "input_layernorm.weight", {hidden_size});
     layer.attention_norm = weights.bf16(prefix + "post_attention_layernorm.weight", {hidden_size});
-    if (is_full_attention(index)) {
+    if (model.is_full_attention(index)) {
         layer.gqa = load_gqa(weights, model, prefix + "self_attn.");
     } else {
         layer.gdn = load_gdn(weights, model, prefix + "linear_attn.");
@@ -142,28 +142,23 @@ Decoder::Model::Model(const std::filesystem::path& directory, int cuda_device)
     DeviceScope selected_device(device);
     cudaDeviceProp properties{};
     check(cudaGetDeviceProperties(&properties, device), "Read decoder CUDA device properties");
-    if (properties.major != 10 || properties.minor != 0) {
-        throw std::invalid_argument("The decoder requires an sm_100 CUDA device");
-    }
-    accelerator_name = properties.name;
     backend = CudaBackendPolicy::for_device(properties);
-    execution = DecoderExecutionPolicy::for_capabilities(
-        backend.ordered_attention,
-        {1, batch_prefill_tile_rows, prefill_chunk_rows, backend.target_split_end});
+    accelerator_name = properties.name;
+    execution = DecoderExecutionPolicy::for_backend(
+        backend, {1, batch_prefill_tile_rows, prefill_chunk_rows});
     auto& checkpoint = memory->transfers().checkpoint;
     checkpoint = std::make_unique<Checkpoint>(directory);
+    const auto& model = checkpoint->text_model();
     memory->open_stream();
     WeightUpload weights(*checkpoint, *memory, memory->stream());
     const std::string root = "model.language_model.";
-    const auto model_vocab = static_cast<std::uint64_t>(decoder::qwen_text_model.vocab_size);
-    const auto model_hidden =
-        static_cast<std::uint64_t>(decoder::qwen_text_model.hidden_size);
+    const auto model_vocab = static_cast<std::uint64_t>(model.vocab_size);
+    const auto model_hidden = static_cast<std::uint64_t>(model.hidden_size);
     embedding = weights.bf16(root + "embed_tokens.weight", {model_vocab, model_hidden});
     final_norm = weights.bf16(root + "norm.weight", {model_hidden});
-    lm_head = weights.bf16_matrix("lm_head.weight", decoder::qwen_text_model.vocab_size,
-                                  decoder::qwen_text_model.hidden_size);
-    for (int index = 0; index < decoder::qwen_text_model.layer_count; ++index) {
-        load_layer(weights, decoder::qwen_text_model, layers[index], index, root);
+    lm_head = weights.bf16_matrix("lm_head.weight", model.vocab_size, model.hidden_size);
+    for (int index = 0; index < model.layer_count; ++index) {
+        load_layer(weights, model, layers[index], index, root);
     }
     memory->close_stream();
     selected_device.restore();

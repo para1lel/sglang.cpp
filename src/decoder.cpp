@@ -432,19 +432,23 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
     if (enable_mtp) {
         model_->mtp_weights = std::make_shared<MtpDraftWeights>(
             checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head,
-            model_->backend.int8_draft_head);
+            model_->backend.draft);
         model_->tc_vocab = model_->mtp_weights->shared_vocab();
     }
 }
 
 Decoder::~Decoder() = default;
 
+const CudaBackendPolicy& Decoder::backend_policy() const {
+    return model_->backend;
+}
+
 bool Decoder::uses_b200_operators() const {
     return model_->is_b200();
 }
 
 bool Decoder::has_int8_draft_head() const {
-    return model_->mtp_weights && model_->backend.int8_draft_head;
+    return model_->mtp_weights && model_->backend.draft.int8_head;
 }
 
 bool Decoder::has_certified_vocab() const {
@@ -665,6 +669,69 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     }
     selected_device.restore();
     return result;
+}
+
+void Decoder::Model::compute_logits(Request& request, bool decode) const {
+    compute_logits(request.work, request.memory.stream(), decode);
+}
+
+void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream) const {
+    check(text_rms_norm(work.hidden, work.residual, final_norm, hidden_size,
+                        work.normalized, nullptr, stream), "Normalize final residual");
+}
+
+bool Decoder::Model::compute_eager_decode_logits(const ForwardLane* lanes, int count,
+                                                cudaStream_t stream) const {
+    DecodeHeadRows rows;
+    if (count != static_cast<int>(rows.size())) {
+        return false;
+    }
+    for (int index = 0; index < count; ++index) {
+        rows[index] = &lanes[index].request->work;
+    }
+    compute_decode_logits(rows, stream);
+    return true;
+}
+
+void Decoder::Model::compute_decode_logits(const DecodeHeadRows& rows, cudaStream_t stream) const {
+    DecodeHeadProjections projections;
+    static_assert(std::tuple_size_v<DecodeHeadRows> == std::tuple_size_v<DecodeHeadProjections>);
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        auto& work = *rows[index];
+        normalize_final(work, stream);
+        projections[index] = {work.normalized, work.logits};
+    }
+    check(decode_bf16_lm_head_batch(lm_head.values, lm_head.rows, lm_head.columns, projections,
+                                   stream), "Run grouped decode LM head");
+    for (auto* work : rows) {
+        check(text_argmax(work->logits, vocab_size, work->argmax_scratch, work->argmax, stream),
+              "Select greedy token");
+    }
+}
+
+void Decoder::Model::compute_prefill_logits(Workspace& work, cudaStream_t stream) const {
+    normalize_final(work, stream);
+    check(text_bf16_gemv(lm_head.values, work.normalized, lm_head.rows, lm_head.columns,
+                         work.logits, stream), "Run BF16 projection");
+}
+
+void Decoder::Model::enqueue_label_logits(Request& request, cudaStream_t stream) const {
+    compute_prefill_logits(request.work, stream);
+    auto& logits = request.memory.transfers().logits;
+    check(cudaMemcpyAsync(logits.data(), request.work.logits, logits.size() * sizeof(logits[0]),
+                          cudaMemcpyDeviceToHost, stream), "Read final prompt logits");
+}
+
+void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode) const {
+    if (decode) {
+        normalize_final(work, stream);
+        check(decode_bf16_lm_head(lm_head.values, work.normalized, lm_head.rows, lm_head.columns,
+                                  work.logits, stream), "Run decode LM head");
+    } else {
+        compute_prefill_logits(work, stream);
+    }
+    check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+          "Select greedy token");
 }
 
 }

@@ -647,7 +647,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             seed.position = grant.position;
             seed.work.hidden += offset * hidden_size;
             seed.work.residual += offset * hidden_size;
-            const bool wmma = model.backend.uses_b200_operators &&
+            const bool wmma = model.backend.draft.wmma_seed_fc &&
                 grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
             seed.seed_draft(*grant.draft, grant.tokens + 1,
                             std::min(grant.rows, grant.prompt_remaining - 1),
@@ -687,7 +687,7 @@ bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* gra
 bool decoder::try_prefill_projection_pairs(
     const DecoderModel& model, const PrefillGrant* grants, int count, cudaStream_t stream,
     DecoderBatchStepStats& stats) {
-    if (!model.backend.tensor_core_prefill || !pairable_prefill_grants(grants, count)) {
+    if (!model.backend.paired_prefill || !pairable_prefill_grants(grants, count)) {
         return false;
     }
     if (count == 4 && prefill_projection_tiles(model, grants, count, 4, stream, stats)) {
@@ -913,7 +913,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                    },
                    [&](const Layer& layer) { chunk.mlp(layer); });
     if (draft && prompt_remaining > 1) {
-        const bool wmma = tensor_core && backend.target_split_end == text_attention_max_tokens &&
+        const bool wmma = tensor_core && backend.draft.wmma_seed_fc &&
                           position + prompt_remaining >= wmma_seed_min_prompt_tokens;
         chunk.seed_draft(*draft, tokens + 1, std::min(rows, prompt_remaining - 1),
                          final_norm, wmma);

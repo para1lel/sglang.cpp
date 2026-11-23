@@ -9,47 +9,15 @@ namespace sglang::decoder {
 namespace {
 
 constexpr int max_pages = decoder_batch_prefix_max_tokens / mxfp8_page_size;
-constexpr int max_request_pages = text_attention_max_tokens / mxfp8_page_size;
 static_assert(decoder_batch_prefix_max_tokens % mxfp8_page_size == 0);
 
-using PageMapping = std::array<std::int32_t, max_request_pages>;
-
-PageMapping read_request_pages(const Request& request, int pages, cudaStream_t stream) {
-    const auto table = request.pages;
-    const int physical_pages = request.caches.front().page_count;
-    if (!table.device_pages || pages < 1 || pages > max_pages ||
-        table.page_count < pages || table.page_count > max_request_pages ||
-        physical_pages < pages || physical_pages > max_request_pages) {
-        throw std::invalid_argument("Invalid prefix KV page capacity");
-    }
-    PageMapping mapping{};
-    check(cudaMemcpyAsync(mapping.data(), table.device_pages, table.page_count * sizeof(mapping[0]),
-                          cudaMemcpyDeviceToHost, stream), "Read prefix KV page mapping");
-    check(cudaStreamSynchronize(stream), "Complete prefix KV page mapping read");
-
-    std::bitset<max_request_pages> used;
-    for (int logical = 0; logical < pages; ++logical) {
-        const int physical = mapping[logical];
-        if (physical < 0 || physical >= physical_pages || used.test(physical)) {
-            throw std::invalid_argument("Invalid prefix KV page mapping");
-        }
-        used.set(physical);
-    }
-    for (int logical = pages; logical < table.page_count; ++logical) {
-        const int physical = mapping[logical];
-        if (physical >= 0 && physical < physical_pages && used.test(physical)) {
-            throw std::invalid_argument("Prefix KV page aliases a suffix page");
-        }
-    }
-    return mapping;
-}
-
 template <typename Copy>
-void copy_page_runs(const PageMapping& mapping, int pages, Copy copy) {
-    for (int logical = 0; logical < pages;) {
-        const int physical = mapping[logical];
+void copy_page_runs(const GpuPrefixSnapshotStore::PageMapping& mapping, Copy copy) {
+    for (int logical = 0; logical < mapping.count;) {
+        const int physical = mapping.physical[logical];
         int length = 1;
-        while (logical + length < pages && mapping[logical + length] == physical + length) {
+        while (logical + length < mapping.count &&
+               mapping.physical[logical + length] == physical + length) {
             ++length;
         }
         copy(logical, physical, length);
@@ -89,9 +57,7 @@ void copy_gdn(TextGdnState dst, TextGdnState src, cudaStream_t stream) {
     copy_state(dst.recurrent, src.recurrent, gdn_layers * gdn_state_elements, stream);
 }
 
-}
-
-static Mxfp8KvCache allocate_kv(Allocations& memory, int layers) {
+Mxfp8KvCache allocate_kv(Allocations& memory, int layers) {
     const auto payload = layers * max_pages * mxfp8_payload_bytes_per_page;
     const auto scales = layers * max_pages * mxfp8_scale_bytes_per_page;
     return {
@@ -100,86 +66,129 @@ static Mxfp8KvCache allocate_kv(Allocations& memory, int layers) {
     };
 }
 
-PrefixCache::Entry::Entry(Allocations& memory, bool with_draft)
+}
+
+GpuPrefixSnapshotStore::PageMapping GpuPrefixSnapshotStore::read_request_pages(
+    const Request& request, int pages, cudaStream_t stream) {
+    const auto table = request.pages;
+    const int physical_pages = request.caches.front().page_count;
+    if (!table.device_pages || pages < 1 || pages > max_pages ||
+        table.page_count < pages || table.page_count > max_request_pages ||
+        physical_pages < pages || physical_pages > max_request_pages) {
+        throw std::invalid_argument("Invalid prefix KV page capacity");
+    }
+    PageMapping mapping{{}, pages};
+    check(cudaMemcpyAsync(mapping.physical.data(), table.device_pages,
+                          table.page_count * sizeof(mapping.physical[0]),
+                          cudaMemcpyDeviceToHost, stream), "Read prefix KV page mapping");
+    check(cudaStreamSynchronize(stream), "Complete prefix KV page mapping read");
+
+    std::bitset<max_request_pages> used;
+    for (int logical = 0; logical < pages; ++logical) {
+        const int physical = mapping.physical[logical];
+        if (physical < 0 || physical >= physical_pages || used.test(physical)) {
+            throw std::invalid_argument("Invalid prefix KV page mapping");
+        }
+        used.set(physical);
+    }
+    for (int logical = pages; logical < table.page_count; ++logical) {
+        const int physical = mapping.physical[logical];
+        if (physical >= 0 && physical < physical_pages && used.test(physical)) {
+            throw std::invalid_argument("Prefix KV page aliases a suffix page");
+        }
+    }
+    return mapping;
+}
+
+GpuPrefixSnapshotStore::Snapshot::Snapshot(Allocations& memory)
     : kv(allocate_kv(memory, full_attention_layers)),
       gdn{memory.allocate<Bf16>(gdn_layers * gdn_history_elements),
           memory.allocate<float>(gdn_layers * gdn_state_elements)},
       hidden(memory.allocate<Bf16>(hidden_size)),
-      residual(memory.allocate<Bf16>(hidden_size)),
-      draft(with_draft ? allocate_kv(memory, 1) : Mxfp8KvCache{}) {}
+      residual(memory.allocate<Bf16>(hidden_size)) {}
 
-PrefixCache::PrefixCache(int device, int capacity, bool with_draft) : memory_(device) {
+GpuPrefixSnapshotStore::GpuPrefixSnapshotStore(int device, int capacity, bool with_draft)
+    : memory_(device) {
     if (capacity < 1 || capacity > decoder_batch_prefix_max_entries) {
         throw std::invalid_argument("Invalid prefix cache capacity");
     }
-    entries_.reserve(capacity);
-    for (int index = 0; index < capacity; ++index) {
-        entries_.push_back(std::make_unique<Entry>(memory_, with_draft));
-    }
-    counters_.device_bytes = memory_.bytes();
-    if (with_draft) {
-        counters_.draft_device_bytes = capacity * max_pages *
-            2 * (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
+    slots_.reserve(capacity);
+    for (int slot = 0; slot < capacity; ++slot) {
+        auto& snapshot = slots_.emplace_back(memory_);
+        if (with_draft) {
+            const auto target_bytes = memory_.bytes();
+            snapshot.draft = allocate_kv(memory_, 1);
+            draft_device_bytes_ += memory_.bytes() - target_bytes;
+        }
     }
 }
+
+std::size_t GpuPrefixSnapshotStore::device_bytes() const { return memory_.bytes(); }
+
+std::size_t GpuPrefixSnapshotStore::draft_device_bytes() const { return draft_device_bytes_; }
+
+void GpuPrefixSnapshotStore::store(int slot, const Request& request, const PageMapping& mapping,
+                                  cudaStream_t stream, const MtpDraftRequest* draft,
+                                  int draft_rows) {
+    auto& snapshot = slots_[slot];
+    copy_page_runs(mapping, [&](int logical, int physical, int length) {
+        copy_kv(snapshot.kv, logical, request.caches.front(), physical, length, stream);
+    });
+    copy_gdn(snapshot.gdn, request.states.front(), stream);
+    copy_state(snapshot.hidden, request.work.hidden, hidden_size, stream);
+    copy_state(snapshot.residual, request.work.residual, hidden_size, stream);
+    if (draft) {
+        draft->snapshot_prefix(snapshot.draft, draft_rows, stream);
+    }
+    check(cudaStreamSynchronize(stream), "Complete decoder prefix checkpoint");
+}
+
+void GpuPrefixSnapshotStore::restore(int slot, Request& request, int pages, bool restore_workspace,
+                                    cudaStream_t stream, MtpDraftRequest* draft,
+                                    int draft_rows) const {
+    const auto& snapshot = slots_[slot];
+    const auto mapping = read_request_pages(request, pages, stream);
+    copy_page_runs(mapping, [&](int logical, int physical, int length) {
+        copy_kv(request.caches.front(), physical, snapshot.kv, logical, length, stream);
+    });
+    copy_gdn(request.states.front(), snapshot.gdn, stream);
+    if (restore_workspace) {
+        copy_state(request.work.hidden, snapshot.hidden, hidden_size, stream);
+        copy_state(request.work.residual, snapshot.residual, hidden_size, stream);
+    }
+    if (draft) {
+        draft->restore_prefix(snapshot.draft, draft_rows, stream);
+    } else {
+        check(cudaStreamSynchronize(stream), "Complete decoder prefix restoration");
+    }
+}
+
+PrefixCache::PrefixCache(int device, int capacity, bool with_draft)
+    : snapshots_(device, capacity, with_draft), index_(capacity) {}
 
 int PrefixCache::checkpoint(int tokens) {
     return std::min(tokens, decoder_batch_prefix_max_tokens) / mxfp8_page_size * mxfp8_page_size;
-}
-
-int PrefixCache::find(const std::vector<int>& prompt, std::string_view salt, int limit,
-                      bool require_draft) const {
-    int best = -1;
-    int longest = 0;
-    for (int index = 0; index < static_cast<int>(entries_.size()); ++index) {
-        const auto& entry = *entries_[index];
-        if (entry.tokens > longest && entry.tokens <= limit &&
-            (!require_draft || entry.draft_rows == entry.tokens - 1) &&
-            salt == std::string_view(entry.salt.data(), entry.salt_size) &&
-            std::equal(entry.ids.begin(), entry.ids.begin() + entry.tokens, prompt.begin())) {
-            longest = entry.tokens;
-            best = index;
-        }
-    }
-    return best;
-}
-
-void PrefixCache::touch(int index) {
-    std::rotate(entries_.begin(), entries_.begin() + index, entries_.begin() + index + 1);
 }
 
 int PrefixCache::restore(Request& request, const std::vector<int>& prompt, std::string_view salt,
                          cudaStream_t stream, MtpDraftRequest* draft, int max_tokens) {
     const int limit = checkpoint(std::min(static_cast<int>(prompt.size()), max_tokens));
     if (!limit) return 0;
-    const int index = find(prompt, salt, limit, draft != nullptr);
-    if (index == -1) {
-        if (draft && find(prompt, salt, limit) != -1) {
-            ++counters_.draft_misses;
-        }
+    const auto match = index_.find(prompt, salt, 1, limit, draft != nullptr);
+    if (match.slot == -1) {
+        counters_.draft_misses += match.draft_miss;
         return 0;
     }
-    const auto& entry = *entries_[index];
-    const int pages = entry.tokens / mxfp8_page_size;
-    const auto mapping = read_request_pages(request, pages, stream);
-    copy_page_runs(mapping, pages, [&](int logical, int physical, int length) {
-        copy_kv(request.caches.front(), physical, entry.kv, logical, length, stream);
-    });
-    copy_gdn(request.states.front(), entry.gdn, stream);
-    if (draft || entry.tokens == static_cast<int>(prompt.size())) {
-        copy_state(request.work.hidden, entry.hidden, hidden_size, stream);
-        copy_state(request.work.residual, entry.residual, hidden_size, stream);
-    }
+    snapshots_.restore(match.slot, request, match.tokens / mxfp8_page_size,
+                       draft || match.tokens == static_cast<int>(prompt.size()), stream,
+                       draft, match.draft_rows);
     if (draft) {
-        draft->restore_prefix(entry.draft, entry.draft_rows, stream);
-        counters_.draft_cached_rows += entry.draft_rows;
-    } else {
-        check(cudaStreamSynchronize(stream), "Complete decoder prefix restoration");
+        counters_.draft_cached_rows += match.draft_rows;
     }
-    touch(index);
+    index_.touch(match);
     ++counters_.hits;
-    counters_.cached_tokens += entry.tokens;
-    return entry.tokens;
+    counters_.cached_tokens += match.tokens;
+    return match.tokens;
 }
 
 void PrefixCache::store(const Request& request, const std::vector<int>& prompt,
@@ -187,42 +196,19 @@ void PrefixCache::store(const Request& request, const std::vector<int>& prompt,
                         const MtpDraftRequest* draft) {
     if (tokens < 1 || tokens > decoder_batch_prefix_max_tokens || tokens % mxfp8_page_size != 0 ||
         std::size_t(tokens) > prompt.size() || salt.size() > decoder_prefix_max_salt_bytes ||
-        (draft && (!counters_.draft_device_bytes || draft->valid_prefix() != tokens - 1))) {
+        (draft && (!snapshots_.draft_device_bytes() || draft->valid_prefix() != tokens - 1))) {
         throw std::invalid_argument("Invalid prefix cache checkpoint");
     }
-    const int index = find(prompt, salt, tokens);
-    const bool matched = index != -1 && entries_[index]->tokens == tokens;
-    if (matched && (!draft || entries_[index]->draft_rows == tokens - 1)) {
-        touch(index);
-        return;
-    }
-    const int pages = tokens / mxfp8_page_size;
-    const auto mapping = read_request_pages(request, pages, stream);
-    const auto free_entry = std::find_if(entries_.begin(), entries_.end(),
-                                        [](const auto& entry) { return entry->tokens == 0; });
-    const int available = std::min(free_entry - entries_.begin(),
-                                   static_cast<std::ptrdiff_t>(entries_.size()) - 1);
-    const int victim = matched ? index : available;
-    auto& entry = *entries_[victim];
-    counters_.evictions += !matched && entry.tokens != 0;
-    entry.tokens = entry.draft_rows = 0;
-    copy_page_runs(mapping, pages, [&](int logical, int physical, int length) {
-        copy_kv(entry.kv, logical, request.caches.front(), physical, length, stream);
-    });
-    copy_gdn(entry.gdn, request.states.front(), stream);
-    copy_state(entry.hidden, request.work.hidden, hidden_size, stream);
-    copy_state(entry.residual, request.work.residual, hidden_size, stream);
-    if (draft) {
-        draft->snapshot_prefix(entry.draft, tokens - 1, stream);
-    }
-    check(cudaStreamSynchronize(stream), "Complete decoder prefix checkpoint");
+    const auto exact = index_.find(prompt, salt, tokens, tokens);
+    const int draft_rows = draft ? tokens - 1 : 0;
+    if (index_.touch_if_covered(exact, draft_rows)) return;
+    const auto mapping =
+        GpuPrefixSnapshotStore::read_request_pages(request, tokens / mxfp8_page_size, stream);
+    const auto write = index_.begin_write(exact);
+    counters_.evictions += write.evicted;
+    snapshots_.store(write.slot, request, mapping, stream, draft, draft_rows);
     ++counters_.stores;
-    std::copy_n(prompt.begin(), tokens, entry.ids.begin());
-    std::copy(salt.begin(), salt.end(), entry.salt.begin());
-    entry.salt_size = salt.size();
-    entry.tokens = tokens;
-    entry.draft_rows = draft ? tokens - 1 : 0;
-    touch(victim);
+    index_.publish(write, prompt, salt, tokens, draft_rows);
 }
 
 void PrefixCache::count_prefill(int tokens, int draft_rows) {
@@ -230,18 +216,15 @@ void PrefixCache::count_prefill(int tokens, int draft_rows) {
     counters_.draft_prefill_rows += draft_rows;
 }
 
-void PrefixCache::reset() {
-    for (auto& entry : entries_) {
-        entry->tokens = entry->draft_rows = 0;
-    }
-}
+void PrefixCache::reset() { index_.reset(); }
 
 DecoderPrefixCacheStats PrefixCache::stats() const {
     auto stats = counters_;
-    for (const auto& entry : entries_) {
-        stats.entries += entry->tokens != 0;
-        stats.pages += entry->tokens / mxfp8_page_size;
-    }
+    stats.device_bytes = snapshots_.device_bytes();
+    stats.draft_device_bytes = snapshots_.draft_device_bytes();
+    const auto occupancy = index_.occupancy();
+    stats.entries = occupancy.entries;
+    stats.pages = occupancy.tokens / mxfp8_page_size;
     return stats;
 }
 

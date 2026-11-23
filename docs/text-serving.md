@@ -50,11 +50,11 @@ Text, chat, and `/generate` share the immutable tokenizer. On first use, the ser
 
 ## Serial prefill
 
-At K0, the generator and direct `Decoder::generate` calls use the serial prefill path. The generator and direct C++ calls use [batch scheduling](batch-graphs.md#runtime-path) when MTP is enabled. The HTTP server uses it at every capacity. CUDA graphs cover eligible later decode steps. [K0 dispatch](../src/decoder.cpp#L656)<!-- prefix: "if (proposal" --> · [Prefill and decode](../src/decoder.cpp#L589)<!-- prefix: "const auto r" -->
+At K0, the generator and direct `Decoder::generate` calls use the serial prefill path. The generator and direct C++ calls use [batch scheduling](batch-graphs.md#runtime-path) when MTP is enabled. The HTTP server uses it at every capacity. CUDA graphs cover eligible later decode steps. [K0 dispatch](../src/decoder.cpp#L660)<!-- prefix: "if (proposal" --> · [Prefill and decode](../src/decoder.cpp#L593)<!-- prefix: "const auto r" -->
 
-The binaries and default C++ constructor use visible CUDA ordinal 0. Use `--device` or the constructor's device argument to select another ordinal. The serial prefill cap is 1,024 rows for B200 text and 128 rows for media and other devices. [Backend policy](../src/runtime/model/decoder_weights.cpp#L149)<!-- prefix: "backend = Cu" --> · [Row selector](../src/decoder.cpp#L474)<!-- prefix: "const int pr" -->
+The binaries and default C++ constructor use visible CUDA ordinal 0. Use `--device` or the constructor's device argument to select another ordinal. The serial prefill cap is 1,024 rows for B200 text and 128 rows for media and other devices. [Backend policy](../src/runtime/backend/cuda_backend_policy.cpp#L11)<!-- prefix: "CudaBackendP" --> · [Row selector](../src/decoder.cpp#L478)<!-- prefix: "const int pr" -->
 
-Prefill processes tiles and any shorter tail in order. Tile capacity fits the prompt, step cap, and available workspace. If large scratch is unavailable, prefill retries with a 128-row workspace. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L467)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L736)<!-- prefix: "PrefillWorks" -->
+Prefill processes tiles and any shorter tail in order. Tile capacity fits the prompt, step cap, and available workspace. If large scratch is unavailable, prefill retries with a 128-row workspace. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L471)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L736)<!-- prefix: "PrefillWorks" -->
 
 The actual tile size determines eligibility for [MXFP8 flash prefill](flash-prefill.md#constraints-and-failure-behavior).
 
@@ -64,13 +64,13 @@ Reserve a B200. For serial K0, run the generator with `--mtp-steps 0`. Check wor
 
 ## Request progress
 
-Serial generation and batch lanes track the next target position and the number of emitted output IDs separately. The position advances with restored prefixes, prompt inputs, and consumed decode rows. Scoring the final prompt row emits the first output without processing another input. Each emitted ID uses one unit of the output budget. For a positive output budget, the logical target KV limit is `prompt length + output budget - 1` positions. [Progress state](../include/sglang/decoder_internal.h#L428)<!-- prefix: "struct Reque" --> · [First score](../src/decoder.cpp#L500)<!-- prefix: "if (progress" -->
+Serial generation and batch lanes track the next target position and the number of emitted output IDs separately. The position advances with restored prefixes, prompt inputs, and consumed decode rows. Scoring the final prompt row emits the first output without processing another input. Each emitted ID uses one unit of the output budget. For a positive output budget, the logical target KV limit is `prompt length + output budget - 1` positions. [Progress state](../include/sglang/decoder_internal.h#L432)<!-- prefix: "struct Reque" --> · [First score](../src/decoder.cpp#L504)<!-- prefix: "if (progress" -->
 
 If `is_cancelled` returns true at entry, direct C++ generation finishes with `cancelled` before prefill. To deliver a selected ID, it appends the ID, calls `on_token`, then records requested top logits. If `on_token` returns false, the result retains that ID and its requested logits and finishes with `cancelled`. Otherwise, a constraint finish or stop match takes precedence over length. In direct MTP, the callback runs before the verifier commits the [consumed target state](mtp.md#runtime-path). [Result update](../src/decoder.cpp#L412)<!-- prefix: "bool SerialO" --> · [Finish decision](../src/decoder.cpp#L304)<!-- prefix: "std::optiona" -->
 
 ## Sampling
 
-Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L200)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L32)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L52)<!-- prefix: "void validat" -->
+Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L200)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L36)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L52)<!-- prefix: "void validat" -->
 
 | Field | Valid values |
 | --- | --- |

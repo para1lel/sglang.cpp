@@ -131,45 +131,47 @@ void check_fields(const json::Object& actual,
     }
 }
 
-void validate_text_config(const Path& path) {
+const decoder::QwenTextModel& validate_text_config(const Path& path) {
     const auto config = read_json_file(path);
+    const auto& model = decoder::qwen_text_model;
     check_fields(config, {
-        {"architectures", json::Array{std::string(checkpoint_architecture)}},
-        {"model_type", std::string(checkpoint_model_type)},
+        {"architectures", json::Array{std::string(model.architecture)}},
+        {"model_type", std::string(model.model_type)},
         {"tie_word_embeddings", false},
     }, path, "");
 
     const auto& text = require_object(config, "text_config", path);
     json::Array layers;
-    for (int layer = 0; layer < 64; ++layer) {
-        layers.emplace_back(layer % 4 == 3 ? "full_attention" : "linear_attention");
+    layers.reserve(model.layer_count);
+    for (int layer = 0; layer < model.layer_count; ++layer) {
+        layers.emplace_back(model.is_full_attention(layer) ? "full_attention" : "linear_attention");
     }
     check_fields(text, {
-        {"model_type", "qwen3_5_text"},
+        {"model_type", std::string(model.text_model_type)},
         {"dtype", "bfloat16"},
         {"hidden_act", "silu"},
-        {"hidden_size", 5120},
-        {"intermediate_size", 17408},
-        {"vocab_size", 248320},
+        {"hidden_size", model.hidden_size},
+        {"intermediate_size", model.intermediate_size},
+        {"vocab_size", model.vocab_size},
         {"tie_word_embeddings", false},
-        {"num_hidden_layers", 64},
-        {"full_attention_interval", 4},
+        {"num_hidden_layers", model.layer_count},
+        {"full_attention_interval", model.full_attention_interval},
         {"layer_types", std::move(layers)},
         {"rms_norm_eps", 1e-6},
-        {"num_attention_heads", 24},
-        {"num_key_value_heads", 4},
-        {"head_dim", 256},
+        {"num_attention_heads", model.query_heads},
+        {"num_key_value_heads", model.kv_heads},
+        {"head_dim", model.attention_head_dim},
         {"attention_bias", false},
         {"attention_dropout", 0.0},
         {"attn_output_gate", true},
-        {"linear_conv_kernel_dim", 4},
-        {"linear_key_head_dim", 128},
-        {"linear_value_head_dim", 128},
-        {"linear_num_key_heads", 16},
-        {"linear_num_value_heads", 48},
+        {"linear_conv_kernel_dim", model.gdn_conv_kernel_dim},
+        {"linear_key_head_dim", model.gdn_head_dim},
+        {"linear_value_head_dim", model.gdn_head_dim},
+        {"linear_num_key_heads", model.gdn_key_heads},
+        {"linear_num_value_heads", model.gdn_value_heads},
         {"output_gate_type", "swish"},
         {"mamba_ssm_dtype", "float32"},
-        {"max_position_embeddings", 262144},
+        {"max_position_embeddings", model.max_position_embeddings},
         {"partial_rotary_factor", 0.25},
     }, path, "text_config.");
 
@@ -187,8 +189,10 @@ void validate_text_config(const Path& path) {
         {"quant_method", "fp8"},
         {"fmt", "e4m3"},
         {"activation_scheme", "dynamic"},
-        {"weight_block_size", json::Array{128, 128}},
+        {"weight_block_size", json::Array{model.fp8_weight_block_size,
+                                         model.fp8_weight_block_size}},
     }, path, "quantization_config.");
+    return model;
 }
 
 using TensorNames = std::set<std::string, std::less<>>;
@@ -382,16 +386,20 @@ void load_shard(const Path& path, const Mapping& file, TensorNames& missing, Ten
 }
 
 struct Checkpoint::Storage {
+    explicit Storage(const decoder::QwenTextModel& model) : model(model) {}
+
+    const decoder::QwenTextModel& model;
     Path config;
     std::list<Mapping> shards;
     TensorMap tensors;
 };
 
 Checkpoint::Checkpoint(const std::filesystem::path& directory) {
-    validate_text_config(directory / "config.json");
+    const auto config = directory / "config.json";
+    const auto& model = validate_text_config(config);
     auto index = read_index(directory / "model.safetensors.index.json");
-    auto storage = std::make_unique<Storage>();
-    storage->config = std::filesystem::absolute(directory / "config.json");
+    auto storage = std::make_unique<Storage>(model);
+    storage->config = std::filesystem::absolute(config);
     for (auto& [shard, missing] : index) {
         const auto path = directory / shard;
         const auto& file = storage->shards.emplace_back(path);
@@ -401,6 +409,10 @@ Checkpoint::Checkpoint(const std::filesystem::path& directory) {
 }
 
 Checkpoint::~Checkpoint() = default;
+
+const decoder::QwenTextModel& Checkpoint::text_model() const {
+    return storage_->model;
+}
 
 const HostTensorView& Checkpoint::tensor(std::string_view name) const {
     const auto tensor = storage_->tensors.find(name);
@@ -423,14 +435,15 @@ const HostTensorView& Checkpoint::tensor(std::string_view name, TensorDtype dtyp
 
 void Checkpoint::validate_vision() const {
     const auto& path = storage_->config;
+    const auto& model = text_model();
     const auto config = read_json_file(path);
     const auto& vision = require_object(config, "vision_config", path);
     check_fields(vision, {
-        {"model_type", "qwen3_5"},
+        {"model_type", std::string(model.model_type)},
         {"depth", 27},
         {"hidden_size", 1152},
         {"intermediate_size", 4304},
-        {"out_hidden_size", 5120},
+        {"out_hidden_size", model.hidden_size},
         {"num_heads", 16},
         {"num_position_embeddings", 2304},
         {"in_channels", 3},

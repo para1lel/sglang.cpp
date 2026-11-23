@@ -14,7 +14,7 @@ The [commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check
 
 **Corrected.** Prefix store and restore assumed that logical and physical page indices matched. The identity case passed. With logical page zero at physical page one, the remapped case reported `Key payload mismatch`.
 
-The [page-map reader](../src/decoder_prefix_cache.cpp#L17)<!-- prefix: "PageMapping " --> now supplies physical indices for both transfers. Store gathers into logical order. Restore scatters into the destination mapping. The selected correction passed the remap and guard checks.
+The [page-map reader](../src/decoder_prefix_cache.cpp#L71)<!-- prefix: "GpuPrefixSna" --> now supplies physical indices for both transfers. Store gathers into logical order. Restore scatters into the destination mapping. The selected correction passed the remap and guard checks.
 
 Run `prefix-state --remapped` and `prefix-state --guards` after changes to KV copies. Use the [B200 build and run procedure](../tests/prefix/README.md). Keep independent source and destination permutations and check all four KV planes and untouched tail pages.
 
@@ -56,7 +56,7 @@ The test compares well-conditioned, query-range, and weighted-value cases with F
 
 ## L007 · Singleton route parity
 
-**Correction verified in Candidate B.** Candidate A changed tensor-core singleton graph attention to the fused split and kept legacy attention in eager. On identical token histories, all 78 eager rows matched HEAD bitwise and 274 replay rows differed. A link-only control restored legacy attention and recovered all 44 sampled rows. Candidate B keeps legacy singleton attention in eager, capture, replay, and eager continuation after an eligible launch rejection. The checkpoint rerun recovered all 352 decode logit rows bitwise. [Bound attention](../src/decoder_forward.cpp#L469)<!-- prefix: "void attend_" -->
+**Correction verified in Candidate B.** Candidate A changed tensor-core singleton graph attention to the fused split and kept legacy attention in eager. On identical token histories, all 78 eager rows matched HEAD bitwise and 274 replay rows differed. A link-only control restored legacy attention and recovered all 44 sampled rows. Candidate B keeps legacy singleton attention in eager, capture, replay, and eager continuation after an eligible launch rejection. The checkpoint rerun recovered all 352 decode logit rows bitwise. [Bound attention](../src/decoder_forward.cpp#L470)<!-- prefix: "void attend_" -->
 
 Build using the [batch graph runbook](../tests/batch/README.md). Set `out` to the Release build directory, `checkpoint` to the local checkpoint, and `GPU_UUID` to a reserved B200. Use a fresh `$out/singleton` directory.
 

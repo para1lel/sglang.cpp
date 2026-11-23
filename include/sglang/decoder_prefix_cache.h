@@ -1,7 +1,8 @@
 #pragma once
 
 #include "sglang/decoder_batch.h"
-#include "sglang/decoder_internal.h"
+#include "sglang/runtime/cache/gpu_prefix_snapshot_store.h"
+#include "sglang/runtime/cache/prefix_index.h"
 
 #include <string_view>
 
@@ -22,27 +23,8 @@ public:
     void reset();
 
 private:
-    struct Entry {
-        Entry(Allocations& memory, bool with_draft);
-
-        std::array<int, decoder_batch_prefix_max_tokens> ids;
-        std::array<char, decoder_prefix_max_salt_bytes> salt;
-        std::size_t salt_size = 0;
-        int tokens = 0;
-        Mxfp8KvCache kv;
-        TextGdnState gdn;
-        Bf16* hidden;
-        Bf16* residual;
-        Mxfp8KvCache draft;
-        int draft_rows = 0;
-    };
-
-    int find(const std::vector<int>& prompt, std::string_view salt, int limit,
-             bool require_draft = false) const;
-    void touch(int index);
-
-    Allocations memory_;
-    std::vector<std::unique_ptr<Entry>> entries_;
+    GpuPrefixSnapshotStore snapshots_;
+    PrefixIndex index_;
     DecoderPrefixCacheStats counters_;
 };
 

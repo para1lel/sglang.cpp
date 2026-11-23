@@ -4,6 +4,7 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/runtime/backend/cuda_backend_policy.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
 #include <cmath>
@@ -154,9 +155,9 @@ void project(Fp8Weight weight, const DraftWorkspace& work, Bf16* output, cudaStr
 struct MtpDraftWeights::State {
     State(const std::filesystem::path& directory, int device,
           std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-          Bf16Weight lm_head, bool b200)
-        : device(device), b200(b200), target_weights(std::move(target_weights)), memory(device),
-          embedding(embedding), lm_head(lm_head) {
+          Bf16Weight lm_head, DraftOperatorCapabilities capabilities)
+        : device(device), capabilities(capabilities), target_weights(std::move(target_weights)),
+          memory(device), embedding(embedding), lm_head(lm_head) {
         if (!this->target_weights || !embedding || !lm_head.values ||
             lm_head.rows != vocab_size || lm_head.columns != hidden_size) {
             throw std::invalid_argument("Invalid MTP target embedding or LM head");
@@ -185,7 +186,7 @@ struct MtpDraftWeights::State {
         mlp_up = upload.projection(mlp + "up_proj", intermediate_size, hidden_size);
         mlp_down = upload.projection(mlp + "down_proj", hidden_size, intermediate_size);
         final_norm = upload.norm("mtp.norm.weight", hidden_size);
-        if (b200) {
+        if (capabilities.int8_head) {
             auto* values = memory.allocate<std::uint8_t>(
                 static_cast<std::size_t>(vocab_size) * hidden_size);
             auto* maxima = memory.allocate<float>(vocab_size);
@@ -196,7 +197,7 @@ struct MtpDraftWeights::State {
             shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
         }
         memory.close_stream();
-        if (b200) {
+        if (capabilities.int8_head) {
             std::vector<float> maxima(vocab_size);
             check(cudaMemcpy(maxima.data(), quantized_head_maxima, maxima.size() * sizeof(float),
                              cudaMemcpyDeviceToHost), "Read INT8 MTP vocabulary row maxima");
@@ -211,7 +212,7 @@ struct MtpDraftWeights::State {
     }
 
     int device;
-    bool b200;
+    const DraftOperatorCapabilities capabilities;
     std::shared_ptr<const Allocations> target_weights;
     Allocations memory;
     const Bf16* embedding;
@@ -440,7 +441,8 @@ void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStre
                              count, stream), "Run batched BF16 MTP vocabulary head");
     }
     DraftArgmaxRows winners{};
-    if (model.b200 && std::all_of(batch, batch + count, [stream](State* row) {
+    if (model.capabilities.grouped_argmax &&
+        std::all_of(batch, batch + count, [stream](State* row) {
             return row->prepare_mapped_score(stream);
         })) {
         for (int index = 0; index < count; ++index) {
@@ -461,9 +463,10 @@ void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStre
 
 MtpDraftWeights::MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
                                  std::shared_ptr<const Allocations> target_weights,
-                                 const Bf16* embedding, Bf16Weight lm_head, bool b200)
+                                 const Bf16* embedding, Bf16Weight lm_head,
+                                 DraftOperatorCapabilities capabilities)
     : state_(std::make_unique<State>(checkpoint, device, std::move(target_weights), embedding,
-                                     lm_head, b200)) {}
+                                     lm_head, capabilities)) {}
 
 MtpDraftWeights::~MtpDraftWeights() = default;
 
@@ -594,7 +597,8 @@ void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
             for (int index = 0; index < count; ++index) {
                 attention[index] = states[index]->attention_row(rows[index].position);
             }
-            check(mtp_gqa_attention_batch(attention.data(), count, model.b200, stream),
+            check(mtp_gqa_attention_batch(attention.data(), count,
+                                          model.capabilities.online_attention, stream),
                   "Read batched MTP MXFP8 attention");
             apply(&State::gate_attention);
             project_wave(model.gqa.output, &DraftWorkspace::branch);
@@ -650,7 +654,7 @@ void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, cons
     }
     const auto& model = *request.weights->state_;
     const auto stream = projections.stream;
-    const bool paired = model.b200 && rows > 1;
+    const bool paired = model.capabilities.paired_seed_kv && rows > 1;
     const auto append = [&](int first, int count) {
         check(text_gqa_preprocess_keys(first, count, buffers.keys, model.gqa.key_norm,
                                         buffers.rope_keys, stream), "Rotate MTP prefill keys");

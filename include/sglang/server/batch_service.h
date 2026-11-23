@@ -1,7 +1,7 @@
 #pragma once
 
-#include "sglang/decoder_batch.h"
 #include "sglang/decoder_media.h"
+#include "sglang/runtime/server/batch_session.h"
 
 #include <atomic>
 #include <chrono>
@@ -158,6 +158,7 @@ public:
     bool reset_prefix_cache();
     bool start_profile(std::string name, std::size_t iterations);
     std::optional<BatchProfile> stop_profile();
+    BatchTopology topology() const noexcept;
 
 private:
     struct State;

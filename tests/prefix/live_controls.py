@@ -152,7 +152,7 @@ def check_live_graph(controls):
     assert len(steps) == 4, steps
     assert all(step["width"] == 2 and step["decode_lanes"] == 2
                and step["prefill_rows"] == 0 for step in steps), steps
-    assert any(step["graph_slots"] == 3 for step in steps), steps
+    assert all(step["graph_slots"] == 0 for step in steps), steps
 
 
 def live_reset(controls, prompt, output):

@@ -3,6 +3,7 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_prefill.h"
 #include "sglang/json.h"
+#include "sglang/runtime/backend/cuda_backend_policy.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/http.h"
@@ -192,10 +193,16 @@ std::string model_info_json(const Arguments& arguments) {
 }
 std::string draft_seed_fc_json(const Arguments& arguments, bool wmma);
 std::string server_info_json(const Arguments& arguments, double startup_seconds,
-                             const BatchRuntimeState& state, const sglang::Decoder& decoder) {
-    const bool b200 = decoder.uses_b200_operators();
+                             const BatchService& service, const sglang::Decoder& decoder) {
+    const auto state = service.runtime_state();
+    const auto topology = service.topology();
+    const auto& backend = decoder.backend_policy();
+    const bool prefix_cache = arguments.prefix_cache_entries != 0;
+    const bool draft_enabled = arguments.mtp_steps != 0;
     std::string body = R"({"frontend":"cpp","version":null,"supports_inline_system":false)";
-    body += R"(,"host":"127.0.0.1","dp_size":1,"tp_size":1,"pp_size":1)";
+    body += R"(,"host":"127.0.0.1","dp_size":)" + std::to_string(topology.dp_size);
+    body += R"(,"tp_size":)" + std::to_string(topology.tp_size);
+    body += R"(,"pp_size":)" + std::to_string(topology.pp_size);
     body += R"(,"launch_command":)";
     sglang::json::append_quoted(body, arguments.launch_command);
     body += R"(,"model_path":)";
@@ -212,17 +219,18 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += R"(,"mtp_int8_head":)";
     body += decoder.has_int8_draft_head() ? "true" : "false";
     body += R"(,"mtp_online_gqa":)";
-    body += b200 && arguments.mtp_steps != 0 && arguments.max_active >= 2 ? "true" : "false";
+    body += backend.draft.online_attention && draft_enabled && arguments.max_active >= 2
+        ? "true" : "false";
     body += R"(,"certified_int8_verify_head":)";
     body += decoder.has_certified_vocab() ? "true" : "false";
     body += R"(,"prefix_cache_entries":)" + std::to_string(arguments.prefix_cache_entries);
     body += R"(,"fp8_prefill":)";
-    const bool tc_prefill = b200 && !arguments.prefix_cache_entries;
+    const bool tc_prefill = backend.tensor_core_prefill && !prefix_cache;
     sglang::json::append_quoted(body, tc_prefill ? "tensor-core" : "exact");
     body += R"(,"target_gqa":)";
-    sglang::json::append_quoted(body, b200 ? "grouped-split" : "exact");
+    sglang::json::append_quoted(body, backend.grouped_target_attention ? "grouped-split" : "exact");
     body += R"(,"paired_prefill":)";
-    const bool paired_prefill = tc_prefill && arguments.mtp_steps != 0 &&
+    const bool paired_prefill = backend.paired_prefill && !prefix_cache && draft_enabled &&
         arguments.max_active >= 2 &&
         arguments.max_num_batched_tokens >= decoder.paired_prefill_threshold() &&
         arguments.max_num_batched_tokens <= sglang::decoder_default_max_num_batched_tokens;
@@ -246,7 +254,8 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += state.ready ? "true" : "false";
     body += R"(,"num_running_reqs":)" + std::to_string(state.running_requests);
     body += R"(,"generation_tokens_total":)" + std::to_string(state.generation_tokens);
-    return body + "}]" + draft_seed_fc_json(arguments, tc_prefill) + "}";
+    return body + "}]" + draft_seed_fc_json(arguments, tc_prefill && backend.draft.wmma_seed_fc) +
+        "}";
 }
 
 Socket listen(const Arguments& arguments) {
@@ -320,8 +329,7 @@ int main(int argc, char** argv) {
             }, model_info, [&](const Socket& connection, std::string_view body) {
                 native_generate.abort(connection, body);
             }, [&] {
-                return server_info_json(arguments, startup.count(), service.runtime_state(),
-                                        decoder);
+                return server_info_json(arguments, startup.count(), service, decoder);
             }, [&](const Socket& connection, int slot, std::string_view body) {
                 serve_score(connection, service, slot, tokenizer.get(), body);
             }, &discovery, [&](const Socket& connection, int slot, std::string_view body) {

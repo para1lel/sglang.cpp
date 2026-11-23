@@ -1,7 +1,7 @@
 #pragma once
 
 #include "sglang/decoder.h"
-#include "sglang/decoder_batch.h"
+#include "sglang/runtime/server/batch_session.h"
 
 #include <functional>
 #include <future>
@@ -18,8 +18,8 @@ public:
         int max_num_batched_tokens;
     };
 
-    using Ready = std::function<void(DecoderBatch&)>;
-    using Process = std::function<void(DecoderBatch&)>;
+    using Ready = std::function<void(BatchSession&)>;
+    using Process = std::function<void(BatchSession&)>;
 
     SingleDeviceBatchExecutor(const Decoder& decoder, Options options, Ready ready,
                               Process process);
@@ -27,6 +27,7 @@ public:
 
     void start();
     void stop();
+    BatchTopology topology() const noexcept;
 
 private:
     void run(std::promise<void> started);

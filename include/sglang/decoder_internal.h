@@ -65,17 +65,22 @@ inline constexpr int hidden_size = qwen_text_model.hidden_size;
 inline constexpr int intermediate_size = qwen_text_model.intermediate_size;
 inline constexpr int vocab_size = qwen_text_model.vocab_size;
 inline constexpr int layer_count = qwen_text_model.layer_count;
-inline constexpr int full_attention_interval = qwen_text_model.full_attention_interval;
-inline constexpr int full_attention_layers = layer_count / full_attention_interval;
-inline constexpr int gdn_layers = layer_count - full_attention_layers;
+inline constexpr int full_attention_layers = qwen_text_model.full_attention_layers();
+inline constexpr int gdn_layers = qwen_text_model.gdn_layers();
 inline constexpr int prefill_chunk_rows = text_embedding_max_rows;
 inline constexpr std::size_t gdn_history_elements = text_gdn_qkv_width * text_gdn_history_taps;
 inline constexpr std::size_t gdn_state_elements =
     text_gdn_value_heads * text_gdn_head_dim * text_gdn_head_dim;
 
-constexpr bool is_full_attention(int layer_index) {
-    return qwen_text_model.is_full_attention(layer_index);
-}
+static_assert(mxfp8_query_heads == qwen_text_model.query_heads);
+static_assert(mxfp8_kv_heads == qwen_text_model.kv_heads);
+static_assert(mxfp8_head_dim == qwen_text_model.attention_head_dim);
+static_assert(text_gdn_qk_heads == qwen_text_model.gdn_key_heads);
+static_assert(text_gdn_value_heads == qwen_text_model.gdn_value_heads);
+static_assert(text_gdn_head_dim == qwen_text_model.gdn_head_dim);
+static_assert(text_gdn_history_taps + 1 == qwen_text_model.gdn_conv_kernel_dim);
+static_assert(text_attention_max_tokens == qwen_text_model.max_position_embeddings);
+static_assert(text_fp8_group_size == qwen_text_model.fp8_weight_block_size);
 
 void check(cudaError_t status, const char* operation);
 struct CudaError : std::runtime_error {
@@ -272,18 +277,17 @@ struct LayerResidual {
 template <typename Normalize, typename Gqa, typename Gdn, typename Mlp>
 void execute_layers_with_attention_input(const std::array<Layer, layer_count>& layers,
                                          Normalize normalize, Gqa gqa, Gdn gdn, Mlp mlp) {
-    int gqa_index = 0;
-    int gdn_index = 0;
     for (int index = 0; index < layer_count; ++index) {
         const auto& layer = layers[index];
         const auto input = [first = index == 0](const auto& work) {
             return first ? LayerResidual{work.residual, nullptr}
                          : LayerResidual{work.hidden, work.residual};
         };
-        if (is_full_attention(index)) {
-            gqa(layer, gqa_index++, input);
+        const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
+        if (full_attention) {
+            gqa(layer, bank, input);
         } else {
-            gdn(layer, gdn_index++, input);
+            gdn(layer, bank, input);
         }
         normalize(layer.attention_norm, "Normalize post-attention residual", [](const auto& work) {
             return LayerResidual{work.projected_attention, work.residual};

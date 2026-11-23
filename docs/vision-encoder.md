@@ -16,7 +16,7 @@ It checks the names, BF16 dtype, and shapes of the required tensors.
 The pinned configuration has an empty DeepStack index list and produces zero DeepStack feature levels.
 The constructor copies 921,460,192 bytes of weights to the current device and waits for the upload.
 The encoder owns those weights. The caller can release the host checkpoint after construction.
-[Configuration validation](../src/checkpoint.cpp#L424)<!-- prefix: "void Checkpo" --> · [Weight validation](../src/vision/weights.cu#L53)<!-- prefix: "const Bf16* " -->
+[Configuration validation](../src/checkpoint.cpp#L436)<!-- prefix: "void Checkpo" --> · [Weight validation](../src/vision/weights.cu#L53)<!-- prefix: "const Bf16* " -->
 
 ## Encode patches
 

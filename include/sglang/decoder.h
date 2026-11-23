@@ -17,6 +17,10 @@ namespace sglang {
 struct DecoderMedia;
 class MediaDecoderCheck;
 
+namespace decoder {
+struct CudaBackendPolicy;
+}
+
 inline constexpr int decoder_max_mtp_steps = 4;
 inline constexpr int decoder_max_generated_top_logprobs = 20;
 inline constexpr std::size_t decoder_prefix_max_salt_bytes = 256;
@@ -163,6 +167,7 @@ public:
                                       const DecoderCallbacks& callbacks = DecoderCallbacks{}) const;
     std::size_t model_device_allocation_bytes() const;
     std::string_view accelerator_name() const;
+    const decoder::CudaBackendPolicy& backend_policy() const;
     bool uses_b200_operators() const;
     bool has_int8_draft_head() const;
     bool has_certified_vocab() const;

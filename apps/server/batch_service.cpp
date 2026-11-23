@@ -60,8 +60,8 @@ struct Work {
     Jobs jobs;
     bool buffered;
 };
-using Selection = std::array<bool, decoder_batch_max_lanes>;
-using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
+using Selection = BatchSession::Selection;
+using Steps = BatchSession::Steps;
 struct BatchJob {
     std::shared_ptr<Job> job;
     std::size_t index = 0;
@@ -77,13 +77,13 @@ struct BatchService::State {
           int prefix_cache_entries, int max_num_batched_tokens);
     ~State();
 
-    void process(DecoderBatch& batch);
-    std::optional<std::uint64_t> begin_iteration(DecoderBatch& batch);
-    std::optional<Work> wait_for_jobs(DecoderBatch& batch);
+    void process(BatchSession& batch);
+    std::optional<std::uint64_t> begin_iteration(BatchSession& batch);
+    std::optional<Work> wait_for_jobs(BatchSession& batch);
     bool idle_for_health() const;
     bool wide_decode_ready(bool buffered) const;
     bool decode_mailboxes_ready(bool require_all) const;
-    bool prepare(DecoderBatch& batch, int slot, const std::shared_ptr<Job>& job, bool buffered);
+    bool prepare(BatchSession& batch, int slot, const std::shared_ptr<Job>& job, bool buffered);
     bool publish(int slot, Job& job, const DecoderBatchStep& step);
     void publish_steps(const Jobs& snapshot, const Selection& selected, const Steps& steps);
     void record_profile(std::uint64_t epoch, std::uint64_t elapsed, int width,
@@ -143,8 +143,8 @@ BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs,
     executor = std::make_unique<SingleDeviceBatchExecutor>(decoder,
         SingleDeviceBatchExecutor::Options{cuda_graphs, max_active, prefix_cache_entries,
                                            max_num_batched_tokens},
-        [this](DecoderBatch& batch) { counters.cache = batch.prefix_cache_stats(); },
-        [this](DecoderBatch& batch) {
+        [this](BatchSession& batch) { counters.cache = batch.prefix_cache_stats(); },
+        [this](BatchSession& batch) {
             try {
                 process(batch);
             } catch (...) {
@@ -227,7 +227,7 @@ bool BatchService::State::idle_for_health() const {
            std::none_of(generating.begin(), generating.end(), [](bool active) { return active; });
 }
 
-std::optional<Work> BatchService::State::wait_for_jobs(DecoderBatch& batch) {
+std::optional<Work> BatchService::State::wait_for_jobs(BatchSession& batch) {
     std::unique_lock lock(mutex);
     const auto end = jobs.begin() + max_active;
     const auto ready = [&] {
@@ -258,7 +258,7 @@ std::optional<Work> BatchService::State::wait_for_jobs(DecoderBatch& batch) {
     if (idle_for_health()) jobs.front() = health_probe->job;
     return Work{jobs, wide_decode_ready(true) || decode_mailboxes_ready(false)};
 }
-bool BatchService::State::prepare(DecoderBatch& batch, int slot,
+bool BatchService::State::prepare(BatchSession& batch, int slot,
                                   const std::shared_ptr<Job>& job, bool buffered) {
     bool cancelled;
     {
@@ -369,7 +369,7 @@ void BatchService::State::record_profile(std::uint64_t epoch, std::uint64_t elap
     profile->steps.push_back({elapsed, width, rows, decode, stats.graph_slots});
 }
 
-std::optional<std::uint64_t> BatchService::State::begin_iteration(DecoderBatch& batch) {
+std::optional<std::uint64_t> BatchService::State::begin_iteration(BatchSession& batch) {
     std::unique_lock lock(mutex);
     if (reset_pending) {
         lock.unlock();
@@ -384,7 +384,7 @@ std::optional<std::uint64_t> BatchService::State::begin_iteration(DecoderBatch& 
     return profile && profile->steps.size() < profile_limit ? profile_epoch : 0;
 }
 
-void BatchService::State::process(DecoderBatch& batch) {
+void BatchService::State::process(BatchSession& batch) {
     std::size_t traced_bytes = 0;
     const bool trace_cache = trace && prefix_cache_entries != 0;
     auto traced_cache = batch.prefix_cache_stats();
@@ -977,5 +977,7 @@ BatchService::generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
     }
     return std::nullopt;
 }
+
+BatchTopology BatchService::topology() const noexcept { return state_->executor->topology(); }
 
 }

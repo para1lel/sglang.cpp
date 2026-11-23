@@ -88,11 +88,17 @@ struct LayerBatch {
         return std::is_same_v<Lane, VerificationRow> && count > fused_verify_rows;
     }
 
-    TextFp8Activation verification_activation(int index, int width) const {
+    bool packs_projection_activation(int width) const {
+        return target_tc && (fuse_verify_activation() || fuse_wide_verify_norm()) &&
+               width > 0 && width <= intermediate_size && width % text_fp8_group_size == 0;
+    }
+
+    TextFp8Activation projection_activation(int index, int width) const {
         auto activation = workspace(lanes[index]).activation;
-        if (target_tc) {
-            static_assert(fused_verify_rows == text_fp8_max_batch);
-            static_assert(fused_verify_rows * intermediate_size <= vocab_size * sizeof(Bf16));
+        if (packs_projection_activation(width)) {
+            static_assert(WideVerifyQuantizeRows::capacity * intermediate_size <=
+                          vocab_size * sizeof(Bf16));
+            // Each projection consumes this input before the stream reuses logits scratch.
             auto* packed = reinterpret_cast<std::uint8_t*>(workspace(lanes[0]).logits);
             activation.values = packed + index * width;
         }
@@ -140,7 +146,7 @@ struct LayerBatch {
         for (int index = 0; index < fused_verify_rows; ++index) {
             auto& work = workspace(lanes[index]);
             rows.entries[index] = {
-                work.*source, up ? work.*up : nullptr, verification_activation(index, width)};
+                work.*source, up ? work.*up : nullptr, projection_activation(index, width)};
         }
         check(verify_quantize_fp8(rows, width, stream), "Quantize five verification rows");
     }
@@ -152,7 +158,8 @@ struct LayerBatch {
         WideVerifyQuantizeRows rows{};
         for (int index = 0; index < count; ++index) {
             auto& work = workspace(lanes[index]);
-            rows.entries[index] = {work.*source, up ? work.*up : nullptr, work.activation};
+            rows.entries[index] = {
+                work.*source, up ? work.*up : nullptr, projection_activation(index, width)};
         }
         check(verify_quantize_fp8_wide(rows, count, width, stream),
               "Quantize wide verification rows");
@@ -179,8 +186,7 @@ struct LayerBatch {
             const int rows = projection_rows(group);
             for (int index = 0; index < rows; ++index) {
                 const auto& work = workspace(lanes[first + index]);
-                const auto activation = fuse_verify_activation()
-                    ? verification_activation(first + index, weight.columns) : work.activation;
+                const auto activation = projection_activation(first + index, weight.columns);
                 projections[index] = {{activation.values, activation.scales}, work.*output};
             }
             check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
@@ -220,14 +226,15 @@ struct LayerBatch {
             auto* entries = operands.data() + target * rows;
             for (int index = 0; index < rows; ++index) {
                 const auto& work = workspace(lanes[first + index]);
-                const auto activation = fuse_verify_activation()
-                    ? verification_activation(first + index, columns) : work.activation;
+                const auto activation = projection_activation(first + index, columns);
                 entries[index] = {{activation.values, activation.scales}, work.*layer.output};
             }
             const auto weight = layer.weight;
             targets[target++] = {weight.values, weight.scales, weight.rows, entries[0].output};
         }
-        auto* scratch = workspace(lanes[first]).logits;
+        auto* scratch = packs_projection_activation(columns)
+            ? reinterpret_cast<Bf16*>(projection_activation(first, columns).values)
+            : workspace(lanes[first]).logits;
         static_assert(text_target_fp8_max_rows * intermediate_size <= vocab_size * sizeof(Bf16));
         const auto status = tensor_core_lane(first)
             ? try_target_fp8_tc(targets.data(), target, columns, operands.data(),
@@ -913,7 +920,7 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
                 const auto [branch, residual] = residuals(work);
                 rows.entries[index] = {
                     branch, residual, work.normalized,
-                    batch.verification_activation(index, hidden_size)};
+                    batch.projection_activation(index, hidden_size)};
             }
             check(verify_rms_quantize(rows, weight, stream), operation);
             return;
@@ -923,7 +930,8 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
             for (int index = 0; index < count; ++index) {
                 auto& work = workspace(lanes[index]);
                 const auto [branch, residual] = residuals(work);
-                rows.entries[index] = {branch, residual, work.normalized, work.activation};
+                rows.entries[index] = {branch, residual, work.normalized,
+                                       batch.projection_activation(index, hidden_size)};
             }
             check(verify_rms_quantize_wide(rows, count, weight, stream), operation);
             return;

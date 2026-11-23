@@ -526,7 +526,7 @@ struct Decoder::Model {
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
                        const decoder::MediaPrefill* media = nullptr,
                        const decoder::PromptLogprobCapture* scores = nullptr,
-                       bool exact = false) const;
+                       bool exact = false, int logical_capacity = 0) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
                         DecoderBatchStepStats& stats, bool prefix_cache,
                         bool label_scores = false) const;

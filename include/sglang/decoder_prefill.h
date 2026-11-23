@@ -81,6 +81,8 @@ private:
     std::unique_ptr<PrefillPool> pool_;
 };
 
+std::size_t prefill_workspace_bytes(int rows);
+
 inline bool pairable_prefill_grants(const PrefillGrant* grants, int count) {
     if (count < 2 || count % 2 != 0 ||
         grants[0].rows > decoder_default_max_num_batched_tokens / count) {
@@ -105,7 +107,7 @@ inline PrefillGrant prefill_tile(PrefillGrant grant, int offset) {
     return grant;
 }
 
-bool try_prefill_projection_pairs(const DecoderModel& model, const PrefillGrant* grants,
-                                  int count, cudaStream_t stream, DecoderBatchStepStats& stats);
+bool try_prefill_projection_groups(const DecoderModel& model, const PrefillGrant* grants,
+                                   int count, cudaStream_t stream, DecoderBatchStepStats& stats);
 
 }

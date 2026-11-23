@@ -86,7 +86,7 @@ A nonfinite visible score, visible V scale byte above 160, or invalid partial or
 
 ## Verification
 
-Follow the [batch graph test runbook](../tests/batch/README.md) to build the release server, `mxfp8-gqa-check`, and `batch-graph-lanes`. Enable `--mxfp8-gqa-check=y` and `--batch-graph-lanes=y` in XMake. The runner checks bound operators, lane reuse, fault recovery, and HTTP parity between default replay and eager execution. Its CPU regression rejects a mask with the correct population count that includes a zero-budget slot. [Test target](../xmake.lua#L271)<!-- prefix: "target(\"batc" -->
+Follow the [batch graph test runbook](../tests/batch/README.md) to build the release server, `mxfp8-gqa-check`, and `batch-graph-lanes`. Enable `--mxfp8-gqa-check=y` and `--batch-graph-lanes=y` in XMake. The runner checks bound operators, lane reuse, fault recovery, and HTTP parity between default replay and eager execution. Its CPU regression rejects a mask with the correct population count that includes a zero-budget slot. [Test target](../xmake.lua#L272)<!-- prefix: "target(\"batc" -->
 
 On the reserved B200, compare eager and graph greedy IDs and full BF16 rows on identical inputs. Check singleton replay, request rebinding, and a zero-budget peer. The width sweep checks eager execution at logical widths two through 32 for the fixture. Follow the [packed route drift rule](long-paged-decode.md#packed-route-drift-evidence). [Lane assertions](../tests/batch/check_graph_evidence.py#L161)<!-- prefix: "def verify_l" -->
 

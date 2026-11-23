@@ -133,6 +133,7 @@ target("sglang_decoder")
     add_files("src/runtime/model/decoder_weights.cpp",
               "src/runtime/backend/cuda_backend_policy.cpp",
               "src/runtime/execution/decoder_execution_policy.cpp",
+              "src/runtime/execution/decoder_prefill_workspace.cpp",
               "src/runtime/cache/kv_residency_policy.cpp")
 
 target("sglang-generate")

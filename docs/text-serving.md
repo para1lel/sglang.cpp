@@ -54,7 +54,7 @@ At K0, the generator and direct `Decoder::generate` calls use the serial prefill
 
 The binaries and default C++ constructor use visible CUDA ordinal 0. Use `--device` or the constructor's device argument to select another ordinal. The serial prefill cap is 1,024 rows for B200 text and 128 rows for media and other devices. [Backend policy](../src/runtime/backend/cuda_backend_policy.cpp#L11)<!-- prefix: "CudaBackendP" --> · [Row selector](../src/decoder.cpp#L478)<!-- prefix: "const int pr" -->
 
-Prefill processes tiles and any shorter tail in order. Tile capacity fits the prompt, step cap, and available workspace. If large scratch is unavailable, prefill retries with a 128-row workspace. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L471)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/decoder_prefill.cpp#L736)<!-- prefix: "PrefillWorks" -->
+Prefill processes tiles and any shorter tail in order. Tile capacity fits the prompt, step cap, and available workspace. If large scratch is unavailable, prefill retries with a 128-row workspace. If normal scratch is unavailable, prefill processes one row at a time. Unavailable scratch means an allocation ran out of memory or the pool is unsupported. Other allocation errors propagate. [Tile loop and retry](../src/decoder.cpp#L471)<!-- prefix: "bool Decoder" --> · [Workspace allocation](../src/runtime/execution/decoder_prefill_workspace.cpp#L178)<!-- prefix: "PrefillWorks" -->
 
 The actual tile size determines eligibility for [MXFP8 flash prefill](flash-prefill.md#constraints-and-failure-behavior).
 

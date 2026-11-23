@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L891)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L362)<!-- prefix: "const auto s" --> |
+| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L764)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L219)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L905)<!-- prefix: "cudaError_t " --> |
 | Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L633)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L527)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L730)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
@@ -25,7 +25,7 @@ language prefill paths.
 
 On 148-SM SM100 devices, automatic dispatch tries ordered TMEM for 256–512 rows, start ≥8,192, and visibility ≤32,768. Both scale bases need eight-byte alignment. [Partial TMEM selection](../src/mxfp8_gqa_prefill.cu#L918)<!-- prefix: "const bool r" -->
 
-The decoder can batch staged paired attention inside a [four-grant projection group](native-prefill-workspace.md#projection-pairs-for-mtp). All four grants must have 1,024 rows and the same start at a 1,024-token boundary from 1,024 through 7,168. After appending KV for each lane, the decoder tries one predecode launch and one attention launch for the group. A declined batch retries each lane through the ordinary dispatcher on the same stream. [Shape guard](../src/decoder_prefill.cpp#L550)<!-- prefix: "bool can_bat" --> · [Batch and fallback](../src/decoder_prefill.cpp#L534)<!-- prefix: "if (staged_b" -->
+The decoder can batch staged paired attention inside a [whole-tile MTP projection group](native-prefill-workspace.md#projection-pairs-for-mtp). All four grants must have 1,024 rows and the same start at a 1,024-token boundary from 1,024 through 7,168. After appending KV for each lane, the decoder tries one predecode launch and one attention launch for the group. A declined batch retries each lane through the ordinary dispatcher on the same stream. [Partial-grant projection groups](native-prefill-workspace.md#partial-grant-projection-groups) run attention per lane. [Shape guard](../src/decoder_prefill.cpp#L408)<!-- prefix: "bool can_bat" --> · [Batch and fallback](../src/decoder_prefill.cpp#L392)<!-- prefix: "if (staged_b" -->
 
 Use the batch planner and serial tile rules for current tile caps. [Batch planner](batch-graphs.md#runtime-path) · [Serial prefill](text-serving.md#serial-prefill)
 
@@ -67,7 +67,7 @@ Split TMEM uses three contiguous partitions per query block and head pair. Its 7
 
 ## Constraints and failure behavior
 
-Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L927)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L860)<!-- prefix: "if (rows == " -->
+Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L927)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L733)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 

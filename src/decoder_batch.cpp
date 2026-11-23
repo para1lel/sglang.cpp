@@ -659,7 +659,7 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, bool only_prefill,
     }
     const bool bounded = budget > 0 && budget <= decoder_default_max_num_batched_tokens;
     if (count && !(only_prefill && !label_count && bounded && !prefix_cache &&
-                   try_prefill_projection_pairs(model, grants.data(), count, stream, stats))) {
+                   try_prefill_projection_groups(model, grants.data(), count, stream, stats))) {
         model.prefill_grants(grants.data(), count, stream, stats, prefix_cache);
     }
     if (label_count) {

@@ -8,158 +8,15 @@
 #include "sglang/text/prefill_attn_sm100.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
-#include <mutex>
 #include <string_view>
 #include <utility>
-
-namespace sglang::decoder {
-
-struct PrefillPool {
-    PrefillPool(int ordinal, bool large) : device(ordinal), large(large) {}
-
-    ~PrefillPool() {
-        if (handle) {
-            cudaMemPoolDestroy(handle);
-        }
-    }
-
-    const int device;
-    const bool large;
-    cudaMemPool_t handle = nullptr;
-    void* pending = nullptr;
-    bool retains_backing = false;
-    PrefillPool* next_retained = nullptr;
-    std::unique_ptr<PrefillPool> next;
-};
-
-}
 
 namespace sglang {
 namespace {
 
 using namespace decoder;
-
-class PrefillPools {
-public:
-    void configure_retention(PrefillPool& pool) {
-        {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            for (auto* owner = retained_; owner; owner = owner->next_retained) {
-                if (owner->device == pool.device && owner->large == pool.large) {
-                    return;
-                }
-            }
-            pool.next_retained = retained_;
-            retained_ = &pool;
-        }
-
-        std::uint64_t threshold = (pool.large ? 1024 : 32) * 1024 * 1024;
-        const auto status =
-            cudaMemPoolSetAttribute(pool.handle, cudaMemPoolAttrReleaseThreshold, &threshold);
-        if (status == cudaSuccess) {
-            pool.retains_backing = true;
-            return;
-        }
-
-        {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            auto** link = &retained_;
-            while (*link != &pool) {
-                link = &(*link)->next_retained;
-            }
-            *link = pool.next_retained;
-            pool.next_retained = nullptr;
-        }
-        if (status != cudaErrorNotSupported) {
-            check(status, "Configure prefill pool retention");
-        }
-    }
-
-    std::unique_ptr<PrefillPool> take_idle(int device, bool large) {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        if (auto pool = take(idle_, device, large, true)) {
-            return pool;
-        }
-        return take(idle_, device, large);
-    }
-
-    std::unique_ptr<PrefillPool> take_pending(int device) {
-        if (!has_pending_.load(std::memory_order_relaxed)) {
-            return {};
-        }
-        const std::lock_guard<std::mutex> lock(mutex_);
-        std::unique_ptr<PrefillPool> pending;
-        while (auto pool = take(pending_, device)) {
-            pool->next = std::move(pending);
-            pending = std::move(pool);
-        }
-        has_pending_.store(pending_ != nullptr, std::memory_order_relaxed);
-        return pending;
-    }
-
-    void put(std::unique_ptr<PrefillPool> pool) {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        auto& list = pool->pending ? pending_ : idle_;
-        pool->next = std::move(list);
-        list = std::move(pool);
-        if (pending_) {
-            has_pending_.store(true, std::memory_order_relaxed);
-        }
-    }
-
-private:
-    static std::unique_ptr<PrefillPool> take(std::unique_ptr<PrefillPool>& list, int device,
-                                             std::optional<bool> large = std::nullopt,
-                                             bool must_retain_backing = false) {
-        auto* link = &list;
-        while (*link && ((*link)->device != device ||
-                        (large && (*link)->large != *large) ||
-                        (must_retain_backing && !(*link)->retains_backing))) {
-            link = &(*link)->next;
-        }
-        auto pool = std::move(*link);
-        if (pool) {
-            *link = std::move(pool->next);
-        }
-        return pool;
-    }
-
-    std::mutex mutex_;
-    PrefillPool* retained_ = nullptr;
-    std::atomic<bool> has_pending_{false};
-    std::unique_ptr<PrefillPool> idle_;
-    std::unique_ptr<PrefillPool> pending_;
-};
-
-PrefillPools& prefill_pools() {
-    static PrefillPools pools;
-    return pools;
-}
-
-void recover_prefill_pool(PrefillPool& pool) noexcept {
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess || device != pool.device ||
-        cudaDeviceSynchronize() != cudaSuccess) {
-        return;
-    }
-    std::uint64_t used = 0;
-    if (cudaMemPoolGetAttribute(pool.handle, cudaMemPoolAttrUsedMemCurrent, &used) != cudaSuccess) {
-        return;
-    }
-    if (used == 0 ||
-        (cudaFreeAsync(pool.pending, cudaStreamPerThread) == cudaSuccess &&
-         cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess)) {
-        pool.pending = nullptr;
-    }
-}
-
-bool prefill_allocation_unavailable(cudaError_t status) {
-    return status == cudaErrorMemoryAllocation || status == cudaErrorNotSupported;
-}
 
 struct ScratchLayout {
     std::byte* data = nullptr;
@@ -448,6 +305,7 @@ void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant
 
 constexpr int layerwise_row_alignment = 128;
 constexpr int max_layerwise_rows = 1023;
+constexpr int min_partial_prefill_rows = 256;
 static_assert(max_layerwise_rows / 256 <= max_gdn_prefill_segments);
 static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
 
@@ -597,13 +455,27 @@ void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
     });
 }
 
+PairedPrefillScratch serial_gqa_scratch(const TileBuffers& buffers, int serial_capacity) {
+    ScratchLayout serial_layout{reinterpret_cast<std::byte*>(buffers.hidden)};
+    const auto sizes = TileBuffers(serial_layout, serial_capacity).gqa_scratch();
+    auto scratch = buffers.gqa_scratch();
+    scratch.key_bytes = sizes.key_bytes;
+    scratch.value_bytes = sizes.value_bytes;
+    return scratch;
+}
+
+enum class PrefillAttentionMode { batched, serial_segments };
+
 void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, PrefillGroup group,
-                       PrefillWorkspace& workspace, bool mixed) {
+                       PrefillWorkspace& workspace, bool mixed,
+                       PrefillAttentionMode attention_mode, int serial_capacity = 0) {
     const auto stream = workspace.stream();
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
     const TileBuffers buffers(layout, workspace.capacity());
     const bool grouped = group.rows > max_layerwise_rows;
-    const Chunk chunk{{buffers.activation, group.rows, stream, true, grouped}, buffers, 0, nullptr};
+    const bool serial_attention = attention_mode == PrefillAttentionMode::serial_segments;
+    const Chunk chunk{{buffers.activation, group.rows, stream, true,
+                       grouped || serial_attention}, buffers, 0, nullptr};
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
         gather_embeddings(model.embedding, grant.tokens, grant.rows,
                           buffers.residual + offset * hidden_size, stream);
@@ -616,7 +488,15 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         },
         [&](const GqaLayer& layer, int bank) {
             chunk.gqa_input(layer);
-            if (grouped && can_batch_staged_gqa(grants, group.grants)) {
+            if (serial_attention) {
+                const auto scratch = serial_gqa_scratch(buffers, serial_capacity);
+                each_prefill_segment(grants, group.grants, 0,
+                                     [&](const PrefillGrant& grant, int row) {
+                    const auto segment = prefill_attention_segment(chunk, grant, row);
+                    segment.gqa_attention(layer, grant.request->caches[bank], grant.request->pages,
+                                          scratch);
+                });
+            } else if (grouped && can_batch_staged_gqa(grants, group.grants)) {
                 prefill_group_gqa(chunk, layer, bank, grants, group.grants, 0, true);
             } else {
                 each_attention_group(grants, group.grants, mixed,
@@ -624,12 +504,22 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                     prefill_group_gqa(chunk, layer, bank, first, count, offset);
                 });
             }
-            chunk.gqa_gate();
+            if (!serial_attention) chunk.gqa_gate();
             chunk.attention_output(layer.output, text_gqa_q_width);
         },
         [&](const GdnLayer& layer, int bank) {
             chunk.gdn_input(layer);
-            if (grouped) {
+            if (serial_attention) {
+                each_prefill_segment(grants, group.grants, 0,
+                                     [&](const PrefillGrant& grant, int row) {
+                    const auto segment = prefill_attention_segment(chunk, grant, row);
+                    const TextFp8Activation quantized{
+                        buffers.activation.values + std::size_t(row) * text_gdn_value_width,
+                        buffers.activation.scales + std::size_t(row) * text_gdn_value_heads,
+                    };
+                    segment.gdn_recur(layer, grant.request->states[bank], bank, quantized);
+                });
+            } else if (grouped) {
                 prefill_group_gdn(chunk, layer, bank, grants, group.grants, 0);
             } else {
                 each_attention_group(grants, group.grants, mixed,
@@ -673,7 +563,8 @@ bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* gra
             for (int lane = 0; lane < lanes; ++lane) {
                 group[lane] = prefill_tile(grants[index + lane], offset);
             }
-            prefill_layerwise(model, group.data(), {lanes, rows}, workspace, false);
+            prefill_layerwise(model, group.data(), {lanes, rows}, workspace, false,
+                              PrefillAttentionMode::batched);
             ++stats.layerwise_prefill_groups;
             stats.layerwise_prefill_rows += rows;
         }
@@ -682,18 +573,81 @@ bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* gra
     return true;
 }
 
+PrefillGroup partial_projection_group(const PrefillGrant* grants, int count) {
+    PrefillGroup group{};
+    while (group.grants < count) {
+        const auto& grant = grants[group.grants];
+        if (grant.rows < min_partial_prefill_rows || grant.rows > batch_prefill_tile_rows ||
+            grant.rows != grant.tile_rows || grant.rows > grouped_prefill_max_rows - group.rows) {
+            break;
+        }
+        ++group.grants;
+        group.rows += grant.rows;
+    }
+    return group;
 }
 
-bool decoder::try_prefill_projection_pairs(
+void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant* grants,
+                                   int count, PrefillWorkspace& workspace, int capacity,
+                                   bool prefix_cache, bool label_scores);
+
+bool prefill_partial_projection_tiles(const DecoderModel& model, const PrefillGrant* grants,
+                                      int count, cudaStream_t stream,
+                                      DecoderBatchStepStats& stats) {
+    if (!model.backend.tensor_core_prefill || count < 2) return false;
+    int serial_capacity = 1;
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        if (grant.exact || grant.media || grant.scores) return false;
+        serial_capacity = std::max(serial_capacity, grant.tile_rows);
+    }
+    int capacity = serial_capacity;
+    for (int index = 0; index < count;) {
+        const auto group = partial_projection_group(grants + index, count - index);
+        if (group.grants >= 2) capacity = std::max(capacity, group.rows);
+        index += std::max(1, group.grants);
+    }
+    if (capacity == serial_capacity) return false;
+
+    PrefillWorkspace workspace(stream, capacity);
+    if (!workspace.data()) return false;
+    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
+    for (int index = 0; index < count;) {
+        const auto group = partial_projection_group(grants + index, count - index);
+        if (group.grants >= 2) {
+            prefill_layerwise(model, grants + index, group, workspace, false,
+                              PrefillAttentionMode::serial_segments, serial_capacity);
+            ++stats.layerwise_prefill_groups;
+            stats.layerwise_prefill_rows += group.rows;
+            index += group.grants;
+            continue;
+        }
+        enqueue_native_prefill_grants(model, grants + index, 1, workspace, serial_capacity,
+                                      false, false);
+        ++index;
+    }
+    workspace.close();
+    return true;
+}
+
+}
+
+std::size_t decoder::prefill_workspace_bytes(int rows) {
+    ScratchLayout layout;
+    const TileBuffers buffers(layout, rows);
+    return layout.bytes;
+}
+
+bool decoder::try_prefill_projection_groups(
     const DecoderModel& model, const PrefillGrant* grants, int count, cudaStream_t stream,
     DecoderBatchStepStats& stats) {
-    if (!model.backend.paired_prefill || !pairable_prefill_grants(grants, count)) {
-        return false;
+    if (model.backend.paired_prefill && pairable_prefill_grants(grants, count)) {
+        if (count == 4 && prefill_projection_tiles(model, grants, count, 4, stream, stats)) {
+            return true;
+        }
+        return prefill_projection_tiles(model, grants, count, 2, stream, stats);
     }
-    if (count == 4 && prefill_projection_tiles(model, grants, count, 4, stream, stats)) {
-        return true;
-    }
-    return prefill_projection_tiles(model, grants, count, 2, stream, stats);
+    return prefill_partial_projection_tiles(model, grants, count, stream, stats);
 }
 
 TextFp8ActivationView PrefillProjections::quantize(const Bf16* input, int width) const {
@@ -720,90 +674,6 @@ void PrefillProjections::project(Fp8Weight weight, TextFp8ActivationView input,
 void PrefillProjections::project(Bf16Weight weight, const Bf16* input, Bf16* output) const {
     check(text_bf16_gemv_rows(weight.values, input, weight.rows, weight.columns, rows, output,
                               stream), "Run exact prefill BF16 projection");
-}
-
-void decoder::reclaim_prefill_workspaces(int device) {
-    auto& pools = prefill_pools();
-    auto pending = pools.take_pending(device);
-    while (pending) {
-        auto pool = std::move(pending);
-        pending = std::move(pool->next);
-        recover_prefill_pool(*pool);
-        pools.put(std::move(pool));
-    }
-}
-
-PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
-    : stream_(stream), capacity_(capacity) {
-    if (!stream || capacity < 1 || capacity > grouped_prefill_max_rows) {
-        throw std::invalid_argument("Invalid decoder prefill workspace");
-    }
-    if (capacity == 1) {
-        return;
-    }
-    int device = 0;
-    check(cudaGetDevice(&device), "Get CUDA device for prefill workspace");
-    reclaim_prefill_workspaces(device);
-    const bool large = capacity > prefill_chunk_rows;
-    auto& pools = prefill_pools();
-    auto pool = pools.take_idle(device, large);
-    if (!pool) {
-        pool = std::make_unique<PrefillPool>(device, large);
-        cudaMemPoolProps props{};
-        props.allocType = cudaMemAllocationTypePinned;
-        props.location.type = cudaMemLocationTypeDevice;
-        props.location.id = device;
-        const auto created = cudaMemPoolCreate(&pool->handle, &props);
-        if (prefill_allocation_unavailable(created)) {
-            return;
-        }
-        check(created, "Create prefill workspace pool");
-        int disabled = 0;
-        check(cudaMemPoolSetAttribute(pool->handle, cudaMemPoolReuseAllowInternalDependencies,
-                                      &disabled), "Configure prefill workspace pool");
-        pools.configure_retention(*pool);
-    }
-    ScratchLayout layout;
-    const TileBuffers buffers(layout, capacity);
-    void* data = nullptr;
-    const auto status = cudaMallocFromPoolAsync(&data, layout.bytes, pool->handle, stream);
-    if (status != cudaSuccess) {
-        pools.put(std::move(pool));
-        if (!prefill_allocation_unavailable(status)) {
-            check(status, "Allocate prefill workspace");
-        }
-        return;
-    }
-    pool_ = std::move(pool);
-    data_ = data;
-    bytes_ = layout.bytes;
-}
-
-PrefillWorkspace::~PrefillWorkspace() {
-    if (release_status_ == cudaSuccess) {
-        const auto status = release();
-        if (status != cudaSuccess) {
-            std::fprintf(stderr, "Release prefill workspace: %s\n", cudaGetErrorString(status));
-        }
-    }
-}
-
-cudaError_t PrefillWorkspace::release() noexcept {
-    if (data_ && release_status_ == cudaSuccess) {
-        release_status_ = cudaFreeAsync(data_, stream_);
-        if (release_status_ != cudaSuccess) {
-            pool_->pending = data_;
-            recover_prefill_pool(*pool_);
-        }
-        prefill_pools().put(std::move(pool_));
-        data_ = nullptr;
-    }
-    stream_ = nullptr;
-    return release_status_;
-}
-
-void PrefillWorkspace::close() {
-    check(release(), "Release prefill workspace");
 }
 
 void Decoder::Model::seed_draft(Workspace& work, MtpDraftRequest& draft, int position,
@@ -849,9 +719,12 @@ void decoder::finish_prompt_logprobs(const DecoderOptions& options, DecoderPromp
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
                                    PrefillWorkspace& workspace, MtpDraftRequest* draft,
                                    int prompt_remaining, const MediaPrefill* media,
-                                   const PromptLogprobCapture* scores, bool exact) const {
+                                   const PromptLogprobCapture* scores, bool exact,
+                                   int logical_capacity) const {
     const auto stream = workspace.stream();
-    if (!stream || !tokens || rows < 1 || rows > workspace.capacity() || position < 0 ||
+    const int capacity = logical_capacity ? logical_capacity : workspace.capacity();
+    if (!stream || !tokens || rows < 1 || rows > capacity || capacity > workspace.capacity() ||
+        position < 0 ||
         position > text_attention_max_tokens - rows ||
         (position + rows - 1) / mxfp8_page_size >= request.pages.page_count ||
         (draft && (prompt_remaining < rows || media))) {
@@ -887,7 +760,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         return;
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
-    const TileBuffers buffers(layout, workspace.capacity());
+    const TileBuffers buffers(layout, capacity);
     const bool tensor_core = backend.tensor_core_prefill && !exact && !media;
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
                       media ? media->positions + position : nullptr};
@@ -926,6 +799,37 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     stage_prefill_row(request, work, rows - 1, stream);
 }
 
+namespace {
+
+void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant* grants,
+                                   int count, PrefillWorkspace& workspace, int capacity,
+                                   bool prefix_cache, bool label_scores) {
+    const auto stream = workspace.stream();
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        if (grant.rows == 1 && grant.draft && grant.prompt_remaining > 1) {
+            model.seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1],
+                             stream);
+        } else if (grant.rows == 1 && !label_scores) {
+            capture_prefill_scores(model, grant, nullptr, 0, stream);
+        } else {
+            for (int offset = 0; offset < grant.rows;) {
+                const int rows = std::min({grant.tile_rows, capacity, grant.rows - offset});
+                model.prefill_chunk(*grant.request, grant.tokens + offset, rows,
+                                    grant.position + offset, workspace, grant.draft,
+                                    grant.prompt_remaining - offset, grant.media, grant.scores,
+                                    label_scores || prefix_cache || grant.exact, capacity);
+                offset += rows;
+            }
+        }
+        if (label_scores && grant.rows == grant.prompt_remaining) {
+            model.enqueue_label_logits(*grant.request, stream);
+        }
+    }
+}
+
+}
+
 void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaStream_t stream,
                                    DecoderBatchStepStats& stats, bool prefix_cache,
                                    bool label_scores) const {
@@ -938,27 +842,8 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
         workspace.emplace(stream, prefill_chunk_rows);
     }
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        if (grant.rows == 1 && grant.draft && grant.prompt_remaining > 1) {
-            seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1], stream);
-        } else if (grant.rows == 1 && !label_scores) {
-            capture_prefill_scores(*this, grant, nullptr, 0, stream);
-        } else {
-            for (int offset = 0; offset < grant.rows;) {
-                const int rows = std::min({grant.tile_rows, workspace->capacity(),
-                                           grant.rows - offset});
-                prefill_chunk(*grant.request, grant.tokens + offset, rows,
-                              grant.position + offset, *workspace, grant.draft,
-                              grant.prompt_remaining - offset, grant.media, grant.scores,
-                              label_scores || prefix_cache || grant.exact);
-                offset += rows;
-            }
-        }
-        if (label_scores && grant.rows == grant.prompt_remaining) {
-            enqueue_label_logits(*grant.request, stream);
-        }
-    }
+    enqueue_native_prefill_grants(*this, grants, count, *workspace, workspace->capacity(),
+                                  prefix_cache, label_scores);
     workspace->close();
 }
 

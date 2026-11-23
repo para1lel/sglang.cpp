@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L865)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L308)<!-- prefix: "const bool c" --> |
+| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L869)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L308)<!-- prefix: "const bool c" --> |
 | GDN operator | Prepare rows, advance each layer's recurrent state, and finish output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L647)<!-- prefix: "cudaError_t " --> |
 | Verification | Check ordered parity, chunked numerical error, and causal continuation. | [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L101)<!-- prefix: "int main(int" --> |
 
@@ -18,7 +18,20 @@ Grouped input preparation assigns four consecutive rows to each 128-thread convo
 
 Per-grant matrix preparation uses one 128-thread block per value head and row group. Recurrence uses a `48 × 2` grid with 256 threads per block. Eight warps share the staging work in each block. Each warp processes eight value channels, so the two blocks cover all 128 channels per head. [Matrix launch](../include/sglang/text/gdn_chunk.cuh#L219)<!-- prefix: "const auto s" --> · [Recurrence launch](../include/sglang/text/gdn_chunk.cuh#L225)<!-- prefix: "return cudaL" --> · [Channel assignment](../include/sglang/text/gdn_warp_mma.cuh#L213)<!-- prefix: "const int fe" -->
 
-On SM100, an existing [layerwise prefill group](native-prefill-workspace.md#multi-request-text-prefill) of two or three eligible grants can share the preparation, matrix, recurrence, and finish launches. The grid Z coordinate selects a grant with its own state and scratch spans. Each block uses the selected grant's row count, including when aligned grant lengths differ. The first GDN layer uses the per-grant path for the whole group when any grant starts at position zero. [Grouped submission](../src/text_attention_gdn.cu#L766)<!-- prefix: "std::optiona" -->
+On SM100, eligible grants can share the preparation, matrix, recurrence, and
+finish launches across up to four segments. The large
+[projection groups](native-prefill-workspace.md#projection-pairs-for-mtp) pass
+four 1,024-row grants at 4,096 rows or two at 2,048 rows. The regular layerwise
+path can group two or three eligible grants.
+[Segment limit](../include/sglang/decoder_cuda.cuh#L120)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L610)<!-- prefix: "if (grouped)" -->
+
+The grid Z coordinate selects a grant with its own state, row slices, and
+scratch spans. Each block uses its grant's row count, including when aligned
+grant lengths differ. Each grant's absolute start determines bank-zero
+eligibility. If any grant starts at position zero, the first GDN layer runs
+per grant for the whole group. A declined grouped submission also runs
+per grant. A CUDA error from the grouped provider propagates.
+[Position guard](../src/decoder_prefill.cpp#L557)<!-- prefix: "grant.rows %" --> · [Grouped submission](../src/text_attention_gdn.cu#L766)<!-- prefix: "std::optiona" -->
 
 Grouped matrix preparation uses one 384-thread block per Q and K head and row group. The three associated value heads share Q and K staging and the FP32 dot products. Each value head applies its own gates and solves its own triangular system with the existing BF16 matrix layout. [Grouped matrix launch](../include/sglang/text/gdn_chunk.cuh#L234)<!-- prefix: "const auto s" -->
 
@@ -51,6 +64,12 @@ Use `gdn-routes` to check the first tile and a tile restored from a prefix while
 Run the checkpoint probe with 2,048 prompt IDs and eight fixed teacher IDs. Leave `SGLANG_SERIAL_PREFILL_ROWS` unset. Require two 1,024-row prefill tiles. For ordered changes, compare carries and histories across all 48 GDN layers after each tile and the decode sequence. Compare full BF16 logits and winners along the fixed history.
 
 For grouped preparation changes, compare output, carry, and history bitwise across builds. Check the 127-, 128-, and 129-row boundary and perturb a later row within a four-row group. Require earlier outputs to match. Measure each stage and the preparation-to-finish interval on the same checkpoint tiles in both run orders. Record any serving estimate with its archived launch count and label it as an estimate.
+
+For grouped projection prefill, compare the full state and draft continuation
+with the per-grant control at the same prompt positions. Repeat with denied
+4,096-row workspace allocation to check the two-grant path. Check bank zero
+at position zero and on a later tile. Record the grouped and per-grant launches
+separately.
 
 For reordered changes, compare logits and labeled-token negative log likelihood on identical prompt and teacher histories. Record greedy divergence separately. Trace the position-zero first-layer guard, eligible layers, short tails, exact, and positive-depth MTP. Use the [frozen serving protocols](performance.md) with matched tile schedules, graph settings, and warmups. To isolate GDN when flash is active, hold flash dispatch fixed across both arms.
 

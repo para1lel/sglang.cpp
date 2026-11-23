@@ -607,10 +607,14 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         },
         [&](const GdnLayer& layer, int bank) {
             chunk.gdn_input(layer);
-            each_attention_group(grants, group.grants, mixed,
-                                 [&](const PrefillGrant* first, int count, int offset) {
-                prefill_group_gdn(chunk, layer, bank, first, count, offset);
-            });
+            if (grouped) {
+                prefill_group_gdn(chunk, layer, bank, grants, group.grants, 0);
+            } else {
+                each_attention_group(grants, group.grants, mixed,
+                                     [&](const PrefillGrant* first, int count, int offset) {
+                    prefill_group_gdn(chunk, layer, bank, first, count, offset);
+                });
+            }
             chunk.project(layer.output, {buffers.activation.values, buffers.activation.scales},
                           buffers.projected_attention);
         },

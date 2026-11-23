@@ -117,7 +117,7 @@ cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __
                                     TextFp8Activation output, cudaStream_t stream,
                                     void* chunk_scratch = nullptr, std::size_t chunk_bytes = 0);
 
-inline constexpr int max_gdn_prefill_segments = 3;
+inline constexpr int max_gdn_prefill_segments = 4;
 
 struct GdnPrefillSegment {
     int rows;

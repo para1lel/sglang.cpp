@@ -401,7 +401,8 @@ __global__ void bf16_gdn_verify_gates(
     }
     __syncthreads();
     const int lane = threadIdx.x % warp_width;
-    const auto row = args.rows[threadIdx.x / warp_width];
+    const auto row = args.rows[blockIdx.y * (blockDim.x / warp_width) +
+                               threadIdx.x / warp_width];
     Bf16Dot dot;
 #pragma unroll 4
     for (int pack = lane; pack < packs; pack += warp_width) {
@@ -586,6 +587,37 @@ std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates(
     };
     return count == wide_gdn_gate_rows ? launch(VerifyGdnGateArguments<wide_gdn_gate_rows>{})
                                        : launch(VerifyGdnGateArguments<text_fp8_max_batch>{});
+}
+
+std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
+    constexpr int capacity = CompactGdnVerificationBatch::lanes * CompactGdnVerificationBatch::rows;
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess) {
+        return pending;
+    }
+    if ((count != capacity / 2 && count != capacity) || !rows || !weight_b || !weight_a ||
+        !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
+        return std::nullopt;
+    }
+    VerifyGdnGateArguments<capacity> arguments;
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        if (!row.input || !row.output_b || !row.output_a || !aligned(row.input, 16)) {
+            return std::nullopt;
+        }
+        arguments.rows[index] = row;
+    }
+    void* args[] = {&weight_b, &weight_a, &arguments};
+    const dim3 grid(2 * text_gdn_value_heads, count / wide_gdn_gate_rows);
+    const auto direct = cudaLaunchKernel(bf16_gdn_verify_gates<capacity>, grid,
+                                         wide_gdn_gate_rows * warp_width, args, 0, stream);
+    const auto recorded = cudaGetLastError();
+    if (direct == cudaSuccess || (!CudaError::terminal(direct) && CudaError::terminal(recorded))) {
+        return recorded;
+    }
+    return direct;
 }
 
 cudaError_t decoder::decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,

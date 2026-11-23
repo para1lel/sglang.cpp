@@ -35,6 +35,9 @@ struct VerifyGdnGateRow {
 std::optional<cudaError_t> try_verify_bf16_gdn_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
+std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
 cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                                int rows, int width, __nv_bfloat16* output, cudaStream_t stream);
 cudaError_t quantize_draft_head_int8(const __nv_bfloat16* input, int rows,
@@ -337,6 +340,27 @@ struct GdnVerificationBatch {
 
 cudaError_t decode_verify_gdn_batch(GdnVerificationBatch batch, TextGdnWeights weights,
                                     cudaStream_t stream);
+
+struct CompactGdnVerificationBatch {
+    static constexpr int lanes = 32;
+    static constexpr int rows = GdnVerificationBatch::rows;
+    GdnVerificationLane entries[lanes];
+};
+
+__host__ __device__ constexpr int compact_gdn_row(int lane, int row) {
+    constexpr int packet_lanes = GdnVerificationBatch::lanes;
+    constexpr int packet_rows = packet_lanes * GdnVerificationBatch::rows;
+    return (lane / packet_lanes) * packet_rows + row * packet_lanes + lane % packet_lanes;
+}
+
+struct CompactGdnFp8Rows {
+    std::uint8_t* values;
+    float* scales[CompactGdnVerificationBatch::lanes * CompactGdnVerificationBatch::rows];
+};
+
+cudaError_t decode_verify_gdn_compact(CompactGdnVerificationBatch batch, int lanes,
+                                      TextGdnWeights weights, CompactGdnFp8Rows output,
+                                      cudaStream_t stream);
 
 struct DecodeFp8Projection {
     const std::uint8_t* values;

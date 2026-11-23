@@ -324,7 +324,7 @@ struct LayerBatch {
     }
 };
 
-constexpr int wide_gdn_rows = GdnVerificationBatch::lanes * GdnVerificationBatch::rows;
+constexpr int gdn_packet_rows = GdnVerificationBatch::lanes * GdnVerificationBatch::rows;
 static_assert(GdnVerificationBatch::lanes == decoder_batch_max_mtp_lanes);
 static_assert(GdnVerificationBatch::rows == target_verify_max_rows);
 
@@ -339,7 +339,7 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
                                   batch.stream);
         return;
     }
-    std::array<VerifyGdnGateRow, wide_gdn_rows> gates;
+    std::array<VerifyGdnGateRow, gdn_packet_rows> gates;
     const auto fill = [&](int first, int rows) {
         for (int index = 0; index < rows; ++index) {
             const auto& work = workspace(batch.lanes[first + index]);
@@ -372,6 +372,56 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
         }
         first += rows;
     }
+}
+
+void run_gdn_packet(const GdnLayer& layer, const LayerBatch<VerificationRow>& packet,
+                    int state_index) {
+    project_gdn_gates(layer, packet, true);
+    GdnVerificationBatch states;
+    for (int lane = 0; lane < GdnVerificationBatch::lanes; ++lane) {
+        states.entries[lane] = packet.lanes[lane].verification->gdn_lane(
+            state_index, layer.recurrent);
+    }
+    check(decode_verify_gdn_batch(states, layer.recurrent, packet.stream),
+          "Advance batched target verification GDN packet");
+}
+
+bool run_compact_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
+                     int state_index) {
+    constexpr int rows_per_lane = CompactGdnVerificationBatch::rows;
+    constexpr int row_capacity = CompactGdnVerificationBatch::lanes * rows_per_lane;
+    if (!batch.packed_activation || !batch.target_tc || batch.lanes[0].binding ||
+        (batch.count != row_capacity / 2 && batch.count != row_capacity) ||
+        layer.b.rows != text_gdn_value_heads || layer.a.rows != text_gdn_value_heads ||
+        layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
+        return false;
+    }
+    std::array<VerifyGdnGateRow, row_capacity> gates;
+    for (int index = 0; index < batch.count; ++index) {
+        const auto& work = workspace(batch.lanes[index]);
+        gates[index] = {work.normalized, work.gdn_b, work.gdn_a};
+    }
+    const auto status = try_verify_bf16_gdn_gates_compact(
+        layer.b.values, layer.a.values, gates.data(), batch.count, batch.stream);
+    if (!status) {
+        return false;
+    }
+    check(*status, "Run compact verification GDN gate projections");
+    CompactGdnVerificationBatch states{};
+    CompactGdnFp8Rows output{batch.packed_activation, {}};
+    const int lanes = batch.count / rows_per_lane;
+    for (int lane = 0; lane < lanes; ++lane) {
+        const int first = compact_gdn_row(lane, 0);
+        states.entries[lane] = batch.lanes[first].verification->gdn_lane(
+            state_index, layer.recurrent);
+        for (int step = 0; step < rows_per_lane; ++step) {
+            const int row = compact_gdn_row(lane, step);
+            output.scales[row] = batch.projection_activation(row, text_gdn_value_width).scales;
+        }
+    }
+    check(decode_verify_gdn_compact(states, lanes, layer.recurrent, output, batch.stream),
+          "Advance and quantize compact verification GDN");
+    return true;
 }
 
 template <typename Lane>
@@ -420,44 +470,33 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
         batch.quantize(&Workspace::normalized, hidden_size);
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
-    const bool batched = batch.target_tc && !first.binding && batch.count == wide_gdn_rows;
-    if (batch.packed_activation) {
-        for (int start = 0; start < batch.count; start += wide_gdn_rows) {
-            const auto packet = batch.verification_packet(start);
-            project_gdn_gates(layer, packet, true);
-            GdnVerificationBatch states;
-            for (int lane = 0; lane < GdnVerificationBatch::lanes; ++lane) {
-                states.entries[lane] = packet.lanes[lane].verification->gdn_lane(
-                    state_index, layer.recurrent);
-            }
-            check(decode_verify_gdn_batch(states, layer.recurrent, batch.stream),
-                  "Advance batched target verification GDN packet");
-        }
-    } else {
-        project_gdn_gates(layer, batch, batched);
+    if (run_compact_gdn(layer, batch, state_index)) {
+        batch.project(layer.output, &Workspace::projected_attention);
+        return;
     }
-    if (first.binding) {
-        auto& scratch = *first.graph_workspace;
-        check(decode_verify_gdn(batch.count, scratch.replay[state_index].inputs,
-                                first.work->gdn_z, layer.recurrent,
-                                &first.binding->initial[state_index],
-                                &first.binding->tail[state_index], scratch.observable,
-                                first.work->attention, batch.stream),
-              "Advance bound verification GDN");
-    } else if (batched) {
-        GdnVerificationBatch states;
-        for (int lane = 0; lane < GdnVerificationBatch::lanes; ++lane) {
-            states.entries[lane] = batch.lanes[lane].verification->gdn_lane(state_index,
-                                                                            layer.recurrent);
+    if (batch.packed_activation) {
+        for (int start = 0; start < batch.count; start += gdn_packet_rows) {
+            run_gdn_packet(layer, batch.verification_packet(start), state_index);
         }
-        check(decode_verify_gdn_batch(states, layer.recurrent, batch.stream),
-              "Advance batched target verification GDN");
-    } else if (!batch.packed_activation) {
-        batch.each([&](const VerificationRow& row, Workspace&) {
-            if (row.first) {
-                row.verification->advance_gdn(state_index, layer.recurrent);
-            }
-        });
+    } else if (batch.target_tc && !first.binding && batch.count == gdn_packet_rows) {
+        run_gdn_packet(layer, batch, state_index);
+    } else {
+        project_gdn_gates(layer, batch, false);
+        if (first.binding) {
+            auto& scratch = *first.graph_workspace;
+            check(decode_verify_gdn(batch.count, scratch.replay[state_index].inputs,
+                                    first.work->gdn_z, layer.recurrent,
+                                    &first.binding->initial[state_index],
+                                    &first.binding->tail[state_index], scratch.observable,
+                                    first.work->attention, batch.stream),
+                  "Advance bound verification GDN");
+        } else {
+            batch.each([&](const VerificationRow& row, Workspace&) {
+                if (row.first) {
+                    row.verification->advance_gdn(state_index, layer.recurrent);
+                }
+            });
+        }
     }
     batch.quantize(&Workspace::attention, text_gdn_value_width);
     batch.project(layer.output, &Workspace::projected_attention);

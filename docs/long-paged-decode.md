@@ -55,7 +55,7 @@ Each tensor-core block serves one lane, one partition, and all six query heads o
 
 Both splits write the same per-head FP32 partials. The common merge rescales the 16 partitions against the global maximum and rounds the quotient to BF16. The recovery launch runs before attention gating on the same stream. [Merge](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/mxfp8_gqa.cu#L667)<!-- prefix: "__global__ v" --> · [Recovery](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/include/sglang/text/mxfp8_gqa_decode.cuh#L332)<!-- prefix: "__global__ v" -->
 
-Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation for partials. The alias requires 16-byte alignment and remains live until the attention launches consume it. The stream orders later scoring writes to that allocation. [Scratch alias](../include/sglang/text/gqa_verify_batch.h#L57)<!-- prefix: "inline Paged" --> · [Scratch size](../include/sglang/decoder_cuda.cuh#L248)<!-- prefix: "inline const" -->
+Each long lane uses 399,360 bytes of its existing 496,640-byte logits allocation for partials. The alias requires 16-byte alignment and remains live until the attention launches consume it. The stream orders later scoring writes to that allocation. [Scratch alias](../include/sglang/text/gqa_verify_batch.h#L57)<!-- prefix: "inline Paged" --> · [Scratch size](../include/sglang/decoder_cuda.cuh#L251)<!-- prefix: "inline const" -->
 
 ## Constraints and failure behavior
 

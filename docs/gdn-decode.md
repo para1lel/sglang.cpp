@@ -4,7 +4,7 @@
 
 The historical packed K0 gated delta network (GDN) decode updated
 recurrent state and convolution history for each active row. Current
-verification uses its [grouped GDN forward path](../src/decoder_forward.cpp#L407)<!-- prefix: "void run_gdn" -->.
+verification uses its [grouped GDN forward path](../src/decoder_forward.cpp#L457)<!-- prefix: "void run_gdn" -->.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |

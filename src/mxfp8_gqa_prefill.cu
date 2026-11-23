@@ -886,6 +886,25 @@ std::optional<cudaError_t> decoder::try_batched_paged_prefill(
                    : launch_paged_batch<flash_rows, false>(batch, shared_limit, stream);
 }
 
+std::optional<cudaError_t> decoder::try_batched_partial_paged_prefill(
+    const PagedPrefillSequence* sequences, int count, cudaStream_t stream) {
+    if (!sequences || count != staged_prefill_batch_size) return std::nullopt;
+    const int rows = sequences[0].rows;
+    if (rows != 256 && rows != 512) return std::nullopt;
+    for (int index = 0; index < count; ++index) {
+        const auto& sequence = sequences[index];
+        if (sequence.rows != rows ||
+            !default_ragged_prefill(sequence.cache, sequence.position, sequence.rows) ||
+            !valid_paged_prefill_sequence(sequence, min_flash_rows, max_multirow_visible_tokens)) {
+            return std::nullopt;
+        }
+    }
+    const auto submitted = launch_batched_ragged_tmem(sequences, count, stream);
+    if (!submitted) return std::nullopt;
+    const auto recorded = cudaGetLastError();
+    return *submitted == cudaSuccess ? recorded : *submitted;
+}
+
 cudaError_t decoder::tensor_core_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const Bf16* queries, Bf16* output, cudaStream_t stream) {
@@ -905,12 +924,8 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
 cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const Bf16* queries, Bf16* output, cudaStream_t stream, PairedPrefillScratch scratch) {
-    if (rows == 0) {
-        return cudaSuccess;
-    }
-    if (position < 0 || rows < 0 || position > INT_MAX - rows) {
-        return cudaErrorInvalidValue;
-    }
+    if (rows == 0) return cudaSuccess;
+    if (position < 0 || rows < 0 || position > INT_MAX - rows) return cudaErrorInvalidValue;
     Attention request{cache, pages.device_pages, position, queries, output};
     const int visible = position + rows;
     const int flash_limit = rows == flash_chunk ? max_flash_visible_tokens :

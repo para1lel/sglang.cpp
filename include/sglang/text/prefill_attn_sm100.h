@@ -29,6 +29,9 @@ struct PagedPrefillSequence {
 std::optional<cudaError_t> try_batched_paged_prefill(
     const PagedPrefillSequence* sequences, int count, cudaStream_t stream);
 
+std::optional<cudaError_t> try_batched_partial_paged_prefill(
+    const PagedPrefillSequence* sequences, int count, cudaStream_t stream);
+
 inline constexpr int staged_prefill_batch_size = 4;
 inline constexpr int staged_prefill_batch_min_position = 1024;
 inline constexpr int staged_prefill_batch_max_position = 7168;

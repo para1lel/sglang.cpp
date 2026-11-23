@@ -1,6 +1,7 @@
 #include "sglang/text_attention.h"
 
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/text/gqa_verify_batch.h"
 
 #include <cuda_runtime.h>
 
@@ -36,15 +37,12 @@ __device__ int rotary_position(const MropePosition* positions, std::size_t row, 
     return position.temporal;
 }
 
-template <typename Position, bool IncludeQueries = true>
-__global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_gate,
-                               const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
-                               const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries,
-                               __nv_bfloat16* rope_keys) {
+template <bool IncludeQueries, typename Position>
+__device__ __forceinline__ void gqa_preprocess_head(
+    Position first_position, std::size_t row, int head, const __nv_bfloat16* q_gate,
+    const __nv_bfloat16* keys, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+    __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys) {
     constexpr int query_heads = IncludeQueries ? mxfp8_query_heads : 0;
-    constexpr int head_count = query_heads + mxfp8_kv_heads;
-    const std::size_t row = blockIdx.x / head_count;
-    const int head = blockIdx.x % head_count;
     const int channel = threadIdx.x;
     const bool is_query = head < query_heads;
     const int kv_head = head - query_heads;
@@ -91,9 +89,27 @@ __global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_g
     }
 }
 
-__global__ void gqa_postgate(const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
-                             __nv_bfloat16* output) {
-    const std::size_t row_head = blockIdx.x;
+template <typename Position, bool IncludeQueries = true>
+__global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_gate,
+                               const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
+                               const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries,
+                               __nv_bfloat16* rope_keys) {
+    constexpr int head_count = (IncludeQueries ? mxfp8_query_heads : 0) + mxfp8_kv_heads;
+    gqa_preprocess_head<IncludeQueries>(first_position, blockIdx.x / head_count,
+        blockIdx.x % head_count, q_gate, keys, q_norm, k_norm, rope_queries, rope_keys);
+}
+
+__global__ void gqa_verify_preprocess_kernel(
+    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyPreprocessRow> batch,
+    const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm) {
+    const auto& row = batch.rows[blockIdx.x];
+    gqa_preprocess_head<true>(row.position, 0, blockIdx.y, row.q_gate, row.keys,
+                             q_norm, k_norm, row.rope_queries, row.rope_keys);
+}
+
+__device__ __forceinline__ void gqa_postgate_head(
+    std::size_t row_head, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
+    __nv_bfloat16* output) {
     const int channel = threadIdx.x;
     const float gate =
         __bfloat162float(q_gate[(row_head * 2 + 1) * mxfp8_head_dim + channel]);
@@ -103,6 +119,53 @@ __global__ void gqa_postgate(const __nv_bfloat16* q_gate, const __nv_bfloat16* a
     output[output_index] = __float2bfloat16(value * sigmoid);
 }
 
+__global__ void gqa_postgate(const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
+                             __nv_bfloat16* output) {
+    gqa_postgate_head(blockIdx.x, q_gate, attention, output);
+}
+
+__global__ void gqa_verify_postgate_kernel(
+    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyGateRow> batch) {
+    const auto& row = batch.rows[blockIdx.x];
+    gqa_postgate_head(blockIdx.y, row.q_gate, row.attention, row.attention);
+}
+
+}
+
+cudaError_t decoder::gqa_verify_preprocess(const GqaVerifyRows<GqaVerifyPreprocessRow>& batch,
+                                           int count, const __nv_bfloat16* q_norm,
+                                           const __nv_bfloat16* k_norm, cudaStream_t stream) {
+    if (count <= 0 || count > target_split_eager_max_rows || !q_norm || !k_norm) {
+        return cudaErrorInvalidValue;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& row = batch.rows[index];
+        if (row.position < 0 || row.position >= text_attention_max_tokens || !row.q_gate ||
+            !row.keys || !row.rope_queries || !row.rope_keys) {
+            return cudaErrorInvalidValue;
+        }
+    }
+    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyPreprocessRow>*>(&batch),
+                         &q_norm, &k_norm};
+    return cudaLaunchKernel(gqa_verify_preprocess_kernel,
+                            dim3(count, mxfp8_query_heads + mxfp8_kv_heads),
+                            mxfp8_head_dim, arguments, 0, stream);
+}
+
+cudaError_t decoder::gqa_verify_postgate(const GqaVerifyRows<GqaVerifyGateRow>& batch,
+                                         int count, cudaStream_t stream) {
+    if (count <= 0 || count > target_split_eager_max_rows) {
+        return cudaErrorInvalidValue;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& row = batch.rows[index];
+        if (!row.q_gate || !row.attention) {
+            return cudaErrorInvalidValue;
+        }
+    }
+    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyGateRow>*>(&batch)};
+    return cudaLaunchKernel(gqa_verify_postgate_kernel, dim3(count, mxfp8_query_heads),
+                            mxfp8_head_dim, arguments, 0, stream);
 }
 
 cudaError_t text_gqa_preprocess(int first_position, int token_count,

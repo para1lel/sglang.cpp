@@ -90,7 +90,7 @@ of four greedy lanes with five rows each. Each lane must use unconstrained
 selection and request only the winner. Unsupported tensor maps, unaligned
 weights, other shapes, and K0 use the BF16 head. CUDA configuration and launch
 errors propagate.
-[Score kernel](../src/text/tc_vocab.cu#L77)<!-- prefix: "__global__ _" --> · [Weight setup](../src/text/tc_vocab.cu#L142)<!-- prefix: "std::shared_" --> · [Scratch setup](../src/text/tc_vocab.cu#L168)<!-- prefix: "std::shared_" --> · [Dispatch guard](../src/decoder_forward.cpp#L753)<!-- prefix: "if (round.co" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
+[Score kernel](../src/text/tc_vocab.cu#L77)<!-- prefix: "__global__ _" --> · [Weight setup](../src/text/tc_vocab.cu#L142)<!-- prefix: "std::shared_" --> · [Scratch setup](../src/text/tc_vocab.cu#L168)<!-- prefix: "std::shared_" --> · [Dispatch guard](../src/decoder_forward.cpp#L751)<!-- prefix: "if (round.co" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
 
 The verifier reads the existing draft INT8 weights and adds 3,973,120 model bytes
 for statistics and 21,544,480 workspace bytes per decoder batch before allocator rounding.

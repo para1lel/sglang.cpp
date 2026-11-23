@@ -3,6 +3,7 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_verify.h"
+#include "sglang/text/gqa_verify_batch.h"
 #include "sglang/text/target_fp8.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
@@ -465,11 +466,6 @@ void gate_gqa(Workspace& work, cudaStream_t stream) {
           "Gate grouped-query attention");
 }
 
-PagedDecodeBuffers paged_gqa_buffers(Workspace& work) {
-    static_assert(vocab_size * sizeof(Bf16) >= paged_decode_scratch_bytes);
-    return {work.rope_queries, work.attention, work.logits};
-}
-
 void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& batch,
                       int cache_index) {
     static_assert(paged_decode_lanes == decoder_batch_max_graph_lanes);
@@ -655,7 +651,9 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     } else if constexpr (std::is_same_v<Lane, VerificationRow>) {
         if (batch.lanes[0].binding) {
             attend_verify_gqa(layer, batch, cache_index);
-        } else {
+        } else if (!try_gqa_verify_batch(layer, batch.lanes, batch.count, cache_index,
+                                         batch.vector_attention, batch.target_split_end,
+                                         batch.stream)) {
             attend_eager_gqa(layer, batch, cache_index);
         }
     } else {

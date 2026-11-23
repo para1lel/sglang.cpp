@@ -3,9 +3,9 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/text/gqa_decode_split.cuh"
+#include "sglang/text/gqa_verify_batch.h"
 
 #include <algorithm>
-#include <limits>
 #include <type_traits>
 
 #include <cuda_fp8.h>
@@ -14,6 +14,8 @@
 
 namespace sglang {
 namespace {
+
+using decoder::cache_covers;
 
 constexpr unsigned int warp_mask = 0xffffffffu;
 constexpr int queries_per_kv_head = mxfp8_query_heads / mxfp8_kv_heads;
@@ -64,18 +66,14 @@ __device__ const std::int32_t* page_values(const Mxfp8PageTable* pages) {
     return pages->device_pages;
 }
 
-template <typename Position, typename Cache, typename Pages>
-__global__ void append_kernel(Cache cache_binding, Pages page_binding,
-                              Position first_position,
-                              const __nv_bfloat16* keys, const __nv_bfloat16* values) {
-    const auto cache = cache_value(cache_binding);
-    const auto* pages = page_values(page_binding);
-    const int position = decoder::position_value(first_position) + static_cast<int>(blockIdx.x);
+__device__ __forceinline__ void append_head(
+    Mxfp8KvCache cache, const std::int32_t* pages, int position, std::size_t input_row,
+    const __nv_bfloat16* keys, const __nv_bfloat16* values) {
     const int token = position % mxfp8_page_size;
     const int physical_page = pages[position / mxfp8_page_size];
     const int head = blockIdx.y;
     const int channel = threadIdx.x;
-    const auto input = row_offset(blockIdx.x, mxfp8_kv_heads, head) + channel;
+    const auto input = row_offset(input_row, mxfp8_kv_heads, head) + channel;
     const auto payload = payload_offset(physical_page, token, head) + channel;
     const float key = __bfloat162float(keys[input]);
     const float value = __bfloat162float(values[input]);
@@ -88,6 +86,21 @@ __global__ void append_kernel(Cache cache_binding, Pages page_binding,
         cache.key_scales[scale] = static_cast<std::uint8_t>(key_exponent);
         cache.value_scales[scale] = static_cast<std::uint8_t>(value_exponent);
     }
+}
+
+template <typename Position, typename Cache, typename Pages>
+__global__ void append_kernel(Cache cache_binding, Pages page_binding,
+                              Position first_position,
+                              const __nv_bfloat16* keys, const __nv_bfloat16* values) {
+    const int position = decoder::position_value(first_position) + static_cast<int>(blockIdx.x);
+    append_head(cache_value(cache_binding), page_values(page_binding), position, blockIdx.x,
+                keys, values);
+}
+
+__global__ void gqa_verify_append_kernel(
+    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyAppendRow> batch) {
+    const auto& row = batch.rows[blockIdx.x];
+    append_head(row.cache, row.pages.device_pages, row.position, 0, row.keys, row.values);
 }
 
 __device__ float warp_sum(float value) {
@@ -152,15 +165,6 @@ __global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
     }
     __syncthreads();
     output[row] = __float2bfloat16_rn(weighted_value / denominator);
-}
-
-bool cache_covers(Mxfp8KvCache cache, Mxfp8PageTable pages, std::int64_t token_count) {
-    if (token_count <= 0 || token_count > std::numeric_limits<int>::max()) {
-        return false;
-    }
-    const auto last_page = (token_count - 1) / mxfp8_page_size;
-    return last_page < cache.page_count && last_page < pages.page_count && pages.device_pages
-        && cache.key_payload && cache.value_payload && cache.key_scales && cache.value_scales;
 }
 
 constexpr int score_warps = 8;
@@ -827,6 +831,23 @@ cudaError_t mxfp8_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, int first_
     const auto kernel = append_kernel<int, Mxfp8KvCache, const std::int32_t*>;
     return launch_gqa_kernel(kernel, dim3(token_count, mxfp8_kv_heads), mxfp8_head_dim, stream,
                              cache, pages.device_pages, first_position, keys, values);
+}
+
+cudaError_t decoder::gqa_verify_append(const GqaVerifyRows<GqaVerifyAppendRow>& batch,
+                                       int count, cudaStream_t stream) {
+    if (count <= 0 || count > target_split_eager_max_rows) {
+        return cudaErrorInvalidValue;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& row = batch.rows[index];
+        if (row.position < 0 || !row.keys || !row.values ||
+            !cache_covers(row.cache, row.pages, static_cast<std::int64_t>(row.position) + 1)) {
+            return cudaErrorInvalidValue;
+        }
+    }
+    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyAppendRow>*>(&batch)};
+    return cudaLaunchKernel(gqa_verify_append_kernel, dim3(count, mxfp8_kv_heads),
+                            mxfp8_head_dim, arguments, 0, stream);
 }
 
 cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int valid_tokens,

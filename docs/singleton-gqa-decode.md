@@ -20,7 +20,7 @@ With tensor-core prefill and no MTP work, a prefill step can reuse the buffer fo
 
 The batch stream owner allocates one buffer on first eligible use. It allocates before graph capture or eager submission. The bound is 3,538,944 device bytes (3.375 MiB) for 24 FP32 scores per position across 36,864 positions. All GQA layers and later requests share the buffer in stream order. It adds zero request-owned bytes. Request KV and existing graph scratch have separate allocations. [Query heads](../include/sglang/mxfp8_gqa.h#L11)<!-- prefix: "inline const" --> · [Resident admission](batch-graphs.md#resident-memory-admission)
 
-The step rounds the live visible length up to a 128-token page for the per-head stride. It requires a page table and K/V payload and scale buffers with sufficient declared capacity in every attention layer. Eager decode passes the score descriptor by value. With graphs enabled, the first eligible width-one step warms up eagerly. Replay uploads the live position, page table, KV cache, and score descriptor. The same width-one executable can use short inline scores or the batch buffer. Both score-backed routes round the attention result to BF16. [Eligibility and stride](../src/text/decoder_graph.cpp#L9)<!-- prefix: "ExactGqaWork" --> · [Eager read](../src/decoder_forward.cpp#L418)<!-- prefix: "if (singleto" --> · [Warmup](../src/text/decoder_graph.cpp#L36)<!-- prefix: "auto& warmed" --> · [Replay binding](../src/text/decoder_graph.cpp#L66)<!-- prefix: "}" -->
+The step rounds the live visible length up to a 128-token page for the per-head stride. It requires a page table and K/V payload and scale buffers with sufficient declared capacity in every attention layer. Eager decode passes the score descriptor by value. With graphs enabled, the first eligible width-one step warms up eagerly. Replay uploads the live position, page table, KV cache, and score descriptor. The same width-one executable can use short inline scores or the batch buffer. Both score-backed routes round the attention result to BF16. [Eligibility and stride](../src/text/decoder_graph.cpp#L9)<!-- prefix: "ExactGqaWork" --> · [Eager read](../src/decoder_forward.cpp#L419)<!-- prefix: "if (singleto" --> · [Warmup](../src/text/decoder_graph.cpp#L36)<!-- prefix: "auto& warmed" --> · [Replay binding](../src/text/decoder_graph.cpp#L66)<!-- prefix: "}" -->
 
 Eager final-prompt replay stages packed V and its scales in two shared-memory buffers at 8,192 or more visible tokens when their bases are 16-byte and 8-byte aligned, respectively. Each CTA handles one query head and 64 value channels. Asynchronous copies follow the page table and zero-fill the invisible part of the last tile. The path reuses the score producer and preserves each channel's token-ordered FP32 recurrence. Eager decode, graph replay, shorter contexts, and misaligned buffers keep the existing replay. [Staged replay](../include/sglang/text/gqa_prefill_replay.cuh#L34)<!-- prefix: "__global__ v" -->
 
@@ -47,9 +47,32 @@ The earlier bounded and long profiles used explicit launch settings. Their
 [historical paired results](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/serving/paired-split-attention-results.md)
 record the measured configuration.
 
+### Batched eager verification
+
+The B200 eager verifier batches Q/K preprocessing, KV append, and attention gating
+for groups of 2–20 target rows. It requires vector attention and the full-context
+split-KV policy. Every row must be in the split window. Other eager groups use
+per-row preprocessing, append, and gating. They can still group eligible split reads.
+Graph replay uses bound verification dispatch.
+[Dispatch](../src/decoder_forward.cpp#L654)<!-- prefix: "} else if (!" --> ·
+[Eligibility](../include/sglang/text/gqa_verify_batch.h#L62)<!-- prefix: "inline bool " --> ·
+[Bound verification](../src/decoder_forward.cpp#L508)<!-- prefix: "void attend_" -->
+
+Each row supplies its own workspace, absolute position, and request KV page table.
+The stream orders BF16 Q/K normalization and RoPE, MXFP8 K/V append,
+the existing grouped split attention, and in-place sigmoid gating.
+Preprocessing, append, and gating each launch one block per row and applicable head.
+Each attention row reads through its own position, even after later rows append KV.
+Output quantization and projection follow gating. The [MTP verifier](mtp.md#runtime-path)
+owns acceptance and the committed KV prefix.
+[Launch sequence](../include/sglang/text/gqa_verify_batch.h#L87)<!-- prefix: "check(gqa_ve" --> ·
+[Preprocessing](../src/text_attention_gqa.cu#L102)<!-- prefix: "__global__ v" --> ·
+[Append](../src/mxfp8_gqa.cu#L100)<!-- prefix: "__global__ v" --> ·
+[Gating](../src/text_attention_gqa.cu#L127)<!-- prefix: "__global__ v" -->
+
 ## Constraints and failure behavior
 
-Short singleton replay remains eligible through 5,120 visible tokens. Decode-only singletons at 5,121–32,767 use direct ordered eager attention. Above 36,864 tokens or when the page table or a layer's buffers lack the required capacity, the new eager binding stays empty and existing dispatch rules apply. The batch buffer stays fixed even if the request reserves more KV. The legacy width-two through width-four graph keeps its separate request-owned long scores. [Replay limit](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L436)<!-- prefix: "if (count ==" --> · [Direct eager read](../src/decoder_forward.cpp#L423)<!-- prefix: "return mxfp8" --> · [Context limit](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" --> · [Legacy scores](batch-graphs.md#constraints-and-failure-behavior)
+Short singleton replay remains eligible through 5,120 visible tokens. Decode-only singletons at 5,121–32,767 use direct ordered eager attention. Above 36,864 tokens or when the page table or a layer's buffers lack the required capacity, the new eager binding stays empty and existing dispatch rules apply. The batch buffer stays fixed even if the request reserves more KV. The legacy width-two through width-four graph keeps its separate request-owned long scores. [Replay limit](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L436)<!-- prefix: "if (count ==" --> · [Direct eager read](../src/decoder_forward.cpp#L424)<!-- prefix: "return mxfp8" --> · [Context limit](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" --> · [Legacy scores](batch-graphs.md#constraints-and-failure-behavior)
 
 After clean score-buffer allocation OOM, the batch remembers the failure for its lifetime and uses direct ordered eager attention for long singletons. Short replay remains eligible. Other allocation errors propagate. A recoverable graph rejection retires the graph for that width. The eager fallback can use the retained score buffer. The buffer survives request retirement and KV growth. Batch cleanup drains the stream and destroys graph handles before releasing the allocation. Cleanup retains device resources while stream or graph completion is uncertain. [Allocation fallback](../src/decoder_resources.cpp#L559)<!-- prefix: "if (error.st" --> · [Graph recovery](../src/decoder_resources.cpp#L610)<!-- prefix: "const auto f" --> · [Graph teardown](../src/decoder_resources.cpp#L225)<!-- prefix: "CleanupError" -->
 
@@ -60,3 +83,12 @@ Run the same-input dispatch fixture on a reserved B200. Compare eager and replay
 The [short-prefill checker](../tests/mxfp8_gqa_short_prefill_check.cu#L119)<!-- prefix: "void check_s" --> compares staged and ordered replay at the visibility threshold and on reversed pages, including misaligned V and scales.
 
 Inject score-buffer OOM and a recoverable graph launch rejection in separate runs. Check direct ordered fallback after OOM. Check score-backed eager after graph rejection. Record warm dispatch timing and serving timing as separate measurements. See the [batch graph checks](batch-graphs.md#verification) for HTTP parity and failure recovery.
+
+For batched verification, compare the batched stages with per-row stages on a
+reserved B200. Give both paths the same histories, packed KV, and grouped split plan.
+Exercise 2, 5, 15, and 20 rows with remapped page tables and a page crossing.
+Compare BF16 Q/K and gated attention byte for byte. Compare all packed K/V payloads
+and scales, including untouched slots. Trace one launch per batched stage per GQA
+layer. Exercise a group that straddles 2,047 and 2,048 visible tokens. Check that
+this group uses the per-row stages. Use the [MTP verification checks](mtp.md#verification)
+for acceptance and continuation.

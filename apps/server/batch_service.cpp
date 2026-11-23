@@ -39,11 +39,19 @@ struct Job {
 
     bool aborted() const { return request_id && request_id->aborted(); }
     bool has_output() const { return !pending.empty() && !(output_overlapped && aborted()); }
-    bool ready(bool buffered = false) const {
-        return cancelled || aborted() || (buffered ? !pending.full() : pending.empty());
+    bool can_overlap_mtp_output() const {
+        return options.mtp_steps > 0 && buffer_decode_output && output_started;
     }
-    bool can_buffer() const {
-        return media.empty() && prompt.size() >= decoder_batch_max_step_tokens &&
+    bool ready(bool buffered = false) const {
+        return cancelled || aborted() ||
+            (buffered || can_overlap_mtp_output() ? !pending.full() : pending.empty());
+    }
+    bool can_buffer(bool per_token = false) const {
+        // Per-token consumers drain published output before reporting worker errors.
+        const bool eligible = options.mtp_steps > 0
+            ? per_token && !options.requires_target_only() && !options.label_token_ids
+            : prompt.size() >= decoder_batch_max_step_tokens;
+        return eligible && media.empty() &&
             !options.samples() && !options.constraint && !options.eager && options.top_logits == 0;
     }
 };
@@ -172,10 +180,13 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
     }
     for (auto& job : jobs) {
         if (job) {
-            if (job->request_id) {
-                job->request_id->finish();
+            if (job->request_id && !job->request_id->finish() && !job->cancelled &&
+                job->can_overlap_mtp_output()) {
+                job->request_id->finish_abort();
+                job->finish = DecoderFinishReason::aborted;
+            } else {
+                job->error = error;
             }
-            job->error = error;
             job.reset();
         }
     }
@@ -875,7 +886,7 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
     job->options = media.empty() ? state_->mtp.options_for(options) : options;
     job->request_id = request_id;
     job->media = std::move(media);
-    job->buffer_decode_output = callbacks.buffer_decode_output && job->can_buffer();
+    job->buffer_decode_output = callbacks.buffer_decode_output && job->can_buffer(true);
     std::unique_lock lock(state_->mutex);
     state_->changed.wait(lock, [&] { return !state_->reset_pending; });
     if (state_->failure) {

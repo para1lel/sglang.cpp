@@ -1,10 +1,11 @@
 #pragma once
 
-#include "sglang/decoder_batch.h"
+#include "sglang/decoder.h"
 #include "sglang/tokenizer/tokenizer.h"
 #include "sglang/utf8.h"
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <string_view>
 
@@ -149,48 +150,36 @@ struct NativeTextStops {
     TextStops stops;
 };
 
-class NativeTextStop {
+class TokenTextStop {
 public:
-    explicit NativeTextStop(std::shared_ptr<const NativeTextStops> config)
-        : config_(std::move(config)), matcher_(config_->stops) {}
+    explicit TokenTextStop(std::shared_ptr<const TextStops> stops)
+        : stops_(std::move(stops)), matcher_(*stops_) {}
 
-    bool apply(DecoderBatchStep& step) {
-        if (!step.token || step.sampling_failed || step.constraint_failed) {
-            return false;
-        }
-        std::array<std::size_t, decoder_batch_max_mtp_steps + 1> ends{};
-        matcher_.push(utf8_.push(config_->tokenizer.piece(*step.token, false)));
-        ends.front() = matcher_.bytes();
-        for (int index = 0; index < step.extra_token_count; ++index) {
-            const int token = step.extra_tokens[index];
-            matcher_.push(utf8_.push(config_->tokenizer.piece(token, false)));
-            ends[index + 1] = matcher_.bytes();
-        }
-        const auto count = 1 + step.extra_token_count;
-        if (step.finish_reason) {
-            matcher_.push(utf8_.finish());
-            ends[count - 1] = matcher_.bytes();
-        }
-        matched = matcher_.match(true);
-        if (!matched) {
-            return false;
-        }
-        const auto end = std::lower_bound(ends.begin(), ends.begin() + count,
-                                          matcher_.matched_end(*matched));
-        const bool retire = !step.finish_reason;
-        step.extra_token_count = static_cast<int>(end - ends.begin());
-        if (!step.extra_token_count) {
-            step.extra_token.reset();
-        }
-        step.mtp_accepted_tokens = std::min(step.mtp_accepted_tokens, 1 + step.extra_token_count);
-        step.finish_reason = DecoderFinishReason::stop;
-        return retire;
+    void push(std::string_view piece, bool terminal) {
+        matcher_.push(utf8_.push(piece));
+        if (terminal) matcher_.push(utf8_.finish());
     }
 
-    std::optional<std::size_t> matched;
+    int match_native(const Tokenizer& tokenizer, const int* ids, int count, bool terminal,
+                     std::optional<std::size_t>& matched) {
+        std::array<std::size_t, decoder_max_mtp_steps + 1> ends;
+        for (int index = 0; index < count; ++index) {
+            push(tokenizer.piece(ids[index], false), terminal && index + 1 == count);
+            ends[index] = matcher_.bytes();
+        }
+        matched = matcher_.match(true);
+        if (!matched) return 0;
+        const auto end = std::lower_bound(ends.begin(), ends.begin() + count,
+                                          matcher_.matched_end(*matched));
+        return 1 + static_cast<int>(end - ends.begin());
+    }
+
+    std::optional<std::size_t> match(bool configured_order) const {
+        return matcher_.match(configured_order);
+    }
 
 private:
-    std::shared_ptr<const NativeTextStops> config_;
+    std::shared_ptr<const TextStops> stops_;
     TextStopMatcher matcher_;
     Utf8Stream utf8_;
 };

@@ -142,8 +142,9 @@ struct MtpRound {
                                 cudaStream_t stream, const Cancel& cancel);
     static void propose_depth(MtpRound* rounds, int count, const DraftDepthScratch& scratch,
                               cudaStream_t stream);
+    int text_stop_after(const DecoderOptions& options, const RequestProgress& progress) const;
     bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
-                MtpDraftInput* repair);
+                MtpDraftInput* repair, const Workspace** committed_row = nullptr);
 };
 
 class TargetVerification {
@@ -155,6 +156,7 @@ public:
 
     void begin(int position, int count, cudaStream_t stream);
     VerificationRow row(int index);
+    const Workspace* checkpoint_row(int index);
     bool graph_eligible(const VerificationSequence& sequence) const;
     void bind_graph(VerificationGraphBinding& binding) const;
     void use_graph_workspace(VerificationWorkspace& workspace);

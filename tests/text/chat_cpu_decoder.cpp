@@ -191,6 +191,20 @@ struct Lane {
         return step;
     }
 
+    void apply_text_stop(DecoderBatchStep& result) {
+        if (!options.text_stop || !result.token) return;
+        std::array<int, decoder_max_mtp_steps + 1> ids;
+        ids.front() = *result.token;
+        std::copy_n(result.extra_tokens.begin(), result.extra_token_count, ids.begin() + 1);
+        const int count = result.extra_token_count + 1;
+        const int cutoff = options.text_stop(ids.data(), count, result.finish_reason.has_value());
+        if (cutoff) {
+            tokens -= count - cutoff;
+            result.extra_token_count = cutoff - 1;
+            result.finish_reason = DecoderFinishReason::stop;
+        }
+    }
+
     DecoderBatchStep advance() {
         const bool speculative = script && tokens != 0 && options.mtp_steps > 0 &&
                                  std::getenv("SGLANG_TEST_SCRIPTED_MTP");
@@ -205,15 +219,19 @@ struct Lane {
             result.label_logprobs = std::make_shared<const std::vector<double>>(std::move(scores));
         }
         if (!speculative || !result.token || result.finish_reason) {
+            apply_text_stop(result);
             return result;
         }
         result.mtp_drafted_tokens = options.mtp_steps;
         while (result.extra_token_count < options.mtp_steps && !result.finish_reason) {
             const auto extra = step();
             result.extra_tokens[result.extra_token_count++] = extra.token.value();
+            result.extra_generated_logprobs[result.extra_token_count - 1] =
+                extra.generated_logprobs;
             result.finish_reason = extra.finish_reason;
         }
-        result.extra_token = result.extra_tokens.front();
+        apply_text_stop(result);
+        if (result.extra_token_count) result.extra_token = result.extra_tokens.front();
         result.mtp_accepted_tokens = 1 + result.extra_token_count;
         std::cerr << ("cpu scripted mtp tokens=" + std::to_string(result.mtp_accepted_tokens) +
                       " terminal=" + std::to_string(result.finish_reason.has_value()) + '\n');
@@ -286,7 +304,8 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt, const DecoderOpt
             result.finish_reason = DecoderFinishReason::cancelled;
             return result;
         }
-        const auto step = lane.step();
+        auto step = lane.step();
+        lane.apply_text_stop(step);
         if (step.token) {
             result.output_token_ids.push_back(*step.token);
             if (callbacks.on_token && !callbacks.on_token(*step.token)) {

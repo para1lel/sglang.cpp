@@ -290,8 +290,27 @@ void MtpRound::propose_depth(MtpRound* rounds, int count, const DraftDepthScratc
     }
 }
 
+int MtpRound::text_stop_after(const DecoderOptions& options,
+                              const RequestProgress& progress) const {
+    ConstraintCursor preview;
+    preview.reset_to(progress.constraint);
+    std::array<int, target_verify_max_rows> winners;
+    int count = 0;
+    bool terminal = false;
+    const int pending = rows();
+    while (count < pending) {
+        const int token = target->winner(count, sampling != nullptr, constraint != nullptr);
+        winners[count++] = token;
+        terminal = RequestProgress::finish_token(options, preview, token,
+                                                  remaining - count).has_value();
+        if (terminal || count > drafted || token != tokens[count]) break;
+    }
+    const int stop = options.text_stop(winners.data(), count, terminal);
+    return stop >= 1 && stop <= count ? stop : 0;
+}
+
 bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
-                      MtpDraftInput* repair) {
+                      MtpDraftInput* repair, const Workspace** committed_row) {
     if (draft->valid_prefix() > position) {
         draft->rewind(position);
     }
@@ -317,6 +336,10 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
         } else {
             repair[index] = input;
         }
+    }
+    if (committed_row && (!continuing ||
+        (position + consumed) % decoder_batch_prefix_checkpoint_interval == 0)) {
+        *committed_row = target->checkpoint_row(consumed - 1);
     }
     if (continuing) {
         const auto* hidden = target->row(consumed - 1).work->normalized;
@@ -381,6 +404,17 @@ void TargetVerification::begin(int position, int count, cudaStream_t stream) {
 
 VerificationRow TargetVerification::row(int index) {
     return {&request_, &workspace().work.at(index), valid_prefix_ + index, this, index == 0};
+}
+
+const Workspace* TargetVerification::checkpoint_row(int index) {
+    const auto& work = *row(index).work;
+    if (active_workspace_ == &*eager_workspace_) return &work;
+    // Later packets can replay into the same graph buffers before publication.
+    for (const auto field : {&Workspace::hidden, &Workspace::residual}) {
+        check(cudaMemcpyAsync(request_.work.*field, work.*field, hidden_size * sizeof(Bf16),
+                              cudaMemcpyDeviceToDevice, stream_), "Retain checkpoint row");
+    }
+    return &request_.work;
 }
 
 bool TargetVerification::graph_eligible(const VerificationSequence& sequence) const {

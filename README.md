@@ -30,8 +30,9 @@ The executables are `./build/bin/sglang-server` and `./build/bin/sglang-generate
 Use `host ./build/bin/sglang-generate --help` for token-ID generation options.
 
 Both executables default to four MTP draft steps. Pass `--mtp-steps 0` or `--mtp-k 0`
-to disable draft generation. On a default server launch, requests for logprobs use zero
-draft steps. An explicit positive server depth rejects requests for logprobs.
+to disable draft generation. Eligible greedy requests for per-token logprobs use the
+configured depth. Active output penalties, logit bias, and minimum-token constraints
+use target-only decoding. See [token logprobs](docs/serving/openai-logprobs.md#request-requirements).
 
 On B200, prefill selects projection and attention kernels from the request shape.
 Uncached text rows use the same policy whether prefix caching is enabled or disabled.
@@ -42,6 +43,8 @@ The HTTP server enables CUDA Graph replay for eligible decode steps by default.
 Pass `--eager` to disable graph replay, including when `--batch-cuda-graphs` is present.
 The server enables four prefix cache entries by default. Set `--prefix-cache-entries 0`
 to disable caching. Both graph and eager decode can use the cache.
+See [prefix cache checkpoints](docs/prefix-cache.md#checkpoint-boundaries) for periodic
+saves and reuse across completed requests.
 
 ## Serve token IDs over HTTP
 

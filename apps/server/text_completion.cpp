@@ -208,7 +208,8 @@ void completion_failure(EventStream& stream, const std::exception& error) {
     }
 }
 
-const char* finish_reason(const TextRequest& request, const DecoderResult& result) {
+const char* finish_reason(const TextRequest& request, const DecoderResult& result,
+                          bool matched_text_stop) {
     const auto count = result.output_token_ids.size();
     const auto budget = static_cast<std::size_t>(request.options.max_new_tokens);
     if (result.finish_reason == DecoderFinishReason::constraint &&
@@ -216,7 +217,8 @@ const char* finish_reason(const TextRequest& request, const DecoderResult& resul
         return "stop";
     }
     const bool stop_matched = count && request.options.stops_at(result.output_token_ids.back());
-    if (result.finish_reason == DecoderFinishReason::stop && stop_matched && count <= budget) {
+    if (result.finish_reason == DecoderFinishReason::stop &&
+        (stop_matched || matched_text_stop) && count <= budget) {
         return "stop";
     }
     const bool reached_limit = count == budget ||
@@ -275,7 +277,7 @@ public:
             parser_.emplace(request.chat_output);
         }
         if (!request.stop_text.empty()) {
-            stop_patterns_.emplace(request.stop_text);
+            stop_patterns_ = std::make_shared<const TextStops>(request.stop_text);
             stop_buffer_.emplace(*stop_patterns_);
         }
     }
@@ -297,7 +299,20 @@ public:
     std::optional<std::string> finish_choice(const DecoderResult& result, std::size_t count);
     const std::string& prefix() const { return prefix_; }
     bool write_choice(const std::string& choice);
-    bool stopped() const { return text_stopped_ && !write_failed_; }
+    std::function<int(const int*, int, bool)> text_stop() const {
+        auto stop = std::make_shared<TokenTextStop>(stop_patterns_);
+        return [stop = std::move(stop), tokenizer = &tokenizer_, options = &request_.options]
+               (const int* ids, int count, bool terminal) {
+            for (int index = 0; index < count; ++index) {
+                const int id = ids[index];
+                const auto piece = options->stops_at(id) ? std::string_view{} :
+                                                           tokenizer->piece(id, true);
+                stop->push(piece, terminal && index + 1 == count);
+                if (stop->match(false)) return index + 1;
+            }
+            return 0;
+        };
+    }
     void set_prompt_scores(const DecoderResult& result);
 
 private:
@@ -332,7 +347,7 @@ private:
     std::string text_;
     std::string reasoning_;
     std::vector<ToolCall> tool_calls_;
-    std::optional<TextStops> stop_patterns_;
+    std::shared_ptr<const TextStops> stop_patterns_;
     std::optional<TextStopBuffer> stop_buffer_;
     bool text_stopped_ = false;
     bool sent_event_ = false;
@@ -571,7 +586,7 @@ bool TextResponse::token(int id, const ScoreRow* score) {
     if (!request_.stop_text.empty()) {
         delta = filter_stop(delta);
     }
-    return project(delta, &id, score) && !text_stopped_;
+    return project(delta, &id, score);
 }
 
 void TextResponse::finish_stream(const std::string& choice, std::size_t count,
@@ -593,7 +608,7 @@ void TextResponse::finish_stream(const std::string& choice, std::size_t count,
 
 const char* TextResponse::finish_output(const DecoderResult& result) {
     const auto tail = filter_stop(utf8_.finish(), true);
-    auto reason = text_stopped_ ? "stop" : finish_reason(request_, result);
+    auto reason = finish_reason(request_, result, text_stopped_);
     if (!project(tail)) {
         return nullptr;
     }
@@ -653,40 +668,30 @@ struct BatchTextChoice {
                     const TextRequest& request, BatchPrompt& prompt, std::size_t index,
                     const std::string* echo = nullptr, std::time_t created = std::time(nullptr))
         : response(connection, stream, tokenizer, request, prompt.prompt, index, echo, created),
-          stop_id(""),
           scored(request.options.generated_top_logprobs >= 0) {
         if (!request.stop_text.empty()) {
-            prompt.request_id = &stop_id;
+            prompt.options.text_stop = response.text_stop();
         }
     }
 
-    bool consume(const Socket& connection, const DecoderResult& result, bool terminal) {
+    bool consume(const DecoderResult& result) {
         response.set_prompt_scores(result);
         const auto& scores = result.generated_logprobs;
         if (scored && scores.size() != result.output_token_ids.size()) {
             throw std::logic_error("Generated logprob count differs from output token count");
         }
-        while (!response.stopped() && count < result.output_token_ids.size()) {
+        while (count < result.output_token_ids.size()) {
             const auto* score = scored ? &scores[count] : nullptr;
             const int id = result.output_token_ids[count++];
             if (score && (!*score || (*score)->selected.token_id != id)) {
                 throw std::logic_error("Generated logprob ID differs from output token ID");
             }
-            if (response.token(id, score)) {
-                continue;
-            }
-            if (!response.stopped() || disconnected(connection)) {
-                return false;
-            }
-            if (!terminal) {
-                stop_id.abort(true);
-            }
+            if (!response.token(id, score)) return false;
         }
         return true;
     }
 
     TextResponse response;
-    BatchRequestId stop_id;
     const bool scored;
     std::size_t count = 0;
     std::string final;
@@ -748,9 +753,14 @@ void complete_text(const Socket& connection, const TextRequest& request,
         };
     }
     try {
-        const auto result = generate(request.prompt, request.options, callbacks);
-        const bool complete = result.finish_reason != DecoderFinishReason::cancelled;
-        if ((complete || response.stopped()) && !cancelled()) {
+        std::optional<DecoderOptions> options;
+        if (!request.stop_text.empty()) {
+            options = request.options;
+            options->text_stop = response.text_stop();
+        }
+        const auto result = generate(request.prompt, options ? *options : request.options,
+                                     callbacks);
+        if (result.finish_reason != DecoderFinishReason::cancelled && !cancelled()) {
             response.finish(result, result.output_token_ids.size());
         }
     } catch (const std::exception& error) {
@@ -789,8 +799,8 @@ void complete_scored_text(const Socket& connection, const TextRequest& request,
         [&] { return disconnected(connection); },
         [&] { return choice.response.start(); },
         [&] { return !request.stream || choice.response.poll(); },
-        [&](std::size_t, const DecoderResult& result, bool terminal) {
-            return choice.consume(connection, result, terminal);
+        [&](std::size_t, const DecoderResult& result, bool) {
+            return choice.consume(result);
         },
     };
     try {
@@ -831,7 +841,7 @@ void complete_text_batch(const Socket& connection, TextCompletionRequest complet
         [&] { return !request.stream || stream.poll(); },
         [&](std::size_t index, const DecoderResult& result, bool terminal) {
             auto& choice = choices[index];
-            if (!choice.consume(connection, result, terminal)) {
+            if (!choice.consume(result)) {
                 return false;
             }
             if (!terminal) {

@@ -10,7 +10,7 @@
 | Checkpoint | Supply the supported model type and architecture. | [Checkpoint identity](../include/sglang/runtime/model/qwen_text_model.h#L8)<!-- prefix: "static const" --> |
 | Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L692)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L327)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L190)<!-- prefix: "std::string " --> |
 | Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L65)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L298)<!-- prefix: "BatchService" --> |
-| Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L822)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L339)<!-- prefix: "counters.gen" --> |
+| Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L830)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L350)<!-- prefix: "counters.gen" --> |
 
 ## Runtime path
 
@@ -86,7 +86,7 @@ Quantization uses the maximum absolute value per weight row and activation. Zero
 
 An INT8 wave of four unconstrained draft lanes uses four vocabulary rows per warp. The warp reuses each weight vector across the four quantized activations and keeps separate signed INT32 sums for each lane and row. It uses the same FP64 rescale and BF16 rounding. One to three lanes use the existing INT8 kernels. The batch entry point requires 16-byte-aligned weights and quantized activation buffers. Each lane writes its own logits before winner selection. [Wave scoring](../src/decoder_mtp.cpp#L436)<!-- prefix: "void MtpDraf" --> · [Four-lane kernel](../src/text_decode_bandwidth.cu#L273)<!-- prefix: "__global__ _" --> · [Batch dispatch](../src/text_decode_bandwidth.cu#L632)<!-- prefix: "cudaError_t " -->
 
-Eligible B200 groups of 16 or 32 eager greedy K4 lanes score active lanes together at each proposal depth. The batch needs five assigned rows per lane and no serial output callback. TMA maps and kernel attributes must support the launch. Scoring reuses verification activation scratch before target submission. Draft forwards and winner selection keep four-lane packets. The shared Tensor Core head preserves signed INT32 accumulation, FP64 rescaling, and BF16 rounding. A clean setup decline uses ordinary packet scoring. CUDA errors outside supported setup declines propagate. [Depth dispatch](../src/decoder_batch.cpp#L822)<!-- prefix: "if (count >=" --> · [Setup](../src/text/draft_depth.cu#L139)<!-- prefix: "std::optiona" --> · [Scoring](../src/decoder_mtp.cpp#L685)<!-- prefix: "void MtpDraf" -->
+Eligible B200 groups of 16 or 32 eager greedy K4 lanes score active lanes together at each proposal depth. The batch needs five assigned rows per lane and no serial output callback. TMA maps and kernel attributes must support the launch. Scoring reuses verification activation scratch before target submission. Draft forwards and winner selection keep four-lane packets. The shared Tensor Core head preserves signed INT32 accumulation, FP64 rescaling, and BF16 rounding. A clean setup decline uses ordinary packet scoring. CUDA errors outside supported setup declines propagate. [Depth dispatch](../src/decoder_batch.cpp#L801)<!-- prefix: "if (count >=" --> · [Setup](../src/text/draft_depth.cu#L139)<!-- prefix: "std::optiona" --> · [Scoring](../src/decoder_mtp.cpp#L685)<!-- prefix: "void MtpDraf" -->
 
 ### Certified Tensor Core target head
 
@@ -97,14 +97,14 @@ of four greedy lanes with five rows each. Each lane must use unconstrained
 selection and request only the winner. Wide MTP verification scores each
 four-lane packet separately. Unsupported tensor maps, unaligned weights, other packet
 shapes, and K0 use the BF16 head. CUDA configuration and launch errors propagate.
-[Score kernel](../src/text/tc_vocab.cu#L77)<!-- prefix: "__global__ _" --> · [Weight setup](../src/text/tc_vocab.cu#L142)<!-- prefix: "std::shared_" --> · [Scratch setup](../src/text/tc_vocab.cu#L168)<!-- prefix: "std::shared_" --> · [Dispatch guard](../src/decoder_verify.cpp#L583)<!-- prefix: "if (round.co" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
-· [Packet dispatch](../src/decoder_verify.cpp#L727)<!-- prefix: "if (packed_a" -->
+[Score kernel](../src/text/tc_vocab.cu#L77)<!-- prefix: "__global__ _" --> · [Weight setup](../src/text/tc_vocab.cu#L142)<!-- prefix: "std::shared_" --> · [Scratch setup](../src/text/tc_vocab.cu#L168)<!-- prefix: "std::shared_" --> · [Dispatch guard](../src/decoder_verify.cpp#L617)<!-- prefix: "if (round.co" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
+· [Packet dispatch](../src/decoder_verify.cpp#L761)<!-- prefix: "if (packed_a" -->
 
 The verifier reads the existing draft INT8 weights and adds 3,973,120 model bytes
 for statistics and 21,544,480 workspace bytes per decoder batch before allocator rounding.
 When the provider is available, batches with capacity for four lanes or more
 prepare workspace before request admission.
-[Batch allocation](../src/decoder_batch.cpp#L233)<!-- prefix: "storage->tc_" -->
+[Batch allocation](../src/decoder_batch.cpp#L218)<!-- prefix: "storage->tc_" -->
 
 The Tensor Core dot accumulates signed INT8 products exactly in INT32. The interval
 includes FP32 subnormal rounding error in the original BF16 head. Refinement repeats
@@ -179,7 +179,7 @@ Retrieval ignores the query and any successfully parsed body. After shared path 
 
 ### Server-info targets
 
-Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L556)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L764)<!-- prefix: "bool BatchSe" -->
+Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L556)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L772)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 

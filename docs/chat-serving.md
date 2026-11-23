@@ -16,7 +16,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L417)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L538)<!-- prefix: "std::string " --> |
 | Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L67)<!-- prefix: "DecoderResul" --> |
 | Chat output parsers | Apply the request options and parse reasoning and tool calls. | [Request options](../apps/server/text_request.cpp#L630)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/chat_output.cpp#L799)<!-- prefix: "bool ChatOut" --> |
-| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L565)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L577)<!-- prefix: "void TextRes" --> |
+| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L580)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L592)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
 
@@ -36,7 +36,7 @@ Each index starts with `delta.role: "assistant"` and a null finish reason. [Head
 
 JSON responses always include usage. `prompt_tokens` counts rendered prompt IDs. `completion_tokens` counts committed output IDs. `total_tokens` sums both counts. `prompt_tokens_details.cached_tokens` counts [restored prompt IDs](prefix-cache.md#runtime-path). Raw chat uses the [same stop and finish rules as text completions](text-serving.md#read-the-response). Parsed chat can also report `tool_calls` as the finish reason.
 
-With `return_token_ids: true`, each committed ID appears once in `token_ids`, even when it produces empty text. A UTF-8 tail flush can carry text with zero IDs. In text chat, `prompt_token_ids` appears in the JSON choice or the first diagnostic SSE choice after the role. Media chat puts the expanded `prompt_token_ids` at the top level of the JSON response or the initial assistant SSE chunk. Media usage counts expanded prompt IDs. [Diagnostic choice](../apps/server/text_completion.cpp#L395)<!-- prefix: "std::string " --> · [Role delta](../apps/server/text_completion.cpp#L462)<!-- prefix: "bool TextRes" -->
+With `return_token_ids: true`, each committed ID appears once in `token_ids`, even when it produces empty text. A UTF-8 tail flush can carry text with zero IDs. In text chat, `prompt_token_ids` appears in the JSON choice or the first diagnostic SSE choice after the role. Media chat puts the expanded `prompt_token_ids` at the top level of the JSON response or the initial assistant SSE chunk. Media usage counts expanded prompt IDs. [Diagnostic choice](../apps/server/text_completion.cpp#L410)<!-- prefix: "std::string " --> · [Role delta](../apps/server/text_completion.cpp#L477)<!-- prefix: "bool TextRes" -->
 
 ### Qwen reasoning and tool calls
 
@@ -135,7 +135,7 @@ The first request that reaches rendering loads the pinned `tokenizer_config.json
 
 Chat and completion routes share [resident memory admission](batch-graphs.md#resident-memory-admission) and [batch graph eligibility](batch-graphs.md). See the [server MTP policy](mtp.md#runtime-path) for text-only chat, including requests with constraints or token logprobs. Media chat uses K0.
 
-A TCP reset or failed write cancels the request. The server discards pending UTF-8 bytes, buffered reasoning, and incomplete tool calls. It retires the lane before it reuses the slot. See [completion streams](http-server.md#completion-streams) for errors before and after headers. [Request lifecycle](../apps/server/text_completion.cpp#L720)<!-- prefix: "void complet" -->
+A TCP reset or failed write cancels the request. The server discards pending UTF-8 bytes, buffered reasoning, and incomplete tool calls. It retires the lane before it reuses the slot. See [completion streams](http-server.md#completion-streams) for errors before and after headers. [Request lifecycle](../apps/server/text_completion.cpp#L725)<!-- prefix: "void complet" -->
 
 ### Sampling defaults and output budget
 

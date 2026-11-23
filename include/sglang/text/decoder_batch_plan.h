@@ -22,6 +22,38 @@ struct BudgetLane {
 
 using BudgetLanes = std::array<BudgetLane, decoder_batch_max_lanes>;
 
+inline PrefillRows plan_legacy_prefill(const BudgetLanes& work, int lanes, int unused,
+                                       int& cursor, bool chunked) {
+    PrefillRows rows{};
+    if (chunked && lanes > decoder_batch_max_mtp_lanes) {
+        for (int slot = 0; slot < lanes; ++slot) unused -= work[slot].decode;
+        const int start = cursor;
+        for (int offset = 0; offset < lanes && unused > 0; ++offset) {
+            const int slot = (start + offset) % lanes;
+            if (!work[slot].prefill) continue;
+            rows[slot] = std::min(unused, work[slot].prefill);
+            unused -= rows[slot];
+            cursor = (slot + 1) % lanes;
+        }
+        return rows;
+    }
+    for (int slot = 0; slot < lanes; ++slot) {
+        unused -= work[slot].decode || work[slot].prefill != 0;
+        rows[slot] = std::min(1, work[slot].prefill);
+    }
+    while (chunked && unused > 0) {
+        const int before = unused;
+        for (int slot = 0; slot < lanes && unused > 0; ++slot) {
+            if (rows[slot] < work[slot].prefill) {
+                ++rows[slot];
+                --unused;
+            }
+        }
+        if (unused == before) break;
+    }
+    return rows;
+}
+
 inline std::optional<StepPlan> plan_tiled_step(const BudgetLanes& work, int lanes, int unused,
                                              int& cursor, int tile) {
     StepPlan plan;

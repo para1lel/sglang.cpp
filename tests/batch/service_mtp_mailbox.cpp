@@ -39,9 +39,13 @@ struct Fixture {
     std::mutex mutex;
     std::condition_variable changed;
     Barrier seed, writer, peer, fault;
+    Barrier before_claim, after_claim;
     int primary_steps = 0;
     int fail_at = 0;
     int cancels = 0;
+    int terminal_stores = 0;
+    bool claim_terminal = false;
+    bool fail_after_claim = false;
     bool permanent = false;
     bool unavailable = false;
 
@@ -327,6 +331,42 @@ void check_abort_fault(bool permanent) {
                 "Recoverable failure prevented slot reuse");
     }
 }
+
+void check_completion_claim(bool abort_first, bool fail_after_claim) {
+    Fixture observed;
+    fixture = &observed;
+    observed.claim_terminal = true;
+    observed.fail_after_claim = fail_after_claim;
+    const Decoder decoder({}, 0, true);
+    BatchService service(decoder, false, true, 4, 4, 1);
+    BatchRequestId id("terminal-claim");
+    auto request = std::async(std::launch::async, [&] {
+        return service.generate(0, {100}, {}, {}, {}, 0, &id);
+    });
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.before_claim.entered; });
+        if (abort_first) require(id.abort(true), "Abort lost before terminal claim");
+        observed.release(observed.before_claim);
+        observed.await(lock, [&] { return observed.after_claim.entered; });
+        require(!id.finished(), "Request ID became reusable before terminal publication");
+        if (!abort_first) require(!id.abort(true), "Abort won after terminal claim");
+        require(observed.terminal_stores == 0, "Terminal store preceded the claim barrier");
+        observed.release(observed.after_claim);
+    }
+    if (fail_after_claim) {
+        expect_fault(request);
+    } else {
+        const auto result = request.get();
+        require(result.finish_reason == (abort_first ? Finish::aborted : Finish::length),
+                "Wrong completion reason after claim arbitration");
+        require(result.output_token_ids == (abort_first ? std::vector<int>{} : prefix(1)),
+                "Losing terminal output was published");
+    }
+    require(id.finished() && id.aborted() == abort_first, "Request ID did not settle");
+    require(observed.terminal_stores == (!abort_first && !fail_after_claim),
+            "Only the successful claimed completion may store the terminal endpoint");
+}
 }
 
 namespace sglang {
@@ -344,6 +384,8 @@ struct DecoderBatch::State {
         int produced = 0;
         int remaining = 0;
         bool mtp = false;
+        std::function<int(const int*, int, bool)> text_stop;
+        std::function<bool()> claim_completion;
     };
     std::array<Lane, decoder_batch_max_lanes> lanes{};
 };
@@ -357,7 +399,8 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     auto& lane = state_->lanes[slot];
     require(prompt.size() == 1 && !lane.remaining, "Bad or reused live slot");
     lane = {prompt.front(), 0, options.max_new_tokens,
-            options.mtp_steps > 0 && !options.requires_target_only() && !options.label_token_ids};
+            options.mtp_steps > 0 && !options.requires_target_only() && !options.label_token_ids,
+            options.text_stop, options.claim_completion};
     return 0;
 }
 int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
@@ -367,6 +410,22 @@ void DecoderBatch::cancel(int slot) {
     const std::lock_guard lock(fixture->mutex);
     ++fixture->cancels;
     fixture->changed.notify_all();
+}
+
+void publish_fixture_checkpoint(const std::function<bool()>& claim, DecoderBatchStep& step) {
+    std::unique_lock lock(fixture->mutex);
+    fixture->hold(lock, fixture->before_claim);
+    lock.unlock();
+    const bool allowed = claim();
+    lock.lock();
+    fixture->hold(lock, fixture->after_claim);
+    if (!allowed) {
+        step.finish_reason = Finish::cancelled;
+    } else if (fixture->fail_after_claim) {
+        throw std::runtime_error("fixture step failure");
+    } else {
+        ++fixture->terminal_stores;
+    }
 }
 
 Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats*) {
@@ -386,16 +445,34 @@ Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepS
             fixture->changed.notify_all();
         }
         auto& step = steps[slot];
-        const auto token = [&] { --lane.remaining; return lane.base + lane.produced++; };
         step.decode = lane.produced > 0;
-        step.token = token();
-        if (step.decode && lane.mtp && lane.remaining >= 4) {
-            step.mtp_drafted_tokens = 4;
-            step.mtp_accepted_tokens = 4;
-            step.extra_token_count = 4;
-            for (int& extra : step.extra_tokens) extra = token();
+        const bool speculative = step.decode && lane.mtp && lane.remaining >= 5;
+        const int available = speculative ? 5 : 1;
+        std::array<int, decoder_max_mtp_steps + 1> ids;
+        for (int index = 0; index < available; ++index) {
+            ids[index] = lane.base + lane.produced + index;
         }
-        if (!lane.remaining) step.finish_reason = Finish::length;
+        const bool terminal = lane.remaining == available;
+        const int cutoff = lane.text_stop ? lane.text_stop(ids.data(), available, terminal) : 0;
+        const int count = cutoff ? cutoff : available;
+        step.token = ids.front();
+        lane.produced += count;
+        lane.remaining -= count;
+        if (speculative) {
+            step.mtp_drafted_tokens = 4;
+            step.extra_token_count = count - 1;
+            step.mtp_accepted_tokens = std::min(4, count);
+            std::copy_n(ids.begin() + 1, step.extra_token_count, step.extra_tokens.begin());
+        }
+        if (cutoff) {
+            step.finish_reason = Finish::stop;
+            lane.remaining = 0;
+        } else if (terminal) {
+            step.finish_reason = Finish::length;
+        }
+        if (step.finish_reason && fixture->claim_terminal) {
+            publish_fixture_checkpoint(lane.claim_completion, step);
+        }
     }
     return steps;
 }
@@ -441,6 +518,9 @@ int main(int argc, char** argv) {
     if (mode == "all" || mode == "abort") {
         check_abort_fault(false);
         check_abort_fault(true);
+        check_completion_claim(true, false);
+        check_completion_claim(false, false);
+        check_completion_claim(false, true);
         std::cout << "Abort ownership across recoverable and permanent failures passed\n";
     }
 }

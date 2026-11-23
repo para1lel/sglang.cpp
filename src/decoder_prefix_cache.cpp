@@ -10,8 +10,8 @@
 namespace sglang::decoder {
 namespace {
 
-constexpr int max_pages = decoder_batch_prefix_max_tokens / mxfp8_page_size;
-static_assert(decoder_batch_prefix_max_tokens % mxfp8_page_size == 0);
+static_assert(decoder_batch_prefix_max_tokens == text_attention_max_tokens);
+static_assert(decoder_batch_prefix_checkpoint_interval % mxfp8_page_size == 0);
 
 void drain_snapshot_failure(cudaStream_t stream, const char* operation) {
     const auto pending = cudaGetLastError();
@@ -152,7 +152,7 @@ GpuPrefixSnapshotStore::PageMapping GpuPrefixSnapshotStore::read_request_pages(
     const Request& request, int pages, cudaStream_t stream) {
     const auto table = request.pages;
     const int physical_pages = request.caches.front().page_count;
-    if (!table.device_pages || pages < 1 || pages > max_pages ||
+    if (!table.device_pages || pages < 1 || pages > max_request_pages ||
         table.page_count < pages || table.page_count > max_request_pages ||
         physical_pages < pages || physical_pages > max_request_pages) {
         throw std::invalid_argument("Invalid prefix KV page capacity");
@@ -249,16 +249,17 @@ void GpuPrefixSnapshotStore::release(int slot) { slots_[slot] = {}; }
 void GpuPrefixSnapshotStore::clear() { slots_ = {}; }
 
 void GpuPrefixSnapshotStore::store(int slot, Snapshot prepared, const Request& request,
-                                  const PageMapping& mapping, int tokens, cudaStream_t stream,
-                                  const MtpDraftRequest* draft, int draft_rows) {
+                                  const Workspace& row, const PageMapping& mapping, int tokens,
+                                  cudaStream_t stream, const MtpDraftRequest* draft,
+                                  int draft_rows) {
     auto& snapshot = slots_[slot];
     if (prepared.target) snapshot.target = std::move(prepared.target);
     if (prepared.draft || draft_rows <= 0) snapshot.draft = std::move(prepared.draft);
     const auto& target = *snapshot.target;
     copy_target_prefix(target.kv, request.caches.front(), mapping, tokens, false, stream);
     copy_gdn(target.gdn, request.states.front(), stream);
-    copy_state(target.hidden, request.work.hidden, hidden_size, stream);
-    copy_state(target.residual, request.work.residual, hidden_size, stream);
+    copy_state(target.hidden, row.hidden, hidden_size, stream);
+    copy_state(target.residual, row.residual, hidden_size, stream);
     if (draft_rows > 0) {
         draft->snapshot_prefix(snapshot.draft->kv, draft_rows, stream);
     }
@@ -293,7 +294,7 @@ std::optional<PrefixMediaKey> PrefixMediaKey::capture(const MultimodalInput* med
     PrefixMediaKey key;
     if (!media) return key;
     const auto& prompt = media->prompt;
-    if (std::size_t(tokens) > prompt.positions.size()) return std::nullopt;
+    const auto input_tokens = std::min(std::size_t(tokens), prompt.positions.size());
     for (const auto& span : prompt.spans) {
         if (span.token_begin >= tokens) break;
         if (span.media_index >= media->cache_identities.size()) return std::nullopt;
@@ -302,7 +303,8 @@ std::optional<PrefixMediaKey> PrefixMediaKey::capture(const MultimodalInput* med
         key.spans_.push_back({span.token_begin, std::min(span.rows, tokens - span.token_begin),
                               span.feature_begin, identity});
     }
-    key.positions_.assign(prompt.positions.begin(), prompt.positions.begin() + tokens);
+    key.positions_.assign(prompt.positions.begin(), prompt.positions.begin() + input_tokens);
+    key.next_position_ = prompt.next_position;
     return key;
 }
 
@@ -310,7 +312,7 @@ bool PrefixMediaKey::matches(const MultimodalInput* media, int tokens) const {
     if (!media) return positions_.empty();
     if (positions_.empty()) return false;
     const auto& prompt = media->prompt;
-    if (positions_.size() > prompt.positions.size()) return false;
+    const auto input_tokens = std::min(std::size_t(tokens), prompt.positions.size());
     std::size_t index = 0;
     for (const auto& span : prompt.spans) {
         if (span.token_begin >= tokens) break;
@@ -325,11 +327,27 @@ bool PrefixMediaKey::matches(const MultimodalInput* media, int tokens) const {
             return false;
         }
     }
-    return index == spans_.size() && std::equal(positions_.begin(), positions_.end(),
-        prompt.positions.begin(), [](const MropePosition& left, const MropePosition& right) {
-            return left.temporal == right.temporal && left.height == right.height &&
-                left.width == right.width;
-        });
+    if (index != spans_.size()) return false;
+    const auto common = std::min(positions_.size(), input_tokens);
+    for (std::size_t i = 0; i < common; ++i) {
+        const auto& saved = positions_[i];
+        const auto& current = prompt.positions[i];
+        if (saved.temporal != current.temporal || saved.height != current.height ||
+            saved.width != current.width) return false;
+    }
+    // Generated rows use one rotary position on all axes, starting at next_position.
+    const auto diagonal = [](const auto& positions, std::size_t from, std::size_t to, int start) {
+        for (; from < to; ++from, ++start) {
+            const auto& position = positions[from];
+            if (position.temporal != start || position.height != start ||
+                position.width != start) return false;
+        }
+        return true;
+    };
+    if (!diagonal(positions_, common, positions_.size(), prompt.next_position) ||
+        !diagonal(prompt.positions, common, input_tokens, next_position_)) return false;
+    if (std::size_t(tokens) == std::max(positions_.size(), input_tokens)) return true;
+    return next_position_ - int(positions_.size()) == prompt.next_position - int(input_tokens);
 }
 
 PrefixCache::PrefixCache(int device, int capacity, bool with_draft)
@@ -366,7 +384,8 @@ int PrefixCache::restore(Request& request, const std::vector<int>& prompt, std::
 
 void PrefixCache::store(const Request& request, const std::vector<int>& prompt,
                         std::string_view salt, int tokens, cudaStream_t stream,
-                        const MtpDraftRequest* draft, const MultimodalInput* media) {
+                        const MtpDraftRequest* draft, const MultimodalInput* media,
+                        const Workspace* row) {
     if (tokens < 1 || tokens > decoder_batch_prefix_max_tokens ||
         std::size_t(tokens) > prompt.size() || salt.size() > decoder_prefix_max_salt_bytes ||
         (draft && (!snapshots_.supports_draft() || draft->valid_prefix() < tokens - 1))) {
@@ -380,13 +399,14 @@ void PrefixCache::store(const Request& request, const std::vector<int>& prompt,
     const auto pages = prefix_kv_pages(tokens);
     const auto mapping = GpuPrefixSnapshotStore::read_request_pages(request, pages, stream);
     const auto write = index_.select_write(exact);
+    index_.prepare(write, tokens);
     auto prepared = snapshots_.prepare(write.slot, pages, prefix_kv_pages(std::max(draft_rows, 0)));
     if (!prepared) return;
     index_.invalidate(write.slot);
     counters_.evictions += write.evicted;
     try {
-        snapshots_.store(write.slot, std::move(*prepared), request, mapping, tokens, stream,
-                         draft, draft_rows);
+        snapshots_.store(write.slot, std::move(*prepared), request, row ? *row : request.work,
+                         mapping, tokens, stream, draft, draft_rows);
     } catch (...) {
         drain_snapshot_failure(stream, "Drain interrupted prefix checkpoint");
         snapshots_.release(write.slot);

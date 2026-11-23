@@ -62,7 +62,7 @@ using namespace sglang::decoder;
 
 constexpr std::uint8_t guard = 0xcd;
 constexpr int page = mxfp8_page_size;
-constexpr int full_pages = decoder_batch_prefix_max_tokens / page;
+constexpr int full_pages = decoder_batch_prefix_checkpoint_interval / page;
 constexpr int fixture_page_stride = full_pages + 5;
 
 constexpr std::size_t target_kv_bytes(int pages) {
@@ -75,7 +75,9 @@ constexpr std::size_t target_snapshot_bytes(int pages) {
         gdn_state_elements * sizeof(float)) + 2 * hidden_size * sizeof(Bf16);
 }
 
-static_assert(target_snapshot_bytes(full_pages) == 370233344);
+static_assert(full_pages == 64);
+static_assert(decoder_batch_prefix_max_tokens == 262144);
+static_assert(decoder_batch_prefix_max_tokens / page == 2048);
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -483,10 +485,12 @@ int main(int argc, char** argv) {
         require(argc == 1 || mode == "--identity" || mode == "--remapped" ||
                 mode == "--full" || mode == "--guards",
                 "Expected optional --identity, --remapped, --full, or --guards");
-        require(PrefixCache::checkpoint(127) == 127 && PrefixCache::checkpoint(128) == 128 &&
-                PrefixCache::checkpoint(129) == 129 && PrefixCache::checkpoint(6399) == 6399 &&
-                PrefixCache::checkpoint(6400) == 6400 && PrefixCache::checkpoint(8192) == 6400,
-                "Incorrect checkpoint limit");
+        require(PrefixCache::checkpoint(-1) == 0 && PrefixCache::checkpoint(127) == 127 &&
+                PrefixCache::checkpoint(128) == 128 && PrefixCache::checkpoint(129) == 129 &&
+                PrefixCache::checkpoint(8191) == 8191 && PrefixCache::checkpoint(8192) == 8192 &&
+                PrefixCache::checkpoint(8193) == 8193 &&
+                PrefixCache::checkpoint(262144) == 262144 &&
+                PrefixCache::checkpoint(262145) == 262144, "Incorrect checkpoint limit");
         if (mode.empty() || mode == "--identity") {
             restore_state(page, false, false);
             eviction();
@@ -500,7 +504,7 @@ int main(int argc, char** argv) {
             }
         }
         if (mode == "--full") {
-            restore_state(decoder_batch_prefix_max_tokens, true, true);
+            restore_state(decoder_batch_prefix_checkpoint_interval, true, true);
         }
         if (mode.empty() || mode == "--guards") {
             invalid_mappings();

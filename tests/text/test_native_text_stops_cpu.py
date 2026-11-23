@@ -377,6 +377,9 @@ class NativeTextStops(unittest.TestCase):
         with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
             self.scalar(options(121, 8, stop=["BAB", "ABA"]), "ZA", [z, a, b, a, b],
                         stopped("BAB"), ["Z"], port=port)
+            self.scalar(options(121, 8, stop=["ABA", "BAB"]), "Z", [z, a, b, a],
+                        stopped("ABA"), ["Z"], port=port)
+            self.check_openai(port, 121, ["BAB", "ABA"], "Z", [z, a, b, a], "stop", 8)
             self.scalar(options(123, 6, stop="QZ"), "ABCDEQ", [a, b, c, d, e, q],
                         length(6), ["A"], port=port)
 
@@ -385,17 +388,15 @@ class NativeTextStops(unittest.TestCase):
         log = self.output / "text-stops-mtp.log"
         with server(self.binary, self.checkpoint, log, "--max-active", "2",
                     "--mtp-steps", "3") as port:
-            for budget in (4, 7):
+            for budget in (3, 4, 7):
                 with self.subTest(budget=budget):
                     start = len(log.read_text(encoding="utf-8").splitlines())
                     self.scalar(options(123, budget, stop="BC"), "A", [a, b, c],
                                 stopped("BC"), ["A"], port=port)
                     lines = log.read_text(encoding="utf-8").splitlines()[start:]
-                    expected = "cpu scripted mtp tokens=" + ("3 terminal=1" if budget == 4
-                                                              else "4 terminal=0")
-                    self.assertEqual(lines.count(expected), 2)
-                    cancels = [line for line in lines if line.startswith("cpu cancel slot=")]
-                    self.assertEqual(len(cancels), 0 if budget == 4 else 2)
+                    self.assertEqual(lines.count("cpu scripted mtp tokens=2 terminal=1"), 2)
+                    self.assertFalse(any(line.startswith("cpu cancel slot=") for line in lines),
+                                     lines)
             self.scalar(options(123, 6, stop="BC", stop_token_ids=[d]), "A", [a, b, c],
                         stopped("BC"), ["A"], port=port)
             self.scalar(options(123, 7, stop="BC", no_stop_trim=True), "ABC", [a, b, c],
@@ -408,6 +409,7 @@ class NativeTextStops(unittest.TestCase):
             self.scalar(options(127, 4, stop=special_stop, no_stop_trim=True),
                         "A", [a, self.special], stopped(special_stop), ["A"], port=port)
             self.check_openai(port, 123, "BC", "A", [a, b, c], "stop", 6)
+            self.check_openai(port, 123, "BC", "A", [a, b, c], "stop", 3)
             self.scalar(options(123, 5, stop="QZ"), "ABCDE", [a, b, c, d, e],
                         length(5), ["A"], port=port)
             self.scalar(options(123, 6, stop="QZ"), "ABCDEQ", [a, b, c, d, e, q],

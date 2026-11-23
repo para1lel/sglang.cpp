@@ -24,6 +24,7 @@ from live_controls import ENTRIES, Controls
 
 CHECKPOINT = Path("/data0/shared/Qwen3.8-27B-FP8")
 TOKEN_BUDGET = 32768
+CACHE_BOUNDARY = 8192
 NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
 TEXT = "/v1/completions"
 CHAT = "/v1/chat/completions"
@@ -342,12 +343,17 @@ def finish_stream(stream):
     return transcript(stream.events[:-1])
 
 
+def checkpoint_prompt():
+    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
+    return json.loads(fixture.read_text())["prompt_token_ids"] * 4
+
+
 def check_queue_and_reset(args):
     output = args.evidence / "w2-prefix-queue"
     flags = ("--batch-cuda-graphs", "--prefix-cache-entries", "2")
-    with server(args, output, 2, 0, flags=flags) as (port, _):
+    with server(args, output, 2, 0, flags=flags, token_budget=CACHE_BOUNDARY) as (port, _):
         controls = Controls(port, output)
-        body = LONG | {"cache_salt": "sampled-queue"}
+        body = LONG | {"prompt": checkpoint_prompt(), "cache_salt": "sampled-queue"}
         wanted = transcript(post(port, TEXT, body))
         with ExitStack() as streams:
             active = [streams.enter_context(sampled_stream(port, body | {"max_tokens": 4096}))
@@ -378,31 +384,34 @@ def check_queue_and_reset(args):
             require(replay[key] == wanted[key] == replay_after_reset[key], key)
         warm_cache = replay["usage"]["prompt_tokens_details"]["cached_tokens"]
         reset_cache = replay_after_reset["usage"]["prompt_tokens_details"]["cached_tokens"]
-        require(warm_cache > 0 and reset_cache == 0, (replay, replay_after_reset))
+        require(warm_cache == CACHE_BOUNDARY and reset_cache == 0, (replay, replay_after_reset))
 
 
 def check_eager_cache(args):
     output = args.evidence / "w1-eager-prefix"
     flags = ("--eager", "--prefix-cache-entries", "2")
-    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
-    prompt = json.loads(fixture.read_text())["prompt_token_ids"][:1024]
-    body = LONG | {"prompt": prompt, "cache_salt": "sampled-eager"}
-    with server(args, output, 1, 4, flags=flags, token_budget=8192) as (port, log):
-        cold_wire = post(port, TEXT, body)
+    prompt = checkpoint_prompt()
+    body = LONG | {"prompt": prompt + [31], "cache_salt": "sampled-eager"}
+    prime = body | {"prompt": prompt, "max_tokens": 1}
+    with server(args, output, 1, 4, flags=flags, token_budget=CACHE_BOUNDARY) as (port, log):
+        cold_wire = post(port, TEXT, body | {"cache_salt": "cold"})
         cold = transcript(cold_wire)
         offset = log.stat().st_size
+        prime_wire = post(port, TEXT, prime)
+        warm_begin = log.stat().st_size
         warm_wire = post(port, TEXT, body)
         warm = transcript(warm_wire)
         warm_end = log.stat().st_size
         media = check_media(port, log, 4)
-    write_json(output / "wire.json", {"cold": cold_wire, "warm": warm_wire, "media": media})
+    write_json(output / "wire.json", {"cold": cold_wire, "prime": prime_wire,
+                                     "warm": warm_wire, "media": media})
     for key in ("prompt", "tokens", "text", "finish"):
         require(warm[key] == cold[key], key)
-    for row, hits in ((cold, 0), (warm, len(warm["prompt"]))):
+    for row, hits in ((cold, 0), (warm, CACHE_BOUNDARY)):
         require(row["usage"]["prompt_tokens_details"] == {"cached_tokens": hits}, row)
     trace = log.read_bytes()
     require(not GRAPH.search(trace), "Eager cache request replayed a graph")
-    for phase in (trace[:offset], trace[offset:warm_end]):
+    for phase in (trace[:offset], trace[warm_begin:warm_end]):
         require(any(int(drafted) > 0 for drafted, *_ in COUNTERS.findall(phase)),
                 "Cold or warm sampled request did not use MTP")
 

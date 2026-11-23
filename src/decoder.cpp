@@ -309,7 +309,11 @@ std::optional<DecoderFinishReason> RequestProgress::commit(
     if (output && !output->emit(token, logits, adjusted_logits, ranked)) {
         return DecoderFinishReason::cancelled;
     }
-    const int remaining = remaining_output(options);
+    return finish_token(options, constraint, token, remaining_output(options));
+}
+
+std::optional<DecoderFinishReason> RequestProgress::finish_token(
+    const DecoderOptions& options, ConstraintCursor& constraint, int token, int remaining) {
     if (options.constraint) {
         if (constraint.commit(*options.constraint, token, remaining)) {
             return DecoderFinishReason::constraint;
@@ -317,10 +321,18 @@ std::optional<DecoderFinishReason> RequestProgress::commit(
     } else if (options.stops_at(token)) {
         return DecoderFinishReason::stop;
     }
-    if (remaining == 0) {
-        return DecoderFinishReason::length;
+    return remaining == 0 ? std::optional{DecoderFinishReason::length} : std::nullopt;
+}
+
+std::optional<DecoderFinishReason> RequestProgress::commit_single(
+    const DecoderOptions& options, int token, const Bf16* logits, SerialOutput* output,
+    const float* adjusted_logits, const std::vector<DecoderLogit>* ranked) {
+    const auto finish = commit(options, token, logits, output, adjusted_logits, ranked);
+    if (finish != DecoderFinishReason::cancelled && options.text_stop &&
+        options.text_stop(&token, 1, finish.has_value()) == 1) {
+        return DecoderFinishReason::stop;
     }
-    return std::nullopt;
+    return finish;
 }
 
 int validate_winner(int winner, bool sampled, bool constrained) {
@@ -611,10 +623,9 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                                              options.min_new_tokens,
                                              options.constraint != nullptr);
                 const auto& transfers = request.memory.transfers();
-                if (const auto finish = progress.commit(options, token, transfers.logits.data(),
-                                                        &output,
-                                                        transfers.adjusted_logits.data(),
-                                                        &transfers.repetition_logits)) {
+                if (const auto finish = progress.commit_single(
+                        options, token, transfers.logits.data(), &output,
+                        transfers.adjusted_logits.data(), &transfers.repetition_logits)) {
                     return *finish;
                 }
             }

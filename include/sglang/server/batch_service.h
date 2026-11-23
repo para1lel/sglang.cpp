@@ -59,9 +59,17 @@ public:
         return false;
     }
 
-    bool finish() {
+    bool claim_completion() {
         auto expected = State::dispatched;
-        return state_.compare_exchange_strong(expected, State::finished);
+        return state_.compare_exchange_strong(expected, State::finishing);
+    }
+
+    bool finish() {
+        auto expected = state_.load();
+        while (expected == State::dispatched || expected == State::finishing) {
+            if (state_.compare_exchange_weak(expected, State::finished)) return true;
+        }
+        return false;
     }
 
     void finish_abort() {
@@ -89,7 +97,7 @@ public:
 
 private:
     enum class State {
-        waiting, dispatched, aborted_waiting, aborted_running, finished,
+        waiting, dispatched, finishing, finished, aborted_waiting, aborted_running,
         finished_waiting_abort, finished_running_abort,
     };
     std::atomic<State> state_{State::waiting};

@@ -67,7 +67,7 @@ public:
             const bool eligible = !require_draft || entry.draft_rows >= 0;
             if ((!eligible && (match.slot != -1 || match.draft_miss)) ||
                 salt != std::string_view(entry.salt.data(), entry.salt_size) ||
-                !std::equal(entry.ids.begin(), entry.ids.begin() + entry.tokens, prompt.begin()) ||
+                !std::equal(entry.ids.begin(), entry.ids.end(), prompt.begin()) ||
                 !entry.media.matches(media, entry.tokens)) {
                 continue;
             }
@@ -107,6 +107,8 @@ public:
         return Write(slot, exact.slot == -1 && entries_[slot].tokens != 0, position);
     }
 
+    void prepare(const Write& write, int tokens) { entries_[write.slot].ids.reserve(tokens); }
+
     void invalidate(int slot) {
         auto& entry = entries_[slot];
         entry.tokens = entry.pages = 0;
@@ -125,7 +127,7 @@ public:
     void publish(const Write& write, const std::vector<int>& prompt, std::string_view salt,
                  int tokens, int pages, int draft_rows, PrefixMediaKey media) {
         auto& entry = entries_[write.slot];
-        std::copy_n(prompt.begin(), tokens, entry.ids.begin());
+        entry.ids.assign(prompt.begin(), prompt.begin() + tokens);
         std::copy(salt.begin(), salt.end(), entry.salt.begin());
         entry.salt_size = salt.size();
         entry.media = std::move(media);
@@ -150,7 +152,7 @@ public:
 
 private:
     struct Entry {
-        std::array<int, decoder_batch_prefix_max_tokens> ids;
+        std::vector<int> ids;
         std::array<char, decoder_prefix_max_salt_bytes> salt;
         PrefixMediaKey media;
         std::size_t salt_size = 0;

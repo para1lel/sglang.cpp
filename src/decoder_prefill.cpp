@@ -306,15 +306,6 @@ void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant
     }
 }
 
-void publish_prefill_snapshot(const PrefillGrant& grant, cudaStream_t stream) {
-    const auto* snapshot = grant.snapshot;
-    if (!snapshot || grant.position + grant.rows != snapshot->position) return;
-    snapshot->publishing = true;
-    snapshot->cache.store(*grant.request, snapshot->prompt, snapshot->options.prefix_cache_salt,
-                          snapshot->position, stream, grant.draft, snapshot->media.get());
-    snapshot->publishing = false;
-}
-
 constexpr int layerwise_row_alignment = 128;
 constexpr int max_layerwise_rows = 1023;
 constexpr int min_partial_prefill_rows = 256;
@@ -667,7 +658,6 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         }
         capture_prefill_scores(model, grant, &buffers, offset, stream);
         stage_prefill_row(*grant.request, buffers, offset + grant.rows - 1, stream);
-        publish_prefill_snapshot(grant, stream);
     });
 }
 
@@ -848,7 +838,6 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                                    PrefillWorkspace& workspace, MtpDraftRequest* draft,
                                    int prompt_remaining, const MediaPrefill* media,
                                    const PromptLogprobCapture* scores,
-                                   const PrefillSnapshotCapture* snapshot,
                                    int logical_capacity) const {
     const auto stream = workspace.stream();
     const int capacity = logical_capacity ? logical_capacity : workspace.capacity();
@@ -860,7 +849,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         throw std::invalid_argument("Invalid decoder prefill tile");
     }
     const PrefillGrant grant{&request, tokens, position, rows, rows, prompt_remaining,
-                             draft, media, scores, snapshot};
+                             draft, media, scores};
     if (rows == 1 || !workspace.data()) {
         if (!std::all_of(tokens, tokens + rows,
                          [](int token) { return token >= 0 && token < vocab_size; })) {
@@ -887,7 +876,6 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
             }
         }
         if (scores) scores->collect(pending, stream);
-        publish_prefill_snapshot(grant, stream);
         return;
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
@@ -924,7 +912,6 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     }
     capture_prefill_scores(*this, grant, &work, 0, stream);
     stage_prefill_row(request, work, rows - 1, stream);
-    publish_prefill_snapshot(grant, stream);
 }
 
 namespace {
@@ -940,14 +927,13 @@ void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant
                                  stream, grant.media);
             }
             capture_prefill_scores(model, grant, nullptr, 0, stream);
-            publish_prefill_snapshot(grant, stream);
         } else {
             for (int offset = 0; offset < grant.rows;) {
                 const int rows = std::min({grant.tile_rows, capacity, grant.rows - offset});
                 model.prefill_chunk(*grant.request, grant.tokens + offset, rows,
                                     grant.position + offset, workspace, grant.draft,
                                     grant.prompt_remaining - offset, grant.media, grant.scores,
-                                    grant.snapshot, capacity);
+                                    capacity);
                 offset += rows;
             }
         }

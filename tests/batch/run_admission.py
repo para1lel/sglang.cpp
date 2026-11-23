@@ -250,9 +250,10 @@ def check_wide_mtp(args):
 
 def check_eager_cache(args):
     flags = ["--eager", "--max-active", "4"]
-    case = prompt_case("eager-cache", 1024)
+    case = prompt_case("eager-cache", DEFAULT_TOKENS + 1)
     body = {"model": media.MODEL, "prompt": case["prompt"], "max_tokens": 8,
             "return_token_ids": True, "temperature": 0, "ignore_eos": True}
+    prime = body | {"prompt": case["prompt"][:-1], "max_tokens": 1}
     with server(args, "eager-cache", flags, cache_entries=2) as (port, log, out, health):
         check_caps(health, 4, DEFAULT_TOKENS)
         evidence = argparse.Namespace(evidence=out)
@@ -261,10 +262,11 @@ def check_eager_cache(args):
         native.write_json(out / "server-info.json", info)
         assert info_status == 200 and info["prefix_cache_entries"] == 2, info
         assert info["eager"] and not info["batch_cuda_graphs"] and info["mtp_steps"] == 4, info
-        cold = media.capture(evidence, "cold", port, media.TEXT, body)
+        cold = media.capture(evidence, "cold", port, media.TEXT, body | {"cache_salt": "cold"})
+        media.capture(evidence, "prime", port, media.TEXT, prime)
         warm = media.capture(evidence, "warm", port, media.TEXT, body)
         assert cold["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, cold
-        assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] == len(case["prompt"]), warm
+        assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] == DEFAULT_TOKENS, warm
         for reply in (cold, warm):
             choice, = reply["choices"]
             assert choice["finish_reason"] == "length" and len(choice["token_ids"]) == 8, choice

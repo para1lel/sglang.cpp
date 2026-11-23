@@ -24,6 +24,7 @@ MODEL = "Qwen3.8-27B-FP8"
 HEADERS = {"Content-Type": "application/json", "Connection": "close"}
 RGB8 = "data:application/x-sglang-rgb8;base64,"
 CACHE_PAGE_TOKENS = 128
+CHECKPOINT_INTERVAL = 8192
 
 
 def exchange(port, route, body=None, *, timeout=90):
@@ -161,13 +162,12 @@ def mixed_content():
             visual("video_url"), {"type": "text", "text": " and the clip."}]
 
 
-def ordinary(args, port, label, content, *, cache=False):
+def ordinary(args, port, label, content):
     reply = capture(args, f"{label}-json", port, CHAT, chat(content))
     expected = received(reply, 4)
     prompt = reply.get("prompt_token_ids")
-    cached = len(prompt) if cache else 0
     raw = capture(args, f"{label}-sse", port, CHAT, chat(content, stream=True))
-    ids, stats, streamed_prompt = stream_result(raw, 4, cached)
+    ids, stats, streamed_prompt = stream_result(raw, 4)
     assert (ids, without_cached_tokens(stats)) == (expected[0], without_cached_tokens(expected[1]))
     assert streamed_prompt == prompt
     return expected, prompt
@@ -294,12 +294,9 @@ def main(args):
     for label, options in (("continuous", ["--max-active", "2", "--prefix-cache-entries", "0"]),
                            ("cached", ["--max-active", "1", "--prefix-cache-entries", "1"])):
         with serve(args, label, *options) as (port, log):
-            assert ordinary(args, port, f"{label}-media", content, cache=label == "cached") == (
-                expected, prompt)
+            assert ordinary(args, port, f"{label}-media", content) == (expected, prompt)
             if label == "cached":
-                cached = len(prompt)
-                cancel_and_replace(args, port, log, content, (*expected, prompt),
-                                   fragment=True, cached=cached)
+                cancel_and_replace(args, port, log, content, (*expected, prompt), fragment=True)
             ordinary(args, port, f"{label}-plain", "Say hello.")
     print("Decoded media HTTP route contract passed.")
 
@@ -388,32 +385,24 @@ def server_policy(args, port, label, entries):
 def feature_media(args, port, log, request, image_or_video, media, controls):
     for name in ("image", "video"):
         output, prompt = controls[name]
-        hits = len(prompt)
-        assert CACHE_PAGE_TOKENS < hits < 2048 and hits % CACHE_PAGE_TOKENS, hits
+        assert len(prompt) > CHECKPOINT_INTERVAL, len(prompt)
         assert image_or_video(port, f"default-cold-{name}", media[name], 0) == (output, prompt)
-        assert image_or_video(port, f"default-warm-{name}", media[name], hits,
-                              stream=True) == (output, prompt)
-        assert image_or_video(port, f"default-warm-json-{name}", media[name], hits) == (
-            output, prompt)
+        branch = f"{name}-branch"
+        branch_prompt = controls[branch][1]
+        assert branch_prompt != prompt
+        assert branch_prompt[:CHECKPOINT_INTERVAL] == prompt[:CHECKPOINT_INTERVAL]
+        for stream in (True, False):
+            assert image_or_video(port, f"default-{branch}-{stream}", media[branch],
+                                  CHECKPOINT_INTERVAL, stream=stream) == controls[branch]
     assert controls["image"][1] == controls["changed-pixels"][1]
-    for name in ("changed-pixels", "changed-grid", "changed-positions"):
+    assert controls["image"][1] == controls["changed-grid"][1]
+    assert controls["video"][1] != controls["changed-positions"][1]
+    for name, base in (("changed-pixels", "image"), ("changed-grid", "image"),
+                       ("changed-positions", "video"), ("salt-distinct", "image")):
+        assert request(port, f"reset-before-{name}", "/reset_prefix_cache", {}) == {"success": True}
+        assert image_or_video(port, f"prime-before-{name}", media[base], 0) == controls[base]
         assert image_or_video(port, f"default-{name}", media[name], 0) == controls[name]
-    original_prompt = controls["image"][1]
-    suffix_prompt = controls["changed-suffix"][1]
-    assert original_prompt != suffix_prompt and original_prompt[:1024] == suffix_prompt[:1024]
-    suffix_hits = 0
-    if suffix_prompt[:len(original_prompt)] == original_prompt:
-        suffix_hits = len(original_prompt)
-    assert request(port, "reset-before-suffix", "/reset_prefix_cache", {}) == {"success": True}
-    assert image_or_video(port, "reprime-image", media["image"], 0) == controls["image"]
-    assert image_or_video(port, "default-changed-suffix", media["changed-suffix"],
-                          suffix_hits) == controls["changed-suffix"]
-    for name, salt, hits in (("salt-cold", "media\0a", 0),
-                             ("salt-warm", "media\0a", len(original_prompt)),
-                             ("salt-distinct", "media\0b", 0)):
-        assert image_or_video(port, name, media["image"] | {"cache_salt": salt}, hits) == (
-            controls["image"])
-    cancelled = media["image"] | {"max_tokens": 1024, "stream": True}
+    cancelled = media["short"] | {"max_tokens": 1024, "stream": True, "cache_salt": "cancelled"}
     with closing(start(port, cancelled)) as active:
         transport = active.sock
         with active.getresponse() as response:
@@ -422,8 +411,9 @@ def feature_media(args, port, log, request, image_or_video, media, controls):
             offset = log.stat().st_size
             transport.close()
     wait_retired(log, offset)
-    assert image_or_video(port, "default-after-cancel", media["image"],
-                          len(original_prompt), stream=True) == controls["image"]
+    replacement = media["short"] | {"cache_salt": "cancelled"}
+    assert image_or_video(port, "default-after-cancel", replacement, 0,
+                          stream=True) == controls["short"]
     wait_retired(log, 0)
 
 
@@ -438,12 +428,7 @@ def check_label_order(got, reversed_labels):
             assert math.isclose(actual, other, rel_tol=1e-12), (scores, reverse)
 
 
-def feature_complete(args):
-    args.evidence.mkdir()
-    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
-    ids = json.loads(fixture.read_text())["prompt_token_ids"]
-    prefix, extension = ids * 2, ids * 2 + ids[:1024]
-    scoring = ids[:132]
+def checkpoint_media_fixtures():
     image = visual("image_url", 32, 64)
     video = visual("video_url", 32, 64)
     changed_pixels = deepcopy(image)
@@ -451,16 +436,29 @@ def feature_complete(args):
         bytes((195, 30, 80)) * 2048).decode()
     changed_positions = deepcopy(video)
     changed_positions["video_url"]["frame_indices"] = [0, 3]
-    stem = "Describe the visual content in detail. " * 150
+    stem = "Describe the visual content in detail. " * 1250
 
     def media_body(visual_part, suffix=""):
         return chat([visual_part, {"type": "text", "text": stem + suffix}], budget=8)
 
-    media = {"image": media_body(image), "video": media_body(video),
-             "changed-pixels": media_body(changed_pixels),
-             "changed-grid": media_body(visual("image_url", 64, 32)),
-             "changed-positions": media_body(changed_positions),
-             "changed-suffix": media_body(image, "Explain the result in French.")}
+    return {"image": media_body(image), "video": media_body(video),
+            "image-branch": media_body(image, "Explain the result in French."),
+            "video-branch": media_body(video, "Describe the last frame."),
+            "changed-pixels": media_body(changed_pixels),
+            "changed-grid": media_body(visual("image_url", 64, 32)),
+            "changed-positions": media_body(changed_positions),
+            "salt-distinct": media_body(image) | {"cache_salt": "media\0a"},
+            "short": chat([image, {"type": "text", "text": "Describe the image."}], budget=8)}
+
+
+def feature_complete(args):
+    args.evidence.mkdir()
+    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
+    ids = json.loads(fixture.read_text())["prompt_token_ids"]
+    prefix = ids * 4
+    extension = prefix + ids[:1024]
+    scoring = ids[:132]
+    media = checkpoint_media_fixtures()
     labels = [[31, 17, 23], [29, 23, 17]]
     score = {"query": scoring[:128], "items": [scoring[128:129], scoring[129:]],
              "label_token_ids": labels, "return_token_logprobs": True, "apply_softmax": True}
@@ -475,8 +473,9 @@ def feature_complete(args):
             with timeline.open("a") as stream:
                 stream.write(json.dumps(record) + "\n")
 
-    def text(port, name, prompt, cached, *, start=None, stream=False):
-        body = native_text(prompt) if start is None else score_body(prompt, start)
+    def text(port, name, prompt, cached, *, start=None, stream=False, budget=8):
+        body = native_text(prompt, budget) if start is None else score_body(prompt, start)
+        body["sampling_params"]["max_new_tokens"] = budget if start is None or start == -1 else 4
         budget = body["sampling_params"]["max_new_tokens"]
         reply = request(port, name, GENERATE, body | {"stream": stream})
         if stream:
@@ -520,7 +519,7 @@ def feature_complete(args):
                                    ("partial", extension, len(prefix))):
             assert text(port, f"default-text-{name}", prompt, hits, stream=name != "cold") == (
                 text_controls[len(prompt)])
-        text(port, "prime-prompt-scores", scoring[:128], 0, start=-1)
+        text(port, "prime-prompt-scores", scoring[:128], 0, start=-1, budget=1)
         for score_start, hits, control in ((128, 128, split_control), (127, 0, boundary_control)):
             for stream in (False, True):
                 assert text(port, f"default-prompt-score-{score_start}-{stream}", scoring, hits,

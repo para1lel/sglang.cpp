@@ -4,7 +4,7 @@ Both `/v1/completions` and `/v1/chat/completions` can return the score of each c
 
 ## Request requirements
 
-Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Eligible greedy requests use the [configured MTP depth](../mtp.md#runtime-path), including decoded-media chat. Active sampling, output constraints, and active chat reasoning or tool output parsers return HTTP 400 before SSE. [Score options](../../apps/server/text_request.cpp#L325)<!-- prefix: "int openai_l" --> · [Batch validation](../../src/decoder_batch.cpp#L431)<!-- prefix: "if ((options" -->
+Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Eligible greedy requests use the [configured MTP depth](../mtp.md#runtime-path), including decoded-media chat. Active sampling, output constraints, and active chat reasoning or tool output parsers return HTTP 400 before SSE. [Score options](../../apps/server/text_request.cpp#L325)<!-- prefix: "int openai_l" --> · [Batch validation](../../src/decoder_batch.cpp#L420)<!-- prefix: "if ((options" -->
 
 Generated logprobs use the scores after [output penalties](../output-penalties.md) and logit bias.
 
@@ -28,7 +28,7 @@ The choice's `logprobs.content` contains one object per committed token. Each ob
 
 ## Streaming and stops
 
-SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L565)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L663)<!-- prefix: "bool consume" -->
+SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L580)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L677)<!-- prefix: "bool consume" -->
 
 ## Verification
 

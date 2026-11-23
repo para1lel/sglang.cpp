@@ -51,8 +51,9 @@ public:
 
     // Validate the live mapping before the caller invalidates an overwrite victim.
     static PageMapping read_request_pages(const Request& request, int pages, cudaStream_t stream);
-    void store(int slot, Snapshot prepared, const Request& request, const PageMapping& mapping,
-               int tokens, cudaStream_t stream, const MtpDraftRequest* draft, int draft_rows);
+    void store(int slot, Snapshot prepared, const Request& request, const Workspace& row,
+               const PageMapping& mapping, int tokens, cudaStream_t stream,
+               const MtpDraftRequest* draft, int draft_rows);
     void restore(int slot, Request& request, int tokens, bool restore_workspace,
                  cudaStream_t stream, MtpDraftRequest* draft, int draft_rows) const;
 

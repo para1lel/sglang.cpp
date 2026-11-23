@@ -28,6 +28,7 @@ private:
     };
 
     std::vector<MropePosition> positions_;
+    int next_position_ = 0;
     std::vector<Span> spans_;
 };
 

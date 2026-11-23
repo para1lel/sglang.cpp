@@ -22,12 +22,13 @@ Append `--mixed-service` to compare image, video, text, and pointwise label resu
 isolated and concurrent requests with the cache explicitly disabled.
 
 Append `--feature-complete` on B200 to compare default serving and explicit cache-off
-controls. The test verifies K4 and the 8192-row budget, cold text, exact and partial hits,
-ordered label scores, and exact prompt/output logprobs against cache-off with matched
-prefill grants. The test compares decoded image and video JSON/SSE, checks exact reuse of
-non-page-aligned media prompts, and rejects stale state after changes to pixels, grids,
-video positions, suffixes, or binary cache salts. It then cancels a live cache-on stream
-and checks a warm replacement. The evidence directory contains the requests and responses.
+controls. The test verifies K4 and the 8,192-row budget, cold text and checkpoint
+hits, ordered label scores, and exact prompt and output logprobs against cache-off
+with matched prefill grants. Decoded image and video branches reuse the first
+8,192 processed tokens and return identical IDs over JSON and SSE. Changing
+pixels, grid geometry, video positions, or a binary cache salt prevents reuse.
+The test also cancels a live media stream and checks that a replacement succeeds.
+The evidence directory contains the requests and responses.
 
 ## Optional codecs
 

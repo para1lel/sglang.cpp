@@ -59,6 +59,8 @@ struct DecoderOptions {
     bool score_prompt = false;
     int prompt_logprob_start = 0;
     std::shared_ptr<const std::vector<int>> label_token_ids = nullptr;
+    std::function<int(const int*, int, bool)> text_stop = {};
+    std::function<bool()> claim_completion = {};
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 

@@ -61,7 +61,9 @@ layers, untouched tail pages, recurrent and convolution data, exact-hit hidden s
 isolation, byte accounting, and eviction. The remapped cases permute either page table and then
 both page tables independently. Failed matches must leave the destination completely untouched.
 The source is overwritten after insertion to check that the cache owns a snapshot. The
-`--full` case verifies all 50 pages through independent permutations at the 6,400-token limit.
+`--full` case verifies all 64 pages at the first 8,192-row cadence boundary through
+independent permutations. The fixture checks the 262,144-token cap without allocating
+a full-context snapshot.
 The guard cases reject invalid indices, duplicate prefix pages, tail aliasing, invalid
 capacities, and bad checkpoint inputs before they touch live state or evict a cache entry.
 Injected transfer failures check that an interrupted store publishes no entry and an
@@ -89,6 +91,24 @@ invalid grammar followed by a successful hit. It repeats the choices across conc
 warm and cold lanes. The test compares output IDs, decoded choices, finish reasons, and
 reported cache hits.
 
+### Committed target state
+
+Run the native state comparison against the same checkpoint and the frozen long-token file.
+The runner takes its 128-token W1 prompt from the streaming benchmark fixture.
+
+```bash
+GPU_UUID="$GPU_UUID" bash tests/prefix/run_tensor_state.sh \
+    "$out" "$checkpoint" "$long_ids" "$out/tensor-prefix-state"
+```
+
+The check covers exact and suffix hits, independent page permutations, interrupted prefill,
+and periodic publication at 8,192 and 16,384 while the request still has work. It compares
+KV payload and scales, GDN state, hidden and residual vectors, and full first BF16 logits.
+Both eager and graph W1 generation verify one 255-row snapshot after 128 emitted tokens.
+The restore processes the last emitted ID as a one-token suffix.
+The completion-claim check verifies that a denied claim at 8,191 has no final snapshot
+and committed cadence at 8,192 retains exactly one checkpoint.
+
 ### Historical Tensor Core cache parity
 
 This archived check predates the shared prefill executor. Use the pinned revision below
@@ -114,8 +134,8 @@ vectors, the seeded first ID, and every BF16 logit.
 ## Prefix cache with MTP
 
 Use a release build and a reserved B200. Supply the frozen 257- and 8192-ID files used by
-the matching-prefix checks. Run from the repository root with the managed Pixi default
-environment active.
+the matching-prefix checks and the `w1.ids` emitted by the committed target runner above.
+Run from the repository root with the managed Pixi default environment active.
 
 ```bash
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
@@ -127,7 +147,8 @@ test -n "$draft"
     -Wl,--wrap=cudaMemcpy2DAsync -Wl,--wrap="$draft" \
     -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
     -lsglang_tokenizer -lcudart -o "$out/prefix-mtp-state"
-CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/prefix-mtp-state" "$checkpoint" "$short_ids" "$long_ids"
+CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/prefix-mtp-state" \
+    "$checkpoint" "$short_ids" "$long_ids" "$out/tensor-prefix-state/w1.ids"
 CUDA_VISIBLE_DEVICES="$GPU_UUID" python3 -B tests/prefix/mtp_routes.py \
     --server "$out/bin/sglang-server" --checkpoint "$checkpoint" --output "$out/mtp-routes"
 ```
@@ -135,14 +156,18 @@ CUDA_VISIBLE_DEVICES="$GPU_UUID" python3 -B tests/prefix/mtp_routes.py \
 Both native batches use the same backend policy and natural prefill boundaries. The test
 resets the cold cache before each admission and checks that it computes the whole prompt
 without restoring target or draft rows. At matched boundaries it compares target KV, GDN
-state, and full first logits byte for byte. [Cold control](mtp_state.cpp#L67)<!-- prefix: "void check_p" -->
+state, and full first logits byte for byte. [Cold control](mtp_state.cpp#L60)<!-- prefix: "void check_p" -->
 
 The fixture checks a K0 prime followed by a positive-depth miss and same-key enrichment.
 It covers K1–K4 consumers, K0 full and partial hits on a paired entry, and a changed suffix
 that shifts prefill tiles. The link observer checks the first rebuilt draft row against
 the new prompt suffix on a partial hit and the current selected first token on a full hit.
 Draft-side copy faults exercise interrupted publication, restore, and retry. Cache
-accounting checks the combined resident charge at capacities one and four.
+accounting checks the combined resident charge at capacities one and four. The committed K4
+fixture reaches 8,192 before completing a turn, then stops on a round with real proposal
+rejection. It checks that rejected rows are excluded from the terminal key and compares
+restored target and draft KV, GDN state, the final committed workspace, and all first logits.
+The last emitted ID runs as the next-turn suffix.
 
 The HTTP check compares seeded, constrained text and chat requests at depths one and four
 with fresh depth-zero controls. It checks the IDs, stop, usage, draft metrics, real verifier

@@ -33,7 +33,6 @@ class MtpDraftRequest;
 class PrefillWorkspace;
 struct PrefillGrant;
 struct PromptLogprobCapture;
-struct PrefillSnapshotCapture;
 struct MediaPrefill;
 struct MultimodalInput;
 class TargetVerification;
@@ -451,11 +450,17 @@ struct RequestProgress {
                 const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
                 void* sampling_workspace, cudaStream_t stream,
                 const AdjustedLogitsWorkspace* adjusted = nullptr);
+    static std::optional<DecoderFinishReason> finish_token(const DecoderOptions& options,
+                                                           ConstraintCursor& constraint,
+                                                           int token, int remaining);
     std::optional<DecoderFinishReason> commit(const DecoderOptions& options, int token,
                                               const Bf16* logits = nullptr,
                                               SerialOutput* output = nullptr,
                                               const float* adjusted_logits = nullptr,
                                               const std::vector<DecoderLogit>* ranked = nullptr);
+    std::optional<DecoderFinishReason> commit_single(
+        const DecoderOptions& options, int token, const Bf16* logits, SerialOutput* output,
+        const float* adjusted_logits = nullptr, const std::vector<DecoderLogit>* ranked = nullptr);
 };
 
 int validate_winner(int winner, bool sampled, bool constrained);
@@ -533,7 +538,6 @@ struct Decoder::Model {
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
                        const decoder::MediaPrefill* media = nullptr,
                        const decoder::PromptLogprobCapture* scores = nullptr,
-                       const decoder::PrefillSnapshotCapture* snapshot = nullptr,
                        int logical_capacity = 0) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
                         DecoderBatchStepStats& stats) const;

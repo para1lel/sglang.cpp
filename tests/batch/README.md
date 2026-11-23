@@ -188,8 +188,8 @@ cancellation releases all request bytes.
 
 The row-accounting cases use explicit cache-off controls. Run
 `run_admission.py --case eager-cache` for the separate eager K4 case with caching
-enabled. It checks a complete warm hit, identical completion, actual draft
-verification, and zero graph replays.
+enabled. It checks an 8,192-token checkpoint hit, identical completion, actual
+draft verification, and zero graph replays.
 
 Run `run_admission.py --case pressure` separately for 32 requests with
 32,769 prompt IDs in total. The trace records actual work per iteration, which
@@ -223,3 +223,23 @@ status at the same allocation. The other injects a memory allocation
 failure there, then reports an illegal address during stream synchronization.
 Both require HTTP 500 for the triggering and fresh requests and an SSE
 error for the active peer.
+
+## Checkpoint lifecycle
+
+Run on a reserved B200 with a fresh evidence directory. Use the default
+cache, K4 and row budget.
+
+```bash
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    python3 -IB tests/batch/checkpoint_lifecycle.py "$out/bin/sglang-server" \
+    "$checkpoint" "$out/checkpoint-lifecycle"
+```
+
+The test checks one terminal save at 255 processed tokens for W1, two session
+branches that restore target and draft state, and saves at each 8,192-token
+boundary reached during prefill or decode. An abort leaves no terminal
+checkpoint. A disconnect after the first boundary preserves the periodic
+checkpoint. Reversing two stop strings that match distinct tokens in one K4
+packet selects a different endpoint. Both endpoints restore for continuation.
+The evidence includes requests, raw SSE, scheduler traces, and cache metrics.
+

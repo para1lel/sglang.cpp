@@ -27,10 +27,12 @@ struct Job {
     std::optional<DecoderFinishReason> finish;
     std::exception_ptr error;
     BatchRequestId* request_id = nullptr;
-    std::unique_ptr<NativeTextStop> text_stop;
+    std::unique_ptr<TokenTextStop> text_stop;
+    std::optional<std::size_t> matched_text_stop;
     int cached_tokens = 0;
     bool admitted = false;
     bool cancelled = false;
+    bool completion_claimed = false;
     bool prefill_completed = false;
     bool buffer_decode_output = false;
     bool output_started = false;
@@ -290,6 +292,15 @@ bool BatchService::State::prepare(BatchSession& batch, int slot,
     }
     if (!job->admitted) {
         try {
+            if (prefix_cache_entries) {
+                job->options.claim_completion = [this, current = job.get()] {
+                    const std::lock_guard lock(mutex);
+                    if (current->cancelled || closing) return false;
+                    current->completion_claimed =
+                        !current->request_id || current->request_id->claim_completion();
+                    return current->completion_claimed;
+                };
+            }
             if (job->media.empty()) {
                 job->cached_tokens = batch.admit(slot, std::move(job->prompt), job->options);
             } else {
@@ -408,11 +419,9 @@ void BatchService::State::process(BatchSession& batch) {
         }
         const auto epoch = *iteration;
         Selection selected{};
-        bool match_text = false;
         for (int slot = 0; slot < max_active; ++slot) {
             const auto& job = snapshot->jobs[slot];
             selected[slot] = prepare(batch, slot, job, snapshot->buffered);
-            match_text |= selected[slot] && job->text_stop != nullptr;
         }
         const int width = std::count(selected.begin(), selected.end(), true);
         Steps steps{};
@@ -451,13 +460,6 @@ void BatchService::State::process(BatchSession& batch) {
                 traced_bytes = bytes;
             }
         }
-        if (match_text) {
-            for (int slot = 0; slot < max_active; ++slot) {
-                const auto& job = snapshot->jobs[slot];
-                if (selected[slot] && job->text_stop && job->text_stop->apply(steps[slot]))
-                    batch.cancel(slot);
-            }
-        }
         const auto cache = prefix_cache_entries ? batch.prefix_cache_stats()
                                                 : DecoderPrefixCacheStats{};
         if (trace_cache) {
@@ -485,7 +487,7 @@ void BatchService::State::cancel(std::unique_lock<std::mutex>& lock, int slot, J
     if (jobs[slot].get() != &job) {
         return;
     }
-    job.cancelled = true;
+    job.cancelled = !job.completion_claimed;
     changed.notify_all();
     changed.wait(lock, [&] { return jobs[slot].get() != &job; });
 }
@@ -542,7 +544,7 @@ void BatchService::State::cancel_batch(std::unique_lock<std::mutex>& lock,
     };
     for (int slot = 0; slot < max_active; ++slot) {
         if (owned(slot)) {
-            jobs[slot]->cancelled = true;
+            jobs[slot]->cancelled = !jobs[slot]->completion_claimed;
         }
     }
     changed.notify_all();
@@ -593,7 +595,13 @@ void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt
         job->buffer_decode_output = buffered && job->can_buffer();
         const auto& text_stops = prompts[next].text_stops;
         if (text_stops) {
-            job->text_stop = std::make_unique<NativeTextStop>(text_stops);
+            job->text_stop = std::make_unique<TokenTextStop>(
+                std::shared_ptr<const TextStops>(text_stops, &text_stops->stops));
+            job->options.text_stop = [current = job.get(), tokenizer = &text_stops->tokenizer]
+                                     (const int* ids, int count, bool terminal) {
+                return current->text_stop->match_native(*tokenizer, ids, count, terminal,
+                                                       current->matched_text_stop);
+            };
         }
         if (job->request_id && !job->request_id->dispatch()) {
             break;
@@ -664,8 +672,8 @@ bool BatchService::State::drain_batch(std::unique_lock<std::mutex>& lock, int ow
         result.cached_prompt_tokens = job.cached_tokens;
         if (finish) {
             result.finish_reason = *finish;
-            if (*finish == DecoderFinishReason::stop && job.text_stop) {
-                result.matched_text_stop = job.text_stop->matched;
+            if (*finish == DecoderFinishReason::stop) {
+                result.matched_text_stop = job.matched_text_stop;
             }
         }
         if (callbacks.on_output) {

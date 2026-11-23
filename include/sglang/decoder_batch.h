@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/decoder.h"
+#include "sglang/runtime/model/qwen_text_model.h"
 
 #include <array>
 #include <cstdint>
@@ -15,7 +16,9 @@ inline constexpr int decoder_batch_max_graph_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_steps = decoder_max_mtp_steps;
 inline constexpr int decoder_batch_prefix_max_entries = 4;
-inline constexpr int decoder_batch_prefix_max_tokens = 6400;
+inline constexpr int decoder_batch_prefix_checkpoint_interval = 8192;
+inline constexpr int decoder_batch_prefix_max_tokens =
+    decoder::QwenTextModel::max_position_embeddings;
 
 struct DecoderBatchStep {
     std::optional<int> token;

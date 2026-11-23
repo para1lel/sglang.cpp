@@ -12,17 +12,6 @@ struct PrefillPool;
 
 void reclaim_prefill_workspaces(int device);
 
-class PrefixCache;
-
-struct PrefillSnapshotCapture {
-    PrefixCache& cache;
-    const std::vector<int>& prompt;
-    const DecoderOptions& options;
-    const std::shared_ptr<const MultimodalInput>& media;
-    bool& publishing;
-    int position;
-};
-
 struct PromptLogprobCapture {
     const std::vector<int>* prompt;
     DecoderPromptLogprobs* output;
@@ -50,7 +39,6 @@ struct PrefillGrant {
     MtpDraftRequest* draft;
     const MediaPrefill* media;
     const PromptLogprobCapture* scores = nullptr;
-    const PrefillSnapshotCapture* snapshot = nullptr;
 };
 
 struct PrefillProjections {

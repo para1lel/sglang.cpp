@@ -360,7 +360,8 @@ std::string draft_seed_fc_json(const Arguments& arguments, bool wmma) {
     const std::string field = R"(,"mtp_seed_fc":)";
     if (!arguments.mtp_steps) return field + "null";
     if (!wmma) return field + R"({"preferred":"simt_bf16_fp32"})";
-    return field + R"({"preferred":"wmma_bf16_fp32","fallback":"simt_bf16_fp32",)"
+    return field + R"({"preferred":"tma_tcgen05_bf16_fp32","fallback":"wmma_bf16_fp32",)"
+        R"("outside_shape_limits":"simt_bf16_fp32",)"
         R"("min_prompt_tokens":)" + std::to_string(wmma_seed_min_prompt_tokens) +
         R"(,"min_rows":)" + std::to_string(wmma_seed_min_rows) +
         R"(,"max_rows":)" + std::to_string(wmma_seed_max_rows) + "}";

@@ -56,7 +56,7 @@ The decoder accepts the normal greedy, [sampling](text-serving.md#sampling), and
 
 ## Verification
 
-Use the managed Pixi default environment. Run from the repository root. Build [`sglang_decoder`](../xmake.lua#L120)<!-- prefix: "target(\"sgla" --> before linking the fixture program. Call `prepare_multimodal_prompt` in the CPU planner check. Supply the same template IDs, grid, and timestamp IDs as the reference.
+Use the managed Pixi default environment. Run from the repository root. Build [`sglang_decoder`](../xmake.lua#L121)<!-- prefix: "target(\"sgla" --> before linking the fixture program. Call `prepare_multimodal_prompt` in the CPU planner check. Supply the same template IDs, grid, and timestamp IDs as the reference.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=''

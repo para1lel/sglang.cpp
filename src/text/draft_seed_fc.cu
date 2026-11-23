@@ -5,8 +5,17 @@
 
 #include <cstdint>
 #include <mma.h>
+#include <optional>
 
 namespace sglang {
+namespace decoder {
+
+std::optional<cudaError_t> try_seed_fc_sm100(const __nv_bfloat16* weight,
+                                            const __nv_bfloat16* input, int height,
+                                            __nv_bfloat16* output, cudaStream_t stream);
+
+}
+
 namespace {
 
 namespace wmma = nvcuda::wmma;
@@ -124,6 +133,11 @@ cudaError_t text_bf16_seed_fc(const __nv_bfloat16* weight, const __nv_bfloat16* 
     }
     static_assert(decoder::hidden_size % seed_tile_columns == 0 &&
                   seed_inner % seed_tile_k == 0);
+    if (reinterpret_cast<std::uintptr_t>(output) % alignof(unsigned) == 0) {
+        if (const auto status = decoder::try_seed_fc_sm100(weight, input, rows, output, stream)) {
+            return *status;
+        }
+    }
     const auto tiles = (rows + seed_tile_rows - 1) / seed_tile_rows;
     bf16_seed_fc_kernel<<<dim3(out_width / seed_tile_columns, tiles), seed_threads, 0, stream>>>(
         weight, input, rows, output);

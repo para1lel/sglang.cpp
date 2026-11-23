@@ -56,12 +56,14 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 | `fp8_prefill` | String `"tensor-core"` for B200 with prefix reuse off, or `"exact"` otherwise. Media and label scoring retain exact prefill. [Backend selection](../apps/sglang-server.cpp#L228)<!-- prefix: "const bool t" --> |
 | `target_gqa` | String `"grouped-split"` on B200, or `"exact"` otherwise. Per-row shape and numerical guards still apply. [Backend selection](../apps/sglang-server.cpp#L231)<!-- prefix: "sglang::json" --> |
 | `paired_prefill` | Boolean indicating availability of [grouped prefill](native-prefill-workspace.md#projection-pairs-for-mtp). True on B200 with prefix reuse off, positive MTP depth, capacity for at least two lanes, and a step budget of 2,048–8,192. The scheduler checks each step separately. [Metadata check](../apps/sglang-server.cpp#L233)<!-- prefix: "const bool p" --> |
-| `mtp_seed_fc` | Null at K0, otherwise an object with the preferred draft seed implementation and any fallback and shape limits. |
+| `mtp_seed_fc` | Null at K0, otherwise the configured [draft seed FC policy](mtp.md#runtime-path). This field is exclusive to the server information routes. [Metadata builder](../apps/sglang-server.cpp#L358)<!-- prefix: "std::string " --> |
 | `sampling_defaults` | String `"model"` or `"openai"`, according to the serving configuration. |
 | `reasoning_parser`, `tool_call_parser` | JSON `null` when disabled. Enabled values are `"qwen3"` and `"qwen3_coder"`, respectively. |
 | `eager`, `trace_batches`, `batch_cuda_graphs` | Booleans for eager execution, batch tracing, and the effective [batch graph policy](batch-graphs.md). `batch_cuda_graphs` defaults to `true`. It is `false` with `--eager`, including when the command also includes `--batch-cuda-graphs`. |
 | `startup_time` | Object with one numeric field, `server_e2e`. It gives elapsed monotonic seconds from before argument parsing through listener creation, fixed for the process lifetime. |
 | `internal_states` | Array with one object for the native scheduler rank. |
+
+For B200 Tensor Core prefill with positive depth and prefix reuse off, `mtp_seed_fc` reports `preferred: "tma_tcgen05_bf16_fp32"`, `fallback: "wmma_bf16_fp32"`, and `outside_shape_limits: "simt_bf16_fp32"`. The limits are `min_prompt_tokens: 4096`, `min_rows: 64`, and `max_rows: 128`. Other positive-depth configurations report `preferred: "simt_bf16_fp32"`. These fields describe startup policy. Actual launches depend on the request, operands, and CUDA preflight. [Policy attachment](../apps/sglang-server.cpp#L257)<!-- prefix: "return body " -->
 
 | Field in `internal_states[0]` | JSON type and meaning |
 | --- | --- |
@@ -238,6 +240,7 @@ done
 diff -u "$samples/server_info" "$samples/get_server_info"
 jq -e '.port == 17384 and .device == 0 and .max_running_requests == 2 and
     .max_num_batched_tokens == 4096 and .prefix_cache_entries == 0 and .mtp_steps == 0 and
+    has("mtp_seed_fc") and .mtp_seed_fc == null and
     .sampling_defaults == "openai" and .eager and (.batch_cuda_graphs == false) and
     .model_path == "/data0/shared/Qwen3.8-27B-FP8" and .tokenizer_path == .model_path and
     ([.launch_command | scan("<redacted>")] | length) == 2 and

@@ -46,7 +46,7 @@ The batch can reduce a [chat request's implicit output budget](chat-serving.md#s
 
 Each batch caches at most one executable per eligible K0 width. Sparse
 selections can rebind after retirement. Prefill runs outside these executables.
-[Capture and binding](../src/text/decoder_graph.cpp#L40)<!-- prefix: "return execu" --> · [Zero-budget completion](../src/decoder_batch.cpp#L909)<!-- prefix: "result.finis" -->
+[Capture and binding](../src/text/decoder_graph.cpp#L40)<!-- prefix: "return execu" --> · [Zero-budget completion](../src/decoder_batch.cpp#L908)<!-- prefix: "result.finis" -->
 
 The historical ordered graph used slot logits at positions 0–5,119 and could allocate request-owned scores at widths 2–4. Each 128-position page needed 12,288 bytes for 24 FP32 scores per position, up to 24 MiB per lane. [Historical score binding](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L466)<!-- prefix: "scores = req" --> · [Score allocation](../src/decoder_resources.cpp#L843)<!-- prefix: "ExactGqaWork" -->
 
@@ -54,7 +54,7 @@ The historical packed implementation fell back after first-use scratch OOM only 
 
 Batch execution owns the winner pin and allocates it on first eligible use. Clean allocation OOM keeps per-lane reads for that batch. Other errors reach batch recovery. Cleanup frees the pin after stream drain and graph teardown. A rejected free retains ownership for device-local deferred reclamation. Terminal errors retain the resources. [Allocation](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/decoder_resources.cpp#L556)<!-- prefix: "TextLogitCan" --> · [Release](../src/decoder_resources.cpp#L259)<!-- prefix: "CleanupError" --> · [Retry](../src/decoder_resources.cpp#L108)<!-- prefix: "static void " -->
 
-Legacy long-score OOM forces eager for that step and later steps needing the failed request's scores. Other requests retain allocations, and recycled slots can replay. Width-local graph scratch OOM or eligible capture, instantiation, or synchronous launch rejection can disable one width. Before eager fallback, end capture, drain the stream, and destroy graph handles. Other widths remain eligible. A target-only execution error outside graph fallback or [prefix recovery](prefix-cache.md#constraints-and-failure-behavior) disables the batch. Invalid selections retire only their lane. Cleanup retains resources while completion is uncertain. [Step recovery](../src/decoder_batch.cpp#L955)<!-- prefix: "} catch (con" -->
+Legacy long-score OOM forces eager for that step and later steps needing the failed request's scores. Other requests retain allocations, and recycled slots can replay. Width-local graph scratch OOM or eligible capture, instantiation, or synchronous launch rejection can disable one width. Before eager fallback, end capture, drain the stream, and destroy graph handles. Other widths remain eligible. A target-only execution error outside graph fallback or [prefix recovery](prefix-cache.md#constraints-and-failure-behavior) disables the batch. Invalid selections retire only their lane. Cleanup retains resources while completion is uncertain. [Step recovery](../src/decoder_batch.cpp#L954)<!-- prefix: "} catch (con" -->
 
 ### Score-backed singleton GQA decode
 

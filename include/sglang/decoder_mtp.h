@@ -8,6 +8,8 @@ struct DraftOperatorCapabilities;
 struct DraftDepthScratch;
 struct PrefillProjections;
 
+inline constexpr int draft_projection_rows = 16;
+
 struct MtpPrefillBuffers {
     Bf16* normalized_hidden;
     Bf16* embedding;
@@ -28,9 +30,6 @@ struct MtpDraftInput {
 };
 
 using DraftRepairs = std::array<MtpDraftInput, decoder_batch_max_mtp_steps>;
-
-void repair_draft_wave(const std::array<DraftRepairs, decoder_batch_max_mtp_lanes>& repairs,
-                       int count, cudaStream_t stream);
 
 class MtpDraftWeights {
 public:
@@ -69,6 +68,8 @@ public:
                               std::uint8_t* activation, cudaStream_t stream);
     static void enqueue_depth(MtpDraftInput* rows, int count, const DraftDepthScratch& scratch,
                               cudaStream_t stream);
+    static void repair_wave(const DraftRepairs* repairs, int count, Bf16* packed,
+                            cudaStream_t stream);
 
     void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                       const Bf16* residual, const Bf16* final_norm,
@@ -91,7 +92,7 @@ private:
                             const ConstraintCandidates* allowed, bool defer_score,
                             const MropePosition* mrope, int rotary_position, const Bf16* feature);
     static void enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
-                                  cudaStream_t stream, bool defer_score);
+                                  cudaStream_t stream, bool defer_score, Bf16* packed = nullptr);
     friend class GpuPrefixSnapshotStore;
     void snapshot_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream) const;
     void restore_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream);

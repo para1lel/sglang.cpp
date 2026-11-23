@@ -750,11 +750,9 @@ WideMtpGroups DecoderBatch::State::prepare_wide_groups(const PrefillRows& decode
     return groups;
 }
 
-namespace {
-bool full_verification(const MtpRound* rounds, int count) {
+static bool full_verification(const MtpRound* rounds, int count) {
     return std::all_of(rounds, rounds + count,
                        [](const auto& round) { return round.rows() == target_verify_max_rows; });
-}
 }
 
 void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, int& next_slot,
@@ -770,9 +768,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     while (next_slot < options.max_lanes && count < limit) {
         const int slot = next_slot++;
         const int rows = verification_rows[slot];
-        if (rows == 0) {
-            continue;
-        }
+        if (rows == 0) continue;
         if (count == 0 && wide_groups.width[slot]) limit = wide_groups.width[slot];
         auto& lane = *storage->slots[slot];
         const int capacity = lane.proposals() + 1;
@@ -798,7 +794,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     if (count == 0) return;
     const auto& cancel = cancel_probe();
     // Reuse the verification activation block before target verification starts.
-    if (count >= 16 && !output && MtpDraftRequest::prepare_depth(
+    if (count >= draft_projection_rows && !output && MtpDraftRequest::prepare_depth(
             *rounds.front().draft, draft_depth, wide_mtp_activation, stream)) {
         MtpRound::propose_depth(rounds.data(), count, draft_depth, stream);
     } else if (!MtpRound::propose_packets(rounds.data(), count, constraint_workspace, stream,
@@ -820,7 +816,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         }
     };
     const auto commit = [&](int first, int size) {
-        std::array<DraftRepairs, packet> repairs{};
+        std::array<DraftRepairs, draft_projection_rows> repairs{};
         for (int index = 0; index < size; ++index) {
             auto& round = rounds[first + index];
             const int slot = slots[first + index];
@@ -830,7 +826,8 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                                                repair, checkpoint_rows ? &(*checkpoint_rows)[slot]
                                                                        : nullptr);
         }
-        repair_draft_wave(repairs, size, stream);
+        auto* packed = size == draft_projection_rows ? wide_mtp_activation : nullptr;
+        MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed), stream);
         check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
         stats.verification_lanes += size;
     };
@@ -844,8 +841,10 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
             width = wide_mtp_lanes;
         }
         verify(first, width, width > packet ? wide_mtp_activation : nullptr);
-        for (int next = 0; next < width; next += packet) {
-            commit(first + next, std::min(width - next, packet));
+        const int commit_width = !output && width >= draft_projection_rows
+            ? draft_projection_rows : packet;
+        for (int next = 0; next < width; next += commit_width) {
+            commit(first + next, std::min(width - next, commit_width));
         }
         first += width;
     }

@@ -80,13 +80,21 @@ Pinned SGLang exposes resolved settings and a launch command at the top level, w
 
 ### INT8 draft head
 
-With draft weights loaded on B200, unconstrained draft proposals use signed INT8 scoring. Constrained drafts use BF16. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive. [Weight preparation](../src/decoder_mtp.cpp#L190)<!-- prefix: "if (capabili" -->
+B200 drafts use signed INT8 when unconstrained, BF16 when constrained. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite weight aborts startup with its token ID. K0 skips draft scoring. [Weight preparation](../src/decoder_mtp.cpp#L193)<!-- prefix: "if (capabili" -->
 
-Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L870)<!-- prefix: "bool MtpDraf" -->
+INT8 quantization uses absolute maxima per weight row and activation. Zero rows yield zero logits for finite operands. FP64 rescaling rounds to BF16. Lowest token ID wins ties. Invalid INT8 scores retry the same activation in BF16. Without a finite retry winner, the lane stops drafting. Target verification and repair continue. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L904)<!-- prefix: "bool MtpDraf" -->
 
-An INT8 wave of four unconstrained draft lanes uses four vocabulary rows per warp. The warp reuses each weight vector across the four quantized activations and keeps separate signed INT32 sums for each lane and row. It uses the same FP64 rescale and BF16 rounding. One to three lanes use the existing INT8 kernels. The batch entry point requires 16-byte-aligned weights and quantized activation buffers. Each lane writes its own logits before winner selection. [Wave scoring](../src/decoder_mtp.cpp#L436)<!-- prefix: "void MtpDraf" --> · [Four-lane kernel](../src/text_decode_bandwidth.cu#L273)<!-- prefix: "__global__ _" --> · [Batch dispatch](../src/text_decode_bandwidth.cu#L664)<!-- prefix: "cudaError_t " -->
+Four unconstrained lanes share four vocabulary rows per warp. Each weight vector serves four activations with independent signed INT32 sums, FP64 rescaling, and BF16 rounding. Weights and quantized activations need 16-byte alignment. Each lane writes its logits before selection. One to three lanes use ordinary INT8 kernels. [Wave scoring](../src/decoder_mtp.cpp#L439)<!-- prefix: "void MtpDraf" --> · [Four-lane kernel](../src/text_decode_bandwidth.cu#L273)<!-- prefix: "__global__ _" --> · [Batch dispatch](../src/text_decode_bandwidth.cu#L664)<!-- prefix: "cudaError_t " -->
 
-Eligible B200 groups of 16 or 32 eager greedy K4 lanes score active lanes together at each proposal depth. The batch needs five assigned rows per lane and no serial output callback. TMA maps and kernel attributes must support the launch. Scoring reuses verification activation scratch before target submission. Draft forwards and winner selection keep four-lane packets. The shared Tensor Core head preserves signed INT32 accumulation, FP64 rescaling, and BF16 rounding. A clean setup decline uses ordinary packet scoring. CUDA errors outside supported setup declines propagate. [Depth dispatch](../src/decoder_batch.cpp#L801)<!-- prefix: "if (count >=" --> · [Setup](../src/text/draft_depth.cu#L139)<!-- prefix: "std::optiona" --> · [Scoring](../src/decoder_mtp.cpp#L685)<!-- prefix: "void MtpDraf" -->
+B200 can share vocabulary scoring per depth across 16 or 32 greedy K4 lanes with five assigned rows each and no serial output callback. TMA setup uses verification scratch. Winner selection stays four-lane. Scoring keeps signed INT32 sums, FP64 rescaling, and BF16 rounding. Clean setup decline uses packet scoring. [Depth dispatch](../src/decoder_batch.cpp#L797)<!-- prefix: "if (count >=" --> · [Setup](../src/text/draft_depth.cu#L139)<!-- prefix: "std::optiona" --> · [Scoring](../src/decoder_mtp.cpp#L749)<!-- prefix: "check(projec" -->
+
+### Grouped draft projections
+
+Four consecutive full packets can reuse verification scratch for 16-row FP8 projections. Grouped quantization writes each lane's activation buffer. Partial packets stay separate. Scored groups can batch Q/K preprocessing and KV append at in-context scalar rotary positions. Other appends run per lane. Attention reads stay four-lane. [Full packets](../src/decoder_mtp.cpp#L726)<!-- prefix: "if (first + " --> · [Rotary guard](../src/decoder_mtp.cpp#L613)<!-- prefix: "const bool g" -->
+
+Clean FP8 setup decline uses four-lane projection calls. CUDA errors propagate, with recorded terminal errors taking precedence. [Projection dispatch](../include/sglang/text/mtp/draft_projection.h#L30)<!-- prefix: "void project" -->
+
+Without a serial output callback, wide rounds can commit 16 lanes together. Complete repair depths share packed K/V projections. Sparse repairs use four-lane packets. All repairs append per lane. [Commit grouping](../src/decoder_batch.cpp#L844)<!-- prefix: "const int co" -->
 
 ### Certified Tensor Core target head
 
@@ -113,7 +121,7 @@ its score capacity, starting at 5,174 tokens with standard scratch. It also need
 valid KV and page coverage, aligned query and KV buffers, and sufficient aligned
 scratch. Each lane keeps its own position, page table, and scratch. One eligible
 lane can use split GQA when the other rows in the wave take different routes.
-[Scored wave call](../src/decoder_mtp.cpp#L636)<!-- prefix: "if (score) {" --> · [Lane selection](../include/sglang/text/mtp/gqa_attention.cuh#L44)<!-- prefix: "cudaError_t " --> · [Alignment](../include/sglang/text/gqa_decode_split.cuh#L70)<!-- prefix: "__host__ __d" -->
+[Scored wave call](../src/decoder_mtp.cpp#L646)<!-- prefix: "if (score) {" --> · [Lane selection](../include/sglang/text/mtp/gqa_attention.cuh#L44)<!-- prefix: "cudaError_t " --> · [Alignment](../include/sglang/text/gqa_decode_split.cuh#L70)<!-- prefix: "__host__ __d" -->
 
 The online route uses the same grouped split operator as target attention.
 It can change draft attention values and proposals through a different reduction order.
@@ -125,15 +133,15 @@ Other long draft calls score 4,096 positions at a time. They carry the FP32
 replay maximum, denominator, and weighted sum between chunks. Ordered paths
 use four-byte V loads when aligned and assemble the same values otherwise.
 Lengths below eight and calls with insufficient score scratch use direct attention.
-Up to four unconstrained lanes share projection and vocabulary weight reads.
+Ordinary waves share projection and vocabulary weight reads across up to four unconstrained lanes.
 Single-row waves use the row dispatch. Batched KV-only repairs skip attention.
-[Chunked replay](../include/sglang/text/mtp/gqa_long.cuh#L151)<!-- prefix: "cudaError_t " --> · [Single-row wave](../src/decoder_mtp.cpp#L583)<!-- prefix: "if (count ==" --> · [Repair waves](../src/decoder_mtp.cpp#L741)<!-- prefix: "void repair_" -->
+[Chunked replay](../include/sglang/text/mtp/gqa_long.cuh#L151)<!-- prefix: "cudaError_t " --> · [Single-row wave](../src/decoder_mtp.cpp#L585)<!-- prefix: "if (count ==" --> · [Repair waves](../src/decoder_mtp.cpp#L763)<!-- prefix: "void MtpDraf" -->
 
 Each draft lane reserves 496,640 bytes for vocabulary logits. Ordered long
 attention uses 419,328 bytes for scores and carry. Online split partials use at
 most 399,360 bytes within the same requirement. Neither path adds request
 memory. The lane stream orders attention before vocabulary scoring overwrites
-the scratch. [Score storage](../src/decoder_mtp.cpp#L120)<!-- prefix: "ExactGqaWork" --> · [Scratch bound](../include/sglang/text/gqa_decode_split.cuh#L47)<!-- prefix: "static_asser" -->
+the scratch. [Score storage](../src/decoder_mtp.cpp#L123)<!-- prefix: "ExactGqaWork" --> · [Scratch bound](../include/sglang/text/gqa_decode_split.cuh#L47)<!-- prefix: "static_asser" -->
 
 Compare the current B200 K4 runtime with a fresh K0 control on the same target dispatch. See pinned Git history at `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3` for the settings and evidence from earlier runtime profiles.
 

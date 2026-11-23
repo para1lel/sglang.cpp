@@ -8,6 +8,7 @@
 #include "sglang/runtime/backend/cuda_backend_policy.h"
 #include "sglang/runtime/cache/mxfp8_prefix_copy.h"
 #include "sglang/text/mtp/draft_depth.h"
+#include "sglang/text/mtp/draft_projection.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
 #include <cmath>
@@ -19,6 +20,8 @@
 
 namespace sglang::decoder {
 namespace {
+
+static_assert(draft_projection_rows % draft_wave_rows == 0);
 
 class DraftWeightUpload {
 public:
@@ -572,12 +575,11 @@ void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
 }
 
 void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
-                                       cudaStream_t stream, bool defer_score) {
-    if (count == 0) {
-        return;
-    }
+                                       cudaStream_t stream, bool defer_score, Bf16* packed) {
+    if (count == 0) return;
     static_assert(draft_wave_rows == decoder_batch_max_mtp_lanes);
-    if (!rows || count < 0 || count > draft_wave_rows) {
+    if (!rows || count < 0 || (count > draft_wave_rows &&
+                               (count != draft_projection_rows || !packed))) {
         throw std::invalid_argument("Invalid MTP draft wave size");
     }
     if (count == 1) {
@@ -587,9 +589,9 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
                                                row.rotary_position, nullptr);
         return;
     }
-    std::array<State*, draft_wave_rows> states{};
+    std::array<State*, draft_projection_rows> states;
     const auto weights = rows[0].request->state_->weights.get();
-    std::array<TextBf16Projection, draft_wave_rows> fc;
+    std::array<TextBf16Projection, draft_projection_rows> fc;
     for (int index = 0; index < count; ++index) {
         const auto& row = rows[index];
         auto& request = *row.request->state_;
@@ -602,52 +604,61 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
         fc[index] = {request.work.concatenated, request.work.residual};
     }
     const auto& model = *weights->state_;
-    const auto project_wave = [&](Fp8Weight weight, Bf16* DraftWorkspace::* output) {
-        std::array<TextFp8Projection, draft_wave_rows> projections;
-        for (int index = 0; index < count; ++index) {
-            const auto& work = states[index]->work;
-            projections[index] = {{work.activation.values, work.activation.scales}, work.*output};
-        }
-        check(text_fp8_gemm(weight.values, weight.scales, weight.rows, weight.columns,
-                             projections.data(), count, stream), "Run batched MTP FP8");
-    };
+    const DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream);
     const auto apply = [&](void (State::* function)(cudaStream_t)) {
         for (int index = 0; index < count; ++index) {
             std::invoke(function, states[index], stream);
         }
     };
+    const bool grouped_rope = packed && score && std::all_of(rows, rows + count,
+        [](const MtpDraftInput& row) {
+            const int rotary = row.rotary_position < 0 ? row.position : row.rotary_position;
+            return !row.mrope && rotary < text_attention_max_tokens;
+        });
     try {
         for (int index = 0; index < count; ++index) {
             const auto& row = rows[index];
             states[index]->embed(row.token, row.hidden, stream);
         }
-        check(text_bf16_gemm(model.fc.values, model.fc.rows, model.fc.columns, fc.data(),
-                             count, stream), "Run batched BF16 MTP FC");
-        apply(&State::prepare_attention);
-        if (score) {
-            project_wave(model.gqa.q_gate, &DraftWorkspace::q_gate);
+        for (int first = 0; first < count; first += draft_wave_rows) {
+            const int size = std::min(count - first, draft_wave_rows);
+            check_draft_submission(text_bf16_gemm(model.fc.values, model.fc.rows,
+                model.fc.columns, fc.data() + first, size, stream), "Run batched BF16 MTP FC");
         }
-        project_wave(model.gqa.key, &DraftWorkspace::keys);
-        project_wave(model.gqa.value, &DraftWorkspace::values);
-        for (int index = 0; index < count; ++index) {
-            const auto& row = rows[index];
-            states[index]->append(row.position, score, row.mrope, row.rotary_position, stream);
-        }
+        if (packed) batch.rms_activation(&DraftWorkspace::residual, model.input_norm, false);
+        else apply(&State::prepare_attention);
         if (score) {
-            std::array<DraftAttentionRow, draft_wave_rows> attention;
-            for (int index = 0; index < count; ++index) {
-                attention[index] = states[index]->attention_row(rows[index].position);
+            batch.project({{model.gqa.q_gate, &DraftWorkspace::q_gate},
+                           {model.gqa.key, &DraftWorkspace::keys},
+                           {model.gqa.value, &DraftWorkspace::values}});
+        } else {
+            batch.project({{model.gqa.key, &DraftWorkspace::keys},
+                           {model.gqa.value, &DraftWorkspace::values}});
+        }
+        if (grouped_rope) {
+            batch.append(rows, model.gqa.query_norm, model.gqa.key_norm);
+        } else {
+            for (int lane = 0; lane < count; ++lane) {
+                const auto& row = rows[lane];
+                states[lane]->append(row.position, score, row.mrope, row.rotary_position, stream);
             }
-            check(mtp_gqa_attention_batch(attention.data(), count,
-                                          model.capabilities.online_attention, stream),
-                  "Read batched MTP MXFP8 attention");
-            apply(&State::gate_attention);
-            project_wave(model.gqa.output, &DraftWorkspace::branch);
-            apply(&State::prepare_mlp);
-            project_wave(model.mlp_gate, &DraftWorkspace::gate);
-            project_wave(model.mlp_up, &DraftWorkspace::up);
-            apply(&State::activate_mlp);
-            project_wave(model.mlp_down, &DraftWorkspace::branch);
+        }
+        if (score) {
+            batch.read_attention(rows, model.capabilities.online_attention);
+            if (packed) batch.gate_attention();
+            else apply(&State::gate_attention);
+            batch.project({{model.gqa.output, &DraftWorkspace::branch}});
+            if (packed) batch.rms_activation(&DraftWorkspace::branch, model.attention_norm, true);
+            else apply(&State::prepare_mlp);
+            batch.project({{model.mlp_gate, &DraftWorkspace::gate},
+                           {model.mlp_up, &DraftWorkspace::up}});
+            if (packed) {
+                batch.quantize_activation(&DraftWorkspace::gate, &DraftWorkspace::up,
+                                          intermediate_size);
+            } else {
+                apply(&State::activate_mlp);
+            }
+            batch.project({{model.mlp_down, &DraftWorkspace::branch}});
             apply(&State::normalize_output);
             if (!defer_score) State::score_wave(states.data(), count, stream);
         }
@@ -709,7 +720,17 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
     }
     if (active_count == 0) return;
     try {
-        for (int first = 0; first < count; first += draft_wave_rows) {
+        for (int first = 0; first < count;) {
+            const int group = first / draft_wave_rows;
+            constexpr int groups = draft_projection_rows / draft_wave_rows;
+            if (first + draft_projection_rows <= count &&
+                std::all_of(packet_sizes.begin() + group, packet_sizes.begin() + group + groups,
+                            [](int size) { return size == draft_wave_rows; })) {
+                enqueue_wave_impl(rows + first, draft_projection_rows, true, stream, true,
+                                  reinterpret_cast<Bf16*>(scratch.activation));
+                first += draft_projection_rows;
+                continue;
+            }
             std::array<MtpDraftInput, draft_wave_rows> packet;
             std::array<int, draft_wave_rows> slots;
             int size = 0;
@@ -723,6 +744,7 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
             for (int index = 0; index < size; ++index) {
                 rows[slots[index]].hidden = packet[index].hidden;
             }
+            first += draft_wave_rows;
         }
         check(project_draft_depth(scratch, weights->state_->quantized_head_maxima, vocab,
                                   active_count, stream),
@@ -738,20 +760,32 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
     }
 }
 
-void repair_draft_wave(const std::array<DraftRepairs, decoder_batch_max_mtp_lanes>& repairs,
-                       int count, cudaStream_t stream) {
-    std::array<MtpDraftInput, decoder_batch_max_mtp_lanes> rows;
+void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* packed,
+                                  cudaStream_t stream) {
+    if (!repairs || count <= 0 || (count > draft_wave_rows &&
+                                  (count != draft_projection_rows || !packed))) {
+        throw std::invalid_argument("Invalid MTP draft repair size");
+    }
+    std::array<MtpDraftInput, draft_projection_rows> rows;
     for (int depth = 0; depth < decoder_batch_max_mtp_steps; ++depth) {
         int size = 0;
-        for (int index = 0; index < count; ++index) {
-            if (const auto& row = repairs[index][depth]; row.request) {
-                rows[size++] = row;
+        for (int lane = 0; lane < count; ++lane) {
+            if (const auto& row = repairs[lane][depth]; row.request) rows[size++] = row;
+        }
+        if (size == 0) break;
+        if (size == draft_projection_rows) {
+            enqueue_wave_impl(rows.data(), size, false, stream, false, packed);
+        } else if (count <= draft_wave_rows) {
+            enqueue_wave(rows.data(), size, false, stream);
+        } else {
+            for (int first = 0; first < count; first += draft_wave_rows) {
+                size = 0;
+                for (int lane = first; lane < first + draft_wave_rows; ++lane) {
+                    if (const auto& row = repairs[lane][depth]; row.request) rows[size++] = row;
+                }
+                enqueue_wave(rows.data(), size, false, stream);
             }
         }
-        if (size == 0) {
-            break;
-        }
-        MtpDraftRequest::enqueue_wave(rows.data(), size, false, stream);
     }
 }
 

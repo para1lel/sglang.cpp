@@ -58,6 +58,11 @@ inline std::vector<DecoderMediaLayout> layouts() {
             {DecoderMediaKind::image, 1, 16, 24, {}}};
 }
 
+inline std::uint16_t sample(int media, int row, int channel) {
+    constexpr std::uint16_t positive = 0x3e80;
+    return positive + ((851 * media + 47 * row + channel) % 1024);
+}
+
 inline std::pair<int, int> feature(int row) {
     for (const auto& span : spans) {
         if (row >= span.start && row < span.start + span.height * span.width) {

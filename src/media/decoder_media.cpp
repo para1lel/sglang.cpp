@@ -1,7 +1,39 @@
+#include "sglang/decoder_batch.h"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_prefill.h"
 
 #include <algorithm>
+
+namespace sglang {
+namespace {
+
+bool same_layout(const DecoderMediaLayout& left, const DecoderMediaLayout& right) {
+    return left.kind == right.kind && left.temporal_pairs == right.temporal_pairs &&
+        left.patch_height == right.patch_height && left.patch_width == right.patch_width &&
+        left.video_timestamp_tokens == right.video_timestamp_tokens;
+}
+
+}
+
+DecoderMediaCacheIdentity::DecoderMediaCacheIdentity(const DecoderMedia& media,
+                                                     std::shared_ptr<const void> encoder,
+                                                     std::string patches_digest)
+    : layout_(media.layout), features_(media.features), address_(media.features.get()),
+      elements_(media.feature_elements), encoder_(std::move(encoder)),
+      patches_digest_(std::move(patches_digest)) {}
+
+bool DecoderMediaCacheIdentity::matches(const DecoderMedia& media) const {
+    return address_ == media.features.get() && elements_ == media.feature_elements &&
+        !features_.owner_before(media.features) && !media.features.owner_before(features_) &&
+        same_layout(layout_, media.layout);
+}
+
+bool DecoderMediaCacheIdentity::same_content(const DecoderMediaCacheIdentity& other) const {
+    return encoder_ == other.encoder_ && patches_digest_ == other.patches_digest_ &&
+        same_layout(layout_, other.layout_);
+}
+
+}
 
 namespace sglang::decoder {
 namespace {
@@ -60,6 +92,7 @@ std::shared_ptr<MultimodalInput> prepare_input(
     std::vector<DecoderMediaLayout> layouts;
     layouts.reserve(media.size());
     input->features.reserve(media.size());
+    input->cache_identities.reserve(media.size());
     for (const auto& item : media) {
         const auto rows = decoder_media_feature_rows(item.layout);
         const auto address = reinterpret_cast<std::uintptr_t>(item.features.get());
@@ -69,6 +102,8 @@ std::shared_ptr<MultimodalInput> prepare_input(
         }
         layouts.push_back(item.layout);
         input->features.push_back(item.features);
+        input->cache_identities.push_back(item.cache_identity && item.cache_identity->matches(item)
+            ? item.cache_identity : nullptr);
     }
     input->prompt = prepare_multimodal_prompt(template_ids, layouts);
     return input;
@@ -105,17 +140,37 @@ DecoderResult Decoder::generate_multimodal_impl(const std::vector<int>& template
     if (options.prefix_cache_salt.size() > decoder_prefix_max_salt_bytes) {
         throw std::invalid_argument("Prefix cache salt is too long");
     }
+    const int proposals = !teacher && !options.requires_target_only() ? options.mtp_steps : 0;
+    if (!teacher && (options.generated_top_logprobs != -1 || options.score_prompt ||
+                     options.label_token_ids)) {
+        throw std::invalid_argument("Generated logprobs require the batch decoder");
+    }
+    if (proposals != 0 && !model_->mtp_weights) {
+        throw std::invalid_argument("MTP weights must be enabled when constructing the decoder");
+    }
+    DecoderResult result;
+    result.peak_device_allocation_bytes = model_device_allocation_bytes();
+    const bool cancelled = callbacks.is_cancelled && callbacks.is_cancelled();
+    if (proposals != 0 && options.max_new_tokens > 0 && !cancelled) {
+        DeviceScope selected_device(model_->device);
+        const int tile = model_->execution.prefill_limit();
+        const int limit = options.max_num_batched_tokens > 0
+            ? std::min(options.max_num_batched_tokens, tile) : tile;
+        DecoderBatch batch(*this, DecoderBatchOptions{false, 1, 0, limit});
+        SerialOutput output(callbacks, options.top_logits, result);
+        batch.generate_mtp(template_token_ids, options, output, result, &media);
+        selected_device.restore();
+        return result;
+    }
     const auto input = prepare_input(template_token_ids, media, model_->memory);
-    validate_request(input->prompt.token_ids, options);
+    validate_request(input->prompt.token_ids, options, !teacher);
     if (teacher &&
         (options.max_new_tokens < 1 || teacher->size() != std::size_t(options.max_new_tokens - 1) ||
          !std::all_of(teacher->begin(), teacher->end(),
                       [](int token) { return token >= 0 && token < vocab_size; }))) {
         throw std::invalid_argument("Invalid teacher-forced continuation");
     }
-    DecoderResult result;
-    result.peak_device_allocation_bytes = model_device_allocation_bytes();
-    if (callbacks.is_cancelled && callbacks.is_cancelled()) {
+    if (cancelled) {
         result.finish_reason = DecoderFinishReason::cancelled;
     } else if (options.max_new_tokens != 0) {
         DeviceScope selected_device(model_->device);

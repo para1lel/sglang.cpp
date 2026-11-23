@@ -52,19 +52,22 @@ void compare_counters(const DecoderBatchStep& expected, const DecoderBatchStep& 
             "Warm continuation differs from the cold oracle");
 }
 
-void check_charge(const DecoderBatch& warm, int capacity) {
-    const auto stats = warm.prefix_cache_stats();
-    constexpr std::size_t target_entry = 370233344;
-    constexpr std::size_t draft_entry = 13516800;
-    require(stats.draft_device_bytes == draft_entry * capacity &&
-            stats.device_bytes == (target_entry + draft_entry) * capacity,
-            "Combined cache does not charge both preallocated fragments");
+void check_charge(const DecoderBatch& batch, int target_pages, int draft_pages) {
+    const auto stats = batch.prefix_cache_stats();
+    constexpr auto kv_bytes = 2 * (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
+    constexpr auto state = gdn_layers * (gdn_history_elements * sizeof(Bf16) +
+        gdn_state_elements * sizeof(float)) + 2 * hidden_size * sizeof(Bf16);
+    const auto target = target_pages ? target_pages * full_attention_layers * kv_bytes + state : 0;
+    const auto draft = draft_pages * kv_bytes;
+    require(stats.entries == int(target_pages > 0) && stats.pages == target_pages &&
+            stats.draft_device_bytes == draft && stats.device_bytes == target + draft,
+            "Unexpected lazy target or draft snapshot charge");
 }
 
 void check_pair(DecoderBatch& cold, DecoderBatch& warm, const std::vector<int>& prompt,
                 int depth, int restored, std::string salt = "shared") {
     const auto consume = mtp_options(depth, std::move(salt));
-    // Enable the same exact prefill route as the warm batch, with no reusable entry.
+    // Match the warm batch's native tile boundaries and clear the reference entries.
     cold.reset_prefix_cache();
     const auto cold_before = cold.prefix_cache_stats();
     require(cold.admit(0, prompt, consume) == 0, "Cold oracle unexpectedly restored");
@@ -89,7 +92,8 @@ void check_pair(DecoderBatch& cold, DecoderBatch& warm, const std::vector<int>& 
     const auto after = warm.prefix_cache_stats();
     const auto target_cached = static_cast<std::uint64_t>(restored);
     const auto target_computed = prompt.size() - target_cached;
-    require(after.cached_tokens - before.cached_tokens == target_cached &&
+    require(after.hits == before.hits + 1 && after.cached_tokens - before.cached_tokens ==
+                target_cached &&
             after.prefill_tokens - before.prefill_tokens == target_computed &&
             after.draft_cached_rows - before.draft_cached_rows == (depth ? target_cached - 1 : 0) &&
             after.draft_prefill_rows - before.draft_prefill_rows == (depth ? target_computed : 0),
@@ -116,47 +120,52 @@ void check_pair(DecoderBatch& cold, DecoderBatch& warm, const std::vector<int>& 
             warm.request_device_allocation_bytes() == 0, "Continuation retained allocations");
 }
 
-void enrichment(Decoder& decoder, const std::vector<int>& tokens) {
-    DecoderBatch cold(decoder, {false, 2, 1, page});
-    DecoderBatch warm(decoder, {false, 2, 1, page});
-    check_charge(warm, 1);
-    const auto shared = head(tokens, page);
+void enrichment(Decoder& decoder, const std::vector<int>& tokens, int length) {
+    const int budget = std::max(length, page);
+    DecoderBatch cold(decoder, {false, 2, 1, budget});
+    DecoderBatch warm(decoder, {false, 2, 1, budget});
+    check_charge(warm, 0, 0);
+    const int target_pages = (length + page - 1) / page;
+    const int draft_pages = (length + page - 2) / page;
+    const auto shared = head(tokens, length);
     require(warm.admit(0, shared, mtp_options(0)) == 0, "Unexpected prime hit");
     first_token(warm, 0);
     retire(warm, 0);
     const auto original = warm.prefix_cache_stats();
-    require(original.entries == 1 && original.pages == 1 && original.stores == 1,
+    require(original.entries == 1 && original.pages == target_pages && original.stores == 1,
             "Target-only prime did not publish exactly once");
+    check_charge(warm, target_pages, 0);
     require(warm.admit(0, shared, mtp_options(4)) == 0, "K4 reused a target-only entry");
     first_token(warm, 0);
     retire(warm, 0);
     const auto enriched = warm.prefix_cache_stats();
-    require(enriched.entries == 1 && enriched.pages == 1 && enriched.stores == 2 &&
+    require(enriched.entries == 1 && enriched.pages == target_pages && enriched.stores == 2 &&
             enriched.evictions == 0 && enriched.draft_misses == 1 && enriched.hits == 0,
             "Same-key enrichment changed occupancy or counted a false hit");
-    check_charge(warm, 1);
-    check_pair(cold, warm, shared, 1, page);
-    check_pair(cold, warm, shared, 0, page);
-    const auto suffix = head(tokens, page + 1);
-    check_pair(cold, warm, suffix, 4, page);
-    check_pair(cold, warm, suffix, 0, page);
+    check_charge(warm, target_pages, draft_pages);
+    check_pair(cold, warm, shared, 1, length);
+    check_pair(cold, warm, shared, 0, length);
+    if (length == page) {
+        const auto suffix = head(tokens, page + 1);
+        check_pair(cold, warm, suffix, 4, page);
+        check_pair(cold, warm, suffix, 0, page + 1);
+    }
     warm.reset_prefix_cache();
     require(warm.prefix_cache_stats().entries == 0 && warm.prefix_cache_stats().pages == 0,
             "Reset retained a target or draft entry");
-    check_charge(warm, 1);
+    check_charge(warm, 0, 0);
 }
 
 void changed_tiles(Decoder& decoder, const std::vector<int>& tokens) {
-    auto prompt = head(tokens, 541);
-    const int boundary = 3 * page;
-    auto producer = head(prompt, boundary + 1);
-    producer.back() = (producer.back() + 1) % vocab_size;
+    constexpr int boundary = 1024;
+    const auto prompt = head(tokens, boundary + 541);
+    const auto producer = head(prompt, boundary);
     DecoderBatch cold(decoder, {false, 2, 1, 1024});
     DecoderBatch warm(decoder, {false, 2, 1, 1024});
     require(warm.admit(0, producer, mtp_options(3)) == 0, "Unexpected larger prime hit");
     score_prompt(warm, 0);
     retire(warm, 0);
-    check_pair(cold, warm, head(prompt, boundary), 0, boundary);
+    check_pair(cold, warm, producer, 0, boundary);
     check_pair(cold, warm, prompt, 0, boundary);
     // A K0 publication of the longer prefix leaves the capacity-one entry target-only.
     require(warm.admit(0, producer, mtp_options(3)) == 0, "Unexpected stale draft hit");
@@ -182,7 +191,7 @@ void check_observed_input(DecoderBatch& batch, int slot, int first, bool generat
 
 void changed_first_token(Decoder& decoder, const Tokenizer& tokenizer,
                          const std::vector<int>& tokens) {
-    DecoderBatch warm(decoder, {false, 2, 1, page});
+    DecoderBatch warm(decoder, {false, 2, 2, page});
     const auto prompt = head(tokens, page);
     const auto suffix = head(tokens, page + 1);
     auto original = suffix;
@@ -232,6 +241,7 @@ void interrupted_store(DecoderBatch& warm, const std::vector<int>& prompt) {
     const auto failed = warm.prefix_cache_stats();
     require(failed.entries == 0 && failed.pages == 0 && failed.stores == 1 && failed.hits == 0,
             "Draft-side store failure exposed a half snapshot");
+    check_charge(warm, 0, 0);
     require(warm.admit(0, prompt, mtp_options(4)) == 0, "Failed store counted as hit");
     first_token(warm, 0);
     retire(warm, 0);
@@ -251,7 +261,9 @@ void interrupted_restore(DecoderBatch& cold, DecoderBatch& warm, const std::vect
     const auto failed = warm.prefix_cache_stats();
     require(failed.entries == before.entries && failed.hits == before.hits &&
             failed.cached_tokens == before.cached_tokens &&
-            failed.draft_cached_rows == before.draft_cached_rows,
+            failed.draft_cached_rows == before.draft_cached_rows &&
+            failed.device_bytes == before.device_bytes &&
+            failed.draft_device_bytes == before.draft_device_bytes,
             "Failed restore altered source or counted a hit");
     check_pair(cold, warm, prompt, 2, page);
 }
@@ -259,23 +271,29 @@ void interrupted_restore(DecoderBatch& cold, DecoderBatch& warm, const std::vect
 }  // namespace
 
 const Bf16* actual_enqueue(MtpDraftRequest*, int, int, const Bf16*, bool, cudaStream_t,
-                           const ConstraintWorkspace*, const ConstraintCandidates*)
+                          const ConstraintWorkspace*, const ConstraintCandidates*,
+                          const MropePosition*, int, const Bf16*)
     asm("__real__ZN6sglang7decoder15MtpDraftRequest7enqueueEiiPK13__nv_bfloat16b"
-        "P11CUstream_stPKNS0_19ConstraintWorkspaceEPKNS0_20ConstraintCandidatesE");
+        "P11CUstream_stPKNS0_19ConstraintWorkspaceEPKNS0_20ConstraintCandidatesE"
+        "PKNS_13MropePositionEiS4_");
 const Bf16* observed_enqueue(MtpDraftRequest*, int, int, const Bf16*, bool, cudaStream_t,
-                             const ConstraintWorkspace*, const ConstraintCandidates*)
+                            const ConstraintWorkspace*, const ConstraintCandidates*,
+                            const MropePosition*, int, const Bf16*)
     asm("__wrap__ZN6sglang7decoder15MtpDraftRequest7enqueueEiiPK13__nv_bfloat16b"
-        "P11CUstream_stPKNS0_19ConstraintWorkspaceEPKNS0_20ConstraintCandidatesE");
+        "P11CUstream_stPKNS0_19ConstraintWorkspaceEPKNS0_20ConstraintCandidatesE"
+        "PKNS_13MropePositionEiS4_");
 
 const Bf16* observed_enqueue(MtpDraftRequest* draft, int position, int shifted_token,
                              const Bf16* hidden, bool score, cudaStream_t stream,
                              const ConstraintWorkspace* scratch,
-                             const ConstraintCandidates* allowed) {
+                             const ConstraintCandidates* allowed, const MropePosition* mrope,
+                             int rotary_position, const Bf16* feature) {
     if (draft == observed_draft && !boundary_input) {
         require(position == page - 1, "First draft rebuild did not start at P - 1");
         boundary_input = shifted_token;
     }
-    return actual_enqueue(draft, position, shifted_token, hidden, score, stream, scratch, allowed);
+    return actual_enqueue(draft, position, shifted_token, hidden, score, stream, scratch, allowed,
+                          mrope, rotary_position, feature);
 }
 
 extern "C" cudaError_t __real_cudaMemcpy2DAsync(void*, std::size_t, const void*, std::size_t,
@@ -303,15 +321,16 @@ int main(int argc, char** argv) {
         const auto long_tokens = ids(argv[3], 8192);
         const Tokenizer tokenizer(std::string(argv[1]) + "/tokenizer.json");
         Decoder decoder(argv[1], 0, true);
-        enrichment(decoder, tokens);
+        for (const int length : {1, page, page + 1}) enrichment(decoder, tokens, length);
         changed_tiles(decoder, long_tokens);
         changed_first_token(decoder, tokenizer, tokens);
         DecoderBatch cold(decoder, {false, 2, 1, page});
         DecoderBatch warm(decoder, {false, 2, 4, page});
-        check_charge(warm, 4);
+        check_charge(warm, 0, 0);
         const auto prompt = head(tokens, page);
         interrupted_store(warm, prompt);
         interrupted_restore(cold, warm, prompt);
+        check_charge(warm, 1, 1);
         std::cout << "Prefix MTP enrichment, accounting, continuation and fault retry passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

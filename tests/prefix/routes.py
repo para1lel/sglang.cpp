@@ -1,4 +1,7 @@
-"""Run against a native batch server with a fresh two-entry cache."""
+"""Run against a fresh native server with two active slots, K0, and two cache entries.
+
+Use --disabled with a server launched with zero cache entries.
+"""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -122,13 +125,15 @@ def test_boundaries(routes, inputs, disabled):
             path = inputs / f"page-{size}.ids"
             data[size] = ([int(token) for token in path.read_text().split()],
                           oracle(path.with_suffix(".ids.bf16")))
-    hit = 0 if disabled else 128
-    cases = ((127, 0), (128, 0), (128, hit), (129, hit), (255, hit),
-             (256, hit), (256, hit * 2), (257, hit * 2))
+    cases = ((127, 0), (128, 127), (128, 128), (129, 128), (255, 129),
+             (256, 255), (256, 256), (257, 256), (257, 257))
     for index, (size, cached) in enumerate(cases):
         prompt, ids = data[size]
-        routes.benchmark(f"page-{index}-{size}", prompt, ids, cached, "boundaries")
+        routes.benchmark(f"page-{index}-{size}", prompt, ids, 0 if disabled else cached,
+                         "boundaries")
     prompt, ids = data[128]
+    routes.benchmark("evicted-prefix", prompt, ids, 0, "boundaries")
+    hit = 0 if disabled else len(prompt)
     routes.benchmark("exact-stop", prompt, ids[:1], hit, "boundaries", "stop", budget=4)
     routes.benchmark("zero-budget", prompt, [], 0, "boundaries")
     routes.benchmark("repeat", prompt, ids, hit, "boundaries")
@@ -140,7 +145,7 @@ def test_cancellation(routes, data, disabled):
     prompt, ids = data[128]
     peer_prompt, peer_ids = data[129]
     replacement_prompt, replacement_ids = data[255]
-    hit = 0 if disabled else 128
+    hit = 0 if disabled else len(prompt)
     routes.benchmark("cancel-prime", prompt, ids, 0, "cancel")
     barrier = Barrier(2, timeout=10)
 
@@ -153,29 +158,27 @@ def test_cancellation(routes, data, disabled):
         completed = pool.submit(peer)
         aborted.result()
         completed.result()
-    routes.benchmark("cancel-replacement", replacement_prompt, replacement_ids, hit, "cancel")
+    routes.benchmark("cancel-replacement", replacement_prompt, replacement_ids,
+                     0 if disabled else len(peer_prompt), "cancel")
 
 
 def test_salts(routes, disabled):
-    hit = 0 if disabled else 128
     text = {"model": MODEL, "prompt": "Prefix cache fixture. " * 70,
-            "max_tokens": 1, "return_token_ids": True, "ignore_eos": True}
+            "max_tokens": 1, "return_token_ids": True, "ignore_eos": True, "temperature": 0}
     for index, salt in enumerate((None, 123, [], {}, "é" * 129, "x" * 257)):
         routes.raw(f"legacy-invalid-{index}", benchmark([220], 0, cache_salt=salt), 400)
         routes.raw(f"text-invalid-{index}", {**text, "cache_salt": salt}, 400)
     expected, output = text_oracle(routes, "text-prime", {**text, "cache_salt": "é" * 128})
-    assert len(expected) >= 128, len(expected)
-    checkpoint = len(expected) // 128 * hit
+    checkpoint = 0 if disabled else len(expected)
     hit_prompt, _ = routes.text("text-hit", {**text, "cache_salt": "é" * 128}, output, checkpoint)
     assert hit_prompt == expected
     routes.text("text-miss", {**text, "cache_salt": "é" * 127}, output, 0)
     chat = {"model": MODEL, "messages": [{"role": "user", "content": text["prompt"]}],
             "max_tokens": 1, "ignore_eos": True, "return_token_ids": True,
-            "cache_salt": "chat"}
+            "temperature": 0, "cache_salt": "chat"}
     route = "/v1/chat/completions"
     prompt, output = text_oracle(routes, "chat-prime", chat, route)
-    assert len(prompt) >= 128, len(prompt)
-    routes.text("chat-hit", chat, output, len(prompt) // 128 * hit, route)
+    routes.text("chat-hit", chat, output, 0 if disabled else len(prompt), route)
     routes.raw("chat-invalid", {**chat, "cache_salt": False}, 400, route)
 
 

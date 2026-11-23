@@ -81,7 +81,7 @@ constexpr int mailbox_min_lanes = 16;
 constexpr int wide_decode_min_ready = 25;
 }
 struct BatchService::State {
-    State(const Decoder& decoder, bool trace, bool cuda_graphs, MtpPolicy mtp, int max_active,
+    State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps, int max_active,
           int prefix_cache_entries, int max_num_batched_tokens);
     ~State();
 
@@ -117,7 +117,7 @@ struct BatchService::State {
 
     const bool trace;
     const bool cuda_graphs;
-    const MtpPolicy mtp;
+    const int mtp_steps;
     const int max_active;
     const int prefix_cache_entries;
     const int max_num_batched_tokens;
@@ -140,9 +140,9 @@ struct BatchService::State {
     std::unique_ptr<SingleDeviceBatchExecutor> executor;
 };
 
-BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, MtpPolicy mtp,
+BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
                            int max_active, int prefix_cache_entries, int max_num_batched_tokens)
-    : trace(trace), cuda_graphs(cuda_graphs), mtp(mtp), max_active(max_active),
+    : trace(trace), cuda_graphs(cuda_graphs), mtp_steps(mtp_steps), max_active(max_active),
       prefix_cache_entries(prefix_cache_entries), max_num_batched_tokens(max_num_batched_tokens) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch service capacity");
@@ -194,7 +194,7 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
 }
 
 bool BatchService::State::wide_decode_ready(bool buffered) const {
-    if (!cuda_graphs || mtp.steps != 0 || max_active != decoder_batch_max_lanes) {
+    if (!cuda_graphs || mtp_steps != 0 || max_active != decoder_batch_max_lanes) {
         return false;
     }
     int ready = 0;
@@ -211,7 +211,7 @@ bool BatchService::State::wide_decode_ready(bool buffered) const {
 }
 
 bool BatchService::State::decode_mailboxes_ready(bool require_all) const {
-    if (!cuda_graphs || mtp.steps != 0 || max_active < mailbox_min_lanes) {
+    if (!cuda_graphs || mtp_steps != 0 || max_active < mailbox_min_lanes) {
         return false;
     }
     int live = 0;
@@ -293,7 +293,8 @@ bool BatchService::State::prepare(BatchSession& batch, int slot,
             if (job->media.empty()) {
                 job->cached_tokens = batch.admit(slot, std::move(job->prompt), job->options);
             } else {
-                batch.admit_multimodal(slot, std::move(job->prompt), job->options, job->media);
+                job->cached_tokens = batch.admit_multimodal(slot, std::move(job->prompt),
+                                                           job->options, job->media);
                 job->media.clear();
             }
             const std::lock_guard lock(mutex);
@@ -446,7 +447,7 @@ void BatchService::State::process(BatchSession& batch) {
                 trace_batch_step(width, decode, bytes);
                 if (width)
                     trace_batch_details(steps, stats, max_active, max_num_batched_tokens,
-                                        mtp.steps);
+                                        mtp_steps);
                 traced_bytes = bytes;
             }
         }
@@ -586,8 +587,8 @@ void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt
         job->prompt = prompts[next].prompt;
         job->media = prompts[next].media;
         job->prompt_tokens = prompts[next].prompt_tokens();
-        job->options = job->media.empty() ? mtp.options_for(prompts[next].options)
-                                        : prompts[next].options;
+        job->options = prompts[next].options;
+        job->options.mtp_steps = mtp_steps;
         job->request_id = prompts[next].request_id;
         job->buffer_decode_output = buffered && job->can_buffer();
         const auto& text_stops = prompts[next].text_stops;
@@ -755,18 +756,12 @@ bool BatchService::State::consume_batch(std::unique_lock<std::mutex>& lock, int 
 
 BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
                            int max_active, int prefix_cache_entries, int max_num_batched_tokens)
-    : BatchService(decoder, trace, cuda_graphs, {mtp_steps, false}, max_active,
-                   prefix_cache_entries, max_num_batched_tokens) {}
-
-BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, MtpPolicy mtp,
-                           int max_active, int prefix_cache_entries, int max_num_batched_tokens)
-    : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp, max_active,
+    : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps, max_active,
                                      prefix_cache_entries, max_num_batched_tokens)) {}
 
 BatchService::~BatchService() = default;
 
 bool BatchService::ready() const { return !state_->failed.load(); }
-bool BatchService::supports_generated_logprobs() const { return state_->mtp.supports_logprobs(); }
 
 bool BatchService::wait_for_generation(Clock::time_point started, Clock::time_point deadline,
                                        const std::function<bool()>& cancelled) {
@@ -883,7 +878,8 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
     auto job = std::make_shared<Job>();
     job->prompt = prompt;
     job->prompt_tokens = media.empty() ? prompt.size() : expanded_tokens;
-    job->options = media.empty() ? state_->mtp.options_for(options) : options;
+    job->options = options;
+    job->options.mtp_steps = state_->mtp_steps;
     job->request_id = request_id;
     job->media = std::move(media);
     job->buffer_decode_output = callbacks.buffer_decode_output && job->can_buffer(true);

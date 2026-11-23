@@ -36,8 +36,7 @@ struct Arguments {
     int max_active = sglang::decoder_batch_max_lanes;
     int max_num_batched_tokens = sglang::decoder_default_max_num_batched_tokens;
     int mtp_steps = 4;
-    int prefix_cache_entries = 0;
-    bool mtp_steps_explicit = false;
+    int prefix_cache_entries = sglang::decoder_batch_prefix_max_entries;
     bool eager = false;
     bool trace_batches = false;
     bool enable_response_store = false;
@@ -150,7 +149,6 @@ Arguments parse_arguments(int argc, char** argv) {
         } else if (option == "--mtp-steps" || option == "--mtp-k") {
             const auto error = "Expected --mtp-steps in [0, 4]";
             arguments.mtp_steps = parse_integer(value, error);
-            arguments.mtp_steps_explicit = true;
             if (arguments.mtp_steps > sglang::decoder_max_mtp_steps) {
                 throw std::invalid_argument(error);
             }
@@ -158,9 +156,6 @@ Arguments parse_arguments(int argc, char** argv) {
             throw std::invalid_argument("Invalid argument " + std::string(option));
         }
         append_launch_option(arguments.launch_command, option, value);
-    }
-    if (arguments.prefix_cache_entries && arguments.eager) {
-        throw std::invalid_argument("--prefix-cache-entries requires omitting --eager");
     }
     return arguments;
 }
@@ -197,9 +192,9 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     const auto state = service.runtime_state();
     const auto topology = service.topology();
     const auto& backend = decoder.backend_policy();
-    const bool prefix_cache = arguments.prefix_cache_entries != 0;
     const bool draft_enabled = arguments.mtp_steps != 0;
     std::string body = R"({"frontend":"cpp","version":null,"supports_inline_system":false)";
+    body += R"(,"enable_multimodal":true)";
     body += R"(,"host":"127.0.0.1","dp_size":)" + std::to_string(topology.dp_size);
     body += R"(,"tp_size":)" + std::to_string(topology.tp_size);
     body += R"(,"pp_size":)" + std::to_string(topology.pp_size);
@@ -225,13 +220,12 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += decoder.has_certified_vocab() ? "true" : "false";
     body += R"(,"prefix_cache_entries":)" + std::to_string(arguments.prefix_cache_entries);
     body += R"(,"fp8_prefill":)";
-    const bool tc_prefill = backend.tensor_core_prefill && !prefix_cache;
+    const bool tc_prefill = backend.tensor_core_prefill;
     sglang::json::append_quoted(body, tc_prefill ? "tensor-core" : "exact");
     body += R"(,"target_gqa":)";
     sglang::json::append_quoted(body, backend.grouped_target_attention ? "grouped-split" : "exact");
     body += R"(,"paired_prefill":)";
-    const bool paired_prefill = backend.paired_prefill && !prefix_cache && draft_enabled &&
-        arguments.max_active >= 2 &&
+    const bool paired_prefill = backend.paired_prefill && arguments.max_active >= 2 &&
         arguments.max_num_batched_tokens >= decoder.paired_prefill_threshold() &&
         arguments.max_num_batched_tokens <= sglang::decoder_default_max_num_batched_tokens;
     body += paired_prefill ? "true" : "false";
@@ -283,7 +277,8 @@ int main(int argc, char** argv) {
                      "Default MTP uses 0 steps for output logprobs.\n"
                      "Batch graphs: enabled by default for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
-                     "Prefix cache: disabled by default. Omit --eager.\n"
+                     "Prefix cache entries: " << sglang::decoder_batch_prefix_max_entries
+                  << " by default. Set --prefix-cache-entries 0 to disable.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
         return 0;
     }
@@ -302,7 +297,7 @@ int main(int argc, char** argv) {
         VisionCompletion vision(arguments.checkpoint, arguments.device);
         BatchService service(decoder, arguments.trace_batches,
                              arguments.enable_batch_cuda_graphs(),
-                             {arguments.mtp_steps, !arguments.mtp_steps_explicit},
+                             arguments.mtp_steps,
                              arguments.max_active,
                              arguments.prefix_cache_entries, arguments.max_num_batched_tokens);
         if (stopping()) {

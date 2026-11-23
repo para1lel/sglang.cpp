@@ -388,8 +388,19 @@ std::vector<DecoderLogit> top_logits(const Bf16* scores, const float* adjusted, 
     return {ranking.begin(), end};
 }
 
-void prepare_serial_request(Request& request, const DecoderOptions& options) {
+void prepare_serial_request(Request& request, const DecoderOptions& options,
+                            AdjustedLogitsWorkspace* adjusted) {
     request.reset();
+    if (adjusted) {
+        auto& transfers = request.memory.transfers();
+        if (options.repetition_penalty != 1) {
+            transfers.repetition_logits.resize(options.top_logits);
+        } else if (options.top_logits > 0) {
+            transfers.adjusted_logits.resize(vocab_size);
+        }
+        adjusted->prepare(request.memory, request, options, request.memory.stream());
+        return;
+    }
     if (options.samples() && !request.sampling_workspace) {
         request.sampling_workspace =
             request.memory.allocate<std::byte>(sampling_workspace_bytes());
@@ -475,8 +486,7 @@ bool Decoder::Model::prefill_serial(Request& request, RequestProgress& progress,
     const int count = static_cast<int>(prompt.size());
     const auto stream = request.memory.stream();
     const int limit = step_budget ? step_budget : batch_prefill_tile_rows;
-    const int preferred = media ? prefill_chunk_rows : backend.prefill_tile_rows;
-    const int capacity = std::min({count, limit, preferred});
+    const int capacity = std::min({count, limit, execution.prefill_limit()});
     std::optional<PrefillWorkspace> tiled(std::in_place, stream, capacity);
     if (!tiled->bytes() && capacity > prefill_chunk_rows) {
         tiled.emplace(stream, prefill_chunk_rows);
@@ -500,7 +510,7 @@ bool Decoder::Model::prefill_serial(Request& request, RequestProgress& progress,
 }
 
 void Decoder::Model::advance_serial(Request& request, RequestProgress& progress,
-                                    int input, bool media, int rotary_delta) const {
+                                    int input, int rotary_delta) const {
     if (progress.generated == 0) {
         compute_logits(request);
         return;
@@ -512,27 +522,24 @@ void Decoder::Model::advance_serial(Request& request, RequestProgress& progress,
     }
     if (request.decode_position) {
         if (progress.generated == 1) {
-            check(set_decode_position(request.decode_position, position, stream),
+            check(set_decode_position(request.decode_position, position, stream,
+                                      request.decode_position + 1, position + rotary_delta),
                   "Set decode position");
         }
         decode_graph(request);
     } else {
-        if (media) {
-            const ForwardLane lane{&request, input, position, TextGdnMode::decode, false,
-                                   nullptr, nullptr, position + rotary_delta};
-            forward(&lane, 1, stream);
-        } else {
-            forward(request, input, position, TextGdnMode::decode);
-        }
+        const ForwardLane lane{&request, input, position, TextGdnMode::decode, true,
+                               nullptr, nullptr, position + rotary_delta};
+        forward(&lane, 1, stream);
         compute_logits(request, true);
     }
     progress.advance(1);
 }
 
-bool Decoder::Model::serial_graph(const DecoderOptions& options, bool media, int prompt_count,
+bool Decoder::Model::serial_graph(const DecoderOptions& options, int prompt_count,
                                   int limit) const {
     const bool split_decode = execution.split_decode(prompt_count, limit);
-    return !options.eager && !media && !options.requires_target_only() && !split_decode;
+    return !options.eager && !options.requires_target_only() && !split_decode;
 }
 
 void Decoder::Model::generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
@@ -548,7 +555,8 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
     const auto sampling = options.samples() ? std::optional{request_sampling(options)}
                                             : std::nullopt;
     const bool adjusted = options.requires_target_only();
-    const RequestLease lease(request_in_use, serial_graph(options, !!media, prompt_count, limit));
+    const bool reuse_graph = !teacher && serial_graph(options, prompt_count, limit);
+    const RequestLease lease(request_in_use, reuse_graph);
     std::unique_ptr<Request> eager_request;
     auto& storage = lease.owns_slot() ? decode_request : eager_request;
     try {
@@ -565,6 +573,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         }
         if (storage) {
             storage->memory.reclaim_deferred();
+            if (media) storage->memory.retain_stream_owner(media);
         } else {
             const std::shared_ptr<const void> owners = media
                 ? std::shared_ptr<const void>(media) : memory;
@@ -573,18 +582,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         }
         auto& request = *storage;
         AdjustedLogitsWorkspace adjusted_workspace;
-        if (adjusted) {
-            request.reset();
-            auto& transfers = request.memory.transfers();
-            if (options.repetition_penalty != 1) {
-                transfers.repetition_logits.resize(options.top_logits);
-            } else if (options.top_logits > 0) {
-                transfers.adjusted_logits.resize(vocab_size);
-            }
-            adjusted_workspace.prepare(request.memory, request, options, request.memory.stream());
-        } else {
-            prepare_serial_request(request, options);
-        }
+        prepare_serial_request(request, options, adjusted ? &adjusted_workspace : nullptr);
         const auto prefill = media
             ? upload_media_positions(request, *media, request.memory.stream()) : MediaPrefill{};
         const int rotary_delta = media ? media->prompt.next_position - prompt_count : 0;
@@ -604,7 +602,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 }
                 const int input = progress.generated != 0 && teacher
                     ? (*teacher)[progress.generated - 1] : progress.last_token;
-                advance_serial(request, progress, input, bool(media), rotary_delta);
+                advance_serial(request, progress, input, rotary_delta);
                 progress.select(request, request.work, options, request.constraint_workspace,
                                 sampling ? &*sampling : nullptr, request.sampling_workspace,
                                 stream, adjusted ? &adjusted_workspace : nullptr);
@@ -625,8 +623,16 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
         result.finish_reason = run_request();
         if (eager_request) {
             request.memory.close();
-        } else if (result.output_token_ids.empty()) {
-            check(cudaStreamSynchronize(request.memory.stream()), "Complete interrupted prefill");
+        } else {
+            if (result.output_token_ids.empty()) {
+                check(cudaStreamSynchronize(request.memory.stream()),
+                      "Complete interrupted prefill");
+            }
+            if (media) {
+                request.memory.free_block(const_cast<MropePosition*>(prefill.positions),
+                                          media->prompt.positions.size() * sizeof(MropePosition));
+                request.memory.retain_stream_owner(memory);
+            }
         }
     } catch (...) {
         storage.reset();
@@ -656,11 +662,11 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     }
     DeviceScope selected_device(model_->device);
     reclaim_prefill_workspaces(model_->device);
-    result.output_token_ids.reserve(options.max_new_tokens);
     if (proposals == 0) {
+        result.output_token_ids.reserve(options.max_new_tokens);
         model_->generate_serial(prompt_token_ids, options, callbacks, result);
     } else {
-        const int tile = model_->backend.prefill_tile_rows;
+        const int tile = model_->execution.prefill_limit();
         const int limit = options.max_num_batched_tokens
             ? std::min(options.max_num_batched_tokens, tile) : tile;
         DecoderBatch batch(*this, DecoderBatchOptions{false, 1, 0, limit});

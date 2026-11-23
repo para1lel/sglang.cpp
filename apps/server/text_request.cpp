@@ -525,14 +525,6 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
         if (key == "stream_options" && value.ordered_object()) {
             const auto& fields = *value.ordered_object();
             options.emplace(key, json::Object(fields.begin(), fields.end()));
-        } else if (media && key == "ebnf") {
-            bad_request("Decoded media chat does not support EBNF constraints");
-        } else if (media && key == "regex") {
-            bad_request("Decoded media chat does not support regex constraints");
-        } else if (media && key == "response_format") {
-            bad_request("Decoded media chat does not support JSON Schema constraints");
-        } else if (media && key == "cache_salt") {
-            bad_request("Decoded media chat does not support cache_salt");
         } else if ((key == "temperature" || key == "top_p" || key == "top_k" ||
                     key == "min_p" || key == "seed") && value.is_null()) {
             continue;
@@ -967,9 +959,6 @@ TextRequest parse_chat_request(const json::OrderedObject& chat,
     normalize_template_options(normalized);
     const auto options = chat_text_options(normalized, media.has_value());
     auto request = text_options(options, tokenizer, true);
-    if (media && request.options.generated_top_logprobs >= 0) {
-        bad_request("Generated logprobs do not support decoded media chat");
-    }
     const auto tools = chat_tools(normalized);
     if (request.choices > 1 && (media || !tools.tools.empty())) {
         bad_request("Multiple chat choices support text without tools");

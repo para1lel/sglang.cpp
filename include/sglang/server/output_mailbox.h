@@ -38,21 +38,26 @@ inline bool emit_step(const DecoderBatchStep& step, const DecoderCallbacks& call
     if (!step.token) return true;
     result.mtp_rounds += step.mtp_drafted_tokens != 0;
     result.mtp_drafted_tokens += step.mtp_drafted_tokens;
-    result.output_token_ids.push_back(*step.token);
-    if (step.generated_logprobs) {
-        result.generated_logprobs.push_back(step.generated_logprobs);
-    }
-    result.mtp_accepted_tokens += step.mtp_accepted_tokens > 0;
-    if (callbacks.on_token && !callbacks.on_token(*step.token)) {
+    const auto emit = [&](int token, const auto& logprobs, bool accepted) {
+        result.output_token_ids.push_back(token);
+        if (logprobs) {
+            result.generated_logprobs.push_back(logprobs);
+        }
+        result.mtp_accepted_tokens += accepted;
+        if (logprobs && callbacks.on_scored_token) {
+            return callbacks.on_scored_token(token, logprobs);
+        }
+        return !callbacks.on_token || callbacks.on_token(token);
+    };
+    if (!emit(*step.token, step.generated_logprobs, step.mtp_accepted_tokens > 0)) {
         return false;
     }
     for (int index = 0; index < step.extra_token_count; ++index) {
         if (callbacks.is_cancelled && callbacks.is_cancelled()) {
             return false;
         }
-        result.output_token_ids.push_back(step.extra_tokens[index]);
-        result.mtp_accepted_tokens += index + 1 < step.mtp_accepted_tokens;
-        if (callbacks.on_token && !callbacks.on_token(step.extra_tokens[index])) {
+        if (!emit(step.extra_tokens[index], step.extra_generated_logprobs[index],
+                  index + 1 < step.mtp_accepted_tokens)) {
             return false;
         }
     }

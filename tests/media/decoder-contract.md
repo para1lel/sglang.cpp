@@ -24,3 +24,9 @@ Swapping equally shaped feature owners under identical text, seed, and salt chan
 Replaying the original owners restores the original scores bitwise.
 The public-entry test also covers rejected layout, timestamp, ownership address, CUDA storage,
 placeholder, MTP, and context-budget inputs, and cancellation before launching a request.
+
+The smaller-budget run compares greedy IDs across grants and compares score bits on a
+repeat with the same grant. The K4 fixture traces the BF16 features at shifted token
+positions and the original prompt M-RoPE axes for draft seed keys. It checks the first
+draft query's axes and verifies a speculative round across an MXFP8 page boundary,
+including rejected rows and the output length limit.

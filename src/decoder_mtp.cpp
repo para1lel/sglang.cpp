@@ -2,9 +2,11 @@
 
 #include "sglang/checkpoint.h"
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_verify.h"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
+#include "sglang/runtime/cache/mxfp8_prefix_copy.h"
 #include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
@@ -60,18 +62,14 @@ private:
     const Checkpoint& checkpoint_;
 };
 
-// The checkpoint ends one row before a page boundary. The final scale group is
-// the last group in each head's interleaved scale plane.
 void copy_draft_prefix(Mxfp8KvCache dst, Mxfp8KvCache src, int rows, cudaStream_t stream) {
     const int full_pages = rows / mxfp8_page_size;
-    const int pages = full_pages + 1;
-    if (rows < 1 || rows % mxfp8_page_size != mxfp8_page_size - 1 ||
-        pages > dst.page_count || pages > src.page_count) {
+    const int pages = prefix_kv_pages(rows);
+    if (rows < 1 || pages > dst.page_count || pages > src.page_count) {
         throw std::invalid_argument("Invalid MTP checkpoint extent");
     }
     const auto payload = rows * mxfp8_kv_heads * mxfp8_head_dim;
     const auto scale_offset = full_pages * mxfp8_scale_bytes_per_page;
-    constexpr auto head_scales = mxfp8_page_size * mxfp8_groups;
     const auto copy_payload = [&](auto* to, const auto* from) {
         check(cudaMemcpyAsync(to, from, payload, cudaMemcpyDeviceToDevice, stream),
               "Copy MTP prefix payload");
@@ -81,9 +79,11 @@ void copy_draft_prefix(Mxfp8KvCache dst, Mxfp8KvCache src, int rows, cudaStream_
             check(cudaMemcpyAsync(to, from, scale_offset, cudaMemcpyDeviceToDevice, stream),
                   "Copy complete MTP prefix scale pages");
         }
-        check(cudaMemcpy2DAsync(to + scale_offset, head_scales, from + scale_offset, head_scales,
-                                head_scales - mxfp8_groups, mxfp8_kv_heads,
-                                cudaMemcpyDeviceToDevice, stream), "Copy MTP prefix tail scales");
+        const int tail = rows % mxfp8_page_size;
+        if (tail) {
+            copy_mxfp8_scale_tail(to + scale_offset, dst.page_count, from + scale_offset,
+                                  src.page_count, 1, tail, stream, "Copy MTP prefix tail scales");
+        }
     };
     copy_payload(dst.key_payload, src.key_payload);
     copy_payload(dst.value_payload, src.value_payload);
@@ -236,9 +236,11 @@ struct MtpDraftWeights::State {
 struct MtpDraftRequest::State {
     State(std::shared_ptr<const MtpDraftWeights> weights, int capacity, RequestBlockCache* cache);
     void validate(int position, int token, const Bf16* hidden) const;
-    void embed(int shifted_token, const Bf16* hidden, cudaStream_t stream);
+    void embed(int shifted_token, const Bf16* hidden, cudaStream_t stream,
+               const Bf16* feature = nullptr);
     void prepare_attention(cudaStream_t stream);
-    void append(int position, bool score, cudaStream_t stream);
+    void append(int position, bool score, const MropePosition* mrope, int rotary_position,
+                cudaStream_t stream);
     DraftAttentionRow attention_row(int position);
     void gate_attention(cudaStream_t stream);
     void prepare_mlp(cudaStream_t stream);
@@ -301,12 +303,16 @@ void MtpDraftRequest::State::validate(int position, int token, const Bf16* hidde
     }
 }
 
-void MtpDraftRequest::State::embed(int shifted_token, const Bf16* hidden, cudaStream_t stream) {
+void MtpDraftRequest::State::embed(int shifted_token, const Bf16* hidden, cudaStream_t stream,
+                                  const Bf16* feature) {
     const auto& model = *weights->state_;
-    check(text_embedding(model.embedding, vocab_size, hidden_size, shifted_token,
-                         work.embedding, stream), "Look up shifted MTP token");
-    check(text_rms_norm(work.embedding, nullptr, model.embedding_norm, hidden_size,
-                        work.concatenated, nullptr, stream), "Normalize MTP embedding");
+    if (!feature) {
+        check(text_embedding(model.embedding, vocab_size, hidden_size, shifted_token,
+                             work.embedding, stream), "Look up shifted MTP token");
+    }
+    check(text_rms_norm(feature ? feature : work.embedding, nullptr, model.embedding_norm,
+                        hidden_size, work.concatenated, nullptr, stream),
+          "Normalize MTP embedding");
     check(text_rms_norm(hidden, nullptr, model.hidden_norm, hidden_size,
                         work.concatenated + hidden_size, nullptr, stream), "Normalize MTP hidden");
 }
@@ -318,15 +324,22 @@ void MtpDraftRequest::State::prepare_attention(cudaStream_t stream) {
     quantize(work.normalized, hidden_size, work, stream);
 }
 
-void MtpDraftRequest::State::append(int position, bool score, cudaStream_t stream) {
+void MtpDraftRequest::State::append(int position, bool score, const MropePosition* mrope,
+                                   int rotary_position, cudaStream_t stream) {
     const auto& gqa = weights->state_->gqa;
+    const int rotary = rotary_position < 0 ? position : rotary_position;
     if (score) {
-        check(text_gqa_preprocess(position, 1, work.q_gate, work.keys, gqa.query_norm,
-                                  gqa.key_norm, work.rope_queries, work.rope_keys, stream),
-              "Rotate MTP Q/K");
+        const auto status = mrope
+            ? mrope_gqa_preprocess(mrope, 1, work.q_gate, work.keys, gqa.query_norm, gqa.key_norm,
+                                   work.rope_queries, work.rope_keys, stream)
+            : text_gqa_preprocess(rotary, 1, work.q_gate, work.keys, gqa.query_norm, gqa.key_norm,
+                                  work.rope_queries, work.rope_keys, stream);
+        check(status, "Rotate MTP Q/K");
     } else {
-        check(text_gqa_preprocess_keys(position, 1, work.keys, gqa.key_norm, work.rope_keys,
-                                      stream), "Rotate MTP key");
+        const auto status = mrope
+            ? mrope_gqa_preprocess_keys(mrope, 1, work.keys, gqa.key_norm, work.rope_keys, stream)
+            : text_gqa_preprocess_keys(rotary, 1, work.keys, gqa.key_norm, work.rope_keys, stream);
+        check(status, "Rotate MTP key");
     }
     check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values, stream),
           "Append MTP MXFP8 KV");
@@ -502,21 +515,26 @@ void MtpDraftRequest::recycle_after_completion() {
 const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16* hidden,
                                     bool score, cudaStream_t stream,
                                     const ConstraintWorkspace* scratch,
-                                    const ConstraintCandidates* allowed) {
-    return enqueue_impl(position, shifted_token, hidden, score, stream, scratch, allowed, false);
+                                    const ConstraintCandidates* allowed,
+                                    const MropePosition* mrope, int rotary_position,
+                                    const Bf16* feature) {
+    return enqueue_impl(position, shifted_token, hidden, score, stream, scratch, allowed, false,
+                        mrope, rotary_position, feature);
 }
 
 const Bf16* MtpDraftRequest::enqueue_impl(int position, int shifted_token, const Bf16* hidden,
                                         bool score, cudaStream_t stream,
                                         const ConstraintWorkspace* scratch,
-                                        const ConstraintCandidates* allowed, bool defer_score) {
+                                        const ConstraintCandidates* allowed, bool defer_score,
+                                        const MropePosition* mrope, int rotary_position,
+                                        const Bf16* feature) {
     auto& request = *state_;
     request.validate(position, shifted_token, hidden);
     auto& work = request.work;
     const auto& model = *request.weights->state_;
     const auto& gqa = model.gqa;
     try {
-        request.embed(shifted_token, hidden, stream);
+        request.embed(shifted_token, hidden, stream, feature);
         check(text_bf16_gemv(model.fc.values, work.concatenated, model.fc.rows, model.fc.columns,
                              work.residual, stream), "Run BF16 MTP FC");
         request.prepare_attention(stream);
@@ -525,7 +543,7 @@ const Bf16* MtpDraftRequest::enqueue_impl(int position, int shifted_token, const
         }
         project(gqa.key, work, work.keys, stream);
         project(gqa.value, work, work.values, stream);
-        request.append(position, score, stream);
+        request.append(position, score, mrope, rotary_position, stream);
         if (score) {
             check(mtp_gqa_attention(request.cache, request.pages, position, work.rope_queries,
                                     work.attention, work.attention_scores(), stream),
@@ -565,7 +583,8 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
     if (count == 1) {
         auto& row = rows[0];
         row.hidden = row.request->enqueue_impl(row.position, row.token, row.hidden, score, stream,
-                                               nullptr, nullptr, defer_score);
+                                               nullptr, nullptr, defer_score, row.mrope,
+                                               row.rotary_position, nullptr);
         return;
     }
     std::array<State*, draft_wave_rows> states{};
@@ -599,7 +618,8 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
     };
     try {
         for (int index = 0; index < count; ++index) {
-            states[index]->embed(rows[index].token, rows[index].hidden, stream);
+            const auto& row = rows[index];
+            states[index]->embed(row.token, row.hidden, stream);
         }
         check(text_bf16_gemm(model.fc.values, model.fc.rows, model.fc.columns, fc.data(),
                              count, stream), "Run batched BF16 MTP FC");
@@ -610,7 +630,8 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
         project_wave(model.gqa.key, &DraftWorkspace::keys);
         project_wave(model.gqa.value, &DraftWorkspace::values);
         for (int index = 0; index < count; ++index) {
-            states[index]->append(rows[index].position, score, stream);
+            const auto& row = rows[index];
+            states[index]->append(row.position, score, row.mrope, row.rotary_position, stream);
         }
         if (score) {
             std::array<DraftAttentionRow, draft_wave_rows> attention;
@@ -737,7 +758,7 @@ void repair_draft_wave(const std::array<DraftRepairs, decoder_batch_max_mtp_lane
 void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                                    const Bf16* residual, const Bf16* final_norm,
                                    const PrefillProjections& projections,
-                                   MtpPrefillBuffers buffers) {
+                                   MtpPrefillBuffers buffers, const MediaPrefill* media) {
     auto& request = *state_;
     if (request.failed) {
         throw std::logic_error("MTP draft request failed");
@@ -751,8 +772,12 @@ void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, cons
     const auto stream = projections.stream;
     const bool paired = model.capabilities.paired_seed_kv && rows > 1;
     const auto append = [&](int first, int count) {
-        check(text_gqa_preprocess_keys(first, count, buffers.keys, model.gqa.key_norm,
-                                        buffers.rope_keys, stream), "Rotate MTP prefill keys");
+        const auto status = media
+            ? mrope_gqa_preprocess_keys(media->positions + first, count, buffers.keys,
+                                        model.gqa.key_norm, buffers.rope_keys, stream)
+            : text_gqa_preprocess_keys(first, count, buffers.keys, model.gqa.key_norm,
+                                       buffers.rope_keys, stream);
+        check(status, "Rotate MTP prefill keys");
         check(mxfp8_kv_append(request.cache, request.pages, first, count, buffers.rope_keys,
                               buffers.values, stream), "Append MTP prefill MXFP8 KV");
         request.prefix += count;
@@ -793,6 +818,9 @@ void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, cons
             check(text_embedding_rows(model.embedding, vocab_size, hidden_size,
                                        shifted_tokens + offset, tile.rows, buffers.embedding,
                                        stream), "Gather shifted MTP tokens");
+            if (media) {
+                media->substitute(buffers.embedding, position + offset + 1, tile.rows, stream);
+            }
             check(text_rms_norm_pair_rows(buffers.embedding, buffers.normalized_hidden,
                                           model.embedding_norm, model.hidden_norm, hidden_size,
                                           tile.rows, buffers.concatenated, stream),
@@ -864,7 +892,7 @@ bool MtpDraftRequest::retry_invalid_int8(cudaStream_t stream) {
 int MtpDraftRequest::valid_prefix() const { return state_->prefix; }
 
 void MtpDraftRequest::snapshot_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream) const {
-    if (state_->failed || state_->prefix != rows) {
+    if (state_->failed || state_->prefix < rows) {
         throw std::logic_error("Draft request is not at its cache checkpoint");
     }
     copy_draft_prefix(snapshot, state_->cache, rows, stream);

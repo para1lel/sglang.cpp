@@ -33,14 +33,15 @@ Both executables default to four MTP draft steps. Pass `--mtp-steps 0` or `--mtp
 to disable draft generation. On a default server launch, requests for logprobs use zero
 draft steps. An explicit positive server depth rejects requests for logprobs.
 
-On B200, text prefill uses Tensor Cores when prefix caching is off.
-Prefix caching, media, and label scoring use exact prefill.
+On B200, prefill selects projection and attention kernels from the request shape.
+Uncached text rows use the same policy whether prefix caching is enabled or disabled.
 See [launch migration](docs/native-model-info.md#migrate-old-launch-commands)
 if you use older launch options.
 
 The HTTP server enables CUDA Graph replay for eligible decode steps by default.
-`--batch-cuda-graphs` remains accepted. Pass `--eager` to disable graph replay,
-even when `--batch-cuda-graphs` is also present. Prefix caching requires omitting `--eager`.
+Pass `--eager` to disable graph replay, including when `--batch-cuda-graphs` is present.
+The server enables four prefix cache entries by default. Set `--prefix-cache-entries 0`
+to disable caching. Both graph and eager decode can use the cache.
 
 ## Serve token IDs over HTTP
 
@@ -72,8 +73,10 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 ## API and limits
 
 - `GET /v1/models` lists the served model. See [model discovery](docs/http-server.md#model-discovery).
-- [Chat completions](docs/chat-serving.md) accept `messages` at `POST /v1/chat/completions`.
-  The guide covers images, video, reasoning, and tool calls.
+- [Chat completions](docs/chat-serving.md) accept `messages` at `POST /v1/chat/completions`,
+  with image and video inputs available on the default launch. The vision encoder loads
+  on its first use. The guide also covers reasoning and tool calls.
+- [Label scoring](docs/serving/pointwise-score.md) is available at `POST /v1/score`.
 - [Text completions](docs/text-serving.md) accept a UTF-8 `prompt` at `POST /v1/completions`.
   Use model `benchmark` on the same endpoint for the [token-ID API](benchmarks/streaming/README.md#wire-contract).
 - Chat and text return JSON or server-sent events. See [output constraints](docs/output-constraints.md)
@@ -88,4 +91,6 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 ## Development and performance
 
 - Find the current component responsibilities in the [native architecture guide](docs/development.md#current-architecture-and-scope).
+- Direct C++ `DecoderBatch` callers can enable prefix caching through
+  `DecoderBatchOptions::prefix_cache_entries`, which defaults to zero in the library.
 - Find the benchmark results and archived run records in [Matched K4 evidence](docs/performance.md#matched-k4-evidence).

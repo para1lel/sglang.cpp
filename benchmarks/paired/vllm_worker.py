@@ -9,6 +9,11 @@ class PairedBaselineObserver(StreamingBaselineObserver):
     def baseline_snapshot(self):
         state = super().baseline_snapshot()
         config = self.vllm_config
+        cache = config.cache_config
+        if cache.enable_prefix_caching:
+            state["cache"].update(block_size=cache.block_size,
+                                  mamba_block_size=cache.mamba_block_size,
+                                  mamba_cache_mode=cache.mamba_cache_mode)
         scheduler = config.scheduler_config
         scheduled = scheduler.max_num_scheduled_tokens
         state["flashinfer"] = version("flashinfer-python")

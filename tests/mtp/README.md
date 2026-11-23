@@ -46,7 +46,7 @@ target sampling under five proposal laws. It also checks that reusing an output
 ordinal after a rejected suffix preserves the target-only draw sequence.
 
 The HTTP check compares seeded JSON and SSE with depth-0 controls on the same
-runtime. At capacity one it covers depths 0 through 4 and eager depth 0. At
+runtime. At capacity one it covers depths 0 through 4 and eager depths 0 and 4. At
 capacity four it covers graph serving at depths 0 through 4 and eager serving
 at depths 0, 1, and 4. The sampling and grammar cases check the resulting token
 sequences against depth-0 output.
@@ -55,13 +55,14 @@ EOS, stop at the output limit, and replay after a TCP reset.
 Server traces verify graph replay at depth 0, joint verification at positive
 depths, and replay of discarded verifier state.
 
-Decoded RGB8 chat uses depth 0 at capacities one and four even when the server
-is configured for text speculation. The check compares media output with the
-depth-0 control and verifies rejection of a per-request depth. The width-two
+Decoded RGB8 chat uses the configured depth. The check compares media output with the
+depth-0 control, verifies draft activity at positive depths, and checks rejection of a
+per-request depth. The width-two
 sampled depth-0 case checks active and queued cancellation, rejection of a busy
 prefix-cache reset, and unchanged seeded output after an idle reset. The runner
 saves requests, transcripts, effective caps, startup results, and server traces.
-The startup matrix checks positive-depth admission through capacity 32,
-batch graphs at capacity one, and exact prefill for combined prefix caching and MTP.
-It also checks explicit eager with positive depth and the batch graph flag, and
-rejects explicit eager when prefix caching is enabled.
+The depth-comparison matrix uses explicit cache-off controls. The startup
+matrix checks positive-depth admission through capacity 32, singleton batch
+graphs, and eager operation with an enabled cache. Use `--eager-cache-only` for
+the focused live K4 case. It checks an exact warm hit, identical seeded output,
+actual drafting before and after the hit, and zero graph replays.

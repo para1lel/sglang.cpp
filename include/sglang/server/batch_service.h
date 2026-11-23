@@ -119,23 +119,9 @@ struct BatchCallbacks {
 
 class BatchService {
 public:
-    struct MtpPolicy {
-        int steps;
-        bool allow_logprob_fallback;
-
-        bool supports_logprobs() const { return steps == 0 || allow_logprob_fallback; }
-        DecoderOptions options_for(DecoderOptions options) const {
-            options.mtp_steps = allow_logprob_fallback && options.generated_top_logprobs >= 0
-                ? 0 : steps;
-            return options;
-        }
-    };
-
     BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false, int mtp_steps = 0,
                  int max_active = decoder_batch_max_mtp_lanes, int prefix_cache_entries = 0,
                  int max_num_batched_tokens = decoder_default_max_num_batched_tokens);
-    BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, MtpPolicy mtp,
-                 int max_active, int prefix_cache_entries, int max_num_batched_tokens);
     ~BatchService();
 
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
@@ -148,7 +134,6 @@ public:
                    const BatchCallbacks& callbacks);
     void notify_abort();
     bool ready() const;
-    bool supports_generated_logprobs() const;
     bool wait_for_generation(std::chrono::steady_clock::time_point started,
                              std::chrono::steady_clock::time_point deadline,
                              const std::function<bool()>& cancelled);

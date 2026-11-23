@@ -23,6 +23,8 @@ struct MtpDraftInput {
     int position;
     int token;
     const Bf16* hidden;
+    const MropePosition* mrope = nullptr;
+    int rotary_position = -1;
 };
 
 using DraftRepairs = std::array<MtpDraftInput, decoder_batch_max_mtp_steps>;
@@ -59,7 +61,9 @@ public:
     /// A scored enqueue returns a device row usable as the next enqueue's input.
     const Bf16* enqueue(int position, int shifted_token, const Bf16* hidden, bool score,
                         cudaStream_t stream, const ConstraintWorkspace* scratch = nullptr,
-                        const ConstraintCandidates* allowed = nullptr);
+                        const ConstraintCandidates* allowed = nullptr,
+                        const MropePosition* mrope = nullptr, int rotary_position = -1,
+                        const Bf16* feature = nullptr);
     static void enqueue_wave(MtpDraftInput* rows, int count, bool score, cudaStream_t stream);
     static bool prepare_depth(MtpDraftRequest& lane, DraftDepthScratch& scratch,
                               std::uint8_t* activation, cudaStream_t stream);
@@ -68,7 +72,8 @@ public:
 
     void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                       const Bf16* residual, const Bf16* final_norm,
-                      const PrefillProjections& projections, MtpPrefillBuffers buffers);
+                      const PrefillProjections& projections, MtpPrefillBuffers buffers,
+                      const MediaPrefill* media = nullptr);
 
     /// Read the most recent scored enqueue after its stream has completed.
     int read_token() const;
@@ -83,7 +88,8 @@ public:
 private:
     const Bf16* enqueue_impl(int position, int shifted_token, const Bf16* hidden, bool score,
                             cudaStream_t stream, const ConstraintWorkspace* scratch,
-                            const ConstraintCandidates* allowed, bool defer_score);
+                            const ConstraintCandidates* allowed, bool defer_score,
+                            const MropePosition* mrope, int rotary_position, const Bf16* feature);
     static void enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
                                   cudaStream_t stream, bool defer_score);
     friend class GpuPrefixSnapshotStore;

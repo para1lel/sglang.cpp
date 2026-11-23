@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from benchmarks.concurrent import client as concurrent
 from benchmarks.streaming import check_vllm, client as streaming
+import cold_cache
 import default_evidence as defaults
 from identity import verify_stream_end
 from makespan import cohort_makespan_ns, compare, validate_cohort
@@ -118,7 +119,7 @@ def campaign(directory):
                 "Exact campaign cannot select an opt-in native configuration")
         return None
     profile = identity["native_profile"]
-    if identity["protocol"] == defaults.PROTOCOL:
+    if identity["protocol"] in (defaults.PROTOCOL, defaults.CACHE_ON_PROTOCOL):
         require(profile == defaults.PROFILE and receipt_version(identity) == 2
                 and "native_config" not in identity
                 and Path(identity["checkpoint_path"]).is_absolute()
@@ -126,6 +127,11 @@ def campaign(directory):
                 and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
                                  identity["campaign_id"]),
                 "Invalid native defaults campaign identity")
+        if identity["protocol"] == defaults.CACHE_ON_PROTOCOL:
+            require(identity.get("cache_policy") == defaults.CACHE_POLICY,
+                    "Invalid cold-cache campaign policy")
+        else:
+            require("cache_policy" not in identity, "Historical defaults do not reset the cache")
         return identity, hashlib.sha256(raw).hexdigest()
     config = identity["native_config"]
     expected = {"fp8_prefill": "tensor-core-mtp-target", "mtp_steps": 4, "mtp_int8_head": True}
@@ -187,7 +193,12 @@ def arm_binding(directory, arm, selected, version):
 
 
 def default_campaign(selected):
-    return selected is not None and selected[0]["protocol"] == defaults.PROTOCOL
+    return selected is not None and selected[0]["protocol"] in (
+        defaults.PROTOCOL, defaults.CACHE_ON_PROTOCOL)
+
+
+def cache_on_campaign(selected):
+    return selected is not None and selected[0]["protocol"] == defaults.CACHE_ON_PROTOCOL
 
 
 def native_info(run, identity, *, opt_in):
@@ -239,7 +250,10 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
     directory.mkdir()
     for lane, body, _ in lanes:
         (directory / f'{lane["lane"]:02d}.request.json').write_bytes(body)
+    cache_on = cache_on_campaign(selected)
+    engine = "vllm" if arm == "vllm-k4" else "native"
     for tag in schedule(row, arm):
+        cache_receipt = cold_cache.before_cohort(url, engine) if cache_on else None
         if row in streaming.SHAPES:
             _, body, case = lanes[0]
             raw = {"row": row, "tag": tag, "requests": [streaming.measure(url, case, body)]}
@@ -249,9 +263,16 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
                 raw = concurrent.capture_cohort(url, row, lanes, tag, policy)
         if binding is not None:
             raw["binding"] = binding
-        with gzip.open(directory / f"{tag}.json.gz", "wt", compresslevel=3) as stream:
-            json.dump(raw, stream, separators=(",", ":"), allow_nan=False)
+        try:
+            if cache_receipt is not None:
+                raw["cold_cache"] = cache_receipt
+                cold_cache.after_cohort(url, engine, cache_receipt)
+        finally:
+            with gzip.open(directory / f"{tag}.json.gz", "wt", compresslevel=3) as stream:
+                json.dump(raw, stream, separators=(",", ":"), allow_nan=False)
         _, outputs = replay(raw, row, tag, lanes, policy, binding)
+        if cache_on:
+            cold_cache.replay(raw, engine)
         if arm == EXACT_CONTROL:
             identity, _ = selected
             diagnostic = {"protocol": OPT_IN_PROTOCOL, "row": row, **binding,
@@ -317,6 +338,8 @@ def assess(row, fixtures, directory):
     identity = receipt_identity(directory, selected)
     version = receipt_version(identity)
     use_defaults = default_campaign(selected)
+    cache_on = cache_on_campaign(selected)
+    cache_receipts = {}
     if use_defaults:
         require(digest(directory / "protocol.sha256") == identity["protocol_sha256"],
                 "Saved protocol manifest differs from the default campaign")
@@ -341,8 +364,14 @@ def assess(row, fixtures, directory):
         tags = schedule(row, arm)
         require({path.name for path in measurement.glob("*.json.gz")}
                 == {f"{tag}.json.gz" for tag in tags}, f"{arm}: wrong cohort set")
+        engine = "vllm" if arm == "vllm-k4" else "native"
+        if cache_on:
+            cache_receipts[arm] = {}
         for tag in tags:
-            duration, outputs = replay(read_raw(measurement, tag), row, tag, lanes, policy, binding)
+            raw = read_raw(measurement, tag)
+            duration, outputs = replay(raw, row, tag, lanes, policy, binding)
+            if cache_on:
+                cache_receipts[arm][tag] = cold_cache.replay(raw, engine)
             if arm == "native-k0":
                 expected = outputs
             elif arm == EXACT_CONTROL:
@@ -354,8 +383,10 @@ def assess(row, fixtures, directory):
     result = {"protocol": PROTOCOL, "row": row, **compare(
         {row: samples["native-k4"]}, {row: samples["vllm-k4"]}, eligible=True)}
     if use_defaults:
-        result.update(protocol=defaults.PROTOCOL, native_profile=defaults.PROFILE,
+        result.update(protocol=identity["protocol"], native_profile=defaults.PROFILE,
                       campaign_sha256=selected[1], vllm_role="timing-only")
+        if cache_on:
+            result.update(cache_policy=identity["cache_policy"], cache_receipts=cache_receipts)
     elif selected:
         identity, fingerprint = selected
         result.update(protocol=OPT_IN_PROTOCOL, native_profile=identity["native_profile"],
@@ -367,20 +398,27 @@ def assess(row, fixtures, directory):
     return result
 
 
-def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measurement=False):
+def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measurement=False,
+                         prefix_cache=False):
     cpus = fields(reservation / "cpus.txt")
     group = "W1-W2" if row in streaming.SHAPES else row
     evidence = saved_worker(run, run, cpus, device(reservation)["uuid"], group, speculative=True,
-                            before_measurement=before_measurement)
+                            before_measurement=before_measurement, prefix_cache=prefix_cache)
     worker = evidence["effective"]
     reference = concurrent.reference()["observed_vllm_settings"]
     require(all(worker[key] == reference[key] for key in ("vllm", "torch", "torch_cuda"))
             and worker["scheduler"]["max_num_scheduled_tokens_effective"] == 8192,
             "Unexpected vLLM runtime or target row cap")
-    check_vllm.audit(load(run / "effective-worker.json"), speculative=True)
+    check_vllm.audit(load(run / "effective-worker.json"), speculative=True,
+                     prefix_cache=prefix_cache)
     config = load(run / "server-info.json")["vllm_config"]
     spec = config["speculative_config"]
     attention = config["attention_config"]
+    if prefix_cache:
+        cache = config["cache_config"]
+        require(all(cache[key] == worker["cache"][key] for key in (
+            "enable_prefix_caching", "mamba_cache_mode", "block_size", "mamba_block_size")),
+            "vLLM API and worker disagree about resolved hybrid prefix caching")
     require(spec["method"] == "mtp" and type(spec["num_speculative_tokens"]) is int
             and spec["num_speculative_tokens"] == 4
             and Path(spec["model"]).resolve() == checkpoint
@@ -398,10 +436,11 @@ def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measuremen
 
 
 def check_vllm_worker(row, run, reservation, checkpoint, *, before_measurement=False):
+    selected = campaign(run.parent)
     evidence, kernels = vllm_worker_evidence(row, run, reservation, checkpoint,
-                                             before_measurement=before_measurement)
+                                             before_measurement=before_measurement,
+                                             prefix_cache=cache_on_campaign(selected))
     if before_measurement:
-        selected = campaign(run.parent)
         require(default_campaign(selected), "Expected a native defaults campaign")
         port = defaults.vllm_argv(run, fields(reservation / "cpus.txt"),
                                   device(reservation)["uuid"])
@@ -433,7 +472,9 @@ def verify_default_receipts(row, run, identity):
             "vLLM environment changed during use")
     defaults.client(run, identity, port)
     evidence, kernels = vllm_worker_evidence(row, run, reservation,
-                                             Path(identity["checkpoint_path"]))
+                                             Path(identity["checkpoint_path"]),
+                                             prefix_cache=(identity["protocol"] ==
+                                                           defaults.CACHE_ON_PROTOCOL))
     require(load(run / "worker-identity.json") == evidence
             and load(run / "attention-kernels.json") == kernels,
             "Saved vLLM worker differs from the resolved receipts")

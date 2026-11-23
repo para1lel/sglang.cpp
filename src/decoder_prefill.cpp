@@ -3,6 +3,7 @@
 
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
+#include "sglang/decoder_prefix_cache.h"
 #include "sglang/prefill_fp8.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/prefill_attn_sm100.h"
@@ -118,13 +119,14 @@ struct Chunk : PrefillProjections {
     }
 
     void seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
-                    const Bf16* final_norm, bool wmma) const {
+                    const Bf16* final_norm, bool wmma, const MediaPrefill* media) const {
         static_assert(intermediate_size >= 2 * hidden_size);
         static_assert(std::max(text_gdn_value_width, text_gqa_q_width) >= hidden_size);
         const PrefillProjections projections{activation, seed_rows, stream, false, false, wmma};
         draft.seed_prefill(position, shifted_tokens, work.hidden, work.residual, final_norm,
                            projections, {work.normalized, work.projected_attention, work.mlp_gate,
-                                         work.attention, work.keys, work.values, work.rope_keys});
+                                         work.attention, work.keys, work.values, work.rope_keys},
+                           media);
     }
 
     void gdn_input(const GdnLayer& layer) const {
@@ -176,7 +178,7 @@ struct Chunk : PrefillProjections {
     }
 
     void gdn_attention(const GdnLayer& layer, TextGdnState state, int bank) const {
-        const bool quantized = tensor_core_fp8 && !mrope;
+        const bool quantized = tensor_core_fp8;
         gdn_recur(layer, state, bank, quantized ? activation : TextFp8Activation{});
         const auto input = quantized
             ? TextFp8ActivationView{activation.values, activation.scales}
@@ -304,6 +306,15 @@ void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant
     }
 }
 
+void publish_prefill_snapshot(const PrefillGrant& grant, cudaStream_t stream) {
+    const auto* snapshot = grant.snapshot;
+    if (!snapshot || grant.position + grant.rows != snapshot->position) return;
+    snapshot->publishing = true;
+    snapshot->cache.store(*grant.request, snapshot->prompt, snapshot->options.prefix_cache_salt,
+                          snapshot->position, stream, grant.draft, snapshot->media.get());
+    snapshot->publishing = false;
+}
+
 constexpr int layerwise_row_alignment = 128;
 constexpr int max_layerwise_rows = 1023;
 constexpr int min_partial_prefill_rows = 256;
@@ -320,19 +331,17 @@ int aligned_layerwise_rows(int rows) {
         layerwise_row_alignment;
 }
 
-PrefillGroup prefill_group(const PrefillGrant* grants, int count, bool mixed) {
+PrefillGroup prefill_group(const PrefillGrant* grants, int count) {
     PrefillGroup group{0, 0};
-    int aligned_rows = 0;
     for (int index = 0; index < count; ++index) {
         const auto& grant = grants[index];
-        const int aligned = aligned_layerwise_rows(grant.rows);
         if (grant.rows < 256 || grant.rows != grant.tile_rows ||
-            (!mixed && aligned != grant.rows) || aligned > max_layerwise_rows - aligned_rows) {
+            aligned_layerwise_rows(grant.rows) != grant.rows ||
+            grant.rows > max_layerwise_rows - group.rows) {
             break;
         }
         ++group.grants;
         group.rows += grant.rows;
-        aligned_rows += aligned;
     }
     return group.grants > 1 ? group : PrefillGroup{1, 0};
 }
@@ -347,10 +356,10 @@ void each_prefill_segment(const PrefillGrant* grants, int count, int offset, Run
 }
 
 template <typename Run>
-void each_attention_group(const PrefillGrant* grants, int count, bool mixed, Run run) {
+void each_attention_group(const PrefillGrant* grants, int count, Run run) {
     int offset = 0;
     for (int index = 0; index < count;) {
-        const auto group = prefill_group(grants + index, count - index, mixed);
+        const auto group = prefill_group(grants + index, count - index);
         run(grants + index, group.grants, offset);
         offset += group.grants == 1 ? grants[index].rows : group.rows;
         index += group.grants;
@@ -373,7 +382,7 @@ void read_paged_sequences(const PagedPrefillSequence* sequences, int count, cuda
 
 Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, int offset) {
     return Chunk{{{}, grant.rows, chunk.stream, true}, chunk.work.attention_segment(offset),
-                 grant.position, nullptr};
+                 grant.position, grant.media ? grant.media->positions + grant.position : nullptr};
 }
 
 bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
@@ -562,8 +571,8 @@ void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
 }
 
 void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, PrefillGroup group,
-                       PrefillWorkspace& workspace, bool mixed,
-                       PrefillAttentionMode attention_mode, int serial_capacity = 0) {
+                       PrefillWorkspace& workspace, PrefillAttentionMode attention_mode,
+                       int serial_capacity = 0) {
     const auto stream = workspace.stream();
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
     const TileBuffers buffers(layout, workspace.capacity());
@@ -577,8 +586,9 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     const Chunk chunk{{buffers.activation, group.rows, stream, true,
                        grouped || serial_attention}, buffers, 0, nullptr};
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
-        gather_embeddings(model.embedding, grant.tokens, grant.rows,
-                          buffers.residual + offset * hidden_size, stream);
+        auto* residual = buffers.residual + offset * hidden_size;
+        gather_embeddings(model.embedding, grant.tokens, grant.rows, residual, stream);
+        if (grant.media) grant.media->substitute(residual, grant.position, grant.rows, stream);
     });
     execute_layers(
         model.layers,
@@ -602,7 +612,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             } else if (grouped && can_batch_staged_gqa(grants, group.grants)) {
                 prefill_group_gqa(chunk, layer, bank, grants, group.grants, 0, true);
             } else {
-                each_attention_group(grants, group.grants, mixed,
+                each_attention_group(grants, group.grants,
                                      [&](const PrefillGrant* first, int count, int offset) {
                     prefill_group_gqa(chunk, layer, bank, first, count, offset);
                 });
@@ -634,7 +644,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             } else if (grouped) {
                 prefill_group_gdn(chunk, layer, bank, grants, group.grants, 0);
             } else {
-                each_attention_group(grants, group.grants, mixed,
+                each_attention_group(grants, group.grants,
                                      [&](const PrefillGrant* first, int count, int offset) {
                     prefill_group_gdn(chunk, layer, bank, first, count, offset);
                 });
@@ -653,10 +663,11 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                 grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
             seed.seed_draft(*grant.draft, grant.tokens + 1,
                             std::min(grant.rows, grant.prompt_remaining - 1),
-                            model.final_norm, wmma);
+                            model.final_norm, wmma, grant.media);
         }
         capture_prefill_scores(model, grant, &buffers, offset, stream);
         stage_prefill_row(*grant.request, buffers, offset + grant.rows - 1, stream);
+        publish_prefill_snapshot(grant, stream);
     });
 }
 
@@ -677,8 +688,7 @@ bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* gra
             for (int lane = 0; lane < lanes; ++lane) {
                 group[lane] = prefill_tile(grants[index + lane], offset);
             }
-            prefill_layerwise(model, group.data(), {lanes, rows}, workspace, false,
-                              attention_mode);
+            prefill_layerwise(model, group.data(), {lanes, rows}, workspace, attention_mode);
             ++stats.layerwise_prefill_groups;
             stats.layerwise_prefill_rows += rows;
         }
@@ -702,8 +712,7 @@ PrefillGroup partial_projection_group(const PrefillGrant* grants, int count) {
 }
 
 void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant* grants,
-                                   int count, PrefillWorkspace& workspace, int capacity,
-                                   bool prefix_cache, bool label_scores);
+                                   int count, PrefillWorkspace& workspace, int capacity);
 
 bool prefill_partial_projection_tiles(const DecoderModel& model, const PrefillGrant* grants,
                                       int count, cudaStream_t stream,
@@ -712,16 +721,19 @@ bool prefill_partial_projection_tiles(const DecoderModel& model, const PrefillGr
     int serial_capacity = 1;
     for (int index = 0; index < count; ++index) {
         const auto& grant = grants[index];
-        if (grant.exact || grant.media || grant.scores) return false;
         serial_capacity = std::max(serial_capacity, grant.tile_rows);
     }
     int capacity = serial_capacity;
+    bool grouped = false;
     for (int index = 0; index < count;) {
         const auto group = partial_projection_group(grants + index, count - index);
-        if (group.grants >= 2) capacity = std::max(capacity, group.rows);
+        if (group.grants >= 2) {
+            grouped = true;
+            capacity = std::max(capacity, group.rows);
+        }
         index += std::max(1, group.grants);
     }
-    if (capacity == serial_capacity) return false;
+    if (!grouped) return false;
 
     PrefillWorkspace workspace(stream, capacity);
     if (!workspace.data()) return false;
@@ -729,15 +741,14 @@ bool prefill_partial_projection_tiles(const DecoderModel& model, const PrefillGr
     for (int index = 0; index < count;) {
         const auto group = partial_projection_group(grants + index, count - index);
         if (group.grants >= 2) {
-            prefill_layerwise(model, grants + index, group, workspace, false,
+            prefill_layerwise(model, grants + index, group, workspace,
                               PrefillAttentionMode::serial_segments, serial_capacity);
             ++stats.layerwise_prefill_groups;
             stats.layerwise_prefill_rows += group.rows;
             index += group.grants;
             continue;
         }
-        enqueue_native_prefill_grants(model, grants + index, 1, workspace, serial_capacity,
-                                      false, false);
+        enqueue_native_prefill_grants(model, grants + index, 1, workspace, serial_capacity);
         ++index;
     }
     workspace.close();
@@ -791,9 +802,12 @@ void PrefillProjections::project(Bf16Weight weight, const Bf16* input, Bf16* out
 }
 
 void Decoder::Model::seed_draft(Workspace& work, MtpDraftRequest& draft, int position,
-                                int shifted_token, cudaStream_t stream) const {
+                                int shifted_token, cudaStream_t stream,
+                                const MediaPrefill* media) const {
     normalize_final(work, stream);
-    draft.enqueue(position, shifted_token, work.normalized, false, stream);
+    draft.enqueue(position, shifted_token, work.normalized, false, stream, nullptr, nullptr,
+                  media ? media->positions + position : nullptr, -1,
+                  media ? media->feature(position + 1) : nullptr);
 }
 
 int PromptLogprobCapture::score_end(int position, int rows) const {
@@ -833,7 +847,8 @@ void decoder::finish_prompt_logprobs(const DecoderOptions& options, DecoderPromp
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
                                    PrefillWorkspace& workspace, MtpDraftRequest* draft,
                                    int prompt_remaining, const MediaPrefill* media,
-                                   const PromptLogprobCapture* scores, bool exact,
+                                   const PromptLogprobCapture* scores,
+                                   const PrefillSnapshotCapture* snapshot,
                                    int logical_capacity) const {
     const auto stream = workspace.stream();
     const int capacity = logical_capacity ? logical_capacity : workspace.capacity();
@@ -841,9 +856,11 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         position < 0 ||
         position > text_attention_max_tokens - rows ||
         (position + rows - 1) / mxfp8_page_size >= request.pages.page_count ||
-        (draft && (prompt_remaining < rows || media))) {
+        (draft && prompt_remaining < rows)) {
         throw std::invalid_argument("Invalid decoder prefill tile");
     }
+    const PrefillGrant grant{&request, tokens, position, rows, rows, prompt_remaining,
+                             draft, media, scores, snapshot};
     if (rows == 1 || !workspace.data()) {
         if (!std::all_of(tokens, tokens + rows,
                          [](int token) { return token >= 0 && token < vocab_size; })) {
@@ -858,7 +875,6 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                 &request, tokens[row], token_position, TextGdnMode::prefill, false,
                 media ? media->feature(token_position) : nullptr,
                 media ? media->positions + token_position : nullptr};
-            lane.exact = exact || media;
             forward(&lane, 1, stream);
             if (token_position >= first && token_position < end) {
                 scores->enqueue(*this, request.work, token_position, pending++, stream);
@@ -867,15 +883,16 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                 }
             }
             if (draft && row + 1 < prompt_remaining) {
-                seed_draft(request.work, *draft, token_position, tokens[row + 1], stream);
+                seed_draft(request.work, *draft, token_position, tokens[row + 1], stream, media);
             }
         }
         if (scores) scores->collect(pending, stream);
+        publish_prefill_snapshot(grant, stream);
         return;
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
     const TileBuffers buffers(layout, capacity);
-    const bool tensor_core = backend.tensor_core_prefill && !exact && !media;
+    const bool tensor_core = backend.tensor_core_prefill;
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
                       media ? media->positions + position : nullptr};
     const auto& work = chunk.work;
@@ -903,41 +920,36 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         const bool wmma = tensor_core && backend.draft.wmma_seed_fc &&
                           position + prompt_remaining >= wmma_seed_min_prompt_tokens;
         chunk.seed_draft(*draft, tokens + 1, std::min(rows, prompt_remaining - 1),
-                         final_norm, wmma);
+                         final_norm, wmma, media);
     }
-    if (scores) {
-        const PrefillGrant grant{&request, tokens, position, rows, rows, 0, nullptr, nullptr,
-                                 scores};
-        capture_prefill_scores(*this, grant, &work, 0, stream);
-    }
+    capture_prefill_scores(*this, grant, &work, 0, stream);
     stage_prefill_row(request, work, rows - 1, stream);
+    publish_prefill_snapshot(grant, stream);
 }
 
 namespace {
 
 void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant* grants,
-                                   int count, PrefillWorkspace& workspace, int capacity,
-                                   bool prefix_cache, bool label_scores) {
+                                   int count, PrefillWorkspace& workspace, int capacity) {
     const auto stream = workspace.stream();
     for (int index = 0; index < count; ++index) {
         const auto& grant = grants[index];
-        if (grant.rows == 1 && grant.draft && grant.prompt_remaining > 1) {
-            model.seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1],
-                             stream);
-        } else if (grant.rows == 1 && !label_scores) {
+        if (grant.rows == 1) {
+            if (grant.draft && grant.prompt_remaining > 1) {
+                model.seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1],
+                                 stream, grant.media);
+            }
             capture_prefill_scores(model, grant, nullptr, 0, stream);
+            publish_prefill_snapshot(grant, stream);
         } else {
             for (int offset = 0; offset < grant.rows;) {
                 const int rows = std::min({grant.tile_rows, capacity, grant.rows - offset});
                 model.prefill_chunk(*grant.request, grant.tokens + offset, rows,
                                     grant.position + offset, workspace, grant.draft,
                                     grant.prompt_remaining - offset, grant.media, grant.scores,
-                                    label_scores || prefix_cache || grant.exact, capacity);
+                                    grant.snapshot, capacity);
                 offset += rows;
             }
-        }
-        if (label_scores && grant.rows == grant.prompt_remaining) {
-            model.enqueue_label_logits(*grant.request, stream);
         }
     }
 }
@@ -945,8 +957,8 @@ void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant
 }
 
 void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaStream_t stream,
-                                   DecoderBatchStepStats& stats, bool prefix_cache,
-                                   bool label_scores) const {
+                                   DecoderBatchStepStats& stats) const {
+    if (count == 0 || try_prefill_projection_groups(*this, grants, count, stream, stats)) return;
     int capacity = 1;
     for (int index = 0; index < count; ++index) {
         capacity = std::max(capacity, grants[index].tile_rows);
@@ -956,8 +968,7 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
         workspace.emplace(stream, prefill_chunk_rows);
     }
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
-    enqueue_native_prefill_grants(*this, grants, count, *workspace, workspace->capacity(),
-                                  prefix_cache, label_scores);
+    enqueue_native_prefill_grants(*this, grants, count, *workspace, workspace->capacity());
     workspace->close();
 }
 

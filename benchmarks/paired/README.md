@@ -148,27 +148,56 @@ Campaign metadata and version 2 evidence distinguish long and bounded split.
 
 ### Native server defaults against matched vLLM K4
 
-Use a fresh campaign directory. `server-defaults` is selected by default.
-Use a verified Release that resolves its default to MTP4, 32 active requests,
-an 8,192-token scheduling budget, prefix caching off, and CUDA graphs enabled.
-The native timed process receives only the loopback port argument and a clean
-environment for device selection, library loading, and private cache paths.
-Its operator settings come from the Release defaults. The separate W1 trace
-adds only the trace switch and proves depth-four activity. This profile does
-not start a native K0 control or test cross-engine output equality.
+Use a fresh campaign directory. `server-defaults` is selected by default and
+writes `matched-k4-native-defaults-cache-on-v2` receipts. Use a verified Release
+whose defaults resolve to MTP4, 32 active requests, an 8,192-token scheduling
+budget, four prefix-cache entries, and CUDA graphs. The native timed process
+receives only `--port` with a clean device and library environment. Its W1
+activity trace adds `--trace-batches` in a separate process.
 
-The pinned vLLM launcher explicitly selects MTP4 and the common scheduling
-settings, and retains the pinned cache and backend recipe. Its literal default
-startup is outside this profile. Both arms use the same physical B200, local
-NUMA placement, CPU sets, checkpoint and frozen requests. The campaign uses
-the same W1–W6 gate order and alternates timed arm order by row.
+Pinned vLLM explicitly enables prefix caching and MTP4. Startup validation binds
+its effective aligned GDN cache mode and block sizes to both API and worker
+observations. Both arms use the same physical B200, local NUMA placement, CPU
+sets, checkpoint, inputs, row order, and measurement windows. vLLM provides
+timing. Native K0 and cross-engine output equality are outside this profile.
 
-The `matched-k4-native-defaults-v1` receipt labels the vLLM arm `timing-only`.
-Offline replay checks the native executable, the observed arguments and
-environment of both API processes, their CPU and GPU receipts, the effective
-vLLM API and worker settings, the native W1 trace, and fresh vLLM MTP activity.
-Each archived cohort binds its launch and resolved configuration to the
-campaign and arm. Use the same `assess` command as the other K4 profiles.
+Both arms drain, issue `POST /reset_prefix_cache` with an empty JSON object, require a
+successful acknowledgement, and sample idle cache counters before every warmup,
+measured cohort, and the separate W1 trace. The client starts its measurement
+clock after those controls. Every fixed W1–W6 request must report zero reused
+prompt tokens and the engine's prefix hit counter must remain unchanged during
+its cohort. W3–W6 lane prompts have distinct first tokens. Resetting between
+replays keeps repeated fixed bodies cold even after a previous cohort populated
+cache. Raw cohorts retain the reset response, before and after metrics, and
+control timestamps. Offline `assess` checks these alongside the launch, device,
+stream, and MTP evidence.
+
+The archived `matched-k4-native-defaults-v1` protocol used a cache-disabled
+Release launched with the same port-only arguments, an explicit cache-off vLLM
+launch, and no cohort resets. Its receipts replay with the same `assess` command.
+To capture that profile on its historical Release, use a fresh campaign and set
+`PAIRED_K4_NATIVE_PROFILE=server-defaults-cache-off`. Use the archived protocol
+source and pinned Release when reconstructing an exact historical campaign.
+
+### Prefix-reuse diagnostic
+
+Run this separately against each verified cache-enabled K4 endpoint. Use the
+same B200, placement, launch settings, and frozen W3 fixtures for both arms.
+Use a fresh evidence directory for each endpoint.
+
+```sh
+PYTHONPATH="$PWD" python3 -B benchmarks/paired/prefix_reuse.py native     http://127.0.0.1:17424 FIXTURES NATIVE_EVIDENCE
+PYTHONPATH="$PWD" python3 -B benchmarks/paired/prefix_reuse.py vllm     http://127.0.0.1:17424 FIXTURES VLLM_EVIDENCE
+```
+
+The diagnostic first resets and captures cold W3. It resets again, then sends
+one 6,401-token off-branch prime. The following four 8,192-token prompts share
+its first 6,400 IDs and diverge immediately afterward. Each returns 1,024 output
+IDs. The diagnostic saves actual per-lane cached IDs, prefix-counter deltas, and
+SSE. It verifies positive reuse up to the common prefix on every lane and records
+vLLM depth-four decoding activity. The last reset must make the identical prime
+cold again. Different cache block geometry can produce different hit vectors.
+Keep these measurements separate from the fixed W1–W6 comparison.
 
 ## Replay the historical GPU 2 arm
 

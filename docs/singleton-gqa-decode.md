@@ -8,13 +8,13 @@ runtime. Current B200 text decode and verification are described under
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L617)<!-- prefix: "const auto r" --> · [Lane selection](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L486)<!-- prefix: "first.narrow" --> |
+| Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L628)<!-- prefix: "const auto r" --> · [Lane selection](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L486)<!-- prefix: "first.narrow" --> |
 | Batch execution owner | Allocates and releases the shared score buffer. | [Allocation](../src/decoder_resources.cpp#L551)<!-- prefix: "ExactGqaWork" --> · [Device release](../src/decoder_resources.cpp#L259)<!-- prefix: "CleanupError" --> |
 | Exact attention | Computes FP32 scores and consumes them in token order. | [Score and replay launches](../include/sglang/text/gqa_ordered_launch.cuh#L4)<!-- prefix: "cudaError_t " --> |
 
 ## Runtime path
 
-The batch selects this path for one ordinary text decode row with 32,768–36,864 visible tokens, including the current token. The step needs zero prefill rows, no MTP work, and no rotary position override. Both FP8 prefill policies support it. Independent full-prefix-hit scoring can share the step. The standalone serial decoder and the eager remainder of a packed group keep their existing attention paths. [Window](../include/sglang/decoder_internal.h#L475)<!-- prefix: "inline const" --> · [Packed remainder](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L573)<!-- prefix: "if (remainin" -->
+The batch selects this path for one ordinary text decode row with 32,768–36,864 visible tokens, including the current token. The step needs zero prefill rows, no MTP work, and no rotary position override. Both FP8 prefill policies support it. Independent full-prefix-hit scoring can share the step. The standalone serial decoder and the eager remainder of a packed group keep their existing attention paths. [Window](../include/sglang/decoder_internal.h#L476)<!-- prefix: "inline const" --> · [Packed remainder](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L573)<!-- prefix: "if (remainin" -->
 
 With tensor-core prefill and no MTP work, a prefill step can reuse the buffer for an ordinary text lane's final one-row prompt grant. It can also reuse it for an ordinary decode row when all other work in the step consists of multi-row prefill or cache-hit scoring. These eager rows qualify above their inline score capacity and through 36,864 visible tokens. Each layer's score and replay launches run in stream order before the next row uses the buffer. [Batch selection](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/decoder_batch.cpp#L675)<!-- prefix: "const auto e" --> · [Eager binding](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L421)<!-- prefix: "void prepare" -->
 
@@ -66,9 +66,9 @@ for groups of 2–20 target rows. It requires vector attention and the full-cont
 split-KV policy. Every row must be in the split window. Other eager groups use
 per-row preprocessing, append, and gating. They can still group eligible split reads.
 Graph replay uses bound verification dispatch.
-[Dispatch](../src/decoder_forward.cpp#L710)<!-- prefix: "if (!try_gqa" --> ·
+[Dispatch](../src/decoder_forward.cpp#L709)<!-- prefix: "if (!try_gqa" --> ·
 [Eligibility](../include/sglang/text/gqa_verify_batch.h#L62)<!-- prefix: "inline bool " --> ·
-[Bound verification](../src/decoder_forward.cpp#L562)<!-- prefix: "void attend_" -->
+[Bound verification](../src/decoder_forward.cpp#L563)<!-- prefix: "void attend_" -->
 
 Wide K4 verification applies these dispatch rules separately to each 20-row packet.
 

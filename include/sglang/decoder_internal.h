@@ -33,6 +33,7 @@ class MtpDraftRequest;
 class PrefillWorkspace;
 struct PrefillGrant;
 struct PromptLogprobCapture;
+struct PrefillSnapshotCapture;
 struct MediaPrefill;
 struct MultimodalInput;
 class TargetVerification;
@@ -179,6 +180,7 @@ public:
     bool verification_graph_failed() const;
     void reclaim_deferred();
     void open_stream(std::shared_ptr<const void> owners = nullptr);
+    void retain_stream_owner(std::shared_ptr<const void> owner);
     void close_stream();
     void close();
     void recycle_after_completion();
@@ -469,7 +471,6 @@ struct ForwardLane {
     const MropePosition* mrope = nullptr;
     int rotary_position = -1;
     ExactGqaWorkspace singleton_scores{};
-    bool exact = false;
 };
 
 inline constexpr int singleton_score_min_visible = 32768;
@@ -480,6 +481,7 @@ static_assert(singleton_score_max_visible % mxfp8_page_size == 0 &&
 struct BatchDecodeBinding {
     TextLogitCandidate input;
     int position;
+    int rotary_position;
     ExactGqaWorkspace scores;
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
@@ -509,13 +511,13 @@ struct Decoder::Model {
 
     bool is_b200() const { return backend.uses_b200_operators; }
     int target_split_end() const { return backend.target_split_end; }
-    void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     bool verify_mtp(decoder::MtpRound* rounds, int count,
                     const decoder::ConstraintWorkspace& scratch, void* sampling_scratch,
                     cudaStream_t stream, decoder::VerificationGraph* graph,
                     const decoder::TcVocabScratch* vocabulary,
-                    std::uint8_t* packed_activation = nullptr) const;
+                    std::uint8_t* packed_activation = nullptr,
+                    void* logprob_workspace = nullptr) const;
     bool forward_verify(const decoder::VerificationSequence* sequences, int count,
                         cudaStream_t stream, decoder::VerificationGraph* graph,
                         const decoder::TcVocabScratch* vocabulary,
@@ -531,10 +533,10 @@ struct Decoder::Model {
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
                        const decoder::MediaPrefill* media = nullptr,
                        const decoder::PromptLogprobCapture* scores = nullptr,
-                       bool exact = false, int logical_capacity = 0) const;
+                       const decoder::PrefillSnapshotCapture* snapshot = nullptr,
+                       int logical_capacity = 0) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
-                        DecoderBatchStepStats& stats, bool prefix_cache,
-                        bool label_scores = false) const;
+                        DecoderBatchStepStats& stats) const;
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;
@@ -543,7 +545,8 @@ struct Decoder::Model {
     bool compute_eager_decode_logits(const decoder::ForwardLane* lanes, int count,
                                    cudaStream_t stream) const;
     void seed_draft(decoder::Workspace& work, decoder::MtpDraftRequest& draft, int position,
-                    int shifted_token, cudaStream_t stream) const;
+                    int shifted_token, cudaStream_t stream,
+                    const decoder::MediaPrefill* media = nullptr) const;
     void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
     void compute_prefill_logits(decoder::Workspace& work, cudaStream_t stream) const;
     void enqueue_label_logits(decoder::Request& request, cudaStream_t stream) const;
@@ -554,9 +557,8 @@ struct Decoder::Model {
                         DecoderResult& result, const decoder::MediaPrefill* media,
                         int step_budget) const;
     void advance_serial(decoder::Request& request, decoder::RequestProgress& progress,
-                        int input, bool media, int rotary_delta) const;
-    bool serial_graph(const DecoderOptions& options, bool media, int prompt_count, int limit)
-        const;
+                        int input, int rotary_delta) const;
+    bool serial_graph(const DecoderOptions& options, int prompt_count, int limit) const;
     void generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
                          const DecoderCallbacks& callbacks, DecoderResult& result,
                          std::shared_ptr<const decoder::MultimodalInput> media = nullptr,
@@ -568,7 +570,7 @@ struct Decoder::Model {
 
     template <typename Lane>
     void forward_layers(const Lane* lanes, int count, cudaStream_t stream,
-                        bool exact = false, std::uint8_t* packed_activation = nullptr) const;
+                        std::uint8_t* packed_activation = nullptr) const;
 
     int device;
     std::string accelerator_name;

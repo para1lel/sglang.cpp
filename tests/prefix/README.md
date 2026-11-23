@@ -48,7 +48,8 @@ xmake build -P "$PWD" sglang-server
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -pthread -Iinclude -I"$toolkit/include" \
     tests/prefix/cache_state.cpp -L"$out/lib" -L"$toolkit/lib" \
-    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaMemcpy2DAsync \
+    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaMemcpy2DAsync -Wl,--wrap=cudaMalloc \
+    -Wl,--wrap=cudaMemGetInfo \
     -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
     -lcudart -o "$out/prefix-state"
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" "$out/prefix-state"
@@ -67,43 +68,13 @@ Injected transfer failures check that an interrupted store publishes no entry an
 interrupted restore records no hit. Both paths must allow a clean retry.
 Run `--identity`, `--remapped`, or `--guards` to isolate one mode.
 
-For the route check, use the local Qwen3.8-27B-FP8 checkpoint and the same reserved device.
-Use an unused port and a fresh output directory.
+For HTTP cache coverage, run the [feature-complete route test](../media/http-contract.md) on the same reserved device and checkpoint. Compare cold, exact-hit, and suffix-hit usage with the matched cache-off arm. Cover full and partial pages, media identity, salt isolation, cancellation, and slot reuse.
 
-```bash
-port=17472
-checkpoint=/data0/shared/Qwen3.8-27B-FP8
-for mode in enabled disabled; do
-    cache_flags=()
-    check_flags=()
-    if [[ $mode == enabled ]]; then
-        cache_flags+=(--prefix-cache-entries 2)
-    else
-        check_flags+=(--disabled)
-    fi
-    CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/bin/sglang-server" --checkpoint "$checkpoint" \
-        --port "$port" --max-active 4 --batch-cuda-graphs \
-        "${cache_flags[@]}" >"$out/$mode.log" 2>&1 &
-    server=$!
-    trap 'kill "$server" 2>/dev/null || true' EXIT
-    curl -fsS --retry 30 --retry-connrefused --retry-delay 1 \
-        "http://127.0.0.1:$port/health"
-    python3 -B tests/prefix/routes.py --port "$port" --evidence "$out/$mode-routes" \
-        "${check_flags[@]}"
-    kill -TERM "$server"
-    wait "$server"
-    trap - EXIT
-done
-```
+The [archived route procedure](https://github.com/para1lel/sglang.cpp/blob/28148cda233e5522274e258d5eb5caa9ab83e313/tests/prefix/README.md#cuda-state-and-routes) used fixed greedy IDs and page-rounded checkpoint expectations. Its oracle was captured at `d69c77ffaff160f2b5693d82455328cda513e171`.
 
-The expected greedy IDs were captured with fresh exact-prefill requests on revision
-`d69c77ffaff160f2b5693d82455328cda513e171`. The script checks request and usage metadata,
-token IDs around page boundaries, cancellation with a concurrent peer, a replacement request,
-the omitted cache flag, and salt handling on all completion routes.
-
-For builds with finite EBNF, capture a fresh exact-prefill reference with the cache flag
-omitted. Start a separate cache-enabled exact server with at least four active lanes and
-run the warm check against the reference. Use a new evidence directory in each command.
+For builds with finite EBNF, start a cold server with `--prefix-cache-entries 0`.
+Start a warm server with at least four active lanes and prefix reuse enabled. Match the
+checkpoint, backend, and step budget. Use a new evidence directory in each command.
 
 ```bash
 python3 -B tests/prefix/grammar_routes.py reference --port "$cold_port" \
@@ -120,9 +91,8 @@ reported cache hits.
 
 ### Historical Tensor Core cache parity
 
-On B200, the current probe's cache-disabled oracle can use Tensor Core prefill. The
-cache-enabled candidate uses exact prefill. Its byte comparisons therefore span two
-prefill backends. [Probe setup](tensor_state.cpp#L226)<!-- prefix: "DecoderBatch" --> · [Prefill dispatch](../../src/decoder_prefill.cpp#L935)<!-- prefix: "label_scores" -->
+This archived check predates the shared prefill executor. Use the pinned revision below
+for both arms. On current builds, cache enablement does not select a separate prefill backend.
 
 To reproduce the Tensor Core parity check, use revision
 `39ecda9f370d0c3605296e6a028ef3561294d6e7` for both the release build and the test runner.
@@ -162,10 +132,10 @@ CUDA_VISIBLE_DEVICES="$GPU_UUID" python3 -B tests/prefix/mtp_routes.py \
     --server "$out/bin/sglang-server" --checkpoint "$checkpoint" --output "$out/mtp-routes"
 ```
 
-Both native batches enable the prefix cache to select exact prefill. The test resets the
-cold batch's cache before each reference admission. It checks that the cold batch computes
-the entire prompt without restoring any target or draft rows. The native check compares target KV,
-GDN state, and full first logits byte for byte.
+Both native batches use the same backend policy and natural prefill boundaries. The test
+resets the cold cache before each admission and checks that it computes the whole prompt
+without restoring target or draft rows. At matched boundaries it compares target KV, GDN
+state, and full first logits byte for byte. [Cold control](mtp_state.cpp#L67)<!-- prefix: "void check_p" -->
 
 The fixture checks a K0 prime followed by a positive-depth miss and same-key enrichment.
 It covers K1–K4 consumers, K0 full and partial hits on a paired entry, and a changed suffix

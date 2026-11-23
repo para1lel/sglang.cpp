@@ -24,6 +24,7 @@ void project(Bf16Weight weight, const Bf16* input, Bf16* output, cudaStream_t st
 struct GraphLane {
     Request* request;
     const int* position;
+    const int* rotary_position;
     TextGdnMode mode;
     static constexpr bool narrow_gqa = true;
 };
@@ -75,8 +76,7 @@ struct LayerBatch {
 
     bool tensor_core_lane(int index) const {
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
-            return target_tc && lanes[index].mode == TextGdnMode::decode &&
-                !lanes[index].mrope && lanes[index].rotary_position < 0;
+            return target_tc && lanes[index].mode == TextGdnMode::decode;
         }
         return target_tc;
     }
@@ -495,7 +495,7 @@ cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
 template <typename Position>
 void append_gqa(const GqaLayer& layer, Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
                 Position position, cudaStream_t stream, const MropePosition* mrope,
-                int rotary_position) {
+                Position rotary_position) {
     if constexpr (std::is_same_v<Position, int>) {
         const auto status = mrope
             ? mrope_gqa_preprocess(mrope, 1, work.q_gate, work.keys, layer.query_norm,
@@ -507,7 +507,7 @@ void append_gqa(const GqaLayer& layer, Workspace& work, Mxfp8PageTable pages, Mx
         check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values,
                               stream), "Append MXFP8 KV");
     } else {
-        check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
+        check(decode_gqa_preprocess(rotary_position, work.q_gate, work.keys, layer.query_norm,
                                     layer.key_norm, work.rope_queries, work.rope_keys, stream),
               "Normalize and rotate decode Q/K");
         check(decode_kv_append(cache, pages, position, work.rope_keys, work.values, stream),
@@ -529,9 +529,10 @@ void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& b
         const auto* binding = lane.binding;
         const auto* position = &binding->position;
         auto& work = workspace(lane);
-        check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
-                                   layer.key_norm, work.rope_queries, work.rope_keys,
-                                   batch.stream), "Normalize and rotate bound decode Q/K");
+        check(decode_gqa_preprocess(&binding->rotary_position, work.q_gate, work.keys,
+                                    layer.query_norm, layer.key_norm, work.rope_queries,
+                                    work.rope_keys, batch.stream),
+              "Normalize and rotate bound Q/K");
         check(decode_kv_append(&binding->caches[cache_index], &binding->pages, position,
                               work.rope_keys, work.values, batch.stream),
               "Append bound decode MXFP8 KV");
@@ -568,9 +569,10 @@ void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>&
     for (int index = 0; index < batch.count; ++index) {
         auto& work = workspace(batch.lanes[index]);
         const auto* position = &binding.positions[index];
-        check(decode_gqa_preprocess(position, work.q_gate, work.keys, layer.query_norm,
-                                    layer.key_norm, work.rope_queries, work.rope_keys,
-                                    batch.stream), "Normalize and rotate bound verification Q/K");
+        check(decode_gqa_preprocess(&binding.rotary_positions[index], work.q_gate, work.keys,
+                                    layer.query_norm, layer.key_norm, work.rope_queries,
+                                    work.rope_keys, batch.stream),
+              "Normalize and rotate bound verification Q/K");
         check(decode_kv_append(cache, &binding.pages, position, work.rope_keys, work.values,
                                batch.stream), "Append bound verification MXFP8 KV");
         auto status = cudaSuccess;
@@ -627,20 +629,17 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         bool narrow_gqa = false;
         ExactGqaWorkspace singleton_scores{};
         const MropePosition* mrope = nullptr;
-        int rotary_position = -1;
         if constexpr (!std::is_same_v<Lane, VerificationRow>) {
             narrow_gqa = lane.narrow_gqa && !batch.ordered_attention;
         }
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
             mrope = lane.mrope;
-            rotary_position = lane.rotary_position;
             singleton_scores = lane.singleton_scores;
         }
         append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
-                   rotary_position);
+                   lane.rotary_position);
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
-            const bool ordered = batch.ordered_attention && rotary_position < 0;
-            if (!ordered && lane.mode == TextGdnMode::decode &&
+            if (!batch.ordered_attention && lane.mode == TextGdnMode::decode &&
                 batch.count > 1 && batch.count <= paged_decode_lanes &&
                 paged_decode_position(lane.position)) {
                 reads[count] = {cache, request.pages, lane.position, paged_gqa_buffers(work)};
@@ -648,7 +647,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
                 return;
             }
         }
-        const bool vector = batch.vector_attention && !mrope && rotary_position < 0;
+        const bool vector = batch.vector_attention;
         if constexpr (std::is_same_v<decltype(lane.position), int>) {
             if (batch.target_split_end && vector && lane.mode == TextGdnMode::decode &&
                 target_split_position(lane.position, batch.target_split_end)) {
@@ -768,11 +767,6 @@ void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
 
 }
 
-void Decoder::Model::forward(Request& request, int token_id, int position, TextGdnMode mode) const {
-    const ForwardLane lane{&request, token_id, position, mode, mode == TextGdnMode::decode};
-    forward(&lane, 1, request.memory.stream());
-}
-
 void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t stream) const {
     if (!lanes || count < 1 || count > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch width");
@@ -788,34 +782,28 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
                                  stream), "Look up token embedding");
         }
     }
-    for (int first = 0; first < count;) {
-        const bool exact = lanes[first].exact;
-        int end = first + 1;
-        while (end < count && lanes[end].exact == exact) {
-            ++end;
-        }
-        forward_layers(lanes + first, end - first, stream, exact);
-        first = end;
-    }
+    forward_layers(lanes, count, stream);
 }
 
 void Decoder::Model::forward_verification_layers(const VerificationRow* rows, int count,
                                                   cudaStream_t stream,
                                                   std::uint8_t* packed_activation) const {
-    forward_layers(rows, count, stream, false, packed_activation);
+    forward_layers(rows, count, stream, packed_activation);
 }
 
 void Decoder::Model::decode_graph(Request& request) const {
     const auto stream = request.memory.stream();
     if (!request.memory.graph()) {
+        auto* const position = request.decode_position;
+        auto* const rotary = position + 1;
         request.memory.capture_graph([&] {
             check(decode_embedding(embedding, vocab_size, hidden_size, request.work.argmax,
                                    request.work.residual, stream),
                   "Look up decode token embedding");
-            const GraphLane lane{&request, request.decode_position, TextGdnMode::decode};
+            const GraphLane lane{&request, position, rotary, TextGdnMode::decode};
             forward_layers(&lane, 1, stream);
             compute_logits(request, true);
-            check(advance_decode_position(request.decode_position, stream),
+            check(advance_decode_position(position, rotary, stream),
                   "Advance decode position");
         });
     }
@@ -839,20 +827,20 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
         return;
     }
     batch.each([&](const BatchGraphLane&, Workspace& work) {
-        compute_logits(work, stream);
+        compute_logits(work, stream, true);
     });
 }
 
 template <typename Lane>
 void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream,
-                                    bool exact, std::uint8_t* packed_activation) const {
+                                    std::uint8_t* packed_activation) const {
     const LayerBatch<Lane> batch{
         lanes, count, stream,
-        backend.ordered_attention && !exact,
-        backend.tensor_core_decode && !exact,
-        backend.vector_decode_attention && !exact,
-        backend.grouped_target_attention && !exact,
-        exact ? 0 : backend.target_split_end,
+        backend.ordered_attention,
+        backend.tensor_core_decode,
+        backend.vector_decode_attention,
+        backend.grouped_target_attention,
+        backend.target_split_end,
         packed_activation,
     };
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {

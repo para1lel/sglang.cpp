@@ -60,12 +60,15 @@ __global__ void decode_embedding_kernel(const __nv_bfloat16* weight, int vocab_s
     }
 }
 
-__global__ void set_decode_position_kernel(int* position, int value) {
+__global__ void set_decode_position_kernel(int* position, int value, int* rotary,
+                                          int rotary_value) {
     *position = value;
+    if (rotary) *rotary = rotary_value;
 }
 
-__global__ void advance_decode_position_kernel(int* position) {
+__global__ void advance_decode_position_kernel(int* position, int* rotary) {
     ++*position;
+    ++*rotary;
 }
 
 __device__ float bf16x2_dot(unsigned int lhs, unsigned int rhs, float sum) {
@@ -568,13 +571,14 @@ cudaError_t decoder::decode_embedding(const __nv_bfloat16* weight, int vocab_siz
                             block_threads, arguments, 0, stream);
 }
 
-cudaError_t decoder::set_decode_position(int* position, int value, cudaStream_t stream) {
-    void* arguments[] = {&position, &value};
+cudaError_t decoder::set_decode_position(int* position, int value, cudaStream_t stream,
+                                         int* rotary, int rotary_value) {
+    void* arguments[] = {&position, &value, &rotary, &rotary_value};
     return cudaLaunchKernel(set_decode_position_kernel, 1, 1, arguments, 0, stream);
 }
 
-cudaError_t decoder::advance_decode_position(int* position, cudaStream_t stream) {
-    void* arguments[] = {&position};
+cudaError_t decoder::advance_decode_position(int* position, int* rotary, cudaStream_t stream) {
+    void* arguments[] = {&position, &rotary};
     return cudaLaunchKernel(advance_decode_position_kernel, 1, 1, arguments, 0, stream);
 }
 

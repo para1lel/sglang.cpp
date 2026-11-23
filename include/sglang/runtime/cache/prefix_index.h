@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/decoder_batch.h"
+#include "sglang/runtime/cache/prefix_media_key.h"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sglang::decoder {
@@ -19,7 +21,7 @@ public:
     struct Match {
         int slot = -1;
         int tokens = 0;
-        int draft_rows = 0;
+        int draft_rows = -1;
         bool draft_miss = false;
 
     private:
@@ -41,7 +43,7 @@ public:
 
     struct Occupancy {
         int entries = 0;
-        int tokens = 0;
+        int pages = 0;
     };
 
     explicit PrefixIndex(int capacity) : capacity_(capacity) {
@@ -54,7 +56,7 @@ public:
 
     // max_tokens bounds the readable part of prompt.
     Match find(const std::vector<int>& prompt, std::string_view salt, int min_tokens,
-               int max_tokens, bool require_draft = false) const {
+               int max_tokens, bool require_draft, const MultimodalInput* media) const {
         Match match;
         int longest = std::max(min_tokens, 1) - 1;
         for (int position = 0; position < capacity_; ++position) {
@@ -62,10 +64,11 @@ public:
             const auto& entry = entries_[slot];
             if (entry.tokens <= longest || entry.tokens > max_tokens) continue;
 
-            const bool eligible = !require_draft || entry.draft_rows == entry.tokens - 1;
+            const bool eligible = !require_draft || entry.draft_rows >= 0;
             if ((!eligible && (match.slot != -1 || match.draft_miss)) ||
                 salt != std::string_view(entry.salt.data(), entry.salt_size) ||
-                !std::equal(entry.ids.begin(), entry.ids.begin() + entry.tokens, prompt.begin())) {
+                !std::equal(entry.ids.begin(), entry.ids.begin() + entry.tokens, prompt.begin()) ||
+                !entry.media.matches(media, entry.tokens)) {
                 continue;
             }
             if (!eligible) {
@@ -91,8 +94,8 @@ public:
         return true;
     }
 
-    // The caller preflights the transfer before invalidating a slot and publishes after completion.
-    Write begin_write(const Match& exact) {
+    // The selected slot remains readable until the caller completes transfer preflight.
+    Write select_write(const Match& exact) const {
         int position = exact.position;
         if (position == -1) {
             const auto end = recency_.begin() + capacity_;
@@ -101,34 +104,46 @@ public:
             position = free_slot == end ? capacity_ - 1 : free_slot - recency_.begin();
         }
         const int slot = recency_[position];
+        return Write(slot, exact.slot == -1 && entries_[slot].tokens != 0, position);
+    }
+
+    void invalidate(int slot) {
         auto& entry = entries_[slot];
-        const bool evicted = exact.slot == -1 && entry.tokens != 0;
-        entry.tokens = entry.draft_rows = 0;
-        return Write(slot, evicted, position);
+        entry.tokens = entry.pages = 0;
+        entry.draft_rows = -1;
+        entry.media = {};
+    }
+
+    int oldest() const {
+        for (int position = capacity_; position > 0; --position) {
+            const int slot = recency_[position - 1];
+            if (entries_[slot].tokens) return slot;
+        }
+        return -1;
     }
 
     void publish(const Write& write, const std::vector<int>& prompt, std::string_view salt,
-                 int tokens, int draft_rows) {
+                 int tokens, int pages, int draft_rows, PrefixMediaKey media) {
         auto& entry = entries_[write.slot];
         std::copy_n(prompt.begin(), tokens, entry.ids.begin());
         std::copy(salt.begin(), salt.end(), entry.salt.begin());
         entry.salt_size = salt.size();
+        entry.media = std::move(media);
         entry.tokens = tokens;
+        entry.pages = pages;
         entry.draft_rows = draft_rows;
         touch_at(write.position);
     }
 
     void reset() {
-        for (int slot = 0; slot < capacity_; ++slot) {
-            entries_[slot].tokens = entries_[slot].draft_rows = 0;
-        }
+        for (int slot = 0; slot < capacity_; ++slot) invalidate(slot);
     }
 
     Occupancy occupancy() const {
         Occupancy occupancy;
         for (int slot = 0; slot < capacity_; ++slot) {
             occupancy.entries += entries_[slot].tokens != 0;
-            occupancy.tokens += entries_[slot].tokens;
+            occupancy.pages += entries_[slot].pages;
         }
         return occupancy;
     }
@@ -137,9 +152,12 @@ private:
     struct Entry {
         std::array<int, decoder_batch_prefix_max_tokens> ids;
         std::array<char, decoder_prefix_max_salt_bytes> salt;
+        PrefixMediaKey media;
         std::size_t salt_size = 0;
         int tokens = 0;
-        int draft_rows = 0;
+        int pages = 0;
+        // Zero draft rows is a valid paired checkpoint at the first target row.
+        int draft_rows = -1;
     };
 
     void touch_at(int position) {

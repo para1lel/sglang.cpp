@@ -1,4 +1,5 @@
 #include "sglang/decoder.h"
+#include "sglang/decoder_batch.h"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/testing/media/decoder_fixture.h"
 #include "sglang/testing/media/decoder_trace.h"
@@ -7,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <string_view>
+#include <limits>
 
 namespace {
 
@@ -63,11 +65,6 @@ std::shared_ptr<Bf16> allocate(std::size_t size, bool managed = false) {
     return {static_cast<Bf16*>(allocation), [](Bf16* address) { cudaFree(address); }};
 }
 
-std::uint16_t sample(int media, int row, int channel) {
-    constexpr std::uint16_t positive = 0x3e80;
-    return positive + ((851 * media + 47 * row + channel) % 1024);
-}
-
 std::vector<DecoderMedia> fixtures() {
     std::vector<DecoderMedia> output;
     for (const auto& layout : layouts()) {
@@ -88,7 +85,7 @@ std::vector<DecoderMedia> fixtures() {
 }
 
 void check_embedding(const MultimodalPrompt& plan, const std::vector<DecoderMedia>& media) {
-    decoder::MultimodalInput input{nullptr, plan, {}};
+    decoder::MultimodalInput input{nullptr, plan, {}, {}};
     for (const auto& item : media) {
         input.features.push_back(item.features);
     }
@@ -154,20 +151,15 @@ void check_public_guards(const Decoder& engine, const std::vector<DecoderMedia>&
     invalid[125] = 19;
     rejects([&] { engine.generate_multimodal(invalid, media); });
     DecoderOptions options;
-    bool entered = false;
-    const DecoderCallbacks callbacks{{}, [&] {
-        entered = true;
-        return true;
-    }};
-    for (int depth : {1, 4}) {
-        options.mtp_steps = depth;
-        rejects([&] { engine.generate_multimodal(template_tokens, media, options, callbacks); },
-                "MTP");
-    }
-    require(!entered, "Media speculation reached the generation cancellation callback");
+    options.mtp_steps = decoder_max_mtp_steps + 1;
+    rejects([&] { engine.generate_multimodal(template_tokens, media, options); }, "MTP");
     options.mtp_steps = 0;
     options.max_new_tokens = 262145 - physical;
     rejects([&] { engine.generate_multimodal(template_tokens, media, options); });
+    options.mtp_steps = 4;
+    options.max_new_tokens = std::numeric_limits<int>::max();
+    rejects([&] { engine.generate_multimodal(template_tokens, media, options); },
+            "Prompt and output budget must fit");
     const auto cancelled = engine.generate_multimodal(template_tokens, media, {},
         DecoderCallbacks{{}, [] { return true; }});
     require(cancelled.output_token_ids.empty() &&
@@ -188,6 +180,8 @@ void check_dispatch(const Decoder& engine, const std::vector<DecoderMedia>& medi
     DecoderOptions options;
     options.max_new_tokens = 4;
     options.top_logits = 8;
+    options.eager = true;
+    options.max_num_batched_tokens = mxfp8_page_size;
     options.prefix_cache_salt = "mixed-media";
     std::vector<int> received;
     start_trace(fallback);
@@ -243,18 +237,82 @@ void check_chunked_media(const Decoder& engine, const std::vector<DecoderMedia>&
     DecoderOptions options;
     options.max_new_tokens = 4;
     options.top_logits = 16;
+    options.eager = true;
     const auto expected = engine.generate_multimodal(prompt(), media, options);
     require(expected.output_token_ids.size() == 4 && expected.step_top_logits.size() == 4 &&
                 expected.finish_reason == DecoderFinishReason::length,
             "Default media generation did not return four scored IDs");
     options.max_num_batched_tokens = 64;
     const auto actual = engine.generate_multimodal(prompt(), media, options);
+    const auto repeated = engine.generate_multimodal(prompt(), media, options);
     require(actual.output_token_ids == expected.output_token_ids &&
                 actual.finish_reason == expected.finish_reason &&
                 actual.cached_prompt_tokens == 0 && actual.mtp_rounds == 0 &&
-                equal_scores(actual, expected),
-            "Chunked media prefill changed generation scores");
+                actual.output_token_ids == repeated.output_token_ids &&
+                equal_scores(actual, repeated),
+            "Chunked media prefill changed greedy IDs or same-budget replay scores");
     print_result("media with smaller prefill budget", actual);
+}
+
+void check_speculative_media(const Decoder& engine, const std::vector<DecoderMedia>& media) {
+    auto tokens = prompt();
+    constexpr int prompt_rows = 3 * mxfp8_page_size - 2;
+    tokens.insert(tokens.end(), prompt_rows - physical, 8149);
+    DecoderOptions options;
+    options.top_logits = 8;
+    options.eager = true;
+    for (int budget : {3, 14}) {
+        options.max_new_tokens = budget;
+        options.mtp_steps = 0;
+        const auto expected = engine.generate_multimodal(tokens, media, options);
+        options.mtp_steps = 4;
+        std::vector<int> emitted;
+        start_mtp_trace(prompt_rows);
+        const auto actual = engine.generate_multimodal(tokens, media, options,
+            DecoderCallbacks{[&](int token) { emitted.push_back(token); return true; }, {}});
+        finish_mtp_trace();
+        require(std::size_t(budget) == expected.output_token_ids.size() &&
+                    expected.step_top_logits.size() == expected.output_token_ids.size() &&
+                    actual.output_token_ids == expected.output_token_ids &&
+                    actual.output_token_ids == emitted && equal_scores(actual, expected) &&
+                    actual.finish_reason == DecoderFinishReason::length &&
+                    actual.finish_reason == expected.finish_reason && actual.mtp_rounds > 0 &&
+                    actual.mtp_drafted_tokens > 0,
+                "Media K4 changed greedy tokens, exact target logits, or final-tail behavior");
+        std::cout << "media K4 cap=" << budget << " drafted=" << actual.mtp_drafted_tokens
+                  << " accepted=" << actual.mtp_accepted_tokens << ' ';
+        print_result("target logits", actual);
+        if (budget == 3) continue;
+
+        options.top_logits = 0;
+        DecoderBatch batch(engine, DecoderBatchOptions{false, 1, 0,
+                                                        options.max_num_batched_tokens});
+        require(batch.admit_multimodal(0, tokens, options, media) == 0,
+                "Unexpected cache hit in the media K4 page test");
+        std::vector<int> committed;
+        int replayed = 0;
+        bool verified_across_page = false;
+        for (;;) {
+            const auto step = batch.advance_chunked({true})[0];
+            require(!step.sampling_failed && !step.constraint_failed, "Media K4 step failed");
+            if (!committed.empty() && step.mtp_verified_rows > 0) {
+                const int start = prompt_rows + static_cast<int>(committed.size()) - 1;
+                const int end = start + step.mtp_verified_rows - 1;
+                verified_across_page |= start / mxfp8_page_size != end / mxfp8_page_size;
+            }
+            replayed += step.mtp_replayed_rows;
+            if (step.token) committed.push_back(*step.token);
+            committed.insert(committed.end(), step.extra_tokens.begin(),
+                step.extra_tokens.begin() + step.extra_token_count);
+            if (step.finish_reason) {
+                require(*step.finish_reason == expected.finish_reason, "Media K4 finish changed");
+                break;
+            }
+        }
+        require(committed == expected.output_token_ids && verified_across_page && replayed > 0,
+                "Media K4 did not preserve the result through cross-page verification and replay");
+        std::cout << "media K4 cross-page verified, replayed=" << replayed << '\n';
+    }
 }
 
 }
@@ -274,6 +332,7 @@ int main(int argc, char** argv) {
             check_dispatch(engine, media, true);
             check_media_identity(engine, media);
             check_chunked_media(engine, media);
+            check_speculative_media(engine, media);
         } else {
             require(std::string_view(argv[2]) == "--embedding-only", "Unknown option");
         }

@@ -25,6 +25,7 @@ struct VerificationRow {
     const VerificationGraphBinding* binding = nullptr;
     VerificationWorkspace* graph_workspace = nullptr;
     bool constrained = false;
+    int rotary_position = -1;
 };
 
 struct VerificationSequence {
@@ -33,6 +34,7 @@ struct VerificationSequence {
     const int* tokens;
     int count;
     bool constrained = false;
+    int rotary_delta = 0;
 };
 
 inline constexpr int k1_verification_rows = 2;
@@ -63,6 +65,7 @@ struct VerificationWorkspace {
 struct VerificationGraphBinding {
     std::array<TextLogitCandidate, k1_verification_rows> inputs;
     std::array<int, k1_verification_rows> positions;
+    std::array<int, k1_verification_rows> rotary_positions;
     std::array<ExactGqaWorkspace, k1_verification_rows> scores;
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
@@ -125,7 +128,11 @@ struct MtpRound {
     int drafted = 0;
     int consumed = 0;
 
-    using Emit = std::function<bool(int, const Bf16*, bool)>;
+    const MediaPrefill* media = nullptr;
+
+    int rotary_delta() const;
+    MtpDraftInput draft_input(int row_position, int token, const Bf16* hidden) const;
+    using Emit = std::function<bool(int, const Bf16*, bool, int)>;
     using Cancel = std::function<bool()>;
 
     int rows() const;
@@ -143,7 +150,8 @@ class TargetVerification {
 public:
     TargetVerification(Request& request, int capacity, int prefix, int rows, bool logits,
                        cudaStream_t stream = nullptr,
-                       std::shared_ptr<TextLogitCandidate> winners = nullptr);
+                       std::shared_ptr<TextLogitCandidate> winners = nullptr,
+                       int generated_top_logprobs = -1);
 
     void begin(int position, int count, cudaStream_t stream);
     VerificationRow row(int index);
@@ -156,6 +164,7 @@ public:
     void sample(const SamplingParameters& parameters, int first_output, void* scratch);
     void constrain(const MtpConstraintRound& constraint, const ConstraintWorkspace& scratch,
                    const SamplingParameters* sampling, int first_output, void* sampling_scratch);
+    void enqueue_generated_logprobs(void* scratch);
     void read();
     static void read_all(TargetVerification* const* verifiers, int count, cudaStream_t stream);
     void commit(int count);
@@ -163,6 +172,8 @@ public:
     int winner(int index, bool sampled = false, bool constrained = false) const;
     bool needs_logits() const { return host_logits_ != nullptr; }
     const Bf16* logits(int index) const;
+    bool needs_generated_logprobs() const { return host_generated_logprobs_ != nullptr; }
+    std::shared_ptr<const DecoderTokenLogprobs> generated_logprobs(int index) const;
 
 private:
     void enqueue_results();
@@ -179,6 +190,8 @@ private:
     VerificationWorkspace* active_workspace_ = nullptr;
     TextLogitCandidate* host_winners_;
     Bf16* host_logits_;
+    GeneratedLogprobReadback* host_generated_logprobs_ = nullptr;
+    int generated_top_logprobs_;
 };
 
 std::shared_ptr<TextLogitCandidate> prepare_verification_winners(int slots);

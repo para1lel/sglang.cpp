@@ -1,7 +1,9 @@
 #include "sglang/decoder_verify.h"
 
+#include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_sampling.h"
+#include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
 #include <algorithm>
@@ -73,6 +75,7 @@ void VerificationGraphScratch::upload(const VerificationSequence& sequence, cuda
     for (int row = 0; row < k1_verification_rows; ++row) {
         binding.inputs[row] = {0.0f, sequence.tokens[row]};
         binding.positions[row] = sequence.position + row;
+        binding.rotary_positions[row] = binding.positions[row] + sequence.rotary_delta;
         binding.scores[row] = workspace.work[row].gqa_scores(capacity);
     }
     check(cudaMemcpyAsync(device_binding, host_binding.get(), sizeof(binding),
@@ -129,6 +132,27 @@ int MtpRound::rows() const {
     return constraint ? constraint->rows() : std::min(drafted + 1, remaining);
 }
 
+int MtpRound::rotary_delta() const {
+    if (!media) {
+        return 0;
+    }
+    const auto& prompt = media->input->prompt;
+    return prompt.next_position - static_cast<int>(prompt.positions.size());
+}
+
+MtpDraftInput MtpRound::draft_input(int row_position, int token, const Bf16* hidden) const {
+    MtpDraftInput input{draft, row_position, token, hidden};
+    if (media) {
+        const int prompt_rows = static_cast<int>(media->input->prompt.positions.size());
+        if (row_position < prompt_rows) {
+            input.mrope = media->positions + row_position;
+        } else {
+            input.rotary_position = row_position + rotary_delta();
+        }
+    }
+    return input;
+}
+
 namespace {
 
 bool enqueue_proposal_wave(MtpRound* rounds, int count, int wave,
@@ -142,14 +166,15 @@ bool enqueue_proposal_wave(MtpRound* rounds, int count, int wave,
         if (wave >= round.proposal_limit) {
             continue;
         }
-        const int position = round.position - 1 + wave;
+        const auto input = round.draft_input(round.position - 1 + wave, round.tokens[wave],
+                                             round.draft_hidden);
         if (round.constraint) {
             round.draft_hidden = round.draft->enqueue(
-                position, round.tokens[wave], round.draft_hidden, true, stream, &scratch,
-                &round.constraint->candidates(wave));
+                input.position, input.token, input.hidden, true, stream, &scratch,
+                &round.constraint->candidates(wave), input.mrope, input.rotary_position);
             submitted = true;
         } else {
-            rows[size] = {round.draft, position, round.tokens[wave], round.draft_hidden};
+            rows[size] = input;
             batched[size++] = &round;
         }
     }
@@ -172,8 +197,8 @@ bool MtpRound::propose_all(MtpRound* rounds, int count, const ConstraintWorkspac
         round.draft_hidden = round.request->work.normalized;
         longest = std::max(longest, round.proposal_limit);
         if (round.proposal_limit == 0) {
-            unscored[unscored_count++] = {
-                round.draft, round.position - 1, round.tokens.front(), round.draft_hidden};
+            unscored[unscored_count++] = round.draft_input(
+                round.position - 1, round.tokens.front(), round.draft_hidden);
         }
     }
     MtpDraftRequest::enqueue_wave(unscored.data(), unscored_count, false, stream);
@@ -238,8 +263,8 @@ void MtpRound::propose_depth(MtpRound* rounds, int count, const DraftDepthScratc
             auto& round = rounds[index];
             inputs[index].request = nullptr;
             if (depth >= round.proposal_limit) continue;
-            inputs[index] = {round.draft, round.position - 1 + depth, round.tokens[depth],
-                             round.draft_hidden};
+            inputs[index] = round.draft_input(round.position - 1 + depth, round.tokens[depth],
+                                              round.draft_hidden);
             ++active;
         }
         if (active == 0) break;
@@ -280,15 +305,17 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
         const int token = target->winner(index, sampling != nullptr, constraint != nullptr);
         const bool accepted = index < drafted && token == tokens[index + 1];
         ++consumed;
-        continuing = emit(token, target->logits(index), accepted);
+        continuing = emit(token, target->logits(index), accepted, index);
         if (!accepted || !continuing) {
             break;
         }
         const auto row = target->row(index);
+        const auto input = draft_input(row.position, token, row.work->normalized);
         if (!repair) {
-            draft->enqueue(row.position, token, row.work->normalized, false, stream);
+            draft->enqueue(input.position, input.token, input.hidden, false, stream, nullptr,
+                           nullptr, input.mrope, input.rotary_position);
         } else {
-            repair[index] = {draft, row.position, token, row.work->normalized};
+            repair[index] = input;
         }
     }
     if (continuing) {
@@ -302,34 +329,43 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
 
 TargetVerification::TargetVerification(Request& request, int capacity, int prefix, int rows,
                                        bool logits, cudaStream_t stream,
-                                       std::shared_ptr<TextLogitCandidate> winners)
+                                       std::shared_ptr<TextLogitCandidate> winners,
+                                       int generated_top_logprobs)
     : request_(request), stream_(stream ? stream : request.memory.stream()),
-      capacity_(capacity), valid_prefix_(prefix) {
+      capacity_(capacity), valid_prefix_(prefix), generated_top_logprobs_(generated_top_logprobs) {
     auto& memory = request.memory;
     auto& host_owner = memory.transfers().verification_results;
     const int reserved = std::max(request.kv_limit, request.pages.page_count * mxfp8_page_size);
     if (!stream_ || (memory.stream() && memory.stream() != stream_) ||
         memory.graph() || host_owner || rows < 1 ||
         rows > target_verify_max_rows || prefix < 0 || prefix > capacity ||
-        capacity > reserved) {
+        capacity > reserved || generated_top_logprobs < -1 ||
+        generated_top_logprobs > decoder_max_generated_top_logprobs) {
         throw std::invalid_argument("Invalid target verification storage");
     }
     allocate_gdn(memory, tail_);
     eager_workspace_.emplace(memory, rows);
 
-    if (winners && !logits) {
+    const bool score = generated_top_logprobs >= 0;
+    if (winners && !logits && !score) {
         host_winners_ = winners.get();
         host_owner = std::move(winners);
         host_logits_ = nullptr;
         return;
     }
     const auto winner_bytes = rows * sizeof(TextLogitCandidate);
+    static_assert(sizeof(TextLogitCandidate) % alignof(GeneratedLogprobReadback) == 0);
+    const auto score_bytes = score ? rows * sizeof(GeneratedLogprobReadback) : 0;
     const auto logits_bytes = logits ? rows * vocab_size * sizeof(Bf16) : 0;
     void* host = nullptr;
-    check(cudaMallocHost(&host, winner_bytes + logits_bytes), "Allocate verifier results");
+    check(cudaMallocHost(&host, winner_bytes + score_bytes + logits_bytes),
+          "Allocate verifier results");
     host_owner = std::shared_ptr<void>(host, free_pinned);
     host_winners_ = static_cast<TextLogitCandidate*>(host);
-    host_logits_ = logits ? reinterpret_cast<Bf16*>(host_winners_ + rows) : nullptr;
+    auto* const scores = static_cast<std::byte*>(host) + winner_bytes;
+    host_generated_logprobs_ = score ? reinterpret_cast<GeneratedLogprobReadback*>(scores)
+                                      : nullptr;
+    host_logits_ = logits ? reinterpret_cast<Bf16*>(scores + score_bytes) : nullptr;
 }
 
 void TargetVerification::begin(int position, int count, cudaStream_t stream) {
@@ -409,6 +445,16 @@ void TargetVerification::constrain(const MtpConstraintRound& constraint,
     }
 }
 
+void TargetVerification::enqueue_generated_logprobs(void* scratch) {
+    if (!needs_generated_logprobs()) return;
+    for (int index = 0; index < pending_rows_; ++index) {
+        const auto& work = workspace().work[index];
+        check(decoder::enqueue_generated_logprobs(work.logits, vocab_size, work.argmax,
+              generated_top_logprobs_, scratch, host_generated_logprobs_ + index, stream_),
+              "Score target verification row");
+    }
+}
+
 void TargetVerification::read() {
     auto* verifier = this;
     read_all(&verifier, 1, stream_);
@@ -476,6 +522,12 @@ const Bf16* TargetVerification::logits(int index) const {
     return host_logits_ ? host_logits_ + index * vocab_size : nullptr;
 }
 
+std::shared_ptr<const DecoderTokenLogprobs>
+TargetVerification::generated_logprobs(int index) const {
+    if (!needs_generated_logprobs()) return nullptr;
+    return collect_generated_logprobs(host_generated_logprobs_[index], generated_top_logprobs_);
+}
+
 std::shared_ptr<TextLogitCandidate> prepare_verification_winners(int slots) {
     check(cudaPeekAtLastError(), "Check CUDA status before allocating batch verifier results");
     void* pinned = nullptr;
@@ -515,7 +567,7 @@ void decoder::project_verification_bf16(Bf16Weight weight, const VerificationRow
 bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
                                 void* sampling_scratch, cudaStream_t stream,
                                 VerificationGraph* graph, const TcVocabScratch* vocabulary,
-                                std::uint8_t* packed_activation) const {
+                                std::uint8_t* packed_activation, void* logprob_workspace) const {
     std::array<VerificationSequence, max_wide_mtp_lanes> sequences;
     std::array<TargetVerification*, max_wide_mtp_lanes> verifiers;
     if (count < 1 || (count > decoder_batch_max_mtp_lanes &&
@@ -527,7 +579,7 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
         const int rows = round.rows();
         verifiers[index] = round.target;
         sequences[index] = {round.target, round.position, round.tokens.data(), rows,
-                            round.constraint != nullptr};
+                            round.constraint != nullptr, round.rotary_delta()};
         if (round.constraint || round.sampling || round.target->needs_logits() ||
             rows != target_verify_max_rows) {
             vocabulary = nullptr;
@@ -546,6 +598,7 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
         } else if (round.sampling) {
             round.target->sample(*round.sampling, round.first_output, sampling_scratch);
         }
+        round.target->enqueue_generated_logprobs(logprob_workspace);
     }
     TargetVerification::read_all(verifiers.data(), count, stream);
     return replayed;
@@ -609,6 +662,7 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
                 if (index < sequence.count) {
                     auto row = sequence.verification->row(index);
                     row.constrained = sequence.constrained;
+                    row.rotary_position = row.position + sequence.rotary_delta;
                     rows[next++] = row;
                     check(text_embedding(embedding, vocab_size, hidden_size,
                                          sequence.tokens[index], row.work->residual, stream),
@@ -638,12 +692,26 @@ void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count
             normalize_final(*first[index].work, stream);
         }
         if (vocabulary && size == tc_vocab_rows) {
-            std::array<TcVocabRow, tc_vocab_rows> projection;
-            for (int index = 0; index < size; ++index) {
-                const auto& work = *first[index].work;
-                projection[index] = {work.normalized, work.argmax};
+            std::array<VerificationRow, tc_vocab_rows> scored;
+            const auto end = std::copy_if(first, first + size, scored.begin(),
+                [](const VerificationRow& row) {
+                    return row.verification && row.verification->needs_generated_logprobs();
+                });
+            const int scored_rows = static_cast<int>(end - scored.begin());
+            if (scored_rows < size) {
+                std::array<TcVocabRow, tc_vocab_rows> projection;
+                for (int index = 0; index < size; ++index) {
+                    const auto& work = *first[index].work;
+                    projection[index] = {work.normalized, work.argmax};
+                }
+                if (try_tc_vocab(*tc_vocab, *vocabulary, projection, stream)) {
+                    if (scored_rows != 0) {
+                        project_verification_bf16(lm_head, scored.data(), scored_rows,
+                                                  &Workspace::logits, stream);
+                    }
+                    return;
+                }
             }
-            if (try_tc_vocab(*tc_vocab, *vocabulary, projection, stream)) return;
         }
         project_verification_bf16(lm_head, first, size, &Workspace::logits, stream);
         for (int index = 0; index < size; ++index) {

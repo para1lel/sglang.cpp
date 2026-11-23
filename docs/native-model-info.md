@@ -6,11 +6,11 @@
 | --- | --- | --- |
 | HTTP control | Match `GET /model_info` and its deprecated alias `GET /get_model_info`. | [Control route](../apps/server/prefix_controls.cpp#L508)<!-- prefix: "if (!model_i" --> |
 | Model discovery | List or retrieve the served model card. | [List dispatch](../apps/server/prefix_controls.cpp#L533)<!-- prefix: "if (path == " --> · [Retrieval dispatch](../apps/server/prefix_controls.cpp#L520)<!-- prefix: "if (model_re" --> · [Shared card writer](../apps/server/prefix_controls.cpp#L455)<!-- prefix: "std::string " --> |
-| Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L173)<!-- prefix: "std::string " --> |
+| Server | Report the selected checkpoint and configured serving properties. | [Metadata writer](../apps/sglang-server.cpp#L168)<!-- prefix: "std::string " --> |
 | Checkpoint | Supply the supported model type and architecture. | [Checkpoint identity](../include/sglang/runtime/model/qwen_text_model.h#L8)<!-- prefix: "static const" --> |
-| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L692)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L332)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L195)<!-- prefix: "std::string " --> |
-| Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L66)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L303)<!-- prefix: "BatchService" --> |
-| Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L827)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L338)<!-- prefix: "counters.gen" --> |
+| Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L692)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L327)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L190)<!-- prefix: "std::string " --> |
+| Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L65)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L298)<!-- prefix: "BatchService" --> |
+| Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L822)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L339)<!-- prefix: "counters.gen" --> |
 
 ## Runtime path
 
@@ -49,21 +49,22 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 | `model_path`, `tokenizer_path`, `served_model_name` | Strings. Both paths expose the effective checkpoint directory. The served ID is `"Qwen3.8-27B-FP8"`. |
 | `launch_command` | String starting with `sglang-server`. It records explicit options in input order, including repeats. |
 | `max_running_requests`, `max_num_batched_tokens` | Integer lane limit from `--max-active` and aggregate target-token budget per scheduler step. Defaults are 32 and 8,192. |
-| `mtp_steps`, `prefix_cache_entries` | Integer [server draft depth](mtp.md#runtime-path) and prefix entry capacity. Zero disables the corresponding feature. |
-| `mtp_online_gqa` | Boolean. True on B200 with positive server draft depth and capacity for at least two lanes. It reports availability. Each scored draft wave checks its lanes. [Metadata check](../apps/sglang-server.cpp#L222)<!-- prefix: "body += back" --> |
+| `mtp_steps`, `prefix_cache_entries` | Integer [server draft depth](mtp.md#runtime-path) and prefix slot limit. Both default to four. Zero disables the corresponding feature. |
+| `enable_multimodal` | Boolean. The server reports `true` for [image and video inputs](chat-serving.md#image-and-video-inputs) and loads the vision encoder on its first use. [Capability field](../apps/sglang-server.cpp#L197)<!-- prefix: "body += R\"(," --> |
+| `mtp_online_gqa` | Boolean. True on B200 with positive server draft depth and capacity for at least two lanes. Each scored draft wave checks its lanes. [Metadata check](../apps/sglang-server.cpp#L217)<!-- prefix: "body += back" --> |
 | `mtp_int8_head` | Boolean indicating availability of the [INT8 draft head](#int8-draft-head). |
 | `certified_int8_verify_head` | Boolean indicating availability of the [certified Tensor Core head](#certified-tensor-core-target-head). |
-| `fp8_prefill` | String `"tensor-core"` for B200 with prefix reuse off, or `"exact"` otherwise. Media and label scoring retain exact prefill. [Backend selection](../apps/sglang-server.cpp#L228)<!-- prefix: "const bool t" --> |
-| `target_gqa` | String `"grouped-split"` on B200, or `"exact"` otherwise. Per-row shape and numerical guards still apply. [Backend selection](../apps/sglang-server.cpp#L231)<!-- prefix: "sglang::json" --> |
-| `paired_prefill` | Boolean indicating availability of [whole-tile MTP projection pairs](native-prefill-workspace.md#projection-pairs-for-mtp). True on B200 with prefix reuse off, positive MTP depth, capacity for at least two lanes, and a step budget of 2,048–8,192. The scheduler checks each step separately. [Partial-grant projection groups](native-prefill-workspace.md#partial-grant-projection-groups) have independent eligibility. [Metadata check](../apps/sglang-server.cpp#L233)<!-- prefix: "const bool p" --> |
-| `mtp_seed_fc` | Null at K0, otherwise the configured [draft seed FC policy](mtp.md#runtime-path). This field is exclusive to the server information routes. [Metadata builder](../apps/sglang-server.cpp#L358)<!-- prefix: "std::string " --> |
+| `fp8_prefill` | String `"tensor-core"` on B200 or `"exact"` otherwise. This reports backend policy. Individual grants still apply shape and resource guards. [Backend selection](../apps/sglang-server.cpp#L223)<!-- prefix: "const bool t" --> |
+| `target_gqa` | String `"grouped-split"` on B200, or `"exact"` otherwise. Per-row shape and numerical guards still apply. [Backend selection](../apps/sglang-server.cpp#L226)<!-- prefix: "sglang::json" --> |
+| `paired_prefill` | Boolean indicating availability of [whole-tile projection groups](native-prefill-workspace.md#projection-pairs-for-mtp). True on B200 with at least two lanes and a step budget of 2,048–8,192. Each step checks grant eligibility. [Partial-grant groups](native-prefill-workspace.md#partial-grant-projection-groups) have separate eligibility. [Metadata check](../apps/sglang-server.cpp#L228)<!-- prefix: "const bool p" --> |
+| `mtp_seed_fc` | Null at K0, otherwise the configured [draft seed FC policy](mtp.md#runtime-path). This field is exclusive to the server information routes. [Metadata builder](../apps/sglang-server.cpp#L353)<!-- prefix: "std::string " --> |
 | `sampling_defaults` | String `"model"` or `"openai"`, according to the serving configuration. |
 | `reasoning_parser`, `tool_call_parser` | JSON `null` when disabled. Enabled values are `"qwen3"` and `"qwen3_coder"`, respectively. |
 | `eager`, `trace_batches`, `batch_cuda_graphs` | Booleans for eager execution, batch tracing, and the effective [batch graph policy](batch-graphs.md). `batch_cuda_graphs` defaults to `true`. It is `false` with `--eager`, including when the command also includes `--batch-cuda-graphs`. |
 | `startup_time` | Object with one numeric field, `server_e2e`. It gives elapsed monotonic seconds from before argument parsing through listener creation, fixed for the process lifetime. |
 | `internal_states` | Array with one object for the native scheduler rank. |
 
-For B200 Tensor Core prefill with positive depth and prefix reuse off, `mtp_seed_fc` reports `preferred: "tma_tcgen05_bf16_fp32"`, `fallback: "wmma_bf16_fp32"`, and `outside_shape_limits: "simt_bf16_fp32"`. The limits are `min_prompt_tokens: 4096`, `min_rows: 64`, and `max_rows: 128`. Other positive-depth configurations report `preferred: "simt_bf16_fp32"`. These fields describe startup policy. Actual launches depend on the request, operands, and CUDA preflight. [Policy attachment](../apps/sglang-server.cpp#L257)<!-- prefix: "return body " -->
+For B200 Tensor Core prefill with positive depth, `mtp_seed_fc` reports `preferred: "tma_tcgen05_bf16_fp32"`, `fallback: "wmma_bf16_fp32"`, and `outside_shape_limits: "simt_bf16_fp32"`. The limits are `min_prompt_tokens: 4096`, `min_rows: 64`, and `max_rows: 128`. Other positive-depth configurations report `preferred: "simt_bf16_fp32"`. Launches still depend on the request, operands, and CUDA preflight. [Policy attachment](../apps/sglang-server.cpp#L251)<!-- prefix: "return body " -->
 
 | Field in `internal_states[0]` | JSON type and meaning |
 | --- | --- |
@@ -73,7 +74,7 @@ For B200 Tensor Core prefill with positive depth and prefix reuse off, `mtp_seed
 | `num_running_reqs` | Integer count of admitted user generation items still in scheduler slots. It excludes waiting HTTP work and internal health jobs. |
 | `generation_tokens_total` | Cumulative integer count of published user output IDs, including additional MTP IDs. It advances at scheduler publication, independently of socket delivery and prefix reuse. Health generation contributes zero. |
 
-The command retains switches and validated numeric or enumerated operands. It replaces every `--checkpoint` operand, including superseded paths, with `'<redacted>'`. The two public path fields still identify the selected checkpoint. Environment variables, executable paths, HTTP headers, query values, and request bodies do not supply command text. [Argument recording](../apps/sglang-server.cpp#L85)<!-- prefix: "Arguments pa" --> · [Startup interval](../apps/sglang-server.cpp#L291)<!-- prefix: "const auto s" --> · [Listener timestamp](../apps/sglang-server.cpp#L313)<!-- prefix: "const std::c" -->
+The command retains switches and validated numeric or enumerated operands. It replaces every `--checkpoint` operand, including superseded paths, with `'<redacted>'`. The two public path fields still identify the selected checkpoint. Environment variables, executable paths, HTTP headers, query values, and request bodies do not supply command text. [Argument recording](../apps/sglang-server.cpp#L84)<!-- prefix: "Arguments pa" --> · [Startup interval](../apps/sglang-server.cpp#L286)<!-- prefix: "const auto s" --> · [Listener timestamp](../apps/sglang-server.cpp#L308)<!-- prefix: "const std::c" -->
 
 Pinned SGLang exposes resolved settings and a launch command at the top level, with startup durations, per-DP state, version, frontend, and inline-system capability. The native schema reports its own settings and counters. It omits Python-specific options, `kv_events`, and upstream `last_gen_throughput` and `memory_usage` measurements. [Pinned Python routes](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L888)<!-- prefix: "@app.get(\"/g" --> · [Resolved fields](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/server_utils.py#L206)<!-- prefix: "def build_se" --> · [Scheduler measurements](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/scheduler_components/internal_state.py#L75)<!-- prefix: "state[\"last_" -->
 
@@ -81,11 +82,11 @@ Pinned SGLang exposes resolved settings and a launch command at the top level, w
 
 With draft weights loaded on B200, unconstrained draft proposals use signed INT8 scoring. Constrained drafts use BF16. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive. [Weight preparation](../src/decoder_mtp.cpp#L190)<!-- prefix: "if (capabili" -->
 
-Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L842)<!-- prefix: "bool MtpDraf" -->
+Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L870)<!-- prefix: "bool MtpDraf" -->
 
-An INT8 wave of four unconstrained draft lanes uses four vocabulary rows per warp. The warp reuses each weight vector across the four quantized activations and keeps separate signed INT32 sums for each lane and row. It uses the same FP64 rescale and BF16 rounding. One to three lanes use the existing INT8 kernels. The batch entry point requires 16-byte-aligned weights and quantized activation buffers. Each lane writes its own logits before winner selection. [Wave scoring](../src/decoder_mtp.cpp#L423)<!-- prefix: "void MtpDraf" --> · [Four-lane kernel](../src/text_decode_bandwidth.cu#L273)<!-- prefix: "__global__ _" --> · [Batch dispatch](../src/text_decode_bandwidth.cu#L632)<!-- prefix: "cudaError_t " -->
+An INT8 wave of four unconstrained draft lanes uses four vocabulary rows per warp. The warp reuses each weight vector across the four quantized activations and keeps separate signed INT32 sums for each lane and row. It uses the same FP64 rescale and BF16 rounding. One to three lanes use the existing INT8 kernels. The batch entry point requires 16-byte-aligned weights and quantized activation buffers. Each lane writes its own logits before winner selection. [Wave scoring](../src/decoder_mtp.cpp#L436)<!-- prefix: "void MtpDraf" --> · [Four-lane kernel](../src/text_decode_bandwidth.cu#L273)<!-- prefix: "__global__ _" --> · [Batch dispatch](../src/text_decode_bandwidth.cu#L632)<!-- prefix: "cudaError_t " -->
 
-Eligible B200 groups of 16 or 32 eager greedy K4 lanes score active lanes together at each proposal depth. The batch needs five assigned rows per lane and no serial output callback. TMA maps and kernel attributes must support the launch. Scoring reuses verification activation scratch before target submission. Draft forwards and winner selection keep four-lane packets. The shared Tensor Core head preserves signed INT32 accumulation, FP64 rescaling, and BF16 rounding. A clean setup decline uses ordinary packet scoring. CUDA errors outside supported setup declines propagate. [Depth dispatch](../src/decoder_batch.cpp#L815)<!-- prefix: "if (count >=" --> · [Setup](../src/text/draft_depth.cu#L139)<!-- prefix: "std::optiona" --> · [Scoring](../src/decoder_mtp.cpp#L664)<!-- prefix: "void MtpDraf" -->
+Eligible B200 groups of 16 or 32 eager greedy K4 lanes score active lanes together at each proposal depth. The batch needs five assigned rows per lane and no serial output callback. TMA maps and kernel attributes must support the launch. Scoring reuses verification activation scratch before target submission. Draft forwards and winner selection keep four-lane packets. The shared Tensor Core head preserves signed INT32 accumulation, FP64 rescaling, and BF16 rounding. A clean setup decline uses ordinary packet scoring. CUDA errors outside supported setup declines propagate. [Depth dispatch](../src/decoder_batch.cpp#L822)<!-- prefix: "if (count >=" --> · [Setup](../src/text/draft_depth.cu#L139)<!-- prefix: "std::optiona" --> · [Scoring](../src/decoder_mtp.cpp#L685)<!-- prefix: "void MtpDraf" -->
 
 ### Certified Tensor Core target head
 
@@ -96,14 +97,14 @@ of four greedy lanes with five rows each. Each lane must use unconstrained
 selection and request only the winner. Wide MTP verification scores each
 four-lane packet separately. Unsupported tensor maps, unaligned weights, other packet
 shapes, and K0 use the BF16 head. CUDA configuration and launch errors propagate.
-[Score kernel](../src/text/tc_vocab.cu#L77)<!-- prefix: "__global__ _" --> · [Weight setup](../src/text/tc_vocab.cu#L142)<!-- prefix: "std::shared_" --> · [Scratch setup](../src/text/tc_vocab.cu#L168)<!-- prefix: "std::shared_" --> · [Dispatch guard](../src/decoder_verify.cpp#L531)<!-- prefix: "if (round.co" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
-· [Packet dispatch](../src/decoder_verify.cpp#L659)<!-- prefix: "if (packed_a" -->
+[Score kernel](../src/text/tc_vocab.cu#L77)<!-- prefix: "__global__ _" --> · [Weight setup](../src/text/tc_vocab.cu#L142)<!-- prefix: "std::shared_" --> · [Scratch setup](../src/text/tc_vocab.cu#L168)<!-- prefix: "std::shared_" --> · [Dispatch guard](../src/decoder_verify.cpp#L583)<!-- prefix: "if (round.co" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
+· [Packet dispatch](../src/decoder_verify.cpp#L727)<!-- prefix: "if (packed_a" -->
 
 The verifier reads the existing draft INT8 weights and adds 3,973,120 model bytes
 for statistics and 21,544,480 workspace bytes per decoder batch before allocator rounding.
 When the provider is available, batches with capacity for four lanes or more
 prepare workspace before request admission.
-[Batch allocation](../src/decoder_batch.cpp#L236)<!-- prefix: "storage-\u003etc_" -->
+[Batch allocation](../src/decoder_batch.cpp#L233)<!-- prefix: "storage->tc_" -->
 
 The Tensor Core dot accumulates signed INT8 products exactly in INT32. The interval
 includes FP32 subnormal rounding error in the original BF16 head. Refinement repeats
@@ -124,7 +125,7 @@ its score capacity, starting at 5,174 tokens with standard scratch. It also need
 valid KV and page coverage, aligned query and KV buffers, and sufficient aligned
 scratch. Each lane keeps its own position, page table, and scratch. One eligible
 lane can use split GQA when the other rows in the wave take different routes.
-[Scored wave call](../src/decoder_mtp.cpp#L615)<!-- prefix: "if (score) {" --> · [Lane selection](../include/sglang/text/mtp/gqa_attention.cuh#L44)<!-- prefix: "cudaError_t " --> · [Alignment](../include/sglang/text/gqa_decode_split.cuh#L70)<!-- prefix: "__host__ __d" -->
+[Scored wave call](../src/decoder_mtp.cpp#L636)<!-- prefix: "if (score) {" --> · [Lane selection](../include/sglang/text/mtp/gqa_attention.cuh#L44)<!-- prefix: "cudaError_t " --> · [Alignment](../include/sglang/text/gqa_decode_split.cuh#L70)<!-- prefix: "__host__ __d" -->
 
 The online route uses the same grouped split operator as target attention.
 It can change draft attention values and proposals through a different reduction order.
@@ -138,7 +139,7 @@ use four-byte V loads when aligned and assemble the same values otherwise.
 Lengths below eight and calls with insufficient score scratch use direct attention.
 Up to four unconstrained lanes share projection and vocabulary weight reads.
 Single-row waves use the row dispatch. Batched KV-only repairs skip attention.
-[Chunked replay](../include/sglang/text/mtp/gqa_long.cuh#L151)<!-- prefix: "cudaError_t " --> · [Single-row wave](../src/decoder_mtp.cpp#L565)<!-- prefix: "if (count ==" --> · [Repair waves](../src/decoder_mtp.cpp#L720)<!-- prefix: "void repair_" -->
+[Chunked replay](../include/sglang/text/mtp/gqa_long.cuh#L151)<!-- prefix: "cudaError_t " --> · [Single-row wave](../src/decoder_mtp.cpp#L583)<!-- prefix: "if (count ==" --> · [Repair waves](../src/decoder_mtp.cpp#L741)<!-- prefix: "void repair_" -->
 
 Each draft lane reserves 496,640 bytes for vocabulary logits. Ordered long
 attention uses 419,328 bytes for scores and carry. Online split partials use at
@@ -152,7 +153,7 @@ Compare the current B200 K4 runtime with a fresh K0 control on the same target d
 
 | Earlier launch setting | Current launch |
 | --- | --- |
-| `--fp8-prefill exact`, `tensor-core`, `tensor-core-mtp`, or `tensor-core-mtp-target` | Remove the option from both executables. The runtime selects text prefill from hardware and cache eligibility. |
+| `--fp8-prefill exact`, `tensor-core`, `tensor-core-mtp`, or `tensor-core-mtp-target` | Remove the option from both executables. Hardware and tile eligibility select the prefill kernels. |
 | `--mtp-int8-head` | Remove the option from `sglang-server`. The server reports INT8 draft head availability. |
 | `SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA`, `SGLANG_EXPERIMENTAL_BULK_PREFILL`, `SGLANG_EXPERIMENTAL_VERIFY_SHARED_INT8_VOCAB` | Unset these variables. Target split attention, paired projections, and the certified vocabulary head use automatic dispatch. |
 | `SGLANG_PREFILL_ATTN`, `SGLANG_EXPERIMENTAL_TMEM_PREFILL`, `SGLANG_SERIAL_PREFILL_ROWS` | Unset these variables. Prefill selects tiles and kernels from the request and device. |
@@ -178,7 +179,7 @@ Retrieval ignores the query and any successfully parsed body. After shared path 
 
 ### Server-info targets
 
-Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L556)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L768)<!-- prefix: "bool BatchSe" -->
+Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L556)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L764)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 
@@ -245,7 +246,7 @@ done
 diff -u "$samples/server_info" "$samples/get_server_info"
 jq -e '.port == 17384 and .device == 0 and .max_running_requests == 2 and
     .max_num_batched_tokens == 4096 and .prefix_cache_entries == 0 and .mtp_steps == 0 and
-    has("mtp_seed_fc") and .mtp_seed_fc == null and
+    .enable_multimodal and has("mtp_seed_fc") and .mtp_seed_fc == null and
     .sampling_defaults == "openai" and .eager and (.batch_cuda_graphs == false) and
     .model_path == "/data0/shared/Qwen3.8-27B-FP8" and .tokenizer_path == .model_path and
     ([.launch_command | scan("<redacted>")] | length) == 2 and

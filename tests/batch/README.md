@@ -186,6 +186,11 @@ slots ready on different iterations. The full batch runner also selects all
 rows, compares each lane's IDs with target-only decoding, and checks that
 cancellation releases all request bytes.
 
+The row-accounting cases use explicit cache-off controls. Run
+`run_admission.py --case eager-cache` for the separate eager K4 case with caching
+enabled. It checks a complete warm hit, identical completion, actual draft
+verification, and zero graph replays.
+
 Run `run_admission.py --case pressure` separately for 32 requests with
 32,769 prompt IDs in total. The trace records actual work per iteration, which
 can also be limited by arrival order and per-request tiles.

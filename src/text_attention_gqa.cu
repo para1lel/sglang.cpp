@@ -274,6 +274,21 @@ cudaError_t decoder::mrope_gqa_preprocess(
                             arguments, 0, stream);
 }
 
+cudaError_t decoder::mrope_gqa_preprocess_keys(
+    const MropePosition* positions, int rows, const __nv_bfloat16* keys,
+    const __nv_bfloat16* k_norm, __nv_bfloat16* rope_keys, cudaStream_t stream) {
+    if (rows <= 0 || rows > text_attention_max_tokens || !positions || !keys || !k_norm ||
+        !rope_keys) {
+        return cudaErrorInvalidValue;
+    }
+    const __nv_bfloat16* unused_input = nullptr;
+    __nv_bfloat16* unused_output = nullptr;
+    void* arguments[] = {&positions, &unused_input, &keys, &unused_input, &k_norm,
+                         &unused_output, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<const MropePosition*, false>,
+                            rows * mxfp8_kv_heads, mxfp8_head_dim, arguments, 0, stream);
+}
+
 cudaError_t text_gqa_postgate(int token_count, const __nv_bfloat16* q_gate,
                               const __nv_bfloat16* attention, __nv_bfloat16* output,
                               cudaStream_t stream) {

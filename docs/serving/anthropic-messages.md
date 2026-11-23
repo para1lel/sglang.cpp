@@ -6,7 +6,7 @@ checkpoint's chat template and submits the result through the native chat genera
 Use [`/v1/messages/count_tokens`](../native-tokenization.md#count-anthropic-prompt-tokens) for
 prompt token counts. [Dispatch](../../apps/server/prefix_controls.cpp#L619)<!-- prefix: "void Connect" --> ·
 [Request adapter](../../apps/server/anthropic_count.cpp#L777)<!-- prefix: "OrderedObjec" --> ·
-[Chat generation](../../apps/server/text_completion.cpp#L903)<!-- prefix: "void complet" -->
+[Chat generation](../../apps/server/text_completion.cpp#L902)<!-- prefix: "void complet" -->
 
 A configured Ollama route takes precedence for the same method and path. For example,
 `SGLANG_OLLAMA_CHAT_ROUTE=/v1/messages` serves Ollama chat on `POST /v1/messages`.
@@ -44,7 +44,7 @@ An override applies only to its configured path.
   text stop sequences. Read `tool_use` blocks, run the function in the client, and send
   `tool_result` history on the next request. Server tool definitions are skipped.
 - User image blocks accept inline base64 PNG in a codec-enabled build and use the native
-  [media limits](../chat-serving.md#image-and-video-inputs). Media generation runs at K0. Remote image
+  [media limits](../chat-serving.md#image-and-video-inputs). Remote image
   and document sources, redacted thinking, deferred tools and disaggregated routing are
   outside the native scope.
 

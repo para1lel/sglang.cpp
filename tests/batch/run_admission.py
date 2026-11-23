@@ -29,12 +29,13 @@ NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
 
 
 @contextmanager
-def server(args, label, flags, *, binary=None, environment=None):
+def server(args, label, flags, *, binary=None, environment=None, cache_entries=0):
     output = args.evidence / label
     output.mkdir()
     port = native.choose_port()
     command = [str(binary or args.binary), "--checkpoint", str(args.checkpoint),
-               "--port", str(port), "--trace-batches", *flags]
+               "--port", str(port), "--trace-batches", "--prefix-cache-entries", str(cache_entries),
+               *flags]
     log_path = output / "server.log"
     native.write_json(output / "command.json", command)
     with log_path.open("wb") as log:
@@ -247,6 +248,33 @@ def check_wide_mtp(args):
         assert slots == set(range(DEFAULT_ACTIVE)), slots
 
 
+def check_eager_cache(args):
+    flags = ["--eager", "--max-active", "4"]
+    case = prompt_case("eager-cache", 1024)
+    body = {"model": media.MODEL, "prompt": case["prompt"], "max_tokens": 8,
+            "return_token_ids": True, "temperature": 0, "ignore_eos": True}
+    with server(args, "eager-cache", flags, cache_entries=2) as (port, log, out, health):
+        check_caps(health, 4, DEFAULT_TOKENS)
+        evidence = argparse.Namespace(evidence=out)
+        info_status, _, raw = media.exchange(port, "/server_info")
+        info = json.loads(raw)
+        native.write_json(out / "server-info.json", info)
+        assert info_status == 200 and info["prefix_cache_entries"] == 2, info
+        assert info["eager"] and not info["batch_cuda_graphs"] and info["mtp_steps"] == 4, info
+        cold = media.capture(evidence, "cold", port, media.TEXT, body)
+        warm = media.capture(evidence, "warm", port, media.TEXT, body)
+        assert cold["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, cold
+        assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] == len(case["prompt"]), warm
+        for reply in (cold, warm):
+            choice, = reply["choices"]
+            assert choice["finish_reason"] == "length" and len(choice["token_ids"]) == 8, choice
+        assert cold["choices"] == warm["choices"], (cold, warm)
+        native.await_retirement(log, 0, 4)
+        trace = log.read_bytes()
+        assert b"batch graph_slots=" not in trace, log
+        assert re.search(rb"batch mtp .* drafted=[1-9]\d* accepted=", trace), log
+
+
 def check_cli(args):
     valid = [[], ["--max-active", "1"], ["--max-active", "4"],
              ["--max-active", str(DEFAULT_ACTIVE), TOKEN_OPTION, str(DEFAULT_TOKENS)],
@@ -256,13 +284,13 @@ def check_cli(args):
              ["--max-active", "4", "--mtp-steps", "1", "--eager"],
              ["--mtp-steps", "1"], ["--max-active", str(DEFAULT_ACTIVE), "--mtp-steps", "1"],
              ["--mtp-steps", "1", "--prefix-cache-entries", "2"],
+             ["--eager", "--prefix-cache-entries", "2"],
              ["--max-active", str(DEFAULT_ACTIVE), "--mtp-k", "4"]]
     invalid = [([TOKEN_OPTION, value], TOKEN_OPTION)
                for value in ("0", "-1", "wide", str(MAX_TOKENS + 1), "2147483648")]
     invalid.extend([(["--max-active", "33"], "--max-active"),
                     (["--mtp-steps", "5"], "--mtp-steps"),
-                    (["--mtp-k", "5"], "--mtp-steps"),
-                    (["--eager", "--prefix-cache-entries", "2"], "--prefix-cache-entries")])
+                    (["--mtp-k", "5"], "--mtp-steps")])
     command = [str(args.binary), "--checkpoint", str(args.evidence / "no-checkpoint")]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     records = []
@@ -415,7 +443,7 @@ def main():
     checks = {"cli": check_cli, "default": check_default, "pressure": check_pressure,
               "width-1": lambda args: check_explicit(args, 1),
               "width-4": lambda args: check_explicit(args, 4), "bounded": check_bounded,
-              "mtp": check_mtp, "wide-mtp": check_wide_mtp}
+              "mtp": check_mtp, "wide-mtp": check_wide_mtp, "eager-cache": check_eager_cache}
     faults = ("kv-capacity", "kv-context", "kv-drain")
     parser.add_argument("--case", choices=[*checks, *faults], action="append")
     args = parser.parse_args()

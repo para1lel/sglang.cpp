@@ -19,8 +19,9 @@ __device__ inline int position_value(const int* position) { return *position; }
 cudaError_t decode_embedding(const __nv_bfloat16* embedding, int vocab_size, int width,
                              const TextLogitCandidate* previous, __nv_bfloat16* output,
                              cudaStream_t stream);
-cudaError_t set_decode_position(int* position, int value, cudaStream_t stream);
-cudaError_t advance_decode_position(int* position, cudaStream_t stream);
+cudaError_t set_decode_position(int* position, int value, cudaStream_t stream,
+                                int* rotary = nullptr, int rotary_value = 0);
+cudaError_t advance_decode_position(int* position, int* rotary, cudaStream_t stream);
 cudaError_t decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
                                   const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
                                   int rows, int width, __nv_bfloat16* output_b,
@@ -185,6 +186,9 @@ cudaError_t mrope_gqa_preprocess(const MropePosition* positions, int rows,
                                 const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
                                 __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
                                 cudaStream_t stream);
+cudaError_t mrope_gqa_preprocess_keys(const MropePosition* positions, int rows,
+                                     const __nv_bfloat16* keys, const __nv_bfloat16* k_norm,
+                                     __nv_bfloat16* rope_keys, cudaStream_t stream);
 cudaError_t decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, const int* position,
                              const __nv_bfloat16* keys, const __nv_bfloat16* values,
                              cudaStream_t stream);

@@ -8,6 +8,8 @@ from saved_evidence import arg, command, fields, load, observed_device, require
 
 
 PROTOCOL = "matched-k4-native-defaults-v1"
+CACHE_ON_PROTOCOL = "matched-k4-native-defaults-cache-on-v2"
+CACHE_POLICY = "reset-before-every-cohort"
 PROFILE = "server-defaults"
 NATIVE_ENVIRONMENT = {
     "PATH", "LANG", "HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
@@ -59,7 +61,8 @@ def native(run, identity):
     trace = run.name == "native-k4-trace"
     expected = {
         "mtp_steps": 4, "max_running_requests": 32, "max_num_batched_tokens": 8192,
-        "prefix_cache_entries": 0, "batch_cuda_graphs": True, "eager": False,
+        "prefix_cache_entries": 4 if identity["protocol"] == CACHE_ON_PROTOCOL else 0,
+        "batch_cuda_graphs": True, "eager": False,
         "trace_batches": trace, "host": "127.0.0.1", "device": 0,
         "tp_size": 1, "dp_size": 1, "pp_size": 1, "model_path": identity["checkpoint_path"],
     }

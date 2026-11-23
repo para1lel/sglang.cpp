@@ -7,6 +7,7 @@ from contextlib import closing, contextmanager
 from copy import deepcopy
 import http.client
 import json
+import math
 from pathlib import Path
 import select
 import socket
@@ -17,9 +18,12 @@ import time
 
 CHAT = "/v1/chat/completions"
 TEXT = "/v1/completions"
+GENERATE = "/generate"
+SCORE = "/v1/score"
 MODEL = "Qwen3.8-27B-FP8"
 HEADERS = {"Content-Type": "application/json", "Connection": "close"}
 RGB8 = "data:application/x-sglang-rgb8;base64,"
+CACHE_PAGE_TOKENS = 128
 
 
 def exchange(port, route, body=None, *, timeout=90):
@@ -65,11 +69,11 @@ def serve(args, label, *options):
                     process.wait(timeout=5)
 
 
-def visual(kind):
+def visual(kind, width=32, height=32):
     frames = 2 if kind == "video_url" else 1
     pixels = bytes((index * 29 + index // 3072 * 113) % 256
-                   for index in range(32 * 32 * 3 * frames))
-    payload = {"url": RGB8 + base64.b64encode(pixels).decode(), "height": 32, "width": 32}
+                   for index in range(width * height * 3 * frames))
+    payload = {"url": RGB8 + base64.b64encode(pixels).decode(), "height": height, "width": width}
     if frames == 2:
         payload.update({"source_fps": 4, "source_frame_count": 5, "frame_indices": [0, 4]})
     return {"type": kind, kind: payload}
@@ -116,31 +120,33 @@ def malformed(args, port):
     for kind, mime in (("image_url", "image/png"), ("video_url", "video/mp4")):
         body = chat([{"type": kind, kind: {"url": f"data:{mime};base64,AAAA"}}])
         negative(args, f"codec-disabled-{kind}", port, body, "enabled inline media data URL")
-    for field, value in (("cache_salt", "media"), ("ebnf", 'root ::= "Hello"')):
-        negative(args, f"media-{field}", port, chat([image]) | {field: value}, field)
     negative(args, "too-many-parts", port, chat([image] * 5), "up to four parts")
 
 
-def usage(body, budget):
+def usage(body, budget, cached=0):
     assert body["prompt_tokens"] > 0 and body["completion_tokens"] == budget, body
     assert body["total_tokens"] == body["prompt_tokens"] + budget, body
-    assert body["prompt_tokens_details"] == {"cached_tokens": 0}, body
+    assert body["prompt_tokens_details"] == {"cached_tokens": cached}, body
 
 
-def received(reply, budget):
+def received(reply, budget, cached=0):
     choice, = reply["choices"]
     assert choice["finish_reason"] == "length" and len(choice["token_ids"]) == budget
-    usage(reply["usage"], budget)
+    usage(reply["usage"], budget, cached)
     return choice["token_ids"], reply["usage"]
 
 
-def stream_result(raw, budget):
+def stream_frames(raw):
     frames = raw.rstrip(b"\n").split(b"\n\n")
     assert frames.pop() == b"data: [DONE]"
     assert all(frame.startswith(b"data: ") for frame in frames)
-    messages = [json.loads(frame[6:]) for frame in frames]
+    return [json.loads(frame[6:]) for frame in frames]
+
+
+def stream_result(raw, budget, cached=0):
+    messages = stream_frames(raw)
     stats = messages.pop()["usage"]
-    usage(stats, budget)
+    usage(stats, budget, cached)
     assert messages[0]["choices"][0]["delta"] == {"role": "assistant"}
     choices = [message["choices"][0] for message in messages]
     assert all(choice["finish_reason"] is None for choice in choices[:-1])
@@ -155,14 +161,20 @@ def mixed_content():
             visual("video_url"), {"type": "text", "text": " and the clip."}]
 
 
-def ordinary(args, port, label, content):
+def ordinary(args, port, label, content, *, cache=False):
     reply = capture(args, f"{label}-json", port, CHAT, chat(content))
     expected = received(reply, 4)
+    prompt = reply.get("prompt_token_ids")
+    cached = len(prompt) if cache else 0
     raw = capture(args, f"{label}-sse", port, CHAT, chat(content, stream=True))
-    ids, stats, prompt = stream_result(raw, 4)
-    assert (ids, stats) == expected
-    assert prompt == reply.get("prompt_token_ids")
+    ids, stats, streamed_prompt = stream_result(raw, 4, cached)
+    assert (ids, without_cached_tokens(stats)) == (expected[0], without_cached_tokens(expected[1]))
+    assert streamed_prompt == prompt
     return expected, prompt
+
+
+def without_cached_tokens(stats):
+    return {key: value for key, value in stats.items() if key != "prompt_tokens_details"}
 
 
 def start(port, body, *, fragment=False):
@@ -226,21 +238,24 @@ def reject_overflow(args, label, first, second):
     return first_rejected
 
 
-def cancel_and_replace(args, port, log, content, expected, *, fragment=False):
+def first_stream_token(response):
+    assert response.status == 200
+    for line in response:
+        if line.startswith(b"data: ") and line.rstrip() != b"data: [DONE]":
+            choices = json.loads(line[6:])["choices"]
+            if choices and choices[0].get("token_ids"):
+                return line
+    raise AssertionError("The active media stream ended before its first token")
+
+
+def cancel_and_replace(args, port, log, content, expected, *, fragment=False, cached=0):
     label = "fragmented" if fragment else "whole"
     body = chat(content, 1024, True)
     with closing(start(port, body)) as active:
         transport = active.sock
         with active.getresponse() as response:
-            assert response.status == 200
-            for line in response:
-                if line.startswith(b"data: ") and line.rstrip() != b"data: [DONE]":
-                    choices = json.loads(line[6:])["choices"]
-                    if choices and choices[0].get("token_ids"):
-                        (args.evidence / f"{label}-active-first-token.sse").write_bytes(line)
-                        break
-            else:
-                raise AssertionError("The active media stream ended before its first token")
+            line = first_stream_token(response)
+            (args.evidence / f"{label}-active-first-token.sse").write_bytes(line)
             offset = log.stat().st_size
             with closing(start(port, body, fragment=fragment)) as first:
                 with closing(start(port, body)) as second:
@@ -252,13 +267,16 @@ def cancel_and_replace(args, port, log, content, expected, *, fragment=False):
             transport.close()
     wait_retired(log, offset)
     survivor = capture(args, f"{label}-survivor", port, CHAT, chat(content, stream=True))
-    assert stream_result(survivor, 4) == expected
+    ids, stats, prompt = stream_result(survivor, 4, cached)
+    assert (ids, without_cached_tokens(stats), prompt) == (
+        expected[0], without_cached_tokens(expected[1]), expected[2])
 
 
 def main(args):
     args.evidence.mkdir()
     content = mixed_content()
-    with serve(args, "width-one", "--max-active", "1", "--mtp-steps", "0") as (port, log):
+    with serve(args, "width-one", "--max-active", "1", "--mtp-steps", "0",
+               "--prefix-cache-entries", "0") as (port, log):
         malformed(args, port)
         response = capture(args, "zero-budget", port, CHAT, chat(content, 0))
         received(response, 0)
@@ -270,14 +288,18 @@ def main(args):
         received(capture(args, "text-completion", port, TEXT,
                          {"model": MODEL, "prompt": "Hello", "max_tokens": 4,
                           "return_token_ids": True, "ignore_eos": True}), 4)
-    with serve(args, "mtp-configured", "--max-active", "1", "--mtp-steps", "1") as (port, _):
-        assert ordinary(args, port, "media-k0", content) == (expected, prompt)
-    for label, options in (("continuous", ["--max-active", "2"]),
+    with serve(args, "mtp-configured", "--max-active", "1", "--mtp-steps", "1",
+               "--prefix-cache-entries", "0") as (port, _):
+        assert ordinary(args, port, "media-k1", content) == (expected, prompt)
+    for label, options in (("continuous", ["--max-active", "2", "--prefix-cache-entries", "0"]),
                            ("cached", ["--max-active", "1", "--prefix-cache-entries", "1"])):
         with serve(args, label, *options) as (port, log):
-            assert ordinary(args, port, f"{label}-media", content) == (expected, prompt)
+            assert ordinary(args, port, f"{label}-media", content, cache=label == "cached") == (
+                expected, prompt)
             if label == "cached":
-                cancel_and_replace(args, port, log, content, (*expected, prompt), fragment=True)
+                cached = len(prompt)
+                cancel_and_replace(args, port, log, content, (*expected, prompt),
+                                   fragment=True, cached=cached)
             ordinary(args, port, f"{label}-plain", "Say hello.")
     print("Decoded media HTTP route contract passed.")
 
@@ -309,7 +331,7 @@ def mixed_service(args):
         assert len(reply["scores"]) == 2 and reply["usage"]["completion_tokens"] == 0
         return reply
 
-    with serve(args, "mixed-service") as (port, _):
+    with serve(args, "mixed-service", "--prefix-cache-entries", "0") as (port, _):
         observed = {name: observe(port, "serial", name) for name in queries}
         with ThreadPoolExecutor(max_workers=len(queries)) as executor:
             concurrent = list(executor.map(
@@ -318,11 +340,215 @@ def mixed_service(args):
     print("Default mixed media, text, and label-score route contract passed.")
 
 
+def native_text(ids, budget=8):
+    return {"input_ids": ids, "sampling_params": {
+        "max_new_tokens": budget, "temperature": 0, "ignore_eos": True}}
+
+
+def native_result(reply, prompt, budget, cached, start=None):
+    meta = dict(reply["meta_info"])
+    assert meta.pop("prompt_tokens") == len(prompt), reply
+    assert meta.pop("cached_tokens") == cached, reply
+    assert meta.pop("completion_tokens") == len(reply["output_ids"]) == budget, reply
+    assert meta.pop("finish_reason") == {"type": "length", "length": budget}, reply
+    meta.pop("id")
+    if start is not None:
+        selected = meta["input_token_logprobs"]
+        assert [row[1] for row in selected] == (prompt[start:] if start >= 0 else []), reply
+        assert meta["output_token_logprobs_length"] == budget, reply
+        output = meta["output_token_logprobs"]
+        assert [row[1] for row in output] == reply["output_ids"], reply
+        assert all(math.isfinite(row[0]) for row in output), reply
+        if selected:
+            assert selected[0][0] is None and meta["input_top_logprobs"][0] is None, reply
+            assert all(math.isfinite(row[0]) for row in selected[1:]), reply
+        for rows in (meta["input_top_logprobs"][1:], meta["output_top_logprobs"]):
+            assert all(len(row) == 5 and all(math.isfinite(score[0]) for score in row)
+                       for row in rows), reply
+    return reply["output_ids"], reply["text"], meta
+
+
+def score_body(prompt, start):
+    return native_text(prompt, 4) | {
+        "return_logprob": True, "logprob_start_len": start, "top_logprobs_num": 5}
+
+
+def server_policy(args, port, label, entries):
+    status, _, raw = exchange(port, "/server_info")
+    (args.evidence / f"{label}-server-info.json").write_bytes(raw)
+    info = json.loads(raw)
+    expected = {"dp_size": 1, "tp_size": 1, "pp_size": 1, "mtp_steps": 4,
+                "max_running_requests": 32, "max_num_batched_tokens": 8192,
+                "prefix_cache_entries": entries, "enable_multimodal": True,
+                "fp8_prefill": "tensor-core", "paired_prefill": True,
+                "target_gqa": "grouped-split", "batch_cuda_graphs": True, "eager": False}
+    assert status == 200 and {key: info[key] for key in expected} == expected, info
+
+
+def feature_media(args, port, log, request, image_or_video, media, controls):
+    for name in ("image", "video"):
+        output, prompt = controls[name]
+        hits = len(prompt)
+        assert CACHE_PAGE_TOKENS < hits < 2048 and hits % CACHE_PAGE_TOKENS, hits
+        assert image_or_video(port, f"default-cold-{name}", media[name], 0) == (output, prompt)
+        assert image_or_video(port, f"default-warm-{name}", media[name], hits,
+                              stream=True) == (output, prompt)
+        assert image_or_video(port, f"default-warm-json-{name}", media[name], hits) == (
+            output, prompt)
+    assert controls["image"][1] == controls["changed-pixels"][1]
+    for name in ("changed-pixels", "changed-grid", "changed-positions"):
+        assert image_or_video(port, f"default-{name}", media[name], 0) == controls[name]
+    original_prompt = controls["image"][1]
+    suffix_prompt = controls["changed-suffix"][1]
+    assert original_prompt != suffix_prompt and original_prompt[:1024] == suffix_prompt[:1024]
+    suffix_hits = 0
+    if suffix_prompt[:len(original_prompt)] == original_prompt:
+        suffix_hits = len(original_prompt)
+    assert request(port, "reset-before-suffix", "/reset_prefix_cache", {}) == {"success": True}
+    assert image_or_video(port, "reprime-image", media["image"], 0) == controls["image"]
+    assert image_or_video(port, "default-changed-suffix", media["changed-suffix"],
+                          suffix_hits) == controls["changed-suffix"]
+    for name, salt, hits in (("salt-cold", "media\0a", 0),
+                             ("salt-warm", "media\0a", len(original_prompt)),
+                             ("salt-distinct", "media\0b", 0)):
+        assert image_or_video(port, name, media["image"] | {"cache_salt": salt}, hits) == (
+            controls["image"])
+    cancelled = media["image"] | {"max_tokens": 1024, "stream": True}
+    with closing(start(port, cancelled)) as active:
+        transport = active.sock
+        with active.getresponse() as response:
+            first = args.evidence / "default-cancel-first-token.sse"
+            first.write_bytes(first_stream_token(response))
+            offset = log.stat().st_size
+            transport.close()
+    wait_retired(log, offset)
+    assert image_or_video(port, "default-after-cancel", media["image"],
+                          len(original_prompt), stream=True) == controls["image"]
+    wait_retired(log, 0)
+
+
+def check_label_order(got, reversed_labels):
+    assert got["token_logprobs"] == [row[::-1] for row in reversed_labels["token_logprobs"]]
+    for scores, logprobs, reverse in zip(got["scores"], got["token_logprobs"],
+                                        reversed_labels["scores"], strict=True):
+        weights = [math.exp(value - max(logprobs)) for value in logprobs]
+        total = math.fsum(weights)
+        for actual, weight, other in zip(scores, weights, reversed(reverse), strict=True):
+            assert math.isclose(actual, weight / total, rel_tol=1e-12), (scores, logprobs)
+            assert math.isclose(actual, other, rel_tol=1e-12), (scores, reverse)
+
+
+def feature_complete(args):
+    args.evidence.mkdir()
+    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
+    ids = json.loads(fixture.read_text())["prompt_token_ids"]
+    prefix, extension = ids * 2, ids * 2 + ids[:1024]
+    scoring = ids[:132]
+    image = visual("image_url", 32, 64)
+    video = visual("video_url", 32, 64)
+    changed_pixels = deepcopy(image)
+    changed_pixels["image_url"]["url"] = RGB8 + base64.b64encode(
+        bytes((195, 30, 80)) * 2048).decode()
+    changed_positions = deepcopy(video)
+    changed_positions["video_url"]["frame_indices"] = [0, 3]
+    stem = "Describe the visual content in detail. " * 150
+
+    def media_body(visual_part, suffix=""):
+        return chat([visual_part, {"type": "text", "text": stem + suffix}], budget=8)
+
+    media = {"image": media_body(image), "video": media_body(video),
+             "changed-pixels": media_body(changed_pixels),
+             "changed-grid": media_body(visual("image_url", 64, 32)),
+             "changed-positions": media_body(changed_positions),
+             "changed-suffix": media_body(image, "Explain the result in French.")}
+    labels = [[31, 17, 23], [29, 23, 17]]
+    score = {"query": scoring[:128], "items": [scoring[128:129], scoring[129:]],
+             "label_token_ids": labels, "return_token_logprobs": True, "apply_softmax": True}
+    timeline = args.evidence / "feature-timeline.jsonl"
+
+    def request(port, name, route, body):
+        start = time.monotonic_ns()
+        try:
+            return capture(args, name, port, route, body)
+        finally:
+            record = {"case": name, "port": port, "begin_ns": start, "end_ns": time.monotonic_ns()}
+            with timeline.open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+
+    def text(port, name, prompt, cached, *, start=None, stream=False):
+        body = native_text(prompt) if start is None else score_body(prompt, start)
+        budget = body["sampling_params"]["max_new_tokens"]
+        reply = request(port, name, GENERATE, body | {"stream": stream})
+        if stream:
+            *partial, reply = stream_frames(reply)
+            assert all(frame["meta_info"]["finish_reason"] is None for frame in partial), partial
+            assert all(frame["output_ids"] == reply["output_ids"][:len(frame["output_ids"])]
+                       for frame in partial), partial
+        return native_result(reply, prompt, budget, cached, start)
+
+    def image_or_video(port, name, body, cached, *, stream=False):
+        budget = body["max_tokens"]
+        if stream:
+            raw = request(port, name, CHAT, body | {"stream": True,
+                                                   "stream_options": {"include_usage": True}})
+            output, stats, prompt = stream_result(raw, budget, cached)
+        else:
+            reply = request(port, name, CHAT, body)
+            output, stats = received(reply, budget, cached)
+            prompt = reply["prompt_token_ids"]
+        assert len(prompt) == stats["prompt_tokens"], (prompt, stats)
+        return output, prompt
+
+    with serve(args, "feature-cache-off", "--prefix-cache-entries", "0") as (port, _):
+        server_policy(args, port, "cache-off", 0)
+        text_controls = {len(prompt): text(port, f"off-text-{len(prompt)}", prompt, 0)
+                         for prompt in (prefix, extension)}
+        boundary_control = text(port, "off-prompt-score-127", scoring, 0, start=127)
+        controls = {name: image_or_video(port, f"off-{name}", body, 0)
+                    for name, body in media.items()}
+
+    with serve(args, "feature-split-score", "--prefix-cache-entries", "0",
+               "--max-num-batched-tokens", str(CACHE_PAGE_TOKENS)) as (port, _):
+        split_control = text(port, "off-split-prompt-score-128", scoring, 0, start=128)
+        label_controls = [request(port, f"off-split-labels-{index}", SCORE, score | {
+            "items": [item], "label_token_ids": [labels[index]],
+        }) for index, item in enumerate(score["items"])]
+
+    with serve(args, "feature-default") as (port, log):
+        server_policy(args, port, "default", 4)
+        for name, prompt, hits in (("cold", prefix, 0), ("exact", prefix, len(prefix)),
+                                   ("partial", extension, len(prefix))):
+            assert text(port, f"default-text-{name}", prompt, hits, stream=name != "cold") == (
+                text_controls[len(prompt)])
+        text(port, "prime-prompt-scores", scoring[:128], 0, start=-1)
+        for score_start, hits, control in ((128, 128, split_control), (127, 0, boundary_control)):
+            for stream in (False, True):
+                assert text(port, f"default-prompt-score-{score_start}-{stream}", scoring, hits,
+                            start=score_start, stream=stream) == control
+        got = request(port, "default-labels", SCORE, score)
+        assert got["token_logprobs"] == [row["token_logprobs"][0] for row in label_controls], got
+        assert got["scores"] == [row["scores"][0] for row in label_controls], got
+        assert got["usage"]["completion_tokens"] == 0, got
+        assert got["usage"]["prompt_tokens"] == 260 and got["usage"]["total_tokens"] == 260, got
+        reversed_labels = request(port, "default-labels-reversed", SCORE,
+                                  score | {"label_token_ids": [row[::-1] for row in labels]})
+        check_label_order(got, reversed_labels)
+        feature_media(args, port, log, request, image_or_video, media, controls)
+    print("Default B200 cache, decoded media, and exact score route contract passed.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("server", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("evidence", type=Path)
-    parser.add_argument("--mixed-service", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--mixed-service", action="store_true")
+    modes.add_argument("--feature-complete", action="store_true")
     args = parser.parse_args()
-    (mixed_service if args.mixed_service else main)(args)
+    if args.feature_complete:
+        feature_complete(args)
+    elif args.mixed_service:
+        mixed_service(args)
+    else:
+        main(args)

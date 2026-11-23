@@ -107,6 +107,8 @@ enum class DecoderFinishReason {
     aborted,
 };
 
+struct DecoderTokenLogprobs;
+
 struct DecoderCallbacks {
     std::function<bool(int)> on_token;
     std::function<bool()> is_cancelled;
@@ -114,6 +116,8 @@ struct DecoderCallbacks {
     std::function<bool()> on_stream_poll = {};
     bool buffer_decode_output = false;
     std::function<bool(std::size_t)> on_prompt_admitted = {};
+    std::function<bool(int, const std::shared_ptr<const DecoderTokenLogprobs>&)>
+        on_scored_token = {};
 };
 
 struct DecoderLogit {

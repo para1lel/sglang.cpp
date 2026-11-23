@@ -152,7 +152,7 @@ def check_live_graph(controls):
     assert len(steps) == 4, steps
     assert all(step["width"] == 2 and step["decode_lanes"] == 2
                and step["prefill_rows"] == 0 for step in steps), steps
-    assert all(step["graph_slots"] == 0 for step in steps), steps
+    assert all(step["graph_slots"] == 3 for step in steps), steps
 
 
 def live_reset(controls, prompt, output):
@@ -195,8 +195,8 @@ def live_reset(controls, prompt, output):
     before = controls.wait_for("before-reset", 0, 0)
     controls.reset("idle-reset")
     after = controls.metrics("after-reset")
-    assert after[ENTRIES] == after[PAGES] == after[OCCUPANCY] == 0, after
-    assert after[DEVICE_BYTES] == before[DEVICE_BYTES] > 0, (before, after)
+    assert after[ENTRIES] == after[PAGES] == after[OCCUPANCY] == after[DEVICE_BYTES] == 0, after
+    assert before[DEVICE_BYTES] > 0, before
     for counter in (CACHED, COMPUTED, PREFILLS, PROMPT, GENERATED,
                     EXTERNAL, HITS, STORES, EVICTIONS):
         assert before[counter] == after[counter], (counter, before, after)
@@ -206,6 +206,7 @@ def live_reset(controls, prompt, output):
 def check_wrong_prefix_and_eviction(controls, prefix, prefix_output):
     wrong = [*prefix[:64], (prefix[64] + 1) % 248320, *prefix[65:]]
     before = controls.metrics("wrong-before")
+    assert before[ENTRIES] == 2, before
     raw, content = controls.raw(
         "wrong-prefix", benchmark(wrong, len(prefix_output), cache_salt="branch")
     )
@@ -213,10 +214,11 @@ def check_wrong_prefix_and_eviction(controls, prefix, prefix_output):
     wrong_output = output_ids(controls, "wrong-prefix", raw, wrong, len(prefix_output), 0)
     after = controls.wait_for("wrong-after", 0, 0)
     assert after[CACHED] == before[CACHED] and after[COMPUTED] - before[COMPUTED] == 128
+    assert after[EVICTIONS] == before[EVICTIONS] + 1, after
     controls.benchmark("wrong-now-warm", wrong, wrong_output, 128, "branch")
     controls.benchmark("another-salt", prefix, prefix_output, 0, "other")
     after = controls.wait_for("evicted", 0, 0)
-    assert after[ENTRIES] == 2 and after[EVICTIONS] == before[EVICTIONS] + 1, after
+    assert after[ENTRIES] == 2 and after[EVICTIONS] == before[EVICTIONS] + 2, after
     verify_step(controls, prefix, prefix_output, "evicted-miss", 0, 128)
 
 
@@ -231,9 +233,12 @@ def run(controls):
         controls.control(f"bad-reset-{index}", "/reset_prefix_cache", body, 400)
     controls.control("reset-with-get", "/reset_prefix_cache", status=404)
     controls.reset("initial-reset")
+    empty = controls.metrics("initially-empty")
+    assert empty[ENTRIES] == empty[PAGES] == empty[DEVICE_BYTES] == 0, empty
     verify_step(controls, prefix, prefix_output, "cold", 0, 128)
     verify_step(controls, prefix, prefix_output, "exact", 128, 0)
     verify_step(controls, suffix, suffix_output, "partial", 128, 1)
+    verify_step(controls, suffix, suffix_output, "unaligned-exact", 129, 0)
 
     check_profile_controls(controls, prefix, prefix_output)
     check_wrong_prefix_and_eviction(controls, prefix, prefix_output)
@@ -285,7 +290,7 @@ def check_text_reply(controls, name, request, expected_text, ids, reason, cached
 
 
 def check_text_stops(controls):
-    # The exact-prefill continuation is " seven, eight,". Both stops trigger on its first comma.
+    # Both stops trigger on the first comma of " seven, eight,".
     prompt = ("Prefix cache fixture. " * 36
               + "\n\nThe sequence starts at one, two, three, four, five, six,")
     body = {"model": MODEL, "prompt": prompt, "max_tokens": 4, "return_token_ids": True,
@@ -297,12 +302,12 @@ def check_text_stops(controls):
     full_ids = [*stopped_ids, 7810, 11]
     cases = (
         ("cold-string-json", string_stop, " seven", stopped_ids, "stop", 0),
-        ("warm-no-stop-json", {}, " seven, eight,", full_ids, "length", 128),
-        ("warm-token-json", token_stop, " seven", stopped_ids, "stop", 128),
-        ("warm-string-json", string_stop, " seven", stopped_ids, "stop", 128),
-        ("warm-token-sse", stream | token_stop, " seven", stopped_ids, "stop", 128),
-        ("warm-string-sse", stream | string_stop, " seven", stopped_ids, "stop", 128),
-        ("warm-after-stop-sse", stream, " seven, eight,", full_ids, "length", 128),
+        ("warm-no-stop-json", {}, " seven, eight,", full_ids, "length", 161),
+        ("warm-token-json", token_stop, " seven", stopped_ids, "stop", 161),
+        ("warm-string-json", string_stop, " seven", stopped_ids, "stop", 161),
+        ("warm-token-sse", stream | token_stop, " seven", stopped_ids, "stop", 161),
+        ("warm-string-sse", stream | string_stop, " seven", stopped_ids, "stop", 161),
+        ("warm-after-stop-sse", stream, " seven, eight,", full_ids, "length", 161),
     )
     usages = [check_text_reply(controls, name, body | options, text, ids, reason, cached)
               for name, options, text, ids, reason, cached in cases]

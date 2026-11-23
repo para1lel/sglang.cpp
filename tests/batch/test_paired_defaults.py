@@ -12,7 +12,7 @@ from tests.test_paired_identity import GPU, OTHER_GPU, k4, write_command, write_
 from tests.test_paired_identity import write_k4_row, write_receipts, write_saved_worker
 
 
-def write_default_vllm(run, checkpoint):
+def write_default_vllm(run, checkpoint, *, cache_on=False):
     write_saved_worker(run, checkpoint, k4.concurrent.reference(), 8192)
     args = shlex.split((run / "server-command.sh").read_text())[6:]
     argv = ["/venv/bin/python", "-B", *args, "--host", "127.0.0.1",
@@ -20,6 +20,12 @@ def write_default_vllm(run, checkpoint):
             "--speculative-config", '{"method":"mtp","num_speculative_tokens":4}']
     snapshot = run / "effective-worker.json"
     data = json.loads(snapshot.read_bytes())
+    cache = {"enable_prefix_caching": True, "mamba_cache_mode": "align",
+             "block_size": 1600, "mamba_block_size": 1600}
+    if cache_on:
+        argv[argv.index("--no-enable-prefix-caching")] = "--enable-prefix-caching"
+        argv.append("--enable-prompt-tokens-details")
+        data["results"][0]["cache"].update(cache)
     scale = {"tensor": 1.0, "dtype": "torch.float32", "host": 1.0}
     gqa = {"backend": "FLASHINFER", "kernel_cache_dtype": "torch.float8_e4m3fn",
            "scales": dict.fromkeys("qkv", scale)}
@@ -35,24 +41,49 @@ def write_default_vllm(run, checkpoint):
         "speculative_config": {"method": "mtp", "num_speculative_tokens": 4,
                                "model": checkpoint},
         "model_config": {"model": checkpoint},
+        **({"cache_config": cache} if cache_on else {}),
         "attention_config": {"use_trtllm_attention": True,
                              "disable_flashinfer_q_quantization": True},
     }})
     return argv
 
 
-def write_default_native(run, arm):
+def write_default_native(run, arm, *, cache_on=False):
     flags = ["--port", "17424"]
     if arm == "native-k4-trace":
         flags.append("--trace-batches")
     info = json.loads((run / "server-info.json").read_bytes())
-    info.update(launch_command=" ".join(["sglang-server", *flags]), dp_size=1, tp_size=1, pp_size=1)
+    info.update(launch_command=" ".join(["sglang-server", *flags]), dp_size=1, tp_size=1, pp_size=1,
+                prefix_cache_entries=4 if cache_on else 0)
     write_json(run / "server-info.json", info)
     write_compute(run, GPU, 123)
     return ["/bin/sglang-server", *flags]
 
 
-def write_default_row(root, native_ns=70):
+def write_cold_cache_receipt(raw, arm):
+    cache = k4.cold_cache
+    request = raw["requests"][0]
+    for field in ("submit_ns", "headers_ns", "done_ns"):
+        request[field] += 100
+    request["response_end"]["ns"] += 100
+    for event in request["events"]:
+        event["ns"] += 100
+    for chunk in request["token_chunks"]:
+        chunk[0] += 100
+    submit = request["submit_ns"]
+    eof = request["response_end"]["ns"]
+    metrics = f'{cache.RUNNING}{{engine="0"}} 0.0\n{cache.WAITING} 0\n{cache.HITS} 40\n'
+    occupied = metrics
+    if arm != "vllm-k4":
+        metrics += "".join(f"{name} 0\n" for name in cache.NATIVE_METRICS)
+        occupied = metrics.replace(f"{cache.ENTRIES} 0", f"{cache.ENTRIES} 1")
+    return {"before": occupied, "cleared": metrics, "after": occupied,
+            "reset": {"status": 200, "body": '{"success":true}'},
+            "reset_started_ns": submit - 30, "reset_completed_ns": submit - 20,
+            "ready_ns": submit - 10, "capture_finished_ns": eof + 10}
+
+
+def write_default_row(root, native_ns=70, *, cache_on=False):
     row = root / "W1"
     row.mkdir()
     write_k4_row(row, native_ns, receipt_version=1)
@@ -60,7 +91,9 @@ def write_default_row(root, native_ns=70):
     protocol.write_text("captured protocol manifest\n")
     checkpoint = "/model"
     write_json(row / "identity.json", {
-        "protocol": k4.defaults.PROTOCOL, "native_profile": k4.defaults.PROFILE,
+        "protocol": k4.defaults.CACHE_ON_PROTOCOL if cache_on else k4.defaults.PROTOCOL,
+        **({"cache_policy": k4.defaults.CACHE_POLICY} if cache_on else {}),
+        "native_profile": k4.defaults.PROFILE,
         "replay_receipts": 2, "campaign_id": "01234567-89ab-cdef-0123-456789abcdef",
         "checkpoint_path": checkpoint, "port": 17424, "gpu_uuid": GPU,
         "server_cpus": "24-33", "client_cpus": "34-35", "memory": "localalloc",
@@ -74,8 +107,8 @@ def write_default_row(root, native_ns=70):
         run = row / arm
         environment = dict.fromkeys(k4.defaults.NATIVE_ENVIRONMENT, "/archive")
         environment.update(CUDA_VISIBLE_DEVICES=GPU, CUDA_DEVICE_ORDER="PCI_BUS_ID")
-        argv = (write_default_vllm(run, checkpoint) if arm == "vllm-k4"
-                else write_default_native(run, arm))
+        argv = (write_default_vllm(run, checkpoint, cache_on=cache_on) if arm == "vllm-k4"
+                else write_default_native(run, arm, cache_on=cache_on))
         assignments = [f"{key}={value}" for key, value in sorted(environment.items())]
         (run / "effective-environment.txt").write_text("\n".join(assignments) + "\n")
         for name in ("live-environment.bin", "live-environment-end.bin"):
@@ -95,6 +128,8 @@ def write_default_row(root, native_ns=70):
             measurement = run / "measurement"
             raw = k4.read_raw(measurement, tag)
             raw["binding"] = k4.arm_binding(measurement, arm, selected, 2)
+            if cache_on:
+                raw["cold_cache"] = write_cold_cache_receipt(raw, arm)
             with gzip.open(measurement / f"{tag}.json.gz", "wt") as stream:
                 json.dump(raw, stream)
     return row
@@ -132,4 +167,62 @@ def test_native_defaults_k4_rejects_conflicting_evidence(tmp_path, name, old, ne
     assert old in raw
     path.write_bytes(raw.replace(old, new, 1))
     with pytest.raises(ValueError, match=message):
+        k4.assess("W1", row, row)
+
+
+def test_cache_on_replays_every_cohort_and_keeps_zero_hit_contract(tmp_path):
+    row = write_default_row(tmp_path, cache_on=True)
+    result = k4.assess("W1", row, row)
+    assert result["protocol"] == k4.defaults.CACHE_ON_PROTOCOL
+    assert result["cache_policy"] == k4.defaults.CACHE_POLICY
+    assert result["passed"]
+    for arm, receipts in result["cache_receipts"].items():
+        assert set(receipts) == set(k4.schedule("W1", arm))
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    ("missing", "Missing cold cache control receipt"),
+    ("declined", "Prefix cache reset was not acknowledged"),
+    ("busy", "active or queued request"),
+    ("late", "overlaps the timed cohort"),
+    ("hit-counter", "Prefix cache hit counter advanced"),
+    ("occupied", "Native cache is occupied after reset"),
+    ("wire-hit", "zero reused prompt tokens"),
+])
+def test_cache_on_rejects_invalid_cohort_isolation(tmp_path, change, message):
+    row = write_default_row(tmp_path, cache_on=True)
+    directory = row / "native-k4/measurement"
+    tag = k4.schedule("W1", "native-k4")[0]
+    raw = k4.read_raw(directory, tag)
+    receipt = raw["cold_cache"]
+    cache = k4.cold_cache
+    if change == "missing":
+        del raw["cold_cache"]
+    elif change == "declined":
+        receipt["reset"]["body"] = '{"success":false}'
+    elif change == "busy":
+        receipt["cleared"] = receipt["cleared"].replace(f"{cache.WAITING} 0", f"{cache.WAITING} 1")
+    elif change == "late":
+        receipt["ready_ns"] = raw["requests"][0]["submit_ns"] + 1
+    elif change == "hit-counter":
+        receipt["after"] = receipt["after"].replace(f"{cache.HITS} 40", f"{cache.HITS} 41")
+    elif change == "wire-hit":
+        request = raw["requests"][0]
+        usage = request["events"][-2]["lines"]
+        usage[0] = usage[0].replace('"cached_tokens": 0', '"cached_tokens": 1')
+    else:
+        receipt["cleared"] = receipt["cleared"].replace(f"{cache.ENTRIES} 0", f"{cache.ENTRIES} 1")
+    with gzip.open(directory / f"{tag}.json.gz", "wt") as stream:
+        json.dump(raw, stream)
+    with pytest.raises(ValueError, match=message):
+        k4.assess("W1", row, row)
+
+
+def test_cache_on_rejects_disagreeing_hybrid_block_geometry(tmp_path):
+    row = write_default_row(tmp_path, cache_on=True)
+    path = row / "vllm-k4/server-info.json"
+    config = json.loads(path.read_bytes())
+    config["vllm_config"]["cache_config"]["mamba_block_size"] += 1
+    write_json(path, config)
+    with pytest.raises(ValueError, match="API and worker disagree"):
         k4.assess("W1", row, row)

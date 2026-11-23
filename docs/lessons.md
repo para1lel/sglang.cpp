@@ -14,7 +14,7 @@ The [commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check
 
 **Corrected.** Prefix store and restore assumed that logical and physical page indices matched. The identity case passed. With logical page zero at physical page one, the remapped case reported `Key payload mismatch`.
 
-The [page-map reader](../src/decoder_prefix_cache.cpp#L71)<!-- prefix: "GpuPrefixSna" --> now supplies physical indices for both transfers. Store gathers into logical order. Restore scatters into the destination mapping. The selected correction passed the remap and guard checks.
+The [page-map reader](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "GpuPrefixSna" --> now supplies physical indices for both transfers. Store gathers into logical order. Restore scatters into the destination mapping. The selected correction passed the remap and guard checks.
 
 Run `prefix-state --remapped` and `prefix-state --guards` after changes to KV copies. Use the [B200 build and run procedure](../tests/prefix/README.md). Keep independent source and destination permutations and check all four KV planes and untouched tail pages.
 

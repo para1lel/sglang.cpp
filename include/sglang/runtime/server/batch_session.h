@@ -18,9 +18,9 @@ public:
 
     /// Return the number of prompt positions restored from the prefix cache.
     virtual int admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options) = 0;
-    virtual void admit_multimodal(int slot, std::vector<int>&& prompt,
-                                  const DecoderOptions& options,
-                                  const std::vector<DecoderMedia>& media) = 0;
+    virtual int admit_multimodal(int slot, std::vector<int>&& prompt,
+                                 const DecoderOptions& options,
+                                 const std::vector<DecoderMedia>& media) = 0;
     virtual void cancel(int slot) = 0;
     virtual Steps advance_chunked(const Selection& selected, DecoderBatchStepStats* stats) = 0;
 

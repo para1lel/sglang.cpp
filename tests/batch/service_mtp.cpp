@@ -10,6 +10,7 @@ namespace {
 
 using Finish = sglang::DecoderFinishReason;
 using Service = sglang::server::BatchService;
+constexpr int cached_media_rows = 5;
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -25,13 +26,16 @@ struct Scenario {
     std::vector<int> expected_ids;
     std::size_t expected_accepted;
     Finish finish;
+    bool scored = false;
 };
 
 bool check(const Scenario& scenario) {
     const bool seed_only = scenario.expected_ids.size() == 1;
     sglang::DecoderOptions options;
     options.max_new_tokens = seed_only ? 1 : 6;
+    if (scenario.scored) options.generated_top_logprobs = 1;
     std::vector<int> emitted;
+    std::vector<std::shared_ptr<const sglang::DecoderTokenLogprobs>> scores;
     bool admitted = false;
     sglang::DecoderCallbacks callbacks;
     callbacks.on_admitted = [&] {
@@ -39,11 +43,24 @@ bool check(const Scenario& scenario) {
         admitted = true;
         return true;
     };
-    callbacks.on_token = [&](int token) {
+    const auto emit = [&](int token) {
         require(admitted, "Token callback before admission callback");
         emitted.push_back(token);
         return scenario.interrupt != Interrupt::callback ||
                emitted.size() < scenario.expected_ids.size();
+    };
+    callbacks.on_token = [&](int token) {
+        require(!scenario.scored, "Scored token used the unscored callback");
+        return emit(token);
+    };
+    callbacks.on_scored_token = [&](int token, const auto& score) {
+        require(scenario.scored && score && score->selected.token_id == token &&
+                    score->selected.value == -0.25f * token && score->alternatives.size() == 1 &&
+                    score->alternatives[0].token_id == token &&
+                    score->alternatives[0].value == score->selected.value,
+                "Missing or misordered score at token callback");
+        scores.push_back(score);
+        return emit(token);
     };
     callbacks.is_cancelled = [&] {
         return scenario.interrupt == Interrupt::poll &&
@@ -64,6 +81,9 @@ bool check(const Scenario& scenario) {
 
     require(emitted == scenario.expected_ids && result.output_token_ids == scenario.expected_ids,
             "Unexpected callback or result token IDs");
+    require(scores == result.generated_logprobs &&
+                scores.size() == (scenario.scored ? emitted.size() : 0),
+            "Result score rows differ from committed callback score rows");
     require(result.finish_reason == scenario.finish, "Unexpected finish reason");
     require(result.mtp_drafted_tokens == (seed_only ? 0 : 4) &&
                 result.mtp_rounds == (seed_only ? 0 : 1),
@@ -89,6 +109,44 @@ bool check(const Scenario& scenario) {
     return exact;
 }
 
+void check_media_cache_usage() {
+    const sglang::Decoder decoder("unused");
+    Service service(decoder, true, false, 4, 4, 0);
+    sglang::DecoderOptions options;
+    options.max_new_tokens = 1;
+    const std::vector<sglang::DecoderMedia> media(1);
+    constexpr std::size_t expanded_rows = 9;
+    sglang::DecoderCallbacks single;
+    std::optional<std::size_t> admitted;
+    single.on_prompt_admitted = [&](std::size_t cached) {
+        require(!admitted, "Duplicate media admission notification");
+        admitted = cached;
+        return true;
+    };
+    const auto result = service.generate(3, {7}, options, single, media, expanded_rows);
+    require(admitted == cached_media_rows && result.cached_prompt_tokens == cached_media_rows &&
+                result.output_token_ids == std::vector{100},
+            "Media cache count was lost in the single-request result or admission callback");
+
+    bool emitted = false;
+    sglang::server::BatchCallbacks indexed;
+    indexed.on_output = [&](std::size_t index, const sglang::DecoderResult& output, bool final) {
+        require(!emitted && index == 0 && final && output.cached_prompt_tokens == cached_media_rows,
+                "Media cache count was lost from the indexed output callback");
+        emitted = true;
+        return true;
+    };
+    sglang::server::BatchPrompt prompt{{7}, options};
+    prompt.media = media;
+    prompt.expanded_tokens = expanded_rows;
+    const auto results = service.generate_batch(3, {prompt}, indexed);
+    require(emitted && results && results->size() == 1 &&
+                results->front().cached_prompt_tokens == cached_media_rows &&
+                results->front().output_token_ids == std::vector{100},
+            "Media cache count was lost from the indexed result");
+    std::cout << "Media admission and indexed results preserved cached prompt tokens\n";
+}
+
 }
 
 namespace sglang {
@@ -100,6 +158,7 @@ Decoder::~Decoder() = default;
 struct DecoderBatch::State {
     int budget = 0;
     bool seeded = false;
+    bool scored = false;
 };
 
 DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
@@ -117,12 +176,16 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     require(state_->budget == 0, "Overlapping admission");
     state_->budget = options.max_new_tokens;
     state_->seeded = false;
+    state_->scored = options.generated_top_logprobs == 1;
     return 0;
 }
 
-int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
-                                  const std::vector<DecoderMedia>&) {
-    throw std::logic_error("Unexpected media admission");
+int DecoderBatch::admit_multimodal(int slot, std::vector<int> prompt,
+                                  const DecoderOptions& options,
+                                  const std::vector<DecoderMedia>& media) {
+    require(media.size() == 1, "Unexpected media count");
+    admit(slot, std::move(prompt), options);
+    return cached_media_rows;
 }
 
 void DecoderBatch::cancel(int slot) {
@@ -137,8 +200,13 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
             "Unexpected scheduler selection");
     std::array<DecoderBatchStep, decoder_batch_max_lanes> steps{};
     auto& step = steps[3];
+    const auto score = [](int token) {
+        const DecoderLogprob value{token, -0.25f * token};
+        return std::make_shared<const DecoderTokenLogprobs>(DecoderTokenLogprobs{value, {value}});
+    };
     if (!std::exchange(state_->seeded, true)) {
         step.token = 100;
+        if (state_->scored) step.generated_logprobs = score(*step.token);
         stats->prefill_rows[3] = 1;
         stats->target_rows = 1;
         if (state_->budget == 1) {
@@ -154,6 +222,12 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
     step.extra_token = 102;
     step.extra_tokens = {102, 103, 104, 105};
     step.extra_token_count = 4;
+    if (state_->scored) {
+        step.generated_logprobs = score(*step.token);
+        for (int index = 0; index < step.extra_token_count; ++index) {
+            step.extra_generated_logprobs[index] = score(step.extra_tokens[index]);
+        }
+    }
     step.mtp_accepted_tokens = 4;
     step.mtp_drafted_tokens = 4;
     step.mtp_verified_rows = 5;
@@ -186,7 +260,15 @@ int main() {
                                  Finish::cancelled});
         const bool full = check({"full round", Interrupt::none, {100, 101, 102, 103, 104, 105}, 4,
                                  Finish::length});
-        return seed && callback && poll && full ? 0 : 1;
+        const bool scored_full = check({"scored full round", Interrupt::none,
+            {100, 101, 102, 103, 104, 105}, 4, Finish::length, true});
+        const bool scored_callback = check({"scored callback false", Interrupt::callback,
+            {100, 101, 102}, 2, Finish::cancelled, true});
+        const bool scored_poll = check({"scored mid-round cancel", Interrupt::poll,
+            {100, 101, 102, 103}, 3, Finish::cancelled, true});
+        check_media_cache_usage();
+        return seed && callback && poll && full && scored_full && scored_callback && scored_poll
+            ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 2;

@@ -4,7 +4,7 @@ Both `/v1/completions` and `/v1/chat/completions` can return the score of each c
 
 ## Request requirements
 
-The [server MTP policy](../mtp.md#runtime-path) uses K0 for scored requests when you omit the depth option. Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Active sampling, output constraints, decoded media, and active chat reasoning or tool output parsers return HTTP 400 before SSE. [Score options](../../apps/server/text_request.cpp#L325)<!-- prefix: "int openai_l" -->
+Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Eligible greedy requests use the [configured MTP depth](../mtp.md#runtime-path), including decoded-media chat. Active sampling, output constraints, and active chat reasoning or tool output parsers return HTTP 400 before SSE. [Score options](../../apps/server/text_request.cpp#L325)<!-- prefix: "int openai_l" --> · [Batch validation](../../src/decoder_batch.cpp#L431)<!-- prefix: "if ((options" -->
 
 Generated logprobs use the scores after [output penalties](../output-penalties.md) and logit bias.
 
@@ -32,7 +32,7 @@ SSE delivers each score once. A scored event can have empty visible text while t
 
 ## Verification
 
-With `--mtp-steps 0`, compare JSON with the concatenated SSE scores for the same greedy requests. Check selected-only and top-20 responses, batch choices by index, zero-budget responses, stop IDs, cross-token text stops, and split UTF-8. Repeat on eager and graph decode. With the default depth, compare scored requests with the K0 control. Require HTTP 400 before SSE for active sampling, output constraints, and scoring with explicit positive MTP depth. Run the [native CUDA and CPU score checks](../native-generate.md#verification) for the shared reducer and native score delivery.
+Compare JSON with concatenated SSE scores for greedy requests at K0 and the configured positive depth. Check selected-only and top-20 scores, indexed choices, zero budgets, and stops across token boundaries. Repeat on eager and eligible graph decode. Require HTTP 400 before SSE for active sampling or output constraints. Run the [native score checks](../native-generate.md#verification) and [mixed media checks](../../tests/media/http-contract.md).
 
 Build the [CPU fixture](../../tests/text/README.md#native-generate-on-cpu), then run the OpenAI wire suite from the repository root in the managed Pixi environment.
 
@@ -43,4 +43,4 @@ CUDA_VISIBLE_DEVICES='' python3 -B tests/text/test_openai_generated_logprobs_cpu
     --server "$out/server" --checkpoint "$checkpoint" --output "$out/openai-logprob-evidence"
 ```
 
-Require exit status zero. The suite compares JSON with SSE across all four completion prompt forms and chat, checks score arrays, byte projection, and stop behavior, and exercises opt-out, frozen benchmark, and MTP guards.
+Require exit status zero. The suite compares JSON with SSE across all four completion prompt forms and chat. It checks score arrays, byte projection, opt-out, benchmark input rejection, and stop handling.

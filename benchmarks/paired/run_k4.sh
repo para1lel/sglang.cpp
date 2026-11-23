@@ -5,9 +5,10 @@ usage() {
     echo "Usage: bash benchmarks/paired/run_k4.sh NATIVE_BINARY GPU_INDEX CAMPAIGN_DIR ROW"
     echo "ROW must be W1, W2, W3, W4, W5, or W6."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
-    echo "The default profile, server-defaults, times native defaults against matched vLLM K4."
+    echo "The default profile, server-defaults, times matched K4 with both caches enabled and cold."
     echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
-    echo "  exact, ordered-tc-int8, ordered-tc-int8-split-gqa, ordered-tc-int8-long-split-gqa."
+    echo "  server-defaults-cache-off, exact, ordered-tc-int8, ordered-tc-int8-split-gqa,
+  ordered-tc-int8-long-split-gqa."
 }
 
 if [[ ${1:-} == --help ]]; then
@@ -30,9 +31,11 @@ native_profile=${PAIRED_K4_NATIVE_PROFILE-server-defaults}
 native_fp8=exact
 native_split_mode=
 native_defaults=false
+cache_on=false
 case "$native_profile" in
     exact) ;;
-    server-defaults) native_defaults=true ;;
+    server-defaults) native_defaults=true; cache_on=true ;;
+    server-defaults-cache-off) native_defaults=true ;;
     ordered-tc-int8) ;;
     ordered-tc-int8-split-gqa) native_split_mode=1 ;;
     ordered-tc-int8-long-split-gqa) native_split_mode=long ;;
@@ -53,8 +56,10 @@ if ! [[ -x $binary && $native_source =~ ^[a-f0-9]{40}$ &&
     exit 2
 fi
 case "$index" in
+    0) export PAIRED_SERVER_CPUS=0-9 PAIRED_CLIENT_CPUS=10-11 ;;
     1|2|3) export PAIRED_SERVER_CPUS=24-33 PAIRED_CLIENT_CPUS=34-35 ;;
     5|6) export PAIRED_SERVER_CPUS=72-81 PAIRED_CLIENT_CPUS=82-83 ;;
+    7) export PAIRED_SERVER_CPUS=84-93 PAIRED_CLIENT_CPUS=94-95 ;;
     *) usage >&2; exit 2 ;;
 esac
 case "$row" in
@@ -105,6 +110,10 @@ protocol_hash=$(cd -- "$project" && sha256sum \
     benchmarks/concurrent/{client.py,reference.py,freeze_prompts.py,fixture-manifest.json} \
     benchmarks/concurrent/gpu2-reference.json \
     benchmarks/vllm/wheel.sha256)
+if [[ $cache_on == true ]]; then
+    cache_protocol_hash=$(cd -- "$project" && sha256sum benchmarks/paired/cold_cache.py)
+    protocol_hash+=$'\n'"$cache_protocol_hash"
+fi
 protocol_sha=$(printf '%s\n' "$protocol_hash" | sha256sum)
 identity=$(jq -nc --arg source "$native_source" --arg binary "$native_sha" \
     --arg gpu "$uuid" --arg checkpoint "$model_sha" --arg vllm "$pin" \
@@ -123,9 +132,11 @@ if [[ $native_profile != exact ]]; then
     [[ $campaign_id =~ ^[0-9a-f-]{36}$ ]]
     if [[ $native_defaults == true ]]; then
         identity=$(jq -c --arg model "$checkpoint" --arg campaign_id "$campaign_id" \
-            --argjson port "$port" \
+            --argjson port "$port" --argjson cache_on "$cache_on" \
             '. + {protocol:"matched-k4-native-defaults-v1",campaign_id:$campaign_id,
-                  native_profile:"server-defaults",checkpoint_path:$model,port:$port}' \
+                  native_profile:"server-defaults",checkpoint_path:$model,port:$port}
+             | if $cache_on then . + {protocol:"matched-k4-native-defaults-cache-on-v2",
+                 cache_policy:"reset-before-every-cohort"} else . end' \
             <<<"$identity")
     else
         identity=$(jq -c --arg profile "$native_profile" --arg fp8 "$native_fp8" \
@@ -287,6 +298,10 @@ start_vllm() {
     fi
     local attention_config='{"backend":"FLASHINFER","disable_flashinfer_q_quantization":true,'
     attention_config+='"use_trtllm_attention":true}'
+    local cache_flags=(--no-enable-prefix-caching)
+    if [[ $cache_on == true ]]; then
+        cache_flags=(--enable-prefix-caching)
+    fi
     start_group "$run" "${environment[@]}" "$python" -B -m vllm.entrypoints.openai.api_server \
         --host 127.0.0.1 --port "$port" --model "$checkpoint" --served-model-name benchmark \
         --dtype bfloat16 --kv-cache-dtype fp8_e4m3 --mamba-cache-dtype bfloat16 \
@@ -294,7 +309,7 @@ start_vllm() {
         --attention-config "$attention_config" \
         --compilation-config '{"mode":"NONE","cudagraph_mode":"FULL_AND_PIECEWISE"}' \
         --language-model-only --skip-tokenizer-init --generation-config vllm --seed 0 \
-        --no-enable-prefix-caching --enable-prompt-tokens-details --enable-chunked-prefill \
+        "${cache_flags[@]}" --enable-prompt-tokens-details --enable-chunked-prefill \
         --max-model-len "$context" --max-num-batched-tokens "$token_budget" --max-num-seqs 32 \
         --max-num-scheduled-tokens "$token_budget" --async-scheduling \
         --kv-cache-memory-bytes "$kv_bytes" --stream-interval 1 \

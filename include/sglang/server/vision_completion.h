@@ -24,6 +24,7 @@ private:
     int device_;
     std::once_flag loaded_;
     std::unique_ptr<VisionEncoder> encoder_;
+    std::shared_ptr<const void> encoder_identity_ = std::make_shared<const char>();
 };
 
 }

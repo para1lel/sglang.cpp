@@ -10,6 +10,10 @@
 namespace {
 
 int copy_budget = -1;
+cudaError_t recorded_copy_error = cudaSuccess;
+cudaError_t rejected_copy_status = cudaSuccess;
+std::size_t failed_allocation_bytes = 0;
+std::size_t free_bytes_override = 0;
 
 }
 
@@ -22,12 +26,33 @@ extern "C" cudaError_t __wrap_cudaMemcpy2DAsync(
     std::size_t width, std::size_t height, cudaMemcpyKind kind, cudaStream_t stream) {
     if (copy_budget == 0) {
         copy_budget = -1;
-        return cudaErrorInvalidValue;
+        rejected_copy_status = __real_cudaMemcpy2DAsync(
+            dst, width - 1, src, src_stride, width, height, kind, stream);
+        recorded_copy_error = cudaPeekAtLastError();
+        return rejected_copy_status;
     }
     if (copy_budget > 0) {
         --copy_budget;
     }
     return __real_cudaMemcpy2DAsync(dst, dst_stride, src, src_stride, width, height, kind, stream);
+}
+
+extern "C" cudaError_t __real_cudaMemGetInfo(std::size_t*, std::size_t*);
+
+extern "C" cudaError_t __wrap_cudaMemGetInfo(std::size_t* free, std::size_t* total) {
+    const auto status = __real_cudaMemGetInfo(free, total);
+    if (status == cudaSuccess && free_bytes_override) *free = free_bytes_override;
+    return status;
+}
+
+extern "C" cudaError_t __real_cudaMalloc(void**, std::size_t);
+
+extern "C" cudaError_t __wrap_cudaMalloc(void** pointer, std::size_t bytes) {
+    if (bytes == failed_allocation_bytes && bytes != 0) {
+        failed_allocation_bytes = 0;
+        return cudaErrorMemoryAllocation;
+    }
+    return __real_cudaMalloc(pointer, bytes);
 }
 
 namespace {
@@ -36,10 +61,21 @@ using namespace sglang;
 using namespace sglang::decoder;
 
 constexpr std::uint8_t guard = 0xcd;
-constexpr std::size_t entry_bytes = 370233344;
 constexpr int page = mxfp8_page_size;
 constexpr int full_pages = decoder_batch_prefix_max_tokens / page;
 constexpr int fixture_page_stride = full_pages + 5;
+
+constexpr std::size_t target_kv_bytes(int pages) {
+    return 2 * full_attention_layers * pages *
+        (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
+}
+
+constexpr std::size_t target_snapshot_bytes(int pages) {
+    return target_kv_bytes(pages) + gdn_layers * (gdn_history_elements * sizeof(Bf16) +
+        gdn_state_elements * sizeof(float)) + 2 * hidden_size * sizeof(Bf16);
+}
+
+static_assert(target_snapshot_bytes(full_pages) == 370233344);
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -67,7 +103,21 @@ void compare(const void* source, std::size_t bytes, unsigned tag, const char* me
     }
 }
 
-void kv_page(Mxfp8KvCache bank, int physical, int logical, int layer, bool write) {
+void compare_page(const std::uint8_t* source, std::size_t bytes, unsigned tag, int rows,
+                  bool scales, const char* message) {
+    std::vector<std::uint8_t> data(bytes);
+    check(cudaMemcpy(data.data(), source, bytes, cudaMemcpyDeviceToHost), "Read test KV page");
+    constexpr int token_groups = page / mxfp8_group_size;
+    for (std::size_t index = 0; index < bytes; ++index) {
+        const auto scale_row = index / mxfp8_groups;
+        const auto token = scales ? scale_row % token_groups * mxfp8_group_size +
+            scale_row / token_groups % mxfp8_group_size : index / (bytes / page);
+        require(data[index] == (token < std::size_t(rows) ? pattern(index, tag) : guard), message);
+    }
+}
+
+void kv_page(Mxfp8KvCache bank, int physical, int logical, int layer, bool write,
+             int partial_rows = 0) {
     const auto page = static_cast<std::size_t>(physical);
     const auto payload = mxfp8_payload_bytes_per_page;
     const auto scales = mxfp8_scale_bytes_per_page;
@@ -77,6 +127,17 @@ void kv_page(Mxfp8KvCache bank, int physical, int logical, int layer, bool write
         fill(bank.value_payload + page * payload, payload, tag + 1);
         fill(bank.key_scales + page * scales, scales, tag + 2);
         fill(bank.value_scales + page * scales, scales, tag + 3);
+        return;
+    }
+    if (partial_rows) {
+        compare_page(bank.key_payload + page * payload, payload, tag, partial_rows, false,
+                     "Key payload tail mismatch");
+        compare_page(bank.value_payload + page * payload, payload, tag + 1, partial_rows, false,
+                     "Value payload tail mismatch");
+        compare_page(bank.key_scales + page * scales, scales, tag + 2, partial_rows, true,
+                     "Key scale tail mismatch");
+        compare_page(bank.value_scales + page * scales, scales, tag + 3, partial_rows, true,
+                     "Value scale tail mismatch");
         return;
     }
     compare(bank.key_payload + page * payload, payload, tag, "Key payload mismatch");
@@ -136,11 +197,13 @@ void fill_kv(Request& request, const std::vector<std::int32_t>& mapping) {
     }
 }
 
-void check_kv(const Request& request, const std::vector<std::int32_t>& mapping, int matched) {
+void check_kv(const Request& request, const std::vector<std::int32_t>& mapping, int matched,
+              int tail = 0) {
     for (int layer = 0; layer < full_attention_layers; ++layer) {
         for (int logical = 0; logical < static_cast<int>(mapping.size()); ++logical) {
-            kv_page(request.caches[layer], mapping[logical], logical < matched ? logical : -1,
-                    layer, false);
+            const int partial = logical == matched ? tail : 0;
+            kv_page(request.caches[layer], mapping[logical],
+                    logical < matched || partial ? logical : -1, layer, false, partial);
         }
     }
 }
@@ -178,13 +241,14 @@ void guard_state(Request& request) {
     check(cudaStreamSynchronize(nullptr), "Complete guard initialization");
 }
 
-void restore_state(int pages, bool remap_seed, bool remap_restored) {
-    const int tokens = pages * page;
+void restore_state(int tokens, bool remap_seed, bool remap_restored) {
+    const int pages = (tokens + page - 1) / page;
     const std::vector<int> prompt(tokens, 17);
     const std::string_view salt("a\0b", 3);
     Request seed(0, (pages + 3) * page, std::shared_ptr<const void>{});
     Request restored(0, (pages + 5) * page, std::shared_ptr<const void>{});
     PrefixCache cache(0, 1);
+    require(cache.stats().device_bytes == 0, "Unused cache allocated device memory");
     const auto source_map = page_map(seed, remap_seed ? 2 : 0, false);
     const auto destination_map = page_map(restored, remap_restored ? 1 : 0, remap_restored);
     const auto stream = restored.memory.stream();
@@ -214,7 +278,7 @@ void restore_state(int pages, bool remap_seed, bool remap_restored) {
     check(cudaStreamSynchronize(stream), "Complete exact restore");
     check_map(restored, destination_map);
     check_state(restored, false, true);
-    check_kv(restored, destination_map, pages);
+    check_kv(restored, destination_map, tokens / page, tokens % page);
     guard_kv(restored);
     guard_state(restored);
     auto suffix = prompt;
@@ -222,17 +286,22 @@ void restore_state(int pages, bool remap_seed, bool remap_restored) {
     require(cache.restore(restored, suffix, salt, stream) == tokens, "Missing suffix match");
     check(cudaStreamSynchronize(stream), "Complete suffix restore");
     check_state(restored, false, false);
-    check_kv(restored, destination_map, pages);
+    check_kv(restored, destination_map, tokens / page, tokens % page);
     cache.store(seed, suffix, salt, tokens, stream);
     require(cache.restore(restored, prompt, salt, stream) == tokens, "Lost repeated match");
     check(cudaStreamSynchronize(stream), "Complete repeated restore");
     check_state(restored, false, true);
-    check_kv(restored, destination_map, pages);
+    check_kv(restored, destination_map, tokens / page, tokens % page);
     const auto stats = cache.stats();
     require(stats.entries == 1 && stats.pages == pages && stats.stores == 1 &&
             stats.evictions == 0 && stats.hits == 3 &&
             stats.cached_tokens == 3 * static_cast<std::uint64_t>(tokens) &&
-            stats.device_bytes == entry_bytes, "Unexpected cache counters");
+            stats.device_bytes == target_snapshot_bytes(pages), "Unexpected cache counters");
+    cache.reset();
+    const auto reset = cache.stats();
+    require(reset.entries == 0 && reset.pages == 0 && reset.device_bytes == 0 &&
+            reset.stores == stats.stores && reset.hits == stats.hits,
+            "Reset did not release snapshots and retain counters");
 }
 
 void eviction() {
@@ -303,7 +372,7 @@ void invalid_mappings() {
     check_invalid("Invalid prefix KV page capacity");
     request.pages = table;
     expect_throw<std::invalid_argument>([&] {
-        cache.store(request, prompt, "bad-size", page + 1, stream);
+        cache.store(request, prompt, "bad-size", prompt.size() + 1, stream);
     }, "Invalid prefix cache checkpoint");
     expect_throw<std::invalid_argument>([&] {
         cache.store(request, prompt, std::string(257, 'x'), page, stream);
@@ -321,6 +390,37 @@ void invalid_mappings() {
     check_state(request, false, true);
 }
 
+void check_impossible_reclaim(PrefixCache& cache) {
+    const auto before = cache.stats();
+    free_bytes_override = decoder_shared_reserve;
+    cache.reclaim_for_admission(before.device_bytes + 1, 0);
+    free_bytes_override = 0;
+    const auto after = cache.stats();
+    require(after.entries == before.entries && after.device_bytes == before.device_bytes &&
+            after.stores == before.stores && after.evictions == before.evictions,
+            "Impossible admission reclaimed an unrelated snapshot");
+}
+
+void check_allocation_failure(PrefixCache& cache, const Request& seed, cudaStream_t stream) {
+    const auto before = cache.stats();
+    const std::vector<int> larger(3 * page, 18);
+    failed_allocation_bytes = target_kv_bytes(3);
+    cache.store(seed, larger, "larger", larger.size(), stream);
+    require(failed_allocation_bytes == 0, "Snapshot allocation fault was not triggered");
+    const auto after = cache.stats();
+    require(after.entries == before.entries && after.device_bytes == before.device_bytes &&
+            after.stores == before.stores && after.evictions == before.evictions,
+            "Failed replacement allocation erased the resident snapshot");
+}
+
+void check_copy_error(const char* operation) {
+    require(copy_budget == -1 && recorded_copy_error == rejected_copy_status &&
+            (recorded_copy_error == cudaErrorInvalidValue ||
+             recorded_copy_error == cudaErrorInvalidPitchValue),
+            "Real Runtime copy fault was not triggered");
+    check(cudaPeekAtLastError(), operation);
+}
+
 void copy_failures() {
     Request seed(0, 3 * page, std::shared_ptr<const void>{});
     Request request(0, 4 * page, std::shared_ptr<const void>{});
@@ -332,14 +432,15 @@ void copy_failures() {
     fill_kv(seed, source);
     check_state(seed, true, true);
     cache.store(seed, prompt, "resident", prompt.size(), stream);
+    check_impossible_reclaim(cache);
+    check_allocation_failure(cache, seed, stream);
     guard_kv(request);
     guard_state(request);
     copy_budget = 1;
     expect_throw<std::runtime_error>([&] {
         cache.restore(request, prompt, "resident", stream);
     }, "Copy prefix KV layers");
-    require(copy_budget == -1, "Restore fault was not triggered");
-    check(cudaStreamSynchronize(stream), "Drain interrupted restore");
+    check_copy_error("Restore left a stale Runtime error");
     check_map(request, destination);
     check_state(request, false, false, false);
     for (int layer = 0; layer < full_attention_layers; ++layer) {
@@ -353,14 +454,15 @@ void copy_failures() {
             "Interrupted restore corrupted the saved prefix");
     check(cudaStreamSynchronize(stream), "Complete retried restore");
     check_kv(request, destination, 2);
+    recorded_copy_error = cudaSuccess;
     copy_budget = 1;
     expect_throw<std::runtime_error>([&] {
         cache.store(seed, prompt, "replacement", prompt.size(), stream);
     }, "Copy prefix KV layers");
-    require(copy_budget == -1, "Store fault was not triggered");
-    check(cudaStreamSynchronize(stream), "Drain interrupted store");
+    check_copy_error("Store left a stale Runtime error");
     const auto stats = cache.stats();
-    require(stats.entries == 0 && stats.stores == 1 && stats.evictions == 1,
+    require(stats.entries == 0 && stats.device_bytes == 0 && stats.stores == 1 &&
+            stats.evictions == 1,
             "Interrupted store published a partial checkpoint");
     require(cache.restore(request, prompt, "resident", stream) == 0 &&
             cache.restore(request, prompt, "replacement", stream) == 0,
@@ -381,21 +483,24 @@ int main(int argc, char** argv) {
         require(argc == 1 || mode == "--identity" || mode == "--remapped" ||
                 mode == "--full" || mode == "--guards",
                 "Expected optional --identity, --remapped, --full, or --guards");
-        require(PrefixCache::checkpoint(127) == 0 && PrefixCache::checkpoint(128) == 128 &&
-                PrefixCache::checkpoint(129) == 128 && PrefixCache::checkpoint(6399) == 6272 &&
+        require(PrefixCache::checkpoint(127) == 127 && PrefixCache::checkpoint(128) == 128 &&
+                PrefixCache::checkpoint(129) == 129 && PrefixCache::checkpoint(6399) == 6399 &&
                 PrefixCache::checkpoint(6400) == 6400 && PrefixCache::checkpoint(8192) == 6400,
-                "Incorrect checkpoint alignment");
+                "Incorrect checkpoint limit");
         if (mode.empty() || mode == "--identity") {
-            restore_state(1, false, false);
+            restore_state(page, false, false);
             eviction();
         }
         if (mode.empty() || mode == "--remapped") {
-            restore_state(2, true, false);
-            restore_state(2, false, true);
-            restore_state(2, true, true);
+            restore_state(2 * page, true, false);
+            restore_state(2 * page, false, true);
+            restore_state(2 * page, true, true);
+            for (const int tokens : {1, 31, 32, 43, 127, 129, 161}) {
+                restore_state(tokens, true, true);
+            }
         }
         if (mode == "--full") {
-            restore_state(full_pages, true, true);
+            restore_state(decoder_batch_prefix_max_tokens, true, true);
         }
         if (mode.empty() || mode == "--guards") {
             invalid_mappings();

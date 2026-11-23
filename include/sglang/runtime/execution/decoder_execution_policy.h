@@ -14,9 +14,8 @@ struct DecoderExecutionPolicy {
     static DecoderExecutionPolicy for_backend(const CudaBackendPolicy& backend,
                                               const Limits& limits);
 
-    bool regular_decode_graph(bool text_decode, bool contains_mtp, int count) const;
-    int prefill_limit(bool media, bool draft, bool prefix_cache) const;
-    int label_scoring_limit(bool media) const;
+    bool regular_decode_graph(int count) const;
+    int prefill_limit() const;
     bool split_decode(int prompt_count, int limit) const;
 
     bool ordered_attention;

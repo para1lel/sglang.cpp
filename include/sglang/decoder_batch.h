@@ -32,6 +32,8 @@ struct DecoderBatchStep {
     bool constraint_failed = false;
     int mtp_verified_rows = 0;
     std::shared_ptr<const DecoderTokenLogprobs> generated_logprobs = nullptr;
+    std::array<std::shared_ptr<const DecoderTokenLogprobs>, decoder_batch_max_mtp_steps>
+        extra_generated_logprobs{};
     std::shared_ptr<const DecoderPromptLogprobs> prompt_logprobs = nullptr;
     std::shared_ptr<const std::vector<double>> label_logprobs = nullptr;
 };
@@ -114,7 +116,8 @@ public:
 private:
     friend class Decoder;
     void generate_mtp(const std::vector<int>& prompt, const DecoderOptions& options,
-                      decoder::SerialOutput& output, DecoderResult& result);
+                      decoder::SerialOutput& output, DecoderResult& result,
+                      const std::vector<DecoderMedia>* media = nullptr);
     int admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& options,
                    const std::vector<DecoderMedia>* media);
     struct State;

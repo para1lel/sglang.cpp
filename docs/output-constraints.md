@@ -55,7 +55,7 @@ Compilation allows up to 4,096 nondeterministic states, 256 deterministic states
 
 ### Native generate
 
-Set `sampling_params.regex` to constrain generated text in `POST /generate`. Omission, null, and `""` disable that field. At most one of `regex`, `json_schema`, and `ebnf` can be active per item. A broadcast sampling object shares the compiled constraint. Each item owns its cursor and budget. Use a sampling object array for distinct constraints or to mix constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L748)<!-- prefix: "void set_gen" -->
+Set `sampling_params.regex` to constrain generated text in `POST /generate`. Omission, null, and `""` disable that field. At most one of `regex`, `json_schema`, and `ebnf` can be active per item. A broadcast sampling object shares the compiled constraint. Each item owns its cursor and budget. Use a sampling object array for distinct constraints or to mix constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L745)<!-- prefix: "void set_gen" -->
 
 ```json
 {
@@ -129,7 +129,7 @@ Put the serialized schema in `sampling_params.json_schema` on `POST /generate`. 
 
 The [native sampling rules](#native-generate) apply. JSON and cumulative SSE return the generated JSON as a string in `text`.
 
-The [schema subset](#json-schema) and [native finish rules](#native-generate) apply. A complete match at the token cap reports `length` unless a stop takes precedence. Text stops can trim the displayed JSON. Use model EOS handling and omit `stop_token_ids`. Zero or insufficient budget, malformed or unsupported schemas, and generated logprobs on the same constrained item return HTTP 400 before decoder admission or SSE headers. An unconstrained sibling can request generated logprobs. [Native validation](../apps/server/native_generate.cpp#L748)<!-- prefix: "void set_gen" -->
+The [schema subset](#json-schema) and [native finish rules](#native-generate) apply. A complete match at the token cap reports `length` unless a stop takes precedence. Text stops can trim the displayed JSON. Use model EOS handling and omit `stop_token_ids`. Zero or insufficient budget, malformed or unsupported schemas, and generated logprobs on the same constrained item return HTTP 400 before decoder admission or SSE headers. An unconstrained sibling can request generated logprobs. [Native validation](../apps/server/native_generate.cpp#L745)<!-- prefix: "void set_gen" -->
 
 ### Native EBNF
 

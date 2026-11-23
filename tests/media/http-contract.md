@@ -10,21 +10,24 @@ python tests/media/http_routes.py build/bin/sglang-server "$checkpoint" /tmp/med
 
 The test creates small RGB8 frames in memory. It sends a mixed image, video and text request
 through JSON and SSE, and compares prompt IDs, token IDs, usage and finish reasons. It repeats
-the media request with MTP enabled for ordinary text to check that media stays on K0.
+the media request with K1 and checks identical output against K0.
 
 Invalid dimensions, RGB8 and video metadata, unsupported options and compressed inputs return
 HTTP 400. The test sends malformed media after a valid attachment and checks that none of the
 rejected requests or the zero-budget request starts decode. It resets a live streaming socket
 and a pending connection, then checks that the surviving request returns identical IDs. Plain
-chat and text completions remain usable. Continuous and cache-enabled servers also serve
-media, with zero cached media tokens.
+chat and text completions remain usable.
 
-Append `--ordered-fp8` and use a fresh evidence directory to test each ordered text policy.
-The suite compares real image and video outputs and pointwise label scores with exact.
-It also checks that the combined policy changes the frozen W1 text continuation and that
-concurrent media, text, and score responses match their serial controls. For the serial C++
-contract, run `media-contract "$checkpoint" --ordered-fp8` to compare BF16-derived top scores
-for mixed features across prefill chunks.
+Append `--mixed-service` to compare image, video, text, and pointwise label results between
+isolated and concurrent requests with the cache explicitly disabled.
+
+Append `--feature-complete` on B200 to compare default serving and explicit cache-off
+controls. The test verifies K4 and the 8192-row budget, cold text, exact and partial hits,
+ordered label scores, and exact prompt/output logprobs against cache-off with matched
+prefill grants. The test compares decoded image and video JSON/SSE, checks exact reuse of
+non-page-aligned media prompts, and rejects stale state after changes to pixels, grids,
+video positions, suffixes, or binary cache salts. It then cancels a live cache-on stream
+and checks a warm replacement. The evidence directory contains the requests and responses.
 
 ## Optional codecs
 

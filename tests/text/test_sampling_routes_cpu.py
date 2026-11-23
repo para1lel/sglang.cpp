@@ -392,13 +392,13 @@ class Routes(unittest.TestCase):
             self.assertIn("error", self.control(port, "/metrics", status=404))
 
     def test_model_discovery(self):
-        with self.subTest(prefix_controls=False):
-            self.check_model_discovery(self.port, self.log, prefix_controls=False)
         with self.subTest(prefix_controls=True):
-            log = self.output / "models-prefix.log"
+            self.check_model_discovery(self.port, self.log, prefix_controls=True)
+        with self.subTest(prefix_controls=False):
+            log = self.output / "models-no-prefix.log"
             with server(self.binary, self.checkpoint, log, "--max-active", "1",
-                        "--prefix-cache-entries", "1") as port:
-                self.check_model_discovery(port, log, prefix_controls=True)
+                        "--prefix-cache-entries", "0") as port:
+                self.check_model_discovery(port, log, prefix_controls=False)
 
     def check_model_info(self, port, checkpoint, *, reasoning=None, tools=None):
         config = json.loads((checkpoint / "config.json").read_text())
@@ -549,13 +549,17 @@ class Routes(unittest.TestCase):
         graph = ("--batch-cuda-graphs",)
         eager = ("--eager",)
         prefix = ("--prefix-cache-entries", "1")
+        no_prefix = ("--prefix-cache-entries", "0")
         cases = (
-            ("default", (), True, 0),
-            ("legacy", graph, True, 0),
-            ("eager", eager, False, 0),
-            ("legacy-then-eager", (*graph, *eager), False, 0),
-            ("eager-then-legacy", (*eager, *graph), False, 0),
+            ("default", (), True, 4),
+            ("legacy", graph, True, 4),
+            ("eager", eager, False, 4),
+            ("legacy-then-eager", (*graph, *eager), False, 4),
+            ("eager-then-legacy", (*eager, *graph), False, 4),
             ("prefix", prefix, True, 1),
+            ("eager-prefix", (*eager, *prefix), False, 1),
+            ("no-prefix", no_prefix, True, 0),
+            ("eager-no-prefix", (*eager, *no_prefix), False, 0),
         )
         for name, flags, graphs, entries in cases:
             with self.subTest(name=name):
@@ -565,16 +569,9 @@ class Routes(unittest.TestCase):
                     self.assertIs(info["batch_cuda_graphs"], graphs)
                     self.assertIs(info["eager"], not graphs)
                     self.assertEqual(info["prefix_cache_entries"], entries)
+                    self.assertIs(info["enable_multimodal"], True)
                     expected_receipt = f"cpu batch cuda_graphs={int(graphs)}"
                     self.assertIn(expected_receipt, log.read_text().splitlines())
-
-        for flags in (eager, (*graph, *eager), (*eager, *graph)):
-            with self.subTest(prefix=flags):
-                result = subprocess.run([str(self.binary), *prefix, *flags],
-                                        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
-                                        capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("--prefix-cache-entries requires omitting --eager", result.stderr)
 
     def test_mtp_launch_depth_with_prefix_cache(self):
         prefix = ("--prefix-cache-entries", "1")

@@ -17,9 +17,9 @@ public:
         return batch_.admit(slot, std::move(prompt), options);
     }
 
-    void admit_multimodal(int slot, std::vector<int>&& prompt, const DecoderOptions& options,
-                          const std::vector<DecoderMedia>& media) override {
-        batch_.admit_multimodal(slot, std::move(prompt), options, media);
+    int admit_multimodal(int slot, std::vector<int>&& prompt, const DecoderOptions& options,
+                         const std::vector<DecoderMedia>& media) override {
+        return batch_.admit_multimodal(slot, std::move(prompt), options, media);
     }
 
     void cancel(int slot) override { batch_.cancel(slot); }

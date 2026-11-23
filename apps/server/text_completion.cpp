@@ -736,6 +736,11 @@ void complete_text(const Socket& connection, const TextRequest& request,
         [&] { return response.start(); },
         [&] { return background ? !cancelled() : response.poll(); },
     };
+    if (request.options.generated_top_logprobs >= 0) {
+        callbacks.on_scored_token = [&](int token, const ScoreRow& score) {
+            return response.token(token, &score);
+        };
+    }
     if (request.anthropic && request.stream) {
         callbacks.on_admitted = {};
         callbacks.on_prompt_admitted = [&](std::size_t cached) {
@@ -777,9 +782,6 @@ void complete_scored_text(const Socket& connection, const TextRequest& request,
     if (disconnected(connection)) {
         return;
     }
-    if (!service.supports_generated_logprobs()) {
-        throw std::invalid_argument("Generated logprobs require server MTP disabled");
-    }
     EventStream stream(connection);
     std::vector<BatchPrompt> prompts{{request.prompt, request.options}};
     BatchTextChoice choice(connection, stream, tokenizer.get(), request, prompts.front(), 0);
@@ -807,9 +809,6 @@ void complete_text_batch(const Socket& connection, TextCompletionRequest complet
         return;
     }
     const auto& request = completion.request;
-    if (request.options.generated_top_logprobs >= 0 && !service.supports_generated_logprobs()) {
-        throw std::invalid_argument("Generated logprobs require server MTP disabled");
-    }
     prepare_choice_prompts(completion);
     EventStream stream(connection);
     const auto& tokens = tokenizer.get();
@@ -915,10 +914,6 @@ void complete_chat_request(const Socket& connection, std::string_view body,
     if (anthropic) request.chat_output.complete_truncated_calls = false;
     if (request.choices > 1) {
         complete_text_batch(connection, {std::move(request), {}, {}}, tokenizer, service, slot);
-        return;
-    }
-    if (request.options.generated_top_logprobs >= 0) {
-        complete_scored_text(connection, request, tokenizer, service, slot);
         return;
     }
     if (!request.media) {

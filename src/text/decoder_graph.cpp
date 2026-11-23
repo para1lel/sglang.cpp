@@ -64,7 +64,8 @@ bool replay_narrow(const DecoderModel& model, Allocations& execution, DecodeGrap
                     return false;
                 }
             }
-            scratch.bindings[index] = {{0.0f, lane.token_id}, lane.position, scores,
+            const int rotary = lane.rotary_position < 0 ? lane.position : lane.rotary_position;
+            scratch.bindings[index] = {{0.0f, lane.token_id}, lane.position, rotary, scores,
                                        request.pages, request.caches, request.states};
         }
         check(cudaMemcpyAsync(scratch.device_bindings, scratch.bindings.data(),
@@ -85,7 +86,7 @@ DecodeRun run_decode_lanes(const DecoderModel& model, Allocations& execution,
     }
     const auto stream = execution.stream();
     auto& first = lanes[0];
-    first.narrow_gqa = count == 1 && options.narrow_allowed && first.rotary_position == -1;
+    first.narrow_gqa = count == 1 && options.narrow_allowed;
     if (first.narrow_gqa && first.mode == TextGdnMode::decode) {
         first.singleton_scores = singleton_scores(execution, first);
     }

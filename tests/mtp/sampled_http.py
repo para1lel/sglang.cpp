@@ -147,7 +147,7 @@ def media_body():
                   "max_tokens": 4, "ignore_eos": True}
 
 
-def check_media(port, log):
+def check_media(port, log, depth):
     body = media_body()
     offset = log.stat().st_size
     error = post(port, CHAT, body | {"mtp_steps": 1}, stream=False, status=400)
@@ -156,7 +156,9 @@ def check_media(port, log):
     frames = post(port, CHAT, body)
     row = transcript(frames)
     require(len(row["tokens"]) == body["max_tokens"] and row["finish"] == "length", row)
-    require(not COUNTERS.search(log.read_bytes()[offset:]), "Media request used MTP")
+    rounds = COUNTERS.findall(log.read_bytes()[offset:])
+    require(any(int(row[0]) > 0 and int(row[2]) > 0 for row in rounds) == bool(depth),
+            ("Unexpected media proposal and verification activity", depth, rounds))
     return {"error": error, "wire": frames, "transcript": row}
 
 
@@ -253,7 +255,7 @@ def run_cases(port, log, width, depth):
     require(all("min_p" in error["error"]["message"] for error in errors), errors)
     return {
         "wire": cases, "transcripts": rows, "errors": errors, "stop_request": stop,
-        "media": check_media(port, log),
+        "media": check_media(port, log, depth),
         "cancellation": check_cancellation(port, log, width, depth, wanted),
     }
 
@@ -268,7 +270,8 @@ def check_configuration(args, width, mode, depths, flags=()):
     media_control = None
     for depth in depths:
         output = args.evidence / f"w{width}-{mode}-k{depth}"
-        with server(args, output, width, depth, flags) as (port, log):
+        cache_off = ("--prefix-cache-entries", "0", *flags)
+        with server(args, output, width, depth, cache_off) as (port, log):
             evidence = run_cases(port, log, width, depth)
         write_json(output / "wire.json", evidence)
         rows = evidence["transcripts"]
@@ -312,8 +315,7 @@ def check_startup(args):
         (["--max-active", "33", "--mtp-steps", "1"], "--max-active in [1, 32]"),
         (["--max-active", "32", "--mtp-steps", "5"], "--mtp-steps in [0, 4]"),
         (["--max-active", "4", "--mtp-steps", "4", "--prefix-cache-entries", "2"], NO_DEVICE),
-        (["--mtp-steps", "1", "--prefix-cache-entries", "2",
-          "--eager"], "--prefix-cache-entries requires omitting --eager"),
+        (["--mtp-steps", "1", "--prefix-cache-entries", "2", "--eager"], NO_DEVICE),
         (["--max-active", "1", "--mtp-steps", "1", "--eager"], NO_DEVICE),
         (["--max-active", "4", "--mtp-steps", "4", "--eager", "--batch-cuda-graphs"],
          NO_DEVICE),
@@ -379,14 +381,44 @@ def check_queue_and_reset(args):
         require(warm_cache > 0 and reset_cache == 0, (replay, replay_after_reset))
 
 
+def check_eager_cache(args):
+    output = args.evidence / "w1-eager-prefix"
+    flags = ("--eager", "--prefix-cache-entries", "2")
+    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
+    prompt = json.loads(fixture.read_text())["prompt_token_ids"][:1024]
+    body = LONG | {"prompt": prompt, "cache_salt": "sampled-eager"}
+    with server(args, output, 1, 4, flags=flags, token_budget=8192) as (port, log):
+        cold_wire = post(port, TEXT, body)
+        cold = transcript(cold_wire)
+        offset = log.stat().st_size
+        warm_wire = post(port, TEXT, body)
+        warm = transcript(warm_wire)
+        warm_end = log.stat().st_size
+        media = check_media(port, log, 4)
+    write_json(output / "wire.json", {"cold": cold_wire, "warm": warm_wire, "media": media})
+    for key in ("prompt", "tokens", "text", "finish"):
+        require(warm[key] == cold[key], key)
+    for row, hits in ((cold, 0), (warm, len(warm["prompt"]))):
+        require(row["usage"]["prompt_tokens_details"] == {"cached_tokens": hits}, row)
+    trace = log.read_bytes()
+    require(not GRAPH.search(trace), "Eager cache request replayed a graph")
+    for phase in (trace[:offset], trace[offset:warm_end]):
+        require(any(int(drafted) > 0 for drafted, *_ in COUNTERS.findall(phase)),
+                "Cold or warm sampled request did not use MTP")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--eager-cache-only", action="store_true")
     args = parser.parse_args()
     args.evidence.mkdir(parents=True)
     check_startup(args)
+    if args.eager_cache_only:
+        check_eager_cache(args)
+        return
     eager_flag = ("--eager",)
     singleton = check_configuration(args, 1, "default", range(5))
     eager = check_configuration(args, 1, "eager", (0, 4), eager_flag)
@@ -398,6 +430,7 @@ def main():
     for depth in depths:
         require(graph[depth] == eager[depth], f"Default graph/eager K{depth} differs")
     check_queue_and_reset(args)
+    check_eager_cache(args)
 
 
 if __name__ == "__main__":

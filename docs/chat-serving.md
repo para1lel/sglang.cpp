@@ -12,10 +12,10 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L167)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L962)<!-- prefix: "TextRequest " --> |
+| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L167)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L954)<!-- prefix: "TextRequest " --> |
 | Chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/chat_template.cpp#L417)<!-- prefix: "ChatTemplate" --> · [Renderer](../apps/server/chat_template.cpp#L538)<!-- prefix: "std::string " --> |
-| Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L61)<!-- prefix: "DecoderResul" --> |
-| Chat output parsers | Apply the request options and parse reasoning and tool calls. | [Request options](../apps/server/text_request.cpp#L638)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/chat_output.cpp#L799)<!-- prefix: "bool ChatOut" --> |
+| Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L67)<!-- prefix: "DecoderResul" --> |
+| Chat output parsers | Apply the request options and parse reasoning and tool calls. | [Request options](../apps/server/text_request.cpp#L630)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/chat_output.cpp#L799)<!-- prefix: "bool ChatOut" --> |
 | Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L565)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L577)<!-- prefix: "void TextRes" --> |
 
 ## Runtime path
@@ -101,7 +101,7 @@ done
 | `"required"` | Require a call frame for an advertised function. |
 | `{"type":"function","function":{"name":"get_weather"}}` | Advertise only the selected function and require a single call frame for it. |
 
-`parallel_tool_calls` is a boolean and defaults to `true`. With `false`, JSON and SSE expose at most one call. Auto with only non-strict tools leaves later wrappers in `content` after the first accepted call. Named choice always allows one call. Required and named choices need an eligible tool, text-only chat, and the `qwen3_coder` parser. They return HTTP 400 when a prerequisite is missing or `response_format`, `regex`, or `ebnf` is set. Active tool constraints require the model EOS stop set and reject nonempty text stops. [Tool admission](../apps/server/text_request.cpp#L609)<!-- prefix: "void check_t" --> · [Parser dispatch](../apps/server/chat_output.cpp#L799)<!-- prefix: "bool ChatOut" -->
+`parallel_tool_calls` is a boolean and defaults to `true`. With `false`, JSON and SSE expose at most one call. Auto with only non-strict tools leaves later wrappers in `content` after the first accepted call. Named choice always allows one call. Required and named choices need an eligible tool, text-only chat, and the `qwen3_coder` parser. They return HTTP 400 when a prerequisite is missing or `response_format`, `regex`, or `ebnf` is set. Active tool constraints require the model EOS stop set and reject nonempty text stops. [Tool admission](../apps/server/text_request.cpp#L601)<!-- prefix: "void check_t" --> · [Parser dispatch](../apps/server/chat_output.cpp#L799)<!-- prefix: "bool ChatOut" -->
 
 The parser accepts an object schema for `function.parameters`, null, or omission. It reads `properties`, `required`, and `additionalProperties`. It removes up to one line feed from each end of a value. It converts scalars and JSON collections. A strict string parameter with the XML value `null` produces the JSON string `"null"`. A strict null parameter produces JSON null. In a loose tool, bare `null` in any letter case produces JSON null, and declared type alternatives are tried in order for other values. Loose tools allow extra keys by default. Validate loose arguments in the application. [Argument conversion](../apps/server/chat_output.cpp#L406)<!-- prefix: "void ToolFra" --> · [Strict schema limits](output-constraints.md#tool-call-constraints)
 
@@ -141,13 +141,13 @@ A TCP reset or failed write cancels the request. The server discards pending UTF
 
 `--sampling-defaults model` is the server default. Chat reads sampling values from the selected checkpoint's `generation_config.json` on first use. For Qwen3.8-27B-FP8, the values are `temperature: 1`, `top_p: 0.95`, `top_k: 20`, and `min_p: 0`.
 
-Use `--sampling-defaults openai` for `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Model mode falls back to these values for missing assets or fields. Omission or null for these four controls inherits the selected default. The request supplies the seed. Raw text has separate defaults. [Server option](../apps/sglang-server.cpp#L32)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L686)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L536)<!-- prefix: "} else if ((" -->
+Use `--sampling-defaults openai` for `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Model mode falls back to these values for missing assets or fields. Omission or null for these four controls inherits the selected default. The request supplies the seed. Raw text has separate defaults. [Server option](../apps/sglang-server.cpp#L32)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L678)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L528)<!-- prefix: "} else if ((" -->
 
-If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L382)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L980)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L358)<!-- prefix: "int limit_re" -->
+If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L382)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L969)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L358)<!-- prefix: "int limit_re" -->
 
 ### Image and video inputs
 
-Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Each media lane uses private eager K0 state. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Media depth selection](../apps/server/batch_service.cpp#L886)<!-- prefix: "job-\u003eoptions" -->
+Media chat accepts up to four attachments in `user` content and preserves their order among text parts. It uses the same sampling, stop, and configured MTP settings as text. A matching [media checkpoint](prefix-cache.md#media-identity-and-prefill) can restore prompt rows. `cache_salt` partitions reuse. [Generated logprobs](serving/openai-logprobs.md#chat-completions) work for unconstrained greedy media chat.
 
 Omit `add_special_tokens` or set it to `false`. Set `enable_thinking` at the top level or as the only member of `chat_template_kwargs`.
 
@@ -192,7 +192,7 @@ Compare auto, none, required, and named choices in JSON and SSE. Include prose-o
 
 ### Media checks
 
-Reserve a B200 and set `checkpoint` to the pinned checkpoint path. Build the release server. Start it at capacity one with prefix reuse off and exact K0.
+Reserve a B200 and set `checkpoint` to the pinned checkpoint path. Build the Release server. Start the K0 media smoke at capacity one with prefix reuse disabled.
 
 ```bash
 xmake f -P . -m release -o build/media-server
@@ -211,7 +211,7 @@ Decode the frozen PNG to RGB8. Decode MP4 frames `[0,2,4,7]` to RGB8. Check the 
 
 Match all 128 expanded prompt IDs to the case file. Require 128 generated IDs, `length`, usage of `128/128/256`, and zero cached prompt tokens. Compare all generated IDs between native JSON and SSE. Repeat with `--eager` and compare the outputs. Require `[DONE]` on SSE.
 
-Verify HTTP rejection before SSE for malformed media. Cancel a live stream and check recovery with a valid request. Run [admission checks](../tests/batch/README.md) for media alongside text. With prefix reuse enabled, check that a valid media completion reports zero cached IDs. Compare the next text request with its warm text control.
+Verify rejection before SSE for malformed media. Cancel a live stream and check recovery. Run the [mixed media and text checks](../tests/media/http-contract.md) on the default server. Check positive MTP, cold and warm media usage, and a miss after changing covered media.
 
 ### Codec checks
 

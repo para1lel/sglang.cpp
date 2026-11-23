@@ -12,6 +12,17 @@ struct PrefillPool;
 
 void reclaim_prefill_workspaces(int device);
 
+class PrefixCache;
+
+struct PrefillSnapshotCapture {
+    PrefixCache& cache;
+    const std::vector<int>& prompt;
+    const DecoderOptions& options;
+    const std::shared_ptr<const MultimodalInput>& media;
+    bool& publishing;
+    int position;
+};
+
 struct PromptLogprobCapture {
     const std::vector<int>* prompt;
     DecoderPromptLogprobs* output;
@@ -39,7 +50,7 @@ struct PrefillGrant {
     MtpDraftRequest* draft;
     const MediaPrefill* media;
     const PromptLogprobCapture* scores = nullptr;
-    bool exact = false;
+    const PrefillSnapshotCapture* snapshot = nullptr;
 };
 
 struct PrefillProjections {
@@ -91,8 +102,7 @@ inline bool pairable_prefill_grants(const PrefillGrant* grants, int count) {
     for (int index = 0; index < count; ++index) {
         const auto& grant = grants[index];
         if (grant.tile_rows != batch_prefill_tile_rows || grant.rows != grants[0].rows ||
-            grant.rows % batch_prefill_tile_rows != 0 || !grant.draft || grant.media ||
-            grant.scores || grant.exact) {
+            grant.rows % batch_prefill_tile_rows != 0) {
             return false;
         }
     }

@@ -400,9 +400,6 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
     const bool scored = std::any_of(items.begin(), items.end(), [](const auto& item) {
         return item.options.generated_top_logprobs >= 0;
     });
-    if (scored && !service.supports_generated_logprobs()) {
-        throw std::invalid_argument("Generated logprobs require server MTP disabled");
-    }
     for (std::size_t index = 0; index < items.size(); ++index) {
         items[index].request_id = ids[index].get();
     }

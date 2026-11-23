@@ -79,7 +79,7 @@ inline bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* r
         const auto cache = row.request->caches[cache_index];
         const auto pages = row.request->pages;
         preprocess.rows[index] = {work.q_gate, work.keys, work.rope_queries, work.rope_keys,
-                                  row.position};
+                                  row.rotary_position < 0 ? row.position : row.rotary_position};
         append.rows[index] = {cache, pages, work.rope_keys, work.values, row.position};
         reads[index] = {cache, pages, row.position, paged_gqa_buffers(work)};
         gate.rows[index] = {work.q_gate, work.attention};

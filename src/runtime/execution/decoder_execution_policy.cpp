@@ -18,18 +18,12 @@ DecoderExecutionPolicy DecoderExecutionPolicy::for_backend(const CudaBackendPoli
     };
 }
 
-bool DecoderExecutionPolicy::regular_decode_graph(bool text_decode, bool contains_mtp,
-                                                  int count) const {
-    return text_decode && !contains_mtp && (!ordered_attention || count == ordered_graph_lanes);
+bool DecoderExecutionPolicy::regular_decode_graph(int count) const {
+    return count != 0 && (!ordered_attention || count == ordered_graph_lanes);
 }
 
-int DecoderExecutionPolicy::prefill_limit(bool media, bool draft, bool prefix_cache) const {
-    return media || (draft && (!tensor_core_prefill || prefix_cache)) ? fallback_prefill_rows
-                                                                      : tensor_prefill_rows;
-}
-
-int DecoderExecutionPolicy::label_scoring_limit(bool media) const {
-    return media ? fallback_prefill_rows : tensor_prefill_rows;
+int DecoderExecutionPolicy::prefill_limit() const {
+    return tensor_core_prefill ? tensor_prefill_rows : fallback_prefill_rows;
 }
 
 bool DecoderExecutionPolicy::split_decode(int prompt_count, int limit) const {

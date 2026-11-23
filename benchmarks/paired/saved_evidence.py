@@ -158,7 +158,7 @@ def artifact_hashes(path):
     return values
 
 
-def vllm_settings(run, args, group, *, speculative=False):
+def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False):
     workers = load(run / "effective-worker.json")["results"]
     require(len(workers) == 1, f"{run}: expected one observed vLLM worker")
     worker = workers[0]
@@ -202,7 +202,7 @@ def vllm_settings(run, args, group, *, speculative=False):
             and "cpu_offload_gb=0.0," in worker["cpu_offload"]
             and "offload_group_size=0," in worker["cpu_offload"],
             f"{run}: unexpected effective vLLM model/parallel/offload settings")
-    require(cache["enable_prefix_caching"] is False and cache["cache_dtype"] == "fp8_e4m3"
+    require(cache["enable_prefix_caching"] is prefix_cache and cache["cache_dtype"] == "fp8_e4m3"
             and cache["mamba_cache_dtype"] == "bfloat16"
             and cache["mamba_ssm_cache_dtype"] == "float32"
             and cache["kv_cache_memory_bytes"] == (10 if group == "W1-W2" else 128) << 30
@@ -213,12 +213,24 @@ def vllm_settings(run, args, group, *, speculative=False):
             f"{run}: unexpected effective vLLM cache, attention or graph settings")
     require(arg(args, "--generation-config") == "vllm" and arg(args, "--seed") == "0"
             and arg(args, "--stream-interval") == "1"
-            and "--language-model-only" in args and "--no-enable-prefix-caching" in args,
+            and "--language-model-only" in args,
             f"{run}: unexpected vLLM generation or streaming settings")
+    if prefix_cache:
+        require(args.count("--enable-prefix-caching") == 1
+                and "--no-enable-prefix-caching" not in args
+                and "--enable-prompt-tokens-details" in args
+                and cache["mamba_cache_mode"] == "align"
+                and type(cache["block_size"]) is int and cache["block_size"] >= 4
+                and type(cache["mamba_block_size"]) is int and cache["mamba_block_size"] >= 4,
+                f"{run}: expected enabled hybrid prefix caching with aligned MTP blocks")
+    else:
+        require("--no-enable-prefix-caching" in args,
+                f"{run}: missing cache-off launch switch")
     return worker
 
 
-def saved_worker(capture, run, cpus, uuid, group, *, speculative=False, before_measurement=False):
+def saved_worker(capture, run, cpus, uuid, group, *, speculative=False,
+                 before_measurement=False, prefix_cache=False):
     args = command(run, "server", cpus)
     log = (run / "server.log").read_text()
     api_pid = (run / "server-pid.txt").read_text().strip()
@@ -234,4 +246,5 @@ def saved_worker(capture, run, cpus, uuid, group, *, speculative=False, before_m
     require(environment["CUDA_VISIBLE_DEVICES"].lower() == uuid,
             f"{run}: CUDA visibility conflicts with observed UUID")
     return {"worker_pid": int(pid), "model_path": model,
-            "effective": vllm_settings(run, args, group, speculative=speculative)}
+            "effective": vllm_settings(run, args, group, speculative=speculative,
+                                       prefix_cache=prefix_cache)}

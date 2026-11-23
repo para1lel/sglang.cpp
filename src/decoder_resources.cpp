@@ -709,6 +709,10 @@ void Allocations::open_stream(std::shared_ptr<const void> owners) {
     state_->owners = std::move(owners);
 }
 
+void Allocations::retain_stream_owner(std::shared_ptr<const void> owner) {
+    state_->owners = std::move(owner);
+}
+
 void Allocations::close_stream() {
     std::shared_ptr<const void> drained_owners;
     state_->close_stream(drained_owners).raise();
@@ -875,7 +879,7 @@ void allocate_gdn(Allocations& memory, GdnBank& states) {
 
 Request::Request(int device, bool reusable, RequestBlockCache* cache)
     : memory(device, cache), work(memory),
-      decode_position(reusable ? memory.allocate<int>(1) : nullptr) {}
+      decode_position(reusable ? memory.allocate<int>(2) : nullptr) {}
 
 Request::Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable,
                  int maximum_kv)

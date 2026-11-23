@@ -91,15 +91,15 @@ plan_comparison() {
 
 prepare_run() {
     local index=$1
-    local directory=$2
+    local reservation_dir=$2
     [[ $index =~ ^[0-9]+$ ]]
     gpu_uuid=$(nvidia-smi -i "$index" --query-gpu=uuid --format=csv,noheader)
     [[ $gpu_uuid =~ ^GPU-[0-9a-fA-F-]{36}$ ]]
     exec 9>>"$vllm_root/$gpu_uuid.lock"
     flock -n 9 || { echo "GPU reservation busy for $gpu_uuid" >&2; return 75; }
     check_idle
-    mkdir -- "$directory"
-    output=$(realpath -- "$directory")
+    mkdir -- "$reservation_dir"
+    output=$(realpath -- "$reservation_dir")
     date -u +%FT%TZ >"$output/started-utc.txt"
     printf '%s\n' "$index $gpu_uuid" >"$output/gpu.txt"
     printf 'server=%s\nclient=%s\nmemory=localalloc\n' "$server_cpus" "$client_cpus" \
@@ -142,8 +142,11 @@ stop_group() {
             sleep .25
         done
         kill -KILL -- "-$server_pid" 2>/dev/null || true
-        wait "$server_pid" 2>/dev/null || true
         server_pid=
+    fi
+    if [[ -n ${server_launcher_pid:-} ]]; then
+        wait "$server_launcher_pid" 2>/dev/null || true
+        server_launcher_pid=
     fi
 }
 
@@ -161,9 +164,22 @@ start_group() {
     nvidia-smi --query-gpu="$gpu_fields" --format=csv -l 5 >"$run/gpu-samples.csv" 9<&- &
     monitor_pid=$!
     date -u +%FT%TZ >"$run/server-started-utc.txt"
-    setsid "${command[@]}" >"$run/server.log" 2>&1 9<&- &
-    server_pid=$!
-    printf '%s\n' "$server_pid" >"$run/server-pid.txt"
+    "$client_python" -IB -c '
+import subprocess
+import sys
+from pathlib import Path
+
+server = subprocess.Popen(sys.argv[2:], start_new_session=True)
+Path(sys.argv[1]).write_text(f"{server.pid}\n")
+sys.exit(server.wait())
+' "$run/server-pid.txt" "${command[@]}" >"$run/server.log" 2>&1 9<&- &
+    server_launcher_pid=$!
+    for ((attempt = 0; attempt < 100; ++attempt)); do
+        [[ ! -s $run/server-pid.txt ]] || break
+        kill -0 "$server_launcher_pid" 2>/dev/null || { tail -40 "$run/server.log" >&2; return 1; }
+        sleep .05
+    done
+    read -r server_pid <"$run/server-pid.txt" || return
     for ((attempt = 0; attempt < 480; ++attempt)); do
         kill -0 "$server_pid" 2>/dev/null || { tail -40 "$run/server.log" >&2; return 1; }
         if curl --noproxy '*' -fsS --max-time 1 "$url/health" >"$run/health.json" 2>/dev/null; then

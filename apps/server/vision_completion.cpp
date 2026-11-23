@@ -4,6 +4,7 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/decoder_media.h"
 #include "sglang/server/batch_service.h"
+#include "sglang/tokenizer/digest.h"
 #include "sglang/vision.h"
 
 namespace sglang::server {
@@ -53,7 +54,12 @@ std::optional<std::vector<DecoderMedia>> VisionCompletion::encode(
         check(cudaMemcpyAsync(pixels, part.patches.data(), part.patches.size() * sizeof(float),
                               cudaMemcpyHostToDevice, work.stream()), "Upload visual patches");
         encoder_->encode(grid, pixels, part.patches.size(), features, elements, work.stream());
-        media.push_back({part.layout, {storage, features}, elements});
+        auto& item = media.emplace_back(DecoderMedia{part.layout, {storage, features}, elements});
+        const auto patch_bytes = std::string_view(
+            reinterpret_cast<const char*>(part.patches.data()),
+            part.patches.size() * sizeof(float));
+        item.cache_identity.reset(new DecoderMediaCacheIdentity(
+            item, encoder_identity_, tokenizer::sha256(patch_bytes)));
     }
     return media;
 }

@@ -1,66 +1,74 @@
-# Qwen3.8-27B-FP8 on one B200
-
-The local checkpoint matches all 81 files published by `Qwen/Qwen3.8-27B-FP8` at revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`. Its 64 target layers include 48 Gated DeltaNet (GDN) layers and 16 grouped-query attention (GQA) layers. It contains one reusable multi-token prediction (MTP) layer. Confidence is high for these file-level facts. B200 execution, MXFP8 cache compatibility, and throughput remain open.
+# Qwen3.8-27B-FP8 checkpoint contract
 
 ## Checkpoint evidence
 
-On 2026-11-18, the probe read `/data0/shared/Qwen3.8-27B-FP8` and retrieved the revision manifest over HTTPS through the host Mihomo proxy. All file names and sizes matched. All 67 LFS files matched their published SHA-256. The other 14 files matched their Git blob SHA-1, including the Git object header. The full read covered 30,890,041,705 bytes. [Qwen revision manifest](https://huggingface.co/api/models/Qwen/Qwen3.8-27B-FP8/revision/c3a462cc3d38cf351f3b26cbd763469eeb74ef81?blobs=true)
+The local copy at `/data0/shared/Qwen3.8-27B-FP8` exactly matches `Qwen/Qwen3.8-27B-FP8` revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`. On 2026-11-18, all 81 file names and sizes matched. All 67 LFS objects matched their published SHA-256 values, and the other 14 files matched their Git blob SHA-1 values. The full local read covered 30,890,041,705 bytes. [Revision manifest](https://huggingface.co/api/models/Qwen/Qwen3.8-27B-FP8/revision/c3a462cc3d38cf351f3b26cbd763469eeb74ef81?blobs=true)
 
-| Local bytes hashed | SHA-256 |
+| Check | Result |
 | --- | --- |
-| Manifest of all 81 files | `0d697a5f1741383964b8be5ca9c967a011de16022b102d97ffa0cde94ba5b3dc` |
-| Manifest of the 66 `.safetensors` files | `82fb8f84fa117c81c3e8639c4675709dfb667d70ddaa2fd097d35fc37d95453a` |
-| `config.json` | `74227dd615bf1ea975aa676bdf355a0379858c12f394b5365cd9dfa5fc2c70bc` |
-| `model.safetensors.index.json` | `f0838c766951bdfe76d6afbdb2771a8f67aaa2231dedb3d33cebd817729843a2` |
+| File count | 81 |
+| LFS SHA-256 matches | 67 / 67 |
+| Non-LFS Git blob SHA-1 matches | 14 / 14 |
+| Local bytes read | 30,890,041,705 |
+| Tensor bytes | 30,866,663,264 |
+| Safe-tensor header and length-prefix bytes | 203,664 |
+| Safe-tensor index entries | 1,606 |
 
-Reproduce the first digest with GNU tools. For the second, add `-name '*.safetensors'` before `-printf`.
+The safe-tensor index has 1,606 entries across 64 layer shards, `outside.safetensors`, and `mtp.safetensors`. Every entry maps to exactly one shard header. Shape, dtype, and offsets account for all payload bytes. [Weight index](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/model.safetensors.index.json)
 
-```bash
-cd /data0/shared/Qwen3.8-27B-FP8
-export LC_ALL=C
-find . -maxdepth 1 -type f -printf '%f\0' | sort -z | xargs -0 sha256sum | sha256sum
-```
+## Model contract
 
-All 1,606 index entries matched exactly one header entry in the named shard. Shape, dtype, and byte offsets accounted for every payload byte through EOF. The 64 `layers-*.safetensors` shards, `outside.safetensors`, and `mtp.safetensors` contain 30,866,663,264 tensor bytes plus 203,664 header and length-prefix bytes. [Weight index](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/model.safetensors.index.json)
-
-| Component | Observed configuration and physical tensors |
+| Surface | Contract |
 | --- | --- |
-| Text | `Qwen3_5ForConditionalGeneration`, `qwen3_5`, hidden width 5,120, SiLU gated FFN width 17,408, RMS epsilon `1e-6`. The separate BF16 embedding and LM head each have shape `[248320,5120]`. |
-| GQA | Zero-based layers `3,7,…,63`. There are 24 query heads and four KV heads of width 256. The gated Q projection is `[12288,5120]`, K and V are each `[1024,5120]`, and O is `[5120,6144]`. |
-| GDN | The other 48 layers use 16 Q/K heads and 48 V heads of width 128. Packed QKV is `[10240,5120]`, Z is `[6144,5120]`, and depthwise convolution is `[10240,1,4]`. `A_log` and `dt_bias` have 48 entries each. |
-| Positions and tokens | Native context is 262,144. Interleaved MRoPE uses sections `[11,11,10]`, theta 10,000,000 and 64 rotary dimensions per GQA head. The generation config lists EOS IDs `248046` and `248044`, temperature 1, top-k 20, and top-p 0.95. |
-| Vision | `outside.safetensors` contains 333 BF16 vision tensors, both vocabulary matrices, and the final text norm. The encoder has 27 layers, width 1,152, 16 heads, FFN width 4,304, and output width 5,120. RGB patches span two frames and 16×16 pixels, with 2×2 spatial merging. No deep-stack layers are configured. |
-| Processor | `Qwen3VLProcessor` selects `Qwen2VLImageProcessorFast` and `Qwen3VLVideoProcessor`. All three RGB means and standard deviations are 0.5. Vision start/end IDs are `248053`/`248054`. Image/video placeholder IDs are `248056`/`248057`. |
-| MTP | `mtp.safetensors` contains 22 tensors. These include two pre-projection norms, a BF16 `[5120,10240]` projection, one full-attention decoder layer, and a final norm. The config selects one layer and shared target embeddings. Qwen reports multi-step training without specifying its horizon. |
+| Architecture | `Qwen3_5ForConditionalGeneration`, `qwen3_5` |
+| Hidden width | 5,120 |
+| FFN | SiLU gated, width 17,408 |
+| RMS epsilon | `1e-6` |
+| Embedding and LM head | Separate BF16 `[248320,5120]` |
+| GQA layers | Zero-based `3,7,…,63` |
+| GQA heads | 24 query, 4 KV, head width 256 |
+| GDN layers | Remaining 48 |
+| GDN heads | 16 Q/K, 48 V, V width 128 |
+| Context | 262,144 |
+| MRoPE | Sections `[11,11,10]`, theta 10,000,000, 64 rotary dimensions per GQA head |
+| EOS | `248046`, `248044` |
+| Sampling defaults | Temperature 1, top-k 20, top-p 0.95 |
 
-Sources for these observations are the authenticated headers and the publisher’s [model config](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/config.json), [generation config](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/generation_config.json), [image settings](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/preprocessor_config.json), [video settings](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/video_preprocessor_config.json), and [model card](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/README.md).
+The GQA packed projection shapes are `[12288,5120]`, `[1024,5120]`, and `[5120,6144]`. The GDN packed QKV, Z, and depthwise convolution shapes are `[10240,5120]`, `[6144,5120]`, and `[10240,1,4]`. `A_log` and `dt_bias` each have 48 elements.
 
-**Weight decoding.** All 407 `F8_E4M3` matrices have a BF16 `weight_scale_inv` of shape `[ceil(out/128),ceil(in/128)]`. The checkpoint specifies dynamic activation quantization. Of 1,199 BF16 tensors, 407 hold scales totaling 3,015,040 bytes. For weight `[r,c]`, multiply the decoded FP8 value by `scale[r//128,c//128]`. The storage order is output row, then input column. [Reference dequantization](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/layers/quantization/fp8_utils.py#L2512)<!-- prefix: "return (x_q_" -->
+The vision encoder has 27 layers, width 1,152, 16 heads, FFN width 4,304, and output width 5,120. RGB patches span two frames and 16×16 pixels, followed by 2×2 spatial merging. `outside.safetensors` contains 333 BF16 vision tensors, both vocabulary matrices, and the final text norm. `Qwen3VLProcessor` selects `Qwen2VLImageProcessorFast` and `Qwen3VLVideoProcessor`; RGB means and standard deviations are all `0.5`. Vision start/end IDs are `248053` and `248054`, and image/video placeholder IDs are `248056` and `248057`.
 
-A local CPU probe crossed both block boundaries in layer 3 `self_attn.q_proj.weight`. In row-major order, rows and columns `[127,128]` yielded bytes `66 63 71 e9` (hex). Their scaled FP32 values were `0.00827789306640625`, `0.00595855712890625`, `0.020050048828125`, and `-0.00872039794921875`.
+`mtp.safetensors` has 22 tensors: two pre-projection norms, a BF16 `[5120,10240]` projection, one full-attention decoder layer, and a final norm. The configuration selects one draft layer and shared target embeddings.
 
-## SGLang behavior at the requested pin
+All 407 `F8_E4M3` weight matrices use BF16 `weight_scale_inv` blocks of shape `[ceil(out/128),ceil(in/128)]`. Decode weight element `[r,c]` as `fp8_value × scale[r//128,c//128]`; storage order is output row then input column. Of 1,199 BF16 tensors, 407 are scales totaling 3,015,040 bytes. [Reference dequantization](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/layers/quantization/fp8_utils.py#L2512)<!-- prefix: "return (x_q_" -->
 
-These are source observations from 2026-11-18. The upstream archive identifies commit `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8` in its root name and Git archive header. [Source archive](https://codeload.github.com/sgl-project/sglang/tar.gz/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8)
+## SGLang reference contract
 
-| Path through the reference | Behavior that matters for this checkpoint |
-| --- | --- |
-| Target loading and execution | The registered architecture uses the Qwen3-VL wrapper with a dense Qwen3.5 text model. Its loader packs Q/K/V, FFN gate/up, GDN QKV/Z and B/A. The GQA path applies a sigmoid output gate. [Model](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/models/qwen3_5.py#L2392)<!-- prefix: "class Qwen3_" --> · [Loader](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/models/qwen3_5.py#L2466)<!-- prefix: "def load_wei" --> · [GQA](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/models/qwen3_5.py#L1628)<!-- prefix: "attn_output " --> |
-| GDN update | For one head, `g = -exp(A_log) × softplus(a + dt_bias)` and `β = sigmoid(b)`. With the kernel’s prepared `q,k`, compute `H = exp(g) × S`, then `S′ = H + β(v − Hk)kᵀ`. Output is `S′q` before output normalization and gating. [Gates](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/kernels/ops/attention/linear/fused_gdn_gating.py#L16)<!-- prefix: "return -tl.e" --> · [Recurrence](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/kernels/ops/attention/fla/fused_recurrent.py#L92)<!-- prefix: "if not IS_KD" --> |
-| Recurrent prefix reuse | Each GDN layer needs convolution history `[10240,3]` and state `[48,128,128]` (value × key per head). A radix hit can extend past the last reusable recurrent state. The reference tracks that boundary and supports copying matched state into a request slot. [Shapes](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/configs/mamba_utils.py#L225)<!-- prefix: "conv_state_s" --> · [Prefix matching](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/mem_cache/unified_cache/components/mamba.py#L209)<!-- prefix: "mamba_bounda" --> |
-| Draft and verify | The drafter concatenates normalized embeddings and hidden states, projects them, and reuses one decoder. For top-k 1, SGLang sets verify width to steps + 1. Three proposals use width four. Four proposals use width five. Target verification distinguishes greedy and sampled paths. Commit selects the last accepted recurrent step, with the bonus token included in the acceptance length. [Drafter](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/models/qwen3_5_mtp.py#L161)<!-- prefix: "mtp_config.n" --> · [Width](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/arg_groups/speculative_hook.py#L1462)<!-- prefix: "speculative_" --> · [Worker](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/speculative/eagle_worker_v2.py#L1625)<!-- prefix: "verify_input" --> · [Sampling](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/speculative/eagle_utils.py#L942)<!-- prefix: "if greedy:" --> · [Commit](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/speculative/spec_utils.py#L1220)<!-- prefix: "def commit_m" --> |
-| MXFP8 KV | The fused writer uses one unsigned exponent byte per 32 channels. It computes `ceil(log2(max(amax,1e-30)/448))+127`, clamps to `[0,254]`, and quantizes values to E4M3. Scale bytes use page/head/token-within-32/token-group/channel-group order at page size 128. FA4 needs per-token Q scales. One scale-scatter helper requires four groups (head width 128), while this model needs eight. The pool’s prefix-valid commit raises an exception. Reachability for this model remains open. [Writer](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/kernels/ops/kvcache/mxfp8_quant_store_kv.py#L46)<!-- prefix: "scale_biased" --> · [FA4](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/layers/attention/flashattention_backend.py#L556)<!-- prefix: "if q_descale" --> · [Scatter](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/kernels/ops/kvcache/mxfp8_interleave_sf.py#L77)<!-- prefix: "assert sf_di" --> · [Commit limitation](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/mem_cache/memory_pool.py#L4232)<!-- prefix: "def set_kv_b" --> |
-| Service and media | The scheduler receives requests, selects batches, runs them, and processes results. Grammar preparation and cancellation have explicit entry points. The vision processor reads image/video grids and video timing for multimodal positions. [Scheduler](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/scheduler.py#L2189)<!-- prefix: "def event_lo" --> · [Cancel](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/scheduler.py#L6524)<!-- prefix: "def abort_re" --> · [Grammar](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/constrained/grammar_manager.py#L157)<!-- prefix: "def process_" --> · [Processor](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/multimodal/processors/qwen_vl.py#L1073)<!-- prefix: "second_per_g" --> |
+The pinned SGLang source is commit `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. It loads the Qwen3-VL wrapper around the dense Qwen3.5 text model and packs Q/K/V, FFN gate/up, GDN QKV/Z, and B/A. GQA applies a sigmoid output gate. For one GDN head:
 
-**Capacity estimate.** With BF16 convolution history and configured FP32 recurrent state, one complete target snapshot costs `48 × (10240 × 3 × 2 + 48 × 128 × 128 × 4)` = 146.8125 MiB. A proposed snapshot every 8,192 tokens costs 4.59 GiB across 32 boundaries at native context. An unaligned request end can require another slot. For 16 GQA layers, ideal MXFP8 K and V cost `16 × 2 × 4 × (256 + 8)` = 33,792 bytes/token, or 8.25 GiB at native context. These estimates exclude padding, allocator overhead, draft KV, live and speculative state, workspaces, and graph pools.
+- `g = -exp(A_log) × softplus(a + dt_bias)`
+- `β = sigmoid(b)`
+- `H = exp(g) × S`
+- `S′ = H + β(v − Hk)kᵀ`
+- Output is `S′q` before output normalization and gating
 
-## P0 experiments
+Prefix reuse must copy both convolution history `[10240,3]` and recurrent state `[48,128,128]` per GDN layer. A radix hit can resume only after the last reusable recurrent boundary. MTP concatenates normalized embeddings and hidden states, projects them, and reuses one decoder. For top-k 1, verification width is `steps + 1`; three and four proposals use widths four and five.
 
-The host reported eight B200s with 183,359 MiB each and driver `590.48.01`. The checkpoint investigation used CPU probes and source inspection. The [independent vLLM smoke](../../benchmarks/vllm/README.md) subsequently completed the eight-token fixture on B200 1 using BF16 KV. The table preserves the experiment specifications, including outstanding peak-memory, cache, MTP, and media checks.
+MXFP8 KV storage uses one unsigned exponent byte per 32 channels. The writer computes `ceil(log2(max(amax,1e-30)/448)) + 127`, clamps to `[0,254]`, and stores E4M3 payloads. Scale bytes use page/head/token-within-32/token-group/channel-group order at page size 128. One FA4 scale-scatter helper requires four groups, while this model’s head width 256 needs eight. The pinned prefix-valid commit path raises for this model, so upstream D256 MXFP8 reachability remains unresolved.
 
-| Experiment | Smallest useful result |
-| --- | --- |
-| 1. Establish the vLLM baseline | Reserve one B200 UUID. Use vLLM `81a8cb063e6247fe254d7caf7e98a6691d71022a`, the verified local files, and the existing eight-token greedy fixture with MTP off. Record actual dispatch, KV dtype, token IDs, peak HBM, and repeat timings. Use the [benchmark agreement](../performance.md) for comparisons. |
-| 2. Exercise D256 MXFP8 KV | On the pinned SGLang path, prefill 127 tokens and append through 129 with four KV heads. Inspect all eight scales per vector, including after page reuse. Compare bytes with an independent encoder and logits with BF16 KV. Record the selected paths, any fallback, and the first unsupported operation. |
-| 3. Resolve MTP depth and state ownership | Use `--speculative-algorithm EAGLE --speculative-eagle-topk 1`. Test `--speculative-num-steps` 3 and 4 with `--speculative-num-draft-tokens` 4 and 5, respectively. Force zero, partial, and full acceptance across token 8,192. Compare committed GDN history, state, KV length, and next logits with replay at the same consumed-token boundary. Fork the prefix, cancel one branch, and check the survivor. Check greedy equality and sampled token frequencies against MTP off. Record proposals, verify width, and accepted drafts separately. |
-| 4. Verify media positions | Use one fixed RGB image and one timestamped short video. Capture template token IDs, patch grids, merged token counts, position IDs, and first-step logits from the reference. Compare each intermediate before interpreting output differences. |
+## State capacity
+
+- GDN history and state: `48 × (10240×3×2 + 48×128×128×4)` = 146.8125 MiB per complete target snapshot
+- GQA ideal K/V: `16 × 2 × 4 × (256 + 8)` = 33,792 bytes/token
+- Native-context GQA ideal K/V: 8.25 GiB
+
+These figures exclude padding, allocator overhead, draft KV, live and speculative state, workspaces, and graph pools.
+
+## Provenance
+
+- Checkpoint revision: `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`
+- SGLang revision: `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`
+- Verification date: 2026-11-18
+- Evidence basis: authenticated local files, remote manifest, safe-tensor headers, and pinned source reads
+
+Historical Candidate B quality evidence is recoverable from tree `e459be98a510d3235c81c94ef5210ef76a622e75`; its baseline capture used fixture source `d6e6eb41cb4ac96ed9f992aee908ac2ea850dca4`. Broader historical measurements are tied to native revisions `6b4f734c9c1a90ce16ff3b61ed9d3f0ad128c811`, `bc07a3b56dc18a9bc32986d76c057a23953d8800`, and `18b9f47ca5dc6ab32c7d51958559407a2f5f85d1`.

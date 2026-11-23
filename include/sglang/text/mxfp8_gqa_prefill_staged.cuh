@@ -162,7 +162,14 @@ std::optional<cudaError_t> staged_stream_context(cudaStream_t stream) {
 }
 
 std::optional<cudaError_t> staged_submission(cudaError_t status) {
-    return flash_setup_error(status, paired_kernel_unavailable(status) ||
+    if (status == cudaSuccess) return status;
+    const bool unavailable = paired_kernel_unavailable(status) ||
         status == cudaErrorInvalidConfiguration || status == cudaErrorInvalidClusterSize ||
-        status == cudaErrorLaunchOutOfResources);
+        status == cudaErrorLaunchOutOfResources;
+    if (unavailable) return flash_setup_error(status, true);
+    const auto recorded = cudaGetLastError();
+    if (!decoder::CudaError::terminal(status) && decoder::CudaError::terminal(recorded)) {
+        return recorded;
+    }
+    return status;
 }

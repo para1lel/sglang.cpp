@@ -394,33 +394,36 @@ bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int 
                                  PairedPrefillScratch scratch, PairedPrefillScratch staging,
                                  bool postgate) {
     constexpr int width = staged_prefill_batch_size;
+    if (count < width) return false;
     const int rows = grants[0].rows;
-    if (count % width != 0 || (rows != 256 && rows != 512) ||
-        !std::all_of(grants, grants + count, [rows](const PrefillGrant& grant) {
+    const bool ordered = count % width == 0 && (rows == 256 || rows == 512) &&
+        std::all_of(grants, grants + count, [rows](const PrefillGrant& grant) {
             return grant.rows == rows && grant.position >= 8192 && grant.position <= 32768 - rows;
-        })) {
-        return false;
-    }
-    for (int first = 0; first < count; first += width) {
+        });
+    int offset = 0;
+    int first = 0;
+    for (; first + width <= count; first += width) {
         std::array<PagedPrefillSequence, width> sequences;
+        int packet_end = offset;
         for (int lane = 0; lane < width; ++lane) {
             const auto& grant = grants[first + lane];
-            const auto segment = prefill_attention_segment(chunk, grant, (first + lane) * rows);
+            const auto segment = prefill_attention_segment(chunk, grant, packet_end);
             const auto cache = grant.request->caches[bank];
             const auto pages = grant.request->pages;
             segment.gqa_append(layer, cache, pages);
-            sequences[lane] = {cache, pages, grant.position, rows, segment.work.rope_queries,
+            sequences[lane] = {cache, pages, grant.position, grant.rows, segment.work.rope_queries,
                                segment.work.attention};
+            packet_end += grant.rows;
         }
         auto submitted = launch_partial_staged_tmem_prefill(sequences.data(), width,
                                                             chunk.stream, staging);
-        if (!submitted) {
+        if (!submitted && ordered) {
             submitted = try_batched_partial_paged_prefill(sequences.data(), width, chunk.stream);
         }
         if (submitted) check(*submitted, "Read grouped ordered partial prefill attention");
         for (int lane = 0; lane < width; ++lane) {
-            const auto segment = prefill_attention_segment(chunk, grants[first + lane],
-                                                           (first + lane) * rows);
+            const auto& grant = grants[first + lane];
+            const auto segment = prefill_attention_segment(chunk, grant, offset);
             const auto& sequence = sequences[lane];
             if (!submitted) {
                 check(tensor_core_model_prefill_gqa(sequence.cache, sequence.pages,
@@ -428,7 +431,15 @@ bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int 
                     chunk.stream, scratch), "Read causal prefill MXFP8 attention");
             }
             if (postgate) segment.gqa_gate();
+            offset += grant.rows;
         }
+    }
+    for (; first < count; ++first) {
+        const auto& grant = grants[first];
+        const auto segment = prefill_attention_segment(chunk, grant, offset);
+        segment.gqa_attention(layer, grant.request->caches[bank], grant.request->pages,
+                              scratch, postgate);
+        offset += grant.rows;
     }
     return true;
 }

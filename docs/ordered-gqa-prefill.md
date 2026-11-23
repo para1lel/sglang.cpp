@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model prefill | Append KV and select the attention path. | [Caller](../src/decoder_prefill.cpp#L224)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L900)<!-- prefix: "const bool t" --> |
+| Model prefill | Append KV and select the attention path. | [Caller](../src/decoder_prefill.cpp#L224)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L911)<!-- prefix: "const bool t" --> |
 | Native dispatcher | Select Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L924)<!-- prefix: "cudaError_t " --> |
 | Ordered tile | Apply causal FP32 scoring and token-ordered accumulation. | [Score](../src/mxfp8_gqa_prefill.cu#L35)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L187)<!-- prefix: "for (int fir" --> |
 
@@ -12,7 +12,7 @@
 
 After KV append, the Tensor Core model path uses native attention dispatch at the same position and row count. Exact multirow tiles use direct MXFP8 attention. See the [Flash dispatcher](flash-prefill.md#runtime-path) for shape and device selection.
 
-[Batched staged attention](flash-prefill.md#runtime-path) is available for eligible full-tile and partial-grant groups. A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L870)<!-- prefix: "if (rows == " -->.
+[Batched staged attention](flash-prefill.md#runtime-path) is available for eligible full-tile and partial-grant groups. A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L881)<!-- prefix: "if (rows == " -->.
 
 Staged tiles double-buffer packed K/V and scales in 32-key blocks. The loads follow the page table and zero-fill slots outside the tile's visible span. Scoring and accumulation apply each row's causal limit. [Copies](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L112)<!-- prefix: "__device__ v" -->
 
@@ -20,9 +20,9 @@ Ordered tiles share decoded K/V across rows and two query heads. They preserve t
 
 ### Grouped partial grants
 
-The [partial-grant projection path](native-prefill-workspace.md#partial-grant-projection-groups) can read a multiple of four equal 256- or 512-row grants in four-lane subgroups. Each lane starts at 8,192 or later and sees at most 32,768 tokens. The staged reader requires SM100, page-aligned starts, 16-byte alignment for all K/V payload and scale bases, and sufficient disjoint scratch. Each lane uses its own start, page table, and causal mask. [Decoder guard](../src/decoder_prefill.cpp#L398)<!-- prefix: "if (count % " --> · [Staged guard](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L702)<!-- prefix: "if (sequence" --> · [Buffer validation](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L497)<!-- prefix: "std::optiona" -->
+The [partial-grant projection path](native-prefill-workspace.md#partial-grant-projection-groups) stages successive four-lane subgroups. Each lane may start at any nonnegative position and take 256–1,024 rows with at most 32,768 visible tokens. Positions and row counts can differ. SM100 needs 16-byte-aligned KV payload and scale bases and sufficient disjoint scratch. Each lane uses its own page table and causal mask. [Grouping](../src/decoder_prefill.cpp#L405)<!-- prefix: "for (; first" --> · [Staged guard](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L719)<!-- prefix: "if (rows < m" --> · [Buffer validation](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L511)<!-- prefix: "std::optiona" -->
 
-The decoder appends each lane’s KV before trying one predecode and one single-CTA attention launch per subgroup. If staging declines, it tries raw grouped ordered TMEM on 148-SM SM100, then reads each lane separately if that setup also declines. Both fallbacks reuse the appended KV. Hard CUDA errors propagate. The decoder gates each lane afterward or defers gating for [fused postgate and quantization](fp8-prefill-projections.md#attention-output-quantization). [Append and stage](../src/decoder_prefill.cpp#L411)<!-- prefix: "segment.gqa_" --> · [Per-lane fallback](../src/decoder_prefill.cpp#L425)<!-- prefix: "if (!submitt" --> · [Raw grouped guard](../src/mxfp8_gqa_prefill.cu#L889)<!-- prefix: "std::optiona" -->
+The decoder appends each lane’s KV before trying one predecode and one single-CTA attention launch per subgroup. The reader masks unwritten KV tails and inactive query rows. If staging declines, raw grouped ordered TMEM remains eligible on 148-SM SM100. That fallback requires a group divisible by four, equal 256- or 512-row grants, and starts at 8,192 or later. If neither route submits, the decoder reads each lane against its appended KV. Leftover grants use ordinary per-lane attention. Pending and unexpected CUDA errors propagate. The decoder gates each lane afterward or defers gating for [fused postgate and quantization](fp8-prefill-projections.md#attention-output-quantization). [Staged launch](../src/decoder_prefill.cpp#L418)<!-- prefix: "auto submitt" --> · [Lane fallback](../src/decoder_prefill.cpp#L428)<!-- prefix: "if (!submitt" --> · [KV tail](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L127)<!-- prefix: "if (logical " -->
 
 ## Constraints and failure behavior
 
@@ -42,8 +42,8 @@ Run the [P2 GQA checker](development.md#p2-gqa-verification) on a reserved B200.
 
 Replay identical checkpoint Q and KV with remapped pages and guarded outputs. Compare complete BF16 outputs and the corresponding rows from a shortened causal grant. Run memcheck, initcheck, and synccheck on eager replays with unwritten tail slots.
 
-For grouped partial grants, compare all BF16 output rows with per-lane dispatch. Test four equal 256-row or 512-row grants with different positions and page tables. Include unequal grants and starts below 8,192. Check visibility at 32,768 and immediately above it. Inject a setup decline and require per-lane output parity. Inject a launch error and require propagation without a second attention launch.
+For grouped staging, compare with ordinary per-lane dispatch. Use unequal 256–1,024-row grants with distinct starts and remapped page tables. Include position zero, non-page-aligned starts, partial KV and query tails, and a group with leftover lanes. Check visibility at 32,768 and immediately above it. Compare all BF16 outputs and verify that inactive rows stay unwritten.
 
 Use identical scheduled grants and token histories to compare full BF16 vocabulary scores and greedy IDs. Report operator replay timings and trace-weighted kernel estimates separately from end-to-end serving measurements.
 
-For staged partial groups, compare 256- and 512-row tiles with raw grouped and per-lane controls. Use different page-aligned starts in the same subgroup and include the 32,768-token limit. Exercise a non-page-aligned start and insufficient scratch to confirm fallback. Check lane-local masks and repair with a remapped page table. Follow the [numerical and quality checks](performance.md#operator-qualification).
+Reject staging on insufficient scratch and check the eligible raw grouped or per-lane fallback. Inject a launch error and require propagation without a second attention launch. Include invalid visible KV and check lane-local repair. Follow the [numerical and quality checks](performance.md#operator-qualification).

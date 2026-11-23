@@ -1,6 +1,6 @@
 # Single-B200 benchmark agreement
 
-Compare correct implementations on the **same physical B200 and immutable checkpoint**. Measure pinned vLLM first. Freeze configuration, workloads, and repeats before candidate timing. See the [current W1–W2 evidence](serving/paired-native-defaults-results.md). Pinned Git history at `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3` retains the historical W1–W6 K0 results.
+Compare both engines on the same physical B200 and immutable checkpoint. Freeze the workload and controls before timing. Follow the matched K4 driver's arm order for each row. [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 ## Implementations and controls
 
@@ -16,10 +16,10 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 
 ## Scheduler and reporting policy
 
-Launch both engines with **8,192 aggregate scheduled tokens per step** and **32 maximum in-service requests** for every new formal comparison.
+Use MTP depth four, 8,192 aggregate scheduled tokens per step, 32 maximum in-service requests, and prefix caching off for the formal W1–W6 comparison.
 
-- **Pinned vLLM.** Set `--max-num-batched-tokens 8192 --max-num-scheduled-tokens 8192 --max-num-seqs 32 --async-scheduling`. Verify the worker settings.
-- **Native server.** Set `--max-active 32 --max-num-batched-tokens 8192`. Verify [`GET /health`](http-server.md).
+- **Pinned vLLM.** Set `--max-num-batched-tokens 8192 --max-num-scheduled-tokens 8192 --max-num-seqs 32 --async-scheduling`. Verify explicit MTP4 and the worker settings.
+- **Native server.** Use the Release defaults. Check the effective lane and step limits, MTP4, and CUDA graphs. [Health](http-server.md#health-and-readiness) · [Server information](native-model-info.md#server-information)
 
 Use the [paired launchers](../benchmarks/paired/README.md). Label other caps exploratory or historical. Preserve historical evidence and explicit operator microbenchmark settings.
 
@@ -33,18 +33,11 @@ The native path stores E4M3 values with E8M0 scales per 32 channels. The pinned 
 
 ## Historical offline smoke
 
-From the repository root, set `GPU_INDEX` to the reserved B200 index. These commands reproduce the archived offline diagnostic.
-
-```bash
-bash benchmarks/vllm/setup.sh
-GPU="${GPU_INDEX:?set the reserved B200 index}" bash benchmarks/vllm/run.sh benchmarks/vllm/small.json
-```
-
-The fixture uses eight greedy output tokens and BF16 KV. Check repeat IDs, UUID, effective settings, request latency, and throughput. Use streaming for W1–W6 TTFT.
+The archived eight-output greedy BF16 KV fixture has a separate offline recipe. Use streaming for W1–W6 TTFT. [Small workload](../benchmarks/vllm/README.md#small-workload) · [Historical BF16 result](../benchmarks/vllm/README.md#historical-bf16-result)
 
 ## Named workloads
 
-**Proposed starting matrix.** Lengths are exact post-template tokens per request. Concurrency is client offered load. Approve prompts, request counts, arrivals, and stops before timing. Test normal EOS separately.
+Lengths are exact post-template tokens per request. Concurrency is the offered client load. Use the frozen requests, arrival pattern, and stop settings. Test normal EOS separately. [Concurrent fixture manifest](../benchmarks/concurrent/fixture-manifest.json#L2)<!-- prefix: "\"seed\": \"sgl" -->
 
 | Workload | Input tokens per request | Output tokens per request | Offered concurrency |
 | --- | ---: | ---: | ---: |
@@ -63,7 +56,7 @@ Retain failures under the original workload name.
 
 ## Measurement
 
-**Paired W1–W6 acceptance.** Require a strictly lower native median client makespan on each workload with matched settings and work on the same B200. For W1 and W2, run three single-request warmups and nine measured cohorts. For W3–W6, run two concurrent warmups and five measured cohorts. Check device identity, request and output integrity, and repeat IDs within each engine. See the [paired launchers](../benchmarks/paired/README.md#observe-and-compare).
+**Paired W1–W6 acceptance.** Require a strictly lower native median client makespan on every row with matched settings and work on the same B200. For W1 and W2, run three single-request warmups and nine measured cohorts. For W3–W6, run two concurrent warmups and five measured cohorts. Progress in row order and stop after the first failure. Validate launch and device identity and every stream's request, token counts, finish condition, usage, and drain. Use each recorded profile's native ID checks and evidence requirements. The pinned vLLM arm supplies timing, and its output IDs can vary across valid streams. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 Use one streaming client and monotonic clock. Measure from earliest submit to last valid `[DONE]`. Preconnect lanes and release them with one barrier. Send all bodies before the first valid completion. Limit the submit span to 50 ms. Retain submit times, headers, token events, completion times, token counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and other empty events from token counts.
 
@@ -85,25 +78,23 @@ For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the
 
 ### Native text completions
 
-Reuse frozen W1–W6 `benchmark` requests, token-ID SSE clients, and timing definitions under the [new launch policy](#scheduler-and-reporting-policy). Check repeat IDs within each engine. Compare cross-engine output IDs only for diagnosis. Run [text verification](text-serving.md#verification) separately.
+Reuse frozen W1–W6 `benchmark` requests, token-ID SSE clients, and timing definitions under the [scheduler policy](#scheduler-and-reporting-policy). Compare cross-engine output IDs for diagnosis. Run [text verification](text-serving.md#verification) separately.
 
 For raw text, freeze UTF-8 requests, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Record streaming, usage, and diagnostic ID settings. Text can lag IDs. A text event can span several IDs, and an ID can produce no text. Count tokens from usage or diagnostic IDs. Calculate TTFT and TPOT from ID timestamps when available. Otherwise, mark them unavailable. Report time to first visible text separately. Give raw text its own result rows.
 
 ### Serial W1 and W2 comparisons
 
-The [GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) uses native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. For native runs, set `--url` and a fresh `--output`. Omit `--reference`.
-
-The GPU3 protocol validates every stream and checks repeat IDs within each engine. Its performance gates use `strict_throughput_ratio_gt` for the native-to-vLLM median throughput ratio and `p95_latency_ceilings_ms` for native p95 TTFT, TPOT, and end-to-end latency.
+The historical GPU3 serial protocol uses its own lane limits, throughput ratio, and p95 latency ceilings. Keep these diagnostics under their original settings and labels. [Frozen GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol)
 
 ### Fused FP8 decode
 
-Match native control IDs and full BF16 logits on W1 and W2 with the same checkpoint, precision, and [GQA path](batch-graphs.md#page-parallel-gqa-decode). Check eager decode and fresh and reused graphs. Exercise exact and direct GQA at their [dispatch bounds](development.md#runtime-path). Run the [prefill](development.md#chunked-prefill-verification), [streaming](development.md#streaming-verification), and [MTP](mtp.md#verification) checks.
+Match native control IDs and full BF16 logits on W1 and W2 with the same checkpoint, precision, and GQA path. Check eager decode and fresh and reused graphs. Exercise exact and direct GQA at their dispatch bounds. [Singleton attention](singleton-gqa-decode.md) · [Prefill](development.md#chunked-prefill-verification) · [Streaming](development.md#streaming-verification) · [MTP](mtp.md#verification)
 
 Verify fused projections for eligible singleton decode and legacy groups of two through five, including mixed decode and single-row prefill. Check [packed K0 decode](batch-graphs.md#packed-paged-gqa-decode) by bucket. Compare shape and alignment fallbacks against separate native ops. Match execution mode, context, and KV capacity for timing. Record row modes, group sizes, captures, and replays.
 
 Compare fused SwiGLU BF16 results with identical and disjoint gate and up output spans. Require `cudaErrorInvalidValue` before launch for identical gate and up spans in fallback, partial output overlaps, and output overlaps with inputs.
 
-Qualify the promoted build with the serial and concurrent fixtures under the new launch policy.
+Qualify the Release build with the serial and concurrent fixtures under the applicable launch policy.
 
 ### Exact decode bandwidth
 
@@ -117,7 +108,7 @@ Record visible lengths and KV capacity. Report ordered fallback timing separatel
 
 Run the [prefill acceptance checks](development.md#chunked-prefill-verification) before timing. For exact prefill, match full BF16 logits and committed KV and GDN state with the row-wise control. Time device prompt processing with CUDA events through the operation before the first LM head. Measure HTTP TTFT from submission to the first token. Record tile sizes, tails, active lanes, and decode token gaps during mixed steps.
 
-Scratch uses 31,944,704 bytes at 128 rows and zero at one row. Generator `peak_device_allocation_bytes` counts logical model, request, and scratch bytes. Batch `workspace_bytes` tracks the largest lane tile's scratch. `request_bytes` counts live request storage after each step. These counters exclude idle backing. Live reservations can exceed [pool thresholds](development.md#constraints-and-failure-behavior).
+Generator `peak_device_allocation_bytes` counts logical model, request, and scratch bytes. Batch `workspace_bytes` tracks the largest active prefill workspace. `request_bytes` counts live request storage after each step. These counters exclude idle backing. Live reservations can exceed the pool release thresholds. [Prefill workspace accounting](native-prefill-workspace.md#constraints-and-failure-behavior)
 
 Record pool used and reserved bytes after synchronization. Require zero live scratch after retirement, including recovered free-enqueue failures. Report peak HBM, headroom, lane mix, and KV capacity.
 
@@ -132,7 +123,7 @@ hashes, toolchain, driver, and dispatch. Trace projection shapes and fallback.
 
 Run the [prefill checks](development.md#chunked-prefill-verification) for exact scoring and cache storage. Compare Tensor Core projections with an independent reference under predefined tolerances. Match fallback and exact projections bitwise. Cover full chunks, tails, mixed steps, and unsupported dispatch. Check repeated tokens and finish reasons.
 
-For arithmetic-preserving [prefill fusions](development.md#runtime-path), match full BF16 logits, committed KV and GDN state, and staged BF16 and FP8 values bitwise. Hold dispatch and tile schedule fixed. Include raw MXFP8 exponents 0 and 255. Cover single rows, two- and four-row tiles, page crossings, positive MTP depth, and graph and eager decode.
+For arithmetic-preserving prefill fusions, match full BF16 logits, committed KV and GDN state, and staged BF16 and FP8 values bitwise. Hold dispatch and tile schedule fixed. Include raw MXFP8 exponents 0 and 255. Cover single rows, two- and four-row tiles, page crossings, positive MTP depth, and graph and eager decode. [Fused activation quantization](fp8-prefill-projections.md#fused-activation-quantization)
 
 Use the [GQA verification criteria and measurements](flash-prefill.md#verification) for flash, ordered fallback, and protected single rows.
 
@@ -142,15 +133,9 @@ Check parity against pinned vLLM on identical histories. Record its execution mo
 
 Run [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 across projection tiles on identical inputs. Follow the [prefill protocol](#chunked-prefill). Report native deltas and gates per policy.
 
-
-
 ### Native concurrent workloads
 
-Verify [streaming](development.md#streaming-verification), [K0 scheduling](#scheduler-and-reporting-policy), offered concurrency, and [decode width and replay](batch-graphs.md#timing).
-
-[Wide long decode checks](long-paged-decode.md#verification) cover direct controls and HTTP cohorts.
-
-[Native-default](serving/paired-native-defaults-results.md) evidence owns the current W1–W2 results. W3–W6 remain unmeasured for that configuration. The historical bounded split-attention campaign is retained in Git history only.
+Verify offered and observed concurrency, streaming, and decode width and replay under the applicable scheduler policy. Keep historical K0 diagnostics with their original controls. [Streaming verification](development.md#streaming-verification) · [Batch timing](batch-graphs.md#timing) · [Wide decode checks](long-paged-decode.md#verification)
 
 ### Native MTP
 
@@ -158,7 +143,7 @@ Run the [MTP checks](mtp.md#verification) before timing. Use `--mtp-steps 0` for
 
 To isolate layer-major verification, compare with row-wise MTP at the same depth. To isolate tiled seeding, keep the verifier, exact precision, and depth fixed. Time target prefill and draft KV seeding through workspace release, before the first LM head. Record HTTP TTFT and request latency separately. Include short, tile-boundary, and long prompts. Record tile sizes, pool state, and output length.
 
-Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. [W3-MTP](../benchmarks/variants/README.md) uses four 8,192-token prompts with 1,024 outputs each. K1 starts beyond the [graph limit](mtp.md#target-verification-graph). The matched run remains pending. Use `--max-active 32 --max-num-batched-tokens 8192`.
+Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. The W3-MTP variant uses four 8,192-token prompts with 1,024 outputs each. Its K1 start exceeds the verification graph's visible limit. [W3-MTP fixture](../benchmarks/variants/README.md) · [Graph limit](mtp.md#target-verification-graph)
 
 Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L241)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L868)<!-- prefix: "result.mtp_r" -->
 
@@ -181,3 +166,25 @@ Performance acceptance requires [native implementation correctness](development.
 - **Profiling.** Record GPU utilization, kernel, JIT, scheduler, and queue times, plus collection methods. Profile separately if tracing changes throughput. Collect [native scheduler samples](prefix-cache.md#native-http-controls) during diagnostics. [Full vLLM verification](../benchmarks/variants/verify.py#L390)<!-- prefix: "def verify(r" --> needs pinned worker metadata and PyTorch traces. Link optimizations to bottlenecks, correctness, and results.
 
 Retain the run manifest, commands, environment, fixture hashes, raw samples, and failures in ignored `artifacts/` storage. A missing counter is unavailable. A missing baseline, failed correctness check, or changed workload leaves that performance claim open.
+
+## Matched K4 evidence
+
+Native Release `9987dc8463ce14d249b558af10ed660d44590927` passed the strict
+median gate against pinned vLLM on W1 and W2 using `matched-k4-native-defaults-v1`.
+Both arms used MTP4, 32 in-service requests, an 8,192-token step budget, and
+the same B200 and checkpoint. Formal W3–W6 remain unmeasured for this campaign.
+
+| Workload | Native median, ms | Pinned vLLM median, ms | Native reduction |
+| --- | ---: | ---: | ---: |
+| W1 | 612.290869 | 644.133185 | 4.94% |
+| W2 | 1,370.155616 | 1,723.769346 | 20.51% |
+
+Across all 12 cohorts per row, each engine reproduced its own IDs from the
+prior formal run at native revision `b7c36ded75985788adae04ced54ca2948c5c3478`.
+Cross-engine IDs differed. A separate W1 trace reached depth four in 49 of 50
+rounds. The archived report retains source, binary, checkpoint, campaign, request,
+and comparison digests. Checkpoint cleanup removed raw SSE captures, parity
+reports, and launch receipts. Replay requires the original receipts. [Archived native-default report](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/serving/paired-native-defaults-results.md)
+
+Use the historical K0 and bounded split-attention K4 reports only under their
+recorded settings. [W1–W6 K0 report](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/performance-comparison.md) · [Measurement ledger](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-measurement-ledger.md) · [Bounded split K4 report](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-split-attention-results.md)

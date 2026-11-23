@@ -1,6 +1,6 @@
 # Native HTTP transport
 
-The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L308)<!-- prefix: "serve_connec" -->
+The loopback server uses one HTTP reader and one batch scheduler at every capacity. [Launch options](../README.md#serve-token-ids-over-http) · [Startup](../apps/sglang-server.cpp#L308)<!-- prefix: "serve_connec" -->
 
 ## Request targets and redirects
 
@@ -12,26 +12,21 @@ The reader checks exact routes before trying a slash redirect. A slash variant t
 
 `Location` uses `http`, the decoded slash-trimmed path, and the original nonempty query with URL quoting. Requests require one nonempty `Host`. An unsuitable authority falls back to `127.0.0.1` with the local port if available and different from 80. Native framing and media-type limits apply. The reader rejects `Transfer-Encoding`, `Content-Encoding`, and `Expect`. [Headers](../apps/server/http.cpp#L150)<!-- prefix: "std::size_t " --> · [Authority](../apps/server/http.cpp#L587)<!-- prefix: "static std::" --> · [Location](../apps/server/http.cpp#L617)<!-- prefix: "void write_r" -->
 
-See [cache flush](prefix-cache.md#cache-flush) for `/flush_cache` methods, timeouts, and queueing.
-See [Anthropic Messages](serving/anthropic-messages.md) and
-[Anthropic token counting](native-tokenization.md#count-anthropic-prompt-tokens).
-See [OpenAI Responses](serving/openai-responses.md) for text, reasoning, and optional state.
-See [Decisions and System One](serving/decisions.md) for zero-output scoring of text.
-[Loads](serving/loads.md).
+[Cache flush](prefix-cache.md#cache-flush) covers methods, timeouts, and queueing. [Anthropic Messages](serving/anthropic-messages.md) and [token counting](native-tokenization.md#count-anthropic-prompt-tokens) describe the Anthropic endpoints. [OpenAI Responses](serving/openai-responses.md) covers text, reasoning, and state. [Decisions and System One](serving/decisions.md) covers zero-output scoring. [`/v1/loads`](serving/loads.md) reports local running and waiting requests.
 
 ## Health and readiness
 
-All three health checks accept empty GET requests and bypass the completion queue.
+Health checks accept empty GET requests and bypass the completion queue.
 
 | Route | Responsibility | Response |
 | --- | --- | --- |
-| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L167)<!-- prefix: "std::string " --> |
-| `/ready` | The HTTP reader checks the permanent decoder worker failure flag. | HTTP 200 with `{"ready":true}` while the worker has no permanent failure. After failure, HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. [Readiness response](../apps/server/http.cpp#L662)<!-- prefix: "void write_r" --> · [Worker flag](../apps/server/batch_service.cpp#L757)<!-- prefix: "bool BatchSe" --> |
-| `/health_generate` | A dedicated HTTP worker asks the batch scheduler for generation progress. | HTTP 200 for progress within the probe window. HTTP 503 for queue overload, probe failure, timeout, permanent worker failure, or shutdown. Both statuses carry `Content-Length: 0` and `Connection: close`. [Dispatch](../apps/server/prefix_controls.cpp#L485)<!-- prefix: "void Connect" --> · [Reply](../apps/server/http.cpp#L671)<!-- prefix: "void write_g" --> |
+| `/health` | Reports liveness and scheduler limits. | HTTP 200 with `max_active` and `max_num_batched_tokens`, even after permanent worker failure. [Health response](../apps/sglang-server.cpp#L167)<!-- prefix: "std::string " --> |
+| `/ready` | Checks for permanent decoder worker failure. | HTTP 200 with `{"ready":true}` or HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. [Readiness response](../apps/server/http.cpp#L662)<!-- prefix: "void write_r" --> · [Worker flag](../apps/server/batch_service.cpp#L757)<!-- prefix: "bool BatchSe" --> |
+| `/health_generate` | A dedicated HTTP worker probes generation progress. | HTTP 200 for progress before timeout. HTTP 503 for queue overload, probe failure, timeout, permanent worker failure, or shutdown. Both carry `Content-Length: 0` and `Connection: close`. [Dispatch](../apps/server/prefix_controls.cpp#L485)<!-- prefix: "void Connect" --> · [Reply](../apps/server/http.cpp#L671)<!-- prefix: "void write_g" --> |
 
-A permanent worker failure also causes new completions to return HTTP 500. A generation health timeout leaves the readiness flag unchanged. [Batch failure](../apps/server/batch_service.cpp#L166)<!-- prefix: "void BatchSe" -->
+Permanent worker failure also makes new completions return HTTP 500. Generation health timeout leaves readiness unchanged. [Batch failure](../apps/server/batch_service.cpp#L166)<!-- prefix: "void BatchSe" -->
 
-The scheduler defaults to 32 active requests and an aggregate budget of 8,192 tokens per step. Change the budget with `--max-num-batched-tokens` (1–32,768) and use `/health` to verify the configured value. [Default budget](../include/sglang/decoder.h#L23)<!-- prefix: "inline const" -->
+Defaults are 32 active requests and 8,192 aggregate tokens per step. Set the token budget with `--max-num-batched-tokens` (1–32,768) and verify it at `/health`. [Default budget](../include/sglang/decoder.h#L23)<!-- prefix: "inline const" -->
 
 ### Generation probe lifecycle
 
@@ -55,9 +50,9 @@ Pinned SGLang can enable generation on `/health` and can bypass generation on bo
 
 ## Model discovery
 
-`GET /v1/models` and `GET /v1/models/{model}` run on the reader and bypass the completion queue with prefix reuse off or on. See [model discovery](native-model-info.md#model-discovery) for their response and target contracts, and [model information](native-model-info.md) for checkpoint capabilities and parser settings.
+The reader handles `GET /v1/models` and `GET /v1/models/{model}` outside the completion queue regardless of prefix reuse. [Model discovery](native-model-info.md#model-discovery) · [Checkpoint capabilities and parsers](native-model-info.md)
 
-See [server information](native-model-info.md#server-information) for `GET /server_info`, its alias, effective launch settings, and live scheduler counters.
+`GET /server_info` and its alias expose effective launch settings and live scheduler counters. [Server information](native-model-info.md#server-information)
 
 Use [`POST /separate_reasoning`](serving/separate-reasoning.md) to split reasoning from supplied text.
 
@@ -65,7 +60,7 @@ Use [`POST /separate_reasoning`](serving/separate-reasoning.md) to split reasoni
 
 Let `A` be `--max-active`. The nonblocking loopback listener uses a TCP backlog setting of 16. The reader polls all retained sockets and advances each request incrementally. It retains up to `A + 1` incomplete requests. The reader services ready and expired reads before accepting a waiting connection. The five-second read deadline starts at acceptance and covers receipt of the HTTP headers and body. The header and body limits are 8 KiB and 2 MiB, respectively. Clients can use `shutdown(SHUT_WR)` after a complete request. [Listener](../apps/server/http.cpp#L405)<!-- prefix: "Socket liste" --> · [Reader](../apps/server/http.cpp#L472)<!-- prefix: "void read_co" --> · [Read limits](../apps/server/http.cpp#L30)<!-- prefix: "constexpr st" -->
 
-When a connection is waiting and the reader is full, the reader looks for the oldest eligible incomplete socket. A socket is eligible if it has no readable data and has been idle for at least 250 milliseconds since acceptance or its last successful read. The reader defers acceptance if no socket is eligible. It closes the eligible socket after accepting the new one. During replacement, the socket count can briefly exceed the reader limit by one. [Socket replacement](../apps/server/http.cpp#L447)<!-- prefix: "static void " -->
+When the reader is full, it defers acceptance unless an incomplete socket has no readable data and has been idle at least 250 milliseconds since acceptance or its last successful read. The reader accepts the new connection, then closes the oldest eligible socket. The count can briefly exceed the limit by one. [Socket replacement](../apps/server/http.cpp#L447)<!-- prefix: "static void " -->
 
 After HTTP parsing, completions, [native generation](native-generate.md), [pointwise scoring](serving/pointwise-score.md), and [tokenization](native-tokenization.md) enter one FIFO. Up to `A` requests can wait, and up to `A` workers can claim requests. The queue removes disconnected waiters before checking capacity. It returns a JSON HTTP 503 response when `A` requests are still waiting, even if some workers are idle. The reader checks the shape of `/generate` and reserves its IDs after this capacity check. Workers validate the prompts and options. A normally claimed request holds its HTTP worker slot until its response socket closes. [Queue admission](../apps/server/prefix_controls.cpp#L619)<!-- prefix: "void Connect" --> · [Worker](../apps/server/prefix_controls.cpp#L786)<!-- prefix: "void Connect" -->
 

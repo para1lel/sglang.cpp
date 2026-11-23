@@ -27,7 +27,7 @@ On 148-SM SM100 devices, automatic dispatch tries ordered TMEM for 256–512 row
 
 The decoder can batch staged paired attention inside a [four-grant projection group](native-prefill-workspace.md#projection-pairs-for-mtp). All four grants must have 1,024 rows and the same start at a 1,024-token boundary from 1,024 through 7,168. After appending KV for each lane, the decoder tries one predecode launch and one attention launch for the group. A declined batch retries each lane through the ordinary dispatcher on the same stream. [Shape guard](../src/decoder_prefill.cpp#L550)<!-- prefix: "bool can_bat" --> · [Batch and fallback](../src/decoder_prefill.cpp#L534)<!-- prefix: "if (staged_b" -->
 
-Media tiles cap at 128 rows. Eligible tensor-core text with MTP can use 1,024-row tiles. The [SM100 page-128 study](sm100-page128-prefill.md) describes the earlier selectable alternatives.
+Use the batch planner and serial tile rules for current tile caps. [Batch planner](batch-graphs.md#runtime-path) · [Serial prefill](text-serving.md#serial-prefill)
 
 Flash and TMEM follow the page table and process causal 64-key tiles using BF16 products, FP32 accumulation, and online normalization.
 
@@ -117,20 +117,20 @@ Check raw dispatch at zero and eager staging at aligned starts from 1,024 throug
 
 ### Ordered TMEM operator verification
 
-Three remapped B200 W5/07 operator replays matched wide Flash bitwise and reduced graph replay time. FP64 sampling covered the late tile. KV NaN and query infinity matched wide Flash and passed memcheck, synccheck, and racecheck. Checkpoint-logit and serving qualification remain open.
+Archived remapped operator replays matched wide Flash bitwise. For ordered changes, repeat remaps and causal boundaries. Compare behavior with visible KV NaNs and query infinity. Keep operator parity and timing separate from checkpoint and serving measurements.
 
 ### Split TMEM operator verification
 
-The independent B200 check passed long-context dispatch, graph, numerical, and causal cases. At 65,536, 98,304, and 131,072 visible tokens, normalized RMSE against FP64 was 0.224%, 0.219%, and 0.221% over 12,800 values per shape. Replay at the first eligible start restored BF16 outputs after overwrite and preserved guards. The 131,072-token mutation preserved all 399,360 BF16 values in the first 65 rows bitwise.
-
-At 1,024 query rows, the paired median time including the merge fell from 18.206 to 7.171 ms at 65,536 visible tokens and from 37.343 to 8.937 ms at 131,072. Memcheck and synccheck each reported zero errors on the 65,536-token operator probe.
-
-A fault probe verified device and resource fallbacks, CUDA error propagation, and scratch release requests after split or merge failure.
+Verify graph replay, output guards, and causal invariance at 65,536, 98,304, and 131,072 visible tokens. Compare with FP64 on identical packed KV. Inject unsupported device or resource settings and split or merge failures to check fallback, error propagation, and scratch release. The archived probe measured lower operator latency including the merge.
 
 ### TMEM checkpoint verification
 
-The Qwen3.8-27B-FP8 probe compared split TMEM with Flash on frozen W6 lane 0. Greedy first tokens changed at 65,536 and 98,304 prompt tokens and matched at 131,072. Repeated captures matched all 496,640 BF16 logits within each arm. Sampled full-tile TMEM-versus-Flash normalized RMSE was 0.06130–0.09469%.
+The historical split TMEM checkpoint probe changed greedy first tokens at
+65,536 and 98,304 prompt tokens. Repeated captures matched within each arm.
+The source of the drift remains unresolved. Keep split TMEM operator evidence
+separate from full-checkpoint quality and the W6 serving gate. [Archived Flash and TMEM verification and reproduction](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/flash-prefill.md#tmem-checkpoint-verification) · [Previous guide with exact operator results](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/flash-prefill.md#ordered-tmem-operator-verification) · [Serving gate](performance.md#measurement)
 
-The source of full-model drift remains unresolved. Split TMEM therefore remains opt-in. Do not use isolated operator parity or timing to claim serving acceptance. W6 acceptance requires full measured cohorts under the [current launch policy](performance.md#scheduler-and-reporting-policy).
-
-The [archived Flash and TMEM verification](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/flash-prefill.md#tmem-checkpoint-verification) retains the reproduction procedure and detailed operator, checkpoint, and serving results.
+The retired page-128 TMA study matched the prior split producer bitwise and
+reduced operator latency. It changed first tokens from wide Flash at 16,384
+and 32,768 prompt tokens and left serving qualification open. The archived
+study retains its selector, fallback rules, and reproduction checks. [Page-128 study](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/sm100-page128-prefill.md) · [Measured selector source](https://github.com/para1lel/sglang.cpp/tree/93648269d852e0fee78f7af4d1c3ffe4897aa361)

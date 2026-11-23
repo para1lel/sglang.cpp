@@ -29,9 +29,7 @@ The verifier can process four K4 lanes together, with up to five target rows per
 
 On B200, eligible text verification rows share a projection launch and reuse the same FP8 weight tiles. The kernel selects an 8-, 16-, or 32-column MMA tile. It keeps each row's FP32 scale, split reduction, and BF16 output. A 20-row group packs at most 348,160 bytes into an existing 496,640-byte verifier logits buffer before that buffer receives scores. Unsupported wide calls fall back to groups of up to five. Single-request W1 and W2 verification use at most five rows. [Projection grouping](../src/decoder_forward.cpp#L251)<!-- prefix: "void project" --> · [Projection launcher](../src/text/decode_proj_fp8.cu#L289)<!-- prefix: "std::optiona" -->
 
-### Historical short text observations
-
-On B200 with Qwen3.8-27B-FP8, a single text request with 128 prompt IDs and 128 greedy output IDs produced the same sequence with the historical ungrouped combined policy at K0 and K4. That sequence first differed from exact at output token 20 and differed on 108 of 128 free-running IDs. A separate ungrouped combined K4 Nsight Systems run recorded 657 ms of verifier GPU activity, including 311 ms in FP8 projection kernels before activation packing. These measurements cover one short checkpoint-backed workload on the earlier runtime.
+### Large prefill tiles
 
 Separate tensor-core K0 projections require at least three rows, input widths divisible by 128, and contiguous, 16-byte-aligned E4M3 payloads. The output can end in a partial tile. At 129–1,023 rows, projections with at least 8,192 output channels or 6,144 input channels first try a paired-TMA 128×128 tile. The launch places the row tiles for each column tile next to one another to improve weight cache reuse. [Eligibility](../src/prefill_fp8_sm100.cu#L542)<!-- prefix: "const int pr" --> · [Separate projection tiles](../src/prefill_fp8_sm100.cu#L571)<!-- prefix: "if (rows > 1" -->
 
@@ -97,18 +95,15 @@ For fused RMSNorm parity, compare BF16 rows, E4M3 bytes, and FP32 scales bitwise
 
 ### Held-out model quality
 
-The native study exercised `exact` and explicit `tensor-core-mtp-target` at K0 and K4. It used the Qwen3.8-27B-FP8 checkpoint on one B200, with graphs enabled, prefix reuse off, 32 slots, and an 8,192-token step cap. It compared the shared text and JSON-schema cases with full-checkpoint SGLang `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. SGLang used deterministic eager execution, Triton kernels, FP32 recurrent state, and no speculation.
+The held-out checkpoint study compared historical exact and Tensor Core
+profiles against pinned SGLang on short answers, reasoning, typed JSON,
+teacher-forced scores, and seeded sampling. Native Tensor Core and SGLang
+answered 11 of 17 unconstrained cases correctly, compared with 10 of 17 for
+native exact. Both native profiles matched their own K0 on the tested greedy
+and seeded cases. The study leaves broader reasoning, long contexts, and
+other sampling settings unmeasured. Its launch flags and default values
+describe the measured historical Release. [Held-out results and source identity](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/fp8-prefill-projections.md#held-out-model-quality) · [Current launch migration](native-model-info.md#migrate-old-launch-commands)
 
-| Check | Native exact | Native tensor-core target | SGLang |
-| --- | ---: | ---: | ---: |
-| Correct unconstrained visible answers | 10/17 | 11/17 | 11/17 |
-| Correct visible answers with thinking enabled | 4/4 | 4/4 | 4/4 |
-| Correct typed JSON under a schema | 2/2 | 2/2 | 2/2 |
-| Mean teacher NLL at the first answer token (17 rows, nats) | 1.23333 | 1.14192 | 1.09220 |
-| Mean teacher NLL during decode (64 rows, nats) | 0.25424 | 0.22718 | 0.23879 |
-
-Both native K4 policies matched their own K0 on 29 greedy cases and nine seeded cases. The seeded cases used temperature 0.85, top-k 32, and top-p 1. CPU replay matched 144 draws per native K0 policy and 144 SGLang draws under their respective sampler rules. Direct kernel traces confirmed tensor-core dispatch for native constrained generation, chat with a schema, thinking chat, and K0 generated logprobs.
-
-The 17 authored prompts span language, math, code, and five non-English languages. The base prompts used 26–67 input IDs, and the four thinking variants used 70–93. Fixed-history comparisons used one canonical answer per prompt and included terminal IDs. The study graded visible answers and counted latent reasoning IDs separately. It leaves broader reasoning quality, long contexts, and other sampling settings unmeasured.
-
-The measured native tree `c6ef0daf79e2f4f4a495d338dc96bfb81f5bc43d` is the tree of `904e1a12ea45d1696128b6b36160367c9a4f85f7`. Its target forward and prefill sources match publication `99c523d95c47788f6c872c6c5428c28418d395eb`. The study predates the optional INT8 draft head and OpenAI Responses. The server default remains `exact`, with the INT8 draft head opt-in. [Target selection](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/decoder_forward.cpp#L896)<!-- prefix: "is_b200() &&" --> · [FP8 default](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/apps/sglang-server.cpp#L32)<!-- prefix: "sglang::Fp8P" --> · [INT8 default](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/apps/sglang-server.cpp#L42)<!-- prefix: "bool mtp_int" -->
+An earlier ungrouped short-text probe also matched its own K0 and K4 but
+diverged from exact. Diagnose differences on identical histories and measure
+serving separately. [Archived short text observations](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/fp8-prefill-projections.md#historical-short-text-observations)

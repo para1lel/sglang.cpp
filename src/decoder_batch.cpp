@@ -10,6 +10,7 @@
 #include "sglang/decoder_verify.h"
 #include "sglang/decoder_prefix_cache.h"
 #include "sglang/prefill_fp8.h"
+#include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/tc_vocab.h"
 #include <algorithm>
 #include <utility>
@@ -310,6 +311,7 @@ struct DecoderBatch::State {
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;
     std::uint8_t* wide_mtp_activation = nullptr;
+    DraftDepthScratch draft_depth;
     int wide_mtp_capacity = 0;
     int wide_mtp_limit = 0;
     std::byte* sampling_workspace = nullptr;
@@ -734,6 +736,7 @@ bool DecoderBatch::State::prepare_wide_mtp(int lanes) {
     check(cudaPeekAtLastError(), "Check CUDA status before allocating verification scratch");
     if (wide_mtp_activation) {
         execution.free_block(wide_mtp_activation, current_bytes);
+        draft_depth.activation = nullptr;
         wide_mtp_activation = nullptr;
         wide_mtp_capacity = 0;
     }
@@ -808,11 +811,12 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     }
     if (count == 0) return;
     const auto& cancel = cancel_probe();
-    for (int first = 0; first < count; first += packet) {
-        if (MtpRound::propose_all(rounds.data() + first, std::min(count - first, packet),
-                                  constraint_workspace, stream, cancel)) {
-            continue;
-        }
+    // Reuse the verification activation block before target verification starts.
+    if (count >= 16 && !output && MtpDraftRequest::prepare_depth(
+            *rounds.front().draft, draft_depth, wide_mtp_activation, stream)) {
+        MtpRound::propose_depth(rounds.data(), count, draft_depth, stream);
+    } else if (!MtpRound::propose_packets(rounds.data(), count, constraint_workspace, stream,
+                                          cancel)) {
         check(cudaStreamSynchronize(stream), "Complete cancelled MTP draft wave");
         for (int index = 0; index < count; ++index) {
             auto& result = results[slots[index]];

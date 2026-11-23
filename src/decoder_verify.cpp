@@ -214,6 +214,57 @@ bool MtpRound::propose_all(MtpRound* rounds, int count, const ConstraintWorkspac
     return !cancel || !cancel();
 }
 
+bool MtpRound::propose_packets(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
+                               cudaStream_t stream, const Cancel& cancel) {
+    constexpr int packet = decoder_batch_max_mtp_lanes;
+    for (int first = 0; first < count; first += packet) {
+        if (!propose_all(rounds + first, std::min(count - first, packet), scratch, stream,
+                         cancel)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void MtpRound::propose_depth(MtpRound* rounds, int count, const DraftDepthScratch& scratch,
+                             cudaStream_t stream) {
+    std::array<MtpDraftInput, decoder_batch_max_lanes> inputs;
+    for (int index = 0; index < count; ++index) {
+        rounds[index].draft_hidden = rounds[index].request->work.normalized;
+    }
+    for (int depth = 0; depth < decoder_batch_max_mtp_steps; ++depth) {
+        int active = 0;
+        for (int index = 0; index < count; ++index) {
+            auto& round = rounds[index];
+            inputs[index].request = nullptr;
+            if (depth >= round.proposal_limit) continue;
+            inputs[index] = {round.draft, round.position - 1 + depth, round.tokens[depth],
+                             round.draft_hidden};
+            ++active;
+        }
+        if (active == 0) break;
+        MtpDraftRequest::enqueue_depth(inputs.data(), count, scratch, stream);
+        check(cudaStreamSynchronize(stream), "Complete depth-major MTP draft wave");
+        bool retried = false;
+        for (int index = 0; index < count; ++index) {
+            if (!inputs[index].request) continue;
+            auto& round = rounds[index];
+            round.draft_hidden = inputs[index].hidden;
+            retried |= round.draft->retry_invalid_int8(stream);
+        }
+        if (retried) {
+            check(cudaStreamSynchronize(stream), "Complete BF16 MTP draft score retries");
+        }
+        for (int index = 0; index < count; ++index) {
+            if (!inputs[index].request) continue;
+            auto& round = rounds[index];
+            const int token = round.draft->read_token();
+            if (token == -1) round.proposal_limit = depth;
+            else round.tokens[++round.drafted] = token;
+        }
+    }
+}
+
 bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
                       MtpDraftInput* repair) {
     if (draft->valid_prefix() > position) {

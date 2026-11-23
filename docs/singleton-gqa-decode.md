@@ -8,7 +8,7 @@ runtime. Current B200 text decode and verification are described under
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L615)<!-- prefix: "const auto r" --> · [Lane selection](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L486)<!-- prefix: "first.narrow" --> |
+| Batch scheduler | Selects eligible text decode steps. | [Batch options](../src/decoder_batch.cpp#L617)<!-- prefix: "const auto r" --> · [Lane selection](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L486)<!-- prefix: "first.narrow" --> |
 | Batch execution owner | Allocates and releases the shared score buffer. | [Allocation](../src/decoder_resources.cpp#L551)<!-- prefix: "ExactGqaWork" --> · [Device release](../src/decoder_resources.cpp#L259)<!-- prefix: "CleanupError" --> |
 | Exact attention | Computes FP32 scores and consumes them in token order. | [Score and replay launches](../include/sglang/text/gqa_ordered_launch.cuh#L4)<!-- prefix: "cudaError_t " --> |
 

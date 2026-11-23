@@ -5,6 +5,7 @@
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_verify.h"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
+#include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
 #include <cmath>
@@ -250,6 +251,7 @@ struct MtpDraftRequest::State {
     bool prepare_mapped_score(cudaStream_t stream);
     int score_token();
     static void score_wave(State* const* batch, int count, cudaStream_t stream);
+    static void select_wave(State* const* batch, int count, cudaStream_t stream);
 
     std::shared_ptr<const MtpDraftWeights> weights;
     Allocations memory;
@@ -440,8 +442,13 @@ void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStre
         check(text_bf16_gemm(head.values, head.rows, head.columns, projections.data(),
                              count, stream), "Run batched BF16 MTP vocabulary head");
     }
+    select_wave(batch, count, stream);
+}
+
+void MtpDraftRequest::State::select_wave(State* const* batch, int count, cudaStream_t stream) {
+    const auto& model = *batch[0]->weights->state_;
     DraftArgmaxRows winners{};
-    if (model.capabilities.grouped_argmax &&
+    if (count > 1 && model.capabilities.grouped_argmax &&
         std::all_of(batch, batch + count, [stream](State* row) {
             return row->prepare_mapped_score(stream);
         })) {
@@ -496,6 +503,13 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
                                     bool score, cudaStream_t stream,
                                     const ConstraintWorkspace* scratch,
                                     const ConstraintCandidates* allowed) {
+    return enqueue_impl(position, shifted_token, hidden, score, stream, scratch, allowed, false);
+}
+
+const Bf16* MtpDraftRequest::enqueue_impl(int position, int shifted_token, const Bf16* hidden,
+                                        bool score, cudaStream_t stream,
+                                        const ConstraintWorkspace* scratch,
+                                        const ConstraintCandidates* allowed, bool defer_score) {
     auto& request = *state_;
     request.validate(position, shifted_token, hidden);
     auto& work = request.work;
@@ -524,7 +538,7 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
             request.activate_mlp(stream);
             project(model.mlp_down, work, work.branch, stream);
             request.normalize_output(stream);
-            request.score(stream, scratch, allowed);
+            if (!defer_score) request.score(stream, scratch, allowed);
         }
     } catch (...) {
         request.failed = true;
@@ -536,6 +550,11 @@ const Bf16* MtpDraftRequest::enqueue(int position, int shifted_token, const Bf16
 
 void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
                                    cudaStream_t stream) {
+    enqueue_wave_impl(rows, count, score, stream, false);
+}
+
+void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
+                                       cudaStream_t stream, bool defer_score) {
     if (count == 0) {
         return;
     }
@@ -545,7 +564,8 @@ void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
     }
     if (count == 1) {
         auto& row = rows[0];
-        row.hidden = row.request->enqueue(row.position, row.token, row.hidden, score, stream);
+        row.hidden = row.request->enqueue_impl(row.position, row.token, row.hidden, score, stream,
+                                               nullptr, nullptr, defer_score);
         return;
     }
     std::array<State*, draft_wave_rows> states{};
@@ -608,7 +628,7 @@ void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
             apply(&State::activate_mlp);
             project_wave(model.mlp_down, &DraftWorkspace::branch);
             apply(&State::normalize_output);
-            State::score_wave(states.data(), count, stream);
+            if (!defer_score) State::score_wave(states.data(), count, stream);
         }
     } catch (...) {
         for (int index = 0; index < count; ++index) {
@@ -619,6 +639,81 @@ void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
     for (int index = 0; index < count; ++index) {
         ++states[index]->prefix;
         rows[index].hidden = score ? states[index]->work.normalized : nullptr;
+    }
+}
+
+bool MtpDraftRequest::prepare_depth(MtpDraftRequest& lane, DraftDepthScratch& scratch,
+                                    std::uint8_t* activation, cudaStream_t stream) {
+    const auto& model = *lane.state_->weights->state_;
+    if (!model.quantized_head || !activation) return false;
+    if (scratch.activation == activation) return scratch.ready;
+    static_assert(wide_mtp_rows * intermediate_size >=
+                  decoder_batch_max_lanes * (hidden_size + sizeof(float)));
+    static_assert((decoder_batch_max_lanes * hidden_size) % alignof(float) == 0);
+    scratch.activation = activation;
+    scratch.maxima = reinterpret_cast<float*>(activation + decoder_batch_max_lanes * hidden_size);
+    const auto status = prepare_draft_depth(scratch, model.quantized_head, stream);
+    if (status && *status != cudaSuccess) {
+        scratch.activation = nullptr;
+        check(*status, "Prepare depth-major INT8 MTP vocabulary projection");
+    }
+    scratch.ready = status.has_value();
+    return scratch.ready;
+}
+
+void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
+                                    const DraftDepthScratch& scratch, cudaStream_t stream) {
+    if (!rows || count < 1 || count > decoder_batch_max_lanes) {
+        throw std::invalid_argument("Invalid wide MTP depth size");
+    }
+    std::array<State*, decoder_batch_max_lanes> active;
+    std::array<int, decoder_batch_max_lanes / draft_wave_rows> packet_sizes{};
+    DraftDepthRows vocab{};
+    const MtpDraftWeights* weights = nullptr;
+    int active_count = 0;
+    for (int index = 0; index < count; ++index) {
+        if (!rows[index].request) continue;
+        auto* state = rows[index].request->state_.get();
+        if (!weights) weights = state->weights.get();
+        const auto end = active.begin() + active_count;
+        if (state->weights.get() != weights || std::find(active.begin(), end, state) != end) {
+            throw std::invalid_argument("Invalid wide MTP depth lanes");
+        }
+        state->validate(rows[index].position, rows[index].token, rows[index].hidden);
+        const auto& work = state->work;
+        vocab.row[active_count] = {
+            work.normalized, work.activation.values, work.activation.scales, work.logits};
+        active[active_count++] = state;
+        ++packet_sizes[index / draft_wave_rows];
+    }
+    if (active_count == 0) return;
+    try {
+        for (int first = 0; first < count; first += draft_wave_rows) {
+            std::array<MtpDraftInput, draft_wave_rows> packet;
+            std::array<int, draft_wave_rows> slots;
+            int size = 0;
+            for (int index = first; index < std::min(first + draft_wave_rows, count); ++index) {
+                if (rows[index].request) {
+                    slots[size] = index;
+                    packet[size++] = rows[index];
+                }
+            }
+            enqueue_wave_impl(packet.data(), size, true, stream, true);
+            for (int index = 0; index < size; ++index) {
+                rows[slots[index]].hidden = packet[index].hidden;
+            }
+        }
+        check(project_draft_depth(scratch, weights->state_->quantized_head_maxima, vocab,
+                                  active_count, stream),
+              "Run depth-major INT8 MTP vocabulary projection");
+        int offset = 0;
+        for (const int size : packet_sizes) {
+            if (size) State::select_wave(active.data() + offset, size, stream);
+            offset += size;
+        }
+    } catch (...) {
+        for (int index = 0; index < active_count; ++index) active[index]->failed = true;
+        throw;
     }
 }
 

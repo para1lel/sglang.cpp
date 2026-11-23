@@ -4,6 +4,7 @@
 
 namespace sglang::decoder {
 
+struct DraftDepthScratch;
 struct MtpDraftInput;
 struct SamplingParameters;
 struct VerificationGraphBinding;
@@ -130,6 +131,10 @@ struct MtpRound {
     int rows() const;
     static bool propose_all(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
                             cudaStream_t stream, const Cancel& cancel);
+    static bool propose_packets(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
+                                cudaStream_t stream, const Cancel& cancel);
+    static void propose_depth(MtpRound* rounds, int count, const DraftDepthScratch& scratch,
+                              cudaStream_t stream);
     bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
                 MtpDraftInput* repair);
 };

@@ -5,6 +5,7 @@
 namespace sglang::decoder {
 
 struct DraftOperatorCapabilities;
+struct DraftDepthScratch;
 struct PrefillProjections;
 
 struct MtpPrefillBuffers {
@@ -60,6 +61,10 @@ public:
                         cudaStream_t stream, const ConstraintWorkspace* scratch = nullptr,
                         const ConstraintCandidates* allowed = nullptr);
     static void enqueue_wave(MtpDraftInput* rows, int count, bool score, cudaStream_t stream);
+    static bool prepare_depth(MtpDraftRequest& lane, DraftDepthScratch& scratch,
+                              std::uint8_t* activation, cudaStream_t stream);
+    static void enqueue_depth(MtpDraftInput* rows, int count, const DraftDepthScratch& scratch,
+                              cudaStream_t stream);
 
     void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                       const Bf16* residual, const Bf16* final_norm,
@@ -76,6 +81,11 @@ public:
     void recycle_after_completion();
 
 private:
+    const Bf16* enqueue_impl(int position, int shifted_token, const Bf16* hidden, bool score,
+                            cudaStream_t stream, const ConstraintWorkspace* scratch,
+                            const ConstraintCandidates* allowed, bool defer_score);
+    static void enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
+                                  cudaStream_t stream, bool defer_score);
     friend class GpuPrefixSnapshotStore;
     void snapshot_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream) const;
     void restore_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream);

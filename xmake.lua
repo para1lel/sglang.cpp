@@ -76,7 +76,7 @@ target("sglang_prefill_fp8_sm100")
     add_includedirs("include", path.join(toolkit, "include"))
     add_files("src/prefill_fp8_sm100.cu", "src/text/mxfp8_gqa_prefill_tmem.cu")
     add_files("src/text/gqa_decode_split.cu")
-    add_files("src/text/tc_vocab.cu")
+    add_files("src/text/tc_vocab.cu", "src/text/draft_depth.cu")
     add_files("src/text/draft_seed_fc_sm100.cu")
     add_files("src/text/decode_proj_fp8.cu", "src/text/decode_proj_bf16.cu",
               "src/text/decode_proj_host.cu")

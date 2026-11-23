@@ -898,9 +898,9 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
 template <typename Lane>
 void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream,
                                     bool exact) const {
-    const bool optimized = is_b200() && !exact;
+    const bool optimized = backend.uses_b200_operators && !exact;
     const LayerBatch<Lane> batch{lanes, count, stream, optimized, optimized,
-                                 optimized, optimized ? target_split_end() : 0};
+                                 optimized, optimized ? backend.target_split_end : 0};
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
         if (batch.fuse_verify_activation()) {
             VerifyRmsQuantizeRows rows;

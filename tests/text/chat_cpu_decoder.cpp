@@ -259,6 +259,12 @@ bool Decoder::has_certified_vocab() const {
     return false;
 }
 
+#ifdef SGLANG_TEST_PAIRED_PREFILL_THRESHOLD
+int Decoder::paired_prefill_threshold() const {
+    return 256;
+}
+#endif
+
 DecoderResult Decoder::generate(const std::vector<int>& prompt, const DecoderOptions& options,
                                 const DecoderCallbacks& callbacks) const {
     validate_token_ids(prompt, options);

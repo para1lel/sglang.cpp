@@ -1,65 +1,38 @@
-# Single-B200 development contract
+# Native B200 development guide
 
 Build a C++ and CUDA C++ inference service for one B200. The [checkpoint investigation](research/checkpoint.md) records hashes, tensors, and SGLang sources for `/data0/shared/Qwen3.8-27B-FP8` at `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`.
 
-## Scope at adoption
+<a id="scope-at-adoption"></a>
+## Current architecture and scope
 
-The initial `sm_100` probe returned 42 on B200 4 (`GPU-57c04c1a-9ae4-b231-f31a-5f4367e759a8`) after an XMake build with GCC 15.3.0 and CUDA 13.4.92.
+The supported deployment is one physical B200 with the exact checkpoint above. The decoder accepts `sm_100` devices, but only the exact `NVIDIA B200` device name enables the B200 operator set; other `sm_100` devices have no supported optimized path.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model | Define weights, mathematics, tokenization, media processing, and native multi-token prediction (MTP). | Official checkpoint, configuration, processor, tokenizer, and model code pinned in P0. |
-| Service | Study scheduling, Radix prefix reuse, memory ownership, speculative verification, constraints, and streaming behavior. | Architectural and behavioral reference `sgl-project/sglang` at `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. |
-| Performance | Reproduce a run independently and compare the candidate on each agreed workload. | The [benchmark agreement](performance.md) owns the vLLM pin, controls, and metrics. |
-| Candidate | Build `src/` with XMake and default Pixi. Use `sglang/...` includes for headers under `include/sglang/`, with server headers in `include/sglang/server/`. | [Build options](../tools/build.sh#L5)<!-- prefix: "echo \"Usage:" --> and [XMake project](../xmake.lua#L2)<!-- prefix: "set_project(" -->. |
+| Model | Qwen3.8-27B-FP8 text and multimodal decoding with native MTP4. | [Qwen model](../include/sglang/runtime/model/qwen_text_model.h#L5)<!-- prefix: "struct QwenT" --> |
+| Backend | Derive B200 operators, prefill, graph, split, and residency policy. | [Backend policy](../include/sglang/runtime/backend/cuda_backend_policy.h#L12)<!-- prefix: "struct CudaB" --> · [Execution policy](../include/sglang/runtime/execution/decoder_execution_policy.h#L5)<!-- prefix: "struct Decod" --> · [Residency policy](../include/sglang/runtime/cache/kv_residency_policy.h#L15)<!-- prefix: "class KvResi" --> |
+| Service | OpenAI-compatible text and chat serving, streaming, cancellation, constraints, concurrent scheduling, and exact prefix reuse. | [HTTP transport](http-server.md) · [Text API](text-serving.md) · [Chat API](chat-serving.md) · [Prefix cache](prefix-cache.md) |
+| Build | Use XMake, default Pixi, user CUDA 13.4 compatibility libraries, and the host driver. | [Build options](../tools/build.sh#L5)<!-- prefix: "echo \"Usage:" --> · [XMake project](../xmake.lua#L2)<!-- prefix: "set_project(" --> |
 
-**Adopted scope.** Target one B200 with the local checkpoint and project-owned model and CUDA operators.
+Production excludes cuBLAS, cuDNN, CUTLASS, FlashInfer, and equivalent operator libraries or generators in the native runtime. The single current exception is the certified Tensor Core vocabulary fast path, which uses an approved B200 cuBLASLt algorithm; unsupported algorithm selection falls back to the native BF16 head. Record the justification, license, version, and execution path of HTTP, JSON, tokenizer, media, and system dependencies. Reference engines may use their own operators. Record failures and preventive checks in [development lessons](lessons.md), and use [isolated XMake builds](serving/isolated-builds.md) for private verification.
 
-Record verified failures and preventive checks in [development lessons](lessons.md).
+## Current matched K4 status
 
-Use [isolated XMake builds](serving/isolated-builds.md) for private verification.
+The November 23, 2026 [matched K4 comparison](serving/paired-native-defaults-results.md) records passes on W1 and W2 for native Release `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3`. W3–W6 remain unmeasured for this profile.
 
-**Operator policy.** Production excludes cuBLAS, cuBLASLt, cuDNN, CUTLASS, FlashInfer, and equivalent operator libraries or generators. Record the justification, license, version, and execution path of HTTP, JSON, tokenizer, media, and system dependencies. Reference engines may use their own operators.
-
-**Proposed scope.** Text generation, sampling, stopping, image and video input, MTP4, concurrent scheduling, and MXFP8 grouped-query attention (GQA) KV. Investigate GDN state and Radix prefix reuse. Verify checkpoint and service semantics before accepting OpenAI-compatible endpoints, streaming, cancellation, or JSON Schema, regex, and grammar constraints.
-
-## First task and next evidence
-
-From the repository root, set `GPU_INDEX` to the reserved B200's physical index.
+Run one workload at a time on the same reserved B200 with a verified Release binary:
 
 ```bash
-bash tools/build.sh --gpu "${GPU_INDEX:?set the reserved B200 index}"
+export PAIRED_CHECKPOINT_MANIFEST=/path/to/published/checkpoint.sha256
+export PAIRED_NATIVE_SOURCE='verified-40-character-source-revision'
+export PAIRED_NATIVE_SHA256='verified-64-character-binary-digest'
+bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4 W1
 ```
 
-Check the `sm_100` image and runtime. Require `GPU returned 42 (expected 42)` and exit zero. Keep the command, UUID, toolchain identities, and binary hash.
+The default `server-defaults` profile resolves MTP4, 32 active requests, an 8,192-token scheduling cap, CUDA graphs, and prefix caching off. Use W2 through W6 in order only after each prior row passes. The [matched K4 recipe](../benchmarks/paired/README.md#matched-k4-timing-protocol) owns the full protocol and evidence requirements. The detailed historical W1–W6 K0 report and ledger are retained in pinned Git history at `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3`.
 
-For P0, use the [checkpoint investigation](research/checkpoint.md) for semantics and pinned SGLang mappings. Propose endpoints, API version, parameters, streaming events, and constraints. Record checkpoint conflicts.
-
-The [baseline smoke](performance.md#historical-offline-smoke) found identical eight-ID greedy continuations across seven vLLM requests with BF16 KV and MTP off. Use the [GQA cache comparison](performance.md#gqa-cache-comparison) for paired runs.
-
-### P1 runtime probe
-
-Use managed Pixi. Set `GPU_INDEX` to the reserved B200's physical index.
-
-```bash
-bash tools/build.sh --build-dir build --nvrtc --gpu "${GPU_INDEX:?set the reserved B200 index}"
-```
-
-The script checks NVRTC inside Pixi and `libcuda.so.1` outside Pixi and exposes only the selected GPU. Check UUID, `compute_capability=10.0`, `architecture=sm_100`, and allocation size.
-
-The [probe](../tools/nvrtc-probe.cpp#L265)<!-- prefix: "void run_pro" --> disables NVRTC's persistent cache. The cold lookup compiles and loads a cubin. The warm lookup reuses its function in the same CUDA context.
-
-Expect these results in order:
-
-- `phase=cold cache=miss compiled=1` with `compile_ms` for the NVRTC compilation call.
-- `phase=warm cache=hit compiled=0` with `compile_ms=0.000000`.
-- `NVRTC probe passed` followed by exit status zero.
-
-Both phases verify all elements and report `verified_elements=257 first=42 last=298`. CUDA events measure `kernel_ms` after buffer reset and before the host copy.
-
-Keep the command, output, allocation size, and device, library, and binary identities.
-
-### P2 GQA cache contract
+<a id="p2-gqa-cache-contract"></a>
+## CUDA operator contracts
 
 K and V use four 256-channel E4M3 heads and one E8M0 scale per 32 contiguous channels. E4M3 weights use BF16 inverse scales per 128×128 block. [Checkpoint investigation](research/checkpoint.md)
 
@@ -74,11 +47,12 @@ Exact scoring reduces eight groups in FP32, sums in group order, and scales by `
 [Singleton](batch-graphs.md#page-parallel-gqa-decode) and [legacy narrow decode](batch-graphs.md#legacy-narrow-paged-gqa-decode) group softmax and value reductions by KV pages.
 [Fused packed decode](long-paged-decode.md#fused-packed-gqa) groups reductions by 64-token chunks. [Legacy wide eager decode](long-paged-decode.md#legacy-wide-eager-decode) selects its split after compaction.
 
-#### Ordered multirow GQA prefill
+### Ordered multirow GQA prefill
 
 The [ordered prefill contract](ordered-gqa-prefill.md) covers dispatch, tile selection, causal scoring, and FP64 recovery.
 
-#### P2 GQA verification
+<a id="p2-gqa-verification"></a>
+### GQA verification
 
 ```bash
 bash tools/build.sh --build-dir build --mxfp8-check
@@ -102,7 +76,7 @@ Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L931)<!-- prefix
 
 Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for staged tails and overflow controls.
 
-### P3 native text decoder
+## Native text decoder
 
 #### Responsibilities and sources of truth
 
@@ -110,15 +84,25 @@ Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for
 | --- | --- | --- |
 | `sglang-generate` | Parse a token-ID prompt, run requests serially, and write JSON. | [CLI entry](../apps/sglang-generate.cpp#L279)<!-- prefix: "int main(int" --> |
 | `sglang_checkpoint` | Validate the text configuration, index, and safetensors metadata. Map immutable shard bytes and expose checked tensor views. | [Loader API](../include/sglang/checkpoint.h#L22)<!-- prefix: "class Checkp" --> |
-| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L147)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L270)<!-- prefix: "void execute" --> |
+| `sglang_decoder` | Own device weights and run requests with `sglang_cuda` operators. | [Decoder API](../include/sglang/decoder.h#L147)<!-- prefix: "class Decode" --> · [Layer order](../include/sglang/decoder_internal.h#L273)<!-- prefix: "void execute" --> |
 
 Checkpoint metadata and HTTP use `sglang_json`. Metadata parsing preserves historical underflow to signed zero and overflow to signed infinity, including in ignored fields. Required config values, index entries, tensor dimensions, and offsets still undergo validation. [Metadata parser](../src/checkpoint.cpp#L79)<!-- prefix: "json::Object" --> · [Runtime dependencies](text-serving.md#run-with-bundled-libraries) · [Link configuration](../xmake.lua#L98)<!-- prefix: "target(\"sgla" -->
 
 #### Runtime path
 
-The decoder validates tensor names, dtypes, and shapes before upload. Upload retains mappings and allocations until completion. Deferred cleanup retains shared weights. FP8 projections quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/decoder_weights.cpp#L133)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L225)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L163)<!-- prefix: "__global__ v" -->
+The decoder validates tensor names, dtypes, and shapes before upload. Upload retains mappings and allocations until completion. Deferred cleanup retains shared weights. FP8 projections quantize BF16 inputs to E4M3 with one FP32 scale per 128 channels. [Weight upload](../src/runtime/model/decoder_weights.cpp#L140)<!-- prefix: "Decoder::Mod" --> · [Stream cleanup](../src/decoder_resources.cpp#L225)<!-- prefix: "CleanupError" --> · [Activation quantization](../src/text_ops.cu#L163)<!-- prefix: "__global__ v" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L532)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L937)<!-- prefix: "void Request" -->
+The supported checkpoint is the pinned Qwen3.8-27B-FP8 text model. The [shared model descriptor](../include/sglang/runtime/model/qwen_text_model.h#L17)<!-- prefix: "inline const" --> defines its sizes and four-layer full-attention interval.
+
+Model construction reads CUDA properties, still rejects every device other than `sm_100`, and derives the effective policies. The exact `NVIDIA B200` name enables the B200 operator set. Other `sm_100` devices keep those operators disabled, so they are accepted only by this compatibility check and do not have a supported optimized path. [Device check](../src/runtime/model/decoder_weights.cpp#L145)<!-- prefix: "if (properti" --> · [Backend construction](../src/runtime/model/decoder_weights.cpp#L149)<!-- prefix: "backend = Cu" --> · [Backend policy](../include/sglang/runtime/backend/cuda_backend_policy.h#L12)<!-- prefix: "struct CudaB" -->
+
+[DecoderExecutionPolicy](../include/sglang/runtime/execution/decoder_execution_policy.h#L5)<!-- prefix: "struct Decod" --> combines backend capabilities with configured limits. On B200, regular batch decode graphs require one text lane with MTP disabled. The backend's split endpoint governs when serial decode uses eager execution for split attention. [Graph policy](../src/runtime/execution/decoder_execution_policy.cpp#L19)<!-- prefix: "bool Decoder" --> · [Split policy](../src/runtime/execution/decoder_execution_policy.cpp#L33)<!-- prefix: "bool Decoder" --> · [Model field](../include/sglang/decoder_internal.h#L567)<!-- prefix: "decoder::Dec" -->
+
+Batch text prefill without MTP and text label scoring use a 1,024-row cap on every accepted device. Media uses the 128-row cap. Text MTP prefill also uses 128 rows when ordered attention is disabled or prefix reuse is enabled. [Batch prefill cap](../src/runtime/execution/decoder_execution_policy.cpp#L24)<!-- prefix: "int DecoderE" --> · [Label scoring cap](../src/runtime/execution/decoder_execution_policy.cpp#L29)<!-- prefix: "int DecoderE" --> · [Serial prefill caps](text-serving.md#serial-prefill)
+
+[KvResidencyPolicy](../include/sglang/runtime/cache/kv_residency_policy.h#L15)<!-- prefix: "class KvResi" --> is active only when a batch requests a resident-memory limit. Its capacity is the smaller of the requested limit and the available bytes after reserving up to 2 GiB. [Residency calculation](../src/runtime/cache/kv_residency_policy.cpp#L21)<!-- prefix: "void KvResid" --> · [Capacity measurement](../src/decoder_batch.cpp#L226)<!-- prefix: "if (options." -->
+
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L534)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L937)<!-- prefix: "void Request" -->
 
 One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L881)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L899)<!-- prefix: "void Decoder" -->
 
@@ -170,7 +154,7 @@ are 32 MiB and 1 GiB respectively. Other pools use CUDA defaults. See the
 [active prefill workspace sizes](native-prefill-workspace.md#projection-pairs-for-mtp).
 [Retention](../src/decoder_prefill.cpp#L48)<!-- prefix: "void configu" -->
 
-Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L652)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L419)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L714)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L769)<!-- prefix: "cudaError_t " -->
+Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L654)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L419)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L714)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L769)<!-- prefix: "cudaError_t " -->
 
 `--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L241)<!-- prefix: "void write_r" -->
 
@@ -202,9 +186,11 @@ Run the [prefill checks](../tests/prefill/README.md). Compare exact scoring and 
 
 See [MTP](mtp.md) for exact tiled seeding, joint target verification, and per-lane rollback. [Verify MTP](mtp.md#verification) before timing.
 
-### Native streaming server
+## Native streaming server
 
 See [native HTTP transport](http-server.md) for admission, overload, health, readiness, and shutdown. `--max-active` accepts 1–32 and defaults to 32. `--max-num-batched-tokens` accepts 1–32,768 and defaults to 8,192. The server uses the [K4 default](mtp.md#runtime-path) and supports [exact prefix reuse](prefix-cache.md). [Batch graphs](batch-graphs.md) are enabled by default for eligible steps. Use `--eager` to disable replay. [CLI limits](../apps/sglang-server.cpp#L134)<!-- prefix: "} else if (o" -->
+
+The [single-device batch executor](../include/sglang/runtime/server/single_device_batch_executor.h#L12)<!-- prefix: "class Single" --> constructs `DecoderBatch` on its worker thread and propagates startup failures to the caller. `BatchService` records initial prefix-cache statistics and handles permanent processing failures. On shutdown, the service wakes the worker and joins it through the executor. [Service callbacks](../apps/server/batch_service.cpp#L143)<!-- prefix: "executor = s" --> · [Worker run loop](../src/runtime/server/single_device_batch_executor.cpp#L35)<!-- prefix: "void SingleD" --> · [Shutdown](../apps/server/batch_service.cpp#L157)<!-- prefix: "BatchService" -->
 
 Lanes share weights and own KV, GDN state, and outputs. [Resident memory admission](batch-graphs.md#resident-memory-admission) applies at every capacity.
 
@@ -239,20 +225,8 @@ Design one execution path for all supported feature combinations, including a ba
 
 Verify [prefix checkpoints](prefix-cache.md#verification), [MTP state](mtp.md#verification), and stream completion before storage reuse.
 
-**Proposed checkpoint policy.** Save GDN state every 8,192 tokens and at the latest session request end. Measure checkpoint bytes and replay cost before adoption. Verify GDN and MTP semantics against the checkpoint and MXFP8 encoding in P2.
+## Development workflow
 
-## Runnable milestones
+Start with source and checkpoint identity, then an isolated Release build. Use focused operator and framework checks before end-to-end serving. Run the [GQA verification](#gqa-verification), [native decoder verification](#verification), [chunked prefill verification](#chunked-prefill-verification), [MTP verification](mtp.md#verification), and [streaming verification](#streaming-verification) in that order as they apply to a change. Keep raw evidence in ignored `artifacts/` and accepted procedures in maintained documentation.
 
-For each proposed milestone, retain the exact invocation, inputs, expected result, and actual output.
-
-| Stage | Run | Accept when |
-| --- | --- | --- |
-| P0 · Model and baseline | Inspect pinned tensors and configuration. Run the fixed greedy request with isolated vLLM on B200. | Reproduce the request. Record model identity, memory budget, reference map, dependencies, and open experiments. |
-| P1 · Runtime | Run the [P1 runtime probe](#p1-runtime-probe). | Cold and warm launches verify every element and meet the probe's cache checks. |
-| P2 · Operators and one layer | Exercise FP8 GEMM, normalization, RoPE, [MXFP8 GQA](#p2-gqa-cache-contract), GDN, FFN, and sampling on model shapes. | Meet independent operator and layer tolerances. Record state updates and per-shape timings. |
-| P3 · Text generation | Run the [native decoder checks](#verification) with the checkpoint. | Math, greedy repeats, state, counts, and finish behavior pass. Record output tokens/s, latency, and peak memory. |
-| P4 · Cache and MTP | Compare fresh execution with prefix hits, replay, and MTP on and off. Check zero, partial, and full acceptance, cancellation, eviction, and reuse. | State and continuation match fresh execution. Sampling preserves the target distribution. Share only committed tokens and reuse only retired storage. |
-| P5 · Serving and media | Use an independent client for text, image, and video. Exercise streaming, all constraints, batching, chunked prefill, cancellation, and sustained concurrency. | API fixtures, media inputs and outputs, stop reasons, constrained outputs, and cleanup pass. Check leaks and stale state. |
-| P6 · End-to-end performance | Profile a workload and change its limiting path. Repeat paired runs under the [benchmark agreement](performance.md). | Each required row passes correctness checks and has a strictly lower median native makespan than same-card vLLM. Keep raw samples, before/after profiles, and the adoption decision. |
-
-P0 has a proposed budget of three to five working days. Assign an owner and experiment to each open question. Keep raw runs in ignored `artifacts/` and accepted procedures in maintained docs.
+Profile a slow path before changing it. Repeat paired measurements under the [performance contract](performance.md), preserving workload, device, checkpoint, build, and launch identity. Start W5 only after W1–W4 pass, and W6 only after W5 passes. Accept a workload only when its native median makespan is strictly lower than matched vLLM.

@@ -207,8 +207,9 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
 struct DecoderBatch::State {
     State(const Decoder::Model& owner, DecoderBatchOptions options)
         : model(owner), options(options),
+          residency(options),
           storage(std::make_shared<BatchStorage>(owner.device, owner.memory,
-                                                 options.resident_memory_limit.has_value())),
+                                                 residency.resident())),
           execution(model.device) {
         validate_batch_options(options);
         DeviceScope device(model.device);
@@ -217,15 +218,13 @@ struct DecoderBatch::State {
                                           model.mtp_weights != nullptr);
         }
         if (options.cuda_graphs) storage->verification_graph.emplace(execution);
-        if (options.resident_memory_limit && model.mtp_weights)
+        if (residency.resident() && model.mtp_weights)
             storage->verification_winners = prepare_verification_winners(options.max_lanes);
         execution.open_stream(storage);
         storage->tc_vocab = model.tc_vocab && options.max_lanes >= 4
             ? prepare_tc_vocab_scratch(execution) : nullptr;
         if (options.resident_memory_limit) {
-            const auto free = available_device_bytes();
-            resident_capacity = std::min(*options.resident_memory_limit,
-                                         free - std::min(free, decoder_shared_reserve));
+            residency.measure_available(available_device_bytes());
         }
         device.restore();
     }
@@ -288,6 +287,7 @@ struct DecoderBatch::State {
 
     const Decoder::Model& model;
     const DecoderBatchOptions options;
+    KvResidencyPolicy residency;
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;
     std::byte* sampling_workspace = nullptr;
@@ -295,7 +295,6 @@ struct DecoderBatch::State {
     GeneratedLogprobReadback* logprob_readback = nullptr;
     ConstraintWorkspace constraint_workspace;
     AdjustedLogitsWorkspace adjusted_workspace;
-    std::size_t resident_capacity = 0;
     int prefill_cursor = 0;
     bool failed = false;
     SerialOutput* output = nullptr;
@@ -321,12 +320,12 @@ int DecoderBatch::admit_multimodal(int slot, std::vector<int> prompt, const Deco
 
 std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
                                          std::size_t extra_bytes) const {
-    if (!options.resident_memory_limit) return 0;
+    if (!residency.resident()) return 0;
     std::size_t charged = 0;
     for (const auto& lane : storage->slots) {
         charged += lane ? lane->resident_bytes : 0;
     }
-    return reserve_request_memory(storage->retired, request, prompt, resident_capacity,
+    return reserve_request_memory(storage->retired, request, prompt, residency.capacity(),
                                   charged, extra_bytes);
 }
 
@@ -336,8 +335,9 @@ void DecoderBatch::State::initialize(Lane& lane, int slot) {
     const int prompt = static_cast<int>(lane.prompt.size());
     if (opts.mtp_steps != 0) lane.draft = std::make_unique<MtpDraftRequest>(
         model.mtp_weights, lane.capacity(), lane.resident_bytes ? &storage->retired : nullptr);
-    lane.request->initialize(opts.incremental_kv ? prompt : lane.capacity(), stream,
-                             opts.incremental_kv ? lane.capacity() : 0);
+    const auto [request_capacity, resident_limit] =
+        residency.request_storage(prompt, lane.capacity(), opts.incremental_kv);
+    lane.request->initialize(request_capacity, stream, resident_limit);
     if (opts.requires_target_only()) {
         adjusted_workspace.prepare(execution, *lane.request, opts, stream);
     }
@@ -532,7 +532,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     const auto stream = execution.stream();
     const auto& rows = stats.prefill_rows;
     auto& slots = storage->slots;
-    const bool ordered = model.is_b200();
+    const auto& policy = model.execution;
     std::array<ForwardLane, decoder_batch_max_lanes> work;
     std::array<Request*, decoder_batch_max_lanes> scoring{};
     std::array<int, decoder_batch_max_lanes> packed_slots;
@@ -588,10 +588,11 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             scoring[slot] = lane.request.get();
         }
     }
-    const bool regular_graph = text_decode && !contains_mtp && (!ordered || count == 1);
+    const bool regular_graph = policy.regular_decode_graph(text_decode, contains_mtp, count);
     const auto run = run_decode_lanes(model, execution, storage->decode_graphs, work.data(), count,
                                       {options.cuda_graphs, regular_graph,
-                                       !ordered && !contains_mtp && max_rows == 0});
+                                       policy.narrow_eager_decode && !contains_mtp &&
+                                           max_rows == 0});
     if (max_rows) prefill(rows, count == 0 && !contains_decode && !restored_prompt, stats);
     bool submitted = count != 0 || max_rows != 0;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
@@ -622,6 +623,7 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, bool only_prefill,
     const auto stream = execution.stream();
     const int budget = options.max_num_batched_tokens;
     const bool prefix_cache = storage->prefix_cache.has_value();
+    const auto& policy = model.execution;
     std::array<PrefillGrant, decoder_batch_max_lanes> grants;
     std::array<PrefillGrant, decoder_batch_max_lanes> labels;
     std::array<PromptLogprobCapture, decoder_batch_max_lanes> captures;
@@ -634,15 +636,15 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, bool only_prefill,
         auto& lane = *storage->slots[slot];
         const int position = lane.progress.position;
         if (lane.options.label_token_ids) {
-            const int limit = lane.media ? prefill_chunk_rows : batch_prefill_tile_rows;
+            const int limit = policy.label_scoring_limit(lane.media != nullptr);
             labels[label_count++] = {
                 lane.request.get(), lane.prompt.data() + position, position, rows[slot],
                 std::min(rows[slot], limit), lane.remaining_prompt(),
                 nullptr, lane.media ? &lane.media_prefill : nullptr};
             continue;
         }
-        const int limit = lane.media || (lane.draft && (!model.is_b200() || prefix_cache))
-            ? prefill_chunk_rows : batch_prefill_tile_rows;
+        const int limit = policy.prefill_limit(lane.media != nullptr, lane.draft != nullptr,
+                                               prefix_cache);
         if (lane.options.score_prompt) {
             captures[count] = {&lane.prompt, &lane.prompt_logprobs, logprob_readback,
                                logprob_workspace, lane.options.generated_top_logprobs,

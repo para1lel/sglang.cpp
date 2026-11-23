@@ -212,6 +212,7 @@ bool DecoderBatch::available() const { return true; }
 std::size_t DecoderBatch::request_device_allocation_bytes() const { return 0; }
 DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const { return {}; }
 void DecoderBatch::reset_prefix_cache() {}
+void DecoderBatch::release_retired_allocations() {}
 
 Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats*) {
     Steps steps{};

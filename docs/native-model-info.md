@@ -10,7 +10,7 @@
 | Checkpoint | Supply the supported model type and architecture. | [Checkpoint identity](../include/sglang/checkpoint.h#L47)<!-- prefix: "inline const" --> |
 | Server information | Match both server-info paths on the HTTP reader and serialize one snapshot per GET. | [Route](../apps/server/prefix_controls.cpp#L692)<!-- prefix: "if (server_i" --> · [Callback](../apps/sglang-server.cpp#L323)<!-- prefix: "return serve" --> · [Response fields](../apps/sglang-server.cpp#L194)<!-- prefix: "std::string " --> |
 | Launcher | Record requested options and pass effective settings to the batch service. | [Command sanitization](../apps/sglang-server.cpp#L65)<!-- prefix: "void append_" --> · [Scheduler construction](../apps/sglang-server.cpp#L294)<!-- prefix: "BatchService" --> |
-| Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L835)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L346)<!-- prefix: "counters.gen" --> |
+| Batch scheduler | Snapshot admitted user jobs, published output tokens, and worker readiness under the scheduler mutex. | [Runtime snapshot](../apps/server/batch_service.cpp#L816)<!-- prefix: "BatchRuntime" --> · [Token accounting](../apps/server/batch_service.cpp#L327)<!-- prefix: "counters.gen" --> |
 
 ## Runtime path
 
@@ -83,10 +83,11 @@ Quantization uses the maximum absolute value per weight row and activation. Zero
 
 ### Certified Tensor Core target head
 
-The certified greedy vocabulary head requires loaded draft INT8 weights on
-B200 and a supported cuBLASLt algorithm. The fast path serves eager batches of
-four greedy lanes with five rows each and no constraints or complete-logit
-consumers. Other shapes and K0 use the BF16 head.
+The certified greedy vocabulary head is the sole cuBLASLt exception in the
+native runtime. It requires loaded draft INT8 weights on B200 and a supported
+cuBLASLt algorithm. The fast path serves eager batches of four greedy lanes
+with five rows each and no constraints or complete-logit consumers. Unsupported
+algorithm selection, other shapes, and K0 use the BF16 head.
 
 The verifier reads the existing draft INT8 weights and adds 3,973,120 model bytes
 for statistics and 21,544,480 workspace bytes per decoder batch before allocator rounding.
@@ -133,7 +134,7 @@ most 399,360 bytes within the same requirement. Neither path adds request
 memory. The lane stream orders attention before vocabulary scoring overwrites
 the scratch. [Score storage](../src/decoder_mtp.cpp#L117)<!-- prefix: "ExactGqaWork" --> · [Scratch bound](../include/sglang/text/gqa_decode_split.cuh#L46)<!-- prefix: "static_asser" -->
 
-Compare the current B200 K4 runtime with a fresh K0 control on the same target dispatch. See the [measurement ledger](serving/paired-measurement-ledger.md) for settings and evidence from earlier runtime profiles.
+Compare the current B200 K4 runtime with a fresh K0 control on the same target dispatch. See pinned Git history at `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3` for the settings and evidence from earlier runtime profiles.
 
 ### Migrate old launch commands
 
@@ -165,7 +166,7 @@ Retrieval ignores the query and any successfully parsed body. After shared path 
 
 ### Server-info targets
 
-Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L556)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L776)<!-- prefix: "bool BatchSe" -->
+Both aliases use the shared decoded path. A GET ignores the query and any successfully framed body. It returns HTTP 200 even when `ready` is `false`. A trailing slash redirects to the corresponding alias. An unknown path returns HTTP 404. Other valid methods on either canonical path return HTTP 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`. HEAD sends only the headers. Invalid HTTP framing fails before the reader calls the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L556)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L757)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 

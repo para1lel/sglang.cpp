@@ -1,4 +1,5 @@
 #include "sglang/server/batch_service.h"
+#include "sglang/tokenizer/tokenizer.h"
 
 #include <array>
 #include <chrono>
@@ -53,11 +54,11 @@ struct Fixture {
                 "Timed out waiting for worker or stream progress");
     }
 
-    void record_wait(std::condition_variable* condition, std::mutex* lock) {
+    void record_wait(pthread_cond_t* condition, pthread_mutex_t* lock, bool grace) {
         std::lock_guard guard(mutex);
-        worker_condition = condition->native_handle();
-        worker_mutex = lock->native_handle();
-        ++blocking_waits;
+        worker_condition = condition;
+        worker_mutex = lock;
+        ++(grace ? grace_waits : blocking_waits);
         changed.notify_all();
     }
 
@@ -196,7 +197,7 @@ extern "C" void __real__ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE
 extern "C" void __wrap__ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE(
     std::condition_variable* condition, std::unique_lock<std::mutex>& lock) {
     if (decoder_worker) {
-        fixture.record_wait(condition, lock.mutex());
+        fixture.record_wait(condition->native_handle(), lock.mutex()->native_handle(), false);
     }
     __real__ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE(condition, lock);
 }
@@ -207,11 +208,8 @@ extern "C" int __wrap_pthread_cond_timedwait(pthread_cond_t* condition, pthread_
     if (!decoder_worker) {
         return __real_pthread_cond_timedwait(condition, lock, deadline);
     }
-    {
-        std::lock_guard guard(fixture.mutex);
-        ++fixture.grace_waits;
-        fixture.changed.notify_all();
-    }
+    const bool grace = deadline->tv_sec == 0;
+    fixture.record_wait(condition, lock, grace);
     return pthread_cond_wait(condition, lock);
 }
 
@@ -233,6 +231,8 @@ DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
 
 DecoderBatch::~DecoderBatch() = default;
 
+std::string_view Tokenizer::piece(TokenId, bool) const { std::abort(); }
+
 int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
     require(prompt == std::vector{slot} && options.max_new_tokens == 2 && options.mtp_steps == 0,
             "Unexpected native admission");
@@ -253,6 +253,8 @@ void DecoderBatch::reset_prefix_cache() {
     std::lock_guard lock(fixture.mutex);
     ++fixture.resets;
 }
+
+void DecoderBatch::release_retired_allocations() {}
 
 Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats*) {
     Mask selection = 0;

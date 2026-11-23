@@ -147,7 +147,7 @@ If both budgets are absent or null, the output limit is 262,142 minus the final 
 
 ### Image and video inputs
 
-Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Each media lane uses private eager K0 state. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Media depth selection](../apps/server/batch_service.cpp#L894)<!-- prefix: "job->options" -->
+Media chat accepts up to four attachments in `user` content and preserves their order among text parts. Each media lane uses private eager K0 state. Media lanes bypass prefix reuse even when the listener enables it. The route rejects `ebnf`, `regex`, `response_format`, and `cache_salt`. Media uses the same chat sampling and stop options. [Media depth selection](../apps/server/batch_service.cpp#L875)<!-- prefix: "job-\u003eoptions" -->
 
 Omit `add_special_tokens` or set it to `false`. Set `enable_thinking` at the top level or as the only member of `chat_template_kwargs`.
 
@@ -215,7 +215,7 @@ Verify HTTP rejection before SSE for malformed media. Cancel a live stream and c
 
 ### Codec checks
 
-For compressed media, configure an absolute `codec_prefix` containing libpng and FFmpeg headers and libraries. The server links `png16`, `avformat`, `avcodec`, `swscale`, and `avutil`. The default build accepts decoded RGB8. [Build option](../xmake.lua#L141)<!-- prefix: "option(\"medi" --> · [Codec setup](../xmake.lua#L147)<!-- prefix: "local functi" -->
+For compressed media, configure an absolute `codec_prefix` containing libpng and FFmpeg headers and libraries. The server links `png16`, `avformat`, `avcodec`, `swscale`, and `avutil`. The default build accepts decoded RGB8. [Build option](../xmake.lua#L145)<!-- prefix: "option(\"medi" --> · [Codec setup](../xmake.lua#L151)<!-- prefix: "local functi" -->
 
 ```bash
 xmake f -P . -m release --media-codec-prefix="$codec_prefix" -o build/media-server

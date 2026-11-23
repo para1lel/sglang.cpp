@@ -14,7 +14,7 @@ runtime. Current B200 text decode and verification are described under
 
 ## Runtime path
 
-The batch selects this path for one ordinary text decode row with 32,768–36,864 visible tokens, including the current token. The step needs zero prefill rows, no MTP work, and no rotary position override. Both FP8 prefill policies support it. Independent full-prefix-hit scoring can share the step. The standalone serial decoder and the eager remainder of a packed group keep their existing attention paths. [Window](../include/sglang/decoder_internal.h#L468)<!-- prefix: "inline const" --> · [Packed remainder](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L573)<!-- prefix: "if (remainin" -->
+The batch selects this path for one ordinary text decode row with 32,768–36,864 visible tokens, including the current token. The step needs zero prefill rows, no MTP work, and no rotary position override. Both FP8 prefill policies support it. Independent full-prefix-hit scoring can share the step. The standalone serial decoder and the eager remainder of a packed group keep their existing attention paths. [Window](../include/sglang/decoder_internal.h#L471)<!-- prefix: "inline const" --> · [Packed remainder](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L573)<!-- prefix: "if (remainin" -->
 
 With tensor-core prefill and no MTP work, a prefill step can reuse the buffer for an ordinary text lane's final one-row prompt grant. It can also reuse it for an ordinary decode row when all other work in the step consists of multi-row prefill or cache-hit scoring. These eager rows qualify above their inline score capacity and through 36,864 visible tokens. Each layer's score and replay launches run in stream order before the next row uses the buffer. [Batch selection](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/decoder_batch.cpp#L675)<!-- prefix: "const auto e" --> · [Eager binding](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L421)<!-- prefix: "void prepare" -->
 
@@ -44,8 +44,8 @@ so scratch size is independent of context length. FP64 head fallback still
 applies when inputs fall outside the split kernel's numerical range.
 
 The earlier bounded and long profiles used explicit launch settings. Their
-[historical paired results](serving/paired-split-attention-results.md) record
-the measured configuration.
+[historical paired results](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/serving/paired-split-attention-results.md)
+record the measured configuration.
 
 ## Constraints and failure behavior
 

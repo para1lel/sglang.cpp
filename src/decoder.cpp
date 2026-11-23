@@ -432,7 +432,7 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
     if (enable_mtp) {
         model_->mtp_weights = std::make_shared<MtpDraftWeights>(
             checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head,
-            model_->is_b200());
+            model_->backend.int8_draft_head);
         model_->tc_vocab = model_->mtp_weights->shared_vocab();
     }
 }
@@ -444,11 +444,15 @@ bool Decoder::uses_b200_operators() const {
 }
 
 bool Decoder::has_int8_draft_head() const {
-    return model_->mtp_weights && model_->is_b200();
+    return model_->mtp_weights && model_->backend.int8_draft_head;
 }
 
 bool Decoder::has_certified_vocab() const {
     return model_->tc_vocab != nullptr;
+}
+
+int Decoder::paired_prefill_threshold() const {
+    return 2 * model_->backend.prefill_tile_rows;
 }
 
 std::size_t Decoder::model_device_allocation_bytes() const {
@@ -467,7 +471,7 @@ bool Decoder::Model::prefill_serial(Request& request, RequestProgress& progress,
     const int count = static_cast<int>(prompt.size());
     const auto stream = request.memory.stream();
     const int limit = step_budget ? step_budget : batch_prefill_tile_rows;
-    const int preferred = !media && is_b200() ? batch_prefill_tile_rows : prefill_chunk_rows;
+    const int preferred = media ? prefill_chunk_rows : backend.prefill_tile_rows;
     const int capacity = std::min({count, limit, preferred});
     std::optional<PrefillWorkspace> tiled(std::in_place, stream, capacity);
     if (!tiled->bytes() && capacity > prefill_chunk_rows) {
@@ -523,9 +527,7 @@ void Decoder::Model::advance_serial(Request& request, RequestProgress& progress,
 
 bool Decoder::Model::serial_graph(const DecoderOptions& options, bool media, int prompt_count,
                                   int limit) const {
-    const int split_end = target_split_end();
-    const bool split_decode = split_end && limit > target_split_first_position &&
-                              prompt_count < split_end;
+    const bool split_decode = execution.split_decode(prompt_count, limit);
     return !options.eager && !media && !options.requires_target_only() && !split_decode;
 }
 
@@ -654,7 +656,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     if (proposals == 0) {
         model_->generate_serial(prompt_token_ids, options, callbacks, result);
     } else {
-        const int tile = model_->is_b200() ? batch_prefill_tile_rows : prefill_chunk_rows;
+        const int tile = model_->backend.prefill_tile_rows;
         const int limit = options.max_num_batched_tokens
             ? std::min(options.max_num_batched_tokens, tile) : tile;
         DecoderBatch batch(*this, DecoderBatchOptions{false, 1, 0, limit});

@@ -166,6 +166,7 @@ public:
     bool uses_b200_operators() const;
     bool has_int8_draft_head() const;
     bool has_certified_vocab() const;
+    int paired_prefill_threshold() const;
 
 private:
     friend class DecoderBatch;

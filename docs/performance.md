@@ -1,6 +1,6 @@
 # Single-B200 benchmark agreement
 
-Compare correct implementations on the **same physical B200 and immutable checkpoint**. Measure pinned vLLM first. Freeze configuration, workloads, and repeats before candidate timing. See the [paired and historical W1–W6 results](performance-comparison.md).
+Compare correct implementations on the **same physical B200 and immutable checkpoint**. Measure pinned vLLM first. Freeze configuration, workloads, and repeats before candidate timing. See the [current W1–W2 evidence](serving/paired-native-defaults-results.md). Pinned Git history at `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3` retains the historical W1–W6 K0 results.
 
 ## Implementations and controls
 
@@ -89,17 +89,11 @@ Reuse frozen W1–W6 `benchmark` requests, token-ID SSE clients, and timing defi
 
 For raw text, freeze UTF-8 requests, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Record streaming, usage, and diagnostic ID settings. Text can lag IDs. A text event can span several IDs, and an ID can produce no text. Count tokens from usage or diagnostic IDs. Calculate TTFT and TPOT from ID timestamps when available. Otherwise, mark them unavailable. Report time to first visible text separately. Give raw text its own result rows.
 
-### Frozen W1 and W2 timing
+### Serial W1 and W2 comparisons
 
-The [GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) used native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. For native runs, set `--url` and a fresh `--output`. Omit `--reference`.
+The [GPU3 protocol](../benchmarks/streaming/README.md#frozen-measurement-protocol) uses native `--max-active 1` and vLLM `--max-num-batched-tokens 2560 --max-num-seqs 1`. Verify input hashes. For native runs, set `--url` and a fresh `--output`. Omit `--reference`.
 
-The GPU3 protocol validated every stream and checked repeat IDs within each engine. Its performance gates used `strict_throughput_ratio_gt` for the native-to-vLLM median throughput ratio and `p95_latency_ceilings_ms` for native p95 TTFT, TPOT, and end-to-end latency.
-
-On November 19, 2026, the candidate matched `60677ec` IDs. Both passed W1. W2 missed only p95 TTFT (base 395.348 ms, candidate 366.781 ms, limit 80.305 ms).
-
-On November 20, 2026, `9d047fe` passed all four W1 gates on repeat after a TTFT miss. W2 missed only p95 TTFT (368.736 ms against 80.258 ms).
-
-On B200 GPU 6, the four-row W2 candidate matched the base's 512 full BF16 score rows and greedy IDs. In clean native-only serving, p95 TTFT fell from 367.158 to 277.963 ms and median throughput rose 2.16%.
+The GPU3 protocol validates every stream and checks repeat IDs within each engine. Its performance gates use `strict_throughput_ratio_gt` for the native-to-vLLM median throughput ratio and `p95_latency_ceilings_ms` for native p95 TTFT, TPOT, and end-to-end latency.
 
 ### Fused FP8 decode
 
@@ -109,17 +103,15 @@ Verify fused projections for eligible singleton decode and legacy groups of two 
 
 Compare fused SwiGLU BF16 results with identical and disjoint gate and up output spans. Require `cudaErrorInvalidValue` before launch for identical gate and up spans in fallback, partial output overlaps, and output overlaps with inputs.
 
-The studies in `artifacts/fp8-decode-next/report.md` and `artifacts/decode-combined/report.md` used earlier source. Qualify the promoted build with the serial and concurrent fixtures under the new launch policy.
+Qualify the promoted build with the serial and concurrent fixtures under the new launch policy.
 
 ### Exact decode bandwidth
 
 Match the published native control's BF16 projections, E4M3 payloads, and FP32 scales byte for byte. Include nonfinite inputs and shape and alignment fallbacks. Trace fresh and reused graphs. Compare full BF16 logits and greedy IDs on shared W1/W2 histories within each policy. Run the [MTP checks](mtp.md#verification).
 
-Historical serial HTTP used `--max-active 1 --mtp-steps 0` and compared within each prefill policy. Use the [frozen GPU3 criteria](#frozen-w1-and-w2-timing) to reproduce that comparison.
+For serial HTTP comparisons, use `--max-active 1 --mtp-steps 0` and compare within each prefill policy. Apply the [serial W1 and W2 criteria](#serial-w1-and-w2-comparisons).
 
 Record visible lengths and KV capacity. Report ordered fallback timing separately if measured.
-
-An earlier GPU1 run compared the unsplit build with the Unit13 runtime. Each arm used three warmups and nine measured requests per workload. W1/W2 median output tokens/s rose from 91.88/35.16 to 95.59/35.70 for exact and from 122.84/57.27 to 129.51/58.70 for tensor-core. All four passed native timing checks. P95 TPOT and end-to-end latency fell throughout. P95 TTFT rose up to 1.00 ms. See `artifacts/exact-decode-after-seed/runs/http.6acmFcnP/`.
 
 ### Chunked prefill
 
@@ -131,7 +123,7 @@ Record pool used and reserved bytes after synchronization. Require zero live scr
 
 Use a fresh process for cold allocator timing. Warm pools with a multirow request. Record tiles, lanes, and order. Report model load, tokenizer warmup, graph state, and prefix state separately.
 
-The historical GPU6 prototype reduced W1 and W2 CUDA prefill time against the row-wise native control. It missed all four paired vLLM targets on both workloads. Qualify each production configuration under its applicable protocol.
+Qualify each production configuration under its applicable protocol.
 
 ### FP8 tensor-core prefill
 
@@ -148,46 +140,17 @@ For cross-policy comparisons, check full BF16 logits within predefined tolerance
 
 Check parity against pinned vLLM on identical histories. Record its execution mode and KV and GDN policies. Record how diagnostic rows were selected. Use frozen fixtures for workload-level results.
 
-Run [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 across projection tiles on identical inputs. Follow the [prefill protocol](#chunked-prefill). Report native deltas and gates per policy. Keep [frozen timings](#frozen-w1-and-w2-timing) historical.
+Run [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 across projection tiles on identical inputs. Follow the [prefill protocol](#chunked-prefill). Report native deltas and gates per policy.
 
-The post-chat GPU3 run used tensor-core prefill, serial graphs, and MTP off. Each workload and arm used three warmups and nine measurements. Both arms returned identical IDs.
 
-| Workload and arm | Median output tok/s | P95 TTFT (ms) | P95 TPOT (ms/token) | P95 E2E (ms) | Gates met |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| W1 chat control | 128.976 | 27.798 | 7.596 | 992.525 | 3/4 |
-| W1 fusion | 129.935 | 20.427 | 7.609 | 986.680 | 4/4 |
-| W1 frozen limits | >117.037 | ≤21.637 | ≤8.625 | ≤1116.170 | |
-| W2 chat control | 58.526 | 1148.397 | 14.878 | 8750.750 | 0/4 |
-| W2 fusion | 61.250 | 753.935 | 14.890 | 8361.881 | 0/4 |
-| W2 frozen limits | >115.815 | ≤80.305 | ≤8.671 | ≤4510.901 | |
-
-The verifier used unrounded limits. Both W2 arms missed all four gates in this run. See `artifacts/tc-prefill-fusion-after-chat/results/performance/comparison.json`.
 
 ### Native concurrent workloads
 
 Verify [streaming](development.md#streaming-verification), [K0 scheduling](#scheduler-and-reporting-policy), offered concurrency, and [decode width and replay](batch-graphs.md#timing).
 
-Historical W3 missed all gates on GPU2 (63.779 IDs/s, 28,672 matching IDs), `w3-fused` (144.84), and GPU3 `9d047fe` (90.519 versus vLLM’s 373.931, 4,096 matching IDs). [Historical protocol](../benchmarks/concurrent/README.md#conditions-and-gates) · `artifacts/takeover-w3/report.md`
-
-GPU6 W3 replay rose from 5.69 to 14.91 IDs/s (4,096 matching IDs). `artifacts/long-batch-graph-release/report.md`
-
-GPU3 W3 pairing raised median IDs/s from 103.724 to 111.340 (+7.34%). Pinned vLLM reached 374.427. All 4,096 IDs matched. Both native arms missed all four frozen gates. `artifacts/takeover-w3-gqa-perf/report.md`
-
-On GPU4, the `dad987dd` W3 [grouped head](batch-graphs.md#runtime-path) raised median throughput by 3.39–3.63% to 138.843–138.849 IDs/s versus pinned vLLM's 374.187. All 143,360 IDs matched. Both candidate arms missed all four gates. `artifacts/takeover-w3-lmhead-code/flash-release/REPORT.md`
-
-The prior W4 singleton spent 54.245 of 58.657 s TTFT in protected single-row GQA. `artifacts/takeover-w4-diagnostic/report.md`
-
-GPU3 singleton median W4 TTFT fell from 58.701 to 29.214 s across three fresh-process pairs. First ID `760` matched.
-
-vLLM completed GPU3 W4. Both 16-lane native runs timed out at 90 s with zero output. Completed prefill rose from 163,840 to 196,608 of 524,288 rows. Native gates stayed unscored. See `artifacts/takeover-w4-long-tiled/report.md`.
-
-GPU5 operator median GQA fell from 222.465 to 101.679 ms for 1,024 rows at 32,768 visible tokens. See `artifacts/takeover-long-prefill-code/handoff.md`.
-
 [Wide long decode checks](long-paged-decode.md#verification) cover direct controls and HTTP cohorts.
 
-[Candidate B evidence](long-paged-decode.md#candidate-b-evidence) includes paired W3 timing. Full performance qualification remains open.
-
-See [W6 prefill diagnostics](flash-prefill.md#w6-warmups-and-diagnostics), [experimental TMEM quality limits](flash-prefill.md#tmem-checkpoint-verification), and the [TMEM prototype](flash-prefill.md#double-buffered-tmem-prototype).
+[Native-default](serving/paired-native-defaults-results.md) evidence owns the current W1–W2 results. W3–W6 remain unmeasured for that configuration. The historical bounded split-attention campaign is retained in Git history only.
 
 ### Native MTP
 
@@ -197,13 +160,13 @@ To isolate layer-major verification, compare with row-wise MTP at the same depth
 
 Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. [W3-MTP](../benchmarks/variants/README.md) uses four 8,192-token prompts with 1,024 outputs each. K1 starts beyond the [graph limit](mtp.md#target-verification-graph). The matched run remains pending. Use `--max-active 32 --max-num-batched-tokens 8192`.
 
-Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L241)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L866)<!-- prefix: "result.mtp_r" -->
+Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L241)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L868)<!-- prefix: "result.mtp_r" -->
 
 Use `--trace-batches` at any capacity in a separate run. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder_verify.cpp#L215)<!-- prefix: "bool MtpRoun" -->
 
 Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../include/sglang/server/batch_trace.h#L12)<!-- prefix: "inline void " -->
 
-See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L863)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L784)<!-- prefix: "current.peak" -->
+See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L865)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L786)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

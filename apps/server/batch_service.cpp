@@ -1,5 +1,6 @@
 #include "sglang/server/batch_service.h"
 
+#include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_trace.h"
 #include "sglang/server/indexed_admission.h"
 #include "sglang/server/output_mailbox.h"
@@ -9,12 +10,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <future>
-#include <limits>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
 namespace sglang::server {
@@ -79,7 +77,6 @@ struct BatchService::State {
           int prefix_cache_entries, int max_num_batched_tokens);
     ~State();
 
-    void run(const Decoder& decoder, std::promise<void> started);
     void process(DecoderBatch& batch);
     std::optional<std::uint64_t> begin_iteration(DecoderBatch& batch);
     std::optional<Work> wait_for_jobs(DecoderBatch& batch);
@@ -128,11 +125,11 @@ struct BatchService::State {
     std::optional<BatchProfile> profile;
     std::uint64_t profile_epoch = 0;
     std::size_t profile_limit = 0;
-    std::exception_ptr failure;
-    std::atomic_bool failed{false};
     bool reset_pending = false;
     bool closing = false;
-    std::thread worker;
+    std::exception_ptr failure;
+    std::atomic_bool failed{false};
+    std::unique_ptr<SingleDeviceBatchExecutor> executor;
 };
 
 BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, MtpPolicy mtp,
@@ -143,15 +140,18 @@ BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs,
         throw std::invalid_argument("Invalid decoder batch service capacity");
     }
     counters.cache_capacity = prefix_cache_entries;
-    std::promise<void> started;
-    auto ready = started.get_future();
-    worker = std::thread(&State::run, this, std::cref(decoder), std::move(started));
-    try {
-        ready.get();
-    } catch (...) {
-        worker.join();
-        throw;
-    }
+    executor = std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        SingleDeviceBatchExecutor::Options{cuda_graphs, max_active, prefix_cache_entries,
+                                           max_num_batched_tokens},
+        [this](DecoderBatch& batch) { counters.cache = batch.prefix_cache_stats(); },
+        [this](DecoderBatch& batch) {
+            try {
+                process(batch);
+            } catch (...) {
+                fail_jobs(std::current_exception(), true);
+            }
+        });
+    executor->start();
 }
 
 BatchService::State::~State() {
@@ -160,26 +160,7 @@ BatchService::State::~State() {
         closing = true;
     }
     changed.notify_all();
-    worker.join();
-}
-
-void BatchService::State::run(const Decoder& decoder, std::promise<void> started) {
-    std::unique_ptr<DecoderBatch> batch;
-    try {
-        batch = std::make_unique<DecoderBatch>(decoder,
-            DecoderBatchOptions{cuda_graphs, max_active, prefix_cache_entries,
-                                max_num_batched_tokens, std::numeric_limits<std::size_t>::max()});
-        counters.cache = batch->prefix_cache_stats();
-    } catch (...) {
-        started.set_exception(std::current_exception());
-        return;
-    }
-    started.set_value();
-    try {
-        process(*batch);
-    } catch (...) {
-        fail_jobs(std::current_exception(), true);
-    }
+    executor->stop();
 }
 
 void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {

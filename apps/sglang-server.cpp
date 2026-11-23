@@ -224,7 +224,7 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += R"(,"paired_prefill":)";
     const bool paired_prefill = tc_prefill && arguments.mtp_steps != 0 &&
         arguments.max_active >= 2 &&
-        arguments.max_num_batched_tokens >= 2 * sglang::decoder::batch_prefill_tile_rows &&
+        arguments.max_num_batched_tokens >= decoder.paired_prefill_threshold() &&
         arguments.max_num_batched_tokens <= sglang::decoder_default_max_num_batched_tokens;
     body += paired_prefill ? "true" : "false";
     body += R"(,"sampling_defaults":)";

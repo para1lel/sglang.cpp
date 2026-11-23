@@ -7,6 +7,10 @@ build=${2:?Pass the matching Release build directory or - for a source build}
 output=$(realpath -m -- "${3:?Pass the output executable path}")
 
 sources=("$source/apps/sglang-server.cpp")
+executor="$source/src/runtime/server/single_device_batch_executor.cpp"
+if [[ -f "$executor" ]]; then
+    sources+=("$executor")
+fi
 for name in batch_service completions flush_cache http loads text_request text_completion \
     chat_template chat_media chat_output chat_tool_constraints native_generate native_sessions \
     ollama_discovery ollama_generate \
@@ -43,6 +47,9 @@ if [[ "$batch_header" == *admit_multimodal* ]]; then
 fi
 if [[ "$batch_header" == *release_retired_allocations* ]]; then
     media_api+=(-DSGLANG_TEST_RETIRED_ALLOCATIONS)
+fi
+if [[ $(<"$source/include/sglang/decoder.h") == *paired_prefill_threshold* ]]; then
+    media_api+=(-DSGLANG_TEST_PAIRED_PREFILL_THRESHOLD)
 fi
 vision_header="$source/include/sglang/server/vision_completion.h"
 if [[ -f "$vision_header" && $(<"$vision_header") == *'generate(const Decoder&'* ]]; then

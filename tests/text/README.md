@@ -13,9 +13,10 @@ xmake run sampling-check /data0/shared/Qwen3.8-27B-FP8
 
 Reserve a B200 and select it with `CUDA_VISIBLE_DEVICES` before running.
 Omit the checkpoint path to run only the synthetic BF16 logit cases. The
-checkpoint run also checks the direct decoder with serial and packed graphs,
-eager fallback, mixed MTP, and slot reuse. The text and chat HTTP tests below
-exercise the sampled JSON and event-stream routes.
+checkpoint run checks singleton graph replay at a high slot, eager fallback,
+mixed MTP, and slot reuse. It expects eager decode for mixed lanes on the B200
+ordered-attention path and packed graph replay when that path is disabled.
+The text and chat HTTP tests below exercise the sampled JSON and event-stream routes.
 
 ## Finite-choice constraints
 

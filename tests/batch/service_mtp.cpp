@@ -168,6 +168,7 @@ DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const { return {}; }
 void DecoderBatch::reset_prefix_cache() {
     throw std::logic_error("Unexpected prefix cache reset");
 }
+void DecoderBatch::release_retired_allocations() {}
 bool DecoderBatch::available() const { return true; }
 
 }

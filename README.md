@@ -85,6 +85,9 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 - `GET /ready` reports worker readiness. `GET /health` reports liveness and scheduler limits.
   See the [HTTP server guide](docs/http-server.md) for admission limits and startup options.
 
-See the [measured vLLM comparison](docs/performance-comparison.md) for results
-and the [benchmark policy](docs/performance.md#scheduler-and-reporting-policy)
+The checked K4 evidence used native source revision `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3`
+and covers W1–W2; W3–W6 remain unmeasured on matched K4. Both measured
+native-default workloads passed the strict median gate against pinned vLLM. See
+[K4 native-default results](docs/serving/paired-native-defaults-results.md)
+for the measured evidence and the [benchmark policy](docs/performance.md#scheduler-and-reporting-policy)
 for the comparison contract and acceptance rules.

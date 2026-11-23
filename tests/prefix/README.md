@@ -149,7 +149,7 @@ test -n "$draft"
     tests/prefix/mtp_state.cpp -L"$out/lib" -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" \
     -Wl,--wrap=cudaMemcpy2DAsync -Wl,--wrap="$draft" \
     -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
-    -lsglang_tokenizer -lcudart -o "$out/prefix-mtp-state"
+    -lsglang_tokenizer -lcudart -lcublasLt -o "$out/prefix-mtp-state"
 CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/prefix-mtp-state" "$checkpoint" "$short_ids" "$long_ids"
 CUDA_VISIBLE_DEVICES="$GPU_UUID" python3 -B tests/prefix/mtp_routes.py \
     --server "$out/bin/sglang-server" --checkpoint "$checkpoint" --output "$out/mtp-routes"

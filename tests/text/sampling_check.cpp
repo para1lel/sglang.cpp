@@ -352,16 +352,27 @@ void check_decoder(const char* checkpoint) {
     DecoderBatch batch(decoder, {true, 32});
     std::vector<Lane> lanes{{31, sampled}, {4, greedy}, {1, other}};
     const auto graph = drain(batch, lanes);
-    require(graph.first == (0x80000000u | (1u << 4) | (1u << 1)) && graph.second == 0,
-            "mixed batch graph did not replay with the sampled high slot");
+    if (decoder.uses_b200_operators()) {
+        require(graph.first == 0 && graph.second == 0,
+                "B200 ordered mixed batch used a graph");
+    } else {
+        require(graph.first == (0x80000000u | (1u << 4) | (1u << 1)) && graph.second == 0,
+                "mixed batch graph did not replay with the sampled high slot");
+    }
     const auto compare = [&] {
         require(lanes[0].tokens == wanted && lanes[1].tokens == wanted_greedy &&
                     lanes[2].tokens == wanted_other, "request RNG changed under slot reassignment");
     };
     compare();
+    lanes = {{31, sampled}};
+    const auto serial_graph = drain(batch, lanes);
+    require(serial_graph.first == (std::uint32_t{1} << 31) && serial_graph.second == 0,
+            "graph-eligible serial decode did not replay");
+    require(lanes[0].tokens == wanted, "serial graph replay changed the sampled stream");
     lanes = {{1, sampled}, {0, greedy}, {31, other}, {4, greedy}, {6, greedy}};
     const auto fallback = drain(batch, lanes);
-    require(fallback.first == 0 && fallback.second == 0, "width-five graph fallback was not eager");
+    require(fallback.first == 0 && fallback.second == 0,
+            "width-five graph fallback was not eager");
     compare();
     DecoderBatch mtp_batch(decoder, {true, 4});
     lanes = {{1, sampled}, {0, speculative}, {3, other}};

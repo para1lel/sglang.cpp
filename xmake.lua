@@ -124,11 +124,15 @@ target("sglang_decoder")
     add_includedirs("include", {public = true})
     add_deps("sglang_checkpoint", "sglang_cuda", "sglang_prefill_fp8_sm100")
     add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
-              "src/decoder_weights.cpp", "src/decoder_batch.cpp", "src/decoder_prefix_cache.cpp",
+              "src/decoder_batch.cpp", "src/decoder_prefix_cache.cpp",
               "src/decoder_mtp.cpp", "src/decoder_prefill.cpp", "src/decoder_verify.cpp",
               "src/decoder_constraint.cpp", "src/media/decoder_media.cpp",
               "src/media/multimodal_prompt.cpp")
     add_files("src/text/decoder_graph.cpp", "src/text/retired_request_blocks.cpp")
+    add_files("src/runtime/model/decoder_weights.cpp",
+              "src/runtime/backend/cuda_backend_policy.cpp",
+              "src/runtime/execution/decoder_execution_policy.cpp",
+              "src/runtime/cache/kv_residency_policy.cpp")
 
 target("sglang-generate")
     set_kind("binary")
@@ -166,6 +170,7 @@ target("sglang-server")
               "apps/server/chat_template.cpp", "apps/server/chat_output.cpp",
               "apps/server/completions.cpp",
               "apps/server/flush_cache.cpp", "apps/server/http.cpp", "apps/server/loads.cpp",
+              "src/runtime/server/single_device_batch_executor.cpp",
               "apps/server/prefix_controls.cpp",
               "apps/server/text_request.cpp", "apps/server/text_completion.cpp",
               "apps/server/chat_media.cpp", "apps/server/vision_completion.cpp")

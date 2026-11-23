@@ -35,11 +35,11 @@ Unexpected CUDA failures return to the caller. After predecode submission succee
 
 ## Tiled prefill under saturation
 
-The tiled planner in the earlier B200 K0 runtime required a positive step cap, prefix reuse off, and the wide SM100 override off. Selected media, draft, or restored-prefix lanes disabled tiling. See the [measured source and settings](serving/paired-measurement-ledger.md#measured-builds).
+The tiled planner in the earlier B200 K0 runtime required a positive step cap, prefix reuse off, and the wide SM100 override off. Selected media, draft, or restored-prefix lanes disabled tiling. See pinned Git history at `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3` for that measured source and settings.
 
 The planner reserved one row per ready decode lane. It used tiled scheduling when the budget fit at least one full tile and more lanes could supply full tiles. The planner scanned from the rotating cursor and granted one full tile or finishing tail per lane when the rows fit. The next step started at the first deferred lane.
 
-With an 8,192-row budget and no decode reservations, a saturated step can dispatch eight physical 1,024-row tiles. Fair share gives 512 rows to each of 16 equally ready lanes or 256 to each of 32. Full tiles pack the same number of rows into fewer grants. At eligible positions, a full grant can use the [1,024-row attention path](#runtime-path). The planner uses ready work and the remaining budget. Per-lane token order stays fixed, and lanes can finish prefill in a different order. See the [short W4 and W5 pilots](performance-comparison.md#tiled-prefill-scheduler-pilots).
+With an 8,192-row budget and no decode reservations, a saturated step can dispatch eight physical 1,024-row tiles. Fair share gives 512 rows to each of 16 equally ready lanes or 256 to each of 32. Full tiles pack the same number of rows into fewer grants. At eligible positions, a full grant can use the [1,024-row attention path](#runtime-path). The planner uses ready work and the remaining budget. Per-lane token order stays fixed, and lanes can finish prefill in a different order.
 
 ## Multi-request text prefill
 
@@ -73,7 +73,7 @@ The step needs an even number of grants with draft state. All grants must have
 the same length in full 1,024-row tiles. A step with decode, restored prompt work,
 media, label scoring, prompt-logprob capture, exact grants, or irregular
 grant lengths follows ordinary dispatch.
-[Step classification](../src/decoder_batch.cpp#L595)<!-- prefix: "if (max_rows" --> · [Step dispatch](../src/decoder_batch.cpp#L660)<!-- prefix: "try_prefill_" --> · [Grant eligibility](../include/sglang/decoder_prefill.h#L84)<!-- prefix: "inline bool " -->
+[Step classification](../src/decoder_batch.cpp#L596)<!-- prefix: "if (max_rows" --> · [Step dispatch](../src/decoder_batch.cpp#L661)<!-- prefix: "if (count &&" --> · [Grant eligibility](../include/sglang/decoder_prefill.h#L84)<!-- prefix: "inline bool " -->
 
 Exactly four eligible grants first try one 4,096-row group per tile offset.
 Four 2,048-row grants use two groups in one step. Two 4,096-row grants use
@@ -110,7 +110,7 @@ largest active prefill workspace in the step.
 
 ## Verification
 
-The `decoder-batch-plan-check` CPU target checks the step budget, decode reservations, finishing tails, rotation under replenished load, and fair-share fallback. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner test target](../xmake.lua#L280)<!-- prefix: "target(\"deco" -->
+The `decoder-batch-plan-check` CPU target checks the step budget, decode reservations, finishing tails, rotation under replenished load, and fair-share fallback. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner test target](../xmake.lua#L285)<!-- prefix: "target(\"deco" -->
 
 On one reserved B200, replay identical checkpoint Q, MXFP8 payloads and scales, and remapped page tables. Exercise both bounds and nonzero page offsets. Compare full BF16 output with raw paired and archived wide Flash. Include a short tail, causal masks, invalid full- and partial-page V, and repair.
 

@@ -5,6 +5,10 @@
 #include "sglang/decoder_constraint.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_sampling.h"
+#include "sglang/runtime/backend/cuda_backend_policy.h"
+#include "sglang/runtime/cache/kv_residency_policy.h"
+#include "sglang/runtime/execution/decoder_execution_policy.h"
+#include "sglang/runtime/model/qwen_text_model.h"
 
 #include <algorithm>
 #include <array>
@@ -57,11 +61,11 @@ private:
     std::vector<DecoderLogit> ranking_;
 };
 
-inline constexpr int hidden_size = 5120;
-inline constexpr int intermediate_size = 17408;
-inline constexpr int vocab_size = 248320;
-inline constexpr int layer_count = 64;
-inline constexpr int full_attention_interval = 4;
+inline constexpr int hidden_size = qwen_text_model.hidden_size;
+inline constexpr int intermediate_size = qwen_text_model.intermediate_size;
+inline constexpr int vocab_size = qwen_text_model.vocab_size;
+inline constexpr int layer_count = qwen_text_model.layer_count;
+inline constexpr int full_attention_interval = qwen_text_model.full_attention_interval;
 inline constexpr int full_attention_layers = layer_count / full_attention_interval;
 inline constexpr int gdn_layers = layer_count - full_attention_layers;
 inline constexpr int prefill_chunk_rows = text_embedding_max_rows;
@@ -70,7 +74,7 @@ inline constexpr std::size_t gdn_state_elements =
     text_gdn_value_heads * text_gdn_head_dim * text_gdn_head_dim;
 
 constexpr bool is_full_attention(int layer_index) {
-    return (layer_index + 1) % full_attention_interval == 0;
+    return qwen_text_model.is_full_attention(layer_index);
 }
 
 void check(cudaError_t status, const char* operation);
@@ -99,7 +103,6 @@ struct CudaError : std::runtime_error {
 };
 
 std::size_t available_device_bytes();
-inline constexpr std::size_t decoder_shared_reserve = std::size_t{2} * 1024 * 1024 * 1024;
 void validate_batch_options(const DecoderBatchOptions& options);
 int reserved_verification_rows(int output, int mtp_steps);
 std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft);
@@ -500,8 +503,8 @@ namespace sglang {
 struct Decoder::Model {
     Model(const std::filesystem::path& checkpoint, int cuda_device);
 
-    bool is_b200() const { return b200_; }
-    int target_split_end() const { return is_b200() ? text_attention_max_tokens : 0; }
+    bool is_b200() const { return backend.uses_b200_operators; }
+    int target_split_end() const { return backend.target_split_end; }
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     bool verify_mtp(decoder::MtpRound* rounds, int count,
@@ -560,6 +563,8 @@ struct Decoder::Model {
 
     int device;
     std::string accelerator_name;
+    decoder::CudaBackendPolicy backend{};
+    decoder::DecoderExecutionPolicy execution{};
     std::shared_ptr<decoder::Allocations> memory;
     std::array<decoder::Layer, decoder::layer_count> layers{};
     const decoder::Bf16* embedding = nullptr;
@@ -569,9 +574,6 @@ struct Decoder::Model {
     std::shared_ptr<const decoder::TcVocabWeights> tc_vocab;
     mutable std::atomic_flag request_in_use = ATOMIC_FLAG_INIT;
     mutable std::unique_ptr<decoder::Request> decode_request;
-
-private:
-    bool b200_ = false;
 };
 
 // Names the private decoder model for the decode-step runner in src/text/.

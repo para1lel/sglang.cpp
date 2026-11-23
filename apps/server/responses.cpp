@@ -607,9 +607,8 @@ void complete_responses(const Socket& connection, BatchService& service, int slo
                 throw RequestError(400, "Output logprobs require MTP disabled or logprob fallback",
                                    "include");
             }
-            constexpr std::size_t score_budget = 8192;
-            if (request.options.max_new_tokens >
-                score_budget / static_cast<std::size_t>(envelope.top_logprobs + 1)) {
+            constexpr int score_budget = 8192;
+            if (request.options.max_new_tokens > score_budget / (envelope.top_logprobs + 1)) {
                 throw RequestError(400, "Output logprobs exceed the 8192-score budget",
                                    "max_output_tokens");
             }

@@ -37,7 +37,7 @@ Other eligible FP8 shapes, including the MLP down projection, use eight stages. 
 
 #### Packed RMSNorm programmatic launch
 
-Packed K0 uses one layer-input producer for GDN QKV and Z or for GQA Q/gate, K, and V. The first layer normalizes the embedding rows without a residual add. Later layers add the previous MLP output to the residual. [Layer input](../include/sglang/decoder_internal.h#L276)<!-- prefix: "const auto i" --> · [GDN targets](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L295)<!-- prefix: "const TextFp" --> · [GQA targets](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L332)<!-- prefix: "const TextFp" -->
+Packed K0 uses one layer-input producer for GDN QKV and Z or for GQA Q/gate, K, and V. The first layer normalizes the embedding rows without a residual add. Later layers add the previous MLP output to the residual. [Layer input](../include/sglang/decoder_internal.h#L279)<!-- prefix: "const auto i" --> · [GDN targets](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L295)<!-- prefix: "const TextFp" --> · [GQA targets](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L332)<!-- prefix: "const TextFp" -->
 
 Once the SM100 dispatcher prepares the projection, it requests the producer's early trigger before launching the consumer. The fused producer issues the trigger after input staging and CTA synchronization, before RMS reduction and output stores. This also applies to the fused variants without a residual or eight-lane quantization. If RMSNorm requires separate normalization and quantization, those launches use ordinary stream ordering and omit the early RMS trigger. If projection falls back to GEMV, the dispatcher requests ordinary production and uses ordinary projection edges. [Consumer dispatch](../src/text/decode_proj_fp8.cu#L377)<!-- prefix: "if (producer" --> · [Fused selection](../src/text_normalization.cu#L376)<!-- prefix: "cudaError_t " --> · [Trigger](../src/text_normalization.cu#L252)<!-- prefix: "asm volatile" --> · [GEMV producer call](../src/text_ops.cu#L835)<!-- prefix: "const auto s" -->
 
@@ -91,42 +91,8 @@ For historical reproduction, check out the measured revision and use the [frozen
 
 Record prefill overlays as separate experiments. Use identical prefill code on both sides of an isolated long-decode comparison. The [Flash prefill contract](flash-prefill.md#constraints-and-failure-behavior) defines the selected 144-row floor.
 
-### Candidate B evidence
+### Packed route drift evidence
 
-The B200 probe compared Candidate B with HEAD `aa4ec04` on 32 prompts and 352 teacher-forced decode rows per width. All 128 prefill rows matched bitwise. KL is `KL(HEAD || Candidate B)`. NLL deltas are Candidate B minus HEAD in nats per token.
+The historical packed comparison found nonzero KL and greedy divergence at widths above one, despite exact width-one results. Same-input FP64 probes and operator substitutions implicated FP8 projection reduction order and BF16 rounding of scaled softmax weights before the packed GQA value multiply.
 
-| Width | Exact decode rows | Greedy IDs matched | Mean KL | Mean NLL delta | 95% interval for NLL delta |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 352/352 | 352/352 | 0 | 0 | [0, 0] |
-| 4 | 0/352 | 332/352 | 0.010905 | +0.014366 | [−0.003239, +0.033153] |
-| 16 | 0/352 | 333/352 | 0.011003 | +0.015422 | [−0.001699, +0.032493] |
-| 32 | 0/352 | 333/352 | 0.011003 | +0.015422 | [−0.001699, +0.032493] |
-
-Peak packed KL was 0.419241. The packed NLL intervals include zero. A separate `exact` prefill control had width-four mean KL 0.016527 for Candidate B and 0.018013 for HEAD. The prompt-bootstrap 95% interval for that difference was [−0.004703, +0.001276].
-
-Same-input FP64 probes and operator substitutions implicate both FP8 projection reduction order and BF16 rounding of scaled softmax weights before packed GQA's value multiply. Across 1,466,368 projection outputs, 192 differed and 181 of those were adjacent BF16 values. Across two checkpoint layers and four positions through 32,768, packed GQA relative L2 error against FP64 was 0.001665–0.001734. Legacy error was 0.001633–0.001711. Gate staging matched all 49,152 tested outputs from the packed ungated results. At width four, substituting legacy projections alone raised greedy agreement from 332 to 338 of 352. Legacy attention alone raised it to 337. Restoring the full legacy operator set recovered all 352 decode and 32 prefill rows in that ablation. The probes attribute measured drift within the sampled operators and histories. See `artifacts/resume-drift/report.md` for the fixed inputs and reproduction commands.
-
-Separately, the final verifier compared **1,696 complete BF16 score rows bitwise** between same-input eager and graph runs. The sweep covered widths 2–32, seven graphs, and 88 completed replays. Each width replayed low and high slot masks, which coincide at width 32. The inherited sweep failed that check because warmup consumed the only low-mask step at width two. See `artifacts/resume-verifier/evidence/` for `final-check.log`, `packed-bucket-replays.log`, and `inherited-coverage-gap.log`.
-
-The paired W3 diagnostic on one B200 used one warmup and three measured cohorts per arm. All 12,288 measured output IDs matched across arms. Candidate B measured 346.53 output IDs/s versus HEAD's 139.43. Candidate B p95 TTFT, TPOT, and E2E were 2,587.87 ms, 9.97 ms/ID, and 12,721.06 ms versus 2,679.32 ms, 26.18 ms/ID, and 29,427.85 ms. Full performance qualification under the frozen serving protocol remains open. See `artifacts/resume-drift/report.md`.
-
-### Isolated tensor-core results
-
-In the GPU5 prototype, direct W4 checkpoint decode took 169.254 ms per median step with the paired split and 105.867 ms with the tensor-core split at width 16. Width 11 fell from 118.674 to 73.230 ms and width five from 56.815 to 33.544 ms. The width-four and singleton routes stayed the same. All 127 generated IDs and graph masks matched across the tested widths.
-
-On one W4 cohort with fixed histories, all 240 decode top-1 predictions matched. Across 59,596,800 decode logits, RMSE was 0.334726 and the largest absolute change was 10.648438. Mean teacher-forced negative log-likelihood changed by +0.000000014 nats. These are direct decode measurements and a short matched-history quality check. See `artifacts/takeover-wide-decode-next/handoff.md` for source identities, traces, and measurements.
-
-### Combined 256-row Flash experiment
-
-The earlier combined build used the 256-row Flash floor, landed GDN, and wide long decode. In W4, it completed all 112 HTTP requests and matched all 114,688 frozen greedy IDs. It missed all four external gates.
-
-| W4 metric | Combined build | Frozen gate |
-| --- | ---: | ---: |
-| Median output IDs/s | 62.209 | > 358.723 |
-| p95 TTFT (s) | 81.627 | ≤ 50.227 |
-| p95 TPOT (ms) | 200.896 | ≤ 59.994 |
-| p95 E2E (s) | 261.143 | ≤ 46.590 |
-
-On W5, the same build completed zero of 32 requests on the first warmup. All 32 reached the 90-second socket timeout before the first ID. The client skipped measured cohorts, leaving the W5 throughput and latency gates unscored.
-
-See `artifacts/takeover-w4-integrated/handoff.md` for the combined build identities and raw evidence.
+The graph requirement is compare complete BF16 score rows bitwise across every eligible width and both low/high slot masks. Warmup must not consume a required mask. Full serving performance qualification remains open.

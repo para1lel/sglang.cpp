@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L899)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L308)<!-- prefix: "const bool c" --> |
+| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L891)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L300)<!-- prefix: "const bool c" --> |
 | GDN operator | Prepare rows, advance each layer's recurrent state, and finish output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L647)<!-- prefix: "cudaError_t " --> |
 | Verification | Check ordered parity, chunked numerical error, and causal continuation. | [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L101)<!-- prefix: "int main(int" --> |
 
@@ -23,7 +23,7 @@ finish launches across up to four segments. The large
 [projection groups](native-prefill-workspace.md#projection-pairs-for-mtp) pass
 four 1,024-row grants at 4,096 rows or two at 2,048 rows. The regular layerwise
 path can group two or three eligible grants.
-[Segment limit](../include/sglang/decoder_cuda.cuh#L120)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L640)<!-- prefix: "if (grouped)" -->
+[Segment limit](../include/sglang/decoder_cuda.cuh#L122)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L632)<!-- prefix: "if (grouped)" -->
 
 The grid Z coordinate selects a grant with its own state, row slices, and
 scratch spans. Each block uses its grant's row count, including when aligned
@@ -31,7 +31,7 @@ grant lengths differ. Each grant's absolute start determines bank-zero
 eligibility. If any grant starts at position zero, the first GDN layer runs
 per grant for the whole group. A declined grouped submission also runs
 per grant. A CUDA error from the grouped provider propagates.
-[Position guard](../src/decoder_prefill.cpp#L583)<!-- prefix: "grant.rows %" --> · [Grouped submission](../src/text_attention_gdn.cu#L766)<!-- prefix: "std::optiona" -->
+[Position guard](../src/decoder_prefill.cpp#L575)<!-- prefix: "grant.rows %" --> · [Grouped submission](../src/text_attention_gdn.cu#L766)<!-- prefix: "std::optiona" -->
 
 Grouped matrix preparation uses one 384-thread block per Q and K head and row group. The three associated value heads share Q and K staging and the FP32 dot products. Each value head applies its own gates and solves its own triangular system with the existing BF16 matrix layout. [Grouped matrix launch](../include/sglang/text/gdn_chunk.cuh#L234)<!-- prefix: "const auto s" -->
 
@@ -41,7 +41,7 @@ The ordered tensor-core fallback uses the paired kernel for at least 32 rows wit
 
 ## Constraints and failure behavior
 
-The fused B/A projection requires `tensor_core_fp8` and two BF16 weight matrices of 48 rows by 5,120 columns each. The input row count must be a multiple of four between 16 and 65,535 inclusive. Both weights, the input, and both outputs must have nonnull pointers. Both weight bases and the input base require 16-byte alignment. If a guard fails, the decoder uses the existing separate projections in B then A order. A fused launch error propagates to the caller. [Policy and shapes](../src/decoder_prefill.cpp#L290)<!-- prefix: "if (tensor_c" --> · [Launch guards](../src/text_decode_bandwidth.cu#L480)<!-- prefix: "if (rows < 1" --> · [Fallback](../src/decoder_prefill.cpp#L301)<!-- prefix: "project(laye" -->
+The fused B/A projection requires `tensor_core_fp8` and two BF16 weight matrices of 48 rows by 5,120 columns each. The input row count must be a multiple of four between 16 and 65,535 inclusive. Both weights, the input, and both outputs must have nonnull pointers. Both weight bases and the input base require 16-byte alignment. If a guard fails, the decoder uses the existing separate projections in B then A order. A fused launch error propagates to the caller. [Policy and shapes](../src/decoder_prefill.cpp#L282)<!-- prefix: "if (tensor_c" --> · [Launch guards](../src/text_decode_bandwidth.cu#L480)<!-- prefix: "if (rows < 1" --> · [Fallback](../src/decoder_prefill.cpp#L293)<!-- prefix: "project(laye" -->
 
 The first GDN layer uses ordered recurrence for a tile that starts at prompt position zero. Later GDN layers in that tile and all GDN layers in subsequent tiles may use chunked recurrence. A tile that resumes a saved prefix uses the absolute restored position. An earlier recurrence experiment on W2 found that reordering only the first GDN call could change later model scores. The guard preserves that call's update order.
 

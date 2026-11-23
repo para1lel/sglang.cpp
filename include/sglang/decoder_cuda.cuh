@@ -9,6 +9,8 @@
 
 namespace sglang::decoder {
 
+struct Fp8Weight;
+
 #ifdef __CUDACC__
 __device__ inline int position_value(int position) { return position; }
 __device__ inline int position_value(const int* position) { return *position; }
@@ -186,6 +188,11 @@ struct DraftAttentionRow {
 
 cudaError_t mtp_gqa_attention_batch(const DraftAttentionRow* rows, int count, bool b200,
                                     cudaStream_t stream);
+
+cudaError_t mtp_seed_project_kv(const Fp8Weight& key, const Fp8Weight& value,
+                               TextFp8ActivationView input, int rows,
+                               __nv_bfloat16* keys, __nv_bfloat16* values,
+                               cudaStream_t stream);
 
 cudaError_t exact_decode_gqa_attention(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,

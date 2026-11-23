@@ -79,7 +79,7 @@ Pinned SGLang exposes resolved settings and a launch command at the top level, w
 
 With draft weights loaded on B200, unconstrained draft proposals use signed INT8 scoring. Constrained drafts use BF16. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive. [Weight preparation](../src/decoder_mtp.cpp#L187)<!-- prefix: "if (b200) {" -->
 
-Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L659)<!-- prefix: "bool MtpDraf" -->
+Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L702)<!-- prefix: "bool MtpDraf" -->
 
 ### Certified Tensor Core target head
 

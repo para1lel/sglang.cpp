@@ -595,6 +595,7 @@ void repair_draft_wave(const std::array<DraftRepairs, decoder_batch_max_mtp_lane
 }
 
 void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
+                                   const Bf16* residual, const Bf16* final_norm,
                                    const PrefillProjections& projections,
                                    MtpPrefillBuffers buffers) {
     auto& request = *state_;
@@ -603,34 +604,76 @@ void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, cons
     }
     const int rows = projections.rows;
     if (position != request.prefix || rows <= 0 || rows > request.capacity - position ||
-        !shifted_tokens || !hidden) {
+        !shifted_tokens || !hidden || !residual || !final_norm) {
         throw std::invalid_argument("Invalid MTP draft prefill input");
     }
     const auto& model = *request.weights->state_;
     const auto stream = projections.stream;
-    try {
-        check(text_embedding_rows(model.embedding, vocab_size, hidden_size, shifted_tokens, rows,
-                                   buffers.embedding, stream), "Gather shifted MTP tokens");
-        check(text_rms_norm_pair_rows(buffers.embedding, hidden, model.embedding_norm,
-                                      model.hidden_norm, hidden_size, rows, buffers.concatenated,
-                                      stream), "Normalize and concatenate MTP prefill inputs");
-        projections.project_seed_fc(model.fc, buffers.concatenated, buffers.embedding);
-        check(text_rms_norm_rows(buffers.embedding, nullptr, model.input_norm, hidden_size, rows,
-                                 buffers.layer_input, nullptr, stream),
-              "Normalize MTP prefill layer input");
-        const auto input = projections.quantize(buffers.layer_input, hidden_size);
-        projections.project(model.gqa.key, input, buffers.keys);
-        projections.project(model.gqa.value, input, buffers.values);
-        check(text_gqa_preprocess_keys(position, rows, buffers.keys, model.gqa.key_norm,
+    const bool paired = model.b200 && rows > 1;
+    const auto append = [&](int first, int count) {
+        check(text_gqa_preprocess_keys(first, count, buffers.keys, model.gqa.key_norm,
                                         buffers.rope_keys, stream), "Rotate MTP prefill keys");
-        check(mxfp8_kv_append(request.cache, request.pages, position, rows, buffers.rope_keys,
+        check(mxfp8_kv_append(request.cache, request.pages, first, count, buffers.rope_keys,
                               buffers.values, stream), "Append MTP prefill MXFP8 KV");
-    } catch (...) {
-        request.failed = true;
-        throw;
+        request.prefix += count;
+        request.scored = false;
+    };
+    const auto append_prepared = [&](int count) {
+        if (!paired || count == 0) {
+            return;
+        }
+        const TextFp8ActivationView input{projections.activation.values,
+                                          projections.activation.scales};
+        try {
+            check(mtp_seed_project_kv(model.gqa.key, model.gqa.value, input, count,
+                                       buffers.keys, buffers.values, stream),
+                  "Run exact prefill FP8 projection");
+            append(position, count);
+        } catch (...) {
+            request.failed = true;
+            throw;
+        }
+    };
+    for (int offset = 0; offset < rows; offset += prefill_chunk_rows) {
+        auto tile = projections;
+        tile.rows = std::min(prefill_chunk_rows, rows - offset);
+        const int hidden_offset = offset * hidden_size;
+        if (paired) {
+            tile.activation.values += hidden_offset;
+            tile.activation.scales += offset * text_fp8_group_count(hidden_size);
+        }
+        const auto status = text_rms_norm_rows(
+            hidden + hidden_offset, residual + hidden_offset, final_norm, hidden_size, tile.rows,
+            buffers.normalized_hidden, nullptr, stream);
+        if (status != cudaSuccess) {
+            append_prepared(offset);
+            check(status, "Normalize target prompt rows for MTP");
+        }
+        try {
+            check(text_embedding_rows(model.embedding, vocab_size, hidden_size,
+                                       shifted_tokens + offset, tile.rows, buffers.embedding,
+                                       stream), "Gather shifted MTP tokens");
+            check(text_rms_norm_pair_rows(buffers.embedding, buffers.normalized_hidden,
+                                          model.embedding_norm, model.hidden_norm, hidden_size,
+                                          tile.rows, buffers.concatenated, stream),
+                  "Normalize and concatenate MTP prefill inputs");
+            tile.project_seed_fc(model.fc, buffers.concatenated, buffers.embedding);
+            check(text_rms_norm_rows(buffers.embedding, nullptr, model.input_norm, hidden_size,
+                                     tile.rows, buffers.layer_input, nullptr, stream),
+                  "Normalize MTP prefill layer input");
+            const auto input = tile.quantize(buffers.layer_input, hidden_size);
+            if (!paired) {
+                tile.project(model.gqa.key, input, buffers.keys);
+                tile.project(model.gqa.value, input, buffers.values);
+                append(position + offset, tile.rows);
+            }
+        } catch (...) {
+            append_prepared(offset);
+            request.failed = true;
+            throw;
+        }
     }
-    request.prefix += rows;
-    request.scored = false;
+    append_prepared(rows);
 }
 
 int MtpDraftRequest::read_token() const {

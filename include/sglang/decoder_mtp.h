@@ -7,6 +7,7 @@ namespace sglang::decoder {
 struct PrefillProjections;
 
 struct MtpPrefillBuffers {
+    Bf16* normalized_hidden;
     Bf16* embedding;
     Bf16* concatenated;
     Bf16* layer_input;
@@ -60,6 +61,7 @@ public:
     static void enqueue_wave(MtpDraftInput* rows, int count, bool score, cudaStream_t stream);
 
     void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
+                      const Bf16* residual, const Bf16* final_norm,
                       const PrefillProjections& projections, MtpPrefillBuffers buffers);
 
     /// Read the most recent scored enqueue after its stream has completed.

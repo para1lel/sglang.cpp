@@ -120,10 +120,10 @@ __device__ __forceinline__ void accumulate_prefill_word(
 }
 
 template <int Rows, int Channels>
-__global__ void fp8_prefill_reuse_kernel(const std::uint8_t* weight,
-                                        const __nv_bfloat16* weight_scales,
-                                        TextFp8ActivationView input, int out_width, int in_width,
-                                        int groups, int rows, int, __nv_bfloat16* output) {
+__device__ __forceinline__ void fp8_prefill_reuse_tile(
+    const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+    TextFp8ActivationView input, int out_width, int in_width, int groups, int rows,
+    __nv_bfloat16* output) {
     static_assert(text_fp8_group_size % Channels == 0);
     constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
     const int lane = threadIdx.x % warp_width;
@@ -188,6 +188,30 @@ __global__ void fp8_prefill_reuse_kernel(const std::uint8_t* weight,
             }
         }
     }
+}
+
+template <int Rows, int Channels>
+__global__ void fp8_prefill_reuse_kernel(const std::uint8_t* weight,
+                                        const __nv_bfloat16* weight_scales,
+                                        TextFp8ActivationView input, int out_width, int in_width,
+                                        int groups, int rows, int, __nv_bfloat16* output) {
+    fp8_prefill_reuse_tile<Rows, Channels>(weight, weight_scales, input, out_width, in_width,
+                                          groups, rows, output);
+}
+
+struct Fp8PrefillMatrix {
+    const std::uint8_t* weight;
+    const __nv_bfloat16* scales;
+    __nv_bfloat16* output;
+};
+
+template <int Rows, int Channels>
+__global__ void fp8_prefill_reuse_pair_kernel(Fp8PrefillMatrix first, Fp8PrefillMatrix second,
+                                             TextFp8ActivationView input, int out_width,
+                                             int in_width, int groups, int rows) {
+    const auto matrix = blockIdx.z == 0 ? first : second;
+    fp8_prefill_reuse_tile<Rows, Channels>(matrix.weight, matrix.scales, input, out_width,
+                                          in_width, groups, rows, matrix.output);
 }
 
 template <int Count>

@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model prefill | Append KV and select the attention path. | [Caller](../src/decoder_prefill.cpp#L370)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L899)<!-- prefix: "const bool t" --> |
+| Model prefill | Append KV and select the attention path. | [Caller](../src/decoder_prefill.cpp#L362)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L891)<!-- prefix: "const bool t" --> |
 | Native dispatcher | Select Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L905)<!-- prefix: "cudaError_t " --> |
 | Ordered tile | Apply causal FP32 scoring and token-ordered accumulation. | [Score](../src/mxfp8_gqa_prefill.cu#L35)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L187)<!-- prefix: "for (int fir" --> |
 
@@ -12,7 +12,7 @@
 
 After KV append, the Tensor Core model path uses native attention dispatch at the same position and row count. Exact multirow tiles use direct MXFP8 attention. See the [Flash dispatcher](flash-prefill.md#runtime-path) for shape and device selection.
 
-[Grouped text prefill](native-prefill-workspace.md#projection-pairs-for-mtp) keeps each request's original grant size and position, including in [batched staged attention](flash-prefill.md#runtime-path). A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L868)<!-- prefix: "if (rows == " -->.
+[Grouped text prefill](native-prefill-workspace.md#projection-pairs-for-mtp) keeps each request's original grant size and position, including in [batched staged attention](flash-prefill.md#runtime-path). A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L860)<!-- prefix: "if (rows == " -->.
 
 Staged tiles double-buffer packed K/V and scales in 32-key blocks. The loads follow the page table and zero-fill slots outside the tile's visible span. Scoring and accumulation apply each row's causal limit. [Copies](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L112)<!-- prefix: "__device__ v" -->
 

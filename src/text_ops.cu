@@ -756,6 +756,34 @@ cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* 
     return cudaSuccess;
 }
 
+cudaError_t decoder::mtp_seed_project_kv(const Fp8Weight& key, const Fp8Weight& value,
+                                        TextFp8ActivationView input, int rows,
+                                        __nv_bfloat16* keys, __nv_bfloat16* values,
+                                        cudaStream_t stream) {
+    constexpr int tile_rows = 4;
+    constexpr int channels = 8;
+    constexpr int threads = fp8_packed_warps * warp_width;
+    static_assert(text_gqa_kv_width % (fp8_packed_warps * channels) == 0);
+    static_assert(hidden_size % text_fp8_group_size == 0);
+    if (rows < 2 || rows > text_attention_max_tokens || !input.values || !input.scales ||
+        !key.values || !value.values || !key.scales || !value.scales || !keys || !values ||
+        key.rows != text_gqa_kv_width || value.rows != text_gqa_kv_width ||
+        key.columns != hidden_size || value.columns != hidden_size ||
+        !supports_wide_fp8(key.values, input, hidden_size) ||
+        !supports_wide_fp8(value.values, input, hidden_size)) {
+        return cudaErrorInvalidValue;
+    }
+    int out_width = text_gqa_kv_width;
+    int in_width = hidden_size;
+    int groups = text_fp8_group_count(in_width);
+    Fp8PrefillMatrix key_matrix{key.values, key.scales, keys};
+    Fp8PrefillMatrix value_matrix{value.values, value.scales, values};
+    void* args[] = {&key_matrix, &value_matrix, &input, &out_width, &in_width, &groups, &rows};
+    const dim3 grid(divide_up(rows, tile_rows), out_width / (fp8_packed_warps * channels), 2);
+    return cudaLaunchKernel(fp8_prefill_reuse_pair_kernel<tile_rows, channels>, grid, threads,
+                            args, 0, stream);
+}
+
 cudaError_t text_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up, int width,
                          __nv_bfloat16* output, cudaStream_t stream) {
     if (gate == nullptr || up == nullptr || output == nullptr || width <= 0) {

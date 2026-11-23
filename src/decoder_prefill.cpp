@@ -264,18 +264,10 @@ struct Chunk : PrefillProjections {
                     const Bf16* final_norm, bool wmma) const {
         static_assert(intermediate_size >= 2 * hidden_size);
         static_assert(std::max(text_gdn_value_width, text_gqa_q_width) >= hidden_size);
-        for (int offset = 0; offset < seed_rows; offset += prefill_chunk_rows) {
-            const int count = std::min(prefill_chunk_rows, seed_rows - offset);
-            const int hidden_offset = offset * hidden_size;
-            check(text_rms_norm_rows(work.hidden + hidden_offset, work.residual + hidden_offset,
-                                     final_norm, hidden_size, count, work.normalized, nullptr,
-                                     stream), "Normalize target prompt rows for MTP");
-            const PrefillProjections projections{activation, count, stream, false, false, wmma};
-            draft.seed_prefill(position + offset, shifted_tokens + offset, work.normalized,
-                               projections,
-                               {work.projected_attention, work.mlp_gate, work.attention,
-                                work.keys, work.values, work.rope_keys});
-        }
+        const PrefillProjections projections{activation, seed_rows, stream, false, false, wmma};
+        draft.seed_prefill(position, shifted_tokens, work.hidden, work.residual, final_norm,
+                           projections, {work.normalized, work.projected_attention, work.mlp_gate,
+                                         work.attention, work.keys, work.values, work.rope_keys});
     }
 
     void gdn_input(const GdnLayer& layer) const {

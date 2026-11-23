@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder prefill | Own the arena and lend two scratch spans during GQA. | [Tile layout](../src/decoder_prefill.cpp#L177)<!-- prefix: "TileBuffers(" --> · [Scratch view](../src/decoder_prefill.cpp#L199)<!-- prefix: "PairedPrefil" --> |
-| Attention dispatch | Try singleton staging within the default paired route and batch eligible four-grant groups. | [Singleton selection](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "const bool d" --> · [Batch selection](../src/decoder_prefill.cpp#L627)<!-- prefix: "if (grouped " --> |
+| Attention dispatch | Try singleton staging within the default paired route and batch eligible four-grant groups. | [Singleton selection](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "const bool d" --> · [Batch selection](../src/decoder_prefill.cpp#L619)<!-- prefix: "if (grouped " --> |
 | Paired launcher | Check bounds and capture state, then submit predecode and attention on the caller's stream. | [Staged launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L421)<!-- prefix: "std::optiona" --> |
 
 ## Runtime path
@@ -19,9 +19,9 @@ The decoder lends two disjoint spans of its existing `PrefillWorkspace` allocati
 | BF16 K | `mlp_gate` through the end of `mlp_up`, bounded by `q_gate` | 68 MiB | 64 MiB |
 | BF16 V and invalid-token indices | `gdn_qkv`, `gdn_z`, `gdn_b`, `gdn_a`, and GDN scratch, bounded by `activation.values` | 64.1875 MiB | 64 MiB + 4 KiB |
 
-Each span has room for up to 127 bytes of padding for 128-byte alignment. The launcher checks both spans separately. A four-grant group partitions both spans by lane, including the invalid-token indices. At the latest eligible start, each lane sees 8,192 tokens. Together they need 64 MiB for K and 64 MiB plus 4 KiB for V and flags. Both routes use the existing arena and add zero device allocation bytes. [Arena allocation](../src/decoder_prefill.cpp#L744)<!-- prefix: "PrefillWorks" --> · [Bounds](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L434)<!-- prefix: "const int fu" -->
+Each span has room for up to 127 bytes of padding for 128-byte alignment. The launcher checks both spans separately. A four-grant group partitions both spans by lane, including the invalid-token indices. At the latest eligible start, each lane sees 8,192 tokens. Together they need 64 MiB for K and 64 MiB plus 4 KiB for V and flags. Both routes use the existing arena and add zero device allocation bytes. [Arena allocation](../src/decoder_prefill.cpp#L736)<!-- prefix: "PrefillWorks" --> · [Bounds](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L434)<!-- prefix: "const int fu" -->
 
-The MLP projection writes its gate and up buffers after GQA. GDN layers write their projection and scratch inputs before use. Predecode, paired attention, later layer work, and workspace release use the workspace's execution stream. Stream ordering puts the last attention read before the next write to either span. Keep both spans exclusive to that stream until the queued work completes. [Layer loop](../src/decoder_prefill.cpp#L911)<!-- prefix: "execute_laye" --> · [Release](../src/decoder_prefill.cpp#L799)<!-- prefix: "cudaError_t " -->
+The MLP projection writes its gate and up buffers after GQA. GDN layers write their projection and scratch inputs before use. Predecode, paired attention, later layer work, and workspace release use the workspace's execution stream. Stream ordering puts the last attention read before the next write to either span. Keep both spans exclusive to that stream until the queued work completes. [Layer loop](../src/decoder_prefill.cpp#L903)<!-- prefix: "execute_laye" --> · [Release](../src/decoder_prefill.cpp#L791)<!-- prefix: "cudaError_t " -->
 
 Predecode follows each lane's page table and expands each complete MXFP8 page once. Separate K and V TMA producers load alternating shared-memory stages. A singleton with a partial page uses the native masked conversion. See [the paired kernel](flash-prefill.md#long-tile-tmem-pipeline) for arithmetic and tile geometry. [Predecode](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L97)<!-- prefix: "__global__ v" --> · [Producers](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L168)<!-- prefix: "__device__ v" -->
 
@@ -31,7 +31,7 @@ The [CUDA 13.4 stream ordering guide](https://docs.nvidia.com/cuda/archive/13.4.
 
 Missing or undersized scratch, capture, and known setup rejection decline staging before submission. Setup rejection includes unavailable kernel resources and tensor-map rejection or descriptor out-of-memory. Batch staging also requires an explicit CUDA stream in the current context. Its output and scratch ranges must be disjoint from each other and from live inputs across all four lanes. [Capture check](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L450)<!-- prefix: "const auto c" --> · [Stream check](../include/sglang/text/mxfp8_gqa_prefill_staged.cuh#L132)<!-- prefix: "std::optiona" --> · [Range check](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L476)<!-- prefix: "if (!valid_s" --> · [Tensor maps](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L497)<!-- prefix: "const auto e" -->
 
-A recognized submission rejection declines staging at either launch. A batch decline runs the usual singleton dispatcher on the same stream. If the attention launch declined after predecode, that stream completes the queued predecode before a fallback can reuse the spans. A singleton decline tries raw paired attention. Pending and unexpected CUDA errors propagate. [Submission handling](../include/sglang/text/mxfp8_gqa_prefill_staged.cuh#L163)<!-- prefix: "std::optiona" --> · [Batch fallback](../src/decoder_prefill.cpp#L549)<!-- prefix: "for (int lan" -->
+A recognized submission rejection declines staging at either launch. A batch decline runs the usual singleton dispatcher on the same stream. If the attention launch declined after predecode, that stream completes the queued predecode before a fallback can reuse the spans. A singleton decline tries raw paired attention. Pending and unexpected CUDA errors propagate. [Submission handling](../include/sglang/text/mxfp8_gqa_prefill_staged.cuh#L163)<!-- prefix: "std::optiona" --> · [Batch fallback](../src/decoder_prefill.cpp#L541)<!-- prefix: "for (int lan" -->
 
 A paired graph capture records the raw kernel with maps by value and uses zero staging scratch. Keep the captured cache, page table, queries, and output valid through replay. [Raw launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L390)<!-- prefix: "std::optiona" --> · [CUDA graph capture](https://docs.nvidia.com/cuda/archive/13.4.2/cuda-programming-guide/04-special-topics/cuda-graphs.html#stream-capture)
 
@@ -83,7 +83,7 @@ four 2,048-row groups. Other eligible grant counts also use pairs.
 Lanes share dense projections and the MLP. Attention and GDN keep each lane's
 1,024-row tiles, positions, KV pages, and recurrent state. Draft seeding uses
 the lane's own hidden and residual rows and shifted token IDs.
-[Group selection](../src/decoder_prefill.cpp#L701)<!-- prefix: "if (count ==" --> · [Draft seed](../src/decoder_prefill.cpp#L654)<!-- prefix: "auto seed = " -->
+[Group selection](../src/decoder_prefill.cpp#L693)<!-- prefix: "if (count ==" --> · [Draft seed](../src/decoder_prefill.cpp#L646)<!-- prefix: "auto seed = " -->
 
 [Grouped GDN](gdn-prefill.md#runtime-path) reuses the existing disjoint row
 spans for both projection group sizes. The group uses the workspace stream.
@@ -103,7 +103,7 @@ Unexpected CUDA errors propagate. One large workspace pool per device can
 retain backing across synchronization with a 1 GiB CUDA release threshold.
 The threshold controls backing retention. Request workspace accounting counts
 the active allocation.
-[Workspace](../src/decoder_prefill.cpp#L673)<!-- prefix: "PrefillWorks" --> · [Allocation](../src/decoder_prefill.cpp#L744)<!-- prefix: "PrefillWorks" --> · [Pool threshold](../src/decoder_prefill.cpp#L60)<!-- prefix: "std::uint64_" -->
+[Workspace](../src/decoder_prefill.cpp#L665)<!-- prefix: "PrefillWorks" --> · [Allocation](../src/decoder_prefill.cpp#L736)<!-- prefix: "PrefillWorks" --> · [Pool threshold](../src/decoder_prefill.cpp#L60)<!-- prefix: "std::uint64_" -->
 
 With `--trace-batches`, `layerwise_prefill_groups` counts the groups,
 `rows` counts their combined rows, and `workspace_bytes` records the

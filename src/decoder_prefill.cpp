@@ -526,8 +526,10 @@ Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, i
 }
 
 void prefill_group_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
-                       const PrefillGrant* grants, int count, int offset) {
-    std::array<PagedPrefillSequence, max_layerwise_rows / 256> sequences;
+                       const PrefillGrant* grants, int count, int offset,
+                       bool staged_batch = false) {
+    static_assert(staged_prefill_batch_size >= max_layerwise_rows / 256);
+    std::array<PagedPrefillSequence, staged_prefill_batch_size> sequences;
     int index = 0;
     each_prefill_segment(grants, count, offset, [&](const PrefillGrant& grant, int row) {
         const auto segment = prefill_attention_segment(chunk, grant, row);
@@ -537,8 +539,32 @@ void prefill_group_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
         sequences[index++] = {cache, pages, grant.position, grant.rows, segment.work.rope_queries,
                               segment.work.attention};
     });
+    if (staged_batch) {
+        const auto scratch = chunk.work.gqa_scratch();
+        if (const auto staged = try_batched_staged_paged_prefill(sequences.data(), count,
+                                                                chunk.stream, scratch)) {
+            check(*staged, "Read staged batched causal prefill MXFP8 attention");
+            return;
+        }
+        for (int lane = 0; lane < count; ++lane) {
+            read_paged_sequences(sequences.data() + lane, 1, chunk.stream, scratch);
+        }
+        return;
+    }
     read_paged_sequences(sequences.data(), count, chunk.stream,
                          count == 1 ? chunk.work.gqa_scratch() : PairedPrefillScratch{});
+}
+
+bool can_batch_staged_gqa(const PrefillGrant* grants, int count) {
+    if (count != staged_prefill_batch_size) {
+        return false;
+    }
+    const int position = grants[0].position;
+    return position >= staged_prefill_batch_min_position &&
+        position <= staged_prefill_batch_max_position && position % batch_prefill_tile_rows == 0 &&
+        std::all_of(grants, grants + count, [&](const PrefillGrant& grant) {
+            return grant.position == position && grant.rows == batch_prefill_tile_rows;
+        });
 }
 
 void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
@@ -598,10 +624,14 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         },
         [&](const GqaLayer& layer, int bank) {
             chunk.gqa_input(layer);
-            each_attention_group(grants, group.grants, mixed,
-                                 [&](const PrefillGrant* first, int count, int offset) {
-                prefill_group_gqa(chunk, layer, bank, first, count, offset);
-            });
+            if (grouped && can_batch_staged_gqa(grants, group.grants)) {
+                prefill_group_gqa(chunk, layer, bank, grants, group.grants, 0, true);
+            } else {
+                each_attention_group(grants, group.grants, mixed,
+                                     [&](const PrefillGrant* first, int count, int offset) {
+                    prefill_group_gqa(chunk, layer, bank, first, count, offset);
+                });
+            }
             chunk.gqa_gate();
             chunk.attention_output(layer.output, text_gqa_q_width);
         },

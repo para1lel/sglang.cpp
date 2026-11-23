@@ -63,11 +63,11 @@ __device__ __forceinline__ Word tmem_smem(const void* pointer) {
     return static_cast<Word>(__cvta_generic_to_shared(pointer));
 }
 
-template <int Members = flash_queries, typename Tile>
+template <int Members = flash_queries, int LoadWarps = tmem_threads / 32, typename Tile>
 __device__ void tmem_stage_query(Tile& tile, Attention request, int row, int head,
                                  int rows = flash_rows) {
     const int lane = threadIdx.x % 32;
-    for (int member = threadIdx.x / 32; member < Members; member += tmem_threads / 32) {
+    for (int member = threadIdx.x / 32; member < Members; member += LoadWarps) {
         const auto offset = row_offset(row + member / ordered_heads, head + member % ordered_heads);
         const bool valid = member / ordered_heads < rows;
         bool bad = false;
@@ -329,25 +329,7 @@ __device__ __forceinline__ void tmem_store_partial(
     }
 }
 
-__device__ __forceinline__ void tmem_store_output(
-    Word row_address, FlashSoftmax state, Attention request, int row, int head,
-    int rows = flash_rows, int member = threadIdx.x) {
-    const auto output = row_offset(row + max(0, member) / ordered_heads,
-                                   head + max(0, member) % ordered_heads);
-    const float inverse = __frcp_rn(state.mass);
-    #pragma unroll 1
-    for (int column = 0; column < channels; column += 32) {
-        float accumulator[32];
-        tmem_load(row_address + column, accumulator);
-        if (member >= 0 && member / ordered_heads < rows) {
-            #pragma unroll
-            for (int index = 0; index < 32; ++index) {
-                request.output[output + column + index] =
-                    __float2bfloat16_rn(accumulator[index] * inverse);
-            }
-        }
-    }
-}
+#include "sglang/text/mxfp8_gqa_prefill_staged.cuh"
 
 template <bool Paired = false, bool Staged = false, typename Tile>
 __device__ __forceinline__ void tmem_initialize(Tile& tile, int warp,
@@ -614,10 +596,7 @@ __device__ __forceinline__ void pair_publish(Word ready) {
     asm volatile("fence.proxy.async.shared::cta;\n"
                  "bar.sync %0, %1;" :: "n"(Barrier), "n"(Count) : "memory");
     if (threadIdx.x == Leader) {
-        asm volatile("{ .reg .u32 leader;\n"
-                     "mapa.shared::cluster.u32 leader, %0, 0;\n"
-                     "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [leader]; }"
-                     :: "r"(ready) : "memory");
+        pair_arrive(ready);
     }
 }
 

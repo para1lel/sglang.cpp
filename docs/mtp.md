@@ -24,7 +24,7 @@ C++ callers set depth per lane. Exact batches can [restore paired prefixes](pref
 
 On B200, loaded draft weights support [INT8 draft scoring](native-model-info.md#int8-draft-head).
 
-Eligible B200 MTP prompt tiles hold up to 1,024 rows. Prefix reuse and other devices cap MTP tiles at 128. Draft seeding pairs each final-normalized target row with the next prompt token embedding. Single rows or unavailable scratch use scalar prefill. [Tile cap](../src/decoder_batch.cpp#L646)<!-- prefix: "const int li" --> · [Row alignment](../src/decoder_prefill.cpp#L896)<!-- prefix: "chunk.seed_d" -->
+Eligible B200 MTP prompt tiles hold up to 1,024 rows. Prefix reuse and other devices cap MTP tiles at 128. Draft seeding pairs each final-normalized target row with the next prompt token embedding. Single rows or unavailable scratch use scalar prefill. [Tile cap](../src/decoder_batch.cpp#L646)<!-- prefix: "const int li" --> · [Row alignment](../src/decoder_prefill.cpp#L926)<!-- prefix: "chunk.seed_d" -->
 
 On the B200 Tensor Core text path, draft seed FC can use WMMA for prompts of at least 4,096 tokens. The WMMA launcher requires 64–128 rows, the draft FC dimensions, and 16-byte-aligned input and weights. Other inputs go to the SIMT row GEMV launcher. [Prompt and row limits](../include/sglang/decoder.h#L186)<!-- prefix: "inline const" --> · [FC dispatch](../src/text/draft_seed_fc.cu#L115)<!-- prefix: "cudaError_t " -->
 

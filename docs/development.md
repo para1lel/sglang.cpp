@@ -104,9 +104,9 @@ Batch text prefill without MTP and text label scoring use a 1,024-row cap on eve
 
 Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset zeros BF16 convolution history and FP32 recurrent state across 48 GDN layers. [Generation loop](../src/decoder.cpp#L534)<!-- prefix: "void Decoder" --> · [State reset](../src/decoder_resources.cpp#L937)<!-- prefix: "void Request" -->
 
-One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L881)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L899)<!-- prefix: "void Decoder" -->
+One model layer loop runs input RMSNorm, GQA or GDN, post-attention RMSNorm, then the MLP. The loop assigns separate KV and GDN state indexes. Tiled prefill and row-based eager, graph, and MTP verification passes supply their own buffers and operator dispatch. Embedding, draft seeding, and scoring stay with their callers. [Tile adapter](../src/decoder_prefill.cpp#L911)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L899)<!-- prefix: "void Decoder" -->
 
-Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L827)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L860)<!-- prefix: "void Decoder" -->
+Prefill follows token order. The final prompt row gives initial logits. [Serial tiles](text-serving.md#serial-prefill) can exceed 128 rows. Serial K0 defaults to graph decode. Overlapping calls use private eager storage. [Prefill dispatch](../src/decoder_prefill.cpp#L857)<!-- prefix: "void Decoder" --> · [Decode graph](../src/decoder_forward.cpp#L860)<!-- prefix: "void Decoder" -->
 
 The runtime selects [Tensor Core projections](fp8-prefill-projections.md#tensor-core-projections) for eligible B200 text. Exact SIMT projections serve label scoring and fallback cases. The two paths can produce different logits and greedy IDs.
 
@@ -154,7 +154,7 @@ are 32 MiB and 1 GiB respectively. Other pools use CUDA defaults. See the
 [active prefill workspace sizes](native-prefill-workspace.md#projection-pairs-for-mtp).
 [Retention](../src/decoder_prefill.cpp#L48)<!-- prefix: "void configu" -->
 
-Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L654)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L419)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L714)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L769)<!-- prefix: "cudaError_t " -->
+Single rows and unavailable normal scratch use row-wise prefill. Release queues a stream-ordered free. After enqueue failure, recovery synchronizes the device, checks used bytes, and waits for any retried free. Explicit close reports the original error. [Generation](../src/decoder.cpp#L654)<!-- prefix: "reclaim_pref" -->, [batch admission](../src/decoder_batch.cpp#L419)<!-- prefix: "reclaim_pref" -->, and multirow allocation retry pending frees. [Allocation](../src/decoder_prefill.cpp#L744)<!-- prefix: "PrefillWorks" --> · [Release](../src/decoder_prefill.cpp#L799)<!-- prefix: "cudaError_t " -->
 
 `--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L241)<!-- prefix: "void write_r" -->
 

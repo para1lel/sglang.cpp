@@ -29,6 +29,14 @@ struct PagedPrefillSequence {
 std::optional<cudaError_t> try_batched_paged_prefill(
     const PagedPrefillSequence* sequences, int count, cudaStream_t stream);
 
+inline constexpr int staged_prefill_batch_size = 4;
+inline constexpr int staged_prefill_batch_min_position = 1024;
+inline constexpr int staged_prefill_batch_max_position = 7168;
+
+std::optional<cudaError_t> try_batched_staged_paged_prefill(
+    const PagedPrefillSequence* sequences, int count, cudaStream_t stream,
+    PairedPrefillScratch scratch);
+
 cudaError_t tensor_core_multirow_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,

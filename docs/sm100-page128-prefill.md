@@ -7,7 +7,7 @@ This document describes the earlier page-128 selector study. See
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model | Try the page-128 launcher under the tensor-core prefill policy. | [Model dispatch](../include/sglang/text/prefill_attn_sm100.h#L37)<!-- prefix: "inline cudaE" --> |
+| Model | Try the page-128 launcher under the tensor-core prefill policy. | [Model dispatch](../include/sglang/text/prefill_attn_sm100.h#L45)<!-- prefix: "inline cudaE" --> |
 | Batch planner | Select the historical tile row count. | [Batch tile cap at the earlier revision](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/decoder_batch.cpp#L715)<!-- prefix: "const bool w" --> |
 | SM100 launcher | Check eligibility, select staging, and submit stream work. | [Launcher](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/prefill_attn_sm100.cu#L914)<!-- prefix: "std::optiona" --> |
 

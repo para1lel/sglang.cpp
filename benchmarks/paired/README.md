@@ -137,6 +137,30 @@ text context. All native K4 captures must match their own long-split K0
 control. The pinned vLLM K4 arm supplies the paired timing observations.
 Campaign metadata and version 2 evidence distinguish long and bounded split.
 
+### Native server defaults against matched vLLM K4
+
+Use a fresh campaign directory and set `PAIRED_K4_NATIVE_PROFILE=server-defaults`.
+Use a verified Release that resolves its default to MTP4, 32 active requests,
+an 8,192-token scheduling budget, prefix caching off, and CUDA graphs enabled.
+The native timed process receives only the loopback port argument and a clean
+environment for device selection, library loading, and private cache paths.
+Its operator settings come from the Release defaults. The separate W1 trace
+adds only the trace switch and proves depth-four activity. This profile does
+not start a native K0 control or test cross-engine output equality.
+
+The pinned vLLM launcher explicitly selects MTP4 and the common scheduling
+settings, and retains the pinned cache and backend recipe. Its literal default
+startup is outside this profile. Both arms use the same physical B200, local
+NUMA placement, CPU sets, checkpoint and frozen requests. The campaign uses
+the same W1–W6 gate order and alternates timed arm order by row.
+
+The `matched-k4-native-defaults-v1` receipt labels the vLLM arm `timing-only`.
+Offline replay checks the native executable, the observed arguments and
+environment of both API processes, their CPU and GPU receipts, the effective
+vLLM API and worker settings, the native W1 trace, and fresh vLLM MTP activity.
+Each archived cohort binds its launch and resolved configuration to the
+campaign and arm. Use the same `assess` command as the other K4 profiles.
+
 ## Replay the historical GPU 2 arm
 
 On the benchmark host, `artifacts/test-bench-baseline` holds the saved 32,768-token vLLM arm

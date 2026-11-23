@@ -1,4 +1,4 @@
-"""Collect and replay the opt-in matched K4 timing protocol."""
+"""Collect and replay matched K4 timing protocols."""
 
 import argparse
 import gzip
@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from benchmarks.concurrent import client as concurrent
 from benchmarks.streaming import check_vllm, client as streaming
+import default_evidence as defaults
 from identity import verify_stream_end
 from makespan import cohort_makespan_ns, compare, validate_cohort
 from saved_evidence import check_native_dispatch, device, digest, fields, load
@@ -117,6 +118,15 @@ def campaign(directory):
                 "Exact campaign cannot select an opt-in native configuration")
         return None
     profile = identity["native_profile"]
+    if identity["protocol"] == defaults.PROTOCOL:
+        require(profile == defaults.PROFILE and receipt_version(identity) == 2
+                and "native_config" not in identity
+                and Path(identity["checkpoint_path"]).is_absolute()
+                and type(identity["port"]) is int and 1 <= identity["port"] <= 65535
+                and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                                 identity["campaign_id"]),
+                "Invalid native defaults campaign identity")
+        return identity, hashlib.sha256(raw).hexdigest()
     config = identity["native_config"]
     expected = {"fp8_prefill": "tensor-core-mtp-target", "mtp_steps": 4, "mtp_int8_head": True}
     if profile == SPLIT_PROFILE:
@@ -155,6 +165,13 @@ def arm_binding(directory, arm, selected, version):
             "Exact diagnostic belongs to an opt-in campaign")
     if selected is None and not version:
         return None
+    if default_campaign(selected):
+        names = {"argv": "live-argv.bin", "server_info": "server-info.json"}
+        if arm == "vllm-k4":
+            names["worker"] = "effective-worker.json"
+        names["environment"] = "live-environment.bin"
+        return {"campaign_sha256": selected[1], "arm": arm, **{
+            f"{key}_sha256": digest(run / name) for key, name in names.items()}}
     split_mode = ""
     if selected is not None and arm != "vllm-k4":
         _, split_mode = native_info(run, selected[0], opt_in=True)
@@ -167,6 +184,10 @@ def arm_binding(directory, arm, selected, version):
             check_native_dispatch(dispatch, split_mode)
             binding["native_dispatch_sha256"] = digest(dispatch)
     return binding
+
+
+def default_campaign(selected):
+    return selected is not None and selected[0]["protocol"] == defaults.PROTOCOL
 
 
 def native_info(run, identity, *, opt_in):
@@ -206,7 +227,10 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
     version = receipt_version(receipt_identity(row_directory, selected))
     binding = arm_binding(directory, arm, selected, version)
     expected = None
-    if arm in ("native-k4", "native-k4-trace", EXACT_CONTROL):
+    if default_campaign(selected):
+        require(arm in ("native-k4", "native-k4-trace", "vllm-k4")
+                and native_control is None, "A default launch has no forced K0 control")
+    elif arm in ("native-k4", "native-k4-trace", EXACT_CONTROL):
         require(native_control is not None, "Provide the native K0 control")
         verify_request_files(native_control, lanes)
         control_binding = arm_binding(native_control, "native-k0", selected, version)
@@ -292,16 +316,26 @@ def assess(row, fixtures, directory):
     selected = campaign(directory)
     identity = receipt_identity(directory, selected)
     version = receipt_version(identity)
+    use_defaults = default_campaign(selected)
+    if use_defaults:
+        require(digest(directory / "protocol.sha256") == identity["protocol_sha256"],
+                "Saved protocol manifest differs from the default campaign")
     samples = {"native-k4": [], "vllm-k4": []}
     expected = None
     exact = None
-    arms = (ARM_ORDER[0], EXACT_CONTROL, *ARM_ORDER[1:]) if selected else ARM_ORDER
+    if use_defaults:
+        arms = ARM_ORDER[1:]
+    else:
+        arms = (ARM_ORDER[0], EXACT_CONTROL, *ARM_ORDER[1:]) if selected else ARM_ORDER
     for arm in arms:
         if arm == "native-k4-trace" and row != "W1":
             continue
         measurement = directory / arm / "measurement"
-        verify_arm_receipts(measurement.parent, identity, opt_in=selected is not None,
-                            version=version)
+        if use_defaults:
+            verify_default_receipts(row, measurement.parent, identity)
+        else:
+            verify_arm_receipts(measurement.parent, identity, opt_in=selected is not None,
+                                version=version)
         binding = arm_binding(measurement, arm, selected, version)
         verify_request_files(measurement, lanes)
         tags = schedule(row, arm)
@@ -313,13 +347,16 @@ def assess(row, fixtures, directory):
                 expected = outputs
             elif arm == EXACT_CONTROL:
                 exact = outputs
-            elif arm != "vllm-k4":
+            elif not use_defaults and arm != "vllm-k4":
                 require(outputs == expected, f"{arm} {tag}: native K4 differs from native K0")
             if tag.startswith("measured-"):
                 samples[arm].append(duration)
     result = {"protocol": PROTOCOL, "row": row, **compare(
         {row: samples["native-k4"]}, {row: samples["vllm-k4"]}, eligible=True)}
-    if selected:
+    if use_defaults:
+        result.update(protocol=defaults.PROTOCOL, native_profile=defaults.PROFILE,
+                      campaign_sha256=selected[1], vllm_role="timing-only")
+    elif selected:
         identity, fingerprint = selected
         result.update(protocol=OPT_IN_PROTOCOL, native_profile=identity["native_profile"],
                       native_config=identity["native_config"], campaign_sha256=fingerprint,
@@ -330,10 +367,11 @@ def assess(row, fixtures, directory):
     return result
 
 
-def check_vllm_worker(row, run, reservation, checkpoint):
+def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measurement=False):
     cpus = fields(reservation / "cpus.txt")
     group = "W1-W2" if row in streaming.SHAPES else row
-    evidence = saved_worker(run, run, cpus, device(reservation)["uuid"], group, speculative=True)
+    evidence = saved_worker(run, run, cpus, device(reservation)["uuid"], group, speculative=True,
+                            before_measurement=before_measurement)
     worker = evidence["effective"]
     reference = concurrent.reference()["observed_vllm_settings"]
     require(all(worker[key] == reference[key] for key in ("vllm", "torch", "torch_cuda"))
@@ -343,7 +381,8 @@ def check_vllm_worker(row, run, reservation, checkpoint):
     config = load(run / "server-info.json")["vllm_config"]
     spec = config["speculative_config"]
     attention = config["attention_config"]
-    require(spec["method"] == "mtp" and spec["num_speculative_tokens"] == 4
+    require(spec["method"] == "mtp" and type(spec["num_speculative_tokens"]) is int
+            and spec["num_speculative_tokens"] == 4
             and Path(spec["model"]).resolve() == checkpoint
             and Path(config["model_config"]["model"]).resolve() == checkpoint
             and attention["use_trtllm_attention"] is True
@@ -355,8 +394,50 @@ def check_vllm_worker(row, run, reservation, checkpoint):
         "prefill=torch.bfloat16, decode=torch.bfloat16, decode_backend=trtllm-gen")
         and "torch.float8_e4m3fn" in line for line in kernels),
         "Unexpected FlashInfer attention kernel")
+    return evidence, kernels
+
+
+def check_vllm_worker(row, run, reservation, checkpoint, *, before_measurement=False):
+    evidence, kernels = vllm_worker_evidence(row, run, reservation, checkpoint,
+                                             before_measurement=before_measurement)
+    if before_measurement:
+        selected = campaign(run.parent)
+        require(default_campaign(selected), "Expected a native defaults campaign")
+        port = defaults.vllm_argv(run, fields(reservation / "cpus.txt"),
+                                  device(reservation)["uuid"])
+        require(port == selected[0]["port"], "vLLM endpoint differs from the default campaign")
+        return
     save(run / "attention-kernels.json", kernels)
     save(run / "worker-identity.json", evidence)
+
+
+def verify_default_receipts(row, run, identity):
+    require((run / "client-exit-code.txt").read_text().strip() == "0",
+            f"{run.name}: client did not succeed")
+    if run.name != "vllm-k4":
+        require(load(run / "server-check.txt") is True, f"{run.name}: native check failed")
+        defaults.native_completed(run, identity)
+        if run.name == "native-k4-trace":
+            saved_activity(run, "native", ("server.log",), True)
+        return
+    reservation = run.parent / "reservation"
+    cpus = fields(reservation / "cpus.txt")
+    require(cpus == {key: identity[f"{key}_cpus"] for key in ("server", "client")}
+            | {"memory": identity["memory"]}
+            and device(reservation)["uuid"] == identity["gpu_uuid"].lower(),
+            "vLLM reservation differs from the default campaign")
+    port = defaults.vllm_argv(run, cpus, identity["gpu_uuid"].lower())
+    require(port == identity["port"], "vLLM endpoint differs from the default campaign")
+    require((run / "live-environment-end.bin").read_bytes()
+            == (run / "live-environment.bin").read_bytes(),
+            "vLLM environment changed during use")
+    defaults.client(run, identity, port)
+    evidence, kernels = vllm_worker_evidence(row, run, reservation,
+                                             Path(identity["checkpoint_path"]))
+    require(load(run / "worker-identity.json") == evidence
+            and load(run / "attention-kernels.json") == kernels,
+            "Saved vLLM worker differs from the resolved receipts")
+    saved_activity(run, "vllm", ("metrics-before.txt", "metrics-after.txt"), True)
 
 
 def native_activity(text, require_groups):
@@ -473,6 +554,7 @@ def main():
     worker.add_argument("directory", type=Path)
     worker.add_argument("reservation", type=Path)
     worker.add_argument("checkpoint", type=Path)
+    worker.add_argument("--before-measurement", action="store_true")
     check = modes.add_parser("activity")
     check.add_argument("directory", type=Path)
     check.add_argument("engine", choices=("native", "vllm"))
@@ -481,6 +563,10 @@ def main():
     cache.add_argument("directory", type=Path)
     dispatch = modes.add_parser("native-dispatch")
     dispatch.add_argument("pid", type=int)
+    environment = modes.add_parser("native-default-environment")
+    environment.add_argument("pid", type=int)
+    native_check = modes.add_parser("native-default-check")
+    native_check.add_argument("directory", type=Path)
     args = parser.parse_args()
     try:
         if args.mode == "capture":
@@ -494,11 +580,19 @@ def main():
             print(json.dumps(result, indent=2))
             return int(not result["passed"])
         elif args.mode == "worker":
-            check_vllm_worker(args.row, args.directory, args.reservation, args.checkpoint)
+            check_vllm_worker(args.row, args.directory, args.reservation, args.checkpoint,
+                              before_measurement=args.before_measurement)
         elif args.mode == "cubins":
             cubins(args.cache, args.directory)
         elif args.mode == "native-dispatch":
             sys.stdout.buffer.write(read_native_dispatch(args.pid))
+        elif args.mode == "native-default-environment":
+            sys.stdout.buffer.write(defaults.read_environment(args.pid))
+        elif args.mode == "native-default-check":
+            selected = campaign(args.directory.parent)
+            require(default_campaign(selected), "Expected a native defaults campaign")
+            defaults.native(args.directory, selected[0])
+            print("true")
         else:
             activity(args.directory, args.engine)
     except (OSError, ValueError, KeyError, TypeError, IndexError) as error:

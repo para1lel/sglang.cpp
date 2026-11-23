@@ -48,8 +48,10 @@ def device(capture):
                             if key not in {"uuid", "index"}}}
 
 
-def observed_device(run, pid, expected):
-    for name in ("compute-ready.csv", "compute-measurement-end.csv"):
+def observed_device(run, pid, expected, *, before_measurement=False):
+    names = ("compute-ready.csv",) if before_measurement else (
+        "compute-ready.csv", "compute-measurement-end.csv")
+    for name in names:
         with (run / name).open(newline="") as stream:
             rows = list(csv.reader(stream, skipinitialspace=True))
         seen = [row[0].strip().lower() for row in rows if row and row[1].strip() == pid]
@@ -216,7 +218,7 @@ def vllm_settings(run, args, group, *, speculative=False):
     return worker
 
 
-def saved_worker(capture, run, cpus, uuid, group, *, speculative=False):
+def saved_worker(capture, run, cpus, uuid, group, *, speculative=False, before_measurement=False):
     args = command(run, "server", cpus)
     log = (run / "server.log").read_text()
     api_pid = (run / "server-pid.txt").read_text().strip()
@@ -227,7 +229,7 @@ def saved_worker(capture, run, cpus, uuid, group, *, speculative=False):
     require(len(engines) == 1 and engines[0][1] == arg(args, "--model"),
             f"{run}: engine log and requested model do not identify one worker")
     pid, model = engines[0]
-    observed_device(run, pid, uuid)
+    observed_device(run, pid, uuid, before_measurement=before_measurement)
     environment = fields(capture / "effective-environment.txt")
     require(environment["CUDA_VISIBLE_DEVICES"].lower() == uuid,
             f"{run}: CUDA visibility conflicts with observed UUID")

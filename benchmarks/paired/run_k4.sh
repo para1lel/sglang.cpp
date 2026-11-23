@@ -8,6 +8,7 @@ usage() {
     echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8 selects the opt-in native profile."
     echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-split-gqa enables bounded split attention."
     echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-long-split-gqa enables long split attention."
+    echo "PAIRED_K4_NATIVE_PROFILE=server-defaults times native defaults against matched vLLM K4."
     echo "The default profile is exact."
 }
 
@@ -30,14 +31,16 @@ manifest=${PAIRED_CHECKPOINT_MANIFEST:-}
 native_profile=${PAIRED_K4_NATIVE_PROFILE-exact}
 native_fp8=exact
 native_split_mode=
+native_defaults=false
 case "$native_profile" in
     exact) ;;
+    server-defaults) native_defaults=true ;;
     ordered-tc-int8) ;;
     ordered-tc-int8-split-gqa) native_split_mode=1 ;;
     ordered-tc-int8-long-split-gqa) native_split_mode=long ;;
     *) echo "Unknown PAIRED_K4_NATIVE_PROFILE: $native_profile" >&2; exit 2 ;;
 esac
-if [[ $native_profile != exact ]]; then
+if [[ $native_profile != exact && $native_defaults == false ]]; then
     native_fp8=tensor-core-mtp-target
     overrides=$(compgen -e | sed -nE '/^SGLANG_(EXPERIMENTAL_|PREFILL_|DECODE_|SERIAL_)/p')
     if [[ -n $overrides ]]; then
@@ -73,6 +76,9 @@ checkpoint=$(realpath -e -- "$checkpoint")
 vllm_root=$(realpath -e -- "$vllm_root")
 python=$vllm_root/venv/bin/python
 seed_cache=$(realpath -e -- "${PAIRED_VLLM_SEED_CACHE:-$host_root/cache/vllm-81a8cb063e62}")
+if [[ $native_defaults == true ]]; then
+    uv=$(realpath -e -- "$(type -P uv)")
+fi
 pin=$(jq -er '.vllm_pin' "$project/benchmarks/concurrent/gpu2-reference.json")
 model_sha=$(jq -er '.checkpoint_manifest_sha256' \
     "$project/benchmarks/concurrent/gpu2-reference.json")
@@ -94,7 +100,8 @@ root=$(realpath -- "$target")
 exec 7>>"$root/campaign.lock"
 flock -n -E 75 7
 protocol_hash=$(cd -- "$project" && sha256sum \
-    benchmarks/paired/{run_k4.sh,k4.py,common.sh,saved_evidence.py,identity.py,makespan.py} \
+    benchmarks/paired/{run_k4.sh,k4.py,common.sh,default_evidence.py,saved_evidence.py} \
+    benchmarks/paired/{identity.py,makespan.py} \
     benchmarks/paired/{measure_concurrent.py,vllm_worker.py} \
     benchmarks/streaming/{client.py,check_vllm.py,vllm_observer.py,W1.json,W2.json} \
     benchmarks/concurrent/{client.py,reference.py,freeze_prompts.py,fixture-manifest.json} \
@@ -116,14 +123,22 @@ if [[ $native_profile != exact ]]; then
         read -r campaign_id </proc/sys/kernel/random/uuid
     fi
     [[ $campaign_id =~ ^[0-9a-f-]{36}$ ]]
-    identity=$(jq -c --arg profile "$native_profile" --arg fp8 "$native_fp8" \
+    if [[ $native_defaults == true ]]; then
+        identity=$(jq -c --arg model "$checkpoint" --arg campaign_id "$campaign_id" \
+            --argjson port "$port" \
+            '. + {protocol:"matched-k4-native-defaults-v1",campaign_id:$campaign_id,
+                  native_profile:"server-defaults",checkpoint_path:$model,port:$port}' \
+            <<<"$identity")
+    else
+        identity=$(jq -c --arg profile "$native_profile" --arg fp8 "$native_fp8" \
         --arg campaign_id "$campaign_id" --arg split_mode "$native_split_mode" \
         '. + {protocol:"matched-k4-opt-in-v1",campaign_id:$campaign_id,native_profile:$profile,
               native_config:{fp8_prefill:$fp8,mtp_steps:4,mtp_int8_head:true}}
          | if $split_mode == "1" then .native_config.experimental_target_split_gqa = true
            elif $split_mode == "long" then .native_config.experimental_long_target_split_gqa = true
            else . end' \
-        <<<"$identity")
+            <<<"$identity")
+    fi
 fi
 if [[ $row == W1 && ! -e $root/identity.json ]]; then
     printf '%s\n' "$identity" >"$root/identity.json"
@@ -220,7 +235,12 @@ export LD_LIBRARY_PATH="$compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 env | LC_ALL=C sort |
     sed -nE '/^(CUDA_|LD_LIBRARY_PATH=|SGLANG_(EXPERIMENTAL_|PREFILL_|DECODE_|SERIAL_))/p' \
     >"$directory/native-environment.txt"
-ldd "$binary" >"$directory/native-ldd.txt"
+if [[ $native_defaults == true ]]; then
+    env -i PATH=/usr/bin:/bin "LD_LIBRARY_PATH=$compat" ldd "$binary" \
+        >"$directory/native-ldd.txt"
+else
+    ldd "$binary" >"$directory/native-ldd.txt"
+fi
 if rg -q 'not found' "$directory/native-ldd.txt"; then
     echo "Native shared libraries are missing. See $directory/native-ldd.txt." >&2
     exit 2
@@ -247,11 +267,29 @@ start_vllm() {
     local -x PYTHONPATH="$paired_dir:$project"
     local env_prefixes='CUDA_|VLLM_|FLASHINFER_|HF_|TRITON_|OMP_NUM_THREADS=|MAX_JOBS=|XDG_'
     env_prefixes+='|LD_LIBRARY_PATH=|CC=|CXX=|TMPDIR=|PYTHONPATH='
-    env | LC_ALL=C sort | sed -nE "/^($env_prefixes)/p" >"$run/effective-environment.txt"
+    local environment=(env -u PYTHONHOME -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS)
+    if [[ $native_defaults == true ]]; then
+        local names=(CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER CUDA_HOME CUDA_CACHE_PATH
+            VLLM_{HAS_FLASHINFER_CUBIN,NO_USAGE_STATS,CACHE_ROOT,CONFIG_ROOT,RPC_BASE_PATH}
+            VLLM_{WORKER_MULTIPROC_METHOD,SERVER_DEV_MODE} HF_{HUB_OFFLINE,HOME}
+            OMP_NUM_THREADS MAX_JOBS XDG_{CACHE_HOME,CONFIG_HOME} TMPDIR TRITON_CACHE_DIR
+            FLASHINFER_WORKSPACE_BASE LD_LIBRARY_PATH CC CXX PYTHONDONTWRITEBYTECODE PYTHONPATH)
+        local name
+        mkdir "$run"/{home,tools}
+        ln -s "$uv" "$run/tools/uv"
+        environment=(env -i "PATH=$vllm_root/venv/bin:$CUDA_HOME/bin:$run/tools:/usr/bin:/bin"
+            "HOME=$run/home" LANG=C.UTF-8 "VIRTUAL_ENV=$vllm_root/venv"
+            UV_NO_CACHE=1 UV_OFFLINE=1)
+        for name in "${names[@]}"; do
+            environment+=("$name=${!name}")
+        done
+        printf '%s\n' "${environment[@]:2}" >"$run/effective-environment.txt"
+    else
+        env | LC_ALL=C sort | sed -nE "/^($env_prefixes)/p" >"$run/effective-environment.txt"
+    fi
     local attention_config='{"backend":"FLASHINFER","disable_flashinfer_q_quantization":true,'
     attention_config+='"use_trtllm_attention":true}'
-    start_group "$run" env -u PYTHONHOME -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
-        "$python" -B -m vllm.entrypoints.openai.api_server \
+    start_group "$run" "${environment[@]}" "$python" -B -m vllm.entrypoints.openai.api_server \
         --host 127.0.0.1 --port "$port" --model "$checkpoint" --served-model-name benchmark \
         --dtype bfloat16 --kv-cache-dtype fp8_e4m3 --mamba-cache-dtype bfloat16 \
         --mamba-ssm-cache-dtype float32 \
@@ -264,6 +302,20 @@ start_vllm() {
         --kv-cache-memory-bytes "$kv_bytes" --stream-interval 1 \
         --worker-extension-cls vllm_worker.PairedBaselineObserver \
         --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
+}
+
+start_native_defaults() {
+    local run=$1 arm=$2
+    local args=("$binary" --port "$port")
+    if [[ $arm == native-k4-trace ]]; then
+        args+=(--trace-batches)
+    fi
+    mkdir "$run"/{home,cache,config,tmp}
+    start_group "$run" env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+        "HOME=$run/home" "TMPDIR=$run/tmp" "XDG_CACHE_HOME=$run/cache" \
+        "XDG_CONFIG_HOME=$run/config" "CUDA_CACHE_PATH=$run/cuda-cache" \
+        "CUDA_VISIBLE_DEVICES=$gpu_uuid" CUDA_DEVICE_ORDER=PCI_BUS_ID \
+        "LD_LIBRARY_PATH=$compat" "${args[@]}"
 }
 
 check_native_info() {
@@ -284,6 +336,43 @@ check_native_info() {
         server-info.json >server-check.txt
 }
 
+finish_arm() {
+    local arm=$1 run=$directory/$1
+    record_compute "$run/compute-measurement-end.csv"
+    if [[ $arm == vllm-k4 ]]; then
+        if [[ $native_defaults == true ]]; then
+            cmp -s live-argv.bin "/proc/$server_pid/cmdline"
+            cat "/proc/$server_pid/environ" >live-environment-end.bin
+            cmp -s live-environment.bin live-environment-end.bin
+        fi
+        "${fetch[@]}" "$url/metrics" >metrics-after.txt
+        "${client[@]}" worker "$row" "$run" "$directory/reservation" "$checkpoint"
+        "${client[@]}" activity "$run" vllm
+    else
+        cat "/proc/$server_pid/cmdline" | cmp -s -- live-argv.bin -
+        if [[ $native_defaults == true ]]; then
+            "${client[@]}" native-default-environment "$server_pid" >live-environment-end.bin
+            cmp -s live-environment.bin live-environment-end.bin
+        else
+            "${client[@]}" native-dispatch "$server_pid" >live-dispatch-end.bin
+            cmp -s -- live-dispatch.bin live-dispatch-end.bin
+        fi
+        for receipt in compute-ready.csv compute-measurement-end.csv; do
+            awk -F', *' -v uuid="$gpu_uuid" -v pid="$server_pid" \
+                '$1 == uuid {count++; if ($2 == pid) owned++}
+                 END {exit !(count == 1 && owned == 1)}' \
+                "$receipt"
+        done
+        if [[ $arm == native-k4-trace ]]; then
+            "${client[@]}" activity "$run" native
+        fi
+    fi
+    stop_group
+    check_idle
+    port_free
+    record_compute "$run/compute-after.csv"
+}
+
 run_arm() {
     local arm=$1 run=$directory/$1 depth=4 traced=false int8=false client_status=0
     local fp8=$native_fp8
@@ -294,11 +383,30 @@ run_arm() {
     port_free
     if [[ $arm == vllm-k4 ]]; then
         start_vllm "$run" 6>&- 7>&- 8<&-
+        if [[ $native_defaults == true ]]; then
+            cat "/proc/$server_pid/cmdline" >live-argv.bin
+            cat "/proc/$server_pid/environ" >live-environment.bin
+            awk '/^Cpus_allowed_list:/ {print $2}' "/proc/$server_pid/status" >live-cpus.txt
+        fi
         "${fetch[@]}" "$url/server_info?config_format=json" >server-info.json
         "${fetch[@]}" -H 'Content-Type: application/json' \
             -d '{"method":"baseline_snapshot","timeout":90}' \
             "$url/collective_rpc" >effective-worker.json
         "${fetch[@]}" "$url/metrics" >metrics-before.txt
+        if [[ $native_defaults == true ]]; then
+            "${client[@]}" worker "$row" "$run" "$directory/reservation" "$checkpoint" \
+                --before-measurement
+        fi
+    elif [[ $native_defaults == true ]]; then
+        [[ $arm != native-k4-trace ]] || traced=true
+        start_native_defaults "$run" "$arm" 6>&- 7>&- 8<&-
+        check_digest "$native_sha" "/proc/$server_pid/exe"
+        sha256sum "/proc/$server_pid/exe" >running-binary.sha256
+        cat "/proc/$server_pid/cmdline" >live-argv.bin
+        awk '/^Cpus_allowed_list:/ {print $2}' "/proc/$server_pid/status" >live-cpus.txt
+        "${client[@]}" native-default-environment "$server_pid" >live-environment.bin
+        "${fetch[@]}" "$url/server_info" >server-info.json
+        "${client[@]}" native-default-check "$run" >server-check.txt
     else
         case "$arm" in
             native-k0) depth=0; flags+=(--mtp-steps 0) ;;
@@ -344,38 +452,18 @@ run_arm() {
     "${capture[@]}" >client.log 2>&1 6>&- 7>&- 8<&- 9<&- || client_status=$?
     printf '%s\n' "$client_status" >client-exit-code.txt
     date -u +%FT%TZ >measurement-finished-utc.txt
-    record_compute "$run/compute-measurement-end.csv"
-    if [[ $arm == vllm-k4 ]]; then
-        "${fetch[@]}" "$url/metrics" >metrics-after.txt
-        "${client[@]}" worker "$row" "$run" "$directory/reservation" "$checkpoint"
-        "${client[@]}" activity "$run" vllm
-    else
-        cat "/proc/$server_pid/cmdline" | cmp -s -- live-argv.bin -
-        "${client[@]}" native-dispatch "$server_pid" >live-dispatch-end.bin
-        cmp -s -- live-dispatch.bin live-dispatch-end.bin
-        for receipt in compute-ready.csv compute-measurement-end.csv; do
-            awk -F', *' -v uuid="$gpu_uuid" -v pid="$server_pid" \
-                '$1 == uuid {count++; if ($2 == pid) owned++}
-                 END {exit !(count == 1 && owned == 1)}' \
-                "$receipt"
-        done
-        if [[ $traced == true ]]; then
-            "${client[@]}" activity "$run" native
-        fi
-    fi
-    stop_group
-    check_idle
-    port_free
-    record_compute "$run/compute-after.csv"
+    finish_arm "$arm"
     if (( client_status != 0 )); then
         cat client.log >&2
         return 2
     fi
 }
 
-run_arm native-k0
-if [[ $native_profile != exact ]]; then
-    run_arm native-exact-k0
+if [[ $native_defaults == false ]]; then
+    run_arm native-k0
+    if [[ $native_profile != exact ]]; then
+        run_arm native-exact-k0
+    fi
 fi
 if [[ $row == W1 ]]; then
     run_arm native-k4-trace

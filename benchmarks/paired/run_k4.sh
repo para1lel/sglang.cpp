@@ -339,7 +339,7 @@ finish_arm() {
     record_compute "$run/compute-measurement-end.csv"
     if [[ $arm == vllm-k4 ]]; then
         if [[ $native_defaults == true ]]; then
-            cmp -s live-argv.bin "/proc/$server_pid/cmdline"
+            cat "/proc/$server_pid/cmdline" | cmp -s -- live-argv.bin -
             cat "/proc/$server_pid/environ" >live-environment-end.bin
             cmp -s live-environment.bin live-environment-end.bin
         fi

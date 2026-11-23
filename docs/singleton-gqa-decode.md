@@ -44,10 +44,10 @@ eager, and bound launches use two stages. Each row has scratch for up to 16 spli
 [Eager grouping](../include/sglang/text/gqa_target_split.cuh#L48)<!-- prefix: "int eager_ta" --> ·
 [Stage dispatch](../src/text/gqa_decode_split.cu#L645)<!-- prefix: "cudaError_t " -->
 
-The one-stage path transposes the QK matrix multiply so each MMA covers 16 keys
-and eight query columns. Warp shuffles restore token order before the causal
-mask, softmax, and value accumulation. Each score keeps the same 32-channel
-group order and scale application. The split merge and FP64 replay stay shared.
+Each transposed QK multiply covers 16 keys and eight query head slots.
+Six heads are active and two are zero padded. Warp shuffles restore token order
+before the causal mask, softmax, and value accumulation. Each score keeps the
+same 32-channel group order and scales. The split merge and FP64 replay stay shared.
 [Transposed scores](../src/text/gqa_decode_split.cu#L297)<!-- prefix: "__device__ v" --> ·
 [Single-stage call](../src/text/gqa_decode_split.cu#L576)<!-- prefix: "process_tile" -->
 
@@ -146,7 +146,7 @@ layer. Exercise a group that straddles 2,047 and 2,048 visible tokens. Check tha
 this group uses the per-row stages. Use the [MTP verification checks](mtp.md#verification)
 for acceptance and continuation.
 
-Compare transposed scoring with ordinary scoring in the same one-stage loop on B200.
+On B200, compare transposed scoring against the ordinary one-stage loop. [Control revision](https://github.com/para1lel/sglang.cpp/commit/650f69d853380d5738955586ce37f30051485f8f)
 Keep the BF16 queries, visible range, split partition, and packed KV identical.
 Remap pages and include a partial tail. Compare BF16 outputs and written split
 partials bitwise. Include a flagged head to check FP64 replay.

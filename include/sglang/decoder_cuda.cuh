@@ -50,6 +50,17 @@ struct DraftInt8Projection {
 };
 
 inline constexpr int draft_wave_rows = 4;
+struct DraftArgmaxRow {
+    const __nv_bfloat16* logits;
+    TextLogitCandidate* scratch;
+    TextLogitCandidate* winner;
+};
+struct DraftArgmaxRows {
+    DraftArgmaxRow rows[draft_wave_rows];
+};
+
+cudaError_t draft_argmax_wave(DraftArgmaxRows rows, int count, int width, bool finite,
+                              cudaStream_t stream);
 cudaError_t decode_draft_head_int8_batch(const std::uint8_t* weight, const float* weight_maxima,
                                         const DraftInt8Projection* rows, int count,
                                         cudaStream_t stream);

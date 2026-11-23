@@ -3,6 +3,7 @@
 #include "sglang/checkpoint.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_prefill.h"
+#include "sglang/decoder_verify.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
 #include <cmath>
@@ -245,6 +246,8 @@ struct MtpDraftRequest::State {
                const ConstraintCandidates* allowed);
     void select_score(cudaStream_t stream, const ConstraintWorkspace* scratch,
                       const ConstraintCandidates* allowed);
+    bool prepare_mapped_score(cudaStream_t stream);
+    int score_token();
     static void score_wave(State* const* batch, int count, cudaStream_t stream);
 
     std::shared_ptr<const MtpDraftWeights> weights;
@@ -258,6 +261,8 @@ struct MtpDraftRequest::State {
     bool constrained_score = false;
     bool int8_score = false;
     bool retried_score = false;
+    bool mapped_score = false;
+    TextLogitCandidate* device_score = nullptr;
     TextLogitCandidate retry_winner{};
     bool failed = false;
 };
@@ -374,6 +379,7 @@ void MtpDraftRequest::State::select_score(cudaStream_t stream, const ConstraintW
                                          const ConstraintCandidates* allowed) {
     int8_score = weights->state_->quantized_head && !allowed;
     retried_score = false;
+    mapped_score = false;
     if (allowed) {
         select_constrained({work.logits, work.argmax_scratch, work.argmax}, *scratch, *allowed,
                            nullptr, 0, nullptr, stream);
@@ -389,6 +395,26 @@ void MtpDraftRequest::State::select_score(cudaStream_t stream, const ConstraintW
     check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner), cudaMemcpyDeviceToHost,
                           stream), "Copy MTP token");
     scored = true;
+}
+
+bool MtpDraftRequest::State::prepare_mapped_score(cudaStream_t stream) {
+    if (device_score) return true;
+    cudaStreamCaptureStatus capture;
+    check(cudaStreamIsCapturing(stream, &capture), "Check MTP draft capture status");
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    auto owner = prepare_verification_winners(1);
+    if (!owner) return false;
+    void* device = nullptr;
+    check(cudaHostGetDevicePointer(&device, owner.get(), 0), "Map MTP draft winner storage");
+    memory.transfers().verification_results = std::move(owner);
+    device_score = static_cast<TextLogitCandidate*>(device);
+    return true;
+}
+
+int MtpDraftRequest::State::score_token() {
+    const auto& transfer = memory.transfers();
+    const auto* host = static_cast<const TextLogitCandidate*>(transfer.verification_results.get());
+    return mapped_score ? host->token_id : transfer.winner;
 }
 
 void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStream_t stream) {
@@ -413,8 +439,23 @@ void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStre
         check(text_bf16_gemm(head.values, head.rows, head.columns, projections.data(),
                              count, stream), "Run batched BF16 MTP vocabulary head");
     }
-    for (int index = 0; index < count; ++index) {
-        batch[index]->select_score(stream, nullptr, nullptr);
+    DraftArgmaxRows winners{};
+    if (model.b200 && std::all_of(batch, batch + count, [stream](State* row) {
+            return row->prepare_mapped_score(stream);
+        })) {
+        for (int index = 0; index < count; ++index) {
+            auto& row = *batch[index];
+            winners.rows[index] = {row.work.logits, row.work.argmax_scratch, row.device_score};
+            row.mapped_score = row.scored = true;
+            row.int8_score = model.quantized_head != nullptr;
+            row.constrained_score = row.retried_score = false;
+        }
+        check(draft_argmax_wave(winners, count, vocab_size, model.quantized_head != nullptr,
+                                 stream), "Select grouped MTP draft winners");
+    } else {
+        for (int index = 0; index < count; ++index) {
+            batch[index]->select_score(stream, nullptr, nullptr);
+        }
     }
 }
 
@@ -689,7 +730,7 @@ int MtpDraftRequest::read_token() const {
         }
         return winner.token_id;
     }
-    const int token = state_->memory.transfers().winner;
+    const int token = state_->score_token();
     if (token == -1 && state_->constrained_score) {
         return -1;
     }
@@ -701,8 +742,9 @@ int MtpDraftRequest::read_token() const {
 
 bool MtpDraftRequest::retry_invalid_int8(cudaStream_t stream) {
     auto& request = *state_;
-    const int token = request.memory.transfers().winner;
-    if (!request.int8_score || (token >= 0 && token < vocab_size)) {
+    if (!request.int8_score) return false;
+    const int token = request.score_token();
+    if (token >= 0 && token < vocab_size) {
         return false;
     }
     std::fputs("INT8 MTP scores are invalid; retrying draft vocabulary head in BF16\n", stderr);

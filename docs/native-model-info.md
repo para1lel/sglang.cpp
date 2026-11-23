@@ -77,9 +77,9 @@ Pinned SGLang exposes resolved settings and a launch command at the top level, w
 
 ### INT8 draft head
 
-With draft weights loaded on B200, unconstrained draft proposals use signed INT8 scoring. Constrained drafts use BF16. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive. [Weight preparation](../src/decoder_mtp.cpp#L187)<!-- prefix: "if (b200) {" -->
+With draft weights loaded on B200, unconstrained draft proposals use signed INT8 scoring. Constrained drafts use BF16. The INT8 copy adds 1,272,391,680 device bytes per model. A nonfinite head weight aborts startup with its token ID. With `--mtp-steps 0`, the head stays inactive. [Weight preparation](../src/decoder_mtp.cpp#L188)<!-- prefix: "if (b200) {" -->
 
-Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L702)<!-- prefix: "bool MtpDraf" -->
+Quantization uses the maximum absolute value per weight row and activation. Zero rows give zero logits for finite operands. Rescaling uses FP64 intermediates before rounding to BF16. Ties choose the lowest token ID. An invalid INT8 score triggers BF16 scoring on the same activation. If the retry has no finite winner, that lane stops drafting for the round. The target verifies the available rows and the normal commit path repairs the draft KV. [Quantization](../src/text_decode_bandwidth.cu#L145)<!-- prefix: "__device__ v" --> · [Retry](../src/decoder_mtp.cpp#L743)<!-- prefix: "bool MtpDraf" -->
 
 ### Certified Tensor Core target head
 
@@ -117,7 +117,7 @@ its score capacity, starting at 5,174 tokens with standard scratch. It also need
 valid KV and page coverage, aligned query and KV buffers, and sufficient aligned
 scratch. Each lane keeps its own position, page table, and scratch. One eligible
 lane can use split GQA when the other rows in the wave take different routes.
-[Scored wave call](../src/decoder_mtp.cpp#L551)<!-- prefix: "if (score) {" --> · [Lane selection](../include/sglang/text/mtp/gqa_attention.cuh#L44)<!-- prefix: "cudaError_t " --> · [Alignment](../include/sglang/text/gqa_decode_split.cuh#L69)<!-- prefix: "__host__ __d" -->
+[Scored wave call](../src/decoder_mtp.cpp#L592)<!-- prefix: "if (score) {" --> · [Lane selection](../include/sglang/text/mtp/gqa_attention.cuh#L44)<!-- prefix: "cudaError_t " --> · [Alignment](../include/sglang/text/gqa_decode_split.cuh#L69)<!-- prefix: "__host__ __d" -->
 
 The online route uses the same grouped split operator as target attention.
 It can change draft attention values and proposals through a different reduction order.
@@ -131,13 +131,13 @@ use four-byte V loads when aligned and assemble the same values otherwise.
 Lengths below eight and calls with insufficient score scratch use direct attention.
 Up to four unconstrained lanes share projection and vocabulary weight reads.
 Single-row waves use the row dispatch. Batched KV-only repairs skip attention.
-[Chunked replay](../include/sglang/text/mtp/gqa_long.cuh#L151)<!-- prefix: "cudaError_t " --> · [Single-row wave](../src/decoder_mtp.cpp#L502)<!-- prefix: "if (count ==" --> · [Repair waves](../src/decoder_mtp.cpp#L580)<!-- prefix: "void repair_" -->
+[Chunked replay](../include/sglang/text/mtp/gqa_long.cuh#L151)<!-- prefix: "cudaError_t " --> · [Single-row wave](../src/decoder_mtp.cpp#L543)<!-- prefix: "if (count ==" --> · [Repair waves](../src/decoder_mtp.cpp#L621)<!-- prefix: "void repair_" -->
 
 Each draft lane reserves 496,640 bytes for vocabulary logits. Ordered long
 attention uses 419,328 bytes for scores and carry. Online split partials use at
 most 399,360 bytes within the same requirement. Neither path adds request
 memory. The lane stream orders attention before vocabulary scoring overwrites
-the scratch. [Score storage](../src/decoder_mtp.cpp#L117)<!-- prefix: "ExactGqaWork" --> · [Scratch bound](../include/sglang/text/gqa_decode_split.cuh#L46)<!-- prefix: "static_asser" -->
+the scratch. [Score storage](../src/decoder_mtp.cpp#L118)<!-- prefix: "ExactGqaWork" --> · [Scratch bound](../include/sglang/text/gqa_decode_split.cuh#L46)<!-- prefix: "static_asser" -->
 
 Compare the current B200 K4 runtime with a fresh K0 control on the same target dispatch. See pinned Git history at `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3` for the settings and evidence from earlier runtime profiles.
 

@@ -23,7 +23,7 @@ finish launches across up to four segments. The large
 [projection groups](native-prefill-workspace.md#projection-pairs-for-mtp) pass
 four 1,024-row grants at 4,096 rows or two at 2,048 rows. The regular layerwise
 path can group two or three eligible grants.
-[Segment limit](../include/sglang/decoder_cuda.cuh#L122)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L632)<!-- prefix: "if (grouped)" -->
+[Segment limit](../include/sglang/decoder_cuda.cuh#L133)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L632)<!-- prefix: "if (grouped)" -->
 
 The grid Z coordinate selects a grant with its own state, row slices, and
 scratch spans. Each block uses its grant's row count, including when aligned

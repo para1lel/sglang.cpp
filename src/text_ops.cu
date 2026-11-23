@@ -470,8 +470,8 @@ __device__ void store_block_best(TextLogitCandidate best, TextLogitCandidate* ou
 }
 
 template <typename Score, bool RequireFinite>
-__global__ void argmax_tiles_kernel(const Score* logits, int vocab_size,
-                                    TextLogitCandidate* scratch) {
+__device__ void argmax_tile_best(const Score* logits, int vocab_size,
+                                 TextLogitCandidate* scratch) {
     const unsigned int start = blockIdx.x * argmax_tile;
     TextLogitCandidate best{-CUDART_INF_F, -1};
     for (unsigned int item = threadIdx.x; item < argmax_tile; item += block_threads) {
@@ -493,13 +493,39 @@ __global__ void argmax_tiles_kernel(const Score* logits, int vocab_size,
 }
 
 template <bool RequireFinite>
-__global__ void argmax_finish_kernel(const TextLogitCandidate* scratch, int count,
-                                     TextLogitCandidate* output) {
+__device__ void argmax_finish_best(const TextLogitCandidate* scratch, int count,
+                                   TextLogitCandidate* output) {
     TextLogitCandidate best{-CUDART_INF_F, -1};
     for (int item = threadIdx.x; item < count; item += block_threads) {
         best = best_candidate<RequireFinite>(best, scratch[item]);
     }
     store_block_best<RequireFinite>(best, output);
+}
+
+template <typename Score, bool RequireFinite>
+__global__ void argmax_tiles_kernel(const Score* logits, int vocab_size,
+                                    TextLogitCandidate* scratch) {
+    argmax_tile_best<Score, RequireFinite>(logits, vocab_size, scratch);
+}
+
+template <bool RequireFinite>
+__global__ void argmax_finish_kernel(const TextLogitCandidate* scratch, int count,
+                                     TextLogitCandidate* output) {
+    argmax_finish_best<RequireFinite>(scratch, count, output);
+}
+
+template <bool RequireFinite>
+__global__ void draft_argmax_tiles(const __grid_constant__ decoder::DraftArgmaxRows rows,
+                                   int width) {
+    const auto& row = rows.rows[blockIdx.y];
+    argmax_tile_best<__nv_bfloat16, RequireFinite>(row.logits, width, row.scratch);
+}
+
+template <bool RequireFinite>
+__global__ void draft_argmax_finish(const __grid_constant__ decoder::DraftArgmaxRows rows,
+                                    int tiles) {
+    const auto& row = rows.rows[blockIdx.x];
+    argmax_finish_best<RequireFinite>(row.scratch, tiles, row.winner);
 }
 
 }
@@ -827,6 +853,26 @@ cudaError_t text_argmax_finite(const __nv_bfloat16* logits, int vocab_size,
                                TextLogitCandidate* scratch, TextLogitCandidate* output,
                                cudaStream_t stream) {
     return launch_argmax<true>(logits, vocab_size, scratch, output, stream);
+}
+
+cudaError_t decoder::draft_argmax_wave(DraftArgmaxRows rows, int count, int width, bool finite,
+                                       cudaStream_t stream) {
+    if (count < 2 || count > draft_wave_rows || width <= 0) return cudaErrorInvalidValue;
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows.rows[index];
+        if (!row.logits || !row.scratch || !row.winner || row.scratch == row.winner) {
+            return cudaErrorInvalidValue;
+        }
+    }
+    int tiles = text_argmax_scratch_count(width);
+    void* tiles_args[] = {&rows, &width};
+    const auto tile_kernel = finite ? draft_argmax_tiles<true> : draft_argmax_tiles<false>;
+    const auto status = cudaLaunchKernel(tile_kernel, dim3(tiles, count), block_threads,
+                                         tiles_args, 0, stream);
+    if (status != cudaSuccess) return status;
+    void* finish_args[] = {&rows, &tiles};
+    const auto finish_kernel = finite ? draft_argmax_finish<true> : draft_argmax_finish<false>;
+    return cudaLaunchKernel(finish_kernel, count, block_threads, finish_args, 0, stream);
 }
 
 cudaError_t text_fp8_decode_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,

@@ -30,7 +30,7 @@ On the B200 Tensor Core text path, draft seed FC can use WMMA for prompts of at 
 
 Each WMMA tile computes 32 rows by 64 output channels in 64-channel input steps. The kernel alternates two shared operand buffers and uses 16-byte `cp.async` copies to overlap the next step with WMMA. Copies zero-fill padded input rows. The kernel keeps the WMMA accumulation order and rounds FP32 results to nearest BF16 for valid rows. WMMA and SIMT can differ in accumulation order, which can change draft KV and proposals. [Tile shape](../src/text/draft_seed_fc.cu#L15)<!-- prefix: "constexpr in" --> · [Copies](../src/text/draft_seed_fc.cu#L24)<!-- prefix: "__device__ v" --> · [Pipeline](../src/text/draft_seed_fc.cu#L75)<!-- prefix: "seed_stage_o" --> · [Output](../src/text/draft_seed_fc.cu#L106)<!-- prefix: "if (first_ro" -->
 
-Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L597)<!-- prefix: "void MtpDraf" -->
+Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L638)<!-- prefix: "void MtpDraf" -->
 
 For a multi-row seed tile on B200, each request prepares FP8 activations in
 slices of up to 128 rows on the prefill stream. One exact FP8 kernel projects
@@ -38,14 +38,22 @@ K and V in separate grid banks for the tile. One key normalization and RoPE
 launch and one MXFP8 append follow. Grouped prefill seeds each request
 separately. Single-row tiles and other devices project and append each slice
 separately. Seed scratch comes from the existing prefill workspace.
-[Slice preparation](../src/decoder_mtp.cpp#L637)<!-- prefix: "for (int off" --> ·
-[Paired projection](../src/text_ops.cu#L759)<!-- prefix: "cudaError_t " --> ·
+[Slice preparation](../src/decoder_mtp.cpp#L678)<!-- prefix: "for (int off" --> ·
+[Paired projection](../src/text_ops.cu#L785)<!-- prefix: "cudaError_t " --> ·
 [Grid banks](../include/sglang/text/prefill_fp8_exact.cuh#L209)<!-- prefix: "__global__ v" --> ·
 [Grouped seed](../src/decoder_prefill.cpp#L652)<!-- prefix: "seed.seed_dr" -->
 
-The target scores the last prompt row and selects the first token. If generation continues, that token and the last normalized target row start the draft round at `L-1`. Later proposals use the previous draft's final-normalized row and prediction. The proposal loop synchronizes once per wave across the group. [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" -->
+The target scores the last prompt row and selects the first token. If generation continues, that token and the last normalized target row start the draft round at `L-1`. Later proposals use the previous draft's final-normalized row and prediction. The proposal loop synchronizes the stream before reading winners. If any lane retries INT8 scoring in BF16, the loop synchronizes again before reading the retry results. [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" -->
 
 Eligible B200 draft waves select [grouped online attention](native-model-info.md#draft-attention) automatically.
+
+### Draft winner readback
+
+On B200, if every lane has mapped pinned host storage, two to four unconstrained draft lanes share two argmax launches. The first launch reduces tiles within each lane. The second writes each lane's winning ID and score directly to that request's host record. The selection rules match the per-lane path, including lowest-ID ties and invalidation for nonfinite INT8 scores. [Dispatch](../src/decoder_mtp.cpp#L420)<!-- prefix: "void MtpDraf" --> · [Launcher](../src/text_ops.cu#L858)<!-- prefix: "cudaError_t " --> · [Selection](../src/text_ops.cu#L427)<!-- prefix: "__device__ T" -->
+
+Each request can reuse its mapping during stream capture. Outside capture, a request can allocate mapped storage on demand. Singleton and constrained lanes use per-lane selection and copy the winning ID. If capture prevents allocation or pinned allocation fails on any lane, the group uses per-lane selection. Other devices also use per-lane selection. Other CUDA errors propagate. [Mapping](../src/decoder_mtp.cpp#L400)<!-- prefix: "bool MtpDraf" --> · [Allocation](../src/decoder_verify.cpp#L426)<!-- prefix: "std::shared_" --> · [Per-lane selection](../src/decoder_mtp.cpp#L378)<!-- prefix: "void MtpDraf" -->
+
+### Target round
 
 Each target round starts with the latest committed token. Proposals supply subsequent inputs. The batch limits proposals to `K`, remaining outputs minus one, and assigned target rows minus one. Each proposal can add one target row. A lane assigned one verification row makes zero proposals. One remaining output uses ordinary eager decode. Zero budget finishes without allocating model state or running a forward. See [target row accounting](batch-graphs.md#runtime-path). [Batch assignment](../src/decoder_batch.cpp#L577)<!-- prefix: "if (results[" --> · [Zero-budget admission](../src/decoder_batch.cpp#L772)<!-- prefix: "if (const in" -->
 
@@ -94,9 +102,9 @@ fails in a later slice, the paired path attempts to append the prepared prefix
 before reporting the error. A draft preparation, projection, or append error
 marks the draft failed. A target final-normalization error leaves the draft's
 failure flag clear if the prepared prefix flush succeeds.
-[Append](../src/decoder_mtp.cpp#L616)<!-- prefix: "check(mxfp8_" --> ·
-[Target normalization failure](../src/decoder_mtp.cpp#L649)<!-- prefix: "append_prepa" --> ·
-[Draft preparation failure](../src/decoder_mtp.cpp#L671)<!-- prefix: "append_prepa" -->
+[Append](../src/decoder_mtp.cpp#L657)<!-- prefix: "check(mxfp8_" --> ·
+[Target normalization failure](../src/decoder_mtp.cpp#L690)<!-- prefix: "append_prepa" --> ·
+[Draft preparation failure](../src/decoder_mtp.cpp#L712)<!-- prefix: "append_prepa" -->
 
 For a recoverable verification graph setup failure, eager fallback requires ended capture, a drained stream, and successful handle cleanup. This disables only the verifier executable. A binding upload failure follows speculative step recovery without replaying the failed round. A verification launch error or unconfirmed capture cleanup disables the batch without reevaluating the target. Resources stay live until safe cleanup. [Graph recovery](../src/decoder_resources.cpp#L610)<!-- prefix: "const auto f" --> · [Launch](../src/decoder_resources.cpp#L687)<!-- prefix: "const auto l" -->
 
@@ -105,6 +113,8 @@ If a constrained draft row has no valid winner, drafting stops and the target ca
 ## Verification
 
 Run the [MTP acceptance procedure](../tests/mtp/README.md) with both release binaries, the pinned checkpoint, and a reserved B200. Require exit status zero. Use explicit K0 with matching target dispatch and prompt tiles as the control for IDs, finish reasons, and BF16 logits. Compare default generation with explicit K4. The runner checks budgets, stops, page crossings, counters, and capacity-one HTTP, including K4 disconnect recovery. At wider capacities, check SSE, finish reasons, usage, and full joint target dispatch. For seeding parity, pass a row-wise seed generator with the same target verifier to `--reference-generate`. [Runner](../tests/mtp/run_native.py#L1)<!-- prefix: "\"\"\"Opt-in re" -->
+
+For draft winner changes, compare winner IDs and scores with per-lane reduction. Require exact matches for waves of two, three, and four rows. Include ties across tiles and nonfinite inputs in both argmax modes. Test eager launches and graph replay with mapped storage. Trace the two grouped launches. Require zero explicit winner copies for the grouped reduction. Check per-lane fallback. Check the BF16 retry after an invalid INT8 winner.
 
 For seeding changes, compare paired RMSNorm and key-only preprocessing with the single-row operations. Compare full target logits, final-normalized rows, committed target KV and GDN state, and seeded draft KV byte for byte where the seed arithmetic agrees. Check later draft and verification logits and continued output. Exercise 1, 127, 128, 129, and 257 prompt positions and a longer multi-tile case. Cover the cache-enabled exact prefill path and the B200 Tensor Core path. Keep the MTP-off graph control. Disconnect during prefill before the first output. Check queued-request parity after retirement. [Paired RMSNorm](../src/text_normalization.cu#L439)<!-- prefix: "cudaError_t " --> · [Key preprocessing](../src/text_attention_gqa.cu#L191)<!-- prefix: "cudaError_t " -->
 

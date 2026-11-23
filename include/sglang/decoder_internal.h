@@ -514,13 +514,18 @@ struct Decoder::Model {
     bool verify_mtp(decoder::MtpRound* rounds, int count,
                     const decoder::ConstraintWorkspace& scratch, void* sampling_scratch,
                     cudaStream_t stream, decoder::VerificationGraph* graph,
-                    const decoder::TcVocabScratch* vocabulary) const;
+                    const decoder::TcVocabScratch* vocabulary,
+                    std::uint8_t* packed_activation = nullptr) const;
     bool forward_verify(const decoder::VerificationSequence* sequences, int count,
                         cudaStream_t stream, decoder::VerificationGraph* graph,
-                        const decoder::TcVocabScratch* vocabulary) const;
+                        const decoder::TcVocabScratch* vocabulary,
+                        std::uint8_t* packed_activation = nullptr) const;
     void enqueue_verification(const decoder::VerificationRow* rows, int count,
                               cudaStream_t stream,
-                              const decoder::TcVocabScratch* vocabulary = nullptr) const;
+                              const decoder::TcVocabScratch* vocabulary = nullptr,
+                              std::uint8_t* packed_activation = nullptr) const;
+    void forward_verification_layers(const decoder::VerificationRow* rows, int count,
+                                     cudaStream_t stream, std::uint8_t* packed_activation) const;
     void prefill_chunk(decoder::Request& request, const int* tokens, int rows, int position,
                        decoder::PrefillWorkspace& workspace,
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
@@ -563,7 +568,7 @@ struct Decoder::Model {
 
     template <typename Lane>
     void forward_layers(const Lane* lanes, int count, cudaStream_t stream,
-                        bool exact = false) const;
+                        bool exact = false, std::uint8_t* packed_activation = nullptr) const;
 
     int device;
     std::string accelerator_name;

@@ -199,7 +199,7 @@ cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void**
 
 cudaError_t configure(const void* kernel, int slot, int device, int& limit) {
     static std::mutex mutex;
-    static int limits[max_devices][15] = {};
+    static int limits[max_devices][17] = {};
     std::lock_guard lock(mutex);
     if (limits[device][slot] > 0) {
         limit = limits[device][slot];

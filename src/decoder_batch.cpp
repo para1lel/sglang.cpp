@@ -186,8 +186,14 @@ PrefillRows plan_wide_prefill(const BatchStorage& storage, const Selection& sele
     return rows;
 }
 
+struct WideMtpCandidates {
+    std::uint32_t speculative = 0;
+    std::uint32_t eligible = 0;
+    int eligible_count = 0;
+};
+
 StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int lanes,
-                   int budget, int& cursor, bool chunked) {
+                   int budget, int& cursor, bool chunked, WideMtpCandidates* wide) {
     BudgetLanes work{};
     for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
@@ -200,8 +206,40 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
         work[slot] = lane->remaining_prompt()
             ? BudgetLane{chunked ? lane->prefill_limit() : 1}
             : BudgetLane{0, lane->proposals(), true};
+        if (wide && work[slot].decode && lane->draft && lane->remaining_output() > 1) {
+            const auto bit = std::uint32_t{1} << slot;
+            wide->speculative |= bit;
+            if (work[slot].proposals == decoder_batch_max_mtp_steps &&
+                lane->remaining_output() >= target_verify_max_rows &&
+                !lane->options.constraint && !lane->sampling && !lane->options.top_logits) {
+                wide->eligible |= bit;
+                ++wide->eligible_count;
+            }
+        }
     }
     return plan_budget_step(work, lanes, budget, cursor, 0);
+}
+
+std::uint32_t wide_mtp_groups(const PrefillRows& decode, const WideMtpCandidates& candidates) {
+    if (candidates.eligible_count < wide_mtp_lanes) return 0;
+    std::uint32_t starts = 0;
+    int first = 0;
+    int count = 0;
+    bool eligible = true;
+    // Match the existing packet boundaries in ascending slot order, ignoring skipped lanes.
+    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+        const auto bit = std::uint32_t{1} << slot;
+        if (!(candidates.speculative & bit) || !decode[slot]) continue;
+        if (!count) first = slot;
+        eligible &= decode[slot] == target_verify_max_rows && (candidates.eligible & bit);
+        ++count;
+        if (count == wide_mtp_lanes || (count == decoder_batch_max_mtp_lanes && !eligible)) {
+            if (eligible) starts |= std::uint32_t{1} << first;
+            count = 0;
+            eligible = true;
+        }
+    }
+    return starts;
 }
 }
 struct DecoderBatch::State {
@@ -223,6 +261,10 @@ struct DecoderBatch::State {
         execution.open_stream(storage);
         storage->tc_vocab = model.tc_vocab && options.max_lanes >= 4
             ? prepare_tc_vocab_scratch(execution) : nullptr;
+        wide_mtp_enabled = model.backend.mtp_verification_lanes == wide_mtp_lanes &&
+            options.max_lanes >= wide_mtp_lanes &&
+            options.max_num_batched_tokens >= wide_mtp_rows &&
+            model.mtp_weights && storage->tc_vocab;
         if (options.resident_memory_limit) {
             residency.measure_available(available_device_bytes());
         }
@@ -231,11 +273,12 @@ struct DecoderBatch::State {
 
     Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats);
     void submit(const Selection& selected, const PrefillRows& decode, Steps& results,
-                DecoderBatchStepStats& stats, bool& contains_mtp);
+                DecoderBatchStepStats& stats, bool& contains_mtp, std::uint32_t wide_groups);
     void prefill(const PrefillRows& rows, bool only_prefill, DecoderBatchStepStats& stats);
     void score(int slot, Lane& lane, Workspace& work, bool logits_ready);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
-                         DecoderBatchStepStats& stats);
+                         DecoderBatchStepStats& stats, std::uint32_t wide_groups);
+    bool prepare_wide_mtp();
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring,
                         const PrefillRows& rows, Steps& results);
     std::size_t reserve(DecoderOptions& request, int prompt, std::size_t extra_bytes) const;
@@ -290,6 +333,8 @@ struct DecoderBatch::State {
     KvResidencyPolicy residency;
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;
+    std::uint8_t* wide_mtp_activation = nullptr;
+    bool wide_mtp_enabled = false;
     std::byte* sampling_workspace = nullptr;
     std::byte* logprob_workspace = nullptr;
     GeneratedLogprobReadback* logprob_readback = nullptr;
@@ -528,7 +573,8 @@ void DecoderBatch::State::score(int slot, Lane& lane, Workspace& work, bool logi
 }
 
 void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& decode,
-                                 Steps& results, DecoderBatchStepStats& stats, bool& contains_mtp) {
+                                 Steps& results, DecoderBatchStepStats& stats, bool& contains_mtp,
+                                 std::uint32_t wide_groups) {
     const auto stream = execution.stream();
     const auto& rows = stats.prefill_rows;
     auto& slots = storage->slots;
@@ -609,7 +655,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     }
     stats.constraint_workspace_bytes = constraint_workspace.bytes();
     for (int next_slot = 0; contains_mtp && next_slot < options.max_lanes;) {
-        speculate_group(speculative, next_slot, results, stats);
+        speculate_group(speculative, next_slot, results, stats, wide_groups);
     }
     stats.sampling_workspace_bytes = sampling_workspace ? sampling_workspace_bytes() : 0;
     if (stats.verification_lanes == 0 && submitted) {
@@ -699,18 +745,44 @@ void DecoderBatch::State::collect_scores(
     }
 }
 
+bool DecoderBatch::State::prepare_wide_mtp() {
+    if (wide_mtp_activation) return true;
+    constexpr std::size_t bytes = wide_mtp_rows * intermediate_size;
+    if (residency.resident() && available_device_bytes() < decoder_shared_reserve + bytes) {
+        wide_mtp_enabled = false;
+        return false;
+    }
+    check(cudaPeekAtLastError(), "Check CUDA status before allocating M40 verification scratch");
+    try {
+        wide_mtp_activation = execution.allocate<std::uint8_t>(bytes);
+        return true;
+    } catch (const CudaError& error) {
+        if (error.status != cudaErrorMemoryAllocation) throw;
+        const auto pending = cudaGetLastError();
+        if (pending != cudaErrorMemoryAllocation) {
+            check(pending, "Check CUDA status before four-lane verification fallback");
+        }
+        wide_mtp_enabled = false;
+        return false;
+    }
+}
+
 void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, int& next_slot,
-                                          Steps& results, DecoderBatchStepStats& stats) {
+                                          Steps& results, DecoderBatchStepStats& stats,
+                                          std::uint32_t wide_groups) {
     const auto stream = execution.stream();
-    std::array<MtpRound, decoder_batch_max_mtp_lanes> rounds;
-    std::array<int, decoder_batch_max_mtp_lanes> slots;
+    constexpr int packet = decoder_batch_max_mtp_lanes;
+    int limit = packet;
+    std::array<MtpRound, wide_mtp_lanes> rounds;
+    std::array<int, wide_mtp_lanes> slots;
     int count = 0;
-    while (next_slot < options.max_lanes && count < decoder_batch_max_mtp_lanes) {
+    while (next_slot < options.max_lanes && count < limit) {
         const int slot = next_slot++;
         const int rows = verification_rows[slot];
         if (rows == 0) {
             continue;
         }
+        if (count == 0 && ((wide_groups >> slot) & 1)) limit = wide_mtp_lanes;
         auto& lane = *storage->slots[slot];
         const int capacity = lane.proposals() + 1;
         if (!lane.verification) {
@@ -733,7 +805,12 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     }
     if (count == 0) return;
     const auto& cancel = cancel_probe();
-    if (!MtpRound::propose_all(rounds.data(), count, constraint_workspace, stream, cancel)) {
+    const auto propose = [&](int first, int size) {
+        return MtpRound::propose_all(rounds.data() + first, size, constraint_workspace,
+                                     stream, cancel);
+    };
+    if (!propose(0, std::min(count, packet)) ||
+        (count == wide_mtp_lanes && !propose(packet, packet))) {
         check(cudaStreamSynchronize(stream), "Complete cancelled MTP draft wave");
         for (int index = 0; index < count; ++index) {
             auto& result = results[slots[index]];
@@ -743,20 +820,38 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         return;
     }
     auto* graph = storage->verification_graph ? &*storage->verification_graph : nullptr;
-    if (model.verify_mtp(rounds.data(), count, constraint_workspace, sampling_workspace,
-                         stream, graph, storage->tc_vocab.get())) {
-        stats.verification_graph_slots |= std::uint32_t{1} << slots[0];
+    const auto verify = [&](int first, int size, std::uint8_t* activation = nullptr) {
+        if (model.verify_mtp(rounds.data() + first, size, constraint_workspace, sampling_workspace,
+                             stream, graph, storage->tc_vocab.get(), activation)) {
+            stats.verification_graph_slots |= std::uint32_t{1} << slots[first];
+        }
+    };
+    const auto commit = [&](int first, int size) {
+        std::array<DraftRepairs, packet> repairs{};
+        for (int index = 0; index < size; ++index) {
+            auto& round = rounds[first + index];
+            const int slot = slots[first + index];
+            stats.verification_rows += round.rows();
+            auto* repair = size > 1 && !round.constraint ? repairs[index].data() : nullptr;
+            storage->slots[slot]->finish_round(round, results[slot], stream, output, cancel,
+                                               repair);
+        }
+        repair_draft_wave(repairs, size, stream);
+        check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
+        stats.verification_lanes += size;
+    };
+    if (count == wide_mtp_lanes && std::all_of(rounds.begin(), rounds.end(),
+            [](const auto& round) { return round.rows() == target_verify_max_rows; })) {
+        verify(0, count, wide_mtp_activation);
+        commit(0, packet);
+        commit(packet, packet);
+        return;
     }
-    std::array<DraftRepairs, decoder_batch_max_mtp_lanes> repairs{};
-    for (int index = 0; index < count; ++index) {
-        stats.verification_rows += rounds[index].rows();
-        auto* repair = count > 1 && !rounds[index].constraint ? repairs[index].data() : nullptr;
-        storage->slots[slots[index]]->finish_round(
-            rounds[index], results[slots[index]], stream, output, cancel, repair);
+    for (int first = 0; first < count; first += packet) {
+        const int size = std::min(count - first, packet);
+        verify(first, size);
+        commit(first, size);
     }
-    repair_draft_wave(repairs, count, stream);
-    check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
-    stats.verification_lanes += count;
 }
 
 Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
@@ -769,9 +864,11 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         Steps results{};
         DecoderBatchStepStats current;
         PrefillRows decode{};
+        WideMtpCandidates wide;
         if (const int budget = options.max_num_batched_tokens; budget) {
-            const auto plan =
-                plan_step(*storage, selected, options.max_lanes, budget, prefill_cursor, chunked);
+            const auto plan = plan_step(*storage, selected, options.max_lanes, budget,
+                                        prefill_cursor, chunked,
+                                        wide_mtp_enabled && !output ? &wide : nullptr);
             current.prefill_rows = plan.prefill;
             decode = plan.decode;
         } else if (chunked && options.max_lanes > decoder_batch_max_mtp_lanes) {
@@ -781,7 +878,12 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             current.prefill_rows = plan_prefill(*storage, selected, chunked);
         }
         const auto live_before = stats ? request_bytes(*storage) : 0;
-        submit(selected, decode, results, current, contains_mtp);
+        auto wide_groups = wide_mtp_groups(decode, wide);
+        if (wide_groups) {
+            contains_mtp = true;
+            if (!prepare_wide_mtp()) wide_groups = 0;
+        }
+        submit(selected, decode, results, current, contains_mtp, wide_groups);
         if (stats) {
             current.peak_request_bytes = std::max(live_before + current.prefill_workspace_bytes,
                                                  request_bytes(*storage));

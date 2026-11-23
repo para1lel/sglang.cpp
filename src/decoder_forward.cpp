@@ -5,7 +5,6 @@
 #include "sglang/decoder_verify.h"
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/text/target_fp8.h"
-#include "sglang/text/mtp/tc_vocab.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -51,6 +50,8 @@ Workspace& workspace(const BatchGraphLane& lane) {
     return *lane.work;
 }
 
+static_assert(wide_mtp_rows == text_target_fp8_m40_rows);
+
 template <typename Lane>
 struct LayerBatch {
     const Lane* lanes;
@@ -61,6 +62,14 @@ struct LayerBatch {
     bool vector_attention = false;
     bool grouped_target_attention = false;
     int target_split_end = 0;
+    std::uint8_t* packed_activation = nullptr;
+
+    LayerBatch verification_packet(int first) const {
+        auto packet = *this;
+        packet.lanes += first;
+        packet.count = verification_packet_rows;
+        return packet;
+    }
 
     bool tensor_core_lane(int index) const {
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
@@ -99,7 +108,8 @@ struct LayerBatch {
             static_assert(WideVerifyQuantizeRows::capacity * intermediate_size <=
                           vocab_size * sizeof(Bf16));
             // Each projection consumes this input before the stream reuses logits scratch.
-            auto* packed = reinterpret_cast<std::uint8_t*>(workspace(lanes[0]).logits);
+            auto* packed = packed_activation ? packed_activation
+                : reinterpret_cast<std::uint8_t*>(workspace(lanes[0]).logits);
             activation.values = packed + index * width;
         }
         return activation;
@@ -155,14 +165,18 @@ struct LayerBatch {
                                     Bf16* Workspace::*up = nullptr) const {
         static_assert(WideVerifyQuantizeRows::capacity ==
                       target_verify_max_rows * decoder_batch_max_mtp_lanes);
-        WideVerifyQuantizeRows rows{};
-        for (int index = 0; index < count; ++index) {
-            auto& work = workspace(lanes[index]);
-            rows.entries[index] = {
-                work.*source, up ? work.*up : nullptr, projection_activation(index, width)};
+        constexpr int capacity = WideVerifyQuantizeRows::capacity;
+        for (int first = 0; first < count; first += capacity) {
+            WideVerifyQuantizeRows rows{};
+            const int size = std::min(count - first, capacity);
+            for (int index = 0; index < size; ++index) {
+                auto& work = workspace(lanes[first + index]);
+                rows.entries[index] = {work.*source, up ? work.*up : nullptr,
+                                       projection_activation(first + index, width)};
+            }
+            check(verify_quantize_fp8_wide(rows, size, width, stream),
+                  "Quantize wide verification rows");
         }
-        check(verify_quantize_fp8_wide(rows, count, width, stream),
-              "Quantize wide verification rows");
     }
 
     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
@@ -216,9 +230,10 @@ struct LayerBatch {
         }
     }
 
+    template <int Capacity = text_target_fp8_max_rows>
     bool project_target_chunk(std::initializer_list<LayerProjection> layers, int first,
                               int rows, bool allow_fallback) const {
-        std::array<TextFp8Projection, text_decode_max_targets * text_target_fp8_max_rows> operands;
+        std::array<TextFp8Projection, text_decode_max_targets * Capacity> operands;
         std::array<TextFp8DecodeTarget, text_decode_max_targets> targets;
         const int columns = layers.begin()->weight.columns;
         int target = 0;
@@ -258,6 +273,20 @@ struct LayerBatch {
 
     void project_target(std::initializer_list<LayerProjection> layers) const {
         constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
+        if constexpr (verification) {
+            if (count == wide_mtp_rows) {
+                if (project_target_chunk<wide_mtp_rows>(layers, 0, count, false)) return;
+                for (int first = 0; first < count; first += verification_packet_rows) {
+                    if (!project_target_chunk(layers, first, verification_packet_rows, false)) {
+                        for (int row = first; row < first + verification_packet_rows;
+                             row += text_fp8_max_batch) {
+                            project_target_chunk(layers, row, text_fp8_max_batch, true);
+                        }
+                    }
+                }
+                return;
+            }
+        }
         int first = 0;
         if constexpr (verification) {
             const int groups = (count - 1) / text_target_fp8_max_rows + 1;
@@ -279,21 +308,6 @@ struct LayerBatch {
     }
 };
 
-void project(Bf16Weight weight, const LayerBatch<VerificationRow>& batch,
-             Bf16* Workspace::*output) {
-    std::array<TextBf16Projection, text_fp8_max_batch> projections;
-    for (int first = 0, group = 0; first < batch.count; ++group) {
-        const int rows = batch.projection_rows(group);
-        for (int index = 0; index < rows; ++index) {
-            const auto& work = workspace(batch.lanes[first + index]);
-            projections[index] = {work.normalized, work.*output};
-        }
-        check(text_bf16_gemm(weight.values, weight.rows, weight.columns, projections.data(),
-                             rows, batch.stream), "Run batched BF16 projection");
-        first += rows;
-    }
-}
-
 constexpr int wide_gdn_rows = GdnVerificationBatch::lanes * GdnVerificationBatch::rows;
 static_assert(GdnVerificationBatch::lanes == decoder_batch_max_mtp_lanes);
 static_assert(GdnVerificationBatch::rows == target_verify_max_rows);
@@ -303,8 +317,10 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
     if (!batch.target_tc || batch.count < 2 ||
         layer.b.rows != text_gdn_value_heads || layer.a.rows != text_gdn_value_heads ||
         layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
-        project(layer.b, batch, &Workspace::gdn_b);
-        project(layer.a, batch, &Workspace::gdn_a);
+        project_verification_bf16(layer.b, batch.lanes, batch.count, &Workspace::gdn_b,
+                                  batch.stream);
+        project_verification_bf16(layer.a, batch.lanes, batch.count, &Workspace::gdn_a,
+                                  batch.stream);
         return;
     }
     std::array<VerifyGdnGateRow, wide_gdn_rows> gates;
@@ -389,7 +405,21 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
     const bool batched = batch.target_tc && !first.binding && batch.count == wide_gdn_rows;
-    project_gdn_gates(layer, batch, batched);
+    if (batch.count == wide_mtp_rows) {
+        for (int start = 0; start < batch.count; start += wide_gdn_rows) {
+            const auto packet = batch.verification_packet(start);
+            project_gdn_gates(layer, packet, true);
+            GdnVerificationBatch states;
+            for (int lane = 0; lane < GdnVerificationBatch::lanes; ++lane) {
+                states.entries[lane] = packet.lanes[lane].verification->gdn_lane(
+                    state_index, layer.recurrent);
+            }
+            check(decode_verify_gdn_batch(states, layer.recurrent, batch.stream),
+                  "Advance batched target verification GDN packet");
+        }
+    } else {
+        project_gdn_gates(layer, batch, batched);
+    }
     if (first.binding) {
         auto& scratch = *first.graph_workspace;
         check(decode_verify_gdn(batch.count, scratch.replay[state_index].inputs,
@@ -406,7 +436,7 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
         }
         check(decode_verify_gdn_batch(states, layer.recurrent, batch.stream),
               "Advance batched target verification GDN");
-    } else {
+    } else if (batch.count != wide_mtp_rows) {
         batch.each([&](const VerificationRow& row, Workspace&) {
             if (row.first) {
                 row.verification->advance_gdn(state_index, layer.recurrent);
@@ -659,10 +689,21 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     } else if constexpr (std::is_same_v<Lane, VerificationRow>) {
         if (batch.lanes[0].binding) {
             attend_verify_gqa(layer, batch, cache_index);
-        } else if (!try_gqa_verify_batch(layer, batch.lanes, batch.count, cache_index,
-                                         batch.vector_attention, batch.target_split_end,
-                                         batch.stream)) {
-            attend_eager_gqa(layer, batch, cache_index);
+        } else {
+            const auto attend = [&](const auto& packet) {
+                if (!try_gqa_verify_batch(layer, packet.lanes, packet.count, cache_index,
+                                          packet.vector_attention, packet.target_split_end,
+                                          packet.stream)) {
+                    attend_eager_gqa(layer, packet, cache_index);
+                }
+            };
+            if (batch.count == wide_mtp_rows) {
+                for (int first = 0; first < batch.count; first += verification_packet_rows) {
+                    attend(batch.verification_packet(first));
+                }
+            } else {
+                attend(batch);
+            }
         }
     } else {
         attend_eager_gqa(layer, batch, cache_index);
@@ -742,125 +783,10 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
     }
 }
 
-bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
-                                void* sampling_scratch, cudaStream_t stream,
-                                VerificationGraph* graph, const TcVocabScratch* vocabulary) const {
-    std::array<VerificationSequence, decoder_batch_max_mtp_lanes> sequences;
-    std::array<TargetVerification*, decoder_batch_max_mtp_lanes> verifiers;
-    if (count < 1 || count > decoder_batch_max_mtp_lanes) {
-        throw std::invalid_argument("Invalid number of MTP rounds");
-    }
-    for (int index = 0; index < count; ++index) {
-        const auto& round = rounds[index];
-        const int rows = round.rows();
-        verifiers[index] = round.target;
-        sequences[index] = {round.target, round.position, round.tokens.data(), rows,
-                            round.constraint != nullptr};
-        if (round.constraint || round.sampling || round.target->needs_logits() ||
-            rows != target_verify_max_rows) {
-            vocabulary = nullptr;
-        }
-    }
-    const bool replayed = forward_verify(sequences.data(), count, stream, graph, vocabulary);
-    for (int index = 0; index < count; ++index) {
-        const auto& round = rounds[index];
-        if (round.constraint) {
-            round.target->constrain(*round.constraint, scratch, round.sampling, round.first_output,
-                                    sampling_scratch);
-        } else if (round.sampling) {
-            round.target->sample(*round.sampling, round.first_output, sampling_scratch);
-        }
-    }
-    TargetVerification::read_all(verifiers.data(), count, stream);
-    return replayed;
-}
-
-bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int count,
-                                    cudaStream_t stream, VerificationGraph* graph,
-                                    const TcVocabScratch* vocabulary) const {
-    if (!sequences || count < 1 || count > decoder_batch_max_mtp_lanes) {
-        throw std::invalid_argument("Invalid number of verification sequences");
-    }
-    constexpr int max_rows = target_verify_max_rows * decoder_batch_max_mtp_lanes;
-    int total = 0;
-    int longest = 0;
-    for (int index = 0; index < count; ++index) {
-        const auto& sequence = sequences[index];
-        if (!sequence.verification || !sequence.tokens ||
-            sequence.count < 1 || sequence.count > target_verify_max_rows) {
-            throw std::invalid_argument("Invalid number of verification rows");
-        }
-        total += sequence.count;
-        longest = std::max(longest, sequence.count);
-        sequence.verification->begin(sequence.position, sequence.count, stream);
-    }
-    const auto& first = sequences[0];
-    if (graph && count == 1 && !first.constrained && first.verification->graph_eligible(first) &&
-        std::exchange(graph->warmed, true)) {
-        const bool replayed = graph->execution.replay_batch_graph(1, [&] {
-            graph->scratch = std::make_unique<VerificationGraphScratch>(device);
-        }, [&] {
-            auto& scratch = *graph->scratch;
-            auto* binding = scratch.device_binding;
-            std::array<VerificationRow, k1_verification_rows> rows;
-            for (int index = 0; index < k1_verification_rows; ++index) {
-                auto& work = scratch.workspace.work[index];
-                rows[index] = {nullptr, &work, 0, nullptr, index == 0, binding, &scratch.workspace};
-                check(decode_embedding(embedding, vocab_size, hidden_size, &binding->inputs[index],
-                                       work.residual, stream), "Look up bound verification input");
-            }
-            enqueue_verification(rows.data(), k1_verification_rows, stream);
-        }, [&] {
-            graph->scratch->upload(first, stream);
-            return true;
-        }, true);
-        if (replayed) {
-            first.verification->use_graph_workspace(graph->scratch->workspace);
-            return true;
-        }
-        graph->scratch.reset();
-    }
-    std::array<VerificationRow, max_rows> rows;
-    int next = 0;
-    for (int index = 0; index < longest; ++index) {
-        for (int lane = 0; lane < count; ++lane) {
-            const auto& sequence = sequences[lane];
-            if (index < sequence.count) {
-                auto row = sequence.verification->row(index);
-                row.constrained = sequence.constrained;
-                rows[next++] = row;
-                check(text_embedding(embedding, vocab_size, hidden_size, sequence.tokens[index],
-                                     row.work->residual, stream), "Look up verification input");
-            }
-        }
-    }
-    enqueue_verification(rows.data(), total, stream, vocabulary);
-    return false;
-}
-
-void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count,
-                                          cudaStream_t stream,
-                                          const TcVocabScratch* vocabulary) const {
-    forward_layers(rows, count, stream);
-    const LayerBatch<VerificationRow> batch{rows, count, stream};
-    batch.each([&](const VerificationRow&, Workspace& work) { normalize_final(work, stream); });
-    if (vocabulary && count == tc_vocab_rows) {
-        std::array<TcVocabRow, tc_vocab_rows> projection;
-        for (int index = 0; index < count; ++index) {
-            const auto& work = *rows[index].work;
-            projection[index] = {work.normalized, work.argmax};
-        }
-        if (try_tc_vocab(*tc_vocab, *vocabulary, projection, stream)) {
-            return;
-        }
-    }
-    project(lm_head, batch, &Workspace::logits);
-    batch.each([&](const VerificationRow& row, Workspace& work) {
-        if (!row.constrained) {
-            check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
-                  "Select target verification winner");
-        }
-    });
+void Decoder::Model::forward_verification_layers(const VerificationRow* rows, int count,
+                                                  cudaStream_t stream,
+                                                  std::uint8_t* packed_activation) const {
+    forward_layers(rows, count, stream, false, packed_activation);
 }
 
 void Decoder::Model::decode_graph(Request& request) const {
@@ -903,7 +829,7 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
 
 template <typename Lane>
 void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream,
-                                    bool exact) const {
+                                    bool exact, std::uint8_t* packed_activation) const {
     const LayerBatch<Lane> batch{
         lanes, count, stream,
         backend.ordered_attention && !exact,
@@ -911,6 +837,7 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
         backend.vector_decode_attention && !exact,
         backend.grouped_target_attention && !exact,
         exact ? 0 : backend.target_split_end,
+        packed_activation,
     };
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
         if (batch.fuse_verify_activation()) {
@@ -926,14 +853,19 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
             return;
         }
         if (batch.fuse_wide_verify_norm()) {
-            WideVerifyRmsQuantizeRows rows{};
-            for (int index = 0; index < count; ++index) {
-                auto& work = workspace(lanes[index]);
-                const auto [branch, residual] = residuals(work);
-                rows.entries[index] = {branch, residual, work.normalized,
-                                       batch.projection_activation(index, hidden_size)};
+            constexpr int capacity = WideVerifyRmsQuantizeRows::capacity;
+            for (int first = 0; first < count; first += capacity) {
+                WideVerifyRmsQuantizeRows rows{};
+                const int size = std::min(count - first, capacity);
+                for (int index = 0; index < size; ++index) {
+                    auto& work = workspace(lanes[first + index]);
+                    const auto [branch, residual] = residuals(work);
+                    rows.entries[index] = {
+                        branch, residual, work.normalized,
+                        batch.projection_activation(first + index, hidden_size)};
+                }
+                check(verify_rms_quantize_wide(rows, size, weight, stream), operation);
             }
-            check(verify_rms_quantize_wide(rows, count, weight, stream), operation);
             return;
         }
         batch.each([&](const Lane&, Workspace& work) {

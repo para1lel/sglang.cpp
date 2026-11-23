@@ -290,13 +290,23 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
     const TextFp8DecodeTarget* projections, int target_count, const std::uint8_t* packed_values,
     int in_width, const TextFp8Projection* rows, int count, cudaStream_t stream) {
     const TextFp8ActivationView input{packed_values, nullptr};
-    if (count < 2 || count > text_target_fp8_max_rows ||
+    if (count < 2 || (count > text_target_fp8_max_rows && count != text_target_fp8_m40_rows) ||
         !supported_targets(projections, target_count, in_width, input)) {
         return std::nullopt;
     }
     LaunchTarget target{};
     if (auto prepared = prepare_launch(stream, target); !prepared || *prepared != cudaSuccess) {
         return prepared;
+    }
+    if (count == text_target_fp8_m40_rows) {
+        if (in_width == hidden_width && target_count == 2 &&
+            projections[0].out_width == intermediate_width &&
+            projections[1].out_width == intermediate_width) {
+            return launch_rows<64, mlp_slots, text_target_fp8_m40_rows>(
+                target, projections, target_count, input, in_width, rows, count, 15, stream);
+        }
+        return launch_rows<64, stages, text_target_fp8_m40_rows>(
+            target, projections, target_count, input, in_width, rows, count, 16, stream);
     }
     if (count <= text_fp8_max_batch) {
         return launch_rows<8, stages, text_fp8_max_batch>(

@@ -4,6 +4,8 @@ typedef struct cudaDeviceProp cudaDeviceProp;
 
 namespace sglang::decoder {
 
+inline constexpr int wide_mtp_lanes = 8;
+
 struct DraftOperatorCapabilities {
     bool int8_head;
     bool online_attention;
@@ -22,6 +24,7 @@ struct CudaBackendPolicy {
     bool grouped_target_attention;
     bool paired_prefill;
     bool tensor_core_prefill;
+    int mtp_verification_lanes;
     int target_split_end;
     int prefill_tile_rows;
     DraftOperatorCapabilities draft;

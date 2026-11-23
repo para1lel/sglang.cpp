@@ -30,7 +30,7 @@ std::optional<cudaError_t> try_target_fp8_tc(const TextFp8DecodeTarget* targets,
                                            __nv_bfloat16* scratch, cudaStream_t stream) {
     if (!rows || !targets || target_count < 1 || target_count > text_decode_max_targets ||
         in_width < group_size || in_width % group_size || count < 1 ||
-        count > text_target_fp8_max_rows) {
+        (count > text_target_fp8_max_rows && count != text_target_fp8_m40_rows)) {
         return std::nullopt;
     }
     for (int index = 0; index < target_count; ++index) {
@@ -61,8 +61,13 @@ std::optional<cudaError_t> try_target_fp8_tc(const TextFp8DecodeTarget* targets,
             !rows[row].input.scales) {
             return std::nullopt;
         }
-        operands.values[row] = rows[row].input.values;
-        already_packed &= operands.values[row] == packed_input + row * in_width;
+        if (row < text_target_fp8_max_rows) {
+            operands.values[row] = rows[row].input.values;
+        }
+        already_packed &= rows[row].input.values == packed_input + row * in_width;
+    }
+    if (!already_packed && count == text_target_fp8_m40_rows) {
+        return std::nullopt;
     }
     if (!already_packed) {
         constexpr int threads = 128;

@@ -7,6 +7,7 @@
 namespace sglang {
 
 inline constexpr int text_target_fp8_max_rows = 24;
+inline constexpr int text_target_fp8_m40_rows = 40;
 
 std::optional<cudaError_t> try_target_fp8_tc(const TextFp8DecodeTarget* targets,
                                            int target_count, int in_width,

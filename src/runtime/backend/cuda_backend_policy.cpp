@@ -1,5 +1,6 @@
 #include "sglang/runtime/backend/cuda_backend_policy.h"
 
+#include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_prefill.h"
 
@@ -21,6 +22,7 @@ CudaBackendPolicy CudaBackendPolicy::for_device(const cudaDeviceProp& properties
     backend.grouped_target_attention = b200;
     backend.paired_prefill = b200;
     backend.tensor_core_prefill = b200;
+    backend.mtp_verification_lanes = b200 ? wide_mtp_lanes : decoder_batch_max_mtp_lanes;
     backend.target_split_end = b200 ? text_attention_max_tokens : 0;
     backend.prefill_tile_rows = b200 ? batch_prefill_tile_rows : text_embedding_max_rows;
     backend.draft.int8_head = b200;

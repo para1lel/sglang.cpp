@@ -45,7 +45,7 @@ Full tiles pack the step's available budget into fewer grants and can enable 1,0
 
 The earlier K0 planner tested fair-share, tiled, and grouped schedules. Its measured cases used the historical selector and K0 rules. Recover the planner and run notes at the original revisions. [K0 campaign](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-measurement-ledger.md) · [Previous workspace guide](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#tiled-prefill-under-saturation)
 
-The scheduler considers projection grouping for pure B200 tensor-core text prefill with prefix reuse off and a step budget of 1–8,192 tokens. It bypasses grouping for decode, restored prompt work, or label scoring. A step with exact grants, media, or prompt-logprob capture uses ordinary dispatch. [Step classification](../src/decoder_batch.cpp#L596)<!-- prefix: "if (max_rows" --> · [Step dispatch](../src/decoder_batch.cpp#L661)<!-- prefix: "if (count &&" -->
+The scheduler considers projection grouping for pure B200 tensor-core text prefill with prefix reuse off and a step budget of 1–8,192 tokens. It bypasses grouping for decode, restored prompt work, or label scoring. A step with exact grants, media, or prompt-logprob capture uses ordinary dispatch. [Step classification](../src/decoder_batch.cpp#L642)<!-- prefix: "if (max_rows" --> · [Step dispatch](../src/decoder_batch.cpp#L707)<!-- prefix: "if (count &&" -->
 
 ### Projection pairs for MTP
 

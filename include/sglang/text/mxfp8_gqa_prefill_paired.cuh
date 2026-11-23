@@ -313,11 +313,14 @@ struct alignas(1024) StagedSingleTile {
 static_assert(offsetof(StagedSingleTile, key) % 1024 == 0 &&
               offsetof(StagedSingleTile, value) % 1024 == 0);
 
-template <bool Key>
-__device__ void single_stage(StagedSingleTile& tile, const StagedPairMaps& maps,
+template <bool Key, class Tile>
+__device__ void single_stage(Tile& tile, const StagedPairMaps& maps,
                              const int* invalid, int page_base, int kv_head, int end) {
     const auto* map = Key ? &maps.keys : &maps.values;
-    auto& destination = Key ? tile.key : tile.value;
+    auto& destination = [&]() -> auto& {
+        if constexpr (Key) return tile.key;
+        else return tile.value;
+    }();
     auto& ready = Key ? tile.key_ready : tile.value_ready;
     for (int chunk = 0; chunk * flash_keys < end; ++chunk) {
         const int stage = chunk & 1;
@@ -351,6 +354,26 @@ __device__ void single_issue_score(StagedSingleTile& tile, int chunk) {
                                tmem_scores + score_slot * flash_keys, k_slot);
 }
 
+template <class Tile>
+__device__ void issue_staged_value(Tile& tile, int chunk, Word probability) {
+    const int stage = chunk & 1;
+    #pragma unroll
+    for (int token = 0; token < flash_keys; token += 16) {
+        constexpr Word format = (1u << 4) | (1u << 7) | (1u << 10);
+        constexpr Word shape = ((flash_queries / 16) << 24) |
+                               ((channels / 8) << 17) | (1u << 16);
+        const Word p = tile.tmem + probability + token / 2;
+        const auto v = tmem_descriptor<true>(&tile.value[stage][0][token][0]);
+        asm volatile("{ .reg .pred accum;\n"
+                     "setp.ne.u32 accum, %4, 0;\n"
+                     "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, "
+                     "{%5,%5,%5,%5}, accum; }"
+                     :: "r"(tile.tmem), "r"(p), "l"(v), "r"(shape | format),
+                        "r"(static_cast<int>(chunk != 0 || token != 0)), "r"(0) : "memory");
+    }
+    tmem_commit(tmem_smem(&tile.output_ready[stage]));
+}
+
 __device__ void single_issue_mmas(StagedSingleTile& tile, int end) {
     single_issue_score(tile, 0);
     if (end > flash_keys) single_issue_score(tile, 1);
@@ -361,26 +384,10 @@ __device__ void single_issue_mmas(StagedSingleTile& tile, int end) {
         const Word phase = (chunk >> 1) & 1;
         tmem_copy_wait(tmem_smem(&tile.value_ready[stage]), phase);
         tmem_mma_wait(tmem_smem(&tile.probability_ready[stage]), phase);
-        #pragma unroll
-        for (int token = 0; token < flash_keys; token += 16) {
-            constexpr Word format = (1u << 4) | (1u << 7) | (1u << 10);
-            constexpr Word shape = ((flash_queries / 16) << 24) |
-                                   ((channels / 8) << 17) | (1u << 16);
-            const Word p = tile.tmem + staged_single_probability +
-                           stage * (flash_keys / 2) + token / 2;
-            const auto v = tmem_descriptor<true>(&tile.value[stage][0][token][0]);
-            asm volatile("{ .reg .pred accum;\n"
-                         "setp.ne.u32 accum, %4, 0;\n"
-                         "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, "
-                         "{%5,%5,%5,%5}, accum; }"
-                         :: "r"(tile.tmem), "r"(p), "l"(v), "r"(shape | format),
-                            "r"(static_cast<int>(chunk != 0 || token != 0)), "r"(0) : "memory");
-        }
-        tmem_commit(tmem_smem(&tile.output_ready[stage]));
+        issue_staged_value(tile, chunk, staged_single_probability + stage * (flash_keys / 2));
     }
 }
 
-template <bool Partial = false>
 __global__ __launch_bounds__(256, 1) void tmem_staged_single_attention(
     const __grid_constant__ StagedRequests<4> requests,
     const __grid_constant__ StagedPairMaps maps, const int* invalid) {
@@ -390,12 +397,9 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_single_attention(
     const int row = blockIdx.x * flash_rows;
     const int head = blockIdx.y * ordered_heads;
     const int position = request.position + row;
-    const int active_rows = Partial ? min(flash_rows, requests.rows[requests.lane()] - row)
-                                    : flash_rows;
-    if (active_rows <= 0) return;
+    constexpr int active_rows = flash_rows;
     const int end = position + active_rows;
-    const int page_base = Partial ? requests.page_base[requests.lane()] :
-        requests.lane() * ((request.position + flash_chunk) / mxfp8_page_size);
+    const int page_base = requests.lane() * ((request.position + flash_chunk) / mxfp8_page_size);
     const int warp = threadIdx.x / 32;
     if (threadIdx.x == 0) {
         tile.bad_key = INT_MAX;
@@ -463,9 +467,11 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_single_attention(
     tmem_repair_ordered(tile, request, row, head, active_rows);
 }
 
+#include "sglang/text/mxfp8_gqa_prefill_page.cuh"
+
 std::optional<cudaError_t> encode_staged_maps(int full_pages, std::uint16_t* keys,
                                            std::uint16_t* values, StagedPairMaps& maps,
-                                           bool single = false) {
+                                           bool single = false, bool page = false) {
     void* entry = nullptr;
     cudaDriverEntryPointQueryResult query{};
     const auto status = cudaGetDriverEntryPointByVersion(
@@ -485,7 +491,8 @@ std::optional<cudaError_t> encode_staged_maps(int full_pages, std::uint16_t* key
     const cuuint64_t shape[] = {tmem_swizzle, mxfp8_page_size,
         static_cast<cuuint64_t>(full_pages) * mxfp8_kv_heads * staged_planes};
     constexpr cuuint32_t elements[] = {1, 1, 1};
-    const cuuint32_t key_box[] = {tmem_swizzle, single ? flash_keys : pair_key_rows, staged_planes};
+    const cuuint32_t key_rows = page ? mxfp8_page_size : (single ? flash_keys : pair_key_rows);
+    const cuuint32_t key_box[] = {tmem_swizzle, key_rows, staged_planes};
     const cuuint32_t value_box[] = {
         tmem_swizzle, flash_keys, single ? staged_planes : staged_planes / 2};
     const auto encode_map = [&](CUtensorMap& map, void* source, const cuuint32_t* box) {
@@ -650,7 +657,8 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
     bool single = false;
     if constexpr (Count == 4) {
         if (Partial || position % flash_chunk == 0) {
-            const auto local = reinterpret_cast<const void*>(tmem_staged_single_attention<Partial>);
+            const auto local = reinterpret_cast<const void*>(
+                Partial ? tmem_staged_page_attention : tmem_staged_single_attention);
             auto local_config = config;
             local_config.dynamicSmemBytes = sizeof(StagedSingleTile);
             if constexpr (Partial) {
@@ -661,7 +669,8 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
             const auto prepared = prepare_staged_single_kernel(local, local_config);
             if (prepared && *prepared != cudaSuccess) return prepared;
             if (prepared) {
-                const auto encoded = encode_staged_maps(total_pages, keys, values, maps, true);
+                const auto encoded = encode_staged_maps(total_pages, keys, values, maps,
+                                                        true, Partial);
                 if (encoded && *encoded != cudaSuccess && *encoded != cudaErrorMemoryAllocation) {
                     return encoded;
                 }

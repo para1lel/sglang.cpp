@@ -390,7 +390,7 @@ std::optional<cudaError_t> launch_staged_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
     const Bf16* queries, Bf16* output, cudaStream_t stream,
     decoder::PairedPrefillScratch scratch) {
-    constexpr int min_position = 8192;
+    constexpr int min_position = flash_chunk;
     constexpr int max_position = 31744;
     if (position < min_position || position > max_position || !scratch.keys || !scratch.values) {
         return std::nullopt;

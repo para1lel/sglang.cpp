@@ -230,7 +230,7 @@ struct Dispatch {
 };
 
 constexpr Dispatch flash{"flash_prefill_attentionILi88ELb1ELb1EE", 12, head_blocks, 1, 352};
-constexpr Dispatch tmem_paired{"tmem_pair_attention", rows / 64, head_blocks, 1, 416, 2};
+constexpr Dispatch tmem_paired{"tmem_pair_attentionILb0EE", rows / 64, head_blocks, 1, 416, 2};
 constexpr Dispatch tmem_paired_tail{"tmem_pair_attentionILb1EE", rows / 64, head_blocks, 1, 416, 2};
 constexpr Dispatch exact{"attention_kernel", rows, mxfp8_query_heads};
 constexpr Dispatch multirow{"multirow_prefill_attention", rows / 4};
@@ -496,7 +496,7 @@ struct DeviceInput {
     }
 
     void check_staged_scratch(const Input& input, int position, const std::vector<BFloat>& raw,
-                              cudaStream_t stream, bool stages) const {
+                              cudaStream_t stream, Dispatch raw_capture) const {
         constexpr std::size_t scratch_guard = 128;
         constexpr Byte poison = 0xa5;
         const auto page_heads = static_cast<std::size_t>((position + rows) / mxfp8_page_size) *
@@ -544,9 +544,9 @@ struct DeviceInput {
             if (mode == "capture") {
                 check_cuda(cudaStreamEndCapture(stream, &graph.graph),
                            "End paired capture with scratch");
-                check_dispatch(stages ? "staged tile capture with scratch"
-                                      : "early tile capture with scratch", graph.graph,
-                               stages ? tmem_paired_tail : tmem_paired);
+                check_dispatch(position % mxfp8_page_size == 0 ? "early tile capture with scratch"
+                                                               : "staged tile capture with scratch",
+                               graph.graph, raw_capture);
                 check_cuda(cudaGraphInstantiate(&graph.executable, graph.graph, 0),
                            "Instantiate paired capture with scratch");
                 check_cuda(cudaGraphLaunch(graph.executable, stream),
@@ -556,8 +556,8 @@ struct DeviceInput {
             if (std::memcmp(result.data(), raw.data(), raw.size() * sizeof(BFloat))) {
                 throw std::runtime_error("Paired workspace changed the raw attention output");
             }
-            check_scratch(key_scratch, key_bytes, stages && mode == "fit");
-            check_scratch(value_scratch, value_bytes, stages && mode == "fit");
+            check_scratch(key_scratch, key_bytes, mode == "fit");
+            check_scratch(value_scratch, value_bytes, mode == "fit");
         }
         std::puts("MXFP8 paired scratch exact-fit, one-byte-short and capture matched raw");
     }
@@ -736,7 +736,7 @@ void check_paired_lower_edge(cudaStream_t stream) {
     const auto samples = attention_samples(input, first);
     const auto raw = device.run("TMEM first aligned start", input, first, tmem_paired,
                                 samples, stream, {.repeat_graph = true});
-    device.check_staged_scratch(input, first, raw, stream, false);
+    device.check_staged_scratch(input, first, raw, stream, tmem_paired);
     device.run("TMEM nonaligned start", input, first + 1, flash,
                attention_samples(input, first + 1), stream);
     device.run("TMEM unaligned key", input, first, multirow, samples, stream,
@@ -888,7 +888,7 @@ void check_flash_prefill(cudaStream_t stream) {
         DeviceInput device(input);
         const auto raw = device.run("paired scratch raw reference", input, position,
                                     tmem_paired_tail, attention_samples(input, position), stream);
-        device.check_staged_scratch(input, position, raw, stream, true);
+        device.check_staged_scratch(input, position, raw, stream, tmem_paired_tail);
     }
     check_partial_boundaries(stream);
     check_tail_recovery(stream, 61, 193, flash_dispatch(193));

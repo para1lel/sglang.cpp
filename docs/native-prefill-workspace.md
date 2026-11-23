@@ -10,7 +10,7 @@
 
 ## Runtime path
 
-The B200 text dispatcher can stage a 1,024-row tile at starts 8,192 through 31,744 inclusive. The start must be a multiple of 1,024 or have a nonzero offset within a 128-token page. At 1,024-aligned starts from 4,096 through 7,168, raw paired attention leaves staging scratch unused. See the [attention dispatch](flash-prefill.md#runtime-path) for eligibility. [Decoder call](../src/decoder_prefill.cpp#L370)<!-- prefix: "const auto s" -->
+The B200 text dispatcher lends these spans to eligible eager 1,024-row tiles. The first eligible start is 1,024. At start zero, raw paired attention leaves staging scratch unused. See the [attention dispatch](flash-prefill.md#runtime-path) for the alignment and upper bounds. [Staging bounds](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L393)<!-- prefix: "constexpr in" -->
 
 The decoder lends two disjoint spans of its existing `PrefillWorkspace` allocation. The first address is inclusive and the end address is exclusive. These capacities apply to a 1,024-row arena.
 

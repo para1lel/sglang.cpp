@@ -927,8 +927,8 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     if (rows >= min_flash_rows && rows <= flash_chunk && visible <= flash_limit &&
         (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
         (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
-        if (rows == flash_chunk && (position >= 8192 ||
-            (position >= 4096 && position % flash_chunk == 0))) {
+        if (rows == flash_chunk &&
+            (position >= 8192 || position % flash_chunk == 0)) {
             constexpr int max_default_paired_position = 31744;
             const bool default_paired = position <= max_default_paired_position &&
                 (position % flash_chunk == 0 || position % mxfp8_page_size != 0);

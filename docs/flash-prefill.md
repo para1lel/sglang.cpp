@@ -18,7 +18,8 @@ language prefill paths.
 
 | Automatic TMEM route | Start position for 1,024 query rows |
 | --- | --- |
-| Raw paired ordered | 4,096–7,168, at 1,024-token boundaries |
+| [Raw paired ordered](../src/mxfp8_gqa_prefill.cu#L930)<!-- prefix: "if (rows == " --> | 0 |
+| [Staged or raw paired ordered](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L393)<!-- prefix: "constexpr in" --> | 1,024–7,168, at 1,024-token boundaries |
 | Staged or raw paired ordered | 8,192–31,744, at 1,024-token boundaries or inside a 128-token page |
 | [Raw paired ordered](../src/mxfp8_gqa_prefill.cu#L942)<!-- prefix: "if (default_" --> | 32,768–130,048, at 1,024-token boundaries |
 
@@ -30,7 +31,7 @@ Flash and TMEM follow the page table and process causal 64-key tiles using BF16 
 
 Regular Flash packs BF16 probabilities into PV registers in reduction order. `cp.async` overlaps the next tile's KV loads with computation. Partial blocks stage zeros, mask scores, and skip output and repair for inactive queries. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L672)<!-- prefix: "__global__ v" -->
 
-From position 1,024, full Flash tiles try one B200 wave of 144 blocks with 88 rows and 352 threads each. [Wide dispatch](../src/mxfp8_gqa_prefill.cu#L757)<!-- prefix: "if (aligned_" -->
+When regular Flash handles a full tile from position 1,024, it tries one B200 wave of 144 blocks. Each block uses 88 rows and 352 threads. [Wide dispatch](../src/mxfp8_gqa_prefill.cu#L757)<!-- prefix: "if (aligned_" -->
 
 Aligned partial tiles from position 4,096 size CTAs for 12 head pairs and the device SM count. Try 32 or 48 rows if they fit one wave. Try 88 when it fits one wave and 64 needs two. On 148 SMs, these choices cover grants of 144–384, 385–576, and 769–1,023 rows, respectively. The 32- and 48-row CTAs use 256 threads for staging and repair, with 128 and 192 for MMA. [Partial dispatch](../src/mxfp8_gqa_prefill.cu#L764)<!-- prefix: "if (aligned_" -->
 
@@ -98,7 +99,7 @@ Check ordered and protected fallback bitwise against the ordered FP32 reference 
 
 For partial Flash changes, match BF16 outputs bitwise on identical checkpoint Q and KV. Match full-vocabulary BF16 logits and greedy IDs across prefill and decode with identical grants and teacher tokens. Cover unaligned starts, remaps, unwritten tails, and unchanged shapes. Weight eager timings by recorded tile counts.
 
-The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L727)<!-- prefix: "void check_p" --> check dispatch and alignment at the first eligible paired start, 4,096. [Graph checks](../tests/mxfp8_gqa_flash_check.cu#L335)<!-- prefix: "void check_d" --> require one node for the automatic path. The [historical split checks](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/tests/mxfp8_gqa_flash_check.cu#L352)<!-- prefix: "void check_t" --> verified graph dependencies and scratch lifetime.
+The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L727)<!-- prefix: "void check_p" --> check dispatch and alignment at 4,096. [Graph checks](../tests/mxfp8_gqa_flash_check.cu#L335)<!-- prefix: "void check_d" --> require one node for the automatic path. The [historical split checks](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/tests/mxfp8_gqa_flash_check.cu#L352)<!-- prefix: "void check_t" --> verified graph dependencies and scratch lifetime.
 
 ### Paired ordered TMEM verification
 
@@ -108,7 +109,7 @@ For paired changes, replay aligned and unaligned 1,024-row checkpoint captures w
 
 Time raw paired graph replay in A/B/B/A order. Weight starts by launch count. See [eager staging checks](native-prefill-workspace.md#verification) and [serving gates](performance.md#scheduler-and-reporting-policy).
 
-Check starts 31,744 and 32,768, the visibility cap, and off-grid starts.
+Check raw dispatch at zero and eager staging at aligned starts from 1,024 through 7,168. Check starts 31,744 and 32,768, the visibility cap, and off-grid starts.
 
 ### Ordered TMEM operator verification
 

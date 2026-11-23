@@ -181,23 +181,26 @@ source and pinned Release when reconstructing an exact historical campaign.
 
 ### Prefix-reuse diagnostic
 
-Run this separately against each verified cache-enabled K4 endpoint. Use the
-same B200, placement, launch settings, and frozen W3 fixtures for both arms.
-Use a fresh evidence directory for each endpoint.
+Run this separately against each verified cache-enabled K4 endpoint on the same
+B200 and NUMA placement. Use the frozen W3 fixtures and a fresh evidence
+directory for each endpoint. Start a dedicated native server with
+`--port 17424 --trace-batches` and capture its standard error in `NATIVE_LOG`.
 
 ```sh
-PYTHONPATH="$PWD" python3 -B benchmarks/paired/prefix_reuse.py native     http://127.0.0.1:17424 FIXTURES NATIVE_EVIDENCE
-PYTHONPATH="$PWD" python3 -B benchmarks/paired/prefix_reuse.py vllm     http://127.0.0.1:17424 FIXTURES VLLM_EVIDENCE
+PYTHONPATH="$PWD" python3 -B benchmarks/paired/prefix_reuse.py native http://127.0.0.1:17424 FIXTURES NATIVE_EVIDENCE --native-trace NATIVE_LOG
+PYTHONPATH="$PWD" python3 -B benchmarks/paired/prefix_reuse.py vllm   http://127.0.0.1:17424 FIXTURES VLLM_EVIDENCE
 ```
 
-The diagnostic first resets and captures cold W3. It resets again, then sends
-one 6,401-token off-branch prime. The following four 8,192-token prompts share
-its first 6,400 IDs and diverge immediately afterward. Each returns 1,024 output
-IDs. The diagnostic saves actual per-lane cached IDs, prefix-counter deltas, and
-SSE. It verifies positive reuse up to the common prefix on every lane and records
-vLLM depth-four decoding activity. The last reset must make the identical prime
-cold again. Different cache block geometry can produce different hit vectors.
-Keep these measurements separate from the fixed W1–W6 comparison.
+The diagnostic resets and captures cold W3. It resets again and sends an
+8,193-token prime. The four 9,984-token branch prompts share its first 8,192
+IDs and each diverges at the next token. Each branch returns 1,024 output IDs.
+The diagnostic saves SSE, per-lane cached token counts, prefix-counter deltas,
+and warm-only depth-four verification evidence from each engine. It requires
+exactly 8,192 cached prompt tokens on each native lane and a positive native
+draft restore count. Pinned vLLM must report positive reuse on every lane, up
+to the common prefix. Its block geometry determines how much it can reuse.
+The last reset must make the identical prime cold again. Use the diagnostic
+as untimed support evidence for `matched-k4-prefix-reuse-v2`.
 
 ## Replay the historical GPU 2 arm
 

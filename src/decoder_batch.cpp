@@ -850,7 +850,6 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         first += width;
     }
 }
-
 void DecoderBatch::State::publish_checkpoint(PrefixCache& cache, Lane& lane,
                                              DecoderBatchStep& result, const Workspace* row,
                                              bool& publishing) {
@@ -866,12 +865,13 @@ void DecoderBatch::State::publish_checkpoint(PrefixCache& cache, Lane& lane,
         }
     }
     publishing = true;
+    const int terminal = periodic && !result.finish_reason ? lane.capacity() : position;
     cache.store(*lane.request, lane.prompt, lane.options.prefix_cache_salt, position,
-                execution.stream(), lane.draft.get(), lane.media.get(), row);
+                execution.stream(), lane.draft.get(), lane.media.get(), row,
+                residency.resident() ? terminal : 0);
     publishing = false;
     lane.checkpoint = position;
 }
-
 Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
                                    DecoderBatchStepStats* stats) {
     require_ready();

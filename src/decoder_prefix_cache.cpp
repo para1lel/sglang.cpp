@@ -219,29 +219,47 @@ std::size_t GpuPrefixSnapshotStore::draft_device_bytes() const {
 }
 
 std::optional<GpuPrefixSnapshotStore::Snapshot> GpuPrefixSnapshotStore::prepare(
-    int slot, int target_pages, int draft_pages) const {
+    int slot, int tokens, int capacity, bool with_draft) const {
+    constexpr int interval_pages = decoder_batch_prefix_checkpoint_interval / mxfp8_page_size;
+    const auto reusable = [capacity](const auto& allocation, int pages) {
+        if (!allocation) return false;
+        const int allocated = allocation->kv.page_count;
+        return allocated == pages || (capacity > 0 && pages >= interval_pages &&
+                                      allocated > pages && allocated - pages <= interval_pages);
+    };
     const auto& old = slots_[slot];
-    const bool target_needed = !old.target || old.target->kv.page_count != target_pages;
-    const bool draft_needed =
-        draft_pages && (!old.draft || old.draft->kv.page_count != draft_pages);
-    const auto bytes = (target_needed ? kv_bytes(full_attention_layers, target_pages) +
-                       target_state_bytes : 0) + (draft_needed ? kv_bytes(1, draft_pages) : 0);
-    Snapshot prepared;
-    if (!bytes) return prepared;
-    DeviceScope device(device_);
-    if (bytes > available_snapshot_bytes()) return std::nullopt;
-    try {
-        if (target_needed) prepared.target = std::make_unique<Target>(device_, target_pages);
-        if (draft_needed) prepared.draft = std::make_unique<KvAllocation>(device_, 1, draft_pages);
-    } catch (const CudaError& error) {
-        if (error.status != cudaErrorMemoryAllocation) throw;
-        const auto pending = cudaGetLastError();
-        if (pending != cudaErrorMemoryAllocation) {
-            check(pending, "Check CUDA error after prefix snapshot allocation");
+    std::optional<std::size_t> available;
+    const auto prepare_capacity = [&](int rows) -> std::optional<Snapshot> {
+        const int target_pages = prefix_kv_pages(rows);
+        const int draft_pages = with_draft ? prefix_kv_pages(rows - 1) : 0;
+        const bool target_needed = !reusable(old.target, target_pages);
+        const bool draft_needed = draft_pages && !reusable(old.draft, draft_pages);
+        const auto bytes = (target_needed ? kv_bytes(full_attention_layers, target_pages) +
+                            target_state_bytes : 0) + (draft_needed ? kv_bytes(1, draft_pages) : 0);
+        Snapshot prepared;
+        if (!bytes) return prepared;
+        DeviceScope device(device_);
+        if (!available) available = available_snapshot_bytes();
+        if (bytes > *available) return std::nullopt;
+        try {
+            if (target_needed) prepared.target = std::make_unique<Target>(device_, target_pages);
+            if (draft_needed) {
+                prepared.draft = std::make_unique<KvAllocation>(device_, 1, draft_pages);
+            }
+        } catch (const CudaError& error) {
+            if (error.status != cudaErrorMemoryAllocation) throw;
+            const auto pending = cudaGetLastError();
+            if (pending != cudaErrorMemoryAllocation) {
+                check(pending, "Check CUDA error after prefix snapshot allocation");
+            }
+            return std::nullopt;
         }
-        return std::nullopt;
+        return prepared;
+    };
+    if (capacity > tokens) {
+        if (auto reserved = prepare_capacity(capacity)) return reserved;
     }
-    return prepared;
+    return prepare_capacity(tokens);
 }
 
 void GpuPrefixSnapshotStore::release(int slot) { slots_[slot] = {}; }
@@ -385,7 +403,7 @@ int PrefixCache::restore(Request& request, const std::vector<int>& prompt, std::
 void PrefixCache::store(const Request& request, const std::vector<int>& prompt,
                         std::string_view salt, int tokens, cudaStream_t stream,
                         const MtpDraftRequest* draft, const MultimodalInput* media,
-                        const Workspace* row) {
+                        const Workspace* row, int terminal_tokens) {
     if (tokens < 1 || tokens > decoder_batch_prefix_max_tokens ||
         std::size_t(tokens) > prompt.size() || salt.size() > decoder_prefix_max_salt_bytes ||
         (draft && (!snapshots_.supports_draft() || draft->valid_prefix() < tokens - 1))) {
@@ -400,7 +418,14 @@ void PrefixCache::store(const Request& request, const std::vector<int>& prompt,
     const auto mapping = GpuPrefixSnapshotStore::read_request_pages(request, pages, stream);
     const auto write = index_.select_write(exact);
     index_.prepare(write, tokens);
-    auto prepared = snapshots_.prepare(write.slot, pages, prefix_kv_pages(std::max(draft_rows, 0)));
+    constexpr int interval = decoder_batch_prefix_checkpoint_interval;
+    // A live periodic checkpoint can reserve the pages for its final checkpoint in this interval.
+    const bool terminal_in_interval = tokens % interval == 0 && terminal_tokens > tokens &&
+        terminal_tokens - tokens < interval && terminal_tokens <= decoder_batch_prefix_max_tokens &&
+        prefix_kv_pages(terminal_tokens) <= request.pages.page_count;
+    const int capacity = terminal_in_interval ? terminal_tokens
+                                              : (terminal_tokens > 0 ? tokens : 0);
+    auto prepared = snapshots_.prepare(write.slot, tokens, capacity, draft);
     if (!prepared) return;
     index_.invalidate(write.slot);
     counters_.evictions += write.evicted;

@@ -19,7 +19,8 @@ public:
                 const MultimodalInput* media = nullptr);
     void store(const Request& request, const std::vector<int>& prompt, std::string_view salt,
                int tokens, cudaStream_t stream, const MtpDraftRequest* draft = nullptr,
-               const MultimodalInput* media = nullptr, const Workspace* row = nullptr);
+               const MultimodalInput* media = nullptr, const Workspace* row = nullptr,
+               int terminal_tokens = 0);
     void count_prefill(int tokens, int draft_rows = 0);
     void reclaim_for_admission(std::size_t bytes, std::size_t reusable_bytes);
     DecoderPrefixCacheStats stats() const;

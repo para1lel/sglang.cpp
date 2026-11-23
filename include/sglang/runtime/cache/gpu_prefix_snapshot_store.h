@@ -45,7 +45,7 @@ public:
     std::size_t device_bytes() const;
     std::size_t draft_device_bytes() const;
 
-    std::optional<Snapshot> prepare(int slot, int target_pages, int draft_pages) const;
+    std::optional<Snapshot> prepare(int slot, int tokens, int capacity, bool with_draft) const;
     void release(int slot);
     void clear();
 

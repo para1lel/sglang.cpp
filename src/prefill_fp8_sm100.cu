@@ -474,7 +474,12 @@ std::optional<cudaError_t> launch_tma(
     void* entry = nullptr;
     status = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &entry, 12000,
                                               cudaEnableDefault, nullptr);
-    if (status == cudaErrorNotSupported || (status == cudaSuccess && !entry)) {
+    if (status == cudaErrorNotSupported) {
+        const auto recorded = cudaGetLastError();
+        if (recorded == cudaSuccess || recorded == status) return std::nullopt;
+        return recorded;
+    }
+    if (status == cudaSuccess && !entry) {
         return std::nullopt;
     }
     if (status != cudaSuccess) {

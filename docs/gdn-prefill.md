@@ -10,7 +10,9 @@
 
 ## Runtime path
 
-Before GDN input preparation, eligible tensor-core prefill tiles project B and A together from the normalized BF16 input. Each warp shares an input load across both gates and reuses each gate's weights across four token rows. Packed FP32 FMA preserves the separate projections' two accumulation chains per lane. The kernel adds those chains, reduces across the warp in the same order, and rounds each output to BF16. [Fused projection](../src/text_decode_bandwidth.cu#L101)<!-- prefix: "__global__ v" --> · [Separate projection order](../src/text_ops.cu#L97)<!-- prefix: "for (std::si" -->
+Eligible SM100 tensor-core prefill projects B and A together from the normalized BF16 input before GDN input preparation. Each Tensor Core block covers 32 token rows and one of ten contiguous 512-element slices of the input width. It writes FP32 partials for both 48-channel gates. A second kernel adds the ten partials in slice order and rounds each output to BF16. This accumulation order can change rounded gate values and downstream scores. [Partial products](../src/text/prefill_gdn_gates_sm100.cu#L44)<!-- prefix: "__global__ _" --> · [Ordered reduction](../src/text/prefill_gdn_gates_sm100.cu#L102)<!-- prefix: "__global__ v" -->
+
+The fused SIMT fallback shares normalized input loads between B and A and reuses the weights across four rows. It preserves the separate projections' two FP32 accumulation chains, warp reduction, and BF16 rounding. [Fused SIMT projection](../src/text_decode_bandwidth.cu#L101)<!-- prefix: "__global__ v" --> · [Separate projection order](../src/text_ops.cu#L97)<!-- prefix: "for (std::si" -->
 
 Exact prefill uses the original token-ordered GDN recurrence. On eligible B200 text tiles, GDN prepares convolution, normalized Q and K, and gates. The SM100 chunked route then prepares causal matrices in groups of 32 token rows. It uses BF16 Tensor Core products with FP32 accumulation to solve for corrections and advance the carry. The recurrence uses BF16 operands for the incoming carry projection, including between groups. Persistent carry remains FP32. The finish updates BF16 convolution history and supplies the [attention output projection](fp8-prefill-projections.md#attention-output-quantization). [Matrix preparation](../include/sglang/text/gdn_chunk.cuh#L185)<!-- prefix: "__global__ v" --> · [Chunked recurrence](../include/sglang/text/gdn_warp_mma.cuh#L345)<!-- prefix: "__global__ v" -->
 
@@ -23,7 +25,7 @@ finish launches across up to four segments. The large
 [projection groups](native-prefill-workspace.md#projection-pairs-for-mtp) pass
 four 1,024-row grants at 4,096 rows or two at 2,048 rows. The regular layerwise
 path can group two or three eligible grants. The same provider handles eligible [partial-grant groups](#grouped-partial-grants).
-[Segment limit](../include/sglang/decoder_cuda.cuh#L137)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L592)<!-- prefix: "void prefill" -->
+[Segment limit](../include/sglang/decoder_cuda.cuh#L142)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L592)<!-- prefix: "void prefill" -->
 
 The grid Z coordinate selects a grant with its own state, row slices, and
 scratch spans. Each block uses its grant's row count, including when aligned
@@ -63,7 +65,9 @@ Compare 80- and 160-row launches with four-lane controls on the same verificatio
 
 ## Constraints and failure behavior
 
-The fused B/A projection requires `tensor_core_fp8` and two BF16 weight matrices of 48 rows by 5,120 columns each. The input row count must be a multiple of four between 16 and 65,535 inclusive. Both weights, the input, and both outputs must have nonnull pointers. Both weight bases and the input base require 16-byte alignment. If a guard fails, the decoder uses the existing separate projections in B then A order. A fused launch error propagates to the caller. [Policy and shapes](../src/decoder_prefill.cpp#L144)<!-- prefix: "if (tensor_c" --> · [Launch guards](../src/text_decode_bandwidth.cu#L532)<!-- prefix: "if (rows < 1" --> · [Fallback](../src/decoder_prefill.cpp#L155)<!-- prefix: "project(laye" -->
+The B/A fast paths require tensor-core prefill policy and two BF16 weight matrices of 48 rows by 5,120 columns. The SM100 projection accepts 512–4,096 rows, including a partial final 32-row block. It needs nonnull buffers, 16-byte-aligned weights, input, and scratch, and supported TMA setup. It borrows 3,840 scratch bytes per token row from the MLP gate buffer. Reduction consumes those bytes on the same stream before recurrence or the MLP reuses them. [Decoder dispatch](../src/decoder_prefill.cpp#L144)<!-- prefix: "if (tensor_c" --> · [SM100 preflight](../src/text/prefill_gdn_gates_sm100.cu#L156)<!-- prefix: "std::optiona" -->
+
+A clean SM100 setup decline tries the fused SIMT projection. That path accepts multiples of four from 16 through 65,535 rows with aligned weights and input. If it also declines, the decoder projects B and A separately in that order. CUDA errors propagate from either fused path. [SIMT preflight](../src/text_decode_bandwidth.cu#L532)<!-- prefix: "if (rows < 1" --> · [Descriptor errors](../src/text/prefill_gdn_gates_sm100.cu#L133)<!-- prefix: "std::optiona" --> · [Separate fallback](../src/decoder_prefill.cpp#L155)<!-- prefix: "project(laye" -->
 
 The first GDN layer uses ordered recurrence for a tile that starts at prompt position zero. Later GDN layers in that tile and all GDN layers in subsequent tiles may use chunked recurrence. A tile that resumes a saved prefix uses the absolute restored position. An earlier recurrence experiment on W2 found that reordering only the first GDN call could change later model scores. The guard preserves that call's update order.
 
@@ -95,7 +99,11 @@ with the per-grant control at the same prompt positions. Repeat with denied
 at position zero and on a later tile. Record the grouped and per-grant launches
 separately.
 
-On a reserved B200, keep grants, positions, and GQA dispatch fixed between grouped and per-grant GDN. Exercise both 4,096-row shapes and a smaller or unequal group. Include bank zero at position zero and at a later tile. Check which grants share launches. Compare BF16 outputs, FP32 carry, and BF16 convolution history bitwise. With positive MTP depth, also compare draft continuation bitwise. Force grouped setup to decline and check per-grant parity. With positive MTP depth, inject a recoverable CUDA setup error and a recoverable launch error separately. Require each error to propagate without retrying the affected grants. Admit a fresh cohort to the same batch after each error and require it to advance.
+On a reserved B200, keep grants, positions, GQA dispatch, and B/A projection dispatch fixed. Change only the GDN submission after projection. Exercise both 4,096-row shapes and a smaller or unequal group. Include bank zero at position zero and at a later tile. Check which grants share launches. Compare BF16 outputs, FP32 carry, and BF16 convolution history bitwise. With positive MTP depth, also compare draft continuation bitwise. Force grouped setup to decline and check per-grant parity. With positive MTP depth, inject a recoverable CUDA setup error and a recoverable launch error separately. Require each error to propagate without retrying the affected grants. Admit a fresh cohort to the same batch after each error and require it to advance.
+
+For the SM100 B/A projection, hold the tile schedule, recurrence, and attention routes fixed against the fused SIMT control. Compare BF16 gate outputs with an FP64 dot-product oracle. Test 511 and 512 rows. Test a partial 32-row block and a 4,096-row group. Check clean fallback and error propagation independently. Time the projection and reduction together under matched cache conditions.
+
+The B200 operator comparison reduced B/A projection time at the tested sizes from 512 to 4,096 rows. Fixed-history checkpoint probes changed some top predictions on natural documents. Both document-level 95% bootstrap intervals for mean loss change included zero. Use the frozen workload protocol for serving timing.
 
 For reordered arithmetic, follow the [operator qualification procedure](performance.md#operator-qualification). Compare logits and labeled-token negative log likelihood on identical prompt and teacher histories. Record greedy divergence separately. Trace the position-zero first-layer guard, eligible layers, short tails, exact, and positive-depth MTP. Use the [frozen serving protocols](performance.md) with matched tile schedules, graph settings, and warmups. To isolate GDN when flash is active, hold flash dispatch fixed across both arms.
 

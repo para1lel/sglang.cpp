@@ -96,17 +96,19 @@ inline constexpr int tmem_columns = [] {
     return columns;
 }();
 
-template <int Columns, int Slots>
+template <int Columns, int Accumulators = 0, int Slots>
 __device__ __forceinline__ void allocate_tmem(DecodePipeline<Slots>& pipe) {
     asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                 :: "r"(shared_address(&pipe.tmem)), "r"(tmem_columns<Columns, Slots>) : "memory");
+                 :: "r"(shared_address(&pipe.tmem)),
+                    "r"(tmem_columns<Columns, Accumulators ? Accumulators : Slots>) : "memory");
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
 }
 
-template <int Columns, int Slots>
+template <int Columns, int Accumulators = 0, int Slots>
 __device__ __forceinline__ void free_tmem(const DecodePipeline<Slots>& pipe) {
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                 :: "r"(pipe.tmem), "r"(tmem_columns<Columns, Slots>) : "memory");
+                 :: "r"(pipe.tmem),
+                    "r"(tmem_columns<Columns, Accumulators ? Accumulators : Slots>) : "memory");
 }
 
 template <bool PerStage = false, int Slots>

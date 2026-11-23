@@ -98,6 +98,7 @@ target("sglang_prefill_fp8_sm100")
     add_files("src/text/draft_seed_fc_sm100.cu")
     add_files("src/text/decode_proj_fp8.cu", "src/text/decode_proj_bf16.cu",
               "src/text/decode_proj_host.cu")
+    add_files("src/text/prefill_gdn_gates_sm100.cu")
     add_packages("sglang-cutlass-headers")
     add_files("src/text/prefill_down_sm100.cu", {cuflags = "--expt-relaxed-constexpr"})
 

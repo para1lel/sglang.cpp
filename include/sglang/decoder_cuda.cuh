@@ -120,6 +120,11 @@ std::optional<cudaError_t> try_prefill_bf16_gdn_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
     int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream);
 
+std::optional<cudaError_t> try_prefill_bf16_gdn_gates_sm100(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
+    int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, void* scratch,
+    std::size_t scratch_bytes, cudaStream_t stream);
+
 cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                                     const __nv_bfloat16* b, const __nv_bfloat16* a,
                                     TextGdnWeights weights, TextGdnState state,

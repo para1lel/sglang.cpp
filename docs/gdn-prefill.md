@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L842)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L157)<!-- prefix: "const bool c" --> |
+| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L871)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L157)<!-- prefix: "const bool c" --> |
 | GDN operator | Prepare rows, advance each layer's recurrent state, and finish output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L647)<!-- prefix: "cudaError_t " --> |
 | Verification | Check ordered parity, chunked numerical error, and causal continuation. | [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L101)<!-- prefix: "int main(int" --> |
 
@@ -22,9 +22,8 @@ On SM100, eligible grants can share the preparation, matrix, recurrence, and
 finish launches across up to four segments. The large
 [projection groups](native-prefill-workspace.md#projection-pairs-for-mtp) pass
 four 1,024-row grants at 4,096 rows or two at 2,048 rows. The regular layerwise
-path can group two or three eligible grants. [Partial-grant projection groups](native-prefill-workspace.md#partial-grant-projection-groups)
-run GDN recurrence per lane.
-[Segment limit](../include/sglang/decoder_cuda.cuh#L133)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L528)<!-- prefix: "void prefill" -->
+path can group two or three eligible grants. The same provider handles eligible [partial-grant groups](#grouped-partial-grants).
+[Segment limit](../include/sglang/decoder_cuda.cuh#L133)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L564)<!-- prefix: "void prefill" -->
 
 The grid Z coordinate selects a grant with its own state, row slices, and
 scratch spans. Each block uses its grant's row count, including when aligned
@@ -41,6 +40,12 @@ After the dot products, grouped preparation reuses Q and K staging for the BF16 
 The grouped recurrence reads and writes adjacent BF16 pairs when it scales the keys. It also reads value pairs for the residual and writes output pairs. The per-grant recurrence accesses one BF16 element at a time in these steps. [Grouped recurrence](../include/sglang/text/gdn_warp_mma.cuh#L350)<!-- prefix: "__global__ _" --> · [Key scaling](../include/sglang/text/gdn_warp_mma.cuh#L168)<!-- prefix: "if constexpr" --> · [Residual inputs](../include/sglang/text/gdn_warp_mma.cuh#L198)<!-- prefix: "if constexpr" --> · [Output store](../include/sglang/text/gdn_warp_mma.cuh#L233)<!-- prefix: "if constexpr" -->
 
 The ordered tensor-core fallback uses the paired kernel for at least 32 rows with 16-byte-aligned recurrence workspace. Otherwise it uses the original recurrence. The paired kernel shares prepared Q, K, and gates between adjacent value channels. SM100 uses packed FP32 arithmetic and preserves each channel's token, update, and warp reduction order. Other compiled architectures use scalar arithmetic in this paired kernel. [Paired kernel](../src/text_attention_gdn.cu#L289)<!-- prefix: "__global__ v" --> · [Paired guard](../src/text_attention_gdn.cu#L670)<!-- prefix: "const bool p" -->
+
+### Grouped partial grants
+
+A [partial-grant projection group](native-prefill-workspace.md#partial-grant-projection-groups) can share GDN launches at 4,096 rows on SM100. It needs eight 512-row grants or sixteen 256-row grants. The decoder submits four grants at a time, with separate convolution history, FP32 carry, and scratch for each grant. The groups use the existing prefill arena. [Shape guard](../src/decoder_prefill.cpp#L531)<!-- prefix: "bool can_gro" --> · [Four-grant dispatch](../src/decoder_prefill.cpp#L543)<!-- prefix: "void prefill" -->
+
+If any of the four starts at position zero, bank zero uses the existing per-grant path for those four. The decoder also uses that path when the provider declines before GDN submission. A returned CUDA error propagates. The decoder clears the CUDA last-error value if it matches the reported error. [Bank guard](../src/decoder_prefill.cpp#L492)<!-- prefix: "grant.rows %" --> · [Error handling](../src/decoder_prefill.cpp#L505)<!-- prefix: "if (status) " -->
 
 ## Grouped target verification
 
@@ -83,6 +88,8 @@ with the per-grant control at the same prompt positions. Repeat with denied
 4,096-row workspace allocation to check the two-grant path. Check bank zero
 at position zero and on a later tile. Record the grouped and per-grant launches
 separately.
+
+On a reserved B200, keep grants, positions, and GQA dispatch fixed between grouped and per-grant GDN. Exercise both 4,096-row shapes and a smaller or unequal group. Include bank zero at position zero and at a later tile. Check which grants share launches. Compare BF16 outputs, FP32 carry, and BF16 convolution history bitwise. With positive MTP depth, also compare draft continuation bitwise. Force grouped setup to decline and check per-grant parity. With positive MTP depth, inject a recoverable CUDA setup error and a recoverable launch error separately. Require each error to propagate without retrying the affected grants. Admit a fresh cohort to the same batch after each error and require it to advance.
 
 For reordered changes, compare logits and labeled-token negative log likelihood on identical prompt and teacher histories. Record greedy divergence separately. Trace the position-zero first-layer guard, eligible layers, short tails, exact, and positive-depth MTP. Use the [frozen serving protocols](performance.md) with matched tile schedules, graph settings, and warmups. To isolate GDN when flash is active, hold flash dispatch fixed across both arms.
 

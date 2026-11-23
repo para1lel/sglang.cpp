@@ -503,6 +503,9 @@ void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
         ? tensor_core_prefill_gdn_group(segments, count, layer.recurrent, chunk.stream)
         : std::nullopt;
     if (status) {
+        if (*status != cudaSuccess && cudaPeekAtLastError() == *status) {
+            (void)cudaGetLastError();
+        }
         check(*status, "Advance grouped prefill Gated DeltaNet");
         return;
     }
@@ -525,6 +528,39 @@ PairedPrefillScratch serial_gqa_scratch(const TileBuffers& buffers, int serial_c
 
 enum class PrefillAttentionMode { batched, full_group, serial_segments };
 
+bool can_group_partial_gdn(const PrefillGrant* grants, PrefillGroup group) {
+    const int rows = grants[0].rows;
+    if (group.rows != grouped_prefill_max_rows || (rows != 256 && rows != 512) ||
+        group.grants % max_gdn_prefill_segments != 0) {
+        return false;
+    }
+    for (int index = 1; index < group.grants; ++index) {
+        if (grants[index].rows != rows) return false;
+    }
+    return true;
+}
+
+void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
+                         const PrefillGrant* grants, int count, bool grouped) {
+    if (grouped) {
+        int offset = 0;
+        for (int index = 0; index < count; index += max_gdn_prefill_segments) {
+            prefill_group_gdn(chunk, layer, bank, grants + index, max_gdn_prefill_segments, offset);
+            offset += max_gdn_prefill_segments * grants[index].rows;
+        }
+        return;
+    }
+    const auto& activation = chunk.work.activation;
+    each_prefill_segment(grants, count, 0, [&](const PrefillGrant& grant, int row) {
+        const auto segment = prefill_attention_segment(chunk, grant, row);
+        const TextFp8Activation quantized{
+            activation.values + std::size_t(row) * text_gdn_value_width,
+            activation.scales + std::size_t(row) * text_gdn_value_heads,
+        };
+        segment.gdn_recur(layer, grant.request->states[bank], bank, quantized);
+    });
+}
+
 void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, PrefillGroup group,
                        PrefillWorkspace& workspace, bool mixed,
                        PrefillAttentionMode attention_mode, int serial_capacity = 0) {
@@ -533,6 +569,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     const TileBuffers buffers(layout, workspace.capacity());
     const bool grouped = group.rows > max_layerwise_rows;
     const bool serial_attention = attention_mode == PrefillAttentionMode::serial_segments;
+    const bool grouped_partial_gdn = serial_attention && can_group_partial_gdn(grants, group);
     const bool full_group = attention_mode == PrefillAttentionMode::full_group;
     const auto rms_launch = full_group ? RmsQuantizeLaunch::full_group_prefill
                                        : RmsQuantizeLaunch::ordinary;
@@ -586,15 +623,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         [&](const GdnLayer& layer, int bank) {
             chunk.gdn_input(layer);
             if (serial_attention) {
-                each_prefill_segment(grants, group.grants, 0,
-                                     [&](const PrefillGrant& grant, int row) {
-                    const auto segment = prefill_attention_segment(chunk, grant, row);
-                    const TextFp8Activation quantized{
-                        buffers.activation.values + std::size_t(row) * text_gdn_value_width,
-                        buffers.activation.scales + std::size_t(row) * text_gdn_value_heads,
-                    };
-                    segment.gdn_recur(layer, grant.request->states[bank], bank, quantized);
-                });
+                prefill_partial_gdn(chunk, layer, bank, grants, group.grants, grouped_partial_gdn);
             } else if (grouped) {
                 prefill_group_gdn(chunk, layer, bank, grants, group.grants, 0);
             } else {

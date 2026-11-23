@@ -84,6 +84,8 @@ static_assert(staged_head_elements * sizeof(std::uint16_t) % staged_alignment ==
 template <int Count>
 struct StagedRequests {
     Attention items[Count];
+    int rows;
+    int page_base[Count];
 
     __device__ int lane() const {
         if constexpr (Count == 1) {
@@ -93,14 +95,19 @@ struct StagedRequests {
     }
 };
 
-template <int Count>
+template <int Count, bool Partial = false>
 __global__ void pair_predecode(const __grid_constant__ StagedRequests<Count> requests,
                                std::uint16_t* keys, std::uint16_t* values, int* invalid) {
     constexpr int vector_elements = 16;
     constexpr int vectors = channels / vector_elements;
     const Attention request = requests.items[requests.lane()];
+    int page_base = requests.lane() * gridDim.x;
+    if constexpr (Partial) {
+        if (blockIdx.x >= (request.position + requests.rows) / mxfp8_page_size) return;
+        page_base = requests.page_base[requests.lane()];
+    }
     const int page = request.pages[blockIdx.x];
-    const int page_head = (requests.lane() * gridDim.x + blockIdx.x) * mxfp8_kv_heads +
+    const int page_head = (page_base + blockIdx.x) * mxfp8_kv_heads +
                           blockIdx.y;
     const auto base = static_cast<std::size_t>(page_head) * staged_head_elements;
     const int channel = (threadIdx.x % vectors) * vector_elements;
@@ -275,8 +282,176 @@ __global__ void tmem_staged_pair_attention(const __grid_constant__ StagedRequest
     pair_repair(tile, request, pair, row, head);
 }
 
+constexpr int staged_single_score_slots = 3;
+constexpr int staged_single_probability = tmem_scores + staged_single_score_slots * flash_keys;
+static_assert(staged_single_probability + flash_keys <= tmem_cols);
+
+struct alignas(1024) StagedSingleTile {
+    std::uint16_t query[staged_planes][flash_queries][tmem_swizzle];
+    std::uint16_t key[2][staged_planes][flash_keys][tmem_swizzle];
+    std::uint16_t value[2][staged_planes][flash_keys][tmem_swizzle];
+    int bad_query[flash_queries];
+    int bad_key;
+    Word tmem;
+    unsigned long long key_ready[2];
+    unsigned long long value_ready[2];
+    unsigned long long scores_ready[3];
+    unsigned long long output_ready[2];
+    unsigned long long probability_ready[2];
+};
+static_assert(offsetof(StagedSingleTile, key) % 1024 == 0 &&
+              offsetof(StagedSingleTile, value) % 1024 == 0);
+
+template <bool Key>
+__device__ void single_stage(StagedSingleTile& tile, const StagedPairMaps& maps,
+                             const int* invalid, int page_base, int kv_head, int end) {
+    const auto* map = Key ? &maps.keys : &maps.values;
+    auto& destination = Key ? tile.key : tile.value;
+    auto& ready = Key ? tile.key_ready : tile.value_ready;
+    for (int chunk = 0; chunk * flash_keys < end; ++chunk) {
+        const int stage = chunk & 1;
+        if (chunk >= 2) {
+            // QK retires a K slot, while only PV retires a V slot.
+            const int old = chunk - 2;
+            const Word retired = Key ? tmem_smem(&tile.scores_ready[old % 3]) :
+                                        tmem_smem(&tile.output_ready[stage]);
+            tmem_copy_wait(retired, Key ? (old / 3) & 1 : (old >> 1) & 1);
+        }
+        const int first = chunk * flash_keys;
+        const int page_head = (page_base + first / mxfp8_page_size) * mxfp8_kv_heads + kv_head;
+        if constexpr (Key) {
+            if (stage == 0 && invalid[page_head] < end) {
+                atomicMin(&tile.bad_key, invalid[page_head]);
+            }
+        }
+        const Word barrier = tmem_smem(&ready[stage]);
+        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                     :: "r"(barrier), "n"(sizeof(destination[0])) : "memory");
+        pair_copy_decoded(map, destination[stage], barrier, first % mxfp8_page_size,
+                          page_head * staged_planes);
+    }
+}
+
+__device__ void single_issue_score(StagedSingleTile& tile, int chunk) {
+    const int k_slot = chunk & 1;
+    const int score_slot = chunk % 3;
+    tmem_copy_wait(tmem_smem(&tile.key_ready[k_slot]), (chunk >> 1) & 1);
+    tmem_query_key<false, true>(tile, tmem_smem(&tile.scores_ready[score_slot]),
+                               tmem_scores + score_slot * flash_keys, k_slot);
+}
+
+__device__ void single_issue_mmas(StagedSingleTile& tile, int end) {
+    single_issue_score(tile, 0);
+    single_issue_score(tile, 1);
+    // PV(n-1) was issued after softmax(n-1) published, so score(n-1) is no longer read.
+    for (int chunk = 0; chunk * flash_keys < end; ++chunk) {
+        if ((chunk + 2) * flash_keys < end) single_issue_score(tile, chunk + 2);
+        const int stage = chunk & 1;
+        const Word phase = (chunk >> 1) & 1;
+        tmem_copy_wait(tmem_smem(&tile.value_ready[stage]), phase);
+        tmem_mma_wait(tmem_smem(&tile.probability_ready[stage]), phase);
+        #pragma unroll
+        for (int token = 0; token < flash_keys; token += 16) {
+            constexpr Word format = (1u << 4) | (1u << 7) | (1u << 10);
+            constexpr Word shape = ((flash_queries / 16) << 24) |
+                                   ((channels / 8) << 17) | (1u << 16);
+            const Word p = tile.tmem + staged_single_probability +
+                           stage * (flash_keys / 2) + token / 2;
+            const auto v = tmem_descriptor<true>(&tile.value[stage][0][token][0]);
+            asm volatile("{ .reg .pred accum;\n"
+                         "setp.ne.u32 accum, %4, 0;\n"
+                         "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, "
+                         "{%5,%5,%5,%5}, accum; }"
+                         :: "r"(tile.tmem), "r"(p), "l"(v), "r"(shape | format),
+                            "r"(static_cast<int>(chunk != 0 || token != 0)), "r"(0) : "memory");
+        }
+        tmem_commit(tmem_smem(&tile.output_ready[stage]));
+    }
+}
+
+template <bool Partial = false>
+__global__ __launch_bounds__(256, 1) void tmem_staged_single_attention(
+    const __grid_constant__ StagedRequests<4> requests,
+    const __grid_constant__ StagedPairMaps maps, const int* invalid) {
+    extern __shared__ StagedSingleTile single_shared[];
+    auto& tile = single_shared[0];
+    const Attention request = requests.items[requests.lane()];
+    const int row = blockIdx.x * flash_rows;
+    const int head = blockIdx.y * ordered_heads;
+    const int position = request.position + row;
+    const int end = position + flash_rows;
+    const int page_base = Partial ? requests.page_base[requests.lane()] :
+        requests.lane() * ((request.position + flash_chunk) / mxfp8_page_size);
+    const int warp = threadIdx.x / 32;
+    if (threadIdx.x == 0) {
+        tile.bad_key = INT_MAX;
+        for (int stage = 0; stage < 2; ++stage) {
+            pipeline_init(tile.key_ready[stage], 1);
+            pipeline_init(tile.value_ready[stage], 1);
+            pipeline_init(tile.output_ready[stage], 1);
+            pipeline_init(tile.probability_ready[stage], flash_queries / 32);
+        }
+        for (auto& barrier : tile.scores_ready) pipeline_init(barrier, 1);
+    }
+    if (warp == 0) {
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
+                     "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;"
+                     :: "r"(tmem_smem(&tile.tmem)), "r"(tmem_cols) : "memory");
+    }
+    tmem_stage_query<flash_queries, 8>(tile, request, row, head);
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncthreads();
+    if (threadIdx.x < flash_queries) {
+        const Word row_address = tile.tmem + ((warp * 32) << 16);
+        FlashSoftmax state{-CUDART_INF_F, 0.0f};
+        for (int chunk = 0; chunk * flash_keys < end; ++chunk) {
+            const int stage = chunk & 1;
+            const int score_slot = chunk % 3;
+            const Word phase = (chunk >> 1) & 1;
+            tmem_mma_wait(tmem_smem(&tile.scores_ready[score_slot]), (chunk / 3) & 1);
+            if (chunk >= 2) tmem_mma_wait(tmem_smem(&tile.output_ready[stage]), phase ^ 1);
+            const int first = chunk * flash_keys;
+            const int visible = position + threadIdx.x / ordered_heads - first + 1;
+            const Word score = tmem_scores + score_slot * flash_keys;
+            const Word p_column = staged_single_probability + stage * (flash_keys / 2);
+            const float history = first + flash_keys <= position + 1 ?
+                tmem_probabilities<true, true, true>(tile.tmem, row_address, threadIdx.x,
+                    visible, state, score, p_column) :
+                tmem_probabilities<false, true, true>(tile.tmem, row_address, threadIdx.x,
+                    visible, state, score, p_column);
+            if (chunk != 0) {
+                tmem_mma_wait(tmem_smem(&tile.output_ready[1 - stage]), ((chunk - 1) >> 1) & 1);
+                tmem_correct_output(row_address, history);
+            }
+            // Publish packed P and the corrected accumulator together before PV can acquire them.
+            asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+            __syncwarp();
+            if ((threadIdx.x & 31) == 0) {
+                asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                             :: "r"(tmem_smem(&tile.probability_ready[stage])) : "memory");
+            }
+        }
+        const int final_chunk = (end - 1) / flash_keys;
+        tmem_mma_wait(tmem_smem(&tile.output_ready[final_chunk & 1]), (final_chunk >> 1) & 1);
+        tmem_store_output<true>(row_address, state, request, row, head);
+    } else if (threadIdx.x == 128) {
+        single_stage<true>(tile, maps, invalid, page_base, head / ratio, end);
+    } else if (threadIdx.x == 160) {
+        single_stage<false>(tile, maps, invalid, page_base, head / ratio, end);
+    } else if (threadIdx.x == 192) {
+        single_issue_mmas(tile, end);
+    }
+    __syncthreads();
+    if (warp == 0) {
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                     :: "r"(tile.tmem), "r"(tmem_cols) : "memory");
+    }
+    tmem_repair_ordered(tile, request, row, head, flash_rows);
+}
+
 std::optional<cudaError_t> encode_staged_maps(int full_pages, std::uint16_t* keys,
-                                           std::uint16_t* values, StagedPairMaps& maps) {
+                                           std::uint16_t* values, StagedPairMaps& maps,
+                                           bool single = false) {
     void* entry = nullptr;
     cudaDriverEntryPointQueryResult query{};
     const auto status = cudaGetDriverEntryPointByVersion(
@@ -296,8 +471,9 @@ std::optional<cudaError_t> encode_staged_maps(int full_pages, std::uint16_t* key
     const cuuint64_t shape[] = {tmem_swizzle, mxfp8_page_size,
         static_cast<cuuint64_t>(full_pages) * mxfp8_kv_heads * staged_planes};
     constexpr cuuint32_t elements[] = {1, 1, 1};
-    constexpr cuuint32_t key_box[] = {tmem_swizzle, pair_key_rows, staged_planes};
-    constexpr cuuint32_t value_box[] = {tmem_swizzle, flash_keys, staged_planes / 2};
+    const cuuint32_t key_box[] = {tmem_swizzle, single ? flash_keys : pair_key_rows, staged_planes};
+    const cuuint32_t value_box[] = {
+        tmem_swizzle, flash_keys, single ? staged_planes : staged_planes / 2};
     const auto encode_map = [&](CUtensorMap& map, void* source, const cuuint32_t* box) {
         return encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT16, 3, source, shape, strides,
                       box, elements, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
@@ -319,10 +495,10 @@ std::optional<cudaError_t> encode_staged_maps(int full_pages, std::uint16_t* key
 }
 
 std::optional<cudaError_t> validate_paired_request(const Attention& request,
-                                                  Mxfp8PageTable pages) {
+                                                  Mxfp8PageTable pages, int rows = flash_chunk) {
     const auto& cache = request.cache;
     const int position = request.position;
-    const int required_pages = (position + flash_chunk + mxfp8_page_size - 1) / mxfp8_page_size;
+    const int required_pages = (position + rows + mxfp8_page_size - 1) / mxfp8_page_size;
     if (pages.page_count < required_pages || cache.page_count < required_pages ||
         !pages.device_pages || !cache.key_payload || !cache.value_payload ||
         !cache.key_scales || !cache.value_scales || !request.queries || !request.output) {
@@ -385,6 +561,27 @@ std::optional<cudaError_t> prepare_paired_kernel(const void* kernel,
     return clusters > 0 ? std::optional{cudaSuccess} : std::nullopt;
 }
 
+std::optional<cudaError_t> prepare_staged_single_kernel(const void* kernel,
+                                                       const cudaLaunchConfig_t& config) {
+    int device = 0;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    cudaDeviceProp properties{};
+    status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) return status;
+    if (properties.major != 10 || properties.minor != 0) return std::nullopt;
+    const auto prepared = prepare_flash_kernel(kernel, config.dynamicSmemBytes, properties, true);
+    if (!prepared || *prepared != cudaSuccess) return prepared;
+    int blocks = 0;
+    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, config.blockDim.x,
+                                                          config.dynamicSmemBytes);
+    if (status != cudaSuccess) {
+        return flash_setup_error(status, paired_kernel_unavailable(status) ||
+            status == cudaErrorInvalidConfiguration || status == cudaErrorInvalidValue);
+    }
+    return blocks > 0 ? std::optional{cudaSuccess} : std::nullopt;
+}
+
 }
 
 std::optional<cudaError_t> launch_paired_tmem_prefill(
@@ -417,22 +614,111 @@ std::optional<cudaError_t> launch_paired_tmem_prefill(
 
 namespace {
 
-template <int Count>
+template <int Count, bool Partial>
+std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& requests,
+                                                  std::uint16_t* keys, std::uint16_t* values,
+                                                  int* invalid, int full_pages, int total_pages,
+                                                  cudaStream_t stream) {
+    const int position = requests.items[0].position;
+    auto paired = tmem_staged_pair_attention<false, Count>;
+    if constexpr (Count == 1) {
+        if (position % mxfp8_page_size) {
+            paired = tmem_staged_pair_attention<true, Count>;
+        }
+    }
+    auto config = paired_config(sizeof(StagedPairTile), stream);
+    if constexpr (Count > 1) {
+        config.gridDim.z = Count;
+        config.blockDim.x = staged_compact_threads;
+    }
+    StagedPairMaps maps{};
+    const void* kernel = reinterpret_cast<const void*>(paired);
+    bool single = false;
+    if constexpr (Count == 4) {
+        if (Partial || position % flash_chunk == 0) {
+            const auto local = reinterpret_cast<const void*>(tmem_staged_single_attention<Partial>);
+            auto local_config = config;
+            local_config.dynamicSmemBytes = sizeof(StagedSingleTile);
+            local_config.gridDim.x = requests.rows / flash_rows;
+            const auto prepared = prepare_staged_single_kernel(local, local_config);
+            if (prepared && *prepared != cudaSuccess) return prepared;
+            if (prepared) {
+                const auto encoded = encode_staged_maps(total_pages, keys, values, maps, true);
+                if (encoded && *encoded != cudaSuccess && *encoded != cudaErrorMemoryAllocation) {
+                    return encoded;
+                }
+                if (encoded && *encoded == cudaSuccess) {
+                    kernel = local;
+                    config = local_config;
+                    single = true;
+                }
+            }
+        }
+    }
+    if constexpr (Partial) {
+        if (!single) return std::nullopt;
+    }
+    if (!single) {
+        if (const auto status = prepare_paired_kernel(kernel, config);
+            !status || *status != cudaSuccess) {
+            return status;
+        }
+        const auto encoded = encode_staged_maps(full_pages * Count, keys, values, maps);
+        if (!encoded || *encoded == cudaErrorMemoryAllocation) return std::nullopt;
+        if (*encoded != cudaSuccess) return encoded;
+    }
+    void* decode_args[] = {&requests, &keys, &values, &invalid};
+    const auto decoded = cudaLaunchKernel(pair_predecode<Count, Partial>,
+        dim3(full_pages, mxfp8_kv_heads, Count), channels, decode_args, 0, stream);
+    if (decoded != cudaSuccess) {
+        return staged_submission(decoded);
+    }
+    void* args[] = {&requests, &maps, &invalid};
+    return staged_submission(cudaLaunchKernel(kernel, config.gridDim, config.blockDim, args,
+                                              config.dynamicSmemBytes, stream));
+}
+
+template <int Count, bool Partial = false>
 std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSequence* sequences,
                                                  cudaStream_t stream,
                                                  decoder::PairedPrefillScratch scratch) {
-    constexpr int max_position = 131072 / Count - flash_chunk;
     const int position = sequences[0].position;
-    if (position < flash_chunk || position > max_position ||
-        !StagedRange(scratch.keys, scratch.key_bytes, 1).valid() ||
-        !StagedRange(scratch.values, scratch.value_bytes, 1).valid()) {
+    const int rows = Partial ? sequences[0].rows : flash_chunk;
+    if (!StagedRange(scratch.keys, scratch.key_bytes, 1).valid() ||
+        !StagedRange(scratch.values, scratch.value_bytes, 1).valid()) return std::nullopt;
+    if constexpr (Partial) {
+        if (rows != 256 && rows != 512) return std::nullopt;
+    } else if (position < flash_chunk || position > 131072 / Count - flash_chunk) {
         return std::nullopt;
+    }
+    StagedRequests<Count> requests{};
+    requests.rows = rows;
+    int full_pages = 0;
+    int total_pages = 0;
+    for (int lane = 0; lane < Count; ++lane) {
+        const auto& sequence = sequences[lane];
+        if (sequence.rows != rows) return std::nullopt;
+        if constexpr (Partial) {
+            if (sequence.position < 8192 || sequence.position > 32768 - rows ||
+                sequence.position % mxfp8_page_size != 0) return std::nullopt;
+        } else if (sequence.position != position) {
+            return std::nullopt;
+        }
+        const int pages = (sequence.position + rows) / mxfp8_page_size;
+        requests.page_base[lane] = total_pages;
+        total_pages += pages;
+        full_pages = std::max(full_pages, pages);
+        auto& request = requests.items[lane];
+        request = {sequence.cache, sequence.pages.device_pages, position, sequence.queries,
+                   sequence.output};
+        request.position = sequence.position;
+        if (const auto status = validate_paired_request(request, sequence.pages, rows);
+            !status || *status != cudaSuccess) return status;
     }
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) {
         return pending;
     }
-    const int full_pages = (position + flash_chunk) / mxfp8_page_size;
-    const auto page_heads = static_cast<std::size_t>(full_pages) * Count * mxfp8_kv_heads;
+    const auto page_heads = static_cast<std::size_t>(total_pages) * mxfp8_kv_heads;
     const auto elements = page_heads * staged_head_elements;
     const auto decoded_bytes = elements * sizeof(std::uint16_t);
     const auto value_bytes = decoded_bytes + page_heads * sizeof(int);
@@ -459,57 +745,12 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
             return status;
         }
     }
-    StagedRequests<Count> requests{};
-    for (int lane = 0; lane < Count; ++lane) {
-        const auto& sequence = sequences[lane];
-        if (sequence.rows != flash_chunk || sequence.position != position) {
-            return std::nullopt;
-        }
-        auto& request = requests.items[lane];
-        request = {sequence.cache, sequence.pages.device_pages, position, sequence.queries,
-                   sequence.output};
-        if (const auto status = validate_paired_request(request, sequence.pages);
-            !status || *status != cudaSuccess) {
-            return status;
-        }
-    }
-    if (!valid_staged_ranges<Count>(sequences, full_pages, {keys, decoded_bytes, staged_alignment},
+    if (!valid_staged_ranges<Count>(sequences, {keys, decoded_bytes, staged_alignment},
                                     {values, value_bytes, staged_alignment})) {
         return std::nullopt;
     }
-    auto* invalid = reinterpret_cast<int*>(values + elements);
-    auto kernel = tmem_staged_pair_attention<false, Count>;
-    if constexpr (Count == 1) {
-        if (position % mxfp8_page_size) {
-            kernel = tmem_staged_pair_attention<true, Count>;
-        }
-    }
-    auto config = paired_config(sizeof(StagedPairTile), stream);
-    if constexpr (Count > 1) {
-        config.gridDim.z = Count;
-        config.blockDim.x = staged_compact_threads;
-    }
-    if (const auto status = prepare_paired_kernel(reinterpret_cast<const void*>(kernel), config);
-        !status || *status != cudaSuccess) {
-        return status;
-    }
-    StagedPairMaps maps{};
-    const auto encoded = encode_staged_maps(full_pages * Count, keys, values, maps);
-    if (!encoded || *encoded == cudaErrorMemoryAllocation) {
-        return std::nullopt;
-    }
-    if (*encoded != cudaSuccess) {
-        return encoded;
-    }
-    void* decode_args[] = {&requests, &keys, &values, &invalid};
-    const auto decoded = cudaLaunchKernel(pair_predecode<Count>,
-        dim3(full_pages, mxfp8_kv_heads, Count), channels, decode_args, 0, stream);
-    if (decoded != cudaSuccess) {
-        return staged_submission(decoded);
-    }
-    void* args[] = {&requests, &maps, &invalid};
-    return staged_submission(cudaLaunchKernel(kernel, config.gridDim, config.blockDim, args,
-                                              config.dynamicSmemBytes, stream));
+    return submit_staged_requests<Count, Partial>(requests, keys, values,
+        reinterpret_cast<int*>(values + elements), full_pages, total_pages, stream);
 }
 
 }
@@ -558,6 +799,14 @@ std::optional<cudaError_t> decoder::try_long_staged_paged_prefill(
         return launch_staged_requests<2>(sequences, stream, scratch);
     }
     return launch_staged_requests<1>(sequences, stream, scratch);
+}
+
+std::optional<cudaError_t> launch_partial_staged_tmem_prefill(
+    const decoder::PagedPrefillSequence* sequences, int count, cudaStream_t stream,
+    decoder::PairedPrefillScratch scratch) {
+    if (!sequences || count != decoder::staged_prefill_batch_size) return std::nullopt;
+    return launch_staged_requests<decoder::staged_prefill_batch_size, true>(
+        sequences, stream, scratch);
 }
 
 }

@@ -226,10 +226,20 @@ __device__ __forceinline__ Word tmem_pack(float low, float high) {
     return packed;
 }
 
-template <bool Historical, bool Ordered, typename Probability>
+__device__ __forceinline__ void tmem_store_probability(Word destination, const Word (&bits)[16]) {
+    asm volatile("tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8,"
+                 "%9,%10,%11,%12,%13,%14,%15,%16};\n"
+                 "tcgen05.wait::st.sync.aligned;"
+                 :: "r"(destination), "r"(bits[0]), "r"(bits[1]), "r"(bits[2]), "r"(bits[3]),
+                    "r"(bits[4]), "r"(bits[5]), "r"(bits[6]), "r"(bits[7]), "r"(bits[8]),
+                    "r"(bits[9]), "r"(bits[10]), "r"(bits[11]), "r"(bits[12]), "r"(bits[13]),
+                    "r"(bits[14]), "r"(bits[15]) : "memory");
+}
+
+template <bool Historical, bool Ordered, bool TmemProbability = false, typename Probability>
 __device__ float tmem_probabilities(Probability& probability_tile, Word row_address, int member,
                                     int visible, FlashSoftmax& state,
-                                    Word score_column = tmem_scores) {
+                                    Word score_column = tmem_scores, Word probability_column = 0) {
     float scores[2][32];
     tmem_load(row_address + score_column, scores[0]);
     tmem_load(row_address + score_column + 32, scores[1]);
@@ -251,6 +261,7 @@ __device__ float tmem_probabilities(Probability& probability_tile, Word row_addr
     float mass[4]{};
     #pragma unroll
     for (int half = 0; half < 2; ++half) {
+        Word packed[16];
         #pragma unroll
         for (int vector = 0; vector < 32; vector += 8) {
             float probability[8];
@@ -259,12 +270,22 @@ __device__ float tmem_probabilities(Probability& probability_tile, Word row_addr
                 probability[item] = __expf(scores[half][vector + item] - maximum);
                 mass[Ordered ? item / 2 : item % 4] += probability[item];
             }
-            const int column = tmem_swizzled(member, half * 32 + vector);
-            *reinterpret_cast<uint4*>(&probability_tile[member][column]) =
-                make_uint4(tmem_pack(probability[0], probability[1]),
-                           tmem_pack(probability[2], probability[3]),
-                           tmem_pack(probability[4], probability[5]),
-                           tmem_pack(probability[6], probability[7]));
+            const auto bits = make_uint4(tmem_pack(probability[0], probability[1]),
+                                         tmem_pack(probability[2], probability[3]),
+                                         tmem_pack(probability[4], probability[5]),
+                                         tmem_pack(probability[6], probability[7]));
+            if constexpr (TmemProbability) {
+                packed[vector / 2] = bits.x;
+                packed[vector / 2 + 1] = bits.y;
+                packed[vector / 2 + 2] = bits.z;
+                packed[vector / 2 + 3] = bits.w;
+            } else {
+                const int column = tmem_swizzled(member, half * 32 + vector);
+                *reinterpret_cast<uint4*>(&probability_tile[member][column]) = bits;
+            }
+        }
+        if constexpr (TmemProbability) {
+            tmem_store_probability(row_address + probability_column + 16 * half, packed);
         }
     }
     const float tile_mass = Ordered ? (mass[0] + mass[2]) + (mass[1] + mass[3]) :
@@ -276,10 +297,10 @@ __device__ float tmem_probabilities(Probability& probability_tile, Word row_addr
 
 template <bool Paired = false, bool Staged = false, int Members = flash_queries, typename Tile>
 __device__ __forceinline__ void tmem_query_key(Tile& tile, Word mma,
-                                              Word score_column = tmem_scores) {
+                                              Word score_column = tmem_scores, int key_slot = -1) {
     const auto& keys = [&]() -> auto& {
         if constexpr (Staged) {
-            return tile.key[(score_column - tmem_scores) / flash_keys];
+            return tile.key[key_slot < 0 ? (score_column - tmem_scores) / flash_keys : key_slot];
         } else {
             return tile.key;
         }

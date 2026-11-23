@@ -15,6 +15,9 @@
 #include <utility>
 
 namespace sglang {
+std::optional<cudaError_t> launch_partial_staged_tmem_prefill(
+    const decoder::PagedPrefillSequence*, int, cudaStream_t, decoder::PairedPrefillScratch);
+
 namespace {
 
 using namespace decoder;
@@ -378,7 +381,8 @@ Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, i
 
 bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
                                  const PrefillGrant* grants, int count,
-                                 PairedPrefillScratch scratch, bool postgate) {
+                                 PairedPrefillScratch scratch, PairedPrefillScratch staging,
+                                 bool postgate) {
     constexpr int width = staged_prefill_batch_size;
     const int rows = grants[0].rows;
     if (count % width != 0 || (rows != 256 && rows != 512) ||
@@ -398,8 +402,11 @@ bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int 
             sequences[lane] = {cache, pages, grant.position, rows, segment.work.rope_queries,
                                segment.work.attention};
         }
-        const auto submitted = try_batched_partial_paged_prefill(sequences.data(), width,
-                                                                 chunk.stream);
+        auto submitted = launch_partial_staged_tmem_prefill(sequences.data(), width,
+                                                            chunk.stream, staging);
+        if (!submitted) {
+            submitted = try_batched_partial_paged_prefill(sequences.data(), width, chunk.stream);
+        }
         if (submitted) check(*submitted, "Read grouped ordered partial prefill attention");
         for (int lane = 0; lane < width; ++lane) {
             const auto segment = prefill_attention_segment(chunk, grants[first + lane],
@@ -592,7 +599,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             if (serial_attention) {
                 const auto scratch = serial_gqa_scratch(buffers, serial_capacity);
                 if (!prefill_grouped_partial_gqa(chunk, layer, bank, grants, group.grants,
-                                                 scratch, !wide_partial)) {
+                                                 scratch, buffers.gqa_scratch(), !wide_partial)) {
                     each_prefill_segment(grants, group.grants, 0,
                                          [&](const PrefillGrant& grant, int row) {
                         const auto segment = prefill_attention_segment(chunk, grant, row);

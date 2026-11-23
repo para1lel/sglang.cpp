@@ -62,7 +62,7 @@ struct StagedRange {
 };
 
 template <int Count>
-bool valid_staged_ranges(const decoder::PagedPrefillSequence* sequences, int full_pages,
+bool valid_staged_ranges(const decoder::PagedPrefillSequence* sequences,
                          StagedRange keys, StagedRange values) {
     constexpr auto head_bytes = channels * sizeof(Bf16);
     constexpr auto row_bytes = mxfp8_query_heads * head_bytes;
@@ -76,7 +76,7 @@ bool valid_staged_ranges(const decoder::PagedPrefillSequence* sequences, int ful
     }
     for (int lane = 0; lane < Count; ++lane) {
         const auto& sequence = sequences[lane];
-        const StagedRange output(sequence.output, flash_chunk * row_bytes,
+        const StagedRange output(sequence.output, sequence.rows * row_bytes,
                                  Count > 1 ? alignof(uint4) : alignof(Bf16));
         if (!output.valid() || output.overlaps(keys) || output.overlaps(values)) {
             return false;
@@ -84,10 +84,11 @@ bool valid_staged_ranges(const decoder::PagedPrefillSequence* sequences, int ful
         for (int peer = 0; peer < Count; ++peer) {
             const auto& other = sequences[peer];
             const auto pages = static_cast<std::size_t>(other.cache.page_count);
+            const auto logical_pages =
+                (other.position + other.rows + mxfp8_page_size - 1) / mxfp8_page_size;
             const StagedRange inputs[] = {
-                {other.queries, flash_chunk * row_bytes, alignof(Bf16)},
-                {other.pages.device_pages,
-                 (full_pages + (other.position % mxfp8_page_size != 0)) * sizeof(std::int32_t),
+                {other.queries, other.rows * row_bytes, alignof(Bf16)},
+                {other.pages.device_pages, logical_pages * sizeof(std::int32_t),
                  alignof(std::int32_t)},
                 {other.cache.key_payload, pages * mxfp8_payload_bytes_per_page, alignof(uint4)},
                 {other.cache.value_payload, pages * mxfp8_payload_bytes_per_page, alignof(uint4)},
@@ -103,7 +104,7 @@ bool valid_staged_ranges(const decoder::PagedPrefillSequence* sequences, int ful
                 }
             }
             if (peer < lane &&
-                output.overlaps({other.output, flash_chunk * row_bytes, output.alignment})) {
+                output.overlaps({other.output, other.rows * row_bytes, output.alignment})) {
                 return false;
             }
         }

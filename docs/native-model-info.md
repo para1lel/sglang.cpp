@@ -90,27 +90,15 @@ Eligible B200 groups of 16 or 32 eager greedy K4 lanes score active lanes togeth
 
 ### Certified Tensor Core target head
 
-The certified greedy vocabulary head uses a native `sm_100a` kernel with TMA
-and `tcgen05`. It requires loaded draft INT8 weights on B200 and valid tensor
-maps for the weights and quantized inputs. The fast path serves eager packets
-of four greedy lanes with five rows each. Each lane must use unconstrained
-selection and request only the winner. Wide MTP verification scores each
-four-lane packet separately. Unsupported tensor maps, unaligned weights, other packet
-shapes, and K0 use the BF16 head. CUDA configuration and launch errors propagate.
-[Score kernel](../src/text/tc_vocab.cu#L77)<!-- prefix: "__global__ _" --> · [Weight setup](../src/text/tc_vocab.cu#L142)<!-- prefix: "std::shared_" --> · [Scratch setup](../src/text/tc_vocab.cu#L168)<!-- prefix: "std::shared_" --> · [Dispatch guard](../src/decoder_verify.cpp#L617)<!-- prefix: "if (round.co" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
-· [Packet dispatch](../src/decoder_verify.cpp#L761)<!-- prefix: "if (packed_a" -->
+The B200 target head reuses draft INT8 weights with `sm_100a` TMA and `tcgen05`. Eager greedy MTP singletons without generated logprobs qualify with one to five rows. The kernel tiles 128 vocabulary entries by 16 columns and certifies live rows only. Existing 20-row packets retain four five-row lanes and BF16 logits for requested score rows. [Score kernel](../src/text/tc_vocab.cu#L103)<!-- prefix: "__global__ _" --> · [Dispatch guard](../src/decoder_verify.cpp#L617)<!-- prefix: "if (round.co" --> · [Score selection](../src/decoder_verify.cpp#L735)<!-- prefix: "if (scored_r" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
 
-The verifier reads the existing draft INT8 weights and adds 3,973,120 model bytes
-for statistics and 21,544,480 workspace bytes per decoder batch before allocator rounding.
-When the provider is available, batches with capacity for four lanes or more
-prepare workspace before request admission.
-[Batch allocation](../src/decoder_batch.cpp#L218)<!-- prefix: "storage->tc_" -->
+K0, sampling, constraints, raw logits, and scored singletons use BF16. Two-row graph replay keeps its existing head. Unsupported maps or unaligned weights decline setup. CUDA errors propagate. [Graph path](../src/decoder_verify.cpp#L665)<!-- prefix: "if (graph &&" --> · [Weight setup](../src/text/tc_vocab.cu#L172)<!-- prefix: "std::shared_" -->
 
-The Tensor Core dot accumulates signed INT8 products exactly in INT32. The interval
-includes FP32 subnormal rounding error in the original BF16 head. Refinement repeats
-the ordered FMA reduction and BF16 rounding, skips NaN scores and chooses the lowest
-token ID on ties. Nonfinite or oversized operands get unbounded intervals. Empty
-or overflowing candidate lists trigger a complete original-order scan.
+Statistics add 3,973,120 model bytes. Before admission, enabled batches allocate 5,386,120 scratch bytes below four-lane capacity or 21,544,480 otherwise, before rounding. [Scratch setup](../src/text/tc_vocab.cu#L204)<!-- prefix: "std::shared_" --> · [Batch allocation](../src/decoder_batch.cpp#L218)<!-- prefix: "storage->tc_" -->
+
+Activation row maxima set signed INT8 quantization. INT32 dots are exact. FP64 bounds cover FP32 subnormal rounding. BF16 refinement repeats ordered FMA, skips NaNs, and breaks ties by lowest ID. Nonfinite or oversized operands get unbounded intervals. Empty or overflowing candidate lists trigger a full original-order scan. [Quantization](../src/text/tc_vocab.cu#L240)<!-- prefix: "check_direct" --> · [Certificate](../src/text/tc_vocab.cu#L257)<!-- prefix: "lower_bounds" -->
+
+Use fixed normalized rows and require exact winner IDs and BF16 winning scores against the ordinary head. Test one through five rows in both scratch capacities and 20 in the larger. Check unused outputs, scored and raw-logit rows, sampling, constraints, and graph replay.
 
 ### Draft attention
 

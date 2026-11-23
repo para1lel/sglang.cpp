@@ -615,7 +615,7 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
         sequences[index] = {round.target, round.position, round.tokens.data(), rows,
                             round.constraint != nullptr, round.rotary_delta()};
         if (round.constraint || round.sampling || round.target->needs_logits() ||
-            rows != target_verify_max_rows) {
+            (count != 1 && rows != target_verify_max_rows)) {
             vocabulary = nullptr;
         }
     }
@@ -725,20 +725,20 @@ void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count
         for (int index = 0; index < size; ++index) {
             normalize_final(*first[index].work, stream);
         }
-        if (vocabulary && size == tc_vocab_rows) {
+        if (vocabulary && (size == tc_vocab_rows || size <= tc_vocab_narrow_rows)) {
             std::array<VerificationRow, tc_vocab_rows> scored;
             const auto end = std::copy_if(first, first + size, scored.begin(),
                 [](const VerificationRow& row) {
                     return row.verification && row.verification->needs_generated_logprobs();
                 });
             const int scored_rows = static_cast<int>(end - scored.begin());
-            if (scored_rows < size) {
+            if (scored_rows == 0 || (size == tc_vocab_rows && scored_rows < size)) {
                 std::array<TcVocabRow, tc_vocab_rows> projection;
                 for (int index = 0; index < size; ++index) {
                     const auto& work = *first[index].work;
                     projection[index] = {work.normalized, work.argmax};
                 }
-                if (try_tc_vocab(*tc_vocab, *vocabulary, projection, stream)) {
+                if (try_tc_vocab(*tc_vocab, *vocabulary, projection.data(), size, stream)) {
                     if (scored_rows != 0) {
                         project_verification_bf16(lm_head, scored.data(), scored_rows,
                                                   &Workspace::logits, stream);

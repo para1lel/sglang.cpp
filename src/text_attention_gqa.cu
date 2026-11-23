@@ -100,8 +100,9 @@ __global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_g
         blockIdx.x % head_count, q_gate, keys, q_norm, k_norm, rope_queries, rope_keys);
 }
 
+template <int Capacity>
 __global__ void gqa_verify_preprocess_kernel(
-    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyPreprocessRow> batch,
+    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyPreprocessRow, Capacity> batch,
     const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm) {
     const auto& row = batch.rows[blockIdx.x];
     gqa_preprocess_head<true>(row.position, 0, blockIdx.y, row.q_gate, row.keys,
@@ -166,18 +167,20 @@ __global__ void gqa_postgate_quantize(const __nv_bfloat16* q_gate, const __nv_bf
     quantize_warp_pairs(first, second, group, offset, lane, output);
 }
 
+template <int Capacity>
 __global__ void gqa_verify_postgate_kernel(
-    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyGateRow> batch) {
+    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyGateRow, Capacity> batch) {
     const auto& row = batch.rows[blockIdx.x];
     gqa_postgate_head(blockIdx.y, row.q_gate, row.attention, row.attention);
 }
 
 }
 
-cudaError_t decoder::gqa_verify_preprocess(const GqaVerifyRows<GqaVerifyPreprocessRow>& batch,
-                                           int count, const __nv_bfloat16* q_norm,
-                                           const __nv_bfloat16* k_norm, cudaStream_t stream) {
-    if (count <= 0 || count > target_split_eager_max_rows || !q_norm || !k_norm) {
+template <int Capacity>
+cudaError_t decoder::gqa_verify_preprocess(
+    const GqaVerifyRows<GqaVerifyPreprocessRow, Capacity>& batch, int count,
+    const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm, cudaStream_t stream) {
+    if (count <= 0 || count > Capacity || !q_norm || !k_norm) {
         return cudaErrorInvalidValue;
     }
     for (int index = 0; index < count; ++index) {
@@ -187,16 +190,17 @@ cudaError_t decoder::gqa_verify_preprocess(const GqaVerifyRows<GqaVerifyPreproce
             return cudaErrorInvalidValue;
         }
     }
-    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyPreprocessRow>*>(&batch),
+    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyPreprocessRow, Capacity>*>(&batch),
                          &q_norm, &k_norm};
-    return cudaLaunchKernel(gqa_verify_preprocess_kernel,
+    return cudaLaunchKernel(gqa_verify_preprocess_kernel<Capacity>,
                             dim3(count, mxfp8_query_heads + mxfp8_kv_heads),
                             mxfp8_head_dim, arguments, 0, stream);
 }
 
-cudaError_t decoder::gqa_verify_postgate(const GqaVerifyRows<GqaVerifyGateRow>& batch,
+template <int Capacity>
+cudaError_t decoder::gqa_verify_postgate(const GqaVerifyRows<GqaVerifyGateRow, Capacity>& batch,
                                          int count, cudaStream_t stream) {
-    if (count <= 0 || count > target_split_eager_max_rows) {
+    if (count <= 0 || count > Capacity) {
         return cudaErrorInvalidValue;
     }
     for (int index = 0; index < count; ++index) {
@@ -205,10 +209,21 @@ cudaError_t decoder::gqa_verify_postgate(const GqaVerifyRows<GqaVerifyGateRow>& 
             return cudaErrorInvalidValue;
         }
     }
-    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyGateRow>*>(&batch)};
-    return cudaLaunchKernel(gqa_verify_postgate_kernel, dim3(count, mxfp8_query_heads),
+    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyGateRow, Capacity>*>(&batch)};
+    return cudaLaunchKernel(gqa_verify_postgate_kernel<Capacity>, dim3(count, mxfp8_query_heads),
                             mxfp8_head_dim, arguments, 0, stream);
 }
+
+template cudaError_t decoder::gqa_verify_preprocess(
+    const GqaVerifyRows<GqaVerifyPreprocessRow>&, int, const __nv_bfloat16*,
+    const __nv_bfloat16*, cudaStream_t);
+template cudaError_t decoder::gqa_verify_preprocess(
+    const GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows>&, int, const __nv_bfloat16*,
+    const __nv_bfloat16*, cudaStream_t);
+template cudaError_t decoder::gqa_verify_postgate(
+    const GqaVerifyRows<GqaVerifyGateRow>&, int, cudaStream_t);
+template cudaError_t decoder::gqa_verify_postgate(
+    const GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows>&, int, cudaStream_t);
 
 cudaError_t text_gqa_preprocess(int first_position, int token_count,
                                 const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,

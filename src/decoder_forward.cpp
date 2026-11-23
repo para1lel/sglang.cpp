@@ -743,7 +743,9 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     } else if constexpr (std::is_same_v<Lane, VerificationRow>) {
         if (batch.lanes[0].binding) {
             attend_verify_gqa(layer, batch, cache_index);
-        } else {
+        } else if (!try_gqa_verify_long(layer, batch.lanes, batch.count, cache_index,
+                                       batch.vector_attention, batch.target_split_end,
+                                       batch.stream)) {
             const auto attend = [&](const auto& packet) {
                 if (!try_gqa_verify_batch(layer, packet.lanes, packet.count, cache_index,
                                           packet.vector_attention, packet.target_split_end,

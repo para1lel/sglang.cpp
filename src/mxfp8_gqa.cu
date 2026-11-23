@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/text/gqa/gqa_decode_long.cuh"
 #include "sglang/text/gqa_decode_split.cuh"
 #include "sglang/text/gqa_verify_batch.h"
 
@@ -95,12 +96,6 @@ __global__ void append_kernel(Cache cache_binding, Pages page_binding,
     const int position = decoder::position_value(first_position) + static_cast<int>(blockIdx.x);
     append_head(cache_value(cache_binding), page_values(page_binding), position, blockIdx.x,
                 keys, values);
-}
-
-__global__ void gqa_verify_append_kernel(
-    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyAppendRow> batch) {
-    const auto& row = batch.rows[blockIdx.x];
-    append_head(row.cache, row.pages.device_pages, row.position, 0, row.keys, row.values);
 }
 
 __device__ float warp_sum(float value) {
@@ -831,23 +826,6 @@ cudaError_t mxfp8_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, int first_
     const auto kernel = append_kernel<int, Mxfp8KvCache, const std::int32_t*>;
     return launch_gqa_kernel(kernel, dim3(token_count, mxfp8_kv_heads), mxfp8_head_dim, stream,
                              cache, pages.device_pages, first_position, keys, values);
-}
-
-cudaError_t decoder::gqa_verify_append(const GqaVerifyRows<GqaVerifyAppendRow>& batch,
-                                       int count, cudaStream_t stream) {
-    if (count <= 0 || count > target_split_eager_max_rows) {
-        return cudaErrorInvalidValue;
-    }
-    for (int index = 0; index < count; ++index) {
-        const auto& row = batch.rows[index];
-        if (row.position < 0 || !row.keys || !row.values ||
-            !cache_covers(row.cache, row.pages, static_cast<std::int64_t>(row.position) + 1)) {
-            return cudaErrorInvalidValue;
-        }
-    }
-    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyAppendRow>*>(&batch)};
-    return cudaLaunchKernel(gqa_verify_append_kernel, dim3(count, mxfp8_kv_heads),
-                            mxfp8_head_dim, arguments, 0, stream);
 }
 
 cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int valid_tokens,

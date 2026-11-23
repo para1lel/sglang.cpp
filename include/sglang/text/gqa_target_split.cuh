@@ -141,3 +141,45 @@ cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, i
     }
     return cudaSuccess;
 }
+
+cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests,
+                                            cudaStream_t stream) {
+    void* arguments[] = {const_cast<LongBatch*>(&batch)};
+    return cudaLaunchKernel(target_split_combine<LongBatch>,
+                            dim3(mxfp8_query_heads, 1, requests * long_rows),
+                            mxfp8_head_dim, arguments, 0, stream);
+}
+
+namespace {
+
+template <int Capacity>
+__global__ void gqa_verify_append_kernel(
+    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyAppendRow, Capacity> batch) {
+    const auto& row = batch.rows[blockIdx.x];
+    append_head(row.cache, row.pages.device_pages, row.position, 0, row.keys, row.values);
+}
+
+}
+
+template <int Capacity>
+cudaError_t decoder::gqa_verify_append(const GqaVerifyRows<GqaVerifyAppendRow, Capacity>& batch,
+                                       int count, cudaStream_t stream) {
+    if (count <= 0 || count > Capacity) {
+        return cudaErrorInvalidValue;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& row = batch.rows[index];
+        if (row.position < 0 || !row.keys || !row.values ||
+            !cache_covers(row.cache, row.pages, static_cast<std::int64_t>(row.position) + 1)) {
+            return cudaErrorInvalidValue;
+        }
+    }
+    void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyAppendRow, Capacity>*>(&batch)};
+    return cudaLaunchKernel(gqa_verify_append_kernel<Capacity>, dim3(count, mxfp8_kv_heads),
+                            mxfp8_head_dim, arguments, 0, stream);
+}
+
+template cudaError_t decoder::gqa_verify_append(
+    const GqaVerifyRows<GqaVerifyAppendRow>&, int, cudaStream_t);
+template cudaError_t decoder::gqa_verify_append(
+    const GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows>&, int, cudaStream_t);

@@ -68,11 +68,11 @@ __device__ __forceinline__ std::uint64_t smem_descriptor(const void* pointer, Bi
            (shared_address(pointer) >> 4);
 }
 
-// kind::f16 instruction descriptor: FP32 accumulate, BF16 A and B, M = 128.
-template <int Columns, bool ValueMajor>
+// kind::f16 instruction descriptor: FP32 accumulate, BF16 A and B.
+template <int Columns, bool ValueMajor, int Rows = 128>
 __host__ __device__ constexpr Bits mma_instruction() {
     constexpr Bits format = (1u << 4) | (1u << 7) | (1u << 10);
-    return (Bits{128 / 16} << 24) | (Bits{Columns / 8} << 17) |
+    return (Bits{Rows / 16} << 24) | (Bits{Columns / 8} << 17) |
            (Bits{ValueMajor} << 16) | format;
 }
 

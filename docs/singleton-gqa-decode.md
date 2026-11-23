@@ -70,14 +70,16 @@ record the measured configuration.
 
 The B200 eager verifier batches Q/K preprocessing, KV append, and attention gating
 for groups of 2–20 target rows. It requires vector attention and the full-context
-split-KV policy. Every row must be in the split window. Other eager groups use
-per-row preprocessing, append, and gating. They can still group eligible split reads.
+split-KV policy. Every row must be in the split window. Other eager groups outside
+the long Tensor Core route use per-row preprocessing, append, and gating.
+They can still group eligible split reads.
 Graph replay uses bound verification dispatch.
-[Dispatch](../src/decoder_forward.cpp#L748)<!-- prefix: "if (!try_gqa" --> ·
-[Eligibility](../include/sglang/text/gqa_verify_batch.h#L62)<!-- prefix: "inline bool " --> ·
+[Dispatch](../src/decoder_forward.cpp#L750)<!-- prefix: "if (!try_gqa" --> ·
+[Eligibility](../include/sglang/text/gqa_verify_batch.h#L66)<!-- prefix: "inline bool " --> ·
 [Bound verification](../src/decoder_forward.cpp#L602)<!-- prefix: "void attend_" -->
 
-Wide K4 verification applies these dispatch rules separately to each 20-row packet.
+Wide K4 verification tries the [long Tensor Core reader](#tensor-core-reads-across-long-k4-packets)
+first. If its geometry check declines, these rules apply separately to each 20-row packet.
 
 Each row supplies its own workspace, absolute position, and request KV page table.
 The stream orders BF16 Q/K normalization and RoPE, MXFP8 K/V append,
@@ -86,10 +88,10 @@ Preprocessing, append, and gating each launch one block per row and applicable h
 Each attention row reads through its own position, even after later rows append KV.
 Output quantization and projection follow gating. The [MTP verifier](mtp.md#runtime-path)
 owns acceptance and the committed KV prefix.
-[Launch sequence](../include/sglang/text/gqa_verify_batch.h#L87)<!-- prefix: "check(gqa_ve" --> ·
-[Preprocessing](../src/text_attention_gqa.cu#L103)<!-- prefix: "__global__ v" --> ·
-[Append](../src/mxfp8_gqa.cu#L100)<!-- prefix: "__global__ v" --> ·
-[Gating](../src/text_attention_gqa.cu#L169)<!-- prefix: "__global__ v" -->
+[Launch sequence](../include/sglang/text/gqa_verify_batch.h#L91)<!-- prefix: "check(gqa_ve" --> ·
+[Preprocessing](../src/text_attention_gqa.cu#L104)<!-- prefix: "__global__ v" --> ·
+[Append](../include/sglang/text/gqa_target_split.cuh#L156)<!-- prefix: "__global__ v" --> ·
+[Gating](../src/text_attention_gqa.cu#L171)<!-- prefix: "__global__ v" -->
 
 ### Shared KV reads for long K4 packets
 
@@ -113,14 +115,41 @@ existing FP64 replay for flagged heads. Each row writes its own split partials.
 [Causal operands](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L66)<!-- prefix: "if (chunk \u003c " --> ·
 [Split output](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L81)<!-- prefix: "write_weight" -->
 
+### Tensor Core reads across long K4 packets
+
+The SM100 reader can group 20–160 rows from complete four-lane K4 packets.
+It requires eager, unconstrained verification and the full 262,144-token context policy.
+Each lane supplies five consecutive positions starting at 32,768 or later.
+All five positions must fit in one 64-token chunk. Lanes can use different chunks.
+Each lane needs a distinct page table, readable paged MXFP8 KV, and aligned buffers.
+A geometry decline leaves the existing packet dispatch eligible.
+[Group guard](../include/sglang/text/gqa_verify_batch.h#L100)<!-- prefix: "inline bool " --> ·
+[Page and buffer checks](../include/sglang/text/gqa_verify_batch.h#L134)<!-- prefix: "for (int pri" -->
+
+One block per lane, KV head, and split shares each 64-token KV chunk across
+five rows and six query heads per row. TMA reads the existing paged payloads
+and scales into shared memory. Each row keeps its own causal mask and FP32
+split partials in the existing logits scratch. The combine retains FP64 replay
+for flagged heads.
+[Paged read](../src/text/gqa_decode_long.cu#L176)<!-- prefix: "__device__ v" --> ·
+[Split partials](../src/text/gqa_decode_long.cu#L428)<!-- prefix: "auto& out = " --> ·
+[Combine](../include/sglang/text/gqa_target_split.cuh#L145)<!-- prefix: "cudaError_t " -->
+
+BF16 Tensor Core multiplies form FP32 scores. Online softmax uses FP32 mass
+and rescaling. The value multiply accumulates two BF16 terms per weight:
+the rounded weight and its rounded residual. This arithmetic can change scores
+compared with the ordinary split reader.
+[Probability split](../src/text/gqa_decode_long.cu#L350)<!-- prefix: "const auto h" --> ·
+[Value accumulation](../src/text/gqa_decode_long.cu#L307)<!-- prefix: "mma(output, " -->
+
 ## Constraints and failure behavior
 
 Short singleton replay remains eligible through 5,120 visible tokens. Decode-only singletons at 5,121–32,767 use direct ordered eager attention. Above 36,864 tokens or when the page table or a layer's buffers lack the required capacity, the new eager binding stays empty and existing dispatch rules apply. The batch buffer stays fixed even if the request reserves more KV. The legacy width-two through width-four graph keeps its separate request-owned long scores. [Replay limit](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L436)<!-- prefix: "if (count ==" --> · [Direct eager read](../src/decoder_forward.cpp#L517)<!-- prefix: "return mxfp8" --> · [Context limit](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" --> · [Legacy scores](batch-graphs.md#constraints-and-failure-behavior)
 
 After clean score-buffer allocation OOM, the batch remembers the failure for its lifetime and uses direct ordered eager attention for long singletons. Short replay remains eligible. Other allocation errors propagate. A recoverable graph rejection retires the graph for that width. The eager fallback can use the retained score buffer. The buffer survives request retirement and KV growth. Batch cleanup drains the stream and destroys graph handles before releasing the allocation. Cleanup retains device resources while stream or graph completion is uncertain. [Allocation fallback](../src/decoder_resources.cpp#L559)<!-- prefix: "if (error.st" --> · [Graph recovery](../src/decoder_resources.cpp#L610)<!-- prefix: "const auto f" --> · [Graph teardown](../src/decoder_resources.cpp#L225)<!-- prefix: "CleanupError" -->
 
-A clean decline or recognized optional setup or launch rejection uses ordinary
-split attention for that packet. A later packet can try the shared reader again.
+For the 20-row shared reader, a clean decline or recognized optional setup or
+launch rejection uses ordinary split attention for that packet. A later packet can try again.
 Hard setup, launch, and combine errors propagate. A pending CUDA error before
 setup prevents shared dispatch and stays recorded. On setup or launch failure,
 the reader clears only a recorded status that matches the returned status.
@@ -128,6 +157,14 @@ A distinct recorded error prevents optional fallback and stays recorded.
 On hard failure, the returned status takes precedence.
 [Rejection handling](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L133)<!-- prefix: "std::optiona" --> ·
 [Setup and launch](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L147)<!-- prefix: "std::optiona" -->
+
+Unsupported device, shared-memory, or tensor-map setup can prevent the long
+Tensor Core read from launching. This decline requires clear CUDA state.
+On that decline, the decoder reuses the KV already appended for each packet.
+It reads through the existing split path before postgating. Pending errors and
+failed CUDA setup, read, or combine calls propagate without retry.
+[Long setup](../src/text/gqa_decode_long.cu#L556)<!-- prefix: "std::optiona" --> ·
+[Packet fallback](../include/sglang/text/gqa_verify_batch.h#L157)<!-- prefix: "if (const au" -->
 
 ## Verification
 
@@ -154,8 +191,9 @@ partials bitwise. Include a flagged head to check FP64 replay.
 Trace 9 and 10 eligible rows. With 10 aligned rows, move one row from 10,240 to
 10,241 visible tokens. Check that dispatch returns to narrow two-stage groups.
 
-Compare the shared and ordinary readers on a reserved B200 with the same checkpoint,
-histories, and paged MXFP8 KV. Trace full K4 packets with first positions at
+For bitwise regression of the 20-row shared reader against the ordinary reader,
+disable the long Tensor Core reader in both arms. Use a reserved B200 with the
+same checkpoint, histories, and paged MXFP8 KV. Trace full K4 packets with first positions at
 32,768 and 36,864. Compare BF16 attention and written split-partial fields
 byte for byte. Include remapped pages and a head that requires FP64 replay.
 Exercise complete packets on both sides of 32,768 and 40,960.
@@ -173,3 +211,13 @@ dispatch for only the rejected packet. Verify shared dispatch on the next eligib
 packet. Inject hard launch and combine errors separately. Check status propagation
 without replay. Check that a preexisting or different recorded CUDA error blocks
 fallback.
+
+Compare the long Tensor Core reader's fixed-history full BF16 vocabulary rows
+against a two-term control. In a separate native greedy run, compare continuation
+IDs with the same control. Separately apply the
+[numerical and quality checks](performance.md#operator-qualification) against
+independent attention and end-to-end oracles. Exercise remapped pages, distinct
+lane positions, and a group that crosses a 64-token boundary. Verify fallback
+after a clean setup decline and error propagation after a failed launch.
+Compare committed target and draft state through rejection and full acceptance.
+Restore a checkpoint and run a further K4 round.

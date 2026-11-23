@@ -36,12 +36,24 @@ Each verification row uses its own causal position. The kernel reads paged MXFP8
 
 Batch graph replay checks each live position on device. The standalone generator uses eager decode if the request can enter the window. Prefill, draft attention, media, and pointwise scoring use their existing paths. The split operator uses the existing checkpoint, KV capacity, and logits scratch.
 
-Eager verification groups 10–20 rows when every row's Tensor Core inputs are aligned and its work
-averages at most 10 chunks per split. Smaller groups, unaligned inputs, higher
-split work, and bound graph replay use groups of at most five. Each row keeps
-its own causal position and scratch. The split count is capped at 16 per row,
-so scratch size is independent of context length. FP64 head fallback still
-applies when inputs fall outside the split kernel's numerical range.
+Under the full-context split policy, eager verification groups 10–20 rows when
+every row has aligned Tensor Core inputs and averages at most ten 64-token chunks
+per split. These launches use one shared-memory copy stage. Other valid eager
+groups use launches of at most five rows. Singleton, narrow eager, and bound
+launches use two stages. Each row has its own scratch for up to 16 splits.
+[Eager grouping](../include/sglang/text/gqa_target_split.cuh#L48)<!-- prefix: "int eager_ta" --> ·
+[Stage dispatch](../src/text/gqa_decode_split.cu#L583)<!-- prefix: "cudaError_t " -->
+
+One stage reduces shared-memory use and lets three CTAs fit per B200 SM.
+Each warp waits for its copies before reading the tile and synchronizes before
+reusing the stage. The CTA computes one softmax weight per warp and query head
+and reuses it across value channels. The merge preserves warp order for the
+maximum, mass, and per-channel FP32 accumulation. The same combine kernel
+reduces split partials and sends flagged heads to FP64 replay.
+[Shared-memory bound](../src/text/gqa_decode_split.cu#L78)<!-- prefix: "static_asser" --> ·
+[Tile loop](../src/text/gqa_decode_split.cu#L514)<!-- prefix: "if constexpr" --> ·
+[Warp weights](../src/text/gqa_decode_split.cu#L444)<!-- prefix: "__device__ v" --> ·
+[Cross-split combine](../include/sglang/text/gqa_target_split.cuh#L6)<!-- prefix: "__global__ v" -->
 
 The earlier bounded and long profiles used explicit launch settings. Their
 [historical paired results](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/serving/paired-split-attention-results.md)
@@ -92,3 +104,11 @@ and scales, including untouched slots. Trace one launch per batched stage per GQ
 layer. Exercise a group that straddles 2,047 and 2,048 visible tokens. Check that
 this group uses the per-row stages. Use the [MTP verification checks](mtp.md#verification)
 for acceptance and continuation.
+
+Compare the one-stage split with the two-stage split on a reserved B200.
+Use identical BF16 queries and packed KV with remapped pages and a partial tail.
+Trace the split launch for 9 and 10 eligible rows. With 10 aligned rows under
+the full-context policy, move one row from 10,240 to 10,241 visible tokens.
+Check that the group switches from one stage to two stages at that boundary.
+Compare BF16 outputs and split scratch byte for byte on the same inputs.
+Include a flagged head to check FP64 replay.

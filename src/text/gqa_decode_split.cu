@@ -57,8 +57,9 @@ struct Query {
     bool flag[32];
 };
 
+template <int StageCount>
 struct Shared {
-    Stage stage[stages];
+    Stage stage[StageCount];
     WarpScales scales[warps];
     int pages[max_split_pages];
     Query query;
@@ -69,11 +70,12 @@ struct Merge {
     float maximum[warps][group_heads];
     float mass[warps][group_heads];
     int flag[warps][group_heads];
+    float weight[warps][group_heads];
 };
 
-constexpr std::size_t shared_bytes = sizeof(Shared);
-static_assert(sizeof(Merge) <= sizeof(Stage) * stages && sizeof(Stage) % 16 == 0);
-static_assert(2 * (shared_bytes + 1024) <= 233472, "two CTAs must fit on one SM");
+static_assert(sizeof(Merge) <= sizeof(Stage) && sizeof(Stage) % 16 == 0);
+static_assert(2 * (sizeof(Shared<stages>) + 1024) <= 233472);
+static_assert(3 * (sizeof(Shared<1>) + 1024) <= 233472);
 
 /// Online state of one warp. `out` holds sum(p * v) * 2^(142 - R_g) for group g, where
 /// R_g is the largest value-scale byte seen in that group (packed bytes in `reference`).
@@ -136,7 +138,8 @@ __device__ __forceinline__ float power_of_two(int biased) {
     return __uint_as_float(static_cast<unsigned int>(biased) << 23);
 }
 
-__device__ void issue_warp_tile(const Shared& shared, Stage& stage,
+template <int StageCount>
+__device__ void issue_warp_tile(const Shared<StageCount>& shared, Stage& stage,
                                const decoder::PagedDecodeLane& lane, int kv_head, int chunk,
                                int first_page, int warp, int lane_id) {
     const int half = chunk % chunks_per_page;
@@ -438,10 +441,49 @@ __device__ void write_partials(const Merge& merge, void* scratch, int kv_head, i
     }
 }
 
-template <typename Input>
-__global__ void __launch_bounds__(threads, 2) split_kernel(const __grid_constant__ Input input) {
+__device__ void write_weighted_partials(Merge& merge, void* scratch, int kv_head, int split) {
+    const int thread = threadIdx.x;
+    if (thread < group_heads) {
+        float maximum = -CUDART_INF_F;
+        int flag = 0;
+        #pragma unroll
+        for (int warp = 0; warp < warps; ++warp) {
+            maximum = fmaxf(maximum, merge.maximum[warp][thread]);
+            flag |= merge.flag[warp][thread];
+        }
+        float mass = 0.0f;
+        #pragma unroll
+        for (int warp = 0; warp < warps; ++warp) {
+            const float previous = merge.maximum[warp][thread];
+            const float delta = previous - maximum;
+            flag |= previous != -CUDART_INF_F && delta < -126.0f;
+            const float weight = previous == -CUDART_INF_F ? 0.0f : exp2f(delta);
+            merge.weight[warp][thread] = weight;
+            mass = fmaf(weight, merge.mass[warp][thread], mass);
+        }
+        auto& out = partials(scratch, kv_head * group_heads + thread)[split];
+        out.maximum = flag ? CUDART_NAN_F : maximum;
+        out.mass = mass;
+    }
+    __syncthreads();
+    for (int item = thread; item < group_heads * mxfp8_head_dim; item += threads) {
+        const int head = item / mxfp8_head_dim;
+        const int channel = item % mxfp8_head_dim;
+        float value = 0.0f;
+        #pragma unroll
+        for (int warp = 0; warp < warps; ++warp) {
+            value = fmaf(merge.weight[warp][head], merge.value[warp][head][channel], value);
+        }
+        partials(scratch, kv_head * group_heads + head)[split].value[channel] = value;
+    }
+}
+
+template <typename Input, bool SingleStage = false>
+__global__ void __launch_bounds__(threads, SingleStage ? 3 : 2)
+split_kernel(const __grid_constant__ Input input) {
     alignas(16) extern __shared__ unsigned char shared_raw[];
-    auto& shared = *reinterpret_cast<Shared*>(shared_raw);
+    constexpr int stage_count = SingleStage ? 1 : stages;
+    auto& shared = *reinterpret_cast<Shared<stage_count>*>(shared_raw);
     const auto lane = resolve_input(input);
     if (!readable(lane) || !tensor_aligned(lane)) {
         return;
@@ -466,46 +508,65 @@ __global__ void __launch_bounds__(threads, 2) split_kernel(const __grid_constant
         load_query(shared.query, lane.buffers.queries, kv_head, lane_id);
     }
     __syncthreads();
-    #pragma unroll
-    for (int index = 0; index < stages - 1; ++index) {
-        if (first + index < last) {
-            issue_warp_tile(shared, shared.stage[index], lane, kv_head, first + index, first_page,
-                            warp, lane_id);
-        }
-        commit();
-    }
     Running run{};
     run.maximum = -CUDART_INF_F;
     run.flag = shared.query.flag[lane_id];
-    for (int chunk = first; chunk < last; ++chunk) {
-        wait_pending<stages - 2>();
-        __syncwarp();
-        const int next = chunk + stages - 1;
-        if (next < last) {
-            issue_warp_tile(shared, shared.stage[(next - first) % stages], lane, kv_head, next,
-                            first_page, warp, lane_id);
+    if constexpr (SingleStage) {
+        for (int chunk = first; chunk < last; ++chunk) {
+            issue_warp_tile(shared, shared.stage[0], lane, kv_head, chunk, first_page, warp,
+                            lane_id);
+            commit();
+            wait_pending<0>();
+            __syncwarp();
+            process_tile(shared.stage[0], shared.scales[warp], shared.query, run, chunk,
+                         lane.position, warp, lane_id);
+            __syncwarp();
         }
-        commit();
-        process_tile(shared.stage[(chunk - first) % stages], shared.scales[warp], shared.query,
-                     run, chunk, lane.position, warp, lane_id);
+    } else {
+        #pragma unroll
+        for (int index = 0; index < stages - 1; ++index) {
+            if (first + index < last) {
+                issue_warp_tile(shared, shared.stage[index], lane, kv_head, first + index,
+                                first_page, warp, lane_id);
+            }
+            commit();
+        }
+        for (int chunk = first; chunk < last; ++chunk) {
+            wait_pending<stages - 2>();
+            __syncwarp();
+            const int next = chunk + stages - 1;
+            if (next < last) {
+                issue_warp_tile(shared, shared.stage[(next - first) % stages], lane, kv_head, next,
+                                first_page, warp, lane_id);
+            }
+            commit();
+            process_tile(shared.stage[(chunk - first) % stages], shared.scales[warp], shared.query,
+                         run, chunk, lane.position, warp, lane_id);
+        }
+        wait_pending<0>();
     }
-    wait_pending<0>();
     __syncthreads();
     auto& merge = *reinterpret_cast<Merge*>(shared_raw);
     store_warp(merge, run, warp, lane_id / 4, lane_id % 4);
     __syncthreads();
-    write_partials(merge, lane.buffers.scratch, kv_head, split);
+    if constexpr (SingleStage) {
+        write_weighted_partials(merge, lane.buffers.scratch, kv_head, split);
+    } else {
+        write_partials(merge, lane.buffers.scratch, kv_head, split);
+    }
 }
 
-template <typename Input>
+template <bool SingleStage = false, typename Input>
 cudaError_t launch_split(const Input& input, int count, cudaStream_t stream) {
-    const auto status = cudaFuncSetAttribute(split_kernel<Input>,
+    constexpr std::size_t shared_bytes = sizeof(Shared<SingleStage ? 1 : stages>);
+    const auto status = cudaFuncSetAttribute(split_kernel<Input, SingleStage>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             static_cast<int>(shared_bytes));
     if (status != cudaSuccess) {
         return status;
     }
-    split_kernel<<<dim3(max_splits, mxfp8_kv_heads, count), threads, shared_bytes, stream>>>(input);
+    split_kernel<Input, SingleStage>
+        <<<dim3(max_splits, mxfp8_kv_heads, count), threads, shared_bytes, stream>>>(input);
     return cudaGetLastError();
 }
 
@@ -520,6 +581,9 @@ cudaError_t launch(const TargetBatch& batch, int count, cudaStream_t stream) {
 }
 
 cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream) {
+    if (count >= 2 * text_gdn_max_verify_rows && batch.end == text_attention_max_tokens) {
+        return launch_split<true>(batch, count, stream);
+    }
     return launch_split(batch, count, stream);
 }
 

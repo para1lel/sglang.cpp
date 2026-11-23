@@ -42,7 +42,14 @@ rows when every row has aligned Tensor Core inputs and averages at most ten
 Other valid eager groups use launches of at most five rows. Singleton, narrow
 eager, and bound launches use two stages. Each row has scratch for up to 16 splits.
 [Eager grouping](../include/sglang/text/gqa_target_split.cuh#L48)<!-- prefix: "int eager_ta" --> ·
-[Stage dispatch](../src/text/gqa_decode_split.cu#L597)<!-- prefix: "cudaError_t " -->
+[Stage dispatch](../src/text/gqa_decode_split.cu#L645)<!-- prefix: "cudaError_t " -->
+
+The one-stage path transposes the QK matrix multiply so each MMA covers 16 keys
+and eight query columns. Warp shuffles restore token order before the causal
+mask, softmax, and value accumulation. Each score keeps the same 32-channel
+group order and scale application. The split merge and FP64 replay stay shared.
+[Transposed scores](../src/text/gqa_decode_split.cu#L297)<!-- prefix: "__device__ v" --> ·
+[Single-stage call](../src/text/gqa_decode_split.cu#L576)<!-- prefix: "process_tile" -->
 
 One stage reduces shared-memory use and lets three CTAs fit per B200 SM.
 Each warp waits for its copies before reading the tile and synchronizes before
@@ -51,8 +58,8 @@ and reuses it across value channels. The merge preserves warp order for the
 maximum, mass, and per-channel FP32 accumulation. The same combine kernel
 reduces split partials and sends flagged heads to FP64 replay.
 [Shared-memory bound](../src/text/gqa_decode_split.cu#L78)<!-- prefix: "static_asser" --> ·
-[Tile loop](../src/text/gqa_decode_split.cu#L521)<!-- prefix: "if constexpr" --> ·
-[Warp weights](../src/text/gqa_decode_split.cu#L451)<!-- prefix: "__device__ v" --> ·
+[Tile loop](../src/text/gqa_decode_split.cu#L569)<!-- prefix: "if constexpr" --> ·
+[Warp weights](../src/text/gqa_decode_split.cu#L499)<!-- prefix: "__device__ v" --> ·
 [Cross-split combine](../include/sglang/text/gqa_target_split.cuh#L6)<!-- prefix: "__global__ v" -->
 
 The earlier bounded and long profiles used explicit launch settings. Their
@@ -139,13 +146,13 @@ layer. Exercise a group that straddles 2,047 and 2,048 visible tokens. Check tha
 this group uses the per-row stages. Use the [MTP verification checks](mtp.md#verification)
 for acceptance and continuation.
 
-Compare the one-stage split with the two-stage split on a reserved B200.
-Use identical BF16 queries and packed KV with remapped pages and a partial tail.
-Trace the split launch for 9 and 10 eligible rows. With 10 aligned rows under
-the full-context policy, move one row from 10,240 to 10,241 visible tokens.
-Check that the group switches from one stage to two stages at that boundary.
-Compare BF16 outputs and split scratch byte for byte on the same inputs.
-Include a flagged head to check FP64 replay.
+Compare transposed scoring with ordinary scoring in the same one-stage loop on B200.
+Keep the BF16 queries, visible range, split partition, and packed KV identical.
+Remap pages and include a partial tail. Compare BF16 outputs and written split
+partials bitwise. Include a flagged head to check FP64 replay.
+
+Trace 9 and 10 eligible rows. With 10 aligned rows, move one row from 10,240 to
+10,241 visible tokens. Check that dispatch returns to narrow two-stage groups.
 
 Compare the shared and ordinary readers on a reserved B200 with the same checkpoint,
 histories, and paged MXFP8 KV. Trace full K4 packets with first positions at

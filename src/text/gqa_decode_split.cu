@@ -292,6 +292,50 @@ __device__ void tile_scores(const Stage& stage, const WarpScales& scales, const 
     }
 }
 
+// Use the 16 MMA rows for keys and the eight columns for query heads.
+// Reduce K32 groups in the original order before restoring the score lane layout.
+__device__ void transposed_scores(const Stage& stage, const WarpScales& scales,
+                                  const Query& query, int warp, int row, int quad,
+                                  float (&score)[4]) {
+    float transposed[4] = {};
+    #pragma unroll
+    for (int group = 0; group < mxfp8_groups; ++group) {
+        const auto words = query.words[group][4 * row + quad];
+        const auto* keys = stage.keys + (warp * tile_tokens + row) * key_stride +
+                           group * mxfp8_group_size + quad * 8;
+        const auto low = *reinterpret_cast<const uint2*>(keys);
+        const auto high = *reinterpret_cast<const uint2*>(keys + 8 * key_stride);
+        unsigned int lo[4], hi[4];
+        expand(low.x, lo[0], lo[1]);
+        expand(low.y, lo[2], lo[3]);
+        expand(high.x, hi[0], hi[1]);
+        expand(high.y, hi[2], hi[3]);
+        float sum[4] = {};
+        mma(sum, lo[0], hi[0], lo[1], hi[1], words.x, words.y);
+        mma(sum, lo[2], hi[2], lo[3], hi[3], words.z, words.w);
+        const float factor_low = scales.key[group][row];
+        const float factor_high = scales.key[group][row + 8];
+        transposed[0] = fmaf(sum[0], factor_low, transposed[0]);
+        transposed[1] = fmaf(sum[1], factor_low, transposed[1]);
+        transposed[2] = fmaf(sum[2], factor_high, transposed[2]);
+        transposed[3] = fmaf(sum[3], factor_high, transposed[3]);
+    }
+    const int lane0 = 8 * quad + row / 2;
+    const int lane1 = lane0 + 4;
+    const float even0 = __shfl_sync(full_mask, transposed[0], lane0);
+    const float even1 = __shfl_sync(full_mask, transposed[0], lane1);
+    const float odd0 = __shfl_sync(full_mask, transposed[1], lane0);
+    const float odd1 = __shfl_sync(full_mask, transposed[1], lane1);
+    const float even2 = __shfl_sync(full_mask, transposed[2], lane0);
+    const float even3 = __shfl_sync(full_mask, transposed[2], lane1);
+    const float odd2 = __shfl_sync(full_mask, transposed[3], lane0);
+    const float odd3 = __shfl_sync(full_mask, transposed[3], lane1);
+    score[0] = row % 2 ? odd0 : even0;
+    score[1] = row % 2 ? odd1 : even1;
+    score[2] = row % 2 ? odd2 : even2;
+    score[3] = row % 2 ? odd3 : even3;
+}
+
 __device__ void update(Running& run, const float (&score)[4], float min_delta,
                        unsigned int valid, int quad, float (&weight)[4]) {
     float logit[4];
@@ -364,7 +408,7 @@ __device__ void accumulate(const Stage& stage, const WarpScales& scales, const f
     }
 }
 
-template <bool SharedTail = false>
+template <bool SharedTail = false, bool Transposed = false>
 __device__ void process_tile(const Stage& stage, WarpScales& scales, const Query& query,
                              Running& run, int chunk, int position, int warp, int lane) {
     const int first = chunk * chunk_tokens;
@@ -383,7 +427,11 @@ __device__ void process_tile(const Stage& stage, WarpScales& scales, const Query
         fp32_min_exponent - e4m3_min_exponent - (min_exponent - fp32_exponent_bias);
     const float min_delta = static_cast<float>(max(fp32_min_exponent, min_value_delta));
     float score[4];
-    tile_scores<SharedTail>(stage, scales, query, warp, row, quad, score, position - first);
+    if constexpr (Transposed) {
+        transposed_scores(stage, scales, query, warp, row, quad, score);
+    } else {
+        tile_scores<SharedTail>(stage, scales, query, warp, row, quad, score, position - first);
+    }
     float weight[4];
     update(run, score, min_delta, valid, quad, weight);
     accumulate<SharedTail>(stage, scales, weight, warp, row, quad, run, position - first);
@@ -525,8 +573,8 @@ split_kernel(const __grid_constant__ Input input) {
             commit();
             wait_pending<0>();
             __syncwarp();
-            process_tile(shared.stage[0], shared.scales[warp], shared.query, run, chunk,
-                         lane.position, warp, lane_id);
+            process_tile<false, true>(shared.stage[0], shared.scales[warp], shared.query,
+                                     run, chunk, lane.position, warp, lane_id);
             __syncwarp();
         }
     } else {

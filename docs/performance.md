@@ -171,21 +171,19 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The cache-on `matched-k4-native-defaults-cache-on-v2` campaign failed W1 on 2026-11-23. Both engines ran on the same B200 with MTP4, an 8,192-token step budget, and a 32-request cap. Each ran three warmups and nine timed requests. Each cohort began after an acknowledged idle reset. All 25 streams, including the separate native trace, reported zero cached tokens. Median client makespan was **658.323903 ms native** versus **627.697053 ms pinned vLLM**. Native was 30.626850 ms slower (4.88%). The campaign stopped, leaving W2–W6 unmeasured.
-
-The measured prerelease native server SHA-256 was `dcac77a6012b2990d189dd67229a0e696e5c5d5716fcc66dae967a6271c6cb3c`. Its frozen source manifest SHA-256 was `e22a47bf8a509535e333fd8d59d05bb8d7dec35649b8cee811f3b4f382319156` on base `28148cda233e5522274e258d5eb5caa9ab83e313`. This run predates the published runtime. The vLLM pin was `81a8cb063e6247fe254d7caf7e98a6691d71022a`. The comparison, row receipt, and provenance are under `artifacts/handover-w3/cache-on-pin/campaign-v2-gpu0.kn5ms1zc/`.
-
-The archived cache-off `matched-k4-native-defaults-v1` campaign passed W1–W3 on a reserved B200 on 2026-11-23, 10:41:24–11:03:51 UTC. W4–W6 were unmeasured. Both engines used MTP4, a 32-request cap, and an 8,192-token step budget. Native used the Release defaults at the time and CUDA graphs. All streams reported zero cached tokens and streamed greedy IDs to their fixed output caps. [Measured revision](https://github.com/para1lel/sglang.cpp/commit/c3c6271fc9be52dcadea4c074cebd87d68355518)
-
-The pinned vLLM arm used a 2,560-token context cap and 10 GiB KV budget for W1/W2, and 132,096 tokens and 128 GiB for W3. Each arm ran three warmups and nine measured serial requests per W1/W2 row. W3 used two warmups and five measured four-request cohorts per arm. W1 and W3 timed vLLM first. W2 timed native first.
+The rolling-cache `matched-k4-native-defaults-cache-on-v2` campaign passed W1 on one reserved B200 (GPU 6). Both engines used MTP4, an 8,192-token step budget, and a 32-request cap. Each ran three warmups and nine untraced timed requests after idle cache resets. The separate native trace also began cold. All 25 streams reported zero cached tokens.
 
 | Workload | Native median, ms | Pinned vLLM median, ms | Native reduction |
 | --- | ---: | ---: | ---: |
-| W1 | 605.388949 | 723.791664 | 16.36% |
-| W2 | 1,348.773244 | 1,934.857093 | 30.29% |
-| W3 | 3,950.509358 | 4,280.063137 | 7.70% |
+| W1 | 605.770952 | 621.347928 | 2.51% |
 
-Both engines repeated full IDs on W1/W2. Cross-engine IDs differed for both serial rows and matched all 28 W3 lane streams. The separate native W1 trace matched timed IDs and verified depth four in 49 of 50 rounds. The archive retains the exact launch settings, build and runner manifests, and separate score smoke. [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)
+Timing ran from submission to wire `[DONE]` and included native terminal checkpoint publication. Native repeated all 128 output IDs, including in the untimed trace. The trace measured depth four in 49 of 50 rounds. W2–W6 have no qualified results in this summary.
+
+The measured native binary SHA-256 is `846181234eb93d0766d4a492706ed9aad22e32c9ccd5341b56b94cccde0932ba`. Its build started from `5089eb0b` with the rolling-cache source freeze. The published runtime wraps one declaration. Its server binary matches the measured binary byte for byte. The vLLM pin is `81a8cb063e6247fe254d7caf7e98a6691d71022a`. [Runtime revision](https://github.com/para1lel/sglang.cpp/commit/b3e9e274e722bb220dd74efc16bf341829c69833) · [Benchmark revision](https://github.com/para1lel/sglang.cpp/commit/54d33669ab8d6385a6fe79316341fad7bc7c9a4d)
+
+The W1 receipt is under `artifacts/handover-w3/cache-on-pin/release-w1/formal.gNo8wvzM/W1/receipt.json` (SHA-256 `d2c0b4aaa3c913fa75c1bb2537604e74b14a243fbfc00db4c7f8ee8e157796c2`). The runner and all three original clients exited successfully. The runner omitted row-level shell exit markers. Recovery verified an idle GPU and absent listener under the device and port locks. It kept the original comparison, wire data, and timing samples. The recorded finish timestamp is the recovery time. Independent replay passed.
+
+The prerelease cache-on v2 campaign failed W1 at 658.323903 ms native versus 627.697053 ms pinned vLLM and stopped. The cache-off v1 campaign passed W1–W3 under its earlier settings. [Prerelease v2 evidence](https://github.com/para1lel/sglang.cpp/blob/5089eb0b3442efe13ba47a86c5650d0409540a8d/docs/performance.md#matched-k4-evidence) · [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)
 
 Earlier native-default campaigns retain their own settings, medians, and digests. [Seed FC campaign](https://github.com/para1lel/sglang.cpp/blob/0b49cd18212d3535305593bc1c5f5c4c88393e0a/docs/performance.md#matched-k4-evidence) · [Archived native-default report](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/serving/paired-native-defaults-results.md)
 

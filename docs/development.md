@@ -18,7 +18,7 @@ Production excludes cuBLAS, cuDNN, CUTLASS, FlashInfer, and equivalent operator 
 
 ## Current matched K4 status
 
-The November 23, 2026 [matched K4 comparison](serving/paired-native-defaults-results.md) records passes on W1 and W2 for native Release `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3`. W3–W6 remain unmeasured for this profile.
+The [matched K4 report](serving/paired-native-defaults-results.md) records timing passes on W1 and W2. Formal W3–W6 remain unmeasured.
 
 Run one workload at a time on the same reserved B200 with a verified Release binary:
 

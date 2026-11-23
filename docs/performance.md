@@ -171,25 +171,18 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The cumulative `matched-k4-native-defaults-cache-on-v2` campaign passed W1 and W2 and missed W3 by 11.918276 ms. Formal timing stopped before W4–W6. Both engines used the same reserved B200 (GPU 6), MTP4, an 8,192-token step budget, and a 32-request cap. W1 and W2 used three warmups and nine untraced timed requests per engine. W3 used two warmups and five timed four-request cohorts per engine. Idle resets preceded each request or cohort. All streams reported zero cached tokens, including the separate W1 native trace.
+The `matched-k4-native-defaults-cache-on-v2` campaign passed W1–W3. W4–W6 remain unmeasured. Both engines used the same reserved B200 (GPU 6), MTP4, an 8,192-token step budget, and a 32-request cap. W1 and W2 used three warmups and nine untraced timed requests per engine. W3 used two warmups and five timed four-request cohorts per engine. Both engines reset their caches before each cohort. All streams reported zero cached tokens, including the separate W1 trace.
 
 | Workload | Native median, ms | Pinned vLLM median, ms | Native change |
 | --- | ---: | ---: | ---: |
-| W1 | 579.958061 | 624.608697 | −7.15% |
-| W2 | 1268.284205 | 1690.511690 | −24.98% |
-| W3 | 3971.051603 | 3959.133327 | +0.301% |
+| W1 | 586.763921 | 625.866143 | −6.248% |
+| W2 | 1268.318258 | 1690.128402 | −24.957% |
+| W3 | 3901.049177 | 3959.073749 | −1.466% |
 
-Timing ran from submission to wire `[DONE]` and included native terminal checkpoint publication. Native repeated full output IDs in each row. The W1 trace matched the native timed IDs and measured depth four in 49 of 50 rounds. No pinned W1 or W2 timed output matched native full IDs (0 of 9 per row). All 28 W3 lane streams matched across engines, including warmups.
+Timing ran from submission to wire `[DONE]` and included native terminal checkpoint publication. Native repeated full output IDs in each row. The separate W1 trace matched native timed IDs and ran at depth four in 49 of 50 rounds. In W1 and W2, zero of nine timed vLLM outputs per row matched native IDs. In W3, all 28 corresponding lane outputs matched across engines, including warmups.
 
-The measured native server SHA-256 is `a30409a517f62b0c8e4683db4763b43dfc423e3259aec8dabba346c79f262b7b`. Its effective source manifest is `9a2bbdbdaedd5eac939bca1381580eaa644678d19671b38061ba09260045f730`. The runner's 40-character source field abbreviates the frozen owner-chain digest. The vLLM pin is `81a8cb063e6247fe254d7caf7e98a6691d71022a`.
+The measured Release server SHA-256 is `945e9226cc475fd4dcae565ad179ae5599812170b945b5c1c25cc877fe788e80`. The qualification manifest SHA-256 is `19dfab9ea1d231f597154a783d51cfeed262cf88f95cac2ed48e12a19750bc0c`. The vLLM pin is `81a8cb063e6247fe254d7caf7e98a6691d71022a`. [Measured runtime revision](https://github.com/para1lel/sglang.cpp/commit/a84fb5388c4676cb4a9f17801c29f6787c3985f8)
 
-The maintained rebuild SHA-256 is `7ba22975f7e59f90bcbfe17ae1b51ed8f8531b5b0313bd2c6c2fef5baea1e38d`. Of 203 inputs, 200 match the timed build byte for byte. The other three contain two source formatting changes and an archive locator change. The formatted sources produce identical linked objects. The rebuild matches host `.text` and all CUDA machine code and resource records. Remaining ELF differences are NVCC namespace strings. The final input and binary attestation SHA-256 is `9e1dbf3783bac5f1396b8b8508552b76c31027f2734c7cfb6bee2bea053f3b0d`. [Maintained runtime revision](https://github.com/para1lel/sglang.cpp/commit/b5a004877cd7ee2b98093492683cbbb7e9ecc181)
+Recover commands, raw streams, and replayed receipts under `artifacts/handover-w3/cache-on-pin/release-w1/short-gqa-formal.ZsTtyKje/`. `identity.json` identifies the checkpoint and protocol. All three original runners exited successfully. Row-level exit records and finish timestamps were reconstructed after verifying cleanup. All raw samples and comparisons were preserved.
 
-Original timing samples, output streams, source identity, and independently replayed row receipts are under `artifacts/handover-w3/cache-on-pin/release-w1/cumulative-formal.WxWUVm1L/`. W1 and W2 required row-end metadata recovery after verified cleanup. Their original samples and comparisons were preserved. W3 retains its original exit status 1.
-
-The prior rolling-cache run passed W1 and W2 and missed W3 by 17.548926 ms (0.444%). The prerelease cache-on v2 run stopped at W1. The earlier cache-off v1 run passed W1–W3 under its recorded settings. [Prior rolling-cache evidence](https://github.com/para1lel/sglang.cpp/blob/2bc8970d0a0555aa1deb681cbdc6fb1ad44bda68/docs/performance.md#matched-k4-evidence) · [Prerelease v2 evidence](https://github.com/para1lel/sglang.cpp/blob/5089eb0b3442efe13ba47a86c5650d0409540a8d/docs/performance.md#matched-k4-evidence) · [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)
-
-Earlier native-default campaigns retain their own settings, medians, and digests. [Seed FC campaign](https://github.com/para1lel/sglang.cpp/blob/0b49cd18212d3535305593bc1c5f5c4c88393e0a/docs/performance.md#matched-k4-evidence) · [Archived native-default report](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/serving/paired-native-defaults-results.md)
-
-Use the historical K0 and bounded split-attention K4 reports only under their
-recorded settings. [W1–W6 K0 report](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/performance-comparison.md) · [Measurement ledger](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-measurement-ledger.md) · [Bounded split K4 report](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-split-attention-results.md)
+The preceding cache-on campaign missed W3 by 11.918276 ms. Earlier campaigns retain their own settings and results. [Prior cache-on evidence](https://github.com/para1lel/sglang.cpp/blob/650f69d853380d5738955586ce37f30051485f8f/docs/performance.md#matched-k4-evidence) · [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)

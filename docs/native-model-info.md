@@ -83,15 +83,20 @@ Quantization uses the maximum absolute value per weight row and activation. Zero
 
 ### Certified Tensor Core target head
 
-The certified greedy vocabulary head is the sole cuBLASLt exception in the
-native runtime. It requires loaded draft INT8 weights on B200 and a supported
-cuBLASLt algorithm. The fast path serves eager batches of four greedy lanes
-with five rows each and no constraints or complete-logit consumers. Unsupported
-algorithm selection, other shapes, and K0 use the BF16 head.
+The certified greedy vocabulary head uses a native `sm_100a` kernel with TMA
+and `tcgen05`. It requires loaded draft INT8 weights on B200 and valid tensor
+maps for the weights and quantized inputs. The fast path serves eager batches
+of four greedy lanes with five rows each. Each lane must use unconstrained
+selection and request only the winner. Unsupported tensor maps, unaligned
+weights, other shapes, and K0 use the BF16 head. CUDA configuration and launch
+errors propagate.
+[Score kernel](../src/text/tc_vocab.cu#L77)<!-- prefix: "__global__ _" --> · [Weight setup](../src/text/tc_vocab.cu#L142)<!-- prefix: "std::shared_" --> · [Scratch setup](../src/text/tc_vocab.cu#L168)<!-- prefix: "std::shared_" --> · [Dispatch guard](../src/decoder_forward.cpp#L753)<!-- prefix: "if (round.co" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
 
 The verifier reads the existing draft INT8 weights and adds 3,973,120 model bytes
 for statistics and 21,544,480 workspace bytes per decoder batch before allocator rounding.
-These allocations apply whenever the provider starts, including batches of ineligible requests.
+When the provider is available, batches with capacity for four lanes or more
+prepare workspace before request admission.
+[Batch allocation](../src/decoder_batch.cpp#L224)<!-- prefix: "storage-\u003etc_" -->
 
 The Tensor Core dot accumulates signed INT8 products exactly in INT32. The interval
 includes FP32 subnormal rounding error in the original BF16 head. Refinement repeats

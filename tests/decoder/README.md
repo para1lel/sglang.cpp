@@ -14,7 +14,7 @@ checkpoint=/data0/shared/Qwen3.8-27B-FP8
 "$CXX" -std=c++20 -O3 -pthread -Iinclude -isystem "$toolkit/include" \
     tests/decoder/gdn_verify_checkpoint.cpp \
     -Wl,--start-group "$out"/lib/libsglang_*.a -Wl,--end-group \
-    -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -lcuda -lcublasLt -o "$out/gdn-verify-check"
+    -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -lcuda -o "$out/gdn-verify-check"
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     "$out/gdn-verify-check" "$checkpoint" lane0.txt lane1.txt lane2.txt lane3.txt
 ```

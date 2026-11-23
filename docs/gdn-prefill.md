@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L871)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L157)<!-- prefix: "const bool c" --> |
+| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L878)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L157)<!-- prefix: "const bool c" --> |
 | GDN operator | Prepare rows, advance each layer's recurrent state, and finish output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L647)<!-- prefix: "cudaError_t " --> |
 | Verification | Check ordered parity, chunked numerical error, and causal continuation. | [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L101)<!-- prefix: "int main(int" --> |
 
@@ -43,7 +43,7 @@ The ordered tensor-core fallback uses the paired kernel for at least 32 rows wit
 
 ### Grouped partial grants
 
-A [partial-grant projection group](native-prefill-workspace.md#partial-grant-projection-groups) can share GDN launches at 4,096 rows on SM100. It needs eight 512-row grants or sixteen 256-row grants. The decoder submits four grants at a time, with separate convolution history, FP32 carry, and scratch for each grant. The groups use the existing prefill arena. [Shape guard](../src/decoder_prefill.cpp#L531)<!-- prefix: "bool can_gro" --> · [Four-grant dispatch](../src/decoder_prefill.cpp#L543)<!-- prefix: "void prefill" -->
+A [partial-grant projection group](native-prefill-workspace.md#partial-grant-projection-groups) can share GDN launches at 4,096 rows on SM100. It needs eight 512-row grants or sixteen 256-row grants. The decoder submits four grants at a time, with separate convolution history, FP32 carry, and scratch for each grant. The groups use the existing prefill arena. [Shape guard](../src/decoder_prefill.cpp#L531)<!-- prefix: "bool is_full" --> · [Four-grant dispatch](../src/decoder_prefill.cpp#L543)<!-- prefix: "void prefill" -->
 
 If any of the four starts at position zero, bank zero uses the existing per-grant path for those four. The decoder also uses that path when the provider declines before GDN submission. A returned CUDA error propagates. The decoder clears the CUDA last-error value if it matches the reported error. [Bank guard](../src/decoder_prefill.cpp#L492)<!-- prefix: "grant.rows %" --> · [Error handling](../src/decoder_prefill.cpp#L505)<!-- prefix: "if (status) " -->
 

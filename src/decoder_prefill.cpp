@@ -214,7 +214,7 @@ struct Chunk : PrefillProjections {
     }
 
     void gqa_attention(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages,
-                       PairedPrefillScratch scratch) const {
+                       PairedPrefillScratch scratch, bool postgate = true) const {
         gqa_append(layer, cache, pages);
         const auto status = tensor_core_fp8
             ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
@@ -222,7 +222,7 @@ struct Chunk : PrefillProjections {
             : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
                                    work.attention, stream);
         check(status, "Read causal prefill MXFP8 attention");
-        gqa_gate();
+        if (postgate) gqa_gate();
     }
 
     void attention_output(Fp8Weight output, int width) const {
@@ -378,7 +378,7 @@ Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, i
 
 bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
                                  const PrefillGrant* grants, int count,
-                                 PairedPrefillScratch scratch) {
+                                 PairedPrefillScratch scratch, bool postgate) {
     constexpr int width = staged_prefill_batch_size;
     const int rows = grants[0].rows;
     if (count % width != 0 || (rows != 256 && rows != 512) ||
@@ -410,7 +410,7 @@ bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int 
                     sequence.position, sequence.rows, sequence.queries, sequence.output,
                     chunk.stream, scratch), "Read causal prefill MXFP8 attention");
             }
-            segment.gqa_gate();
+            if (postgate) segment.gqa_gate();
         }
     }
     return true;
@@ -528,7 +528,7 @@ PairedPrefillScratch serial_gqa_scratch(const TileBuffers& buffers, int serial_c
 
 enum class PrefillAttentionMode { batched, full_group, serial_segments };
 
-bool can_group_partial_gdn(const PrefillGrant* grants, PrefillGroup group) {
+bool is_full_partial_prefill_group(const PrefillGrant* grants, PrefillGroup group) {
     const int rows = grants[0].rows;
     if (group.rows != grouped_prefill_max_rows || (rows != 256 && rows != 512) ||
         group.grants % max_gdn_prefill_segments != 0) {
@@ -569,10 +569,11 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     const TileBuffers buffers(layout, workspace.capacity());
     const bool grouped = group.rows > max_layerwise_rows;
     const bool serial_attention = attention_mode == PrefillAttentionMode::serial_segments;
-    const bool grouped_partial_gdn = serial_attention && can_group_partial_gdn(grants, group);
+    const bool wide_partial = serial_attention && is_full_partial_prefill_group(grants, group);
     const bool full_group = attention_mode == PrefillAttentionMode::full_group;
-    const auto rms_launch = full_group ? RmsQuantizeLaunch::full_group_prefill
-                                       : RmsQuantizeLaunch::ordinary;
+    const bool packed_preparation = full_group || wide_partial;
+    const auto rms_launch = packed_preparation ? RmsQuantizeLaunch::full_group_prefill
+                                               : RmsQuantizeLaunch::ordinary;
     const Chunk chunk{{buffers.activation, group.rows, stream, true,
                        grouped || serial_attention}, buffers, 0, nullptr};
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
@@ -590,12 +591,12 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             if (serial_attention) {
                 const auto scratch = serial_gqa_scratch(buffers, serial_capacity);
                 if (!prefill_grouped_partial_gqa(chunk, layer, bank, grants, group.grants,
-                                                 scratch)) {
+                                                 scratch, !wide_partial)) {
                     each_prefill_segment(grants, group.grants, 0,
                                          [&](const PrefillGrant& grant, int row) {
                         const auto segment = prefill_attention_segment(chunk, grant, row);
                         segment.gqa_attention(layer, grant.request->caches[bank],
-                                              grant.request->pages, scratch);
+                                              grant.request->pages, scratch, !wide_partial);
                     });
                 }
             } else if (grouped && can_batch_staged_gqa(grants, group.grants)) {
@@ -606,7 +607,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                     prefill_group_gqa(chunk, layer, bank, first, count, offset);
                 });
             }
-            if (full_group) {
+            if (packed_preparation) {
                 if (const auto status = try_prefill_gqa_postgate_quantize(
                         group.rows, buffers.q_gate, buffers.attention, buffers.activation,
                         stream)) {
@@ -617,13 +618,19 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                     return;
                 }
             }
+            if (wide_partial) {
+                each_prefill_segment(grants, group.grants, 0,
+                                     [&](const PrefillGrant& grant, int row) {
+                    prefill_attention_segment(chunk, grant, row).gqa_gate();
+                });
+            }
             if (!serial_attention) chunk.gqa_gate();
             chunk.attention_output(layer.output, text_gqa_q_width);
         },
         [&](const GdnLayer& layer, int bank) {
             chunk.gdn_input(layer);
             if (serial_attention) {
-                prefill_partial_gdn(chunk, layer, bank, grants, group.grants, grouped_partial_gdn);
+                prefill_partial_gdn(chunk, layer, bank, grants, group.grants, wide_partial);
             } else if (grouped) {
                 prefill_group_gdn(chunk, layer, bank, grants, group.grants, 0);
             } else {

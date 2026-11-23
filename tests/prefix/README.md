@@ -122,7 +122,7 @@ reported cache hits.
 
 On B200, the current probe's cache-disabled oracle can use Tensor Core prefill. The
 cache-enabled candidate uses exact prefill. Its byte comparisons therefore span two
-prefill backends. [Probe setup](tensor_state.cpp#L226)<!-- prefix: "DecoderBatch" --> · [Prefill dispatch](../../src/decoder_prefill.cpp#L928)<!-- prefix: "label_scores" -->
+prefill backends. [Probe setup](tensor_state.cpp#L226)<!-- prefix: "DecoderBatch" --> · [Prefill dispatch](../../src/decoder_prefill.cpp#L935)<!-- prefix: "label_scores" -->
 
 To reproduce the Tensor Core parity check, use revision
 `39ecda9f370d0c3605296e6a028ef3561294d6e7` for both the release build and the test runner.

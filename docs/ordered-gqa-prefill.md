@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model prefill | Append KV and select the attention path. | [Caller](../src/decoder_prefill.cpp#L224)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L890)<!-- prefix: "const bool t" --> |
+| Model prefill | Append KV and select the attention path. | [Caller](../src/decoder_prefill.cpp#L224)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L900)<!-- prefix: "const bool t" --> |
 | Native dispatcher | Select Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L924)<!-- prefix: "cudaError_t " --> |
 | Ordered tile | Apply causal FP32 scoring and token-ordered accumulation. | [Score](../src/mxfp8_gqa_prefill.cu#L35)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L187)<!-- prefix: "for (int fir" --> |
 
@@ -12,7 +12,7 @@
 
 After KV append, the Tensor Core model path uses native attention dispatch at the same position and row count. Exact multirow tiles use direct MXFP8 attention. See the [Flash dispatcher](flash-prefill.md#runtime-path) for shape and device selection.
 
-[Batched staged attention](flash-prefill.md#runtime-path) is available for eligible full-tile and partial-grant groups. A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L860)<!-- prefix: "if (rows == " -->.
+[Batched staged attention](flash-prefill.md#runtime-path) is available for eligible full-tile and partial-grant groups. A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L870)<!-- prefix: "if (rows == " -->.
 
 Staged tiles double-buffer packed K/V and scales in 32-key blocks. The loads follow the page table and zero-fill slots outside the tile's visible span. Scoring and accumulation apply each row's causal limit. [Copies](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L112)<!-- prefix: "__device__ v" -->
 
@@ -20,9 +20,9 @@ Ordered tiles share decoded K/V across rows and two query heads. They preserve t
 
 ### Grouped partial grants
 
-The [partial-grant projection path](native-prefill-workspace.md#partial-grant-projection-groups) can read a multiple of four equal 256- or 512-row grants in four-lane subgroups. Each lane starts at 8,192 or later and sees at most 32,768 tokens. The staged reader requires SM100, page-aligned starts, 16-byte alignment for all K/V payload and scale bases, and sufficient disjoint scratch. Each lane uses its own start, page table, and causal mask. [Decoder guard](../src/decoder_prefill.cpp#L388)<!-- prefix: "if (count % " --> · [Staged guard](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L702)<!-- prefix: "if (sequence" --> · [Buffer validation](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L497)<!-- prefix: "std::optiona" -->
+The [partial-grant projection path](native-prefill-workspace.md#partial-grant-projection-groups) can read a multiple of four equal 256- or 512-row grants in four-lane subgroups. Each lane starts at 8,192 or later and sees at most 32,768 tokens. The staged reader requires SM100, page-aligned starts, 16-byte alignment for all K/V payload and scale bases, and sufficient disjoint scratch. Each lane uses its own start, page table, and causal mask. [Decoder guard](../src/decoder_prefill.cpp#L398)<!-- prefix: "if (count % " --> · [Staged guard](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L702)<!-- prefix: "if (sequence" --> · [Buffer validation](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L497)<!-- prefix: "std::optiona" -->
 
-The decoder appends each lane’s KV before trying one predecode and one single-CTA attention launch per subgroup. If staging declines, it tries raw grouped ordered TMEM on 148-SM SM100, then reads each lane separately if that setup also declines. Both fallbacks reuse the appended KV. Hard CUDA errors propagate. The decoder gates each lane afterward or defers gating for [fused postgate and quantization](fp8-prefill-projections.md#attention-output-quantization). [Append and stage](../src/decoder_prefill.cpp#L401)<!-- prefix: "segment.gqa_" --> · [Per-lane fallback](../src/decoder_prefill.cpp#L415)<!-- prefix: "if (!submitt" --> · [Raw grouped guard](../src/mxfp8_gqa_prefill.cu#L889)<!-- prefix: "std::optiona" -->
+The decoder appends each lane’s KV before trying one predecode and one single-CTA attention launch per subgroup. If staging declines, it tries raw grouped ordered TMEM on 148-SM SM100, then reads each lane separately if that setup also declines. Both fallbacks reuse the appended KV. Hard CUDA errors propagate. The decoder gates each lane afterward or defers gating for [fused postgate and quantization](fp8-prefill-projections.md#attention-output-quantization). [Append and stage](../src/decoder_prefill.cpp#L411)<!-- prefix: "segment.gqa_" --> · [Per-lane fallback](../src/decoder_prefill.cpp#L425)<!-- prefix: "if (!submitt" --> · [Raw grouped guard](../src/mxfp8_gqa_prefill.cu#L889)<!-- prefix: "std::optiona" -->
 
 ## Constraints and failure behavior
 

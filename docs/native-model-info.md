@@ -90,7 +90,7 @@ Eligible B200 groups of 16 or 32 eager greedy K4 lanes score active lanes togeth
 
 ### Certified Tensor Core target head
 
-The B200 target head reuses draft INT8 weights with `sm_100a` TMA and `tcgen05`. Eager greedy MTP singletons without generated logprobs qualify with one to five rows. The kernel tiles 128 vocabulary entries by 16 columns and certifies live rows only. Existing 20-row packets retain four five-row lanes and BF16 logits for requested score rows. [Score kernel](../src/text/tc_vocab.cu#L103)<!-- prefix: "__global__ _" --> · [Dispatch guard](../src/decoder_verify.cpp#L617)<!-- prefix: "if (round.co" --> · [Score selection](../src/decoder_verify.cpp#L735)<!-- prefix: "if (scored_r" --> · [Build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
+The B200 target head reuses draft INT8 weights with `sm_100a` TMA and `tcgen05`. Eager greedy MTP singletons without generated logprobs qualify with one to five rows. The kernel tiles 128 vocabulary entries by 16 columns and certifies live rows only. Existing 20-row packets retain four five-row lanes and BF16 logits for requested score rows. [Score kernel](../src/text/tc_vocab.cu#L103)<!-- prefix: "__global__ _" --> · [Dispatch guard](../src/decoder_verify.cpp#L617)<!-- prefix: "if (round.co" --> · [Score selection](../src/decoder_verify.cpp#L735)<!-- prefix: "if (scored_r" --> · [Build target](../xmake.lua#L87)<!-- prefix: "target(\"sgla" -->
 
 K0, sampling, constraints, raw logits, and scored singletons use BF16. Two-row graph replay keeps its existing head. Unsupported maps or unaligned weights decline setup. CUDA errors propagate. [Graph path](../src/decoder_verify.cpp#L665)<!-- prefix: "if (graph &&" --> · [Weight setup](../src/text/tc_vocab.cu#L172)<!-- prefix: "std::shared_" -->
 

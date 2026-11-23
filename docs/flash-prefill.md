@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L890)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L224)<!-- prefix: "const auto s" --> |
+| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L900)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L224)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L924)<!-- prefix: "cudaError_t " --> |
 | Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L548)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L751)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
@@ -22,7 +22,7 @@ Eligible B200 prefill uses the native Flash dispatcher. The full-tile path check
 
 On 148-SM SM100 devices, automatic dispatch tries ordered TMEM for 256–512 rows, start ≥8,192, and visibility ≤32,768. Both scale bases need eight-byte alignment. [Partial TMEM selection](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "const bool r" --> [Grouped ordered attention](ordered-gqa-prefill.md#grouped-partial-grants) also handles eligible partial-grant groups.
 
-Inside a [whole-tile MTP projection group](native-prefill-workspace.md#projection-pairs-for-mtp), staged attention needs four equal 1,024-row grants with the same aligned start from 1,024 through 130,048. The decoder appends each lane's KV first. With visibility of at most 32,768 tokens it stages all four lanes together. Through 65,536 it stages two at a time, then one at a time through 131,072. Each subgroup uses one predecode and one attention launch. A declined subgroup uses the ordinary per-lane dispatcher on the same stream. Later subgroups can still stage. [Shape guard](../src/decoder_prefill.cpp#L473)<!-- prefix: "bool can_bat" --> · [Subgroup selection](../src/decoder_prefill.cpp#L455)<!-- prefix: "const int su" --> · [Long staged launcher](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L784)<!-- prefix: "std::optiona" -->
+Inside a [whole-tile MTP projection group](native-prefill-workspace.md#projection-pairs-for-mtp), staged attention needs four equal 1,024-row grants with the same aligned start from 1,024 through 130,048. The decoder appends each lane's KV first. With visibility of at most 32,768 tokens it stages all four lanes together. Through 65,536 it stages two at a time, then one at a time through 131,072. Each subgroup uses one predecode and one attention launch. A declined subgroup uses the ordinary per-lane dispatcher on the same stream. Later subgroups can still stage. [Shape guard](../src/decoder_prefill.cpp#L483)<!-- prefix: "bool can_bat" --> · [Subgroup selection](../src/decoder_prefill.cpp#L465)<!-- prefix: "const int su" --> · [Long staged launcher](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L784)<!-- prefix: "std::optiona" -->
 
 Use the batch planner and serial tile rules for current tile caps. [Batch planner](batch-graphs.md#runtime-path) · [Serial prefill](text-serving.md#serial-prefill)
 
@@ -38,7 +38,7 @@ The 32-, 48-, and 88-row variants use `ldmatrix.x4` to load two BF16 K or V frag
 
 ### Long-tile TMEM pipeline
 
-The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for scores and FP32 value accumulators. Regular Flash stays in the `sm_100` target. [TMEM build target](../xmake.lua#L69)<!-- prefix: "target(\"sgla" -->
+The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for scores and FP32 value accumulators. Regular Flash stays in the `sm_100` target. [TMEM build target](../xmake.lua#L87)<!-- prefix: "target(\"sgla" -->
 
 TMA double-buffers raw KV. Producers pack finite MXFP8 into BF16 at scale exponents 15–148 and check other scales individually.
 
@@ -64,7 +64,7 @@ Split TMEM uses three contiguous partitions per query block and head pair. Its 7
 
 ## Constraints and failure behavior
 
-Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L942)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L860)<!-- prefix: "if (rows == " -->
+Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L942)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L870)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 

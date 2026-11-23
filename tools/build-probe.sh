@@ -47,7 +47,7 @@ if [[ "$check" == y && ! -f tests/mxfp8_gqa_check.cu ]]; then
     echo "The optional MXFP8 check requires tests/mxfp8_gqa_check.cu." >&2
     exit 1
 fi
-"$xmake" f -P . -o "$work/build" -p linux -a x86_64 -m release --mxfp8-gqa-check="$check"
+"$xmake" f -y -P . -o "$work/build" -p linux -a x86_64 -m release --mxfp8-gqa-check="$check"
 "$xmake" build -P . -v toolchain-probe
 
 probe="$work/build/bin/toolchain-probe"

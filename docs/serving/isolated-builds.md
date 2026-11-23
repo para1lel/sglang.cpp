@@ -11,6 +11,10 @@ selected source tree to a private snapshot and enter that snapshot inside locked
 Pixi. Use absolute, canonical `$work` and `$snapshot` paths and create the private
 directories before invoking XMake.
 
+XMake configures CUTLASS 4.7.1 from a checksum-pinned release archive. The SM100 down operator compiles with the CUTLASS/CuTe headers. The server has no CUTLASS runtime library dependency. [Package pin](../../xmake.lua#L15)<!-- prefix: "add_versions" --> · [SM100 binding](../../xmake.lua#L101)<!-- prefix: "add_packages" -->
+
+Set `SGLANG_CUTLASS_ARCHIVE` to the absolute path of the original archive for either `bash tools/build.sh` or the direct recipe below. XMake checks the same hash for either source. For a network-free direct configure, run `xmake g --network=private` after exporting `XMAKE_GLOBALDIR` and before `xmake f`. Record the archive hash with the build evidence. [Wrapper forwarding](../../tools/build.sh#L42)<!-- prefix: "SGLANG_CUTLA" --> · [Archive override](../../xmake.lua#L9)<!-- prefix: "local archiv" -->
+
 ```bash
 export XMAKE_CONFIGDIR="$work/config" XMAKE_GLOBALDIR="$work/global"
 export XMAKE_BUILDDIR="$work/build" XMAKE_TMPDIR="$work/tmp"
@@ -18,7 +22,7 @@ export TMPDIR="$work/tmp" XDG_CONFIG_HOME="$work/config"
 export CUDA_CACHE_PATH="$work/cuda-cache"
 cd -- "$snapshot"
 test "$(pwd -P)" = "$snapshot"
-xmake f -P "$snapshot" -F "$snapshot/xmake.lua" -o "$work/build" -m release -p linux -a x86_64
+xmake f -y -P "$snapshot" -F "$snapshot/xmake.lua" -o "$work/build" -m release -p linux -a x86_64
 xmake build -P "$snapshot" -F "$snapshot/xmake.lua" -v sglang-server
 binary=$(realpath -e "$work/build/bin/sglang-server")
 test "$binary" = "$work/build/bin/sglang-server"

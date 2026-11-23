@@ -247,6 +247,16 @@ struct Chunk : PrefillProjections {
             check(tensor_core_prefill_swiglu_quantize(work.mlp_gate, work.mlp_up,
                                                       intermediate_size, rows, activation, stream),
                   "Apply and quantize prefill SwiGLU");
+            const auto& down = layer.mlp_down;
+            if (grouped_projection && rows == grouped_prefill_max_rows) {
+                const auto status = try_prefill_down_sm100(
+                    input, down.values, down.scales, rows, down.rows, down.columns, work.hidden,
+                    work.mlp_gate, work.mlp_up, stream);
+                if (status) {
+                    check(*status, "Run grouped FP8 prefill down projection");
+                    return;
+                }
+            }
             project(layer.mlp_down, input, work.hidden);
             return;
         }

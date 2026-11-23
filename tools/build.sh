@@ -39,6 +39,7 @@ proxy=http://127.0.0.1:12233
 exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin \
     SGLANG_HOST_ROOT="$base" SGLANG_BUILD_DIR="$output_dir" SGLANG_GPU_INDEX="$gpu_index" \
     SGLANG_GPU_PROBE="$gpu_probe" SGLANG_MXFP8_CHECK="$mxfp8_check" \
+    SGLANG_CUTLASS_ARCHIVE="${SGLANG_CUTLASS_ARCHIVE:-}" \
     http_proxy="$proxy" https_proxy="$proxy" all_proxy="$proxy" \
     "$base/bin/pixi" run --manifest-path "$base/pixi.toml" --environment default --as-is \
     /bin/bash "$tools/build-probe.sh"

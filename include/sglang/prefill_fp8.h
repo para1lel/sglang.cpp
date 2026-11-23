@@ -22,6 +22,13 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
     int rows, int out_width, int in_width, __nv_bfloat16* output, cudaStream_t stream,
     bool allow_large_rows, bool grouped_projection = false);
 
+/// Reuses the distinct, consumed MLP gate/up buffers for scale conversion.
+/// Empty indicates an unsupported geometry or device before any submission.
+std::optional<cudaError_t> try_prefill_down_sm100(
+    TextFp8ActivationView input, const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
+    int rows, int out_width, int in_width, __nv_bfloat16* output,
+    __nv_bfloat16* gate_scratch, __nv_bfloat16* up_scratch, cudaStream_t stream);
+
 struct PrefillFp8Projection {
     const std::uint8_t* weight;
     const __nv_bfloat16* scales;

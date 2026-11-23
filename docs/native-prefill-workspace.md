@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder prefill | Lay out the arena and lend two scratch spans during GQA. | [Tile layout](../src/decoder_prefill.cpp#L38)<!-- prefix: "TileBuffers(" --> · [Scratch view](../src/decoder_prefill.cpp#L60)<!-- prefix: "PairedPrefil" --> |
-| Attention dispatch | Stage eligible singleton and four-lane groups. Partial-grant groups can use staged, raw grouped, or per-lane attention. | [Singleton selection](../src/mxfp8_gqa_prefill.cu#L948)<!-- prefix: "const bool d" --> · [Grouped dispatch](../src/decoder_prefill.cpp#L571)<!-- prefix: "void prefill" --> |
+| Attention dispatch | Stage eligible singleton and four-lane groups. Partial-grant groups can use staged, raw grouped, or per-lane attention. | [Singleton selection](../src/mxfp8_gqa_prefill.cu#L948)<!-- prefix: "const bool d" --> · [Grouped dispatch](../src/decoder_prefill.cpp#L581)<!-- prefix: "void prefill" --> |
 | Paired launcher | Check bounds and capture state, then submit predecode and attention on the caller's stream. | [Staged launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L682)<!-- prefix: "std::optiona" --> |
 
 ## Runtime path
@@ -21,7 +21,7 @@ The decoder lends two disjoint spans of its existing `PrefillWorkspace` allocati
 
 Both spans allow up to 127 bytes of 128-byte alignment padding. The four-tile arena supplies 272 MiB for K and 256.75 MiB for V and invalid-token indices. A [staged subgroup](flash-prefill.md#runtime-path) covers at most 131,072 visible tokens in total. It uses up to 256 MiB for K and 256 MiB plus 16 KiB for V and indices before padding. The partial reader packs each lane’s visible pages at a separate offset. It checks both span sizes against their combined page count, so eligibility also depends on the active arena. Subgroups reuse both spans on one stream without another device allocation. [Arena allocation](../src/runtime/execution/decoder_prefill_workspace.cpp#L178)<!-- prefix: "PrefillWorks" --> · [Scratch sizing](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L721)<!-- prefix: "const auto p" -->
 
-The MLP projection writes its gate and up buffers after GQA. GDN layers write their projection and scratch inputs before use. Predecode, paired attention, later layer work, and workspace release use the workspace's execution stream. Stream ordering puts the last attention read before the next write to either span. Keep both spans exclusive to that stream until the queued work completes. [Layer loop](../src/decoder_prefill.cpp#L902)<!-- prefix: "execute_laye" --> · [Release](../src/runtime/execution/decoder_prefill_workspace.cpp#L233)<!-- prefix: "cudaError_t " -->
+The MLP projection writes its gate and up buffers after GQA. GDN layers write their projection and scratch inputs before use. Predecode, paired attention, later layer work, and workspace release use the workspace's execution stream. Stream ordering puts the last attention read before the next write to either span. Keep both spans exclusive to that stream until the queued work completes. [Layer loop](../src/decoder_prefill.cpp#L912)<!-- prefix: "execute_laye" --> · [Release](../src/runtime/execution/decoder_prefill_workspace.cpp#L233)<!-- prefix: "cudaError_t " -->
 
 Predecode follows each lane's page table and expands each complete MXFP8 page once. Separate K and V TMA producers load alternating shared-memory stages. A singleton with a partial page uses the native masked conversion. See [the paired kernel](flash-prefill.md#long-tile-tmem-pipeline) for arithmetic and tile geometry. [Predecode](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L99)<!-- prefix: "__global__ v" --> · [Producers](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L175)<!-- prefix: "__device__ v" -->
 
@@ -31,11 +31,11 @@ The [CUDA 13.4 stream ordering guide](https://docs.nvidia.com/cuda/archive/13.4.
 
 The workspace allocator reuses private CUDA pools by device and size class, separating workspaces at or below 128 rows from larger ones. At most one pool per device and class uses a non-default release threshold, 32 MiB for small pools and 1 GiB for large ones. CUDA can retain that backing after synchronization and request retirement. `workspace_bytes` counts active workspace bytes, including staging spans. Use device memory measurements to observe retained backing. [Pool policy](../src/runtime/execution/decoder_prefill_workspace.cpp#L50)<!-- prefix: "void configu" --> · [Allocation](../src/runtime/execution/decoder_prefill_workspace.cpp#L178)<!-- prefix: "PrefillWorks" -->
 
-Out-of-memory or unsupported pool creation or allocation leaves the workspace unavailable. Ordinary prefill retries an unavailable large allocation with 128 rows, then uses row-wise prefill if scratch remains unavailable. Single-row tiles also use row-wise prefill. Other CUDA allocation errors and outstanding errors propagate. Release enqueues a free on the workspace stream. If enqueue fails, recovery synchronizes the owning device, checks used bytes, and waits for a retried free when required. Explicit close reports the original failure. [Unavailable statuses](../src/runtime/execution/decoder_prefill_workspace.cpp#L161)<!-- prefix: "bool prefill" --> · [Ordinary retry](../src/decoder_prefill.cpp#L960)<!-- prefix: "if (!workspa" --> · [Release](../src/runtime/execution/decoder_prefill_workspace.cpp#L233)<!-- prefix: "cudaError_t " --> · [Recovery](../src/runtime/execution/decoder_prefill_workspace.cpp#L144)<!-- prefix: "void recover" -->
+Out-of-memory or unsupported pool creation or allocation leaves the workspace unavailable. Ordinary prefill retries an unavailable large allocation with 128 rows, then uses row-wise prefill if scratch remains unavailable. Single-row tiles also use row-wise prefill. Other CUDA allocation errors and outstanding errors propagate. Release enqueues a free on the workspace stream. If enqueue fails, recovery synchronizes the owning device, checks used bytes, and waits for a retried free when required. Explicit close reports the original failure. [Unavailable statuses](../src/runtime/execution/decoder_prefill_workspace.cpp#L161)<!-- prefix: "bool prefill" --> · [Ordinary retry](../src/decoder_prefill.cpp#L970)<!-- prefix: "if (!workspa" --> · [Release](../src/runtime/execution/decoder_prefill_workspace.cpp#L233)<!-- prefix: "cudaError_t " --> · [Recovery](../src/runtime/execution/decoder_prefill_workspace.cpp#L144)<!-- prefix: "void recover" -->
 
 Missing or undersized scratch, capture, and known setup rejection decline staging before submission. Setup rejection includes unavailable kernel resources and tensor-map rejection or descriptor out-of-memory. Batch staging also requires an explicit CUDA stream in the current context. Its output and scratch ranges must be disjoint from each other and from live inputs within a subgroup. [Capture check](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L736)<!-- prefix: "const auto c" --> · [Stream check](../include/sglang/text/mxfp8_gqa_prefill_staged.cuh#L133)<!-- prefix: "std::optiona" --> · [Range check](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L748)<!-- prefix: "if (!valid_s" --> · [Tensor maps](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L646)<!-- prefix: "const auto e" -->
 
-A recognized rejection can decline either staged launch. Full-tile subgroups fall back lane by lane. Ordinary singleton staging still falls back to raw paired attention. Partial subgroups try [raw grouped ordered TMEM](ordered-gqa-prefill.md#grouped-partial-grants) first. If attention declines after predecode queues, the stream orders fallback and later reuse after predecode. Pending and unexpected CUDA errors propagate. [Submission handling](../include/sglang/text/mxfp8_gqa_prefill_staged.cuh#L164)<!-- prefix: "std::optiona" --> · [Full-tile fallback](../src/decoder_prefill.cpp#L463)<!-- prefix: "for (int ind" -->
+A recognized rejection can decline either staged launch. Full-tile subgroups fall back lane by lane. Ordinary singleton staging still falls back to raw paired attention. Partial subgroups try [raw grouped ordered TMEM](ordered-gqa-prefill.md#grouped-partial-grants) first. If attention declines after predecode queues, the stream orders fallback and later reuse after predecode. Pending and unexpected CUDA errors propagate. [Submission handling](../include/sglang/text/mxfp8_gqa_prefill_staged.cuh#L164)<!-- prefix: "std::optiona" --> · [Full-tile fallback](../src/decoder_prefill.cpp#L473)<!-- prefix: "for (int ind" -->
 
 A paired graph capture records the raw kernel with maps by value and uses zero staging scratch. Keep the captured cache, page table, queries, and output valid through replay. [Raw launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L587)<!-- prefix: "std::optiona" --> · [CUDA graph capture](https://docs.nvidia.com/cuda/archive/13.4.2/cuda-programming-guide/04-special-topics/cuda-graphs.html#stream-capture)
 
@@ -49,7 +49,7 @@ The scheduler sends generation and scoring grants to one prefill executor. B200 
 
 ### Projection pairs for MTP
 
-Whole-tile grouping has priority. It requires an even number of equal grants made of full 1,024-row tiles, with at most 8,192 prefill rows. The [`paired_prefill` field](native-model-info.md#server-information) reports startup capability. Each lane uses its own draft state if its depth is positive. [Grant eligibility](../include/sglang/decoder_prefill.h#L85)<!-- prefix: "inline bool " --> · [Group priority](../src/decoder_prefill.cpp#L766)<!-- prefix: "if (model.ba" -->
+Whole-tile grouping has priority. It requires an even number of equal grants made of full 1,024-row tiles, with at most 8,192 prefill rows. The [`paired_prefill` field](native-model-info.md#server-information) reports startup capability. Each lane uses its own draft state if its depth is positive. [Grant eligibility](../include/sglang/decoder_prefill.h#L85)<!-- prefix: "inline bool " --> · [Group priority](../src/decoder_prefill.cpp#L776)<!-- prefix: "if (model.ba" -->
 
 Exactly four eligible grants first try one 4,096-row group per tile offset.
 Four 2,048-row grants use two groups in one step. Two 4,096-row grants use
@@ -57,7 +57,7 @@ four 2,048-row groups. Other eligible grant counts also use pairs.
 Lanes share dense projections and the MLP. Attention and GDN keep each lane's
 1,024-row tiles, positions, KV pages, and recurrent state. Draft seeding uses
 the lane's own hidden and residual rows and shifted token IDs.
-[Group selection](../src/decoder_prefill.cpp#L767)<!-- prefix: "if (count ==" --> · [Draft seed](../src/decoder_prefill.cpp#L656)<!-- prefix: "auto seed = " -->
+[Group selection](../src/decoder_prefill.cpp#L777)<!-- prefix: "if (count ==" --> · [Draft seed](../src/decoder_prefill.cpp#L666)<!-- prefix: "auto seed = " -->
 
 [Grouped GDN](gdn-prefill.md#runtime-path) reuses the existing disjoint row
 spans for both projection group sizes. The group uses the workspace stream.
@@ -73,15 +73,15 @@ The step reuses one workspace across all groups. Four-grant grouping adds
 511,115,264 active bytes over pairs. If the four-grant pool or allocation is
 unavailable, dispatch tries pairs before submitting grouped work. If the pair
 allocation is also unavailable, dispatch uses ordinary per-grant prefill.
-Unexpected CUDA errors propagate. [Group workspace](../src/decoder_prefill.cpp#L677)<!-- prefix: "PrefillWorks" -->
+Unexpected CUDA errors propagate. [Group workspace](../src/decoder_prefill.cpp#L687)<!-- prefix: "PrefillWorks" -->
 
 ### Partial-grant projection groups
 
-The partial-grant planner can pack consecutive complete grants of 256–1,024 rows. Each grant must fit its own native tile. A group needs at least two grants and fits at most 4,096 rows. The planner leaves grant order intact. Ungrouped grants use ordinary prefill. [Plan and dispatch](../src/decoder_prefill.cpp#L714)<!-- prefix: "bool prefill" -->
+The partial-grant planner can pack consecutive complete grants of 256–1,024 rows. Each grant must fit its own native tile. A group needs at least two grants and fits at most 4,096 rows. The planner leaves grant order intact. Ungrouped grants use ordinary prefill. [Plan and dispatch](../src/decoder_prefill.cpp#L724)<!-- prefix: "bool prefill" -->
 
-The group shares dense projections and MLP work. Uniform 4,096-row groups of eight 512-row or sixteen 256-row grants can also share [RMSNorm and GQA postgate preparation](fp8-prefill-projections.md#attention-output-quantization). [Grouped staged and ordered GQA](ordered-gqa-prefill.md#grouped-partial-grants) and [grouped GDN](gdn-prefill.md#grouped-partial-grants) qualify independently. Other attention and recurrence use per-lane dispatch. Each lane keeps its positions, KV pages, and recurrent state. All work uses the same stream and existing workspace. Draft seeding uses the lane's own rows where applicable. [Layer dispatch](../src/decoder_prefill.cpp#L571)<!-- prefix: "void prefill" --> · [GQA selection](../src/decoder_prefill.cpp#L601)<!-- prefix: "if (!prefill" -->
+The group shares dense projections and MLP work. Uniform 4,096-row groups of eight 512-row or sixteen 256-row grants can also share [RMSNorm and GQA postgate preparation](fp8-prefill-projections.md#attention-output-quantization). [Grouped staged and ordered GQA](ordered-gqa-prefill.md#grouped-partial-grants) and [grouped GDN](gdn-prefill.md#grouped-partial-grants) qualify independently. Other attention and recurrence use per-lane dispatch. Each lane keeps its positions, KV pages, and recurrent state. All work uses the same stream and existing workspace. Draft seeding uses the lane's own rows where applicable. [Layer dispatch](../src/decoder_prefill.cpp#L581)<!-- prefix: "void prefill" --> · [GQA selection](../src/decoder_prefill.cpp#L611)<!-- prefix: "if (!prefill" -->
 
-One arena fits the largest planned group and ordinary tile in the step. The executor reuses it for the other grants. If no group qualifies or its allocation is unavailable, the executor falls back before submitting grouped work. [Allocation and fallback](../src/decoder_prefill.cpp#L733)<!-- prefix: "if (!grouped" -->
+One arena fits the largest planned group and ordinary tile in the step. The executor reuses it for the other grants. If no group qualifies or its allocation is unavailable, the executor falls back before submitting grouped work. [Allocation and fallback](../src/decoder_prefill.cpp#L743)<!-- prefix: "if (!grouped" -->
 
 With `--trace-batches`, `layerwise_prefill_groups` counts the groups,
 `rows` counts their combined rows, and `workspace_bytes` records the
@@ -90,7 +90,7 @@ largest active prefill workspace in the step.
 
 ## Verification
 
-The `decoder-batch-plan-check` CPU target checks the step budget, decode reservations, finishing tails, rotation under replenished load, and fair-share fallback. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner test target](../xmake.lua#L287)<!-- prefix: "target(\"deco" -->
+The `decoder-batch-plan-check` CPU target checks the step budget, decode reservations, finishing tails, rotation under replenished load, and fair-share fallback. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner test target](../xmake.lua#L307)<!-- prefix: "target(\"deco" -->
 
 On one reserved B200, replay identical checkpoint Q, MXFP8 payloads and scales, and remapped page tables. Exercise both bounds and nonzero page offsets. Compare full BF16 output with raw paired and archived wide Flash. Include a short tail, causal masks, invalid full- and partial-page V, and repair.
 

@@ -4,6 +4,24 @@ set_languages("cxx17")
 set_policy("build.ccache", false)
 add_rules("mode.release")
 
+package("sglang-cutlass-headers")
+    set_kind("library", {headeronly = true})
+    local archive = os.getenv("SGLANG_CUTLASS_ARCHIVE")
+    if archive and archive ~= "" then
+        set_urls("file://" .. archive)
+    else
+        set_urls("https://github.com/NVIDIA/cutlass/archive/refs/tags/v$(version).tar.gz")
+    end
+    add_versions("4.7.1", "8290eb914cd5aaf4c665ee4108ba5bd65383cfee1296286a42a7ef711554d365")
+    on_install(function (package)
+        os.cp("include/*", package:installdir("include"))
+        os.cp("tools/util/include/cutlass/util", package:installdir("include/cutlass"))
+        os.cp("LICENSE.txt", package:installdir())
+    end)
+package_end()
+
+add_requires("sglang-cutlass-headers 4.7.1", {system = false})
+
 local prefix = os.getenv("CONDA_PREFIX")
 local bindir = path.join(prefix, "bin")
 local toolkit = path.join(prefix, "targets/x86_64-linux")
@@ -80,6 +98,8 @@ target("sglang_prefill_fp8_sm100")
     add_files("src/text/draft_seed_fc_sm100.cu")
     add_files("src/text/decode_proj_fp8.cu", "src/text/decode_proj_bf16.cu",
               "src/text/decode_proj_host.cu")
+    add_packages("sglang-cutlass-headers")
+    add_files("src/text/prefill_down_sm100.cu", {cuflags = "--expt-relaxed-constexpr"})
 
 target("sglang_json")
     set_kind("static")

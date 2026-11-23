@@ -49,7 +49,7 @@ If any of the four starts at position zero, bank zero uses the existing per-gran
 
 ## Grouped target verification
 
-With target Tensor Cores enabled, four eager five-row MTP lanes share the grouped GDN verifier launches. The eight-lane K4 route runs two of these packets. Each lane retains its own convolution history and recurrent state. [Dispatch](../src/decoder_forward.cpp#L408)<!-- prefix: "if (batch.co" --> · [Grouped launch](../src/text/gdn_verify.cu#L232)<!-- prefix: "cudaError_t " -->
+With target Tensor Cores enabled, four eager five-row MTP lanes share the grouped GDN verifier launches. Wide K4 verification invokes the same launch for each four-lane packet. Each lane retains its own convolution history and recurrent state. [Dispatch](../src/decoder_forward.cpp#L424)<!-- prefix: "if (batch.pa" --> · [Grouped launch](../src/text/gdn_verify.cu#L232)<!-- prefix: "cudaError_t " -->
 
 Each recurrence warp advances two independent value channels eight channels apart. Eight warps cover 16 channels per block. Eight blocks cover each 128-channel value head. SM100 packs the FP32 multiply and FMA operations across the two channels. Other architectures use scalar arithmetic for each channel. Each channel keeps its token order, accumulation through the four key parts, and warp reduction order. The kernel stores BF16 outputs and FP32 tail state in their existing slots. [Recurrence](../src/text/gdn_verify.cu#L135)<!-- prefix: "__global__ v" --> · [Packed arithmetic](../src/text/gdn_verify.cu#L119)<!-- prefix: "__device__ f" --> · [Output reduction](../src/text/gdn_verify.cu#L175)<!-- prefix: "const float " -->
 

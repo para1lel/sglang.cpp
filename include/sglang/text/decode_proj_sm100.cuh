@@ -90,16 +90,23 @@ __device__ __forceinline__ void fence_before_sync() {
 }
 
 template <int Columns, int Slots>
+inline constexpr int tmem_columns = [] {
+    int columns = 32;
+    while (columns < Slots * Columns) columns *= 2;
+    return columns;
+}();
+
+template <int Columns, int Slots>
 __device__ __forceinline__ void allocate_tmem(DecodePipeline<Slots>& pipe) {
     asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                 :: "r"(shared_address(&pipe.tmem)), "r"(Slots * Columns) : "memory");
+                 :: "r"(shared_address(&pipe.tmem)), "r"(tmem_columns<Columns, Slots>) : "memory");
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
 }
 
 template <int Columns, int Slots>
 __device__ __forceinline__ void free_tmem(const DecodePipeline<Slots>& pipe) {
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                 :: "r"(pipe.tmem), "r"(Slots * Columns) : "memory");
+                 :: "r"(pipe.tmem), "r"(tmem_columns<Columns, Slots>) : "memory");
 }
 
 template <bool PerStage = false, int Slots>

@@ -39,6 +39,7 @@ static_assert(wide_mtp_lanes == 2 * decoder_batch_max_mtp_lanes);
 inline constexpr int verification_packet_rows =
     decoder_batch_max_mtp_lanes * target_verify_max_rows;
 inline constexpr int wide_mtp_rows = 2 * verification_packet_rows;
+inline constexpr int max_wide_mtp_rows = max_wide_mtp_lanes * target_verify_max_rows;
 
 void project_verification_bf16(Bf16Weight weight, const VerificationRow* rows, int count,
                                Bf16* Workspace::*output, cudaStream_t stream);

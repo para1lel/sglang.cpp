@@ -51,6 +51,8 @@ Workspace& workspace(const BatchGraphLane& lane) {
 }
 
 static_assert(wide_mtp_rows == text_target_fp8_m40_rows);
+static_assert(2 * wide_mtp_rows == text_target_fp8_m80_rows);
+static_assert(max_wide_mtp_rows == text_target_fp8_m160_rows);
 
 template <typename Lane>
 struct LayerBatch {
@@ -274,13 +276,15 @@ struct LayerBatch {
     void project_target(std::initializer_list<LayerProjection> layers) const {
         constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
         if constexpr (verification) {
-            if (count == wide_mtp_rows) {
-                if (project_target_chunk<wide_mtp_rows>(layers, 0, count, false)) return;
-                for (int first = 0; first < count; first += verification_packet_rows) {
-                    if (!project_target_chunk(layers, first, verification_packet_rows, false)) {
-                        for (int row = first; row < first + verification_packet_rows;
-                             row += text_fp8_max_batch) {
-                            project_target_chunk(layers, row, text_fp8_max_batch, true);
+            if (packed_activation) {
+                if (project_target_chunk<max_wide_mtp_rows>(layers, 0, count, false)) return;
+                if (count == wide_mtp_rows) {
+                    project_verification_packets(layers, 0, count);
+                } else {
+                    for (int first = 0; first < count; first += wide_mtp_rows) {
+                        if (!project_target_chunk<wide_mtp_rows>(layers, first, wide_mtp_rows,
+                                                                 false)) {
+                            project_verification_packets(layers, first, wide_mtp_rows);
                         }
                     }
                 }
@@ -304,6 +308,18 @@ struct LayerBatch {
             const int rows = verification ? remaining / groups + (group < remaining % groups) : 1;
             project_target_chunk(layers, first, rows, true);
             first += rows;
+        }
+    }
+
+    void project_verification_packets(std::initializer_list<LayerProjection> layers, int first,
+                                      int size) const {
+        for (int end = first + size; first < end; first += verification_packet_rows) {
+            if (!project_target_chunk(layers, first, verification_packet_rows, false)) {
+                for (int row = first; row < first + verification_packet_rows;
+                     row += text_fp8_max_batch) {
+                    project_target_chunk(layers, row, text_fp8_max_batch, true);
+                }
+            }
         }
     }
 };
@@ -405,7 +421,7 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
     const bool batched = batch.target_tc && !first.binding && batch.count == wide_gdn_rows;
-    if (batch.count == wide_mtp_rows) {
+    if (batch.packed_activation) {
         for (int start = 0; start < batch.count; start += wide_gdn_rows) {
             const auto packet = batch.verification_packet(start);
             project_gdn_gates(layer, packet, true);
@@ -436,7 +452,7 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch, in
         }
         check(decode_verify_gdn_batch(states, layer.recurrent, batch.stream),
               "Advance batched target verification GDN");
-    } else if (batch.count != wide_mtp_rows) {
+    } else if (!batch.packed_activation) {
         batch.each([&](const VerificationRow& row, Workspace&) {
             if (row.first) {
                 row.verification->advance_gdn(state_index, layer.recurrent);
@@ -697,7 +713,7 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
                     attend_eager_gqa(layer, packet, cache_index);
                 }
             };
-            if (batch.count == wide_mtp_rows) {
+            if (batch.packed_activation) {
                 for (int first = 0; first < batch.count; first += verification_packet_rows) {
                     attend(batch.verification_packet(first));
                 }

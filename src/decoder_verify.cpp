@@ -465,10 +465,10 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
                                 void* sampling_scratch, cudaStream_t stream,
                                 VerificationGraph* graph, const TcVocabScratch* vocabulary,
                                 std::uint8_t* packed_activation) const {
-    std::array<VerificationSequence, wide_mtp_lanes> sequences;
-    std::array<TargetVerification*, wide_mtp_lanes> verifiers;
+    std::array<VerificationSequence, max_wide_mtp_lanes> sequences;
+    std::array<TargetVerification*, max_wide_mtp_lanes> verifiers;
     if (count < 1 || (count > decoder_batch_max_mtp_lanes &&
-        (count != wide_mtp_lanes || !packed_activation || !vocabulary))) {
+        (!wide_mtp_width(count) || !packed_activation || !vocabulary))) {
         throw std::invalid_argument("Invalid number of MTP rounds");
     }
     for (int index = 0; index < count; ++index) {
@@ -482,8 +482,8 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
             vocabulary = nullptr;
         }
     }
-    if (count == wide_mtp_lanes && !vocabulary) {
-        throw std::invalid_argument("Eight-lane MTP requires full greedy verification rows");
+    if (count > decoder_batch_max_mtp_lanes && !vocabulary) {
+        throw std::invalid_argument("Wide MTP requires full greedy verification rows");
     }
     const bool replayed = forward_verify(sequences.data(), count, stream, graph, vocabulary,
                                          packed_activation);
@@ -504,7 +504,7 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
                                     cudaStream_t stream, VerificationGraph* graph,
                                     const TcVocabScratch* vocabulary,
                                     std::uint8_t* packed_activation) const {
-    const bool wide = count == wide_mtp_lanes && packed_activation != nullptr && vocabulary;
+    const bool wide = wide_mtp_width(count) && packed_activation && vocabulary;
     if (!sequences || count < 1 || (count > decoder_batch_max_mtp_lanes && !wide)) {
         throw std::invalid_argument("Invalid number of verification sequences");
     }
@@ -517,7 +517,7 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
             throw std::invalid_argument("Invalid number of verification rows");
         }
         if (wide && (sequence.count != target_verify_max_rows || sequence.constrained)) {
-            throw std::invalid_argument("Invalid eight-lane verification packet");
+            throw std::invalid_argument("Invalid wide verification packet");
         }
         total += sequence.count;
         longest = std::max(longest, sequence.count);
@@ -549,7 +549,7 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
         }
         graph->scratch.reset();
     }
-    std::array<VerificationRow, wide_mtp_rows> rows;
+    std::array<VerificationRow, max_wide_mtp_rows> rows;
     int next = 0;
     const auto prepare_packet = [&](int first_lane, int end_lane) {
         for (int index = 0; index < longest; ++index) {
@@ -567,8 +567,9 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
         }
     };
     if (wide) {
-        prepare_packet(0, decoder_batch_max_mtp_lanes);
-        prepare_packet(decoder_batch_max_mtp_lanes, count);
+        for (int first_lane = 0; first_lane < count; first_lane += decoder_batch_max_mtp_lanes) {
+            prepare_packet(first_lane, first_lane + decoder_batch_max_mtp_lanes);
+        }
     } else {
         prepare_packet(0, count);
     }
@@ -604,9 +605,10 @@ void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count
             }
         }
     };
-    if (count == wide_mtp_rows) {
-        score_packet(rows, verification_packet_rows);
-        score_packet(rows + verification_packet_rows, verification_packet_rows);
+    if (packed_activation) {
+        for (int first = 0; first < count; first += verification_packet_rows) {
+            score_packet(rows + first, verification_packet_rows);
+        }
     } else {
         score_packet(rows, count);
     }

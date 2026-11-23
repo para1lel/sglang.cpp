@@ -5,6 +5,11 @@ typedef struct cudaDeviceProp cudaDeviceProp;
 namespace sglang::decoder {
 
 inline constexpr int wide_mtp_lanes = 8;
+inline constexpr int max_wide_mtp_lanes = 32;
+
+constexpr bool wide_mtp_width(int lanes) {
+    return lanes == wide_mtp_lanes || lanes == 2 * wide_mtp_lanes || lanes == max_wide_mtp_lanes;
+}
 
 struct DraftOperatorCapabilities {
     bool int8_head;

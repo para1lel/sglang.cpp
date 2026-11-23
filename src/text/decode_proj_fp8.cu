@@ -2,6 +2,7 @@
 #include "sglang/text/decode_proj_sm100.cuh"
 #include "sglang/text/target_fp8.h"
 
+#include <algorithm>
 #include <cuda_runtime.h>
 #include <type_traits>
 
@@ -274,8 +275,10 @@ std::optional<cudaError_t> launch_rows(
     if (status != cudaSuccess) {
         return status;
     }
-    const int shared = Slots * stage_bytes<Columns> +
-                       ((job.groups - 1) / plan.splits + 1) * scale_bytes<Columns>;
+    const int stages_and_scales = Slots * stage_bytes<Columns> +
+                                  ((job.groups - 1) / plan.splits + 1) * scale_bytes<Columns>;
+    const int partials = plan.splits > 1 ? Columns * tile_rows * int(sizeof(float)) : 0;
+    const int shared = std::max(stages_and_scales, partials);
     if (shared > limit) {
         return std::nullopt;
     }
@@ -284,19 +287,40 @@ std::optional<cudaError_t> launch_rows(
     return launch_split(kernel, grid, shared, args, stream, grid.x);
 }
 
+std::optional<cudaError_t> compact_status(std::optional<cudaError_t> status) {
+    const auto recorded = cudaGetLastError();
+    if ((!status || *status == cudaSuccess) && recorded != cudaSuccess) return recorded;
+    return status;
+}
+
 }
 
 std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
     const TextFp8DecodeTarget* projections, int target_count, const std::uint8_t* packed_values,
     int in_width, const TextFp8Projection* rows, int count, cudaStream_t stream) {
+    const bool compact = count == text_target_fp8_m80_rows || count == text_target_fp8_m160_rows;
+    if (compact) {
+        const auto pending = cudaGetLastError();
+        if (pending != cudaSuccess) return pending;
+    }
     const TextFp8ActivationView input{packed_values, nullptr};
-    if (count < 2 || (count > text_target_fp8_max_rows && count != text_target_fp8_m40_rows) ||
+    if (count < 2 || (count > text_target_fp8_max_rows && !target_fp8_wide_rows(count)) ||
         !supported_targets(projections, target_count, in_width, input)) {
         return std::nullopt;
     }
     LaunchTarget target{};
     if (auto prepared = prepare_launch(stream, target); !prepared || *prepared != cudaSuccess) {
-        return prepared;
+        if (!compact) return prepared;
+        const auto status = compact_status(prepared);
+        return !prepared && status == cudaErrorNotSupported ? std::nullopt : status;
+    }
+    if (count == text_target_fp8_m80_rows) {
+        return compact_status(launch_rows<text_target_fp8_m80_rows, 4, text_target_fp8_m80_rows>(
+            target, projections, target_count, input, in_width, rows, count, 17, stream));
+    }
+    if (count == text_target_fp8_m160_rows) {
+        return compact_status(launch_rows<text_target_fp8_m160_rows, 2, text_target_fp8_m160_rows>(
+            target, projections, target_count, input, in_width, rows, count, 18, stream));
     }
     if (count == text_target_fp8_m40_rows) {
         if (in_width == hidden_width && target_count == 2 &&

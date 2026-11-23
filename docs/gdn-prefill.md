@@ -42,6 +42,14 @@ The grouped recurrence reads and writes adjacent BF16 pairs when it scales the k
 
 The ordered tensor-core fallback uses the paired kernel for at least 32 rows with 16-byte-aligned recurrence workspace. Otherwise it uses the original recurrence. The paired kernel shares prepared Q, K, and gates between adjacent value channels. SM100 uses packed FP32 arithmetic and preserves each channel's token, update, and warp reduction order. Other compiled architectures use scalar arithmetic in this paired kernel. [Paired kernel](../src/text_attention_gdn.cu#L289)<!-- prefix: "__global__ v" --> · [Paired guard](../src/text_attention_gdn.cu#L670)<!-- prefix: "const bool p" -->
 
+## Grouped target verification
+
+With target Tensor Cores enabled, four eager five-row MTP lanes share the grouped GDN verifier launches. Each lane retains its own convolution history and recurrent state. [Dispatch](../src/decoder_forward.cpp#L391)<!-- prefix: "const bool b" --> · [Grouped launch](../src/text/gdn_verify.cu#L232)<!-- prefix: "cudaError_t " -->
+
+Each recurrence warp advances two independent value channels eight channels apart. Eight warps cover 16 channels per block. Eight blocks cover each 128-channel value head. SM100 packs the FP32 multiply and FMA operations across the two channels. Other architectures use scalar arithmetic for each channel. Each channel keeps its token order, accumulation through the four key parts, and warp reduction order. The kernel stores BF16 outputs and FP32 tail state in their existing slots. [Recurrence](../src/text/gdn_verify.cu#L135)<!-- prefix: "__global__ v" --> · [Packed arithmetic](../src/text/gdn_verify.cu#L119)<!-- prefix: "__device__ f" --> · [Output reduction](../src/text/gdn_verify.cu#L175)<!-- prefix: "const float " -->
+
+Use the [batched target GDN check](../tests/decoder/README.md#batched-target-gdn) to compare scores, normalized rows, and committed state against scalar decode. Exercise zero through five consumed rows and a replacement token.
+
 ## Constraints and failure behavior
 
 The fused B/A projection requires `tensor_core_fp8` and two BF16 weight matrices of 48 rows by 5,120 columns each. The input row count must be a multiple of four between 16 and 65,535 inclusive. Both weights, the input, and both outputs must have nonnull pointers. Both weight bases and the input base require 16-byte alignment. If a guard fails, the decoder uses the existing separate projections in B then A order. A fused launch error propagates to the caller. [Policy and shapes](../src/decoder_prefill.cpp#L139)<!-- prefix: "if (tensor_c" --> · [Launch guards](../src/text_decode_bandwidth.cu#L480)<!-- prefix: "if (rows < 1" --> · [Fallback](../src/decoder_prefill.cpp#L150)<!-- prefix: "project(laye" -->

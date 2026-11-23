@@ -12,7 +12,7 @@ constexpr int conv_threads = 128;
 constexpr int tap_count = text_gdn_history_taps + 1;
 constexpr int value_heads_per_qk = text_gdn_value_heads / text_gdn_qk_heads;
 constexpr int recurrent_threads = 2 * text_gdn_head_dim;
-constexpr int values_per_warp = 4;
+constexpr int values_per_warp = 2;
 constexpr int tile_values = recurrent_threads / warp_width * values_per_warp;
 constexpr int tiles_per_head = text_gdn_head_dim / tile_values;
 constexpr int finish_heads_per_block = 4;
@@ -116,6 +116,22 @@ __device__ void prepare_recurrent(const GdnVerificationLane& job, TextGdnWeights
     __syncthreads();
 }
 
+__device__ float2 multiply_channels(float2 values, float factor) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
+    return __fmul2_rn(values, {factor, factor});
+#else
+    return {values.x * factor, values.y * factor};
+#endif
+}
+
+__device__ float2 multiply_add_channels(float2 values, float factor, float2 addends) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
+    return __ffma2_rn(values, {factor, factor}, addends);
+#else
+    return {fmaf(values.x, factor, addends.x), fmaf(values.y, factor, addends.y)};
+#endif
+}
+
 __global__ void gdn_verify_recur(const __grid_constant__ Batch batch, TextGdnWeights weights) {
     const auto& job = batch.entries[blockIdx.z];
     const int head = blockIdx.x / tiles_per_head;
@@ -124,61 +140,53 @@ __global__ void gdn_verify_recur(const __grid_constant__ Batch batch, TextGdnWei
     const int first_value = head * text_gdn_head_dim +
                             (blockIdx.x % tiles_per_head) * tile_values + warp;
     constexpr int warps = recurrent_threads / warp_width;
-    float state[values_per_warp][parts];
+    float2 state[parts];
     #pragma unroll
-    for (int value = 0; value < values_per_warp; ++value) {
-        const int feature = first_value + value * warps;
-        #pragma unroll
-        for (int part = 0; part < parts; ++part) {
-            state[value][part] =
-                job.initial.recurrent[feature * text_gdn_head_dim + part * warp_width + lane];
-        }
+    for (int part = 0; part < parts; ++part) {
+        const auto* initial = job.initial.recurrent + first_value * text_gdn_head_dim +
+                              part * warp_width + lane;
+        state[part] = {initial[0], initial[warps * text_gdn_head_dim]};
     }
 
     __shared__ RecurrentInputs shared;
     prepare_recurrent(job, weights, head, shared);
     #pragma unroll
     for (int row = 0; row < Batch::rows; ++row) {
-        float keys[parts], queries[parts];
+        float2 prediction{};
         #pragma unroll
         for (int part = 0; part < parts; ++part) {
             const int key = part * warp_width + lane;
-            keys[part] = shared.qk[row][1][key];
-            queries[part] = shared.qk[row][0][key];
+            state[part] = multiply_channels(state[part], shared.decay[row]);
+            prediction = multiply_add_channels(state[part], shared.qk[row][1][key], prediction);
         }
+        const auto* target = job.inputs.convolved + row * text_gdn_qkv_width +
+                             2 * text_gdn_qk_width + first_value;
+        const float2 correction{
+            shared.beta[row] * (__bfloat162float(target[0]) - sum_warp(prediction.x)),
+            shared.beta[row] * (__bfloat162float(target[warps]) - sum_warp(prediction.y)),
+        };
+        float2 result{};
         #pragma unroll
-        for (int value = 0; value < values_per_warp; ++value) {
-            const int feature = first_value + value * warps;
-            float prediction = 0.0f;
-            #pragma unroll
-            for (int part = 0; part < parts; ++part) {
-                state[value][part] *= shared.decay[row];
-                prediction = fmaf(state[value][part], keys[part], prediction);
-            }
-            const float target = __bfloat162float(
-                job.inputs.convolved[row * text_gdn_qkv_width + 2 * text_gdn_qk_width + feature]);
-            const float correction = shared.beta[row] * (target - sum_warp(prediction));
-            float result = 0.0f;
-            #pragma unroll
-            for (int part = 0; part < parts; ++part) {
-                state[value][part] = fmaf(correction, keys[part], state[value][part]);
-                result = fmaf(state[value][part], queries[part], result);
-            }
-            const float sum = sum_warp(result);
-            if (lane == 0) {
-                job.observable[row * text_gdn_value_width + feature] = __float2bfloat16(sum);
-            }
+        for (int part = 0; part < parts; ++part) {
+            const int key = part * warp_width + lane;
+            state[part] = multiply_add_channels(correction, shared.qk[row][1][key], state[part]);
+            result = multiply_add_channels(state[part], shared.qk[row][0][key], result);
+        }
+        const float sum0 = sum_warp(result.x);
+        const float sum1 = sum_warp(result.y);
+        if (lane == 0) {
+            auto* out = job.observable + row * text_gdn_value_width + first_value;
+            out[0] = __float2bfloat16(sum0);
+            out[warps] = __float2bfloat16(sum1);
         }
     }
 
     #pragma unroll
-    for (int value = 0; value < values_per_warp; ++value) {
-        const int feature = first_value + value * warps;
-        #pragma unroll
-        for (int part = 0; part < parts; ++part) {
-            job.tail.recurrent[feature * text_gdn_head_dim + part * warp_width + lane] =
-                state[value][part];
-        }
+    for (int part = 0; part < parts; ++part) {
+        auto* tail = job.tail.recurrent + first_value * text_gdn_head_dim +
+                     part * warp_width + lane;
+        tail[0] = state[part].x;
+        tail[warps * text_gdn_head_dim] = state[part].y;
     }
 }
 

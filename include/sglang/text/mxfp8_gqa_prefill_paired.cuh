@@ -421,7 +421,7 @@ template <int Count>
 std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSequence* sequences,
                                                  cudaStream_t stream,
                                                  decoder::PairedPrefillScratch scratch) {
-    constexpr int max_position = 31744;
+    constexpr int max_position = 131072 / Count - flash_chunk;
     const int position = sequences[0].position;
     if (position < flash_chunk || position > max_position ||
         !StagedRange(scratch.keys, scratch.key_bytes, 1).valid() ||
@@ -518,6 +518,9 @@ std::optional<cudaError_t> launch_staged_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
     const Bf16* queries, Bf16* output, cudaStream_t stream,
     decoder::PairedPrefillScratch scratch) {
+    if (position > 31744) {
+        return std::nullopt;
+    }
     const decoder::PagedPrefillSequence sequence{cache, pages, position, flash_chunk, queries,
                                                 output};
     return launch_staged_requests<1>(&sequence, stream, scratch);
@@ -535,6 +538,26 @@ std::optional<cudaError_t> decoder::try_batched_staged_paged_prefill(
         return std::nullopt;
     }
     return launch_staged_requests<staged_prefill_batch_size>(sequences, stream, scratch);
+}
+
+std::optional<cudaError_t> decoder::try_long_staged_paged_prefill(
+    const PagedPrefillSequence* sequences, int count, cudaStream_t stream,
+    PairedPrefillScratch scratch) {
+    if (!sequences || !(count == 1 || count == 2 || count == staged_prefill_batch_size)) {
+        return std::nullopt;
+    }
+    const int position = sequences[0].position;
+    if (position <= staged_prefill_batch_max_position ||
+        position > staged_prefill_batch_long_max_position || position % flash_chunk != 0) {
+        return std::nullopt;
+    }
+    if (count == staged_prefill_batch_size) {
+        return launch_staged_requests<staged_prefill_batch_size>(sequences, stream, scratch);
+    }
+    if (count == 2) {
+        return launch_staged_requests<2>(sequences, stream, scratch);
+    }
+    return launch_staged_requests<1>(sequences, stream, scratch);
 }
 
 }

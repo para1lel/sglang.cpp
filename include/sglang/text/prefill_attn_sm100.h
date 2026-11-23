@@ -32,8 +32,13 @@ std::optional<cudaError_t> try_batched_paged_prefill(
 inline constexpr int staged_prefill_batch_size = 4;
 inline constexpr int staged_prefill_batch_min_position = 1024;
 inline constexpr int staged_prefill_batch_max_position = 7168;
+inline constexpr int staged_prefill_batch_long_max_position = 130048;
 
 std::optional<cudaError_t> try_batched_staged_paged_prefill(
+    const PagedPrefillSequence* sequences, int count, cudaStream_t stream,
+    PairedPrefillScratch scratch);
+
+std::optional<cudaError_t> try_long_staged_paged_prefill(
     const PagedPrefillSequence* sequences, int count, cudaStream_t stream,
     PairedPrefillScratch scratch);
 

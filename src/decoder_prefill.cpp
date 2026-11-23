@@ -392,13 +392,30 @@ void prefill_group_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
     });
     if (staged_batch) {
         const auto scratch = chunk.work.gqa_scratch();
-        if (const auto staged = try_batched_staged_paged_prefill(sequences.data(), count,
-                                                                chunk.stream, scratch)) {
-            check(*staged, "Read staged batched causal prefill MXFP8 attention");
+        const int position = sequences.front().position;
+        if (position <= staged_prefill_batch_max_position) {
+            if (const auto staged = try_batched_staged_paged_prefill(sequences.data(), count,
+                                                                    chunk.stream, scratch)) {
+                check(*staged, "Read staged batched causal prefill MXFP8 attention");
+                return;
+            }
+            for (int lane = 0; lane < count; ++lane) {
+                read_paged_sequences(sequences.data() + lane, 1, chunk.stream, scratch);
+            }
             return;
         }
-        for (int lane = 0; lane < count; ++lane) {
-            read_paged_sequences(sequences.data() + lane, 1, chunk.stream, scratch);
+        const int visible = position + batch_prefill_tile_rows;
+        const int subgroup = visible <= 32768 ? 4 : visible <= 65536 ? 2 : 1;
+        for (int lane = 0; lane < count; lane += subgroup) {
+            const auto* first = sequences.data() + lane;
+            if (const auto staged = try_long_staged_paged_prefill(first, subgroup, chunk.stream,
+                                                                  scratch)) {
+                check(*staged, "Read long staged causal prefill MXFP8 attention");
+                continue;
+            }
+            for (int index = 0; index < subgroup; ++index) {
+                read_paged_sequences(first + index, 1, chunk.stream, scratch);
+            }
         }
         return;
     }
@@ -412,7 +429,8 @@ bool can_batch_staged_gqa(const PrefillGrant* grants, int count) {
     }
     const int position = grants[0].position;
     return position >= staged_prefill_batch_min_position &&
-        position <= staged_prefill_batch_max_position && position % batch_prefill_tile_rows == 0 &&
+        position <= staged_prefill_batch_long_max_position &&
+        position % batch_prefill_tile_rows == 0 &&
         std::all_of(grants, grants + count, [&](const PrefillGrant& grant) {
             return grant.position == position && grant.rows == batch_prefill_tile_rows;
         });

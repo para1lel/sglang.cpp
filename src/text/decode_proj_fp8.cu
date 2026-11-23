@@ -68,13 +68,27 @@ __device__ void load_scales(const Job& job, float* scales,
     consumer_sync();
 }
 
-template <int Fragment>
-__device__ void promote(const unsigned (&partial)[Fragment], const float* scales, float scale,
-                        float* result) {
-    #pragma unroll
-    for (int col = 0; col < Fragment; ++col) {
-        const float scaled = __fmul_rn(__uint_as_float(partial[col]), scales[col]);
-        result[col] = __fmaf_rn(scaled, scale, result[col]);
+template <bool Packed, int Fragment>
+__device__ __forceinline__ void promote(const unsigned (&partial)[Fragment], const float* scales,
+                                        float scale, float* result) {
+    if constexpr (Packed) {
+        const auto factor = make_float2(scale, scale);
+        #pragma unroll
+        for (int col = 0; col < Fragment; col += 2) {
+            const auto values = make_float2(__uint_as_float(partial[col]),
+                                            __uint_as_float(partial[col + 1]));
+            const auto activation_scales = make_float2(scales[col], scales[col + 1]);
+            const auto scaled = __fmul2_rn(values, activation_scales);
+            const auto sum = __ffma2_rn(scaled, factor, make_float2(result[col], result[col + 1]));
+            result[col] = sum.x;
+            result[col + 1] = sum.y;
+        }
+    } else {
+        #pragma unroll
+        for (int col = 0; col < Fragment; ++col) {
+            const float scaled = __fmul_rn(__uint_as_float(partial[col]), scales[col]);
+            result[col] = __fmaf_rn(scaled, scale, result[col]);
+        }
     }
 }
 
@@ -95,14 +109,17 @@ __device__ void consume_single(DecodePipeline<Slots>& pipe, const float* scales,
 }
 
 template <int Columns, int Slots>
-__device__ void consume(DecodePipeline<Slots>& pipe, const float* scales,
-                        const float* weight_scales,
-                        int count, int active, float (&result)[Columns]) {
+__device__ __forceinline__ void consume(DecodePipeline<Slots>& pipe, const float* scales,
+                                        const float* weight_scales,
+                                        int count, int active, float (&result)[Columns]) {
+    constexpr bool compact = Columns == 80 || Columns == 160;
     const int warp = threadIdx.x / warp_size;
     const unsigned lane_base = pipe.tmem + (static_cast<unsigned>(warp * warp_size) << 16);
-    if (active == 1) {
-        consume_single<Columns>(pipe, scales, weight_scales, count, lane_base, result[0]);
-        return;
+    if constexpr (!compact) {
+        if (active == 1) {
+            consume_single<Columns>(pipe, scales, weight_scales, count, lane_base, result[0]);
+            return;
+        }
     }
     constexpr int fragment = Columns == 8 ? 8 : 16;
     for (int index = 0; index < count; ++index) {
@@ -112,14 +129,14 @@ __device__ void consume(DecodePipeline<Slots>& pipe, const float* scales,
         fence_after_sync();
         #pragma unroll
         for (int block = 0; block < Columns; block += fragment) {
-            if (block < active) {
+            if (compact || block < active) {
                 unsigned partial[fragment];
                 if constexpr (fragment == 8) {
                     load_tmem8(lane_base + slot * Columns + block, partial);
                 } else {
                     load_tmem16(lane_base + slot * Columns + block, partial);
                 }
-                promote(partial, scales + index * Columns + block, scale, result + block);
+                promote<compact>(partial, scales + index * Columns + block, scale, result + block);
             }
         }
         release_slot(&pipe.accum_empty[slot]);
@@ -137,7 +154,8 @@ void fp8_decode(const __grid_constant__ Job job) {
     const int first = blockIdx.x * job.groups / splits;
     const int count = (blockIdx.x + 1) * job.groups / splits - first;
     const int act_row = blockIdx.z * Columns;
-    const int active = min(Columns, job.rows - act_row);
+    constexpr bool compact = Columns == 80 || Columns == 160;
+    const int active = compact ? Columns : min(Columns, job.rows - act_row);
     const int warp = threadIdx.x / warp_size;
     int target = 0;
     for (int index = 1; index < job.targets; ++index) {
@@ -319,7 +337,7 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
             target, projections, target_count, input, in_width, rows, count, 17, stream));
     }
     if (count == text_target_fp8_m160_rows) {
-        return compact_status(launch_rows<text_target_fp8_m160_rows, 2, text_target_fp8_m160_rows>(
+        return compact_status(launch_rows<text_target_fp8_m160_rows, 3, text_target_fp8_m160_rows>(
             target, projections, target_count, input, in_width, rows, count, 18, stream));
     }
     if (count == text_target_fp8_m40_rows) {

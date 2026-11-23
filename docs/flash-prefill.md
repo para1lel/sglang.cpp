@@ -101,7 +101,7 @@ The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L748)<!-- prefix: "vo
 
 Check ordered and protected fallback bitwise against the ordered FP32 reference for finite scores and quotients. Check FP64 recovery independently. Use the [exact prefill runbook](../tests/prefill/README.md) for the separate `exact` contract.
 
-For partial Flash changes, match BF16 outputs bitwise on identical checkpoint Q and KV. Match full-vocabulary BF16 logits and greedy IDs across prefill and decode with identical grants and teacher tokens. Cover unaligned starts, remaps, unwritten tails, and unchanged shapes. Weight eager timings by recorded tile counts.
+If a partial Flash change preserves arithmetic, match BF16 outputs bitwise on identical checkpoint Q and KV. In that comparison, match full-vocabulary BF16 logits and greedy IDs across prefill and decode with identical grants and teacher tokens. For reordered arithmetic, follow the [operator qualification procedure](performance.md#operator-qualification). Cover unaligned starts, remaps, unwritten tails, and unchanged shapes. Weight eager timings by recorded tile counts.
 
 The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L727)<!-- prefix: "void check_p" --> check dispatch and alignment at 4,096. [Graph checks](../tests/mxfp8_gqa_flash_check.cu#L335)<!-- prefix: "void check_d" --> require one node for the automatic path. The [historical split checks](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/tests/mxfp8_gqa_flash_check.cu#L352)<!-- prefix: "void check_t" --> verified graph dependencies and scratch lifetime.
 

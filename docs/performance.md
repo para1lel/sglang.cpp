@@ -76,6 +76,12 @@ Report one row per engine, workload, and mode with absolute metrics and successf
 
 For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident request storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L216)<!-- prefix: "Measurements" -->
 
+### Operator qualification
+
+Operators may reorder arithmetic within their numerical contract. Compare outputs and state with an independent mathematical reference under the operation's established error criteria. Check causality where the operation uses token history. Check model quality on frozen inputs and shared token histories. Record free-running divergence separately. Require bitwise equality for copied bytes, exact replay, and comparisons that preserve arithmetic.
+
+Use repeated matched measurements to choose the fastest validated implementation for each supported case. Keep one production implementation per case. Use validated fallbacks where shape, device, or available resources prevent the primary route. Keep frozen fixtures and timing gates unchanged.
+
 ### Native text completions
 
 Reuse frozen W1–W6 `benchmark` requests, token-ID SSE clients, and timing definitions under the [scheduler policy](#scheduler-and-reporting-policy). Compare cross-engine output IDs for diagnosis. Run [text verification](text-serving.md#verification) separately.
@@ -127,11 +133,11 @@ For arithmetic-preserving prefill fusions, match full BF16 logits, committed KV 
 
 Use the [GQA verification criteria and measurements](flash-prefill.md#verification) for flash, ordered fallback, and protected single rows.
 
-For cross-policy comparisons, check full BF16 logits within predefined tolerances on identical histories and prefill boundaries. Use shared teacher-forced tokens after greedy divergence. Report logit errors, ranks, top-two margins, free-running IDs, and first divergence.
+For cross-policy diagnostics, compare full BF16 logits on identical histories and prefill boundaries. Use shared teacher-forced tokens after greedy divergence. Report logit errors, ranks, top-two margins, labeled-token negative log likelihood, free-running IDs, and first divergence.
 
-Check parity against pinned vLLM on identical histories. Record its execution mode and KV and GDN policies. Record how diagnostic rows were selected. Use frozen fixtures for workload-level results.
+Compare with pinned vLLM on identical histories for model diagnostics. Record its execution mode and KV and GDN policies. Record how diagnostic rows were selected. Use frozen fixtures for workload-level results.
 
-Run [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 across projection tiles on identical inputs. Follow the [prefill protocol](#chunked-prefill). Report native deltas and gates per policy.
+Run [serial tile checks](text-serving.md#serial-prefill-verification) before timing. Match BF16 scores across tiles on identical inputs when arithmetic stays the same. Follow the [prefill protocol](#chunked-prefill). Report native deltas and gates per policy.
 
 ### Native concurrent workloads
 

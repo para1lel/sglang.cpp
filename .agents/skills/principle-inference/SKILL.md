@@ -94,7 +94,9 @@ Lossless storage preserves saved bits.
 It does not by itself prove bitwise equality after execution with a different operation order.
 Use exact comparisons for discrete metadata and justified tolerances for numerical results.
 Assess compression error separately from changes to cache reuse or speculative execution.
-Keep arithmetic and reduction policies consistent across equivalent decode, prefill, and speculative paths.
+Permit mathematically justified arithmetic and reduction reordering when independent checks
+satisfy the operation's numerical contract and required state invariants.
+Use the fastest validated implementation for each supported case.
 Select canonical partitions from each query's visible prefix when equivalence requires them.
 Locate the first divergent state or logit row before selecting a numerical correction.
 Plausible output text and wider tolerances do not establish the required equivalence.

@@ -94,25 +94,23 @@ def server(binary, checkpoint, log, *flags, sampling=True, with_process=False):
 
 
 class Routes(unittest.TestCase):
-    def test_draft_head_opt_in_and_k0(self):
+    def test_default_mtp_and_target_only_launch(self):
         data = self.control(self.port, "/server_info")
         self.assertEqual(data["fp8_prefill"], "exact")
         self.assertEqual(data["mtp_steps"], 4)
         self.assertIs(data["mtp_int8_head"], False)
-        for depth in (0, 4):
-            with self.subTest(depth=depth):
-                log = self.output / f"draft-head-k{depth}.log"
-                with server(self.binary, self.checkpoint, log, "--mtp-steps", str(depth),
-                            "--fp8-prefill", "tensor-core-mtp-target", "--mtp-int8-head") as port:
-                    data = self.control(port, "/server_info")
-                    self.assertEqual(data["fp8_prefill"], "tensor-core-mtp-target")
-                    self.assertEqual(data["mtp_steps"], depth)
-                    self.assertIs(data["mtp_int8_head"], depth > 0)
-                    response, receipt = self.exchange(
-                        TEXT, body(TEXT, max_tokens=1, temperature=0, ignore_eos=True),
-                        port=port, log=log,
-                    )
-                    self.completion(response, receipt, 1, "length")
+        self.assertIs(data["certified_int8_verify_head"], False)
+        log = self.output / "draft-head-k0.log"
+        with server(self.binary, self.checkpoint, log, "--mtp-steps", "0") as port:
+            data = self.control(port, "/server_info")
+            self.assertEqual(data["mtp_steps"], 0)
+            self.assertIs(data["mtp_int8_head"], False)
+            self.assertIs(data["certified_int8_verify_head"], False)
+            response, receipt = self.exchange(
+                TEXT, body(TEXT, max_tokens=1, temperature=0, ignore_eos=True),
+                port=port, log=log,
+            )
+            self.completion(response, receipt, 1, "length")
 
     def test_scheduler_budget_default_and_override(self):
         for flag, budget in (((), 8192), (("--max-num-batched-tokens", "32768"), 32768)):
@@ -580,27 +578,17 @@ class Routes(unittest.TestCase):
 
     def test_mtp_launch_depth_with_prefix_cache(self):
         prefix = ("--prefix-cache-entries", "1")
-        tensor = (*prefix, "--fp8-prefill", "tensor-core")
         cases = (
-            ("default", (), 4, 0),
-            ("target-only", ("--mtp-steps", "0"), 0, 0),
-            ("exact-prefix", prefix, 4, 1),
-            ("tensor-prefix", tensor, 0, 1),
-            ("tensor-prefix-target-only", (*tensor, "--mtp-k", "0"), 0, 1),
+            ("prefix", prefix, 4),
+            ("prefix-target-only", (*prefix, "--mtp-k", "0"), 0),
         )
-        for name, flags, depth, entries in cases:
+        for name, flags, depth in cases:
             with self.subTest(name=name):
                 log = self.output / f"mtp-launch-{name}.log"
                 with server(self.binary, self.checkpoint, log, *flags) as port:
                     info = self.control(port, "/server_info")
                     self.assertEqual(info["mtp_steps"], depth)
-                    self.assertEqual(info["prefix_cache_entries"], entries)
-
-        result = subprocess.run([str(self.binary), *tensor, "--mtp-k", "4"],
-                                env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
-                                capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("requires --fp8-prefill exact", result.stderr)
+                    self.assertEqual(info["prefix_cache_entries"], 1)
 
     def test_flush_cache_methods_and_timeout(self):
         flushed = (b"Cache flushed.\nPlease check backend logs for more details. "

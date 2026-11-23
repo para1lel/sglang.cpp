@@ -134,7 +134,7 @@ struct Scenario {
 };
 
 void run(const std::filesystem::path& checkpoint, int width) {
-    const Decoder decoder(checkpoint, 0, false, Fp8PrefillPolicy::exact);
+    const Decoder decoder(checkpoint);
     Scenario test(decoder, width);
     constexpr std::array prompts{13, 198, 31784};
     std::array<DecoderResult, prompts.size()> serial;
@@ -160,9 +160,11 @@ void run(const std::filesystem::path& checkpoint, int width) {
 
     Selection sparse{};
     sparse[0] = sparse[last] = true;
-    test.step(sparse);
-    require(test.step(sparse) == (std::uint32_t{1} | (std::uint32_t{1} << last)),
-            "Sparse graph did not report both logical slots");
+    require(test.step(sparse) == 0 && test.step(sparse) == 0, "Sparse B200 pair used a graph");
+    sparse[0] = false;
+    require(test.step(sparse) == 0, "Singleton did not warm eagerly");
+    require(test.step(sparse) == (std::uint32_t{1} << last),
+            "Singleton graph omitted the highest logical slot");
     while (std::any_of(test.live.begin(), test.live.end(), [](bool active) { return active; })) {
         test.step(test.live);
     }

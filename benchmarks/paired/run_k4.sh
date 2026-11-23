@@ -5,11 +5,9 @@ usage() {
     echo "Usage: bash benchmarks/paired/run_k4.sh NATIVE_BINARY GPU_INDEX CAMPAIGN_DIR ROW"
     echo "ROW must be W1, W2, W3, W4, W5, or W6."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
-    echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8 selects the opt-in native profile."
-    echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-split-gqa enables bounded split attention."
-    echo "PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-long-split-gqa enables long split attention."
-    echo "PAIRED_K4_NATIVE_PROFILE=server-defaults times native defaults against matched vLLM K4."
-    echo "The default profile is exact."
+    echo "The default profile, server-defaults, times native defaults against matched vLLM K4."
+    echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
+    echo "  exact, ordered-tc-int8, ordered-tc-int8-split-gqa, ordered-tc-int8-long-split-gqa."
 }
 
 if [[ ${1:-} == --help ]]; then
@@ -28,7 +26,7 @@ row=$4
 native_source=${PAIRED_NATIVE_SOURCE:-}
 native_sha=${PAIRED_NATIVE_SHA256:-}
 manifest=${PAIRED_CHECKPOINT_MANIFEST:-}
-native_profile=${PAIRED_K4_NATIVE_PROFILE-exact}
+native_profile=${PAIRED_K4_NATIVE_PROFILE-server-defaults}
 native_fp8=exact
 native_split_mode=
 native_defaults=false

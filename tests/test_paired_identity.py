@@ -178,6 +178,7 @@ start_group() {
     fi
     printf '{"max_active":32,"max_num_batched_tokens":%s}\n' "$token_budget" >"$1/health.json"
 }
+curl() { printf '{}\n'; }
 measure_group() { [[ $1 != W5 || $SCENARIO != measurement-error ]]; }
 comparison_identity() {
     printf '{"group":"%s"}\n' "$3"
@@ -854,21 +855,38 @@ class PairedIdentityTest(unittest.TestCase):
                          "published frozen reference (cross-device, cross-cap)")
         self.assertEqual(fourth["planned_comparison"], "published frozen reference (cross-cap)")
 
-    def prepare_native(self):
+    def prepare_native(self, *, historical=False):
         output = self.args.output
         plan_path = output / "comparison-plan.json"
-        write_json(plan_path, identity.plan(self.args))
+        plan = identity.plan(self.args)
+        if historical:
+            del plan["native_protocol"]
+        write_json(plan_path, plan)
         self.args.plan_sha256 = identity.digest(plan_path)
         run = output / GROUP
         run.mkdir()
         (run / "server-pid.txt").write_text("2000\n")
         write_compute(run, GPU, 2000)
-        write_command(run, "server", "24-33", [
+        launch = [
             "sglang-server", "--checkpoint", str(self.args.checkpoint), "--device", "0",
+            "--port", "17393",
             "--max-active", "32", "--max-num-batched-tokens",
             str(self.args.max_num_batched_tokens),
-            "--fp8-prefill", "tensor-core", "--prefix-cache-entries", "0", "--mtp-steps", "0",
-            "--batch-cuda-graphs"])
+            "--prefix-cache-entries", "0", "--mtp-steps", "0", "--batch-cuda-graphs",
+        ]
+        if historical:
+            launch.extend(("--fp8-prefill", "tensor-core"))
+        else:
+            write_json(run / "server-info.json", {
+                "model_path": str(self.args.checkpoint), "launch_command": " ".join(launch),
+                "mtp_steps": 0, "host": "127.0.0.1", "device": 0, "port": 17393,
+                "max_running_requests": 32,
+                "max_num_batched_tokens": self.args.max_num_batched_tokens,
+                "prefix_cache_entries": 0, "batch_cuda_graphs": True, "eager": False,
+                "trace_batches": False, "fp8_prefill": "tensor-core",
+                "target_gqa": "grouped-split", "paired_prefill": False,
+            })
+        write_command(run, "server", "24-33", launch)
         write_command(run, "client", "34-35", [
             "python", str(ROOT / "benchmarks/streaming/client.py")])
         (output / "native-environment.txt").write_text(f"CUDA_VISIBLE_DEVICES={GPU}\n")
@@ -889,6 +907,15 @@ class PairedIdentityTest(unittest.TestCase):
         result = identity.finish(self.args)
         self.assertEqual(result["comparison"], "same-device matched-cap")
         self.assertFalse(result["quality"]["cross_engine_ids_compared"])
+        self.assertEqual(result["native"]["protocol"], identity.NATIVE_K0_PROTOCOL)
+        self.assertEqual(result["native"]["effective_policy"]["fp8_prefill"], "tensor-core")
+        self.assertNotIn("fp8-prefill", result["native"]["launch_settings"])
+
+    def test_historical_native_plan_preserves_original_launch_receipt(self):
+        self.prepare_native(historical=True)
+        result = identity.finish(self.args)
+        self.assertEqual(result["native"]["launch_settings"]["fp8-prefill"], "tensor-core")
+        self.assertNotIn("effective_policy", result["native"])
 
     def test_finish_uses_each_workload_makespan_and_preserves_tie_receipt(self):
         run = self.prepare_native()

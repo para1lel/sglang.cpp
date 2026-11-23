@@ -107,7 +107,7 @@ int main(int argc, char** argv) try {
     if (prompt.size() != 2048 || teachers.size() != 8) {
         throw std::invalid_argument("Expected 2048 prompt IDs and eight teacher tokens");
     }
-    const Decoder::Model model(argv[1], 0, Fp8PrefillPolicy::tensor_core);
+    const Decoder::Model model(argv[1], 0);
     Capture capture(argv[4]);
     teacher_force(model, prompt, teachers, capture);
     capture.close();

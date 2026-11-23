@@ -171,7 +171,6 @@ def serve(args, pieces):
         command.append("--eager")
     if args.cache_entries:
         command += ["--prefix-cache-entries", str(args.cache_entries)]
-    command += ["--fp8-prefill", args.prefill]
     (args.output / "command.json").write_text(json.dumps(command))
     with (args.output / "server.log").open("wb") as log:
         process = subprocess.Popen(command, stdout=log, stderr=log)
@@ -298,7 +297,6 @@ def arguments():
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--standin", action="store_true")
     parser.add_argument("--integrated", action="store_true")
-    parser.add_argument("--prefill", choices=("exact", "tensor-core"), default="exact")
     parser.add_argument("--cache-entries", type=int, choices=(0, 2, 4), default=0)
     parser.add_argument("--media-body", type=Path)
     parser.add_argument("--media-sha256")

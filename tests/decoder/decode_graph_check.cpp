@@ -64,12 +64,8 @@ extern "C" cudaError_t __wrap_cudaStreamBeginCapture(cudaStream_t stream,
 }
 
 int main(int argc, char** argv) try {
-    require(argc == 3, "Usage: decode-graph-check CHECKPOINT exact|tensor-core");
-    const std::string_view policy = argv[2];
-    require(policy == "exact" || policy == "tensor-core", "Unknown FP8 prefill policy");
-    const auto precision = policy == "exact" ? sglang::Fp8PrefillPolicy::exact
-                                             : sglang::Fp8PrefillPolicy::tensor_core;
-    const sglang::Decoder decoder(argv[1], 0, false, precision);
+    require(argc == 2, "Usage: decode-graph-check CHECKPOINT");
+    const sglang::Decoder decoder(argv[1]);
     std::vector<int> prompt(chunk_rows + 1, 760);
     prompt.back() = 369;
     sglang::DecoderOptions options;
@@ -89,7 +85,7 @@ int main(int argc, char** argv) try {
     require(graph_captures == captures_before + 1, "Eager greedy decode captured a CUDA graph");
     match(graph, eager);
     match(reused, eager);
-    std::cout << "Greedy CUDA graph and eager score checks passed (" << policy << ")\n";
+    std::cout << "Greedy CUDA graph and eager score checks passed\n";
 } catch (const std::exception& error) {
     std::cerr << "Greedy CUDA graph check failed: " << error.what() << '\n';
     return 1;

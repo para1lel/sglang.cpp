@@ -18,6 +18,7 @@ namespace {
 
 using Attempt = std::pair<std::size_t, cudaError_t>;
 constexpr std::size_t bytes_128 = 31944704;
+constexpr std::size_t bytes_129 = bytes_128 / 128 * 129;
 constexpr std::size_t bytes_512 = 127778816;
 constexpr std::size_t bytes_1024 = 255557632;
 constexpr int vocabulary = 248320;
@@ -41,11 +42,8 @@ std::vector<int> prompt(int length) {
 }
 
 sglang::DecoderResult generate(const sglang::Decoder& decoder, int length,
-                               const char* setting, std::size_t reject, const char* label,
+                               std::size_t reject, const char* label,
                                const std::vector<Attempt>& expected) {
-    const int configured = setting ? setenv("SGLANG_SERIAL_PREFILL_ROWS", setting, 1)
-                                   : unsetenv("SGLANG_SERIAL_PREFILL_ROWS");
-    require(configured == 0, "Could not set serial prefill policy");
     attempts.clear();
     reject_at = reject;
     const auto result = decoder.generate(prompt(length), {.top_logits = vocabulary});
@@ -85,23 +83,19 @@ extern "C" cudaError_t __wrap_cudaMallocFromPoolAsync(void** storage, std::size_
 
 int main(int argc, char** argv) try {
     require(argc == 2, "Usage: automatic-rows CHECKPOINT (reserved NVIDIA B200 visible)");
-    const sglang::Decoder decoder(argv[1], 0, false, sglang::Fp8PrefillPolicy::tensor_core);
-    generate(decoder, 511, nullptr, 0, "below-threshold", {{bytes_128, cudaSuccess}});
-    const auto control = generate(decoder, 512, "128", 0, "opt-out", {{bytes_128, cudaSuccess}});
-    compare(control, generate(decoder, 512, nullptr, 0, "automatic", {{bytes_512, cudaSuccess}}));
-    const auto tail = generate(decoder, 1025, "128", 0, "tail-opt-out", {{bytes_128, cudaSuccess}});
-    compare(tail, generate(decoder, 1025, nullptr, 0, "automatic-tail",
-                           {{bytes_1024, cudaSuccess}}));
-    compare(control, generate(decoder, 512, nullptr, bytes_512, "retry-small",
-                              {{bytes_512, cudaErrorMemoryAllocation}, {bytes_128, cudaSuccess}}));
-    const auto rowwise = generate(decoder, 512, "128", bytes_128, "row-wise-control",
-                                  {{bytes_128, cudaErrorMemoryAllocation}});
-    compare(rowwise, generate(decoder, 512, nullptr, bytes_128, "retry-row-wise",
+    const sglang::Decoder decoder(argv[1]);
+    generate(decoder, 128, 0, "128 rows", {{bytes_128, cudaSuccess}});
+    generate(decoder, 129, 0, "129 rows", {{bytes_129, cudaSuccess}});
+    generate(decoder, 1025, 0, "1024 rows and tail", {{bytes_1024, cudaSuccess}});
+    const auto control = generate(decoder, 512, 0, "512 rows", {{bytes_512, cudaSuccess}});
+    compare(control, generate(decoder, 512, bytes_512, "retry-small",
                               {{bytes_512, cudaErrorMemoryAllocation},
-                               {bytes_128, cudaErrorMemoryAllocation}}));
-    std::cout << "Opt-out and row-wise first tokens: " << control.output_token_ids.front()
-              << ' ' << rowwise.output_token_ids.front() << '\n';
-    compare(control, generate(decoder, 512, nullptr, 0, "after-allocation-failure",
+                               {bytes_128, cudaSuccess}}));
+    const std::vector<Attempt> rowwise_failures{
+        {bytes_512, cudaErrorMemoryAllocation}, {bytes_128, cudaErrorMemoryAllocation}};
+    const auto rowwise = generate(decoder, 512, bytes_128, "retry-row-wise", rowwise_failures);
+    compare(rowwise, generate(decoder, 512, bytes_128, "repeat-row-wise", rowwise_failures));
+    compare(control, generate(decoder, 512, 0, "after-allocation-failure",
                               {{bytes_512, cudaSuccess}}));
     std::cout << "Automatic serial prefill selection passed\n";
     return 0;

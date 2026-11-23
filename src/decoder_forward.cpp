@@ -556,7 +556,6 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
     std::array<Workspace*, decoder_batch_max_lanes> pending;
     std::array<PagedDecodeLane, target_split_eager_max_rows> split_reads;
     std::array<Workspace*, target_split_eager_max_rows> split_pending;
-    const bool wide = batch.count > paged_decode_lanes;
     const bool grouped = std::is_same_v<Lane, VerificationRow> &&
                          batch.target_split_end == text_attention_max_tokens && batch.count > 1;
     int count = 0;
@@ -591,9 +590,9 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
                    rotary_position);
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
             const bool ordered = batch.ordered_attention && rotary_position < 0;
-            if (!ordered && lane.mode == TextGdnMode::decode && (wide
-                    ? lane.long_gqa && long_paged_decode_position(lane.position)
-                    : batch.count > 1 && paged_decode_position(lane.position))) {
+            if (!ordered && lane.mode == TextGdnMode::decode &&
+                batch.count > 1 && batch.count <= paged_decode_lanes &&
+                paged_decode_position(lane.position)) {
                 reads[count] = {cache, request.pages, lane.position, paged_gqa_buffers(work)};
                 pending[count++] = &work;
                 return;
@@ -625,8 +624,7 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
     });
     flush_split();
     if (count > 0) {
-        const auto status = wide ? long_paged_decode_gqa(reads.data(), count, batch.stream)
-                                 : paged_decode_gqa(reads.data(), count, batch.stream);
+        const auto status = paged_decode_gqa(reads.data(), count, batch.stream);
         check(status, "Read paged MXFP8 attention");
         for (int index = 0; index < count; ++index) {
             gate_gqa(*pending[index], batch.stream);
@@ -727,7 +725,15 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
                                  stream), "Look up token embedding");
         }
     }
-    forward_layers(lanes, count, stream);
+    for (int first = 0; first < count;) {
+        const bool exact = lanes[first].exact;
+        int end = first + 1;
+        while (end < count && lanes[end].exact == exact) {
+            ++end;
+        }
+        forward_layers(lanes + first, end - first, stream, exact);
+        first = end;
+    }
 }
 
 bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
@@ -890,12 +896,11 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
 }
 
 template <typename Lane>
-void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream) const {
-    const auto policy = fp8_prefill();
-    const LayerBatch<Lane> batch{lanes, count, stream, token_ordered_decode(policy),
-                                 is_b200() && tensor_core_target(policy),
-                                 is_b200() && policy == Fp8PrefillPolicy::tensor_core_mtp_target,
-                                 target_split_end_};
+void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t stream,
+                                    bool exact) const {
+    const bool optimized = is_b200() && !exact;
+    const LayerBatch<Lane> batch{lanes, count, stream, optimized, optimized,
+                                 optimized, optimized ? target_split_end() : 0};
     const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
         if (batch.fuse_verify_activation()) {
             VerifyRmsQuantizeRows rows;
@@ -992,5 +997,4 @@ void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool d
     check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
           "Select greedy token");
 }
-
 }

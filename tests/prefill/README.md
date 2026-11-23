@@ -13,19 +13,15 @@ python -B tests/prefill/run_native.py \
     --evidence artifacts/prefill-check
 ```
 
-Pass either executable to run only its checks. The CLI compares five greedy tokens and the
-ordered top 64 scores. The oracle uses prefixes of the fixed W2 prompt and the native row-wise
-decoder at `dc087912a794372485e78c0a6de5140ac43746e7` for lengths 1, 2, 127, 128, 129, and 257.
-The 511-token policy probe uses explicit `exact` at `5c5281f11a5ba5a25950f84cbf8d110d46401138`.
-Each score digest covers the little-endian 32-bit token ID and IEEE 754 binary32 logit for
-each ranked score, in output step and rank order.
+Pass either executable to run its checks on seven fixed W2 prefixes from 1 to 511 rows.
+The CLI uses `--mtp-steps 0` and compares five greedy IDs and the ordered top 64 scores
+across two invocations. Each score digest covers the little-endian 32-bit token ID and
+IEEE 754 binary32 logit in step and rank order.
 
-The CLI and HTTP checks set `--mtp-steps 0` for the row-wise oracle. The first HTTP server keeps
-the default capacity, token budget, and FP8 prefill policy.
-It verifies the advertised capacity of 32 and budget of 8,192, then checks complete streams
-against the frozen oracle. The 511-token probe distinguishes `exact` from `tensor-core` by the
-first generated token. A separate server runs the same prompts and generation budgets with
-`--max-active 1 --eager --fp8-prefill exact` to exercise the scheduler with one slot.
+The HTTP checks use `--mtp-steps 0`, compare complete SSE against serial SSE under the
+same server configuration, and retain the serial responses as evidence. The first
+server checks the advertised default capacity of 32 and token budget of 8,192. A
+separate `--max-active 1 --eager` server exercises the same requests with one slot.
 
 The width-two cohort uses 129- and 257-token prompts. The width-four cohort uses 2-, 127-,
 129-, and 257-token prompts. Both use the same five-token generation budget and an explicit
@@ -36,8 +32,8 @@ allocations to return to zero, then checks a replacement stream and its own allo
 transition. The reset evidence records the trace offsets for both transitions. Each launch
 records its command and `/health` response. Require `passed` in the resulting `status.json`.
 
-For the FP8 prefill policy options, run the CPU-only check against the release binaries.
-It hides all CUDA devices and verifies help and argument rejection before model load.
+The CPU-only CLI check hides CUDA devices and verifies help and rejection of the
+retired FP8 prefill selector before model load.
 
 ```sh
 python -B tests/prefill/run_native.py --check-policy \
@@ -61,24 +57,8 @@ The operator check verifies FP64-derived BF16 output and output guards for 197 c
 and 1,024 inputs. It covers tensor-core launches at 3, 127, and 128 rows and exact fallback
 at 2 and 129 rows. It also checks alignment, odd input widths, and invalid arguments.
 
-Configure the release build with `--mxfp8-gqa-check=y` and build
-`mxfp8-gqa-sm100-check` to check the experimental SM100 prefill attention. Run
-`build/bin/mxfp8-gqa-sm100-check` on the reserved GPU. It enables the experimental
-route internally, compares sampled output against FP64 attention, checks graph
-replay, and verifies rejection of undersized page tables and unaligned queries.
-At position 8,192 the check compares the TMA producer and scale-alignment fallback
-against original split across all 6,291,456 BF16 values after poisoned-output graph
-replay. It requires a 576-thread TMA producer and 544-thread split producers. It also
-checks launcher decline with the selector unset and normal tile planning under
-`sm100-tma`. The rising-max FP64 control requires maximum absolute error below
-`2e-5`.
-
-Run the setup fault controls against the same Release archive in the default Pixi
-environment. They interpose on the production launcher's CUDA calls and need no GPU.
-They require split dispatch on recoverable encoder and TMA attribute rejections,
-error propagation before stream work on unexpected failures, and one release with
-the original error returned after a producer launch failure.
-
-```sh
-bash tests/prefill/page128_setup_faults.sh build
-```
+Configure with `--mxfp8-gqa-check=y` and build `mxfp8-gqa-check` to exercise the
+serving attention routes. The CUDA check covers raw and staged paired kernels,
+Flash and protected paths, causal and nonfinite recovery, alignment and context
+boundaries, and graph replay. It checks that exact-fit staged scratch matches raw
+output bit for bit and that one-byte-short scratch and capture use the raw route.

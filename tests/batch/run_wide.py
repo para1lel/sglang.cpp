@@ -62,38 +62,40 @@ def check_native(args, width):
     steps = [tuple(map(int, step)) for step in NATIVE_STEP.findall(log.read_text())]
     assert steps and steps[-1][2] == 0, log
     masks = [mask for _, mask, _ in steps if mask]
-    assert (1 | (1 << (width - 1))) in masks, log
+    assert (1 << (width - 1)) in masks, log
     assert all(not mask or decode.bit_count() in BATCH_GRAPH_WIDTHS
                for decode, mask, _ in steps), log
     device, _ = check_graph_evidence.trace(activity)
     assert len(device) == len(masks), (log, activity)
-    print(f"Native width {width} passed packed decode, high-slot refill, and CUPTI", flush=True)
+    print(f"Native width {width} passed eager decode, high-slot refill, and CUPTI", flush=True)
 
 
 def check_http(args, width):
     out = args.evidence / f"http-{width}"
     spec = argparse.Namespace(output=out, binary=args.binary, checkpoint=args.checkpoint,
-                              width=width, route="graph", policy="exact", activity=args.activity,
+                              width=width, route="graph", activity=args.activity,
                               max_num_batched_tokens=PREFILL_ROW_BUDGET)
     with http.server(spec) as port:
         log = out / "server.log"
-        offset = log.stat().st_size
         case = http.FIXTURES["held-out"]
+        reference, = http.parallel(port, [case], exact=False)
+        cases = http.native.serial_cases(port, http.FIXTURES, out / "serial-reference.json")
+        offset = log.stat().st_size
         cohort = [{**case, "name": f"lane-{lane}"} for lane in range(width)]
-        responses = http.parallel(port, cohort, exact=True)
+        responses = http.parallel(port, cohort, exact=False)
         http.native.await_retirement(log, offset, width)
         rows = http.scheduler(log, offset)
-        http.save(out / "cohort.json", {"streams": responses, "rows": rows})
-        assert all(item["tokens"] == case["output"] and item["finish"] == case["finish_reason"]
+        http.save(out / "cohort.json", {"reference": reference, "streams": responses, "rows": rows})
+        assert all(item["tokens"] == reference["tokens"] and item["finish"] == reference["finish"]
                    for item in responses), out
         assert max(item["tokens_ns"][0] for item in responses) < min(
             item["done_ns"] for item in responses), "A stream finished before every lane emitted"
         assert any(row["width"] == width for row in rows), out
         assert any(row["decode"] > 4 for row in rows), out
         http.native.check_admission(port, log, out / "cancel-and-reuse.json",
-                                    http.FIXTURES, width)
+                                    cases, width)
         http.native.await_retirement(log, offset, width)
-        http_rows = http.scheduler(log, offset)
+        http_rows = http.scheduler(log, 0)
     assert all(0 <= row["decode"] <= row["width"] <= width for row in http_rows), out
     for row in http_rows:
         if row["width"]:

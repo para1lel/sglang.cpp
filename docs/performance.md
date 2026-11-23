@@ -55,7 +55,11 @@ The fixture uses eight greedy output tokens and BF16 KV. Check repeat IDs, UUID,
 | W5 | 32,768 | 4,096 | 32 |
 | W6 | 131,072 | 1,024 | 4 |
 
-For W1–W6, use disjoint prefixes and disable MTP. Set native `--mtp-steps 0`. Keep [W3-prefix](prefix-cache.md#w3-prefix), `W3-MTP`, and media variants separate. Freeze media bytes, dimensions, sampled frames, timestamps, preprocessing, positions, and output budget. Retain failed outcomes under the original workload name.
+For current W1–W6 timing, use the [native server-defaults protocol](../benchmarks/paired/README.md#native-server-defaults-against-matched-vllm-k4).
+It compares native default K4 with pinned vLLM K4. The historical K0 campaign
+used native `--mtp-steps 0`. Keep [W3-prefix](prefix-cache.md#w3-prefix) and
+media variants separate. Freeze media, preprocessing, positions, and budget.
+Retain failures under the original workload name.
 
 ## Measurement
 
@@ -77,7 +81,7 @@ Exclude startup, model load, JIT compilation, and graph capture from steady meas
 
 Report one row per engine, workload, and mode with absolute metrics and successful and attempted request counts. Use paired throughput ratios and latency differences for diagnosis. Set any undefined workload margins from baseline repeats before candidate timing.
 
-For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident request storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L223)<!-- prefix: "Measurements" -->
+For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident request storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L215)<!-- prefix: "Measurements" -->
 
 ### Native text completions
 
@@ -131,11 +135,12 @@ The historical GPU6 prototype reduced W1 and W2 CUDA prefill time against the ro
 
 ### FP8 tensor-core prefill
 
-Compare both `--fp8-prefill` policies on one binary with `--mtp-steps 0`. Match measurement controls and KV and GDN policies. Record commands, source and binary hashes, toolchain, and driver. Trace projection shapes, grids, shared memory, and fallback separately.
+For the native control, use `--mtp-steps 0`. Record commands, binary and source
+hashes, toolchain, driver, and dispatch. Trace projection shapes and fallback.
 
-Run [exact prefill checks](development.md#chunked-prefill-verification) with default and explicit `exact` in both binaries. Compare tensor-core projections with an independent reference under predefined tolerances. Match fallback and exact projections bitwise. Cover full chunks, tails, mixed steps, and unsupported dispatch. Check repeated tokens and finish reasons.
+Run the [prefill checks](development.md#chunked-prefill-verification) for exact scoring and cache storage. Compare Tensor Core projections with an independent reference under predefined tolerances. Match fallback and exact projections bitwise. Cover full chunks, tails, mixed steps, and unsupported dispatch. Check repeated tokens and finish reasons.
 
-For arithmetic-preserving [prefill fusions](development.md#runtime-path), match full BF16 logits, committed KV and GDN state, and staged BF16 and FP8 values bitwise. Hold the policy and tile schedule fixed. Include raw MXFP8 exponents 0 and 255. Cover single rows, two- and four-row tiles, page crossings, positive MTP depth under both policies, and graph and eager decode.
+For arithmetic-preserving [prefill fusions](development.md#runtime-path), match full BF16 logits, committed KV and GDN state, and staged BF16 and FP8 values bitwise. Hold dispatch and tile schedule fixed. Include raw MXFP8 exponents 0 and 255. Cover single rows, two- and four-row tiles, page crossings, positive MTP depth, and graph and eager decode.
 
 Use the [GQA verification criteria and measurements](flash-prefill.md#verification) for flash, ordered fallback, and protected single rows.
 
@@ -192,13 +197,13 @@ To isolate layer-major verification, compare with row-wise MTP at the same depth
 
 Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. [W3-MTP](../benchmarks/variants/README.md) uses four 8,192-token prompts with 1,024 outputs each. K1 starts beyond the [graph limit](mtp.md#target-verification-graph). The matched run remains pending. Use `--max-active 32 --max-num-batched-tokens 8192`.
 
-Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L249)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L981)<!-- prefix: "result.mtp_r" -->
+Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L241)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L866)<!-- prefix: "result.mtp_r" -->
 
 Use `--trace-batches` at any capacity in a separate run. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder_verify.cpp#L215)<!-- prefix: "bool MtpRoun" -->
 
 Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../include/sglang/server/batch_trace.h#L12)<!-- prefix: "inline void " -->
 
-See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L978)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L899)<!-- prefix: "current.peak" -->
+See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L863)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L784)<!-- prefix: "current.peak" -->
 
 ## Correctness, memory, and diagnosis
 

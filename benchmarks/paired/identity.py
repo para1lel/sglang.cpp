@@ -38,6 +38,7 @@ ACTIVE_FROZEN_PROTOCOL = FROZEN_PROTOCOL | {"streaming/client.py": DRAINING_STRE
 DEFAULT_TOKEN_BUDGET = 8192
 STREAMING_COUNTS = (3, 9)
 CONCURRENT_COUNTS = (2, 5)
+NATIVE_K0_PROTOCOL = "automatic-k0-v1"
 
 
 def token_budget(value):
@@ -345,10 +346,53 @@ def plan(args):
     for checkpoint in sorted(checkpoints):
         subprocess.run(["sha256sum", "--check", "--strict", "--quiet",
                         str(args.checkpoint_manifest.resolve())], cwd=checkpoint, check=True)
-    return {"status": "planned", "mode": args.mode, "device": native_device, "cpus": cpus,
+    return {"status": "planned", "mode": args.mode, "native_protocol": NATIVE_K0_PROTOCOL,
+            "device": native_device, "cpus": cpus,
             "checkpoint": str(args.checkpoint.resolve()), "max_num_batched_tokens": budget,
             "fixtures": str(args.fixtures.resolve()),
             "checkpoint_manifest_sha256": checkpoint_hash, "groups": rows}
+
+
+def native_k0_policy(run, checkpoint, budget, port):
+    receipt = run / "server-info.json"
+    info = load(receipt)
+    expected = {
+        "mtp_steps": 0, "max_running_requests": 32, "max_num_batched_tokens": budget,
+        "prefix_cache_entries": 0, "batch_cuda_graphs": True, "eager": False,
+        "trace_batches": False, "paired_prefill": False, "device": 0, "port": port,
+        "host": "127.0.0.1",
+    }
+    require(all(type(info.get(key)) is type(value) and info[key] == value
+                for key, value in expected.items())
+            and Path(info["model_path"]).resolve() == checkpoint.resolve()
+            and info.get("fp8_prefill") in ("tensor-core", "exact")
+            and info.get("target_gqa") in ("grouped-split", "exact")
+            and "--fp8-prefill" not in info["launch_command"].split(),
+            f"{run}: unexpected resolved native K0 settings or operator policy")
+    return {"protocol": NATIVE_K0_PROTOCOL,
+            "effective_policy": {key: info[key] for key in
+                                 ("fp8_prefill", "target_gqa", "paired_prefill")},
+            "server_info_sha256": digest(receipt)}
+
+
+def native_k0_launch(run, launch, checkpoint, budget, protocol):
+    settings = {"device": "0", "max-active": "32", "max-num-batched-tokens": str(budget),
+                "prefix-cache-entries": "0", "mtp-steps": "0"}
+    require(protocol in (None, NATIVE_K0_PROTOCOL), "Unknown native K0 protocol")
+    policy = {}
+    if protocol is None:
+        settings["fp8-prefill"] = "tensor-core"
+    else:
+        require("--fp8-prefill" not in launch, f"{run}: retired native FP8 override")
+        port = int(arg(launch, "--port"))
+        require(1 <= port <= 65535, f"{run}: invalid native server port")
+        policy = native_k0_policy(run, checkpoint, budget, port)
+    require(Path(arg(launch, "--checkpoint")).resolve() == checkpoint.resolve()
+            and all(arg(launch, "--" + name) == value for name, value in settings.items())
+            and "--batch-cuda-graphs" in launch
+            and not {"--eager", "--mtp-k", "--trace-batches"}.intersection(launch),
+            f"{run}: native command differs from planned settings")
+    return settings, policy
 
 
 def finish(args):
@@ -371,13 +415,8 @@ def finish(args):
     health = load(run / "health.json")
     require(health["max_active"] == 32 and health["max_num_batched_tokens"] == budget,
             f"{run}: effective native scheduler settings differ")
-    settings = {"device": "0", "max-active": "32", "max-num-batched-tokens": str(budget),
-                "fp8-prefill": "tensor-core", "prefix-cache-entries": "0", "mtp-steps": "0"}
-    require(Path(arg(launch, "--checkpoint")).resolve() == Path(planned["checkpoint"])
-            and all(arg(launch, "--" + name) == value for name, value in settings.items())
-            and "--batch-cuda-graphs" in launch
-            and not {"--eager", "--mtp-k", "--trace-batches"}.intersection(launch),
-            f"{run}: native command differs from planned settings")
+    settings, policy = native_k0_launch(run, launch, Path(planned["checkpoint"]), budget,
+                                        planned.get("native_protocol"))
     environment = fields(args.output / "native-environment.txt")
     require(environment["CUDA_VISIBLE_DEVICES"].lower() == planned["device"]["uuid"]
             and not any(key.startswith("SGLANG_") for key in environment),
@@ -408,6 +447,7 @@ def finish(args):
             "checkpoint_manifest_sha256": planned["checkpoint_manifest_sha256"],
             "protocol": hashes, "native": {"device": planned["device"], "cpus": planned["cpus"],
                 "worker_pid": int(pid), "effective_scheduler": health, "launch_settings": settings,
+                **policy,
                 "batch_cuda_graphs_requested": True, "counts": counts,
                 "summary_sha256": digest(run / "measurement" / "summary.json")}}
 
@@ -432,9 +472,18 @@ def main():
     complete.add_argument("mode", choices=("matched", "frozen"))
     complete.add_argument("group", choices=["W1-W2", *ROWS])
     complete.add_argument("plan_sha256")
+    observe = modes.add_parser("native-k0")
+    observe.add_argument("group", choices=["W1-W2", *ROWS])
+    observe.add_argument("checkpoint", type=Path)
+    observe.add_argument("budget", type=int)
+    observe.add_argument("port", type=int)
     args = parser.parse_args()
     try:
-        result = plan(args) if args.action == "plan" else finish(args)
+        if args.action == "native-k0":
+            result = native_k0_policy(args.output / args.group, args.checkpoint,
+                                      token_budget(args.budget), args.port)
+        else:
+            result = plan(args) if args.action == "plan" else finish(args)
     except (OSError, ValueError, TypeError, KeyError, IndexError, subprocess.CalledProcessError) \
             as error:
         print(f"Paired identity {args.action} failed: {error}", file=sys.stderr)

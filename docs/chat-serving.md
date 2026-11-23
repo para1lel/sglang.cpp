@@ -47,7 +47,7 @@ To parse supplied text, use [`POST /parse_function_call`](serving/parse-function
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
   ./build/bin/sglang-server --checkpoint /data0/shared/Qwen3.8-27B-FP8 \
-  --device 0 --port 17384 --max-active 1 --mtp-steps 0 --fp8-prefill exact \
+  --device 0 --port 17384 --max-active 1 --mtp-steps 0 \
   --prefix-cache-entries 0 --reasoning-parser qwen3 --tool-call-parser qwen3_coder
 ```
 
@@ -141,9 +141,9 @@ A TCP reset or failed write cancels the request. The server discards pending UTF
 
 `--sampling-defaults model` is the server default. Chat reads sampling values from the selected checkpoint's `generation_config.json` on first use. For Qwen3.8-27B-FP8, the values are `temperature: 1`, `top_p: 0.95`, `top_k: 20`, and `min_p: 0`.
 
-Use `--sampling-defaults openai` for `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Model mode falls back to these values for missing assets or fields. Omission or null for these four controls inherits the selected default. The request supplies the seed. Raw text has separate defaults. [Server option](../apps/sglang-server.cpp#L33)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L686)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L536)<!-- prefix: "} else if ((" -->
+Use `--sampling-defaults openai` for `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. Model mode falls back to these values for missing assets or fields. Omission or null for these four controls inherits the selected default. The request supplies the seed. Raw text has separate defaults. [Server option](../apps/sglang-server.cpp#L31)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L686)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L536)<!-- prefix: "} else if ((" -->
 
-If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L382)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L980)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L363)<!-- prefix: "int limit_re" -->
+If both budgets are absent or null, the output limit is 262,142 minus the final prompt length. The prompt must then contain fewer than 262,138 positions, including media expansion. Batch admission can lower this limit to fit the worker's total resident capacity. An explicit budget must fit in full. [Budget calculation](../apps/server/text_request.cpp#L382)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L980)<!-- prefix: "if (media) {" --> · [Resident limit](../src/decoder_resources.cpp#L358)<!-- prefix: "int limit_re" -->
 
 ### Image and video inputs
 
@@ -198,7 +198,7 @@ Reserve a B200 and set `checkpoint` to the pinned checkpoint path. Build the rel
 xmake f -P . -m release -o build/media-server
 xmake build -P . sglang-server
 build/media-server/bin/sglang-server --checkpoint "$checkpoint" \
-  --port 17384 --max-active 1 --prefix-cache-entries 0 --mtp-steps 0 --fp8-prefill exact
+  --port 17384 --max-active 1 --prefix-cache-entries 0 --mtp-steps 0
 ```
 
 Verify the [pinned W1 media corpus](../benchmarks/media/README.md) from the repository root.

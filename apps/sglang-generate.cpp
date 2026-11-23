@@ -1,5 +1,3 @@
-#include "sglang/fp8_prefill_option.h"
-
 #include "sglang/decoder.h"
 
 #include <algorithm>
@@ -24,7 +22,6 @@ struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
     std::vector<int> prompt;
     sglang::DecoderOptions options;
-    sglang::Fp8PrefillPolicy fp8_prefill = sglang::Fp8PrefillPolicy::exact;
     int device = 0;
     int warmup = 0;
     int repeats = 1;
@@ -37,13 +34,10 @@ void usage(std::ostream& output) {
            << "                       [--mtp-steps N | --mtp-k N] (0–4, default 4)\n"
            << "                       [--temperature T] [--top-p P] [--top-k K]\n"
            << "                       [--min-p P] [--seed INTEGER]\n"
-           << "                       [--fp8-prefill exact|tensor-core|tensor-core-mtp|\n"
-           << "                        tensor-core-target|tensor-core-mtp-target]\n"
            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
               "Device is a CUDA ordinal.\n"
-           << "Prompt IDs may be separated by commas or whitespace. Results are written as JSON.\n"
-           << sglang::cli::fp8_prefill_usage;
+           << "Prompt IDs may be separated by commas or whitespace. Results are written as JSON.\n";
 }
 
 int positive_or_zero(std::string_view input, std::string_view option) {
@@ -146,8 +140,6 @@ Arguments parse_arguments(int argc, char** argv) {
             have_prompt = true;
         } else if (option == "--checkpoint") {
             arguments.checkpoint = value;
-        } else if (option == "--fp8-prefill") {
-            arguments.fp8_prefill = sglang::cli::parse_fp8_prefill(value);
         } else if (option == "--max-new-tokens") {
             arguments.options.max_new_tokens = positive_or_zero(value, option);
         } else if (option == "--stop-token") {
@@ -247,7 +239,7 @@ Measurements measure(const sglang::Decoder& decoder, const Arguments& arguments)
 }
 
 void write_result(const Arguments& arguments, const Measurements& measured,
-                  std::size_t model_bytes, double load_ms) {
+                  const sglang::Decoder& decoder, double load_ms) {
     const auto& result = measured.result;
     const bool stopped = result.finish_reason == sglang::DecoderFinishReason::stop;
     const double rate = measured.elapsed_ms == 0 ? 0 :
@@ -271,7 +263,11 @@ void write_result(const Arguments& arguments, const Measurements& measured,
     }
     output << ",\"device\":" << arguments.device << ",\"warmup\":" << arguments.warmup
            << ",\"repeats\":" << arguments.repeats << ",\"load_ms\":" << load_ms
-           << ",\"model_device_allocation_bytes\":" << model_bytes
+           << ",\"fp8_prefill\":\"" << (decoder.uses_b200_operators() ? "tensor-core" : "exact")
+           << "\",\"mtp_int8_head\":" << (decoder.has_int8_draft_head() ? "true" : "false")
+           << ",\"certified_int8_verify_head\":"
+           << (decoder.has_certified_vocab() ? "true" : "false")
+           << ",\"model_device_allocation_bytes\":" << decoder.model_device_allocation_bytes()
            << ",\"peak_device_allocation_bytes\":" << measured.peak_bytes
            << ",\"output_tokens_per_second\":" << rate << ",\"request_ms\":";
     write_array(output, measured.samples, write_number<double>);
@@ -289,10 +285,10 @@ int main(int argc, char** argv) {
         }
         const auto start = Clock::now();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
-                                      arguments.options.mtp_steps != 0, arguments.fp8_prefill);
+                                      arguments.options.mtp_steps != 0);
         const double load_ms = milliseconds(Clock::now() - start);
         const auto measured = measure(decoder, arguments);
-        write_result(arguments, measured, decoder.model_device_allocation_bytes(), load_ms);
+        write_result(arguments, measured, decoder, load_ms);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "sglang-generate: " << error.what() << '\n';

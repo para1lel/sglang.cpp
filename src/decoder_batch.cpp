@@ -10,7 +10,6 @@
 #include "sglang/decoder_verify.h"
 #include "sglang/decoder_prefix_cache.h"
 #include "sglang/prefill_fp8.h"
-#include "sglang/text/prefill_attn_sm100.h"
 #include "sglang/text/mtp/tc_vocab.h"
 #include <algorithm>
 #include <utility>
@@ -49,6 +48,9 @@ struct Lane {
     int remaining_output() const { return progress.remaining_output(options); }
     int capacity() const { return RequestProgress::capacity(int(prompt.size()), options); }
     int proposals() const { return std::min(options.mtp_steps, remaining_output() - 1); }
+    bool exact_target() const {
+        return media || options.score_prompt || options.generated_top_logprobs >= 0;
+    }
 
     ForwardLane input() const {
         const int position = progress.position;
@@ -184,83 +186,13 @@ PrefillRows plan_wide_prefill(const BatchStorage& storage, const Selection& sele
     return rows;
 }
 
-PrefillRows plan_tensor_cache_prefill(const BatchStorage& storage, const Selection& selected,
-                                      int lanes, int& cursor) {
-    PrefillRows rows{};
-    int unused = prefill_chunk_rows;
-    const int start = cursor;
-    for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-        const int slot = (start + offset) % lanes;
-        const auto& lane = storage.slots[slot];
-        if (selected[slot] && lane && lane->request) {
-            const int tile = std::min(prefill_chunk_rows, lane->prefill_limit());
-            if (tile > 0 && tile <= unused) {
-                rows[slot] = tile;
-                unused -= tile;
-                cursor = (slot + 1) % lanes;
-            }
-        }
-    }
-    return rows;
-}
-
-int cache_prefill_tile(int budget) {
-    int tile = prefill_chunk_rows;
-    while (tile > budget) {
-        tile /= 2;
-    }
-    return tile;
-}
-
-StepPlan plan_cached_step(const BatchStorage& storage, const Selection& selected, int lanes,
-                          int unused, int& cursor) {
-    StepPlan plan;
-    PrefillRows limits{};
-    const int tile = cache_prefill_tile(unused);
-    const int start = cursor;
-    cursor = (start + 1) % lanes;
-    bool first = true;
-    for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-        const int slot = (start + offset) % lanes;
-        const auto& lane = storage.slots[slot];
-        if (!selected[slot] || !lane || !lane->request || lane->restored_prompt) {
-            continue;
-        }
-        const int rows = limits[slot] = lane->prefill_limit();
-        if (rows == 0) {
-            plan.decode[slot] = 1;
-            --unused;
-        } else if (first) {
-            plan.prefill[slot] = std::min(tile, rows);
-            unused -= plan.prefill[slot];
-        }
-        first = false;
-    }
-    for (bool progress = true; progress && unused > 0;) {
-        progress = false;
-        for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-            const int slot = (start + offset) % lanes;
-            const int rows = std::min(tile, limits[slot] - plan.prefill[slot]);
-            if (rows > 0 && rows <= unused) {
-                plan.prefill[slot] += rows;
-                unused -= rows;
-                progress = true;
-            }
-        }
-    }
-    return plan;
-}
-
 StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int lanes,
-                   int budget, int& cursor, bool chunked, int tile) {
+                   int budget, int& cursor, bool chunked) {
     BudgetLanes work{};
     for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
         if (!selected[slot] || !lane || !lane->request) {
             continue;
-        }
-        if (lane->draft || lane->media || lane->restored_prompt) {
-            tile = 0;
         }
         if (lane->restored_prompt) {
             continue;
@@ -269,7 +201,7 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
             ? BudgetLane{chunked ? lane->prefill_limit() : 1}
             : BudgetLane{0, lane->proposals(), true};
     }
-    return plan_budget_step(work, lanes, budget, cursor, tile);
+    return plan_budget_step(work, lanes, budget, cursor, 0);
 }
 }
 struct DecoderBatch::State {
@@ -277,16 +209,12 @@ struct DecoderBatch::State {
         : model(owner), options(options),
           storage(std::make_shared<BatchStorage>(owner.device, owner.memory,
                                                  options.resident_memory_limit.has_value())),
-          tensor_cache(options.prefix_cache_entries > 0 &&
-                       model.fp8_prefill() == Fp8PrefillPolicy::tensor_core),
           execution(model.device) {
         validate_batch_options(options);
-        if (options.prefix_cache_entries && token_ordered_decode(model.fp8_prefill()))
-            throw std::invalid_argument("Selected FP8 policy requires prefix cache off");
         DeviceScope device(model.device);
         if (options.prefix_cache_entries != 0) {
             storage->prefix_cache.emplace(model.device, options.prefix_cache_entries,
-                                          !tensor_cache && model.mtp_weights != nullptr);
+                                          model.mtp_weights != nullptr);
         }
         if (options.cuda_graphs) storage->verification_graph.emplace(execution);
         if (options.resident_memory_limit && model.mtp_weights)
@@ -305,14 +233,12 @@ struct DecoderBatch::State {
     Steps advance(const Selection& selected, bool chunked, DecoderBatchStepStats* stats);
     void submit(const Selection& selected, const PrefillRows& decode, Steps& results,
                 DecoderBatchStepStats& stats, bool& contains_mtp);
-    void prefill(const PrefillRows& rows, const Steps& results, bool only_prefill,
-                 bool contains_mtp, DecoderBatchStepStats& stats);
+    void prefill(const PrefillRows& rows, bool only_prefill, DecoderBatchStepStats& stats);
     void score(int slot, Lane& lane, Workspace& work, bool logits_ready);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats);
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring,
-                        const std::array<int, decoder_batch_max_lanes>& packed_slots,
-                        const DecodeRun& run, const PrefillRows& rows, Steps& results);
+                        const PrefillRows& rows, Steps& results);
     std::size_t reserve(DecoderOptions& request, int prompt, std::size_t extra_bytes) const;
     void initialize(Lane& lane, int slot);
     void drain(const char* operation, std::optional<Lane>* lane = nullptr) {
@@ -363,7 +289,6 @@ struct DecoderBatch::State {
     const Decoder::Model& model;
     const DecoderBatchOptions options;
     std::shared_ptr<BatchStorage> storage;
-    const bool tensor_cache;
     Allocations execution;
     std::byte* sampling_workspace = nullptr;
     std::byte* logprob_workspace = nullptr;
@@ -475,9 +400,6 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
     }
     if (options.prefix_cache_salt.size() > decoder_prefix_max_salt_bytes) {
         throw std::invalid_argument("Prefix cache salt exceeds 256 bytes");
-    }
-    if (state_->tensor_cache && options.mtp_steps != 0) {
-        throw std::invalid_argument("Tensor-core prefix cache requires MTP off");
     }
     if (options.mtp_steps != 0 && !state_->model.mtp_weights) {
         throw std::invalid_argument("Decoder batch requires draft weights for MTP");
@@ -610,17 +532,17 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     const auto stream = execution.stream();
     const auto& rows = stats.prefill_rows;
     auto& slots = storage->slots;
-    const bool legacy_tensor_core = model.fp8_prefill() == Fp8PrefillPolicy::tensor_core;
-    const bool ordered = token_ordered_decode(model.fp8_prefill());
+    const bool ordered = model.is_b200();
     std::array<ForwardLane, decoder_batch_max_lanes> work;
     std::array<Request*, decoder_batch_max_lanes> scoring{};
     std::array<int, decoder_batch_max_lanes> packed_slots;
     packed_slots.fill(-1);
     PrefillRows speculative{};
     const int max_rows = *std::max_element(rows.begin(), rows.end());
+    const bool prefix_cache = storage->prefix_cache.has_value();
     bool text_decode = max_rows == 0;
-    std::uint64_t greedy_winners = 0;
-    std::uint64_t final_text_rows = 0;
+    bool contains_decode = false;
+    bool restored_prompt = false;
     int count = 0;
     for (int slot = 0; slot < options.max_lanes; ++slot) {
         if (!selected[slot] || !slots[slot] || !slots[slot]->request) {
@@ -629,6 +551,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         auto& lane = *slots[slot];
         if (lane.restored_prompt) {
             scoring[slot] = lane.request.get();
+            restored_prompt = true;
             continue;
         }
         const int remaining = lane.remaining_prompt();
@@ -642,13 +565,15 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
                                   lane.progress.position, stream);
         }
         results[slot].decode = remaining == 0;
+        contains_decode = contains_decode || results[slot].decode;
         contains_mtp = contains_mtp || lane.draft != nullptr;
         const int position = lane.progress.position;
         if (rows[slot] && lane.draft && position > lane.draft->valid_prefix()) {
             model.seed_draft(lane.request->work, *lane.draft, position - 1,
                              lane.prompt[position], stream);
         }
-        text_decode = text_decode && !lane.media;
+        const bool exact = lane.exact_target() || prefix_cache;
+        text_decode = text_decode && !exact;
         if (results[slot].decode && lane.draft && lane.remaining_output() > 1) {
             speculative[slot] = decode_rows;
             continue;
@@ -657,38 +582,24 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         if (rows[slot] <= 1 && !lane.options.label_token_ids) {
             packed_slots[slot] = count;
             work[count++] = lane.input();
-            const bool plain = results[slot].decode && !lane.draft && !lane.media;
-            work[count - 1].packed = plain;
-            work[count - 1].long_gqa = plain && legacy_tensor_core;
-            const bool final_text = rows[slot] == 1 && remaining == 1 && !lane.media;
-            final_text_rows |= std::uint64_t{final_text} << packed_slots[slot];
-            if (plain && !lane.sampling && !lane.options.adjusts_logits(lane.progress.generated) &&
-                !lane.options.constraint && lane.request->memory.transfers().logits.empty()) {
-                greedy_winners |= std::uint64_t{1} << packed_slots[slot];
-            }
+            work[count - 1].exact = exact;
         }
         if (rows[slot] == remaining && lane.options.max_new_tokens > 0) {
             scoring[slot] = lane.request.get();
         }
     }
-    const bool tensor_core = !contains_mtp && legacy_tensor_core;
-    const auto eager_score_rows = tensor_core && max_rows > 0 ?
-        final_text_rows | (count == 1 && work[0].packed ? std::uint64_t{1} : 0) : 0;
     const bool regular_graph = text_decode && !contains_mtp && (!ordered || count == 1);
     const auto run = run_decode_lanes(model, execution, storage->decode_graphs, work.data(), count,
                                       {options.cuda_graphs, regular_graph,
-                                       !ordered && !contains_mtp && max_rows == 0, tensor_core,
-                                       greedy_winners, eager_score_rows});
-    if (max_rows) prefill(rows, results, count == 0, contains_mtp, stats);
+                                       !ordered && !contains_mtp && max_rows == 0});
+    if (max_rows) prefill(rows, count == 0 && !contains_decode && !restored_prompt, stats);
     bool submitted = count != 0 || max_rows != 0;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = scoring[slot]) {
             auto& lane = *slots[slot];
             const int index = lane.restored_prompt ? -1 : packed_slots[slot];
             auto* ready = index < 0 ? nullptr : run.ready[index];
-            if (index < 0 || !run.winners[index] || lane.options.generated_top_logprobs >= 0) {
-                score(slot, lane, ready ? *ready : request->work, ready != nullptr);
-            }
+            score(slot, lane, ready ? *ready : request->work, ready != nullptr);
             submitted = true;
             if (index >= 0 && (run.graphed >> index & 1) != 0) {
                 stats.graph_slots |= std::uint32_t{1} << slot;
@@ -703,34 +614,24 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     if (stats.verification_lanes == 0 && submitted) {
         check(cudaStreamSynchronize(stream), "Complete decoder batch step");
     }
-    collect_scores(scoring, packed_slots, run, rows, results);
+    collect_scores(scoring, rows, results);
 }
 
-void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results, bool only_prefill,
-                                  bool contains_mtp, DecoderBatchStepStats& stats) {
+void DecoderBatch::State::prefill(const PrefillRows& rows, bool only_prefill,
+                                  DecoderBatchStepStats& stats) {
     const auto stream = execution.stream();
     const int budget = options.max_num_batched_tokens;
-    const int cache_tile = tensor_cache && budget ? cache_prefill_tile(budget) : 0;
-    const int tile_limit = cache_tile ? cache_tile : batch_prefill_tile_rows;
-    const bool wide = !cache_tile && model.is_b200() &&
-        model.fp8_prefill() == Fp8PrefillPolicy::tensor_core && sm100_prefill_enabled();
+    const bool prefix_cache = storage->prefix_cache.has_value();
     std::array<PrefillGrant, decoder_batch_max_lanes> grants;
     std::array<PrefillGrant, decoder_batch_max_lanes> labels;
     std::array<PromptLogprobCapture, decoder_batch_max_lanes> captures;
     int count = 0;
     int label_count = 0;
-    bool contains_decode = false;
-    bool text_batch = true;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
-        if (rows[slot] == 0 && !results[slot].decode) {
-            continue;
-        }
-        auto& lane = *storage->slots[slot];
-        contains_decode = contains_decode || results[slot].decode;
-        text_batch = text_batch && !lane.media;
         if (rows[slot] == 0) {
             continue;
         }
+        auto& lane = *storage->slots[slot];
         const int position = lane.progress.position;
         if (lane.options.label_token_ids) {
             const int limit = lane.media ? prefill_chunk_rows : batch_prefill_tile_rows;
@@ -740,12 +641,8 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
                 nullptr, lane.media ? &lane.media_prefill : nullptr};
             continue;
         }
-        int limit = tile_limit;
-        if (lane.media || (lane.draft && !mtp_tensor_core_prefill(model.fp8_prefill())))
-            limit = prefill_chunk_rows;
-        if (wide && !lane.draft && !lane.media && lane.prompt.size() <= sm100_prefill_max_visible) {
-            limit = serial_prefill_max_rows;
-        }
+        const int limit = lane.media || (lane.draft && (!model.is_b200() || prefix_cache))
+            ? prefill_chunk_rows : batch_prefill_tile_rows;
         if (lane.options.score_prompt) {
             captures[count] = {&lane.prompt, &lane.prompt_logprobs, logprob_readback,
                                logprob_workspace, lane.options.generated_top_logprobs,
@@ -754,31 +651,27 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, const Steps& results,
         grants[count] = {lane.request.get(), lane.prompt.data() + position, position, rows[slot],
                          std::min(rows[slot], limit), lane.prefill_limit(), lane.draft.get(),
                          lane.media ? &lane.media_prefill : nullptr,
-                         lane.options.score_prompt ? &captures[count] : nullptr};
+                         lane.options.score_prompt ? &captures[count] : nullptr,
+                         lane.exact_target()};
         ++count;
     }
-    const bool mixed = contains_decode && text_batch;
     const bool bounded = budget > 0 && budget <= decoder_default_max_num_batched_tokens;
-    const bool layerwise = (only_prefill || mixed) && !contains_mtp && !tensor_cache && bounded;
-    if (count && !(only_prefill && bounded && !tensor_cache &&
+    if (count && !(only_prefill && !label_count && bounded && !prefix_cache &&
                    try_prefill_projection_pairs(model, grants.data(), count, stream, stats))) {
-        model.prefill_grants(grants.data(), count, stream, tensor_cache, layerwise, mixed, stats);
+        model.prefill_grants(grants.data(), count, stream, stats, prefix_cache);
     }
     if (label_count) {
-        model.prefill_grants(labels.data(), label_count, stream, false, false, false, stats, true);
+        model.prefill_grants(labels.data(), label_count, stream, stats, false, true);
     }
 }
 
 void DecoderBatch::State::collect_scores(
     const std::array<Request*, decoder_batch_max_lanes>& scoring,
-    const std::array<int, decoder_batch_max_lanes>& packed_slots, const DecodeRun& run,
     const PrefillRows& rows, Steps& results) {
     const auto& slots = storage->slots;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (scoring[slot]) {
             const auto& lane = *slots[slot];
-            const int index = packed_slots[slot];
-            const auto* winner = index < 0 ? nullptr : run.winners[index];
             try {
                 const int top = lane.options.generated_top_logprobs;
                 if (top >= 0) {
@@ -786,11 +679,10 @@ void DecoderBatch::State::collect_scores(
                     results[slot].generated_logprobs = collect_generated_logprobs(readback, top);
                     results[slot].token = readback.selected.token_id;
                 } else {
-                    results[slot].token = winner
-                        ? validate_winner(winner->token_id, false, false)
-                        : read_token(*scoring[slot], lane.sampling || lane.progress.generated <
-                                     lane.options.min_new_tokens,
-                                     lane.options.constraint != nullptr);
+                    results[slot].token =
+                        read_token(*scoring[slot], lane.sampling || lane.progress.generated <
+                                   lane.options.min_new_tokens,
+                                   lane.options.constraint != nullptr);
                 }
             } catch (const DecoderSamplingError&) {
                 results[slot].sampling_failed = true;
@@ -876,17 +768,10 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         DecoderBatchStepStats current;
         PrefillRows decode{};
         if (const int budget = options.max_num_batched_tokens; budget) {
-            const bool tiled = chunked && !storage->prefix_cache && model.is_b200() &&
-                model.fp8_prefill() == Fp8PrefillPolicy::tensor_core && !sm100_prefill_enabled();
-            const auto plan = tensor_cache
-                ? plan_cached_step(*storage, selected, options.max_lanes, budget, prefill_cursor)
-                : plan_step(*storage, selected, options.max_lanes, budget, prefill_cursor, chunked,
-                            tiled ? batch_prefill_tile_rows : 0);
+            const auto plan =
+                plan_step(*storage, selected, options.max_lanes, budget, prefill_cursor, chunked);
             current.prefill_rows = plan.prefill;
             decode = plan.decode;
-        } else if (tensor_cache) {
-            current.prefill_rows =
-                plan_tensor_cache_prefill(*storage, selected, options.max_lanes, prefill_cursor);
         } else if (chunked && options.max_lanes > decoder_batch_max_mtp_lanes) {
             current.prefill_rows =
                 plan_wide_prefill(*storage, selected, options.max_lanes, prefill_cursor);

@@ -138,9 +138,6 @@ struct TcVocabScratch {
 std::shared_ptr<const TcVocabWeights> prepare_tc_vocab(const Bf16* original,
                                                        const std::uint8_t* quantized,
                                                        const float* maxima, Allocations& memory) {
-    if (!setting_enabled("SGLANG_EXPERIMENTAL_VERIFY_SHARED_INT8_VOCAB")) {
-        return {};
-    }
     auto weights = std::make_shared<TcVocabWeights>();
     if (!weights->matmul.prepare()) {
         std::fputs("sglang tc_vocab: approved B200 cuBLASLt algorithm unavailable\n", stderr);

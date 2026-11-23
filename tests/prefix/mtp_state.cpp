@@ -293,7 +293,7 @@ int main(int argc, char** argv) {
         const auto tokens = ids(argv[2], 257);
         const auto long_tokens = ids(argv[3], 8192);
         const Tokenizer tokenizer(std::string(argv[1]) + "/tokenizer.json");
-        Decoder decoder(argv[1], 0, true, Fp8PrefillPolicy::exact);
+        Decoder decoder(argv[1], 0, true);
         enrichment(decoder, tokens);
         changed_tiles(decoder, long_tokens);
         changed_first_token(decoder, tokenizer, tokens);

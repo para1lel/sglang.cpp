@@ -486,28 +486,6 @@ PrefillGroup prefill_group(const PrefillGrant* grants, int count, bool mixed) {
     return group.grants > 1 ? group : PrefillGroup{1, 0};
 }
 
-PrefillGroup projection_group(const PrefillGrant* grants, int count, int max_rows, bool mixed) {
-    constexpr int paired_rows = 2 * batch_prefill_tile_rows;
-    if (!mixed && max_rows >= paired_rows && count >= 2 &&
-        grants[0].rows == batch_prefill_tile_rows && grants[0].tile_rows == grants[0].rows &&
-        grants[1].rows == batch_prefill_tile_rows && grants[1].tile_rows == grants[1].rows) {
-        return {2, paired_rows};
-    }
-    auto group = prefill_group(grants, count, mixed);
-    if (!group.rows || max_rows == max_layerwise_rows) {
-        return group;
-    }
-    while (group.grants < count) {
-        const auto next = prefill_group(grants + group.grants, count - group.grants, mixed);
-        if (!next.rows || next.rows > max_rows - group.rows) {
-            break;
-        }
-        group.grants += next.grants;
-        group.rows += next.rows;
-    }
-    return group;
-}
-
 template <typename Run>
 void each_prefill_segment(const PrefillGrant* grants, int count, int offset, Run run) {
     for (int index = 0; index < count; ++index) {
@@ -654,26 +632,12 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     });
 }
 
-int prefill_capacity(const PrefillGrant* grants, int count, int scalar_capacity, int max_rows,
-                     bool mixed) {
-    int capacity = scalar_capacity;
-    for (int index = 0; index < count;) {
-        const auto group = projection_group(grants + index, count - index, max_rows, mixed);
-        capacity = std::max(capacity, group.rows);
-        index += group.grants;
-    }
-    return capacity;
-}
-
 }
 
 bool decoder::try_prefill_projection_pairs(
     const DecoderModel& model, const PrefillGrant* grants, int count, cudaStream_t stream,
     DecoderBatchStepStats& stats) {
-    const char* value = std::getenv("SGLANG_EXPERIMENTAL_BULK_PREFILL");
-    if (!value || std::string_view(value) != "1" || !model.is_b200() ||
-        model.fp8_prefill() != Fp8PrefillPolicy::tensor_core_mtp_target ||
-        !pairable_prefill_grants(grants, count)) {
+    if (!model.is_b200() || !pairable_prefill_grants(grants, count)) {
         return false;
     }
     PrefillWorkspace workspace(stream, 2 * batch_prefill_tile_rows);
@@ -865,10 +829,11 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         const int end = scores ? scores->score_end(position, rows) : position;
         for (int row = 0; row < rows; ++row) {
             const int token_position = position + row;
-            const ForwardLane lane{
+            ForwardLane lane{
                 &request, tokens[row], token_position, TextGdnMode::prefill, false,
                 media ? media->feature(token_position) : nullptr,
                 media ? media->positions + token_position : nullptr};
+            lane.exact = exact || media;
             forward(&lane, 1, stream);
             if (token_position >= first && token_position < end) {
                 scores->enqueue(*this, request.work, token_position, pending++, stream);
@@ -885,8 +850,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
     const TileBuffers buffers(layout, workspace.capacity());
-    const bool tensor_core = !exact && ((!media && mtp_tensor_core_prefill(fp8_prefill())) ||
-        (!draft && fp8_prefill() == Fp8PrefillPolicy::tensor_core));
+    const bool tensor_core = is_b200() && !exact && !media;
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
                       media ? media->positions + position : nullptr};
     const auto& work = chunk.work;
@@ -925,63 +889,37 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
 }
 
 void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaStream_t stream,
-                                   bool tensor_cache, bool layerwise, bool mixed,
-                                   DecoderBatchStepStats& stats, bool label_scores) const {
-    int scalar_capacity = 1;
-    int total_rows = 0;
+                                   DecoderBatchStepStats& stats, bool prefix_cache,
+                                   bool label_scores) const {
+    int capacity = 1;
     for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        scalar_capacity = std::max(scalar_capacity, grant.tile_rows);
-        total_rows += grant.rows;
-        layerwise = layerwise && !grant.draft && !grant.media;
+        capacity = std::max(capacity, grants[index].tile_rows);
     }
-    layerwise = layerwise && is_b200() && fp8_prefill() == Fp8PrefillPolicy::tensor_core;
-    const int capacity = layerwise
-        ? prefill_capacity(grants, count, scalar_capacity, max_layerwise_rows, mixed)
-        : scalar_capacity;
-    int max_rows = !mixed && total_rows == decoder_default_max_num_batched_tokens
-        ? serial_prefill_max_rows : max_layerwise_rows;
-    const int wide_capacity = layerwise && max_rows > max_layerwise_rows
-        ? prefill_capacity(grants, count, scalar_capacity, max_rows, mixed) : capacity;
-    std::optional<PrefillWorkspace> workspace(std::in_place, stream, wide_capacity);
-    if (!workspace->data() && wide_capacity > capacity) {
-        max_rows = max_layerwise_rows;
-        workspace.emplace(stream, capacity);
-    }
-    if (!workspace->data() && capacity > scalar_capacity) {
-        workspace.emplace(stream, scalar_capacity);
-        layerwise = false;
-    }
-    if (tensor_cache && scalar_capacity > 1 && !workspace->data()) {
-        throw std::runtime_error("Tensor-core prefix cache requires a prefill workspace");
+    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity);
+    if (!workspace->data() && capacity > prefill_chunk_rows) {
+        workspace.emplace(stream, prefill_chunk_rows);
     }
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
-    for (int index = 0; index < count;) {
-        const auto group = layerwise && workspace->data()
-            ? projection_group(grants + index, count - index, max_rows, mixed) : PrefillGroup{1, 0};
+    for (int index = 0; index < count; ++index) {
         const auto& grant = grants[index];
-        if (group.grants > 1) {
-            prefill_layerwise(*this, grants + index, group, *workspace, mixed);
-            ++stats.layerwise_prefill_groups;
-            stats.layerwise_prefill_rows += group.rows;
-        } else if (grant.rows == 1 && grant.draft && grant.prompt_remaining > 1) {
+        if (grant.rows == 1 && grant.draft && grant.prompt_remaining > 1) {
             seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1], stream);
         } else if (grant.rows == 1 && !label_scores) {
             capture_prefill_scores(*this, grant, nullptr, 0, stream);
         } else {
             for (int offset = 0; offset < grant.rows;) {
-                const int count = std::min(grant.tile_rows, grant.rows - offset);
-                prefill_chunk(*grant.request, grant.tokens + offset, count,
+                const int rows = std::min({grant.tile_rows, workspace->capacity(),
+                                           grant.rows - offset});
+                prefill_chunk(*grant.request, grant.tokens + offset, rows,
                               grant.position + offset, *workspace, grant.draft,
                               grant.prompt_remaining - offset, grant.media, grant.scores,
-                              label_scores);
-                offset += count;
+                              label_scores || prefix_cache || grant.exact);
+                offset += rows;
             }
         }
         if (label_scores && grant.rows == grant.prompt_remaining) {
             enqueue_label_logits(*grant.request, stream);
         }
-        index += group.grants;
     }
     workspace->close();
 }

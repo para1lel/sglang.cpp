@@ -133,8 +133,9 @@ def check_bounded(args):
 
 
 def check_mixed(port, log, out, cap):
+    short = native.serial_cases(port, {"held-out": http.FIXTURES["held-out"]},
+                                out / "mixed-reference.json")["held-out"]
     offset = log.stat().st_size
-    short = http.FIXTURES["held-out"]
     prompts = [prompt_case("short-tail", cap - 3), prompt_case("long-tail", cap + 5, 3)]
     with native.Stream(port, short, budget=1024) as decoder:
         decoder.post()
@@ -159,7 +160,7 @@ def check_mixed(port, log, out, cap):
 def check_default(args):
     with server(args, "default", ["--mtp-steps", "0"]) as (port, log, out, health):
         check_caps(health, DEFAULT_ACTIVE, DEFAULT_TOKENS)
-        cases = http.FIXTURES
+        cases = native.serial_cases(port, http.FIXTURES, out / "serial-reference.json")
         offset = log.stat().st_size
         native.burst(port, log, out / "low-concurrency.json",
                      [cases["held-out"], cases["facts"]], full_decode=True)
@@ -198,7 +199,7 @@ def check_explicit(args, width):
     flags = ["--max-active", str(width), "--mtp-steps", "0"]
     with server(args, f"width-{width}", flags) as (port, log, out, health):
         check_caps(health, width, DEFAULT_TOKENS)
-        cases = http.FIXTURES
+        cases = native.serial_cases(port, http.FIXTURES, out / "serial-reference.json")
         if width == 1:
             response = native.request(port, cases["held-out"])
             native.write_json(out / "serial.json", response.evidence())
@@ -227,12 +228,12 @@ def check_mtp(args):
 
 
 def check_wide_mtp(args):
-    flags = ["--mtp-steps", "1", "--fp8-prefill", "exact"]
+    flags = ["--mtp-steps", "1"]
     with server(args, "wide-mtp", flags) as (port, log, out, health):
         check_caps(health, DEFAULT_ACTIVE, DEFAULT_TOKENS)
+        cases = native.serial_cases(port, http.FIXTURES, out / "serial-reference.json")
         offset = log.stat().st_size
-        native.check_admission(
-            port, log, out / "queue-and-reuse.json", http.FIXTURES, DEFAULT_ACTIVE)
+        native.check_admission(port, log, out / "queue-and-reuse.json", cases, DEFAULT_ACTIVE)
         steps = scheduler(log, offset, DEFAULT_ACTIVE)
         native.write_json(out / "steps.json", steps)
         check_step_budget(steps, DEFAULT_TOKENS)

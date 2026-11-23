@@ -82,7 +82,7 @@ The November 22, 2026 W1 run checked native release `dce521eaecabfca707b6a3e6d72
 
 Live vLLM K0 and K4 matched for 28 output tokens. At token 29, K0 selected ID `524` with a 0.125 logprob lead over ID `321`. K4 reported equal logprobs for those IDs and selected `321`. This mismatch failed the v4 campaign's then-required vLLM K0/K4 ID check.
 
-The [maintained matched K4 protocol](../../benchmarks/paired/README.md#matched-k4-timing-protocol) supersedes that v4 ID check. It requires strict native exact-K0 parity and valid streams from both arms. vLLM serves as a timing reference, and valid K4 streams qualify regardless of their output ID values. The archived v4 receipts retain their original checks and results.
+The [subsequent exact K4 protocol](https://github.com/para1lel/sglang.cpp/blob/09287423b9d222c2c5d674bbd4c2466bde12b0ca/benchmarks/paired/README.md#matched-k4-timing-protocol) used strict native exact-K0 parity and valid streams from both arms. vLLM supplied timing and stream evidence. The archived v4 receipts retain their original checks and results.
 
 The v4 campaign measured nine W1 cohorts per arm. The median makespan was 1.930878220 s for native and 0.638064157 s for vLLM. The native median was 3.026 times the vLLM median, so W1 missed the strict timing gate on its own. The campaign stopped at W1.
 
@@ -143,7 +143,7 @@ Separate CUDA captures used one profiled request per arm after three warmups. Bo
 | Target verification | 1,150.10 | 964.09 |
 | Commit and repair | 34.23 | 34.27 |
 
-The archived v4 vLLM W1 median of 638.064 ms came from B200 GPU2 and serves only as historical timing context. The candidate median was 890.41 ms higher, or 2.395 times that value. The [formal matched K4 gate](../../benchmarks/paired/README.md#matched-k4-timing-protocol) remains open.
+The archived v4 vLLM W1 median of 638.064 ms came from B200 GPU2 and supplies historical timing context. The candidate median was 890.41 ms higher, or 2.395 times that value. This native pilot supplied no matched result for the exact K4 policy.
 
 | Arm | Measured source | Measured tree | Release server SHA-256 |
 | --- | --- | --- | --- |
@@ -202,9 +202,8 @@ launches switched to 4×8. Summed projection kernel time fell from
 bytes per arm. The timing trial includes draft KV-only repair and
 predates the five-row MLP layout.
 
-Each comparison uses its own measured control. The combined stack has
-no timing in these trials. The [formal matched K4 gate](../../benchmarks/paired/README.md#matched-k4-timing-protocol)
-for exact FP8 remains open.
+Each comparison uses its own measured control. These trials time individual
+changes in the exact FP8 K4 path.
 
 | Trial | Measured control | Measured candidate |
 | --- | --- | --- |
@@ -249,9 +248,8 @@ recorded 52 rounds, 205 drafted IDs, 75 accepted IDs, and 257 verify rows.
 
 The control was commit `267d1ded2adc7c26f0d467e16673859802b64c5c`. The
 cumulative build used tree `0a86c34dc38ce3764dc6bc543ff6f13caf776a18`.
-The archived vLLM median of 638.064 ms used a different B200. The
-[formal matched K4 gate](../../benchmarks/paired/README.md#matched-k4-timing-protocol)
-remains open.
+The archived vLLM median of 638.064 ms used a different B200. This native
+pilot supplied no matched result for its exact K4 stack.
 
 | Receipt under `artifacts/continue-cumulative-w1/` | SHA-256 |
 | --- | --- |
@@ -265,10 +263,10 @@ On November 22, 2026 UTC, both timed arms ran on B200 GPU3
 The Release native source was `99c523d95c47788f6c872c6c5428c28418d395eb`.
 The vLLM arm used the pinned revision above. Both used the same checkpoint,
 32 request slots, and an 8,192-token scheduling cap. The
-[opt-in profile](../../benchmarks/paired/README.md#ordered-tensor-core-with-int8-draft)
-uses `tensor-core-mtp-target` and an INT8 draft head at explicit K4.
-Exact FP8 remains the server default. This campaign has a separate gate from
-the earlier exact K4 and K0 comparisons.
+[historical ordered profile](https://github.com/para1lel/sglang.cpp/blob/99c523d95c47788f6c872c6c5428c28418d395eb/benchmarks/paired/README.md#ordered-tensor-core-with-int8-draft)
+used `tensor-core-mtp-target` and an INT8 draft head at explicit K4.
+This campaign evaluated that profile independently of the earlier exact K4
+and K0 comparisons.
 
 | Workload | Warmups / measured per arm | Native median (range), ms | vLLM median (range), ms | Strict native median gate |
 | --- | ---: | ---: | ---: | --- |

@@ -21,7 +21,7 @@ from test_native_chat import (
 REASONING = ("--reasoning-parser", "qwen3")
 TOOLS = ("--tool-call-parser", "qwen3_coder")
 BOTH = REASONING + TOOLS
-COMMON = ("--mtp-steps", "0", "--fp8-prefill", "exact", "--prefix-cache-entries", "0")
+COMMON = ("--mtp-steps", "0")
 
 
 def fold_calls(calls, deltas):

@@ -39,5 +39,4 @@ nvidia-smi -i "$gpu" --query-gpu=index,name,uuid,compute_cap,driver_version --fo
 export CUDA_VISIBLE_DEVICES="$gpu" CUDA_DEVICE_ORDER=PCI_BUS_ID
 compat="$shared/software/cuda-compat-13.4/usr/local/cuda-13.4/compat"
 export LD_LIBRARY_PATH="$compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-unset SGLANG_PREFILL_ATTN SGLANG_EXPERIMENTAL_TMEM_PREFILL
 timeout -k 5s 120s "$output/logit-bias-check" "$checkpoint"

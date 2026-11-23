@@ -9,9 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <random>
-#include <string_view>
 
 namespace sglang {
 namespace decoder {
@@ -19,27 +17,6 @@ namespace {
 
 bool valid_token(int id) {
     return id >= 0 && id < vocab_size;
-}
-
-int serial_prefill_rows(bool b200, int prompt_rows) {
-    const auto* setting = std::getenv("SGLANG_SERIAL_PREFILL_ROWS");
-    if (!setting) {
-        return b200 && prompt_rows >= 512 ? 1024 : prefill_chunk_rows;
-    }
-    const std::string_view value(setting);
-    if (value == "256") {
-        return 256;
-    }
-    if (value == "512") {
-        return 512;
-    }
-    if (value == "1024") {
-        return 1024;
-    }
-    if (value == "2048") {
-        return serial_prefill_max_rows;
-    }
-    return prefill_chunk_rows;
 }
 
 void validate_constraint(const DecoderOptions& options) {
@@ -447,51 +424,31 @@ bool SerialOutput::emit(int token, const Bf16* logits, const float* adjusted_log
     return keep_running;
 }
 
-Decoder::Model::Model(const std::filesystem::path& checkpoint, int cuda_device,
-                      Fp8PrefillPolicy fp8_prefill)
-    : Model(checkpoint, cuda_device) {
-    fp8_prefill_ = fp8_prefill;
-    if (is_b200() && fp8_prefill == Fp8PrefillPolicy::tensor_core_mtp_target) {
-        const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA");
-        const std::string_view mode = setting ? setting : "";
-        target_split_end_ = mode == "long" ? text_attention_max_tokens
-                         : mode == "1" ? target_split_end_position : 0;
-    }
-}
-
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device)
     : Decoder(checkpoint, cuda_device, false) {}
 
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp)
-    : Decoder(checkpoint, cuda_device, enable_mtp, Fp8PrefillPolicy::exact) {}
-
-Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
-                 Fp8PrefillPolicy fp8_prefill)
-    : Decoder(checkpoint, cuda_device, enable_mtp, fp8_prefill, false) {}
-
-Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
-                 Fp8PrefillPolicy fp8_prefill, bool mtp_int8_head) {
-    if (fp8_prefill != Fp8PrefillPolicy::exact && fp8_prefill != Fp8PrefillPolicy::tensor_core &&
-        !token_ordered_decode(fp8_prefill)) {
-        throw std::invalid_argument("Invalid FP8 prefill policy");
-    }
-    model_ = std::make_unique<Model>(checkpoint, cuda_device, fp8_prefill);
+    : model_(std::make_unique<Model>(checkpoint, cuda_device)) {
     if (enable_mtp) {
         model_->mtp_weights = std::make_shared<MtpDraftWeights>(
             checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head,
-            mtp_int8_head, model_->is_b200());
+            model_->is_b200(), model_->is_b200());
         model_->tc_vocab = model_->mtp_weights->shared_vocab();
     }
 }
 
 Decoder::~Decoder() = default;
 
-bool Decoder::experimental_target_split_gqa() const {
-    return model_->target_split_end() == target_split_end_position;
+bool Decoder::uses_b200_operators() const {
+    return model_->is_b200();
 }
 
-bool Decoder::experimental_long_target_split_gqa() const {
-    return model_->target_split_end() == text_attention_max_tokens;
+bool Decoder::has_int8_draft_head() const {
+    return model_->mtp_weights && model_->is_b200();
+}
+
+bool Decoder::has_certified_vocab() const {
+    return model_->tc_vocab != nullptr;
 }
 
 std::size_t Decoder::model_device_allocation_bytes() const {
@@ -509,33 +466,19 @@ bool Decoder::Model::prefill_serial(Request& request, RequestProgress& progress,
                                     int step_budget) const {
     const int count = static_cast<int>(prompt.size());
     const auto stream = request.memory.stream();
-    const bool shared_tiles = !media && mtp_tensor_core_prefill(fp8_prefill());
-    const int aligned = shared_tiles ? count : count / prefill_chunk_rows * prefill_chunk_rows;
-    std::optional<PrefillWorkspace> tiled;
-    if (shared_tiles) {
-        const int limit = step_budget ? step_budget : batch_prefill_tile_rows;
-        tiled.emplace(stream, std::min({count, limit, batch_prefill_tile_rows}));
-    } else if (!media && fp8_prefill() == Fp8PrefillPolicy::tensor_core) {
-        const int configured = serial_prefill_rows(b200_, count);
-        const int limit = step_budget ? step_budget / prefill_chunk_rows * prefill_chunk_rows
-                                      : configured;
-        const int larger = std::min({aligned, configured, limit});
-        if (larger > prefill_chunk_rows) {
-            tiled.emplace(stream, larger);
-        }
-    }
-    if (!tiled || !tiled->bytes()) {
-        const int limit = step_budget ? std::min(step_budget, prefill_chunk_rows)
-                                      : prefill_chunk_rows;
-        tiled.emplace(stream, std::min(count, limit));
+    const int limit = step_budget ? step_budget : batch_prefill_tile_rows;
+    const int preferred = !media && is_b200() ? batch_prefill_tile_rows : prefill_chunk_rows;
+    const int capacity = std::min({count, limit, preferred});
+    std::optional<PrefillWorkspace> tiled(std::in_place, stream, capacity);
+    if (!tiled->bytes() && capacity > prefill_chunk_rows) {
+        tiled.emplace(stream, prefill_chunk_rows);
     }
     auto& workspace = *tiled;
     result.peak_device_allocation_bytes += workspace.bytes();
     const int tile_rows = workspace.bytes() ? workspace.capacity() : 1;
     while (progress.remaining_prompt(count)) {
         const int position = progress.position;
-        const int end = position < aligned ? aligned : count;
-        const int rows = std::min(tile_rows, end - position);
+        const int rows = std::min(tile_rows, count - position);
         prefill_chunk(request, prompt.data() + position, rows, position, workspace,
                       nullptr, 0, media);
         progress.advance(rows);
@@ -580,8 +523,9 @@ void Decoder::Model::advance_serial(Request& request, RequestProgress& progress,
 
 bool Decoder::Model::serial_graph(const DecoderOptions& options, bool media, int prompt_count,
                                   int limit) const {
-    const bool split_decode = target_split_end_ && limit > target_split_first_position &&
-                              prompt_count < target_split_end_;
+    const int split_end = target_split_end();
+    const bool split_decode = split_end && limit > target_split_first_position &&
+                              prompt_count < split_end;
     return !options.eager && !media && !options.requires_target_only() && !split_decode;
 }
 
@@ -710,8 +654,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     if (proposals == 0) {
         model_->generate_serial(prompt_token_ids, options, callbacks, result);
     } else {
-        const int tile = mtp_tensor_core_prefill(model_->fp8_prefill())
-            ? batch_prefill_tile_rows : prefill_chunk_rows;
+        const int tile = model_->is_b200() ? batch_prefill_tile_rows : prefill_chunk_rows;
         const int limit = options.max_num_batched_tokens
             ? std::min(options.max_num_batched_tokens, tile) : tile;
         DecoderBatch batch(*this, DecoderBatchOptions{false, 1, 0, limit});

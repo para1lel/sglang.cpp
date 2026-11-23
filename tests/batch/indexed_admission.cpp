@@ -306,7 +306,7 @@ void check_singleton_owner(const Decoder& decoder) {
 namespace sglang {
 
 struct Decoder::Model {};
-Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy) {}
+Decoder::Decoder(const std::filesystem::path&, int, bool) {}
 Decoder::~Decoder() = default;
 
 std::string_view Tokenizer::piece(TokenId, bool) const { std::abort(); }
@@ -365,7 +365,7 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
 }
 
 int main() {
-    const Decoder decoder({}, 0, false, Fp8PrefillPolicy::exact);
+    const Decoder decoder({}, 0, false);
     check_tickets();
     check_two_owners(decoder);
     check_refill(decoder);

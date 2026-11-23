@@ -1,6 +1,8 @@
 # Paired W1–W6 benchmark
 
-Run pinned vLLM first, then run the native release build on the same reserved B200.
+Use the [matched K4 driver](#matched-k4-timing-protocol) to compare the native
+Release defaults against pinned vLLM MTP4. For a depth-zero control, run pinned
+vLLM first, then run the native release build on the same reserved B200.
 Both commands default to 8,192 scheduled tokens and 32 in-service requests, with
 two warmups and five measured cohorts for each concurrent row. Select the same GPU
 and CPU placement for both arms. Each output directory must be new.
@@ -42,7 +44,7 @@ checks the fixture and request bytes. Both arms record resolved settings before 
 
 ## Matched K4 timing protocol
 
-Run the opt-in protocol one row at a time on the same reserved B200. Use a Release
+Run the protocol one row at a time on the same reserved B200. Use a Release
 binary with a verified source revision and binary digest, the published checkpoint
 manifest, and the pinned vLLM environment and FlashInfer cubin cache.
 
@@ -61,9 +63,9 @@ from the earliest submit to the last valid `[DONE]`. The runner uses port 17424
 on loopback by default and holds the campaign, port, and both GPU coordination
 locks. `PAIRED_VLLM_SEED_CACHE` can point to the retained cache seed used for v4.
 
-Each native K4 output must match the same lane in a fresh native exact-FP8 K0
-control. A separate W1 native trace checks depth-four verification. The timed
-native arm uses default K4 with tracing disabled. The vLLM arm uses explicit MTP
+The launcher selects `server-defaults` when `PAIRED_K4_NATIVE_PROFILE` is unset.
+A separate W1 native trace checks depth-four verification. The timed native arm
+uses the Release defaults with tracing disabled. The vLLM arm uses explicit MTP
 depth four on the pinned revision, with its resolved worker configuration and
 fresh verification counters recorded. Its streams must pass the full wire,
 length, usage, and drain checks. vLLM output IDs may vary across valid streams
@@ -72,22 +74,29 @@ and may differ from native and archived IDs. The runner launches only K4 on vLLM
 `Wn/comparison.json` records the strict median makespan gate. A slower or tied
 native median records a timing miss and returns status 1. Invalid evidence stops
 the row before comparison. The campaign retains its raw captures and exits at
-the first failure. The K0 commands and historical receipts retain their
-original contracts.
+the first failure. Saved historical rows retain the acceptance criteria for their
+recorded profiles.
 
 Replay a saved row with `python benchmarks/paired/k4.py assess Wn FIXTURES ROW_DIR`
 from the repository root with `PYTHONPATH=.`. New rows require saved native process
 arguments, the W1 native trace, raw vLLM activity counters, and successful client
 statuses. Replay verifies these against the launch, server settings, and activity
-summaries. Version 2 rows also capture the native split dispatch setting from the
-live process at readiness and after measurement. Native cohorts bind the digests
-of their process arguments and readiness dispatch receipts.
+summaries. Historical version 2 exact and opt-in rows also capture the native
+split dispatch setting at readiness and after measurement. Their native cohorts
+bind the digests of the process arguments and readiness dispatch receipts.
 The native trace must contain a complete depth-four event. Verification headers
 and their lane and row counts must agree with the trace events.
 Replay also checks any saved comparison and final row exit status. Older rows remain
 replayable and any process or activity receipts they contain are checked.
 
-### Ordered Tensor Core with INT8 draft
+### Historical K4 profiles
+
+Use the measured Release that accepted `--fp8-prefill` to reproduce these
+profiles. `PAIRED_K4_NATIVE_PROFILE=exact` selects the historical native exact-FP8
+profile, which requires every native K4 output to match the same lane in a fresh
+native exact-FP8 K0 control.
+
+#### Ordered Tensor Core with INT8 draft
 
 Use a fresh campaign directory and set `PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8`
 with a verified Release server that supports `--mtp-int8-head`. The native K4
@@ -99,11 +108,11 @@ vLLM still uses the pinned standard K4 worker and has the same stream contract.
 A separate fresh exact-FP8 K0 control writes `exact-k0-compatibility.json` before
 timing. It records per-lane mismatch counts and the first differing IDs.
 The comparison also includes this diagnostic. The opt-in timing result applies
-only to the named policy. The exact-FP8 comparison above retains its original
+only to the named policy. The historical exact-FP8 comparison retains its original
 adoption gate. Each opt-in cohort carries its campaign and arm identity. Use the
 same profile and directory for each subsequent row.
 
-### Ordered Tensor Core with split target attention and INT8 draft
+#### Ordered Tensor Core with split target attention and INT8 draft
 
 Set `PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-split-gqa` in a fresh campaign
 directory and use a Release server that implements split target attention.
@@ -121,7 +130,7 @@ Neither establishes equivalence to the published ordered profile. The
 campaign binds the split policy and the fixed native settings to all receipts,
 including rows where attention falls back to the ordered implementation.
 
-### Ordered Tensor Core with long split target attention and INT8 draft
+#### Ordered Tensor Core with long split target attention and INT8 draft
 
 Set `PAIRED_K4_NATIVE_PROFILE=ordered-tc-int8-long-split-gqa` in a fresh campaign
 directory for W1 through W6. Use a Release server with the long split path.
@@ -139,7 +148,7 @@ Campaign metadata and version 2 evidence distinguish long and bounded split.
 
 ### Native server defaults against matched vLLM K4
 
-Use a fresh campaign directory and set `PAIRED_K4_NATIVE_PROFILE=server-defaults`.
+Use a fresh campaign directory. `server-defaults` is selected by default.
 Use a verified Release that resolves its default to MTP4, 32 active requests,
 an 8,192-token scheduling budget, prefix caching off, and CUDA graphs enabled.
 The native timed process receives only the loopback port argument and a clean
@@ -220,15 +229,18 @@ caps and the required cohort counts. The historical example yields `exploratory
 (non-protocol cap 32768)`. At 8,192, equal override counts yield `exploratory
 (non-protocol counts)`. A permitted difference yields `exploratory (count
 mismatch)`. The result records which arms were replayed and whether cross-engine
-IDs were compared. The native receipts
-establish its launch settings and scheduler limits. Actual kernel dispatch
-requires independent profiling.
+IDs were compared. Current native K0 plans use the `automatic-k0-v1` policy
+receipt. The driver records `/server_info` and the reported FP8 prefill, target
+attention, and paired-prefill policies in `native-k0-policy.json`. Historical
+plans retain their explicit launch settings. Actual kernel dispatch requires
+independent profiling.
 
 ## Compare against the published frozen reference
 
 The published W3–W6 GPU2 vLLM reference uses an 8,192-token scheduler cap. Select
 one or more concurrent groups and use the published manifest for an archival comparison.
-The following command reproduces the historical native 32,768-token setting:
+The following command uses the historical native 32,768-token scheduling cap
+with the current Release's automatic operator policy:
 
 ```bash
 PAIRED_COMPARISON_MODE=frozen \
@@ -246,7 +258,8 @@ The published replay keeps its historical collector and speed gates. Its
 
 Append any of `W1-W2 W3 W4 W5 W6` to select groups. Each group starts a fresh
 server with 32 active slots and an 8,192-token scheduling cap. The native arm uses
-tensor-core FP8 prefill and batch CUDA graphs. Both arms disable MTP and prefix reuse.
+the Release's automatic operator policy and enables batch CUDA graphs.
+Both arms disable MTP and prefix reuse.
 W1 and W2 use three warmups and nine measured requests each. The client times the
 first `[DONE]` and keeps reading through the end of the HTTP response. A second
 terminal, other data event after `[DONE]`, or short HTTP body invalidates the sample.

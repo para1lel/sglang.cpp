@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
         require(argc == 2, "Expected the checkpoint directory");
         const std::filesystem::path checkpoint = argv[1];
         const Tokenizer tokenizer(checkpoint / "tokenizer.json");
-        const Decoder decoder(checkpoint, 0, true, sglang::Fp8PrefillPolicy::exact);
+        const Decoder decoder(checkpoint, 0, true);
         const auto tokens = tokenizer.encode("Complete the requested output.");
         check_mtp(decoder, tokenizer, {tokens.begin(), tokens.end()});
         return 0;

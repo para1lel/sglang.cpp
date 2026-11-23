@@ -417,7 +417,7 @@ int main(int argc, char** argv) try {
     require(arm == "base" || arm == "candidate", "Unexpected test arm");
     require(mode == "eager" || mode == "graph" || mode == "rejected", "Unexpected graph mode");
     const bool graph = mode != "eager";
-    const Decoder decoder(argv[1], 0, false, Fp8PrefillPolicy::exact);
+    const Decoder decoder(argv[1]);
     CheckpointRun run(decoder, graph, arm == "candidate", argv[2], argv[5]);
     exercise(run, graph, mode == "rejected");
     std::cout << "Grouped head routes passed with " << run.non_greedy() << " non-greedy tokens\n";

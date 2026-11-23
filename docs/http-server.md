@@ -1,6 +1,6 @@
 # Native HTTP transport
 
-The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L335)<!-- prefix: "serve_connec" -->
+The loopback server uses one HTTP reader and one batch scheduler at every capacity. See the [launch procedure](../README.md#serve-token-ids-over-http) for server options. [Startup](../apps/sglang-server.cpp#L308)<!-- prefix: "serve_connec" -->
 
 ## Request targets and redirects
 
@@ -25,7 +25,7 @@ All three health checks accept empty GET requests and bypass the completion queu
 
 | Route | Responsibility | Response |
 | --- | --- | --- |
-| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L196)<!-- prefix: "std::string " --> |
+| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L169)<!-- prefix: "std::string " --> |
 | `/ready` | The HTTP reader checks the permanent decoder worker failure flag. | HTTP 200 with `{"ready":true}` while the worker has no permanent failure. After failure, HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. [Readiness response](../apps/server/http.cpp#L662)<!-- prefix: "void write_r" --> · [Worker flag](../apps/server/batch_service.cpp#L776)<!-- prefix: "bool BatchSe" --> |
 | `/health_generate` | A dedicated HTTP worker asks the batch scheduler for generation progress. | HTTP 200 for progress within the probe window. HTTP 503 for queue overload, probe failure, timeout, permanent worker failure, or shutdown. Both statuses carry `Content-Length: 0` and `Connection: close`. [Dispatch](../apps/server/prefix_controls.cpp#L485)<!-- prefix: "void Connect" --> · [Reply](../apps/server/http.cpp#L671)<!-- prefix: "void write_g" --> |
 
@@ -94,7 +94,9 @@ A decoder step occupies a FIFO mailbox entry until its callback accepts it. The 
 
 Ready lanes wait up to 1 millisecond for peers. With CUDA graphs on and MTP off, 25 ready lanes can end grace when all 32 live jobs have published output. This rule applies with prefix reuse off or on. [Grace interval](../apps/server/batch_service.cpp#L73)<!-- prefix: "constexpr au" --> · [Early dispatch conditions](../apps/server/batch_service.cpp#L204)<!-- prefix: "bool BatchSe" --> · [Wait](../apps/server/batch_service.cpp#L249)<!-- prefix: "std::optiona" --> · [Publication](../apps/server/batch_service.cpp#L329)<!-- prefix: "bool BatchSe" -->
 
-The worker rechecks selected lanes before dispatch. Later acknowledgements can produce a separate step. If all 25–32 selected lanes qualify for [packed decode](batch-graphs.md#runtime-path), they use the same 32-row bucket. [Readiness check](../apps/server/batch_service.cpp#L280)<!-- prefix: "bool BatchSe" --> · [Bucket selection](../src/text/decoder_graph_packed.cpp#L223)<!-- prefix: "bool PackedD" -->
+The worker rechecks selected lanes before dispatch. Later acknowledgements
+can produce a separate step. See the [graph eligibility rules](batch-graphs.md#runtime-path)
+for the selected width. [Readiness check](../apps/server/batch_service.cpp#L280)<!-- prefix: "bool BatchSe" -->
 
 ### Bounded decode output
 
@@ -136,6 +138,6 @@ For bounded decode output, block a writer after its first callback and verify on
 
 The focused B200 replay checked greedy IDs on frozen histories for four full-length W5 prompts and 32 decode steps. Full W5 parity still requires 32 full-length prompts and 4,096 free-running output tokens per lane. CPU callback tests and modeled receipt delays leave socket-writer latency, GPU scheduler throughput, and end-to-end W5 speedup unmeasured.
 
-Run the [streaming verification](development.md#streaming-verification) on a reserved B200. The [native prefill reset check](../tests/prefill/README.md) requires headers before prefill finishes. It resets after a traced chunk, checks retirement to zero request bytes, and verifies a replacement. [Reset assertions](../tests/prefill/run_native.py#L144)<!-- prefix: "def check_re" -->
+Run the [streaming verification](development.md#streaming-verification) on a reserved B200. The [native prefill reset check](../tests/prefill/README.md) requires headers before prefill finishes. It resets after a traced chunk, checks retirement to zero request bytes, and verifies a replacement. [Reset assertions](../tests/prefill/run_native.py#L145)<!-- prefix: "def check_re" -->
 
 Check wire silence with no decoder steps and with steps that [buffer tokens](lessons.md#l008--buffered-tokens-suppress-sse-keepalives). Require a comment after 15 seconds and measure TTFT at the first output ID frame. Exercise rejection before headers and generation failure after headers but before the first token. Require JSON status for rejection and an SSE error without `[DONE]` for the open stream.

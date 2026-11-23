@@ -3,8 +3,6 @@
 #include "sglang/decoder_cuda.cuh"
 
 #include <climits>
-#include <cstdlib>
-#include <string_view>
 
 namespace sglang {
 namespace {
@@ -814,8 +812,7 @@ std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
 
 std::optional<cudaError_t> decoder::try_batched_paged_prefill(
     const PagedPrefillSequence* sequences, int count, cudaStream_t stream) {
-    if (!sequences || count < 2 || count > paged_batch_sequences ||
-        std::getenv("SGLANG_PREFILL_ATTN") || std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL")) {
+    if (!sequences || count < 2 || count > paged_batch_sequences) {
         return std::nullopt;
     }
     int device = 0;
@@ -918,15 +915,12 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     const int visible = position + rows;
     const int flash_limit = rows == flash_chunk ? max_flash_visible_tokens :
                                                   max_multirow_visible_tokens;
-    const auto* setting = std::getenv("SGLANG_EXPERIMENTAL_TMEM_PREFILL");
-    const std::string_view mode = setting ? setting : "";
-    const bool default_ragged = !setting && (default_ragged_prefill(cache, position, rows) ||
-        (!std::getenv("SGLANG_PREFILL_ATTN") && default_ragged_prefill_tail(
-            {cache, pages, position, rows, queries, output}, max_multirow_visible_tokens)));
-    const bool ragged_opt_in = mode == "ragged" && position >= 4096 && rows >= 256 && rows <= 512;
-    if ((default_ragged || ragged_opt_in) && visible <= max_multirow_visible_tokens) {
+    const bool ragged = default_ragged_prefill(cache, position, rows) ||
+        default_ragged_prefill_tail({cache, pages, position, rows, queries, output},
+                                   max_multirow_visible_tokens);
+    if (ragged && visible <= max_multirow_visible_tokens) {
         if (const auto status = launch_tmem_prefill(cache, pages, position, queries, output,
-                                                   stream, true, rows, default_ragged)) {
+                                                   stream, true, rows, true)) {
             return *status;
         }
     }
@@ -934,10 +928,9 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
         (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
         (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
         if (rows == flash_chunk && (position >= 8192 ||
-            (!setting && position >= 4096 && position % flash_chunk == 0))) {
+            (position >= 4096 && position % flash_chunk == 0))) {
             constexpr int max_default_paired_position = 31744;
-            const bool default_paired = (!setting || mode == "ragged") &&
-                position <= max_default_paired_position &&
+            const bool default_paired = position <= max_default_paired_position &&
                 (position % flash_chunk == 0 || position % mxfp8_page_size != 0);
             if (default_paired && scratch.keys && scratch.values) {
                 if (const auto status = launch_staged_tmem_prefill(cache, pages, position,
@@ -946,18 +939,10 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
                     return *status;
                 }
             }
-            if (default_paired || mode == "paired" || (!setting && position % flash_chunk == 0 &&
-                position >= max_multirow_visible_tokens)) {
+            if (default_paired || (position % flash_chunk == 0 &&
+                                   position >= max_multirow_visible_tokens)) {
                 if (const auto status = launch_paired_tmem_prefill(cache, pages, position, queries,
                                                                   output, stream)) {
-                    return *status;
-                }
-            }
-            const bool ordered = mode == "ordered";
-            if (position % flash_keys == 0 &&
-                (ordered || (mode == "1" && position >= max_multirow_visible_tokens))) {
-                if (const auto status = launch_tmem_prefill(cache, pages, position, queries,
-                                                           output, stream, ordered)) {
                     return *status;
                 }
             }

@@ -239,27 +239,22 @@ void check_media_identity(const Decoder& engine, std::vector<DecoderMedia> media
     print_result("replayed media owners", replay);
 }
 
-void check_ordered_fp8(const char* checkpoint, const std::vector<DecoderMedia>& media) {
+void check_chunked_media(const Decoder& engine, const std::vector<DecoderMedia>& media) {
     DecoderOptions options;
     options.max_new_tokens = 4;
     options.top_logits = 16;
+    const auto expected = engine.generate_multimodal(prompt(), media, options);
+    require(expected.output_token_ids.size() == 4 && expected.step_top_logits.size() == 4 &&
+                expected.finish_reason == DecoderFinishReason::length,
+            "Default media generation did not return four scored IDs");
     options.max_num_batched_tokens = 64;
-    const auto expected = [&] {
-        const Decoder engine(checkpoint);
-        return engine.generate_multimodal(prompt(), media, options);
-    }();
-    for (const auto policy : {Fp8PrefillPolicy::tensor_core_mtp,
-                              Fp8PrefillPolicy::tensor_core_target,
-                              Fp8PrefillPolicy::tensor_core_mtp_target}) {
-        const Decoder engine(checkpoint, 0, false, policy);
-        const auto actual = engine.generate_multimodal(prompt(), media, options);
-        require(actual.output_token_ids == expected.output_token_ids &&
-                    actual.finish_reason == expected.finish_reason &&
-                    actual.cached_prompt_tokens == 0 && actual.mtp_rounds == 0 &&
-                    equal_scores(actual, expected),
-                "An ordered text policy changed chunked media scores");
-        print_result("exact media fallback under ordered policy", actual);
-    }
+    const auto actual = engine.generate_multimodal(prompt(), media, options);
+    require(actual.output_token_ids == expected.output_token_ids &&
+                actual.finish_reason == expected.finish_reason &&
+                actual.cached_prompt_tokens == 0 && actual.mtp_rounds == 0 &&
+                equal_scores(actual, expected),
+            "Chunked media prefill changed generation scores");
+    print_result("media with smaller prefill budget", actual);
 }
 
 }
@@ -267,19 +262,18 @@ void check_ordered_fp8(const char* checkpoint, const std::vector<DecoderMedia>& 
 int main(int argc, char** argv) {
     try {
         require(argc == 2 || argc == 3,
-                "Usage: media-contract CHECKPOINT [--embedding-only|--ordered-fp8]");
+                "Usage: media-contract CHECKPOINT [--embedding-only]");
         const auto plan = check_plan();
         const auto media = fixtures();
         check_embedding(plan, media);
         std::cout << "Mixed planner and BF16 row substitution passed\n";
         if (argc == 2) {
-            const Decoder engine(argv[1]);
+            const Decoder engine(argv[1], 0, true);
             check_public_guards(engine, media);
             check_dispatch(engine, media, false);
             check_dispatch(engine, media, true);
             check_media_identity(engine, media);
-        } else if (std::string_view(argv[2]) == "--ordered-fp8") {
-            check_ordered_fp8(argv[1], media);
+            check_chunked_media(engine, media);
         } else {
             require(std::string_view(argv[2]) == "--embedding-only", "Unknown option");
         }

@@ -344,8 +344,7 @@ def main():
     parser.add_argument("--prefix", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    flags = PARSERS + (("--prefix-cache-entries", "2", "--fp8-prefill", "exact")
-                       if args.prefix else ())
+    flags = PARSERS + (("--prefix-cache-entries", "2") if args.prefix else ())
     with server(args.binary, CHECKPOINT, args.out / "server", 1,
                 flags=flags, mtp=args.mtp, graph=args.live) as port:
         result = {"cache": cache(port)} if args.prefix else exercise(

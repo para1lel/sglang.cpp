@@ -45,13 +45,11 @@ The oracle compares complete sequence probabilities at depths 1 through 4 with d
 target sampling under five proposal laws. It also checks that reusing an output
 ordinal after a rejected suffix preserves the target-only draw sequence.
 
-The HTTP check compares seeded JSON and SSE with exact depth-0 controls. It
-covers exact prefill at capacity one with depths 0 through 4, explicit `--eager`
-at depth 0, and capacity-four serving with and without graphs under both prefill
-policies at depths 0, 1, and 4. It also checks capacity-four exact graph serving
-at depths 2 and 3. Under either configured policy, positive-depth text uses
-exact prefill, including requests with grammar masks. The check compares it with
-exact depth-0 output.
+The HTTP check compares seeded JSON and SSE with depth-0 controls on the same
+runtime. At capacity one it covers depths 0 through 4 and eager depth 0. At
+capacity four it covers graph serving at depths 0 through 4 and eager serving
+at depths 0, 1, and 4. The sampling and grammar cases check the resulting token
+sequences against depth-0 output.
 The check covers long prompts, concurrent seeds, grammar masks, sampling filters,
 EOS, stop at the output limit, and replay after a TCP reset.
 Server traces verify graph replay at depth 0, joint verification at positive

@@ -5,6 +5,7 @@ usage() {
     echo "Usage: bash benchmarks/paired/run_native.sh" \
         "BUILD_DIR GPU_INDEX NEW_OUTPUT_DIR [GROUP ...]"
     echo "Groups: W1-W2 W3 W4 W5 W6 (default: all in this order)"
+    echo "Native K0 uses --mtp-steps 0 with the Release's automatic operator policy."
     echo "PAIRED_MAX_NUM_BATCHED_TOKENS defaults to 8192."
     echo "Set PAIRED_VLLM_RESULTS to validate a saved same-device control."
     echo "Set PAIRED_COMPARISON_MODE=frozen for the published GPU2 W3-W6 reference."
@@ -58,7 +59,7 @@ printf '%s\n' "warmups=$warmups" "measured=$measured" \
     "allow_count_mismatch=${PAIRED_ALLOW_COUNT_MISMATCH:-0}" \
     "mode=${mode:-unpaired}" "max_num_batched_tokens=$token_budget" \
     >"$output/comparison-inputs.txt"
-sha256sum "$binary" "$paired_dir/run_native.sh" >"$output/native.sha256"
+sha256sum "$binary" "$paired_dir"/{run_native.sh,identity.py} >"$output/native.sha256"
 export CUDA_VISIBLE_DEVICES=$gpu_uuid CUDA_DEVICE_ORDER=PCI_BUS_ID
 export LD_LIBRARY_PATH="$compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mkdir "$output/cuda-cache"
@@ -81,10 +82,13 @@ for group in "${groups[@]}"; do
     echo "$group on $gpu_uuid"
     comparison_status=0
     if start_group "$run" "$binary" --checkpoint "$checkpoint" --device 0 --port "$port" \
-        --fp8-prefill tensor-core --batch-cuda-graphs --mtp-steps 0 --prefix-cache-entries 0 \
+        --batch-cuda-graphs --mtp-steps 0 --prefix-cache-entries 0 \
         --max-active 32 --max-num-batched-tokens "$token_budget" &&
         jq -e --argjson budget "$token_budget" \
-        '.max_active == 32 and .max_num_batched_tokens == $budget' "$run/health.json" >/dev/null
+        '.max_active == 32 and .max_num_batched_tokens == $budget' "$run/health.json" >/dev/null &&
+        curl --noproxy '*' -fsS --max-time 5 "$url/server_info" >"$run/server-info.json" &&
+        comparison_identity native-k0 "$group" "$checkpoint" "$token_budget" "$port" \
+        >"$run/native-k0-policy.json"
     then
         if ! measure_group "$group" "$run" native; then
             exit_code=1

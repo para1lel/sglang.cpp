@@ -134,15 +134,14 @@ def run(args, fields, schema_validator=None):
     validate = partial(validate_constraint, pieces, schema_validator)
     with serve(args, pieces) as http:
         if args.cache_entries:
-            assert args.width > 1 and args.graph and args.prefill == "tensor-core"
+            assert args.width > 1 and args.graph
             check_prefix(http, fields, validate)
         else:
             check_mtp(http, args, fields, validate)
         (args.output / "summary.json").write_text(json.dumps(http.summary, ensure_ascii=True))
         candidate = http.summary
     if not args.cache_entries and args.mtp:
-        control = Namespace(**(vars(args) | {"mtp": 0, "prefill": "exact",
-                                             "output": args.output / "k0"}))
+        control = Namespace(**(vars(args) | {"mtp": 0, "output": args.output / "k0"}))
         run(control, fields, schema_validator)
         expected = json.loads((control.output / "summary.json").read_text())
         assert candidate.keys() == expected.keys()

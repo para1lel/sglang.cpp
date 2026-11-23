@@ -1,8 +1,10 @@
 # Matched W1 and W2 K4 with split target attention
 
 On November 22, 2026 UTC, Release `96aff6ab1796b71f07e11ad529e4f77837fde4ff`
-ran the [opt-in split profile](../../benchmarks/paired/README.md#ordered-tensor-core-with-split-target-attention-and-int8-draft).
-Exact FP8 remains the default. Both arms used B200 GPU3
+ran the [historical bounded split profile](https://github.com/para1lel/sglang.cpp/blob/96aff6ab1796b71f07e11ad529e4f77837fde4ff/benchmarks/paired/README.md#ordered-tensor-core-with-split-target-attention-and-int8-draft).
+The measured native command used ordered Tensor Core, K4, and an INT8
+draft head, with split target attention at 2,048–4,096 visible tokens.
+Both arms used B200 GPU3
 (`GPU-ceeff2f7-3f39-50b4-8d29-576159781b9d`), both GPU UUID locks, local
 NUMA allocation, server CPUs 24–33, client CPUs 34–35, 32 slots and an 8,192-token cap.
 Each timed arm ran three warmups and nine measured cohorts.
@@ -19,8 +21,8 @@ The native W1 trace reached depth four in 49 of 50 rounds. vLLM supplied timing.
 
 An independent capped W3 diagnostic on a private tree measured 11.561 s of
 target verification attention across four 8,192-token lanes at 32 outputs each.
-This blocked the formal W3 launch pending long-context runtime qualification.
-W3–W6 remain unmeasured.
+This blocked the formal W3 launch for that campaign.
+The campaign has no W3–W6 measurements.
 
 Raw comparisons, audits, lock receipts and teardown are under
 `artifacts/continue-split-campaign-test/campaign-published-96aff6a-gpu3/`.

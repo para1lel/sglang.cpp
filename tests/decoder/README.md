@@ -6,7 +6,7 @@ Use the Release decoder libraries, the Qwen3.8-27B-FP8 checkpoint, and a reserve
 Pass four distinct files of whitespace-separated checkpoint token IDs, each with at least 145
 tokens. The check compares score and normalized rows and committed KV and GDN state with
 scalar decode for cuts from zero through five and a replacement token. It also checks
-two-row graph replay and the exact FP8 default.
+two-row graph replay with the selected operators.
 
 ```bash
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
@@ -57,9 +57,7 @@ checkpoint=/data0/shared/Qwen3.8-27B-FP8
     -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
     -lcudart -o "$out/decode-graph-check"
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" "$out/decode-bandwidth-check"
-for policy in exact tensor-core; do
-    CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/decode-graph-check" "$checkpoint" "$policy"
-done
+CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/decode-graph-check" "$checkpoint"
 ```
 
 The operator check compares output bits and guards with ordinary BF16 GEMV and FP8 quantization.
@@ -70,7 +68,7 @@ unaligned inputs or weights, and a different hidden width. Invalid arguments mus
 The checkpoint check expects one capture on the first request, three graph launches on each of
 two default requests, and no capture or launch on the eager request. The second default request
 must reuse the first graph. All three requests must return identical greedy IDs and full score
-bits within each prefill policy.
+bits.
 
 ## Grouped decode LM head
 
@@ -116,15 +114,13 @@ export CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}"
 "$out/bin/gdn-check"
 "$out/bin/gdn-check" short paired "$out/ordered.bin"
 "$out/bin/gdn-check" chunked
-for policy in exact tensor-core; do
-    "$out/bin/gdn-routes" "$checkpoint" "$out/prompt.ids" "$policy"
-done
+"$out/bin/gdn-routes" "$checkpoint" "$out/prompt.ids"
 ```
 
 The chunked check observes the matrix and recurrence launches, compares outputs and state with
 an FP64 sequence, and verifies causal outputs and workspace guards. The route check observes
 the first absolute tile, restored prefix, mixed prefill and decode, and reuse of a retired lane.
-Its exact mode emits four generated IDs and 16 scores per step for comparison across builds.
+The route check also compares a cold request and its restored continuation.
 
 ## Checkpoint metadata
 
@@ -165,10 +161,7 @@ for mode in full recovery small unaligned graph; do
     CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
         "$out/bin/long-decode-check" "$mode"
 done
-for policy in exact tensor-core; do
-    CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/bin/long-decode-routes" \
-        "$checkpoint" "$out/prompt.ids" candidate "$policy"
-done
+CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/bin/long-decode-routes" "$checkpoint" "$out/prompt.ids"
 ```
 
 The operator check verifies split and combine launch geometry, shuffled pages,
@@ -177,10 +170,8 @@ and injected launch failures. The graph mode rebinds page tables, positions, and
 output buffers across replays, including padded lanes.
 
 The checkpoint check uses sparse slots, mixed long and short lengths, fixed-seed
-sampling, slot reuse, and short and long graph replay. Under `tensor-core`, five
-long lanes use the padded width-eight bucket. The `exact` policy uses short prompts.
-Use `paired` or `legacy-tensor` with the corresponding historical libraries to
-check their launch sequences.
+sampling, slot reuse, and singleton capture and replay. It counts split and combine
+launches for eligible multi-lane B200 decode and checks zero replay masks there.
 
 An optional `LOGITS` path records raw BF16 logits for two groups of three
 width-five steps. An optional `TEACHER` file after `LOGITS` supplies 15

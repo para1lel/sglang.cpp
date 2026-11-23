@@ -52,12 +52,12 @@ GRAPH = re.compile(rb"^batch graph_slots=\d+", re.M)
 
 
 @contextmanager
-def server(args, output, width, depth, prefill="exact", flags=(), token_budget=TOKEN_BUDGET):
+def server(args, output, width, depth, flags=(), token_budget=TOKEN_BUDGET):
     output.mkdir()
     port = choose_port()
     command = [str(args.server), "--checkpoint", str(args.checkpoint), "--device", "0",
                "--port", str(port), "--max-active", str(width), "--mtp-steps", str(depth),
-               "--max-num-batched-tokens", str(token_budget), "--fp8-prefill", prefill,
+               "--max-num-batched-tokens", str(token_budget),
                "--trace-batches", *flags]
     write_json(output / "command.json", command)
     log = output / "server.log"
@@ -201,7 +201,7 @@ def check_cancellation(port, log, width, depth, wanted):
     return {"interrupted": interrupted, "before_replay_trace": trace.decode(), "replay": replay}
 
 
-def run_cases(port, log, width, depth, prefill):
+def run_cases(port, log, width, depth):
     main = post(port, TEXT, MAIN)
     wanted = transcript(main)
     stop = stop_case(wanted)
@@ -238,7 +238,7 @@ def run_cases(port, log, width, depth, prefill):
     require(rows["mask"]["text"] in MASKED_CHOICES and rows["mask"]["finish"] == "stop",
             rows["mask"])
     require(len(rows["long"]["prompt"]) >= 512 and
-            len(rows["long"]["tokens"]) == LONG["max_tokens"], (prefill, rows["long"]))
+            len(rows["long"]["tokens"]) == LONG["max_tokens"], rows["long"])
     if width == 4:
         other = MAIN | {"seed": 2**63 - 1}
         mixed = [(TEXT, other), (CHAT, EOS), (TEXT, MAIN), (TEXT, MASKED)]
@@ -263,27 +263,26 @@ def check_against_control(rows, control, context):
         require(row == control[name], f"{context}: changed {name}")
 
 
-def check_configuration(args, width, prefill, mode, depths, flags=(), exact=None):
+def check_configuration(args, width, mode, depths, flags=()):
     observed = {}
     media_control = None
     for depth in depths:
-        output = args.evidence / f"w{width}-{prefill}-{mode}-k{depth}"
-        with server(args, output, width, depth, prefill, flags) as (port, log):
-            evidence = run_cases(port, log, width, depth, prefill)
+        output = args.evidence / f"w{width}-{mode}-k{depth}"
+        with server(args, output, width, depth, flags) as (port, log):
+            evidence = run_cases(port, log, width, depth)
         write_json(output / "wire.json", evidence)
         rows = evidence["transcripts"]
         media = evidence["media"]["transcript"]
         if depth:
-            require(media == media_control, f"W{width} {prefill} {mode} K{depth}: changed media")
+            require(media == media_control, f"W{width} {mode} K{depth}: changed media")
         else:
             media_control = media
         if width == 1:
             rows = rows | {"media": media}
         if depth:
-            control = observed[0] if exact is None else exact[depth]
-            check_against_control(rows, control, f"W{width} {prefill} {mode} K{depth}")
+            check_against_control(rows, observed[0], f"W{width} {mode} K{depth}")
         observed[depth] = rows
-        summary = {"depth": depth, "width": width, "prefill": prefill, "mode": mode}
+        summary = {"depth": depth, "width": width, "mode": mode}
         trace = log.read_bytes()
         graph_steps = len(GRAPH.findall(trace))
         summary["graph_steps"] = graph_steps
@@ -312,11 +311,8 @@ def check_startup(args):
         (["--max-active", "32", "--prefix-cache-entries", "2"], NO_DEVICE),
         (["--max-active", "33", "--mtp-steps", "1"], "--max-active in [1, 32]"),
         (["--max-active", "32", "--mtp-steps", "5"], "--mtp-steps in [0, 4]"),
-        (["--max-active", "4", "--mtp-steps", "4", "--prefix-cache-entries", "2",
-          "--fp8-prefill", "exact"], NO_DEVICE),
-        (["--max-active", "32", "--mtp-steps", "1", "--prefix-cache-entries", "2",
-          "--fp8-prefill", "tensor-core"], "requires --fp8-prefill exact"),
-        (["--mtp-steps", "1", "--prefix-cache-entries", "2", "--fp8-prefill", "exact",
+        (["--max-active", "4", "--mtp-steps", "4", "--prefix-cache-entries", "2"], NO_DEVICE),
+        (["--mtp-steps", "1", "--prefix-cache-entries", "2",
           "--eager"], "--prefix-cache-entries requires omitting --eager"),
         (["--max-active", "1", "--mtp-steps", "1", "--eager"], NO_DEVICE),
         (["--max-active", "4", "--mtp-steps", "4", "--eager", "--batch-cuda-graphs"],
@@ -345,7 +341,7 @@ def finish_stream(stream):
 
 
 def check_queue_and_reset(args):
-    output = args.evidence / "w2-exact-queue"
+    output = args.evidence / "w2-prefix-queue"
     flags = ("--batch-cuda-graphs", "--prefix-cache-entries", "2")
     with server(args, output, 2, 0, flags=flags) as (port, _):
         controls = Controls(port, output)
@@ -391,25 +387,16 @@ def main():
     args = parser.parse_args()
     args.evidence.mkdir(parents=True)
     check_startup(args)
-    graph_flag = ("--batch-cuda-graphs",)
     eager_flag = ("--eager",)
-    singleton = check_configuration(args, 1, "exact", "default", range(5))
-    eager = check_configuration(args, 1, "exact", "eager", (0, 4), (*graph_flag, *eager_flag))
+    singleton = check_configuration(args, 1, "default", range(5))
+    eager = check_configuration(args, 1, "eager", (0, 4), eager_flag)
     for depth in eager:
         require(singleton[depth] == eager[depth], f"Explicit eager changed capacity-one K{depth}")
     depths = (0, 1, 4)
-    exact_graph = check_configuration(args, 4, "exact", "graph", range(5), graph_flag)
-    exact_eager = check_configuration(args, 4, "exact", "eager", depths, eager_flag)
-    tensor_graph = check_configuration(args, 4, "tensor-core", "graph", depths,
-                                       graph_flag, exact=exact_graph)
-    tensor_eager = check_configuration(args, 4, "tensor-core", "eager", depths,
-                                       eager_flag, exact=exact_eager)
+    graph = check_configuration(args, 4, "default", range(5))
+    eager = check_configuration(args, 4, "eager", depths, eager_flag)
     for depth in depths:
-        require(exact_graph[depth] == exact_eager[depth], f"Exact graph/eager K{depth} differs")
-        require(tensor_graph[depth] == tensor_eager[depth], f"Tensor graph/eager K{depth} differs")
-    write_json(args.evidence / "precision-controls.json",
-               {"exact_k0": exact_graph[0]["long"]["tokens"],
-                "tensor_k0": tensor_graph[0]["long"]["tokens"]})
+        require(graph[depth] == eager[depth], f"Default graph/eager K{depth} differs")
     check_queue_and_reset(args)
 
 

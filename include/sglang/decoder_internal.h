@@ -158,7 +158,6 @@ public:
 
     std::size_t bytes() const;
     TransferBuffers& transfers();
-    TextLogitCandidate* prepare_packed_winners();
     GeneratedLogprobReadback* prepare_generated_logprobs();
     ExactGqaWorkspace prepare_singleton_scores();
     cudaStream_t stream() const;
@@ -169,9 +168,6 @@ public:
     bool replay_batch_graph(int width, const std::function<void()>& prepare,
                             const std::function<void()>& capture,
                             const std::function<bool()>& bind, bool target_verify = false);
-    bool replay_packed_graph(int bucket, int rows, const std::function<void()>& prepare,
-                             const std::function<void()>& capture,
-                             const std::function<bool()>& bind);
     bool verification_graph_failed() const;
     void reclaim_deferred();
     void open_stream(std::shared_ptr<const void> owners = nullptr);
@@ -465,17 +461,9 @@ struct ForwardLane {
     const Bf16* feature = nullptr;
     const MropePosition* mrope = nullptr;
     int rotary_position = -1;
-    bool long_gqa = false;
-    bool packed = false;
     ExactGqaWorkspace singleton_scores{};
+    bool exact = false;
 };
-
-// Packed decode runs one padded row per lane. Buckets bound graph executables; eager packed steps
-// pad to the same bucket so both routes enqueue identical work.
-inline constexpr int packed_decode_min_lanes = 2;
-inline constexpr std::array<int, 12> packed_decode_buckets{1, 2, 4, 8, 12, 16, 24, 32,
-                                                           40, 48, 56, 64};
-inline constexpr int packed_decode_max_rows = decoder_batch_max_lanes;
 
 inline constexpr int singleton_score_min_visible = 32768;
 inline constexpr int singleton_score_max_visible = 36864;
@@ -510,11 +498,10 @@ struct BatchGraphScratch {
 namespace sglang {
 
 struct Decoder::Model {
-    Model(const std::filesystem::path& checkpoint, int cuda_device, Fp8PrefillPolicy fp8_prefill);
+    Model(const std::filesystem::path& checkpoint, int cuda_device);
 
-    Fp8PrefillPolicy fp8_prefill() const { return fp8_prefill_; }
     bool is_b200() const { return b200_; }
-    int target_split_end() const { return target_split_end_; }
+    int target_split_end() const { return is_b200() ? text_attention_max_tokens : 0; }
     void forward(decoder::Request& request, int token_id, int position, TextGdnMode mode) const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     bool verify_mtp(decoder::MtpRound* rounds, int count,
@@ -534,8 +521,8 @@ struct Decoder::Model {
                        const decoder::PromptLogprobCapture* scores = nullptr,
                        bool exact = false) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
-                        bool tensor_cache, bool layerwise, bool mixed,
-                        DecoderBatchStepStats& stats, bool label_scores = false) const;
+                        DecoderBatchStepStats& stats, bool prefix_cache,
+                        bool label_scores = false) const;
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;
@@ -568,7 +555,8 @@ struct Decoder::Model {
                                      DecoderResult& result) const;
 
     template <typename Lane>
-    void forward_layers(const Lane* lanes, int count, cudaStream_t stream) const;
+    void forward_layers(const Lane* lanes, int count, cudaStream_t stream,
+                        bool exact = false) const;
 
     int device;
     std::string accelerator_name;
@@ -583,10 +571,6 @@ struct Decoder::Model {
     mutable std::unique_ptr<decoder::Request> decode_request;
 
 private:
-    Model(const std::filesystem::path& checkpoint, int cuda_device);
-
-    Fp8PrefillPolicy fp8_prefill_ = Fp8PrefillPolicy::exact;
-    int target_split_end_ = 0;
     bool b200_ = false;
 };
 
@@ -599,25 +583,15 @@ struct DecoderModelAccess {
 
 namespace sglang::decoder {
 
-class PackedDecode;
-
 using DecoderModel = DecoderModelAccess::Model;
 
 struct DecodeGraphs {
-    DecodeGraphs();
-    ~DecodeGraphs();
-    DecodeGraphs(DecodeGraphs&&) noexcept;
-    DecodeGraphs& operator=(DecodeGraphs&&) noexcept;
-
     std::unique_ptr<BatchGraphScratch> narrow;
     std::array<bool, decoder_batch_max_graph_lanes> narrow_warmed{};
-    std::unique_ptr<PackedDecode> packed;
-    bool packed_unavailable = false;
 };
 
 struct DecodeRun {
     std::array<Workspace*, decoder_batch_max_lanes> ready{};
-    std::array<const TextLogitCandidate*, decoder_batch_max_lanes> winners{};
     std::uint64_t graphed = 0;
 };
 
@@ -625,9 +599,6 @@ struct DecodeRunOptions {
     bool cuda_graphs;
     bool graph_step;
     bool narrow_allowed;
-    bool packed;
-    std::uint64_t greedy_winners;
-    std::uint64_t eager_score_rows;
 };
 
 // Enqueues one decode step for lanes. ready[index] names the workspace that already holds logits

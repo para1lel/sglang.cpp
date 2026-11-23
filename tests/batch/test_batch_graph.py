@@ -192,23 +192,25 @@ def scheduler(path, offset):
     return rows
 
 
-def check(port, out, maximum_width, graph_enabled, exact):
+def check(port, out, maximum_width, graph_enabled):
     log = out / "server.log"
     result = {}
     for width in range(1, maximum_width + 1):
         cases = [FIXTURES[name] for name in DIRECT[:width]]
         offset = log.stat().st_size
-        streams = parallel(port, cases, exact)
+        streams = parallel(port, cases, exact=False)
         rows = scheduler(log, offset)
         assert any(row["width"] == row["decode"] == width for row in rows), (width, rows)
-        assert any(row["graph_slots"].bit_count() == width for row in rows) == graph_enabled
+        assert all(row["graph_slots"].bit_count() <= int(graph_enabled) for row in rows)
+        if width == 1 and graph_enabled:
+            assert any(row["graph_slots"] for row in rows)
         result[f"width{width}"] = {"streams": streams, "rows": rows}
         save(out / "http.json", result)
     offset = log.stat().st_size
     mixed = [{"name": "chatml-eos", "raw": True, "prompt": TEXT["ids"], "max_tokens": 24},
              FIXTURES["numbers"],
              FIXTURES["held-out"], FIXTURES["page-boundary"]][:maximum_width]
-    streams = parallel(port, mixed, exact)
+    streams = parallel(port, mixed, exact=False)
     result["independent-stops"] = {"streams": streams, "rows": scheduler(log, offset)}
     save(out / "http.json", result)
     greedy = {**FIXTURES["held-out"], "max_tokens": 32}
@@ -217,19 +219,21 @@ def check(port, out, maximum_width, graph_enabled, exact):
         "temperature": 0.8, "top_k": 20, "seed": 42,
     }}
     offset = log.stat().st_size
-    streams = parallel(port, [greedy, sampled], exact)
+    streams = parallel(port, [greedy, sampled], exact=False)
     assert all(stream["finish"] == "length" and len(stream["tokens"]) == 32 for stream in streams)
     rows = scheduler(log, offset)
     joint_decode = [row for row in rows
                     if row["decode"] == 2 and row.get("sampling_workspace_bytes")]
-    assert joint_decode and any(row["graph_slots"].bit_count() == 2
-                                for row in joint_decode) == graph_enabled, rows
+    assert joint_decode and all(row["graph_slots"] == 0 for row in joint_decode), rows
     result["sampling-and-replay"] = {"streams": streams, "rows": rows}
     save(out / "http.json", result)
     offset = log.stat().st_size
-    result["cancel-and-replace"] = cancel_and_replace(port, maximum_width, exact)
+    result["cancel-and-replace"] = cancel_and_replace(port, maximum_width, exact=False)
     result["cancel-and-replace"]["rows"] = scheduler(log, offset)
-    result["recovery"] = parallel(port, [FIXTURES["code"]], exact)[0]
+    result["recovery"] = parallel(port, [FIXTURES["code"]], exact=False)[0]
+    replacement = result["cancel-and-replace"]["replacement"]
+    assert replacement["tokens"] == result["recovery"]["tokens"]
+    assert replacement["finish"] == result["recovery"]["finish"]
     save(out / "http.json", result)
 
 
@@ -239,10 +243,11 @@ def server(args):
     port = native.choose_port()
     command = [str(args.binary.resolve()), "--checkpoint", str(args.checkpoint.resolve()),
                "--device", "0", "--port", str(port), "--max-active", str(args.width),
-               "--fp8-prefill", args.policy, "--mtp-steps", "0", "--trace-batches"]
+               "--mtp-steps", "0", "--trace-batches"]
     if getattr(args, "max_num_batched_tokens", None) is not None:
         command += ["--max-num-batched-tokens", str(args.max_num_batched_tokens)]
-    command.append("--batch-cuda-graphs" if args.route == "graph" else "--eager")
+    if args.route == "eager":
+        command.append("--eager")
     environment = dict(os.environ, LD_PRELOAD=str(args.activity.resolve()),
                        BATCH_GRAPH_ACTIVITY=str((args.output / "cupti.tsv").resolve()))
     log_path = args.output / "server.log"
@@ -264,20 +269,17 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("width", type=int, choices=(2, 3, 4))
     parser.add_argument("route", choices=("eager", "graph"))
-    parser.add_argument("policy", choices=("exact", "tc", "tensor-core"))
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--activity", type=Path)
     args = parser.parse_args()
     if args.port:
-        check(args.port, args.output, args.width, args.route == "graph", args.policy == "exact")
+        check(args.port, args.output, args.width, args.route == "graph")
         return
     if not all((args.binary, args.checkpoint, args.activity)):
         parser.error("Starting a server requires --binary, --checkpoint and --activity")
-    if args.policy == "tc":
-        args.policy = "tensor-core"
     with server(args) as port:
-        check(port, args.output, args.width, args.route == "graph", args.policy == "exact")
+        check(port, args.output, args.width, args.route == "graph")
 
 
 if __name__ == "__main__":

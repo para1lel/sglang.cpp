@@ -218,7 +218,7 @@ extern "C" int __wrap_pthread_cond_timedwait(pthread_cond_t* condition, pthread_
 namespace sglang {
 
 struct Decoder::Model {};
-Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy) {}
+Decoder::Decoder(const std::filesystem::path&, int, bool) {}
 Decoder::~Decoder() = default;
 
 struct DecoderBatch::State {
@@ -281,7 +281,7 @@ Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepS
 int main() {
     bool passed;
     {
-        const Decoder decoder({}, 0, false, Fp8PrefillPolicy::exact);
+        const Decoder decoder({}, 0, false);
         sglang::server::BatchService service(decoder, false, true, 0, width);
         require(service.ready(), "Batch worker did not start");
         fixture.await([] { return fixture.blocking_waits > 0; });

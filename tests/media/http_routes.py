@@ -42,13 +42,12 @@ def wait_ready(process, port):
 
 
 @contextmanager
-def serve(args, label, *options, policy="exact"):
+def serve(args, label, *options):
     with closing(socket.socket()) as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     command = [str(args.server.resolve()), "--checkpoint", str(args.checkpoint.resolve()),
-               "--device", "0", "--port", str(port), "--fp8-prefill", policy,
-               "--trace-batches", *options]
+               "--device", "0", "--port", str(port), "--trace-batches", *options]
     log = args.evidence / f"{label}.server.log"
     (args.evidence / f"{label}.argv.json").write_text(json.dumps(command) + "\n")
     with log.open("wb") as stream:
@@ -283,7 +282,7 @@ def main(args):
     print("Decoded media HTTP route contract passed.")
 
 
-def ordered_fp8(args):
+def mixed_service(args):
     args.evidence.mkdir()
     prompt = json.loads((Path(__file__).parents[2] / "benchmarks/streaming/W1.json").read_text())[
         "prompt_token_ids"]
@@ -310,24 +309,13 @@ def ordered_fp8(args):
         assert len(reply["scores"]) == 2 and reply["usage"]["completion_tokens"] == 0
         return reply
 
-    exact = "exact"
-    combined = "tensor-core-mtp-target"
-    controls = {}
-    for policy in (exact, "tensor-core-mtp", "tensor-core-target", combined):
-        with serve(args, policy, "--max-active", "4", policy=policy) as (port, _):
-            observed = {name: observe(port, policy, name) for name in queries}
-            if policy == exact:
-                controls = observed
-                continue
-            for name in ("image", "video", "score"):
-                assert observed[name] == controls[name], (policy, name)
-            if policy == combined:
-                assert observed["text"] != controls["text"]
-                with ThreadPoolExecutor(max_workers=len(queries)) as executor:
-                    concurrent = list(executor.map(
-                        lambda name: observe(port, "combined-concurrent", name), queries))
-                assert dict(zip(queries, concurrent)) == observed
-    print("Ordered FP8 media, text, and exact label-score route contract passed.")
+    with serve(args, "mixed-service") as (port, _):
+        observed = {name: observe(port, "serial", name) for name in queries}
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            concurrent = list(executor.map(
+                lambda name: observe(port, "concurrent", name), queries))
+        assert dict(zip(queries, concurrent)) == observed
+    print("Default mixed media, text, and label-score route contract passed.")
 
 
 if __name__ == "__main__":
@@ -335,6 +323,6 @@ if __name__ == "__main__":
     parser.add_argument("server", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("evidence", type=Path)
-    parser.add_argument("--ordered-fp8", action="store_true")
+    parser.add_argument("--mixed-service", action="store_true")
     args = parser.parse_args()
-    (ordered_fp8 if args.ordered_fp8 else main)(args)
+    (mixed_service if args.mixed_service else main)(args)

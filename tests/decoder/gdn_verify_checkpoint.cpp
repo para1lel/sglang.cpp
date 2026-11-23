@@ -226,16 +226,11 @@ int main(int argc, char** argv) {
             prompts[lane] = ids(argv[lane + 2]);
             require(prompts[lane].size() >= 145, "short prompt fixture");
         }
-        {
-            const DecoderModel model(argv[1], 0, Fp8PrefillPolicy::tensor_core_mtp_target);
-            for (int cut = 0; cut <= rows; ++cut) {
-                test(model, prompts, cut, cut % 2 != 0);
-            }
-            test_graph(model, prompts);
+        const DecoderModel model(argv[1], 0);
+        for (int cut = 0; cut <= rows; ++cut) {
+            test(model, prompts, cut, cut % 2 != 0);
         }
-        const DecoderModel exact(argv[1], 0, Fp8PrefillPolicy::exact);
-        std::cout << "exact FP8 default control" << std::endl;
-        test(exact, prompts, 0, false);
+        test_graph(model, prompts);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

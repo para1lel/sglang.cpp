@@ -250,6 +250,42 @@ def request(port, case):
     return stream
 
 
+def serial_cases(port, cases, evidence):
+    references, responses = {}, {}
+    for key, case in cases.items():
+        output = []
+        with Stream(port, case) as stream:
+            stream.post()
+            stream.open()
+            while True:
+                event = stream.event()
+                choice, = event["choices"]
+                if not output:
+                    require(choice["prompt_token_ids"] == case["prompt"], case["name"])
+                require(choice["index"] == 0 and event.get("usage") is None, case["name"])
+                ids = choice["token_ids"]
+                if not ids:
+                    finish = choice["finish_reason"]
+                    break
+                require(choice["finish_reason"] is None, case["name"])
+                output.extend(ids)
+                require(len(output) <= case["max_tokens"], case["name"])
+            require(stream.event() == {"choices": [], "usage": {
+                "prompt_tokens": len(case["prompt"]),
+                "completion_tokens": len(output),
+                "prompt_tokens_details": {"cached_tokens": 0},
+            }}, case["name"])
+            require(stream.event() == "[DONE]" and stream.response.read(1) == b"", case["name"])
+        require(0 < len(output) <= case["max_tokens"]
+                and ((finish == "length" and len(output) == case["max_tokens"])
+                     or (finish == "stop" and output[-1] == case.get("stop_token_id"))),
+                case["name"])
+        references[key] = {**case, "output": output, "finish_reason": finish}
+        responses[key] = stream.evidence()
+    write_json(evidence, responses)
+    return references
+
+
 def trace_rows(log_path, offset, capacity):
     with log_path.open("rb") as log:
         log.seek(offset)
@@ -341,9 +377,13 @@ def check_admission(port, log_path, evidence, cases, capacity):
 def check_singleton_graph(args, evidence, width, cases):
     flags = ("--batch-cuda-graphs", "--trace-batches")
     with server(args, evidence, width, profile=True, flags=flags) as (port, log):
+        cases = serial_cases(port, cases, evidence / "serial.json")
+        offset = log.stat().st_size
         streams = [request(port, case).evidence() for case in cases.values()]
         write_json(evidence / "serial-oracle.json", streams)
-    traced = log.read_bytes().count(b"batch graph_slots=1\n")
+    trace = log.read_bytes()
+    traced = trace[offset:].count(b"batch graph_slots=1\n")
+    total_traced = trace.count(b"batch graph_slots=1\n")
     database = evidence / "graph.sqlite"
     with closing(sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)) as connection:
         launches, = connection.execute("""
@@ -352,11 +392,12 @@ def check_singleton_graph(args, evidence, width, cases):
             JOIN StringIds AS names ON api.nameId = names.id
             WHERE names.value LIKE 'cudaGraphLaunch%'
         """).fetchone()
-    expected = sum(len(case["output"]) - 1 for case in cases.values()) - 1
+    expected = sum(len(case["output"]) - 1 for case in cases.values())
     write_json(evidence / "graph-launches.json", {
-        "expected": expected, "observed": launches, "traced": traced,
+        "expected_streaming": expected, "traced_streaming": traced,
+        "observed_total": launches, "traced_total": total_traced,
     })
-    require(launches == traced == expected,
+    require(launches == total_traced and traced == expected,
             f"{width}: expected {expected} launches, got {launches} with {traced} traced")
 
 
@@ -364,6 +405,7 @@ def check_parallel(args, evidence, width, cases):
     mixed = ["numbers", "code"] if width == "2" else ["facts", "numbers", "code", "facts"]
     page = ["page-boundary", "held-out", "colors", "facts"][:int(width)]
     with server(args, evidence, width) as (port, log):
+        cases = serial_cases(port, cases, evidence / "serial.json")
         burst(port, log, evidence / "mixed-stop.json", [cases[name] for name in mixed],
               full_decode=True)
         burst(port, log, evidence / "mixed-page.json", [cases[name] for name in page],

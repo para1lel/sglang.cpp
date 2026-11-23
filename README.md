@@ -31,10 +31,12 @@ Use `host ./build/bin/sglang-generate --help` for token-ID generation options.
 
 Both executables default to four MTP draft steps. Pass `--mtp-steps 0` or `--mtp-k 0`
 to disable draft generation. On a default server launch, requests for logprobs use zero
-draft steps, and a Tensor Core prefix cache resolves the server default to zero steps.
-An explicit positive server depth rejects requests for logprobs. With prefix
-caching enabled, positive depth requires `--fp8-prefill exact`.
-The default FP8 policy is `exact`. See the [opt-in Tensor Core policies](docs/fp8-prefill-projections.md#tensor-core-projections) for precision and cache requirements.
+draft steps. An explicit positive server depth rejects requests for logprobs.
+
+On B200, text prefill uses Tensor Cores when prefix caching is off.
+Prefix caching, media, and label scoring use exact prefill.
+See [launch migration](docs/native-model-info.md#migrate-old-launch-commands)
+if you use older launch options.
 
 The HTTP server enables CUDA Graph replay for eligible decode steps by default.
 `--batch-cuda-graphs` remains accepted. Pass `--eager` to disable graph replay,
@@ -48,11 +50,13 @@ In the same shell, select the UUID of your reserved B200 and start the server.
 nvidia-smi -L
 read -r -p 'Reserved B200 UUID: ' GPU_UUID
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
-    host ./build/bin/sglang-server --device 0 --port 17384
+    host ./build/bin/sglang-server
 ```
 
 When the server listens on `127.0.0.1:17384`, send a chat request from another shell.
 The example streams assistant output as server-sent events and ends with `[DONE]`.
+Use [`GET /server_info`](docs/native-model-info.md#server-information) to verify
+the resolved settings.
 
 ```bash
 curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \

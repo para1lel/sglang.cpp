@@ -240,19 +240,22 @@ bool health_control(std::string_view name) {
 
 struct Decoder::Model {};
 
-Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy) {}
-Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy, bool) {}
+Decoder::Decoder(const std::filesystem::path&, int, bool) {}
 Decoder::~Decoder() = default;
 
 std::string_view Decoder::accelerator_name() const {
     return {};
 }
 
-bool Decoder::experimental_target_split_gqa() const {
+bool Decoder::uses_b200_operators() const {
     return false;
 }
 
-bool Decoder::experimental_long_target_split_gqa() const {
+bool Decoder::has_int8_draft_head() const {
+    return false;
+}
+
+bool Decoder::has_certified_vocab() const {
     return false;
 }
 

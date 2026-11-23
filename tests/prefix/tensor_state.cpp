@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
         const auto w3_prime = ids(argv[3], 6401);
         std::ofstream logits(argv[4], std::ios::binary);
         require(logits.good(), "Open BF16 evidence");
-        Decoder decoder(argv[1], 0, false, Fp8PrefillPolicy::tensor_core);
+        Decoder decoder(argv[1]);
         DecoderBatch oracle(decoder, {false, 1, 0});
         DecoderBatch candidate(decoder, {true, 4, 2});
         for (const int size : {127, 128, 129, 255, 256, 257, 385}) {

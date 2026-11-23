@@ -216,7 +216,7 @@ void drain(DecoderBatch& batch, std::vector<Lane>& lanes, int cached, bool graph
 }
 
 void check_checkpoint(const char* checkpoint) {
-    Decoder decoder(checkpoint, 0, false, Fp8PrefillPolicy::exact);
+    Decoder decoder(checkpoint);
     for (const bool graphs : {false, true}) {
         DecoderBatch batch(decoder, {graphs, 4, 4});
         std::vector<Lane> reference{{0, 0, -1, 8}, {1, 1, -1, 8}, {3, 2, -1, 8}};

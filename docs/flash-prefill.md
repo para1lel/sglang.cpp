@@ -4,38 +4,37 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L888)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L370)<!-- prefix: "const auto s" --> |
-| Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L908)<!-- prefix: "cudaError_t " --> |
+| Decoder | Select the target prefill policy and append KV before attention. | [Policy](../src/decoder_prefill.cpp#L853)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L370)<!-- prefix: "const auto s" --> |
+| Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L905)<!-- prefix: "cudaError_t " --> |
 | Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L545)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L751)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
 
 ## Runtime path
 
-The CLI, server, and C++ default to `exact`. [Full-tile `tensor-core` dispatch](../src/mxfp8_gqa_prefill.cu#L936)<!-- prefix: "if (rows == " --> uses `SGLANG_EXPERIMENTAL_TMEM_PREFILL` and the zero-based start.
+Eligible B200 text prefill uses the native Flash dispatcher. The full-tile
+path checks the zero-based start, aligned buffers, and available device
+resources. Exact scoring, cached prompt prefill, and media use separate
+language prefill paths.
 
-| Setting | TMEM route | Start position for 1,024 query rows |
-| --- | --- | --- |
-| Unset | Raw paired ordered | 4,096–7,168, at 1,024-token boundaries |
-| Unset or `ragged` | Staged or raw paired ordered | 8,192–31,744, at 1,024-token boundaries or inside a 128-token page |
-| Unset | [Raw paired ordered](../src/mxfp8_gqa_prefill.cu#L949)<!-- prefix: "if (default_" --> | 32,768–130,048, at 1,024-token boundaries |
-| `paired` | Paired ordered | Any start from 8,192 through 130,048 |
-| `ordered` | Single-CTA ordered | At least 8,192, divisible by 64 |
-| `1` | Three-part split | At least 32,768, divisible by 64 |
-| Any other set value, including empty or `wide` | Disabled | Regular Flash and its fallbacks |
+| Automatic TMEM route | Start position for 1,024 query rows |
+| --- | --- |
+| Raw paired ordered | 4,096–7,168, at 1,024-token boundaries |
+| Staged or raw paired ordered | 8,192–31,744, at 1,024-token boundaries or inside a 128-token page |
+| [Raw paired ordered](../src/mxfp8_gqa_prefill.cu#L942)<!-- prefix: "if (default_" --> | 32,768–130,048, at 1,024-token boundaries |
 
-With the variable unset, 148-SM SM100 devices try ordered TMEM for 256–512 rows, start ≥8,192, and visibility ≤32,768. Both scale bases need eight-byte alignment. `ragged` lowers the start to 4,096 under explicit TMEM resource checks. [Partial TMEM selection](../src/mxfp8_gqa_prefill.cu#L923)<!-- prefix: "const bool d" -->
+On 148-SM SM100 devices, automatic dispatch tries ordered TMEM for 256–512 rows, start ≥8,192, and visibility ≤32,768. Both scale bases need eight-byte alignment. [Partial TMEM selection](../src/mxfp8_gqa_prefill.cu#L918)<!-- prefix: "const bool r" -->
 
-The [SM100 page-128 opt-ins](sm100-page128-prefill.md) run first. Media and tensor-core prefix-cache tiles cap at 128 rows. Ordered tensor-core text with MTP can use 1,024-row tiles.
+Media tiles cap at 128 rows. Eligible tensor-core text with MTP can use 1,024-row tiles. The [SM100 page-128 study](sm100-page128-prefill.md) describes the earlier selectable alternatives.
 
 Flash and TMEM follow the page table and process causal 64-key tiles using BF16 products, FP32 accumulation, and online normalization.
 
-Regular Flash packs BF16 probabilities into PV registers in reduction order. `cp.async` overlaps the next tile's KV loads with computation. Partial blocks stage zeros, mask scores, and skip output and repair for inactive queries. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L674)<!-- prefix: "__global__ v" -->
+Regular Flash packs BF16 probabilities into PV registers in reduction order. `cp.async` overlaps the next tile's KV loads with computation. Partial blocks stage zeros, mask scores, and skip output and repair for inactive queries. [Regular Flash](../src/mxfp8_gqa_prefill.cu#L672)<!-- prefix: "__global__ v" -->
 
-From position 1,024, full Flash tiles try one B200 wave of 144 blocks with 88 rows and 352 threads each. [Wide dispatch](../src/mxfp8_gqa_prefill.cu#L759)<!-- prefix: "if (aligned_" -->
+From position 1,024, full Flash tiles try one B200 wave of 144 blocks with 88 rows and 352 threads each. [Wide dispatch](../src/mxfp8_gqa_prefill.cu#L757)<!-- prefix: "if (aligned_" -->
 
-Aligned partial tiles from position 4,096 size CTAs for 12 head pairs and the device SM count. Try 32 or 48 rows if they fit one wave. Try 88 when it fits one wave and 64 needs two. On 148 SMs, these choices cover grants of 144–384, 385–576, and 769–1,023 rows, respectively. The 32- and 48-row CTAs use 256 threads for staging and repair, with 128 and 192 for MMA. [Partial dispatch](../src/mxfp8_gqa_prefill.cu#L766)<!-- prefix: "if (aligned_" -->
+Aligned partial tiles from position 4,096 size CTAs for 12 head pairs and the device SM count. Try 32 or 48 rows if they fit one wave. Try 88 when it fits one wave and 64 needs two. On 148 SMs, these choices cover grants of 144–384, 385–576, and 769–1,023 rows, respectively. The 32- and 48-row CTAs use 256 threads for staging and repair, with 128 and 192 for MMA. [Partial dispatch](../src/mxfp8_gqa_prefill.cu#L764)<!-- prefix: "if (aligned_" -->
 
-The 32-, 48-, and 88-row variants use `ldmatrix.x4` to load two BF16 K or V fragments in MMA order. A warp skips masking if all queries are active and see all 64 keys. It skips PV rescaling if every history multiplier is `+1`. Extra warps in an 88-row block finish before repair. [Fragment loads](../src/mxfp8_gqa_prefill.cu#L351)<!-- prefix: "__device__ _" --> · [Score mask](../src/mxfp8_gqa_prefill.cu#L637)<!-- prefix: "const bool f" --> · [PV rescaling](../src/mxfp8_gqa_prefill.cu#L552)<!-- prefix: "if constexpr" -->
+The 32-, 48-, and 88-row variants use `ldmatrix.x4` to load two BF16 K or V fragments in MMA order. A warp skips masking if all queries are active and see all 64 keys. It skips PV rescaling if every history multiplier is `+1`. Extra warps in an 88-row block finish before repair. [Fragment loads](../src/mxfp8_gqa_prefill.cu#L349)<!-- prefix: "__device__ _" --> · [Score mask](../src/mxfp8_gqa_prefill.cu#L635)<!-- prefix: "const bool f" --> · [PV rescaling](../src/mxfp8_gqa_prefill.cu#L550)<!-- prefix: "if constexpr" -->
 
 ### Long-tile TMEM pipeline
 
@@ -57,13 +56,13 @@ Two stages alternate scores, BF16 probabilities, and V. Producers await QK befor
 
 PV awaits both CTAs' BF16 probabilities and V, then releases operands. Softmax preserves 64-key reduction order and rescales the FP32 accumulator after the preceding PV. The final wait precedes output, deallocation, and repair. [Operand wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L646)<!-- prefix: "pair_wait(tm" --> · [Correction](../src/text/mxfp8_gqa_prefill_tmem.cu#L705)<!-- prefix: "tmem_correct" --> · [Final wait](../src/text/mxfp8_gqa_prefill_tmem.cu#L711)<!-- prefix: "tmem_mma_wai" --> · [Repair](../src/text/mxfp8_gqa_prefill_tmem.cu#L590)<!-- prefix: "__device__ v" -->
 
-Capture records one node with maps by value and zero global scratch. Keep KV, pages, queries, and output valid through replay. Intermediate prefill can skip scoring. [Arguments](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Batch scoring](../src/decoder_batch.cpp#L731)<!-- prefix: "if (rows[slo" -->
+Capture records one node with maps by value and zero global scratch. Keep KV, pages, queries, and output valid through replay. Intermediate prefill can skip scoring. [Arguments](../src/text/mxfp8_gqa_prefill_tmem.cu#L654)<!-- prefix: "__global__ v" --> · [Batch scoring](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/decoder_batch.cpp#L731)<!-- prefix: "if (rows[slo" -->
 
 Split TMEM uses three contiguous partitions per query block and head pair. Its 76,087,296 scratch bytes hold FP32 numerators, maxima, and masses. Merge rescales, combines, normalizes, and rounds to BF16. Allocation and release share one stream. [Scratch allocation](../src/text/mxfp8_gqa_prefill_tmem.cu#L973)<!-- prefix: "status = cud" -->
 
 ## Constraints and failure behavior
 
-Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L933)<!-- prefix: "if (rows >= " --> · [Decoder](../src/decoder_prefill.cpp#L858)<!-- prefix: "if (rows == " -->
+Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L927)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L822)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 
@@ -89,27 +88,27 @@ FlashInfer's [Blackwell paged context API](https://github.com/flashinfer-ai/flas
 
 Check BF16 results against independent FP64 and compare logits and IDs. Test causality, remaps, guards, repair, graph replay, and dispatch fallbacks.
 
-Run the [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L952)<!-- prefix: "void check_f" --> on a reserved B200 using the [checker commands](development.md#p2-gqa-verification). Against FP64, require sampled maximum absolute error below 0.08 and normalized RMSE below 0.005. [FP64 limits](../tests/mxfp8_gqa_flash_check.cu#L451)<!-- prefix: "if (!(max_ab" -->
+Run the [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L879)<!-- prefix: "void check_f" --> on a reserved B200 using the [checker commands](development.md#p2-gqa-verification). Against FP64, require sampled maximum absolute error below 0.08 and normalized RMSE below 0.005. [FP64 limits](../tests/mxfp8_gqa_flash_check.cu#L397)<!-- prefix: "if (!(max_ab" -->
 
-The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L879)<!-- prefix: "void check_p" --> cover the 143/144 and 191/192/193 row boundaries and unaligned K/V scale parity. [Tail recovery](../tests/mxfp8_gqa_flash_check.cu#L912)<!-- prefix: "void check_t" --> confines nonfinite outputs to affected channels on the final active row.
+The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L806)<!-- prefix: "void check_p" --> cover the 143/144 and 191/192/193 row boundaries and unaligned K/V scale parity. [Tail recovery](../tests/mxfp8_gqa_flash_check.cu#L839)<!-- prefix: "void check_t" --> confines nonfinite outputs to affected channels on the final active row.
 
-The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L805)<!-- prefix: "void check_l" --> check 32,768/32,769-token partial tiles, the 131,072-token cap, causality, and overflow recovery. The aligned 1,023-row case checks geometry by SM count and shared memory. At 32,768, ordered TMEM matches unaligned-scale output. At 32,769, compare wide and synchronous Flash.
+The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L748)<!-- prefix: "void check_l" --> check 32,768/32,769-token partial tiles, the 131,072-token cap, causality, and overflow recovery. The aligned 1,023-row case checks geometry by SM count and shared memory. At 32,769, compare wide and synchronous Flash.
 
 Check ordered and protected fallback bitwise against the ordered FP32 reference for finite scores and quotients. Check FP64 recovery independently. Use the [exact prefill runbook](../tests/prefill/README.md) for the separate `exact` contract.
 
 For partial Flash changes, match BF16 outputs bitwise on identical checkpoint Q and KV. Match full-vocabulary BF16 logits and greedy IDs across prefill and decode with identical grants and teacher tokens. Cover unaligned starts, remaps, unwritten tails, and unchanged shapes. Weight eager timings by recorded tile counts.
 
-The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L786)<!-- prefix: "void check_t" --> check dispatch and alignment at ordered TMEM start 8,192 and split start 32,768. [Graph checks](../tests/mxfp8_gqa_flash_check.cu#L382)<!-- prefix: "void check_d" --> require one ordered node or four split nodes. [Split checks](../tests/mxfp8_gqa_flash_check.cu#L352)<!-- prefix: "void check_t" --> verify dependencies and scratch lifetime.
+The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L727)<!-- prefix: "void check_p" --> check dispatch and alignment at the first eligible paired start, 4,096. [Graph checks](../tests/mxfp8_gqa_flash_check.cu#L335)<!-- prefix: "void check_d" --> require one node for the automatic path. The [historical split checks](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/tests/mxfp8_gqa_flash_check.cu#L352)<!-- prefix: "void check_t" --> verified graph dependencies and scratch lifetime.
 
 ### Paired ordered TMEM verification
 
-The [aligned regression](../tests/mxfp8_gqa_flash_check.cu#L676)<!-- prefix: "void check_p" --> checks dispatch, replay, causality, and 1,023-row parity with synchronous 64-row Flash using unaligned V scales. The [unaligned regression](../tests/mxfp8_gqa_flash_check.cu#L765)<!-- prefix: "void check_u" --> checks page offsets 1, 63, 64, and 127, replay, short page counts, and causal repair.
+The [aligned regression](../tests/mxfp8_gqa_flash_check.cu#L624)<!-- prefix: "void check_p" --> checks dispatch, replay, causality, and 1,023-row parity with synchronous 64-row Flash using unaligned V scales. The [unaligned regression](../tests/mxfp8_gqa_flash_check.cu#L706)<!-- prefix: "void check_u" --> checks page offsets 1, 63, 64, and 127, replay, short page counts, and causal repair.
 
 For paired changes, replay aligned and unaligned 1,024-row checkpoint captures with remaps. Compare all BF16 outputs with the prior kernel and wide Flash. Require one paired graph node and eager parity. Mutate one visible V on each of a full and partial page. Check earlier rows and unaffected heads. Run memcheck, initcheck, and synccheck on repair with unwritten tails. Record racecheck launch size and repair coverage.
 
 Time raw paired graph replay in A/B/B/A order. Weight starts by launch count. See [eager staging checks](native-prefill-workspace.md#verification) and [serving gates](performance.md#scheduler-and-reporting-policy).
 
-Check starts 31,744 and 32,768, the visibility cap, and off-grid starts with the selector unset.
+Check starts 31,744 and 32,768, the visibility cap, and off-grid starts.
 
 ### Ordered TMEM operator verification
 
@@ -133,9 +132,10 @@ Identical-input replays used the first eligible tile at position 32,768 in layer
 
 Split TMEM on the first eligible call preserved argmax 7,035 (+0.010311 nats NLL). The first 256 eligible calls changed it to 3,470 (+18.999520 nats). The source of full-model drift remains unresolved. Two tile replays and one document leave corpus quality and serving acceptance open. Split TMEM requires opt-in because of this drift.
 
-#### Reproduce the first-token comparison
+#### Reproduce the historical first-token comparison
 
-Build the generator with the [P2 build command](development.md#p2-gqa-verification). Regenerate the [W6 fixtures](../benchmarks/concurrent/README.md#regenerate-and-measure) with the Qwen3.8-27B-FP8 tokenizer. Set `FIXTURES` to that fixture directory, `CHECKPOINT` to the checkpoint, and use the same `BUILD_WORK_DIR` and `GPU_UUID` as for the checker.
+Use the historical generator revision and settings from the experiment above.
+Regenerate the [W6 fixtures](../benchmarks/concurrent/README.md#regenerate-and-measure) with the Qwen3.8-27B-FP8 tokenizer. Set `FIXTURES` to that fixture directory and `CHECKPOINT` to the checkpoint. Use the same `BUILD_WORK_DIR` and `GPU_UUID` as for the checker.
 
 ```bash
 python - "$FIXTURES/W6/00.request.json" > prompt-96k.ids <<'PY'

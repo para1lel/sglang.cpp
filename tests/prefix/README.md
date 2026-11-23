@@ -82,7 +82,7 @@ for mode in enabled disabled; do
         check_flags+=(--disabled)
     fi
     CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/bin/sglang-server" --checkpoint "$checkpoint" \
-        --port "$port" --fp8-prefill exact --max-active 4 --batch-cuda-graphs \
+        --port "$port" --max-active 4 --batch-cuda-graphs \
         "${cache_flags[@]}" >"$out/$mode.log" 2>&1 &
     server=$!
     trap 'kill "$server" 2>/dev/null || true' EXIT

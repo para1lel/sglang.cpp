@@ -705,7 +705,7 @@ int main(int argc, char** argv) {
     try {
         require(argc == 2, "Usage: logit-bias-check CHECKPOINT");
         const std::filesystem::path checkpoint(argv[1]);
-        Decoder decoder(checkpoint, 0, true, Fp8PrefillPolicy::tensor_core);
+        Decoder decoder(checkpoint, 0, true);
         const Tokenizer tokenizer(checkpoint / "tokenizer.json");
         verify_singleton(decoder, tokenizer);
         verify_output_history(decoder);

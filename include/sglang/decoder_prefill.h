@@ -39,6 +39,7 @@ struct PrefillGrant {
     MtpDraftRequest* draft;
     const MediaPrefill* media;
     const PromptLogprobCapture* scores = nullptr;
+    bool exact = false;
 };
 
 struct PrefillProjections {
@@ -89,7 +90,7 @@ inline bool pairable_prefill_grants(const PrefillGrant* grants, int count) {
         const auto& grant = grants[index];
         if (grant.tile_rows != batch_prefill_tile_rows || grant.rows != grants[0].rows ||
             grant.rows % batch_prefill_tile_rows != 0 || !grant.draft || grant.media ||
-            grant.scores) {
+            grant.scores || grant.exact) {
             return false;
         }
     }

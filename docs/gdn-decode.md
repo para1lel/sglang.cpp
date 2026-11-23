@@ -2,26 +2,28 @@
 
 ## Responsibilities and sources of truth
 
-Packed gated delta network (GDN) decode updates recurrent state and convolution history for each active row.
+The historical packed K0 gated delta network (GDN) decode updated
+recurrent state and convolution history for each active row. Current
+verification uses its [grouped GDN forward path](../src/decoder_forward.cpp#L366)<!-- prefix: "void run_gdn" -->.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Batch graph | Bind each row to its request's state. | [Batch runtime](batch-graphs.md#runtime-path) |
-| Scratch | Own normalized vectors and gate values for the batch. | [Scratch allocation](../src/text/decoder_graph_packed.cpp#L187)<!-- prefix: "rows_.normal" --> |
-| Dispatch | Select the three launches by submitted width. | [GDN dispatch](../src/text/decoder_graph_ops.cu#L403)<!-- prefix: "if (rows >= " --> |
-| Convolution | Prepare the inputs to recurrence and advance wide-path history. | [Packed convolution](../src/text/decoder_graph_ops.cu#L63)<!-- prefix: "__global__ v" --> |
-| Recurrence | Update each request's FP32 state and write the BF16 observable. | [Scalar recurrence](../src/text/decoder_graph_ops.cu#L121)<!-- prefix: "__global__ v" --> · [Streaming recurrence](../src/text/decoder_graph_ops.cu#L181)<!-- prefix: "__global__ v" --> |
-| Finish | Apply gated RMS normalization and advance narrow-path history. | [Packed finish](../src/text/decoder_graph_ops.cu#L259)<!-- prefix: "__global__ v" --> |
+| Scratch | Own normalized vectors and gate values for the batch. | [Scratch allocation](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L187)<!-- prefix: "rows_.normal" --> |
+| Dispatch | Select the three launches by submitted width. | [GDN dispatch](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L403)<!-- prefix: "if (rows >= " --> |
+| Convolution | Prepare the inputs to recurrence and advance wide-path history. | [Packed convolution](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L63)<!-- prefix: "__global__ v" --> |
+| Recurrence | Update each request's FP32 state and write the BF16 observable. | [Scalar recurrence](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L121)<!-- prefix: "__global__ v" --> · [Streaming recurrence](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L181)<!-- prefix: "__global__ v" --> |
+| Finish | Apply gated RMS normalization and advance narrow-path history. | [Packed finish](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L259)<!-- prefix: "__global__ v" --> |
 
 ## Runtime path
 
-The [packed input projection](long-paged-decode.md#packed-rmsnorm-programmatic-launch) produces QKV and Z. The GDN gate projection reads the BF16 normalized rows from the same RMSNorm. [Gate call](../src/text/decoder_graph_packed.cpp#L298)<!-- prefix: "check(text_b" -->
+The [packed input projection](long-paged-decode.md#packed-rmsnorm-programmatic-launch) produces QKV and Z. The GDN gate projection reads the BF16 normalized rows from the same RMSNorm. [Gate call](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L298)<!-- prefix: "check(text_b" -->
 
 Eager execution and graph replay use the same packed dispatch. Convolution rounds its activated result to BF16 before normalizing Q and K. It writes BF16 convolved values and FP32 normalized vectors, decay, and beta to batch scratch. Each recurrence warp reuses these inputs across four value rows. Finish applies gated RMS normalization to the BF16 recurrence observable. The batch stream orders the three launches and allows the next layer to reuse the scratch.
 
-Submitted width selects the path, including when the replay has a shorter live prefix. Below width 8, the scalar recurrence uses eight warps per CTA and finish shifts history in separate CTAs. At width 8 and above, each convolution thread loads a tap before writing it into the preceding history slot. The final tap appends the raw current QKV sample. Finish launches only the gated normalization CTAs. [History shift](../src/text/decoder_graph_ops.cu#L80)<!-- prefix: "if constexpr" -->
+Submitted width selects the path, including when the replay has a shorter live prefix. Below width 8, the scalar recurrence uses eight warps per CTA and finish shifts history in separate CTAs. At width 8 and above, each convolution thread loads a tap before writing it into the preceding history slot. The final tap appends the raw current QKV sample. Finish launches only the gated normalization CTAs. [History shift](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L80)<!-- prefix: "if constexpr" -->
 
-The streaming recurrence uses four warps per CTA, with 16 value rows per CTA and eight CTAs per request and value head. Each lane processes four K elements at a stride of 32. Streaming loads and stores move FP32 state directly between global memory and registers. Each FP32x2 instruction pairs independent value rows and preserves the scalar multiply, FMA, and XOR reduction order within each row. [State load](../src/text/decoder_graph_ops.cu#L214)<!-- prefix: "const float2" --> · [State store](../src/text/decoder_graph_ops.cu#L242)<!-- prefix: "__stcs(addre" --> · [Warp reduction](../src/text/decoder_graph_ops.cu#L40)<!-- prefix: "__device__ f" -->
+The streaming recurrence uses four warps per CTA, with 16 value rows per CTA and eight CTAs per request and value head. Each lane processes four K elements at a stride of 32. Streaming loads and stores move FP32 state directly between global memory and registers. Each FP32x2 instruction pairs independent value rows and preserves the scalar multiply, FMA, and XOR reduction order within each row. [State load](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L214)<!-- prefix: "const float2" --> · [State store](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L242)<!-- prefix: "__stcs(addre" --> · [Warp reduction](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L40)<!-- prefix: "__device__ f" -->
 
 FlashInfer v0.7.4's single-token FP32 pretranspose kernel provides a source comparison for SM100. For `V = K = 128`, it also assigns 16 value rows per CTA and eight CTAs per request and value head. It stages FP32 `[V,K]` state in shared memory with cache-global 128-bit `cp.async`, moving four contiguous K elements per lane. It then updates the state in registers, uses warp butterfly reductions, and writes to the destination pool slot. [FlashInfer launch](https://github.com/flashinfer-ai/flashinfer/blob/77039051b0be921788dc2784ec41423b558878ec/flashinfer/gdn_kernels/gdn_decode_pretranspose.py#L725-L793) · [FlashInfer recurrence](https://github.com/flashinfer-ai/flashinfer/blob/77039051b0be921788dc2784ec41423b558878ec/flashinfer/gdn_kernels/gdn_decode_pretranspose.py#L280-L367)
 

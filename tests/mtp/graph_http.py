@@ -78,7 +78,7 @@ def exercise(args, arm, graphs, clock=lambda: 0):
         "selector": (http.TEXT, http.MASKED),
     }
     wire, traces, intervals = {}, {}, {}
-    with http.server(args, output, 2, 1, "tensor-core", flags) as (port, log):
+    with http.server(args, output, 2, 1, flags) as (port, log):
         for name, (route, body) in cases.items():
             start = clock()
             wire[name], traces[name] = request(port, log, output, name, route, body)

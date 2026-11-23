@@ -78,7 +78,7 @@ void check_scores(const DecoderResult& result) {
 void check_terminal(Outcome outcome, bool scored) {
     Scenario events;
     scenario = &events;
-    const Decoder decoder({}, 0, false, Fp8PrefillPolicy::exact);
+    const Decoder decoder({}, 0, false);
     BatchService service(decoder, false, true, 0, width, 0, decoder_batch_max_step_tokens);
     BatchRequestId id("terminal-race");
     std::array<DecoderResult, width> results;
@@ -171,7 +171,7 @@ void check_terminal(Outcome outcome, bool scored) {
 namespace sglang {
 
 struct Decoder::Model {};
-Decoder::Decoder(const std::filesystem::path&, int, bool, Fp8PrefillPolicy) {}
+Decoder::Decoder(const std::filesystem::path&, int, bool) {}
 Decoder::~Decoder() = default;
 
 struct DecoderBatch::State {

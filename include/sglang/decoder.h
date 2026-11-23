@@ -144,36 +144,10 @@ struct DecoderResult {
     std::shared_ptr<const std::vector<double>> label_logprobs = nullptr;
 };
 
-enum class Fp8PrefillPolicy {
-    exact,
-    tensor_core,
-    tensor_core_mtp,
-    tensor_core_target,
-    tensor_core_mtp_target,
-};
-
-inline constexpr bool mtp_tensor_core_prefill(Fp8PrefillPolicy policy) {
-    return policy == Fp8PrefillPolicy::tensor_core_mtp ||
-           policy == Fp8PrefillPolicy::tensor_core_mtp_target;
-}
-
-inline constexpr bool tensor_core_target(Fp8PrefillPolicy policy) {
-    return policy == Fp8PrefillPolicy::tensor_core_target ||
-           policy == Fp8PrefillPolicy::tensor_core_mtp_target;
-}
-
-inline constexpr bool token_ordered_decode(Fp8PrefillPolicy policy) {
-    return mtp_tensor_core_prefill(policy) || tensor_core_target(policy);
-}
-
 class Decoder {
 public:
     explicit Decoder(const std::filesystem::path& checkpoint, int cuda_device = 0);
     Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp);
-    Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
-            Fp8PrefillPolicy fp8_prefill);
-    Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
-            Fp8PrefillPolicy fp8_prefill, bool mtp_int8_head);
     ~Decoder();
 
     Decoder(const Decoder&) = delete;
@@ -189,8 +163,9 @@ public:
                                       const DecoderCallbacks& callbacks = DecoderCallbacks{}) const;
     std::size_t model_device_allocation_bytes() const;
     std::string_view accelerator_name() const;
-    bool experimental_target_split_gqa() const;
-    bool experimental_long_target_split_gqa() const;
+    bool uses_b200_operators() const;
+    bool has_int8_draft_head() const;
+    bool has_certified_vocab() const;
 
 private:
     friend class DecoderBatch;

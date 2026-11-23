@@ -1,8 +1,9 @@
-"""Opt-in native CLI and HTTP acceptance for exact prefill on a reserved B200."""
+"""Native prefill acceptance on a reserved B200."""
 
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -15,7 +16,7 @@ import time
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT.parent))
 from batch.run_native import (
-    TRACE, Stream, await_retirement, burst, request, require, server, write_json,
+    TRACE, Stream, await_retirement, burst, request, require, serial_cases, server, write_json,
 )
 
 BOUNDARIES = (1, 2, 127, 128, 129, 257, 511)
@@ -56,59 +57,59 @@ def score_digest(rows):
     return digest.hexdigest()
 
 
-def check_policy(args):
+def check_cli_options(args):
     environment = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
-    for executable, serving in ((args.generate, False), (args.server, True)):
+    for executable in (args.generate, args.server):
         if executable is None:
             continue
         executable = executable.resolve(strict=True)
-        cases = [
-            (["--help"], 0, "tensor-core-target|tensor-core-mtp-target"),
-            (["--fp8-prefill", "auto"], 1, "Expected --fp8-prefill exact, tensor-core"),
-            (["--fp8-prefill", ""], 1, "Expected --fp8-prefill exact, tensor-core"),
-        ]
-        missing = "value" if serving else "argument"
-        cases.append((["--fp8-prefill"], 1, f"Missing {missing} for --fp8-prefill"))
-        if serving:
-            for policy in ("tensor-core-mtp", "tensor-core-target", "tensor-core-mtp-target"):
-                cases.append((
-                    ["--fp8-prefill", policy, "--prefix-cache-entries", "1"],
-                    1, "Selected FP8 policy requires prefix cache off",
-                ))
-            cases.append((
-                ["--fp8-prefill", "tensor-core", "--max-active", "2", "--mtp-steps", "5"],
-                1, "Expected --mtp-steps in [0, 4]",
-            ))
-        for flags, status, message in cases:
+        for flags, status, message in (
+            (["--help"], 0, "--mtp-steps"),
+            (["--fp8-prefill", "exact"], 1, "--fp8-prefill"),
+            (["--fp8-prefill", "tensor-core"], 1, "--fp8-prefill"),
+        ):
             result = subprocess.run([str(executable), *flags], env=environment, text=True,
                                     capture_output=True, timeout=10)
             output = result.stdout if status == 0 else result.stderr
             require(result.returncode == status and message in output,
                     f"{executable.name} {flags}: {result.returncode}, {output}")
-    print("FP8 prefill policy option checks passed with CUDA devices hidden")
+            if status == 0:
+                require("--fp8-prefill" not in output, f"{executable.name}: obsolete selector")
+    print("CLI selector checks passed with CUDA devices hidden")
+
+
+def cli_result(args, case, evidence):
+    evidence.mkdir()
+    command = [
+        str(args.generate), "--checkpoint", str(args.checkpoint), "--device", str(args.device),
+        "--prompt-ids", ",".join(map(str, case["prompt"])), "--max-new-tokens",
+        str(case["max_tokens"]), "--top-logits", "64", "--mtp-steps", "0",
+    ]
+    write_json(evidence / "command.json", command)
+    output_path = evidence / "stdout.json"
+    with output_path.open("wb") as output, (evidence / "stderr.log").open("wb") as errors:
+        subprocess.run(command, stdout=output, stderr=errors, check=True, timeout=120)
+    result = json.loads(output_path.read_text())
+    rows = result["step_top_logits"]
+    tokens = result["output_token_ids"]
+    require(result["prompt_token_ids"] == case["prompt"] and result["finish_reason"] == "length"
+            and len(rows) == len(tokens) == case["max_tokens"], case["name"])
+    for token, row in zip(tokens, rows, strict=True):
+        scores = [entry["logit"] for entry in row]
+        require(len(row) == 64 and row[0]["token_id"] == token
+                and len({entry["token_id"] for entry in row}) == 64
+                and all(math.isfinite(score) for score in scores)
+                and scores == sorted(scores, reverse=True), case["name"])
+    return tokens, score_digest(rows)
 
 
 def check_cli(args, cases):
     for case in cases.values():
         evidence = args.evidence / case["name"]
         evidence.mkdir()
-        prompt = case["prompt"]
-        command = [
-            str(args.generate), "--checkpoint", str(args.checkpoint), "--device", str(args.device),
-            "--prompt-ids", ",".join(map(str, prompt)), "--max-new-tokens", str(case["max_tokens"]),
-            "--top-logits", "64", "--mtp-steps", "0",
-        ]
-        write_json(evidence / "command.json", command)
-        output_path = evidence / "stdout.json"
-        with output_path.open("wb") as output, (evidence / "stderr.log").open("wb") as errors:
-            subprocess.run(command, stdout=output, stderr=errors, check=True, timeout=120)
-        result = json.loads(output_path.read_text())
-        rows = result["step_top_logits"]
-        require(result["prompt_token_ids"] == prompt
-                and result["output_token_ids"] == case["output"]
-                and result["finish_reason"] == "length" and len(rows) == case["max_tokens"]
-                and all(len(row) == 64 for row in rows)
-                and score_digest(rows) == case["top64_sha256"], case["name"])
+        first = cli_result(args, case, evidence / "first")
+        repeat = cli_result(args, case, evidence / "repeat")
+        require(first == repeat, f"{case['name']}: repeated IDs or ranked scores differ")
 
 
 def prefill_rows(log_path, offset):
@@ -169,14 +170,15 @@ def check_reset(port, log_path, evidence, width, cases):
 def check_http_baseline(args, cases, name, width, flags, limits):
     evidence = args.evidence / name
     with server(args, evidence, width, flags=flags, expected_health=limits) as (port, _):
-        streams = [request(port, case).evidence() for case in cases.values()]
+        references = serial_cases(port, cases, evidence / "serial.json")
+        streams = [request(port, case).evidence() for case in references.values()]
         write_json(evidence / "streams.json", streams)
 
 
 def check_http(args, cases):
     check_http_baseline(args, cases, "http-default", None, (),
                         {"max_active": 32, "max_num_batched_tokens": 8192})
-    check_http_baseline(args, cases, "http-1", "1", ("--eager", "--fp8-prefill", "exact"),
+    check_http_baseline(args, cases, "http-1", "1", ("--eager",),
                         {"max_active": 1, "max_num_batched_tokens": 8192})
     for width, lengths in ((2, (129, 257)), (4, (2, 127, 129, 257))):
         evidence = args.evidence / f"http-{width}"
@@ -184,8 +186,10 @@ def check_http(args, cases):
         limits = {"max_active": width, "max_num_batched_tokens": BATCH_TOKEN_BUDGET}
         with server(args, evidence, str(width), flags=flags,
                     expected_health=limits) as (port, log_path):
+            references = serial_cases(port, {length: cases[length] for length in lengths},
+                                      evidence / "serial.json")
             offset = log_path.stat().st_size
-            burst(port, log_path, evidence / "cohort.json", [cases[size] for size in lengths],
+            burst(port, log_path, evidence / "cohort.json", list(references.values()),
                   full_decode=False)
             await_retirement(log_path, offset, width)
             rows = prefill_rows(log_path, offset)
@@ -200,7 +204,7 @@ def check_http(args, cases):
             require(any(decodes and max(positions) > 1 for _, decodes, positions, _ in rows),
                     "No decode progress alongside chunked prefill")
             if width == 4:
-                check_reset(port, log_path, evidence / "reset.json", width, cases)
+                check_reset(port, log_path, evidence / "reset.json", width, references)
 
 
 def main():
@@ -217,7 +221,7 @@ def main():
     if args.check_policy:
         if not (args.generate or args.server):
             parser.error("Provide at least one release executable for --check-policy")
-        check_policy(args)
+        check_cli_options(args)
         return
     cases = load_cases()
     if args.check_fixtures and not (args.generate or args.server):

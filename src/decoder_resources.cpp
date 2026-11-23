@@ -148,7 +148,7 @@ struct Allocations::State {
     }
 
     bool owns_cuda() const {
-        return stream || packed_winners || generated_logprobs || !blocks.empty();
+        return stream || generated_logprobs || !blocks.empty();
     }
 
     CleanupError close_stream(std::shared_ptr<const void>& drained_owners);
@@ -172,8 +172,7 @@ struct Allocations::State {
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
-    std::array<BatchGraph, decoder_batch_max_graph_lanes + 1 + packed_decode_buckets.size()>
-        batch_graphs{};
+    std::array<BatchGraph, decoder_batch_max_graph_lanes + 1> batch_graphs{};
     bool verification_graph_incomplete = false;
     bool uncertain_stream = false;
     bool uncertain_graph = false;
@@ -184,9 +183,7 @@ struct Allocations::State {
     CleanupError uncertain;
     CleanupError terminal;
     TransferBuffers transfers;
-    TextLogitCandidate* packed_winners = nullptr;
     GeneratedLogprobReadback* generated_logprobs = nullptr;
-    bool packed_winners_unavailable = false;
     std::optional<ExactGqaWorkspace> singleton_scores;
     std::shared_ptr<const void> owners;
     std::unique_ptr<State> next;
@@ -264,8 +261,6 @@ CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& d
     if (terminal || (stream && !uncertain_stream)) {
         return error;
     }
-    const auto packed = release_pinned(packed_winners, "Free packed winner storage");
-    if (terminal) return terminal;
     const auto logprobs = release_pinned(generated_logprobs, "Free generated logprob readback");
     if (terminal) return terminal;
     while (blocks.size() > uncertain_blocks) {
@@ -285,7 +280,7 @@ CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& d
         std::swap(blocks[uncertain_blocks++], blocks.back());
     }
     if (uncertain) return uncertain;
-    return packed ? packed : logprobs;
+    return logprobs;
 }
 
 CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_owners) {
@@ -553,26 +548,6 @@ collect_generated_logprobs(const GeneratedLogprobReadback& row, int top) {
         DecoderTokenLogprobs{row.selected, {row.alternatives, row.alternatives + top}});
 }
 
-TextLogitCandidate* Allocations::prepare_packed_winners() {
-    if (!state_->packed_winners && !state_->packed_winners_unavailable) {
-        check(cudaPeekAtLastError(), "Check CUDA error before allocating packed winner storage");
-        void* storage = nullptr;
-        const auto bytes = packed_decode_max_rows * sizeof(TextLogitCandidate);
-        const auto status = cudaMallocHost(&storage, bytes);
-        if (status == cudaErrorMemoryAllocation) {
-            const auto pending = cudaGetLastError();
-            if (pending != status) {
-                check(pending, "Check CUDA error after allocating packed winner storage");
-            }
-            state_->packed_winners_unavailable = true;
-        } else {
-            check(status, "Allocate packed winner storage");
-            state_->packed_winners = static_cast<TextLogitCandidate*>(storage);
-        }
-    }
-    return state_->packed_winners;
-}
-
 ExactGqaWorkspace Allocations::prepare_singleton_scores() {
     if (!state_->singleton_scores) {
         check(cudaPeekAtLastError(), "Check CUDA error before allocating singleton scores");
@@ -622,16 +597,6 @@ bool Allocations::replay_batch_graph(int width, const std::function<void()>& pre
                                      const std::function<bool()>& bind, bool target_verify) {
     const int index = target_verify ? decoder_batch_max_graph_lanes : width - 1;
     return replay_graph_slot(index, width, prepare, capture_nodes, bind, target_verify);
-}
-
-bool Allocations::replay_packed_graph(int bucket, int rows, const std::function<void()>& prepare,
-                                      const std::function<void()>& capture_nodes,
-                                      const std::function<bool()>& bind) {
-    if (bucket < 0 || bucket >= static_cast<int>(packed_decode_buckets.size())) {
-        throw std::out_of_range("Invalid packed decode graph bucket");
-    }
-    return replay_graph_slot(decoder_batch_max_graph_lanes + 1 + bucket, rows, prepare,
-                             capture_nodes, bind, false);
 }
 
 bool Allocations::replay_graph_slot(int index, int width, const std::function<void()>& prepare,

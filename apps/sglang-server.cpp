@@ -1,8 +1,7 @@
-#include "sglang/fp8_prefill_option.h"
-
 #include "sglang/checkpoint.h"
 #include "sglang/decoder.h"
 #include "sglang/decoder_batch.h"
+#include "sglang/decoder_prefill.h"
 #include "sglang/json.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
@@ -29,7 +28,6 @@ using namespace sglang::server;
 struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
     std::string launch_command = "sglang-server";
-    sglang::Fp8PrefillPolicy fp8_prefill = sglang::Fp8PrefillPolicy::exact;
     SamplingDefaults sampling = SamplingDefaults::model;
     ChatParsers chat_parsers;
     int device = 0;
@@ -39,7 +37,6 @@ struct Arguments {
     int mtp_steps = 4;
     int prefix_cache_entries = 0;
     bool mtp_steps_explicit = false;
-    bool mtp_int8_head = false;
     bool eager = false;
     bool trace_batches = false;
     bool batch_cuda_graphs = true;
@@ -75,7 +72,7 @@ void append_launch_option(std::string& command, std::string_view option,
     }
     command += ' ';
     if (option == "--sampling-defaults" || option == "--reasoning-parser" ||
-        option == "--tool-call-parser" || option == "--fp8-prefill" ||
+        option == "--tool-call-parser" ||
         option == "--device" || option == "--port" || option == "--max-active" ||
         option == "--max-num-batched-tokens" || option == "--prefix-cache-entries" ||
         option == "--mtp-steps" || option == "--mtp-k") {
@@ -85,36 +82,12 @@ void append_launch_option(std::string& command, std::string_view option,
     }
 }
 
-void configure_prefix_cache(Arguments& arguments) {
-    if (arguments.prefix_cache_entries == 0) {
-        return;
-    }
-    if (sglang::token_ordered_decode(arguments.fp8_prefill)) {
-        throw std::invalid_argument("Selected FP8 policy requires prefix cache off");
-    }
-    if (arguments.eager) {
-        throw std::invalid_argument("--prefix-cache-entries requires omitting --eager");
-    }
-    if (arguments.fp8_prefill == sglang::Fp8PrefillPolicy::tensor_core) {
-        if (arguments.mtp_steps_explicit && arguments.mtp_steps != 0) {
-            throw std::invalid_argument(
-                "MTP with --prefix-cache-entries requires --fp8-prefill exact");
-        }
-        arguments.mtp_steps = 0;
-    }
-}
-
 Arguments parse_arguments(int argc, char** argv) {
     Arguments arguments;
     for (int index = 1; index < argc; ++index) {
         const std::string_view option = argv[index];
         if (option == "--trace-batches") {
             arguments.trace_batches = true;
-            append_launch_option(arguments.launch_command, option);
-            continue;
-        }
-        if (option == "--mtp-int8-head") {
-            arguments.mtp_int8_head = true;
             append_launch_option(arguments.launch_command, option);
             continue;
         }
@@ -153,8 +126,6 @@ Arguments parse_arguments(int argc, char** argv) {
                 throw std::invalid_argument("Expected --tool-call-parser qwen3_coder");
             }
             arguments.chat_parsers.qwen3_coder_tools = true;
-        } else if (option == "--fp8-prefill") {
-            arguments.fp8_prefill = sglang::cli::parse_fp8_prefill(value);
         } else if (option == "--device") {
             arguments.device = parse_integer(value, "Expected a nonnegative CUDA device ordinal");
         } else if (option == "--port") {
@@ -189,7 +160,9 @@ Arguments parse_arguments(int argc, char** argv) {
         }
         append_launch_option(arguments.launch_command, option, value);
     }
-    configure_prefix_cache(arguments);
+    if (arguments.prefix_cache_entries && arguments.eager) {
+        throw std::invalid_argument("--prefix-cache-entries requires omitting --eager");
+    }
     return arguments;
 }
 
@@ -221,8 +194,8 @@ std::string model_info_json(const Arguments& arguments) {
 }
 std::string draft_seed_fc_json(const Arguments& arguments, bool wmma);
 std::string server_info_json(const Arguments& arguments, double startup_seconds,
-                             const BatchRuntimeState& state, bool experimental_target_split_gqa,
-                             bool experimental_long_target_split_gqa) {
+                             const BatchRuntimeState& state, const sglang::Decoder& decoder) {
+    const bool b200 = decoder.uses_b200_operators();
     std::string body = R"({"frontend":"cpp","version":null,"supports_inline_system":false)";
     body += R"(,"host":"127.0.0.1","dp_size":1,"tp_size":1,"pp_size":1)";
     body += R"(,"launch_command":)";
@@ -239,16 +212,21 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += R"(,"max_num_batched_tokens":)" + std::to_string(arguments.max_num_batched_tokens);
     body += R"(,"mtp_steps":)" + std::to_string(arguments.mtp_steps);
     body += R"(,"mtp_int8_head":)";
-    body += arguments.mtp_int8_head && arguments.mtp_steps != 0 ? "true" : "false";
+    body += decoder.has_int8_draft_head() ? "true" : "false";
+    body += R"(,"certified_int8_verify_head":)";
+    body += decoder.has_certified_vocab() ? "true" : "false";
     body += R"(,"prefix_cache_entries":)" + std::to_string(arguments.prefix_cache_entries);
     body += R"(,"fp8_prefill":)";
-    sglang::json::append_quoted(body, sglang::cli::fp8_prefill_name(arguments.fp8_prefill));
-    if (experimental_target_split_gqa) {
-        body += R"(,"experimental_target_split_gqa":true)";
-    }
-    if (experimental_long_target_split_gqa) {
-        body += R"(,"experimental_long_target_split_gqa":true)";
-    }
+    const bool tc_prefill = b200 && !arguments.prefix_cache_entries;
+    sglang::json::append_quoted(body, tc_prefill ? "tensor-core" : "exact");
+    body += R"(,"target_gqa":)";
+    sglang::json::append_quoted(body, b200 ? "grouped-split" : "exact");
+    body += R"(,"paired_prefill":)";
+    const bool paired_prefill = tc_prefill && arguments.mtp_steps != 0 &&
+        arguments.max_active >= 2 &&
+        arguments.max_num_batched_tokens >= 2 * sglang::decoder::batch_prefill_tile_rows &&
+        arguments.max_num_batched_tokens <= sglang::decoder_default_max_num_batched_tokens;
+    body += paired_prefill ? "true" : "false";
     body += R"(,"sampling_defaults":)";
     body += arguments.sampling == SamplingDefaults::model ? "\"model\"" : "\"openai\"";
     body += R"(,"reasoning_parser":)";
@@ -268,7 +246,7 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += state.ready ? "true" : "false";
     body += R"(,"num_running_reqs":)" + std::to_string(state.running_requests);
     body += R"(,"generation_tokens_total":)" + std::to_string(state.generation_tokens);
-    return body + "}]" + draft_seed_fc_json(arguments, experimental_long_target_split_gqa) + "}";
+    return body + "}]" + draft_seed_fc_json(arguments, tc_prefill) + "}";
 }
 
 Socket listen(const Arguments& arguments) {
@@ -284,8 +262,6 @@ int main(int argc, char** argv) {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
                      " [--max-active N] [--mtp-steps N] [--eager] [--batch-cuda-graphs]\n"
                      "                     [--max-num-batched-tokens N] [--trace-batches]\n"
-                     "                     [--fp8-prefill exact|tensor-core|tensor-core-mtp|\n"
-                     "                      tensor-core-target|tensor-core-mtp-target]\n"
                      "                     [--prefix-cache-entries 0..4]\n"
                      "                     [--reasoning-parser qwen3]\n"
                      "                     [--tool-call-parser qwen3_coder]\n"
@@ -295,13 +271,11 @@ int main(int argc, char** argv) {
                      "Target rows per step: " << sglang::decoder_default_max_num_batched_tokens
                   << " by default, range 1-32768.\n"
                      "MTP steps: 4 by default, range 0-4. --mtp-k is an alias.\n"
-                     "--mtp-int8-head enables an INT8 vocabulary head for MTP proposals.\n"
-                     "Default MTP uses 0 steps for logprobs and with a Tensor Core prefix cache.\n"
+                     "Default MTP uses 0 steps for output logprobs.\n"
                      "Batch graphs: enabled by default for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
-                     "Prefix cache: disabled by default. Omit --eager. MTP requires exact.\n"
-                     "Serves on 127.0.0.1 only. Default port: 17384.\n"
-                  << sglang::cli::fp8_prefill_usage;
+                     "Prefix cache: disabled by default. Omit --eager.\n"
+                     "Serves on 127.0.0.1 only. Default port: 17384.\n";
         return 0;
     }
     try {
@@ -309,8 +283,7 @@ int main(int argc, char** argv) {
         const auto arguments = parse_arguments(argc, argv);
         install_shutdown_handlers();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
-                                      arguments.mtp_steps != 0, arguments.fp8_prefill,
-                                      arguments.mtp_int8_head);
+                                      arguments.mtp_steps != 0);
         if (stopping()) {
             return 0;
         }
@@ -348,8 +321,7 @@ int main(int argc, char** argv) {
                 native_generate.abort(connection, body);
             }, [&] {
                 return server_info_json(arguments, startup.count(), service.runtime_state(),
-                                        decoder.experimental_target_split_gqa(),
-                                        decoder.experimental_long_target_split_gqa());
+                                        decoder);
             }, [&](const Socket& connection, int slot, std::string_view body) {
                 serve_score(connection, service, slot, tokenizer.get(), body);
             }, &discovery, [&](const Socket& connection, int slot, std::string_view body) {

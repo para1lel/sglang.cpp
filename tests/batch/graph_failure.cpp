@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
-#include <unordered_set>
 
 namespace {
 
@@ -13,8 +12,6 @@ bool failed = false;
 bool pending = false;
 bool fail_drain = false;
 int launches = 0;
-void* packed_pin = nullptr;
-std::unordered_set<void*> pins;
 
 bool enabled(std::string_view boundary) {
     const auto* mode = std::getenv("BATCH_GRAPH_FAILURE");
@@ -38,28 +35,7 @@ extern "C" cudaError_t cudaMallocHost(void** address, std::size_t bytes) {
     if (bytes == sizeof(sglang::decoder::VerificationGraphBinding) && inject("prepare")) {
         return cudaErrorMemoryAllocation;
     }
-    const auto status = real(address, bytes);
-    if (status == cudaSuccess && enabled("packed-pin-release")) {
-        pins.insert(*address);
-    }
-    return status;
-}
-
-extern "C" cudaError_t cudaFreeHost(void* address) {
-    static const auto real =
-        reinterpret_cast<decltype(&cudaFreeHost)>(dlsym(RTLD_NEXT, "cudaFreeHost"));
-    if (address && address == packed_pin && inject("packed-pin-release")) {
-        return cudaErrorInvalidValue;
-    }
-    const auto status = real(address);
-    if (status == cudaSuccess && enabled("packed-pin-release")) {
-        pins.erase(address);
-        if (address && address == packed_pin) {
-            std::fputs("released packed winner pin after rejected free\n", stderr);
-            packed_pin = nullptr;
-        }
-    }
-    return status;
+    return real(address, bytes);
 }
 
 extern "C" cudaError_t cudaMemcpyAsync(void* destination, const void* source, std::size_t bytes,
@@ -70,13 +46,7 @@ extern "C" cudaError_t cudaMemcpyAsync(void* destination, const void* source, st
         bytes == sizeof(sglang::decoder::VerificationGraphBinding) && inject("upload")) {
         return cudaErrorInvalidValue;
     }
-    const auto status = real(destination, source, bytes, kind, stream);
-    if (status == cudaSuccess && enabled("packed-pin-release") && !packed_pin &&
-        kind == cudaMemcpyDeviceToHost && bytes == 2 * sizeof(sglang::TextLogitCandidate) &&
-        pins.count(destination)) {
-        packed_pin = destination;
-    }
-    return status;
+    return real(destination, source, bytes, kind, stream);
 }
 
 extern "C" cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCaptureMode mode) {

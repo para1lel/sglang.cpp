@@ -13,7 +13,9 @@ directories before invoking XMake.
 
 XMake configures CUTLASS 4.7.1 from a checksum-pinned release archive. The SM100 down operator compiles with the CUTLASS/CuTe headers. The server has no CUTLASS runtime library dependency. [Package pin](../../xmake.lua#L15)<!-- prefix: "add_versions" --> · [SM100 binding](../../xmake.lua#L101)<!-- prefix: "add_packages" -->
 
-Set `SGLANG_CUTLASS_ARCHIVE` to the absolute path of the original archive for either `bash tools/build.sh` or the direct recipe below. XMake checks the same hash for either source. For a network-free direct configure, run `xmake g --network=private` after exporting `XMAKE_GLOBALDIR` and before `xmake f`. Record the archive hash with the build evidence. [Wrapper forwarding](../../tools/build.sh#L42)<!-- prefix: "SGLANG_CUTLA" --> · [Archive override](../../xmake.lua#L9)<!-- prefix: "local archiv" -->
+The wrapper uses private XMake repository mode and installs from a local CUTLASS archive. By default it checks `$SGLANG_HOST_ROOT/cache/cutlass/<sha256>/cutlass-4.7.1.tar.gz`. It fetches the release archive if the cached bytes are missing or fail verification. [Archive cache](../../tools/build-probe.sh#L35)<!-- prefix: "cached_cutla" --> · [Private configure](../../tools/build-probe.sh#L77)<!-- prefix: "\"$xmake\" g -" -->
+
+Set `SGLANG_CUTLASS_ARCHIVE` to an absolute path to supply the original archive to the wrapper or the direct recipe below. XMake verifies the archive hash. For a network-free direct configure, run `xmake g --network=private` after exporting `XMAKE_GLOBALDIR` and before `xmake f`. Record the archive hash with the build evidence. [Wrapper forwarding](../../tools/build.sh#L42)<!-- prefix: "SGLANG_CUTLA" --> · [Archive override](../../xmake.lua#L9)<!-- prefix: "local archiv" -->
 
 ```bash
 export XMAKE_CONFIGDIR="$work/config" XMAKE_GLOBALDIR="$work/global"

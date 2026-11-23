@@ -31,6 +31,29 @@ else
     trap 'rm -rf -- "$work"' EXIT
 fi
 echo "Build directory: $work"
+
+cached_cutlass_archive() (
+    set -e
+    # Keep these in sync with the project package pin in xmake.lua.
+    version=4.7.1
+    checksum=8290eb914cd5aaf4c665ee4108ba5bd65383cfee1296286a42a7ef711554d365
+    directory="$base/cache/cutlass/$checksum"
+    archive="$directory/cutlass-$version.tar.gz"
+    mkdir -p -- "$directory"
+    exec 9>"$directory/download.lock"
+    flock -w 90 9
+    if ! printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status &>/dev/null; then
+        temporary=$(mktemp "$directory/archive.XXXXXXXX")
+        trap 'rm -f -- "$temporary"' EXIT
+        curl --fail --location --silent --show-error --connect-timeout 10 --max-time 90 \
+            "https://github.com/NVIDIA/cutlass/archive/refs/tags/v$version.tar.gz" \
+            --output "$temporary"
+        printf '%s  %s\n' "$checksum" "$temporary" | sha256sum --check --strict >&2
+        mv -fT -- "$temporary" "$archive"
+    fi
+    printf '%s\n' "$archive"
+)
+
 cd -- "$root"
 mkdir -p -- "$work/tmp"
 export XMAKE_CONFIGDIR="$work/config" XMAKE_GLOBALDIR="$work/global"
@@ -47,6 +70,11 @@ if [[ "$check" == y && ! -f tests/mxfp8_gqa_check.cu ]]; then
     echo "The optional MXFP8 check requires tests/mxfp8_gqa_check.cu." >&2
     exit 1
 fi
+if [[ -z ${SGLANG_CUTLASS_ARCHIVE:-} ]]; then
+    SGLANG_CUTLASS_ARCHIVE=$(cached_cutlass_archive)
+fi
+export SGLANG_CUTLASS_ARCHIVE
+"$xmake" g --network=private
 "$xmake" f -y -P . -o "$work/build" -p linux -a x86_64 -m release --mxfp8-gqa-check="$check"
 "$xmake" build -P . -v toolchain-probe
 

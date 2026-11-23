@@ -57,7 +57,7 @@ public:
             retained_ = &pool;
         }
 
-        std::uint64_t threshold = (pool.large ? 512 : 32) * 1024 * 1024;
+        std::uint64_t threshold = (pool.large ? 1024 : 32) * 1024 * 1024;
         const auto status =
             cudaMemPoolSetAttribute(pool.handle, cudaMemPoolAttrReleaseThreshold, &threshold);
         if (status == cudaSuccess) {
@@ -632,6 +632,30 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     });
 }
 
+bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* grants, int count,
+                              int lanes, cudaStream_t stream,
+                              DecoderBatchStepStats& stats) {
+    const int rows = lanes * batch_prefill_tile_rows;
+    PrefillWorkspace workspace(stream, rows);
+    if (!workspace.data()) {
+        return false;
+    }
+    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
+    for (int offset = 0; offset < grants[0].rows; offset += batch_prefill_tile_rows) {
+        for (int index = 0; index < count; index += lanes) {
+            std::array<PrefillGrant, grouped_prefill_max_rows / batch_prefill_tile_rows> group;
+            for (int lane = 0; lane < lanes; ++lane) {
+                group[lane] = prefill_tile(grants[index + lane], offset);
+            }
+            prefill_layerwise(model, group.data(), {lanes, rows}, workspace, false);
+            ++stats.layerwise_prefill_groups;
+            stats.layerwise_prefill_rows += rows;
+        }
+    }
+    workspace.close();
+    return true;
+}
+
 }
 
 bool decoder::try_prefill_projection_pairs(
@@ -640,22 +664,10 @@ bool decoder::try_prefill_projection_pairs(
     if (!model.is_b200() || !pairable_prefill_grants(grants, count)) {
         return false;
     }
-    PrefillWorkspace workspace(stream, 2 * batch_prefill_tile_rows);
-    if (!workspace.data()) {
-        return false;
+    if (count == 4 && prefill_projection_tiles(model, grants, count, 4, stream, stats)) {
+        return true;
     }
-    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
-    for (int offset = 0; offset < grants[0].rows; offset += batch_prefill_tile_rows) {
-        for (int index = 0; index < count; index += 2) {
-            const PrefillGrant pair[] = {prefill_tile(grants[index], offset),
-                                         prefill_tile(grants[index + 1], offset)};
-            prefill_layerwise(model, pair, {2, 2 * batch_prefill_tile_rows}, workspace, false);
-            ++stats.layerwise_prefill_groups;
-            stats.layerwise_prefill_rows += 2 * batch_prefill_tile_rows;
-        }
-    }
-    workspace.close();
-    return true;
+    return prefill_projection_tiles(model, grants, count, 2, stream, stats);
 }
 
 TextFp8ActivationView PrefillProjections::quantize(const Bf16* input, int width) const {
@@ -697,7 +709,7 @@ void decoder::reclaim_prefill_workspaces(int device) {
 
 PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
     : stream_(stream), capacity_(capacity) {
-    if (!stream || capacity < 1 || capacity > serial_prefill_max_rows) {
+    if (!stream || capacity < 1 || capacity > grouped_prefill_max_rows) {
         throw std::invalid_argument("Invalid decoder prefill workspace");
     }
     if (capacity == 1) {

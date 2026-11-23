@@ -539,7 +539,9 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
                        output, out_width)) {
         return cudaErrorInvalidValue;
     }
-    const int max_rows = allow_large_rows ? serial_prefill_max_rows : text_embedding_max_rows;
+    const int prefill_max_rows =
+        grouped_projection ? grouped_prefill_max_rows : serial_prefill_max_rows;
+    const int max_rows = allow_large_rows ? prefill_max_rows : text_embedding_max_rows;
     if (rows < 3 || rows > max_rows || in_width % group_size != 0 ||
         reinterpret_cast<std::uintptr_t>(weight) % 16 != 0 ||
         reinterpret_cast<std::uintptr_t>(input.values) % 16 != 0) {
@@ -555,6 +557,14 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
             weight, weight_scales, input, rows, out_width, in_width, output, stream, device, 8);
         if (paired) {
             return paired;
+        }
+    }
+    if (grouped_projection && rows == 4096 && in_width == 6144 && out_width == 5120) {
+        const auto wide = launch_tma<Tile<128, packed_wide_tile_cols, 4, 1, 1>>(
+            weight, weight_scales, input, rows, out_width, in_width, output, stream, device,
+            rows / 128);
+        if (wide) {
+            return wide;
         }
     }
     const bool narrow_high_k = in_width >= 8192 && rows < 1024;
@@ -591,7 +601,8 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
         return cudaErrorInvalidValue;
     }
     const auto& first = *projections.begin();
-    if (rows < 256 || rows > serial_prefill_max_rows || in_width % group_size != 0 ||
+    const int max_rows = grouped_projection ? grouped_prefill_max_rows : serial_prefill_max_rows;
+    if (rows < 256 || rows > max_rows || in_width % group_size != 0 ||
         reinterpret_cast<std::uintptr_t>(input.values) % 16 != 0 ||
         reinterpret_cast<std::uintptr_t>(first.weight) % 16 != 0) {
         return std::nullopt;
@@ -633,13 +644,21 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
         }
     }
     int device = 0;
-    const auto status = tma_device(stream, device);
-    if (status != cudaSuccess) {
+    if (const auto status = tma_device(stream, device); status != cudaSuccess) {
         return status;
     }
     const bool packed_mlp_chunk = projections.size() == 2 &&
                                   output.slices[0].width == 17408 &&
                                   output.slices[1].width == 17408;
+    if (grouped_projection && (rows == 2048 || rows == 4096) && in_width == 5120 && wide_slices &&
+        (packed_mlp_chunk || total_width == 16384 || total_width == 14336)) {
+        const auto wide = launch_tma<Tile<128, packed_wide_tile_cols, 4, 1, 1>>(
+            first.weight, first.scales, input, rows, total_width, in_width, output, stream,
+            device, rows / 128);
+        if (wide) {
+            return wide;
+        }
+    }
     if ((rows == 768 || grouped_projection) && in_width == 5120 && packed_mlp_chunk) {
         using GateUpTile = Tile<128, 128, 3, 1, 2, 1, true>;
         const auto compact = launch_tma<GateUpTile>(

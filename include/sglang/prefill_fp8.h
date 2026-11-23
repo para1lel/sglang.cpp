@@ -8,6 +8,7 @@
 namespace sglang {
 
 inline constexpr int serial_prefill_max_rows = 2048;
+inline constexpr int grouped_prefill_max_rows = 4096;
 
 /// Uses the contiguous FP8 layouts and finite-input contract of text_fp8_gemv_rows.
 /// Empty means the backend declined before submission and SIMT fallback is safe.

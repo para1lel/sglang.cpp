@@ -19,9 +19,9 @@ The decoder lends two disjoint spans of its existing `PrefillWorkspace` allocati
 | BF16 K | `mlp_gate` through the end of `mlp_up`, bounded by `q_gate` | 68 MiB | 64 MiB |
 | BF16 V and invalid-token indices | `gdn_qkv`, `gdn_z`, `gdn_b`, `gdn_a`, and GDN scratch, bounded by `activation.values` | 64.1875 MiB | 64 MiB + 4 KiB |
 
-Each span has room for up to 127 bytes of padding for 128-byte alignment. The launcher checks both spans separately. Workspace allocation size, memory pool setup, and KV cache capacity stay the same. The staged route adds zero device allocation bytes. [Arena allocation](../src/decoder_prefill.cpp#L698)<!-- prefix: "PrefillWorks" --> · [Bounds](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L398)<!-- prefix: "const int fu" -->
+Each span has room for up to 127 bytes of padding for 128-byte alignment. The launcher checks both spans separately. Workspace allocation size, memory pool setup, and KV cache capacity stay the same. The staged route adds zero device allocation bytes. [Arena allocation](../src/decoder_prefill.cpp#L710)<!-- prefix: "PrefillWorks" --> · [Bounds](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L398)<!-- prefix: "const int fu" -->
 
-The MLP projection writes its gate and up buffers after GQA. GDN layers write their projection and scratch inputs before use. Predecode, paired attention, later layer work, and workspace release use the workspace's execution stream. Stream ordering puts the last attention read before the next write to either span. Keep both spans exclusive to that stream until the queued work completes. [Layer loop](../src/decoder_prefill.cpp#L865)<!-- prefix: "execute_laye" --> · [Release](../src/decoder_prefill.cpp#L753)<!-- prefix: "cudaError_t " -->
+The MLP projection writes its gate and up buffers after GQA. GDN layers write their projection and scratch inputs before use. Predecode, paired attention, later layer work, and workspace release use the workspace's execution stream. Stream ordering puts the last attention read before the next write to either span. Keep both spans exclusive to that stream until the queued work completes. [Layer loop](../src/decoder_prefill.cpp#L877)<!-- prefix: "execute_laye" --> · [Release](../src/decoder_prefill.cpp#L765)<!-- prefix: "cudaError_t " -->
 
 Predecode follows the page table and expands each complete MXFP8 page once. Separate K and V TMA producers load alternating shared-memory stages. A partial page uses the native masked conversion. The paired kernel retains the ordered BF16 operands, FP32 softmax and accumulation, and protected repair. [Predecode](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L77)<!-- prefix: "__global__ v" --> · [Producers](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L146)<!-- prefix: "__device__ v" -->
 
@@ -63,27 +63,43 @@ The step reuses one 487.44 MiB arena across all pairs. A 1,024-row arena uses 24
 
 ### Projection pairs for MTP
 
-On B200 with prefix reuse off, pure prefill steps can pair FP8 projections.
-The step budget must be positive and at most 8,192 tokens.
-An even number of consecutive text grants must have equal lengths made up of
-full 1,024-row tiles. Each grant needs draft state.
-Media, score grants, mixed steps, and irregular grants use separate paths.
-[Eligibility](../include/sglang/decoder_prefill.h#L84)<!-- prefix: "inline bool " --> · [Step dispatch](../src/decoder_batch.cpp#L660)<!-- prefix: "try_prefill_" -->
+On B200 with prefix reuse off, a pure tensor-core text prefill step can share
+FP8 projections across grants. The configured step budget must be positive
+and at most 8,192 tokens. The grants must total at most 8,192 rows.
+The step needs an even number of grants with draft state. All grants must have
+the same length in full 1,024-row tiles. A step with decode, restored prompt work,
+media, label scoring, prompt-logprob capture, exact grants, or irregular
+grant lengths follows ordinary dispatch.
+[Step classification](../src/decoder_batch.cpp#L595)<!-- prefix: "if (max_rows" --> · [Step dispatch](../src/decoder_batch.cpp#L660)<!-- prefix: "try_prefill_" --> · [Grant eligibility](../include/sglang/decoder_prefill.h#L84)<!-- prefix: "inline bool " -->
 
-The historical long-profile qualification set `SGLANG_EXPERIMENTAL_BULK_PREFILL=1`
-and `SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA=long`. It used four 8,192-token
-prompts, K4, and the INT8 draft head. Each prefill step had four
-2,048-row grants and dispatched four pairs. The projections and MLP see 2,048 rows per
-pair. Each lane keeps its original 1,024-row attention and GDN cuts,
-KV pages, recurrent state and draft state. Draft seed work uses the lane's
-hidden and residual rows and shifted token IDs before the next tile.
-[Tile pairs](../src/decoder_prefill.cpp#L650)<!-- prefix: "const Prefil" --> · [Draft seed](../src/decoder_prefill.cpp#L620)<!-- prefix: "auto seed = " -->
+Exactly four eligible grants first try one 4,096-row group per tile offset.
+Four 2,048-row grants use two groups in one step. Two 4,096-row grants use
+four 2,048-row groups. Other eligible grant counts also use pairs.
+Lanes share dense projections and the MLP. Attention and GDN keep each lane's
+1,024-row tiles, positions, KV pages, and recurrent state. Draft seeding uses
+the lane's own hidden and residual rows and shifted token IDs.
+[Group selection](../src/decoder_prefill.cpp#L667)<!-- prefix: "if (count ==" --> · [Draft seed](../src/decoder_prefill.cpp#L620)<!-- prefix: "auto seed = " -->
 
-The step reuses one 487.44 MiB workspace across pairs, 243.72 MiB more
-than the ordinary 1,024-row workspace. If the allocation is unavailable,
-the step uses the existing dispatch before submitting any paired work.
-`--trace-batches` reports the paired group counts and workspace bytes.
-[Workspace](../src/decoder_prefill.cpp#L644)<!-- prefix: "if (!workspa" -->
+| Workspace | Active bytes |
+| --- | ---: |
+| Ordinary 1,024-row tile | 255,557,632 |
+| Two-grant, 2,048-row group | 511,115,264 |
+| Four-grant, 4,096-row group | 1,022,230,528 |
+
+The step reuses one workspace across all groups. Four-grant grouping adds
+511,115,264 active bytes over pairs. If the four-grant pool or allocation is
+unavailable, dispatch tries pairs before submitting grouped work. If the pair
+allocation is also unavailable, dispatch uses ordinary per-grant prefill.
+Unexpected CUDA errors propagate. One large workspace pool per device can
+retain backing across synchronization with a 1 GiB CUDA release threshold.
+The threshold controls backing retention. Request workspace accounting counts
+the active allocation.
+[Workspace](../src/decoder_prefill.cpp#L639)<!-- prefix: "PrefillWorks" --> · [Allocation](../src/decoder_prefill.cpp#L710)<!-- prefix: "PrefillWorks" --> · [Pool threshold](../src/decoder_prefill.cpp#L60)<!-- prefix: "std::uint64_" -->
+
+With `--trace-batches`, `layerwise_prefill_groups` counts the groups,
+`rows` counts their combined rows, and `workspace_bytes` records the
+largest active prefill workspace in the step.
+[Batch trace](../include/sglang/server/batch_trace.h#L44)<!-- prefix: "if (stats.la" -->
 
 ## Verification
 
@@ -102,5 +118,12 @@ For mixed projection groups, hold admissions, grants, and generated history fixe
 For wide groups, compare complete decoder advances at 8,192 prompt rows. Include unequal, ragged, singleton, and partial final grants. Compare full BF16 scores and per-grant state, and reject the wide arena allocation to exercise the initial groups.
 
 For whole-tile pairs, check both lane offsets and cover mixed, partial, and per-lane split grants. The host check modeled allocation failures and checked grouping against the scheduler-only path. A device audit matched 16,384,000 sampled BF16 hidden and residual values across aligned and shifted positions at four layers. Full logits and recurrent state require separate checks. See `artifacts/takeover-native-tile-pair/review.md`.
+
+For four-grant grouping, check four equal grants and a two-grant control on
+the same native policy. Compare target hidden rows, logits, KV, recurrence,
+and subsequent draft state. Check uneven grants, a mixed decode step,
+and a configured budget above 8,192. Reject the 4,096-row allocation, confirm
+paired fallback, then remove the failure and confirm four-grant recovery.
+Record output IDs, active workspace bytes, and physical GPU memory separately.
 
 Two mirrored W4 comparisons on B200 GPU 7 kept the tiled scheduler in both arms. Each arm used 16 lanes with 32,768 prompt IDs and a 512-output cap. With pairing, the last prefill completed 2.176 s and 1.261 s earlier. Client makespan fell by 0.178 s and 1.110 s. All 32,768 returned IDs across the four arms matched the frozen prefixes. Admission and decode overlap varied across arms. W3 exercised zero pairs across 12 cohorts. W5 and W6 pairing evidence in this review comes from host replay. See `artifacts/takeover-w4-combined/half-output-report.md` and `artifacts/takeover-native-tile-pair/review.md`.

@@ -55,7 +55,7 @@ Pinned SGLang can list loaded LoRA adapters and retrieves its configured base se
 | `certified_int8_verify_head` | Boolean indicating availability of the [certified Tensor Core head](#certified-tensor-core-target-head). |
 | `fp8_prefill` | String `"tensor-core"` for B200 with prefix reuse off, or `"exact"` otherwise. Media and label scoring retain exact prefill. |
 | `target_gqa` | String `"grouped-split"` on B200, or `"exact"` otherwise. Per-row shape and numerical guards still apply. |
-| `paired_prefill` | Boolean indicating whether the runtime allows paired prefill. |
+| `paired_prefill` | Boolean indicating availability of [grouped prefill](native-prefill-workspace.md#projection-pairs-for-mtp). True on B200 with prefix reuse off, positive MTP depth, capacity for at least two lanes, and a step budget of 2,048–8,192. The scheduler checks each step separately. [Metadata check](../apps/sglang-server.cpp#L225)<!-- prefix: "const bool p" --> |
 | `mtp_seed_fc` | Null at K0, otherwise an object with the preferred draft seed implementation and any fallback and shape limits. |
 | `sampling_defaults` | String `"model"` or `"openai"`, according to the serving configuration. |
 | `reasoning_parser`, `tool_call_parser` | JSON `null` when disabled. Enabled values are `"qwen3"` and `"qwen3_coder"`, respectively. |

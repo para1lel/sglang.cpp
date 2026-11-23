@@ -41,7 +41,7 @@ cudaError_t decoder::mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages,
         replay_threads, stream, cache, pages.device_pages, position, queries, output);
 }
 
-cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int count,
+cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int count, bool b200,
                                              cudaStream_t stream) {
     if (!rows || count <= 0 || count > draft_wave_rows) {
         return cudaErrorInvalidValue;
@@ -49,6 +49,8 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
     DraftAttentionBatch long_rows{};
     int long_count = 0;
     int longest = 0;
+    PagedDecodeLane online_lanes[draft_wave_rows];
+    int online_count = 0;
     for (int index = 0; index < count; ++index) {
         const auto& row = rows[index];
         const auto visible = static_cast<std::int64_t>(row.position) + 1;
@@ -58,6 +60,16 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
         if (row.workspace.scores && visible > row.workspace.capacity &&
             visible <= text_attention_max_tokens &&
             row.workspace.capacity >= draft_score_chunk + draft_carry_per_head && count > 1) {
+            static_assert(sizeof(float) * mxfp8_query_heads *
+                          (draft_score_chunk + draft_carry_per_head) >=
+                          sizeof(gqa_decode::Partial) * gqa_decode::max_splits * mxfp8_query_heads);
+            const PagedDecodeLane lane{row.cache, row.pages, row.position,
+                {row.queries, row.output, row.workspace.scores}};
+            if (b200 && gqa_decode::valid_buffers(lane.buffers) &&
+                gqa_decode::tensor_aligned(lane)) {
+                online_lanes[online_count++] = lane;
+                continue;
+            }
             long_rows.rows[long_count++] = row;
             longest = std::max(longest, static_cast<int>(visible));
         } else {
@@ -66,6 +78,13 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
             if (status != cudaSuccess) {
                 return status;
             }
+        }
+    }
+    if (online_count > 0) {
+        const auto status = target_split_gqa(online_lanes, online_count, text_attention_max_tokens,
+                                             stream);
+        if (status != cudaSuccess) {
+            return status;
         }
     }
     return launch_long_draft_batch(long_rows.rows, long_count, longest, stream);

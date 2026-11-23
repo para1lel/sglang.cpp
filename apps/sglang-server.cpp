@@ -39,10 +39,9 @@ struct Arguments {
     bool mtp_steps_explicit = false;
     bool eager = false;
     bool trace_batches = false;
-    bool batch_cuda_graphs = true;
     bool enable_response_store = false;
 
-    bool enable_batch_cuda_graphs() const { return batch_cuda_graphs && !eager; }
+    bool enable_batch_cuda_graphs() const { return !eager; }
 };
 
 int parse_integer(std::string_view value, const char* error) {
@@ -92,7 +91,6 @@ Arguments parse_arguments(int argc, char** argv) {
             continue;
         }
         if (option == "--batch-cuda-graphs") {
-            arguments.batch_cuda_graphs = true;
             append_launch_option(arguments.launch_command, option);
             continue;
         }
@@ -213,6 +211,8 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += R"(,"mtp_steps":)" + std::to_string(arguments.mtp_steps);
     body += R"(,"mtp_int8_head":)";
     body += decoder.has_int8_draft_head() ? "true" : "false";
+    body += R"(,"mtp_online_gqa":)";
+    body += b200 && arguments.mtp_steps != 0 && arguments.max_active >= 2 ? "true" : "false";
     body += R"(,"certified_int8_verify_head":)";
     body += decoder.has_certified_vocab() ? "true" : "false";
     body += R"(,"prefix_cache_entries":)" + std::to_string(arguments.prefix_cache_entries);
@@ -260,7 +260,7 @@ Socket listen(const Arguments& arguments) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
-                     " [--max-active N] [--mtp-steps N] [--eager] [--batch-cuda-graphs]\n"
+                     " [--max-active N] [--mtp-steps N] [--eager]\n"
                      "                     [--max-num-batched-tokens N] [--trace-batches]\n"
                      "                     [--prefix-cache-entries 0..4]\n"
                      "                     [--reasoning-parser qwen3]\n"

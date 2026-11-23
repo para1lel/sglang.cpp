@@ -432,7 +432,7 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
     if (enable_mtp) {
         model_->mtp_weights = std::make_shared<MtpDraftWeights>(
             checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head,
-            model_->is_b200(), model_->is_b200());
+            model_->is_b200());
         model_->tc_vocab = model_->mtp_weights->shared_vocab();
     }
 }

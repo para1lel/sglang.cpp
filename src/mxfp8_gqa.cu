@@ -546,12 +546,10 @@ struct alignas(16) DecodePartial {
 static_assert(sizeof(DecodePartial) * decode_splits * mxfp8_query_heads ==
               decoder::paged_decode_scratch_bytes);
 
-template <typename Lane, int Count = decoder::paged_decode_lanes>
+template <typename Lane>
 struct PagedDecodeBatch {
-    Lane lanes[Count];
+    Lane lanes[decoder::paged_decode_lanes];
 };
-
-using LongDecodeBatch = PagedDecodeBatch<decoder::PagedDecodeLane, decoder_batch_max_lanes>;
 
 __device__ decoder::PagedDecodeLane resolve_lane(decoder::PagedDecodeLane lane) { return lane; }
 
@@ -663,13 +661,11 @@ __global__ void split_decode_attention(PagedDecodeBatch<Lane> batch) {
     }
 }
 
-template <typename Lane, int Count>
-__global__ void merge_decode_attention(PagedDecodeBatch<Lane, Count> batch) {
+template <typename Lane>
+__global__ void merge_decode_attention(PagedDecodeBatch<Lane> batch) {
     const auto input = resolve_lane(batch.lanes[blockIdx.z]);
-    if constexpr (Count == decoder::paged_decode_lanes) {
-        if (!decoder::paged_decode_position(input.position)) {
-            return;
-        }
+    if (!decoder::paged_decode_position(input.position)) {
+        return;
     }
     __shared__ float weights[decode_splits];
     __shared__ float mass;
@@ -982,11 +978,6 @@ cudaError_t decoder::paged_decode_gqa(
 cudaError_t gqa_decode::decode(const decoder::BoundPagedDecodeLane* lanes,
                               const __nv_bfloat16* const* gates, int count, cudaStream_t stream) {
     return launch_split_decode(lanes, count, stream, gates);
-}
-
-cudaError_t decoder::long_paged_decode_gqa(const PagedDecodeLane* lanes, int count,
-                                          cudaStream_t stream) {
-    return launch_long_paged_decode(lanes, count, stream);
 }
 
 #include "sglang/text/mtp/gqa_attention.cuh"

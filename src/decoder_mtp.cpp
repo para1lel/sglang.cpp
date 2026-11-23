@@ -153,8 +153,8 @@ void project(Fp8Weight weight, const DraftWorkspace& work, Bf16* output, cudaStr
 struct MtpDraftWeights::State {
     State(const std::filesystem::path& directory, int device,
           std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-          Bf16Weight lm_head, bool int8_head, bool prepare_shared_vocab)
-        : device(device), target_weights(std::move(target_weights)), memory(device),
+          Bf16Weight lm_head, bool b200)
+        : device(device), b200(b200), target_weights(std::move(target_weights)), memory(device),
           embedding(embedding), lm_head(lm_head) {
         if (!this->target_weights || !embedding || !lm_head.values ||
             lm_head.rows != vocab_size || lm_head.columns != hidden_size) {
@@ -184,7 +184,7 @@ struct MtpDraftWeights::State {
         mlp_up = upload.projection(mlp + "up_proj", intermediate_size, hidden_size);
         mlp_down = upload.projection(mlp + "down_proj", hidden_size, intermediate_size);
         final_norm = upload.norm("mtp.norm.weight", hidden_size);
-        if (int8_head) {
+        if (b200) {
             auto* values = memory.allocate<std::uint8_t>(
                 static_cast<std::size_t>(vocab_size) * hidden_size);
             auto* maxima = memory.allocate<float>(vocab_size);
@@ -192,12 +192,10 @@ struct MtpDraftWeights::State {
                                           memory.stream()), "Quantize MTP vocabulary head");
             quantized_head = values;
             quantized_head_maxima = maxima;
-            if (prepare_shared_vocab) {
-                shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
-            }
+            shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
         }
         memory.close_stream();
-        if (int8_head) {
+        if (b200) {
             std::vector<float> maxima(vocab_size);
             check(cudaMemcpy(maxima.data(), quantized_head_maxima, maxima.size() * sizeof(float),
                              cudaMemcpyDeviceToHost), "Read INT8 MTP vocabulary row maxima");
@@ -212,6 +210,7 @@ struct MtpDraftWeights::State {
     }
 
     int device;
+    bool b200;
     std::shared_ptr<const Allocations> target_weights;
     Allocations memory;
     const Bf16* embedding;
@@ -421,10 +420,9 @@ void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStre
 
 MtpDraftWeights::MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
                                  std::shared_ptr<const Allocations> target_weights,
-                                 const Bf16* embedding, Bf16Weight lm_head, bool int8_head,
-                                 bool prepare_shared_vocab)
+                                 const Bf16* embedding, Bf16Weight lm_head, bool b200)
     : state_(std::make_unique<State>(checkpoint, device, std::move(target_weights), embedding,
-                                     lm_head, int8_head, prepare_shared_vocab)) {}
+                                     lm_head, b200)) {}
 
 MtpDraftWeights::~MtpDraftWeights() = default;
 
@@ -555,7 +553,7 @@ void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
             for (int index = 0; index < count; ++index) {
                 attention[index] = states[index]->attention_row(rows[index].position);
             }
-            check(mtp_gqa_attention_batch(attention.data(), count, stream),
+            check(mtp_gqa_attention_batch(attention.data(), count, model.b200, stream),
                   "Read batched MTP MXFP8 attention");
             apply(&State::gate_attention);
             project_wave(model.gqa.output, &DraftWorkspace::branch);

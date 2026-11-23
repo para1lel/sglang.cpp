@@ -184,7 +184,8 @@ struct DraftAttentionRow {
     ExactGqaWorkspace workspace;
 };
 
-cudaError_t mtp_gqa_attention_batch(const DraftAttentionRow* rows, int count, cudaStream_t stream);
+cudaError_t mtp_gqa_attention_batch(const DraftAttentionRow* rows, int count, bool b200,
+                                    cudaStream_t stream);
 
 cudaError_t exact_decode_gqa_attention(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, const __nv_bfloat16* queries,
@@ -229,12 +230,6 @@ inline constexpr bool paged_decode_position(int position) {
     return position >= paged_decode_min_visible - 1 && position < paged_decode_max_visible;
 }
 #endif
-
-inline constexpr int long_paged_decode_min_visible = 32768;
-
-inline constexpr bool long_paged_decode_position(int position) {
-    return position >= long_paged_decode_min_visible - 1 && position < text_attention_max_tokens;
-}
 
 struct PagedDecodeBuffers {
     const __nv_bfloat16* queries;
@@ -283,7 +278,6 @@ cudaError_t target_split_gqa(const PagedDecodeLane* lanes, int count, int end,
 
 cudaError_t paged_decode_gqa(const PagedDecodeLane* lanes, int count, cudaStream_t stream);
 cudaError_t paged_decode_gqa(const BoundPagedDecodeLane* lanes, int count, cudaStream_t stream);
-cudaError_t long_paged_decode_gqa(const PagedDecodeLane* lanes, int count, cudaStream_t stream);
 
 cudaError_t decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                        const __nv_bfloat16* b, const __nv_bfloat16* a,

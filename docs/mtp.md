@@ -13,7 +13,7 @@ target model. It supports greedy decoding and sampling.
 
 ## Runtime path
 
-`sglang-server` and `sglang-generate` default to MTP depth four (K4). Use `--mtp-steps 0` to disable MTP (K0). Values `1`–`4` limit draft proposals per round. Both commands accept `--mtp-k` as an alias. C++ `DecoderOptions` defaults to K0. [Depth option](../apps/sglang-server.cpp#L151)<!-- prefix: "} else if (o" --> · [Server default](../apps/sglang-server.cpp#L37)<!-- prefix: "int mtp_step" --> · [Generator default](../apps/sglang-generate.cpp#L123)<!-- prefix: "arguments.op" --> · [C++ options](../include/sglang/decoder.h#L36)<!-- prefix: "int mtp_step" -->
+`sglang-server` and `sglang-generate` default to MTP depth four (K4). Use `--mtp-steps 0` to disable MTP (K0). Values `1`–`4` limit draft proposals per round. Both commands accept `--mtp-k` as an alias. C++ `DecoderOptions` defaults to K0. [Depth option](../apps/sglang-server.cpp#L149)<!-- prefix: "} else if (o" --> · [Server default](../apps/sglang-server.cpp#L37)<!-- prefix: "int mtp_step" --> · [Generator default](../apps/sglang-generate.cpp#L123)<!-- prefix: "arguments.op" --> · [C++ options](../include/sglang/decoder.h#L36)<!-- prefix: "int mtp_step" -->
 
 At capacities 1–32, the server supports MTP for text completions, text-only chat, and native prompts, including sampling and [constraints](output-constraints.md). If you omit the depth option, jobs with [token logprobs](native-generate.md#token-logprobs) use K0. At explicit positive depth, these requests return HTTP 400. [Media requests](multimodal-decoder.md) use K0. A [prefix-cache-enabled batch](prefix-cache.md#runtime-path) uses exact prompt projections. `Decoder::generate` uses one batch lane for MTP. [Logprob policy](../include/sglang/server/batch_service.h#L126)<!-- prefix: "bool support" --> · [Single-prompt selection](../apps/server/batch_service.cpp#L894)<!-- prefix: "job->options" --> · [Batch selection](../apps/server/batch_service.cpp#L597)<!-- prefix: "job->options" -->
 
@@ -28,11 +28,11 @@ Eligible B200 MTP prompt tiles hold up to 1,024 rows. Prefix reuse and other dev
 
 On the B200 Tensor Core text path, draft seed FC can use WMMA for prompts of at least 4,096 tokens and aligned chunks of 64–128 rows. BF16 inputs accumulate in FP32 and round to BF16. Accumulation order can change draft KV and proposals. Ineligible chunks use SIMT seed FC.
 
-Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L599)<!-- prefix: "void MtpDraf" -->
+Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L597)<!-- prefix: "void MtpDraf" -->
 
 The target scores the last prompt row and selects the first token. If generation continues, that token and the last normalized target row start the draft round at `L-1`. Later proposals use the previous draft's final-normalized row and prediction. The proposal loop synchronizes once per wave across the group. [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" -->
 
-Draft forwards select [MXFP8 attention by context length](native-model-info.md#draft-attention).
+Eligible B200 draft waves select [grouped online attention](native-model-info.md#draft-attention) automatically.
 
 Each target round starts with the latest committed token. Proposals supply subsequent inputs. The batch limits proposals to `K`, remaining outputs minus one, and assigned target rows minus one. Each proposal can add one target row. A lane assigned one verification row makes zero proposals. One remaining output uses ordinary eager decode. Zero budget finishes without allocating model state or running a forward. See [target row accounting](batch-graphs.md#runtime-path). [Batch assignment](../src/decoder_batch.cpp#L577)<!-- prefix: "if (results[" --> · [Zero-budget admission](../src/decoder_batch.cpp#L770)<!-- prefix: "if (const in" -->
 

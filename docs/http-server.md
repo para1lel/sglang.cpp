@@ -25,7 +25,7 @@ All three health checks accept empty GET requests and bypass the completion queu
 
 | Route | Responsibility | Response |
 | --- | --- | --- |
-| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L169)<!-- prefix: "std::string " --> |
+| `/health` | The HTTP reader reports liveness and the configured scheduler limits. | HTTP 200 with JSON fields `max_active` and `max_num_batched_tokens`, including after permanent worker failure. [Health response](../apps/sglang-server.cpp#L167)<!-- prefix: "std::string " --> |
 | `/ready` | The HTTP reader checks the permanent decoder worker failure flag. | HTTP 200 with `{"ready":true}` while the worker has no permanent failure. After failure, HTTP 503 with `{"ready":false,"reason":"worker_failed"}`. [Readiness response](../apps/server/http.cpp#L662)<!-- prefix: "void write_r" --> · [Worker flag](../apps/server/batch_service.cpp#L776)<!-- prefix: "bool BatchSe" --> |
 | `/health_generate` | A dedicated HTTP worker asks the batch scheduler for generation progress. | HTTP 200 for progress within the probe window. HTTP 503 for queue overload, probe failure, timeout, permanent worker failure, or shutdown. Both statuses carry `Content-Length: 0` and `Connection: close`. [Dispatch](../apps/server/prefix_controls.cpp#L485)<!-- prefix: "void Connect" --> · [Reply](../apps/server/http.cpp#L671)<!-- prefix: "void write_g" --> |
 

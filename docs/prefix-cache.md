@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L145)<!-- prefix: "} else if (o" --> · [Salt validation](../apps/server/text_request.cpp#L719)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L50)<!-- prefix: "void append_" --> |
+| Server | Configure prefix reuse, validate salts, and report usage. | [CLI](../apps/sglang-server.cpp#L143)<!-- prefix: "} else if (o" --> · [Salt validation](../apps/server/text_request.cpp#L719)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L50)<!-- prefix: "void append_" --> |
 | HTTP controls | Dispatch cache reset, metrics, and bounded scheduler profiling. | [Control routes](../apps/server/prefix_controls.cpp#L485)<!-- prefix: "void Connect" --> |
 | Batch | Restore request state, schedule remaining prompt rows, and publish completed checkpoints. | [Admission](../src/decoder_batch.cpp#L313)<!-- prefix: "int DecoderB" --> · [Checkpoint publication](../src/decoder_batch.cpp#L812)<!-- prefix: "cache-\u003estore" --> |
 | Cache | Match checkpoint keys and own the copies until eviction or batch teardown. | [Lookup](../src/decoder_prefix_cache.cpp#L130)<!-- prefix: "int PrefixCa" --> · [Restore](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "int PrefixCa" --> · [Store](../src/decoder_prefix_cache.cpp#L185)<!-- prefix: "void PrefixC" --> |
@@ -23,7 +23,7 @@ The checkpoint boundary is the largest multiple of 128 within the prompt length 
 
 ### Checkpoint compatibility and resume
 
-For a checkpoint of `P` prompt IDs, target KV covers positions `0` through `P-1`. The entry also stores GDN state and the target hidden and residual rows after position `P-1`. A paired checkpoint contains draft KV for positions `0` through `P-2`. Each draft position needs the next token's embedding, so the checkpoint leaves draft position `P-1` open. [Restore](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "int PrefixCa" --> · [Draft copy](../src/decoder_mtp.cpp#L691)<!-- prefix: "void MtpDraf" -->
+For a checkpoint of `P` prompt IDs, target KV covers positions `0` through `P-1`. The entry also stores GDN state and the target hidden and residual rows after position `P-1`. A paired checkpoint contains draft KV for positions `0` through `P-2`. Each draft position needs the next token's embedding, so the checkpoint leaves draft position `P-1` open. [Restore](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "int PrefixCa" --> · [Draft copy](../src/decoder_mtp.cpp#L689)<!-- prefix: "void MtpDraf" -->
 
 K0 can use either a target-only or a paired entry. Depths 1–4 share paired entries, and lookup skips target-only entries even if they match a longer prefix. If no eligible pair matches, the lane prefills from the start. Publication can fill in the draft state of the same target-only key without an eviction. Publishing K0 state for a key that already has a pair preserves the pair. [Store](../src/decoder_prefix_cache.cpp#L185)<!-- prefix: "void PrefixC" -->
 

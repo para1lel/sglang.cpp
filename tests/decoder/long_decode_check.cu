@@ -148,13 +148,13 @@ void expect_launches(int count, bool fused = false) {
     std::cout << "launches=" << observed << " width=" << count << " fused=" << fused << '\n';
 }
 
-cudaError_t invoke_legacy(const PagedDecodeLane* inputs, int count, cudaStream_t stream,
-                          bool narrow = false) {
+cudaError_t invoke_eager(const PagedDecodeLane* inputs, int count, cudaStream_t stream,
+                         bool narrow = false) {
     observed = 0;
     fail_at = 0;
     watching = true;
     const auto result = narrow ? paged_decode_gqa(inputs, count, stream)
-                              : long_paged_decode_gqa(inputs, count, stream);
+                              : target_split_gqa(inputs, count, max_tokens, stream);
     watching = false;
     return result;
 }
@@ -179,7 +179,7 @@ cudaError_t invoke(const PagedDecodeLane* inputs, int count, cudaStream_t stream
 }
 
 void invalid(const PagedDecodeLane* inputs, int count, cudaStream_t stream) {
-    check(invoke_legacy(inputs, count, stream) == cudaErrorInvalidValue && observed == 0,
+    check(invoke_eager(inputs, count, stream) == cudaErrorInvalidValue && observed == 0,
           "Invalid grouped input must fail before launch");
 }
 
@@ -205,9 +205,9 @@ void check_errors(std::vector<PagedDecodeLane> inputs, unsigned char* scratch,
                   cudaStream_t stream) {
     invalid(nullptr, 1, stream);
     invalid(inputs.data(), 0, stream);
-    invalid(inputs.data(), width + 1, stream);
+    invalid(inputs.data(), target_split_eager_max_rows + 1, stream);
     const auto original = inputs[1];
-    inputs[1].position = 32766;
+    inputs[1].position = target_split_first_position - 1;
     invalid(inputs.data(), 2, stream);
     inputs[1].position = max_tokens;
     invalid(inputs.data(), 2, stream);
@@ -235,12 +235,12 @@ void check_errors(std::vector<PagedDecodeLane> inputs, unsigned char* scratch,
     }
     inputs[0].position = paged_decode_min_visible - 1;
     inputs[1].position = paged_decode_min_visible - 2;
-    check(invoke_legacy(inputs.data(), 2, stream, true) == cudaErrorInvalidValue && observed == 0,
+    check(invoke_eager(inputs.data(), 2, stream, true) == cudaErrorInvalidValue && observed == 0,
           "Narrow window accepted a short context");
     inputs[1].position = paged_decode_max_visible;
-    check(invoke_legacy(inputs.data(), 2, stream, true) == cudaErrorInvalidValue && observed == 0,
+    check(invoke_eager(inputs.data(), 2, stream, true) == cudaErrorInvalidValue && observed == 0,
           "Narrow window accepted a long context");
-    check(invoke_legacy(inputs.data(), paged_decode_lanes + 1, stream, true) ==
+    check(invoke_eager(inputs.data(), paged_decode_lanes + 1, stream, true) ==
               cudaErrorInvalidValue && observed == 0, "Narrow window accepted a wide batch");
     std::cout << "invalid=13 injected_launch_failures=4\n";
 }

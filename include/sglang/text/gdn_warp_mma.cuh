@@ -9,6 +9,8 @@ constexpr int warp_value_tiles = dimension / (columns * block_warps);
 constexpr int matrix_stride = rows + vector_elements;
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+using Pair = __nv_bfloat162;
+
 struct OperandA {
     unsigned int fragments[4];
 };
@@ -154,6 +156,62 @@ __device__ __forceinline__ void prefetch(Stage& target, const Matrices& matrix,
 
 constexpr int dynamic_bytes = 2 * sizeof(Stage);
 
+template<bool Grouped>
+__device__ __forceinline__ void scale_keys(const Stage& stage, Bf16* scaled_keys) {
+    constexpr int elements = Grouped ? 2 : 1;
+    for (int index = elements * threadIdx.x; index < rows * dimension;
+         index += elements * block_threads) {
+        const int position = index / dimension;
+        const int offset = position * key_stride + index % dimension;
+        const auto* key = stage.qk + rows * key_stride + offset;
+        const float tail = stage.tail[position];
+        if constexpr (Grouped) {
+            const auto keys = __bfloat1622float2(*reinterpret_cast<const Pair*>(key));
+            *reinterpret_cast<Pair*>(scaled_keys + offset) =
+                __floats2bfloat162_rn(tail * keys.x, tail * keys.y);
+        } else {
+            scaled_keys[offset] = __float2bfloat16(tail * __bfloat162float(*key));
+        }
+    }
+}
+
+template<bool Grouped>
+__device__ __forceinline__ void write_residual(const Stage& stage, const Bf16* convolved,
+                                              const Result (&projection)[2 * time_tiles],
+                                              int first, int valid, int feature, int lane,
+                                              Bf16* work) {
+    constexpr int elements = Grouped ? 2 : 1;
+    #pragma unroll
+    for (int task = 0; task < time_tiles; ++task) {
+        Result residual;
+        #pragma unroll
+        for (int element = 0; element < 4; element += elements) {
+            const int position = task * tile + result_row(lane, element);
+            if (position < valid) {
+                const int token = first + position;
+                const auto* target = convolved +
+                    static_cast<std::size_t>(token) * text_gdn_qkv_width +
+                    2 * text_gdn_qk_width + feature + result_column(lane, element);
+                const float beta = stage.beta[position];
+                const float initial = stage.initial[position];
+                const auto& projected = projection[time_tiles + task];
+                if constexpr (Grouped) {
+                    const auto value = __bfloat1622float2(*reinterpret_cast<const Pair*>(target));
+                    residual.fragments[element] =
+                        beta * (value.x - initial * projected.fragments[element]);
+                    residual.fragments[element + 1] =
+                        beta * (value.y - initial * projected.fragments[element + 1]);
+                } else {
+                    residual.fragments[element] = beta *
+                        (__bfloat162float(*target) - initial * projected.fragments[element]);
+                }
+            }
+        }
+        store_bf16(work + task * tile * columns, residual, lane);
+    }
+}
+
+template<bool Grouped>
 __device__ __forceinline__ void write_observable(const Stage& stage, const Bf16* work,
                                                 const Result (&projection)[2 * time_tiles],
                                                 int first, int valid, int feature, int lane,
@@ -163,15 +221,24 @@ __device__ __forceinline__ void write_observable(const Stage& stage, const Bf16*
     #pragma unroll
     for (int task = 0; task < time_tiles; ++task) {
         #pragma unroll
-        for (int element = 0; element < 4; ++element) {
+        for (int element = 0; element < 4; element += Grouped ? 2 : 1) {
             const int position = task * tile + result_row(lane, element);
             if (position < valid) {
                 constexpr float query_scale = 0.08838834764831845f;
-                const float value = fmaf(stage.initial[position],
+                const float first_value = fmaf(stage.initial[position],
                     projection[task].fragments[element], output[task].fragments[element]);
-                observable[static_cast<std::size_t>(first + position) * text_gdn_value_width +
-                           feature + result_column(lane, element)] =
-                    __float2bfloat16(query_scale * value);
+                auto* target = observable +
+                    static_cast<std::size_t>(first + position) * text_gdn_value_width +
+                    feature + result_column(lane, element);
+                if constexpr (Grouped) {
+                    const float second_value = fmaf(stage.initial[position],
+                        projection[task].fragments[element + 1],
+                        output[task].fragments[element + 1]);
+                    *reinterpret_cast<Pair*>(target) = __floats2bfloat162_rn(
+                        query_scale * first_value, query_scale * second_value);
+                } else {
+                    *target = __float2bfloat16(query_scale * first_value);
+                }
             }
         }
     }
@@ -199,6 +266,7 @@ __device__ __forceinline__ void advance_state(const Bf16* scaled_keys, const Bf1
     }
 }
 
+template<bool Grouped>
 __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
                                               const Matrices* matrices, float* recurrent,
                                               Bf16* observable) {
@@ -238,35 +306,11 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
                      first + rows, min(count - first - rows, rows), head);
         }
 
-        for (int index = threadIdx.x; index < rows * dimension; index += block_threads) {
-            const int position = index / dimension;
-            const int offset = position * key_stride + index % dimension;
-            scaled_keys[offset] =
-                __float2bfloat16(stage.tail[position] *
-                                 __bfloat162float(stage.qk[rows * key_stride + offset]));
-        }
+        scale_keys<Grouped>(stage, scaled_keys);
 
         Result projection[2 * time_tiles];
         project(stage.qk, state, lane, projection);
-        #pragma unroll
-        for (int task = 0; task < time_tiles; ++task) {
-            Result residual;
-            #pragma unroll
-            for (int element = 0; element < 4; ++element) {
-                const int position = task * tile + result_row(lane, element);
-                if (position < valid) {
-                    const int token = first + position;
-                    const auto* target = convolved +
-                        static_cast<std::size_t>(token) * text_gdn_qkv_width +
-                        2 * text_gdn_qk_width + feature;
-                    residual.fragments[element] = stage.beta[position] *
-                        (__bfloat162float(target[result_column(lane, element)]) -
-                         stage.initial[position] *
-                         projection[time_tiles + task].fragments[element]);
-                }
-            }
-            store_bf16(work + task * tile * columns, residual, lane);
-        }
+        write_residual<Grouped>(stage, convolved, projection, first, valid, feature, lane, work);
         __syncwarp();
         Result correction[time_tiles];
         solve(stage.inverse, work, lane, correction);
@@ -277,7 +321,7 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
         }
         __syncwarp();
 
-        write_observable(stage, work, projection, first, valid, feature, lane, observable);
+        write_observable<Grouped>(stage, work, projection, first, valid, feature, lane, observable);
         __syncthreads();
 
         advance_state(scaled_keys, work, stage.initial[rows - 1], lane, accumulator);
@@ -300,13 +344,14 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
 
 __global__ void recur_warp(int count, const Bf16* convolved, const Matrices* matrices,
                            float* recurrent, Bf16* observable) {
-    recur_segment(count, convolved, matrices, recurrent, observable);
+    recur_segment<false>(count, convolved, matrices, recurrent, observable);
 }
 
-__global__ void recur_segments(const __grid_constant__ Segments segments) {
+__global__ __launch_bounds__(block_threads, 3)
+void recur_segments(const __grid_constant__ Segments segments) {
     const auto& segment = segments.values[blockIdx.z];
-    recur_segment(segment.count, segment.convolved, segment.matrices, segment.recurrent,
-                  segment.observable);
+    recur_segment<true>(segment.count, segment.convolved, segment.matrices, segment.recurrent,
+                        segment.observable);
 }
 #else
 constexpr int dynamic_bytes = 0;

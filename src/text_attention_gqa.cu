@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/text/gqa_verify_batch.h"
+#include "sglang/text/quantize_warp.cuh"
 
 #include <cuda_runtime.h>
 
@@ -107,21 +108,62 @@ __global__ void gqa_verify_preprocess_kernel(
                              q_norm, k_norm, row.rope_queries, row.rope_keys);
 }
 
+__device__ __forceinline__ __nv_bfloat16 gated_attention(__nv_bfloat16 gate,
+                                                         __nv_bfloat16 attention) {
+    const float value = __bfloat162float(attention);
+    const float sigmoid = 1.0f / (1.0f + expf(-__bfloat162float(gate)));
+    return __float2bfloat16(value * sigmoid);
+}
+
 __device__ __forceinline__ void gqa_postgate_head(
     std::size_t row_head, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
     __nv_bfloat16* output) {
     const int channel = threadIdx.x;
-    const float gate =
-        __bfloat162float(q_gate[(row_head * 2 + 1) * mxfp8_head_dim + channel]);
+    const auto gate = q_gate[(row_head * 2 + 1) * mxfp8_head_dim + channel];
     const std::size_t output_index = row_head * mxfp8_head_dim + channel;
-    const float value = __bfloat162float(attention[output_index]);
-    const float sigmoid = 1.0f / (1.0f + expf(-gate));
-    output[output_index] = __float2bfloat16(value * sigmoid);
+    output[output_index] = gated_attention(gate, attention[output_index]);
 }
 
 __global__ void gqa_postgate(const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
                              __nv_bfloat16* output) {
     gqa_postgate_head(blockIdx.x, q_gate, attention, output);
+}
+
+struct GatedAttentionPairs {
+    __nv_bfloat162 first;
+    __nv_bfloat162 second;
+};
+
+__device__ __forceinline__ GatedAttentionPairs gqa_postgate_pairs(
+    const __nv_bfloat16* q_gate, const __nv_bfloat16* attention, int offset) {
+    const int head = offset / mxfp8_head_dim;
+    const auto* gates = reinterpret_cast<const __nv_bfloat162*>(
+        q_gate + offset + (head + 1) * mxfp8_head_dim);
+    const auto* inputs = reinterpret_cast<const __nv_bfloat162*>(attention + offset);
+    const auto gate_first = gates[0];
+    const auto gate_second = gates[1];
+    const auto first = inputs[0];
+    const auto second = inputs[1];
+    return {{gated_attention(gate_first.x, first.x), gated_attention(gate_first.y, first.y)},
+            {gated_attention(gate_second.x, second.x), gated_attention(gate_second.y, second.y)}};
+}
+
+__global__ void gqa_postgate_quantize(const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
+                                     TextFp8Activation output) {
+    using namespace text_kernel;
+    static_assert(text_fp8_group_size == warp_width * 4);
+    static_assert(mxfp8_head_dim % text_fp8_group_size == 0);
+    constexpr int groups_per_row = text_gqa_q_width / text_fp8_group_size;
+    static_assert(groups_per_row % block_warps == 0);
+    const int group = blockIdx.x * block_warps + threadIdx.x / warp_width;
+    const int lane = threadIdx.x % warp_width;
+    const int offset = group * text_fp8_group_size + lane * 4;
+    const auto row = static_cast<std::size_t>(blockIdx.y);
+    const auto [first, second] = gqa_postgate_pairs(q_gate + row * text_gqa_q_gate_width,
+                                                   attention + row * text_gqa_q_width, offset);
+    output.values += row * text_gqa_q_width;
+    output.scales += row * groups_per_row;
+    quantize_warp_pairs(first, second, group, offset, lane, output);
 }
 
 __global__ void gqa_verify_postgate_kernel(
@@ -245,6 +287,26 @@ cudaError_t text_gqa_postgate(int token_count, const __nv_bfloat16* q_gate,
     void* arguments[] = {&q_gate, &attention, &output};
     return cudaLaunchKernel(gqa_postgate, dim3(token_count * mxfp8_query_heads),
                             dim3(mxfp8_head_dim), arguments, 0, stream);
+}
+
+std::optional<cudaError_t> decoder::try_prefill_gqa_postgate_quantize(
+    int rows, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
+    TextFp8Activation activation, cudaStream_t stream) {
+    using namespace text_kernel;
+    if (rows != 4096 || !q_gate || !attention || !activation.values || !activation.scales ||
+        !aligned(q_gate, alignof(__nv_bfloat162)) || !aligned(attention, alignof(__nv_bfloat162)) ||
+        !aligned(activation.values, alignof(__nv_fp8x4_storage_t)) ||
+        !aligned(activation.scales, alignof(float))) {
+        return std::nullopt;
+    }
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess) return pending;
+    constexpr int blocks = text_gqa_q_width / (text_fp8_group_size * block_warps);
+    void* args[] = {&q_gate, &attention, &activation};
+    const auto status = cudaLaunchKernel(gqa_postgate_quantize, dim3(blocks, rows), block_threads,
+                                         args, 0, stream);
+    const auto recorded = cudaGetLastError();
+    return status == cudaSuccess ? recorded : status;
 }
 
 }

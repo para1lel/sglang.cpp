@@ -153,7 +153,16 @@ cudaError_t tensor_core_prefill_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages, in
                                     int rows, const __nv_bfloat16* queries,
                                     __nv_bfloat16* output, cudaStream_t stream);
 
-enum class RmsQuantizeLaunch { ordinary, packed_gate_up, prefetch_decode_weights };
+std::optional<cudaError_t> try_prefill_gqa_postgate_quantize(
+    int rows, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
+    TextFp8Activation activation, cudaStream_t stream);
+
+enum class RmsQuantizeLaunch {
+    ordinary,
+    packed_gate_up,
+    prefetch_decode_weights,
+    full_group_prefill,
+};
 
 cudaError_t tensor_core_prefill_rms_quantize(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,

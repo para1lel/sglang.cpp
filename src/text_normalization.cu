@@ -216,7 +216,8 @@ __device__ void rms_quantize_subwarps(const __nv_bfloat16* normalized,
     }
 }
 
-template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false>
+template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false,
+          bool AsyncStage = PackedGroups>
 __device__ __forceinline__ void rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
                                      const __nv_bfloat16* weight, __nv_bfloat16* normalized,
                                      TextFp8Activation activation) {
@@ -229,7 +230,7 @@ __device__ __forceinline__ void rms_quantize(const __nv_bfloat16* branch, __nv_b
     __shared__ alignas(16) __nv_bfloat16 gains[rms_hidden_width];
     for (int col = threadIdx.x * vector_width; col < rms_hidden_width;
          col += block_threads * vector_width) {
-        if constexpr (PackedGroups) {
+        if constexpr (AsyncStage) {
             stage_rms_vector_async(branch + col, branch_values + col);
             if constexpr (HasResidual) {
                 stage_rms_vector_async(residual + col, residual_values + col);
@@ -243,7 +244,7 @@ __device__ __forceinline__ void rms_quantize(const __nv_bfloat16* branch, __nv_b
             stage_rms_vector(weight + col, gains + col);
         }
     }
-    if constexpr (PackedGroups) {
+    if constexpr (AsyncStage) {
         asm volatile("cp.async.commit_group;" ::: "memory");
         asm volatile("cp.async.wait_group 0;" ::: "memory");
     }
@@ -304,14 +305,15 @@ __device__ __forceinline__ void rms_quantize(const __nv_bfloat16* branch, __nv_b
     }
 }
 
-template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false>
+template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false,
+          bool AsyncStage = PackedGroups>
 __global__ void prefill_rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
                                      const __nv_bfloat16* weight, __nv_bfloat16* normalized,
                                      TextFp8Activation activation) {
     const auto offset = static_cast<std::size_t>(blockIdx.x) * rms_hidden_width;
     activation.values += offset;
     activation.scales += offset / text_fp8_group_size;
-    rms_quantize<HasResidual, PackedGroups, LaunchDependents>(
+    rms_quantize<HasResidual, PackedGroups, LaunchDependents, AsyncStage>(
         branch + offset, HasResidual ? residual + offset : nullptr, weight,
         normalized + offset, activation);
 }
@@ -387,6 +389,16 @@ cudaError_t decoder::tensor_core_prefill_rms_quantize(
     }
     void* args[] = {&branch, &residual, &weight, &normalized, &activation};
     const bool prefetch_weights = launch == RmsQuantizeLaunch::prefetch_decode_weights;
+    if (launch == RmsQuantizeLaunch::full_group_prefill && rows == 4096 &&
+        aligned(activation.values, alignof(uint2))) {
+        const auto pending = cudaGetLastError();
+        if (pending != cudaSuccess) return pending;
+        const auto kernel = residual ? prefill_rms_quantize<true, true, false, false>
+                                     : prefill_rms_quantize<false, true, false, false>;
+        const auto status = cudaLaunchKernel(kernel, rows, block_threads, args, 0, stream);
+        const auto recorded = cudaGetLastError();
+        return status == cudaSuccess ? recorded : status;
+    }
     if (residual && rows >= 2 && rows <= 32 && aligned(activation.values, alignof(uint2))) {
         const bool early = prefetch_weights ||
                            (launch == RmsQuantizeLaunch::packed_gate_up && rows == 32);

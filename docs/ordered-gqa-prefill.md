@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model prefill | Append KV and select the attention path. | [Caller](../src/decoder_prefill.cpp#L219)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L764)<!-- prefix: "const bool t" --> |
+| Model prefill | Append KV and select the attention path. | [Caller](../src/decoder_prefill.cpp#L219)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L781)<!-- prefix: "const bool t" --> |
 | Native dispatcher | Select Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L905)<!-- prefix: "cudaError_t " --> |
 | Ordered tile | Apply causal FP32 scoring and token-ordered accumulation. | [Score](../src/mxfp8_gqa_prefill.cu#L35)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L187)<!-- prefix: "for (int fir" --> |
 
@@ -12,7 +12,7 @@
 
 After KV append, the Tensor Core model path uses native attention dispatch at the same position and row count. Exact multirow tiles use direct MXFP8 attention. See the [Flash dispatcher](flash-prefill.md#runtime-path) for shape and device selection.
 
-[Grouped text prefill](native-prefill-workspace.md#multi-request-text-prefill) preserves each lane's positions, KV pages, and causal mask. [Batched staged attention](flash-prefill.md#runtime-path) is available for eligible full-tile groups. A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L733)<!-- prefix: "if (rows == " -->.
+[Grouped text prefill](native-prefill-workspace.md#multi-request-text-prefill) preserves each lane's positions, KV pages, and causal mask. [Batched staged attention](flash-prefill.md#runtime-path) is available for eligible full-tile groups. A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L750)<!-- prefix: "if (rows == " -->.
 
 Staged tiles double-buffer packed K/V and scales in 32-key blocks. The loads follow the page table and zero-fill slots outside the tile's visible span. Scoring and accumulation apply each row's causal limit. [Copies](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L112)<!-- prefix: "__device__ v" -->
 

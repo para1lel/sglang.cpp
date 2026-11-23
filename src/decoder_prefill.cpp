@@ -250,10 +250,11 @@ struct Chunk : PrefillProjections {
         project(layer.mlp_down, quantize(work.mlp_gate, intermediate_size), work.hidden);
     }
 
-    void normalize(const Bf16* branch, Bf16* residual, const Bf16* weight) const {
+    void normalize(const Bf16* branch, Bf16* residual, const Bf16* weight,
+                   RmsQuantizeLaunch launch = RmsQuantizeLaunch::ordinary) const {
         if (tensor_core_fp8) {
             check(tensor_core_prefill_rms_quantize(branch, residual, weight, hidden_size, rows,
-                                                   work.normalized, activation, stream),
+                                                   work.normalized, activation, stream, launch),
                   "Normalize and quantize prefill residual");
             return;
         }
@@ -464,7 +465,7 @@ PairedPrefillScratch serial_gqa_scratch(const TileBuffers& buffers, int serial_c
     return scratch;
 }
 
-enum class PrefillAttentionMode { batched, serial_segments };
+enum class PrefillAttentionMode { batched, full_group, serial_segments };
 
 void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, PrefillGroup group,
                        PrefillWorkspace& workspace, bool mixed,
@@ -474,6 +475,9 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     const TileBuffers buffers(layout, workspace.capacity());
     const bool grouped = group.rows > max_layerwise_rows;
     const bool serial_attention = attention_mode == PrefillAttentionMode::serial_segments;
+    const bool full_group = attention_mode == PrefillAttentionMode::full_group;
+    const auto rms_launch = full_group ? RmsQuantizeLaunch::full_group_prefill
+                                       : RmsQuantizeLaunch::ordinary;
     const Chunk chunk{{buffers.activation, group.rows, stream, true,
                        grouped || serial_attention}, buffers, 0, nullptr};
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
@@ -484,7 +488,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         model.layers,
         [&](const Bf16* weight, const char*, const auto& residuals) {
             const auto [branch, residual] = residuals(buffers);
-            chunk.normalize(branch, residual, weight);
+            chunk.normalize(branch, residual, weight, rms_launch);
         },
         [&](const GqaLayer& layer, int bank) {
             chunk.gqa_input(layer);
@@ -503,6 +507,17 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                                      [&](const PrefillGrant* first, int count, int offset) {
                     prefill_group_gqa(chunk, layer, bank, first, count, offset);
                 });
+            }
+            if (full_group) {
+                if (const auto status = try_prefill_gqa_postgate_quantize(
+                        group.rows, buffers.q_gate, buffers.attention, buffers.activation,
+                        stream)) {
+                    check(*status, "Gate and quantize prefill grouped-query attention");
+                    const TextFp8ActivationView input{
+                        buffers.activation.values, buffers.activation.scales};
+                    chunk.project(layer.output, input, buffers.projected_attention);
+                    return;
+                }
             }
             if (!serial_attention) chunk.gqa_gate();
             chunk.attention_output(layer.output, text_gqa_q_width);
@@ -552,6 +567,8 @@ bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* gra
                               int lanes, cudaStream_t stream,
                               DecoderBatchStepStats& stats) {
     const int rows = lanes * batch_prefill_tile_rows;
+    const auto attention_mode = lanes == grouped_prefill_max_rows / batch_prefill_tile_rows
+        ? PrefillAttentionMode::full_group : PrefillAttentionMode::batched;
     PrefillWorkspace workspace(stream, rows);
     if (!workspace.data()) {
         return false;
@@ -564,7 +581,7 @@ bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* gra
                 group[lane] = prefill_tile(grants[index + lane], offset);
             }
             prefill_layerwise(model, group.data(), {lanes, rows}, workspace, false,
-                              PrefillAttentionMode::batched);
+                              attention_mode);
             ++stats.layerwise_prefill_groups;
             stats.layerwise_prefill_rows += rows;
         }

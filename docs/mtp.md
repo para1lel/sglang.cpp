@@ -24,9 +24,9 @@ C++ callers set depth per lane. Exact batches can [restore paired prefixes](pref
 
 On B200, loaded draft weights support [INT8 draft scoring](native-model-info.md#int8-draft-head).
 
-Eligible B200 MTP prompt tiles hold up to 1,024 rows. Prefix reuse and other devices cap MTP tiles at 128. Draft seeding pairs each final-normalized target row with the next prompt token embedding. Single rows or unavailable scratch use scalar prefill. [Tile cap](../src/decoder_batch.cpp#L646)<!-- prefix: "const int li" --> · [Row alignment](../src/decoder_prefill.cpp#L791)<!-- prefix: "chunk.seed_d" -->
+Eligible B200 MTP prompt tiles hold up to 1,024 rows. Prefix reuse and other devices cap MTP tiles at 128. Draft seeding pairs each final-normalized target row with the next prompt token embedding. Single rows or unavailable scratch use scalar prefill. [Tile cap](../src/decoder_batch.cpp#L646)<!-- prefix: "const int li" --> · [Row alignment](../src/decoder_prefill.cpp#L808)<!-- prefix: "chunk.seed_d" -->
 
-With prefix reuse off, B200 Tensor Core text prefill can prefer TMA and `tcgen05` for draft seed FC on prompts of at least 4,096 tokens. Each FC call must have 64–128 effective rows, 10,240 input and 5,120 output channels, and 16-byte-aligned input and weights. Other shapes and input alignments use SIMT row GEMV. [Prefill selection](../src/decoder_prefill.cpp#L540)<!-- prefix: "const bool w" --> · [Row slicing](../src/decoder_mtp.cpp#L682)<!-- prefix: "for (int off" --> · [FC dispatch](../src/text/draft_seed_fc.cu#L124)<!-- prefix: "cudaError_t " -->
+With prefix reuse off, B200 Tensor Core text prefill can prefer TMA and `tcgen05` for draft seed FC on prompts of at least 4,096 tokens. Each FC call must have 64–128 effective rows, 10,240 input and 5,120 output channels, and 16-byte-aligned input and weights. Other shapes and input alignments use SIMT row GEMV. [Prefill selection](../src/decoder_prefill.cpp#L555)<!-- prefix: "const bool w" --> · [Row slicing](../src/decoder_mtp.cpp#L682)<!-- prefix: "for (int off" --> · [FC dispatch](../src/text/draft_seed_fc.cu#L124)<!-- prefix: "cudaError_t " -->
 
 TMA requires 4-byte-aligned output, a matching image and tensor-map encoder, and enough shared memory. Unaligned output or unsupported preflight selects the 32×64 WMMA tile. CUDA errors, including stream/device mismatch and launch failure, propagate without retry. SIMT accumulation can change draft KV and proposals. [TMA preflight](../src/text/draft_seed_fc_sm100.cu#L195)<!-- prefix: "std::optiona" --> · [Submission](../src/text/draft_seed_fc_sm100.cu#L241)<!-- prefix: "return submi" --> · [WMMA tile](../src/text/draft_seed_fc.cu#L24)<!-- prefix: "constexpr in" -->
 
@@ -41,7 +41,7 @@ separately. Seed scratch comes from the existing prefill workspace.
 [Slice preparation](../src/decoder_mtp.cpp#L682)<!-- prefix: "for (int off" --> ·
 [Paired projection](../src/text_ops.cu#L785)<!-- prefix: "cudaError_t " --> ·
 [Grid banks](../include/sglang/text/prefill_fp8_exact.cuh#L209)<!-- prefix: "__global__ v" --> ·
-[Grouped seed](../src/decoder_prefill.cpp#L542)<!-- prefix: "seed.seed_dr" -->
+[Grouped seed](../src/decoder_prefill.cpp#L557)<!-- prefix: "seed.seed_dr" -->
 
 The target scores the last prompt row and selects the first token. If generation continues, that token and the last normalized target row start the draft round at `L-1`. Later proposals use the previous draft's final-normalized row and prediction. The proposal loop synchronizes the stream before reading winners. If any lane retries INT8 scoring in BF16, the loop synchronizes again before reading the retry results. [Proposal loop](../src/decoder_verify.cpp#L163)<!-- prefix: "bool MtpRoun" -->
 
@@ -116,7 +116,7 @@ Run the [MTP acceptance procedure](../tests/mtp/README.md) with both release bin
 
 For draft winner changes, compare winner IDs and scores with per-lane reduction. Require exact matches for waves of two, three, and four rows. Include ties across tiles and nonfinite inputs in both argmax modes. Test eager launches and graph replay with mapped storage. Trace the two grouped launches. Require zero explicit winner copies for the grouped reduction. Check per-lane fallback. Check the BF16 retry after an invalid INT8 winner.
 
-For seeding changes, compare paired RMSNorm and key-only preprocessing with the single-row operations. Compare full target logits, final-normalized rows, committed target KV and GDN state, and seeded draft KV byte for byte where the seed arithmetic agrees. Check later draft and verification logits and continued output. Exercise 1, 127, 128, 129, and 257 prompt positions and a longer multi-tile case. Cover the cache-enabled exact prefill path and the B200 Tensor Core path. Keep the MTP-off graph control. Disconnect during prefill before the first output. Check queued-request parity after retirement. [Paired RMSNorm](../src/text_normalization.cu#L439)<!-- prefix: "cudaError_t " --> · [Key preprocessing](../src/text_attention_gqa.cu#L191)<!-- prefix: "cudaError_t " -->
+For seeding changes, compare paired RMSNorm and key-only preprocessing with the single-row operations. Compare full target logits, final-normalized rows, committed target KV and GDN state, and seeded draft KV byte for byte where the seed arithmetic agrees. Check later draft and verification logits and continued output. Exercise 1, 127, 128, 129, and 257 prompt positions and a longer multi-tile case. Cover the cache-enabled exact prefill path and the B200 Tensor Core path. Keep the MTP-off graph control. Disconnect during prefill before the first output. Check queued-request parity after retirement. [Paired RMSNorm](../src/text_normalization.cu#L451)<!-- prefix: "cudaError_t " --> · [Key preprocessing](../src/text_attention_gqa.cu#L233)<!-- prefix: "cudaError_t " -->
 
 Compare paired K and V BF16 projections byte for byte with the exact per-slice
 projections before key preprocessing. Trace one paired projection and one

@@ -66,6 +66,21 @@ __device__ __forceinline__ void stage_qk(Bf16* target, const Bf16* convolved,
     }
 }
 
+template<int Stride>
+__device__ __forceinline__ void store_grouped_matrices(Matrices& matrix, const Bf16* solution,
+                                                        const Bf16* scores, int thread) {
+    __syncthreads();
+    using Pair = __nv_bfloat162;
+    static_assert(rows % 2 == 0 && Stride % 2 == 0);
+    for (int index = thread * 2; index < rows * rows; index += 2 * threads) {
+        const int offset = index / rows * Stride + index % rows;
+        *reinterpret_cast<Pair*>(matrix.inverse + index) =
+            *reinterpret_cast<const Pair*>(solution + offset);
+        *reinterpret_cast<Pair*>(matrix.scores + index) =
+            *reinterpret_cast<const Pair*>(scores + offset);
+    }
+}
+
 template<int SharedHeads>
 __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved,
                                                 const float2* gates, Matrices* matrices) {
@@ -118,14 +133,22 @@ __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved
     }
     __syncthreads();
 
+    // QK staging is no longer live. Pad the shared rows for column writes,
+    // then store contiguous BF16 pairs into the existing scratch layout.
+    constexpr bool grouped = SharedHeads > 1;
+    constexpr int stride = rows + (grouped ? 2 : 0);
+    constexpr int plane_size = rows * stride;
+    static_assert(2 * SharedHeads * plane_size <= 2 * rows * key_stride);
+
     if (warp < SharedHeads) {
         auto& matrix = chunk[warp];
+        auto* scores = grouped ? qk + warp * plane_size : matrix.scores;
         float product = 1.0f;
         for (int source = lane; source >= 0; --source) {
             const int index = lane * rows + source;
             lower[warp][source * rows + lane] = source < lane
                 ? product * beta[warp][lane] * dots[rows * rows + index] : 0.0f;
-            matrix.scores[index] = __float2bfloat16(product * dots[index]);
+            scores[lane * stride + source] = __float2bfloat16(product * dots[index]);
             if (lane == rows - 1) {
                 matrix.tail[source] = product;
             }
@@ -136,13 +159,14 @@ __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved
     const int value_head = warp / warps;
     const int head_warp = warp % warps;
     auto& matrix = chunk[value_head];
+    auto* scores = grouped ? qk + value_head * plane_size : matrix.scores;
+    auto* solution = grouped ? qk + (SharedHeads + value_head) * plane_size : matrix.inverse;
     for (int index = head_warp * 32 + lane; index < rows * rows; index += threads) {
         if (index / rows < index % rows) {
-            matrix.scores[index] = __float2bfloat16(0.0f);
+            scores[index / rows * stride + index % rows] = __float2bfloat16(0.0f);
         }
     }
     __syncthreads();
-
     for (int column = head_warp; column < rows; column += warps) {
         float inverse = lane == column ? 1.0f : 0.0f;
         for (int pivot = column; pivot < rows - 1; ++pivot) {
@@ -151,7 +175,10 @@ __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved
                 inverse = fmaf(-lower[value_head][pivot * rows + lane], solved, inverse);
             }
         }
-        matrix.inverse[lane * rows + column] = __float2bfloat16(inverse);
+        solution[lane * stride + column] = __float2bfloat16(inverse);
+    }
+    if constexpr (grouped) {
+        store_grouped_matrices<stride>(matrix, solution, scores, head_warp * 32 + lane);
     }
 }
 

@@ -85,8 +85,9 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 - `GET /ready` reports worker readiness. `GET /health` reports liveness and scheduler limits.
   See the [HTTP server guide](docs/http-server.md) for admission limits and startup options.
 
-The formal K4 native-default comparison used native revision `94e8bdca73ce2017e501b6b8b6abda9156ce0c89`.
-Native median client makespan was 15.7% lower on W1 and 19.2% lower on W2 than pinned vLLM.
+The formal K4 native-default comparison used native revision `f46973d433fcf19cee3d80b6e2d0953f5a616324`.
+On W1, native median client makespan was 613.830555 ms, 5.45% lower than pinned vLLM at 649.218988 ms.
+On W2, it was 1420.752210 ms, 18.38% lower than pinned vLLM at 1740.642327 ms.
 Output token IDs repeated within each engine and differed across engines in all nine timed pairs on each workload.
 W3–W6 remain unmeasured under the formal protocol. See the
 [K4 native-default results](docs/serving/paired-native-defaults-results.md) and

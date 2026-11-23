@@ -6,6 +6,7 @@
 #include "sglang/mxfp8_gqa.h"
 
 #include <cstdint>
+#include <optional>
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -101,6 +102,8 @@ struct EagerTargetBatch {
 cudaError_t launch(TargetLane lane, cudaStream_t stream);
 cudaError_t launch(const TargetBatch& batch, int count, cudaStream_t stream);
 cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream);
+std::optional<cudaError_t> try_launch_reuse(const EagerTargetBatch& batch, int count,
+                                           cudaStream_t stream);
 
 #ifdef __CUDACC__
 __device__ inline decoder::PagedDecodeLane resolve(TargetLane lane) {

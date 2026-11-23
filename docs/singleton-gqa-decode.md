@@ -36,13 +36,13 @@ Each verification row uses its own causal position. The kernel reads paged MXFP8
 
 Batch graph replay checks each live position on device. The standalone generator uses eager decode if the request can enter the window. Prefill, draft attention, media, and pointwise scoring use their existing paths. The split operator uses the existing checkpoint, KV capacity, and logits scratch.
 
-Under the full-context split policy, eager verification groups 10–20 rows when
-every row has aligned Tensor Core inputs and averages at most ten 64-token chunks
-per split. These launches use one shared-memory copy stage. Other valid eager
-groups use launches of at most five rows. Singleton, narrow eager, and bound
-launches use two stages. Each row has its own scratch for up to 16 splits.
+In the ordinary eager route, the full-context policy groups 10–20 verification
+rows when every row has aligned Tensor Core inputs and averages at most ten
+64-token chunks per split. These launches use one shared-memory copy stage.
+Other valid eager groups use launches of at most five rows. Singleton, narrow
+eager, and bound launches use two stages. Each row has scratch for up to 16 splits.
 [Eager grouping](../include/sglang/text/gqa_target_split.cuh#L48)<!-- prefix: "int eager_ta" --> ·
-[Stage dispatch](../src/text/gqa_decode_split.cu#L583)<!-- prefix: "cudaError_t " -->
+[Stage dispatch](../src/text/gqa_decode_split.cu#L597)<!-- prefix: "cudaError_t " -->
 
 One stage reduces shared-memory use and lets three CTAs fit per B200 SM.
 Each warp waits for its copies before reading the tile and synchronizes before
@@ -51,8 +51,8 @@ and reuses it across value channels. The merge preserves warp order for the
 maximum, mass, and per-channel FP32 accumulation. The same combine kernel
 reduces split partials and sends flagged heads to FP64 replay.
 [Shared-memory bound](../src/text/gqa_decode_split.cu#L78)<!-- prefix: "static_asser" --> ·
-[Tile loop](../src/text/gqa_decode_split.cu#L514)<!-- prefix: "if constexpr" --> ·
-[Warp weights](../src/text/gqa_decode_split.cu#L444)<!-- prefix: "__device__ v" --> ·
+[Tile loop](../src/text/gqa_decode_split.cu#L521)<!-- prefix: "if constexpr" --> ·
+[Warp weights](../src/text/gqa_decode_split.cu#L451)<!-- prefix: "__device__ v" --> ·
 [Cross-split combine](../include/sglang/text/gqa_target_split.cuh#L6)<!-- prefix: "__global__ v" -->
 
 The earlier bounded and long profiles used explicit launch settings. Their
@@ -84,11 +84,43 @@ owns acceptance and the committed KV prefix.
 [Append](../src/mxfp8_gqa.cu#L100)<!-- prefix: "__global__ v" --> ·
 [Gating](../src/text_attention_gqa.cu#L169)<!-- prefix: "__global__ v" -->
 
+### Shared KV reads for long K4 packets
+
+The B200 full-context eager split path can share KV reads in a 20-row K4 target
+packet. It needs four distinct cache and page-table identities, each with five
+consecutive positions in one 64-token chunk. Every zero-based position must
+be at least 32,768 and below 40,960. All rows need readable KV, valid scratch,
+and aligned Tensor Core inputs. Each packet in a wider wave qualifies separately.
+Short, partial, cross-chunk, unaligned, or otherwise ineligible packets use the
+ordinary split rules. Bound replay, draft, and nonverification routes keep their
+existing dispatch.
+[Packet dispatch](../include/sglang/text/gqa_target_split.cuh#L119)<!-- prefix: "if (count ==" --> ·
+[Eligibility](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L94)<!-- prefix: "bool make_re" -->
+
+One CTA per request, KV head, and split stages paged MXFP8 K/V and scales once
+for its five query rows. The loader uses the newest row's visible tail. Each
+query keeps its own causal mask and zeroes K and V operands past its position.
+The reader keeps native BF16 MMA, FP32 accumulation and merge order, and the
+existing FP64 replay for flagged heads. Each row writes its own split partials.
+[Shared load](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L48)<!-- prefix: "if (query_in" --> ·
+[Causal operands](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L66)<!-- prefix: "if (chunk \u003c " --> ·
+[Split output](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L81)<!-- prefix: "write_weight" -->
+
 ## Constraints and failure behavior
 
 Short singleton replay remains eligible through 5,120 visible tokens. Decode-only singletons at 5,121–32,767 use direct ordered eager attention. Above 36,864 tokens or when the page table or a layer's buffers lack the required capacity, the new eager binding stays empty and existing dispatch rules apply. The batch buffer stays fixed even if the request reserves more KV. The legacy width-two through width-four graph keeps its separate request-owned long scores. [Replay limit](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L436)<!-- prefix: "if (count ==" --> · [Direct eager read](../src/decoder_forward.cpp#L478)<!-- prefix: "return mxfp8" --> · [Context limit](../include/sglang/text_attention.h#L9)<!-- prefix: "inline const" --> · [Legacy scores](batch-graphs.md#constraints-and-failure-behavior)
 
 After clean score-buffer allocation OOM, the batch remembers the failure for its lifetime and uses direct ordered eager attention for long singletons. Short replay remains eligible. Other allocation errors propagate. A recoverable graph rejection retires the graph for that width. The eager fallback can use the retained score buffer. The buffer survives request retirement and KV growth. Batch cleanup drains the stream and destroys graph handles before releasing the allocation. Cleanup retains device resources while stream or graph completion is uncertain. [Allocation fallback](../src/decoder_resources.cpp#L559)<!-- prefix: "if (error.st" --> · [Graph recovery](../src/decoder_resources.cpp#L610)<!-- prefix: "const auto f" --> · [Graph teardown](../src/decoder_resources.cpp#L225)<!-- prefix: "CleanupError" -->
+
+A clean decline or recognized optional setup or launch rejection uses ordinary
+split attention for that packet. A later packet can try the shared reader again.
+Hard setup, launch, and combine errors propagate. A pending CUDA error before
+setup prevents shared dispatch and stays recorded. On setup or launch failure,
+the reader clears only a recorded status that matches the returned status.
+A distinct recorded error prevents optional fallback and stays recorded.
+On hard failure, the returned status takes precedence.
+[Rejection handling](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L133)<!-- prefix: "std::optiona" --> ·
+[Setup and launch](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L147)<!-- prefix: "std::optiona" -->
 
 ## Verification
 
@@ -114,3 +146,23 @@ the full-context policy, move one row from 10,240 to 10,241 visible tokens.
 Check that the group switches from one stage to two stages at that boundary.
 Compare BF16 outputs and split scratch byte for byte on the same inputs.
 Include a flagged head to check FP64 replay.
+
+Compare the shared and ordinary readers on a reserved B200 with the same checkpoint,
+histories, and paged MXFP8 KV. Trace full K4 packets with first positions at
+32,768 and 36,864. Compare BF16 attention and written split-partial fields
+byte for byte. Include remapped pages and a head that requires FP64 replay.
+Exercise complete packets on both sides of 32,768 and 40,960.
+Check ordinary dispatch for a cross-chunk group, a partial
+packet, and bound replay.
+
+Replay the same five target inputs per lane with both readers. Compare all 20
+full BF16 vocabulary rows bitwise in a separate fixed-history diagnostic. Capture
+those scores through the ordinary full vocabulary head. Run native greedy K4
+separately with its certified winner path. Compare continuation IDs and MTP
+row counts. Exercise both replacement and full acceptance.
+
+Inject optional setup and launch rejections in separate runs. Check ordinary
+dispatch for only the rejected packet. Verify shared dispatch on the next eligible
+packet. Inject hard launch and combine errors separately. Check status propagation
+without replay. Check that a preexisting or different recorded CUDA error blocks
+fallback.

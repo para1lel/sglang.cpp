@@ -138,13 +138,11 @@ __device__ __forceinline__ float power_of_two(int biased) {
     return __uint_as_float(static_cast<unsigned int>(biased) << 23);
 }
 
-template <int StageCount>
-__device__ void issue_warp_tile(const Shared<StageCount>& shared, Stage& stage,
+__device__ void issue_warp_tile(const int* pages, Stage& stage,
                                const decoder::PagedDecodeLane& lane, int kv_head, int chunk,
                                int first_page, int warp, int lane_id) {
     const int half = chunk % chunks_per_page;
-    const auto physical =
-        static_cast<std::size_t>(shared.pages[chunk / chunks_per_page - first_page]);
+    const auto physical = static_cast<std::size_t>(pages[chunk / chunks_per_page - first_page]);
     const int first = chunk * chunk_tokens;
     const std::size_t payload = physical * mxfp8_payload_bytes_per_page +
         (static_cast<std::size_t>(half * chunk_tokens) * mxfp8_kv_heads + kv_head) *
@@ -264,8 +262,9 @@ __device__ int prepare_scales(const Stage& stage, WarpScales& scales, Running& r
     return __reduce_min_sync(full_mask, live ? min_exponent : value_bias);
 }
 
+template <bool SharedTail = false>
 __device__ void tile_scores(const Stage& stage, const WarpScales& scales, const Query& query,
-                            int warp, int row, int quad, float (&score)[4]) {
+                            int warp, int row, int quad, float (&score)[4], int last = 0) {
     #pragma unroll
     for (int slot = 0; slot < 4; ++slot) {
         score[slot] = 0.0f;
@@ -276,8 +275,9 @@ __device__ void tile_scores(const Stage& stage, const WarpScales& scales, const 
         #pragma unroll
         for (int tile = 0; tile < 2; ++tile) {
             const int token = warp * tile_tokens + tile * 8 + row;
-            const auto bits = *reinterpret_cast<const uint2*>(
-                stage.keys + token * key_stride + group * mxfp8_group_size + quad * 8);
+            const auto bits = SharedTail && token > last ? make_uint2(0, 0) :
+                *reinterpret_cast<const uint2*>(
+                    stage.keys + token * key_stride + group * mxfp8_group_size + quad * 8);
             unsigned int k0, k1, k2, k3;
             expand(bits.x, k0, k1);
             expand(bits.y, k2, k3);
@@ -334,9 +334,11 @@ __device__ void update(Running& run, const float (&score)[4], float min_delta,
 }
 
 /// O^T += V^T P'. Rows of a value tile are channels 32g + 4r (+1) and 32g + 4r + 2 (+3).
+template <bool SharedTail = false>
 __device__ void accumulate(const Stage& stage, const WarpScales& scales, const float (&weight)[4],
-                           int warp, int row, int quad, Running& run) {
-    const auto* base = stage.values + (warp * tile_tokens + 2 * quad) * value_stride + 4 * row;
+                           int warp, int row, int quad, Running& run, int last = 0) {
+    const int token = warp * tile_tokens + 2 * quad;
+    const auto* base = stage.values + token * value_stride + 4 * row;
     #pragma unroll
     for (int group = 0; group < mxfp8_groups; ++group) {
         const auto low = *reinterpret_cast<const float2*>(&scales.value[group][2 * quad]);
@@ -344,10 +346,14 @@ __device__ void accumulate(const Stage& stage, const WarpScales& scales, const f
         const auto b0 = pack(weight[0] * low.x, weight[1] * low.y);
         const auto b1 = pack(weight[2] * high.x, weight[3] * high.y);
         const auto* column = base + group * mxfp8_group_size;
-        const auto wa = *reinterpret_cast<const unsigned int*>(column);
-        const auto wb = *reinterpret_cast<const unsigned int*>(column + value_stride);
-        const auto wc = *reinterpret_cast<const unsigned int*>(column + 8 * value_stride);
-        const auto wd = *reinterpret_cast<const unsigned int*>(column + 9 * value_stride);
+        const auto wa = SharedTail && token > last ? 0u :
+            *reinterpret_cast<const unsigned int*>(column);
+        const auto wb = SharedTail && token + 1 > last ? 0u :
+            *reinterpret_cast<const unsigned int*>(column + value_stride);
+        const auto wc = SharedTail && token + 8 > last ? 0u :
+            *reinterpret_cast<const unsigned int*>(column + 8 * value_stride);
+        const auto wd = SharedTail && token + 9 > last ? 0u :
+            *reinterpret_cast<const unsigned int*>(column + 9 * value_stride);
         unsigned int ab[4], cd[4];
         expand(__byte_perm(wa, wb, 0x5140u), ab[0], ab[1]);
         expand(__byte_perm(wa, wb, 0x7362u), ab[2], ab[3]);
@@ -358,6 +364,7 @@ __device__ void accumulate(const Stage& stage, const WarpScales& scales, const f
     }
 }
 
+template <bool SharedTail = false>
 __device__ void process_tile(const Stage& stage, WarpScales& scales, const Query& query,
                              Running& run, int chunk, int position, int warp, int lane) {
     const int first = chunk * chunk_tokens;
@@ -376,10 +383,10 @@ __device__ void process_tile(const Stage& stage, WarpScales& scales, const Query
         fp32_min_exponent - e4m3_min_exponent - (min_exponent - fp32_exponent_bias);
     const float min_delta = static_cast<float>(max(fp32_min_exponent, min_value_delta));
     float score[4];
-    tile_scores(stage, scales, query, warp, row, quad, score);
+    tile_scores<SharedTail>(stage, scales, query, warp, row, quad, score, position - first);
     float weight[4];
     update(run, score, min_delta, valid, quad, weight);
-    accumulate(stage, scales, weight, warp, row, quad, run);
+    accumulate<SharedTail>(stage, scales, weight, warp, row, quad, run, position - first);
 }
 
 /// Writes the warp state to `merge` at true scale: out * 2^(R_g - 142).
@@ -441,8 +448,8 @@ __device__ void write_partials(const Merge& merge, void* scratch, int kv_head, i
     }
 }
 
-__device__ void write_weighted_partials(Merge& merge, void* scratch, int kv_head, int split) {
-    const int thread = threadIdx.x;
+__device__ void write_weighted_partials(Merge& merge, void* scratch, int kv_head, int split,
+                                       int thread = threadIdx.x) {
     if (thread < group_heads) {
         float maximum = -CUDART_INF_F;
         int flag = 0;
@@ -513,7 +520,7 @@ split_kernel(const __grid_constant__ Input input) {
     run.flag = shared.query.flag[lane_id];
     if constexpr (SingleStage) {
         for (int chunk = first; chunk < last; ++chunk) {
-            issue_warp_tile(shared, shared.stage[0], lane, kv_head, chunk, first_page, warp,
+            issue_warp_tile(shared.pages, shared.stage[0], lane, kv_head, chunk, first_page, warp,
                             lane_id);
             commit();
             wait_pending<0>();
@@ -526,7 +533,7 @@ split_kernel(const __grid_constant__ Input input) {
         #pragma unroll
         for (int index = 0; index < stages - 1; ++index) {
             if (first + index < last) {
-                issue_warp_tile(shared, shared.stage[index], lane, kv_head, first + index,
+                issue_warp_tile(shared.pages, shared.stage[index], lane, kv_head, first + index,
                                 first_page, warp, lane_id);
             }
             commit();
@@ -536,8 +543,8 @@ split_kernel(const __grid_constant__ Input input) {
             __syncwarp();
             const int next = chunk + stages - 1;
             if (next < last) {
-                issue_warp_tile(shared, shared.stage[(next - first) % stages], lane, kv_head, next,
-                                first_page, warp, lane_id);
+                issue_warp_tile(shared.pages, shared.stage[(next - first) % stages], lane, kv_head,
+                                next, first_page, warp, lane_id);
             }
             commit();
             process_tile(shared.stage[(chunk - first) % stages], shared.scales[warp], shared.query,
@@ -570,6 +577,13 @@ cudaError_t launch_split(const Input& input, int count, cudaStream_t stream) {
     return cudaGetLastError();
 }
 
+#include "sglang/text/gqa/gqa_decode_reuse.cuh"
+
+}
+
+std::optional<cudaError_t> try_launch_reuse(const EagerTargetBatch& batch, int count,
+                                           cudaStream_t stream) {
+    return launch_reuse(batch, count, stream);
 }
 
 cudaError_t launch(TargetLane lane, cudaStream_t stream) {

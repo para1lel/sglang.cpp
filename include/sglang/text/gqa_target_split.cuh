@@ -116,6 +116,19 @@ cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, i
             return cudaErrorInvalidValue;
         }
     }
+    if (count == target_split_eager_max_rows) {
+        gqa_decode::EagerTargetBatch batch{{}, end};
+        std::copy_n(lanes, count, batch.lanes);
+        if (const auto status = gqa_decode::try_launch_reuse(batch, count, stream)) {
+            if (*status != cudaSuccess) {
+                return *status;
+            }
+            target_split_combine<<<dim3(mxfp8_query_heads, 1, count), mxfp8_head_dim, 0, stream>>>(
+                batch);
+            return cudaGetLastError();
+        }
+    }
+
     const int width = eager_target_batch_width(lanes, count, end);
     for (int offset = 0; offset < count; offset += width) {
         const int size = std::min(width, count - offset);

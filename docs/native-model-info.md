@@ -122,7 +122,7 @@ its score capacity, starting at 5,174 tokens with standard scratch. It also need
 valid KV and page coverage, aligned query and KV buffers, and sufficient aligned
 scratch. Each lane keeps its own position, page table, and scratch. One eligible
 lane can use split GQA when the other rows in the wave take different routes.
-[Scored wave call](../src/decoder_mtp.cpp#L595)<!-- prefix: "if (score) {" --> · [Lane selection](../include/sglang/text/mtp/gqa_attention.cuh#L44)<!-- prefix: "cudaError_t " --> · [Alignment](../include/sglang/text/gqa_decode_split.cuh#L69)<!-- prefix: "__host__ __d" -->
+[Scored wave call](../src/decoder_mtp.cpp#L595)<!-- prefix: "if (score) {" --> · [Lane selection](../include/sglang/text/mtp/gqa_attention.cuh#L44)<!-- prefix: "cudaError_t " --> · [Alignment](../include/sglang/text/gqa_decode_split.cuh#L70)<!-- prefix: "__host__ __d" -->
 
 The online route uses the same grouped split operator as target attention.
 It can change draft attention values and proposals through a different reduction order.
@@ -142,7 +142,7 @@ Each draft lane reserves 496,640 bytes for vocabulary logits. Ordered long
 attention uses 419,328 bytes for scores and carry. Online split partials use at
 most 399,360 bytes within the same requirement. Neither path adds request
 memory. The lane stream orders attention before vocabulary scoring overwrites
-the scratch. [Score storage](../src/decoder_mtp.cpp#L119)<!-- prefix: "ExactGqaWork" --> · [Scratch bound](../include/sglang/text/gqa_decode_split.cuh#L46)<!-- prefix: "static_asser" -->
+the scratch. [Score storage](../src/decoder_mtp.cpp#L119)<!-- prefix: "ExactGqaWork" --> · [Scratch bound](../include/sglang/text/gqa_decode_split.cuh#L47)<!-- prefix: "static_asser" -->
 
 Compare the current B200 K4 runtime with a fresh K0 control on the same target dispatch. See pinned Git history at `8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3` for the settings and evidence from earlier runtime profiles.
 

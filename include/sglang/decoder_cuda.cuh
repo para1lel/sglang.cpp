@@ -95,7 +95,7 @@ struct VerifyQuantizeRows {
 };
 
 struct WideVerifyQuantizeRows {
-    static constexpr int capacity = 20;
+    static constexpr int capacity = 160;
     VerifyQuantizeRow entries[capacity];
 };
 
@@ -104,7 +104,7 @@ struct VerifyRmsQuantizeRows {
 };
 
 struct WideVerifyRmsQuantizeRows {
-    static constexpr int capacity = 20;
+    static constexpr int capacity = WideVerifyQuantizeRows::capacity;
     VerifyRmsQuantizeRow entries[capacity];
 };
 

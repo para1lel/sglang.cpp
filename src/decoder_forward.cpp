@@ -94,8 +94,7 @@ struct LayerBatch {
     }
 
     bool fuse_wide_verify_norm() const {
-        static_assert(WideVerifyRmsQuantizeRows::capacity ==
-                      target_verify_max_rows * decoder_batch_max_mtp_lanes);
+        static_assert(WideVerifyRmsQuantizeRows::capacity == max_wide_mtp_rows);
         return std::is_same_v<Lane, VerificationRow> && count > fused_verify_rows;
     }
 
@@ -107,7 +106,7 @@ struct LayerBatch {
     TextFp8Activation projection_activation(int index, int width) const {
         auto activation = workspace(lanes[index]).activation;
         if (packs_projection_activation(width)) {
-            static_assert(WideVerifyQuantizeRows::capacity * intermediate_size <=
+            static_assert(verification_packet_rows * intermediate_size <=
                           vocab_size * sizeof(Bf16));
             // Each projection consumes this input before the stream reuses logits scratch.
             auto* packed = packed_activation ? packed_activation
@@ -165,9 +164,8 @@ struct LayerBatch {
 
     void quantize_wide_verification(Bf16* Workspace::*source, int width,
                                     Bf16* Workspace::*up = nullptr) const {
-        static_assert(WideVerifyQuantizeRows::capacity ==
-                      target_verify_max_rows * decoder_batch_max_mtp_lanes);
-        constexpr int capacity = WideVerifyQuantizeRows::capacity;
+        const int capacity = packed_activation ? WideVerifyQuantizeRows::capacity
+                                               : verification_packet_rows;
         for (int first = 0; first < count; first += capacity) {
             WideVerifyQuantizeRows rows{};
             const int size = std::min(count - first, capacity);
@@ -898,7 +896,8 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
             return;
         }
         if (batch.fuse_wide_verify_norm()) {
-            constexpr int capacity = WideVerifyRmsQuantizeRows::capacity;
+            const int capacity = packed_activation ? WideVerifyRmsQuantizeRows::capacity
+                                                   : verification_packet_rows;
             for (int first = 0; first < count; first += capacity) {
                 WideVerifyRmsQuantizeRows rows{};
                 const int size = std::min(count - first, capacity);

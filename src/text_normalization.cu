@@ -1,7 +1,7 @@
 #include "sglang/text_ops.h"
 
 #include "sglang/decoder_cuda.cuh"
-
+#include "sglang/decoder_internal.h"
 #include "sglang/text/text_cuda_primitives.cuh"
 #include "sglang/text/quantize_warp.cuh"
 
@@ -340,6 +340,17 @@ cudaError_t launch_verify_quantize(Rows rows, int count, int width, cudaStream_t
                                            : verify_quantize_kernel<false, Rows>;
     return cudaLaunchKernel(kernel, grid, block_threads, args, 0, stream);
 }
+
+cudaError_t wide_verify_launch_status(cudaError_t direct) {
+    const auto recorded = cudaPeekAtLastError();
+    if (!decoder::CudaError::terminal(direct) && decoder::CudaError::terminal(recorded)) {
+        return cudaGetLastError();
+    }
+    if (direct != cudaSuccess && recorded == direct) {
+        (void)cudaGetLastError();
+    }
+    return direct;
+}
 }
 
 cudaError_t decoder::verify_quantize_fp8(VerifyQuantizeRows rows, int width, cudaStream_t stream) {
@@ -352,7 +363,7 @@ cudaError_t decoder::verify_quantize_fp8_wide(WideVerifyQuantizeRows rows, int c
         width <= 0 || width % text_fp8_group_size != 0) {
         return cudaErrorInvalidValue;
     }
-    return launch_verify_quantize(rows, count, width, stream);
+    return wide_verify_launch_status(launch_verify_quantize(rows, count, width, stream));
 }
 
 cudaError_t decoder::verify_rms_quantize(VerifyRmsQuantizeRows rows, const __nv_bfloat16* weight,
@@ -372,7 +383,8 @@ cudaError_t decoder::verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, in
     const auto kernel = rows.entries[0].residual
         ? verify_rms_kernel<true, WideVerifyRmsQuantizeRows>
         : verify_rms_kernel<false, WideVerifyRmsQuantizeRows>;
-    return cudaLaunchKernel(kernel, count, block_threads, args, 0, stream);
+    return wide_verify_launch_status(cudaLaunchKernel(kernel, count, block_threads, args, 0,
+                                                       stream));
 }
 
 cudaError_t decoder::tensor_core_prefill_rms_quantize(

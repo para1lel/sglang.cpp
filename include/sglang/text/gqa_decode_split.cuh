@@ -26,8 +26,6 @@ cudaError_t launch_gqa_kernel(void (*kernel)(Parameters...), dim3 grid, dim3 blo
 
 namespace sglang::gqa_decode {
 
-/// Packed decode lanes accepted by one split-KV launch. Independent of the graph chunk size.
-inline constexpr int max_lanes = 64;
 /// Upper bound on KV splits per lane; each split owns one partial per query head.
 inline constexpr int max_splits = 16;
 /// Tokens per pipeline chunk; splits own whole chunks.
@@ -82,10 +80,6 @@ inline bool valid_buffers(const decoder::PagedDecodeBuffers& buffers) {
     return buffers.queries && buffers.output && scratch && scratch % alignof(Partial) == 0;
 }
 
-struct Batch {
-    decoder::BoundPagedDecodeLane lanes[max_lanes];
-};
-
 struct TargetLane {
     decoder::PagedDecodeLane eager;
     decoder::BoundPagedDecodeLane bound;
@@ -102,33 +96,11 @@ struct EagerTargetBatch {
     int end;
 };
 
-/// Copies `count` lanes into `batch` after checking buffer pointers and alignment.
-inline cudaError_t make_batch(const decoder::BoundPagedDecodeLane* lanes, int count,
-                              Batch& batch) {
-    if (!lanes || count < 1 || count > max_lanes) {
-        return cudaErrorInvalidValue;
-    }
-    for (int index = 0; index < count; ++index) {
-        const auto& lane = lanes[index];
-        if (!valid_buffers(lane.buffers) || !lane.cache || !lane.pages || !lane.position) {
-            return cudaErrorInvalidValue;
-        }
-        batch.lanes[index] = lane;
-    }
-    return cudaSuccess;
-}
-
 /// Launches the split-KV pass. Each lane reads positions [0, position] of its cache and
 /// writes one Partial per query head and split; combine_head finishes the head.
-cudaError_t launch(const Batch& batch, int count, cudaStream_t stream);
 cudaError_t launch(TargetLane lane, cudaStream_t stream);
 cudaError_t launch(const TargetBatch& batch, int count, cudaStream_t stream);
 cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream);
-
-/// Split-KV attention, combine, FP64 replay of flagged heads, and optional output gates.
-/// Null gates leave the attention values ungated.
-cudaError_t decode(const decoder::BoundPagedDecodeLane* lanes, const __nv_bfloat16* const* gates,
-                   int count, cudaStream_t stream);
 
 #ifdef __CUDACC__
 __device__ inline decoder::PagedDecodeLane resolve(TargetLane lane) {

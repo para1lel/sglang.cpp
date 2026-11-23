@@ -4,14 +4,16 @@
 #include "sglang/mxfp8_gqa.h"
 
 #ifndef SGLANG_GQA_ORDERED_ONLY
-#include "sglang/text/gqa_decode_split.cuh"
+#include "sglang/decoder_cuda.cuh"
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -84,14 +86,16 @@ bool compare(const Case& test, const char* route, const std::vector<Bf16>& actua
 }
 
 bool run(const Case& test) {
+    constexpr int split_tokens = 2048;
+    constexpr int split_pages = split_tokens / mxfp8_page_size;
     const int page_id = 0;
     const int position = 1;
     Device<int> page(1);
     page.upload(&page_id);
-    Device<std::uint8_t> keys(mxfp8_payload_bytes_per_page);
-    Device<std::uint8_t> values(mxfp8_payload_bytes_per_page);
-    Device<std::uint8_t> key_scales(mxfp8_scale_bytes_per_page);
-    Device<std::uint8_t> value_scales(mxfp8_scale_bytes_per_page);
+    Device<std::uint8_t> keys(split_pages * mxfp8_payload_bytes_per_page);
+    Device<std::uint8_t> values(split_pages * mxfp8_payload_bytes_per_page);
+    Device<std::uint8_t> key_scales(split_pages * mxfp8_scale_bytes_per_page);
+    Device<std::uint8_t> value_scales(split_pages * mxfp8_scale_bytes_per_page);
     std::vector<std::uint8_t> host_keys(keys.count), host_values(values.count);
     std::vector<std::uint8_t> host_key_scales(key_scales.count, 127);
     std::vector<std::uint8_t> host_value_scales(value_scales.count, 127);
@@ -127,16 +131,44 @@ bool run(const Case& test) {
     check(mxfp8_gqa_attention(cache, table, 2, position, 1, queries.data, output.data, nullptr));
     const bool ordered = compare(test, "ordered", output.read());
 #ifndef SGLANG_GQA_ORDERED_ONLY
-    Device<int> device_position(1);
-    Device<Mxfp8KvCache> device_cache(1);
-    Device<Mxfp8PageTable> device_table(1);
+    static_assert(split_tokens == decoder::target_split_first_position + 1);
+    static_assert(split_tokens % mxfp8_page_size == 0);
+    for (int token = 2; token < mxfp8_page_size; ++token) {
+        const int source = token % 2;
+        std::copy_n(host_keys.begin() + source * token_stride, token_stride,
+                    host_keys.begin() + token * token_stride);
+        std::copy_n(host_values.begin() + source * token_stride, token_stride,
+                    host_values.begin() + token * token_stride);
+        for (int head = 0; head < mxfp8_kv_heads; ++head) {
+            const int base = head * scale_head_stride;
+            const int target = base + (token % 32 * 4 + token / 32) * mxfp8_groups;
+            const int reference = base + source * 4 * mxfp8_groups;
+            std::copy_n(host_key_scales.begin() + reference, mxfp8_groups,
+                        host_key_scales.begin() + target);
+            std::copy_n(host_value_scales.begin() + reference, mxfp8_groups,
+                        host_value_scales.begin() + target);
+        }
+    }
+    for (auto* plane : {&host_keys, &host_values, &host_key_scales, &host_value_scales}) {
+        const auto page_bytes = plane->size() / split_pages;
+        for (int index = 1; index < split_pages; ++index) {
+            std::copy_n(plane->begin(), page_bytes, plane->begin() + index * page_bytes);
+        }
+    }
+    keys.upload(host_keys.data());
+    values.upload(host_values.data());
+    key_scales.upload(host_key_scales.data());
+    value_scales.upload(host_value_scales.data());
+    Device<int> split_by_page(split_pages);
+    std::array<int, split_pages> split_mapping{};
+    std::iota(split_mapping.begin(), split_mapping.end(), 0);
+    split_by_page.upload(split_mapping.data());
     Device<std::byte> scratch(decoder::paged_decode_scratch_bytes);
-    device_position.upload(&position);
-    device_cache.upload(&cache);
-    device_table.upload(&table);
-    const decoder::BoundPagedDecodeLane lane{device_cache.data, device_table.data,
-        device_position.data, nullptr, {queries.data, output.data, scratch.data}};
-    check(gqa_decode::decode(&lane, nullptr, 1, nullptr));
+    const Mxfp8KvCache split_cache{keys.data, values.data, key_scales.data, value_scales.data,
+                                  split_pages};
+    const decoder::PagedDecodeLane lane{split_cache, {split_by_page.data, split_pages},
+        split_tokens - 1, {queries.data, output.data, scratch.data}};
+    check(decoder::target_split_gqa(lane, nullptr));
     const bool split = compare(test, "split", output.read());
     return ordered && split;
 #else

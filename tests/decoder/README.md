@@ -157,7 +157,7 @@ xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release --long-decode-check=y
 xmake build -P "$PWD" long-decode-check long-decode-routes
 python3 -c 'import json, sys; print(*json.load(open(sys.argv[1]))["prompt"])' \
     tests/prefix/route-cases.json >"$out/prompt.ids"
-for mode in full recovery small unaligned graph; do
+for mode in full recovery small unaligned; do
     CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
         "$out/bin/long-decode-check" "$mode"
 done
@@ -166,8 +166,8 @@ CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/bin/long-decode-routes" "$checkpoint" "$o
 
 The operator check verifies split and combine launch geometry, shuffled pages,
 contexts through 262,144 tokens, FP64 recovery, guard bytes, rejected arguments,
-and injected launch failures. The graph mode rebinds page tables, positions, and
-output buffers across replays, including padded lanes.
+and injected launch failures. The separate checkpoint check captures and replays
+the current decode graphs.
 
 The checkpoint check uses sparse slots, mixed long and short lengths, fixed-seed
 sampling, slot reuse, and singleton capture and replay. It counts split and combine

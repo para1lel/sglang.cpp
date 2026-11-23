@@ -85,14 +85,6 @@ struct Running {
     bool flag;
 };
 
-__device__ decoder::PagedDecodeLane resolve(const decoder::BoundPagedDecodeLane& lane) {
-    return {*lane.cache, *lane.pages, *lane.position, lane.buffers};
-}
-
-__device__ decoder::PagedDecodeLane resolve_input(const Batch& batch) {
-    return resolve(batch.lanes[blockIdx.z]);
-}
-
 template <typename Target>
 __device__ decoder::PagedDecodeLane resolve_input(const Target& input) {
     auto lane = resolve(input);
@@ -517,13 +509,6 @@ cudaError_t launch_split(const Input& input, int count, cudaStream_t stream) {
     return cudaGetLastError();
 }
 
-}
-
-cudaError_t launch(const Batch& batch, int count, cudaStream_t stream) {
-    if (count < 1 || count > max_lanes) {
-        return cudaErrorInvalidValue;
-    }
-    return launch_split(batch, count, stream);
 }
 
 cudaError_t launch(TargetLane lane, cudaStream_t stream) {

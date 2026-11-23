@@ -171,18 +171,21 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The rolling-cache `matched-k4-native-defaults-cache-on-v2` campaign passed W1 and W2 on one reserved B200 (GPU 6). Both engines used MTP4, an 8,192-token step budget, and a 32-request cap. Each ran three warmups and nine untraced timed requests per row after idle cache resets. All streams reported zero cached tokens, including the separate W1 native trace.
+The rolling-cache `matched-k4-native-defaults-cache-on-v2` campaign passed W1 and W2 and missed W3, the first concurrent row. The campaign stopped before formal timing of W4–W6. Both engines used the same reserved B200 (GPU 6), MTP4, an 8,192-token step budget, and a 32-request cap. W1 and W2 used three warmups and nine untraced timed requests per arm. W3 used two warmups and five timed four-request cohorts per arm. All streams reported zero cached tokens after idle resets, including the separate W1 native trace.
 
-| Workload | Native median, ms | Pinned vLLM median, ms | Native reduction |
+| Workload | Native median, ms | Pinned vLLM median, ms | Native change |
 | --- | ---: | ---: | ---: |
-| W1 | 605.770952 | 621.347928 | 2.51% |
-| W2 | 1349.362377 | 1689.842160 | 20.15% |
+| W1 | 605.770952 | 621.347928 | −2.51% |
+| W2 | 1349.362377 | 1689.842160 | −20.15% |
+| W3 | 3969.217898 | 3951.668972 | +0.444% |
 
-Timing ran from submission to wire `[DONE]` and included native terminal checkpoint publication. Native repeated all output IDs within each row, including the W1 trace. The trace measured depth four in 49 of 50 rounds. W3–W6 have no qualified results in this summary.
+Timing ran from submission to wire `[DONE]` and included native terminal checkpoint publication. Native repeated all output IDs within each row. The W1 trace matched the timed IDs and measured depth four in 49 of 50 rounds. All 28 W3 lane streams matched the corresponding pinned vLLM streams, including warmups. Native missed the strict lower-median gate by 17.548926 ms.
+
+In W3, the median time to the last lane's first token was 1324.765 ms native versus 1298.528 ms pinned vLLM. From that event to cohort `[DONE]`, the medians were 2643.743 ms and 2653.324 ms. Each phase has its own median. See `W3/phase-and-acceptance.json` beside the receipt.
 
 The measured native binary SHA-256 is `846181234eb93d0766d4a492706ed9aad22e32c9ccd5341b56b94cccde0932ba`. Its build started from `5089eb0b` with the rolling-cache source freeze. The published runtime wraps one declaration. Its server binary matches the measured binary byte for byte. The vLLM pin is `81a8cb063e6247fe254d7caf7e98a6691d71022a`. [Runtime revision](https://github.com/para1lel/sglang.cpp/commit/b3e9e274e722bb220dd74efc16bf341829c69833) · [Benchmark revision](https://github.com/para1lel/sglang.cpp/commit/54d33669ab8d6385a6fe79316341fad7bc7c9a4d)
 
-Row receipts are under `artifacts/handover-w3/cache-on-pin/release-w1/formal.gNo8wvzM/`. The SHA-256 of `W1/receipt.json` is `d2c0b4aaa3c913fa75c1bb2537604e74b14a243fbfc00db4c7f8ee8e157796c2`. For `W2/receipt.json` it is `9d6a83b02b69eccfce98cc3061a0f0f029a4d367714e3f1b7f6cdba5ed5cc001`. Both runners and their original clients exited successfully. Recovery filled in missing row-level shell exit records after verifying no GPU activity or listener under the device and port locks. The recorded finish timestamps mark recovery. Original comparisons, wire data, and timing samples were preserved. Independent replay passed for both rows.
+Row receipts are under `artifacts/handover-w3/cache-on-pin/release-w1/formal.gNo8wvzM/`. The SHA-256 of `W1/receipt.json` is `d2c0b4aaa3c913fa75c1bb2537604e74b14a243fbfc00db4c7f8ee8e157796c2`. For `W2/receipt.json` it is `9d6a83b02b69eccfce98cc3061a0f0f029a4d367714e3f1b7f6cdba5ed5cc001`. W1 and W2 row-level shell exit records were recovered after verifying an idle GPU and no listener. Their finish timestamps mark recovery. Original comparisons, wire data, and timing samples were preserved. `W3/concurrent-receipt.json` records the original failed outcome (SHA-256 `37f60bac41ec58ed862a741bbef63761e9f17125eaaa70db9066efc44ddeade2`). Independent replay verified all three outcomes.
 
 The prerelease cache-on v2 campaign failed W1 at 658.323903 ms native versus 627.697053 ms pinned vLLM and stopped. The cache-off v1 campaign passed W1–W3 under its earlier settings. [Prerelease v2 evidence](https://github.com/para1lel/sglang.cpp/blob/5089eb0b3442efe13ba47a86c5650d0409540a8d/docs/performance.md#matched-k4-evidence) · [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)
 

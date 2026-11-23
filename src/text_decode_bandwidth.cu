@@ -264,6 +264,51 @@ __global__ void draft_head_int8_batch_kernel(
     }
 }
 
+constexpr int draft_four_lane_threads = 128;
+constexpr int draft_four_lane_rows_per_warp = 4;
+constexpr int draft_four_lane_rows_per_block =
+    draft_four_lane_rows_per_warp * (draft_four_lane_threads / warp_width);
+static_assert(decoder::vocab_size % draft_four_lane_rows_per_block == 0);
+
+__global__ __launch_bounds__(draft_four_lane_threads) void draft_head_int8_four_lane_kernel(
+    const std::uint8_t* weights, const float* maxima,
+    const __grid_constant__ DraftHeadArguments<4> projection) {
+    constexpr int width = decoder::hidden_size;
+    constexpr int rows = draft_four_lane_rows_per_warp;
+    const int lane = threadIdx.x % warp_width;
+    const int token = rows * (blockIdx.x * (draft_four_lane_threads / warp_width) +
+                              threadIdx.x / warp_width);
+    const auto* weight = weights + static_cast<std::size_t>(token) * width;
+    int accumulators[4][rows]{};
+    for (int column = lane * 16; column < width; column += warp_width * 16) {
+        uint4 input[4];
+        #pragma unroll
+        for (int index = 0; index < 4; ++index) {
+            input[index] = *reinterpret_cast<const uint4*>(projection.rows[index].values + column);
+        }
+        #pragma unroll
+        for (int row = 0; row < rows; ++row) {
+            const auto item = load_streaming_128(weight + row * width + column);
+            #pragma unroll
+            for (int index = 0; index < 4; ++index) {
+                accumulators[index][row] = dot_signed_bytes(item, input[index],
+                                                            accumulators[index][row]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int row = 0; row < rows; ++row) {
+        #pragma unroll
+        for (int index = 0; index < 4; ++index) {
+            const int sum = __reduce_add_sync(warp_mask, accumulators[index][row]);
+            if (lane == 0) {
+                const auto& r = projection.rows[index];
+                r.output[token + row] = draft_head_logit(sum, maxima[token + row], *r.maximum);
+            }
+        }
+    }
+}
+
 template <int Count>
 cudaError_t launch_draft_head_batch(const std::uint8_t* weights, const float* weight_maxima,
                                     const decoder::DraftInt8Projection* rows, cudaStream_t stream) {
@@ -276,9 +321,15 @@ cudaError_t launch_draft_head_batch(const std::uint8_t* weights, const float* we
         return status;
     }
     void* score[] = {&weights, &weight_maxima, &batch};
-    return cudaLaunchKernel(draft_head_int8_batch_kernel<Count>,
-                            decoder::vocab_size / (2 * block_warps), block_threads,
-                            score, 0, stream);
+    if constexpr (Count == 4) {
+        return cudaLaunchKernel(draft_head_int8_four_lane_kernel,
+                                decoder::vocab_size / draft_four_lane_rows_per_block,
+                                draft_four_lane_threads, score, 0, stream);
+    } else {
+        return cudaLaunchKernel(draft_head_int8_batch_kernel<Count>,
+                                decoder::vocab_size / (2 * block_warps), block_threads,
+                                score, 0, stream);
+    }
 }
 
 __global__ void bf16_gdn_gates_kernel(const __nv_bfloat16* weight_b,

@@ -169,22 +169,18 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-Native Release `9987dc8463ce14d249b558af10ed660d44590927` passed the strict
-median gate against pinned vLLM on W1 and W2 using `matched-k4-native-defaults-v1`.
-Both arms used MTP4, 32 in-service requests, an 8,192-token step budget, and
-the same B200 and checkpoint. Formal W3–W6 remain unmeasured for this campaign.
+W1 and W2 passed the strict median client makespan gate on the same reserved B200 and checkpoint on 2026-11-23, 09:37:58–09:43:19 UTC. `matched-k4-native-defaults-v1` used MTP4, a 32-request cap, and an 8,192-token step budget. The pinned vLLM arm used a 2,560-token context cap and a 10 GiB KV budget. Each timed arm started a fresh server with prefix caching off and reported zero cached tokens across three warmups and nine measured requests per row. Requests used greedy streaming and ignored EOS to reach the specified output caps. W1 timed vLLM first and W2 timed native first. Formal W3–W6 remain unmeasured for this campaign. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 | Workload | Native median, ms | Pinned vLLM median, ms | Native reduction |
 | --- | ---: | ---: | ---: |
-| W1 | 612.290869 | 644.133185 | 4.94% |
-| W2 | 1,370.155616 | 1,723.769346 | 20.51% |
+| W1 | 607.335726 | 727.868580 | 16.56% |
+| W2 | 1,349.509284 | 1,711.256761 | 21.14% |
 
-Across all 12 cohorts per row, each engine reproduced its own IDs from the
-prior formal run at native revision `b7c36ded75985788adae04ced54ca2948c5c3478`.
-Cross-engine IDs differed. A separate W1 trace reached depth four in 49 of 50
-rounds. The archived report retains source, binary, checkpoint, campaign, request,
-and comparison digests. Checkpoint cleanup removed raw SSE captures, parity
-reports, and launch receipts. Replay requires the original receipts. [Archived native-default report](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/serving/paired-native-defaults-results.md)
+Native IDs matched across all warmups and measured requests within each row. A separate cold W1 trace matched those IDs and verified depth four in 49 of 50 rounds. Pinned vLLM supplied timing and produced a different ID sequence. Both prompt lengths were below the 4,096-token seed FC fast-path threshold.
+
+The measured Release server SHA-256 was `b0ed8c525d5ebf459ed2d5a526b3340650d132acf20565175db9d5abf01de32c`. The published source changes two CUDA alignment declarations to `alignas`. Its Release rebuild SHA-256 was `791e5e661b37fcec0ca657196680fc9c75b6b400d1d5738fb892179079c121c8`. Host `.text` matched byte for byte. Host `.rodata` and the CUDA ELF, SASS, and resource-usage dumps matched after build-ID normalization. [Published source](https://github.com/para1lel/sglang.cpp/commit/71cb7453f765bfe2a92591c234251fc5eaa2f0fd)
+
+The prior native-default W1/W2 campaign retains its own settings, medians, and digests. [Archived native-default report](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/serving/paired-native-defaults-results.md)
 
 Use the historical K0 and bounded split-attention K4 reports only under their
 recorded settings. [W1–W6 K0 report](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/performance-comparison.md) · [Measurement ledger](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-measurement-ledger.md) · [Bounded split K4 report](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-split-attention-results.md)

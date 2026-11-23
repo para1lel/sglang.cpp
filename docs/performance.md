@@ -171,6 +171,10 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
+The cache-on `matched-k4-native-defaults-cache-on-v2` campaign failed W1 on 2026-11-23. Both engines ran on the same B200 with MTP4, an 8,192-token step budget, and a 32-request cap. Each ran three warmups and nine timed requests. Each cohort began after an acknowledged idle reset. All 25 streams, including the separate native trace, reported zero cached tokens. Median client makespan was **658.323903 ms native** versus **627.697053 ms pinned vLLM**. Native was 30.626850 ms slower (4.88%). The campaign stopped, leaving W2–W6 unmeasured.
+
+The measured prerelease native server SHA-256 was `dcac77a6012b2990d189dd67229a0e696e5c5d5716fcc66dae967a6271c6cb3c`. Its frozen source manifest SHA-256 was `e22a47bf8a509535e333fd8d59d05bb8d7dec35649b8cee811f3b4f382319156` on base `28148cda233e5522274e258d5eb5caa9ab83e313`. This run predates the published runtime. The vLLM pin was `81a8cb063e6247fe254d7caf7e98a6691d71022a`. The comparison, row receipt, and provenance are under `artifacts/handover-w3/cache-on-pin/campaign-v2-gpu0.kn5ms1zc/`.
+
 The archived cache-off `matched-k4-native-defaults-v1` campaign passed W1–W3 on a reserved B200 on 2026-11-23, 10:41:24–11:03:51 UTC. W4–W6 were unmeasured. Both engines used MTP4, a 32-request cap, and an 8,192-token step budget. Native used the Release defaults at the time and CUDA graphs. All streams reported zero cached tokens and streamed greedy IDs to their fixed output caps. [Measured revision](https://github.com/para1lel/sglang.cpp/commit/c3c6271fc9be52dcadea4c074cebd87d68355518)
 
 The pinned vLLM arm used a 2,560-token context cap and 10 GiB KV budget for W1/W2, and 132,096 tokens and 128 GiB for W3. Each arm ran three warmups and nine measured serial requests per W1/W2 row. W3 used two warmups and five measured four-request cohorts per arm. W1 and W3 timed vLLM first. W2 timed native first.
@@ -181,11 +185,7 @@ The pinned vLLM arm used a 2,560-token context cap and 10 GiB KV budget for W1/W
 | W2 | 1,348.773244 | 1,934.857093 | 30.29% |
 | W3 | 3,950.509358 | 4,280.063137 | 7.70% |
 
-Both engines repeated full IDs across all warmups and measured streams within each W1/W2 row. None of the nine measured vLLM streams per row matched native IDs. The separate cold W1 trace matched native timed IDs and verified depth four in 49 of 50 rounds. For W3, both engines repeated full IDs by lane, and all 28 corresponding lane streams matched across engines. Cross-engine ID agreement is diagnostic.
-
-The measured Release server SHA-256 was `6d7b82e422f2fab44cd7035a0f7f5f56abafde26e74804701231c5eabaeaf8d0`. The published source matches all 197 frozen Release build inputs and 154 test files byte for byte. The prefix test README is the sole test-tree difference. The frozen build inputs manifest SHA-256 was `a76fbe4fe8881885ee5e64c3402f4160a1eac37888c9613664746b59d8807156`. [Published source](https://github.com/para1lel/sglang.cpp/commit/c3c6271fc9be52dcadea4c074cebd87d68355518)
-
-All three rows invoked the frozen `run_k4.sh` under `matched-k4-native-defaults-v1`. The driver manifest SHA-256 was `5b63731b64c38a913de468e05560b81d860f5ce52425a618e7c0e7fb743be9d9`. A separately hashed concurrent harness replayed W1/W2 before W3 and audited the four-lane streams. The campaign directory `artifacts/handover-runtime/formal-optimized-a76fbe4f-gpu5/` holds commands, comparisons, receipts, and source and runner attestations. Its separate score smoke matched W1/W2 JSON and SSE scores, finish reasons, usage, and IDs against the accepted native reference.
+Both engines repeated full IDs on W1/W2. Cross-engine IDs differed for both serial rows and matched all 28 W3 lane streams. The separate native W1 trace matched timed IDs and verified depth four in 49 of 50 rounds. The archive retains the exact launch settings, build and runner manifests, and separate score smoke. [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)
 
 Earlier native-default campaigns retain their own settings, medians, and digests. [Seed FC campaign](https://github.com/para1lel/sglang.cpp/blob/0b49cd18212d3535305593bc1c5f5c4c88393e0a/docs/performance.md#matched-k4-evidence) · [Archived native-default report](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/serving/paired-native-defaults-results.md)
 

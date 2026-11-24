@@ -4,6 +4,7 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/text/text_cuda_primitives.cuh"
 #include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/mtp/draft_batch_ops.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
 #include <cuda_fp8.h>
@@ -125,12 +126,9 @@ __device__ void store_rms(float value, float inverse_rms, const __nv_bfloat16* w
 }
 
 template <bool HasResidual, bool StoresResidual, bool Pack = false>
-__device__ __forceinline__ void rms_norm_vector_row(const __nv_bfloat16* branch,
-                                                    const __nv_bfloat16* residual,
-                                                    const __nv_bfloat16* weight,
-                                                    __nv_bfloat16* output,
-                                                    __nv_bfloat16* residual_output,
-                                                    __nv_bfloat16* packed = nullptr) {
+__device__ void rms_norm_vector(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                                const __nv_bfloat16* weight, __nv_bfloat16* output,
+                                __nv_bfloat16* residual_output, __nv_bfloat16* packed = nullptr) {
     __shared__ alignas(16) __nv_bfloat16 branch_values[rms_hidden_width];
     __shared__ alignas(16) __nv_bfloat16 residual_values[HasResidual ? rms_hidden_width : 1];
     __shared__ alignas(16) __nv_bfloat16 gains[rms_hidden_width];
@@ -178,15 +176,29 @@ __global__ void rms_norm_vector_kernel(const __nv_bfloat16* branch,
                                        const __nv_bfloat16* residual,
                                        const __nv_bfloat16* weight, __nv_bfloat16* output,
                                        __nv_bfloat16* residual_output) {
-    rms_norm_vector_row<HasResidual, StoresResidual>(branch, residual, weight, output,
-                                                    residual_output);
+    rms_norm_vector<HasResidual, StoresResidual>(branch, residual, weight, output, residual_output);
+}
+
+__global__ void draft_input_rms(const __grid_constant__ decoder::DraftRmsRows embeddings,
+                               const __grid_constant__ decoder::DraftRmsRows hidden,
+                               const __nv_bfloat16* embedding_weight,
+                               const __nv_bfloat16* hidden_weight) {
+    const auto& row = blockIdx.y == 0 ? embeddings.rows[blockIdx.x] : hidden.rows[blockIdx.x];
+    const auto* weight = blockIdx.y == 0 ? embedding_weight : hidden_weight;
+    rms_norm_vector<false, false>(row.branch, nullptr, weight, row.output, nullptr);
+}
+
+__global__ void draft_output_rms(const __grid_constant__ decoder::DraftRmsRows rows,
+                                const __nv_bfloat16* weight) {
+    const auto& row = rows.rows[blockIdx.x];
+    rms_norm_vector<true, false>(row.branch, row.residual, weight, row.output, nullptr);
 }
 
 __global__ void packed_vocab_rms_kernel(const __grid_constant__ decoder::TcVocabRmsRows rows,
                                        const __nv_bfloat16* weight, __nv_bfloat16* packed) {
     const auto& row = rows.rows[blockIdx.x];
-    rms_norm_vector_row<true, false, true>(row.branch, row.residual, weight, row.normalized,
-                                          nullptr, packed + blockIdx.x * rms_hidden_width);
+    rms_norm_vector<true, false, true>(row.branch, row.residual, weight, row.normalized,
+                                      nullptr, packed + blockIdx.x * rms_hidden_width);
 }
 
 __device__ float4 rms_quant_values(uint2 bits) {
@@ -384,6 +396,23 @@ cudaError_t decoder::pack_tc_vocab_rms(const TcVocabRmsRows& rows, const Bf16* w
     void* args[] = {const_cast<TcVocabRmsRows*>(&rows), &weight, &packed};
     return wide_verify_launch_status(cudaLaunchKernel(packed_vocab_rms_kernel,
         tc_vocab_wide_rows, block_threads, args, 0, stream));
+}
+
+cudaError_t decoder::normalize_draft_inputs(const DraftRmsRows& embeddings,
+                                            const DraftRmsRows& hidden,
+                                            const Bf16* embedding_weight,
+                                            const Bf16* hidden_weight, cudaStream_t stream) {
+    void* args[] = {const_cast<DraftRmsRows*>(&embeddings), const_cast<DraftRmsRows*>(&hidden),
+                    &embedding_weight, &hidden_weight};
+    return cudaLaunchKernel(draft_input_rms, dim3(draft_projection_rows, 2), block_threads,
+                            args, 0, stream);
+}
+
+cudaError_t decoder::normalize_draft_output(const DraftRmsRows& rows, const Bf16* weight,
+                                             cudaStream_t stream) {
+    void* args[] = {const_cast<DraftRmsRows*>(&rows), &weight};
+    return cudaLaunchKernel(draft_output_rms, draft_projection_rows, block_threads,
+                            args, 0, stream);
 }
 
 cudaError_t decoder::verify_quantize_fp8(VerifyQuantizeRows rows, int width, cudaStream_t stream) {

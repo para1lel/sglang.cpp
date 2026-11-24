@@ -63,8 +63,13 @@ std::optional<cudaError_t> prepare_launch(cudaStream_t stream, LaunchTarget& tar
         return state.status;
     }
     std::call_once(encode_once, [] {
+        const auto previous = cudaPeekAtLastError();
         encode_status = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &encode_entry,
                                                          12000, cudaEnableDefault, nullptr);
+        if (previous == cudaSuccess && encode_status == cudaErrorNotSupported &&
+            cudaPeekAtLastError() == encode_status) {
+            (void)cudaGetLastError();
+        }
     });
     if (!state.supported || encode_status == cudaErrorNotSupported ||
         (encode_status == cudaSuccess && !encode_entry)) {
@@ -199,7 +204,10 @@ cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void**
 
 cudaError_t configure(const void* kernel, int slot, int device, int& limit) {
     static std::mutex mutex;
-    static int limits[max_devices][20] = {};
+    constexpr unsigned slot_count = 20;
+    static int limits[max_devices][slot_count] = {};
+    if (static_cast<unsigned>(slot) >= slot_count) return cudaErrorInvalidValue;
+    if (static_cast<unsigned>(device) >= max_devices) return cudaErrorInvalidDevice;
     std::lock_guard lock(mutex);
     if (limits[device][slot] > 0) {
         limit = limits[device][slot];

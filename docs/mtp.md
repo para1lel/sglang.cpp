@@ -30,7 +30,7 @@ B200 Tensor Core prefill can prefer TMA and `tcgen05` for draft seed FC on promp
 
 TMA requires 4-byte-aligned output, a matching image and tensor-map encoder, and enough shared memory. Unaligned output or unsupported preflight selects the 32×64 WMMA tile. CUDA errors, including stream/device mismatch and launch failure, propagate without retry. SIMT accumulation can change draft KV and proposals. [TMA preflight](../src/text/draft_seed_fc_sm100.cu#L195)<!-- prefix: "std::optiona" --> · [Submission](../src/text/draft_seed_fc_sm100.cu#L241)<!-- prefix: "return submi" --> · [WMMA tile](../src/text/draft_seed_fc.cu#L24)<!-- prefix: "constexpr in" -->
 
-Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L792)<!-- prefix: "void MtpDraf" -->
+Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L789)<!-- prefix: "void MtpDraf" -->
 
 For a multi-row seed tile on B200, each request prepares FP8 activations in
 slices of up to 128 rows on the prefill stream. One exact FP8 kernel projects
@@ -38,7 +38,7 @@ K and V in separate grid banks for the tile. One key normalization and RoPE
 launch and one MXFP8 append follow. Grouped prefill seeds each request
 separately. Single-row tiles and other devices project and append each slice
 separately. Seed scratch comes from the existing prefill workspace.
-[Slice preparation](../src/decoder_mtp.cpp#L836)<!-- prefix: "for (int off" --> ·
+[Slice preparation](../src/decoder_mtp.cpp#L833)<!-- prefix: "for (int off" --> ·
 [Paired projection](../src/text_ops.cu#L789)<!-- prefix: "cudaError_t " --> ·
 [Grid banks](../include/sglang/text/prefill_fp8_exact.cuh#L209)<!-- prefix: "__global__ v" --> ·
 [Grouped seed](../src/decoder_prefill.cpp#L683)<!-- prefix: "seed.seed_dr" -->
@@ -102,9 +102,9 @@ fails in a later slice, the paired path attempts to append the prepared prefix
 before reporting the error. A draft preparation, projection, or append error
 marks the draft failed. A target final-normalization error leaves the draft's
 failure flag clear if the prepared prefix flush succeeds.
-[Append](../src/decoder_mtp.cpp#L815)<!-- prefix: "check(mxfp8_" --> ·
-[Target normalization failure](../src/decoder_mtp.cpp#L848)<!-- prefix: "append_prepa" --> ·
-[Draft preparation failure](../src/decoder_mtp.cpp#L873)<!-- prefix: "append_prepa" -->
+[Append](../src/decoder_mtp.cpp#L812)<!-- prefix: "check(mxfp8_" --> ·
+[Target normalization failure](../src/decoder_mtp.cpp#L845)<!-- prefix: "append_prepa" --> ·
+[Draft preparation failure](../src/decoder_mtp.cpp#L870)<!-- prefix: "append_prepa" -->
 
 For a recoverable verification graph setup failure, eager fallback requires ended capture, a drained stream, and successful handle cleanup. This disables only the verifier executable. A binding upload failure follows speculative step recovery without replaying the failed round. A verification launch error or unconfirmed capture cleanup disables the batch without reevaluating the target. Resources stay live until safe cleanup. [Graph recovery](../src/decoder_resources.cpp#L610)<!-- prefix: "const auto f" --> · [Launch](../src/decoder_resources.cpp#L687)<!-- prefix: "const auto l" -->
 
@@ -116,7 +116,7 @@ Run the [MTP acceptance procedure](../tests/mtp/README.md) with both release bin
 
 Compare complete BF16 draft vocabulary rows bitwise with per-lane scoring. Compare winner IDs and scores exactly in waves of two, three, and four. Include cross-tile ties and nonfinite inputs. Test eager launches and graph replay with mapped storage. Trace both grouped argmax launches and require zero explicit winner copies. Check per-lane fallback and the BF16 retry after an invalid INT8 winner.
 
-Compare paired RMSNorm and key-only preprocessing with the single-row operations. At matched compute boundaries, compare full logits, final-normalized rows, target state, and draft KV where arithmetic agrees. Check subsequent draft and verifier logits. Exercise 1, 127, 128, 129, and 257 positions and a longer multi-tile prompt. Cover cold and restored prompts, media, and scored generation. Keep the K0 graph control. Disconnect during prefill and verify queued-request parity after retirement. [Paired RMSNorm](../src/text_normalization.cu#L496)<!-- prefix: "cudaError_t " --> · [Key preprocessing](../src/text_attention_gqa.cu#L248)<!-- prefix: "cudaError_t " -->
+Compare paired RMSNorm and key-only preprocessing with the single-row operations. At matched compute boundaries, compare full logits, final-normalized rows, target state, and draft KV where arithmetic agrees. Check subsequent draft and verifier logits. Exercise 1, 127, 128, 129, and 257 positions and a longer multi-tile prompt. Cover cold and restored prompts, media, and scored generation. Keep the K0 graph control. Disconnect during prefill and verify queued-request parity after retirement. [Paired RMSNorm](../src/text_normalization.cu#L525)<!-- prefix: "cudaError_t " --> · [Key preprocessing](../src/text_attention_gqa.cu#L266)<!-- prefix: "cudaError_t " -->
 
 Compare paired K and V BF16 projections byte for byte with the exact per-slice
 projections before key preprocessing. Trace one paired projection and one
@@ -129,7 +129,7 @@ Compare TMA seed FC output byte for byte with WMMA at every eligible row count. 
 
 Compare BF16 logits, normalized rows, target KV, and GDN with row-wise eager verification through zero, partial, and full acceptance. Check draft KV and continuation after rewind, KV crossings, mixed depths, and the exact GQA score-capacity boundary. Reset a lane and check retained and replacement streams. Require zero request bytes after retirement. Check recovery from result-sync failure and real launches for K0 and positive-K graphs. Use the [wide projection controls](fp8-prefill-projections.md#wide-verifier-checks) for 40-, 80-, and 160-row routes.
 
-Compare grouped draft projections against four-lane controls at widths 16 and 32. Hold grants and target verification fixed. Check full and sparse proposal depths and KV repairs. Compare BF16 projection rows, committed KV, IDs, and continuation. Check setup decline, launch-error propagation, and replacement after a recoverable failure.
+At widths 16 and 32, compare dense draft with four-lane controls at fixed grants and target dispatch. Cover full and sparse proposal and repair depths. Dense BF16 FC can change draft KV and acceptance. On fixed histories, compare draft projections and KV separately from target state and continuation IDs. Check clean setup decline, error propagation, and replacement.
 
 At server capacity 32, check K1 with more than four verifying lanes. Check sparse slot selections. Match committed IDs, finish reasons, and usage against same-policy controls. Check the combined target-row count against the step cap. Include a lane that receives one verification row and makes zero proposals. Check final-token eager decode, zero-budget completion, and reset recovery. Run [performance measurement](performance.md#native-mtp) separately.
 

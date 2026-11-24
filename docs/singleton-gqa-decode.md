@@ -89,9 +89,9 @@ Each attention row reads through its own position, even after later rows append 
 Output quantization and projection follow gating. The [MTP verifier](mtp.md#runtime-path)
 owns acceptance and the committed KV prefix.
 [Launch sequence](../include/sglang/text/gqa_verify_batch.h#L91)<!-- prefix: "check(gqa_ve" --> ·
-[Preprocessing](../src/text_attention_gqa.cu#L104)<!-- prefix: "__global__ v" --> ·
+[Preprocessing](../src/text_attention_gqa.cu#L105)<!-- prefix: "__global__ v" --> ·
 [Append](../include/sglang/text/gqa_target_split.cuh#L156)<!-- prefix: "__global__ v" --> ·
-[Gating](../src/text_attention_gqa.cu#L171)<!-- prefix: "__global__ v" -->
+[Gating](../src/text_attention_gqa.cu#L172)<!-- prefix: "__global__ v" -->
 
 ### Shared KV reads for long K4 packets
 

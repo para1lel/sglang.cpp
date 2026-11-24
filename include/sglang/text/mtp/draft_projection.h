@@ -1,7 +1,9 @@
 #pragma once
 
 #include "sglang/decoder_mtp.h"
+#include "sglang/text/decode_proj.h"
 #include "sglang/text/gqa_verify_batch.h"
+#include "sglang/text/mtp/draft_batch_ops.h"
 #include "sglang/text/target_fp8.h"
 
 #include <algorithm>
@@ -26,6 +28,44 @@ public:
 
     DraftProjectionBatch(State* const* states, int count, Bf16* packed, cudaStream_t stream)
         : states_(states), count_(count), packed_(packed), stream_(stream) {}
+
+    void prepare_fc(const MtpDraftInput* input, const Bf16* embedding,
+                    const Bf16* embedding_norm, const Bf16* hidden_norm, Bf16Weight fc) {
+        if (packed_) {
+            DraftRmsRows embeddings;
+            DraftRmsRows hidden;
+            for (int lane = 0; lane < count_; ++lane) {
+                auto* concatenated = packed_ + lane * 2 * hidden_size;
+                const auto token = static_cast<std::size_t>(input[lane].token);
+                embeddings.rows[lane] = {embedding + token * hidden_size, nullptr, concatenated};
+                hidden.rows[lane] = {input[lane].hidden, nullptr, concatenated + hidden_size};
+            }
+            check(cudaGetLastError(), "Check grouped MTP FC stream status");
+            check_draft_submission(normalize_draft_inputs(embeddings, hidden, embedding_norm,
+                                   hidden_norm, stream_), "Normalize grouped MTP FC inputs");
+            auto* output = packed_ + draft_fc_input_values;
+            if (const auto status = try_text_bf16_decode_sm100(fc.values, packed_, fc.rows,
+                                    fc.columns, count_, output, stream_)) {
+                check_draft_submission(*status, "Run dense BF16 MTP FC");
+                dense_residual_ = output;
+                return;
+            }
+            check(cudaGetLastError(), "Check declined dense MTP FC status");
+        }
+        std::array<TextBf16Projection, draft_projection_rows> projections;
+        for (int lane = 0; lane < count_; ++lane) {
+            auto& state = *states_[lane];
+            if (!packed_) state.embed(input[lane].token, input[lane].hidden, stream_);
+            const auto* concatenated = packed_ ? packed_ + lane * 2 * hidden_size
+                                               : state.work.concatenated;
+            projections[lane] = {concatenated, state.work.residual};
+        }
+        for (int first = 0; first < count_; first += draft_wave_rows) {
+            const int size = std::min(count_ - first, draft_wave_rows);
+            check_draft_submission(text_bf16_gemm(fc.values, fc.rows, fc.columns,
+                projections.data() + first, size, stream_), "Run batched BF16 MTP FC");
+        }
+    }
 
     void project(std::initializer_list<Projection> stage) const {
         std::array<TextFp8DecodeTarget, text_decode_max_targets> targets;
@@ -63,11 +103,12 @@ public:
         }
     }
 
-    void rms_activation(Output input, const Bf16* weight, bool residual) const {
+    void rms_activation(Output input, const Bf16* weight, bool add_residual) const {
         WideVerifyRmsQuantizeRows batch{};
         for (int lane = 0; lane < count_; ++lane) {
             const auto& work = states_[lane]->work;
-            batch.entries[lane] = {work.*input, residual ? work.residual : nullptr,
+            const auto* value = input == &Work::residual ? residual(lane) : work.*input;
+            batch.entries[lane] = {value, add_residual ? residual(lane) : nullptr,
                                    work.normalized, work.activation};
         }
         check_draft_submission(verify_rms_quantize_wide(batch, count_, weight, stream_),
@@ -84,7 +125,8 @@ public:
                                "Prepare depth-major MTP FP8 activation");
     }
 
-    void append(const MtpDraftInput* rows, const Bf16* q_norm, const Bf16* k_norm) const {
+    void append(const MtpDraftInput* rows, const Bf16* q_norm, const Bf16* k_norm,
+                bool score) const {
         GqaVerifyRows<GqaVerifyPreprocessRow> preprocess{};
         GqaVerifyRows<GqaVerifyAppendRow> append{};
         for (int lane = 0; lane < count_; ++lane) {
@@ -97,8 +139,11 @@ public:
             append.rows[lane] = {request.cache, request.pages, work.rope_keys, work.values,
                                  row.position};
         }
-        check_draft_submission(gqa_verify_preprocess(preprocess, count_, q_norm, k_norm, stream_),
-                               "Rotate depth-major MTP Q/K");
+        const auto status = score
+            ? gqa_verify_preprocess(preprocess, count_, q_norm, k_norm, stream_)
+            : draft_verify_preprocess_keys(preprocess, count_, k_norm, stream_);
+        check_draft_submission(status, score ? "Rotate depth-major MTP Q/K"
+                                             : "Rotate depth-major MTP keys");
         check_draft_submission(gqa_verify_append(append, count_, stream_),
                                "Append depth-major MTP MXFP8 KV");
     }
@@ -127,10 +172,26 @@ public:
         quantize_activation(&Work::attention, nullptr, text_gqa_q_width);
     }
 
+    void normalize_output(const Bf16* weight) const {
+        DraftRmsRows rows;
+        for (int lane = 0; lane < count_; ++lane) {
+            const auto& work = states_[lane]->work;
+            rows.rows[lane] = {work.branch, residual(lane), work.normalized};
+        }
+        check_draft_submission(normalize_draft_output(rows, weight, stream_),
+                               "Normalize depth-major MTP output");
+    }
+
 private:
+    Bf16* residual(int lane) const {
+        return dense_residual_ ? dense_residual_ + lane * hidden_size
+                               : states_[lane]->work.residual;
+    }
+
     State* const* states_;
     int count_;
     Bf16* packed_;
+    Bf16* dense_residual_ = nullptr;
     cudaStream_t stream_;
 };
 

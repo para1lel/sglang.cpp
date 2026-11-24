@@ -118,9 +118,14 @@ std::optional<cudaError_t> try_text_bf16_decode_sm100(
         encoded = encode_map(target, activation_map, input, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
                              rows, in_width, columns);
     }
-    if (encoded != CUDA_SUCCESS) {
-        return encoded == CUDA_ERROR_NOT_SUPPORTED ? std::optional<cudaError_t>{}
-                                                   : std::optional{cudaErrorInvalidValue};
+    switch (encoded) {
+        case CUDA_SUCCESS: break;
+        case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
+        case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
+        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
+        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
+        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
+        default: return cudaErrorInvalidValue;
     }
     void* args[] = {&weight_map, &activation_map, &out_width, &rows, &chunks, &output};
     const dim3 grid(plan.splits, row_blocks, (rows - 1) / columns + 1);

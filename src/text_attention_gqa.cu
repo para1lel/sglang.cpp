@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/text/gqa_verify_batch.h"
+#include "sglang/text/mtp/draft_batch_ops.h"
 #include "sglang/text/quantize_warp.cuh"
 
 #include <cuda_runtime.h>
@@ -100,13 +101,13 @@ __global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_g
         blockIdx.x % head_count, q_gate, keys, q_norm, k_norm, rope_queries, rope_keys);
 }
 
-template <int Capacity>
+template <int Capacity, bool IncludeQueries = true>
 __global__ void gqa_verify_preprocess_kernel(
     const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyPreprocessRow, Capacity> batch,
     const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm) {
     const auto& row = batch.rows[blockIdx.x];
-    gqa_preprocess_head<true>(row.position, 0, blockIdx.y, row.q_gate, row.keys,
-                             q_norm, k_norm, row.rope_queries, row.rope_keys);
+    gqa_preprocess_head<IncludeQueries>(row.position, 0, blockIdx.y, row.q_gate, row.keys,
+                                       q_norm, k_norm, row.rope_queries, row.rope_keys);
 }
 
 __device__ __forceinline__ __nv_bfloat16 gated_attention(__nv_bfloat16 gate,
@@ -195,6 +196,23 @@ cudaError_t decoder::gqa_verify_preprocess(
     return cudaLaunchKernel(gqa_verify_preprocess_kernel<Capacity>,
                             dim3(count, mxfp8_query_heads + mxfp8_kv_heads),
                             mxfp8_head_dim, arguments, 0, stream);
+}
+
+cudaError_t decoder::draft_verify_preprocess_keys(
+    const GqaVerifyRows<GqaVerifyPreprocessRow>& batch, int count,
+    const __nv_bfloat16* k_norm, cudaStream_t stream) {
+    if (count <= 0 || count > target_split_eager_max_rows || !k_norm) {
+        return cudaErrorInvalidValue;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& row = batch.rows[index];
+        if (row.position < 0 || row.position >= text_attention_max_tokens ||
+            !row.keys || !row.rope_keys) return cudaErrorInvalidValue;
+    }
+    const __nv_bfloat16* q_norm = nullptr;
+    void* args[] = {const_cast<GqaVerifyRows<GqaVerifyPreprocessRow>*>(&batch), &q_norm, &k_norm};
+    return cudaLaunchKernel(gqa_verify_preprocess_kernel<target_split_eager_max_rows, false>,
+                            dim3(count, mxfp8_kv_heads), mxfp8_head_dim, args, 0, stream);
 }
 
 template <int Capacity>

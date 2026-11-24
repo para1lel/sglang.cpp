@@ -591,7 +591,6 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
     }
     std::array<State*, draft_projection_rows> states;
     const auto weights = rows[0].request->state_->weights.get();
-    std::array<TextBf16Projection, draft_projection_rows> fc;
     for (int index = 0; index < count; ++index) {
         const auto& row = rows[index];
         auto& request = *row.request->state_;
@@ -601,32 +600,26 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
             throw std::invalid_argument("Invalid MTP draft wave lanes");
         }
         states[index] = &request;
-        fc[index] = {request.work.concatenated, request.work.residual};
     }
     const auto& model = *weights->state_;
-    const DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream);
+    DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream);
     const auto apply = [&](void (State::* function)(cudaStream_t)) {
         for (int index = 0; index < count; ++index) {
             std::invoke(function, states[index], stream);
         }
     };
-    const bool grouped_rope = packed && score && std::all_of(rows, rows + count,
+    const bool grouped_rope = packed && std::all_of(rows, rows + count,
         [](const MtpDraftInput& row) {
             const int rotary = row.rotary_position < 0 ? row.position : row.rotary_position;
             return !row.mrope && rotary < text_attention_max_tokens;
         });
     try {
-        for (int index = 0; index < count; ++index) {
-            const auto& row = rows[index];
-            states[index]->embed(row.token, row.hidden, stream);
+        batch.prepare_fc(rows, model.embedding, model.embedding_norm, model.hidden_norm, model.fc);
+        if (packed) {
+            batch.rms_activation(&DraftWorkspace::residual, model.input_norm, false);
+        } else {
+            apply(&State::prepare_attention);
         }
-        for (int first = 0; first < count; first += draft_wave_rows) {
-            const int size = std::min(count - first, draft_wave_rows);
-            check_draft_submission(text_bf16_gemm(model.fc.values, model.fc.rows,
-                model.fc.columns, fc.data() + first, size, stream), "Run batched BF16 MTP FC");
-        }
-        if (packed) batch.rms_activation(&DraftWorkspace::residual, model.input_norm, false);
-        else apply(&State::prepare_attention);
         if (score) {
             batch.project({{model.gqa.q_gate, &DraftWorkspace::q_gate},
                            {model.gqa.key, &DraftWorkspace::keys},
@@ -636,7 +629,7 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
                            {model.gqa.value, &DraftWorkspace::values}});
         }
         if (grouped_rope) {
-            batch.append(rows, model.gqa.query_norm, model.gqa.key_norm);
+            batch.append(rows, model.gqa.query_norm, model.gqa.key_norm, score);
         } else {
             for (int lane = 0; lane < count; ++lane) {
                 const auto& row = rows[lane];
@@ -648,8 +641,11 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
             if (packed) batch.gate_attention();
             else apply(&State::gate_attention);
             batch.project({{model.gqa.output, &DraftWorkspace::branch}});
-            if (packed) batch.rms_activation(&DraftWorkspace::branch, model.attention_norm, true);
-            else apply(&State::prepare_mlp);
+            if (packed) {
+                batch.rms_activation(&DraftWorkspace::branch, model.attention_norm, true);
+            } else {
+                apply(&State::prepare_mlp);
+            }
             batch.project({{model.mlp_gate, &DraftWorkspace::gate},
                            {model.mlp_up, &DraftWorkspace::up}});
             if (packed) {
@@ -659,7 +655,8 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
                 apply(&State::activate_mlp);
             }
             batch.project({{model.mlp_down, &DraftWorkspace::branch}});
-            apply(&State::normalize_output);
+            if (packed) batch.normalize_output(model.final_norm);
+            else apply(&State::normalize_output);
             if (!defer_score) State::score_wave(states.data(), count, stream);
         }
     } catch (...) {

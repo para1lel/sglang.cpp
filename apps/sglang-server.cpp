@@ -26,6 +26,9 @@ namespace {
 
 using namespace sglang::server;
 
+constexpr int default_max_active = sglang::decoder_default_max_running_requests *
+    single_device_batch_topology.device_count();
+
 struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
     std::string launch_command = "sglang-server";
@@ -33,7 +36,7 @@ struct Arguments {
     ChatParsers chat_parsers;
     int device = 0;
     int port = 17384;
-    int max_active = sglang::decoder_batch_max_lanes;
+    int max_active = default_max_active;
     int max_num_batched_tokens = sglang::decoder_default_max_num_batched_tokens;
     int mtp_steps = 4;
     int prefix_cache_entries = sglang::decoder_batch_prefix_max_entries;
@@ -269,7 +272,7 @@ int main(int argc, char** argv) {
                      "                     [--reasoning-parser qwen3]\n"
                      "                     [--tool-call-parser qwen3_coder]\n"
                      "                     [--enable-response-store]\n"
-                     "Active requests: 32 by default, range 1-32.\n"
+                     "Active requests: " << default_max_active << " by default, range 1-32.\n"
                      "Waiting completions: up to --max-active. Full queue returns HTTP 503.\n"
                      "Target rows per step: " << sglang::decoder_default_max_num_batched_tokens
                   << " by default, range 1-32768.\n"

@@ -131,11 +131,12 @@ struct Lane {
 };
 
 struct BatchStorage {
-    BatchStorage(int device, std::shared_ptr<const Allocations> memory, bool resident)
-        : weights(std::move(memory)), retired(device, resident) {}
+    BatchStorage(int device, std::shared_ptr<const Allocations> memory, bool resident, int lanes)
+        : weights(std::move(memory)), retired(device, resident), admission(lanes) {}
     std::shared_ptr<const Allocations> weights;
     RequestBlockCache retired;
     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
+    BatchAdmissionOrder admission;
     DecodeGraphs decode_graphs;
     std::optional<VerificationGraph> verification_graph;
     std::optional<PrefixCache> prefix_cache;
@@ -168,16 +169,15 @@ static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
 static_assert(prefill_chunk_rows == mxfp8_page_size);
 
 StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int lanes,
-                   int budget, int& cursor, int tile, bool chunked, WideMtpCandidates* wide) {
+                   int budget, bool chunked, WideMtpCandidates* wide) {
     BudgetLanes work{};
+    const bool checkpoints = storage.prefix_cache.has_value();
     for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
         if (!selected[slot] || !lane || !lane->request || lane->restored_prompt) continue;
-        const bool checkpoints = storage.prefix_cache.has_value();
         work[slot] = lane->remaining_prompt()
             ? BudgetLane{chunked ? lane->prefill_rows(checkpoints) : 1}
-            : BudgetLane{0, lane->proposals(checkpoints), true};
-        work[slot].position = lane->progress.position;
+            : BudgetLane{0, std::max(0, lane->proposals(checkpoints)), true};
         if (wide && work[slot].decode && lane->draft && lane->remaining_output() > 1) {
             const auto bit = std::uint32_t{1} << slot;
             wide->speculative |= bit;
@@ -189,11 +189,8 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
             }
         }
     }
-    if (!budget) return {plan_legacy_prefill(work, lanes, prefill_chunk_rows, cursor, chunked)};
-    const auto aligned = plan_aligned_prefill(work, lanes, budget, cursor, min_partial_prefill_rows,
-                                             chunked ? std::min(tile, batch_prefill_tile_rows) : 0);
-    if (aligned) return *aligned;
-    return plan_budget_step(work, lanes, budget, cursor, 0);
+    return plan_budget_step(work, storage.admission, budget ? budget : prefill_chunk_rows,
+                            budget != 0);
 }
 
 }
@@ -202,7 +199,7 @@ struct DecoderBatch::State {
         : model(owner), options(options),
           residency(options),
           storage(std::make_shared<BatchStorage>(owner.device, owner.memory,
-                                                 residency.resident())),
+                                                 residency.resident(), options.max_lanes)),
           execution(model.device) {
         validate_batch_options(options);
         DeviceScope device(model.device);
@@ -305,7 +302,6 @@ struct DecoderBatch::State {
     GeneratedLogprobReadback* logprob_readback = nullptr;
     ConstraintWorkspace constraint_workspace;
     AdjustedLogitsWorkspace adjusted_workspace;
-    int prefill_cursor = 0;
     bool failed = false;
     SerialOutput* output = nullptr;
     MtpRound::Cancel no_cancel;
@@ -460,6 +456,7 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         lane->resident_bytes = resident;
         state_->initialize(*lane, slot);
         device.restore();
+        state_->storage->admission.admitted(slot);
         return lane->progress.position;
     } catch (const CudaError& error) {
         const bool out_of_memory = error.status == cudaErrorMemoryAllocation;
@@ -883,9 +880,8 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         Steps results{};
         DecoderBatchStepStats current;
         WideMtpCandidates wide;
-        const int tile = model.backend.tensor_core_prefill ? model.execution.prefill_limit() : 0;
         const auto plan = plan_step(*storage, selected, options.max_lanes,
-                                    options.max_num_batched_tokens, prefill_cursor, tile, chunked,
+                                    options.max_num_batched_tokens, chunked,
                                     wide_mtp_limit >= wide_mtp_lanes && !output ? &wide : nullptr);
         current.prefill_rows = plan.prefill;
         const auto live_before = stats ? request_bytes(*storage) : 0;

@@ -11,6 +11,7 @@ namespace sglang {
 namespace decoder { class SerialOutput; }
 
 inline constexpr int decoder_batch_max_lanes = 32;
+inline constexpr int decoder_default_max_running_requests = 8;
 inline constexpr int decoder_batch_max_step_tokens = 32768;
 inline constexpr int decoder_batch_max_graph_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_lanes = 4;
@@ -58,7 +59,7 @@ struct DecoderBatchStepStats {
 
 struct DecoderBatchOptions {
     bool cuda_graphs = false;
-    int max_lanes = decoder_batch_max_mtp_lanes;
+    int max_lanes = decoder_default_max_running_requests;
     int prefix_cache_entries = 0;
     int max_num_batched_tokens = decoder_default_max_num_batched_tokens;
     std::optional<std::size_t> resident_memory_limit = std::nullopt;
@@ -94,7 +95,6 @@ public:
     void cancel(int slot);
 
     /// Advance each selected slot by one position or one speculative round.
-    /// Tensor-core prefill with an enabled cache uses the same tiles as advance_chunked().
     /// Consume token and the first extra_token_count entries of extra_tokens in order.
     /// extra_token mirrors the first extra token for callers using depth one.
     /// A zero-budget slot finishes without work. A failed selection retires only its slot.
@@ -103,9 +103,8 @@ public:
     std::array<DecoderBatchStep, decoder_batch_max_lanes>
     advance(const std::array<bool, decoder_batch_max_lanes>& selected);
 
-    /// Share one bounded prompt position budget across selected slots. Each ready
-    /// decode slot advances by one position or speculative round.
-    /// Tensor-core prefill with an enabled cache keeps prompt tiles aligned to KV pages.
+    /// Reserve target rows for ready decode before granting the remaining budget to prompts.
+    /// Prompts use as many legal rows as possible in successful admission order.
     std::array<DecoderBatchStep, decoder_batch_max_lanes>
     advance_chunked(const std::array<bool, decoder_batch_max_lanes>& selected,
                     DecoderBatchStepStats* stats = nullptr);

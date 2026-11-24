@@ -1,6 +1,7 @@
 #include "sglang/server/batch_service.h"
 
 #include "sglang/runtime/server/single_device_batch_executor.h"
+#include "sglang/runtime/execution/batch_admission_order.h"
 #include "sglang/server/batch_trace.h"
 #include "sglang/server/indexed_admission.h"
 #include "sglang/server/output_mailbox.h"
@@ -67,6 +68,7 @@ struct HealthProbe {
 using Jobs = std::array<std::shared_ptr<Job>, decoder_batch_max_lanes>;
 struct Work {
     Jobs jobs;
+    BatchAdmissionOrder admission;
     bool buffered;
 };
 using Selection = BatchSession::Selection;
@@ -124,6 +126,7 @@ struct BatchService::State {
     std::mutex mutex;
     std::condition_variable changed;
     Jobs jobs;
+    BatchAdmissionOrder admission{max_active};
     Selection generating{};
     Selection reserved{};
     IndexedAdmission indexed_admission;
@@ -267,25 +270,26 @@ std::optional<Work> BatchService::State::wait_for_jobs(BatchSession& batch) {
     });
     if (closing) return std::nullopt;
     if (idle_for_health()) jobs.front() = health_probe->job;
-    return Work{jobs, wide_decode_ready(true) || decode_mailboxes_ready(false)};
+    return Work{jobs, admission, wide_decode_ready(true) || decode_mailboxes_ready(false)};
 }
 
 std::uint32_t BatchService::State::refresh_prefill_roster(Work& work, int capacity) {
     const std::unique_lock lock(mutex, std::try_to_lock);
     if (!lock || closing || reset_pending) return 0;
     std::uint32_t added = 0;
-    for (int slot = 0; slot < max_active && capacity > 0; ++slot) {
+    for (const int slot : admission) {
+        if (capacity == 0) break;
         const auto& job = jobs[slot];
-        if (!work.jobs[slot] && job && !job->health_check && !job->admitted &&
+        if (job && job != work.jobs[slot] && !job->health_check && !job->admitted &&
             !job->cancelled && !job->aborted()) {
             work.jobs[slot] = job;
             added |= std::uint32_t{1} << slot;
             --capacity;
         }
     }
+    work.admission = admission;
     return added;
 }
-
 bool BatchService::State::prepare(BatchSession& batch, int slot,
                                   const std::shared_ptr<Job>& job, bool buffered) {
     bool cancelled;
@@ -344,7 +348,6 @@ bool BatchService::State::prepare(BatchSession& batch, int slot,
     }
     return true;
 }
-
 bool BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& step) {
     const bool terminal = step.finish_reason || step.sampling_failed || step.constraint_failed;
     if (terminal && job.request_id && !job.request_id->finish() && !job.cancelled) {
@@ -379,7 +382,6 @@ bool BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& st
     }
     return published;
 }
-
 void BatchService::State::publish_steps(const Jobs& snapshot, const Selection& selected,
                                         const Steps& steps) {
     bool generated = false;
@@ -395,7 +397,6 @@ void BatchService::State::publish_steps(const Jobs& snapshot, const Selection& s
         }
     }
 }
-
 std::optional<std::uint64_t> BatchService::State::begin_iteration(BatchSession& batch) {
     std::unique_lock lock(mutex);
     if (reset_pending) {
@@ -420,10 +421,8 @@ void BatchService::State::process(BatchSession& batch) {
         }
         const auto epoch = *iteration;
         Selection selected{};
-        bool cold = true;
-        bool has_empty_slot = false;
-        bool starts_long_prefill = false;
-        for (int slot = 0; slot < max_active; ++slot) {
+        bool cold = true, has_empty_slot = false, starts_long_prefill = false;
+        for (const int slot : snapshot->admission) {
             const auto& job = snapshot->jobs[slot];
             if (!job) {
                 has_empty_slot = true;
@@ -440,7 +439,7 @@ void BatchService::State::process(BatchSession& batch) {
         // Pick up already-published arrivals once before the first long prefill grant.
         if (cold && starts_long_prefill && has_empty_slot && capacity > 0) {
             const auto added = refresh_prefill_roster(*snapshot, capacity);
-            for (int slot = 0; slot < max_active && (added >> slot); ++slot) {
+            for (const int slot : snapshot->admission) {
                 if (!(added >> slot & 1U)) continue;
                 selected[slot] = prepare(batch, slot, snapshot->jobs[slot], snapshot->buffered);
                 width += selected[slot];
@@ -609,6 +608,7 @@ void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt
             break;
         }
         active[slot] = {job, next++};
+        admission.admitted(slot);
         jobs[slot] = std::move(job);
         if (indexed) {
             indexed_admission.claimed(owner, slot);
@@ -931,6 +931,7 @@ DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
             result.finish_reason = DecoderFinishReason::aborted;
             return result;
         }
+        state_->admission.admitted(slot);
         queue = job;
         state_->changed.notify_all();
         auto result = state_->consume(lock, slot, *job, callbacks);
@@ -996,5 +997,4 @@ BatchService::generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
 }
 
 BatchTopology BatchService::topology() const noexcept { return state_->executor->topology(); }
-
 }

@@ -155,6 +155,9 @@ def scheduler(path, offset):
         elif prefill := re.fullmatch(rb"batch prefill_rows=([\d,]+) workspace_bytes=(\d+)", line):
             rows[-1]["prefill"] = [int(value) for value in prefill[1].split(b",")]
             rows[-1]["workspace_bytes"] = int(prefill[2])
+        elif groups := re.fullmatch(rb"batch layerwise_prefill_groups=(\d+) rows=(\d+)", line):
+            rows[-1]["layerwise_prefill_groups"], rows[-1]["layerwise_prefill_rows"] = map(
+                int, groups.groups())
         elif graph := re.fullmatch(rb"batch graph_slots=(\d+)", line):
             rows[-1]["graph_slots"] = int(graph[1])
         elif sampling := re.fullmatch(rb"batch sampling_workspace_bytes=([1-9]\d*)", line):

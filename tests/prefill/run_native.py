@@ -169,6 +169,7 @@ def check_reset(port, log_path, evidence, width, cases):
 
 def check_http_baseline(args, cases, name, width, flags, limits):
     evidence = args.evidence / name
+    flags = (*flags, "--prefix-cache-entries", "0")
     with server(args, evidence, width, flags=flags, expected_health=limits) as (port, _):
         references = serial_cases(port, cases, evidence / "serial.json")
         streams = [request(port, case).evidence() for case in references.values()]
@@ -177,12 +178,12 @@ def check_http_baseline(args, cases, name, width, flags, limits):
 
 def check_http(args, cases):
     check_http_baseline(args, cases, "http-default", None, (),
-                        {"max_active": 32, "max_num_batched_tokens": 8192})
+                        {"max_active": 8, "max_num_batched_tokens": 8192})
     check_http_baseline(args, cases, "http-1", "1", ("--eager",),
                         {"max_active": 1, "max_num_batched_tokens": 8192})
     for width, lengths in ((2, (129, 257)), (4, (2, 127, 129, 257))):
         evidence = args.evidence / f"http-{width}"
-        flags = ("--max-num-batched-tokens", str(BATCH_TOKEN_BUDGET))
+        flags = ("--max-num-batched-tokens", str(BATCH_TOKEN_BUDGET), "--prefix-cache-entries", "0")
         limits = {"max_active": width, "max_num_batched_tokens": BATCH_TOKEN_BUDGET}
         with server(args, evidence, str(width), flags=flags,
                     expected_health=limits) as (port, log_path):
@@ -199,8 +200,8 @@ def check_http(args, cases):
                 and (max(positions) > 1) == (scratch > 0)
                 for _, decodes, positions, scratch in rows
             ), "Invalid per-step position or scratch accounting")
-            require(any(sum(count > 1 for count in positions) >= 2
-                        for _, _, positions, _ in rows), "No concurrent chunked prefill lanes")
+            require(any(max(positions) == BATCH_TOKEN_BUDGET
+                        for _, _, positions, _ in rows), "No full-budget head prefill grant")
             require(any(decodes and max(positions) > 1 for _, decodes, positions, _ in rows),
                     "No decode progress alongside chunked prefill")
             if width == 4:

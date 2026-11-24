@@ -31,7 +31,7 @@ Eligible B200 projections through 20 rows use 8-, 16-, or 32-column MMA tiles. A
 
 Compact setup decline tries 40 rows, then 20, then groups of at most five. M80/M160 check pending CUDA errors before setup and recorded status after dispatch. An unavailable launch target can fall back when setup returns no status and CUDA records only `cudaErrorNotSupported`. Explicit setup and dispatch errors propagate. [Fallback](../src/decoder_forward.cpp#L274)<!-- prefix: "void project" --> · [CUDA status](../src/text/decode_proj_fp8.cu#L382)<!-- prefix: "std::optiona" -->
 
-The batch lazily allocates stream-owned scratch before submission (87,040 bytes per lane, up to 2,785,280 bytes). Resident batches check the 2 GiB shared reserve plus net growth. Reserve shortage or allocation OOM lowers the width cap and replans. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L711)<!-- prefix: "bool Decoder" --> · [Width downgrade](../src/decoder_batch.cpp#L741)<!-- prefix: "WideMtpGroup" -->
+The batch lazily allocates stream-owned scratch before submission (87,040 bytes per lane, up to 2,785,280 bytes). Resident batches check the 2 GiB shared reserve plus net growth. Reserve shortage or allocation OOM lowers the width cap and replans. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L708)<!-- prefix: "bool Decoder" --> · [Width downgrade](../src/decoder_batch.cpp#L738)<!-- prefix: "WideMtpGroup" -->
 
 ### Large prefill tiles
 

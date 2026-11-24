@@ -41,11 +41,11 @@ A paired graph capture records the raw kernel with maps by value and uses zero s
 
 ## Multi-request text prefill
 
-The [aligned prompt planner](batch-graphs.md#runtime-path) can grant a full tile to each compatible prompt lane. Full 1,024-row tiles can enable paired attention and projection kernels. Compare grant sizes and decode overlap when diagnosing prefill timing. Each lane retains token order, KV pages, recurrent state, and its own output rows. [Attention dispatch](flash-prefill.md#runtime-path)
+The [batch planner](batch-graphs.md#runtime-path) assigns rows. The executor splits grants into physical tiles of up to 1,024 rows and groups compatible work. Each request keeps its token order, KV pages, recurrent state, and output rows. [Attention dispatch](flash-prefill.md#runtime-path)
 
 The earlier K0 planner tested fair-share, tiled, and grouped schedules. Its measured cases used the historical selector and K0 rules. Recover the planner and run notes at the original revisions. [K0 campaign](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-measurement-ledger.md) · [Previous workspace guide](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#tiled-prefill-under-saturation)
 
-The scheduler sends generation and scoring grants to one prefill executor. B200 can group compatible Tensor Core tiles. Cache restore supplies the starting state. Media embeddings, rotary positions, and score captures belong to each lane. Decode work has separate dispatch in the same step. [Step dispatch](../src/decoder_batch.cpp#L623)<!-- prefix: "if (max_rows" --> · [Grant assembly](../src/decoder_batch.cpp#L654)<!-- prefix: "void Decoder" -->
+The scheduler sends generation and scoring grants to one prefill executor. B200 can group compatible Tensor Core tiles. Cache restore supplies the starting state. Media embeddings, rotary positions, and score captures belong to each lane. Decode work has separate dispatch in the same step. [Step dispatch](../src/decoder_batch.cpp#L620)<!-- prefix: "if (max_rows" --> · [Grant assembly](../src/decoder_batch.cpp#L651)<!-- prefix: "void Decoder" -->
 
 ### Projection pairs for MTP
 
@@ -90,7 +90,7 @@ largest active prefill workspace in the step.
 
 ## Verification
 
-The `decoder-batch-plan-check` CPU target checks the step budget, decode reservations, finishing tails, rotation under replenished load, and fair-share fallback. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner test target](../xmake.lua#L309)<!-- prefix: "target(\"deco" -->
+The `decoder-batch-plan-check` CPU target checks decode reservations, MTP budget clipping, prompt order, slot reuse, and full occupancy. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner assertions](../tests/decoder/decoder_batch_plan_check.cpp#L24)<!-- prefix: "void check_d" --> · [Planner target](../xmake.lua#L309)<!-- prefix: "target(\"deco" -->
 
 On one reserved B200, replay identical checkpoint Q, MXFP8 payloads and scales, and remapped page tables. Exercise both bounds and nonzero page offsets. Compare full BF16 output with raw paired and archived wide Flash. Include a short tail, causal masks, invalid full- and partial-page V, and repair.
 

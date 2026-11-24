@@ -8,7 +8,11 @@ struct BatchTopology {
     int dp_size;
     int tp_size;
     int pp_size;
+
+    constexpr int device_count() const noexcept { return dp_size * tp_size * pp_size; }
 };
+
+inline constexpr BatchTopology single_device_batch_topology{1, 1, 1};
 
 /// Call these operations on the worker thread that owns the session.
 class BatchSession {

@@ -71,7 +71,9 @@ void SingleDeviceBatchExecutor::stop() {
     }
 }
 
-BatchTopology SingleDeviceBatchExecutor::topology() const noexcept { return {1, 1, 1}; }
+BatchTopology SingleDeviceBatchExecutor::topology() const noexcept {
+    return single_device_batch_topology;
+}
 
 void SingleDeviceBatchExecutor::run(std::promise<void> started) {
     std::optional<SingleDeviceBatchSession> session;

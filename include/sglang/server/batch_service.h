@@ -128,10 +128,10 @@ struct BatchCallbacks {
 class BatchService {
 public:
     BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false, int mtp_steps = 0,
-                 int max_active = decoder_batch_max_mtp_lanes, int prefix_cache_entries = 0,
+                 int max_active = decoder_default_max_running_requests,
+                 int prefix_cache_entries = 0,
                  int max_num_batched_tokens = decoder_default_max_num_batched_tokens);
     ~BatchService();
-
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
                            const DecoderCallbacks& callbacks,
                            std::vector<DecoderMedia> media = std::vector<DecoderMedia>(),

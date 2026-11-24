@@ -20,7 +20,8 @@ import test_batch_graph as http
 from media import http_routes as media
 
 
-DEFAULT_ACTIVE = 32
+DEFAULT_ACTIVE = 8
+MAX_ACTIVE = 32
 DEFAULT_TOKENS = 8192
 MAX_TOKENS = 32768
 SMALL_TOKENS = 64
@@ -188,12 +189,13 @@ def check_default_media(port, log, out, fixture):
 
 
 def check_pressure(args):
-    with server(args, "pressure", ["--mtp-steps", "0"]) as (port, log, out, health):
-        check_caps(health, DEFAULT_ACTIVE, DEFAULT_TOKENS)
-        count = DEFAULT_TOKENS // DEFAULT_ACTIVE
+    flags = ["--mtp-steps", "0", "--max-active", str(MAX_ACTIVE)]
+    with server(args, "pressure", flags) as (port, log, out, health):
+        check_caps(health, MAX_ACTIVE, DEFAULT_TOKENS)
+        count = DEFAULT_TOKENS // MAX_ACTIVE
         cases = [prompt_case(f"lane-{lane}", count + (lane == 0), lane)
-                 for lane in range(DEFAULT_ACTIVE)]
-        check_ordinary(port, log, out, DEFAULT_ACTIVE, DEFAULT_TOKENS, "cohort", cases)
+                 for lane in range(MAX_ACTIVE)]
+        check_ordinary(port, log, out, MAX_ACTIVE, DEFAULT_TOKENS, "cohort", cases)
 
 
 def check_explicit(args, width):
@@ -224,7 +226,11 @@ def check_mtp(args):
         steps = scheduler(log, offset, 4)
         native.write_json(out / "cohort.json", {"streams": streams, "rows": steps})
         assert max(check_step_budget(steps, cap)) == cap, steps
-        assert any(step.get("verification_lanes") == 2 for step in steps), steps
+        verified_slots = {
+            slot for step in steps for slot, entry in step.get("mtp_slots", {}).items()
+            if entry["verified"] == 2
+        }
+        assert len(verified_slots) == 2, steps
         assert sum(sum(step["prefill"]) for step in steps) == 2 * len(fixture["prompt"]), steps
 
 
@@ -280,6 +286,7 @@ def check_eager_cache(args):
 def check_cli(args):
     valid = [[], ["--max-active", "1"], ["--max-active", "4"],
              ["--max-active", str(DEFAULT_ACTIVE), TOKEN_OPTION, str(DEFAULT_TOKENS)],
+             ["--max-active", str(MAX_ACTIVE)],
              [TOKEN_OPTION, str(MAX_TOKENS)],
              [TOKEN_OPTION, str(args.small_tokens)],
              ["--max-active", "1", "--eager"], ["--max-active", "4", "--mtp-steps", "1"],

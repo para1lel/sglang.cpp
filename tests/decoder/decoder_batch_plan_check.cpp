@@ -1,17 +1,15 @@
 #include "sglang/text/decoder_batch_plan.h"
 
-#include <algorithm>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
 
 namespace {
 
+using sglang::BatchAdmissionOrder;
 using sglang::decoder::BudgetLanes;
 using sglang::decoder::PrefillRows;
 using sglang::decoder::plan_budget_step;
-
-constexpr int tile = 1024;
 
 void check(bool condition, const char* detail) {
     if (!condition) {
@@ -23,120 +21,83 @@ int total(const PrefillRows& rows) {
     return std::accumulate(rows.begin(), rows.end(), 0);
 }
 
-void check_rotation() {
-    constexpr int lanes = 16;
-    constexpr int prefill_lanes = 14;
-    constexpr int budget = 2611;
+void check_decode_first() {
+    BatchAdmissionOrder order(8);
+    for (const int slot : {7, 0, 6, 1}) order.admitted(slot);
     BudgetLanes work{};
-    PrefillRows waited{};
-    for (int slot = 0; slot < prefill_lanes; ++slot) {
-        work[slot].prefill = 3101 + 47 * slot;
+    work[7].prefill = 73;
+    work[0].prefill = 8192;
+    work[6] = {0, 4, true};
+    work[1] = {0, 2, true};
+
+    const auto plan = plan_budget_step(work, order, 128);
+    check(plan.decode[6] == 5 && plan.decode[1] == 3, "Decode must reserve legal proposal rows");
+    check(plan.prefill[7] == 73 && plan.prefill[0] == 47, "Give the head its full legal tail");
+    check(total(plan.prefill) + total(plan.decode) == 128, "Use the entire step budget");
+
+    const auto tight = plan_budget_step(work, order, 6);
+    check(tight.decode[6] == 5 && tight.decode[1] == 1 && total(tight.prefill) == 0,
+          "Clip the newer decode grant before allowing prefill");
+    work[1] = {0, 0, true};
+    const auto exhausted = plan_budget_step(work, order, 4);
+    check(exhausted.decode[6] == 4 && exhausted.decode[1] == 0 &&
+              total(exhausted.prefill) == 0,
+          "The oldest running lane can use the only affordable rows");
+    work[1] = {0, 2, true};
+    const auto unmetered = plan_budget_step(work, order, 128, false);
+    check(unmetered.decode[6] == 1 && unmetered.decode[1] == 1 &&
+              unmetered.prefill[7] == 73 && unmetered.prefill[0] == 53,
+          "Preserve the unmetered decode reservation");
+}
+
+void check_admission_order() {
+    BatchAdmissionOrder order(8);
+    order.admitted(0);
+    order.admitted(7);
+    order.admitted(0);
+    BudgetLanes work{};
+    work[0].prefill = 8192;
+    work[7].prefill = 8192;
+
+    const auto head = plan_budget_step(work, order, 8192);
+    check(head.prefill[7] == 8192 && head.prefill[0] == 0, "A reused slot joins the queue tail");
+    work[7] = {};
+    const auto after_cancel = plan_budget_step(work, order, 8192);
+    check(after_cancel.prefill[0] == 8192 && after_cancel.prefill[7] == 0,
+          "An inactive slot cannot reserve budget");
+    order.admitted(7);
+    work[7].prefill = 8192;
+    const auto after_reuse = plan_budget_step(work, order, 8192);
+    check(after_reuse.prefill[0] == 8192 && after_reuse.prefill[7] == 0,
+          "The surviving request keeps its original place in line");
+}
+
+void check_dense() {
+    constexpr int width = sglang::decoder_batch_max_lanes;
+    BatchAdmissionOrder order(width);
+    BudgetLanes work{};
+    for (int slot = width - 1; slot >= 0; --slot) {
+        order.admitted(slot);
+        work[slot].prefill = 32768;
     }
-    work[14].decode = true;
-    work[15].decode = true;
-    int cursor = 13;
-    int tiled_steps = 0;
-    for (int iteration = 0; iteration < 800; ++iteration) {
-        const auto full_tiles = std::count_if(work.begin(), work.end(), [](const auto& lane) {
-            return lane.prefill >= tile;
-        });
-        const bool tiled = full_tiles > (budget - 2) / tile;
-        tiled_steps += tiled;
-        const auto plan = plan_budget_step(work, lanes, budget, cursor, tile);
-        check(plan.decode[14] == 1 && plan.decode[15] == 1, "reserve ready decode rows");
-        check(total(plan.prefill) + total(plan.decode) <= budget, "fit the step budget");
-        for (int slot = 0; slot < prefill_lanes; ++slot) {
-            const int grant = plan.prefill[slot];
-            if (grant == 0) {
-                check(++waited[slot] < lanes, "rotate past lanes already granted a tile");
-                continue;
-            }
-            check(grant > 0 && grant <= work[slot].prefill, "fit the remaining prompt");
-            if (tiled) {
-                check(grant == std::min(tile, work[slot].prefill), "grant a tile or final tail");
-            }
-            waited[slot] = 0;
-            work[slot].prefill -= grant;
-            if (work[slot].prefill == 0) {
-                work[slot].prefill = 2737 + (37 * iteration + slot) % 900;
-            }
+    for (int head = width - 1; head >= 0; --head) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            const auto plan = plan_budget_step(work, order, 8192);
+            check(total(plan.prefill) == 8192 && plan.prefill[head] == 8192,
+                  "Occupancy does not change the head grant");
+            work[head].prefill -= plan.prefill[head];
         }
     }
-    check(tiled_steps > 0 && tiled_steps < 800, "exercise saturated and low-occupancy steps");
-}
-
-void check_mixed_work() {
-    BudgetLanes work{};
-    work[0].prefill = 3023;
-    work[1].prefill = 6027;
-    work[3].prefill = 1777;
-    work[4].prefill = 73;
-    work[5].prefill = 3100;
-    work[6].decode = true;
-    work[7].decode = true;
-    int cursor = 0;
-    const auto plan = plan_budget_step(work, 8, 2200, cursor, tile);
-    check(total(plan.decode) == 2 && plan.decode[6] == 1 && plan.decode[7] == 1,
-          "reserve ready decode rows before prefill");
-    check(plan.prefill[0] == tile && plan.prefill[1] == tile && plan.prefill[4] == 73,
-          "fit a finishing tail beside whole tiles");
-    check(total(plan.prefill) == 2 * tile + 73 && cursor == 3,
-          "leave residual space and resume at the first deferred lane");
-
-    int stock_cursor = cursor;
-    const auto small = plan_budget_step(work, 8, tile + 1, cursor, tile);
-    const auto stock = plan_budget_step(work, 8, tile + 1, stock_cursor, 0);
-    check(small.prefill == stock.prefill && small.decode == stock.decode && cursor == stock_cursor,
-          "use fair share when decode reservations leave less than a tile");
-    check(total(small.prefill) == tile - 1 && total(small.decode) == 2,
-          "keep making progress with a sub-tile budget");
-}
-
-void check_occupancy() {
-    BudgetLanes work{};
-    int cursor = 0;
-    constexpr int slots = sglang::decoder_batch_max_lanes;
-    constexpr int budget = 8 * tile;
-    for (int slot = 0; slot < 4; ++slot) {
-        work[slot].prefill = 131072;
-    }
-    auto plan = plan_budget_step(work, slots, budget, cursor, tile);
-    check(total(plan.prefill) == budget && cursor == 1, "use fair share at low occupancy");
-    for (int slot = 0; slot < 4; ++slot) {
-        check(plan.prefill[slot] == 2 * tile, "allow multiple tiles on each low-occupancy lane");
-    }
-    for (auto& lane : work) {
-        lane.prefill = 32769;
-    }
-    plan = plan_budget_step(work, slots, budget, cursor, tile);
-    check(total(plan.prefill) == budget && cursor == 9, "rotate saturated grants");
-    for (int slot = 0; slot < slots; ++slot) {
-        check(plan.prefill[slot] == (slot >= 1 && slot <= 8 ? tile : 0),
-              "grant at most one tile per saturated lane");
-    }
-}
-
-void check_stock_speculation() {
-    BudgetLanes work{};
-    work[0].prefill = 50;
-    work[1].prefill = 90;
-    work[2] = {0, 4, true};
-    work[3] = {0, 2, true};
-    int cursor = 2;
-    const auto plan = plan_budget_step(work, 4, 14, cursor, 0);
-    check(plan.decode[2] == 5 && plan.decode[3] == 3, "preserve speculative proposal allowance");
-    check(plan.prefill[0] == 3 && plan.prefill[1] == 3 && cursor == 3,
-          "preserve stock prefill share beside speculative decode");
+    check(total(plan_budget_step(work, order, 8192).prefill) == 0, "No work remains");
 }
 
 }
 
 int main() {
     try {
-        check_rotation();
-        check_mixed_work();
-        check_occupancy();
-        check_stock_speculation();
+        check_decode_first();
+        check_admission_order();
+        check_dense();
         std::cout << "Decoder batch planner checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

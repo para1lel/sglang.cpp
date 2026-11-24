@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_batch.h"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
+#include "sglang/runtime/execution/batch_admission_order.h"
 
 #include <algorithm>
 
@@ -18,142 +19,24 @@ struct BudgetLane {
     int prefill = 0;
     int proposals = 0;
     bool decode = false;
-    int position = 0;
 };
 
 using BudgetLanes = std::array<BudgetLane, decoder_batch_max_lanes>;
 
-inline PrefillRows plan_legacy_prefill(const BudgetLanes& work, int lanes, int unused,
-                                       int& cursor, bool chunked) {
-    PrefillRows rows{};
-    if (chunked && lanes > decoder_batch_max_mtp_lanes) {
-        for (int slot = 0; slot < lanes; ++slot) unused -= work[slot].decode;
-        const int start = cursor;
-        for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-            const int slot = (start + offset) % lanes;
-            if (!work[slot].prefill) continue;
-            rows[slot] = std::min(unused, work[slot].prefill);
-            unused -= rows[slot];
-            cursor = (slot + 1) % lanes;
-        }
-        return rows;
-    }
-    for (int slot = 0; slot < lanes; ++slot) {
-        unused -= work[slot].decode || work[slot].prefill != 0;
-        rows[slot] = std::min(1, work[slot].prefill);
-    }
-    while (chunked && unused > 0) {
-        const int before = unused;
-        for (int slot = 0; slot < lanes && unused > 0; ++slot) {
-            if (rows[slot] < work[slot].prefill) {
-                ++rows[slot];
-                --unused;
-            }
-        }
-        if (unused == before) break;
-    }
-    return rows;
-}
-
-inline std::optional<StepPlan> plan_tiled_step(const BudgetLanes& work, int lanes, int unused,
-                                             int& cursor, int tile) {
+inline StepPlan plan_budget_step(const BudgetLanes& work, const BatchAdmissionOrder& order,
+                                 int unused, bool metered_decode = true) {
     StepPlan plan;
-    int full_tiles = 0;
-    for (int slot = 0; slot < lanes; ++slot) {
-        plan.decode[slot] = work[slot].decode;
+    for (const int slot : order) {
+        if (!work[slot].decode) continue;
+        const int reserve = metered_decode ? 1 + work[slot].proposals : 1;
+        plan.decode[slot] = std::min(unused, reserve);
         unused -= plan.decode[slot];
-        full_tiles += work[slot].prefill >= tile;
+        if (!unused) return plan;
     }
-    if (unused < tile || full_tiles <= unused / tile) {
-        return std::nullopt;
-    }
-    const int start = cursor;
-    int first_deferred = -1;
-    for (int offset = 0; offset < lanes; ++offset) {
-        const int slot = (start + offset) % lanes;
-        const int rows = std::min(tile, work[slot].prefill);
-        if (rows <= unused) {
-            plan.prefill[slot] = rows;
-            unused -= rows;
-        } else if (first_deferred < 0) {
-            first_deferred = slot;
-        }
-    }
-    cursor = first_deferred;
-    return plan;
-}
-
-inline std::optional<StepPlan> plan_aligned_prefill(const BudgetLanes& work, int lanes, int budget,
-                                                   int& cursor, int min_rows, int max_rows) {
-    if (max_rows < min_rows) return std::nullopt;
-    int prompts = 0;
-    for (int slot = 0; slot < lanes; ++slot) {
-        if (work[slot].decode) return std::nullopt;
-        prompts += work[slot].prefill != 0;
-    }
-    // Leave the one spare tile unspent to avoid distributing a ragged tail to every lane.
-    if (prompts < 2 || budget % (prompts + 1) != 0) return std::nullopt;
-    const int rows = budget / (prompts + 1);
-    if (rows < min_rows || rows > max_rows || (rows & (rows - 1))) return std::nullopt;
-
-    StepPlan plan;
-    for (int slot = 0; slot < lanes; ++slot) {
-        const auto& lane = work[slot];
-        if (!lane.prefill) continue;
-        if (lane.prefill < rows || lane.position % rows != 0) return std::nullopt;
-        plan.prefill[slot] = rows;
-    }
-    cursor = (cursor + 1) % lanes;
-    return plan;
-}
-
-inline StepPlan plan_budget_step(const BudgetLanes& work, int lanes, int unused, int& cursor,
-                                 int tile) {
-    if (tile) {
-        if (const auto tiled = plan_tiled_step(work, lanes, unused, cursor, tile)) {
-            return *tiled;
-        }
-    }
-    StepPlan plan;
-    const int start = cursor;
-    for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-        const int slot = (start + offset) % lanes;
-        if (work[slot].decode) {
-            plan.decode[slot] = 1;
-        } else if (work[slot].prefill) {
-            plan.prefill[slot] = 1;
-        } else {
-            continue;
-        }
-        --unused;
-        cursor = (slot + 1) % lanes;
-    }
-    if (unused > 0) {
-        cursor = (start + 1) % lanes;
-    }
-    for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-        const int slot = (start + offset) % lanes;
-        if (plan.decode[slot]) {
-            const int extra = std::min(unused, work[slot].proposals);
-            plan.decode[slot] += extra;
-            unused -= extra;
-        }
-    }
-    while (unused > 0) {
-        int unfinished = 0;
-        for (int slot = 0; slot < lanes; ++slot) {
-            unfinished += plan.prefill[slot] < work[slot].prefill;
-        }
-        if (unfinished == 0) {
-            break;
-        }
-        const int share = std::max(1, unused / unfinished);
-        for (int offset = 0; offset < lanes && unused > 0; ++offset) {
-            const int slot = (start + offset) % lanes;
-            const int extra = std::min({unused, share, work[slot].prefill - plan.prefill[slot]});
-            plan.prefill[slot] += extra;
-            unused -= extra;
-        }
+    for (const int slot : order) {
+        plan.prefill[slot] = std::min(unused, work[slot].prefill);
+        unused -= plan.prefill[slot];
+        if (!unused) break;
     }
     return plan;
 }

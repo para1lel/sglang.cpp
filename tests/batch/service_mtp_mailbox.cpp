@@ -43,10 +43,14 @@ struct Fixture {
     Barrier seed, writer, peer, fault;
     Barrier before_claim, after_claim;
     Barrier prefill_admit, prefill_advance;
-    std::array<Barrier, 4> consumers{};
-    std::array<int, 4> admissions{};
+    std::array<Barrier, decoder_batch_max_lanes> consumers{};
+    std::array<int, decoder_batch_max_lanes> admissions{};
+    std::vector<int> admission_order;
     std::vector<Selection> prefill_grants;
     bool inspect_prefill = false;
+    int max_lanes = 4;
+    int hold_prefill_slot = 0;
+    int fail_admission_slot = -1;
     int primary_steps = 0;
     int fail_at = 0;
     int cancels = 0;
@@ -497,6 +501,104 @@ void check_prefill_roster(Arrival arrival, bool trace = false) {
     }
 }
 
+void check_prefill_publication_order() {
+    Fixture observed;
+    fixture = &observed;
+    observed.inspect_prefill = true;
+    observed.max_lanes = 8;
+    observed.prefill_admit.released = true;
+    observed.consumers[1].released = true;
+    const Decoder decoder({}, 0, true);
+    BatchService service(decoder, false, true, 4, 8);
+    auto blocker = start_prefill_request(observed, service, Arrival::none, 1, nullptr);
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.prefill_advance.entered; });
+    }
+    auto older = start_prefill_request(observed, service, Arrival::none, 7, nullptr);
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.consumers[7].entered; });
+    }
+    auto newer = start_prefill_request(observed, service, Arrival::none, 0, nullptr);
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.consumers[0].entered; });
+        observed.release(observed.consumers[7]);
+        observed.release(observed.consumers[0]);
+        observed.release(observed.prefill_advance);
+    }
+    check_prefill_output(blocker.get(), 101);
+    check_prefill_output(older.get(), 107);
+    check_prefill_output(newer.get(), 100);
+    require(observed.admission_order == std::vector{1, 7, 0},
+            "Worker admitted newer slot 0 before published slot 7");
+}
+
+void check_prefill_replacement_order(bool fail_admission) {
+    Fixture observed;
+    fixture = &observed;
+    observed.inspect_prefill = true;
+    observed.hold_prefill_slot = 2;
+    observed.fail_admission_slot = fail_admission ? 0 : -1;
+    observed.consumers[1].released = true;
+    observed.consumers[2].released = true;
+    const Decoder decoder({}, 0, true);
+    BatchService service(decoder, false, true, 4, 4);
+    auto blocker = start_prefill_request(observed, service, Arrival::none, 1, nullptr);
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.prefill_advance.entered; });
+    }
+    BatchRequestId old_id("retiring-cold-slot");
+    auto old = start_prefill_request(observed, service, Arrival::none, 0, &old_id);
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.consumers[0].entered; });
+    }
+    auto head = start_prefill_request(observed, service, Arrival::none, 2, nullptr);
+    if (!fail_admission) {
+        require(old_id.abort(true), "Old cold slot did not accept abort");
+        service.notify_abort();
+    }
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.consumers[2].entered; });
+        observed.release(observed.prefill_advance);
+        observed.await(lock, [&] { return observed.prefill_admit.entered; });
+        observed.release(observed.consumers[0]);
+    }
+    if (fail_admission) {
+        expect_fault(old);
+    } else {
+        require(old.get().finish_reason == Finish::aborted, "Old cold slot did not retire");
+    }
+    {
+        std::lock_guard lock(observed.mutex);
+        observed.consumers[0] = {};
+    }
+    auto older = start_prefill_request(observed, service, Arrival::none, 0, nullptr);
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.consumers[0].entered; });
+    }
+    auto newer = start_prefill_request(observed, service, Arrival::none, 3, nullptr);
+    {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.consumers[3].entered; });
+        observed.release(observed.consumers[0]);
+        observed.release(observed.consumers[3]);
+        observed.release(observed.prefill_admit);
+    }
+    check_prefill_output(blocker.get(), 101);
+    check_prefill_output(head.get(), 102);
+    check_prefill_output(older.get(), 100);
+    check_prefill_output(newer.get(), 103);
+    require(observed.admission_order == std::vector{1, 2, 0, 3} &&
+                observed.prefill_grants[1] == Selection{true, false, true, true},
+            "Cold refresh admitted a newer job before a replacement in the same turn");
+}
+
 void check_prefill_trace() {
     std::ostringstream output;
     auto* const previous = std::cerr.rdbuf(output.rdbuf());
@@ -537,20 +639,28 @@ struct DecoderBatch::State {
 
 DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
     : state_(std::make_unique<State>()) {
-    require(options.max_lanes == 4 && options.cuda_graphs, "Unexpected worker configuration");
+    require(options.max_lanes == fixture->max_lanes && options.cuda_graphs,
+            "Unexpected worker configuration");
 }
 DecoderBatch::~DecoderBatch() = default;
 int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
     auto& lane = state_->lanes[slot];
     require((prompt.size() == 1 || fixture->inspect_prefill) && !lane.remaining,
             "Bad or reused live slot");
+    if (slot == fixture->fail_admission_slot) {
+        fixture->fail_admission_slot = -1;
+        throw std::runtime_error("fixture step failure");
+    }
     lane = {prompt.front(), 0, options.max_new_tokens,
             options.mtp_steps > 0 && !options.requires_target_only() && !options.label_token_ids,
             options.text_stop, options.claim_completion};
     if (fixture->inspect_prefill) {
         std::unique_lock lock(fixture->mutex);
-        if (slot == 0 && !fixture->admissions[slot]) fixture->hold(lock, fixture->prefill_admit);
+        if (slot == fixture->hold_prefill_slot && !fixture->admissions[slot]) {
+            fixture->hold(lock, fixture->prefill_admit);
+        }
         ++fixture->admissions[slot];
+        fixture->admission_order.push_back(slot);
     }
     return 0;
 }
@@ -686,6 +796,9 @@ int main(int argc, char** argv) {
                              Arrival::aborted, Arrival::disconnected, Arrival::blocked_writer}) {
             check_prefill_roster(arrival);
         }
+        check_prefill_publication_order();
+        check_prefill_replacement_order(false);
+        check_prefill_replacement_order(true);
         std::cout << "Cold prefill roster, late arrival, and output ownership passed\n";
     }
 }

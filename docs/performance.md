@@ -173,18 +173,19 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The `matched-k4-native-defaults-cache-on-v2` campaign passed W1–W3. W4–W6 remain unmeasured. Both engines used the same reserved B200 (GPU 6), MTP4, an 8,192-token step budget, and a 32-request cap. W1 and W2 used three warmups and nine untraced timed requests per engine. W3 used two warmups and five timed four-request cohorts per engine. Both engines reset their caches before each cohort. All streams reported zero cached tokens, including the separate W1 trace.
+Public release `9229bd5` passed W1–W3 under the inclusive 1.10× criterion. W4 was the first miss, 35.669711 ms above its limit. W5 and W6 stayed held. The `matched-k4-native-defaults-cache-on-v2` campaign used one reserved B200, effective MTP4, an 8,192-token step budget, and a 32-request cap. Both engines acknowledged an idle prefix-cache reset before each cohort. Every stream reported zero cached prompt tokens. [Measured release](https://github.com/para1lel/sglang.cpp/commit/9229bd5ae3081973796f2347433e083cf4bb26af)
 
-| Workload | Native median, ms | Pinned vLLM median, ms | Native change |
-| --- | ---: | ---: | ---: |
-| W1 | 586.763921 | 625.866143 | −6.248% |
-| W2 | 1268.318258 | 1690.128402 | −24.957% |
-| W3 | 3901.049177 | 3959.073749 | −1.466% |
+| Workload | Native median, ms | Pinned vLLM median, ms | Native ÷ vLLM | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| W1 | 624.808359 | 623.065032 | 1.002797986× | Pass |
+| W2 | 1374.950250 | 1691.470318 | 0.812872822× | Pass |
+| W3 | 3837.898377 | 3957.630571 | 0.969746496× | Pass |
+| W4 | 30506.263018 | 27700.539370 | 1.101287690× | Miss |
 
-Timing ran from submission to wire `[DONE]` and included native terminal checkpoint publication. Native repeated full output IDs in each row. The separate W1 trace matched native timed IDs and ran at depth four in 49 of 50 rounds. In W1 and W2, zero of nine timed vLLM outputs per row matched native IDs. In W3, all 28 corresponding lane outputs matched across engines, including warmups.
+Timing ran from submission to wire `[DONE]` with the warmup and sample counts above. Native repeated full output IDs within each row. The engines produced the same IDs for all corresponding W3 and W4 lanes. W1 and W2 IDs repeated within each engine and differed across engines. The independent W1 trace matched timed native IDs and recorded depth four on 49 of 50 verification rounds.
 
-The measured Release server SHA-256 is `945e9226cc475fd4dcae565ad179ae5599812170b945b5c1c25cc877fe788e80`. The qualification manifest SHA-256 is `19dfab9ea1d231f597154a783d51cfeed262cf88f95cac2ed48e12a19750bc0c`. The vLLM pin is `81a8cb063e6247fe254d7caf7e98a6691d71022a`. [Measured runtime revision](https://github.com/para1lel/sglang.cpp/commit/a84fb5388c4676cb4a9f17801c29f6787c3985f8)
+The measured Release server SHA-256 is `82e7f4f1212456031a5eb09c7928efeb5a3c9ff9a9641273be933dd6800cdb75`. All 209 production paths matched the compiled and published inputs. The vLLM pin is `81a8cb063e6247fe254d7caf7e98a6691d71022a`.
 
-Recover commands, raw streams, and replayed receipts under `artifacts/handover-w3/cache-on-pin/release-w1/short-gqa-formal.ZsTtyKje/`. `identity.json` identifies the checkpoint and protocol. All three original runners exited successfully. Row-level exit records and finish timestamps were reconstructed after verifying cleanup. All raw samples and comparisons were preserved.
+Recover launch commands, raw streams, and offline receipts under `artifacts/handover-w3/cache-on-pin/release-w1/formal-9229bd5-gpu7.PZuEl8Hu/`. The `report.md` SHA-256 is `7210e4397f9e5678f17a21093c24ffd621a316c9c8ae2ed4b63687bb819c9523`. The original W1–W3 runners exited successfully. Row completion markers were recovered from original status and cleanup records before progression. The original W4 runner and offline replay both returned 1 for the timing miss.
 
-The preceding cache-on campaign missed W3 by 11.918276 ms. Earlier campaigns retain their own settings and results. [Prior cache-on evidence](https://github.com/para1lel/sglang.cpp/blob/650f69d853380d5738955586ce37f30051485f8f/docs/performance.md#matched-k4-evidence) · [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)
+Earlier campaigns retain their own settings and verdicts. [Prior strict W1–W3 pass](https://github.com/para1lel/sglang.cpp/blob/c92b30303a7c8359d2298b968ff49a847c387e42/docs/performance.md#matched-k4-evidence) · [Prior strict W3 miss](https://github.com/para1lel/sglang.cpp/blob/650f69d853380d5738955586ce37f30051485f8f/docs/performance.md#matched-k4-evidence) · [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)

@@ -321,7 +321,6 @@ void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant
 
 constexpr int layerwise_row_alignment = 128;
 constexpr int max_layerwise_rows = 1023;
-constexpr int min_partial_prefill_rows = 256;
 static_assert(max_layerwise_rows / 256 <= max_gdn_prefill_segments);
 static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
 

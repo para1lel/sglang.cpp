@@ -18,6 +18,7 @@ struct BudgetLane {
     int prefill = 0;
     int proposals = 0;
     bool decode = false;
+    int position = 0;
 };
 
 using BudgetLanes = std::array<BudgetLane, decoder_batch_max_lanes>;
@@ -79,6 +80,30 @@ inline std::optional<StepPlan> plan_tiled_step(const BudgetLanes& work, int lane
         }
     }
     cursor = first_deferred;
+    return plan;
+}
+
+inline std::optional<StepPlan> plan_aligned_prefill(const BudgetLanes& work, int lanes, int budget,
+                                                   int& cursor, int min_rows, int max_rows) {
+    if (max_rows < min_rows) return std::nullopt;
+    int prompts = 0;
+    for (int slot = 0; slot < lanes; ++slot) {
+        if (work[slot].decode) return std::nullopt;
+        prompts += work[slot].prefill != 0;
+    }
+    // Leave the one spare tile unspent to avoid distributing a ragged tail to every lane.
+    if (prompts < 2 || budget % (prompts + 1) != 0) return std::nullopt;
+    const int rows = budget / (prompts + 1);
+    if (rows < min_rows || rows > max_rows || (rows & (rows - 1))) return std::nullopt;
+
+    StepPlan plan;
+    for (int slot = 0; slot < lanes; ++slot) {
+        const auto& lane = work[slot];
+        if (!lane.prefill) continue;
+        if (lane.prefill < rows || lane.position % rows != 0) return std::nullopt;
+        plan.prefill[slot] = rows;
+    }
+    cursor = (cursor + 1) % lanes;
     return plan;
 }
 

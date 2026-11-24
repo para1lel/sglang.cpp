@@ -7,6 +7,7 @@
 namespace sglang::decoder {
 
 inline constexpr int batch_prefill_tile_rows = 1024;
+inline constexpr int min_partial_prefill_rows = 256;
 
 struct PrefillPool;
 

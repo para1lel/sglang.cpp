@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | CUDA backend policy | Chooses the B200 split-KV policy or the generic SM100 path. | [Device policy](../src/runtime/backend/cuda_backend_policy.cpp#L16)<!-- prefix: "const bool b" --> |
-| Batch executor | Selects direct decode lanes, binds scores and request state, and owns graph and scratch lifetimes. | [Batch selection](../src/decoder_batch.cpp#L620)<!-- prefix: "const auto r" --> · [Graph dispatch](../src/text/decoder_graph.cpp#L80)<!-- prefix: "DecodeRun ru" --> · [Score allocation](../src/decoder_resources.cpp#L551)<!-- prefix: "ExactGqaWork" --> |
+| Batch executor | Selects direct decode lanes, binds scores and request state, and owns graph and scratch lifetimes. | [Batch selection](../src/decoder_batch.cpp#L619)<!-- prefix: "const auto r" --> · [Graph dispatch](../src/text/decoder_graph.cpp#L80)<!-- prefix: "DecodeRun ru" --> · [Score allocation](../src/decoder_resources.cpp#L551)<!-- prefix: "ExactGqaWork" --> |
 | Target attention | Appends KV, reads each row's causal prefix, and gates the attention output before projection. | [Eager attention](../src/decoder_forward.cpp#L689)<!-- prefix: "if (batch.ta" --> · [Bound singleton](../src/decoder_forward.cpp#L582)<!-- prefix: "if (batch.ta" --> · [Bound verification](../src/decoder_forward.cpp#L600)<!-- prefix: "void attend_" --> |
 
 ## Runtime path

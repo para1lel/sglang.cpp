@@ -168,20 +168,16 @@ static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
 static_assert(prefill_chunk_rows == mxfp8_page_size);
 
 StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int lanes,
-                   int budget, int& cursor, bool chunked, WideMtpCandidates* wide) {
+                   int budget, int& cursor, int tile, bool chunked, WideMtpCandidates* wide) {
     BudgetLanes work{};
     for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
-        if (!selected[slot] || !lane || !lane->request) {
-            continue;
-        }
-        if (lane->restored_prompt) {
-            continue;
-        }
+        if (!selected[slot] || !lane || !lane->request || lane->restored_prompt) continue;
         const bool checkpoints = storage.prefix_cache.has_value();
         work[slot] = lane->remaining_prompt()
             ? BudgetLane{chunked ? lane->prefill_rows(checkpoints) : 1}
             : BudgetLane{0, lane->proposals(checkpoints), true};
+        work[slot].position = lane->progress.position;
         if (wide && work[slot].decode && lane->draft && lane->remaining_output() > 1) {
             const auto bit = std::uint32_t{1} << slot;
             wide->speculative |= bit;
@@ -194,6 +190,9 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
         }
     }
     if (!budget) return {plan_legacy_prefill(work, lanes, prefill_chunk_rows, cursor, chunked)};
+    const auto aligned = plan_aligned_prefill(work, lanes, budget, cursor, min_partial_prefill_rows,
+                                             chunked ? std::min(tile, batch_prefill_tile_rows) : 0);
+    if (aligned) return *aligned;
     return plan_budget_step(work, lanes, budget, cursor, 0);
 }
 
@@ -884,8 +883,9 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         Steps results{};
         DecoderBatchStepStats current;
         WideMtpCandidates wide;
+        const int tile = model.backend.tensor_core_prefill ? model.execution.prefill_limit() : 0;
         const auto plan = plan_step(*storage, selected, options.max_lanes,
-                                    options.max_num_batched_tokens, prefill_cursor, chunked,
+                                    options.max_num_batched_tokens, prefill_cursor, tile, chunked,
                                     wide_mtp_limit >= wide_mtp_lanes && !output ? &wide : nullptr);
         current.prefill_rows = plan.prefill;
         const auto live_before = stats ? request_bytes(*storage) : 0;

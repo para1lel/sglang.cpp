@@ -1,3 +1,4 @@
+#include "sglang/decoder_internal.h"
 #include "sglang/prefill_fp8.h"
 
 #include <cstddef>
@@ -448,6 +449,12 @@ std::optional<cudaError_t> tensor_map_failure(CUresult status) {
     }
 }
 
+cudaError_t consume_tma_error(cudaError_t direct) {
+    const auto recorded = cudaGetLastError();
+    return !decoder::CudaError::terminal(direct) && decoder::CudaError::terminal(recorded)
+        ? recorded : direct;
+}
+
 template <class Config, class Output>
 std::optional<cudaError_t> launch_tma(
     const std::uint8_t* weight, const __nv_bfloat16* weight_scales, TextFp8ActivationView input,
@@ -497,14 +504,16 @@ std::optional<cudaError_t> launch_tma(
     status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   shared_bytes);
     if (status != cudaSuccess) {
-        return status;
+        return consume_tma_error(status);
     }
     int groups = in_width / group_size;
     void* args[] = {&activation_map, &weight_map, &input.scales, &weight_scales,
                     &rows, &out_width, &groups, &row_tile_group, &output};
     const dim3 grid((1 + (out_width - 1) / Config::cols) * row_tile_group,
                     1 + (rows - 1) / (Config::rows * row_tile_group));
-    return cudaLaunchKernel(kernel, grid, Config::threads, args, shared_bytes, stream);
+    const auto launched = cudaLaunchKernel(kernel, grid, Config::threads, args, shared_bytes,
+                                           stream);
+    return launched == cudaSuccess ? launched : consume_tma_error(launched);
 }
 
 std::optional<cudaError_t> tma_device(cudaStream_t stream, int& device) {

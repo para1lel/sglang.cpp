@@ -1,3 +1,5 @@
+#include "sglang/runtime/execution/decoder_prefill_plan.h"
+
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_batch.h"
 
@@ -21,6 +23,7 @@ std::optional<cudaError_t> launch_partial_staged_tmem_prefill(
 namespace {
 
 using namespace decoder;
+using namespace decoder::prefill_detail;
 
 struct ScratchLayout {
     std::byte* data = nullptr;
@@ -322,11 +325,6 @@ constexpr int max_layerwise_rows = 1023;
 static_assert(max_layerwise_rows / 256 <= max_gdn_prefill_segments);
 static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
 
-struct PrefillGroup {
-    int grants;
-    int rows;
-};
-
 int aligned_layerwise_rows(int rows) {
     return (rows + layerwise_row_alignment - 1) / layerwise_row_alignment *
         layerwise_row_alignment;
@@ -551,8 +549,6 @@ PairedPrefillScratch serial_gqa_scratch(const TileBuffers& buffers, int serial_c
     return scratch;
 }
 
-enum class PrefillAttentionMode { batched, full_group, serial_segments };
-
 bool is_full_partial_prefill_group(const PrefillGrant* grants, PrefillGroup group) {
     const int rows = grants[0].rows;
     if (group.rows != grouped_prefill_max_rows || (rows != 256 && rows != 512) ||
@@ -593,8 +589,10 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
     const TileBuffers buffers(layout, workspace.capacity());
     const bool grouped = group.rows > max_layerwise_rows;
-    const bool serial_attention = attention_mode == PrefillAttentionMode::serial_segments;
-    const bool wide_partial = serial_attention && is_full_partial_prefill_group(grants, group);
+    const bool causal = attention_mode == PrefillAttentionMode::causal_segments;
+    const bool serial_attention = causal || attention_mode == PrefillAttentionMode::serial_segments;
+    const bool wide_partial = !causal && serial_attention &&
+        is_full_partial_prefill_group(grants, group);
     const bool full_group = attention_mode == PrefillAttentionMode::full_group;
     const bool packed_preparation = full_group || wide_partial;
     const auto rms_launch = packed_preparation ? RmsQuantizeLaunch::full_group_prefill
@@ -607,8 +605,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         gather_embeddings(model.embedding, grant.tokens, grant.rows, residual, stream);
         if (grant.media) grant.media->substitute(residual, grant.position, grant.rows, stream);
     });
-    execute_layers(
-        model.layers,
+    execute_layers(model.layers,
         [&](const Bf16* weight, const char*, const auto& residuals) {
             const auto [branch, residual] = residuals(buffers);
             chunk.normalize(branch, residual, weight, rms_launch);
@@ -617,8 +614,8 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             chunk.gqa_input(layer);
             if (serial_attention) {
                 const auto scratch = serial_gqa_scratch(buffers, serial_capacity);
-                if (!prefill_grouped_partial_gqa(chunk, layer, bank, grants, group.grants,
-                                                 scratch, buffers.gqa_scratch(), !wide_partial)) {
+                if (causal || !prefill_grouped_partial_gqa(chunk, layer, bank, grants, group.grants,
+                    scratch, buffers.gqa_scratch(), !wide_partial)) {
                     each_prefill_segment(grants, group.grants, 0,
                                          [&](const PrefillGrant& grant, int row) {
                         const auto segment = prefill_attention_segment(chunk, grant, row);
@@ -665,9 +662,8 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                     prefill_group_gdn(chunk, layer, bank, first, count, offset);
                 });
             }
-            chunk.project_scaled(layer.output,
-                                 {buffers.activation.values, buffers.activation.scales},
-                                 buffers.projected_attention, scaled_output);
+            chunk.project_scaled(layer.output, {buffers.activation.values,
+                buffers.activation.scales}, buffers.projected_attention, scaled_output);
         },
         [&](const Layer& layer) { chunk.mlp(layer); });
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
@@ -705,71 +701,16 @@ bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* gra
                 group[lane] = prefill_tile(grants[index + lane], offset);
             }
             prefill_layerwise(model, group.data(), {lanes, rows}, workspace, attention_mode);
-            ++stats.layerwise_prefill_groups;
-            stats.layerwise_prefill_rows += rows;
+            record_projection_group(stats, rows);
         }
     }
     workspace.close();
     return true;
-}
-
-PrefillGroup partial_projection_group(const PrefillGrant* grants, int count) {
-    PrefillGroup group{};
-    while (group.grants < count) {
-        const auto& grant = grants[group.grants];
-        if (grant.rows < min_partial_prefill_rows || grant.rows > batch_prefill_tile_rows ||
-            grant.rows != grant.tile_rows || grant.rows > grouped_prefill_max_rows - group.rows) {
-            break;
-        }
-        ++group.grants;
-        group.rows += grant.rows;
-    }
-    return group;
 }
 
 void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant* grants,
-                                   int count, PrefillWorkspace& workspace, int capacity);
-
-bool prefill_partial_projection_tiles(const DecoderModel& model, const PrefillGrant* grants,
-                                      int count, cudaStream_t stream,
-                                      DecoderBatchStepStats& stats) {
-    if (!model.backend.tensor_core_prefill || count < 2) return false;
-    int serial_capacity = 1;
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        serial_capacity = std::max(serial_capacity, grant.tile_rows);
-    }
-    int capacity = serial_capacity;
-    bool grouped = false;
-    for (int index = 0; index < count;) {
-        const auto group = partial_projection_group(grants + index, count - index);
-        if (group.grants >= 2) {
-            grouped = true;
-            capacity = std::max(capacity, group.rows);
-        }
-        index += std::max(1, group.grants);
-    }
-    if (!grouped) return false;
-
-    PrefillWorkspace workspace(stream, capacity);
-    if (!workspace.data()) return false;
-    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
-    for (int index = 0; index < count;) {
-        const auto group = partial_projection_group(grants + index, count - index);
-        if (group.grants >= 2) {
-            prefill_layerwise(model, grants + index, group, workspace,
-                              PrefillAttentionMode::serial_segments, serial_capacity);
-            ++stats.layerwise_prefill_groups;
-            stats.layerwise_prefill_rows += group.rows;
-            index += group.grants;
-            continue;
-        }
-        enqueue_native_prefill_grants(model, grants + index, 1, workspace, serial_capacity);
-        ++index;
-    }
-    workspace.close();
-    return true;
-}
+                                   int count, PrefillWorkspace& workspace, int capacity,
+                                   int first_offset = 0);
 
 }
 
@@ -788,7 +729,15 @@ bool decoder::try_prefill_projection_groups(
         }
         return prefill_projection_tiles(model, grants, count, 2, stream, stats);
     }
-    return prefill_partial_projection_tiles(model, grants, count, stream, stats);
+    if (!model.backend.tensor_core_prefill) return false;
+    return execute_partial_projection_groups(grants, count, stream, stats,
+        [&](const PrefillGrant* group, PrefillGroup rows, PrefillWorkspace& workspace,
+            PrefillAttentionMode attention, int capacity) {
+            prefill_layerwise(model, group, rows, workspace, attention, capacity);
+        },
+        [&](const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity, int offset) {
+            enqueue_native_prefill_grants(model, grant, 1, workspace, capacity, offset);
+        });
 }
 
 TextFp8ActivationView PrefillProjections::quantize(const Bf16* input, int width) const {
@@ -867,15 +816,9 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                                    int logical_capacity) const {
     const auto stream = workspace.stream();
     const int capacity = logical_capacity ? logical_capacity : workspace.capacity();
-    if (!stream || !tokens || rows < 1 || rows > capacity || capacity > workspace.capacity() ||
-        position < 0 ||
-        position > text_attention_max_tokens - rows ||
-        (position + rows - 1) / mxfp8_page_size >= request.pages.page_count ||
-        (draft && prompt_remaining < rows)) {
-        throw std::invalid_argument("Invalid decoder prefill tile");
-    }
     const PrefillGrant grant{&request, tokens, position, rows, rows, prompt_remaining,
                              draft, media, scores};
+    validate_prefill_tile(grant, workspace, capacity);
     if (rows == 1 || !workspace.data()) {
         if (!std::all_of(tokens, tokens + rows,
                          [](int token) { return token >= 0 && token < vocab_size; })) {
@@ -944,9 +887,10 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
 namespace {
 
 void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant* grants,
-                                   int count, PrefillWorkspace& workspace, int capacity) {
+                                   int count, PrefillWorkspace& workspace, int capacity,
+                                   int first_offset) {
     const auto stream = workspace.stream();
-    for (int index = 0; index < count; ++index) {
+    for (int index = 0; index < count; ++index, first_offset = 0) {
         const auto& grant = grants[index];
         if (grant.rows == 1) {
             if (grant.draft && grant.prompt_remaining > 1) {
@@ -955,7 +899,7 @@ void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant
             }
             capture_prefill_scores(model, grant, nullptr, 0, stream);
         } else {
-            for (int offset = 0; offset < grant.rows;) {
+            for (int offset = first_offset; offset < grant.rows;) {
                 const int rows = std::min({grant.tile_rows, capacity, grant.rows - offset});
                 model.prefill_chunk(*grant.request, grant.tokens + offset, rows,
                                     grant.position + offset, workspace, grant.draft,

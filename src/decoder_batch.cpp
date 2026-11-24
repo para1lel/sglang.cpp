@@ -216,7 +216,8 @@ struct DecoderBatch::State {
             storage->verification_winners = prepare_verification_winners(options.max_lanes);
         execution.open_stream(storage);
         storage->tc_vocab = model.tc_vocab
-            ? prepare_tc_vocab_scratch(execution, options.max_lanes >= 4) : nullptr;
+            ? prepare_tc_vocab_scratch(execution, options.max_lanes >= 4, residency.resident())
+            : nullptr;
         if (options.max_lanes >= wide_mtp_lanes &&
             options.max_num_batched_tokens >= wide_mtp_rows &&
             model.mtp_weights && storage->tc_vocab) {

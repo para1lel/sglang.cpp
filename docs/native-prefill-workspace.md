@@ -45,7 +45,7 @@ Full tiles pack the step's available budget into fewer grants and can enable 1,0
 
 The earlier K0 planner tested fair-share, tiled, and grouped schedules. Its measured cases used the historical selector and K0 rules. Recover the planner and run notes at the original revisions. [K0 campaign](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-measurement-ledger.md) · [Previous workspace guide](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#tiled-prefill-under-saturation)
 
-The scheduler sends generation and scoring grants to one prefill executor. B200 can group compatible Tensor Core tiles. Cache restore supplies the starting state. Media embeddings, rotary positions, and score captures belong to each lane. Decode work has separate dispatch in the same step. [Step dispatch](../src/decoder_batch.cpp#L623)<!-- prefix: "if (max_rows" --> · [Grant assembly](../src/decoder_batch.cpp#L654)<!-- prefix: "void Decoder" -->
+The scheduler sends generation and scoring grants to one prefill executor. B200 can group compatible Tensor Core tiles. Cache restore supplies the starting state. Media embeddings, rotary positions, and score captures belong to each lane. Decode work has separate dispatch in the same step. [Step dispatch](../src/decoder_batch.cpp#L624)<!-- prefix: "if (max_rows" --> · [Grant assembly](../src/decoder_batch.cpp#L655)<!-- prefix: "void Decoder" -->
 
 ### Projection pairs for MTP
 

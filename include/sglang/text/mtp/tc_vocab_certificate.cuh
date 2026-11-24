@@ -11,7 +11,7 @@ namespace sglang::decoder::tc_vocab {
 using Bf16 = __nv_bfloat16;
 constexpr int vocabulary = 248320;
 constexpr int width = 5120;
-constexpr int rows = tc_vocab_rows;
+constexpr int rows = tc_vocab_wide_rows;
 constexpr int tile = 1024;
 constexpr int tiles = (vocabulary + tile - 1) / tile;
 constexpr int threads = 256;

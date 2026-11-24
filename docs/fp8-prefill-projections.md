@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder | Select the prefill policy and supply activation and output buffers. | [Packed call](../src/decoder_prefill.cpp#L110)<!-- prefix: "bool project" --> |
-| Fused RMSNorm | Produce BF16 normalized values, E4M3 activations, and FP32 activation scales for prefill and packed decode. | [Launcher](../src/text_normalization.cu#L390)<!-- prefix: "cudaError_t " --> |
+| Fused RMSNorm | Produce BF16 normalized values, E4M3 activations, and FP32 activation scales for prefill and packed decode. | [Launcher](../src/text_normalization.cu#L423)<!-- prefix: "cudaError_t " --> |
 | Attention output quantizer | Convert BF16 GDN and GQA output rows for their FP8 output projections. | [Row launcher](../src/text_ops.cu#L659)<!-- prefix: "cudaError_t " --> |
 | SM100 operator | Select the tile, manage CTA-local storage, and write BF16 outputs. | [Separate dispatch](../src/prefill_fp8_sm100.cu#L576)<!-- prefix: "if (rows > 1" --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L685)<!-- prefix: "if (rows < 1" --> |
 
@@ -25,13 +25,13 @@ For eligible GDN verification, one launch projects the BF16 b and a gates for tw
 
 ### Multi-lane target verification
 
-Four-lane packets batch activation quantization at six to twenty rows. With a packed activation buffer, [wide K4 verification](mtp.md#target-round) batches 40, 80, or 160 rows per launch. This covers RMSNorm, attention output, and SwiGLU quantization. [Compact GDN](gdn-prefill.md#grouped-target-verification) writes FP8 during finish, bypassing separate output quantization. Rows keep BF16 rounding, E4M3 values, FP32 scales, and output slots. [RMSNorm](../src/decoder_forward.cpp#L898)<!-- prefix: "if (batch.fu" --> · [Quantization](../src/decoder_forward.cpp#L165)<!-- prefix: "void quantiz" --> · [Wide launcher](../src/text_normalization.cu#L360)<!-- prefix: "cudaError_t " -->
+Four-lane packets batch activation quantization at six to twenty rows. With a packed activation buffer, [wide K4 verification](mtp.md#target-round) batches 40, 80, or 160 rows per launch. This covers RMSNorm, attention output, and SwiGLU quantization. [Compact GDN](gdn-prefill.md#grouped-target-verification) writes FP8 during finish, bypassing separate output quantization. Rows keep BF16 rounding, E4M3 values, FP32 scales, and output slots. [RMSNorm](../src/decoder_forward.cpp#L898)<!-- prefix: "if (batch.fu" --> · [Quantization](../src/decoder_forward.cpp#L165)<!-- prefix: "void quantiz" --> · [Wide launcher](../src/text_normalization.cu#L393)<!-- prefix: "cudaError_t " -->
 
 Eligible B200 projections through 20 rows use 8-, 16-, or 32-column MMA tiles. At five to twenty rows, E4M3 occupies at most 348,160 of 496,640 bytes in the first logits buffer. Wide projections use separate packed storage. The 40-, 80-, and 160-row kernels use 64, 80, and 160 columns. Compact 80- and 160-row kernels use four and three pipeline slots, respectively. They process column pairs with rounded FP32 multiply before FMA. Splits accumulate K-groups in order. The epilogue sums splits in rank order and rounds once to BF16. Stream order protects buffer reuse. [Packing](../src/decoder_forward.cpp#L112)<!-- prefix: "auto* packed" --> · [Compact arithmetic](../src/text/decode_proj_fp8.cu#L71)<!-- prefix: "template <bo" --> · [Wide dispatch](../src/text/decode_proj_fp8.cu#L335)<!-- prefix: "if (count ==" -->
 
 If compact setup declines, try 40-row calls. If their setup declines, try 20-row calls, then groups of at most five. M80 and M160 report pending CUDA errors before setup and check recorded status after dispatch. An unavailable launch target can fall back if setup declines without a status and CUDA records only `cudaErrorNotSupported`. Explicit setup and dispatch errors propagate. [Fallback](../src/decoder_forward.cpp#L274)<!-- prefix: "void project" --> · [CUDA status](../src/text/decode_proj_fp8.cu#L308)<!-- prefix: "std::optiona" -->
 
-The batch allocates stream-owned scratch lazily before submission. It needs 87,040 bytes per lane, up to 2,785,280 bytes. Resident execution checks for the 2 GiB shared reserve plus the net growth. A reserve shortage or allocation OOM lowers the batch’s width cap and retries planning at smaller widths. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L711)<!-- prefix: "bool Decoder" --> · [Width downgrade](../src/decoder_batch.cpp#L741)<!-- prefix: "WideMtpGroup" -->
+The batch allocates stream-owned scratch lazily before submission. It needs 87,040 bytes per lane, up to 2,785,280 bytes. Resident execution checks for the 2 GiB shared reserve plus the net growth. A reserve shortage or allocation OOM lowers the batch’s width cap and retries planning at smaller widths. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L712)<!-- prefix: "bool Decoder" --> · [Width downgrade](../src/decoder_batch.cpp#L742)<!-- prefix: "WideMtpGroup" -->
 
 ### Large prefill tiles
 
@@ -71,13 +71,13 @@ The kernel writes row-major E4M3 values and 48 row-major FP32 scales per row. It
 
 ### Fused activation quantization
 
-Packed decode and tensor-core prefill share the fused RMSNorm launcher. For ordinary small tiles, the eight-lane quantizer requires 2–32 launch rows, width 5,120, and a residual buffer. In packed decode, the bucket width sets the launch row count. Branch, residual, and gain buffers require 16-byte alignment. The E4M3 output requires 8-byte alignment. Eligible prefill tiles also use this path. Other valid calls use the existing fused kernel or separate RMSNorm and quantization according to width and input alignment. [Packed decode](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L270)<!-- prefix: "void PackedD" --> · [Prefill](../src/decoder_prefill.cpp#L268)<!-- prefix: "void normali" --> · [Selection](../src/text_normalization.cu#L414)<!-- prefix: "if (residual" -->
+Packed decode and tensor-core prefill share the fused RMSNorm launcher. For ordinary small tiles, the eight-lane quantizer requires 2–32 launch rows, width 5,120, and a residual buffer. In packed decode, the bucket width sets the launch row count. Branch, residual, and gain buffers require 16-byte alignment. The E4M3 output requires 8-byte alignment. Eligible prefill tiles also use this path. Other valid calls use the existing fused kernel or separate RMSNorm and quantization according to width and input alignment. [Packed decode](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L270)<!-- prefix: "void PackedD" --> · [Prefill](../src/decoder_prefill.cpp#L268)<!-- prefix: "void normali" --> · [Selection](../src/text_normalization.cu#L447)<!-- prefix: "if (residual" -->
 
-These 4,096-row groups can also use the eight-lane RMSNorm quantization epilogue before attention and MLP projections. It supports both residual modes with ordinary loads and stream ordering. The same shape and alignment requirements apply. Other partial groups, ragged tiles, two-grant groups, and singleton tiles retain ordinary preparation. [Layer RMS dispatch](../src/decoder_prefill.cpp#L616)<!-- prefix: "chunk.normal" --> · [4,096-row RMS guard](../src/text_normalization.cu#L404)<!-- prefix: "if (launch =" -->
+These 4,096-row groups can also use the eight-lane RMSNorm quantization epilogue before attention and MLP projections. It supports both residual modes with ordinary loads and stream ordering. The same shape and alignment requirements apply. Other partial groups, ragged tiles, two-grant groups, and singleton tiles retain ordinary preparation. [Layer RMS dispatch](../src/decoder_prefill.cpp#L616)<!-- prefix: "chunk.normal" --> · [4,096-row RMS guard](../src/text_normalization.cu#L437)<!-- prefix: "if (launch =" -->
 
 Packed decode can use [programmatic launch](long-paged-decode.md#packed-rmsnorm-programmatic-launch) to start projection weight loads during fused RMSNorm.
 
-The specialization keeps the FP32 RMS accumulation order and produces BF16 residual and normalized rows. It quantizes the rounded normalized row with one FP32 scale per 128 channels. Scale and reciprocal use FP32 round-to-nearest division. The conversion saturates to finite E4M3. [RMS arithmetic](../src/text_normalization.cu#L255)<!-- prefix: "float values" --> · [Quantizer](../src/text_normalization.cu#L182)<!-- prefix: "__device__ v" -->
+The specialization keeps the FP32 RMS accumulation order and produces BF16 residual and normalized rows. It quantizes the rounded normalized row with one FP32 scale per 128 channels. Scale and reciprocal use FP32 round-to-nearest division. The conversion saturates to finite E4M3. [RMS arithmetic](../src/text_normalization.cu#L281)<!-- prefix: "float values" --> · [Quantizer](../src/text_normalization.cu#L208)<!-- prefix: "__device__ v" -->
 
 ## Constraints and failure behavior
 
@@ -85,7 +85,7 @@ The `sm_100a` build uses TMA, TMEM, and `tcgen05`. It requires capability 10.0, 
 
 Attention output quantization requires a valid FP32 scale buffer with ordinary float alignment. Other valid shapes or alignments use the scalar kernel, which supports partial groups. The row launcher rejects null pointers, nonpositive widths, and row counts outside 1 through 65,535. The selected launch returns its CUDA status. Fused SwiGLU shares the warp kernel and retains its own dispatch and BF16 rounding. [Row launcher](../src/text_ops.cu#L659)<!-- prefix: "cudaError_t " --> · [SwiGLU dispatch](../src/text_ops.cu#L678)<!-- prefix: "cudaError_t " -->
 
-Recorded terminal CUDA errors outrank nonterminal launch returns. The wide activation launchers consume matching error records and leave unrelated nonterminal records for their callers. [Launch status](../src/text_normalization.cu#L344)<!-- prefix: "cudaError_t " -->
+Recorded terminal CUDA errors outrank nonterminal launch returns. The wide activation launchers consume matching error records and leave unrelated nonterminal records for their callers. [Launch status](../src/text_normalization.cu#L370)<!-- prefix: "cudaError_t " -->
 
 ## Verification
 

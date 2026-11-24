@@ -758,12 +758,32 @@ void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count
             }
         }
     };
-    if (packed_activation) {
-        for (int first = 0; first < count; first += verification_packet_rows) {
-            score_packet(rows + first, verification_packet_rows);
-        }
-    } else {
+    if (!packed_activation) {
         score_packet(rows, count);
+        return;
+    }
+    static_assert(tc_vocab_wide_rows == 2 * verification_packet_rows);
+    for (int first = 0; first < count;) {
+        const auto* packet = rows + first;
+        if (vocabulary && count - first >= tc_vocab_wide_rows &&
+            std::none_of(packet, packet + tc_vocab_wide_rows, [](const VerificationRow& row) {
+                return row.verification && row.verification->needs_generated_logprobs();
+            })) {
+            std::array<TcVocabRow, tc_vocab_wide_rows> projection;
+            TcVocabRmsRows rms;
+            for (int index = 0; index < tc_vocab_wide_rows; ++index) {
+                const auto& work = *packet[index].work;
+                projection[index] = {work.normalized, work.argmax};
+                rms.rows[index] = {work.hidden, work.residual, work.normalized};
+            }
+            if (try_tc_vocab_final(*tc_vocab, *vocabulary, projection.data(), rms, final_norm,
+                                   stream)) {
+                first += tc_vocab_wide_rows;
+                continue;
+            }
+        }
+        score_packet(packet, verification_packet_rows);
+        first += verification_packet_rows;
     }
 }
 

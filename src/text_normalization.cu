@@ -4,6 +4,7 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/text/text_cuda_primitives.cuh"
 #include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/mtp/tc_vocab.h"
 
 #include <cuda_fp8.h>
 
@@ -123,11 +124,13 @@ __device__ void store_rms(float value, float inverse_rms, const __nv_bfloat16* w
     output[col] = __float2bfloat16_rn((value * inverse_rms) * gain);
 }
 
-template <bool HasResidual, bool StoresResidual>
-__global__ void rms_norm_vector_kernel(const __nv_bfloat16* branch,
-                                       const __nv_bfloat16* residual,
-                                       const __nv_bfloat16* weight, __nv_bfloat16* output,
-                                       __nv_bfloat16* residual_output) {
+template <bool HasResidual, bool StoresResidual, bool Pack = false>
+__device__ __forceinline__ void rms_norm_vector_row(const __nv_bfloat16* branch,
+                                                    const __nv_bfloat16* residual,
+                                                    const __nv_bfloat16* weight,
+                                                    __nv_bfloat16* output,
+                                                    __nv_bfloat16* residual_output,
+                                                    __nv_bfloat16* packed = nullptr) {
     __shared__ alignas(16) __nv_bfloat16 branch_values[rms_hidden_width];
     __shared__ alignas(16) __nv_bfloat16 residual_values[HasResidual ? rms_hidden_width : 1];
     __shared__ alignas(16) __nv_bfloat16 gains[rms_hidden_width];
@@ -158,9 +161,32 @@ __global__ void rms_norm_vector_kernel(const __nv_bfloat16* branch,
 #pragma unroll
     for (int index = 0; index < values_per_thread; ++index) {
         const int col = threadIdx.x + index * block_threads;
-        store_rms(values[index], inverse_rms, gains, col, output,
-                  StoresResidual ? residual_output : nullptr);
+        if constexpr (Pack) {
+            const float gain = 1.0f + __bfloat162float(gains[col]);
+            const auto normalized = __float2bfloat16_rn((values[index] * inverse_rms) * gain);
+            output[col] = normalized;
+            packed[col] = normalized;
+        } else {
+            store_rms(values[index], inverse_rms, gains, col, output,
+                      StoresResidual ? residual_output : nullptr);
+        }
     }
+}
+
+template <bool HasResidual, bool StoresResidual>
+__global__ void rms_norm_vector_kernel(const __nv_bfloat16* branch,
+                                       const __nv_bfloat16* residual,
+                                       const __nv_bfloat16* weight, __nv_bfloat16* output,
+                                       __nv_bfloat16* residual_output) {
+    rms_norm_vector_row<HasResidual, StoresResidual>(branch, residual, weight, output,
+                                                    residual_output);
+}
+
+__global__ void packed_vocab_rms_kernel(const __grid_constant__ decoder::TcVocabRmsRows rows,
+                                       const __nv_bfloat16* weight, __nv_bfloat16* packed) {
+    const auto& row = rows.rows[blockIdx.x];
+    rms_norm_vector_row<true, false, true>(row.branch, row.residual, weight, row.normalized,
+                                          nullptr, packed + blockIdx.x * rms_hidden_width);
 }
 
 __device__ float4 rms_quant_values(uint2 bits) {
@@ -351,6 +377,13 @@ cudaError_t wide_verify_launch_status(cudaError_t direct) {
     }
     return direct;
 }
+}
+
+cudaError_t decoder::pack_tc_vocab_rms(const TcVocabRmsRows& rows, const Bf16* weight,
+                                       Bf16* packed, cudaStream_t stream) {
+    void* args[] = {const_cast<TcVocabRmsRows*>(&rows), &weight, &packed};
+    return wide_verify_launch_status(cudaLaunchKernel(packed_vocab_rms_kernel,
+        tc_vocab_wide_rows, block_threads, args, 0, stream));
 }
 
 cudaError_t decoder::verify_quantize_fp8(VerifyQuantizeRows rows, int width, cudaStream_t stream) {

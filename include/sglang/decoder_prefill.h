@@ -84,8 +84,8 @@ private:
 std::size_t prefill_workspace_bytes(int rows);
 
 inline bool pairable_prefill_grants(const PrefillGrant* grants, int count) {
-    if (count < 2 || count % 2 != 0 ||
-        grants[0].rows > decoder_default_max_num_batched_tokens / count) {
+    constexpr int max_paired_grant_rows = 8192;
+    if (count < 2 || count % 2 != 0 || grants[0].rows > max_paired_grant_rows / count) {
         return false;
     }
     for (int index = 0; index < count; ++index) {

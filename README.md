@@ -86,7 +86,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
   for regular expressions, literal choices, and the supported JSON Schema subset.
 - The prompt and output budget share a 262,144-token context. Available GPU memory can
   reduce the admitted capacity. The server defaults to eight active requests per participating GPU.
-- The scheduler defaults to 8,192 tokens per step across requests. Set
+- The scheduler defaults to 32,768 tokens per step across requests. Set
   `--max-num-batched-tokens` to a value from 1 to 32,768 to override it.
 - `GET /ready` reports worker readiness. `GET /health` reports liveness and scheduler limits.
   See the [HTTP server guide](docs/http-server.md) for admission limits and startup options.

@@ -113,7 +113,7 @@ class Routes(unittest.TestCase):
             self.completion(response, receipt, 1, "length")
 
     def test_scheduler_budget_default_and_override(self):
-        for flag, budget in (((), 8192), (("--max-num-batched-tokens", "32768"), 32768)):
+        for flag, budget in (((), 32768), (("--max-num-batched-tokens", "8192"), 8192)):
             with self.subTest(budget=budget):
                 log = self.output / f"scheduler-budget-{budget}.log"
                 with server(self.binary, self.checkpoint, log, *flag) as port:
@@ -122,7 +122,7 @@ class Routes(unittest.TestCase):
                         with conn.getresponse() as response:
                             self.assertEqual(response.status, 200)
                             self.assertEqual(json.load(response), {
-                                "max_active": 32, "max_num_batched_tokens": budget,
+                                "max_active": 8, "max_num_batched_tokens": budget,
                             })
 
     @classmethod

@@ -1,6 +1,6 @@
 # Native HTTP transport
 
-The loopback server uses one HTTP reader and one batch scheduler at every capacity. [Launch options](../README.md#serve-token-ids-over-http) · [Startup](../apps/sglang-server.cpp#L315)<!-- prefix: "serve_connec" -->
+The loopback server uses one HTTP reader and one batch scheduler at every capacity. [Launch options](../README.md#serve-token-ids-over-http) · [Startup](../apps/sglang-server.cpp#L314)<!-- prefix: "serve_connec" -->
 
 ## Request targets and redirects
 
@@ -26,7 +26,7 @@ Health checks accept empty GET requests and bypass the completion queue.
 
 Permanent worker failure also makes new completions return HTTP 500. Generation health timeout leaves readiness unchanged. [Batch failure](../apps/server/batch_service.cpp#L177)<!-- prefix: "void BatchSe" -->
 
-The defaults are eight active requests per participating GPU and 8,192 aggregate tokens per step. Override them with `--max-active` (1–32) and `--max-num-batched-tokens` (1–32,768). Verify both at `/health`. [Default capacity](../apps/sglang-server.cpp#L29)<!-- prefix: "constexpr in" --> · [Default budget](../include/sglang/decoder.h#L27)<!-- prefix: "inline const" -->
+The defaults are eight active requests per participating GPU and 32,768 aggregate tokens per step. Override them with `--max-active` (1–32) and `--max-num-batched-tokens` (1–32,768). Verify both at `/health`. [Default capacity](../apps/sglang-server.cpp#L29)<!-- prefix: "constexpr in" --> · [Default budget](../include/sglang/decoder.h#L27)<!-- prefix: "inline const" -->
 
 ### Generation probe lifecycle
 

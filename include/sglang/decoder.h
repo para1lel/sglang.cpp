@@ -24,7 +24,7 @@ struct CudaBackendPolicy;
 inline constexpr int decoder_max_mtp_steps = 4;
 inline constexpr int decoder_max_generated_top_logprobs = 20;
 inline constexpr std::size_t decoder_prefix_max_salt_bytes = 256;
-inline constexpr int decoder_default_max_num_batched_tokens = 8192;
+inline constexpr int decoder_default_max_num_batched_tokens = 32768;
 
 class TokenConstraint;
 

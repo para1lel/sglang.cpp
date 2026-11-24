@@ -22,7 +22,7 @@ Append `--mixed-service` to compare image, video, text, and pointwise label resu
 isolated and concurrent requests with the cache explicitly disabled.
 
 Append `--feature-complete` on B200 to compare default serving and explicit cache-off
-controls. The test verifies K4 and the 8,192-row budget, cold text and checkpoint
+controls. The test verifies K4 and the 32,768-row budget, cold text and checkpoint
 hits, ordered label scores, and exact prompt and output logprobs against cache-off
 with matched prefill grants. Decoded image and video branches reuse the first
 8,192 processed tokens and return identical IDs over JSON and SSE. Changing

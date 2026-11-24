@@ -229,8 +229,7 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     sglang::json::append_quoted(body, backend.grouped_target_attention ? "grouped-split" : "exact");
     body += R"(,"paired_prefill":)";
     const bool paired_prefill = backend.paired_prefill && arguments.max_active >= 2 &&
-        arguments.max_num_batched_tokens >= decoder.paired_prefill_threshold() &&
-        arguments.max_num_batched_tokens <= sglang::decoder_default_max_num_batched_tokens;
+        arguments.max_num_batched_tokens >= decoder.paired_prefill_threshold();
     body += paired_prefill ? "true" : "false";
     body += R"(,"sampling_defaults":)";
     body += arguments.sampling == SamplingDefaults::model ? "\"model\"" : "\"openai\"";

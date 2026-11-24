@@ -164,7 +164,7 @@ struct DecoderBatch::State {
 DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
     : state_(std::make_unique<State>()) {
     require(!options.cuda_graphs && options.max_lanes == 4 &&
-                options.prefix_cache_entries == 0 && options.max_num_batched_tokens == 8192,
+                options.prefix_cache_entries == 0 && options.max_num_batched_tokens == 32768,
             "Unexpected service scheduler configuration");
 }
 DecoderBatch::~DecoderBatch() = default;
@@ -249,9 +249,9 @@ bool DecoderBatch::available() const { return true; }
 
 int main() {
     try {
-        require(sglang::DecoderOptions{}.max_num_batched_tokens == 8192,
+        require(sglang::DecoderOptions{}.max_num_batched_tokens == 32768,
                 "Unexpected standalone decoder budget default");
-        require(sglang::DecoderBatchOptions{}.max_num_batched_tokens == 8192,
+        require(sglang::DecoderBatchOptions{}.max_num_batched_tokens == 32768,
                 "Unexpected batch decoder budget default");
         const bool seed = check({"seed only", Interrupt::none, {100}, 0, Finish::length});
         const bool callback = check({"callback false", Interrupt::callback, {100, 101}, 1,

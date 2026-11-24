@@ -49,7 +49,7 @@ The scheduler sends generation and scoring grants to one prefill executor. B200 
 
 ### Projection pairs for MTP
 
-Whole-tile grouping has priority. It requires an even number of equal grants made of full 1,024-row tiles, with at most 8,192 prefill rows. The [`paired_prefill` field](native-model-info.md#server-information) reports startup capability. Each lane uses its own draft state if its depth is positive. [Grant eligibility](../include/sglang/decoder_prefill.h#L86)<!-- prefix: "inline bool " --> · [Group priority](../src/decoder_prefill.cpp#L726)<!-- prefix: "if (model.ba" -->
+Whole-tile grouping has priority. It requires an even number of equal grants made of full 1,024-row tiles, with at most 8,192 rows across the grants. The 32,768-row scheduler budget is a separate limit. The [`paired_prefill` field](native-model-info.md#server-information) reports startup capability. Each lane uses its own draft state if its depth is positive. [Grant eligibility](../include/sglang/decoder_prefill.h#L86)<!-- prefix: "inline bool " --> · [Group priority](../src/decoder_prefill.cpp#L726)<!-- prefix: "if (model.ba" -->
 
 Exactly four eligible grants first try one 4,096-row group per tile offset.
 Four 2,048-row grants use two groups in one step. Two 4,096-row grants use
@@ -113,11 +113,6 @@ On B200, hold admissions and grants fixed. Compare full score rows, per-lane sta
 
 For whole-tile pairs, check both lane offsets and cover mixed, partial, and per-lane split grants. Compare complete logits and recurrent state in addition to sampled hidden and residual values.
 
-For four-grant grouping, check four equal grants and a two-grant control on
-the same native policy. Compare target hidden rows, logits, KV, recurrence,
-and subsequent draft state. Check uneven grants, a mixed decode step,
-and a configured budget above 8,192. Reject the 4,096-row allocation, confirm
-paired fallback, then remove the failure and confirm four-grant recovery.
-Record output IDs, active workspace bytes, and physical GPU memory separately.
+For four-grant grouping, use the default 32,768-row scheduler budget. Check four equal grants and a two-grant control on the same native policy. Compare target hidden rows, logits, KV, recurrence, and subsequent draft state. Check uneven grants and a mixed decode step. Verify that whole-tile pairing declines when grants total more than 8,192 rows. Reject the 4,096-row allocation and confirm paired fallback. Remove the failure and confirm four-grant recovery. Record output IDs, active workspace bytes, and physical GPU memory separately.
 
 Historical K0 comparisons exercised pairing on the reduced-output W4 fixture. W3 cohorts exercised no pairs. W5 and W6 used host replay. Inspect traced grant sizes and admission and decode overlap before attributing serving timing changes to pairing. [Historical pairing evidence](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#verification)

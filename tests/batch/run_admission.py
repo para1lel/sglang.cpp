@@ -22,9 +22,10 @@ from media import http_routes as media
 
 DEFAULT_ACTIVE = 8
 MAX_ACTIVE = 32
-DEFAULT_TOKENS = 8192
+DEFAULT_TOKENS = 32768
 MAX_TOKENS = 32768
 SMALL_TOKENS = 64
+CHECKPOINT_INTERVAL = 8192
 TOKEN_OPTION = "--max-num-batched-tokens"
 NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
 
@@ -256,7 +257,7 @@ def check_wide_mtp(args):
 
 def check_eager_cache(args):
     flags = ["--eager", "--max-active", "4"]
-    case = prompt_case("eager-cache", DEFAULT_TOKENS + 1)
+    case = prompt_case("eager-cache", CHECKPOINT_INTERVAL + 1)
     body = {"model": media.MODEL, "prompt": case["prompt"], "max_tokens": 8,
             "return_token_ids": True, "temperature": 0, "ignore_eos": True}
     prime = body | {"prompt": case["prompt"][:-1], "max_tokens": 1}
@@ -272,7 +273,7 @@ def check_eager_cache(args):
         media.capture(evidence, "prime", port, media.TEXT, prime)
         warm = media.capture(evidence, "warm", port, media.TEXT, body)
         assert cold["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, cold
-        assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] == DEFAULT_TOKENS, warm
+        assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] == CHECKPOINT_INTERVAL, warm
         for reply in (cold, warm):
             choice, = reply["choices"]
             assert choice["finish_reason"] == "length" and len(choice["token_ids"]) == 8, choice
@@ -288,6 +289,7 @@ def check_cli(args):
              ["--max-active", str(DEFAULT_ACTIVE), TOKEN_OPTION, str(DEFAULT_TOKENS)],
              ["--max-active", str(MAX_ACTIVE)],
              [TOKEN_OPTION, str(MAX_TOKENS)],
+             [TOKEN_OPTION, "8192"],
              [TOKEN_OPTION, str(args.small_tokens)],
              ["--max-active", "1", "--eager"], ["--max-active", "4", "--mtp-steps", "1"],
              ["--max-active", "4", "--mtp-steps", "1", "--eager"],

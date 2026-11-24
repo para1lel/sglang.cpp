@@ -20,8 +20,8 @@ IEEE 754 binary32 logit in step and rank order.
 
 The HTTP checks use `--mtp-steps 0`, compare complete SSE against serial SSE under the
 same server configuration, and retain the serial responses as evidence. The first
-server checks the advertised default capacity of 32 and token budget of 8,192. A
-separate `--max-active 1 --eager` server exercises the same requests with one slot.
+server checks the default eight active requests and 32,768-token budget. A separate
+`--max-active 1 --eager --max-num-batched-tokens 8192` launch checks the explicit override.
 
 The width-two cohort uses 129- and 257-token prompts. The width-four cohort uses 2-, 127-,
 129-, and 257-token prompts. Both use the same five-token generation budget and an explicit

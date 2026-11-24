@@ -375,7 +375,7 @@ def server_policy(args, port, label, entries):
     (args.evidence / f"{label}-server-info.json").write_bytes(raw)
     info = json.loads(raw)
     expected = {"dp_size": 1, "tp_size": 1, "pp_size": 1, "mtp_steps": 4,
-                "max_running_requests": 8, "max_num_batched_tokens": 8192,
+                "max_running_requests": 8, "max_num_batched_tokens": 32768,
                 "prefix_cache_entries": entries, "enable_multimodal": True,
                 "fp8_prefill": "tensor-core", "paired_prefill": True,
                 "target_gqa": "grouped-split", "batch_cuda_graphs": True, "eager": False}

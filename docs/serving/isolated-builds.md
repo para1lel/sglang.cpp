@@ -11,6 +11,12 @@ selected source tree to a private snapshot and enter that snapshot inside locked
 Pixi. Use absolute, canonical `$work` and `$snapshot` paths and create the private
 directories before invoking XMake.
 
+After applying a patch, verify the resulting files from the private snapshot root
+before configuring XMake. Use `sha256sum --check` with an independent manifest of
+the intended contents of every added or modified file. List paths relative to the
+snapshot root. For each expected deletion, check `test ! -e "$path" && test ! -L "$path"`.
+Stop if any check fails.
+
 XMake configures CUTLASS 4.7.1 from a checksum-pinned release archive. The SM100 down operator compiles with the CUTLASS/CuTe headers. The server has no CUTLASS runtime library dependency. [Package pin](../../xmake.lua#L15)<!-- prefix: "add_versions" --> · [SM100 binding](../../xmake.lua#L102)<!-- prefix: "add_packages" -->
 
 The wrapper uses private XMake repository mode and installs from a local CUTLASS archive. By default it checks `$SGLANG_HOST_ROOT/cache/cutlass/<sha256>/cutlass-4.7.1.tar.gz`. It fetches the release archive if the cached bytes are missing or fail verification. [Archive cache](../../tools/build-probe.sh#L35)<!-- prefix: "cached_cutla" --> · [Private configure](../../tools/build-probe.sh#L77)<!-- prefix: "\"$xmake\" g -" -->

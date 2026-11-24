@@ -129,7 +129,7 @@ __device__ void pipeline_produce(TmemPipelineTile& tile, Attention request, int 
 }
 
 __device__ void pipeline_softmax(TmemPipelineTile& tile, Attention request, int row, int head,
-                                 int position, int end, int warp) {
+                                 int position, int end, int rows, int warp) {
     const Word address = tile.tmem + ((warp * 32) << 16);
     const int lane = threadIdx.x % 32;
     const int member = lane < 16 ? warp * 16 + lane : -1;
@@ -152,19 +152,20 @@ __device__ void pipeline_softmax(TmemPipelineTile& tile, Attention request, int 
     }
     const int last = (end - 1) / flash_keys;
     tmem_mma_wait(tmem_smem(&tile.output_ready[last & 1]), (last >> 1) & 1);
-    tmem_store_output(address, state, request, row, head, pipeline_rows, member);
+    tmem_store_output(address, state, request, row, head, rows, member);
 }
 
 __launch_bounds__(pipeline_threads, 1)
 __global__ void tmem_pipeline_attention(Attention request,
                                         const __grid_constant__ CUtensorMap key_map,
-                                        const __grid_constant__ CUtensorMap value_map) {
+                                        const __grid_constant__ CUtensorMap value_map, int rows) {
     extern __shared__ TmemPipelineTile shared_pipeline[];
     auto& tile = shared_pipeline[0];
     const int row = blockIdx.x * pipeline_rows;
     const int head = blockIdx.y * ordered_heads;
     const int position = request.position + row;
-    const int end = position + pipeline_rows;
+    const int active = min(pipeline_rows, rows - row);
+    const int end = position + active;
     const int warp = threadIdx.x / 32;
     tmem_initialize(tile, warp, tmem_smem(&tile.copy_ready), tmem_smem(&tile.scores_ready[0]));
     if (threadIdx.x == 0) {
@@ -176,12 +177,12 @@ __global__ void tmem_pipeline_attention(Attention request,
         }
     }
     if (threadIdx.x < tmem_threads) {
-        tmem_stage_query<pipeline_members>(tile, request, row, head, pipeline_rows);
+        tmem_stage_query<pipeline_members>(tile, request, row, head, active);
     }
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     __syncthreads();
     if (threadIdx.x < flash_queries) {
-        pipeline_softmax(tile, request, row, head, position, end, warp);
+        pipeline_softmax(tile, request, row, head, position, end, active, warp);
     } else if (threadIdx.x < tmem_threads) {
         pipeline_produce(tile, request, head / ratio, end, &key_map, &value_map);
     } else if (threadIdx.x == tmem_threads) {
@@ -194,7 +195,7 @@ __global__ void tmem_pipeline_attention(Attention request,
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
                      :: "r"(tile.tmem), "r"(tmem_cols) : "memory");
     }
-    tmem_repair_ordered(tile, request, row, head, pipeline_rows);
+    tmem_repair_ordered(tile, request, row, head, active);
 }
 
 std::optional<cudaError_t> prepare_flash_kernel(
@@ -215,9 +216,9 @@ std::optional<cudaError_t> prepare_flash_kernel(
 }
 
 cudaError_t launch_pipeline(Attention& request, CUtensorMap& keys, CUtensorMap& values,
-                            cudaStream_t stream) {
-    void* args[] = {&request, &keys, &values};
-    const dim3 blocks(pipeline_query_rows / pipeline_rows, mxfp8_query_heads / ordered_heads);
+                            int rows, cudaStream_t stream) {
+    void* args[] = {&request, &keys, &values, &rows};
+    const dim3 blocks((rows + pipeline_rows - 1) / pipeline_rows, head_pairs);
     return cudaLaunchKernel(tmem_pipeline_attention, blocks, pipeline_threads, args,
                             sizeof(TmemPipelineTile), stream);
 }

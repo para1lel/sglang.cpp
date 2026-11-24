@@ -335,8 +335,16 @@ constexpr int flash_short_rows = 32;
 constexpr int flash_medium_rows = 48;
 constexpr int paged_batch_sequences = 32;
 constexpr int head_pairs = mxfp8_query_heads / ordered_heads;
+constexpr int min_flash_rows = 144;
 constexpr int default_ragged_min_position = 8192;
 static_assert(mxfp8_page_size % flash_keys == 0);
+
+inline bool raw_pipeline_before_flash(Mxfp8KvCache cache, int rows, int visible) {
+    return rows >= min_flash_rows && rows < 4 * flash_rows &&
+        visible >= default_ragged_min_position &&
+        (reinterpret_cast<std::uintptr_t>(cache.key_scales) |
+         reinterpret_cast<std::uintptr_t>(cache.value_scales)) % 8 == 0;
+}
 
 inline bool default_ragged_prefill(Mxfp8KvCache cache, int position, int rows) {
     return rows >= 256 && rows <= 512 && position >= default_ragged_min_position &&

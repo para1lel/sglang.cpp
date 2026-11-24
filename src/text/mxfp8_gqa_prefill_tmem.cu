@@ -918,13 +918,11 @@ std::optional<cudaError_t> launch_tmem_prefill(
         return std::nullopt;
     }
     int device = 0;
-    auto status = cudaGetDevice(&device);
-    if (status != cudaSuccess) {
+    if (auto status = cudaGetDevice(&device); status != cudaSuccess) {
         return status;
     }
     cudaDeviceProp properties{};
-    status = cudaGetDeviceProperties(&properties, device);
-    if (status != cudaSuccess) {
+    if (auto status = cudaGetDeviceProperties(&properties, device); status != cudaSuccess) {
         return status;
     }
     if (properties.major != 10 || properties.minor != 0 ||
@@ -932,18 +930,23 @@ std::optional<cudaError_t> launch_tmem_prefill(
         (!ordered && !properties.memoryPoolsSupported)) {
         return std::nullopt;
     }
-    const auto pending = automatic ? cudaPeekAtLastError() : cudaSuccess;
-    if (pending != cudaSuccess) {
-        return pending;
-    }
+    if (const auto pending = automatic ? cudaPeekAtLastError() : cudaSuccess;
+        pending != cudaSuccess) return pending;
     const auto stock = ragged_rows ? tmem_flash_attention<true, true> :
         ordered ? tmem_flash_attention<true> : tmem_flash_attention<false>;
-    bool pipeline = automatic && ragged_rows == pipeline_query_rows;
+    const bool before_flash = automatic && raw_pipeline_before_flash(cache, ragged_rows, visible);
+    // A 32-row pipeline tile doubles row parallelism. Keep it within one resident wave.
+    const bool one_wave = (rows + pipeline_rows - 1) / pipeline_rows * head_pairs <=
+        properties.multiProcessorCount;
+    bool pipeline = automatic && (before_flash || ragged_rows == pipeline_query_rows ||
+        (ragged_rows > pipeline_query_rows && one_wave &&
+         default_ragged_prefill(cache, position, rows)));
     const auto stock_kernel = reinterpret_cast<const void*>(stock);
     const auto pipeline_kernel = reinterpret_cast<const void*>(tmem_pipeline_attention);
     const void* kernel = pipeline ? pipeline_kernel : stock_kernel;
     auto ready = prepare_flash_kernel(kernel, dynamic_shared, properties, automatic);
     if (pipeline && !ready) {
+        if (before_flash) return std::nullopt;
         pipeline = false;
         kernel = stock_kernel;
         ready = prepare_flash_kernel(kernel, dynamic_shared, properties, automatic);
@@ -958,7 +961,8 @@ std::optional<cudaError_t> launch_tmem_prefill(
     }
     Attention request{cache, pages.device_pages, position, queries, output};
     if (pipeline) {
-        return launch_pipeline(request, key_map, value_map, stream);
+        return consume_prefill_submission(
+            launch_pipeline(request, key_map, value_map, rows, stream));
     }
     if (ordered) {
         float* partial = nullptr;
@@ -971,7 +975,7 @@ std::optional<cudaError_t> launch_tmem_prefill(
     constexpr std::size_t partial_rows = tmem_parts * tmem_partial_rows;
     constexpr std::size_t partial_values = partial_rows * channels;
     void* scratch = nullptr;
-    status = cudaMallocAsync(&scratch,
+    auto status = cudaMallocAsync(&scratch,
         partial_values * sizeof(float) + partial_rows * sizeof(float2), stream);
     if (status != cudaSuccess) {
         return status;
@@ -990,7 +994,6 @@ std::optional<cudaError_t> launch_tmem_prefill(
     const auto release = cudaFreeAsync(scratch, stream);
     return status == cudaSuccess ? release : status;
 }
-
 }
 
 #include "sglang/text/mxfp8_gqa_prefill_paired.cuh"

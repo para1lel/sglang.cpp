@@ -678,7 +678,6 @@ __global__ void flash_prefill_attention(Attention request, int rows) {
 }
 
 constexpr int min_long_prefix = 4096;
-constexpr int min_flash_rows = 144;
 
 template <int Rows, bool Partial>
 __launch_bounds__(flash_threads<Rows>, 1)
@@ -933,7 +932,7 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     const bool ragged = default_ragged_prefill(cache, position, rows) ||
         default_ragged_prefill_tail({cache, pages, position, rows, queries, output},
                                    max_multirow_visible_tokens);
-    if (ragged && visible <= max_multirow_visible_tokens) {
+    if ((ragged || raw_pipeline_before_flash(cache, rows, visible)) && visible <= flash_limit) {
         if (const auto status = launch_tmem_prefill(cache, pages, position, queries, output,
                                                    stream, true, rows, true)) {
             return *status;

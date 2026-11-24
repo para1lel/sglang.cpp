@@ -122,11 +122,12 @@ __device__ inline decoder::PagedDecodeLane resolve(const EagerTargetBatch& batch
 
 /// Combines the splits of one head with 256 threads (one channel each) and writes the output.
 /// Returns false (block-uniform) and marks split 0 nonfinite when the head needs a replay.
+template <int FixedSplits = 0>
 __device__ inline bool combine_head(const decoder::PagedDecodeLane& lane, int head) {
     __shared__ float weights[max_splits];
     __shared__ float total;
     const int channel = static_cast<int>(threadIdx.x);
-    const int splits = split_count(lane.position);
+    const int splits = FixedSplits ? FixedSplits : split_count(lane.position);
     auto* part = partials(lane.buffers.scratch, head);
     const float maximum = channel < splits ? part[channel].maximum : -CUDART_INF_F;
     bool invalid = __syncthreads_or(channel < splits && !isfinite(maximum));

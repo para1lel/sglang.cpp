@@ -49,6 +49,8 @@ constexpr int stripe = 128;
 constexpr int group_heads = mxfp8_query_heads / mxfp8_kv_heads;
 constexpr int keys = split_chunk_tokens;
 constexpr int stages = 2;
+constexpr int key_slots = 1;
+constexpr int value_slots = stages;
 constexpr int raw_tokens = keys;
 constexpr int raw_stages = 2;
 constexpr int columns = mxfp8_head_dim;
@@ -81,8 +83,8 @@ struct BatchMaps {
 
 struct alignas(1024) Shared {
     std::uint16_t query[columns / tmem_swizzle][members][tmem_swizzle];
-    std::uint16_t key[columns / tmem_swizzle][keys][tmem_swizzle];
-    std::uint16_t value[columns / tmem_swizzle][keys][tmem_swizzle];
+    std::uint16_t key[key_slots][columns / tmem_swizzle][keys][tmem_swizzle];
+    std::uint16_t value[value_slots][columns / tmem_swizzle][keys][tmem_swizzle];
     alignas(128) std::uint16_t probability[stages][members][keys];
     alignas(128) std::uint16_t residual[stages][members][keys];
     float transposed[stages][keys][members + 1];
@@ -244,17 +246,22 @@ __device__ void load_operands(Shared& shared, const LongRequest& request, int be
         const int slot = chunk % stages;
         const int raw_slot = chunk % raw_stages;
         const int raw_epoch = chunk / raw_stages & 1;
-        const int prior_epoch = (chunk - 1) / stages & 1;
         const int first = (begin + chunk) * keys;
         const int end = request.first + request.count;
         wait(&shared.raw_ready[Operand][raw_slot], raw_epoch);
-        // Each decoded buffer can be reused as soon as its last asynchronous consumer finishes.
+        // Only the last asynchronous consumer of this decoded slot can block its refill.
+        constexpr int decoded_slots = Operand == 0 ? key_slots : value_slots;
+        const int previous = chunk - decoded_slots;
+        if (previous >= 0) {
+            auto* consumed = Operand == 0 ? shared.scores : shared.outputs;
+            wait(&consumed[previous % stages], previous / stages & 1);
+        }
         if constexpr (Operand == 0) {
-            if (chunk) wait(&shared.scores[slot ^ 1], prior_epoch);
-            decode_operand<0>(shared, shared.key, raw_slot, first, end, producer);
+            decode_operand<0>(shared, shared.key[chunk % decoded_slots], raw_slot,
+                              first, end, producer);
         } else {
-            if (chunk) wait(&shared.outputs[slot ^ 1], prior_epoch);
-            decode_operand<1>(shared, shared.value, raw_slot, first, end, producer);
+            decode_operand<1>(shared, shared.value[chunk % decoded_slots], raw_slot,
+                              first, end, producer);
         }
         if (!(producer % 32)) {
             arrive(Operand == 0 ? &shared.key_ready[slot] : &shared.value_ready[slot]);
@@ -276,7 +283,7 @@ __device__ __forceinline__ void issue_scores(Shared& shared, int chunk) {
     for (int dim = 0; dim < columns; dim += 16) {
         const int group = dim / tmem_swizzle;
         const int column = dim % tmem_swizzle;
-        mma(score, descriptor(&shared.key[group][0][column]),
+        mma(score, descriptor(&shared.key[chunk % key_slots][group][0][column]),
             descriptor(&shared.query[group][0][column]),
             mma_instruction<members, false, keys>(), dim != 0);
     }
@@ -300,7 +307,7 @@ __device__ void issue_mmas(Shared& shared, int chunks) {
             #pragma unroll
             for (int part = 0; part < 2; ++part) {
                 const auto value = descriptor<true>(
-                    &shared.value[part * stripe / tmem_swizzle][token][0]);
+                    &shared.value[chunk % value_slots][part * stripe / tmem_swizzle][token][0]);
                 const unsigned output = shared.tensor + part * members;
                 constexpr unsigned a_mn_major = 1u << 15;
                 constexpr auto op = mma_instruction<members, false, stripe>() | a_mn_major;

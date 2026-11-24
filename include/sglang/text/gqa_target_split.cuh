@@ -2,7 +2,7 @@
 
 namespace {
 
-template <typename Binding>
+template <typename Binding, int FixedSplits = 0>
 __global__ void target_split_combine(const __grid_constant__ Binding binding) {
     const auto lane = gqa_decode::resolve(binding);
     if (!decoder::target_split_position(lane.position, binding.end) ||
@@ -10,7 +10,7 @@ __global__ void target_split_combine(const __grid_constant__ Binding binding) {
         return;
     }
     const int head = blockIdx.x;
-    if (!gqa_decode::tensor_aligned(lane) || !gqa_decode::combine_head(lane, head)) {
+    if (!gqa_decode::tensor_aligned(lane) || !gqa_decode::combine_head<FixedSplits>(lane, head)) {
         wide_decode_head(lane, head);
     }
 }
@@ -144,8 +144,10 @@ cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, i
 
 cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests,
                                             cudaStream_t stream) {
+    // The long verifier starts beyond the position that saturates split_count.
+    static_assert(long_min_position >= (max_splits - 1) * min_split_chunks * split_chunk_tokens);
     void* arguments[] = {const_cast<LongBatch*>(&batch)};
-    return cudaLaunchKernel(target_split_combine<LongBatch>,
+    return cudaLaunchKernel(target_split_combine<LongBatch, max_splits>,
                             dim3(mxfp8_query_heads, 1, requests * long_rows),
                             mxfp8_head_dim, arguments, 0, stream);
 }

@@ -11,7 +11,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -90,14 +89,13 @@ struct BatchService::State {
     void process(BatchSession& batch);
     std::optional<std::uint64_t> begin_iteration(BatchSession& batch);
     std::optional<Work> wait_for_jobs(BatchSession& batch);
+    std::uint32_t refresh_prefill_roster(Work& work, int capacity);
     bool idle_for_health() const;
     bool wide_decode_ready(bool buffered) const;
     bool decode_mailboxes_ready(bool require_all) const;
     bool prepare(BatchSession& batch, int slot, const std::shared_ptr<Job>& job, bool buffered);
     bool publish(int slot, Job& job, const DecoderBatchStep& step);
     void publish_steps(const Jobs& snapshot, const Selection& selected, const Steps& steps);
-    void record_profile(std::uint64_t epoch, std::uint64_t elapsed, int width,
-                        const Steps& steps, const DecoderBatchStepStats& stats);
     void fail_jobs(std::exception_ptr error, bool permanent);
     void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);
     DecoderResult consume(std::unique_lock<std::mutex>& lock, int slot, Job& job,
@@ -271,6 +269,23 @@ std::optional<Work> BatchService::State::wait_for_jobs(BatchSession& batch) {
     if (idle_for_health()) jobs.front() = health_probe->job;
     return Work{jobs, wide_decode_ready(true) || decode_mailboxes_ready(false)};
 }
+
+std::uint32_t BatchService::State::refresh_prefill_roster(Work& work, int capacity) {
+    const std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock || closing || reset_pending) return 0;
+    std::uint32_t added = 0;
+    for (int slot = 0; slot < max_active && capacity > 0; ++slot) {
+        const auto& job = jobs[slot];
+        if (!work.jobs[slot] && job && !job->health_check && !job->admitted &&
+            !job->cancelled && !job->aborted()) {
+            work.jobs[slot] = job;
+            added |= std::uint32_t{1} << slot;
+            --capacity;
+        }
+    }
+    return added;
+}
+
 bool BatchService::State::prepare(BatchSession& batch, int slot,
                                   const std::shared_ptr<Job>& job, bool buffered) {
     bool cancelled;
@@ -381,17 +396,6 @@ void BatchService::State::publish_steps(const Jobs& snapshot, const Selection& s
     }
 }
 
-void BatchService::State::record_profile(std::uint64_t epoch, std::uint64_t elapsed, int width,
-                                         const Steps& steps, const DecoderBatchStepStats& stats) {
-    if (!profile || epoch != profile_epoch || profile->steps.size() == profile_limit || !width) {
-        return;
-    }
-    const int decode = std::count_if(steps.begin(), steps.end(),
-                                    [](const auto& step) { return step.decode; });
-    const int rows = std::accumulate(stats.prefill_rows.begin(), stats.prefill_rows.end(), 0);
-    profile->steps.push_back({elapsed, width, rows, decode, stats.graph_slots});
-}
-
 std::optional<std::uint64_t> BatchService::State::begin_iteration(BatchSession& batch) {
     std::unique_lock lock(mutex);
     if (reset_pending) {
@@ -408,22 +412,40 @@ std::optional<std::uint64_t> BatchService::State::begin_iteration(BatchSession& 
 }
 
 void BatchService::State::process(BatchSession& batch) {
-    std::size_t traced_bytes = 0;
-    const bool trace_cache = trace && prefix_cache_entries != 0;
-    auto traced_cache = batch.prefix_cache_stats();
-    if (trace_cache) trace_prefix_cache(traced_cache);
-    while (const auto snapshot = wait_for_jobs(batch)) {
+    BatchTrace trace_state(trace && prefix_cache_entries != 0, batch.prefix_cache_stats());
+    while (auto snapshot = wait_for_jobs(batch)) {
         const auto iteration = begin_iteration(batch);
         if (!iteration) {
             continue;
         }
         const auto epoch = *iteration;
         Selection selected{};
+        bool cold = true;
+        bool has_empty_slot = false;
+        bool starts_long_prefill = false;
         for (int slot = 0; slot < max_active; ++slot) {
             const auto& job = snapshot->jobs[slot];
+            if (!job) {
+                has_empty_slot = true;
+                continue;
+            }
+            cold &= !job->admitted;
             selected[slot] = prepare(batch, slot, job, snapshot->buffered);
+            starts_long_prefill |= cold && selected[slot] && !job->health_check &&
+                job->prompt_tokens >=
+                    static_cast<std::size_t>(job->cached_tokens) + max_num_batched_tokens;
         }
-        const int width = std::count(selected.begin(), selected.end(), true);
+        int width = std::count(selected.begin(), selected.end(), true);
+        const int capacity = std::min(max_active, max_num_batched_tokens) - width;
+        // Pick up already-published arrivals once before the first long prefill grant.
+        if (cold && starts_long_prefill && has_empty_slot && capacity > 0) {
+            const auto added = refresh_prefill_roster(*snapshot, capacity);
+            for (int slot = 0; slot < max_active && (added >> slot); ++slot) {
+                if (!(added >> slot & 1U)) continue;
+                selected[slot] = prepare(batch, slot, snapshot->jobs[slot], snapshot->buffered);
+                width += selected[slot];
+            }
+        }
         Steps steps{};
         DecoderBatchStepStats stats;
         std::uint64_t elapsed = 0;
@@ -437,45 +459,25 @@ void BatchService::State::process(BatchSession& batch) {
                         std::chrono::steady_clock::now() - start).count();
                 }
             } catch (...) {
-                if (!batch.available()) {
-                    throw;
-                }
+                if (!batch.available()) throw;
                 fail_jobs(std::current_exception(), false);
-                if (trace) {
-                    trace_batch_step(0, 0, batch.request_device_allocation_bytes());
-                    traced_bytes = 0;
-                }
+                if (trace) trace_state.failed(batch.request_device_allocation_bytes());
                 continue;
             }
         }
         if (trace) {
-            const auto bytes = batch.request_device_allocation_bytes();
-            const int decode = std::count_if(steps.begin(), steps.end(),
-                                              [](const auto& step) { return step.decode; });
-            if (width || bytes != traced_bytes) {
-                trace_batch_step(width, decode, bytes);
-                if (width)
-                    trace_batch_details(steps, stats, max_active, max_num_batched_tokens,
-                                        mtp_steps);
-                traced_bytes = bytes;
-            }
+            trace_state.step(width, steps, stats, batch.request_device_allocation_bytes(),
+                             max_active, max_num_batched_tokens, mtp_steps);
         }
         const auto cache = prefix_cache_entries ? batch.prefix_cache_stats()
                                                 : DecoderPrefixCacheStats{};
-        if (trace_cache) {
-            const bool finished = std::any_of(steps.begin(), steps.end(),
-                [](const auto& step) { return step.finish_reason.has_value(); });
-            if (finished || cache.hits != traced_cache.hits ||
-                cache.stores != traced_cache.stores) {
-                trace_prefix_cache(cache);
-                traced_cache = cache;
-            }
-        }
+        trace_state.cache(cache, steps);
         {
             const std::lock_guard lock(mutex);
             counters.cache = cache;
-            if (epoch) {
-                record_profile(epoch, elapsed, width, steps, stats);
+            if (epoch && profile && epoch == profile_epoch &&
+                profile->steps.size() != profile_limit && width) {
+                profile->steps.push_back(batch_profile_step(elapsed, width, steps, stats));
             }
             publish_steps(snapshot->jobs, selected, steps);
         }

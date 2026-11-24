@@ -86,7 +86,7 @@ One arena fits the largest planned group and ordinary tile in the step. The exec
 With `--trace-batches`, `layerwise_prefill_groups` counts the groups,
 `rows` counts their combined rows, and `workspace_bytes` records the
 largest active prefill workspace in the step.
-[Batch trace](../include/sglang/server/batch_trace.h#L44)<!-- prefix: "if (stats.la" -->
+[Batch trace](../include/sglang/server/batch_trace.h#L46)<!-- prefix: "if (stats.la" -->
 
 ## Verification
 

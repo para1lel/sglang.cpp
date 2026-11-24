@@ -9,6 +9,7 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -22,6 +23,7 @@ using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
 using Finish = DecoderFinishReason;
 
 enum class Outcome { length, abort, disconnect, failure };
+enum class Arrival { none, during_admit, during_advance, aborted, disconnected, blocked_writer };
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -40,6 +42,11 @@ struct Fixture {
     std::condition_variable changed;
     Barrier seed, writer, peer, fault;
     Barrier before_claim, after_claim;
+    Barrier prefill_admit, prefill_advance;
+    std::array<Barrier, 4> consumers{};
+    std::array<int, 4> admissions{};
+    std::vector<Selection> prefill_grants;
+    bool inspect_prefill = false;
     int primary_steps = 0;
     int fail_at = 0;
     int cancels = 0;
@@ -367,6 +374,144 @@ void check_completion_claim(bool abort_first, bool fail_after_claim) {
     require(observed.terminal_stores == (!abort_first && !fail_after_claim),
             "Only the successful claimed completion may store the terminal endpoint");
 }
+
+std::future<DecoderResult> start_prefill_request(Fixture& observed, BatchService& service,
+                                                Arrival arrival, int slot, BatchRequestId* id) {
+    return std::async(std::launch::async, [&observed, &service, arrival, slot, id] {
+        DecoderOptions options;
+        options.max_new_tokens = 1;
+        DecoderCallbacks callbacks;
+        callbacks.is_cancelled = [&] {
+            std::unique_lock lock(observed.mutex);
+            observed.hold(lock, observed.consumers[slot]);
+            return false;
+        };
+        if (slot == 1 && arrival == Arrival::disconnected) {
+            callbacks.on_admitted = [&] {
+                std::unique_lock lock(observed.mutex);
+                observed.hold(lock, observed.writer);
+                return false;
+            };
+        }
+        if (slot == 1 && arrival == Arrival::blocked_writer) {
+            callbacks.on_token = [&](int) {
+                std::unique_lock lock(observed.mutex);
+                observed.hold(lock, observed.writer);
+                return true;
+            };
+        }
+        auto prompt = prefix(decoder_default_max_num_batched_tokens);
+        prompt.front() += slot;
+        return service.generate(slot, prompt, options, callbacks, {}, 0, id);
+    });
+}
+
+void check_prefill_output(const DecoderResult& result, int token) {
+    require(result.finish_reason == Finish::length &&
+            result.output_token_ids == std::vector{token},
+            "Prefill owner did not receive exactly one output");
+}
+
+void check_prefill_roster(Arrival arrival, bool trace = false) {
+    Fixture observed;
+    fixture = &observed;
+    observed.inspect_prefill = true;
+    const bool in_flight = arrival == Arrival::during_advance;
+    observed.prefill_admit.released = in_flight || arrival == Arrival::none;
+    observed.prefill_advance.released = arrival == Arrival::none;
+    if (arrival == Arrival::none) observed.consumers[0].released = true;
+    const Decoder decoder({}, 0, true);
+    BatchService service(decoder, trace, true, 4, 4, 1);
+    BatchRequestId late_id("late-prefill");
+    auto first = start_prefill_request(observed, service, arrival, 0, nullptr);
+    std::future<DecoderResult> late;
+    if (arrival != Arrival::none) {
+        {
+            std::unique_lock lock(observed.mutex);
+            const auto& first_barrier = in_flight ? observed.prefill_advance :
+                                                    observed.prefill_admit;
+            observed.await(lock, [&] { return first_barrier.entered; });
+        }
+        late = start_prefill_request(observed, service, arrival, 1, &late_id);
+        {
+            std::unique_lock lock(observed.mutex);
+            observed.await(lock, [&] { return observed.consumers[0].entered &&
+                                              observed.consumers[1].entered; });
+        }
+        if (arrival == Arrival::aborted) {
+            require(late_id.abort(true), "Late prefill abort did not win");
+            service.notify_abort();
+        }
+        require(!service.reset_prefix_cache(), "Cache reset took ownership of a live prefill slot");
+        {
+            std::unique_lock lock(observed.mutex);
+            if (!in_flight) {
+                observed.release(observed.prefill_admit);
+                observed.await(lock, [&] { return observed.prefill_advance.entered; });
+            }
+            observed.release(observed.consumers[0]);
+            observed.release(observed.consumers[1]);
+            if (arrival == Arrival::disconnected) {
+                observed.await(lock, [&] { return observed.writer.entered; });
+                observed.release(observed.writer);
+            }
+            observed.release(observed.prefill_advance);
+        }
+    }
+    check_prefill_output(first.get(), 100);
+    if (arrival == Arrival::blocked_writer) {
+        std::unique_lock lock(observed.mutex);
+        observed.await(lock, [&] { return observed.writer.entered; });
+        require(late.wait_for(0s) == std::future_status::timeout,
+                "Blocked writer retired before its output was delivered");
+        observed.release(observed.writer);
+    }
+    if (late.valid()) {
+        const auto result = late.get();
+        if (arrival == Arrival::aborted || arrival == Arrival::disconnected) {
+            const auto reason = arrival == Arrival::aborted ? Finish::aborted : Finish::cancelled;
+            require(result.finish_reason == reason && result.output_token_ids.empty(),
+                    "Cancelled prefill owner published output or settled incorrectly");
+        } else {
+            check_prefill_output(result, 101);
+        }
+        require(late_id.finished(), "Late request ID remained live after retirement");
+    }
+    const bool joined = arrival != Arrival::none && arrival != Arrival::aborted && !in_flight;
+    {
+        const std::lock_guard lock(observed.mutex);
+        require(observed.prefill_grants.size() == (in_flight ? 2U : 1U) &&
+                observed.prefill_grants.front() == Selection{true, joined},
+                "A prefill grant selected the wrong roster");
+        if (in_flight) require(observed.prefill_grants.back() == Selection{false, true},
+                               "In-flight arrival did not select its own next grant");
+        require(observed.admissions[0] == 1 && observed.admissions[1] == (joined || in_flight) &&
+                observed.cancels == 0, "A roster member was admitted or retired twice");
+    }
+    if (!trace) {
+        require(!service.runtime_state().running_requests && service.reset_prefix_cache(),
+                "Retired prefill roster did not release cache ownership");
+        DecoderOptions options;
+        options.max_new_tokens = 1;
+        check_prefill_output(service.generate(1, {200}, options, {}), 200);
+    }
+}
+
+void check_prefill_trace() {
+    std::ostringstream output;
+    auto* const previous = std::cerr.rdbuf(output.rdbuf());
+    check_prefill_roster(Arrival::none, true);
+    std::cerr.rdbuf(previous);
+    const std::string cache = "prefix cache entries=0 pages=0 device_bytes=0 hits=0"
+        " cached_tokens=0 prefill_tokens=0 stores=0 evictions=0\n";
+    std::string rows = "batch prefill_rows=0";
+    for (int slot = 1; slot < decoder_batch_max_mtp_lanes; ++slot) rows += ",0";
+    require(output.str() == cache + "batch width=1 decode=0 request_bytes=0\n" + rows +
+            " workspace_bytes=0\nbatch target_rows=0 step_budget=" +
+            std::to_string(decoder_default_max_num_batched_tokens) +
+            "\nbatch verify lanes=0 rows=0 peak_request_bytes=0\n" + cache,
+            "Prefill trace records or ordering changed");
+}
 }
 
 namespace sglang {
@@ -397,10 +542,16 @@ DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
 DecoderBatch::~DecoderBatch() = default;
 int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
     auto& lane = state_->lanes[slot];
-    require(prompt.size() == 1 && !lane.remaining, "Bad or reused live slot");
+    require((prompt.size() == 1 || fixture->inspect_prefill) && !lane.remaining,
+            "Bad or reused live slot");
     lane = {prompt.front(), 0, options.max_new_tokens,
             options.mtp_steps > 0 && !options.requires_target_only() && !options.label_token_ids,
             options.text_stop, options.claim_completion};
+    if (fixture->inspect_prefill) {
+        std::unique_lock lock(fixture->mutex);
+        if (slot == 0 && !fixture->admissions[slot]) fixture->hold(lock, fixture->prefill_admit);
+        ++fixture->admissions[slot];
+    }
     return 0;
 }
 int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
@@ -429,6 +580,11 @@ void publish_fixture_checkpoint(const std::function<bool()>& claim, DecoderBatch
 }
 
 Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats*) {
+    if (fixture->inspect_prefill) {
+        std::unique_lock lock(fixture->mutex);
+        fixture->prefill_grants.push_back(selected);
+        if (fixture->prefill_grants.size() == 1) fixture->hold(lock, fixture->prefill_advance);
+    }
     Steps steps{};
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (!selected[slot]) continue;
@@ -487,7 +643,8 @@ void DecoderBatch::release_retired_allocations() {}
 int main(int argc, char** argv) {
     const std::string_view mode = argc == 2 ? argv[1] : "all";
     require(argc <= 2 && (mode == "all" || mode == "scalar" || mode == "backpressure" ||
-                          mode == "step" || mode == "abort"), "Unknown mailbox scenario");
+                          mode == "step" || mode == "abort" || mode == "prefill" ||
+                          mode == "trace"), "Unknown mailbox scenario");
     if (mode == "all" || mode == "scalar") {
         for (auto outcome : {Outcome::length, Outcome::abort,
                              Outcome::disconnect, Outcome::failure}) {
@@ -522,5 +679,13 @@ int main(int argc, char** argv) {
         check_completion_claim(false, false);
         check_completion_claim(false, true);
         std::cout << "Abort ownership across recoverable and permanent failures passed\n";
+    }
+    if (mode == "all" || mode == "trace") check_prefill_trace();
+    if (mode == "all" || mode == "prefill") {
+        for (auto arrival : {Arrival::none, Arrival::during_admit, Arrival::during_advance,
+                             Arrival::aborted, Arrival::disconnected, Arrival::blocked_writer}) {
+            check_prefill_roster(arrival);
+        }
+        std::cout << "Cold prefill roster, late arrival, and output ownership passed\n";
     }
 }

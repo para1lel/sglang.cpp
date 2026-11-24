@@ -1,10 +1,12 @@
 #pragma once
 
 #include "sglang/decoder_batch.h"
+#include "sglang/server/batch_service.h"
 
 #include <algorithm>
 #include <array>
 #include <iostream>
+#include <numeric>
 #include <string>
 
 namespace sglang::server {
@@ -79,6 +81,56 @@ inline void trace_prefix_cache(const DecoderPrefixCacheStats& stats) {
                   " prefill_tokens=" + std::to_string(stats.prefill_tokens) +
                   " stores=" + std::to_string(stats.stores) +
                   " evictions=" + std::to_string(stats.evictions) + '\n');
+}
+
+class BatchTrace {
+public:
+    using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
+
+    BatchTrace(bool trace_cache, const DecoderPrefixCacheStats& cache)
+        : trace_cache_(trace_cache), last_cache_(cache) {
+        if (trace_cache_) trace_prefix_cache(cache);
+    }
+
+    void failed(std::size_t bytes) {
+        trace_batch_step(0, 0, bytes);
+        last_bytes_ = 0;
+    }
+
+    void step(int width, const Steps& steps, const DecoderBatchStepStats& stats, std::size_t bytes,
+              int max_active, int max_num_batched_tokens, int mtp_steps) {
+        if (!width && bytes == last_bytes_) return;
+        const int decode = std::count_if(steps.begin(), steps.end(),
+                                         [](const auto& step) { return step.decode; });
+        trace_batch_step(width, decode, bytes);
+        if (width) trace_batch_details(steps, stats, max_active, max_num_batched_tokens, mtp_steps);
+        last_bytes_ = bytes;
+    }
+
+    void cache(const DecoderPrefixCacheStats& current, const Steps& steps) {
+        if (!trace_cache_) return;
+        const bool finished = std::any_of(steps.begin(), steps.end(), [](const auto& step) {
+            return step.finish_reason.has_value();
+        });
+        if (finished || current.hits != last_cache_.hits || current.stores != last_cache_.stores) {
+            trace_prefix_cache(current);
+            last_cache_ = current;
+        }
+    }
+
+private:
+    bool trace_cache_;
+    DecoderPrefixCacheStats last_cache_;
+    std::size_t last_bytes_ = 0;
+};
+
+inline BatchProfileStep batch_profile_step(std::uint64_t elapsed, int width,
+                                           const BatchTrace::Steps& steps,
+                                           const DecoderBatchStepStats& stats) {
+    const int decode = std::count_if(steps.begin(), steps.end(),
+                                     [](const auto& step) { return step.decode; });
+    const int rows = std::accumulate(stats.prefill_rows.begin(), stats.prefill_rows.end(), 0);
+    return {elapsed, width, rows, decode, stats.graph_slots};
 }
 
 }

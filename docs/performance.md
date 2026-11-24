@@ -174,16 +174,17 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The November 24, 2026 `matched-k4-native-defaults-cache-on-v3` campaign measured median client makespan from first submit to last `[DONE]`. Each row passes at a native median at most 1.10 times the pinned vLLM median. W3 exceeded that limit by 72.209801 ms. The campaign stopped there, with W4 and W5 unmeasured.
+The November 24, 2026 `matched-k4-native-defaults-cache-on-v3` campaign passed W1 through W3. W4 exceeded the 1.10× median client makespan limit by 6.873837291 s. The campaign stopped at W4, and W5 remains unmeasured.
 
 | Workload | Native median (s) | vLLM median (s) | Native / vLLM | Verdict |
 | --- | ---: | ---: | ---: | --- |
-| W1 | 0.590615747 | 0.622668277 | 0.948523907 | Pass |
-| W2 | 1.381074147 | 1.689446097 | 0.817471566 | Pass |
-| W3 | 4.426445999 | 3.958396544 | 1.118242185 | Miss |
+| W1 | 0.573617682 | 0.621677740 | 0.922692973 | Pass |
+| W2 | 1.424455108 | 1.689483938 | 0.843130305 | Pass |
+| W3 | 4.241288221 | 3.955133117 | 1.072350309 | Pass |
+| W4 | 35.198634393 | 25.749815547 | 1.366947050 | Miss |
 
-Both engines used one B200, the same checkpoint, MTP4, an 8,192-token step budget and capacity eight. Both enabled prefix caching and reset it before every cohort. The native Release binary SHA-256 was `7fdb2b763155573e77cb9c6372094bcbe2db305d3e87b3e83df98ff6ac9427c1`. The vLLM revision was `81a8cb063e6247fe254d7caf7e98a6691d71022a`. [Measured public source](https://github.com/para1lel/sglang.cpp/tree/6cd145094b7107cb486d0a93d46fbb01e3bcff94) · [Fixed scheduler revision](https://github.com/para1lel/sglang.cpp/tree/d90b536f52a567d16ee7f83b02a64ba7aa4236a9)
+Both engines used one B200, the same checkpoint, MTP4, an 8,192-token step budget, and capacity eight. Both enabled prefix caching and reset it before every cohort. The native Release binary SHA-256 was `7853b65ca1d52b64580ab083a157390ad69f57db74ee863028c273a2651dde8e`. [Measured public source](https://github.com/para1lel/sglang.cpp/tree/bd8d47d6c8f6f9a24141a4d0f6a80812e780b91e)
 
-Independent replay validated 105 streams with zero cached prompt tokens and repeatable native output IDs. W3 also matched all four full output ID arrays across engines. A separate native W1 trace stayed outside the timed samples. W1 and W2 completion markers were recovered from successful runner and arm records with original requests and timestamps intact. The campaign’s `report.md` and the `evidence.sha256` index of raw receipts are in `artifacts/handover-w3/cache-on-pin/release-w1/formal-v3-6cd1450-gpu7.JZg2eYJG`.
+Independent replay validated 217 cold streams with zero cached prompt tokens and repeatable native output IDs. The first cohorts matched full output ID arrays across engines in all four W3 lanes and all eight W4 lanes. The separate native W1 trace confirmed depth four outside the timed samples. The `summary.json` and `evidence.sha256` index are in `artifacts/handover-w3/cache-on-pin/release-w1/formal-v3-bd8d47d-gpu7.Ks6BSSzx`.
 
-Earlier campaigns used the historical W1–W6 table and a 32-request cap. The archived cache-on campaign records W1–W4 passes and a separate historical W5 diagnostic. Reproduce those results with their original workload names, launcher controls, and verdict rules. [Archived workloads](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#named-workloads) · [Archived evidence and earlier campaigns](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#matched-k4-evidence)
+The previous v3 campaign stopped at W3. Earlier 32-request campaigns retain their own workload definitions and verdict rules. [Previous v3 evidence](https://github.com/para1lel/sglang.cpp/blob/bc0d5a83a92d7ddfd8f9acfc412e07ffb29e63ce/docs/performance.md#matched-k4-evidence) · [Archived workloads](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#named-workloads) · [Archived evidence and earlier campaigns](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#matched-k4-evidence)

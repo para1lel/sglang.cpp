@@ -1,3 +1,5 @@
+#include "sglang/runtime/model/qwen_serving_profile.h"
+
 #include "sglang/server/chat_template.h"
 
 #include "sglang/tokenizer/digest.h"
@@ -412,9 +414,23 @@ void append_turns(std::string& output, const std::vector<Turn>& turns, VisionCou
     }
 }
 
+class QwenChatTemplate final : public ChatTemplate {
+public:
+    explicit QwenChatTemplate(const std::filesystem::path& checkpoint);
+    std::string render(const OrderedObject& chat, ChatInput input) const override;
+    std::string render(const OrderedObject& chat, ChatInput input,
+                       const ChatTools& selection) const override;
+
+private:
+    std::string xhigh_;
+    std::string low_;
+    std::string tools_intro_;
+    std::string tools_instructions_;
+};
+
 }
 
-ChatTemplate::ChatTemplate(const std::filesystem::path& checkpoint) {
+QwenChatTemplate::QwenChatTemplate(const std::filesystem::path& checkpoint) {
     checked_file(checkpoint / "tokenizer_config.json", 9984,
                  "207c03c41a06a9c3b0cc527d8a56115159c1eac6b59a4ffae85b646e773d074e");
     const auto source = checked_file(checkpoint / "chat_template.jinja", 9004,
@@ -493,7 +509,7 @@ std::string chat_template_json(const json::Value& value, bool compact) {
     return serialized;
 }
 
-ChatTools chat_tools(const OrderedObject& chat) {
+ChatTools select_qwen_chat_tools(const OrderedObject& chat) {
     ChatTools output;
     std::string_view selected;
     output.choice = read_tool_choice(get(chat, "tool_choice"), selected);
@@ -531,12 +547,12 @@ ChatTools chat_tools(const OrderedObject& chat) {
     return output;
 }
 
-std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input) const {
-    return render(chat, input, chat_tools(chat));
+std::string QwenChatTemplate::render(const OrderedObject& chat, ChatInput input) const {
+    return render(chat, input, select_qwen_chat_tools(chat));
 }
 
-std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input,
-                                 const ChatTools& selection) const {
+std::string QwenChatTemplate::render(const OrderedObject& chat, ChatInput input,
+                                     const ChatTools& selection) const {
     auto turns = read_turns(chat);
     const bool thinking = boolean(chat, "enable_thinking", true);
     const bool preserve = boolean(chat, "preserve_thinking", true);
@@ -592,6 +608,11 @@ std::string ChatTemplate::render(const OrderedObject& chat, ChatInput input,
         }
     }
     return output;
+}
+
+std::unique_ptr<const ChatTemplate> load_qwen_chat_template(
+    const std::filesystem::path& checkpoint) {
+    return std::make_unique<const QwenChatTemplate>(checkpoint);
 }
 
 }

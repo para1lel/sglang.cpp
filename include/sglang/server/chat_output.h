@@ -62,7 +62,6 @@ class ChatOutputParser {
 public:
     explicit ChatOutputParser(const ChatOutputOptions& options);
     ~ChatOutputParser();
-    static SeparatedReasoning separate_qwen3(std::string_view text, bool force_reasoning);
     bool push(std::string_view text, const ChatOutputSink& sink);
     bool finish(ChatEnd end, const ChatOutputSink& sink);
     std::size_t calls() const { return calls_; }

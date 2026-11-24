@@ -1,3 +1,4 @@
+#include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/indexed_admission.h"
 #include "sglang/tokenizer/tokenizer.h"
@@ -115,7 +116,8 @@ void check_tickets() {
 
 void check_two_owners(const Decoder& decoder) {
     admissions.clear();
-    BatchService service(decoder, false, false, 0, 4);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{false, 4, 0, decoder_default_max_num_batched_tokens}), false);
     Gate gate;
     auto left = std::async(std::launch::async, [&] {
         BatchCallbacks callbacks;
@@ -147,7 +149,8 @@ void check_two_owners(const Decoder& decoder) {
 
 void check_refill(const Decoder& decoder) {
     admissions.clear();
-    BatchService service(decoder, false, false, 0, 2);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{false, 2, 0, decoder_default_max_num_batched_tokens}), false);
     Gate gate;
     auto left = std::async(std::launch::async, [&] {
         BatchCallbacks callbacks;
@@ -180,7 +183,8 @@ void check_refill(const Decoder& decoder) {
 
 void check_paused_cancellation(const Decoder& decoder) {
     admissions.clear();
-    BatchService service(decoder, false, false, 0, 2);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{false, 2, 0, decoder_default_max_num_batched_tokens}), false);
     Gate incumbent_gate;
     auto incumbent = std::async(std::launch::async, [&] {
         BatchCallbacks callbacks;
@@ -223,7 +227,8 @@ void check_paused_cancellation(const Decoder& decoder) {
 
 void check_scalar_reservation(const Decoder& decoder) {
     admissions.clear();
-    BatchService service(decoder, false, false, 0, 2);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{false, 2, 0, decoder_default_max_num_batched_tokens}), false);
     Gate gate;
     auto group = std::async(std::launch::async, [&] {
         BatchCallbacks callbacks;
@@ -261,7 +266,8 @@ void check_scalar_reservation(const Decoder& decoder) {
 void check_singleton_owner(const Decoder& decoder) {
     admissions.clear();
     hold_first_lane = true;
-    BatchService service(decoder, false, false, 0, 2);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{false, 2, 0, decoder_default_max_num_batched_tokens}), false);
     std::promise<void> peer_finished;
     auto peer_finished_signal = peer_finished.get_future();
     auto group = std::async(std::launch::async, [&] {

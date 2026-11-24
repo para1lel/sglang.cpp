@@ -1,5 +1,5 @@
 #include "sglang/text/gqa/gqa_decode_long.cuh"
-#include "sglang/decoder_internal.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh"
 
 #include <cuda.h>

@@ -38,7 +38,7 @@ The planner preserves the outer template wrappers. It expands an image pad into 
 
 Physical token indices advance by one for every expanded ID. KV writes and causal attention use these indices. Text and wrapper tokens assign the same scalar to all three rotary axes. Within a visual plane, merged row `r` and column `c` use `(base, base + r, base + c)`. The next scalar advances by the larger merged spatial dimension. The language model rotates Q and K with interleaved temporal, height, and width sections of `[11, 11, 10]`. [Plane positions](../src/media/multimodal_prompt.cpp#L38)<!-- prefix: "void append_" --> · [Rotary axis selection](../src/text_attention_gqa.cu#L31)<!-- prefix: "__device__ i" -->
 
-Prefill scores the first output. When the next forward pass consumes the output token at zero-based index `k`, its KV index is `expanded_prompt_length + k`. All three rotary axes then use `next_position + k`, where `next_position` is one above the largest prompt coordinate. The CPU planner returns `next_position`. [Continuation](../src/decoder.cpp#L543)<!-- prefix: "const Forwar" -->
+Prefill scores the first output. When the next forward pass consumes the output token at zero-based index `k`, its KV index is `expanded_prompt_length + k`. All three rotary axes then use `next_position + k`, where `next_position` is one above the largest prompt coordinate. The CPU planner returns `next_position`. [Continuation](../src/decoder.cpp#L541)<!-- prefix: "const Forwar" -->
 
 ## Constraints and failure behavior
 

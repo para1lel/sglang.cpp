@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sglang/runtime/model/serving_profile.h"
 #include "sglang/tokenizer/tokenizer.h"
 
 #include <list>
@@ -30,14 +31,14 @@ struct ChatParsers {
 
 class CompletionTokenizer {
 public:
-    explicit CompletionTokenizer(const std::filesystem::path& checkpoint,
-                                 SamplingDefaults sampling = SamplingDefaults::model,
-                                 ChatParsers parsers = ChatParsers());
+    CompletionTokenizer(const std::filesystem::path& checkpoint, SamplingDefaults sampling,
+                        ChatParsers parsers, const model::ServingProfile& profile);
     ~CompletionTokenizer();
     const Tokenizer& get() const;
     const ChatTemplate& chat_template() const;
     const DecoderOptions& chat_sampling_defaults() const;
     ChatParsers chat_parsers() const { return chat_parsers_; }
+    const model::ServingProfile& serving_profile() const { return profile_; }
     std::shared_ptr<const TokenConstraint> tool_constraint(const ChatTools& tools,
                                                            bool prompt_has_open_think) const;
 
@@ -53,6 +54,7 @@ private:
     const std::filesystem::path checkpoint_;
     const SamplingDefaults sampling_mode_;
     const ChatParsers chat_parsers_;
+    const model::ServingProfile& profile_;
     mutable std::once_flag loaded_;
     mutable std::unique_ptr<const Tokenizer> tokenizer_;
     mutable std::once_flag chat_loaded_;

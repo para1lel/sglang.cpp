@@ -6,7 +6,7 @@
 #include <memory>
 #include <string>
 
-#include <cuda_bf16.h>
+struct __nv_bfloat16;
 
 namespace sglang {
 

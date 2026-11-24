@@ -1,7 +1,7 @@
 #include "sglang/server/loads.h"
 
 #include "sglang/json.h"
-#include "sglang/mxfp8_gqa.h"
+#include "sglang/runtime/cache/mxfp8_cache_geometry.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/http.h"
 

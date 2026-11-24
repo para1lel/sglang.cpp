@@ -17,17 +17,14 @@
 namespace sglang {
 namespace {
 
-constexpr std::size_t file_size = 12809320;
-constexpr std::string_view file_sha256 =
-    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3";
-constexpr TokenId mapped_vocab_size = 248077;
+constexpr TokenId mapped_vocab_size = model::qwen_tokenizer_mapped_vocab;
 
 json::Value read_checkpoint(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
-    std::string bytes(file_size, '\0');
+    std::string bytes(model::qwen_tokenizer_size, '\0');
     if (!input.read(bytes.data(), bytes.size()) ||
         input.peek() != std::char_traits<char>::eof() || input.bad() ||
-        tokenizer::sha256(bytes) != file_sha256) {
+        tokenizer::sha256(bytes) != model::qwen_tokenizer_sha256) {
         throw std::runtime_error("Cannot read pinned tokenizer.json or SHA-256 differs");
     }
     return json::parse(bytes);

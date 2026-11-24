@@ -124,7 +124,7 @@ target("sglang_checkpoint")
     set_targetdir("$(builddir)/lib")
     add_includedirs("include", {public = true})
     add_deps("sglang_json")
-    add_files("src/checkpoint.cpp")
+    add_files("src/checkpoint.cpp", "src/runtime/model/qwen_checkpoint.cpp")
 
 target("sglang_vision")
     set_kind("static")
@@ -146,13 +146,14 @@ target("sglang_decoder")
     set_targetdir("$(builddir)/lib")
     add_includedirs("include", {public = true})
     add_deps("sglang_checkpoint", "sglang_cuda", "sglang_prefill_fp8_sm100")
-    add_files("src/decoder.cpp", "src/decoder_forward.cpp", "src/decoder_resources.cpp",
+    add_files("src/decoder.cpp", "src/decoder_forward.cpp",
               "src/decoder_batch.cpp", "src/decoder_prefix_cache.cpp",
               "src/decoder_mtp.cpp", "src/decoder_prefill.cpp", "src/decoder_verify.cpp",
               "src/decoder_constraint.cpp", "src/media/decoder_media.cpp",
               "src/media/multimodal_prompt.cpp")
-    add_files("src/text/decoder_graph.cpp", "src/text/retired_request_blocks.cpp")
-    add_files("src/runtime/model/decoder_weights.cpp",
+    add_files("src/text/decoder_graph.cpp", "src/runtime/model/decoder_weights.cpp",
+              "src/runtime/model/qwen_request.cpp", "src/runtime/backend/cuda_resources.cpp",
+              "src/runtime/backend/retired_request_blocks.cpp",
               "src/runtime/backend/cuda_backend_policy.cpp",
               "src/runtime/execution/decoder_execution_policy.cpp",
               "src/runtime/execution/decoder_prefill_workspace.cpp",
@@ -191,7 +192,6 @@ target("sglang-server")
     add_deps("sglang_decoder", "sglang_tokenizer", "sglang_media_preprocess", "sglang_vision")
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
-              "apps/server/chat_template.cpp", "apps/server/chat_output.cpp",
               "apps/server/completions.cpp",
               "apps/server/flush_cache.cpp", "apps/server/http.cpp", "apps/server/loads.cpp",
               "src/runtime/server/single_device_batch_executor.cpp",
@@ -199,7 +199,7 @@ target("sglang-server")
               "apps/server/text_request.cpp", "apps/server/text_completion.cpp",
               "apps/server/chat_media.cpp", "apps/server/vision_completion.cpp")
     add_files("apps/server/anthropic_count.cpp", "apps/server/anthropic_messages.cpp",
-              "apps/server/chat_tool_constraints.cpp", "apps/server/decisions.cpp",
+              "apps/server/decisions.cpp",
               "apps/server/native_generate.cpp", "apps/server/native_sessions.cpp",
               "apps/server/ollama_discovery.cpp",
               "apps/server/ollama_generate.cpp",
@@ -208,6 +208,11 @@ target("sglang-server")
               "apps/server/tokenization.cpp",
               "apps/server/tokenization_validation.cpp", "apps/server/tool_literal.cpp",
               "apps/server/tool_union.cpp")
+    add_files("src/runtime/model/qwen_chat_template.cpp",
+              "src/runtime/model/qwen_chat_output.cpp",
+              "src/runtime/model/qwen_tool_constraints.cpp",
+              "src/runtime/model/qwen_serving_profile.cpp",
+              "src/runtime/model/qwen_tool_output.cpp")
     add_media_codecs()
 
 option("text-tokenizer-check")

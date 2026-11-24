@@ -27,6 +27,16 @@ using Clock = std::chrono::steady_clock;
 constexpr auto timeout = 3s;
 constexpr int capacity = 2;
 
+class ReaderQueueExecutor final : public BatchExecutor {
+public:
+    explicit ReaderQueueExecutor(bool cached)
+        : BatchExecutor({false, capacity, cached ? 2 : 0,
+                         sglang::decoder_default_max_num_batched_tokens}) {}
+    BatchTopology topology() const noexcept override { return single_device_batch_topology; }
+    void start(Ready, Process) override { throw std::logic_error("Unexpected decoder startup"); }
+    void join() noexcept override {}
+};
+
 void require(bool condition, const char* message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -116,19 +126,18 @@ constexpr int large_body_bytes = 48 * 1024;
 
 }
 
-namespace sglang {
-
-struct Decoder::Model {};
-Decoder::Decoder(const std::filesystem::path&, int) {}
-Decoder::~Decoder() = default;
-
-namespace server {
+namespace sglang::server {
 
 struct BatchService::State { int cache_capacity; };
 
-BatchService::BatchService(const Decoder&, bool, bool, int, int, int cache, int)
-    : state_(std::make_unique<State>(State{cache})) {}
+BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool, int)
+    : state_(std::make_unique<State>(State{executor->options().prefix_cache_entries})) {}
 BatchService::~BatchService() = default;
+
+std::optional<std::vector<DecoderResult>> BatchService::generate_batch(
+    int, const std::vector<BatchPrompt>&, const BatchCallbacks&) {
+    throw std::logic_error("Unexpected decoder batch generation in reader queue fixture");
+}
 
 bool BatchService::ready() const { return !worker_failed; }
 
@@ -161,7 +170,6 @@ bool BatchService::reset_prefix_cache() {
 bool BatchService::start_profile(std::string, std::size_t) { return false; }
 std::optional<BatchProfile> BatchService::stop_profile() { return std::nullopt; }
 
-}
 }
 
 namespace {
@@ -681,8 +689,7 @@ int main(int argc, char** argv) {
         const bool cached = mode == "--cache-on" || reader_failure || flush;
         require(cached || broken_worker || mode == "--cache-off", "Unknown transport test mode");
         const auto descriptors = fd_count();
-        const sglang::Decoder decoder(std::filesystem::path{});
-        BatchService service(decoder, false, false, 0, capacity, cached ? 2 : 0);
+        BatchService service(std::make_unique<ReaderQueueExecutor>(cached), false);
         for (const int invalid : {0, sglang::decoder_batch_max_lanes + 1}) {
             bool rejected = false;
             try {

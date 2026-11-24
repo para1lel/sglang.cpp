@@ -19,7 +19,7 @@ namespace sglang::server {
 
 const Tokenizer& CompletionTokenizer::get() const {
     std::call_once(loaded_, [this] {
-        tokenizer_ = std::make_unique<const Tokenizer>(checkpoint_ / "tokenizer.json");
+        tokenizer_ = std::make_unique<const Tokenizer>(checkpoint_ / profile_.tokenizer_file);
     });
     return *tokenizer_;
 }
@@ -181,7 +181,8 @@ void append_chat_scores(std::string& output, const Tokenizer& tokenizer,
     output += "]}";
 }
 
-std::string response_prefix(const TextRequest& request, std::time_t created) {
+std::string response_prefix(const TextRequest& request, std::string_view served_name,
+                            std::time_t created) {
     if (!request.chat && request.choices == 1) {
         return "{";
     }
@@ -193,7 +194,7 @@ std::string response_prefix(const TextRequest& request, std::time_t created) {
         request.stream ? R"("chat.completion.chunk")" : R"("chat.completion")";
     output += R"(,"created":)" + std::to_string(created);
     output += R"(,"model":)";
-    json::append_quoted(output, model_name);
+    json::append_quoted(output, served_name);
     output += ',';
     return output;
 }
@@ -259,14 +260,14 @@ void append_call(std::string& output, std::size_t index, std::string_view id,
 
 class TextResponse {
 public:
-    TextResponse(const Socket& connection, EventStream& stream, const Tokenizer& tokenizer,
+    TextResponse(const Socket& connection, EventStream& stream, const CompletionTokenizer& loader,
                  const TextRequest& request, const std::vector<int>& prompt,
                  std::size_t index = 0, const std::string* echo = nullptr,
                  std::time_t created = std::time(nullptr))
-        : connection_(connection), stream_(stream), tokenizer_(tokenizer), request_(request),
+        : connection_(connection), stream_(stream), tokenizer_(loader.get()), request_(request),
           prompt_(prompt), index_(index),
           echo_(echo ? echo : request.echo ? &*request.echo : nullptr),
-          prefix_(response_prefix(request, created)) {
+          prefix_(response_prefix(request, loader.serving_profile().served_name, created)) {
         if (request.anthropic) {
             anthropic_.emplace(connection, stream, request.stream, prompt.size());
         }
@@ -274,7 +275,7 @@ public:
             responses_.emplace(connection, stream, *request.responses, request);
         }
         if (request.chat_output.enabled()) {
-            parser_.emplace(request.chat_output);
+            loader.serving_profile().start_chat_output(parser_, request.chat_output);
         }
         if (!request.stop_text.empty()) {
             stop_patterns_ = std::make_shared<const TextStops>(request.stop_text);
@@ -664,10 +665,11 @@ void TextResponse::finish(const DecoderResult& result, std::size_t count) {
 }
 
 struct BatchTextChoice {
-    BatchTextChoice(const Socket& connection, EventStream& stream, const Tokenizer& tokenizer,
-                    const TextRequest& request, BatchPrompt& prompt, std::size_t index,
+    BatchTextChoice(const Socket& connection, EventStream& stream,
+                    const CompletionTokenizer& loader, const TextRequest& request,
+                    BatchPrompt& prompt, std::size_t index,
                     const std::string* echo = nullptr, std::time_t created = std::time(nullptr))
-        : response(connection, stream, tokenizer, request, prompt.prompt, index, echo, created),
+        : response(connection, stream, loader, request, prompt.prompt, index, echo, created),
           scored(request.options.generated_top_logprobs >= 0) {
         if (!request.stop_text.empty()) {
             prompt.options.text_stop = response.text_stop();
@@ -728,7 +730,7 @@ void complete_text(const Socket& connection, const TextRequest& request,
         return;
     }
     EventStream stream(connection);
-    TextResponse response(connection, stream, tokenizer.get(), request, request.prompt);
+    TextResponse response(connection, stream, tokenizer, request, request.prompt);
     const bool background = request.responses && request.responses->background;
     if (background && !response.queue_responses()) return;
     const auto cancelled = [&] {
@@ -794,7 +796,7 @@ void complete_scored_text(const Socket& connection, const TextRequest& request,
     }
     EventStream stream(connection);
     std::vector<BatchPrompt> prompts{{request.prompt, request.options}};
-    BatchTextChoice choice(connection, stream, tokenizer.get(), request, prompts.front(), 0);
+    BatchTextChoice choice(connection, stream, tokenizer, request, prompts.front(), 0);
     const BatchCallbacks callbacks{
         [&] { return disconnected(connection); },
         [&] { return choice.response.start(); },
@@ -821,7 +823,6 @@ void complete_text_batch(const Socket& connection, TextCompletionRequest complet
     const auto& request = completion.request;
     prepare_choice_prompts(completion);
     EventStream stream(connection);
-    const auto& tokens = tokenizer.get();
     std::deque<BatchTextChoice> choices;
     std::size_t prompt_tokens = 0;
     const auto created = std::time(nullptr);
@@ -829,7 +830,7 @@ void complete_text_batch(const Socket& connection, TextCompletionRequest complet
         const auto index = choices.size();
         const auto* echo = completion.batch_echoes.empty() ? nullptr :
             &completion.batch_echoes[index];
-        choices.emplace_back(connection, stream, tokens, request, prompt, index, echo, created);
+        choices.emplace_back(connection, stream, tokenizer, request, prompt, index, echo, created);
         if (!index || request.choices == 1) prompt_tokens += prompt.prompt.size();
     }
     std::size_t completion_tokens = 0;

@@ -832,8 +832,8 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
         const auto& lane = lanes[index];
         auto* residual = lane.request->work.residual;
         if (lane.feature) {
-            check(cudaMemcpyAsync(residual, lane.feature, hidden_size * sizeof(Bf16),
-                                  cudaMemcpyDeviceToDevice, stream), "Substitute visual embedding");
+            copy_cuda_async(residual, lane.feature, hidden_size * sizeof(Bf16),
+                            cudaMemcpyDeviceToDevice, stream, "Substitute visual embedding");
         } else {
             check(text_embedding(embedding, vocab_size, hidden_size, lane.token_id, residual,
                                  stream), "Look up token embedding");

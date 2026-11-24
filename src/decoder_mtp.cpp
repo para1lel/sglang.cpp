@@ -1,12 +1,12 @@
 #include "sglang/decoder_mtp.h"
 
-#include "sglang/checkpoint.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_verify.h"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
 #include "sglang/runtime/cache/mxfp8_prefix_copy.h"
+#include "sglang/runtime/model/qwen_weight_upload.h"
 #include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/draft_projection.h"
 #include "sglang/text/mtp/tc_vocab.h"
@@ -23,48 +23,6 @@ namespace {
 
 static_assert(draft_projection_rows % draft_wave_rows == 0);
 
-class DraftWeightUpload {
-public:
-    explicit DraftWeightUpload(Allocations& memory)
-        : memory_(memory), checkpoint_(*memory.transfers().checkpoint) {}
-
-    const Bf16* norm(const std::string& name, int width) {
-        return bf16(name, {extent(width)});
-    }
-
-    Bf16Weight fc(int rows, int columns) {
-        return {bf16("mtp.fc.weight", {extent(rows), extent(columns)}), rows, columns};
-    }
-
-    Fp8Weight projection(const std::string& name, int rows, int columns) {
-        const auto* values = upload(name + ".weight", TensorDtype::F8_E4M3,
-                                    {extent(rows), extent(columns)});
-        const auto* scales = bf16(name + ".weight_scale_inv",
-                                  {extent(text_fp8_group_count(rows)),
-                                   extent(text_fp8_group_count(columns))});
-        return {values, scales, rows, columns};
-    }
-
-private:
-    static std::uint64_t extent(int size) { return static_cast<std::uint64_t>(size); }
-
-    const Bf16* bf16(const std::string& name, std::initializer_list<std::uint64_t> shape) {
-        return reinterpret_cast<const Bf16*>(upload(name, TensorDtype::BF16, shape));
-    }
-
-    const std::uint8_t* upload(const std::string& name, TensorDtype dtype,
-                               std::initializer_list<std::uint64_t> shape) {
-        const auto& tensor = checkpoint_.tensor(name, dtype, shape);
-        auto* destination = memory_.allocate<std::uint8_t>(tensor.size_bytes);
-        check(cudaMemcpyAsync(destination, tensor.data, tensor.size_bytes, cudaMemcpyHostToDevice,
-                              memory_.stream()), name.c_str());
-        return destination;
-    }
-
-    Allocations& memory_;
-    const Checkpoint& checkpoint_;
-};
-
 void copy_draft_prefix(Mxfp8KvCache dst, Mxfp8KvCache src, int rows, cudaStream_t stream) {
     const int full_pages = rows / mxfp8_page_size;
     const int pages = prefix_kv_pages(rows);
@@ -74,13 +32,13 @@ void copy_draft_prefix(Mxfp8KvCache dst, Mxfp8KvCache src, int rows, cudaStream_
     const auto payload = rows * mxfp8_kv_heads * mxfp8_head_dim;
     const auto scale_offset = full_pages * mxfp8_scale_bytes_per_page;
     const auto copy_payload = [&](auto* to, const auto* from) {
-        check(cudaMemcpyAsync(to, from, payload, cudaMemcpyDeviceToDevice, stream),
-              "Copy MTP prefix payload");
+        copy_cuda_async(to, from, payload, cudaMemcpyDeviceToDevice, stream,
+                        "Copy MTP prefix payload");
     };
     const auto copy_scales = [&](auto* to, const auto* from) {
         if (full_pages != 0) {
-            check(cudaMemcpyAsync(to, from, scale_offset, cudaMemcpyDeviceToDevice, stream),
-                  "Copy complete MTP prefix scale pages");
+            copy_cuda_async(to, from, scale_offset, cudaMemcpyDeviceToDevice, stream,
+                            "Copy complete MTP prefix scale pages");
         }
         const int tail = rows % mxfp8_page_size;
         if (tail) {
@@ -170,26 +128,26 @@ struct MtpDraftWeights::State {
         auto& checkpoint = memory.transfers().checkpoint;
         checkpoint = std::make_unique<Checkpoint>(directory);
         memory.open_stream();
-        DraftWeightUpload upload(memory);
-        embedding_norm = upload.norm("mtp.pre_fc_norm_embedding.weight", hidden_size);
-        hidden_norm = upload.norm("mtp.pre_fc_norm_hidden.weight", hidden_size);
-        fc = upload.fc(hidden_size, 2 * hidden_size);
-        input_norm = upload.norm("mtp.layers.0.input_layernorm.weight", hidden_size);
-        attention_norm = upload.norm("mtp.layers.0.post_attention_layernorm.weight", hidden_size);
+        QwenWeightUpload upload(*checkpoint, memory, memory.stream());
+        embedding_norm = upload.bf16("mtp.pre_fc_norm_embedding.weight", {hidden_size});
+        hidden_norm = upload.bf16("mtp.pre_fc_norm_hidden.weight", {hidden_size});
+        fc = upload.bf16_matrix("mtp.fc.weight", hidden_size, 2 * hidden_size);
+        input_norm = upload.bf16("mtp.layers.0.input_layernorm.weight", {hidden_size});
+        attention_norm = upload.bf16("mtp.layers.0.post_attention_layernorm.weight", {hidden_size});
         const std::string attention = "mtp.layers.0.self_attn.";
         gqa = {
-            upload.projection(attention + "q_proj", text_gqa_q_gate_width, hidden_size),
-            upload.projection(attention + "k_proj", text_gqa_kv_width, hidden_size),
-            upload.projection(attention + "v_proj", text_gqa_kv_width, hidden_size),
-            upload.norm(attention + "q_norm.weight", mxfp8_head_dim),
-            upload.norm(attention + "k_norm.weight", mxfp8_head_dim),
-            upload.projection(attention + "o_proj", hidden_size, text_gqa_q_width),
+            upload.fp8_matrix(attention + "q_proj", text_gqa_q_gate_width, hidden_size),
+            upload.fp8_matrix(attention + "k_proj", text_gqa_kv_width, hidden_size),
+            upload.fp8_matrix(attention + "v_proj", text_gqa_kv_width, hidden_size),
+            upload.bf16(attention + "q_norm.weight", {mxfp8_head_dim}),
+            upload.bf16(attention + "k_norm.weight", {mxfp8_head_dim}),
+            upload.fp8_matrix(attention + "o_proj", hidden_size, text_gqa_q_width),
         };
         const std::string mlp = "mtp.layers.0.mlp.";
-        mlp_gate = upload.projection(mlp + "gate_proj", intermediate_size, hidden_size);
-        mlp_up = upload.projection(mlp + "up_proj", intermediate_size, hidden_size);
-        mlp_down = upload.projection(mlp + "down_proj", hidden_size, intermediate_size);
-        final_norm = upload.norm("mtp.norm.weight", hidden_size);
+        mlp_gate = upload.fp8_matrix(mlp + "gate_proj", intermediate_size, hidden_size);
+        mlp_up = upload.fp8_matrix(mlp + "up_proj", intermediate_size, hidden_size);
+        mlp_down = upload.fp8_matrix(mlp + "down_proj", hidden_size, intermediate_size);
+        final_norm = upload.bf16("mtp.norm.weight", {hidden_size});
         if (capabilities.int8_head) {
             auto* values = memory.allocate<std::uint8_t>(
                 static_cast<std::size_t>(vocab_size) * hidden_size);
@@ -292,8 +250,8 @@ MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, in
     host_pages.resize(page_count);
     std::iota(host_pages.begin(), host_pages.end(), 0);
     memory.open_stream();
-    check(cudaMemcpyAsync(table, host_pages.data(), host_pages.size() * sizeof(std::int32_t),
-                          cudaMemcpyHostToDevice, memory.stream()), "Upload MTP KV page table");
+    copy_cuda_async(table, host_pages.data(), host_pages.size() * sizeof(std::int32_t),
+                    cudaMemcpyHostToDevice, memory.stream(), "Upload MTP KV page table");
     memory.close_stream();
 }
 
@@ -411,8 +369,8 @@ void MtpDraftRequest::State::select_score(cudaStream_t stream, const ConstraintW
     }
     constrained_score = allowed != nullptr;
     auto& winner = memory.transfers().winner;
-    check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner), cudaMemcpyDeviceToHost,
-                          stream), "Copy MTP token");
+    copy_cuda_async(&winner, &work.argmax->token_id, sizeof(winner), cudaMemcpyDeviceToHost,
+                    stream, "Copy MTP token");
     scored = true;
 }
 
@@ -916,8 +874,8 @@ bool MtpDraftRequest::retry_invalid_int8(cudaStream_t stream) {
           "Retry MTP vocabulary head in BF16");
     check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
           "Select BF16 MTP retry token");
-    check(cudaMemcpyAsync(&request.retry_winner, work.argmax, sizeof(request.retry_winner),
-                          cudaMemcpyDeviceToHost, stream), "Copy BF16 MTP retry winner");
+    copy_cuda_async(&request.retry_winner, work.argmax, sizeof(request.retry_winner),
+                    cudaMemcpyDeviceToHost, stream, "Copy BF16 MTP retry winner");
     request.int8_score = false;
     request.retried_score = true;
     return true;
@@ -937,7 +895,7 @@ void MtpDraftRequest::restore_prefix(Mxfp8KvCache snapshot, int rows, cudaStream
         throw std::logic_error("Invalid draft request for prefix restoration");
     }
     copy_draft_prefix(state_->cache, snapshot, rows, stream);
-    check(cudaStreamSynchronize(stream), "Complete paired decoder prefix restoration");
+    synchronize_cuda(stream, "Complete paired decoder prefix restoration");
     state_->prefix = rows;
 }
 

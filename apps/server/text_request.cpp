@@ -1,7 +1,6 @@
 #include "sglang/server/text_completion.h"
 
 #include "sglang/server/chat_template.h"
-#include "sglang/server/chat_tool_constraints.h"
 #include "sglang/decoder_constraint.h"
 #include "sglang/json.h"
 #include "sglang/server/http.h"
@@ -469,11 +468,12 @@ TextCompletionRequest parse_text(const json::Object& object,
             throw std::invalid_argument("Unsupported text completion option: " + key);
         }
     }
-    if (json::get_string(object, "model") != model_name) {
-        if (json::get_string(object, "prompt")) {
-            bad_request("Expected model Qwen3.8-27B-FP8 for a string prompt");
-        }
-        bad_request("Expected model Qwen3.8-27B-FP8");
+    const auto model = tokenizer.serving_profile().served_name;
+    if (json::get_string(object, "model") != model) {
+        const auto expected = "Expected model " + std::string(model);
+        const auto message = json::get_string(object, "prompt") ?
+            expected + " for a string prompt" : expected;
+        bad_request(message.c_str());
     }
     const auto* prompt = json::get(object, "prompt");
     const auto* list = prompt ? prompt->array() : nullptr;
@@ -519,7 +519,8 @@ TextCompletionRequest parse_text(const json::Object& object,
     return completion;
 }
 
-json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
+json::Object chat_text_options(const json::OrderedObject& chat, bool media,
+                                const model::ServingProfile& profile) {
     json::Object options;
     for (const auto& [key, value] : chat) {
         if (key == "stream_options" && value.ordered_object()) {
@@ -539,117 +540,18 @@ json::Object chat_text_options(const json::OrderedObject& chat, bool media) {
                 bad_request("Decoded media chat requires add_special_tokens=false");
             }
         } else if (key != "messages" && key != "tools" && key != "tool_choice" &&
-                   key != "add_generation_prompt" && key != "add_vision_id" &&
-                   key != "enable_thinking" && key != "preserve_thinking" &&
-                   key != "reasoning_effort" && key != "separate_reasoning" &&
-                   key != "stream_reasoning" && key != "parallel_tool_calls") {
+                   key != "add_generation_prompt" && key != "separate_reasoning" &&
+                   key != "stream_reasoning" && key != "parallel_tool_calls" &&
+                   !profile.is_chat_template_option(key)) {
             throw std::invalid_argument("Unsupported chat completion option: " + key);
         }
     }
-    if (json::get_string(options, "model") != model_name) {
-        bad_request("Expected model Qwen3.8-27B-FP8 for a chat request");
+    if (json::get_string(options, "model") != profile.served_name) {
+        const auto message = "Expected model " + std::string(profile.served_name) +
+            " for a chat request";
+        bad_request(message.c_str());
     }
     return options;
-}
-
-void normalize_template_options(json::OrderedObject& chat) {
-    const auto kwargs = std::find_if(chat.begin(), chat.end(), [](const auto& field) {
-        return field.first == "chat_template_kwargs";
-    });
-    if (kwargs == chat.end()) {
-        return;
-    }
-    if (kwargs->second.is_null()) {
-        chat.erase(kwargs);
-        return;
-    }
-    const auto* object = kwargs->second.ordered_object();
-    if (!object) {
-        bad_request("Expected a chat_template_kwargs object");
-    }
-    auto settings = *object;
-    chat.erase(kwargs);
-    for (auto& [key, value] : settings) {
-        if (key != "enable_thinking" && key != "preserve_thinking" &&
-            key != "reasoning_effort" && key != "add_vision_id") {
-            bad_request("Unsupported chat_template_kwargs option");
-        }
-        if (!json::get(chat, key)) {
-            chat.emplace_back(std::move(key), std::move(value));
-        }
-    }
-}
-
-bool chat_flag(const json::OrderedObject& chat, std::string_view key) {
-    const auto* value = json::get(chat, key);
-    if (!value) {
-        return true;
-    }
-    if (const auto flag = value->boolean()) {
-        return *flag;
-    }
-    throw std::invalid_argument("Expected a boolean for " + std::string(key));
-}
-
-bool model_eos_stops(const DecoderOptions& options) {
-    const auto& stops = options.additional_stop_token_ids;
-    return (!options.stop_token_id || constraint_eos(*options.stop_token_id)) &&
-        stops.count(end_of_text) && stops.count(end_of_message) &&
-        std::all_of(stops.begin(), stops.end(), constraint_eos);
-}
-
-void check_tool_constraint(const TextRequest& request, const ChatTools& tools,
-                           ChatParsers parsers) {
-    const bool forced = tools.forced();
-    if (!forced && (!tool_constraint_applies(tools) || request.media ||
-                    request.options.constraint || !parsers.qwen3_coder_tools)) {
-        return;
-    }
-    if (request.media) {
-        bad_request("Decoded media chat does not support tool_choice required or a named tool");
-    }
-    if (request.options.constraint) {
-        bad_request("tool_choice 'required' or a named tool cannot be combined with "
-                    "response_format, regex, or ebnf: the tool-call constraint and the output "
-                    "constraint cannot both be honored.");
-    }
-    if (!parsers.qwen3_coder_tools) {
-        bad_request("tool_choice 'required' or a named tool needs --tool-call-parser qwen3_coder");
-    }
-    const std::string subject = forced ? "tool_choice 'required' or a named tool" :
-                                         "A strict tool with tool_choice auto";
-    if (!model_eos_stops(request.options)) {
-        bad_request((subject + " requires model EOS stops without ignore_eos or stop_token_ids "
-                    "overrides").c_str());
-    }
-    if (!request.stop_text.empty()) {
-        bad_request((subject + " cannot be combined with text stops").c_str());
-    }
-}
-
-void set_chat_output(TextRequest& request, const json::OrderedObject& chat,
-                     std::string_view prompt, const CompletionTokenizer& tokenizer,
-                     const ChatTools& tools) {
-    const auto parsers = tokenizer.chat_parsers();
-    const bool separate = chat_flag(chat, "separate_reasoning");
-    const bool stream = chat_flag(chat, "stream_reasoning");
-    check_tool_constraint(request, tools, parsers);
-    if (request.media || request.options.constraint) {
-        return;
-    }
-    constexpr std::string_view open_suffix = "<|im_start|>assistant\n<think>\n";
-    auto& output = request.chat_output;
-    output.separate_reasoning = parsers.qwen3_reasoning && separate;
-    output.stream_reasoning = stream;
-    output.prompt_has_open_think = prompt.size() >= open_suffix.size() &&
-        prompt.substr(prompt.size() - open_suffix.size()) == open_suffix;
-    if (!parsers.qwen3_coder_tools) {
-        return;
-    }
-    output.parallel_tool_calls = tools.parallel && tools.choice != ChatToolChoice::named;
-    read_chat_tools(output, tools.tools);
-    request.options.constraint = tokenizer.tool_constraint(tools, output.prompt_has_open_think);
-    output.complete_truncated_calls = request.options.constraint != nullptr;
 }
 
 json::Value parse_body(std::string_view body, json::Syntax syntax) {
@@ -663,14 +565,16 @@ json::Value parse_body(std::string_view body, json::Syntax syntax) {
 }
 
 CompletionTokenizer::CompletionTokenizer(const std::filesystem::path& checkpoint,
-                                         SamplingDefaults sampling, ChatParsers parsers)
-    : checkpoint_(checkpoint), sampling_mode_(sampling), chat_parsers_(parsers) {}
+                                         SamplingDefaults sampling, ChatParsers parsers,
+                                         const model::ServingProfile& profile)
+    : checkpoint_(checkpoint), sampling_mode_(sampling), chat_parsers_(parsers),
+      profile_(profile) {}
 
 CompletionTokenizer::~CompletionTokenizer() = default;
 
 const ChatTemplate& CompletionTokenizer::chat_template() const {
     std::call_once(chat_loaded_, [this] {
-        chat_template_ = std::make_unique<const ChatTemplate>(checkpoint_);
+        chat_template_ = profile_.load_chat_template(checkpoint_);
     });
     return *chat_template_;
 }
@@ -956,10 +860,11 @@ TextRequest parse_chat_request(const json::OrderedObject& chat,
                                bool media_enabled) {
     auto media = parse_chat_media(chat, media_enabled);
     auto normalized = media ? std::move(media->chat) : chat;
-    normalize_template_options(normalized);
-    const auto options = chat_text_options(normalized, media.has_value());
+    const auto& profile = tokenizer.serving_profile();
+    profile.normalize_chat_options(normalized);
+    const auto options = chat_text_options(normalized, media.has_value(), profile);
     auto request = text_options(options, tokenizer, true);
-    const auto tools = chat_tools(normalized);
+    const auto tools = profile.select_chat_tools(normalized);
     if (request.choices > 1 && (media || !tools.tools.empty())) {
         bad_request("Multiple chat choices support text without tools");
     }
@@ -979,7 +884,7 @@ TextRequest parse_chat_request(const json::OrderedObject& chat,
         }
     }
     finish_options(request, options, tokenizer);
-    set_chat_output(request, normalized, prompt, tokenizer, tools);
+    profile.prepare_chat_output(request, normalized, prompt, tokenizer, tools);
     if (request.options.generated_top_logprobs >= 0 && request.chat_output.enabled()) {
         bad_request("Generated logprobs do not support chat reasoning or tool output parsers");
     }

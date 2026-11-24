@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 typedef struct cudaDeviceProp cudaDeviceProp;
 
 namespace sglang::decoder {
@@ -35,4 +37,10 @@ struct CudaBackendPolicy {
     DraftOperatorCapabilities draft;
 };
 
+struct CudaBackendDevice {
+    CudaBackendPolicy policy;
+    std::string name;
+};
+
+CudaBackendDevice read_cuda_backend_device(int device);
 }

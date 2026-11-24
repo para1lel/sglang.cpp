@@ -3,6 +3,7 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_prefill.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 
 #include <stdexcept>
 #include <string_view>
@@ -31,6 +32,12 @@ CudaBackendPolicy CudaBackendPolicy::for_device(const cudaDeviceProp& properties
     backend.draft.paired_seed_kv = b200;
     backend.draft.wmma_seed_fc = b200;
     return backend;
+}
+
+CudaBackendDevice read_cuda_backend_device(int device) {
+    cudaDeviceProp properties{};
+    check(cudaGetDeviceProperties(&properties, device), "Read decoder CUDA device properties");
+    return {CudaBackendPolicy::for_device(properties), properties.name};
 }
 
 }

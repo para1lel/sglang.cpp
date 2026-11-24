@@ -1,5 +1,5 @@
 #include "sglang/decoder_cuda.cuh"
-#include "sglang/decoder_internal.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/text/quantize_warp.cuh"
 
 #include <cuda_runtime.h>

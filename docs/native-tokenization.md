@@ -10,9 +10,9 @@ prompt for the configured Qwen checkpoint.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L389)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L619)<!-- prefix: "void Connect" --> |
+| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L389)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L615)<!-- prefix: "void Connect" --> |
 | Tokenization worker | Validate inputs and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L900)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_completion.cpp#L20)<!-- prefix: "const Tokeni" --> |
-| Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" --> · [Renderer](../apps/server/chat_template.cpp#L538)<!-- prefix: "std::string " --> |
+| Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" --> · [Renderer](../src/runtime/model/qwen_chat_template.cpp#L554)<!-- prefix: "std::string " --> |
 
 ## Runtime path
 
@@ -168,7 +168,7 @@ the trailing-slash form receives HTTP 307. Other methods on the canonical
 path receive HTTP 405 with `Allow: POST`. Malformed content or invalid fields
 receive HTTP 400 with an `invalid_request_error`. For example, omit `model`
 to receive this body.
-[Method check](../apps/server/prefix_controls.cpp#L676)<!-- prefix: "if ((count |" --> ·
+[Method check](../apps/server/prefix_controls.cpp#L672)<!-- prefix: "if ((count |" --> ·
 [Anthropic error body](../apps/server/http.cpp#L652)<!-- prefix: "void write_a" -->
 
 ```json
@@ -192,7 +192,7 @@ Boolean spellings such as `"false"` and `"yes"`. `add_special_tokens` and
 apply the HTTP limits of 8 KiB for headers and 2 MiB for bodies. The
 tokenizer returns all encoded IDs on encode routes. The JSON parser limits
 nesting to 32 containers. Anthropic counting uses the last value of duplicate
-keys. Encode and decode requests reject duplicate keys. [Vocabulary](../include/sglang/tokenizer/tokenizer.h#L13)<!-- prefix: "inline const" --> · [Context](../include/sglang/tokenizer/tokenizer.h#L16)<!-- prefix: "inline const" --> · [HTTP limits](../apps/server/http.cpp#L30)<!-- prefix: "constexpr st" --> · [JSON depth](../src/json.cpp#L86)<!-- prefix: "if (depth ==" -->
+keys. Encode and decode requests reject duplicate keys. [Vocabulary](../include/sglang/tokenizer/tokenizer.h#L19)<!-- prefix: "inline const" --> · [Context](../include/sglang/tokenizer/tokenizer.h#L19)<!-- prefix: "inline const" --> · [HTTP limits](../apps/server/http.cpp#L30)<!-- prefix: "constexpr st" --> · [JSON depth](../src/json.cpp#L86)<!-- prefix: "if (depth ==" -->
 
 In chat tokenization bodies, decimal and exponent numbers can round to signed
 zero. For example, `1e-999` and `-1e-999` produce `0.0` and `-0.0`, as in

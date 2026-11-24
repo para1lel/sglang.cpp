@@ -1,3 +1,4 @@
+#include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_service.h"
 
 #include <array>
@@ -79,7 +80,8 @@ void check_terminal(Outcome outcome, bool scored) {
     Scenario events;
     scenario = &events;
     const Decoder decoder({}, 0, false);
-    BatchService service(decoder, false, true, 0, width, 0, decoder_batch_max_step_tokens);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, width, 0, decoder_batch_max_step_tokens}), false);
     BatchRequestId id("terminal-race");
     std::array<DecoderResult, width> results;
     std::array<int, width> received{};

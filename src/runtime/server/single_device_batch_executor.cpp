@@ -46,26 +46,25 @@ private:
 
 }
 
-SingleDeviceBatchExecutor::SingleDeviceBatchExecutor(const Decoder& decoder, Options options,
-                                                     Ready ready, Process process)
-    : decoder_(decoder), options_(options), ready_(std::move(ready)),
-      process_(std::move(process)) {}
+SingleDeviceBatchExecutor::SingleDeviceBatchExecutor(const Decoder& decoder, Options options)
+    : BatchExecutor(options), decoder_(decoder) {}
 
-SingleDeviceBatchExecutor::~SingleDeviceBatchExecutor() { stop(); }
+SingleDeviceBatchExecutor::~SingleDeviceBatchExecutor() { join(); }
 
-void SingleDeviceBatchExecutor::start() {
+void SingleDeviceBatchExecutor::start(Ready ready, Process process) {
     std::promise<void> started;
-    auto ready = started.get_future();
-    worker_ = std::thread(&SingleDeviceBatchExecutor::run, this, std::move(started));
+    auto result = started.get_future();
+    worker_ = std::thread(&SingleDeviceBatchExecutor::run, this, std::move(ready),
+                          std::move(process), std::move(started));
     try {
-        ready.get();
+        result.get();
     } catch (...) {
-        stop();
+        join();
         throw;
     }
 }
 
-void SingleDeviceBatchExecutor::stop() {
+void SingleDeviceBatchExecutor::join() noexcept {
     if (worker_.joinable()) {
         worker_.join();
     }
@@ -75,23 +74,20 @@ BatchTopology SingleDeviceBatchExecutor::topology() const noexcept {
     return single_device_batch_topology;
 }
 
-void SingleDeviceBatchExecutor::run(std::promise<void> started) {
+void SingleDeviceBatchExecutor::run(Ready ready, Process process, std::promise<void> started) {
     std::optional<SingleDeviceBatchSession> session;
     try {
+        const auto& config = options();
         session.emplace(decoder_, DecoderBatchOptions{
-            options_.cuda_graphs, options_.max_active, options_.prefix_cache_entries,
-            options_.max_num_batched_tokens, std::numeric_limits<std::size_t>::max()});
-        if (ready_) {
-            ready_(*session);
-        }
+            config.cuda_graphs, config.max_active, config.prefix_cache_entries,
+            config.max_num_batched_tokens, std::numeric_limits<std::size_t>::max()});
+        ready(*session);
     } catch (...) {
         started.set_exception(std::current_exception());
         return;
     }
     started.set_value();
-    if (process_) {
-        process_(*session);
-    }
+    process(*session);
 }
 
 }

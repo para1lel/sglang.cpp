@@ -1,18 +1,18 @@
-#include "sglang/checkpoint.h"
 #include "sglang/decoder.h"
 #include "sglang/decoder_batch.h"
-#include "sglang/decoder_prefill.h"
 #include "sglang/json.h"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
+#include "sglang/runtime/model/qwen_serving_profile.h"
+#include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
+#include "sglang/server/decisions.h"
 #include "sglang/server/http.h"
 #include "sglang/server/native_generate.h"
 #include "sglang/server/ollama_discovery.h"
 #include "sglang/server/prefix_controls.h"
 #include "sglang/server/responses.h"
 #include "sglang/server/score.h"
-#include "sglang/server/decisions.h"
 #include "sglang/server/tokenization.h"
 #include "sglang/server/vision_completion.h"
 
@@ -20,7 +20,9 @@
 #include <chrono>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -30,7 +32,7 @@ constexpr int default_max_active = sglang::decoder_default_max_running_requests 
     single_device_batch_topology.device_count();
 
 struct Arguments {
-    std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
+    std::filesystem::path checkpoint;
     std::string launch_command = "sglang-server";
     SamplingDefaults sampling = SamplingDefaults::model;
     ChatParsers chat_parsers;
@@ -84,8 +86,9 @@ void append_launch_option(std::string& command, std::string_view option,
     }
 }
 
-Arguments parse_arguments(int argc, char** argv) {
+Arguments parse_arguments(int argc, char** argv, const sglang::model::ServingProfile& profile) {
     Arguments arguments;
+    arguments.checkpoint = profile.checkpoint_path;
     for (int index = 1; index < argc; ++index) {
         const std::string_view option = argv[index];
         if (option == "--trace-batches") {
@@ -118,12 +121,12 @@ Arguments parse_arguments(int argc, char** argv) {
         } else if (option == "--sampling-defaults" && value == "openai") {
             arguments.sampling = SamplingDefaults::openai;
         } else if (option == "--reasoning-parser") {
-            if (value != "qwen3") {
+            if (value != profile.reasoning_parser) {
                 throw std::invalid_argument("Expected --reasoning-parser qwen3");
             }
             arguments.chat_parsers.qwen3_reasoning = true;
         } else if (option == "--tool-call-parser") {
-            if (value != "qwen3_coder") {
+            if (value != profile.tool_call_parser) {
                 throw std::invalid_argument("Expected --tool-call-parser qwen3_coder");
             }
             arguments.chat_parsers.qwen3_coder_tools = true;
@@ -168,36 +171,52 @@ std::string health_json(const Arguments& arguments) {
         ",\"max_num_batched_tokens\":" + std::to_string(arguments.max_num_batched_tokens) + "}";
 }
 
-std::string model_info_json(const Arguments& arguments) {
+void append_parser(std::string& body, bool enabled, std::string_view parser) {
+    if (enabled) sglang::json::append_quoted(body, parser);
+    else body += "null";
+}
+
+std::string model_info_json(const Arguments& arguments,
+                            const sglang::model::ServingProfile& profile) {
     std::string body = R"({"model_path":)";
     const auto checkpoint = arguments.checkpoint.string();
     sglang::json::append_quoted(body, checkpoint);
     body += R"(,"served_model_name":)";
-    sglang::json::append_quoted(body, sglang::model_name);
+    sglang::json::append_quoted(body, profile.served_name);
     body += R"(,"tokenizer_path":)";
     sglang::json::append_quoted(body, checkpoint);
     body += R"(,"is_generation":true,"preferred_sampling_params":null,)";
-    body += R"("weight_version":"default","load_format":"safetensors","reasoning_parser":)";
-    body += arguments.chat_parsers.qwen3_reasoning ? R"("qwen3")" : "null";
+    body += R"("weight_version":)";
+    sglang::json::append_quoted(body, profile.weight_version);
+    body += R"(,"load_format":)";
+    sglang::json::append_quoted(body, profile.load_format);
+    body += R"(,"reasoning_parser":)";
+    append_parser(body, arguments.chat_parsers.qwen3_reasoning, profile.reasoning_parser);
     body += R"(,"tool_call_parser":)";
-    body += arguments.chat_parsers.qwen3_coder_tools ? R"("qwen3_coder")" : "null";
-    body += R"(,"disaggregation_mode":"null","has_image_understanding":true,)";
-    body += R"("has_audio_understanding":false,"model_type":)";
-    sglang::json::append_quoted(body, sglang::checkpoint_model_type);
+    append_parser(body, arguments.chat_parsers.qwen3_coder_tools, profile.tool_call_parser);
+    body += R"(,"disaggregation_mode":"null","has_image_understanding":)";
+    body += profile.has_image_understanding ? "true" : "false";
+    body += R"(,"has_audio_understanding":)";
+    body += profile.has_audio_understanding ? "true" : "false";
+    body += R"(,"model_type":)";
+    sglang::json::append_quoted(body, profile.model_type);
     body += R"(,"architectures":[)";
-    sglang::json::append_quoted(body, sglang::checkpoint_architecture);
+    sglang::json::append_quoted(body, profile.architecture);
     body += "]}";
     return body;
 }
 std::string draft_seed_fc_json(const Arguments& arguments, bool wmma);
 std::string server_info_json(const Arguments& arguments, double startup_seconds,
-                             const BatchService& service, const sglang::Decoder& decoder) {
+                             const BatchService& service, const sglang::Decoder& decoder,
+                             const sglang::model::ServingProfile& profile) {
     const auto state = service.runtime_state();
     const auto topology = service.topology();
     const auto& backend = decoder.backend_policy();
     const bool draft_enabled = arguments.mtp_steps != 0;
-    std::string body = R"({"frontend":"cpp","version":null,"supports_inline_system":false)";
-    body += R"(,"enable_multimodal":true)";
+    std::string body = R"({"frontend":"cpp","version":null,"supports_inline_system":)";
+    body += profile.supports_inline_system ? "true" : "false";
+    body += R"(,"enable_multimodal":)";
+    body += profile.has_image_understanding ? "true" : "false";
     body += R"(,"host":"127.0.0.1","dp_size":)" + std::to_string(topology.dp_size);
     body += R"(,"tp_size":)" + std::to_string(topology.tp_size);
     body += R"(,"pp_size":)" + std::to_string(topology.pp_size);
@@ -208,7 +227,7 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += R"(,"tokenizer_path":)";
     sglang::json::append_quoted(body, arguments.checkpoint.string());
     body += R"(,"served_model_name":)";
-    sglang::json::append_quoted(body, sglang::model_name);
+    sglang::json::append_quoted(body, profile.served_name);
     body += R"(,"port":)" + std::to_string(arguments.port);
     body += R"(,"device":)" + std::to_string(arguments.device);
     body += R"(,"max_running_requests":)" + std::to_string(arguments.max_active);
@@ -234,9 +253,9 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     body += R"(,"sampling_defaults":)";
     body += arguments.sampling == SamplingDefaults::model ? "\"model\"" : "\"openai\"";
     body += R"(,"reasoning_parser":)";
-    body += arguments.chat_parsers.qwen3_reasoning ? "\"qwen3\"" : "null";
+    append_parser(body, arguments.chat_parsers.qwen3_reasoning, profile.reasoning_parser);
     body += R"(,"tool_call_parser":)";
-    body += arguments.chat_parsers.qwen3_coder_tools ? "\"qwen3_coder\"" : "null";
+    append_parser(body, arguments.chat_parsers.qwen3_coder_tools, profile.tool_call_parser);
     body += R"(,"eager":)";
     body += arguments.eager ? "true" : "false";
     body += R"(,"trace_batches":)";
@@ -286,7 +305,8 @@ int main(int argc, char** argv) {
     }
     try {
         const auto started = std::chrono::steady_clock::now();
-        const auto arguments = parse_arguments(argc, argv);
+        const auto& profile = sglang::model::qwen_serving_profile;
+        const auto arguments = parse_arguments(argc, argv, profile);
         install_shutdown_handlers();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
                                       arguments.mtp_steps != 0);
@@ -294,18 +314,18 @@ int main(int argc, char** argv) {
             return 0;
         }
         const CompletionTokenizer tokenizer(arguments.checkpoint, arguments.sampling,
-                                            arguments.chat_parsers);
+                                            arguments.chat_parsers, profile);
         const auto health = health_json(arguments);
         VisionCompletion vision(arguments.checkpoint, arguments.device);
-        BatchService service(decoder, arguments.trace_batches,
-                             arguments.enable_batch_cuda_graphs(),
-                             arguments.mtp_steps,
-                             arguments.max_active,
-                             arguments.prefix_cache_entries, arguments.max_num_batched_tokens);
+        const BatchExecutor::Options batch_options{
+            arguments.enable_batch_cuda_graphs(), arguments.max_active,
+            arguments.prefix_cache_entries, arguments.max_num_batched_tokens};
+        auto executor = std::make_unique<SingleDeviceBatchExecutor>(decoder, batch_options);
+        BatchService service(std::move(executor), arguments.trace_batches, arguments.mtp_steps);
         if (stopping()) {
             return 0;
         }
-        const auto model_info = model_info_json(arguments);
+        const auto model_info = model_info_json(arguments, profile);
         const auto listener = listen(arguments);
         const std::chrono::duration<double> startup = std::chrono::steady_clock::now() - started;
         NativeGenerate native_generate(service, tokenizer);
@@ -326,7 +346,7 @@ int main(int argc, char** argv) {
             }, model_info, [&](const Socket& connection, std::string_view body) {
                 native_generate.abort(connection, body);
             }, [&] {
-                return server_info_json(arguments, startup.count(), service, decoder);
+                return server_info_json(arguments, startup.count(), service, decoder, profile);
             }, [&](const Socket& connection, int slot, std::string_view body) {
                 serve_score(connection, service, slot, tokenizer.get(), body);
             }, &discovery, [&](const Socket& connection, int slot, std::string_view body) {

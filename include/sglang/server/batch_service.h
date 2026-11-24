@@ -1,7 +1,7 @@
 #pragma once
 
 #include "sglang/decoder_media.h"
-#include "sglang/runtime/server/batch_session.h"
+#include "sglang/runtime/server/batch_executor.h"
 
 #include <atomic>
 #include <chrono>
@@ -127,10 +127,7 @@ struct BatchCallbacks {
 
 class BatchService {
 public:
-    BatchService(const Decoder& decoder, bool trace, bool cuda_graphs = false, int mtp_steps = 0,
-                 int max_active = decoder_default_max_running_requests,
-                 int prefix_cache_entries = 0,
-                 int max_num_batched_tokens = decoder_default_max_num_batched_tokens);
+    BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps = 0);
     ~BatchService();
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
                            const DecoderCallbacks& callbacks,

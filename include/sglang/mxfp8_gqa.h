@@ -1,5 +1,7 @@
 #pragma once
 
+#include "sglang/runtime/cache/mxfp8_cache_geometry.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -7,17 +9,6 @@
 #include <cuda_runtime_api.h>
 
 namespace sglang {
-
-inline constexpr int mxfp8_query_heads = 24;
-inline constexpr int mxfp8_kv_heads = 4;
-inline constexpr int mxfp8_head_dim = 256;
-inline constexpr int mxfp8_group_size = 32;
-inline constexpr int mxfp8_groups = mxfp8_head_dim / mxfp8_group_size;
-inline constexpr int mxfp8_page_size = 128;
-inline constexpr std::size_t mxfp8_payload_bytes_per_page =
-    mxfp8_page_size * mxfp8_kv_heads * mxfp8_head_dim;
-inline constexpr std::size_t mxfp8_scale_bytes_per_page =
-    mxfp8_page_size * mxfp8_kv_heads * mxfp8_groups;
 
 /// Separate byte arrays for K and V. Payload is [page, token, head, channel].
 /// Scales are [page, head, token % 32, token / 32, channel / 32].

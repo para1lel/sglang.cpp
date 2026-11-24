@@ -6,9 +6,10 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_sampling.h"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/runtime/cache/kv_residency_policy.h"
 #include "sglang/runtime/execution/decoder_execution_policy.h"
-#include "sglang/runtime/model/qwen_text_model.h"
+#include "sglang/runtime/model/qwen_request.h"
 
 #include <algorithm>
 #include <array>
@@ -44,8 +45,6 @@ struct VerificationGraph;
 struct MtpRound;
 struct GeneratedLogprobReadback;
 
-using Bf16 = __nv_bfloat16;
-
 class SerialOutput {
 public:
     SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result);
@@ -61,53 +60,8 @@ private:
     std::vector<DecoderLogit> ranking_;
 };
 
-inline constexpr int hidden_size = qwen_text_model.hidden_size;
-inline constexpr int intermediate_size = qwen_text_model.intermediate_size;
-inline constexpr int vocab_size = qwen_text_model.vocab_size;
-inline constexpr int layer_count = qwen_text_model.layer_count;
-inline constexpr int full_attention_layers = qwen_text_model.full_attention_layers();
-inline constexpr int gdn_layers = qwen_text_model.gdn_layers();
 inline constexpr int prefill_chunk_rows = text_embedding_max_rows;
-inline constexpr std::size_t gdn_history_elements = text_gdn_qkv_width * text_gdn_history_taps;
-inline constexpr std::size_t gdn_state_elements =
-    text_gdn_value_heads * text_gdn_head_dim * text_gdn_head_dim;
 
-static_assert(mxfp8_query_heads == qwen_text_model.query_heads);
-static_assert(mxfp8_kv_heads == qwen_text_model.kv_heads);
-static_assert(mxfp8_head_dim == qwen_text_model.attention_head_dim);
-static_assert(text_gdn_qk_heads == qwen_text_model.gdn_key_heads);
-static_assert(text_gdn_value_heads == qwen_text_model.gdn_value_heads);
-static_assert(text_gdn_head_dim == qwen_text_model.gdn_head_dim);
-static_assert(text_gdn_history_taps + 1 == qwen_text_model.gdn_conv_kernel_dim);
-static_assert(text_attention_max_tokens == qwen_text_model.max_position_embeddings);
-static_assert(text_fp8_group_size == qwen_text_model.fp8_weight_block_size);
-
-void check(cudaError_t status, const char* operation);
-struct CudaError : std::runtime_error {
-    CudaError(cudaError_t status, const char* operation);
-    static bool terminal(cudaError_t error) {
-        switch (error) {
-            case cudaErrorCudartUnloading:
-            case cudaErrorECCUncorrectable:
-            case cudaErrorIllegalAddress:
-            case cudaErrorLaunchTimeout:
-            case cudaErrorContextIsDestroyed:
-            case cudaErrorAssert:
-            case cudaErrorHardwareStackError:
-            case cudaErrorIllegalInstruction:
-            case cudaErrorMisalignedAddress:
-            case cudaErrorInvalidAddressSpace:
-            case cudaErrorInvalidPc:
-            case cudaErrorLaunchFailure:
-                return true;
-            default:
-                return false;
-        }
-    }
-    cudaError_t status;
-};
-
-std::size_t available_device_bytes();
 void validate_batch_options(const DecoderBatchOptions& options);
 int reserved_verification_rows(int output, int mtp_steps);
 std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft);
@@ -116,293 +70,9 @@ int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t
 void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
                       bool allow_mtp = false);
 
-class DeviceScope {
-public:
-    explicit DeviceScope(int device);
-    ~DeviceScope();
-    DeviceScope(const DeviceScope&) = delete;
-    DeviceScope& operator=(const DeviceScope&) = delete;
-
-    void restore();
-
-private:
-    int previous_ = 0;
-    bool changed_ = false;
-};
-
-struct TransferBuffers {
-    std::unique_ptr<Checkpoint> checkpoint;
-    std::vector<std::int32_t> logical_pages;
-    int winner = -1;
-    std::vector<Bf16> logits;
-    std::vector<float> adjusted_logits;
-    std::vector<DecoderLogit> repetition_logits;
-    std::shared_ptr<void> verification_results;
-    std::shared_ptr<void> mtp_constraint_inputs;
-};
-
-struct DeviceBlock {
-    void* pointer;
-    std::size_t bytes;
-};
-
-class RequestBlockCache;
-class RetiredBlockReclaimer;
-
-class Allocations {
-public:
-    explicit Allocations(int device, RequestBlockCache* cache = nullptr);
-    ~Allocations();
-    Allocations(const Allocations&) = delete;
-    Allocations& operator=(const Allocations&) = delete;
-
-    template <typename Element>
-    Element* allocate(std::size_t count) {
-        if (count > std::numeric_limits<std::size_t>::max() / sizeof(Element)) {
-            throw std::overflow_error("CUDA allocation size overflow");
-        }
-        return static_cast<Element*>(allocate_bytes(count * sizeof(Element)));
-    }
-
-    std::size_t bytes() const;
-    TransferBuffers& transfers();
-    GeneratedLogprobReadback* prepare_generated_logprobs();
-    ExactGqaWorkspace prepare_singleton_scores();
-    cudaStream_t stream() const;
-    cudaGraphExec_t graph() const;
-    void capture_graph(const std::function<void()>& enqueue);
-    void discard_graph();
-    void free_block(void* pointer, std::size_t bytes);
-    bool replay_batch_graph(int width, const std::function<void()>& prepare,
-                            const std::function<void()>& capture,
-                            const std::function<bool()>& bind, bool target_verify = false);
-    bool verification_graph_failed() const;
-    void reclaim_deferred();
-    void open_stream(std::shared_ptr<const void> owners = nullptr);
-    void retain_stream_owner(std::shared_ptr<const void> owner);
-    void close_stream();
-    void close();
-    void recycle_after_completion();
-
-private:
-    friend class RequestBlockCache;
-    struct State;
-    void* allocate_bytes(std::size_t bytes);
-    bool replay_graph_slot(int index, int width, const std::function<void()>& prepare,
-                           const std::function<void()>& capture,
-                           const std::function<bool()>& bind, bool target_verify);
-
-    std::unique_ptr<State> state_;
-};
-
-class RequestBlockCache {
-public:
-    explicit RequestBlockCache(int device, bool resident = false);
-    ~RequestBlockCache();
-    RequestBlockCache(const RequestBlockCache&) = delete;
-    RequestBlockCache& operator=(const RequestBlockCache&) = delete;
-
-    std::size_t bytes() const;
-    std::size_t unavailable_bytes() const;
-    std::size_t pending_bytes() const;
-    void clear();
-
-private:
-    friend class Allocations;
-    bool accepts(int device) const;
-    void* take(std::size_t bytes);
-    bool retain(DeviceBlock block);
-    void quarantine(Allocations::State& state);
-
-    void release_blocks(Allocations::State& state, bool keep);
-    std::size_t resident_bytes_limit() const;
-    std::size_t resident_blocks_limit() const;
-    static constexpr std::size_t max_bytes = 768 * 1024 * 1024;
-    static constexpr std::size_t max_blocks = 384;
-    std::unique_ptr<Allocations::State> state_;
-    std::unique_ptr<RetiredBlockReclaimer> reclaimer_;
-    std::size_t quarantined_bytes_ = 0;
-    bool reusable_ = true;
-};
-
 std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request,
                                    int prompt, std::size_t capacity, std::size_t charged,
                                    std::size_t extra_bytes);
-
-struct Fp8Weight {
-    const std::uint8_t* values;
-    const Bf16* scales;
-    int rows;
-    int columns;
-};
-
-struct Bf16Weight {
-    const Bf16* values;
-    int rows;
-    int columns;
-};
-
-struct GdnLayer {
-    Fp8Weight qkv;
-    Fp8Weight z;
-    Bf16Weight b;
-    Bf16Weight a;
-    TextGdnWeights recurrent;
-    Fp8Weight output;
-};
-
-struct GqaLayer {
-    Fp8Weight q_gate;
-    Fp8Weight key;
-    Fp8Weight value;
-    const Bf16* query_norm;
-    const Bf16* key_norm;
-    Fp8Weight output;
-};
-
-struct Layer {
-    const Bf16* input_norm;
-    const Bf16* attention_norm;
-    Fp8Weight mlp_gate;
-    Fp8Weight mlp_up;
-    Fp8Weight mlp_down;
-    GdnLayer gdn;
-    GqaLayer gqa;
-};
-
-struct LayerResidual {
-    const Bf16* branch;
-    Bf16* residual;
-};
-
-template <typename Normalize, typename Gqa, typename Gdn, typename Mlp>
-void execute_layers_with_attention_input(const std::array<Layer, layer_count>& layers,
-                                         Normalize normalize, Gqa gqa, Gdn gdn, Mlp mlp) {
-    for (int index = 0; index < layer_count; ++index) {
-        const auto& layer = layers[index];
-        const auto input = [first = index == 0](const auto& work) {
-            return first ? LayerResidual{work.residual, nullptr}
-                         : LayerResidual{work.hidden, work.residual};
-        };
-        const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
-        if (full_attention) {
-            gqa(layer, bank, input);
-        } else {
-            gdn(layer, bank, input);
-        }
-        normalize(layer.attention_norm, "Normalize post-attention residual", [](const auto& work) {
-            return LayerResidual{work.projected_attention, work.residual};
-        });
-        mlp(layer);
-    }
-}
-
-template <typename Normalize, typename Gqa, typename Gdn, typename Mlp>
-void execute_layers(const std::array<Layer, layer_count>& layers, Normalize normalize,
-                    Gqa gqa, Gdn gdn, Mlp mlp) {
-    execute_layers_with_attention_input(
-        layers, normalize,
-        [&](const Layer& layer, int bank, const auto& input) {
-            normalize(layer.input_norm, "Normalize layer input", input);
-            gqa(layer.gqa, bank);
-        },
-        [&](const Layer& layer, int bank, const auto& input) {
-            normalize(layer.input_norm, "Normalize layer input", input);
-            gdn(layer.gdn, bank);
-        }, mlp);
-}
-
-struct Workspace {
-    Workspace() = default;
-    explicit Workspace(Allocations& allocations, Bf16* verification_attention = nullptr,
-                       TextLogitCandidate* verification_winner = nullptr);
-
-    ExactGqaWorkspace gqa_scores(int capacity) const;
-
-    Bf16* hidden = nullptr;
-    Bf16* normalized = nullptr;
-    Bf16* residual = nullptr;
-    Bf16* projected_attention = nullptr;
-    Bf16* attention = nullptr;
-    Bf16* mlp_gate = nullptr;
-    Bf16* mlp_up = nullptr;
-    Bf16* q_gate = nullptr;
-    Bf16* keys = nullptr;
-    Bf16* values = nullptr;
-    Bf16* rope_queries = nullptr;
-    Bf16* rope_keys = nullptr;
-    Bf16* gdn_qkv = nullptr;
-    Bf16* gdn_z = nullptr;
-    Bf16* gdn_b = nullptr;
-    Bf16* gdn_a = nullptr;
-    Bf16* gdn_scratch = nullptr;
-    Bf16* logits = nullptr;
-    TextFp8Activation activation{};
-    TextLogitCandidate* argmax_scratch = nullptr;
-    TextLogitCandidate* argmax = nullptr;
-};
-
-using GdnBank = std::array<TextGdnState, gdn_layers>;
-void allocate_gdn(Allocations& memory, GdnBank& states);
-
-struct ConstraintWorkspace {
-    int* ids = nullptr;
-    Bf16* logits = nullptr;
-    std::uint32_t* mask = nullptr;
-    Bf16* masked_logits = nullptr;
-
-    void allocate(Allocations& memory, bool wide);
-    std::size_t bytes() const;
-};
-
-struct ConstraintCandidates {
-    int count;
-    const int* ids;
-    const std::uint32_t* mask;
-};
-
-struct LogitSelection {
-    const Bf16* logits;
-    TextLogitCandidate* argmax_scratch;
-    TextLogitCandidate* argmax;
-};
-
-void select_constrained(LogitSelection work, const ConstraintWorkspace& scratch,
-                        ConstraintCandidates allowed, const SamplingParameters* sampling,
-                        int position, void* sampling_workspace, cudaStream_t stream);
-
-void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
-                        const ConstraintCursor& cursor, const SamplingParameters* sampling,
-                        int position, void* sampling_workspace, cudaStream_t stream);
-
-struct Request {
-    explicit Request(int device, bool reusable = false, RequestBlockCache* cache = nullptr);
-    Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false,
-            int kv_limit = 0);
-
-    void initialize(int capacity, cudaStream_t stream, int kv_limit = 0);
-    void grow_kv(int positions, int written, cudaStream_t stream);
-    void reset(cudaStream_t stream);
-    void reset();
-    void prepare_minimum_stops(const DecoderOptions& options, cudaStream_t stream);
-    void prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream);
-    ExactGqaWorkspace batch_graph_scores();
-
-    std::vector<std::uint32_t> minimum_stop_upload;
-    Allocations memory;
-    Workspace work;
-    int* decode_position;
-    Mxfp8PageTable pages;
-    std::array<Mxfp8KvCache, full_attention_layers> caches;
-    int kv_limit = 0;
-    GdnBank states;
-    std::optional<ExactGqaWorkspace> long_graph_scores;
-    std::byte* sampling_workspace = nullptr;
-    ConstraintWorkspace constraint_workspace;
-    const DecoderLogitBias* logit_bias = nullptr;
-    const std::uint32_t* minimum_stop_mask = nullptr;
-    OutputPenalties output_penalties;
-};
 
 std::size_t logit_adjustment_bytes(const DecoderOptions& options);
 
@@ -477,11 +147,6 @@ struct ForwardLane {
     int rotary_position = -1;
     ExactGqaWorkspace singleton_scores{};
 };
-
-inline constexpr int singleton_score_min_visible = 32768;
-inline constexpr int singleton_score_max_visible = 36864;
-static_assert(singleton_score_max_visible % mxfp8_page_size == 0 &&
-              singleton_score_max_visible <= text_attention_max_tokens);
 
 struct BatchDecodeBinding {
     TextLogitCandidate input;
@@ -623,23 +288,5 @@ struct DecodeRunOptions {
 DecodeRun run_decode_lanes(const DecoderModel& model, Allocations& execution,
                            DecodeGraphs& graphs, ForwardLane* lanes, int count,
                            DecodeRunOptions options);
-
-class RetiredBlockReclaimer {
-public:
-    static constexpr std::size_t byte_limit = 3ULL * 1024 * 1024 * 1024;
-    static constexpr std::size_t block_limit = 1024;
-
-    static std::unique_ptr<RetiredBlockReclaimer> create(int device);
-    ~RetiredBlockReclaimer();
-    bool submit(DeviceBlock block);
-    std::size_t unavailable_bytes() const;
-    std::size_t pending_bytes() const;
-    void drain();
-
-private:
-    struct State;
-    RetiredBlockReclaimer(int device, cudaStream_t stream);
-    std::unique_ptr<State> state_;
-};
 
 }

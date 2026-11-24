@@ -32,7 +32,7 @@ Staged ordered attention accepts 2–143 rows and 8,192–32,768 visible tokens,
 
 Staged attention uses four-row tiles at 32 rows or more. It uses two-row tiles for even counts from 12 through 30. Other eligible counts use single-row tiles. Each remainder row from a four-row tile uses protected attention. [Tile size](../src/mxfp8_gqa_prefill.cu#L980)<!-- prefix: "const int ti" --> · [Remainder](../src/mxfp8_gqa_prefill.cu#L261)<!-- prefix: "if (tile \u003e= " -->
 
-Through 32,768 visible tokens, direct ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more. Smaller grants, leftovers, and longer prefixes use protected single-row attention. Both routes recover nonfinite visible scores by head and nonfinite quotients by channel using FP64. [Fallback](../src/mxfp8_gqa_prefill.cu#L989)<!-- prefix: "if (rows \u003c m" --> · [Recovery](../include/sglang/mxfp8_gqa.h#L65)<!-- prefix: "/// Shared a" -->
+Through 32,768 visible tokens, direct ordered fallback uses two-row tiles at 64–127 rows and four-row tiles at 128 or more. Smaller grants, leftovers, and longer prefixes use protected single-row attention. Both routes recover nonfinite visible scores by head and nonfinite quotients by channel using FP64. [Fallback](../src/mxfp8_gqa_prefill.cu#L989)<!-- prefix: "if (rows \u003c m" --> · [Recovery](../include/sglang/mxfp8_gqa.h#L56)<!-- prefix: "/// Shared a" -->
 
 Zero rows succeed. For other inputs, negative positions, negative rows, and position-plus-row overflow return `cudaErrorInvalidValue`.
 

@@ -22,6 +22,14 @@ for name in batch_service completions flush_cache http loads text_request text_c
     fi
 done
 
+for name in qwen_chat_template qwen_chat_output qwen_tool_constraints qwen_serving_profile \
+    qwen_tool_output; do
+    file="$source/src/runtime/model/$name.cpp"
+    if [[ -f "$file" ]]; then
+        sources+=("$file")
+    fi
+done
+
 if [[ -f "$source/apps/server/chat_media.cpp" ]]; then
     sources+=("$source/src/media_preprocess.cpp" "$source/src/media_resize.cpp"
              "$source/src/media/multimodal_prompt.cpp")
@@ -36,7 +44,7 @@ else
 fi
 
 cuda_headers=()
-if [[ -n ${CONDA_PREFIX:-} ]]; then
+if [[ -n ${CONDA_PREFIX:-} && ! -f "$source/include/sglang/runtime/model/serving_profile.h" ]]; then
     cuda_headers=(-isystem "$CONDA_PREFIX/targets/x86_64-linux/include")
 fi
 

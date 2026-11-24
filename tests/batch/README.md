@@ -151,8 +151,10 @@ mkdir -p "$(dirname "$score_check")"
 "$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++" -std=c++17 -O2 -Wall -Wextra -Werror \
     -ffunction-sections -fdata-sections -Wl,--gc-sections \
     -Iinclude -I"$toolkit/include" \
-    tests/batch/check_score_slab.cpp src/decoder_resources.cpp \
-    src/checkpoint.cpp src/json.cpp src/utf8.cpp -o "$score_check"
+    tests/batch/check_score_slab.cpp src/runtime/backend/cuda_resources.cpp \
+    src/runtime/backend/retired_request_blocks.cpp \
+    src/checkpoint.cpp src/runtime/model/qwen_checkpoint.cpp \
+    src/json.cpp src/utf8.cpp -o "$score_check"
 CUDA_VISIBLE_DEVICES= "$score_check"
 ```
 

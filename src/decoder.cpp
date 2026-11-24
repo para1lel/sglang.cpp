@@ -142,9 +142,8 @@ void Request::prepare_minimum_stops(const DecoderOptions& options, cudaStream_t 
     if (options.stop_token_id) mark(*options.stop_token_id);
     for (const int token : options.additional_stop_token_ids) mark(token);
     auto* buffer = memory.allocate<std::uint32_t>(constraint_mask_words);
-    check(cudaMemcpyAsync(buffer, minimum_stop_upload.data(),
-                          constraint_mask_words * sizeof(*buffer), cudaMemcpyHostToDevice,
-                          stream), "Upload minimum-output stop mask");
+    copy_cuda_async(buffer, minimum_stop_upload.data(), constraint_mask_words * sizeof(*buffer),
+                    cudaMemcpyHostToDevice, stream, "Upload minimum-output stop mask");
     minimum_stop_mask = buffer;
 }
 
@@ -153,24 +152,24 @@ void Request::prepare_logit_adjustments(const DecoderOptions& options, cudaStrea
     if (options.logit_bias && !options.logit_bias->empty()) {
         const auto& entries = *options.logit_bias;
         auto* buffer = memory.allocate<DecoderLogitBias>(entries.size());
-        check(cudaMemcpyAsync(buffer, entries.data(), entries.size() * sizeof(*buffer),
-                              cudaMemcpyHostToDevice, stream), "Upload logit bias");
+        copy_cuda_async(buffer, entries.data(), entries.size() * sizeof(*buffer),
+                        cudaMemcpyHostToDevice, stream, "Upload logit bias");
         logit_bias = buffer;
     }
     if (options.frequency_penalty != 0) {
         output_penalties.frequency = static_cast<float>(options.frequency_penalty);
         auto*& totals = output_penalties.frequency_totals;
         totals = memory.allocate<float>(vocab_size);
-        check(cudaMemsetAsync(totals, 0, vocab_size * sizeof(*totals), stream),
-              "Initialize frequency penalties");
+        zero_cuda_async(totals, vocab_size * sizeof(*totals), stream,
+                        "Initialize frequency penalties");
     }
     if (needs_seen_history(options)) {
         output_penalties.presence = static_cast<float>(options.presence_penalty);
         output_penalties.repetition = options.repetition_penalty;
         auto*& seen = output_penalties.seen;
         seen = memory.allocate<std::uint8_t>(vocab_size);
-        check(cudaMemsetAsync(seen, 0, vocab_size * sizeof(*seen), stream),
-              "Initialize seen-token history");
+        zero_cuda_async(seen, vocab_size * sizeof(*seen), stream,
+                        "Initialize seen-token history");
     }
 }
 
@@ -218,9 +217,8 @@ void AdjustedLogitsWorkspace::select(const Request& request, Workspace& work,
         if (allowed->ids().empty()) {
             throw std::logic_error("Output constraint has no remaining continuation");
         }
-        check(cudaMemcpyAsync(mask, allowed->mask().data(), constraint_mask_words *
-                              sizeof(*mask), cudaMemcpyHostToDevice, stream),
-              "Upload allowed token mask");
+        copy_cuda_async(mask, allowed->mask().data(), constraint_mask_words * sizeof(*mask),
+                        cudaMemcpyHostToDevice, stream, "Upload allowed token mask");
     }
     if (options.repetition_penalty != 1) {
         select_repetition(request, work, options, allowed ? mask : nullptr, previous_token,
@@ -275,21 +273,21 @@ void RequestProgress::select(Request& request, Workspace& work, const DecoderOpt
     }
     auto& transfers = request.memory.transfers();
     auto& winner = transfers.winner;
-    check(cudaMemcpyAsync(&winner, &work.argmax->token_id, sizeof(winner),
-                          cudaMemcpyDeviceToHost, stream), "Read selected token");
+    copy_cuda_async(&winner, &work.argmax->token_id, sizeof(winner), cudaMemcpyDeviceToHost,
+                    stream, "Read selected token");
     auto& logits = transfers.logits;
     if (!logits.empty()) {
-        check(cudaMemcpyAsync(logits.data(), work.logits, logits.size() * sizeof(Bf16),
-                              cudaMemcpyDeviceToHost, stream), "Read decoder step logits");
+        copy_cuda_async(logits.data(), work.logits, logits.size() * sizeof(Bf16),
+                        cudaMemcpyDeviceToHost, stream, "Read decoder step logits");
     }
     auto& adjusted_logits = transfers.adjusted_logits;
     if (adjusted && !adjusted_logits.empty()) {
         if (options.constraint) {
             adjusted->apply(request, work, options, nullptr, generated, -1, stream);
         }
-        check(cudaMemcpyAsync(adjusted_logits.data(), adjusted->logits,
-                              adjusted_logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
-                              stream), "Read adjusted decoder step logits");
+        copy_cuda_async(adjusted_logits.data(), adjusted->logits,
+                        adjusted_logits.size() * sizeof(float), cudaMemcpyDeviceToHost, stream,
+                        "Read adjusted decoder step logits");
     }
     auto& repetition_logits = transfers.repetition_logits;
     if (adjusted && !repetition_logits.empty()) {
@@ -618,7 +616,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                 progress.select(request, request.work, options, request.constraint_workspace,
                                 sampling ? &*sampling : nullptr, request.sampling_workspace,
                                 stream, adjusted ? &adjusted_workspace : nullptr);
-                check(cudaStreamSynchronize(stream), "Complete decoder step");
+                synchronize_cuda(stream, "Complete decoder step");
                 const int token = read_token(request, sampling || progress.generated <
                                              options.min_new_tokens,
                                              options.constraint != nullptr);
@@ -636,8 +634,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
             request.memory.close();
         } else {
             if (result.output_token_ids.empty()) {
-                check(cudaStreamSynchronize(request.memory.stream()),
-                      "Complete interrupted prefill");
+                synchronize_cuda(request.memory.stream(), "Complete interrupted prefill");
             }
             if (media) {
                 request.memory.free_block(const_cast<MropePosition*>(prefill.positions),

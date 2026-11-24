@@ -1,3 +1,4 @@
+#include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/text_stop.h"
 
@@ -111,7 +112,8 @@ void check_scalar_output(Outcome outcome) {
         observed.fault.released = true;
     }
     const Decoder decoder({}, 0, true);
-    BatchService service(decoder, false, true, 4, 4);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, 4, 0, decoder_default_max_num_batched_tokens}), false, 4);
     BatchRequestId id("scalar-mailbox");
     std::vector<int> delivered;
     DecoderOptions options;
@@ -179,7 +181,8 @@ void check_backpressure(DecoderOptions options, bool opt_in) {
     Fixture observed;
     fixture = &observed;
     const Decoder decoder({}, 0, true);
-    BatchService service(decoder, false, true, 4, 4);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, 4, 0, decoder_default_max_num_batched_tokens}), false, 4);
     options.max_new_tokens = 16;
     DecoderCallbacks callbacks;
     callbacks.buffer_decode_output = opt_in;
@@ -215,7 +218,8 @@ void check_step_delivery(bool stop, bool permanent) {
     observed.fault.released = true;
     const Decoder decoder({}, 0, true);
     const Tokenizer tokenizer("unused");
-    BatchService service(decoder, false, true, 4, 4);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, 4, 0, decoder_default_max_num_batched_tokens}), false, 4);
     BatchPrompt prompt;
     prompt.prompt = {100};
     prompt.options.max_new_tokens = 16;
@@ -279,7 +283,8 @@ void check_abort_fault(bool permanent) {
     observed.fail_at = 3;
     observed.permanent = permanent;
     const Decoder decoder({}, 0, true);
-    BatchService service(decoder, false, true, 4, 4);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, 4, 0, decoder_default_max_num_batched_tokens}), false, 4);
     BatchRequestId id("abort-during-fault");
     DecoderOptions options;
     options.max_new_tokens = 16;
@@ -349,7 +354,8 @@ void check_completion_claim(bool abort_first, bool fail_after_claim) {
     observed.claim_terminal = true;
     observed.fail_after_claim = fail_after_claim;
     const Decoder decoder({}, 0, true);
-    BatchService service(decoder, false, true, 4, 4, 1);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, 4, 1, decoder_default_max_num_batched_tokens}), false, 4);
     BatchRequestId id("terminal-claim");
     auto request = std::async(std::launch::async, [&] {
         return service.generate(0, {100}, {}, {}, {}, 0, &id);
@@ -425,7 +431,8 @@ void check_prefill_roster(Arrival arrival, bool trace = false) {
     observed.prefill_advance.released = arrival == Arrival::none;
     if (arrival == Arrival::none) observed.consumers[0].released = true;
     const Decoder decoder({}, 0, true);
-    BatchService service(decoder, trace, true, 4, 4, 1);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, 4, 1, decoder_default_max_num_batched_tokens}), trace, 4);
     BatchRequestId late_id("late-prefill");
     auto first = start_prefill_request(observed, service, arrival, 0, nullptr);
     std::future<DecoderResult> late;
@@ -509,7 +516,8 @@ void check_prefill_publication_order() {
     observed.prefill_admit.released = true;
     observed.consumers[1].released = true;
     const Decoder decoder({}, 0, true);
-    BatchService service(decoder, false, true, 4, 8);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, 8, 0, decoder_default_max_num_batched_tokens}), false, 4);
     auto blocker = start_prefill_request(observed, service, Arrival::none, 1, nullptr);
     {
         std::unique_lock lock(observed.mutex);
@@ -544,7 +552,8 @@ void check_prefill_replacement_order(bool fail_admission) {
     observed.consumers[1].released = true;
     observed.consumers[2].released = true;
     const Decoder decoder({}, 0, true);
-    BatchService service(decoder, false, true, 4, 4);
+    BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+        BatchExecutor::Options{true, 4, 0, decoder_default_max_num_batched_tokens}), false, 4);
     auto blocker = start_prefill_request(observed, service, Arrival::none, 1, nullptr);
     {
         std::unique_lock lock(observed.mutex);

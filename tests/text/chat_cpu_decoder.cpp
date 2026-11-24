@@ -4,7 +4,6 @@
 #endif
 #include "sglang/server/vision_completion.h"
 #include "sglang/tokenizer/tokenizer.h"
-#include "sglang/vision.h"
 
 #include <algorithm>
 #include <array>
@@ -460,9 +459,7 @@ void DecoderBatch::reset_prefix_cache() {}
 void DecoderBatch::release_retired_allocations() {}
 #endif
 
-struct VisionEncoder::Impl {};
-
-VisionEncoder::~VisionEncoder() = default;
+class VisionEncoder {};
 
 namespace server {
 

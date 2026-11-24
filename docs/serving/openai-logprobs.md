@@ -4,13 +4,13 @@ Both `/v1/completions` and `/v1/chat/completions` can return the score of each c
 
 ## Request requirements
 
-Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Eligible greedy requests use the [configured MTP depth](../mtp.md#runtime-path), including decoded-media chat. Active sampling, output constraints, and active chat reasoning or tool output parsers return HTTP 400 before SSE. [Score options](../../apps/server/text_request.cpp#L325)<!-- prefix: "int openai_l" --> · [Batch validation](../../src/decoder_batch.cpp#L416)<!-- prefix: "if ((options" -->
+Set `temperature: 0` for greedy decoding. `top_k: 1` also stays greedy at positive temperature. Eligible greedy requests use the [configured MTP depth](../mtp.md#runtime-path), including decoded-media chat. Active sampling, output constraints, and active chat reasoning or tool output parsers return HTTP 400 before SSE. [Score options](../../apps/server/text_request.cpp#L324)<!-- prefix: "int openai_l" --> · [Batch validation](../../src/decoder_batch.cpp#L416)<!-- prefix: "if ((options" -->
 
 Generated logprobs use the scores after [output penalties](../output-penalties.md) and logit bias.
 
 ## Logit bias
 
-In OpenAI completions and native `/generate`, `logit_bias` maps decimal token ID strings in `[0, 248320)` to finite offsets in `[-1e30, 1e30]`. When different spellings identify the same token, the last entry supplies its offset. Omission, null, an empty object, and zero offsets leave scores unchanged. Active offsets apply to FP32 scores before greedy or sampled selection and respect output constraints. Active bias uses target-only decoding for that request, including on an MTP server. Generated logprobs use the adjusted scores and follow the request requirements above. [Bias parser](../../apps/server/text_request.cpp#L140)<!-- prefix: "void set_log" -->
+In OpenAI completions and native `/generate`, `logit_bias` maps decimal token ID strings in `[0, 248320)` to finite offsets in `[-1e30, 1e30]`. When different spellings identify the same token, the last entry supplies its offset. Omission, null, an empty object, and zero offsets leave scores unchanged. Active offsets apply to FP32 scores before greedy or sampled selection and respect output constraints. Active bias uses target-only decoding for that request, including on an MTP server. Generated logprobs use the adjusted scores and follow the request requirements above. [Bias parser](../../apps/server/text_request.cpp#L139)<!-- prefix: "void set_log" -->
 
 ## Text completions
 
@@ -28,7 +28,7 @@ The choice's `logprobs.content` contains one object per committed token. Each ob
 
 ## Streaming and stops
 
-SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L580)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L677)<!-- prefix: "bool consume" -->
+SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L581)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L679)<!-- prefix: "bool consume" -->
 
 ## Verification
 

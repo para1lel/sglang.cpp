@@ -1,4 +1,7 @@
 #include "sglang/decoder_constraint.h"
+#ifdef SGLANG_TOOL_PROBE_SERVING_PROFILE
+#include "sglang/runtime/model/qwen_serving_profile.h"
+#endif
 #include "sglang/server/http.h"
 #include "sglang/server/text_completion.h"
 
@@ -108,8 +111,13 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: tool_probe CHECKPOINT\n";
         return 64;
     }
+#ifdef SGLANG_TOOL_PROBE_SERVING_PROFILE
+    const server::CompletionTokenizer tokenizer(argv[1], server::SamplingDefaults::model,
+                                                {true, true}, model::qwen_serving_profile);
+#else
     const server::CompletionTokenizer tokenizer(argv[1], server::SamplingDefaults::model,
                                                 {true, true});
+#endif
     for (std::string line; std::getline(std::cin, line);) {
         try {
             probe(tokenizer, line);

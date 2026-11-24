@@ -78,8 +78,8 @@ void VerificationGraphScratch::upload(const VerificationSequence& sequence, cuda
         binding.rotary_positions[row] = binding.positions[row] + sequence.rotary_delta;
         binding.scores[row] = workspace.work[row].gqa_scores(capacity);
     }
-    check(cudaMemcpyAsync(device_binding, host_binding.get(), sizeof(binding),
-                          cudaMemcpyHostToDevice, stream), "Upload K1 verifier graph bindings");
+    copy_cuda_async(device_binding, host_binding.get(), sizeof(binding), cudaMemcpyHostToDevice,
+                    stream, "Upload K1 verifier graph bindings");
 }
 
 MtpConstraintRound::MtpConstraintRound(Request& request, const TokenConstraint& constraint,
@@ -209,7 +209,7 @@ bool MtpRound::propose_all(MtpRound* rounds, int count, const ConstraintWorkspac
         if (!enqueue_proposal_wave(rounds, count, wave, scratch, stream)) {
             break;
         }
-        check(cudaStreamSynchronize(stream), "Complete MTP draft wave");
+        synchronize_cuda(stream, "Complete MTP draft wave");
         bool retried = false;
         for (int index = 0; index < count; ++index) {
             auto& round = rounds[index];
@@ -218,7 +218,7 @@ bool MtpRound::propose_all(MtpRound* rounds, int count, const ConstraintWorkspac
             }
         }
         if (retried) {
-            check(cudaStreamSynchronize(stream), "Complete BF16 MTP draft score retries");
+            synchronize_cuda(stream, "Complete BF16 MTP draft score retries");
         }
         for (int index = 0; index < count; ++index) {
             auto& round = rounds[index];
@@ -269,7 +269,7 @@ void MtpRound::propose_depth(MtpRound* rounds, int count, const DraftDepthScratc
         }
         if (active == 0) break;
         MtpDraftRequest::enqueue_depth(inputs.data(), count, scratch, stream);
-        check(cudaStreamSynchronize(stream), "Complete depth-major MTP draft wave");
+        synchronize_cuda(stream, "Complete depth-major MTP draft wave");
         bool retried = false;
         for (int index = 0; index < count; ++index) {
             if (!inputs[index].request) continue;
@@ -278,7 +278,7 @@ void MtpRound::propose_depth(MtpRound* rounds, int count, const DraftDepthScratc
             retried |= round.draft->retry_invalid_int8(stream);
         }
         if (retried) {
-            check(cudaStreamSynchronize(stream), "Complete BF16 MTP draft score retries");
+            synchronize_cuda(stream, "Complete BF16 MTP draft score retries");
         }
         for (int index = 0; index < count; ++index) {
             if (!inputs[index].request) continue;
@@ -343,8 +343,8 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
     }
     if (continuing) {
         const auto* hidden = target->row(consumed - 1).work->normalized;
-        check(cudaMemcpyAsync(request->work.normalized, hidden, hidden_size * sizeof(Bf16),
-                              cudaMemcpyDeviceToDevice, stream), "Carry committed MTP hidden row");
+        copy_cuda_async(request->work.normalized, hidden, hidden_size * sizeof(Bf16),
+                        cudaMemcpyDeviceToDevice, stream, "Carry committed MTP hidden row");
     }
     target->commit(consumed);
     return true;
@@ -411,8 +411,8 @@ const Workspace* TargetVerification::checkpoint_row(int index) {
     if (active_workspace_ == &*eager_workspace_) return &work;
     // Later packets can replay into the same graph buffers before publication.
     for (const auto field : {&Workspace::hidden, &Workspace::residual}) {
-        check(cudaMemcpyAsync(request_.work.*field, work.*field, hidden_size * sizeof(Bf16),
-                              cudaMemcpyDeviceToDevice, stream_), "Retain checkpoint row");
+        copy_cuda_async(request_.work.*field, work.*field, hidden_size * sizeof(Bf16),
+                        cudaMemcpyDeviceToDevice, stream_, "Retain checkpoint row");
     }
     return &request_.work;
 }
@@ -506,7 +506,7 @@ void TargetVerification::read_all(TargetVerification* const* verifiers, int coun
     for (int index = 0; index < count; ++index) {
         verifiers[index]->enqueue_results();
     }
-    check(cudaStreamSynchronize(stream), "Complete target verification round");
+    synchronize_cuda(stream, "Complete target verification round");
     for (int index = 0; index < count; ++index) {
         verifiers[index]->ready_ = true;
     }
@@ -514,14 +514,13 @@ void TargetVerification::read_all(TargetVerification* const* verifiers, int coun
 
 void TargetVerification::enqueue_results() {
     const auto& scratch = workspace();
-    check(cudaMemcpyAsync(host_winners_, scratch.winners,
-                          pending_rows_ * sizeof(TextLogitCandidate), cudaMemcpyDeviceToHost,
-                          stream_), "Read target verification winners");
+    copy_cuda_async(host_winners_, scratch.winners, pending_rows_ * sizeof(TextLogitCandidate),
+                    cudaMemcpyDeviceToHost, stream_, "Read target verification winners");
     if (host_logits_) {
         for (int index = 0; index < pending_rows_; ++index) {
-            check(cudaMemcpyAsync(host_logits_ + index * vocab_size, scratch.work[index].logits,
-                                  vocab_size * sizeof(Bf16), cudaMemcpyDeviceToHost, stream_),
-                  "Read target verification logits");
+            copy_cuda_async(host_logits_ + index * vocab_size, scratch.work[index].logits,
+                            vocab_size * sizeof(Bf16), cudaMemcpyDeviceToHost, stream_,
+                            "Read target verification logits");
         }
     }
 }

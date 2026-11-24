@@ -2,8 +2,8 @@
 #include "sglang/server/responses.h"
 
 #include "sglang/json.h"
+#include "sglang/runtime/model/qwen_parser.h"
 #include "sglang/server/batch_service.h"
-#include "sglang/server/chat_output.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/flush_cache.h"
 #include "sglang/server/http.h"
@@ -129,17 +129,13 @@ void separate_reasoning(const Socket& connection, std::string_view body) {
                 "this server does not serve that model");
             return;
         }
-        const auto name = lowercase_ascii(parser);
-        constexpr std::array<std::string_view, 6> qwen3_parsers{
-            "qwen3", "qwen3-thinking", "dots", "interns1", "minimax", "nanbeige"};
-        if (std::find(qwen3_parsers.begin(), qwen3_parsers.end(), name) == qwen3_parsers.end()) {
+        const auto text = *json::get_string(*object, "text");
+        const auto result = model::separate_qwen_reasoning(text, parser);
+        if (!result) {
             write_internal_server_error(connection);
             return;
         }
-        const auto text = *json::get_string(*object, "text");
-        const bool forced = name == "qwen3-thinking" || name == "minimax";
-        write_separated_reasoning(connection, ChatOutputParser::separate_qwen3(text, forced),
-                                  return_blocks);
+        write_separated_reasoning(connection, *result, return_blocks);
     } catch (const json::ParseError& error) {
         write_tokenization_error(connection, "400 Bad Request", "Bad Request",
                                  "JSON decode error: " + std::string(error.what()));

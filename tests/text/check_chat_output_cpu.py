@@ -11,7 +11,8 @@ import struct
 import time
 
 from run_chat_layer1 import save, server
-from test_chat_output import BOTH, COMMON, REASONING, TOOLS, expect, native_body, pair
+from test_chat_output import BOTH, COMMON, REASONING, TOOLS, expect, fold_json, fold_sse
+from test_chat_output import native_body, pair
 from test_native_chat import CHAT, CHECKPOINT, HEADERS, MODEL, RAW, event, json_response, one_choice
 from test_native_chat import tokenizer_pieces
 
@@ -87,7 +88,7 @@ def check_validation(port, out, body):
         "choice-bad": body | {"tool_choice": "any"},
         "parallel-type": body | {"parallel_tool_calls": "false"},
         "logprobs": body | {"logprobs": True},
-        "top-logprobs": body | {"top_logprobs": 1},
+        "top-logprobs": body | {"top_logprobs": 21},
         "stream-reasoning": body | {"stream_reasoning": "true"},
         "separate-reasoning": body | {"separate_reasoning": None},
     }
@@ -95,9 +96,22 @@ def check_validation(port, out, body):
     for name, request in invalid.items():
         for stream in (False, True):
             returned = json_response(port, CHAT, request | {"stream": stream}, status=400)
-            assert returned["error"]["message"], returned
+            message = returned["error"]["message"]
+            assert message, returned
+            if name == "top-logprobs":
+                assert message == "Expected integer top_logprobs in [0, 20]", returned
             errors[f"{name}-{stream}"] = returned
     save(out / "validation.json", errors)
+
+    request = body | {"top_logprobs": 1}
+    response = json_response(port, CHAT, request)
+    frames, folded = fold_sse(port, request, include_usage=True)
+    assert fold_json(response, request.get("return_token_ids", False)) == folded
+    assert "logprobs" not in one_choice(response), response
+    for frame in frames[:-1]:
+        assert all("logprobs" not in choice for choice in frame["choices"]), frame
+    save(out / "top-logprobs-unscored.json",
+         {"request": request, "response": response, "sse": frames})
 
 
 def recoveries():

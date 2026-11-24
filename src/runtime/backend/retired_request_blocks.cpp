@@ -1,9 +1,10 @@
-#include "sglang/decoder_internal.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace sglang::decoder {
 
@@ -148,43 +149,6 @@ void RetiredBlockReclaimer::drain() {
     state_->changed.wait(lock, [&] { return state_->pending_blocks == 0; });
     if (CudaError::terminal(state_->failure))
         check(state_->failure, "Drain retired decoder allocations");
-}
-
-std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request,
-                                   int prompt, std::size_t capacity, std::size_t charged,
-                                   std::size_t extra_bytes) {
-    const auto headroom = [&] {
-        return capacity - std::min(capacity, charged + retired.unavailable_bytes());
-    };
-    const auto after_reserve = [](std::size_t free) {
-        return free - std::min(free, decoder_shared_reserve);
-    };
-    auto free = available_device_bytes();
-    try {
-        request.max_new_tokens = limit_resident_output(
-            prompt, request, capacity, std::min(headroom(), after_reserve(free + retired.bytes())),
-            extra_bytes);
-    } catch (const DecoderCapacityError& error) {
-        if (!error.retryable || !retired.pending_bytes()) throw;
-        retired.clear();
-        free = available_device_bytes();
-        request.max_new_tokens = limit_resident_output(
-            prompt, request, capacity, std::min(headroom(), after_reserve(free)), extra_bytes);
-    }
-    request.min_new_tokens = std::min(request.min_new_tokens, request.max_new_tokens);
-    request.incremental_kv = false;
-    const auto reserved = extra_bytes + request_resident_bytes(
-        RequestProgress::capacity(prompt, request),
-        reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
-        request.mtp_steps != 0);
-    if (reserved > after_reserve(free) || retired.bytes() > headroom() - reserved) {
-        retired.clear();
-        if (reserved > headroom() || reserved > after_reserve(available_device_bytes())) {
-            throw DecoderCapacityError("Insufficient free resident decoder memory. Retry later.",
-                                       true);
-        }
-    }
-    return reserved;
 }
 
 }

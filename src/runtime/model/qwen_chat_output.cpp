@@ -1,4 +1,5 @@
-#include "sglang/server/chat_output.h"
+#include "sglang/runtime/model/qwen_parser.h"
+#include "sglang/runtime/model/qwen_serving_profile.h"
 
 #include <algorithm>
 #include <array>
@@ -750,31 +751,49 @@ ChatOutputParser::ChatOutputParser(const ChatOutputOptions& options)
 
 ChatOutputParser::~ChatOutputParser() = default;
 
-SeparatedReasoning ChatOutputParser::separate_qwen3(std::string_view text, bool force_reasoning) {
-    if (!force_reasoning && text.find(think_open) == text.npos) {
-        return {{}, std::string(text)};
+}
+
+namespace sglang::model {
+
+std::optional<server::SeparatedReasoning> separate_qwen_reasoning(std::string_view text,
+                                                                std::string_view parser_name) {
+    std::string name(parser_name);
+    for (auto& character : name) {
+        if (character >= 'A' && character <= 'Z') character += 'a' - 'A';
     }
-    while (starts_with(text, think_open)) {
-        text.remove_prefix(think_open.size());
+    constexpr std::array<std::string_view, 6> parsers{
+        qwen_reasoning_parser, "qwen3-thinking", "dots", "interns1", "minimax", "nanbeige"};
+    if (std::find(parsers.begin(), parsers.end(), name) == parsers.end()) return std::nullopt;
+    const bool force_reasoning = name == "qwen3-thinking" || name == "minimax";
+    if (!force_reasoning && text.find(server::think_open) == text.npos) {
+        return server::SeparatedReasoning{{}, std::string(text)};
     }
-    ChatOutputOptions options;
+    while (server::starts_with(text, server::think_open)) {
+        text.remove_prefix(server::think_open.size());
+    }
+    server::ChatOutputOptions options;
     options.separate_reasoning = true;
     options.prompt_has_open_think = true;
-    ChatOutputParser parser(options);
-    SeparatedReasoning result;
-    const auto collect = [&](const ChatOutputEvent& event) {
-        auto& field = event.kind == ChatOutputKind::reasoning ? result.reasoning : result.text;
-        field += event.text;
+    server::ChatOutputParser parser(options);
+    server::SeparatedReasoning result;
+    const auto collect = [&](const server::ChatOutputEvent& event) {
+        auto& output = event.kind == server::ChatOutputKind::reasoning ?
+            result.reasoning : result.text;
+        output += event.text;
         return true;
     };
-    const auto tool_start = text.find(tool_open);
+    const auto tool_start = text.find(server::tool_open);
     parser.push(text.substr(0, tool_start), collect);
-    parser.finish(ChatEnd::stop, collect);
+    parser.finish(server::ChatEnd::stop, collect);
     if (tool_start != text.npos) {
         result.text += text.substr(tool_start);
     }
     return result;
 }
+
+}
+
+namespace sglang::server {
 
 bool ChatOutputParser::emit_text(std::string_view text, const ChatOutputSink& sink) {
     if (text.empty()) {

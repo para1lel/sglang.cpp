@@ -1,4 +1,5 @@
 #include "sglang/decoder_batch.h"
+#include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_service.h"
 
 #include <iostream>
@@ -71,7 +72,10 @@ bool check(const Scenario& scenario) {
     sglang::DecoderResult result;
     try {
         const sglang::Decoder decoder("unused");
-        Service service(decoder, true, false, 4, 4, 0);
+        auto executor = std::make_unique<sglang::server::SingleDeviceBatchExecutor>(decoder,
+            sglang::server::BatchExecutor::Options{
+                false, 4, 0, sglang::decoder_default_max_num_batched_tokens});
+        Service service(std::move(executor), true, 4);
         result = service.generate(3, {7}, options, callbacks);
     } catch (...) {
         std::cerr.rdbuf(original);
@@ -111,7 +115,10 @@ bool check(const Scenario& scenario) {
 
 void check_media_cache_usage() {
     const sglang::Decoder decoder("unused");
-    Service service(decoder, true, false, 4, 4, 0);
+    auto executor = std::make_unique<sglang::server::SingleDeviceBatchExecutor>(decoder,
+        sglang::server::BatchExecutor::Options{
+            false, 4, 0, sglang::decoder_default_max_num_batched_tokens});
+    Service service(std::move(executor), true, 4);
     sglang::DecoderOptions options;
     options.max_new_tokens = 1;
     const std::vector<sglang::DecoderMedia> media(1);

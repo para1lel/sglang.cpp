@@ -1,5 +1,8 @@
 #pragma once
 
+#include "sglang/runtime/model/qwen_text_model.h"
+#include "sglang/runtime/model/qwen_tokenizer.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -10,12 +13,12 @@
 namespace sglang {
 
 using TokenId = std::uint32_t;
-inline constexpr TokenId model_vocab_size = 248320;
-inline constexpr TokenId end_of_text = 248044;
-inline constexpr TokenId end_of_message = 248046;
-inline constexpr std::size_t checkpoint_context = 262144;
-inline constexpr TokenId checkpoint_base_vocab_size = 248044;
-inline constexpr std::string_view model_name = "Qwen3.8-27B-FP8";
+inline constexpr TokenId model_vocab_size = decoder::qwen_text_model.vocab_size;
+inline constexpr TokenId end_of_text = model::qwen_end_of_text;
+inline constexpr TokenId end_of_message = model::qwen_end_of_message;
+inline constexpr std::size_t checkpoint_context = decoder::QwenTextModel::max_position_embeddings;
+inline constexpr TokenId checkpoint_base_vocab_size = model::qwen_tokenizer_base_vocab;
+inline constexpr std::string_view model_name = model::qwen_served_name;
 
 class Tokenizer {
 public:

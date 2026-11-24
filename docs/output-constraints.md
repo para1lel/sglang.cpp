@@ -7,10 +7,10 @@ Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finit
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP request | Validate the constraint fields and compile with the checkpoint tokenizer. | [Request validation](../apps/server/text_request.cpp#L287)<!-- prefix: "void set_con" --> |
+| HTTP request | Validate the constraint fields and compile with the checkpoint tokenizer. | [Request validation](../apps/server/text_request.cpp#L286)<!-- prefix: "void set_con" --> |
 | Regular expression compiler | Build the token transition table and compute the minimum budget. | [Tokenizer compiler](../src/tokenizer/regex_constraint.cpp#L153)<!-- prefix: "std::shared_" --> |
 | Schema compiler | Convert the supported schema to a token constraint. | [Schema compiler](../src/tokenizer/json_schema.cpp#L435)<!-- prefix: "std::shared_" --> |
-| Tool-call constraint | Compile and cache the grammar for the selected functions and request mode. | [Tool grammar cache](../apps/server/chat_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" --> · [Trigger compiler](../src/tokenizer/regex_constraint.cpp#L166)<!-- prefix: "std::shared_" --> |
+| Tool-call constraint | Compile and cache the grammar for the selected functions and request mode. | [Tool grammar cache](../src/runtime/model/qwen_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" --> · [Trigger compiler](../src/tokenizer/regex_constraint.cpp#L166)<!-- prefix: "std::shared_" --> |
 | Decoder | Apply the request cursor to target scores and commit the selected ID. | [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [Cursor update](../include/sglang/decoder_constraint.h#L134)<!-- prefix: "bool commit(" --> |
 
 ## Runtime path
@@ -96,7 +96,7 @@ Send `response_format` with `POST /v1/chat/completions`. For `POST /v1/completio
 }
 ```
 
-`response_format` contains exactly `type` and `json_schema`. The descriptor requires `schema`. It accepts optional `strict: true`, a nonempty `name` of at most 64 bytes, and `description` of at most 256 bytes. A supplied `strict: false` is invalid. HTTP rejects `json_object`, `text`, and other format types. [Envelope validation](../apps/server/text_request.cpp#L253)<!-- prefix: "const json::" -->
+`response_format` contains exactly `type` and `json_schema`. The descriptor requires `schema`. It accepts optional `strict: true`, a nonempty `name` of at most 64 bytes, and `description` of at most 256 bytes. A supplied `strict: false` is invalid. HTTP rejects `json_object`, `text`, and other format types. [Envelope validation](../apps/server/text_request.cpp#L252)<!-- prefix: "const json::" -->
 
 | Schema | Supported output |
 | --- | --- |
@@ -153,13 +153,13 @@ C++ callers can use `TokenConstraint::compile_regex(tokenizer, pattern)` with th
 
 The [tool choice contract](chat-serving.md#tool-choice) defines which functions are advertised and when the grammar applies. In strict auto, generation can emit prose and enters the grammar at `<tool_call>`. Required and named choices force a call frame after any open reasoning prelude. After a complete frame, parallel mode permits prose or another frame. Serial and named mode allow only model EOS if budget remains. [Trigger states](../src/tokenizer/regex_constraint.cpp#L166)<!-- prefix: "std::shared_" -->
 
-A non-strict function in the grammar constrains the wrapper and function name. With `function.strict: true`, `parameters` is a closed object with up to eight properties in declaration order. Omit `additionalProperties` or set it to `false`. Names must be unique XML labels of 1–64 UTF-8 bytes without angle brackets or line breaks. List declared keys in `required`. Omitted or null `parameters` permits an empty argument object. [Function grammar](../apps/server/chat_tool_constraints.cpp#L28)<!-- prefix: "std::string " --> · [Parameter compiler](../src/tokenizer/json_schema.cpp#L380)<!-- prefix: "std::string " -->
+A non-strict function in the grammar constrains the wrapper and function name. With `function.strict: true`, `parameters` is a closed object with up to eight properties in declaration order. Omit `additionalProperties` or set it to `false`. Names must be unique XML labels of 1–64 UTF-8 bytes without angle brackets or line breaks. List declared keys in `required`. Omitted or null `parameters` permits an empty argument object. [Function grammar](../src/runtime/model/qwen_tool_constraints.cpp#L28)<!-- prefix: "std::string " --> · [Parameter compiler](../src/tokenizer/json_schema.cpp#L380)<!-- prefix: "std::string " -->
 
 Use the [JSON Schema subset](#json-schema) for nested objects and arrays, which use compact JSON inside XML parameter values. Direct strings use raw text. Direct string enums reject line breaks and tool delimiters. Direct integers accept inclusive `minimum` and `maximum` within the signed 18-digit range. An integer enum cannot also set bounds. The schema depth, node, and expanded pattern limits apply. [Schema nodes](../src/tokenizer/json_schema.cpp#L351)<!-- prefix: "std::string " -->
 
-The triggered compiler allows up to 4,096 nondeterministic states, 4,096 deterministic subsets before minimization, 1,024 final states, and 8,388,608 token transitions. Unsupported schemas and exceeded compiler limits return HTTP 400. The tokenizer caches up to eight compiled grammars in least-recently-used order. The key includes the generated pattern, choice mode, parallel setting, and open reasoning state. Cache lookup and cold compilation share one mutex. [Automaton limits](../src/tokenizer/regex_automaton.cpp#L353)<!-- prefix: "std::vector<" --> · [Token compiler](../src/tokenizer/regex_constraint.cpp#L203)<!-- prefix: "std::shared_" --> · [Tool grammar cache](../apps/server/chat_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" -->
+The triggered compiler allows up to 4,096 nondeterministic states, 4,096 deterministic subsets before minimization, 1,024 final states, and 8,388,608 token transitions. Unsupported schemas and exceeded compiler limits return HTTP 400. The tokenizer caches up to eight compiled grammars in least-recently-used order. The key includes the generated pattern, choice mode, parallel setting, and open reasoning state. Cache lookup and cold compilation share one mutex. [Automaton limits](../src/tokenizer/regex_automaton.cpp#L353)<!-- prefix: "std::vector<" --> · [Token compiler](../src/tokenizer/regex_constraint.cpp#L203)<!-- prefix: "std::shared_" --> · [Tool grammar cache](../src/runtime/model/qwen_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" -->
 
-The triggered cursor allows a token-budget cut within a tool frame. At a length cut, the parser suppresses pending wrapper markup. It can return a partial call after recognizing the opening function tag. Partial arguments can omit required keys or contain incomplete values. If the last allowed token closes the frame, the finish reason is still `length` in JSON and SSE. [Cursor budget](../include/sglang/decoder_constraint.h#L89)<!-- prefix: "void candida" --> · [Length-cut recovery](../apps/server/chat_output.cpp#L646)<!-- prefix: "bool ToolFra" -->
+The triggered cursor allows a token-budget cut within a tool frame. At a length cut, the parser suppresses pending wrapper markup. It can return a partial call after recognizing the opening function tag. Partial arguments can omit required keys or contain incomplete values. If the last allowed token closes the frame, the finish reason is still `length` in JSON and SSE. [Cursor budget](../include/sglang/decoder_constraint.h#L89)<!-- prefix: "void candida" --> · [Length-cut recovery](../src/runtime/model/qwen_chat_output.cpp#L647)<!-- prefix: "bool ToolFra" -->
 
 ## Verification
 

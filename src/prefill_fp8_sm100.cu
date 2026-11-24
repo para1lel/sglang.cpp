@@ -1,5 +1,5 @@
-#include "sglang/decoder_internal.h"
 #include "sglang/prefill_fp8.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 
 #include <cstddef>
 #include <limits>

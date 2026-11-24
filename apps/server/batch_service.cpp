@@ -1,6 +1,5 @@
 #include "sglang/server/batch_service.h"
 
-#include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/runtime/execution/batch_admission_order.h"
 #include "sglang/server/batch_trace.h"
 #include "sglang/server/indexed_admission.h"
@@ -84,10 +83,9 @@ constexpr int mailbox_min_lanes = 16;
 constexpr int wide_decode_min_ready = 25;
 }
 struct BatchService::State {
-    State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps, int max_active,
-          int prefix_cache_entries, int max_num_batched_tokens);
+    State(std::unique_ptr<BatchExecutor> owner, bool trace, int mtp_steps);
     ~State();
-
+    void start();
     void process(BatchSession& batch);
     std::optional<std::uint64_t> begin_iteration(BatchSession& batch);
     std::optional<Work> wait_for_jobs(BatchSession& batch);
@@ -140,20 +138,22 @@ struct BatchService::State {
     bool closing = false;
     std::exception_ptr failure;
     std::atomic_bool failed{false};
-    std::unique_ptr<SingleDeviceBatchExecutor> executor;
+    std::unique_ptr<BatchExecutor> executor;
 };
 
-BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
-                           int max_active, int prefix_cache_entries, int max_num_batched_tokens)
-    : trace(trace), cuda_graphs(cuda_graphs), mtp_steps(mtp_steps), max_active(max_active),
-      prefix_cache_entries(prefix_cache_entries), max_num_batched_tokens(max_num_batched_tokens) {
+BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int mtp_steps)
+    : trace(trace), cuda_graphs(owner->options().cuda_graphs), mtp_steps(mtp_steps),
+      max_active(owner->options().max_active),
+      prefix_cache_entries(owner->options().prefix_cache_entries),
+      max_num_batched_tokens(owner->options().max_num_batched_tokens), executor(std::move(owner)) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch service capacity");
     }
     counters.cache_capacity = prefix_cache_entries;
-    executor = std::make_unique<SingleDeviceBatchExecutor>(decoder,
-        SingleDeviceBatchExecutor::Options{cuda_graphs, max_active, prefix_cache_entries,
-                                           max_num_batched_tokens},
+}
+
+void BatchService::State::start() {
+    executor->start(
         [this](BatchSession& batch) { counters.cache = batch.prefix_cache_stats(); },
         [this](BatchSession& batch) {
             try {
@@ -162,7 +162,6 @@ BatchService::State::State(const Decoder& decoder, bool trace, bool cuda_graphs,
                 fail_jobs(std::current_exception(), true);
             }
         });
-    executor->start();
 }
 
 BatchService::State::~State() {
@@ -171,7 +170,7 @@ BatchService::State::~State() {
         closing = true;
     }
     changed.notify_all();
-    executor->stop();
+    executor->join();
 }
 
 void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
@@ -764,10 +763,11 @@ bool BatchService::State::consume_batch(std::unique_lock<std::mutex>& lock, int 
     return true;
 }
 
-BatchService::BatchService(const Decoder& decoder, bool trace, bool cuda_graphs, int mtp_steps,
-                           int max_active, int prefix_cache_entries, int max_num_batched_tokens)
-    : state_(std::make_unique<State>(decoder, trace, cuda_graphs, mtp_steps, max_active,
-                                     prefix_cache_entries, max_num_batched_tokens)) {}
+BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps) {
+    if (!executor) throw std::invalid_argument("Missing decoder batch executor");
+    state_ = std::make_unique<State>(std::move(executor), trace, mtp_steps);
+    state_->start();
+}
 
 BatchService::~BatchService() = default;
 

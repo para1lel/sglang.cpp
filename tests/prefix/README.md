@@ -9,11 +9,13 @@ and explicit barriers for final responses and reset acknowledgement. It needs no
 ```bash
 out="$PWD/build/prefix-readers"
 mkdir -p "$out"
-toolkit="$CONDA_PREFIX/targets/x86_64-linux"
 "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
-    -Iinclude -I"$toolkit/include" tests/prefix/reader_queue.cpp \
-    apps/server/{prefix_controls,chat_output,flush_cache,http,loads,completions}.cpp \
-    src/{json,utf8}.cpp \
+    -Iinclude tests/prefix/reader_queue.cpp \
+    apps/server/{prefix_controls,flush_cache,http,loads,completions,ollama_discovery}.cpp \
+    apps/server/{parse_function_call,native_sessions,responses,native_generate,ollama_generate}.cpp \
+    apps/server/{text_request,text_completion,tokenization_validation,tool_literal,tool_union}.cpp \
+    src/runtime/model/{qwen_chat_output,qwen_tool_output,qwen_chat_template}.cpp \
+    src/tokenizer/*.cpp src/{json,utf8}.cpp \
     -Wl,--gc-sections \
     -Wl,--wrap=accept4 -o "$out/reader-queue"
 for mode in --cache-off --cache-on --reader-failure --worker-failure --flush; do

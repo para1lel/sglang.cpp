@@ -1,3 +1,4 @@
+#include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/tokenizer/tokenizer.h"
 
@@ -284,7 +285,10 @@ int main() {
     bool passed;
     {
         const Decoder decoder({}, 0, false);
-        sglang::server::BatchService service(decoder, false, true, 0, width);
+        using namespace sglang::server;
+        auto executor = std::make_unique<SingleDeviceBatchExecutor>(decoder,
+            BatchExecutor::Options{true, width, 0, sglang::decoder_default_max_num_batched_tokens});
+        BatchService service(std::move(executor), false);
         require(service.ready(), "Batch worker did not start");
         fixture.await([] { return fixture.blocking_waits > 0; });
         require(service.reset_prefix_cache(), "Idle reset before streaming failed");

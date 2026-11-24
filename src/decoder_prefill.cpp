@@ -295,10 +295,10 @@ void gather_embeddings(const Bf16* embedding, const int* tokens, int rows,
 void stage_prefill_row(Request& request, const TileBuffers& work, int row, cudaStream_t stream) {
     const int offset = row * hidden_size;
     const auto bytes = hidden_size * sizeof(Bf16);
-    check(cudaMemcpyAsync(request.work.hidden, work.hidden + offset, bytes,
-                          cudaMemcpyDeviceToDevice, stream), "Stage final prefill hidden row");
-    check(cudaMemcpyAsync(request.work.residual, work.residual + offset, bytes,
-                          cudaMemcpyDeviceToDevice, stream), "Stage final prefill residual row");
+    copy_cuda_async(request.work.hidden, work.hidden + offset, bytes,
+                    cudaMemcpyDeviceToDevice, stream, "Stage final prefill hidden row");
+    copy_cuda_async(request.work.residual, work.residual + offset, bytes,
+                    cudaMemcpyDeviceToDevice, stream, "Stage final prefill residual row");
 }
 
 void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant,
@@ -844,7 +844,7 @@ void PromptLogprobCapture::enqueue(const DecoderModel& model, Workspace& work, i
 
 void PromptLogprobCapture::collect(int rows, cudaStream_t stream) const {
     if (!rows) return;
-    check(cudaStreamSynchronize(stream), "Collect prompt token scores");
+    synchronize_cuda(stream, "Collect prompt token scores");
     for (int index = 0; index < rows; ++index) {
         const auto& row = readback[index];
         output->push_back(

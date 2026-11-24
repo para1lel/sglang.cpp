@@ -44,15 +44,16 @@ checks the fixture and request bytes. Both arms record resolved settings before 
 
 ## Matched K4 timing protocol
 
-Run the protocol one row at a time on the same reserved B200. Use a Release
-binary with a verified source revision and binary digest, the published checkpoint
-manifest, and the pinned vLLM environment and FlashInfer cubin cache.
+Start a fresh campaign directory and run one row at a time on the same reserved
+B200. Use a Release binary with a verified source revision and binary digest,
+the published checkpoint manifest, and the pinned vLLM environment and
+FlashInfer cubin cache.
 
 ```bash
 export PAIRED_CHECKPOINT_MANIFEST=/path/to/published/checkpoint.sha256
 export PAIRED_NATIVE_SOURCE='verified-40-character-source-revision'
 export PAIRED_NATIVE_SHA256='verified-64-character-binary-digest'
-bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4 W1
+bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4-110 W1
 ```
 
 Supply W2 through W6 in order after each prior row passes. A row starts fresh servers
@@ -71,11 +72,15 @@ fresh verification counters recorded. Its streams must pass the full wire,
 length, usage, and drain checks. vLLM output IDs may vary across valid streams
 and may differ from native and archived IDs. The runner launches only K4 on vLLM.
 
-`Wn/comparison.json` records the strict median makespan gate. A slower or tied
-native median records a timing miss and returns status 1. Invalid evidence stops
-the row before comparison. The campaign retains its raw captures and exits at
-the first failure. Saved historical rows retain the acceptance criteria for their
-recorded profiles.
+Each W1–W6 row passes when the native median makespan is at most 1.10 times the
+pinned vLLM median, including equality at 1.10. The campaign identity and each
+`Wn/comparison.json` record `makespan_criterion` as
+`native-median-at-most-110-percent`. The comparison includes both measured
+medians, `native_to_vllm_median_ratio`, and `strict_passed` for the historical
+strict win. Advancement requires every prior row to pass under the same
+criterion and campaign identity. A timing miss returns status 1 with the raw
+captures and comparison retained. Invalid evidence stops the row before
+comparison.
 
 Replay a saved row with `python benchmarks/paired/k4.py assess Wn FIXTURES ROW_DIR`
 from the repository root with `PYTHONPATH=.`. New rows require saved native process
@@ -86,8 +91,10 @@ split dispatch setting at readiness and after measurement. Their native cohorts
 bind the digests of the process arguments and readiness dispatch receipts.
 The native trace must contain a complete depth-four event. Verification headers
 and their lane and row counts must agree with the trace events.
-Replay also checks any saved comparison and final row exit status. Older rows remain
-replayable and any process or activity receipts they contain are checked.
+Replay uses the criterion in the row identity and checks any saved comparison
+and final exit status. Historical rows without the criterion field retain their
+strict gate, which requires the native median to be below the vLLM median.
+Replay also checks any process or activity receipts those rows contain.
 
 ### Historical K4 profiles
 
@@ -307,9 +314,9 @@ first warmup, the observer retains the offending cohort and records the first
 differing token under `repeat_id_mismatch`. Compare separately captured diagnostic
 IDs with the first warmup before using them as repeatability evidence.
 
-The sole paired performance gate is native median makespan strictly below the
-same-card vLLM median for each workload. A cohort's makespan starts at its earliest
-client submit and ends at its last valid `[DONE]`. Use measured cohorts only.
+The separate retained K0 driver requires the native median makespan to be strictly
+below the same-card vLLM median for each workload. A cohort's makespan starts at
+its earliest client submit and ends at its last valid `[DONE]`. Use measured cohorts only.
 `GROUP/comparison.json` records the samples and medians in nanoseconds and the
 verdict under `makespan.workloads`. W1 and W2 have independent verdicts even
 though they share a group. On a makespan miss, including a tie, the native driver

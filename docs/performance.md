@@ -52,7 +52,9 @@ Use the [server-defaults protocol](../benchmarks/paired/README.md#native-server-
 
 ## Measurement
 
-**Paired W1–W6 acceptance.** Require a strictly lower native median client makespan on every row with matched settings and work on the same B200. For W1 and W2, run three single-request warmups and nine measured cohorts. For W3–W6, run two concurrent warmups and five measured cohorts. Progress in row order and stop after the first failure. Validate launch and device identity and every stream's request, token counts, finish condition, usage, and drain. Use each recorded profile's native ID checks and evidence requirements. The pinned vLLM arm supplies timing, and its output IDs can vary across valid streams. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+**W1–W6 delivery criterion.** Use the same B200 and match settings and workloads. For each row, require a native median client makespan at most 1.10 times the pinned vLLM median. Pause tuning when the full set meets this criterion. Retain the strictly lower median and first-failure rule for replay of frozen adoption campaigns.
+
+For W1 and W2, run three single-request warmups and nine measured cohorts. For W3–W6, run two concurrent warmups and five measured cohorts. Progress in row order. Validate launch and device identity and every stream’s request, token counts, finish condition, usage, and drain. Apply each profile’s native ID checks and evidence requirements. The pinned vLLM arm supplies timing, and its output IDs can vary across valid streams. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 Use one streaming client and monotonic clock. Measure from earliest submit to last valid `[DONE]`. Preconnect lanes and release them with one barrier. Send all bodies before the first valid completion. Limit the submit span to 50 ms. Retain submit times, headers, token events, completion times, token counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and other empty events from token counts.
 

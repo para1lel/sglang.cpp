@@ -16,7 +16,7 @@ from benchmarks.streaming import check_vllm, client as streaming
 import cold_cache
 import default_evidence as defaults
 from identity import verify_stream_end
-from makespan import cohort_makespan_ns, compare, validate_cohort
+from makespan import cohort_makespan_ns, compare, makespan_criterion, validate_cohort
 from saved_evidence import check_native_dispatch, device, digest, fields, load
 from saved_evidence import native_process, read_native_dispatch, require, saved_worker
 
@@ -162,6 +162,8 @@ def receipt_identity(directory, selected):
 def receipt_version(identity):
     version = identity.get("replay_receipts", 0)
     require(type(version) is int and version in (0, 1, 2), "Unknown K4 replay receipt version")
+    require("makespan_criterion" not in identity or version == 2,
+            "A K4 makespan criterion requires version 2 replay receipts")
     return version
 
 
@@ -331,11 +333,31 @@ def verify_row_status(directory, result, required):
                 "Saved row exit status differs from replay")
 
 
+def check_prior_rows(row, root):
+    identity_bytes = (root / "identity.json").read_bytes()
+    identity = json.loads(identity_bytes)
+    criterion = makespan_criterion(identity)
+    require(criterion is not None, "Prior rows require the current K4 makespan criterion")
+    fingerprint = hashlib.sha256(identity_bytes).hexdigest()
+    for previous in ROWS[:ROWS.index(row)]:
+        directory = root / previous
+        comparison = load(directory / "comparison.json")
+        require((directory / "exit-code.txt").read_text().strip() == "0"
+                and (directory / "identity.json").read_bytes() == identity_bytes
+                and comparison.get("row") == previous
+                and comparison.get("protocol") == identity["protocol"]
+                and comparison.get("campaign_sha256") == fingerprint
+                and makespan_criterion(comparison) == criterion
+                and comparison.get("passed") is True,
+                f"{previous} must pass under this campaign's makespan criterion before {row}")
+
+
 def assess(row, fixtures, directory):
     lanes = fixture(row, fixtures)
     policy = concurrent.reference()["policy"]
     selected = campaign(directory)
     identity = receipt_identity(directory, selected)
+    criterion = makespan_criterion(identity)
     version = receipt_version(identity)
     use_defaults = default_campaign(selected)
     cache_on = cache_on_campaign(selected)
@@ -381,7 +403,10 @@ def assess(row, fixtures, directory):
             if tag.startswith("measured-"):
                 samples[arm].append(duration)
     result = {"protocol": PROTOCOL, "row": row, **compare(
-        {row: samples["native-k4"]}, {row: samples["vllm-k4"]}, eligible=True)}
+        {row: samples["native-k4"]}, {row: samples["vllm-k4"]},
+        eligible=True, criterion=criterion)}
+    if criterion is not None and selected is None:
+        result["campaign_sha256"] = digest(directory / "identity.json")
     if use_defaults:
         result.update(protocol=identity["protocol"], native_profile=defaults.PROFILE,
                       campaign_sha256=selected[1], vllm_role="timing-only")
@@ -590,6 +615,9 @@ def main():
     compare_row.add_argument("row", choices=ROWS)
     compare_row.add_argument("fixtures", type=Path)
     compare_row.add_argument("directory", type=Path)
+    prior = modes.add_parser("check-prior")
+    prior.add_argument("row", choices=ROWS)
+    prior.add_argument("directory", type=Path)
     worker = modes.add_parser("worker")
     worker.add_argument("row", choices=ROWS)
     worker.add_argument("directory", type=Path)
@@ -620,6 +648,8 @@ def main():
                 save(comparison, result)
             print(json.dumps(result, indent=2))
             return int(not result["passed"])
+        elif args.mode == "check-prior":
+            check_prior_rows(args.row, args.directory)
         elif args.mode == "worker":
             check_vllm_worker(args.row, args.directory, args.reservation, args.checkpoint,
                               before_measurement=args.before_measurement)

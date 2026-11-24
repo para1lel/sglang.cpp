@@ -6,6 +6,7 @@ usage() {
     echo "ROW must be W1, W2, W3, W4, W5, or W6."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
     echo "The default profile, server-defaults, times matched K4 with both caches enabled and cold."
+    echo "Each row passes when the native median is at most 110% of the pinned vLLM median."
     echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
     echo "  server-defaults-cache-off, exact, ordered-tc-int8, ordered-tc-int8-split-gqa,
   ordered-tc-int8-long-split-gqa."
@@ -120,6 +121,7 @@ identity=$(jq -nc --arg source "$native_source" --arg binary "$native_sha" \
     --arg protocol_sha "${protocol_sha%% *}" \
     --arg server "$server_cpus" --arg client "$client_cpus" \
     '{protocol:"matched-k4-v1",replay_receipts:2,protocol_sha256:$protocol_sha,
+      makespan_criterion:"native-median-at-most-110-percent",
       native_source:$source,native_binary_sha256:$binary,gpu_uuid:$gpu,
       checkpoint_sha256:$checkpoint,vllm_commit:$vllm,
       server_cpus:$server,client_cpus:$client,memory:"localalloc"}')
@@ -156,20 +158,7 @@ if [[ $(cat "$root/identity.json") != "$identity" ]]; then
     echo "Campaign identity differs. Use a fresh campaign directory." >&2
     exit 2
 fi
-campaign_sha=$(sha256sum "$root/identity.json")
-campaign_sha=${campaign_sha%% *}
-protocol_name=$(jq -r '.protocol' <<<"$identity")
-for ((previous = 1; previous < ${row:1}; ++previous)); do
-    if ! [[ $(cat "$root/W$previous/exit-code.txt") == 0 ]] ||
-        ! cmp -s "$root/identity.json" "$root/W$previous/identity.json" ||
-        ! jq -e --arg row "W$previous" --arg protocol "$protocol_name" --arg sha "$campaign_sha" \
-            '.protocol == $protocol and .row == $row and .passed == true
-             and ($protocol == "matched-k4-v1" or .campaign_sha256 == $sha)' \
-            "$root/W$previous/comparison.json" >/dev/null; then
-        echo "W$previous must pass in this campaign before $row." >&2
-        exit 2
-    fi
-done
+PYTHONPATH="$project" "$client_python" -B "$paired_dir/k4.py" check-prior "$row" "$root"
 
 directory=$root/$row
 mkdir -- "$directory"

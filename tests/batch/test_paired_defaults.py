@@ -4,12 +4,14 @@ import gzip
 import json
 import os
 import shlex
+import sys
 from pathlib import Path
 
 import pytest
 
 from tests.test_paired_identity import GPU, OTHER_GPU, k4, write_command, write_compute, write_json
 from tests.test_paired_identity import write_k4_row, write_receipts, write_saved_worker
+from makespan import K4_MAKESPAN_CRITERION, compare
 
 
 def write_default_vllm(run, checkpoint, *, cache_on=False):
@@ -83,7 +85,7 @@ def write_cold_cache_receipt(raw, arm):
             "ready_ns": submit - 10, "capture_finished_ns": eof + 10}
 
 
-def write_default_row(root, native_ns=70, *, cache_on=False):
+def write_default_row(root, native_ns=70, *, cache_on=False, criterion=None):
     row = root / "W1"
     row.mkdir()
     write_k4_row(row, native_ns, receipt_version=1)
@@ -93,6 +95,7 @@ def write_default_row(root, native_ns=70, *, cache_on=False):
     write_json(row / "identity.json", {
         "protocol": k4.defaults.CACHE_ON_PROTOCOL if cache_on else k4.defaults.PROTOCOL,
         **({"cache_policy": k4.defaults.CACHE_POLICY} if cache_on else {}),
+        **({"makespan_criterion": criterion} if criterion else {}),
         "native_profile": k4.defaults.PROFILE,
         "replay_receipts": 2, "campaign_id": "01234567-89ab-cdef-0123-456789abcdef",
         "checkpoint_path": checkpoint, "port": 17424, "gpu_uuid": GPU,
@@ -133,6 +136,71 @@ def write_default_row(root, native_ns=70, *, cache_on=False):
             with gzip.open(measurement / f"{tag}.json.gz", "wt") as stream:
                 json.dump(raw, stream)
     return row
+
+
+@pytest.mark.parametrize(("native_ns", "passed", "strict"), [
+    (79, True, True), (80, True, False), (88, True, False), (89, False, False),
+])
+def test_k4_current_criterion_and_prior_row_chain(tmp_path, monkeypatch, native_ns, passed, strict):
+    row = write_default_row(tmp_path, native_ns, cache_on=True,
+                            criterion=K4_MAKESPAN_CRITERION)
+    root_identity = row.joinpath("identity.json").read_bytes()
+    tmp_path.joinpath("identity.json").write_bytes(root_identity)
+    monkeypatch.setattr(sys, "argv", ["k4.py", "assess", "W1", str(row), str(row)])
+    assert k4.main() == int(not passed)
+    comparison = row / "comparison.json"
+    result = k4.load(comparison)
+    assert result["protocol"] == k4.defaults.CACHE_ON_PROTOCOL
+    assert result["passed"] is passed
+    assert result["makespan_criterion"] == K4_MAKESPAN_CRITERION
+    workload = result["workloads"]["W1"]
+    assert workload["native"]["median_ns"] == native_ns
+    assert workload["vllm"]["median_ns"] == 80
+    assert workload["native_to_vllm_median_ratio"] == native_ns / 80
+    assert workload["strict_passed"] is strict
+    row.joinpath("exit-code.txt").write_text(f"{int(not passed)}\n")
+    assert k4.assess("W1", row, row) == result
+
+    if passed:
+        k4.check_prior_rows("W2", tmp_path)
+    else:
+        with pytest.raises(ValueError, match="W1 must pass"):
+            k4.check_prior_rows("W2", tmp_path)
+
+    if passed:
+        for changed_field in ("makespan_criterion", "campaign_sha256"):
+            write_json(comparison, {key: value for key, value in result.items()
+                                    if key != changed_field})
+            with pytest.raises(ValueError, match="Saved comparison differs from replay"):
+                k4.assess("W1", row, row)
+            with pytest.raises(ValueError, match="W1 must pass"):
+                k4.check_prior_rows("W2", tmp_path)
+
+
+@pytest.mark.parametrize("criterion", [None, 1.1, "unknown"])
+def test_k4_rejects_unknown_criterion(tmp_path, criterion):
+    write_k4_row(tmp_path)
+    write_json(tmp_path / "identity.json", {"protocol": k4.PROTOCOL, "replay_receipts": 2,
+                                          "makespan_criterion": criterion})
+    with pytest.raises(ValueError, match="Unknown K4 makespan criterion"):
+        k4.assess("W1", tmp_path, tmp_path)
+
+
+@pytest.mark.parametrize(("native", "passed"), [([115, 116], True), ([116, 116], False)])
+def test_k4_accepts_fractional_median_at_boundary(native, passed):
+    result = compare({"W1": native}, {"W1": [104, 106]}, eligible=True,
+                     criterion=K4_MAKESPAN_CRITERION)
+    assert result["passed"] is passed
+
+
+def test_k4_replays_legacy_receipt_with_strict_verdict(tmp_path):
+    write_k4_row(tmp_path, 80, receipt_version=2)
+    native = {"samples_ns": [80] * 9, "median_ns": 80}
+    result = {"protocol": k4.PROTOCOL, "row": "W1", "passed": False,
+              "workloads": {"W1": {"native": native, "vllm": native, "passed": False}}}
+    write_json(tmp_path / "comparison.json", result)
+    (tmp_path / "exit-code.txt").write_text("1\n")
+    assert k4.assess("W1", tmp_path, tmp_path) == result
 
 
 @pytest.mark.parametrize(("native_ns", "passed"), [(70, True), (80, False)])

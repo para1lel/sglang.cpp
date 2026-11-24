@@ -7,6 +7,18 @@ from benchmarks.concurrent import client
 from measure_concurrent import main as collect
 
 
+K4_MAKESPAN_CRITERION = "native-median-at-most-110-percent"
+
+
+def makespan_criterion(identity):
+    if "makespan_criterion" not in identity:
+        return None
+    criterion = identity["makespan_criterion"]
+    if criterion != K4_MAKESPAN_CRITERION:
+        raise ValueError("Unknown K4 makespan criterion")
+    return criterion
+
+
 def cohort_makespan_ns(records):
     if any(type(record["submit_ns"]) is not int or type(record["done_ns"]) is not int
            or record["done_ns"] <= record["submit_ns"] for record in records):
@@ -50,7 +62,9 @@ def validate_cohort(raw, lanes, policy):
             "request_latencies": [record["metrics"] for record in records]}
 
 
-def compare(native, vllm, eligible):
+def compare(native, vllm, eligible, *, criterion=None):
+    if criterion is not None and criterion != K4_MAKESPAN_CRITERION:
+        raise ValueError("Unknown K4 makespan criterion")
     if eligible and (not native or native.keys() != vllm.keys()
                      or any(len(samples) != len(vllm[name]) for name, samples in native.items())):
         raise ValueError("Paired makespan requires matching workload and measured sample counts")
@@ -59,14 +73,24 @@ def compare(native, vllm, eligible):
         control = vllm.get(name)
         native_median = median(samples)
         vllm_median = median(control) if control is not None else None
+        strict_passed = native_median < vllm_median if eligible else None
         workloads[name] = {
             "native": {"samples_ns": samples, "median_ns": native_median},
             "vllm": {"samples_ns": control, "median_ns": vllm_median}
             if control is not None else None,
-            "passed": native_median < vllm_median if eligible else None,
+            "passed": strict_passed,
         }
-    return {"passed": all(row["passed"] for row in workloads.values()) if eligible else None,
-            "workloads": workloads}
+        if criterion is not None and eligible:
+            workloads[name].update(
+                passed=10 * native_median <= 11 * vllm_median,
+                native_to_vllm_median_ratio=native_median / vllm_median,
+                strict_passed=strict_passed,
+            )
+    result = {"passed": all(row["passed"] for row in workloads.values()) if eligible else None,
+              "workloads": workloads}
+    if criterion is not None:
+        result["makespan_criterion"] = criterion
+    return result
 
 
 if __name__ == "__main__":

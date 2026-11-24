@@ -174,4 +174,14 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The 32,768-token v4 protocol has no formal measurements yet. The archived 8,192-token v3 campaign passed W1–W3 and stopped at W4. Earlier 32-request campaigns retain their own workload definitions and verdict rules. [Archived v3 evidence](https://github.com/para1lel/sglang.cpp/blob/7de0fd49bd6e48fb960934498992f650ea00f009/docs/performance.md#matched-k4-evidence) · [Archived workloads](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#named-workloads) · [Earlier evidence](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#matched-k4-evidence)
+The formal 32,768-token v4 campaign `8d2262b9-696f-4232-8440-7bac76735041` started at W4. On one B200, both engines ran matched cold-cache MTP4 with eight lanes of 32,768 prompt tokens and 4,096 output tokens. Each arm ran two warmup cohorts and five measured cohorts. Replay validated 112 cold streams and matched all eight first-cohort output ID sequences across engines.
+
+| Row | Native median (s) | Pinned vLLM median (s) | Native / vLLM | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| W4 | 31.872456108 | 26.633599282 | 1.196701 | Miss |
+
+W4 exceeded the inclusive 1.10 limit by 2.575496898 seconds. W5 stayed held. W1–W3 have no v4 measurements in this campaign.
+
+The run used frozen native Release binary SHA-256 `cd1619d8abe7b909cd615a347af7d0741975391ccae97e21c1cb741845956793`. The campaign identity records the frozen build’s base revision `7de0fd49bd6e48fb960934498992f650ea00f009`. The supplemental `published-release.json` binds that original identity and binary to the public release by verifying 211 compiler inputs. The comparison receipt SHA-256 is `70a9f8e72a7c9a3ba4cf392194d840ccadb9217270e942c45df680836dec15da`. [Native release](https://github.com/para1lel/sglang.cpp/commit/c7d6b65f9fae4604861747fb7816df22e6f5ef25)
+
+The archived 8,192-token v3 campaign passed W1–W3 and stopped at W4. Earlier 32-request campaigns retain their own workload definitions and verdict rules. [Archived v3 evidence](https://github.com/para1lel/sglang.cpp/blob/7de0fd49bd6e48fb960934498992f650ea00f009/docs/performance.md#matched-k4-evidence) · [Archived workloads](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#named-workloads) · [Earlier evidence](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#matched-k4-evidence)

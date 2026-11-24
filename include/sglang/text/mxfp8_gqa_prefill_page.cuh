@@ -130,8 +130,9 @@ __device__ void staged_page_softmax(StagedPageTile& tile, const Attention& reque
     tmem_store_output<true>(row_address, state, request, row, head, active_rows);
 }
 
+template <int Count>
 __global__ __launch_bounds__(256, 1) void tmem_staged_page_attention(
-    const __grid_constant__ StagedRequests<4> requests,
+    const __grid_constant__ StagedRequests<Count> requests,
     const __grid_constant__ StagedPairMaps maps, const int* invalid) {
     extern __shared__ StagedPageTile page_shared[];
     auto& tile = page_shared[0];

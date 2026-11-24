@@ -472,7 +472,8 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_single_attention(
 
 std::optional<cudaError_t> encode_staged_maps(int full_pages, std::uint16_t* keys,
                                            std::uint16_t* values, StagedPairMaps& maps,
-                                           bool single = false, bool page = false) {
+                                           bool single = false, bool page = false,
+                                           bool strict = false) {
     PFN_cuTensorMapEncodeTiled_v12000 encode = nullptr;
     if (const auto status = staged_driver_entry("cuTensorMapEncodeTiled", 12000, encode);
         !status || *status != cudaSuccess) {
@@ -499,6 +500,8 @@ std::optional<cudaError_t> encode_staged_maps(int full_pages, std::uint16_t* key
     switch (result) {
     case CUDA_SUCCESS: return cudaSuccess;
     case CUDA_ERROR_INVALID_VALUE:
+        if (strict) return cudaErrorInvalidValue;
+        return std::nullopt;
     case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
     case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
     case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
@@ -574,6 +577,7 @@ std::optional<cudaError_t> prepare_paired_kernel(const void* kernel,
     return clusters > 0 ? std::optional{cudaSuccess} : std::nullopt;
 }
 
+template <bool Strict = false>
 std::optional<cudaError_t> prepare_staged_single_kernel(const void* kernel,
                                                        const cudaLaunchConfig_t& config) {
     int device = 0;
@@ -583,12 +587,14 @@ std::optional<cudaError_t> prepare_staged_single_kernel(const void* kernel,
     status = cudaGetDeviceProperties(&properties, device);
     if (status != cudaSuccess) return status;
     if (properties.major != 10 || properties.minor != 0) return std::nullopt;
-    const auto prepared = prepare_flash_kernel(kernel, config.dynamicSmemBytes, properties, true);
+    const auto prepared = prepare_flash_kernel(
+        kernel, config.dynamicSmemBytes, properties, !Strict);
     if (!prepared || *prepared != cudaSuccess) return prepared;
     int blocks = 0;
     status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, config.blockDim.x,
                                                           config.dynamicSmemBytes);
     if (status != cudaSuccess) {
+        if constexpr (Strict) return status;
         return flash_setup_error(status, paired_kernel_unavailable(status) ||
             status == cudaErrorInvalidConfiguration || status == cudaErrorInvalidValue);
     }
@@ -627,7 +633,32 @@ std::optional<cudaError_t> launch_paired_tmem_prefill(
 
 namespace {
 
-template <int Count, bool Partial, bool CausalGroup>
+template <int Count>
+std::optional<cudaError_t> prepare_long_page(const StagedRequests<Count>& requests,
+                                            std::uint16_t* keys, std::uint16_t* values,
+                                            int total_pages, StagedPairMaps& maps,
+                                            cudaLaunchConfig_t& config) {
+    for (const auto& request : requests.items) {
+        if (reinterpret_cast<std::uintptr_t>(request.output) % alignof(uint4) != 0) {
+            return std::nullopt;
+        }
+    }
+    const auto kernel = reinterpret_cast<const void*>(tmem_staged_page_attention<Count>);
+    auto local = config;
+    local.blockDim.x = staged_compact_threads;
+    local.dynamicSmemBytes = sizeof(StagedPageTile);
+    const auto prepared = prepare_staged_single_kernel<true>(kernel, local);
+    if (const auto status = consume_prefill_submission(prepared.value_or(cudaSuccess));
+        status != cudaSuccess) return status;
+    if (!prepared) return std::nullopt;
+    const auto encoded = encode_staged_maps(total_pages, keys, values, maps, true, true, true);
+    if (const auto status = consume_prefill_submission(encoded.value_or(cudaSuccess));
+        status != cudaSuccess) return status;
+    if (encoded) config = local;
+    return encoded;
+}
+
+template <int Count, bool Partial, bool CausalGroup, bool LongPage>
 std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& requests,
                                                   std::uint16_t* keys, std::uint16_t* values,
                                                   int* invalid, int full_pages, int total_pages,
@@ -650,7 +681,7 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
     if constexpr (Count == 4 || CausalGroup) {
         if (Partial || position % flash_chunk == 0) {
             const auto local = Partial
-                ? reinterpret_cast<const void*>(tmem_staged_page_attention)
+                ? reinterpret_cast<const void*>(tmem_staged_page_attention<Count>)
                 : reinterpret_cast<const void*>(tmem_staged_single_attention<Count>);
             auto local_config = config;
             local_config.dynamicSmemBytes = sizeof(StagedSingleTile);
@@ -679,6 +710,14 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
             }
         }
     }
+    if constexpr (LongPage) {
+        const auto prepared = prepare_long_page(requests, keys, values, total_pages, maps, config);
+        if (prepared && *prepared != cudaSuccess) return prepared;
+        if (prepared) {
+            kernel = reinterpret_cast<const void*>(tmem_staged_page_attention<Count>);
+            single = true;
+        }
+    }
     if constexpr (Partial || CausalGroup) {
         if (!single) return std::nullopt;
     }
@@ -694,6 +733,16 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
     void* decode_args[] = {&requests, &keys, &values, &invalid};
     const auto decoded = cudaLaunchKernel(pair_predecode<Count, Partial>,
         dim3(full_pages, mxfp8_kv_heads, Count), channels, decode_args, 0, stream);
+    if constexpr (LongPage) {
+        if (single) {
+            if (const auto status = consume_prefill_submission(decoded); status != cudaSuccess) {
+                return status;
+            }
+            void* args[] = {&requests, &maps, &invalid};
+            return consume_prefill_submission(cudaLaunchKernel(kernel, config.gridDim,
+                config.blockDim, args, config.dynamicSmemBytes, stream));
+        }
+    }
     if (decoded != cudaSuccess) {
         return staged_submission(decoded);
     }
@@ -702,7 +751,7 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
                                               config.dynamicSmemBytes, stream));
 }
 
-template <int Count, bool Partial = false, bool CausalGroup = false>
+template <int Count, bool Partial = false, bool CausalGroup = false, bool LongPage = false>
 std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSequence* sequences,
                                                  cudaStream_t stream,
                                                  decoder::PairedPrefillScratch scratch) {
@@ -777,7 +826,7 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
                                     {values, value_bytes, staged_alignment})) {
         return std::nullopt;
     }
-    return submit_staged_requests<Count, Partial, CausalGroup>(requests, keys, values,
+    return submit_staged_requests<Count, Partial, CausalGroup, LongPage>(requests, keys, values,
         reinterpret_cast<int*>(values + elements), full_pages, total_pages, stream);
 }
 
@@ -832,9 +881,9 @@ std::optional<cudaError_t> decoder::try_long_staged_paged_prefill(
         return launch_staged_requests<staged_prefill_batch_size>(sequences, stream, scratch);
     }
     if (count == 2) {
-        return launch_staged_requests<2>(sequences, stream, scratch);
+        return launch_staged_requests<2, false, false, true>(sequences, stream, scratch);
     }
-    return launch_staged_requests<1>(sequences, stream, scratch);
+    return launch_staged_requests<1, false, false, true>(sequences, stream, scratch);
 }
 
 std::optional<cudaError_t> launch_partial_staged_tmem_prefill(

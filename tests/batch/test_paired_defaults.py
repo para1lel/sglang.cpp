@@ -10,11 +10,13 @@ from pathlib import Path
 import pytest
 
 from tests.test_paired_identity import GPU, OTHER_GPU, k4, write_command, write_compute, write_json
-from tests.test_paired_identity import write_k4_row, write_receipts, write_saved_worker
+from tests.test_paired_identity import (
+    synthetic_cohort, write_k4_row, write_receipts, write_saved_worker,
+)
 from makespan import K4_MAKESPAN_CRITERION, compare
 
 
-def write_default_vllm(run, checkpoint, *, cache_on=False):
+def write_default_vllm(run, checkpoint, *, cache_on=False, max_seqs=32):
     write_saved_worker(run, checkpoint, k4.concurrent.reference(), 8192)
     args = shlex.split((run / "server-command.sh").read_text())[6:]
     argv = ["/venv/bin/python", "-B", *args, "--host", "127.0.0.1",
@@ -22,6 +24,8 @@ def write_default_vllm(run, checkpoint, *, cache_on=False):
             "--speculative-config", '{"method":"mtp","num_speculative_tokens":4}']
     snapshot = run / "effective-worker.json"
     data = json.loads(snapshot.read_bytes())
+    argv[argv.index("--max-num-seqs") + 1] = str(max_seqs)
+    data["results"][0]["scheduler"]["max_num_seqs"] = max_seqs
     cache = {"enable_prefix_caching": True, "mamba_cache_mode": "align",
              "block_size": 1600, "mamba_block_size": 1600}
     if cache_on:
@@ -50,13 +54,13 @@ def write_default_vllm(run, checkpoint, *, cache_on=False):
     return argv
 
 
-def write_default_native(run, arm, *, cache_on=False):
+def write_default_native(run, arm, *, cache_on=False, max_seqs=32):
     flags = ["--port", "17424"]
     if arm == "native-k4-trace":
         flags.append("--trace-batches")
     info = json.loads((run / "server-info.json").read_bytes())
     info.update(launch_command=" ".join(["sglang-server", *flags]), dp_size=1, tp_size=1, pp_size=1,
-                prefix_cache_entries=4 if cache_on else 0)
+                prefix_cache_entries=4 if cache_on else 0, max_running_requests=max_seqs)
     write_json(run / "server-info.json", info)
     write_compute(run, GPU, 123)
     return ["/bin/sglang-server", *flags]
@@ -85,7 +89,14 @@ def write_cold_cache_receipt(raw, arm):
             "ready_ns": submit - 10, "capture_finished_ns": eof + 10}
 
 
-def write_default_row(root, native_ns=70, *, cache_on=False, criterion=None):
+def write_default_row(root, native_ns=70, *, cache_on=False, criterion=None, current=False):
+    if current:
+        cache_on = True
+        criterion = K4_MAKESPAN_CRITERION
+    max_seqs = 8 if current else 32
+    protocol_name = k4.defaults.CACHE_ON_PROTOCOL if cache_on else k4.defaults.PROTOCOL
+    if current:
+        protocol_name = k4.workload_suite.PROTOCOL
     row = root / "W1"
     row.mkdir()
     write_k4_row(row, native_ns, receipt_version=1)
@@ -93,7 +104,8 @@ def write_default_row(root, native_ns=70, *, cache_on=False, criterion=None):
     protocol.write_text("captured protocol manifest\n")
     checkpoint = "/model"
     write_json(row / "identity.json", {
-        "protocol": k4.defaults.CACHE_ON_PROTOCOL if cache_on else k4.defaults.PROTOCOL,
+        "protocol": protocol_name,
+        **({"participating_gpus": [GPU], "max_running_requests": max_seqs} if current else {}),
         **({"cache_policy": k4.defaults.CACHE_POLICY} if cache_on else {}),
         **({"makespan_criterion": criterion} if criterion else {}),
         "native_profile": k4.defaults.PROFILE,
@@ -110,8 +122,10 @@ def write_default_row(root, native_ns=70, *, cache_on=False, criterion=None):
         run = row / arm
         environment = dict.fromkeys(k4.defaults.NATIVE_ENVIRONMENT, "/archive")
         environment.update(CUDA_VISIBLE_DEVICES=GPU, CUDA_DEVICE_ORDER="PCI_BUS_ID")
-        argv = (write_default_vllm(run, checkpoint, cache_on=cache_on) if arm == "vllm-k4"
-                else write_default_native(run, arm, cache_on=cache_on))
+        if arm == "vllm-k4":
+            argv = write_default_vllm(run, checkpoint, cache_on=cache_on, max_seqs=max_seqs)
+        else:
+            argv = write_default_native(run, arm, cache_on=cache_on, max_seqs=max_seqs)
         assignments = [f"{key}={value}" for key, value in sorted(environment.items())]
         (run / "effective-environment.txt").write_text("\n".join(assignments) + "\n")
         for name in ("live-environment.bin", "live-environment-end.bin"):
@@ -294,3 +308,92 @@ def test_cache_on_rejects_disagreeing_hybrid_block_geometry(tmp_path):
     write_json(path, config)
     with pytest.raises(ValueError, match="API and worker disagree"):
         k4.assess("W1", row, row)
+
+
+def test_current_workload_geometry_and_frozen_lane_selection():
+    suite = k4.workload_suite
+    assert tuple(suite.ROWS) == ("W1", "W2", "W3", "W4", "W5")
+    shapes = [(128, 128, 1), (2048, 512, 1), (8192, 1024, 4),
+              (32768, 4096, 8), (131072, 1024, 4)]
+    for row, (prompt, output, per_gpu) in zip(suite.ROWS, shapes, strict=True):
+        assert suite.geometry(row, 3) == {"prompt_tokens": prompt, "output_tokens": output,
+                                          "requests_per_gpu": per_gpu,
+                                          "concurrent_requests": 3 * per_gpu}
+    assert suite.serving_capacity(3) == 24
+    original = suite.reference.lane_manifest()["rows"]
+    assert suite.concurrent_metadata("W4", 1) == original["W5"]["lanes"][:8]
+    assert suite.concurrent_metadata("W5", 1) == original["W6"]["lanes"]
+    assert suite.concurrent_metadata("W4", 3) == original["W5"]["lanes"][:24]
+
+
+def test_current_replay_checks_effective_default_capacity(tmp_path):
+    row = write_default_row(tmp_path, current=True)
+    identity, _ = k4.campaign(row)
+    result = k4.assess("W1", row, row)
+    assert result["passed"] is True
+    assert result["protocol"] == k4.workload_suite.PROTOCOL
+    assert result["workload"] == k4.workload_evidence("W1", identity)
+    native = row / "native-k4/server-info.json"
+    info = json.loads(native.read_bytes())
+    write_json(native, {**info, "max_running_requests": 32})
+    with pytest.raises(ValueError, match="wrong resolved native defaults"):
+        k4.assess("W1", row, row)
+    write_json(native, info)
+    worker = row / "vllm-k4/effective-worker.json"
+    settings = json.loads(worker.read_bytes())
+    settings["results"][0]["scheduler"]["max_num_seqs"] = 32
+    write_json(worker, settings)
+    with pytest.raises(ValueError, match="scheduler"):
+        k4.assess("W1", row, row)
+
+
+@pytest.mark.parametrize("devices, cap", [([OTHER_GPU], 8), ([GPU, OTHER_GPU], 16), ([GPU], 32)])
+def test_current_identity_rejects_mismatched_execution_group(tmp_path, devices, cap):
+    row = write_default_row(tmp_path, current=True)
+    identity, _ = k4.campaign(row)
+    write_json(row / "identity.json", {**identity, "participating_gpus": devices,
+                                      "max_running_requests": cap})
+    with pytest.raises(ValueError, match="participating GPU|serving concurrency"):
+        k4.campaign(row)
+
+
+def test_current_w5_requires_exact_current_w4_workload(tmp_path):
+    first = write_default_row(tmp_path, current=True)
+    identity, fingerprint = k4.campaign(first)
+    root_identity = first / "identity.json"
+    (tmp_path / "identity.json").write_bytes(root_identity.read_bytes())
+    for name in ("W1", "W2", "W3", "W4"):
+        row = tmp_path / name
+        row.mkdir(exist_ok=True)
+        (row / "identity.json").write_bytes(root_identity.read_bytes())
+        (row / "exit-code.txt").write_text("0\n")
+        write_json(row / "comparison.json", {"row": name, "protocol": identity["protocol"],
+                   "campaign_sha256": fingerprint, "passed": True,
+                   "makespan_criterion": K4_MAKESPAN_CRITERION,
+                   "workload": k4.workload_evidence(name, identity)})
+    k4.check_prior_rows("W5", tmp_path)
+    with pytest.raises(ValueError, match="W6 is unavailable"):
+        k4.check_prior_rows("W6", tmp_path)
+    with pytest.raises(ValueError, match="W6 is unavailable"):
+        k4.fixture("W6", tmp_path, identity)
+    comparison = tmp_path / "W4/comparison.json"
+    current = json.loads(comparison.read_bytes())
+    for rejected in ({**current, "protocol": k4.defaults.CACHE_ON_PROTOCOL},
+                     {**current, "workload": {**current["workload"], "output_tokens": 1024}},
+                     {**current, "workload": {**current["workload"],
+                                              "request_sha256": ["0" * 64]}}):
+        write_json(comparison, rejected)
+        with pytest.raises(ValueError, match="W4 must pass"):
+            k4.check_prior_rows("W5", tmp_path)
+
+
+def test_current_wire_replay_retains_staggered_first_outputs():
+    raw, lanes = synthetic_cohort()
+    policy = k4.concurrent.reference()["policy"]
+    duration, ids, metrics = k4.replay_cohort(raw, "W3", "measured-01", lanes, policy, None)
+    assert duration == 95
+    assert ids == [request["output_ids"] for request in raw["requests"]]
+    assert metrics["all_generating_overlap_ms"] < 0
+    raw["requests"][1]["sent_ns"] = raw["requests"][0]["done_ns"]
+    with pytest.raises(ValueError, match="overlap bounds"):
+        k4.replay_cohort(raw, "W3", "measured-01", lanes, policy, None)

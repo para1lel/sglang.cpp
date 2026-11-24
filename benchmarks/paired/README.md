@@ -1,8 +1,8 @@
-# Paired W1–W6 benchmark
+# Paired serving benchmarks
 
-Use the [matched K4 driver](#matched-k4-timing-protocol) to compare the native
-Release defaults against pinned vLLM MTP4. For a depth-zero control, run pinned
-vLLM first, then run the native release build on the same reserved B200.
+Use the [matched K4 driver](#matched-k4-timing-protocol) for the current W1–W5 suite.
+For an archived depth-zero control, run pinned vLLM first, then run the matching
+historical native release on the same reserved B200.
 Both commands default to 8,192 scheduled tokens and 32 in-service requests, with
 two warmups and five measured cohorts for each concurrent row. Select the same GPU
 and CPU placement for both arms. Each output directory must be new.
@@ -56,15 +56,42 @@ export PAIRED_NATIVE_SHA256='verified-64-character-binary-digest'
 bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4-110 W1
 ```
 
-Supply W2 through W6 in order after each prior row passes. A row starts fresh servers
+Supply W2 through W5 in order after each prior row passes. A row starts fresh servers
 for both timed arms. The vLLM arm goes first on W1, W3 and W5. Both K4 arms use
 the same checkpoint files, physical GPU, CPU placement, request bytes, cohort
 counts, and client clock. The clients drain each SSE response after measuring
 from the earliest submit to the last valid `[DONE]`. The runner uses port 17424
 on loopback by default and holds the campaign, port, and both GPU coordination
-locks. `PAIRED_VLLM_SEED_CACHE` can point to the retained cache seed used for v4.
+locks. `PAIRED_VLLM_SEED_CACHE` can point to the retained compiler cache seed.
 
-The launcher selects `server-defaults` when `PAIRED_K4_NATIVE_PROFILE` is unset.
+The launcher selects `server-defaults` and records
+`matched-k4-native-defaults-cache-on-v3` when `PAIRED_K4_NATIVE_PROFILE` is unset.
+Choose the participating B200 by `GPU_INDEX`. Both engine processes use only
+that device. The row width is the requests per participating GPU multiplied by
+the number of participating GPUs. The current launcher supports one GPU.
+
+See the [named workloads](../../docs/performance.md#named-workloads) for row sizes.
+
+W4 selects lanes 00–07 from the immutable archived W5 corpus. W5 selects all
+four archived W6 lanes. `PAIRED_FIXTURES` takes the original corpus directory,
+including those archived directory names. Request bytes are checked by digest.
+W1 and W2 use three warmups and nine measured cohorts per arm. W3–W5 use two
+warmups and five measured cohorts per arm.
+
+Both arms use MTP4 and an 8,192-token budget. The native arm uses its default
+active-request cap and checks it against eight times the participating GPU
+count. vLLM receives that cap through `--max-num-seqs` and uses async scheduling
+with both token caps set to 8,192. Both engines enable prefix caching. The runner
+drains outstanding work and requires an acknowledged `POST /reset_prefix_cache`
+with an empty JSON object before each warmup, measured cohort, and W1 trace. The
+timing starts after those controls. Every fixed request must report zero reused
+prompt tokens and the engine prefix hit counter must stay unchanged during its
+cohort. Replay checks the raw reset response, metrics, and control timestamps.
+All request bodies
+must be sent before the first valid completion, within the frozen submit-span
+bound. The comparison records whether every lane started generating before the
+first completion and reports per-request latencies and throughput from SSE
+replay.
 A separate W1 native trace checks depth-four verification. The timed native arm
 uses the Release defaults with tracing disabled. The vLLM arm uses explicit MTP
 depth four on the pinned revision, with its resolved worker configuration and
@@ -72,13 +99,15 @@ fresh verification counters recorded. Its streams must pass the full wire,
 length, usage, and drain checks. vLLM output IDs may vary across valid streams
 and may differ from native and archived IDs. The runner launches only K4 on vLLM.
 
-Each W1–W6 row passes when the native median makespan is at most 1.10 times the
+Each current row passes when the native median makespan is at most 1.10 times the
 pinned vLLM median, including equality at 1.10. The campaign identity and each
 `Wn/comparison.json` record `makespan_criterion` as
 `native-median-at-most-110-percent`. The comparison includes both measured
 medians, `native_to_vllm_median_ratio`, and `strict_passed` for the historical
 strict win. Advancement requires every prior row to pass under the same
-criterion and campaign identity. A timing miss returns status 1 with the raw
+criterion, campaign identity, and exact current workload. In particular, W5
+requires a passing current W4 with eight 32,768-input/4,096-output lanes on one
+GPU. A timing miss returns status 1 with the raw
 captures and comparison retained. Invalid evidence stops the row before
 comparison.
 
@@ -97,6 +126,12 @@ strict gate, which requires the native median to be below the vLLM median.
 Replay also checks any process or activity receipts those rows contain.
 
 ### Historical K4 profiles
+
+For the former cache-on W1–W6 launch, use a cache-on Release with a 32-request
+cap and `PAIRED_K4_NATIVE_PROFILE=server-defaults-cache-on-v2`. Its archived
+receipts retain protocol `matched-k4-native-defaults-cache-on-v2` and their
+original W4/W5/W6 meanings. The replay command reads the saved row identity to
+select the archived workload and criterion.
 
 Use the measured Release that accepted `--fp8-prefill` to reproduce these
 profiles. `PAIRED_K4_NATIVE_PROFILE=exact` selects the historical native exact-FP8
@@ -155,29 +190,11 @@ Campaign metadata and version 2 evidence distinguish long and bounded split.
 
 ### Native server defaults against matched vLLM K4
 
-Use a fresh campaign directory. `server-defaults` is selected by default and
-writes `matched-k4-native-defaults-cache-on-v2` receipts. Use a verified Release
-whose defaults resolve to MTP4, 32 active requests, an 8,192-token scheduling
-budget, four prefix-cache entries, and CUDA graphs. The native timed process
-receives only `--port` with a clean device and library environment. Its W1
-activity trace adds `--trace-batches` in a separate process.
-
-Pinned vLLM explicitly enables prefix caching and MTP4. Startup validation binds
-its effective aligned GDN cache mode and block sizes to both API and worker
-observations. Both arms use the same physical B200, local NUMA placement, CPU
-sets, checkpoint, inputs, row order, and measurement windows. vLLM provides
-timing. Native K0 and cross-engine output equality are outside this profile.
-
-Both arms drain, issue `POST /reset_prefix_cache` with an empty JSON object, require a
-successful acknowledgement, and sample idle cache counters before every warmup,
-measured cohort, and the separate W1 trace. The client starts its measurement
-clock after those controls. Every fixed W1–W6 request must report zero reused
-prompt tokens and the engine's prefix hit counter must remain unchanged during
-its cohort. W3–W6 lane prompts have distinct first tokens. Resetting between
-replays keeps repeated fixed bodies cold even after a previous cohort populated
-cache. Raw cohorts retain the reset response, before and after metrics, and
-control timestamps. Offline `assess` checks these alongside the launch, device,
-stream, and MTP evidence.
+The archived `matched-k4-native-defaults-cache-on-v2` profile used a verified
+Release with 32 active requests, the original W1–W6 fixtures, and the same
+cold-cache reset and stream validation as the current protocol. Select
+`PAIRED_K4_NATIVE_PROFILE=server-defaults-cache-on-v2` to capture this
+historical profile with its matching Release.
 
 The archived `matched-k4-native-defaults-v1` protocol used a cache-disabled
 Release launched with the same port-only arguments, an explicit cache-off vLLM

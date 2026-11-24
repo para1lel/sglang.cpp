@@ -158,7 +158,7 @@ def artifact_hashes(path):
     return values
 
 
-def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False):
+def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False, max_seqs=32):
     workers = load(run / "effective-worker.json")["results"]
     require(len(workers) == 1, f"{run}: expected one observed vLLM worker")
     worker = workers[0]
@@ -180,14 +180,15 @@ def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False):
     effective = scheduler.get("max_num_scheduled_tokens_effective", cap if historical else None)
     async_scheduling = scheduler.get("async_scheduling", True if historical else None)
     require(type(cap) is int and type(effective) is int and cap == effective
-            and scheduler["max_num_seqs"] == 32 and scheduler["max_model_len"] == context
+            and type(scheduler["max_num_seqs"]) is int and scheduler["max_num_seqs"] == max_seqs
+            and scheduler["max_model_len"] == context
             and scheduler["enable_chunked_prefill"] is True
             and async_scheduling is True
             and not any(item.startswith((scheduled_flag + "=", "--no-async-scheduling",
                                          "--enforce-eager"))
                         for item in args),
             f"{run}: unexpected effective vLLM scheduler settings")
-    for key, expected in (("--max-num-batched-tokens", cap), ("--max-num-seqs", 32),
+    for key, expected in (("--max-num-batched-tokens", cap), ("--max-num-seqs", max_seqs),
                           ("--max-model-len", context)):
         require(arg(args, key) == str(expected), f"{run}: {key} differs from worker observation")
     cache = worker["cache"]
@@ -230,7 +231,7 @@ def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False):
 
 
 def saved_worker(capture, run, cpus, uuid, group, *, speculative=False,
-                 before_measurement=False, prefix_cache=False):
+                 before_measurement=False, prefix_cache=False, max_seqs=32):
     args = command(run, "server", cpus)
     log = (run / "server.log").read_text()
     api_pid = (run / "server-pid.txt").read_text().strip()
@@ -247,4 +248,4 @@ def saved_worker(capture, run, cpus, uuid, group, *, speculative=False,
             f"{run}: CUDA visibility conflicts with observed UUID")
     return {"worker_pid": int(pid), "model_path": model,
             "effective": vllm_settings(run, args, group, speculative=speculative,
-                                       prefix_cache=prefix_cache)}
+                                       prefix_cache=prefix_cache, max_seqs=max_seqs)}

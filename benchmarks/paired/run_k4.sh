@@ -3,13 +3,13 @@ set -euo pipefail
 
 usage() {
     echo "Usage: bash benchmarks/paired/run_k4.sh NATIVE_BINARY GPU_INDEX CAMPAIGN_DIR ROW"
-    echo "ROW must be W1, W2, W3, W4, W5, or W6."
+    echo "Current rows are W1, W2, W3, W4, and W5. GPU_INDEX selects the single participating B200."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
     echo "The default profile, server-defaults, times matched K4 with both caches enabled and cold."
     echo "Each row passes when the native median is at most 110% of the pinned vLLM median."
     echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
-    echo "  server-defaults-cache-off, exact, ordered-tc-int8, ordered-tc-int8-split-gqa,
-  ordered-tc-int8-long-split-gqa."
+    echo "  server-defaults-cache-on-v2, server-defaults-cache-off, exact, ordered-tc-int8,"
+    echo "  ordered-tc-int8-split-gqa, ordered-tc-int8-long-split-gqa."
 }
 
 if [[ ${1:-} == --help ]]; then
@@ -33,9 +33,12 @@ native_fp8=exact
 native_split_mode=
 native_defaults=false
 cache_on=false
+current=false
+max_seqs=32
 case "$native_profile" in
     exact) ;;
-    server-defaults) native_defaults=true; cache_on=true ;;
+    server-defaults) native_defaults=true; cache_on=true; current=true ;;
+    server-defaults-cache-on-v2) native_defaults=true; cache_on=true ;;
     server-defaults-cache-off) native_defaults=true ;;
     ordered-tc-int8) ;;
     ordered-tc-int8-split-gqa) native_split_mode=1 ;;
@@ -54,6 +57,14 @@ unset SGLANG_EXPERIMENTAL_TARGET_SPLIT_GQA
 if ! [[ -x $binary && $native_source =~ ^[a-f0-9]{40}$ &&
         $native_sha =~ ^[a-f0-9]{64}$ && -f $manifest ]]; then
     usage >&2
+    exit 2
+fi
+if [[ ! $index =~ ^[0-9]+$ ]]; then
+    echo "Specify exactly one participating GPU index." >&2
+    exit 2
+fi
+if [[ $current == true && $row == W6 ]]; then
+    echo "W6 is an archived row. The current suite ends at W5." >&2
     exit 2
 fi
 case "$index" in
@@ -111,6 +122,12 @@ protocol_hash=$(cd -- "$project" && sha256sum \
     benchmarks/concurrent/{client.py,reference.py,freeze_prompts.py,fixture-manifest.json} \
     benchmarks/concurrent/gpu2-reference.json \
     benchmarks/vllm/wheel.sha256)
+if [[ $current == true ]]; then
+    max_seqs=$(PYTHONPATH="$project:$paired_dir" "$client_python" -B -c \
+        'from workload_suite import serving_capacity; print(serving_capacity(1))')
+    workload_protocol_hash=$(cd -- "$project" && sha256sum benchmarks/paired/workload_suite.py)
+    protocol_hash+=$'\n'"$workload_protocol_hash"
+fi
 if [[ $cache_on == true ]]; then
     cache_protocol_hash=$(cd -- "$project" && sha256sum benchmarks/paired/cold_cache.py)
     protocol_hash+=$'\n'"$cache_protocol_hash"
@@ -135,10 +152,13 @@ if [[ $native_profile != exact ]]; then
     if [[ $native_defaults == true ]]; then
         identity=$(jq -c --arg model "$checkpoint" --arg campaign_id "$campaign_id" \
             --argjson port "$port" --argjson cache_on "$cache_on" \
+            --argjson current "$current" --argjson max_seqs "$max_seqs" \
             '. + {protocol:"matched-k4-native-defaults-v1",campaign_id:$campaign_id,
                   native_profile:"server-defaults",checkpoint_path:$model,port:$port}
              | if $cache_on then . + {protocol:"matched-k4-native-defaults-cache-on-v2",
-                 cache_policy:"reset-before-every-cohort"} else . end' \
+                 cache_policy:"reset-before-every-cohort"} else . end
+             | if $current then . + {protocol:"matched-k4-native-defaults-cache-on-v3",
+                 participating_gpus:[.gpu_uuid],max_running_requests:$max_seqs} else . end' \
             <<<"$identity")
     else
         identity=$(jq -c --arg profile "$native_profile" --arg fp8 "$native_fp8" \
@@ -299,7 +319,8 @@ start_vllm() {
         --compilation-config '{"mode":"NONE","cudagraph_mode":"FULL_AND_PIECEWISE"}' \
         --language-model-only --skip-tokenizer-init --generation-config vllm --seed 0 \
         "${cache_flags[@]}" --enable-prompt-tokens-details --enable-chunked-prefill \
-        --max-model-len "$context" --max-num-batched-tokens "$token_budget" --max-num-seqs 32 \
+        --max-model-len "$context" --max-num-batched-tokens "$token_budget" \
+        --max-num-seqs "$max_seqs" \
         --max-num-scheduled-tokens "$token_budget" --async-scheduling \
         --kv-cache-memory-bytes "$kv_bytes" --stream-interval 1 \
         --worker-extension-cls vllm_worker.PairedBaselineObserver \

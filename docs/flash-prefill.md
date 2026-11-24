@@ -127,7 +127,7 @@ Verify graph replay, output guards, and causal invariance at 65,536, 98,304, and
 The historical split TMEM checkpoint probe changed greedy first tokens at
 65,536 and 98,304 prompt tokens. Repeated captures matched within each arm.
 The source of the drift remains unresolved. Keep split TMEM operator evidence
-separate from full-checkpoint quality and the W6 serving gate. [Archived Flash and TMEM verification and reproduction](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/flash-prefill.md#tmem-checkpoint-verification) · [Previous guide with exact operator results](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/flash-prefill.md#ordered-tmem-operator-verification) · [Serving gate](performance.md#measurement)
+separate from full-checkpoint quality and the serving gate. [Archived Flash and TMEM verification and reproduction](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/flash-prefill.md#tmem-checkpoint-verification) · [Previous guide with exact operator results](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/flash-prefill.md#ordered-tmem-operator-verification) · [Serving gate](performance.md#measurement)
 
 The retired page-128 TMA study matched the prior split producer bitwise and
 reduced operator latency. It changed first tokens from wide Flash at 16,384

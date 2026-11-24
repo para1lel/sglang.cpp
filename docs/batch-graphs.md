@@ -116,6 +116,6 @@ For legacy narrow decode, replay one executable with rebound page tables, KV, an
 
 ## Timing
 
-Compare default graph selection with `--eager` on one binary. Keep prefill policy fixed and prefix reuse off. Match graph and prefill policies across releases. Freeze requests, arrivals, device, and warmups. Record cold capture separately. Verify widths in a separate trace. Disable observers and tracing for timing. Measure whole-request latency separately from replay. Frozen W3 and W6 begin decode above inline score capacity.
+Compare default graph selection with `--eager` on one binary. Keep prefill policy fixed and prefix reuse off. Match graph and prefill policies across releases. Freeze requests, arrivals, device, and warmups. Record cold capture separately. Verify widths in a separate trace. Disable observers and tracing for timing. Measure whole-request latency separately from replay. The historical W3 and W6 fixtures began decode above inline score capacity.
 
 Before timing, repeat each native route for stable output IDs. If native builds diverge, compare full BF16 logit rows at the first differing step on their common history. Record the winner margin. Use the [strict concurrent policy](performance.md#native-concurrent-workloads) for HTTP serving.

@@ -182,7 +182,7 @@ Check both sampling default modes with omitted, null, and explicit controls. Che
 
 Compare prompt IDs, committed IDs, finish reasons, and usage for unconstrained K4 and K0 requests. Use the same chat fixtures and limits at width one and with overlapping requests. For constrained chat, follow the [constrained MTP checks](mtp.md#constrained-verification). For batch graphs, overlap chat, raw text, and benchmark ID requests. Compare each response with a same-policy control. Correlate a multi-lane decode mask with an actual CUDA graph launch. Reset a chat stream while a peer is active. Check the peer and replacement request against their controls.
 
-For serving performance, record template and tokenizer assets, request bytes, rendered prompt IDs, stops, and active decoder options. Use the [performance contract](performance.md) for frozen comparisons and timing definitions. Keep chat checks separate from W1–W6.
+For serving performance, record template and tokenizer assets, request bytes, rendered prompt IDs, stops, and active decoder options. Use the [performance contract](performance.md) for frozen comparisons and timing definitions. Keep chat checks separate from the token-ID workloads.
 
 ### Qwen output checks
 

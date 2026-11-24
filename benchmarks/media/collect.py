@@ -14,8 +14,9 @@ from benchmarks.streaming.check_vllm import audit
 
 HERE = Path(__file__).resolve().parent
 NAMES = ("W1-image", "W1-video")
-WARMUP = 3
-MEASURED = 9
+ARCHIVED_COUNTS = (3, 9)
+SINGLE_ROUND_COUNTS = (1, 1)
+SINGLE_ROUND_PROTOCOL = "media-single-round-v2"
 TOKEN_LIMIT = 128
 ENDPOINT = "/v1/chat/completions"
 TOKENIZE_KEYS = {
@@ -180,7 +181,12 @@ def percentile(values, probability):
     return ordered[lower] + (index - lower) * (ordered[upper] - ordered[lower])
 
 
-def summarize(samples, output_ids):
+def summarize(samples, output_ids, counts=ARCHIVED_COUNTS):
+    if counts == SINGLE_ROUND_COUNTS:
+        sample, = samples
+        return {"requests": {"warmup": 1, "measured": 1}, "output_ids": output_ids,
+                "finish_reason": "length", "measurement": {key: sample[key]
+                    for key in ("throughput_tps", "ttft_ms", "tpot_ms", "e2e_ms")}}
     durations = {}
     for metric in ("throughput_tps", "ttft_ms", "tpot_ms", "e2e_ms"):
         values = [result[metric] for result in samples]
@@ -195,7 +201,7 @@ def summarize(samples, output_ids):
         for metric, stats in durations.items() if metric != "throughput_tps"
     }
     return {
-        "requests": {"warmup": WARMUP, "measured": MEASURED},
+        "requests": dict(zip(("warmup", "measured"), counts, strict=True)),
         "output_ids": output_ids, "finish_reason": "length", "statistics": durations,
         "thresholds": {
             "median_throughput_ratio_strictly_greater_than": 1 + margin,
@@ -211,6 +217,7 @@ def verify():
     assert not reference["failures"] and set(reference["rows"]) == set(NAMES)
     columns = ("first_output_ns", "last_output_ns", "done_ns")
     assert timings["submission_relative_columns"] == list(columns)
+    _, measured = ARCHIVED_COUNTS
     for name in NAMES:
         case, raw = read_request(name)
         media, text = json.loads(raw)["messages"][0]["content"]
@@ -229,19 +236,26 @@ def verify():
         output_ids = expected["output_ids"]
         assert len(output_ids) == TOKEN_LIMIT
         assert all(type(token) is int and 0 <= token < 248320 for token in input_ids + output_ids)
-        assert len(timings[name]) == MEASURED
+        assert len(timings[name]) == measured
         for first_ns, last_ns, e2e_ns in timings[name]:
             assert 0 < first_ns <= last_ns <= e2e_ns
         samples = [timing_metrics(*row) for row in timings[name]]
         assert summarize(samples, output_ids) == expected
-        print(f"{name}: verified media, request, input IDs, and {MEASURED} timing rows")
+        print(f"{name}: verified media, request, input IDs, and {measured} timing rows")
 
 
 def replay(path):
     cases = {name: read_request(name)[0] for name in NAMES}
     raw = [json.loads(line) for line in path.read_text().splitlines()]
+    versions = {row.get("protocol") for row in raw}
+    if versions == {SINGLE_ROUND_PROTOCOL}:
+        counts = SINGLE_ROUND_COUNTS
+    elif versions == {None}:
+        counts = ARCHIVED_COUNTS
+    else:
+        raise ValueError("Unknown or mixed media protocols")
     schedule = [(phase, cohort, name)
-                for phase, rounds in (("warmup", WARMUP), ("measure", MEASURED))
+                for phase, rounds in zip(("warmup", "measure"), counts, strict=True)
                 for cohort in range(1, rounds + 1) for name in NAMES]
     assert [(row["phase"], row["cohort"], row["name"]) for row in raw] == schedule
     expected = {}
@@ -258,10 +272,13 @@ def replay(path):
             failure.append({"name": name, "phase": row["phase"], "cohort": row["cohort"],
                             "error": f"{type(error).__name__}: {error}"})
     report = {"failures": failure, "rows": {}}
+    if counts == SINGLE_ROUND_COUNTS:
+        report["protocol"] = SINGLE_ROUND_PROTOCOL
+    _, measured = counts
     for name in NAMES:
         samples = measurements[name]
-        if len(samples) == MEASURED and not any(item["name"] == name for item in failure):
-            report["rows"][name] = summarize(samples, expected[name])
+        if len(samples) == measured and not any(item["name"] == name for item in failure):
+            report["rows"][name] = summarize(samples, expected[name], counts)
     return report
 
 
@@ -289,19 +306,19 @@ def measure(url, output):
             assert result["count"] == TOKEN_LIMIT
     stream_path = output / "streams.jsonl"
     with stream_path.open("x", encoding="utf-8") as rows:
-        for phase, rounds in (("warmup", WARMUP), ("measure", MEASURED)):
-            for cohort in range(1, rounds + 1):
-                for name, (case, raw) in fixtures.items():
-                    record = request(url, phase, cohort, name, raw)
-                    rows.write(json.dumps(record, separators=(",", ":")) + "\n")
-                    rows.flush()
-                    try:
-                        result = validate(record, case)
-                        rate = result["throughput_tps"]
-                        print(name, phase, cohort, f"{rate:.2f} tok/s", flush=True)
-                    except Exception as error:
-                        detail = f"{type(error).__name__}: {error}"
-                        print(name, phase, cohort, "failed:", detail, flush=True)
+        for phase in ("warmup", "measure"):
+            for name, (case, raw) in fixtures.items():
+                record = request(url, phase, 1, name, raw)
+                record["protocol"] = SINGLE_ROUND_PROTOCOL
+                rows.write(json.dumps(record, separators=(",", ":")) + "\n")
+                rows.flush()
+                try:
+                    result = validate(record, case)
+                    rate = result["throughput_tps"]
+                    print(name, phase, 1, f"{rate:.2f} tok/s", flush=True)
+                except Exception as error:
+                    detail = f"{type(error).__name__}: {error}"
+                    print(name, phase, 1, "failed:", detail, flush=True)
     report = replay(stream_path)
     write(output / "summary.json", report)
     if report["failures"]:

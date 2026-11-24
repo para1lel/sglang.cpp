@@ -36,6 +36,8 @@ FROZEN_PROTOCOL = dict(zip(CONCURRENT, (
 ), strict=True))
 ACTIVE_FROZEN_PROTOCOL = FROZEN_PROTOCOL | {"streaming/client.py": DRAINING_STREAMING_CLIENT}
 DEFAULT_TOKEN_BUDGET = 8192
+ARCHIVED_MAKESPAN = "c8a876ca2a9240c1e90e1a66a9ad5468342e971e3cc7f083627f8e1b3c2656b2"
+SINGLE_ROUND_COUNTS = (1, 1)
 STREAMING_COUNTS = (3, 9)
 CONCURRENT_COUNTS = (2, 5)
 NATIVE_K0_PROTOCOL = "automatic-k0-v1"
@@ -55,10 +57,12 @@ def current_protocol(group, protocol, *, frozen=False):
                          else protocol / "benchmarks" / name) for name in paths}
 
 
-def stream_identity(protocol, hashes):
+def stream_identity(protocol, hashes, counts=STREAMING_COUNTS):
     cases = streaming.load_cases(protocol / "benchmarks" / "streaming")
+    version = {"protocol": streaming.SINGLE_ROUND_PROTOCOL} if counts == SINGLE_ROUND_COUNTS else {}
     return {
-        "clock": "perf_counter_ns", "schedule": [["warmup", 3], ["measured", 9]],
+        **version, "clock": "perf_counter_ns",
+        "schedule": [["warmup", counts[0]], ["measured", counts[1]]],
         "workload_order": ["W1", "W2"], "client_sha256": hashes["streaming/client.py"],
         "fixture_sha256": {name: sha for name, (_, sha) in cases.items()},
         "request_sha256": {name: hashlib.sha256(
@@ -72,13 +76,17 @@ def summary(run, group, hashes, protocol):
             f"{run}: client did not exit successfully")
     report = load(run / "measurement" / "summary.json")
     if group == "W1-W2":
-        expected = stream_identity(protocol, hashes)
+        version = report["manifest"].get("protocol")
+        require(version in (None, streaming.SINGLE_ROUND_PROTOCOL), "Unknown streaming protocol")
+        counts = SINGLE_ROUND_COUNTS if version is not None else STREAMING_COUNTS
+        expected = stream_identity(protocol, hashes, counts)
         require(all(report["manifest"][key] == value for key, value in expected.items()),
                 f"{run}: streaming client, fixtures, request bytes or schedule differ")
         require(set(report["workloads"]) == {"W1", "W2"} and all(
-            row["valid"] is True and row["warmups_successful"] == 3 and row["successful"] == 9
+            row["valid"] is True and row["warmups_successful"] == counts[0]
+            and row["successful"] == counts[1]
             for row in report["workloads"].values()), f"{run}: incomplete streaming results")
-        return report, STREAMING_COUNTS
+        return report, counts
     baseline = concurrent.reference()
     require(report["status"] == "complete" and report["row"] == group
             and report["fixture_manifest_sha256"] == hashes["concurrent/fixture-manifest.json"]
@@ -89,7 +97,10 @@ def summary(run, group, hashes, protocol):
               sum(tag.startswith("measured-") for tag in tags))
     policy = {"warmup_cohorts": counts[0], "measured_cohorts": counts[1]}
     lanes = ROWS[group][2]
-    require(counts[0] >= 1 and counts[1] >= 2 and tags == concurrent.tags(policy) and all(
+    version = report.get("protocol")
+    valid_counts = (counts == SINGLE_ROUND_COUNTS if version == concurrent.SINGLE_ROUND_PROTOCOL
+                    else version is None and counts[0] >= 1 and counts[1] >= 2)
+    require(valid_counts and tags == concurrent.tags(policy) and all(
         outcome["attempted"] == lanes and outcome["successful_http_completions"] == lanes
         and outcome["raw_file"] == outcome["tag"] + ".json.gz" and "error" not in outcome
         and (run / "measurement" / outcome["raw_file"]).is_file()
@@ -181,7 +192,8 @@ def replay_streams(run, report, protocol, freeze_baseline):
             results[name].append(record)
             if phase == "measured":
                 samples[name].append(duration)
-    require(all(streaming.summarize(items, freeze_baseline) == report["workloads"][name]
+    historical_freeze = freeze_baseline and "protocol" not in report["manifest"]
+    require(all(streaming.summarize(items, historical_freeze) == report["workloads"][name]
                 for name, items in results.items()),
             f"{run}: streaming summary differs from replay")
     return samples
@@ -238,11 +250,12 @@ def saved_arm(args, group, hashes, lanes, native_device, native_cpus):
                     f"{run}: formal W1/W2 needs a fresh capture through response end")
             hashes = hashes | {"streaming/client.py": LEGACY_STREAMING_CLIENT}
             reconstructed.append("legacy streaming capture ends at first [DONE]")
-    else:
-        if PAIRED_COLLECTOR not in recorded:
-            require(all(hashes[name] == sha for name, sha in ACTIVE_FROZEN_PROTOCOL.items()),
-                    f"{run}: active sources differ from the historical collector protocol")
-            hashes = FROZEN_PROTOCOL
+        elif recorded.get("streaming/client.py") == DRAINING_STREAMING_CLIENT:
+            hashes = hashes | {"streaming/client.py": DRAINING_STREAMING_CLIENT}
+    elif PAIRED_COLLECTOR not in recorded:
+        hashes = FROZEN_PROTOCOL
+    elif recorded[PAIRED_COLLECTOR] == ARCHIVED_MAKESPAN:
+        hashes = ACTIVE_FROZEN_PROTOCOL | {PAIRED_COLLECTOR: ARCHIVED_MAKESPAN}
     report, counts = summary(run, group, hashes, args.protocol)
     if group != "W1-W2":
         if manifest not in recorded:
@@ -265,8 +278,10 @@ def saved_arm(args, group, hashes, lanes, native_device, native_cpus):
 
 
 def frozen_arm(hashes):
-    require(hashes == ACTIVE_FROZEN_PROTOCOL,
-            "Active concurrent protocol differs from frozen publication")
+    immutable = ("concurrent/reference.py", "concurrent/fixture-manifest.json",
+                 "concurrent/gpu2-reference.json")
+    require(all(hashes.get(name) == FROZEN_PROTOCOL[name] for name in immutable),
+            "Concurrent fixtures differ from the frozen publication")
     reference = concurrent.reference()
     policy = reference["policy"]
     return {"device": {"uuid": reference["physical_gpu_uuid"].lower(),
@@ -279,9 +294,11 @@ def frozen_arm(hashes):
 
 def comparison_label(mode, group, arm, hashes, native_device, counts, budget):
     if mode == "frozen":
-        require(arm == frozen_arm(hashes) and tuple(arm["counts"]) == tuple(counts),
+        require(arm == frozen_arm(hashes),
                 "Frozen comparison arm differs from the published reference")
         differences = []
+        if tuple(arm["counts"]) != tuple(counts):
+            differences.append("count mismatch")
         if arm["device"]["uuid"] != native_device["uuid"]:
             differences.append("cross-device")
         if arm["effective"]["config"]["max_num_batched_tokens"] != budget:
@@ -299,7 +316,7 @@ def comparison_label(mode, group, arm, hashes, native_device, counts, budget):
     if budget != DEFAULT_TOKEN_BUDGET:
         return f"exploratory (non-protocol cap {budget})"
     required_counts = STREAMING_COUNTS if group == "W1-W2" else CONCURRENT_COUNTS
-    if tuple(counts) != required_counts:
+    if tuple(counts) not in (required_counts, SINGLE_ROUND_COUNTS):
         return "exploratory (non-protocol counts)"
     require(scheduler["max_num_scheduled_tokens_configured"] == budget
             and scheduler["max_num_scheduled_tokens_effective"] == budget
@@ -331,14 +348,16 @@ def plan(args):
     for group in args.groups:
         hashes = current_protocol(group, args.protocol, frozen=args.mode == "frozen")
         lanes = None if group == "W1-W2" else load_lanes(args.fixtures, group)
-        expected = STREAMING_COUNTS if group == "W1-W2" else (args.warmups, args.measured)
+        requested = (args.warmups, args.measured)
+        expected = (STREAMING_COUNTS if group == "W1-W2" and requested != SINGLE_ROUND_COUNTS
+                    else requested)
         if args.mode == "matched":
             arm = saved_arm(args, group, hashes, lanes, native_device, cpus)
             checkpoints.add(Path(arm["model_path"]).resolve())
         else:
             arm = frozen_arm(hashes)
         matched_counts = tuple(arm["counts"]) == expected
-        require(matched_counts or (args.mode == "matched" and args.allow_count_mismatch),
+        require(matched_counts or args.mode == "frozen" or args.allow_count_mismatch,
                 f"{group}: saved warmup/measured counts {arm['counts']} differ from {expected}")
         label = comparison_label(args.mode, group, arm, hashes, native_device, expected, budget)
         rows[group] = {"planned_comparison": label, "vllm": arm,

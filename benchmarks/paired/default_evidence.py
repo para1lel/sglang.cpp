@@ -77,7 +77,7 @@ def serving_capacity(identity):
 
 
 def token_budget(identity):
-    if identity["protocol"] == workload_suite.PROTOCOL_V4:
+    if identity["protocol"] in workload_suite.WIDE_BUDGET_PROTOCOLS:
         return workload_suite.V4_TOKEN_BUDGET
     return 8192
 

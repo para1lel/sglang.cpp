@@ -1,7 +1,6 @@
 """Collect paired concurrent cohorts and compare their replayed makespans."""
 
 from statistics import median
-from unittest.mock import patch
 
 from benchmarks.concurrent import client
 from measure_concurrent import main as collect
@@ -94,5 +93,4 @@ def compare(native, vllm, eligible, *, criterion=None):
 
 
 if __name__ == "__main__":
-    with patch.object(client, "validate_cohort", validate_cohort):
-        raise SystemExit(collect())
+    raise SystemExit(collect(validate=validate_cohort))

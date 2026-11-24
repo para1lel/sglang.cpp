@@ -8,7 +8,9 @@ from saved_evidence import UUID, require
 
 PROTOCOL = "matched-k4-native-defaults-cache-on-v3"
 PROTOCOL_V4 = "matched-k4-native-defaults-cache-on-v4"
-WORKLOAD_PROTOCOLS = (PROTOCOL, PROTOCOL_V4)
+PROTOCOL_V5 = "matched-k4-native-defaults-cache-on-v5"
+WIDE_BUDGET_PROTOCOLS = (PROTOCOL_V4, PROTOCOL_V5)
+WORKLOAD_PROTOCOLS = (PROTOCOL, *WIDE_BUDGET_PROTOCOLS)
 V4_TOKEN_BUDGET = 32768
 ROWS = {
     "W1": (128, 128, 1),
@@ -41,10 +43,10 @@ def validate_identity(identity):
     cap = identity.get("max_running_requests")
     require(type(cap) is int and cap == serving_capacity(len(devices)),
             "Wrong current campaign serving concurrency")
-    if identity["protocol"] == PROTOCOL_V4:
+    if identity["protocol"] in WIDE_BUDGET_PROTOCOLS:
         budget = identity.get("max_num_batched_tokens")
         require(type(budget) is int and budget == V4_TOKEN_BUDGET,
-                "Wrong v4 campaign token budget")
+                f"Wrong {identity['protocol'].rsplit('-', 1)[1]} campaign token budget")
 
 
 def concurrent_metadata(row, gpu_count):

@@ -6,8 +6,9 @@ usage() {
     echo "Current rows are W1, W2, W3, W4, and W5. GPU_INDEX selects the single participating B200."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
     echo "The default profile, server-defaults, uses matched 32768-token cold-cache K4."
-    echo "W4 can start a fresh v4 campaign. W5 requires a passing v4 W4 in that campaign."
-    echo "Each row passes when the native median is at most 110% of the pinned vLLM median."
+    echo "W4 can start a fresh v5 campaign. W5 requires a passing v5 W4 in that campaign."
+    echo "Every live timing arm runs one warmup and one measured cohort. Controls remain untimed."
+    echo "Each row passes when the measured native makespan is at most 110% of pinned vLLM."
     echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
     echo "  server-defaults-cache-on-v3, server-defaults-cache-on-v2, server-defaults-cache-off,"
     echo "  exact, ordered-tc-int8,"
@@ -91,6 +92,7 @@ if [[ $wide_budget == true ]]; then
 fi
 export PAIRED_PORT=${PAIRED_PORT:-17424}
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+validate_run_settings
 
 [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 ))
 manifest=$(realpath -- "$manifest")
@@ -144,7 +146,8 @@ identity=$(jq -nc --arg source "$native_source" --arg binary "$native_sha" \
     --arg gpu "$uuid" --arg checkpoint "$model_sha" --arg vllm "$pin" \
     --arg protocol_sha "${protocol_sha%% *}" \
     --arg server "$server_cpus" --arg client "$client_cpus" \
-    '{protocol:"matched-k4-v1",replay_receipts:2,protocol_sha256:$protocol_sha,
+    '{protocol:"matched-k4-v1",sampling:"single-round-v1",replay_receipts:2,
+      protocol_sha256:$protocol_sha,
       makespan_criterion:"native-median-at-most-110-percent",
       native_source:$source,native_binary_sha256:$binary,gpu_uuid:$gpu,
       checkpoint_sha256:$checkpoint,vllm_commit:$vllm,
@@ -167,7 +170,7 @@ if [[ $native_profile != exact ]]; then
                  cache_policy:"reset-before-every-cohort"} else . end
              | if $current then . + {protocol:"matched-k4-native-defaults-cache-on-v3",
                  participating_gpus:[.gpu_uuid],max_running_requests:$max_seqs} else . end
-             | if $wide_budget then . + {protocol:"matched-k4-native-defaults-cache-on-v4",
+             | if $wide_budget then . + {protocol:"matched-k4-native-defaults-cache-on-v5",
                  max_num_batched_tokens:$token_budget} else . end' \
             <<<"$identity")
     else
@@ -185,7 +188,7 @@ if [[ ! -e $root/identity.json ]] &&
    [[ $row == W1 || ( $wide_budget == true && $row == W4 ) ]]; then
     printf '%s\n' "$identity" >"$root/identity.json"
 fi
-if [[ $(cat "$root/identity.json") != "$identity" ]]; then
+if [[ ! -f $root/identity.json || $(cat "$root/identity.json") != "$identity" ]]; then
     echo "Campaign identity differs. Use a fresh campaign directory." >&2
     exit 2
 fi
@@ -270,7 +273,7 @@ if [[ $native_defaults == true ]]; then
 else
     ldd "$binary" >"$directory/native-ldd.txt"
 fi
-if rg -q 'not found' "$directory/native-ldd.txt"; then
+if grep -q 'not found' "$directory/native-ldd.txt"; then
     echo "Native shared libraries are missing. See $directory/native-ldd.txt." >&2
     exit 2
 fi

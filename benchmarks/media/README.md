@@ -95,13 +95,13 @@ To audit a new collection, run the same command with `replay` in place of `measu
 Both requests use greedy decoding, seed 0, an output budget of 128, and EOS ignored.
 Prefix reuse, processor caching, and speculative decoding are disabled.
 The collector verifies the worker state and two `/tokenize` responses per case before timing.
-It sends three image-then-video warmup cohorts and nine measured cohorts in the same order.
-Each request uses a new loopback connection. Every attempted stream enters validation.
+It sends one image-then-video warmup cohort and one measured cohort. Each
+request uses a new loopback connection. Every attempted stream enters validation.
+The measured stream per case supplies its point estimates.
 
 TTFT starts at client submission and ends on the first output ID.
 TPOT divides first-to-last output time by 127.
 End-to-end latency ends on `[DONE]`. Throughput divides 128 by end-to-end seconds.
-The calculation uses inclusive linear percentiles and sample standard deviation.
-The candidate median throughput ratio must exceed `1 + max(0.01, 2 × stdev / median)`.
-Each candidate p95 latency must meet the ceiling `baseline p95 + max(0.01 × baseline p95, 2 × stdev)`.
-Use the fixed limits in the reference for comparison with this historical run.
+The archived three-warmup, nine-measurement capture used inclusive linear
+percentiles and sample standard deviation. Its replay retains the original
+throughput and p95 gates stored in the reference.

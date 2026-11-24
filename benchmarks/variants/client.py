@@ -12,7 +12,7 @@ from pathlib import Path
 from time import perf_counter_ns, time_ns
 from urllib.parse import urlsplit
 
-from benchmarks.concurrent.client import consume_events, summarize, tags
+from benchmarks.concurrent.client import consume_events, summarize
 from benchmarks.concurrent.reference import digest, goldens
 from benchmarks.concurrent.replay import verify_greedy_ids
 from benchmarks.streaming.client import Completion, json_bytes, sse_frames
@@ -97,8 +97,8 @@ def capture_lane(item, url, barrier, sockets, ready):
     return result
 
 
-def start_profile(url, phase, directory):
-    data = {"profile_prefix": f"diagnostic-{phase}", "max_iterations": 4,
+def start_profile(url, tag, phase, directory):
+    data = {"profile_prefix": f"{tag}-{phase}", "max_iterations": 4,
             "profiler_kwargs": {"with_stack": False}}
     result = control(url, "start_profile", json_bytes(data))
     write_json(directory / f"{phase}-profile-start.json", result)
@@ -114,7 +114,7 @@ def capture_cohort(url, lanes, tag, directory, profile=False):
     ready = [threading.Event() if profile else None for _ in lanes]
     instrumentation = {}
     if profile:
-        instrumentation["prefill"] = start_profile(url, "prefill", directory)
+        instrumentation["prefill"] = start_profile(url, tag, "prefill", directory)
     with ThreadPoolExecutor(len(lanes)) as pool:
         jobs = [pool.submit(capture_lane, lane, url, barrier, sockets, signal)
                 for lane, signal in zip(lanes, ready, strict=True)]
@@ -125,7 +125,7 @@ def capture_cohort(url, lanes, tag, directory, profile=False):
                         raise ValueError("All lanes did not begin generating before the deadline")
                 instrumentation["all_lanes_emitting_ns"] = perf_counter_ns()
                 instrumentation["prefill_stop"] = require_http(control(url, "stop_profile", b"{}"))
-                instrumentation["decode"] = start_profile(url, "decode", directory)
+                instrumentation["decode"] = start_profile(url, tag, "decode", directory)
             except (OSError, ValueError, http.client.HTTPException) as error:
                 instrumentation["error"] = str(error)
         _, pending = wait(jobs, timeout=max(0, deadline - perf_counter_ns()) / 1e9)
@@ -253,6 +253,10 @@ def reset(url, controls, tag):
     require_http(result)
 
 
+SINGLE_ROUND_PROTOCOL = "variant-single-round-v2"
+SINGLE_ROUND_TAGS = ("warmup-01", "measured-01")
+
+
 def run_vllm(row, endpoint, fixtures, directory):
     url = urlsplit(endpoint)
     if (url.scheme != "http" or url.hostname not in {"127.0.0.1", "localhost", "::1"}
@@ -263,7 +267,8 @@ def run_vllm(row, endpoint, fixtures, directory):
     lanes = load_requests(fixtures, "prefix" if is_prefix else "mtp")
     controls = directory / "controls"
     controls.mkdir()
-    summary = {"row": row, "status": "in_progress", "attempted": [],
+    summary = {"protocol": SINGLE_ROUND_PROTOCOL, "row": row,
+               "status": "in_progress", "attempted": [],
                "fixture_manifest_sha256": digest((fixtures / "manifest.json").read_bytes())}
     measured = []
     try:
@@ -275,13 +280,13 @@ def run_vllm(row, endpoint, fixtures, directory):
         else:
             expected = goldens("W3")
         write_json(directory / "output-ids.json", expected)
-        for tag in tags(POLICY) + ["diagnostic"]:
+        for tag in SINGLE_ROUND_TAGS:
             summary["attempted"].append(tag)
             if is_prefix:
                 reset(url, controls, tag)
                 capture(url, load_requests(fixtures, "prime"), f"{tag}-prime", controls)
             metrics(url, controls, f"{tag}-before")
-            report = capture(url, lanes, tag, directory, expected, tag == "diagnostic")
+            report = capture(url, lanes, tag, directory, expected, tag == "warmup-01")
             metrics(url, controls, f"{tag}-after")
             if tag.startswith("measured"):
                 measured.append(report)

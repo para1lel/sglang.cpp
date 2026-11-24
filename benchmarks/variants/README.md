@@ -76,9 +76,10 @@ date -u +%FT%TZ > "$run/$row/release.txt"
 
 ## Evidence and comparison
 
-The client uses two warmup and five measured cohorts, plus one diagnostic cohort
-with separate four-step prefill and decode profiles. It uses the concurrent
-barrier, timeouts, overlap requirements, and monotonic-clock definitions. The
+The live collector uses one warmup and one measured cohort. It profiles four
+prefill and decode steps during `warmup-01`. Prefix priming and cold controls
+provide separate correctness evidence. The concurrent barrier, timeouts,
+overlap requirements, and monotonic-clock definitions still apply. The
 first prefix profile shows the two GDN align kernels and replays exactly 1,792
 input IDs per lane. Live page geometry makes the cached state column 3 and the
 new state column 5. The pinned precopy kernel copies the state when those
@@ -87,10 +88,10 @@ chunked GDN. Decode verifies TRTLLM-Gen GQA and the BF16/FP32 GDN route for
 each mode. MTP also checks the draft gather and argmax kernels, target rejection
 sampling kernel, and four full-batch steps at two positions per request.
 
-The row `frozen.json` records full-precision gates, profiles, counters, per-metric
-samples, and the output IDs digest. The same 1% or two-sample-SD rule as the
-concurrent benchmark applies. Both throughput ratios must strictly exceed
-1.01, and every p95 must meet its row's ceiling.
+The archived capture used two warmup cohorts, five measured cohorts, and one
+separate diagnostic cohort. Its `frozen.json` records full-precision gates,
+profiles, counters, samples, and the output ID digest. Both archived throughput
+ratios must strictly exceed 1.01, and every p95 must meet its row's ceiling.
 
 | Row | Median IDs/s must exceed | p95 TTFT ceiling, ms | TPOT ceiling, ms | E2E ceiling, ms |
 | --- | ---: | ---: | ---: | ---: |

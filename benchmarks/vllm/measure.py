@@ -74,7 +74,7 @@ def completed_ids(request, case):
     return tokens
 
 
-def measure(engine, case, sampling_params=None):
+def measure(engine, case, sampling_params=None, *, warmup_request=None):
     if sampling_params is None:
         from vllm import SamplingParams as sampling_params
 
@@ -84,7 +84,10 @@ def measure(engine, case, sampling_params=None):
     elapsed_ms = []
     for iteration in range(case["warmup"] + case["repeats"]):
         start = perf_counter_ns()
-        request, = engine.generate([prompt], params, use_tqdm=False)
+        if iteration == 0 and warmup_request is not None:
+            request = warmup_request
+        else:
+            request, = engine.generate([prompt], params, use_tqdm=False)
         duration = (perf_counter_ns() - start) / 1e6
         tokens = completed_ids(request, case)
         if reference is not None and tokens != reference:
@@ -267,12 +270,12 @@ def observe_fp8(engine, case, sampling_params, destination):
         state, = engine.collective_rpc(finish_fp8_observer)
         destination.with_name("fp8-dispatch.json").write_text(json.dumps(state, indent=2) + "\n")
     completed_ids(request, case)
-    return validate_fp8_dispatch(state, case)
+    return request, validate_fp8_dispatch(state, case)
 
 
 def main():
     case_path, model, destination = map(Path, sys.argv[1:])
-    case = load_case(case_path)
+    case = load_case(case_path) | {"warmup": 1, "repeats": 1}
     fp8 = case.get("kv_cache_dtype") == "fp8_e4m3"
     if fp8:
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -290,15 +293,18 @@ def main():
     if fp8:
         scale_audit = checkpoint_scale_audit(model)
     engine = LLM(model=str(model.resolve(strict=True)), **config)
-    result = measure(engine, case, SamplingParams)
-    result.update(case=case, model=str(model), config=config, vllm=vllm.__version__,
+    warmup_request, dispatch = observe_fp8(engine, case, SamplingParams, destination) if fp8 else (
+        None, None)
+    result = measure(engine, case, SamplingParams, warmup_request=warmup_request)
+    result.update(protocol="offline-single-round-v2", case=case, model=str(model),
+                  config=config, vllm=vllm.__version__,
                   source_commit=pin, torch=str(torch.__version__), cuda=torch.version.cuda,
                   gpu_uuid=os.environ["CUDA_VISIBLE_DEVICES"], gpu=torch.cuda.get_device_name(0))
     if fp8:
         result.update(python=platform.python_version(), flashinfer=version("flashinfer-python"),
                       checkpoint_scale_audit=scale_audit,
                       requests_matching_output_ids=case["warmup"] + case["repeats"])
-        result["effective"] = observe_fp8(engine, case, SamplingParams, destination)
+        result["effective"] = dispatch
     destination.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
 
 

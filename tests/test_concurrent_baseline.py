@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from benchmarks.concurrent import client
 from benchmarks.concurrent.client import (
     capture_cohort, gate, summarize, thresholds, validate_cohort,
 )
@@ -259,3 +260,21 @@ def test_portable_goldens_and_condition_identity():
         row = baseline["rows"][name]
         assert row["thresholds"]["strict_throughput_ratio_gt"] == 1.01
         assert row["observed_cached_prompt_tokens"] == 0
+
+
+def test_current_concurrent_runs_each_round_once(tmp_path, monkeypatch):
+    previous = client.reference()
+    previous["rows"]["W3"]["thresholds"]["strict_median_output_tokens_per_second_gt"] = 1e12
+    monkeypatch.setattr(client, "reference", lambda: previous)
+    lanes = wire_fixture()
+    monkeypatch.setattr(client, "load_lanes", lambda *_: lanes)
+    output = tmp_path / "capture"
+    with loopback(lanes) as (url, received):
+        assert client.run("W3", url.geturl(), tmp_path, output) == 1
+        assert len(received) == 2 * len(lanes)
+    report = json.loads((output / "summary.json").read_bytes())
+    assert report["protocol"] == client.SINGLE_ROUND_PROTOCOL
+    assert [outcome["tag"] for outcome in report["request_outcomes"]] == [
+        "warmup-01", "measured-01"]
+    assert report["throughput"]["output_tokens_per_second"]["sample_stdev"] is None
+    assert report["wire_and_timing_gates"]["throughput"] is False

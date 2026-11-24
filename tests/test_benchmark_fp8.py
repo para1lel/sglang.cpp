@@ -146,3 +146,20 @@ def test_archived_fp8_result_matches_fixture_and_recomputes_rates():
     tokens = case["output_tokens"] * case["repeats"]
     assert result["total_output_tokens"] == tokens
     assert result["output_tokens_per_second"] == pytest.approx(tokens * 1000 / sum(samples))
+
+
+def test_profiled_fp8_warmup_is_reused_by_timing():
+    case = RUNNER["load_case"](BENCHMARK / "small-fp8.json") | {"warmup": 1, "repeats": 1}
+    output = SimpleNamespace(token_ids=case["expected_output_ids"], finish_reason="length")
+    request = SimpleNamespace(finished=True, prompt_token_ids=case["prompt_token_ids"],
+                              outputs=[output])
+    calls = []
+
+    def generate(prompts, params, *, use_tqdm):
+        calls.append(prompts)
+        return [request]
+
+    result = RUNNER["measure"](SimpleNamespace(generate=generate), case, sampling_params=dict,
+                             warmup_request=request)
+    assert len(calls) == len(result["latency_ms"]) == 1
+    assert result["output_ids"] == case["expected_output_ids"]

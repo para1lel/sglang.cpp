@@ -27,6 +27,7 @@ PROTOCOL = "matched-k4-v1"
 OPT_IN_PROTOCOL = "matched-k4-opt-in-v1"
 ARM_ORDER = ("native-k0", "native-k4-trace", "native-k4", "vllm-k4")
 EXACT_CONTROL = "native-exact-k0"
+SINGLE_ROUND_SAMPLING = "single-round-v1"
 ORDERED_PROFILE = "ordered-tc-int8"
 SPLIT_PROFILE = "ordered-tc-int8-split-gqa"
 LONG_SPLIT_PROFILE = "ordered-tc-int8-long-split-gqa"
@@ -40,12 +41,14 @@ NATIVE_VERIFY_LINE = re.compile("batch verify " + " ".join(
     f"{field}={TRACE_INTEGER}" for field in ("lanes", "rows", "peak_request_bytes")))
 
 
-def schedule(row, arm):
+def schedule(row, arm, identity=None):
     if arm in (*ARM_ORDER[:2], EXACT_CONTROL):
         return ["control"]
+    if single_round(identity):
+        return ["warmup-01", "measured-01"]
     if row in streaming.SHAPES:
-        return concurrent.tags({"warmup_cohorts": streaming.WARMUPS,
-                                "measured_cohorts": streaming.REPEATS})
+        return concurrent.tags({"warmup_cohorts": streaming.ARCHIVED_WARMUPS,
+                                "measured_cohorts": streaming.ARCHIVED_REPEATS})
     return concurrent.tags(concurrent.reference()["policy"])
 
 
@@ -64,6 +67,16 @@ def fixture(row, fixtures, identity=None):
     case, _ = streaming.load_cases(Path(streaming.__file__).parent)[row]
     body = streaming.json_bytes(streaming.request_body(case))
     return [({"lane": 0, "request_sha256": hashlib.sha256(body).hexdigest()}, body, case)]
+
+
+def single_round(identity):
+    if not identity:
+        return False
+    sampling = identity.get("sampling")
+    require("sampling" not in identity or sampling == SINGLE_ROUND_SAMPLING,
+            "Unknown K4 sampling policy")
+    return (sampling == SINGLE_ROUND_SAMPLING
+            or identity.get("protocol") == workload_suite.PROTOCOL_V5)
 
 
 def current_campaign(identity):
@@ -275,6 +288,7 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
     version = receipt_version(identity)
     binding = arm_binding(directory, arm, selected, version)
     expected = None
+    warmup_outputs = None
     if default_campaign(selected):
         require(arm in ("native-k4", "native-k4-trace", "vllm-k4")
                 and native_control is None, "A default launch has no forced K0 control")
@@ -289,7 +303,7 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
         (directory / f'{lane["lane"]:02d}.request.json').write_bytes(body)
     cache_on = cache_on_campaign(selected)
     engine = "vllm" if arm == "vllm-k4" else "native"
-    for tag in schedule(row, arm):
+    for tag in schedule(row, arm, identity):
         cache_receipt = cold_cache.before_cohort(url, engine) if cache_on else None
         if row in streaming.SHAPES:
             _, body, case = lanes[0]
@@ -318,6 +332,16 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
         else:
             require(expected is None or outputs == expected,
                     f"{tag}: native K4 differs from native K0")
+        if single_round(identity):
+            warmup_outputs = verify_single_round_outputs(arm, tag, outputs, warmup_outputs)
+
+
+def verify_single_round_outputs(arm, tag, outputs, warmup_outputs):
+    if tag == "warmup-01":
+        return outputs
+    if tag == "measured-01":
+        require(outputs == warmup_outputs, f"{arm}: measured output IDs differ from the warmup")
+    return warmup_outputs
 
 
 def exact_compatibility(expected, exact, profile):
@@ -368,6 +392,18 @@ def verify_row_status(directory, result, required):
                 "Saved row exit status differs from replay")
 
 
+def verify_single_round_comparison(row, receipt, criterion):
+    workload = receipt.get("workloads", {}).get(row, {})
+    samples = [workload.get(arm, {}).get("samples_ns") for arm in ("native", "vllm")]
+    require(all(isinstance(values, list) and len(values) == 1
+                and type(values[0]) is int and values[0] > 0 for values in samples),
+            f"{row}: expected one measured makespan per engine")
+    native, vllm = samples
+    expected = compare({row: native}, {row: vllm}, eligible=True, criterion=criterion)
+    require(expected["passed"] and workload == expected["workloads"][row],
+            f"{row}: measured makespan does not certify a pass")
+
+
 def check_prior_rows(row, root):
     identity_bytes = (root / "identity.json").read_bytes()
     identity = json.loads(identity_bytes)
@@ -379,7 +415,7 @@ def check_prior_rows(row, root):
     if current_campaign(identity):
         workload_suite.validate_identity(identity)
     previous_rows = rows[:rows.index(row)]
-    wide_budget = identity["protocol"] == workload_suite.PROTOCOL_V4
+    wide_budget = identity["protocol"] in workload_suite.WIDE_BUDGET_PROTOCOLS
     if wide_budget and row in ("W4", "W5"):
         previous_rows = ("W4",) if row == "W5" else ()
     for previous in previous_rows:
@@ -401,6 +437,9 @@ def check_prior_rows(row, root):
                      workload_evidence(previous, identity))
                 and (not wide_budget or comparison.get("max_num_batched_tokens") ==
                      workload_suite.V4_TOKEN_BUDGET), requirement)
+        if single_round(identity):
+            require(comparison.get("sampling") == identity.get("sampling"), requirement)
+            verify_single_round_comparison(previous, comparison, criterion)
 
 
 def assess(row, fixtures, directory):
@@ -425,9 +464,12 @@ def assess(row, fixtures, directory):
         arms = ARM_ORDER[1:]
     else:
         arms = (ARM_ORDER[0], EXACT_CONTROL, *ARM_ORDER[1:]) if selected else ARM_ORDER
+    arms = tuple(arm for arm in arms if row == "W1" or arm != "native-k4-trace")
+    if single_round(identity):
+        require(not any((directory / arm).exists()
+                        for arm in (*ARM_ORDER, EXACT_CONTROL) if arm not in arms),
+                "Unexpected arm for this campaign profile")
     for arm in arms:
-        if arm == "native-k4-trace" and row != "W1":
-            continue
         measurement = directory / arm / "measurement"
         if use_defaults:
             verify_default_receipts(row, measurement.parent, identity)
@@ -436,12 +478,13 @@ def assess(row, fixtures, directory):
                                 version=version)
         binding = arm_binding(measurement, arm, selected, version)
         verify_request_files(measurement, lanes)
-        tags = schedule(row, arm)
+        tags = schedule(row, arm, identity)
         require({path.name for path in measurement.glob("*.json.gz")}
                 == {f"{tag}.json.gz" for tag in tags}, f"{arm}: wrong cohort set")
         engine = "vllm" if arm == "vllm-k4" else "native"
         if cache_on:
             cache_receipts[arm] = {}
+        warmup_outputs = None
         for tag in tags:
             raw = read_raw(measurement, tag)
             duration, outputs, metrics = replay_cohort(raw, row, tag, lanes, policy, binding)
@@ -453,6 +496,8 @@ def assess(row, fixtures, directory):
                 exact = outputs
             elif not use_defaults and arm != "vllm-k4":
                 require(outputs == expected, f"{arm} {tag}: native K4 differs from native K0")
+            if single_round(identity):
+                warmup_outputs = verify_single_round_outputs(arm, tag, outputs, warmup_outputs)
             if tag.startswith("measured-"):
                 samples[arm].append(duration)
                 if current:
@@ -480,8 +525,10 @@ def assess(row, fixtures, directory):
     if current:
         result.update(workload=workload_evidence(row, identity, lanes),
                       cohort_metrics=diagnostics)
-    if identity.get("protocol") == workload_suite.PROTOCOL_V4:
+    if identity.get("protocol") in workload_suite.WIDE_BUDGET_PROTOCOLS:
         result["max_num_batched_tokens"] = defaults.token_budget(identity)
+    if "sampling" in identity:
+        result["sampling"] = identity["sampling"]
     verify_row_status(directory, result, version > 0)
     return result
 
@@ -714,6 +761,9 @@ def main():
     args = parser.parse_args()
     try:
         if args.mode == "capture":
+            directory = args.directory.parent.parent
+            identity = receipt_identity(directory, campaign(directory))
+            require(single_round(identity), "Live capture requires a single-round campaign")
             capture(args.row, args.arm, args.endpoint, args.fixtures, args.directory,
                     args.native_control)
         elif args.mode == "assess":

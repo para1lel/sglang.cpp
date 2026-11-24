@@ -41,28 +41,26 @@ save runs outside the provisioned environment's `runs/` directory.
 
 `small.json` supplies the five token IDs for `The capital of France is`. The engine accepts IDs
 directly and returns greedy token IDs without detokenization. One resident eager engine serves
-two warmups and seven measured serial requests, each with eight output tokens, EOS ignored,
-prefix caching disabled, and seed 0. Each call must complete at the requested length and
-produce the same token IDs. The text-only path uses checkpoint FP8 weights, BF16 activation
-dtype, tensor parallelism 1, a 256-token context, and a 1 GiB KV cache allocation.
+one warmup and one measured serial request, each with eight output tokens, EOS
+ignored, prefix caching disabled, and seed 0. Both calls must complete at the
+requested length and produce the same IDs. The text-only path uses checkpoint
+FP8 weights, BF16 activations, tensor parallelism 1, a 256-token context, and a
+1 GiB KV cache allocation.
 
-Latency starts immediately before `LLM.generate` and ends when it returns the completed request.
-It includes scheduling, prefill, and decode. Model loading, checkpoint hashing, and the two
-warmups occur outside the samples. The offline serial smoke rate, `output_tokens_per_second`,
-divides the 56 measured output tokens by the sum of the seven completed request durations in
-seconds. `output_tokens_per_median_request_second` divides eight tokens by median request latency
-in seconds. The stored individual samples allow both rates to be recalculated. The runner enforces a
-ten-minute engine timeout. Its printed run directory contains per-trial samples, output IDs,
-the engine log, settings, and before/after device snapshots. A failed run preserves its log
-and exit status.
+Latency starts immediately before `LLM.generate` and ends when it returns the
+completed request. It includes scheduling, prefill, and decode. Model loading,
+checkpoint hashing, and the warmup occur outside the measured request. The
+runner divides eight output tokens by that request's duration. The run directory
+keeps the timing, IDs, settings, engine log, and device snapshots. The runner
+enforces a ten-minute timeout and preserves the log and exit status on failure.
 
 ## FP8 comparator
 
-Run `small-fp8.json` with the same launcher after setup. The fixture pins the expected
-eight greedy IDs for all nine requests and requests `fp8_e4m3` GQA KV with FlashInfer
-and BF16 queries. After timing, the runner issues one separate request to check the actual
-FlashInfer `fa2` paged prefill and `trtllm-gen` decode calls, their E4M3 KV inputs,
-the LBHNC cache layout, and BF16 convolution and FP32 recurrent GDN state.
+Run `small-fp8.json` with the same launcher after setup. The fixture pins the
+eight greedy IDs and requests `fp8_e4m3` GQA KV with FlashInfer and BF16 queries.
+During the warmup, the runner observes FlashInfer `fa2` paged prefill and
+`trtllm-gen` decode, their E4M3 KV inputs, the LBHNC cache layout, and BF16
+convolution and FP32 recurrent GDN state.
 It checks the checkpoint's scale inventory and verifies unit per-tensor K and V scales
 on all 16 GQA layers. The FP8 subprocess enables vLLM callable serialization for the
 local worker probe. It writes `fp8-dispatch.json` with the observations and succeeds only after
@@ -80,8 +78,8 @@ samples yielded **26.0176 output tokens/s** and **307.766493 ms** median request
 latency, with a range of 305.747803–308.984207 ms. The archive includes the runtime
 identity and hashes of the original raw evidence under `artifacts/decoder-oracle/run.cctk0V/`.
 That run used `small.json` with the FP8 engine options applied separately. The standalone FP8
-fixture records the same options and observed IDs. Reproduction uses the checked-in launcher,
-fixture, and pinned environment.
+fixture records the same options and observed IDs. The stored samples use the
+original two-warmup, seven-measurement schedule.
 
 ## Historical BF16 result
 

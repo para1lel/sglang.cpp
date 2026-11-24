@@ -137,9 +137,10 @@ def test_paired_collector_keeps_diagnostic_failures_out_of_exit_status(tmp_path,
         runpy.run_path(str(collector), run_name="__main__")
     assert exit_info.value.code == 0
     report = identity.load(destination / "summary.json")
+    assert report["protocol"] == identity.concurrent.SINGLE_ROUND_PROTOCOL
     assert report["wire_and_timing_gates"]["throughput"] is False
     assert identity.replay_cohorts(
-        tmp_path, "W3", report, lanes, identity.PAIRED_COLLECTOR) == {"W3": [95] * 5}
+        tmp_path, "W3", report, lanes, identity.PAIRED_COLLECTOR) == {"W3": [95]}
 
 
 def test_paired_comparison_uses_medians_and_rejects_ties_and_slower_workloads():

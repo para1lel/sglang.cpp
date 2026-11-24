@@ -49,13 +49,13 @@ Lengths are exact post-template tokens per request. Multiply offered requests pe
 | W4 | 32,768 | 4,096 | 8 |
 | W5 | 131,072 | 1,024 | 4 |
 
-Use the [server-defaults protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol) for `matched-k4-native-defaults-cache-on-v4`. W4 uses the first eight requests from archived W5. W5 uses all four archived W6 requests. Keep the [warm-prefix diagnostic](../benchmarks/paired/README.md#prefix-reuse-diagnostic) and media variants separate.
+Use the [server-defaults protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol) for `matched-k4-native-defaults-cache-on-v5`. W4 uses the first eight requests from archived W5. W5 uses all four archived W6 requests. Keep the [warm-prefix diagnostic](../benchmarks/paired/README.md#prefix-reuse-diagnostic) and media variants separate.
 
 ## Measurement
 
-For each W1–W5 row, require a native median client makespan at most 1.10 times the pinned vLLM median. Stop tuning once every row passes. Keep the scheduling rule and workload settings fixed. Improve calculation through CUDA kernels, programmatic dependent launch (PDL), streams, and CUDA Graph replay.
+For each W1–W5 row, require native client makespan at most 1.10 times the pinned vLLM makespan. Stop tuning once every row passes. Keep the scheduling rule and workload settings fixed. Improve calculation through CUDA kernels, programmatic dependent launch (PDL), streams, and CUDA Graph replay.
 
-For W1 and W2, run three warmup cohorts and nine measured cohorts. For W3–W5, run two warmup cohorts and five measured cohorts. Start long-row profiling with W4 in a separate diagnostic run. W4 can start a fresh formal campaign. Run W5 only after W4 passes in that v4 campaign. Run W1–W3 in order. Each later short row requires the prior short rows to pass in that campaign. Validate launch and device identity and every stream’s request, token counts, finish condition, usage, and drain. Apply each profile’s native ID checks and evidence requirements. The pinned vLLM arm supplies timing, and its output IDs can vary across valid streams. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Run one warmup and one measured cohort per item and engine. Use the measured cohort for the verdict. Run long-row profiling separately. W4 can start a fresh formal campaign. Run W5 after W4 passes in that campaign. Run W1–W3 in order and advance after each pass. Validate device identity, launch settings, and every stream’s request, token counts, finish condition, usage, and drain. Require each engine's measured output IDs to match its warmup. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 Use one streaming client and monotonic clock. Measure from earliest submit to last valid `[DONE]`. Preconnect lanes and release them with one barrier. Send all bodies before the first valid completion. Limit the submit span to 50 ms. Retain submit times, headers, token events, completion times, token counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and other empty events from token counts.
 
@@ -69,11 +69,11 @@ Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane s
 | End-to-end latency (ms) | Time from request submission to its terminal response. Record stream chunking when multiple tokens arrive together. |
 | Requests/s and aggregate tokens/s | Completed requests per cohort second, and total input plus output tokens per cohort second, respectively. |
 
-Exclude startup, model load, JIT compilation, and graph capture from steady measurements. Before every warmup, timed cohort, and separate W1 trace, drain both engines. Send `{}` as `application/json` to each idle reset route. Require success and record cache counters. Start the timer after reset. Require zero cached tokens per request and unchanged prefix-hit counters. Report cohort median and range for makespan and output throughput. Report request p50 and p95 for TTFT, TPOT, and end-to-end latency, with sample counts and the percentile method.
+Exclude startup, model load, JIT compilation, and graph capture from steady measurements. Drain each engine before the warmup and measured cohorts. Send `{}` as `application/json` to its idle reset route. Require success and record cache counters. Start the timer after reset. Require zero cached tokens per request and unchanged prefix-hit counters. Report measured makespan and output throughput as point estimates. Label request-level latency statistics with the sample count and percentile method.
 
-Report one row per engine, workload, and mode with absolute metrics and successful and attempted request counts. Use paired throughput ratios and latency differences for diagnosis. Set any undefined workload margins from baseline repeats before candidate timing.
+Report one row per engine, workload, and mode with absolute metrics and successful and attempted request counts. Use paired throughput ratios and latency differences for diagnosis. Keep archived statistics under their original protocols.
 
-For offline timing, omit `--top-logits`. Match `--warmup` and `--repeats` to the reference workload. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident request storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L216)<!-- prefix: "Measurements" -->
+For new offline timing, use `--warmup 1 --repeats 1` and omit `--top-logits`. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L216)<!-- prefix: "Measurements" -->
 
 ### Operator qualification
 
@@ -168,11 +168,13 @@ Performance acceptance requires [native implementation correctness](development.
 - **Sampling.** Run the [sampling checks](text-serving.md#verification) and [sampled MTP checks](mtp.md#sampled-verification). Report rates separately by width, depth, and arm order.
 - **Finite choices.** Run the [constraint checks](text-serving.md#finite-choice-verification). Record grammar, candidate counts, effective dispatch, and [batch scratch](batch-graphs.md#runtime-path) separately from frozen workloads.
 - **Multimodal.** Verify image and video processing, visual token positions, and reference output behavior on each fixture. Include client-visible preprocessing and transport in end-to-end measurements. Record server processing and vision-encoder time separately when observable.
-- **Profiling.** Record GPU utilization, kernel, JIT, scheduler, and queue times, plus collection methods. Profile separately if tracing changes throughput. Collect [native scheduler samples](prefix-cache.md#native-http-controls) during diagnostics. [Full vLLM verification](../benchmarks/variants/verify.py#L390)<!-- prefix: "def verify(r" --> needs pinned worker metadata and PyTorch traces. Link optimizations to bottlenecks, correctness, and results.
+- **Profiling.** Record GPU utilization, kernel, JIT, scheduler, and queue times, plus collection methods. Profile separately if tracing changes throughput. Collect [native scheduler samples](prefix-cache.md#native-http-controls) during diagnostics. [Full vLLM verification](../benchmarks/variants/verify.py#L407)<!-- prefix: "def verify(r" --> needs pinned worker metadata and PyTorch traces. Link optimizations to bottlenecks, correctness, and results.
 
 Retain the run manifest, commands, environment, fixture hashes, raw samples, and failures in ignored `artifacts/` storage. A missing counter is unavailable. A missing baseline, failed correctness check, or changed workload leaves that performance claim open.
 
 ## Matched K4 evidence
+
+The following results use the archived multi-cohort v4 protocol.
 
 Both engines ran on the same B200 for each row. GPU 7 ran W1–W3. GPU 6 ran W4–W5. Both used MTP4, a 32,768-token step budget, and an eight-slot capacity. Each cohort reset the enabled prefix cache. Native used four cache slots and CUDA graphs. Pinned vLLM used async scheduling and a 32,768-token scheduled cap. Its context and KV budgets were 2,560 tokens and 10 GiB for W1–W2. W3–W5 used 132,096 tokens and 128 GiB.
 

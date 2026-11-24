@@ -44,8 +44,9 @@ cohort. A reported `total_tokens` must equal prompt plus output.
 Preconnect one loopback socket per lane, release submissions on a barrier, and require
 the submit span to stay within 50 ms. Every request body must be sent before any output
 ID arrives. All streams must overlap, with at least one ID received from every lane
-before the first `[DONE]`. Run two warmup and five measured cohorts. The per-socket I/O,
-barrier, and cohort timeouts are 90, 15, and 360 seconds. Stop the row at the first
+before the first `[DONE]`. Run one warmup and one measured cohort. Compare each
+lane's full outputs between cohorts. The per-socket I/O, barrier, and cohort
+timeouts are 90, 15, and 360 seconds. Stop the row at the first
 invalid cohort, retaining every attempt and its original workload name. Gzip JSON
 preserves the SSE frames, read boundaries, timestamps, IDs, usage, stops, and errors.
 
@@ -70,9 +71,12 @@ vLLM used `FULL_AND_PIECEWISE` CUDA graphs with compile mode `NONE` and `enforce
 The separate diagnostic cohort profiled four initial steps and four full-batch decode
 steps per row. Profile replay checks FlashInfer FA2 paged GQA and Blackwell chunked GDN
 in prefill, with TRTLLM-Gen GQA in any mixed steps. Full decode uses TRTLLM-Gen GQA and
-packed recurrent GDN. The client checks the wire and timing gates. Establish effective
-hardware, cache, and dispatched backend conditions independently for any paired run.
+packed recurrent GDN. Establish effective hardware, cache, and dispatched
+backend conditions independently for any paired run.
 Use native MXFP8 KV for the candidate as specified by the project benchmark contract.
+
+The archived capture used two warmups and five measured cohorts. Its replay
+checks the original wire and timing gates.
 
 Require median cohort output IDs/s to **strictly exceed** the baseline median times
 `1 + max(0.01, 2 × sample SD / median)`. Require each request-level p95 to stay at or

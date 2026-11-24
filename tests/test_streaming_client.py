@@ -197,9 +197,18 @@ class StreamingClientTest(unittest.TestCase):
                 self.assertEqual(client.main(), 0)
             reports = json.loads((output / "summary.json").read_bytes())["workloads"]
             for name, report in reports.items():
-                self.assertEqual(report["successful"], 9)
+                self.assertEqual(report["warmups_successful"], 1)
+                self.assertEqual(report["successful"], 1)
                 self.assertEqual(report["greedy_output_ids"], workloads[name]["greedy_output_ids"])
+                self.assertAlmostEqual(report["comparison"]["throughput_ratio"], 1.02)
                 self.assertTrue(report["comparison"]["passed"])
+                self.assertIsNone(report["output_tokens_per_second"]["sample_stdev"])
+                self.assertNotIn("thresholds", report)
+            events = (output / "events.jsonl").read_text().splitlines()
+            records = [json.loads(line) for line in events]
+            self.assertEqual([(row["phase"], row["workload"], row["cohort"]) for row in records],
+                             [(phase, name, 1) for phase in ("warmup", "measured")
+                              for name in ("W1", "W2")])
 
 
 if __name__ == "__main__":

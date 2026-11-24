@@ -20,8 +20,7 @@ if (( $# < 3 )); then
     exit 2
 fi
 
-binary=$(realpath -- "$1/bin/sglang-server")
-[[ -x $binary ]]
+build_dir=$1
 index=$2
 target=$3
 shift 3
@@ -29,15 +28,23 @@ groups=("$@")
 if (( ${#groups[@]} == 0 )); then
     groups=(W1-W2 W3 W4 W5 W6)
 fi
+declare -A selected_groups=()
 for group in "${groups[@]}"; do
     case "$group" in
         W1-W2|W3|W4|W5|W6) ;;
         *) usage >&2; exit 2 ;;
     esac
+    if [[ ${selected_groups[$group]+present} ]]; then
+        echo "Duplicate benchmark group: $group" >&2
+        exit 2
+    fi
+    selected_groups[$group]=1
 done
 
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 validate_run_settings
+binary=$(realpath -- "$build_dir/bin/sglang-server")
+[[ -x $binary ]]
 mode=${PAIRED_COMPARISON_MODE:-}
 if [[ -n ${PAIRED_VLLM_RESULTS:-} && -z $mode ]]; then
     mode=matched

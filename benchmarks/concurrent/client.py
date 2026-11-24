@@ -241,7 +241,8 @@ def validate_cohort(raw, lanes, policy):
 def describe(values):
     return {"n": len(values), "p50": statistics.median(values),
             "p95": percentile(values, .95), "min": min(values), "max": max(values),
-            "sample_stdev": statistics.stdev(values), "samples": values}
+            "sample_stdev": statistics.stdev(values) if len(values) > 1 else None,
+            "samples": values}
 
 
 def summarize(measured):
@@ -278,17 +279,33 @@ def tags(policy):
             for index in range(1, policy[f"{phase}_cohorts"] + 1)]
 
 
-def run(name, endpoint, fixtures, directory):
+def verify_round_ids(raw, warmup_ids):
+    for request, expected in zip(raw["requests"], warmup_ids, strict=True):
+        actual = request["output_ids"]
+        if actual == expected:
+            continue
+        for offset, (before, after) in enumerate(zip(expected, actual, strict=True)):
+            if before != after:
+                raise ValueError(f"Lane {request['lane']} output {offset} differs from warmup: "
+                                 f"expected {before}, observed {after}")
+
+
+SINGLE_ROUND_PROTOCOL = "concurrent-single-round-v2"
+
+
+def run(name, endpoint, fixtures, directory, *, validate=validate_cohort, enforce_gate=True):
     url = urlsplit(endpoint)
     if (url.scheme != "http" or url.hostname not in {"127.0.0.1", "localhost", "::1"}
             or url.path not in ("", "/") or url.query or url.fragment or url.username is not None):
         raise ValueError("Provide a loopback HTTP origin")
     baseline = reference()
-    policy = baseline["policy"]
+    policy = baseline["policy"] | {"warmup_cohorts": 1, "measured_cohorts": 1}
     lanes = load_lanes(fixtures, name)
     directory.mkdir()
     attempts, measured = [], []
-    report = {"row": name, "request_outcomes": attempts, "status": "in_progress",
+    warmup_ids = None
+    report = {"protocol": SINGLE_ROUND_PROTOCOL, "row": name,
+              "request_outcomes": attempts, "status": "in_progress",
               "fixture_manifest_sha256": baseline["fixture_manifest_sha256"],
               "baseline_bundle_sha256": baseline["archive"]["bundle_sha256"]}
     for tag in tags(policy):
@@ -301,7 +318,11 @@ def run(name, endpoint, fixtures, directory):
                        sum("error" not in item for item in raw["requests"])}
         attempts.append(outcome)
         try:
-            result = validate_cohort(raw, lanes, policy)
+            result = validate(raw, lanes, policy)
+            if warmup_ids is None:
+                warmup_ids = [request["output_ids"] for request in raw["requests"]]
+            else:
+                verify_round_ids(raw, warmup_ids)
         except (ValueError, KeyError, TypeError) as error:
             outcome["error"] = str(error)
             report["status"] = "invalid_cohort"
@@ -317,7 +338,7 @@ def run(name, endpoint, fixtures, directory):
     if report["status"] != "complete":
         return 1
     verdict = report["wire_and_timing_gates"]
-    return int(not (verdict["throughput"] and all(verdict["latency"].values())))
+    return int(enforce_gate and not (verdict["throughput"] and all(verdict["latency"].values())))
 
 
 if __name__ == "__main__":

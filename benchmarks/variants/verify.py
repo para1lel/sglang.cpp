@@ -13,7 +13,9 @@ from pathlib import Path
 from benchmarks.concurrent.client import tags
 from benchmarks.concurrent.profile import GRAPH_LAUNCHES, STEP, kernel_route
 from benchmarks.concurrent.reference import digest, goldens, lane_manifest
-from benchmarks.variants.client import replay_cohort, verify_same_engine_greedy
+from benchmarks.variants.client import (
+    SINGLE_ROUND_PROTOCOL, SINGLE_ROUND_TAGS, replay_cohort, verify_same_engine_greedy,
+)
 from benchmarks.variants.fixtures import (
     OUTPUT, POLICY, PREFIX, PRIOR_BUNDLE_SHA256, PROMPT, ROWS, TOKENIZER_SHA256, load_requests,
 )
@@ -267,7 +269,8 @@ def independently_summarize(cohorts):
         p95 = ordered[lower] + fraction * (ordered[upper] - ordered[lower])
         return {"n": len(values), "p50": statistics.median(values), "p95": p95,
                 "min": min(values), "max": max(values),
-                "sample_stdev": statistics.stdev(values), "samples": values}
+                "sample_stdev": statistics.stdev(values) if len(values) > 1 else None,
+                "samples": values}
 
     rates = collections.defaultdict(list)
     durations = collections.defaultdict(list)
@@ -356,7 +359,19 @@ def verify_capture(run, name):
         raise ValueError("MTP goldens differ from archived no-MTP W3 goldens")
     reports, counters = {}, {}
     registration = datetime.fromisoformat((run / "fixtures-frozen-utc.txt").read_text().strip())
-    for tag in tags(POLICY) + ["diagnostic"]:
+    captured = read(capture / "summary.json")
+    protocol = captured.get("protocol")
+    if protocol == SINGLE_ROUND_PROTOCOL:
+        expected_tags = list(SINGLE_ROUND_TAGS)
+        attempted = ["cold-control", *expected_tags] if prefix else expected_tags
+        if (captured["attempted"] != attempted or set(capture.glob("*.json.gz")) !=
+                {capture / f"{tag}.json.gz" for tag in expected_tags}):
+            raise ValueError("Unexpected number or order of variant rounds")
+    elif protocol is None:
+        expected_tags = tags(POLICY) + ["diagnostic"]
+    else:
+        raise ValueError("Unknown variant capture protocol")
+    for tag in expected_tags:
         raw = read_gzip(capture / f"{tag}.json.gz")
         if raw["tag"] != tag or datetime.fromisoformat(raw["started_utc"]) <= registration:
             raise ValueError(f"Wrong recorded cohort for {tag}")
@@ -366,6 +381,9 @@ def verify_capture(run, name):
             primed = replay_cohort(prime, load_requests(fixtures, "prime"))
             if primed["requests"][0]["done_ns"] >= raw["barrier_ns"]:
                 raise ValueError(f"Prime completed after the cohort started: {tag}")
+        if protocol == SINGLE_ROUND_PROTOCOL and bool(raw["instrumentation"]) != (
+                tag == "warmup-01"):
+            raise ValueError(f"{tag}: profiling must occur during the warmup")
         replayed = replay_cohort(raw, lanes)
         verify_same_engine_greedy(replayed, expected)
         saved = read(capture / f"{tag}-replayed.json")
@@ -379,7 +397,6 @@ def verify_capture(run, name):
     stats = independently_summarize(
         [report for tag, report in reports.items() if tag.startswith("measured")]
     )
-    captured = read(capture / "summary.json")
     fixture_digest = digest((fixtures / "manifest.json").read_bytes())
     if (captured["status"] != "captured" or captured["fixture_manifest_sha256"] != fixture_digest
             or any(captured[key] != values for key, values in stats.items())):
@@ -391,16 +408,20 @@ def verify(run, name, frozen_utc):
     worker = verify_worker(run, name)
     verify_fixtures(run / "fixtures")
     stats, counters = verify_capture(run, name)
+    single_round = "diagnostic" not in counters
+    profile_tag = "warmup-01" if single_round else "diagnostic"
     profiles = {}
     inspect_variant = verify_prefix_profile if name == "W3-prefix" else verify_mtp_profile
     for phase in ("prefill", "decode"):
-        trace, = (run / name / "profile").glob(f"diagnostic-{phase}*.pt.trace.json.gz")
+        trace, = (run / name / "profile").glob(f"{profile_tag}-{phase}*.pt.trace.json.gz")
         steps, launches, signatures = profile_stats(trace)
         routes = inspect_variant(phase, steps, signatures)
         profiles[phase] = {"file": str(trace.relative_to(run)),
                            "sha256": digest(trace.read_bytes()), "scheduler_steps": steps,
                            "graph_launches": launches, "routes": routes}
     fixture_sha = digest((run / "fixtures" / "manifest.json").read_bytes())
+    evidence = ({"protocol": SINGLE_ROUND_PROTOCOL} if single_round else
+                {"thresholds": freeze_limits(stats)})
     return {"row": name, "status": "verified_frozen",
             "frozen_utc": frozen_utc, "gpu_uuid": GPU_UUID,
             "vllm_pin": PIN, "checkpoint_manifest_sha256": CHECKPOINT,
@@ -408,7 +429,7 @@ def verify(run, name, frozen_utc):
             "output_ids_file": f"{name}/capture/output-ids.json",
             "output_ids_sha256": digest((run / name / "capture" / "output-ids.json").read_bytes()),
             "effective_variant": worker["variant"], "capacity": worker["pool"]["rows"]["W3"],
-            **stats, "thresholds": freeze_limits(stats), "counters": counters, "profiles": profiles}
+            **stats, **evidence, "counters": counters, "profiles": profiles}
 
 
 def main():

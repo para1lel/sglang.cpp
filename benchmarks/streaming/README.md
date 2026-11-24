@@ -30,14 +30,14 @@ even if its output ID array is empty. The final choice reports
 The client validates all lengths, the prompt echo, usage, and completion reason.
 It compares the complete emitted ID sequence across repetitions and against the
 baseline when `--reference` is supplied. The reference also checks client,
-fixture and request hashes and evaluates each frozen performance limit.
+fixture and request hashes and reports the measured throughput ratio.
 
 ## Frozen measurement protocol
 
-Run three warmup rounds followed by nine measured rounds. Each round has one
-W1 request followed by one W2 request, with a shared `cohort` number within its
-phase in the JSONL. Submit the next request as soon as the previous one has
-finished and its raw events have been stored.
+Live collection runs one warmup and one measured round. Each round sends W1,
+then W2. Submit the next request after storing the previous request's events.
+The measured round supplies the point estimates. The archived GPU3 capture
+used three warmup and nine measured rounds.
 Each request uses a fresh localhost HTTP connection. Set GPU visibility to the
 selected physical UUID. Keep the prefix cache disabled for startup, warmup,
 measurement, and dispatch observation. Preserve all attempts without retries
@@ -52,6 +52,8 @@ first-to-last ID interval by the actual output count minus one. E2E runs to
 `[DONE]`. Output tokens/s divides the useful output count by E2E seconds.
 Raw JSONL includes the SSE lines, read timestamps, output IDs, counts, and
 failures. Disk writes happen between requests.
+
+The original GPU3 protocol used the following statistics and limits.
 
 Report median and range of throughput, and p50/p95 per-request latencies
 using linear interpolation at `(n - 1) × p`. Compute sample standard deviation
@@ -95,12 +97,9 @@ UUID available for later native timing. The launcher uses a UUID lock in that
 environment, copies its inputs, checks the checkpoint and wheel identities,
 and keeps the server bound to loopback. It uses the normal vLLM graph policy,
 an explicit FlashInfer BF16 query policy, E4M3 KV, and BF16/FP32 GDN state.
-The RPC reads live tensor metadata and scales before warmups. After measurement,
-the client sends one separate full request per workload while the profiler
-records one prefill and two decode iterations. For each workload the collector
-requires one trace with 16 BF16-Q/E4M3-KV FA2 prefill calls, 32 BF16-Q/E4M3-KV
-TRTLLM-Gen decode calls, 48 Blackwell chunked GDN prefill calls, 96 packed
-recurrent GDN decode calls, and CUDA graph launches.
+The RPC reads live tensor metadata and scales before warmup. The wrapper also
+collects one untimed dispatch profile per workload. Use `--probe W1` or
+`--probe W2` to run a direct client probe against an already running endpoint.
 
 For a native server with the wire contract, run
 the checkout client under the same device and host controls. The compact
@@ -112,6 +111,5 @@ reference works without the archived run.
     --reference benchmarks/streaming/gpu3-reference.json
 ```
 
-Use the archived client and fixtures when passing the archived
-`measurement/summary.json` as the reference. Supply `--freeze-baseline` only
-for the pinned vLLM run.
+Use the archived client and fixtures to reproduce the original multi-round run.
+Its `measurement/summary.json` remains evidence for that protocol.

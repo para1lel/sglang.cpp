@@ -11,8 +11,8 @@ from urllib.parse import urlsplit
 
 
 SHAPES = {"W1": (128, 128), "W2": (2048, 512)}
-WARMUPS = 3
-REPEATS = 9
+ARCHIVED_WARMUPS, ARCHIVED_REPEATS = 3, 9
+SINGLE_ROUND_PROTOCOL = "streaming-single-round-v2"
 PUBLISHED_REFERENCE_SHA256 = "798aeebc2688a9d5744892524c1995e6060612640656fde03b6e2609ac4c4bc7"
 
 
@@ -265,7 +265,7 @@ def summarize(results, freeze_baseline):
             "sample_stdev": statistics.stdev(values) if len(values) > 1 else None,
             "samples": values,
         }
-    if freeze_baseline and report["valid"] and len(good) == REPEATS:
+    if freeze_baseline and report["valid"] and len(good) == ARCHIVED_REPEATS:
         throughput = report["output_tokens_per_second"]
         margin = max(0.01, 2 * throughput["sample_stdev"] / throughput["p50"])
         report["thresholds"] = {
@@ -307,17 +307,21 @@ def run(args):
     if (url.scheme != "http" or not url.hostname or url.username is not None
             or url.path not in ("", "/") or url.query or url.fragment):
         raise ValueError("Use an HTTP origin without credentials, query or path")
+    if args.freeze_baseline and args.reference:
+        raise ValueError("Capture a new baseline without an existing reference")
     cases = load_cases(args.fixtures)
     previous_bytes = args.reference.read_bytes() if args.reference else None
     previous = json.loads(previous_bytes) if previous_bytes is not None else None
-    schedule = [("warmup", WARMUPS), ("measured", REPEATS)]
+    schedule = [("warmup", 1), ("measured", 1)]
     if args.probe:
         schedule = [("probe", 1)]
         cases = {args.probe: cases[args.probe]}
     bodies = {name: json_bytes(request_body(case)) for name, (case, _) in cases.items()}
     manifest = {
         "url": args.url, "command": sys.argv, "python": sys.version, "host": platform.platform(),
-        "clock": "perf_counter_ns", "schedule": schedule, "workload_order": list(cases),
+        "protocol": "streaming-dispatch-probe-v1" if args.probe else SINGLE_ROUND_PROTOCOL,
+        "clock": "perf_counter_ns",
+        "schedule": schedule, "workload_order": list(cases),
         "fixture_sha256": {name: digest for name, (_, digest) in cases.items()},
         "request_sha256": {name: hashlib.sha256(body).hexdigest() for name, body in bodies.items()},
         "client_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -334,7 +338,7 @@ def run(args):
                     actual, frozen = actual[name], frozen[name]
                 if actual != frozen and (field != "client_sha256" or not published):
                     raise ValueError(f"{name} differs from baseline {field}")
-            if not baseline["valid"] or "thresholds" not in baseline:
+            if not baseline["valid"]:
                 raise ValueError(f"{name} reference requires a successful baseline")
             expected[name] = baseline["greedy_output_ids"]
     args.output.mkdir(parents=True)
@@ -357,10 +361,17 @@ def run(args):
                     raw.flush()
                     if "error" in item:
                         print(f"{name} {phase} {cohort}: {item['error']}", file=sys.stderr)
-    summary = {name: summarize(items, args.freeze_baseline) for name, items in results.items()}
+    summary = {name: summarize(items, False) for name, items in results.items()}
     if previous and not args.probe:
         for name, report in summary.items():
-            report["comparison"] = compare(report, previous["workloads"][name])
+            baseline = previous["workloads"][name]
+            if "thresholds" in baseline:
+                report["comparison"] = compare(report, baseline)
+            elif report["valid"]:
+                report["measured_to_reference_throughput_ratio"] = (
+                    report["output_tokens_per_second"]["p50"]
+                    / baseline["output_tokens_per_second"]["p50"]
+                )
     (args.output / "summary.json").write_text(
         json.dumps({"manifest": manifest, "workloads": summary}, indent=2) + "\n", encoding="utf-8"
     )
@@ -375,7 +386,8 @@ def main():
     parser.add_argument("--fixtures", type=Path, default=Path(__file__).parent)
     parser.add_argument("--reference", type=Path)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--freeze-baseline", action="store_true")
+    mode.add_argument("--freeze-baseline", action="store_true",
+                      help="Record a reference from the one measured request per workload")
     mode.add_argument("--probe", choices=SHAPES)
     return run(parser.parse_args())
 

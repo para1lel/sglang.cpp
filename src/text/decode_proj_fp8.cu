@@ -143,6 +143,77 @@ __device__ __forceinline__ void consume(DecodePipeline<Slots>& pipe, const float
     }
 }
 
+__device__ __forceinline__ float4 load_cluster4(const float* local, unsigned rank) {
+    if (rank == blockIdx.x) return *reinterpret_cast<const float4*>(local);
+    unsigned remote;
+    float4 value;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                 : "=r"(remote) : "r"(shared_address(local)), "r"(rank));
+    asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(value.x), "=f"(value.y), "=f"(value.z), "=f"(value.w)
+                 : "r"(remote) : "memory");
+    return value;
+}
+
+template <int Columns, typename Output>
+__device__ __noinline__ void reduce_compact(const float* partials, int splits, int row_base,
+                                           int out_width, const Output* output) {
+    if (out_width % 4 != 0) {
+        reduce_store(partials, splits, Columns, row_base, out_width, *output);
+        return;
+    }
+    constexpr int vectors = Columns * tile_rows / 4;
+    const int first = blockIdx.x * vectors / splits;
+    const int last = (blockIdx.x + 1) * vectors / splits;
+    for (int vector = first + threadIdx.x; vector < last; vector += threads) {
+        const int index = vector * 4;
+        const int row = row_base + index % tile_rows;
+        if (row >= out_width) continue;
+        const auto* values = partials + index;
+        auto sum = load_cluster4(values, 0);
+        for (int source = 1; source < splits; ++source) {
+            const auto other = load_cluster4(values, source);
+            sum.x += other.x;
+            sum.y += other.y;
+            sum.z += other.z;
+            sum.w += other.w;
+        }
+        auto* out = (*output)(index / tile_rows) + row;
+        const auto low = __floats2bfloat162_rn(sum.x, sum.y);
+        const auto high = __floats2bfloat162_rn(sum.z, sum.w);
+        if (reinterpret_cast<std::uintptr_t>(out) % 8 == 0) {
+            const __nv_bfloat162_raw lo = low;
+            const __nv_bfloat162_raw hi = high;
+            *reinterpret_cast<uint2*>(out) = make_uint2(unsigned(lo.x) | unsigned(lo.y) << 16,
+                                                       unsigned(hi.x) | unsigned(hi.y) << 16);
+        } else {
+            out[0] = low.x;
+            out[1] = low.y;
+            out[2] = high.x;
+            out[3] = high.y;
+        }
+    }
+}
+
+template <int Columns, typename Output>
+__device__ __forceinline__ void store_compact(const float (&result)[Columns], float* partials,
+                                               int splits, int row_base, int out_width,
+                                               const Output& output) {
+    if (splits == 1) {
+        store_result(result, partials, 1, Columns, row_base, out_width, output);
+        return;
+    }
+    if (threadIdx.x < tile_rows) {
+        #pragma unroll
+        for (int col = 0; col < Columns; ++col) {
+            partials[col * tile_rows + threadIdx.x] = result[col];
+        }
+    }
+    cluster_sync();
+    reduce_compact<Columns>(partials, splits, row_base, out_width, &output);
+    cluster_sync();
+}
+
 template <int Columns, int Slots = stages, typename Job = Fp8Job>
 __global__ __launch_bounds__(threads, 1)
 void fp8_decode(const __grid_constant__ Job job) {
@@ -195,7 +266,10 @@ void fp8_decode(const __grid_constant__ Job job) {
     if (warp == mma_warp) {
         free_tmem<Columns>(pipe);
     }
-    if constexpr (!std::is_same_v<Job, Fp8Job>) {
+    if constexpr (compact) {
+        store_compact(result, reinterpret_cast<float*>(tiles), splits, row_base,
+                      job.out_width[target], job.lanes[target]);
+    } else if constexpr (!std::is_same_v<Job, Fp8Job>) {
         store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
                      job.out_width[target], job.lanes[target]);
     } else {

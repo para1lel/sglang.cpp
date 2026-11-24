@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L852)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L165)<!-- prefix: "const bool c" --> |
+| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L858)<!-- prefix: "const bool t" --> · [First-layer guard](../src/decoder_prefill.cpp#L165)<!-- prefix: "const bool c" --> |
 | GDN operator | Prepare rows, advance each layer's recurrent state, and finish output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L647)<!-- prefix: "cudaError_t " --> |
 | Verification | Check ordered parity, chunked numerical error, and causal continuation. | [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L101)<!-- prefix: "int main(int" --> |
 
@@ -23,7 +23,7 @@ Per-grant matrix preparation uses one 128-thread block per value head and row gr
 On SM100, eligible grants can share the preparation, matrix, recurrence, and
 finish launches across up to four segments. The large
 [projection groups](native-prefill-workspace.md#projection-pairs-for-mtp) pass
-four 1,024-row grants at 4,096 rows or two at 2,048 rows. The regular layerwise
+four 1,024-row tiles at 4,096 rows or two at 2,048 rows. The regular layerwise
 path can group two or three eligible grants. The same provider handles eligible [partial-grant groups](#grouped-partial-grants).
 [Segment limit](../include/sglang/decoder_cuda.cuh#L142)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L585)<!-- prefix: "void prefill" -->
 
@@ -94,10 +94,9 @@ Run the checkpoint probe with 2,048 prompt IDs and eight fixed teacher IDs. Leav
 If grouped preparation preserves arithmetic, compare output, carry, and history bitwise across builds. Check the 127-, 128-, and 129-row boundary and perturb a later row within a four-row group. Require earlier outputs to match. Measure each stage and the preparation-to-finish interval on the same checkpoint tiles in both run orders. Record any serving estimate with its archived launch count and label it as an estimate.
 
 For grouped projection prefill, compare the full state and draft continuation
-with the per-grant control at the same prompt positions. Repeat with denied
-4,096-row workspace allocation to check the two-grant path. Check bank zero
-at position zero and on a later tile. Record the grouped and per-grant launches
-separately.
+with the per-grant control at the same prompt positions. Check bank zero at
+position zero and on a later tile. Record grouped and per-grant launches
+separately. See the [workspace pressure checks](native-prefill-workspace.md#verification).
 
 On a reserved B200, keep grants, positions, GQA dispatch, and B/A projection dispatch fixed. Change only the GDN submission after projection. Exercise both 4,096-row shapes and a smaller or unequal group. Include bank zero at position zero and at a later tile. Check which grants share launches. Compare BF16 outputs, FP32 carry, and BF16 convolution history bitwise. With positive MTP depth, also compare draft continuation bitwise. Force grouped setup to decline and check per-grant parity. With positive MTP depth, inject a recoverable CUDA setup error and a recoverable launch error separately. Require each error to propagate without retrying the affected grants. Admit a fresh cohort to the same batch after each error and require it to advance.
 

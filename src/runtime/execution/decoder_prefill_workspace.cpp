@@ -36,12 +36,8 @@ using namespace decoder;
 
 void check_prefill_pool_result(cudaError_t status, bool can_decline, const char* operation) {
     if (status == cudaSuccess) return;
-    const auto pending = cudaPeekAtLastError();
-    if (pending == status) {
-        (void)cudaGetLastError();
-    } else if (pending != cudaSuccess) {
-        check(cudaGetLastError(), operation);
-    }
+    const auto recorded = cudaGetLastError();
+    if (recorded != status && !CudaError::terminal(status)) check(recorded, operation);
     if (!can_decline) check(status, operation);
 }
 

@@ -723,11 +723,17 @@ std::size_t decoder::prefill_workspace_bytes(int rows) {
 bool decoder::try_prefill_projection_groups(
     const DecoderModel& model, const PrefillGrant* grants, int count, cudaStream_t stream,
     DecoderBatchStepStats& stats) {
-    if (model.backend.paired_prefill && pairable_prefill_grants(grants, count)) {
-        if (count == 4 && prefill_projection_tiles(model, grants, count, 4, stream, stats)) {
+    constexpr int full_group_lanes = grouped_prefill_max_rows / batch_prefill_tile_rows;
+    constexpr int max_paired_grant_rows = 8192;
+    if (model.backend.paired_prefill && count % 2 == 0 && full_tile_prefill_grants(grants, count)) {
+        if (count == full_group_lanes &&
+            prefill_projection_tiles(model, grants, count, full_group_lanes, stream, stats)) {
             return true;
         }
-        return prefill_projection_tiles(model, grants, count, 2, stream, stats);
+        // Keep the original budget for two-lane groups when the full workspace is unavailable.
+        if (grants[0].rows <= max_paired_grant_rows / count) {
+            return prefill_projection_tiles(model, grants, count, 2, stream, stats);
+        }
     }
     if (!model.backend.tensor_core_prefill) return false;
     return execute_partial_projection_groups(grants, count, stream, stats,

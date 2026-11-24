@@ -37,7 +37,15 @@ __device__ void stage_page_keys(StagedPageTile& tile, const StagedPairMaps& maps
     }
 }
 
+template <int N, cute::UMMA::Major B>
+__device__ __forceinline__ std::uint64_t page_instruction() {
+    return cute::UMMA::make_runtime_instr_desc<cute::bfloat16_t, cute::bfloat16_t, float,
+        flash_queries, N, cute::UMMA::Major::K, B>();
+}
+
 __device__ void issue_page_scores(StagedPageTile& tile, int page) {
+    using Atom = cute::SM100_MMA_F16BF16_SS<cute::bfloat16_t, cute::bfloat16_t, float,
+        flash_queries, staged_page_keys, cute::UMMA::Major::K, cute::UMMA::Major::K>;
     const int slot = page & 1;
     const Word phase = (page >> 1) & 1;
     tmem_copy_wait(tmem_smem(&tile.key_ready[slot]), phase);
@@ -46,14 +54,31 @@ __device__ void issue_page_scores(StagedPageTile& tile, int page) {
     for (int dimension = 0; dimension < channels; dimension += 16) {
         const int plane = dimension / tmem_swizzle;
         const int offset = dimension % tmem_swizzle;
-        tmem_mma<staged_page_keys>(score, tmem_descriptor(&tile.query[plane][0][offset]),
-                                  tmem_descriptor(&tile.key[plane][0][offset]), dimension != 0);
+        const auto query = tmem_descriptor(&tile.query[plane][0][offset]);
+        const auto key = tmem_descriptor(&tile.key[plane][0][offset]);
+        Atom::fma(query, key, score, dimension != 0,
+                  page_instruction<staged_page_keys, cute::UMMA::Major::K>());
     }
-    tmem_commit(tmem_smem(&tile.scores_ready[slot]));
+    if (cute::elect_one_sync()) tmem_commit(tmem_smem(&tile.scores_ready[slot]));
 }
 
 __device__ Word staged_page_score(int chunk) {
     return tmem_scores + ((chunk >> 1) & 1) * staged_page_keys + (chunk & 1) * flash_keys;
+}
+
+__device__ void issue_page_values(StagedPageTile& tile, int chunk) {
+    using Atom = cute::SM100_MMA_F16BF16_TS<cute::bfloat16_t, cute::bfloat16_t, float,
+        flash_queries, channels, cute::UMMA::Major::K, cute::UMMA::Major::MN>;
+    const Word probability = staged_page_score(chunk);
+    const int stage = chunk & 1;
+    #pragma unroll
+    for (int token = 0; token < flash_keys; token += 16) {
+        const auto value = tmem_descriptor<true>(&tile.value[stage][0][token][0]);
+        const Word p = tile.tmem + probability + token / 2;
+        Atom::fma(p, value, tile.tmem, chunk != 0 || token != 0,
+                  page_instruction<channels, cute::UMMA::Major::MN>());
+    }
+    if (cute::elect_one_sync()) tmem_commit(tmem_smem(&tile.output_ready[stage]));
 }
 
 __device__ void issue_page_mmas(StagedPageTile& tile, int chunks) {
@@ -63,7 +88,7 @@ __device__ void issue_page_mmas(StagedPageTile& tile, int chunks) {
         const Word phase = (chunk >> 1) & 1;
         tmem_copy_wait(tmem_smem(&tile.value_ready[stage]), phase);
         tmem_mma_wait(tmem_smem(&tile.probability_ready[stage]), phase);
-        issue_staged_value(tile, chunk, staged_page_score(chunk));
+        issue_page_values(tile, chunk);
         // Current P was published after the prior PV completed. The next score page
         // can overwrite the preceding page while the current page is still live.
         if (stage == 0 && chunk + 2 < chunks) issue_page_scores(tile, (chunk >> 1) + 1);
@@ -145,7 +170,8 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_page_attention(
         stage_page_keys(tile, maps, invalid, page_base, head / ratio, (chunks + 1) / 2);
     } else if (threadIdx.x == 160) {
         single_stage<false>(tile, maps, invalid, page_base, head / ratio, end);
-    } else if (threadIdx.x == 192) {
+    } else if (warp == 6) {
+        // CuTe elects an issuer within the converged warp for each MMA.
         issue_page_mmas(tile, chunks);
     }
     __syncthreads();

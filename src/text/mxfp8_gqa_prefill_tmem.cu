@@ -1,6 +1,6 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh"
-
+#include <cute/arch/mma_sm100_umma.hpp>
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <climits>

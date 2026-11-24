@@ -35,8 +35,9 @@ echo "Build directory: $work"
 cached_cutlass_archive() (
     set -e
     # Keep these in sync with the project package pin in xmake.lua.
-    version=4.7.1
-    checksum=8290eb914cd5aaf4c665ee4108ba5bd65383cfee1296286a42a7ef711554d365
+    version=4.9.0dev
+    commit=f8acf1aa78f96ff2f1ba7662fe495e5535c461bf
+    checksum=773d01d7a901646dd9efff90c6bff183399e7330eefb03684ef0c7a984cb42f2
     directory="$base/cache/cutlass/$checksum"
     archive="$directory/cutlass-$version.tar.gz"
     mkdir -p -- "$directory"
@@ -46,7 +47,7 @@ cached_cutlass_archive() (
         temporary=$(mktemp "$directory/archive.XXXXXXXX")
         trap 'rm -f -- "$temporary"' EXIT
         curl --fail --location --silent --show-error --connect-timeout 10 --max-time 90 \
-            "https://github.com/NVIDIA/cutlass/archive/refs/tags/v$version.tar.gz" \
+            "https://codeload.github.com/NVIDIA/cutlass/tar.gz/$commit" \
             --output "$temporary"
         printf '%s  %s\n' "$checksum" "$temporary" | sha256sum --check --strict >&2
         mv -fT -- "$temporary" "$archive"

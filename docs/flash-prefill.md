@@ -38,7 +38,7 @@ The 32-, 48-, and 88-row variants use `ldmatrix.x4` to load two BF16 K or V frag
 
 ### Long-tile TMEM pipeline
 
-The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for scores and FP32 value accumulators. Regular Flash stays in the `sm_100` target. [TMEM build target](../xmake.lua#L87)<!-- prefix: "target(\"sgla" -->
+The Blackwell `sm_100a` target uses `tcgen05` and tensor memory (TMEM) for scores and FP32 value accumulators. Regular Flash stays in the `sm_100` target. [TMEM build target](../xmake.lua#L88)<!-- prefix: "target(\"sgla" -->
 
 TMA double-buffers raw KV. Producers pack finite MXFP8 into BF16 at scale exponents 15–148 and check other scales individually.
 

@@ -10,9 +10,10 @@ package("sglang-cutlass-headers")
     if archive and archive ~= "" then
         set_urls("file://" .. archive)
     else
-        set_urls("https://github.com/NVIDIA/cutlass/archive/refs/tags/v$(version).tar.gz")
+        set_urls("https://codeload.github.com/NVIDIA/cutlass/tar.gz/" ..
+                 "f8acf1aa78f96ff2f1ba7662fe495e5535c461bf")
     end
-    add_versions("4.7.1", "8290eb914cd5aaf4c665ee4108ba5bd65383cfee1296286a42a7ef711554d365")
+    add_versions("4.9.0dev", "773d01d7a901646dd9efff90c6bff183399e7330eefb03684ef0c7a984cb42f2")
     on_install(function (package)
         os.cp("include/*", package:installdir("include"))
         os.cp("tools/util/include/cutlass/util", package:installdir("include/cutlass"))
@@ -20,7 +21,7 @@ package("sglang-cutlass-headers")
     end)
 package_end()
 
-add_requires("sglang-cutlass-headers 4.7.1", {system = false})
+add_requires("sglang-cutlass-headers 4.9.0dev", {system = false})
 
 local prefix = os.getenv("CONDA_PREFIX")
 local bindir = path.join(prefix, "bin")

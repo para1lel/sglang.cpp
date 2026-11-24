@@ -17,9 +17,9 @@ the intended contents of every added or modified file. List paths relative to th
 snapshot root. For each expected deletion, check `test ! -e "$path" && test ! -L "$path"`.
 Stop if any check fails.
 
-XMake configures CUTLASS 4.7.1 from a checksum-pinned release archive. The SM100 down operator compiles with the CUTLASS/CuTe headers. The server has no CUTLASS runtime library dependency. [Package pin](../../xmake.lua#L15)<!-- prefix: "add_versions" --> · [SM100 binding](../../xmake.lua#L102)<!-- prefix: "add_packages" -->
+XMake uses a checksum-pinned source archive for CUTLASS v4.9.0dev at commit `f8acf1aa78f96ff2f1ba7662fe495e5535c461bf`. The SM100 down operator compiles with the CUTLASS/CuTe headers. The server has no CUTLASS runtime library dependency. [Package pin](../../xmake.lua#L16)<!-- prefix: "add_versions" --> · [SM100 binding](../../xmake.lua#L103)<!-- prefix: "add_packages" -->
 
-The wrapper uses private XMake repository mode and installs from a local CUTLASS archive. By default it checks `$SGLANG_HOST_ROOT/cache/cutlass/<sha256>/cutlass-4.7.1.tar.gz`. It fetches the release archive if the cached bytes are missing or fail verification. [Archive cache](../../tools/build-probe.sh#L35)<!-- prefix: "cached_cutla" --> · [Private configure](../../tools/build-probe.sh#L77)<!-- prefix: "\"$xmake\" g -" -->
+The wrapper uses private XMake repository mode and installs from a local CUTLASS archive. Without an archive override, it reuses `$SGLANG_HOST_ROOT/cache/cutlass/<sha256>/cutlass-4.9.0dev.tar.gz` after verifying its hash. It fetches the pinned archive if the cached file is missing or fails verification. [Archive cache](../../tools/build-probe.sh#L35)<!-- prefix: "cached_cutla" --> · [Private configure](../../tools/build-probe.sh#L78)<!-- prefix: "\"$xmake\" g -" -->
 
 Set `SGLANG_CUTLASS_ARCHIVE` to an absolute path to supply the original archive to the wrapper or the direct recipe below. XMake verifies the archive hash. For a network-free direct configure, run `xmake g --network=private` after exporting `XMAKE_GLOBALDIR` and before `xmake f`. Record the archive hash with the build evidence. [Wrapper forwarding](../../tools/build.sh#L42)<!-- prefix: "SGLANG_CUTLA" --> · [Archive override](../../xmake.lua#L9)<!-- prefix: "local archiv" -->
 

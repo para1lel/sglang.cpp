@@ -141,7 +141,7 @@ __device__ void load_queries(Shared& shared, const LongRequest& request, int kv_
         const int member = vector / (columns / 8);
         const int channel = (vector % (columns / 8)) * 8;
         uint4 bits{};
-        if (member < long_rows * group_heads) {
+        if (member < request.count * group_heads) {
             const auto* query = request.rows[member / group_heads].queries +
                                 (kv_head * group_heads + member % group_heads) * columns;
             bits = *reinterpret_cast<const uint4*>(query + channel);
@@ -246,7 +246,7 @@ __device__ void load_operands(Shared& shared, const LongRequest& request, int be
         const int raw_epoch = chunk / raw_stages & 1;
         const int prior_epoch = (chunk - 1) / stages & 1;
         const int first = (begin + chunk) * keys;
-        const int end = request.first + long_rows;
+        const int end = request.first + request.count;
         wait(&shared.raw_ready[Operand][raw_slot], raw_epoch);
         // Each decoded buffer can be reused as soon as its last asynchronous consumer finishes.
         if constexpr (Operand == 0) {
@@ -388,7 +388,7 @@ __device__ void softmax(Shared& shared, const LongRequest& request, int begin, i
                         int warp, int split, int kv_head) {
     const int lane = threadIdx.x % 32;
     const int member = warp * 8 + (lane % 8);
-    const int position = member < long_rows * group_heads
+    const int position = member < request.count * group_heads
         ? request.first + member / group_heads : -1;
     const unsigned tensor_row = shared.tensor + ((warp * 32) << 16);
     Online state{-CUDART_INF_F, 0.0f, false};
@@ -439,7 +439,7 @@ __device__ void softmax(Shared& shared, const LongRequest& request, int begin, i
         tensor_load_wait();
         const int channel = part * stripe + warp * 32 + lane;
         #pragma unroll 1
-        for (int query = 0; query < long_rows * group_heads; ++query) {
+        for (int query = 0; query < request.count * group_heads; ++query) {
             auto& out = partials(request.rows[query / group_heads].scratch,
                                  kv_head * group_heads + query % group_heads)[split];
             out.value[channel] = values[query];
@@ -452,7 +452,7 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
     alignas(1024) extern __shared__ unsigned char storage[];
     auto& shared = *reinterpret_cast<Shared*>(storage);
     const auto& request = batch.requests[blockIdx.z];
-    const int last_position = request.first + long_rows - 1;
+    const int last_position = request.first + request.count - 1;
     const int split = blockIdx.x;
     const int splits = split_count(last_position);
     if (split >= splits) return;
@@ -556,8 +556,11 @@ cudaError_t long_decode_status(cudaError_t status) {
 
 std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int requests,
                                              cudaStream_t stream) {
-    if (requests < decoder_batch_max_mtp_lanes || requests > long_requests ||
-        requests % decoder_batch_max_mtp_lanes) return std::nullopt;
+    if (requests < 1 || requests > long_requests) return std::nullopt;
+    for (int index = 0; index < requests; ++index) {
+        const int count = batch.requests[index].count;
+        if (count < 1 || count > long_rows) return std::nullopt;
+    }
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) return pending;
     int device;
     auto status = long_decode_status(cudaGetDevice(&device));

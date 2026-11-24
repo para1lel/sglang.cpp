@@ -718,6 +718,39 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
     }
 }
 
+void attend_eager_verification(const GqaLayer& layer, const LayerBatch<VerificationRow>& batch,
+                               int cache_index) {
+    const auto attend = [&](const auto& packet) {
+        if (!try_gqa_verify_batch(layer, packet.lanes, packet.count, cache_index,
+                                  packet.vector_attention, packet.target_split_end,
+                                  packet.stream)) {
+            attend_eager_gqa(layer, packet, cache_index);
+        }
+    };
+    const int width = batch.packed_activation ? verification_packet_rows : batch.count;
+    const auto remainder = [&](const auto& selected) {
+        std::array<VerificationRow, verification_packet_rows> rows;
+        for (int first = 0; first < batch.count; first += width) {
+            auto packet = batch;
+            packet.lanes = rows.data();
+            packet.count = 0;
+            for (int index = first; index < std::min(first + width, batch.count); ++index) {
+                if (!selected[index]) rows[packet.count++] = batch.lanes[index];
+            }
+            if (packet.count) attend(packet);
+        }
+    };
+    if (try_gqa_verify_long(layer, batch.lanes, batch.count, cache_index, batch.vector_attention,
+                            batch.target_split_end, batch.stream, remainder)) return;
+    if (!batch.packed_activation) {
+        attend(batch);
+        return;
+    }
+    for (int first = 0; first < batch.count; first += width) {
+        attend(batch.verification_packet(first));
+    }
+}
+
 template <typename Lane>
 void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
     if (!batch.fuse_verify_activation() && !batch.fuse_wide_verify_norm()) {
@@ -741,23 +774,8 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     } else if constexpr (std::is_same_v<Lane, VerificationRow>) {
         if (batch.lanes[0].binding) {
             attend_verify_gqa(layer, batch, cache_index);
-        } else if (!try_gqa_verify_long(layer, batch.lanes, batch.count, cache_index,
-                                       batch.vector_attention, batch.target_split_end,
-                                       batch.stream)) {
-            const auto attend = [&](const auto& packet) {
-                if (!try_gqa_verify_batch(layer, packet.lanes, packet.count, cache_index,
-                                          packet.vector_attention, packet.target_split_end,
-                                          packet.stream)) {
-                    attend_eager_gqa(layer, packet, cache_index);
-                }
-            };
-            if (batch.packed_activation) {
-                for (int first = 0; first < batch.count; first += verification_packet_rows) {
-                    attend(batch.verification_packet(first));
-                }
-            } else {
-                attend(batch);
-            }
+        } else {
+            attend_eager_verification(layer, batch, cache_index);
         }
     } else {
         attend_eager_gqa(layer, batch, cache_index);

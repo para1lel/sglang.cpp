@@ -74,12 +74,12 @@ split-KV policy. Every row must be in the split window. Other eager groups outsi
 the long Tensor Core route use per-row preprocessing, append, and gating.
 They can still group eligible split reads.
 Graph replay uses bound verification dispatch.
-[Dispatch](../src/decoder_forward.cpp#L748)<!-- prefix: "if (!try_gqa" --> ·
-[Eligibility](../include/sglang/text/gqa_verify_batch.h#L66)<!-- prefix: "inline bool " --> ·
+[Dispatch](../src/decoder_forward.cpp#L724)<!-- prefix: "if (!try_gqa" --> ·
+[Eligibility](../include/sglang/text/gqa_verify_batch.h#L67)<!-- prefix: "inline bool " --> ·
 [Bound verification](../src/decoder_forward.cpp#L600)<!-- prefix: "void attend_" -->
 
-Wide K4 verification tries the [long Tensor Core reader](#tensor-core-reads-across-long-k4-packets)
-first. If its geometry check declines, these rules apply separately to each 20-row packet.
+Eager verification first selects [long Tensor Core suffixes](#tensor-core-reads-across-long-k4-packets).
+It applies the ordinary rules to unselected rows in their original packet order.
 
 Each row supplies its own workspace, absolute position, and request KV page table.
 The stream orders BF16 Q/K normalization and RoPE, MXFP8 K/V append,
@@ -88,7 +88,7 @@ Preprocessing, append, and gating each launch one block per row and applicable h
 Each attention row reads through its own position, even after later rows append KV.
 Output quantization and projection follow gating. The [MTP verifier](mtp.md#runtime-path)
 owns acceptance and the committed KV prefix.
-[Launch sequence](../include/sglang/text/gqa_verify_batch.h#L91)<!-- prefix: "check(gqa_ve" --> ·
+[Launch sequence](../include/sglang/text/gqa_verify_batch.h#L92)<!-- prefix: "check(gqa_ve" --> ·
 [Preprocessing](../src/text_attention_gqa.cu#L105)<!-- prefix: "__global__ v" --> ·
 [Append](../include/sglang/text/gqa_target_split.cuh#L156)<!-- prefix: "__global__ v" --> ·
 [Gating](../src/text_attention_gqa.cu#L172)<!-- prefix: "__global__ v" -->
@@ -117,21 +117,24 @@ existing FP64 replay for flagged heads. Each row writes its own split partials.
 
 ### Tensor Core reads across long K4 packets
 
-The SM100 reader can group 20–160 rows from complete four-lane K4 packets.
-It requires eager, unconstrained verification and the full 262,144-token context policy.
-Each lane supplies five consecutive positions starting at 32,768 or later.
-Those positions can cross a 64-token chunk or 128-token KV page boundary.
-Each lane needs a distinct page table, readable paged MXFP8 KV, and aligned buffers.
-A geometry decline leaves the existing packet dispatch eligible.
-[Group guard](../include/sglang/text/gqa_verify_batch.h#L100)<!-- prefix: "inline bool " --> ·
-[Page and buffer checks](../include/sglang/text/gqa_verify_batch.h#L133)<!-- prefix: "for (int pri" -->
+The SM100 reader selects a contiguous suffix of one to five rows per request
+in eager Tensor Core verification under the full 262,144-token context policy.
+Selected positions are 32,768 or later. A suffix can span a 64-token chunk or
+128-token KV page boundary. Duplicate page tables anywhere in the wave
+preclude long selection. Selected rows must be unconstrained and have
+readable paged MXFP8 KV and valid, aligned buffers. The existing eager path
+processes earlier rows and ineligible requests first. The decoder then appends
+KV for the selected rows and submits one long reader and combine per GQA layer.
+[Group guard](../include/sglang/text/gqa_verify_batch.h#L138)<!-- prefix: "bool try_gqa" --> ·
+[Page tables](../include/sglang/text/gqa_verify_batch.h#L106)<!-- prefix: "inline int c" --> ·
+[Suffix checks](../include/sglang/text/gqa_verify_batch.h#L157-L172)<!-- prefix: "while (begin" -->
 
 One block per lane, KV head, and split shares each 64-token KV chunk across
-five rows and six query heads per row. The first position sets the split boundaries.
-The final split extends through the fifth position. TMA reads the paged payloads
-and scales into shared memory. Each row masks keys past its own position and
-writes FP32 split partials in the existing logits scratch. The combine retains
-FP64 replay for flagged heads.
+up to five rows and six query heads per row. The first selected position sets
+the split boundaries. The final split extends through the last selected
+position. TMA reads paged payloads and scales into shared memory. Each row
+masks later keys and writes FP32 split partials in the existing logits scratch.
+The combine retains FP64 replay for flagged heads.
 [Paged read](../src/text/gqa_decode_long.cu#L176)<!-- prefix: "__device__ v" --> ·
 [Split bounds](../src/text/gqa_decode_long.cu#L460-L462)<!-- prefix: "const int to" --> ·
 [Split partials](../src/text/gqa_decode_long.cu#L428)<!-- prefix: "auto& out = " --> ·
@@ -162,11 +165,13 @@ On hard failure, the returned status takes precedence.
 
 Unsupported device, shared-memory, or tensor-map setup can prevent the long
 Tensor Core read from launching. This decline requires clear CUDA state.
-On that decline, the decoder reuses the KV already appended for each packet.
-It reads through the existing split path before postgating. Pending errors and
-failed CUDA setup, read, or combine calls propagate without retry.
+On that decline, the decoder reuses the selected rows' appended KV. It sends
+those rows through the existing split path before postgating. Pending errors
+and failed CUDA setup, read, or combine calls propagate without retry.
+A recorded terminal CUDA error takes precedence over a nonterminal returned status.
 [Long setup](../src/text/gqa_decode_long.cu#L557)<!-- prefix: "std::optiona" --> ·
-[Packet fallback](../include/sglang/text/gqa_verify_batch.h#L156)<!-- prefix: "if (const au" -->
+[Packet fallback](../include/sglang/text/gqa_verify_batch.h#L204)<!-- prefix: "if (const au" --> ·
+[CUDA status](../src/text/gqa_decode_long.cu#L550)<!-- prefix: "cudaError_t " -->
 
 ## Verification
 
@@ -220,7 +225,9 @@ IDs with the same control. Separately apply the
 [numerical and quality checks](performance.md#operator-qualification) against
 independent attention and end-to-end oracles. Exercise remapped pages and distinct
 lane positions. Run the [K4 boundary crossing check](../tests/decoder/README.md#k4-boundary-crossings)
-to verify the optimized route when some lanes cross chunk or page boundaries.
+to verify the long reader across chunk and page boundaries. Run the
+[mixed-request check](../tests/decoder/README.md#mixed-k4-verification)
+to verify eligible suffixes and ordinary attention in the same wave.
 Verify fallback after a clean setup decline and error propagation after a failed
 launch. Compare committed target and draft state through rejection and full
 acceptance. Restore a checkpoint and run a further K4 round.

@@ -196,3 +196,18 @@ CUDA_VISIBLE_DEVICES="$GPU_UUID" \
 The check requires full K4 acceptance and the expected output IDs. Each wave
 must launch one grouped long reader and combine per GQA layer, with zero legacy
 verification readers.
+
+### Mixed K4 verification
+
+Use the same extraction above with the frozen `W4` or `W5` subdirectory to
+write the 16 or 32 prompts in lane order. Set `mixed_ids` to that ID file.
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU_UUID" \
+    "$out/bin/long-decode-routes" "$checkpoint" --mtp-mixed "$mixed_ids"
+```
+
+The check combines requests with all five rows eligible for the long reader,
+requests with only a long suffix, and requests below position 32,768. It checks
+one grouped reader and combine per GQA layer, ordinary eager readers, and
+the expected output IDs for long-eligible requests.

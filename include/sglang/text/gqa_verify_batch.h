@@ -4,6 +4,7 @@
 #include "sglang/decoder_verify.h"
 #include "sglang/text/gqa/gqa_decode_long.cuh"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -97,78 +98,127 @@ inline bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* r
     return true;
 }
 
-inline bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int count,
-                                int cache_index, bool vector_attention, int split_end,
-                                cudaStream_t stream) {
+struct LongVerifySequence {
+    int indices[gqa_decode::long_rows];
+    int count = 0;
+};
+
+inline int collect_long_verify_sequences(const VerificationRow* rows, int count,
+    std::array<LongVerifySequence, gqa_decode::long_requests>& sequences) {
+    int sequence_count = 0;
+    int packet_first = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        if (row.binding) return 0;
+        if (row.first) {
+            if (index && !rows[index - 1].first) packet_first = sequence_count;
+            if (sequence_count == gqa_decode::long_requests) return 0;
+            for (int prior = 0; prior < sequence_count; ++prior) {
+                if (rows[sequences[prior].indices[0]].request->pages.device_pages ==
+                    row.request->pages.device_pages) return 0;
+            }
+            auto& sequence = sequences[sequence_count++];
+            sequence.indices[sequence.count++] = index;
+            continue;
+        }
+        int lane = packet_first;
+        while (lane < sequence_count &&
+               rows[sequences[lane].indices[0]].request != row.request) ++lane;
+        if (lane == sequence_count) return 0;
+        auto& sequence = sequences[lane];
+        if (sequence.count == gqa_decode::long_rows ||
+            row.position != rows[sequence.indices[0]].position + sequence.count) return 0;
+        sequence.indices[sequence.count++] = index;
+    }
+
+    return sequence_count;
+}
+
+template <typename Remainder>
+bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int count,
+                         int cache_index, bool vector_attention, int split_end,
+                         cudaStream_t stream, Remainder&& attend_remainder) {
     using namespace gqa_decode;
-    static_assert(verification_packet_rows == decoder_batch_max_mtp_lanes * long_rows);
     static_assert(max_wide_mtp_rows == long_requests * long_rows);
-    if (!vector_attention || split_end != LongBatch::end || count < verification_packet_rows ||
-        count > max_wide_mtp_rows || count % verification_packet_rows) {
+    if (!vector_attention || split_end != LongBatch::end || count > max_wide_mtp_rows) {
         return false;
     }
 
+    std::array<LongVerifySequence, long_requests> sequences;
+    const int sequence_count = collect_long_verify_sequences(rows, count, sequences);
+
     LongBatch read{};
+    std::array<bool, max_wide_mtp_rows> selected{};
+    int requests = 0;
+    int selected_count = 0;
+    for (int lane = 0; lane < sequence_count; ++lane) {
+        const auto& sequence = sequences[lane];
+        int begin = 0;
+        while (begin < sequence.count &&
+               rows[sequence.indices[begin]].position < long_min_position) ++begin;
+        if (begin == sequence.count) continue;
+        const auto& seed = rows[sequence.indices[begin]];
+        auto& request = read.requests[requests];
+        request.cache = seed.request->caches[cache_index];
+        request.pages = seed.request->pages;
+        request.first = seed.position;
+        request.count = sequence.count - begin;
+        bool eligible = true;
+        for (int depth = 0; depth < request.count; ++depth) {
+            const auto& row = rows[sequence.indices[begin + depth]];
+            request.rows[depth] = paged_gqa_buffers(*row.work);
+            const auto input = request.lane(depth);
+            eligible &= !row.constrained && readable(input) && tensor_aligned(input) &&
+                        valid_buffers(input.buffers);
+        }
+        if (!eligible) continue;
+        ++requests;
+        for (int i = begin; i < sequence.count; ++i) selected[sequence.indices[i]] = true;
+        selected_count += request.count;
+    }
+    if (!requests) return false;
+
+    check(cudaPeekAtLastError(), "Prepare long grouped target attention");
+    // Earlier rows of a crossing request must append before its selected suffix reads KV.
+    if (selected_count != count) attend_remainder(selected);
+
     GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows> preprocess{};
     GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows> append{};
     GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows> gate{};
-    constexpr int width = decoder_batch_max_mtp_lanes;
+    int next = 0;
     for (int index = 0; index < count; ++index) {
-        const int packet = index / verification_packet_rows;
-        const int lane = index % width;
-        const int depth = index % verification_packet_rows / width;
+        if (!selected[index]) continue;
         const auto& row = rows[index];
-        const auto& seed = rows[packet * verification_packet_rows + lane];
-        if (row.request != seed.request || row.binding || row.constrained ||
-            row.position != seed.position + depth || row.position < long_min_position ||
-            row.position >= split_end) {
-            return false;
-        }
-        auto& request = read.requests[packet * width + lane];
-        auto& work = *row.work;
-        if (depth == 0) {
-            request.cache = row.request->caches[cache_index];
-            request.pages = row.request->pages;
-            request.first = row.position;
-            for (int prior = 0; prior < packet * width + lane; ++prior) {
-                if (read.requests[prior].pages.device_pages == request.pages.device_pages) {
-                    return false;
-                }
-            }
-        }
-        request.rows[depth] = paged_gqa_buffers(work);
-        const auto input = request.lane(depth);
-        if (!readable(input) || !tensor_aligned(input) || !valid_buffers(input.buffers)) {
-            return false;
-        }
-        const int rotary = row.rotary_position < 0 ? row.position : row.rotary_position;
-        preprocess.rows[index] = {work.q_gate, work.keys, work.rope_queries, work.rope_keys,
-                                  rotary};
-        append.rows[index] = {input.cache, input.pages, work.rope_keys, work.values, row.position};
-        gate.rows[index] = {work.q_gate, work.attention};
+        const auto& work = *row.work;
+        preprocess.rows[next] = {work.q_gate, work.keys, work.rope_queries, work.rope_keys,
+                                 row.rotary_position < 0 ? row.position : row.rotary_position};
+        append.rows[next] = {row.request->caches[cache_index], row.request->pages, work.rope_keys,
+                             work.values, row.position};
+        gate.rows[next++] = {work.q_gate, work.attention};
     }
-    check(cudaPeekAtLastError(), "Prepare long grouped target attention");
-    check(long_decode_status(gqa_verify_preprocess(preprocess, count, layer.query_norm,
+    check(long_decode_status(gqa_verify_preprocess(preprocess, next, layer.query_norm,
                                                   layer.key_norm, stream)),
           "Normalize and rotate long grouped target Q/K");
-    check(long_decode_status(gqa_verify_append(append, count, stream)),
+    check(long_decode_status(gqa_verify_append(append, next, stream)),
           "Append long grouped target MXFP8 KV");
-    if (const auto status = launch_long_decode(read, count / long_rows, stream)) {
+    if (const auto status = launch_long_decode(read, requests, stream)) {
         check(*status, "Read long grouped target MXFP8 attention");
     } else {
         std::array<PagedDecodeLane, verification_packet_rows> fallback;
-        for (int first = 0; first < count / long_rows; first += width) {
-            for (int depth = 0; depth < long_rows; ++depth) {
-                for (int lane = 0; lane < width; ++lane) {
-                    fallback[depth * width + lane] = read.requests[first + lane].lane(depth);
-                }
+        for (int first = 0; first < count; first += verification_packet_rows) {
+            int size = 0;
+            for (int i = first; i < std::min(first + verification_packet_rows, count); ++i) {
+                if (!selected[i]) continue;
+                const auto& row = rows[i];
+                fallback[size++] = {row.request->caches[cache_index], row.request->pages,
+                                    row.position, paged_gqa_buffers(*row.work)};
             }
-            check(long_decode_status(target_split_gqa(fallback.data(), fallback.size(),
-                                                      split_end, stream)),
+            if (!size) continue;
+            check(long_decode_status(target_split_gqa(fallback.data(), size, split_end, stream)),
                   "Read grouped target MXFP8 attention");
         }
     }
-    check(long_decode_status(gqa_verify_postgate(gate, count, stream)),
+    check(long_decode_status(gqa_verify_postgate(gate, next, stream)),
           "Gate long grouped target attention");
     return true;
 }

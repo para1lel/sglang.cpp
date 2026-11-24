@@ -14,6 +14,7 @@ struct LongRequest {
     Mxfp8PageTable pages;
     decoder::PagedDecodeBuffers rows[long_rows];
     int first;
+    int count = long_rows;
 
     __host__ __device__ decoder::PagedDecodeLane lane(int row) const {
         return {cache, pages, first + row, rows[row]};
@@ -32,7 +33,9 @@ cudaError_t combine_long_decode(const LongBatch& batch, int requests, cudaStream
 
 #ifdef __CUDACC__
 __device__ inline decoder::PagedDecodeLane resolve(const LongBatch& batch) {
-    return batch.requests[blockIdx.z / long_rows].lane(blockIdx.z % long_rows);
+    const auto& request = batch.requests[blockIdx.z / long_rows];
+    const int row = blockIdx.z % long_rows;
+    return row < request.count ? request.lane(row) : decoder::PagedDecodeLane{{}, {}, -1, {}};
 }
 #endif
 

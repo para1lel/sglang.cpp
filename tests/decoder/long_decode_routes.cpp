@@ -44,6 +44,7 @@ struct MtpRoutes {
     int readers = 0;
     int merges = 0;
     int legacy = 0;
+    unsigned requests = slots;
 };
 MtpRoutes* mtp_routes = nullptr;
 
@@ -355,6 +356,74 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
     check(crossing_waves == 4, "Missing mixed K64 and P128 crossing waves");
 }
 
+std::vector<std::vector<int>> read_mtp_cohort(const char* fixture) {
+    std::ifstream file(fixture);
+    check(file.good(), "Cannot open 32K MTP cohort");
+    std::vector<std::vector<int>> prompts;
+    for (std::string line; std::getline(file, line);) {
+        std::istringstream ids(line);
+        auto& prompt = prompts.emplace_back();
+        prompt.assign(std::istream_iterator<int>(ids), {});
+        check(ids.eof() && prompt.size() == 32768, "Invalid 32K MTP fixture lane");
+    }
+    check(prompts.size() == 16 || prompts.size() == slots, "Expected W4 or W5 MTP cohort");
+    return prompts;
+}
+
+void mtp_mixed(const char* checkpoint, const char* fixture) {
+    auto prompts = read_mtp_cohort(fixture);
+    const int count = static_cast<int>(prompts.size());
+    const Decoder decoder(checkpoint, 0, true);
+    check(decoder.uses_b200_operators(), "Mixed MTP route check requires a B200");
+    DecoderBatch batch(decoder, {true, count, 0, 8192});
+    DecoderOptions options;
+    options.mtp_steps = 4;
+    options.max_new_tokens = 96;
+    options.ignore_eos = true;
+    Selection selected{};
+    std::fill_n(selected.begin(), count, true);
+    for (int slot = 0; slot < count; ++slot) {
+        if (slot % 4 == 0) prompts[slot].resize(32765);
+        if (slot % 4 == 1) prompts[slot].resize(32384);
+        check(batch.admit(slot, std::move(prompts[slot]), options) == 0, "Unexpected prefix hit");
+    }
+    DecoderBatchStepStats stats;
+    for (int pass = 0; std::any_of(selected.begin(), selected.end(), [](bool x) { return x; });
+         ++pass) {
+        check(pass < 140, "Mixed MTP prefill did not reach ready width");
+        const auto steps = batch.advance_chunked(selected, &stats);
+        check(!stats.verification_lanes, "A parked mixed MTP lane entered verification");
+        for (int slot = 0; slot < count; ++slot) {
+            if (!steps[slot].token) continue;
+            if (slot % 4 != 1) {
+                check(steps[slot].token == (slot % 4 == 0 ? 7629 : 760), "Mixed MTP seed changed");
+            }
+            selected[slot] = false;
+        }
+    }
+    std::fill_n(selected.begin(), count, true);
+    MtpRoutes launches;
+    launches.requests = count / 4 * 3;
+    mtp_routes = &launches;
+    const auto steps = batch.advance_chunked(selected, &stats);
+    mtp_routes = nullptr;
+    check(stats.verification_lanes == count && stats.verification_rows == 5 * count,
+          "Mixed MTP verification geometry changed");
+    check(launches.readers == gqa_layers && launches.merges == gqa_layers && launches.legacy,
+          "Eligible partial verification suffix lost its long reader or eager remainder");
+    for (int slot = 0; slot < count; ++slot) {
+        if (slot % 4 != 1) {
+            int ordinal = slot % 4 == 0 ? 4 : 1;
+            check_crossing_tokens(steps[slot], ordinal);
+        } else {
+            check(steps[slot].decode && steps[slot].token && !steps[slot].finish_reason,
+                  "Below-threshold verification lane failed");
+        }
+    }
+    std::cout << "Mixed K4 lanes=" << count << " readers=" << launches.readers
+              << " merges=" << launches.merges << " legacy=" << launches.legacy << '\n';
+}
+
 }
 
 using namespace sglang::decoder;
@@ -404,19 +473,20 @@ extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, 
 static void record_launch(std::string_view symbol, dim3 grid, dim3 block) {
     if (mtp_routes) {
         const bool reader = symbol.find("decode_long") != symbol.npos;
-        const bool merge = symbol.find("target_split_combine") != symbol.npos && grid.z == 160;
+        const bool merge = symbol.find("target_split_combine") != symbol.npos &&
+                           grid.z == 5 * mtp_routes->requests;
         const bool legacy = (symbol.find("gqa_decode") != symbol.npos &&
                              symbol.find("split_kernel") != symbol.npos && grid.z != 4) ||
                             symbol.find("reuse_split_kernel") != symbol.npos;
         if (reader) {
-            check(grid.x == 16 && grid.y == 4 && grid.z == 32 && block.x == 480,
-                  "Unexpected W5 long reader geometry");
-            check(mtp_routes->readers == mtp_routes->merges, "Missing previous W5 merge");
+            check(grid.x == 16 && grid.y == 4 && grid.z == mtp_routes->requests && block.x == 480,
+                  "Unexpected MTP long reader geometry");
+            check(mtp_routes->readers == mtp_routes->merges, "Missing previous MTP merge");
             ++mtp_routes->readers;
         }
         if (merge) {
             check(grid.x == 24 && grid.y == 1 && block.x == 256 &&
-                      mtp_routes->readers == mtp_routes->merges + 1, "Unexpected W5 merge");
+                      mtp_routes->readers == mtp_routes->merges + 1, "Unexpected MTP merge");
             ++mtp_routes->merges;
         }
         mtp_routes->legacy += legacy;
@@ -489,8 +559,13 @@ int main(int argc, char** argv) try {
         mtp_crossings(argv[1], argv[3]);
         return 0;
     }
+    if (argc == 4 && std::string_view(argv[2]) == "--mtp-mixed") {
+        mtp_mixed(argv[1], argv[3]);
+        return 0;
+    }
     check(argc >= 3 && argc <= 5,
-          "Usage: long-decode-routes CHECKPOINT {PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5}");
+          "Usage: long-decode-routes CHECKPOINT "
+          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5|--mtp-mixed W4_OR_W5_IDS}");
     const Decoder decoder(argv[1], 0, false);
     check(decoder.uses_b200_operators(), "Long decode route check requires a B200");
     const DecoderBatchOptions options{.cuda_graphs = true, .max_lanes = slots,

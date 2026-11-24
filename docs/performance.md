@@ -174,20 +174,22 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The v4 campaigns paired both engines on one B200 per row. W1–W3 ran on GPU 7 and W4–W5 on GPU 6. Both engines used MTP4, a 32,768-token step budget, and an eight-slot capacity. They reset the enabled prefix cache before each cohort. W1 and W2 used three warmup cohorts and nine measured cohorts. W3–W5 used two warmup cohorts and five measured cohorts. Pinned vLLM ran first for W1, W3, and W5. Native ran first for W2 and W4.
+Both engines ran on the same B200 for each row. GPU 7 ran W1–W3. GPU 6 ran W4–W5. Both used MTP4, a 32,768-token step budget, and an eight-slot capacity. Each cohort reset the enabled prefix cache. Native used four cache slots and CUDA graphs. Pinned vLLM used async scheduling and a 32,768-token scheduled cap. Its context and KV budgets were 2,560 tokens and 10 GiB for W1–W2. W3–W5 used 132,096 tokens and 128 GiB.
+
+W1–W2 used three warmup and nine measured cohorts. W3–W5 used two warmup and five measured cohorts. vLLM ran first for W1, W3, and W5. Native ran first for W2 and W4.
 
 | Row | Native median (s) | Pinned vLLM median (s) | Native / vLLM | Verdict |
 | --- | ---: | ---: | ---: | --- |
-| W1 | 0.579252084 | 0.621142824 | 0.932559 | Pass |
-| W2 | 1.378267441 | 1.685609937 | 0.817667 | Pass |
-| W3 | 3.845667626 | 3.961542939 | 0.970750 | Pass |
-| W4 | 26.489704336 | 26.606192531 | 0.995622 | Pass |
-| W5 | 45.396524055 | 36.002232295 | 1.260936 | Miss |
+| W1 | 0.579399485 | 0.620786550 | 0.933331 | Pass |
+| W2 | 1.378620668 | 1.687075021 | 0.817166 | Pass |
+| W3 | 3.847110023 | 4.053063668 | 0.949186 | Pass |
+| W4 | 26.355181397 | 26.622566650 | 0.989956 | Pass |
+| W5 | 38.170671560 | 35.974923597 | 1.061036 | Pass |
 
-W5 ran after W4 passed in the same campaign. W5 exceeded the inclusive 1.10 limit by 5.794068531 seconds. The median time to the last lane’s first token was 41.390876548 seconds native and 32.304491492 seconds pinned vLLM. The median remaining time to completion was 4.005846309 and 3.698580270 seconds, respectively.
+W5 passed after W4 in the same campaign, 1.401744397 seconds inside the limit. Median time to the last lane’s first token was 34.121730816 seconds native and 32.280663452 seconds vLLM. Median completion tails were 4.035544912 and 3.696915861 seconds.
 
-Replay validated 273 cold streams across both campaigns. Within each engine, repeated cohorts returned the same output IDs. The separate W1 trace matched the timed native IDs. In 49 of 50 rounds, native drafted four rows and verified five. The engines matched all first-cohort ID sequences for W3–W5. W1 and W2 produced different sequences across engines. [Makespan criterion](#measurement)
+Replay validated 273 cold streams. Both engines repeated output IDs on every row. Full first-cohort output sequences matched across engines for W3, W4, and W5. They differed for W1 and W2. The W1 trace matched timed native IDs. Native drafted four rows and verified five in 49 of 50 trace rounds.
 
-The measured Release binary SHA-256 was `885fdc5b2325847ecc50d6bed84ce5058b953d2421369c487abade3a9bdd6a9a`. The campaign receipts retained the provisional source parent. The public source attestation matched all 211 compiler inputs to the released revision. [Native release](https://github.com/para1lel/sglang.cpp/commit/380f3501c8c251a0efec44fbb0748c6104cded3b)
+The measured native Release binary had SHA-256 `4bf7f8588f9c48ddedfa9b34a0b531c296e9a20a25c73b82cfa5c1de8e9b80e5`. The public release matched 211 compiler inputs and 202 other frozen paths. [Native release](https://github.com/para1lel/sglang.cpp/commit/b8764ee28523c7223865a0e1de8ebc8041ca857a)
 
-The earlier v4 campaign stopped at W4. Its archived guide links the earlier 8,192-token and 32-request campaigns with their original workload and verdict rules. [Prior v4 evidence](https://github.com/para1lel/sglang.cpp/blob/c18210bd3a4fcb4e61252ab2681016b755c426d6/docs/performance.md#matched-k4-evidence)
+The previous v4 campaign passed W1–W4 and missed W5. [Prior v4 evidence](https://github.com/para1lel/sglang.cpp/blob/17d8634f1f9677bf4b2bc3dea93b7e5ca58eca5a/docs/performance.md#matched-k4-evidence)

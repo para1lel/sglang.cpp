@@ -387,6 +387,7 @@ if has_config("long-decode-check") then
         add_deps("sglang_decoder")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
+        add_ldflags("-Wl,--wrap=cudaMallocFromPoolAsync", {force = true})
         add_ldflags("-Wl,--wrap=_ZN6sglang7decoder15RequestProgress6selectERNS0_7RequestERNS0_" ..
                     "9WorkspaceERKNS_14DecoderOptionsERKNS0_19ConstraintWorkspaceEPKNS0_" ..
                     "18SamplingParametersEPvP11CUstream_stPKNS0_23AdjustedLogitsWorkspaceE",

@@ -33,7 +33,7 @@ constexpr int guard = 32;
 constexpr std::size_t scratch_stride = paged_decode_scratch_bytes + 2 * guard;
 constexpr unsigned char poison = 0xa5;
 
-enum class Kind { split, combine, other };
+enum class Kind { split, combine, ordered, other };
 enum class Mode { full, small, recovery, unaligned };
 struct Launch {
     Kind kind;
@@ -467,9 +467,83 @@ void run(Mode mode) {
     cuda_check(cudaStreamDestroy(stream));
 }
 
+void check_serial() {
+    constexpr int physical = 5;
+    constexpr std::array positions{255, 511, 257};
+    Buffer<std::uint8_t> keys(physical * mxfp8_payload_bytes_per_page);
+    Buffer<std::uint8_t> values(physical * mxfp8_payload_bytes_per_page);
+    Buffer<std::uint8_t> key_scales(physical * mxfp8_scale_bytes_per_page);
+    Buffer<std::uint8_t> value_scales(physical * mxfp8_scale_bytes_per_page);
+    Buffer<int> map(physical), position(1);
+    Buffer<Bf16> query(row_size), direct(row_size), replay(row_size);
+    const Mxfp8KvCache cache{keys.data, values.data, key_scales.data, value_scales.data, physical};
+    const Mxfp8PageTable table{map.data, physical};
+    std::array<int, physical> mapping{};
+    std::array<Bf16, row_size> queries{}, expected{}, actual{};
+    for (int row = 0; row < physical; ++row) mapping[row] = page_map(0, row, physical);
+    for (int head = 0; head < heads; ++head) queries[head * dim] = Bf16(query_value(0, head));
+    cudaStream_t stream{};
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cuda_check(cudaMemcpyAsync(map.data, mapping.data(), sizeof(mapping), cudaMemcpyHostToDevice,
+                               stream));
+    cuda_check(cudaMemcpyAsync(query.data, queries.data(), sizeof(queries), cudaMemcpyHostToDevice,
+                               stream));
+    fill_cache<<<physical * mxfp8_payload_bytes_per_page / 256, 256, 0, stream>>>(cache, physical,
+                                                                              -1);
+    cuda_check(cudaGetLastError());
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    watching = true;
+    observed = 0;
+    cuda_check(decode_gqa_attention(cache, table, position.data, query.data, replay.data, stream));
+    watching = false;
+    cudaGraph_t graph{};
+    cuda_check(cudaStreamEndCapture(stream, &graph));
+    std::size_t nodes = 0;
+    cuda_check(cudaGraphGetNodes(graph, nullptr, &nodes));
+    check(nodes == 1 && observed == 1, "Serial GQA graph must contain one kernel");
+    const bool ordered_graph = launches[0].kind == Kind::ordered;
+    if (ordered_graph) expect_launch(launches[0], Kind::ordered, dim3(1, heads / 2), dim);
+    bool ordered_direct = true;
+    cudaGraphExec_t exec{};
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0));
+    for (int last : positions) {
+        cuda_check(cudaMemcpyAsync(position.data, &last, sizeof(last), cudaMemcpyHostToDevice,
+                                   stream));
+        observed = 0;
+        watching = true;
+        cuda_check(mxfp8_gqa_attention(cache, table, last + 1, last, 1, query.data, direct.data,
+                                       stream));
+        watching = false;
+        check(observed == 1, "Scratch-free GQA must use one kernel");
+        const bool ordered = launches[0].kind == Kind::ordered;
+        if (ordered) expect_launch(launches[0], Kind::ordered, dim3(1, heads / 2), dim);
+        ordered_direct &= ordered;
+        cuda_check(cudaGraphLaunch(exec, stream));
+        cuda_check(cudaMemcpyAsync(expected.data(), direct.data, sizeof(expected),
+                                   cudaMemcpyDeviceToHost, stream));
+        cuda_check(cudaMemcpyAsync(actual.data(), replay.data, sizeof(actual),
+                                   cudaMemcpyDeviceToHost, stream));
+        cuda_check(cudaStreamSynchronize(stream));
+        check(std::memcmp(expected.data(), actual.data(), sizeof(actual)) == 0,
+              "Graph did not use the current device position");
+        for (int head = 0; head < heads; ++head) {
+            const auto truth = reference(0, last + 1, head, 0, -1, physical);
+            check(std::abs(float(actual[head * dim]) - truth) < 0.005,
+                  "Scratch-free GQA disagrees with FP64");
+        }
+    }
+    cuda_check(cudaGraphExecDestroy(exec));
+    cuda_check(cudaGraphDestroy(graph));
+    cuda_check(cudaStreamDestroy(stream));
+    if (!ordered_graph) std::cerr << "Wrong reader for bound graph position\n";
+    if (!ordered_direct) std::cerr << "Wrong reader for scratch-free host position\n";
+    check(ordered_graph && ordered_direct, "Serial GQA did not use the scratch-free tiled reader");
+}
+
 void record_launch(std::string_view name, dim3 grid, dim3& block) {
     const auto type = name.find("split_kernel") != name.npos ? Kind::split
-        : name.find("target_split_combine") != name.npos ? Kind::combine : Kind::other;
+        : name.find("target_split_combine") != name.npos ? Kind::combine
+        : name.find("tiled_prefill_attention") != name.npos ? Kind::ordered : Kind::other;
     check(observed < int(launches.size()), "Too many grouped launches");
     launches[observed++] = {type, grid, block};
     if (observed == fail_at) block.x = 1025;
@@ -509,12 +583,13 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
 }
 
 int main(int argc, char** argv) try {
-    check(argc <= 2, "Usage: long-decode-check [full|small|recovery|unaligned]");
+    check(argc <= 2, "Usage: long-decode-check [full|small|recovery|unaligned|serial]");
     const std::string_view mode = argc == 2 ? argv[1] : "full";
     if (mode == "full") run(Mode::full);
     else if (mode == "small") run(Mode::small);
     else if (mode == "recovery") run(Mode::recovery);
     else if (mode == "unaligned") run(Mode::unaligned);
+    else if (mode == "serial") check_serial();
     else check(false, "Invalid operator test mode");
     return 0;
 } catch (const std::exception& error) {

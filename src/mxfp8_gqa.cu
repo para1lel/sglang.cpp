@@ -105,10 +105,9 @@ __device__ float warp_sum(float value) {
     return value;
 }
 
-template <typename Position>
-__global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
-                                 Position first_query_position, const __nv_bfloat16* queries,
-                                 __nv_bfloat16* output) {
+__global__ void tiny_attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
+                                      int first_query_position, const __nv_bfloat16* queries,
+                                      __nv_bfloat16* output) {
     __shared__ float warp_dots[mxfp8_groups];
     __shared__ float history_weight;
     __shared__ float token_weight;
@@ -119,8 +118,7 @@ __global__ void attention_kernel(Mxfp8KvCache cache, const std::int32_t* pages,
     const int channel = threadIdx.x;
     const int group = channel / mxfp8_group_size;
     const auto row = row_offset(blockIdx.x, mxfp8_query_heads, query_head) + channel;
-    const int last_position =
-        decoder::position_value(first_query_position) + static_cast<int>(blockIdx.x);
+    const int last_position = first_query_position + static_cast<int>(blockIdx.x);
     const float query = __bfloat162float(queries[row]);
     float max_score = -CUDART_INF_F;
     float weight_sum = 0.0f;
@@ -840,9 +838,14 @@ cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int va
         || !cache_covers(cache, pages, valid_tokens)) {
         return cudaErrorInvalidValue;
     }
-    return launch_gqa_kernel(attention_kernel<int>, dim3(query_count, mxfp8_query_heads),
-                             mxfp8_head_dim, stream,
-                             cache, pages.device_pages, first_query_position, queries, output);
+    constexpr int min_tiled_tokens = 8;
+    if (end >= min_tiled_tokens) {
+        return decoder::tensor_core_prefill_gqa(cache, pages, first_query_position, query_count,
+                                                queries, output, stream);
+    }
+    return launch_gqa_kernel(tiny_attention_kernel, dim3(query_count, mxfp8_query_heads),
+                             mxfp8_head_dim, stream, cache, pages.device_pages,
+                             first_query_position, queries, output);
 }
 
 cudaError_t decoder::decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages,
@@ -856,9 +859,7 @@ cudaError_t decoder::decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages,
 cudaError_t decoder::decode_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages,
                                           const int* position, const __nv_bfloat16* queries,
                                           __nv_bfloat16* output, cudaStream_t stream) {
-    return launch_gqa_kernel(attention_kernel<const int*>, dim3(1, mxfp8_query_heads),
-                             mxfp8_head_dim, stream, cache, pages.device_pages, position,
-                             queries, output);
+    return tensor_core_prefill_gqa(cache, pages, 0, 1, queries, output, stream, position);
 }
 
 cudaError_t decoder::exact_decode_gqa_attention(

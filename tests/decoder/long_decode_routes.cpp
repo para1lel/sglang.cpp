@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -47,6 +48,9 @@ struct MtpRoutes {
     unsigned requests = slots;
 };
 MtpRoutes* mtp_routes = nullptr;
+int* serial_reads = nullptr;
+bool reject_prefill_arena = false;
+int arena_failures = 0;
 
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -424,6 +428,58 @@ void mtp_mixed(const char* checkpoint, const char* fixture) {
               << " merges=" << launches.merges << " legacy=" << launches.legacy << '\n';
 }
 
+void serial_prefill(const char* checkpoint, const char* fixture) {
+    constexpr int prefix = decoder_batch_prefix_checkpoint_interval;
+    const Decoder decoder(checkpoint, 0, false);
+    check(decoder.uses_b200_operators(), "Serial prefill route check requires a B200");
+    DecoderBatch batch(decoder, {.max_lanes = 1, .prefix_cache_entries = 1});
+    const auto tokens = read_prompt(fixture);
+    check(tokens.size() >= prefix + 3, "Expected at least 8195 prompt IDs");
+    const DecoderOptions options{.max_new_tokens = 2, .generated_top_logprobs = 2,
+                                 .ignore_eos = true};
+    const auto selected = select({0});
+    check(batch.admit(0, {tokens.begin(), tokens.begin() + prefix}, options) == 0,
+          "Unexpected initial prefix hit");
+    check(batch.advance_chunked(selected)[0].token.has_value(), "Missing warm-up token");
+    batch.cancel(0);
+    batch.release_retired_allocations();
+    const auto tail = [&](int rows, bool without_arena, int* reads) {
+        check(batch.admit(0, {tokens.begin(), tokens.begin() + prefix + rows}, options) == prefix,
+              "Missing restored 8192-token prefix");
+        serial_reads = reads;
+        arena_failures = 0;
+        reject_prefill_arena = without_arena;
+        DecoderBatchStepStats stats;
+        const auto step = batch.advance_chunked(selected, &stats)[0];
+        reject_prefill_arena = false;
+        serial_reads = nullptr;
+        check(step.token && step.generated_logprobs && stats.prefill_rows[0] == rows,
+              "Missing token, scores, or restored prefill rows");
+        check(arena_failures == int(without_arena) &&
+                  (stats.prefill_workspace_bytes == 0) == (without_arena || rows == 1),
+              "Unexpected prefill arena outcome");
+        check(std::isfinite(step.generated_logprobs->selected.value), "Nonfinite selected score");
+        batch.cancel(0);
+        batch.release_retired_allocations();
+        check(batch.request_device_allocation_bytes() == 0, "Request allocations remained live");
+        return step.generated_logprobs->selected;
+    };
+    int singleton_reads = 0, fallback_reads = 0;
+    tail(1, false, &singleton_reads);
+    const auto control = tail(3, false, nullptr);
+    const auto fallback = tail(3, true, &fallback_reads);
+    const auto recovered = tail(3, false, nullptr);
+    const auto repeated = tail(3, true, nullptr);
+    check(control.token_id == recovered.token_id && control.value == recovered.value &&
+              fallback.token_id == repeated.token_id && fallback.value == repeated.value,
+          "Allocation fallback or recovery changed its token or score");
+    if (singleton_reads != gqa_layers) std::cerr << "Wrong reader for restored singleton\n";
+    if (fallback_reads != 3 * gqa_layers) std::cerr << "Wrong reader for no-arena tail\n";
+    check(singleton_reads == gqa_layers && fallback_reads == 3 * gqa_layers,
+          "Restored serial prefill did not use the scratch-free tiled reader");
+    std::cout << "Restored singleton and allocation-limited prefill passed\n";
+}
+
 }
 
 using namespace sglang::decoder;
@@ -470,7 +526,26 @@ void wrap_select(RequestProgress* progress, Request& request, Workspace& work,
 extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, std::size_t,
                                                cudaStream_t);
 
+extern "C" cudaError_t __real_cudaMallocFromPoolAsync(void**, std::size_t, cudaMemPool_t,
+                                                      cudaStream_t);
+extern "C" cudaError_t __wrap_cudaMallocFromPoolAsync(
+    void** output, std::size_t bytes, cudaMemPool_t pool, cudaStream_t stream) {
+    if (reject_prefill_arena) {
+        std::size_t free = 0, total = 0;
+        const auto status = cudaMemGetInfo(&free, &total);
+        if (status != cudaSuccess) return status;
+        bytes = total + (1ull << 30);
+    }
+    const auto status = __real_cudaMallocFromPoolAsync(output, bytes, pool, stream);
+    arena_failures += reject_prefill_arena && status == cudaErrorMemoryAllocation;
+    return status;
+}
+
 static void record_launch(std::string_view symbol, dim3 grid, dim3 block) {
+    if (serial_reads) {
+        *serial_reads += symbol.find("tiled_prefill_attention") != symbol.npos;
+        return;
+    }
     if (mtp_routes) {
         const bool reader = symbol.find("decode_long") != symbol.npos;
         const bool merge = symbol.find("target_split_combine") != symbol.npos &&
@@ -511,7 +586,7 @@ extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 b
     static const auto launch = reinterpret_cast<decltype(&__cudaLaunchKernel)>(
         dlsym(RTLD_NEXT, "__cudaLaunchKernel"));
     check(launch != nullptr, "Cannot resolve CUDA kernel launch");
-    if (watch || mtp_routes) {
+    if (watch || mtp_routes || serial_reads) {
         static void* const driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
         check(driver != nullptr, "Cannot load the CUDA driver");
         static const auto get_name = reinterpret_cast<decltype(&cuKernelGetName)>(
@@ -527,11 +602,13 @@ extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 b
 extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, dim3 block,
                                                void** args, std::size_t shared,
                                                cudaStream_t stream) {
-    if (watch || mtp_routes) {
+    if (watch || mtp_routes || serial_reads) {
         const char* name = nullptr;
         check(cudaFuncGetName(&name, function) == cudaSuccess, "Cannot identify decode kernel");
         record_launch(name, grid, block);
-        if (mtp_routes) return __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
+        if (mtp_routes || serial_reads) {
+            return __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
+        }
         const std::string_view symbol(name);
         const bool tensor = symbol.find("split_long_decode_tensor") != symbol.npos;
         const bool split = tensor || symbol.find("split_long_decode_attention") != symbol.npos;
@@ -563,9 +640,13 @@ int main(int argc, char** argv) try {
         mtp_mixed(argv[1], argv[3]);
         return 0;
     }
+    if (argc == 4 && std::string_view(argv[2]) == "--serial-prefill") {
+        serial_prefill(argv[1], argv[3]);
+        return 0;
+    }
     check(argc >= 3 && argc <= 5,
           "Usage: long-decode-routes CHECKPOINT "
-          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5|--mtp-mixed W4_OR_W5_IDS}");
+          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5|--mtp-mixed IDS|--serial-prefill IDS}");
     const Decoder decoder(argv[1], 0, false);
     check(decoder.uses_b200_operators(), "Long decode route check requires a B200");
     const DecoderBatchOptions options{.cuda_graphs = true, .max_lanes = slots,

@@ -10,8 +10,9 @@ namespace {
 constexpr int max_multirow_visible_tokens = 32768;
 constexpr int max_flash_visible_tokens = 131072;
 
-__global__ void tiled_prefill_attention(Attention request) {
+__global__ void tiled_prefill_attention(Attention request, const int* position) {
     __shared__ OrderedTile<float> shared;
+    if (position) request.position = *position;
     ordered_attention(shared, request, blockIdx.x, blockIdx.y * ordered_heads);
 }
 
@@ -906,11 +907,11 @@ std::optional<cudaError_t> decoder::try_batched_partial_paged_prefill(
 
 cudaError_t decoder::tensor_core_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const Bf16* queries, Bf16* output, cudaStream_t stream) {
+    const Bf16* queries, Bf16* output, cudaStream_t stream, const int* device_position) {
     Attention request{cache, pages.device_pages, position, queries, output};
-    void* args[] = {&request};
-    const dim3 blocks(rows, mxfp8_query_heads / ordered_heads);
-    return cudaLaunchKernel(tiled_prefill_attention, blocks, channels, args, 0, stream);
+    void* args[] = {&request, &device_position};
+    return cudaLaunchKernel(tiled_prefill_attention, dim3(rows, mxfp8_query_heads / ordered_heads),
+                            channels, args, 0, stream);
 }
 
 cudaError_t decoder::tensor_core_multirow_prefill_gqa(

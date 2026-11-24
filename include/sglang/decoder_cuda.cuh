@@ -160,7 +160,8 @@ std::optional<cudaError_t> tensor_core_prefill_gdn_group(
 
 cudaError_t tensor_core_prefill_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
                                     int rows, const __nv_bfloat16* queries,
-                                    __nv_bfloat16* output, cudaStream_t stream);
+                                    __nv_bfloat16* output, cudaStream_t stream,
+                                    const int* device_position = nullptr);
 
 std::optional<cudaError_t> try_prefill_gqa_postgate_quantize(
     int rows, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,

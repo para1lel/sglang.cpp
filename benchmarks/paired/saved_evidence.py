@@ -158,7 +158,8 @@ def artifact_hashes(path):
     return values
 
 
-def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False, max_seqs=32):
+def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False, max_seqs=32,
+                  paired_budget=None):
     workers = load(run / "effective-worker.json")["results"]
     require(len(workers) == 1, f"{run}: expected one observed vLLM worker")
     worker = workers[0]
@@ -174,9 +175,12 @@ def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False, ma
     else:
         require(configured is None, f"{run}: unexpected configured scheduled token cap")
     historical = cap == 32768 and "max_num_scheduled_tokens_configured" not in scheduler
-    if cap == 8192:
-        require(scheduled_flag in args and "--async-scheduling" in args,
-                f"{run}: expected explicit 8192 scheduled cap and async scheduling")
+    if paired_budget is not None:
+        require(type(cap) is int and cap == paired_budget and not historical,
+                f"{run}: expected observed {paired_budget} vLLM token budget")
+    if cap == 8192 or paired_budget is not None:
+        require(scheduled_flag in args and args.count("--async-scheduling") == 1,
+                f"{run}: expected explicit {cap} scheduled cap and async scheduling")
     effective = scheduler.get("max_num_scheduled_tokens_effective", cap if historical else None)
     async_scheduling = scheduler.get("async_scheduling", True if historical else None)
     require(type(cap) is int and type(effective) is int and cap == effective
@@ -231,7 +235,8 @@ def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False, ma
 
 
 def saved_worker(capture, run, cpus, uuid, group, *, speculative=False,
-                 before_measurement=False, prefix_cache=False, max_seqs=32):
+                 before_measurement=False, prefix_cache=False, max_seqs=32,
+                 paired_budget=None):
     args = command(run, "server", cpus)
     log = (run / "server.log").read_text()
     api_pid = (run / "server-pid.txt").read_text().strip()
@@ -248,4 +253,5 @@ def saved_worker(capture, run, cpus, uuid, group, *, speculative=False,
             f"{run}: CUDA visibility conflicts with observed UUID")
     return {"worker_pid": int(pid), "model_path": model,
             "effective": vllm_settings(run, args, group, speculative=speculative,
-                                       prefix_cache=prefix_cache, max_seqs=max_seqs)}
+                                       prefix_cache=prefix_cache, max_seqs=max_seqs,
+                                       paired_budget=paired_budget)}

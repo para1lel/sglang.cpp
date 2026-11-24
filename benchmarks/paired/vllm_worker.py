@@ -3,6 +3,8 @@
 from importlib.metadata import version
 
 from benchmarks.streaming.vllm_observer import StreamingBaselineObserver
+from default_evidence import GRAPH_CAPTURE_FIELDS
+from workload_suite import V4_TOKEN_BUDGET
 
 
 class PairedBaselineObserver(StreamingBaselineObserver):
@@ -27,6 +29,10 @@ class PairedBaselineObserver(StreamingBaselineObserver):
             "async_scheduling": scheduler.async_scheduling,
             "enable_chunked_prefill": scheduler.enable_chunked_prefill,
         }
+        if scheduler.max_num_batched_tokens == V4_TOKEN_BUDGET:
+            compilation = config.compilation_config
+            state["compilation"].update(
+                (key, getattr(compilation, key)) for key in GRAPH_CAPTURE_FIELDS)
         state["parallel"] = {
             "tp": config.parallel_config.tensor_parallel_size,
             "dp": config.parallel_config.data_parallel_size,

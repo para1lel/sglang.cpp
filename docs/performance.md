@@ -16,9 +16,9 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 
 ## Scheduler and reporting policy
 
-Use MTP4, an 8,192-token step budget, and capacity for eight active requests per participating GPU. Enable prefix caching on both engines and measure cold prefixes.
+Use MTP4, a 32,768-token step budget, and capacity for eight active requests per participating GPU. Enable prefix caching on both engines and measure cold prefixes.
 
-- **Pinned vLLM.** Set `--max-num-batched-tokens 8192 --max-num-scheduled-tokens 8192` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
+- **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-scheduled-tokens 32768` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
 - **Native server.** Use the Release defaults and pass only `--port` for timing. Verify four prefix-cache slots, MTP4, the scheduler limits, and CUDA graphs. [Server information](native-model-info.md#server-information)
 
 The pinned vLLM scheduler scans its running list before its FCFS waiting queue. That list can include an unfinished prompt. Native [reserves ready decode rows before FCFS prefill](batch-graphs.md#runtime-path). Match workload and capacity settings across the engines. [Pinned vLLM running scan](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/v1/core/sched/scheduler.py#L767) · [Waiting scan](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/v1/core/sched/scheduler.py#L1029)
@@ -49,13 +49,13 @@ Lengths are exact post-template tokens per request. Multiply offered requests pe
 | W4 | 32,768 | 4,096 | 8 |
 | W5 | 131,072 | 1,024 | 4 |
 
-Use the [server-defaults protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol) for `matched-k4-native-defaults-cache-on-v3`. W4 uses the first eight requests from archived W5. W5 uses all four archived W6 requests. Keep the [warm-prefix diagnostic](../benchmarks/paired/README.md#prefix-reuse-diagnostic) and media variants separate.
+Use the [server-defaults protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol) for `matched-k4-native-defaults-cache-on-v4`. W4 uses the first eight requests from archived W5. W5 uses all four archived W6 requests. Keep the [warm-prefix diagnostic](../benchmarks/paired/README.md#prefix-reuse-diagnostic) and media variants separate.
 
 ## Measurement
 
 For each W1–W5 row, require a native median client makespan at most 1.10 times the pinned vLLM median. Stop tuning once every row passes. Keep the scheduling rule and workload settings fixed. Improve calculation through CUDA kernels, programmatic dependent launch (PDL), streams, and CUDA Graph replay.
 
-For W1 and W2, run three warmup cohorts and nine measured cohorts. For W3–W5, run two warmup cohorts and five measured cohorts. Advance only after each prior row passes. Validate launch and device identity and every stream’s request, token counts, finish condition, usage, and drain. Apply each profile’s native ID checks and evidence requirements. The pinned vLLM arm supplies timing, and its output IDs can vary across valid streams. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+For W1 and W2, run three warmup cohorts and nine measured cohorts. For W3–W5, run two warmup cohorts and five measured cohorts. Start long-row profiling with W4 in a separate diagnostic run. W4 can start a fresh formal campaign. Run W5 only after W4 passes in that v4 campaign. Run W1–W3 in order. Each later short row requires the prior short rows to pass in that campaign. Validate launch and device identity and every stream’s request, token counts, finish condition, usage, and drain. Apply each profile’s native ID checks and evidence requirements. The pinned vLLM arm supplies timing, and its output IDs can vary across valid streams. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 Use one streaming client and monotonic clock. Measure from earliest submit to last valid `[DONE]`. Preconnect lanes and release them with one barrier. Send all bodies before the first valid completion. Limit the submit span to 50 ms. Retain submit times, headers, token events, completion times, token counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and other empty events from token counts.
 
@@ -174,17 +174,4 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The November 24, 2026 `matched-k4-native-defaults-cache-on-v3` campaign passed W1 through W3. W4 exceeded the 1.10× median client makespan limit by 6.873837291 s. The campaign stopped at W4, and W5 remains unmeasured.
-
-| Workload | Native median (s) | vLLM median (s) | Native / vLLM | Verdict |
-| --- | ---: | ---: | ---: | --- |
-| W1 | 0.573617682 | 0.621677740 | 0.922692973 | Pass |
-| W2 | 1.424455108 | 1.689483938 | 0.843130305 | Pass |
-| W3 | 4.241288221 | 3.955133117 | 1.072350309 | Pass |
-| W4 | 35.198634393 | 25.749815547 | 1.366947050 | Miss |
-
-Both engines used one B200, the same checkpoint, MTP4, an 8,192-token step budget, and capacity eight. Both enabled prefix caching and reset it before every cohort. The native Release binary SHA-256 was `7853b65ca1d52b64580ab083a157390ad69f57db74ee863028c273a2651dde8e`. [Measured public source](https://github.com/para1lel/sglang.cpp/tree/bd8d47d6c8f6f9a24141a4d0f6a80812e780b91e)
-
-Independent replay validated 217 cold streams with zero cached prompt tokens and repeatable native output IDs. The first cohorts matched full output ID arrays across engines in all four W3 lanes and all eight W4 lanes. The separate native W1 trace confirmed depth four outside the timed samples. The `summary.json` and `evidence.sha256` index are in `artifacts/handover-w3/cache-on-pin/release-w1/formal-v3-bd8d47d-gpu7.Ks6BSSzx`.
-
-The previous v3 campaign stopped at W3. Earlier 32-request campaigns retain their own workload definitions and verdict rules. [Previous v3 evidence](https://github.com/para1lel/sglang.cpp/blob/bc0d5a83a92d7ddfd8f9acfc412e07ffb29e63ce/docs/performance.md#matched-k4-evidence) · [Archived workloads](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#named-workloads) · [Archived evidence and earlier campaigns](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#matched-k4-evidence)
+The 32,768-token v4 protocol has no formal measurements yet. The archived 8,192-token v3 campaign passed W1–W3 and stopped at W4. Earlier 32-request campaigns retain their own workload definitions and verdict rules. [Archived v3 evidence](https://github.com/para1lel/sglang.cpp/blob/7de0fd49bd6e48fb960934498992f650ea00f009/docs/performance.md#matched-k4-evidence) · [Archived workloads](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#named-workloads) · [Earlier evidence](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#matched-k4-evidence)

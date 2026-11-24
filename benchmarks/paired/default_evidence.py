@@ -4,16 +4,27 @@ import json
 import os
 from pathlib import Path
 
-from workload_suite import PROTOCOL as CURRENT_PROTOCOL
+import workload_suite
 from saved_evidence import arg, command, fields, load, observed_device, require
 
 
 PROTOCOL = "matched-k4-native-defaults-v1"
 CACHE_ON_PROTOCOL = "matched-k4-native-defaults-cache-on-v2"
-CACHE_ON_PROTOCOLS = (CACHE_ON_PROTOCOL, CURRENT_PROTOCOL)
+CACHE_ON_PROTOCOLS = (CACHE_ON_PROTOCOL, *workload_suite.WORKLOAD_PROTOCOLS)
 DEFAULT_PROTOCOLS = (PROTOCOL, *CACHE_ON_PROTOCOLS)
 CACHE_POLICY = "reset-before-every-cohort"
 PROFILE = "server-defaults"
+GRAPH_CONFIG = {"mode": "NONE", "cudagraph_mode": "FULL_AND_PIECEWISE"}
+GRAPH_CAPTURE_FIELDS = ("max_cudagraph_capture_size", "max_prefill_cudagraph_capture_tokens",
+                        "prefill_cudagraph_capture_token_sizes",
+                        "max_decode_cudagraph_capture_requests",
+                        "max_decode_cudagraph_capture_tokens",
+                        "decode_cudagraph_capture_request_sizes")
+VLLM_ENVIRONMENT = {
+    "VLLM_HAS_FLASHINFER_CUBIN", "VLLM_NO_USAGE_STATS", "VLLM_CACHE_ROOT",
+    "VLLM_CONFIG_ROOT", "VLLM_RPC_BASE_PATH", "VLLM_WORKER_MULTIPROC_METHOD",
+    "VLLM_SERVER_DEV_MODE",
+}
 NATIVE_ENVIRONMENT = {
     "PATH", "LANG", "HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
     "CUDA_CACHE_PATH", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "LD_LIBRARY_PATH",
@@ -60,7 +71,15 @@ def verify_argv(run, argv):
 
 
 def serving_capacity(identity):
-    return identity["max_running_requests"] if identity["protocol"] == CURRENT_PROTOCOL else 32
+    if identity["protocol"] in workload_suite.WORKLOAD_PROTOCOLS:
+        return identity["max_running_requests"]
+    return 32
+
+
+def token_budget(identity):
+    if identity["protocol"] == workload_suite.PROTOCOL_V4:
+        return workload_suite.V4_TOKEN_BUDGET
+    return 8192
 
 
 def native(run, identity):
@@ -68,7 +87,7 @@ def native(run, identity):
     trace = run.name == "native-k4-trace"
     expected = {
         "mtp_steps": 4, "max_running_requests": serving_capacity(identity),
-        "max_num_batched_tokens": 8192,
+        "max_num_batched_tokens": token_budget(identity),
         "prefix_cache_entries": 4 if identity["protocol"] in CACHE_ON_PROTOCOLS else 0,
         "batch_cuda_graphs": True, "eager": False,
         "trace_batches": trace, "host": "127.0.0.1", "device": 0,
@@ -121,7 +140,7 @@ def native_completed(run, identity):
     return info
 
 
-def vllm_argv(run, cpus, gpu_uuid):
+def vllm_argv(run, cpus, gpu_uuid, *, wide_budget=False):
     wrapper = command(run, "server", cpus)
     module = wrapper.index("-m")
     environment = fields(run / "effective-environment.txt")
@@ -148,4 +167,41 @@ def vllm_argv(run, cpus, gpu_uuid):
             and json.loads(arg(argv, "--speculative-config")) ==
             {"method": "mtp", "num_speculative_tokens": 4},
             f"{run.name}: wrong vLLM endpoint, workload alias, or MTP launch")
+    if wide_budget:
+        verify_vllm_graph_launch(argv, environment)
     return int(port)
+
+
+def verify_vllm_graph_launch(argv, environment):
+    graph_flags = ("--cudagraph-", "--max-cudagraph-", "--prefill-cudagraph-",
+                   "--max-prefill-cudagraph-", "--decode-cudagraph-",
+                   "--max-decode-cudagraph-", "--enforce-eager")
+    require(json.loads(arg(argv, "--compilation-config")) == GRAPH_CONFIG
+            and not any(flag.startswith(graph_flags) for flag in argv)
+            and {key for key in environment if key.startswith("VLLM_")} == VLLM_ENVIRONMENT
+            and environment["VLLM_HAS_FLASHINFER_CUBIN"] == "1"
+            and not any(key.startswith(("TORCH", "PYTORCH", "CUDAGRAPH"))
+                        for key in environment),
+            "Unexpected vLLM CUDA graph launch or environment override")
+
+
+def vllm_budget(config, worker, budget):
+    scheduler = config["scheduler_config"]
+    expected = {"max_num_batched_tokens": budget, "max_num_scheduled_tokens": budget,
+                "max_num_seqs": worker["scheduler"]["max_num_seqs"],
+                "async_scheduling": True, "enable_chunked_prefill": True}
+    require(all(type(scheduler.get(key)) is type(value) and scheduler[key] == value
+                for key, value in expected.items()),
+            "vLLM API and worker disagree about resolved v4 scheduler settings")
+    graph = config["compilation_config"]
+    observed = worker["compilation"]
+    sizes = observed["cudagraph_capture_sizes"]
+    decode_sizes = graph.get("decode_cudagraph_capture_request_sizes", [])
+    prefill_sizes = graph.get("prefill_cudagraph_capture_token_sizes", [])
+    require(graph.get("mode") == 0 and graph.get("cudagraph_mode") == [2, 1]
+            and sizes == graph.get("cudagraph_capture_sizes")
+            and all(key in graph and graph[key] == observed.get(key)
+                    for key in GRAPH_CAPTURE_FIELDS)
+            and bool(prefill_sizes) and max(prefill_sizes) <= budget
+            and expected["max_num_seqs"] in decode_sizes,
+            "vLLM API and worker disagree about resolved v4 CUDA graph settings")

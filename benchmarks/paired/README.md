@@ -53,11 +53,12 @@ FlashInfer cubin cache.
 export PAIRED_CHECKPOINT_MANIFEST=/path/to/published/checkpoint.sha256
 export PAIRED_NATIVE_SOURCE='verified-40-character-source-revision'
 export PAIRED_NATIVE_SHA256='verified-64-character-binary-digest'
-bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4-110 W1
+bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4-110 W4
 ```
 
-Supply W2 through W5 in order after each prior row passes. A row starts fresh servers
-for both timed arms. The vLLM arm goes first on W1, W3 and W5. Both K4 arms use
+W4 can start a fresh campaign. Run W5 after W4 passes in that campaign.
+The short rows follow W1, W2, then W3, advancing after each pass. A row starts
+fresh servers for both timed arms. The vLLM arm goes first on W1, W3 and W5. Both K4 arms use
 the same checkpoint files, physical GPU, CPU placement, request bytes, cohort
 counts, and client clock. The clients drain each SSE response after measuring
 from the earliest submit to the last valid `[DONE]`. The runner uses port 17424
@@ -65,7 +66,7 @@ on loopback by default and holds the campaign, port, and both GPU coordination
 locks. `PAIRED_VLLM_SEED_CACHE` can point to the retained compiler cache seed.
 
 The launcher selects `server-defaults` and records
-`matched-k4-native-defaults-cache-on-v3` when `PAIRED_K4_NATIVE_PROFILE` is unset.
+`matched-k4-native-defaults-cache-on-v4` when `PAIRED_K4_NATIVE_PROFILE` is unset.
 Choose the participating B200 by `GPU_INDEX`. Both engine processes use only
 that device. The row width is the requests per participating GPU multiplied by
 the number of participating GPUs. The current launcher supports one GPU.
@@ -78,10 +79,13 @@ including those archived directory names. Request bytes are checked by digest.
 W1 and W2 use three warmups and nine measured cohorts per arm. W3–W5 use two
 warmups and five measured cohorts per arm.
 
-Both arms use MTP4 and an 8,192-token budget. The native arm uses its default
-active-request cap and checks it against eight times the participating GPU
-count. vLLM receives that cap through `--max-num-seqs` and uses async scheduling
-with both token caps set to 8,192. Both engines enable prefix caching. The runner
+Both arms use MTP4 and a 32,768-token budget. The native arm launches with only
+`--port` and verifies the resolved budget and active-request cap of eight times
+the participating GPU count. vLLM receives that cap through `--max-num-seqs` and
+uses async scheduling with both token caps explicitly set to 32,768. The driver
+checks the resolved scheduler and CUDA graph settings against the API and worker
+receipts and checks the launch environment. Both engines enable prefix caching.
+The runner
 drains outstanding work and requires an acknowledged `POST /reset_prefix_cache`
 with an empty JSON object before each warmup, measured cohort, and W1 trace. The
 timing starts after those controls. Every fixed request must report zero reused
@@ -104,10 +108,10 @@ pinned vLLM median, including equality at 1.10. The campaign identity and each
 `Wn/comparison.json` record `makespan_criterion` as
 `native-median-at-most-110-percent`. The comparison includes both measured
 medians, `native_to_vllm_median_ratio`, and `strict_passed` for the historical
-strict win. Advancement requires every prior row to pass under the same
-criterion, campaign identity, and exact current workload. In particular, W5
-requires a passing current W4 with eight 32,768-input/4,096-output lanes on one
-GPU. A timing miss returns status 1 with the raw
+strict win. Advancement checks the applicable prior rows under the same
+criterion and campaign identity. W5 requires a passing v4 W4 with a 32,768-token
+budget and eight 32,768-input/4,096-output lanes on one GPU. A timing miss
+returns status 1 with the raw
 captures and comparison retained. Invalid evidence stops the row before
 comparison.
 
@@ -126,6 +130,10 @@ strict gate, which requires the native median to be below the vLLM median.
 Replay also checks any process or activity receipts those rows contain.
 
 ### Historical K4 profiles
+
+Use `PAIRED_K4_NATIVE_PROFILE=server-defaults-cache-on-v3` with the matching
+Release to capture the archived 8,192-token, eight-request W1–W5 protocol. Its
+receipts replay under `matched-k4-native-defaults-cache-on-v3`.
 
 For the former cache-on W1–W6 launch, use a cache-on Release with a 32-request
 cap and `PAIRED_K4_NATIVE_PROFILE=server-defaults-cache-on-v2`. Its archived
@@ -235,7 +243,8 @@ for all six rows. See `REPRODUCE.md` there for the pinned vLLM commands,
 The retained run used physical UUID `GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`,
 CPUs 24–33 for the server and 34–35 for the client, and local NUMA allocation.
 Reuse that UUID, CPU placement and memory policy. Measure a new vLLM arm on the
-chosen card for other placement and use two fresh 8,192-token arms for the formal protocol.
+chosen card for other placement. The matched K4 protocol uses two fresh arms
+with its own 32,768-token budget and workload fixtures.
 
 Export the historical protocol to check the saved source hashes. Use the current
 checkout for the candidate protocol. Run these commands in Bash from its root.

@@ -67,7 +67,7 @@ def fixture(row, fixtures, identity=None):
 
 
 def current_campaign(identity):
-    return bool(identity and identity["protocol"] == workload_suite.PROTOCOL)
+    return bool(identity and identity["protocol"] in workload_suite.WORKLOAD_PROTOCOLS)
 
 
 def workload_evidence(row, identity, lanes=None):
@@ -378,9 +378,18 @@ def check_prior_rows(row, root):
     require(row in rows, f"{row} is unavailable in this workload suite")
     if current_campaign(identity):
         workload_suite.validate_identity(identity)
-    for previous in rows[:rows.index(row)]:
+    previous_rows = rows[:rows.index(row)]
+    wide_budget = identity["protocol"] == workload_suite.PROTOCOL_V4
+    if wide_budget and row in ("W4", "W5"):
+        previous_rows = ("W4",) if row == "W5" else ()
+    for previous in previous_rows:
         directory = root / previous
-        comparison = load(directory / "comparison.json")
+        comparison_path = directory / "comparison.json"
+        requirement = (f"{previous} must pass under this campaign's makespan "
+                       f"criterion before {row}")
+        require(all((directory / name).is_file() for name in (
+            "comparison.json", "identity.json", "exit-code.txt")), requirement)
+        comparison = load(comparison_path)
         require((directory / "exit-code.txt").read_text().strip() == "0"
                 and (directory / "identity.json").read_bytes() == identity_bytes
                 and comparison.get("row") == previous
@@ -389,8 +398,9 @@ def check_prior_rows(row, root):
                 and makespan_criterion(comparison) == criterion
                 and comparison.get("passed") is True
                 and (not current_campaign(identity) or comparison.get("workload") ==
-                     workload_evidence(previous, identity)),
-                f"{previous} must pass under this campaign's makespan criterion before {row}")
+                     workload_evidence(previous, identity))
+                and (not wide_budget or comparison.get("max_num_batched_tokens") ==
+                     workload_suite.V4_TOKEN_BUDGET), requirement)
 
 
 def assess(row, fixtures, directory):
@@ -470,25 +480,29 @@ def assess(row, fixtures, directory):
     if current:
         result.update(workload=workload_evidence(row, identity, lanes),
                       cohort_metrics=diagnostics)
+    if identity.get("protocol") == workload_suite.PROTOCOL_V4:
+        result["max_num_batched_tokens"] = defaults.token_budget(identity)
     verify_row_status(directory, result, version > 0)
     return result
 
 
 def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measurement=False,
-                         prefix_cache=False, max_seqs=32):
+                         prefix_cache=False, max_seqs=32, token_budget=8192):
     cpus = fields(reservation / "cpus.txt")
     group = "W1-W2" if row in streaming.SHAPES else row
     evidence = saved_worker(run, run, cpus, device(reservation)["uuid"], group, speculative=True,
                             before_measurement=before_measurement, prefix_cache=prefix_cache,
-                            max_seqs=max_seqs)
+                            max_seqs=max_seqs, paired_budget=token_budget)
     worker = evidence["effective"]
     reference = concurrent.reference()["observed_vllm_settings"]
     require(all(worker[key] == reference[key] for key in ("vllm", "torch", "torch_cuda"))
-            and worker["scheduler"]["max_num_scheduled_tokens_effective"] == 8192,
+            and worker["scheduler"]["max_num_scheduled_tokens_effective"] == token_budget,
             "Unexpected vLLM runtime or target row cap")
     check_vllm.audit(load(run / "effective-worker.json"), speculative=True,
                      prefix_cache=prefix_cache)
     config = load(run / "server-info.json")["vllm_config"]
+    if token_budget == workload_suite.V4_TOKEN_BUDGET:
+        defaults.vllm_budget(config, worker, token_budget)
     spec = config["speculative_config"]
     attention = config["attention_config"]
     if prefix_cache:
@@ -514,15 +528,18 @@ def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measuremen
 
 def check_vllm_worker(row, run, reservation, checkpoint, *, before_measurement=False):
     selected = campaign(run.parent)
-    max_seqs = defaults.serving_capacity(selected[0]) if selected else 32
+    use_defaults = default_campaign(selected)
+    max_seqs = defaults.serving_capacity(selected[0]) if use_defaults else 32
+    token_budget = defaults.token_budget(selected[0]) if use_defaults else 8192
     evidence, kernels = vllm_worker_evidence(row, run, reservation, checkpoint,
                                              before_measurement=before_measurement,
                                              prefix_cache=cache_on_campaign(selected),
-                                             max_seqs=max_seqs)
+                                             max_seqs=max_seqs, token_budget=token_budget)
     if before_measurement:
         require(default_campaign(selected), "Expected a native defaults campaign")
         port = defaults.vllm_argv(run, fields(reservation / "cpus.txt"),
-                                  device(reservation)["uuid"])
+                                  device(reservation)["uuid"],
+                                  wide_budget=token_budget == workload_suite.V4_TOKEN_BUDGET)
         require(port == selected[0]["port"], "vLLM endpoint differs from the default campaign")
         return
     save(run / "attention-kernels.json", kernels)
@@ -544,7 +561,9 @@ def verify_default_receipts(row, run, identity):
             | {"memory": identity["memory"]}
             and device(reservation)["uuid"] == identity["gpu_uuid"].lower(),
             "vLLM reservation differs from the default campaign")
-    port = defaults.vllm_argv(run, cpus, identity["gpu_uuid"].lower())
+    token_budget = defaults.token_budget(identity)
+    port = defaults.vllm_argv(run, cpus, identity["gpu_uuid"].lower(),
+                              wide_budget=token_budget == workload_suite.V4_TOKEN_BUDGET)
     require(port == identity["port"], "vLLM endpoint differs from the default campaign")
     require((run / "live-environment-end.bin").read_bytes()
             == (run / "live-environment.bin").read_bytes(),
@@ -554,7 +573,8 @@ def verify_default_receipts(row, run, identity):
     evidence, kernels = vllm_worker_evidence(row, run, reservation,
                                              Path(identity["checkpoint_path"]),
                                              prefix_cache=cache_on,
-                                             max_seqs=defaults.serving_capacity(identity))
+                                             max_seqs=defaults.serving_capacity(identity),
+                                             token_budget=token_budget)
     require(load(run / "worker-identity.json") == evidence
             and load(run / "attention-kernels.json") == kernels,
             "Saved vLLM worker differs from the resolved receipts")

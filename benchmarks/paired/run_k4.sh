@@ -5,10 +5,12 @@ usage() {
     echo "Usage: bash benchmarks/paired/run_k4.sh NATIVE_BINARY GPU_INDEX CAMPAIGN_DIR ROW"
     echo "Current rows are W1, W2, W3, W4, and W5. GPU_INDEX selects the single participating B200."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
-    echo "The default profile, server-defaults, times matched K4 with both caches enabled and cold."
+    echo "The default profile, server-defaults, uses matched 32768-token cold-cache K4."
+    echo "W4 can start a fresh v4 campaign. W5 requires a passing v4 W4 in that campaign."
     echo "Each row passes when the native median is at most 110% of the pinned vLLM median."
     echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
-    echo "  server-defaults-cache-on-v2, server-defaults-cache-off, exact, ordered-tc-int8,"
+    echo "  server-defaults-cache-on-v3, server-defaults-cache-on-v2, server-defaults-cache-off,"
+    echo "  exact, ordered-tc-int8,"
     echo "  ordered-tc-int8-split-gqa, ordered-tc-int8-long-split-gqa."
 }
 
@@ -34,10 +36,12 @@ native_split_mode=
 native_defaults=false
 cache_on=false
 current=false
+wide_budget=false
 max_seqs=32
 case "$native_profile" in
     exact) ;;
-    server-defaults) native_defaults=true; cache_on=true; current=true ;;
+    server-defaults) native_defaults=true; cache_on=true; current=true; wide_budget=true ;;
+    server-defaults-cache-on-v3) native_defaults=true; cache_on=true; current=true ;;
     server-defaults-cache-on-v2) native_defaults=true; cache_on=true ;;
     server-defaults-cache-off) native_defaults=true ;;
     ordered-tc-int8) ;;
@@ -82,6 +86,9 @@ esac
 export PAIRED_PROTOCOL_ROOT
 PAIRED_PROTOCOL_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 export PAIRED_MAX_NUM_BATCHED_TOKENS=8192
+if [[ $wide_budget == true ]]; then
+    export PAIRED_MAX_NUM_BATCHED_TOKENS=32768
+fi
 export PAIRED_PORT=${PAIRED_PORT:-17424}
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
@@ -153,12 +160,15 @@ if [[ $native_profile != exact ]]; then
         identity=$(jq -c --arg model "$checkpoint" --arg campaign_id "$campaign_id" \
             --argjson port "$port" --argjson cache_on "$cache_on" \
             --argjson current "$current" --argjson max_seqs "$max_seqs" \
+            --argjson wide_budget "$wide_budget" --argjson token_budget "$token_budget" \
             '. + {protocol:"matched-k4-native-defaults-v1",campaign_id:$campaign_id,
                   native_profile:"server-defaults",checkpoint_path:$model,port:$port}
              | if $cache_on then . + {protocol:"matched-k4-native-defaults-cache-on-v2",
                  cache_policy:"reset-before-every-cohort"} else . end
              | if $current then . + {protocol:"matched-k4-native-defaults-cache-on-v3",
-                 participating_gpus:[.gpu_uuid],max_running_requests:$max_seqs} else . end' \
+                 participating_gpus:[.gpu_uuid],max_running_requests:$max_seqs} else . end
+             | if $wide_budget then . + {protocol:"matched-k4-native-defaults-cache-on-v4",
+                 max_num_batched_tokens:$token_budget} else . end' \
             <<<"$identity")
     else
         identity=$(jq -c --arg profile "$native_profile" --arg fp8 "$native_fp8" \
@@ -171,7 +181,8 @@ if [[ $native_profile != exact ]]; then
             <<<"$identity")
     fi
 fi
-if [[ $row == W1 && ! -e $root/identity.json ]]; then
+if [[ ! -e $root/identity.json ]] &&
+   [[ $row == W1 || ( $wide_budget == true && $row == W4 ) ]]; then
     printf '%s\n' "$identity" >"$root/identity.json"
 fi
 if [[ $(cat "$root/identity.json") != "$identity" ]]; then

@@ -39,13 +39,9 @@ namespace sglang {
 namespace {
 
 using namespace cute;
-constexpr int rows = grouped_prefill_max_rows;
 constexpr int out_width = 5120;
-constexpr int in_width = 17408;
 constexpr int scale_group = 128;
-constexpr int groups = in_width / scale_group;
 constexpr int scale_tile = 16;
-constexpr int weight_scale_count = (out_width / scale_group) * groups;
 using Fp8 = cutlass::float_e4m3_t;
 using Bf16 = cutlass::bfloat16_t;
 using Arch = cutlass::arch::Sm100;
@@ -68,11 +64,13 @@ using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
 using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue>;
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 
+template <int rows, int groups>
 __global__ void prepare_scales(const float* activation, const __nv_bfloat16* weight,
                                float* transposed, float* converted) {
     __shared__ float tile[scale_tile][scale_tile + 1];
     const int group_in = blockIdx.x * scale_tile + threadIdx.x;
     const int row_in = blockIdx.y * scale_tile + threadIdx.y;
+    constexpr int weight_scale_count = (out_width / scale_group) * groups;
     if (group_in < groups) tile[threadIdx.y][threadIdx.x] = activation[row_in * groups + group_in];
     const int index = (blockIdx.y * gridDim.x + blockIdx.x) * scale_tile * scale_tile +
                       threadIdx.y * scale_tile + threadIdx.x;
@@ -85,7 +83,7 @@ __global__ void prepare_scales(const float* activation, const __nv_bfloat16* wei
 
 Gemm::Arguments arguments(TextFp8ActivationView input, const std::uint8_t* weight,
                           __nv_bfloat16* output, float* transposed, float* converted,
-                          int device) {
+                          int rows, int in_width, int device) {
     const auto shape = make_shape(rows, out_width, in_width, 1);
     const auto a = cutlass::make_cute_packed_stride(Kernel::StrideA{},
                                                     make_shape(rows, in_width, 1));
@@ -150,15 +148,16 @@ cudaError_t tensor_map_status(CUresult status) {
 
 }
 
-std::optional<cudaError_t> try_prefill_down_sm100(
+std::optional<cudaError_t> try_prefill_scaled_sm100(
     TextFp8ActivationView input, const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
     int row_count, int output_width, int input_width, __nv_bfloat16* output,
     __nv_bfloat16* gate_scratch, __nv_bfloat16* up_scratch, cudaStream_t stream) {
     const auto pending = cudaGetLastError();
     if (pending != cudaSuccess) return pending;
-    if (row_count != rows || output_width != out_width || input_width != in_width) {
-        return std::nullopt;
-    }
+    const bool attention_output = row_count == grouped_prefill_max_rows && input_width == 6144;
+    const bool down = (row_count == grouped_prefill_max_rows || row_count == 1024) &&
+                      input_width == 17408;
+    if (output_width != out_width || !(attention_output || down)) return std::nullopt;
     if (!aligned(input.values, 16) || !aligned(input.scales, alignof(float)) ||
         !aligned(weight, 16) || !aligned(weight_scales, alignof(__nv_bfloat16)) ||
         !aligned(output, 16) || !aligned(gate_scratch, 16) || !aligned(up_scratch, 16) ||
@@ -171,7 +170,8 @@ std::optional<cudaError_t> try_prefill_down_sm100(
     if (!setup) return std::nullopt;
     auto* transposed = reinterpret_cast<float*>(gate_scratch);
     auto* converted = reinterpret_cast<float*>(up_scratch);
-    const auto args = arguments(input, weight, output, transposed, converted, device);
+    const auto args = arguments(input, weight, output, transposed, converted, row_count,
+                                input_width, device);
     if (Gemm::can_implement(args) != cutlass::Status::kSuccess || Gemm::get_workspace_size(args)) {
         return std::nullopt;
     }
@@ -181,10 +181,14 @@ std::optional<cudaError_t> try_prefill_down_sm100(
     } catch (const TensorMapError& error) {
         return submit_status(tensor_map_status(error.status));
     }
-    dim3 scale_grid((groups + scale_tile - 1) / scale_tile, rows / scale_tile);
+    const int groups = input_width / scale_group;
+    dim3 scale_grid((groups + scale_tile - 1) / scale_tile, row_count / scale_tile);
+    const auto scale_kernel = attention_output ? prepare_scales<4096, 6144 / scale_group> :
+        row_count == 1024 ? prepare_scales<1024, 17408 / scale_group> :
+                           prepare_scales<4096, 17408 / scale_group>;
     void* scale_args[] = {&input.scales, &weight_scales, &transposed, &converted};
     const auto status = submit_status(cudaLaunchKernel(
-        prepare_scales, scale_grid, dim3(scale_tile, scale_tile), scale_args, 0, stream));
+        scale_kernel, scale_grid, dim3(scale_tile, scale_tile), scale_args, 0, stream));
     if (status != cudaSuccess) return status;
     cudaLaunchAttribute cluster{};
     cluster.id = cudaLaunchAttributeClusterDimension;

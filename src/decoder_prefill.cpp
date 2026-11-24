@@ -230,8 +230,14 @@ struct Chunk : PrefillProjections {
         if (postgate) gqa_gate();
     }
 
-    void attention_output(Fp8Weight output, int width) const {
-        project(output, quantize(work.attention, width), work.projected_attention);
+    void project_scaled(Fp8Weight weight, TextFp8ActivationView input, Bf16* output,
+                        bool eligible) const {
+        if (eligible) {
+            const auto status = try_prefill_scaled_sm100(input, weight.values, weight.scales, rows,
+                weight.rows, weight.columns, output, work.mlp_gate, work.mlp_up, stream);
+            if (status) return check(*status, "Run scaled FP8 prefill projection");
+        }
+        project(weight, input, output);
     }
 
     void mlp(const Layer& layer) const {
@@ -247,17 +253,9 @@ struct Chunk : PrefillProjections {
             check(tensor_core_prefill_swiglu_quantize(work.mlp_gate, work.mlp_up,
                                                       intermediate_size, rows, activation, stream),
                   "Apply and quantize prefill SwiGLU");
-            const auto& down = layer.mlp_down;
-            if (grouped_projection && rows == grouped_prefill_max_rows) {
-                const auto status = try_prefill_down_sm100(
-                    input, down.values, down.scales, rows, down.rows, down.columns, work.hidden,
-                    work.mlp_gate, work.mlp_up, stream);
-                if (status) {
-                    check(*status, "Run grouped FP8 prefill down projection");
-                    return;
-                }
-            }
-            project(layer.mlp_down, input, work.hidden);
+            project_scaled(layer.mlp_down, input, work.hidden,
+                           rows == 1024 ||
+                           (grouped_projection && rows == grouped_prefill_max_rows));
             return;
         }
         check(text_swiglu(work.mlp_gate, work.mlp_up, rows * intermediate_size,
@@ -603,6 +601,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                                                : RmsQuantizeLaunch::ordinary;
     const Chunk chunk{{buffers.activation, group.rows, stream, true,
                        grouped || serial_attention}, buffers, 0, nullptr};
+    const bool scaled_output = group.rows == grouped_prefill_max_rows;
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
         auto* residual = buffers.residual + offset * hidden_size;
         gather_embeddings(model.embedding, grant.tokens, grant.rows, residual, stream);
@@ -637,12 +636,10 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             }
             if (packed_preparation) {
                 if (const auto status = try_prefill_gqa_postgate_quantize(
-                        group.rows, buffers.q_gate, buffers.attention, buffers.activation,
-                        stream)) {
+                    group.rows, buffers.q_gate, buffers.attention, buffers.activation, stream)) {
                     check(*status, "Gate and quantize prefill grouped-query attention");
-                    const TextFp8ActivationView input{
-                        buffers.activation.values, buffers.activation.scales};
-                    chunk.project(layer.output, input, buffers.projected_attention);
+                    chunk.project_scaled(layer.output, {buffers.activation.values,
+                        buffers.activation.scales}, buffers.projected_attention, scaled_output);
                     return;
                 }
             }
@@ -653,7 +650,8 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                 });
             }
             if (!serial_attention) chunk.gqa_gate();
-            chunk.attention_output(layer.output, text_gqa_q_width);
+            chunk.project_scaled(layer.output, chunk.quantize(buffers.attention, text_gqa_q_width),
+                                 buffers.projected_attention, scaled_output);
         },
         [&](const GdnLayer& layer, int bank) {
             chunk.gdn_input(layer);
@@ -667,8 +665,9 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                     prefill_group_gdn(chunk, layer, bank, first, count, offset);
                 });
             }
-            chunk.project(layer.output, {buffers.activation.values, buffers.activation.scales},
-                          buffers.projected_attention);
+            chunk.project_scaled(layer.output,
+                                 {buffers.activation.values, buffers.activation.scales},
+                                 buffers.projected_attention, scaled_output);
         },
         [&](const Layer& layer) { chunk.mlp(layer); });
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
@@ -924,7 +923,8 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                        chunk.gqa_input(layer);
                        chunk.gqa_attention(layer, request.caches[bank], request.pages,
                                            work.gqa_scratch());
-                       chunk.attention_output(layer.output, text_gqa_q_width);
+                       chunk.project(layer.output, chunk.quantize(work.attention, text_gqa_q_width),
+                                     work.projected_attention);
                    },
                    [&](const GdnLayer& layer, int bank) {
                        chunk.gdn_input(layer);

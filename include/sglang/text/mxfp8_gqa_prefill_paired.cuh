@@ -388,8 +388,9 @@ __device__ void single_issue_mmas(StagedSingleTile& tile, int end) {
     }
 }
 
+template <int Count>
 __global__ __launch_bounds__(256, 1) void tmem_staged_single_attention(
-    const __grid_constant__ StagedRequests<4> requests,
+    const __grid_constant__ StagedRequests<Count> requests,
     const __grid_constant__ StagedPairMaps maps, const int* invalid) {
     extern __shared__ StagedSingleTile single_shared[];
     auto& tile = single_shared[0];
@@ -472,20 +473,11 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_single_attention(
 std::optional<cudaError_t> encode_staged_maps(int full_pages, std::uint16_t* keys,
                                            std::uint16_t* values, StagedPairMaps& maps,
                                            bool single = false, bool page = false) {
-    void* entry = nullptr;
-    cudaDriverEntryPointQueryResult query{};
-    const auto status = cudaGetDriverEntryPointByVersion(
-        "cuTensorMapEncodeTiled", &entry, 12000, cudaEnableDefault, &query);
-    if (status == cudaErrorNotSupported || status == cudaErrorSymbolNotFound) {
-        return std::nullopt;
-    }
-    if (status != cudaSuccess) {
+    PFN_cuTensorMapEncodeTiled_v12000 encode = nullptr;
+    if (const auto status = staged_driver_entry("cuTensorMapEncodeTiled", 12000, encode);
+        !status || *status != cudaSuccess) {
         return status;
     }
-    if (!entry || query != cudaDriverEntryPointSuccess) {
-        return std::nullopt;
-    }
-    const auto encode = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(entry);
     constexpr cuuint64_t width_bytes = tmem_swizzle * sizeof(std::uint16_t);
     constexpr cuuint64_t strides[] = {width_bytes, width_bytes * mxfp8_page_size};
     const cuuint64_t shape[] = {tmem_swizzle, mxfp8_page_size,
@@ -635,7 +627,7 @@ std::optional<cudaError_t> launch_paired_tmem_prefill(
 
 namespace {
 
-template <int Count, bool Partial>
+template <int Count, bool Partial, bool CausalGroup>
 std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& requests,
                                                   std::uint16_t* keys, std::uint16_t* values,
                                                   int* invalid, int full_pages, int total_pages,
@@ -655,12 +647,17 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
     StagedPairMaps maps{};
     const void* kernel = reinterpret_cast<const void*>(paired);
     bool single = false;
-    if constexpr (Count == 4) {
+    if constexpr (Count == 4 || CausalGroup) {
         if (Partial || position % flash_chunk == 0) {
-            const auto local = reinterpret_cast<const void*>(
-                Partial ? tmem_staged_page_attention : tmem_staged_single_attention);
+            const auto local = Partial
+                ? reinterpret_cast<const void*>(tmem_staged_page_attention)
+                : reinterpret_cast<const void*>(tmem_staged_single_attention<Count>);
             auto local_config = config;
             local_config.dynamicSmemBytes = sizeof(StagedSingleTile);
+            if constexpr (CausalGroup) {
+                local_config.blockDim.x = staged_compact_threads;
+                local_config.gridDim.x = requests.rows[0] / flash_rows;
+            }
             if constexpr (Partial) {
                 int rows = 0;
                 for (const int active : requests.rows) rows = std::max(rows, active);
@@ -682,7 +679,7 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
             }
         }
     }
-    if constexpr (Partial) {
+    if constexpr (Partial || CausalGroup) {
         if (!single) return std::nullopt;
     }
     if (!single) {
@@ -705,7 +702,7 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
                                               config.dynamicSmemBytes, stream));
 }
 
-template <int Count, bool Partial = false>
+template <int Count, bool Partial = false, bool CausalGroup = false>
 std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSequence* sequences,
                                                  cudaStream_t stream,
                                                  decoder::PairedPrefillScratch scratch) {
@@ -713,7 +710,7 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
     constexpr int min_partial_rows = 256;
     if (!StagedRange(scratch.keys, scratch.key_bytes, 1).valid() ||
         !StagedRange(scratch.values, scratch.value_bytes, 1).valid()) return std::nullopt;
-    if constexpr (!Partial) {
+    if constexpr (!Partial && !CausalGroup) {
         if (position < flash_chunk || position > 131072 / Count - flash_chunk) {
             return std::nullopt;
         }
@@ -727,6 +724,9 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
         if constexpr (Partial) {
             if (rows < min_partial_rows || rows > flash_chunk || sequence.position < 0 ||
                 sequence.position > 32768 - rows) return std::nullopt;
+        } else if constexpr (CausalGroup) {
+            if (rows != 4 * flash_chunk || position < 0 || position > 32768 - rows ||
+                position % flash_chunk != 0) return std::nullopt;
         } else if (rows != flash_chunk || sequence.position != position) {
             return std::nullopt;
         }
@@ -777,7 +777,7 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
                                     {values, value_bytes, staged_alignment})) {
         return std::nullopt;
     }
-    return submit_staged_requests<Count, Partial>(requests, keys, values,
+    return submit_staged_requests<Count, Partial, CausalGroup>(requests, keys, values,
         reinterpret_cast<int*>(values + elements), full_pages, total_pages, stream);
 }
 
@@ -793,6 +793,14 @@ std::optional<cudaError_t> launch_staged_tmem_prefill(
     const decoder::PagedPrefillSequence sequence{cache, pages, position, flash_chunk, queries,
                                                 output};
     return launch_staged_requests<1>(&sequence, stream, scratch);
+}
+
+std::optional<cudaError_t> launch_causal_group_staged_tmem_prefill(
+    const decoder::PagedPrefillSequence& sequence, cudaStream_t stream,
+    decoder::PairedPrefillScratch scratch) {
+    const auto status = launch_staged_requests<1, false, true>(&sequence, stream, scratch);
+    if (status && *status != cudaSuccess) return consume_prefill_submission(*status);
+    return status;
 }
 
 std::optional<cudaError_t> decoder::try_batched_staged_paged_prefill(

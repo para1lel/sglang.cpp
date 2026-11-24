@@ -18,9 +18,9 @@ struct DraftRmsRows {
 
 cudaError_t normalize_draft_inputs(const DraftRmsRows& embeddings, const DraftRmsRows& hidden,
                                    const Bf16* embedding_weight, const Bf16* hidden_weight,
-                                   cudaStream_t stream);
+                                   int count, cudaStream_t stream);
 cudaError_t normalize_draft_output(const DraftRmsRows& rows, const Bf16* weight,
-                                   cudaStream_t stream);
+                                   int count, cudaStream_t stream);
 
 cudaError_t draft_verify_preprocess_keys(const GqaVerifyRows<GqaVerifyPreprocessRow>& batch,
                                         int count, const Bf16* k_norm, cudaStream_t stream);

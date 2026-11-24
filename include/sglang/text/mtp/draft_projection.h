@@ -42,7 +42,8 @@ public:
             }
             check(cudaGetLastError(), "Check grouped MTP FC stream status");
             check_draft_submission(normalize_draft_inputs(embeddings, hidden, embedding_norm,
-                                   hidden_norm, stream_), "Normalize grouped MTP FC inputs");
+                                   hidden_norm, count_, stream_),
+                                   "Normalize grouped MTP FC inputs");
             auto* output = packed_ + draft_fc_input_values;
             if (const auto status = try_text_bf16_decode_sm100(fc.values, packed_, fc.rows,
                                     fc.columns, count_, output, stream_)) {
@@ -178,7 +179,7 @@ public:
             const auto& work = states_[lane]->work;
             rows.rows[lane] = {work.branch, residual(lane), work.normalized};
         }
-        check_draft_submission(normalize_draft_output(rows, weight, stream_),
+        check_draft_submission(normalize_draft_output(rows, weight, count_, stream_),
                                "Normalize depth-major MTP output");
     }
 

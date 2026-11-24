@@ -791,8 +791,10 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     if (count == 0) return;
     const auto& cancel = cancel_probe();
     // Reuse the verification activation block before target verification starts.
-    if (count >= draft_projection_rows && !output && MtpDraftRequest::prepare_depth(
-            *rounds.front().draft, draft_depth, wide_mtp_activation, stream)) {
+    const bool score_together = count >= draft_projection_rows || count == wide_mtp_lanes;
+    const bool depth_scoring = score_together && !output && MtpDraftRequest::prepare_depth(
+        *rounds.front().draft, draft_depth, wide_mtp_activation, stream);
+    if (depth_scoring) {
         MtpRound::propose_depth(rounds.data(), count, draft_depth, stream);
     } else if (!MtpRound::propose_packets(rounds.data(), count, constraint_workspace, stream,
                                           cancel)) {
@@ -823,7 +825,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                                                repair, checkpoint_rows ? &(*checkpoint_rows)[slot]
                                                                        : nullptr);
         }
-        auto* packed = size == draft_projection_rows ? wide_mtp_activation : nullptr;
+        auto* packed = size > packet ? wide_mtp_activation : nullptr;
         MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed), stream);
         check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
         stats.verification_lanes += size;
@@ -839,7 +841,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         }
         verify(first, width, width > packet ? wide_mtp_activation : nullptr);
         const int commit_width = !output && width >= draft_projection_rows
-            ? draft_projection_rows : packet;
+            ? draft_projection_rows : (depth_scoring && width == wide_mtp_lanes ? width : packet);
         for (int next = 0; next < width; next += commit_width) {
             commit(first + next, std::min(width - next, commit_width));
         }

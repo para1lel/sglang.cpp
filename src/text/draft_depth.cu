@@ -121,12 +121,35 @@ __global__ __launch_bounds__(threads, 2) void head_tc(
     }
 }
 
+std::optional<cudaError_t> setup_status(std::optional<cudaError_t> direct) {
+    const auto recorded = cudaGetLastError();
+    const auto expected = direct.value_or(cudaErrorNotSupported);
+    if (recorded != cudaSuccess && recorded != expected && !CudaError::terminal(expected)) {
+        return recorded;
+    }
+    return direct;
+}
+
+std::optional<cudaError_t> tensor_map_status(CUresult status) {
+    switch (status) {
+        case CUDA_SUCCESS: return cudaSuccess;
+        case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
+        case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
+        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
+        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
+        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
+        case CUDA_ERROR_ILLEGAL_ADDRESS: return cudaErrorIllegalAddress;
+        case CUDA_ERROR_LAUNCH_FAILED: return cudaErrorLaunchFailure;
+        default: return cudaErrorInvalidValue;
+    }
+}
+
 template<int Cols>
 std::optional<cudaError_t> configure() {
     const auto status = cudaFuncSetAttribute(head_tc<Cols, 2>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * stage_bytes<Cols>);
-    const auto recorded = cudaGetLastError();
-    if (recorded != cudaSuccess && recorded != status) return recorded;
+    const auto resolved = setup_status(status);
+    if (resolved != status) return resolved;
     if (status == cudaErrorInvalidValue || status == cudaErrorNotSupported ||
         status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice) {
         return std::nullopt;
@@ -141,20 +164,19 @@ std::optional<cudaError_t> prepare_draft_depth(DraftDepthScratch& scratch,
     const auto pending = cudaGetLastError();
     if (pending != cudaSuccess) return pending;
     LaunchTarget target{};
-    const auto status = prepare_launch(stream, target);
-    const auto recorded = cudaGetLastError();
-    const auto expected = status.value_or(cudaErrorNotSupported);
-    if (recorded != cudaSuccess && recorded != expected) return recorded;
+    const auto status = setup_status(prepare_launch(stream, target));
     if (status != cudaSuccess) return status;
     const auto type = CU_TENSOR_MAP_DATA_TYPE_UINT8;
     constexpr int rows = decoder_batch_max_lanes;
-    if (encode_map(target, scratch.weights, weights, type, 1, V, K, tile_rows) != CUDA_SUCCESS ||
-        encode_map(target, scratch.activation16, scratch.activation, type, 1, rows, K, 16) !=
-            CUDA_SUCCESS ||
-        encode_map(target, scratch.activation32, scratch.activation, type, 1, rows, K, 32) !=
-            CUDA_SUCCESS) {
-        return std::nullopt;
-    }
+    const auto weight_map = setup_status(tensor_map_status(
+        encode_map(target, scratch.weights, weights, type, 1, V, K, tile_rows)));
+    if (weight_map != cudaSuccess) return weight_map;
+    const auto small_map = setup_status(tensor_map_status(
+        encode_map(target, scratch.activation16, scratch.activation, type, 1, rows, K, 16)));
+    if (small_map != cudaSuccess) return small_map;
+    const auto large_map = setup_status(tensor_map_status(
+        encode_map(target, scratch.activation32, scratch.activation, type, 1, rows, K, 32)));
+    if (large_map != cudaSuccess) return large_map;
     const auto small = configure<16>();
     if (!small || *small != cudaSuccess) return small;
     return configure<32>();

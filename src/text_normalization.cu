@@ -401,17 +401,18 @@ cudaError_t decoder::pack_tc_vocab_rms(const TcVocabRmsRows& rows, const Bf16* w
 cudaError_t decoder::normalize_draft_inputs(const DraftRmsRows& embeddings,
                                             const DraftRmsRows& hidden,
                                             const Bf16* embedding_weight,
-                                            const Bf16* hidden_weight, cudaStream_t stream) {
+                                            const Bf16* hidden_weight, int count,
+                                            cudaStream_t stream) {
     void* args[] = {const_cast<DraftRmsRows*>(&embeddings), const_cast<DraftRmsRows*>(&hidden),
                     &embedding_weight, &hidden_weight};
-    return cudaLaunchKernel(draft_input_rms, dim3(draft_projection_rows, 2), block_threads,
+    return cudaLaunchKernel(draft_input_rms, dim3(count, 2), block_threads,
                             args, 0, stream);
 }
 
 cudaError_t decoder::normalize_draft_output(const DraftRmsRows& rows, const Bf16* weight,
-                                             cudaStream_t stream) {
+                                             int count, cudaStream_t stream) {
     void* args[] = {const_cast<DraftRmsRows*>(&rows), &weight};
-    return cudaLaunchKernel(draft_output_rms, draft_projection_rows, block_threads,
+    return cudaLaunchKernel(draft_output_rms, count, block_threads,
                             args, 0, stream);
 }
 

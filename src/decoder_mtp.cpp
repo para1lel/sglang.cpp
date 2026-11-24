@@ -579,7 +579,7 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
     if (count == 0) return;
     static_assert(draft_wave_rows == decoder_batch_max_mtp_lanes);
     if (!rows || count < 0 || (count > draft_wave_rows &&
-                               (count != draft_projection_rows || !packed))) {
+                               (!packed || count > draft_projection_rows))) {
         throw std::invalid_argument("Invalid MTP draft wave size");
     }
     if (count == 1) {
@@ -719,13 +719,15 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
     try {
         for (int first = 0; first < count;) {
             const int group = first / draft_wave_rows;
-            constexpr int groups = draft_projection_rows / draft_wave_rows;
-            if (first + draft_projection_rows <= count &&
+            const int projection_rows = count == 2 * draft_wave_rows
+                ? count : draft_projection_rows;
+            const int groups = projection_rows / draft_wave_rows;
+            if (first + projection_rows <= count &&
                 std::all_of(packet_sizes.begin() + group, packet_sizes.begin() + group + groups,
                             [](int size) { return size == draft_wave_rows; })) {
-                enqueue_wave_impl(rows + first, draft_projection_rows, true, stream, true,
+                enqueue_wave_impl(rows + first, projection_rows, true, stream, true,
                                   reinterpret_cast<Bf16*>(scratch.activation));
-                first += draft_projection_rows;
+                first += projection_rows;
                 continue;
             }
             std::array<MtpDraftInput, draft_wave_rows> packet;
@@ -760,7 +762,8 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
 void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* packed,
                                   cudaStream_t stream) {
     if (!repairs || count <= 0 || (count > draft_wave_rows &&
-                                  (count != draft_projection_rows || !packed))) {
+                                  (!packed || count > draft_projection_rows ||
+                                   count % draft_wave_rows != 0))) {
         throw std::invalid_argument("Invalid MTP draft repair size");
     }
     std::array<MtpDraftInput, draft_projection_rows> rows;
@@ -770,7 +773,7 @@ void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* 
             if (const auto& row = repairs[lane][depth]; row.request) rows[size++] = row;
         }
         if (size == 0) break;
-        if (size == draft_projection_rows) {
+        if (packed && size == count) {
             enqueue_wave_impl(rows.data(), size, false, stream, false, packed);
         } else if (count <= draft_wave_rows) {
             enqueue_wave(rows.data(), size, false, stream);

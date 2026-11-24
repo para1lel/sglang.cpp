@@ -174,14 +174,20 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The formal 32,768-token v4 campaign `8d2262b9-696f-4232-8440-7bac76735041` started at W4. On one B200, both engines ran matched cold-cache MTP4 with eight lanes of 32,768 prompt tokens and 4,096 output tokens. Each arm ran two warmup cohorts and five measured cohorts. Replay validated 112 cold streams and matched all eight first-cohort output ID sequences across engines.
+The v4 campaigns paired both engines on one B200 per row. W1–W3 ran on GPU 7 and W4–W5 on GPU 6. Both engines used MTP4, a 32,768-token step budget, and an eight-slot capacity. They reset the enabled prefix cache before each cohort. W1 and W2 used three warmup cohorts and nine measured cohorts. W3–W5 used two warmup cohorts and five measured cohorts. Pinned vLLM ran first for W1, W3, and W5. Native ran first for W2 and W4.
 
 | Row | Native median (s) | Pinned vLLM median (s) | Native / vLLM | Verdict |
 | --- | ---: | ---: | ---: | --- |
-| W4 | 31.872456108 | 26.633599282 | 1.196701 | Miss |
+| W1 | 0.579252084 | 0.621142824 | 0.932559 | Pass |
+| W2 | 1.378267441 | 1.685609937 | 0.817667 | Pass |
+| W3 | 3.845667626 | 3.961542939 | 0.970750 | Pass |
+| W4 | 26.489704336 | 26.606192531 | 0.995622 | Pass |
+| W5 | 45.396524055 | 36.002232295 | 1.260936 | Miss |
 
-W4 exceeded the inclusive 1.10 limit by 2.575496898 seconds. W5 stayed held. W1–W3 have no v4 measurements in this campaign.
+W5 ran after W4 passed in the same campaign. W5 exceeded the inclusive 1.10 limit by 5.794068531 seconds. The median time to the last lane’s first token was 41.390876548 seconds native and 32.304491492 seconds pinned vLLM. The median remaining time to completion was 4.005846309 and 3.698580270 seconds, respectively.
 
-The run used frozen native Release binary SHA-256 `cd1619d8abe7b909cd615a347af7d0741975391ccae97e21c1cb741845956793`. The campaign identity records the frozen build’s base revision `7de0fd49bd6e48fb960934498992f650ea00f009`. The supplemental `published-release.json` binds that original identity and binary to the public release by verifying 211 compiler inputs. The comparison receipt SHA-256 is `70a9f8e72a7c9a3ba4cf392194d840ccadb9217270e942c45df680836dec15da`. [Native release](https://github.com/para1lel/sglang.cpp/commit/c7d6b65f9fae4604861747fb7816df22e6f5ef25)
+Replay validated 273 cold streams across both campaigns. Within each engine, repeated cohorts returned the same output IDs. The separate W1 trace matched the timed native IDs. In 49 of 50 rounds, native drafted four rows and verified five. The engines matched all first-cohort ID sequences for W3–W5. W1 and W2 produced different sequences across engines. [Makespan criterion](#measurement)
 
-The archived 8,192-token v3 campaign passed W1–W3 and stopped at W4. Earlier 32-request campaigns retain their own workload definitions and verdict rules. [Archived v3 evidence](https://github.com/para1lel/sglang.cpp/blob/7de0fd49bd6e48fb960934498992f650ea00f009/docs/performance.md#matched-k4-evidence) · [Archived workloads](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#named-workloads) · [Earlier evidence](https://github.com/para1lel/sglang.cpp/blob/e0f45046af0f859806c531497e194318a23d9a75/docs/performance.md#matched-k4-evidence)
+The measured Release binary SHA-256 was `885fdc5b2325847ecc50d6bed84ce5058b953d2421369c487abade3a9bdd6a9a`. The campaign receipts retained the provisional source parent. The public source attestation matched all 211 compiler inputs to the released revision. [Native release](https://github.com/para1lel/sglang.cpp/commit/380f3501c8c251a0efec44fbb0748c6104cded3b)
+
+The earlier v4 campaign stopped at W4. Its archived guide links the earlier 8,192-token and 32-request campaigns with their original workload and verdict rules. [Prior v4 evidence](https://github.com/para1lel/sglang.cpp/blob/c18210bd3a4fcb4e61252ab2681016b755c426d6/docs/performance.md#matched-k4-evidence)

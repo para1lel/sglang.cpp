@@ -173,19 +173,19 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-Public release `9229bd5` passed W1–W3 under the inclusive 1.10× criterion. W4 was the first miss, 35.669711 ms above its limit. W5 and W6 stayed held. The `matched-k4-native-defaults-cache-on-v2` campaign used one reserved B200, effective MTP4, an 8,192-token step budget, and a 32-request cap. Both engines acknowledged an idle prefix-cache reset before each cohort. Every stream reported zero cached prompt tokens. [Measured release](https://github.com/para1lel/sglang.cpp/commit/9229bd5ae3081973796f2347433e083cf4bb26af)
+Public release `98e0c487` passed W1–W4. Each native median was also strictly lower than the pinned vLLM median. The `matched-k4-native-defaults-cache-on-v2` campaign used one reserved B200, effective MTP4, an 8,192-token step budget, and a 32-request cap. Both engines acknowledged an idle prefix-cache reset before each cohort. W6 stayed held. [Measured release](https://github.com/para1lel/sglang.cpp/commit/98e0c487b773516f6dc676113b99d94ea01c8fba)
 
 | Workload | Native median, ms | Pinned vLLM median, ms | Native ÷ vLLM | Verdict |
 | --- | ---: | ---: | ---: | --- |
-| W1 | 624.808359 | 623.065032 | 1.002797986× | Pass |
-| W2 | 1374.950250 | 1691.470318 | 0.812872822× | Pass |
-| W3 | 3837.898377 | 3957.630571 | 0.969746496× | Pass |
-| W4 | 30506.263018 | 27700.539370 | 1.101287690× | Miss |
+| W1 | 579.312879 | 626.139099 | 0.925214349× | Pass |
+| W2 | 1367.136594 | 1691.573895 | 0.808203885× | Pass |
+| W3 | 3828.965791 | 3958.864033 | 0.967188001× | Pass |
+| W4 | 27360.628356 | 27681.159747 | 0.988420594× | Pass |
 
-Timing ran from submission to wire `[DONE]` with the warmup and sample counts above. Native repeated full output IDs within each row. The engines produced the same IDs for all corresponding W3 and W4 lanes. W1 and W2 IDs repeated within each engine and differed across engines. The independent W1 trace matched timed native IDs and recorded depth four on 49 of 50 verification rounds.
+Native output IDs repeated within each row. All corresponding W3 and W4 lanes matched across engines. W1 and W2 IDs differed across engines. The separate W1 trace matched timed native IDs and recorded depth four on 49 of 50 verification rounds.
 
-The measured Release server SHA-256 is `82e7f4f1212456031a5eb09c7928efeb5a3c9ff9a9641273be933dd6800cdb75`. All 209 production paths matched the compiled and published inputs. The vLLM pin is `81a8cb063e6247fe254d7caf7e98a6691d71022a`.
+All 209 compiled production paths matched the public release. The measured Release server SHA-256 is `151ed8d29517a187dce2ea4282f4012d4eaf9864470ed01bb651d5492a1f2928`. The vLLM pin is `81a8cb063e6247fe254d7caf7e98a6691d71022a`.
 
-Recover launch commands, raw streams, and offline receipts under `artifacts/handover-w3/cache-on-pin/release-w1/formal-9229bd5-gpu7.PZuEl8Hu/`. The `report.md` SHA-256 is `7210e4397f9e5678f17a21093c24ffd621a316c9c8ae2ed4b63687bb819c9523`. The original W1–W3 runners exited successfully. Row completion markers were recovered from original status and cleanup records before progression. The original W4 runner and offline replay both returned 1 for the timing miss.
+The four original runs and their offline replays passed. Recover the commands, streams, and receipts under `artifacts/handover-w3/cache-on-pin/release-w1/formal-98e0c48-gpu7.U3b42yAs/`. The `sequence.log` SHA-256 is `9ed19580e6a18a7f88b7eb9b59041e75a99f2899399828929b0230d0124d5934`. [Previous cache-on campaign and earlier evidence](https://github.com/para1lel/sglang.cpp/blob/591a9c610111e82689a3d4455d049b3c6bc9078d/docs/performance.md#matched-k4-evidence)
 
-Earlier campaigns retain their own settings and verdicts. [Prior strict W1–W3 pass](https://github.com/para1lel/sglang.cpp/blob/c92b30303a7c8359d2298b968ff49a847c387e42/docs/performance.md#matched-k4-evidence) · [Prior strict W3 miss](https://github.com/para1lel/sglang.cpp/blob/650f69d853380d5738955586ce37f30051485f8f/docs/performance.md#matched-k4-evidence) · [Cache-off v1 evidence](https://github.com/para1lel/sglang.cpp/blob/f00cb0cc976e1a20bf85fd30030f259a7e11a7c6/docs/performance.md#matched-k4-evidence)
+**W5 diagnostic.** On the same release, one measured cold pair took 82.088485244 seconds native and 72.551712791 seconds pinned vLLM. The ratio was 1.131447930×, or 2.281601174 seconds above the 1.10× limit. All 32 lanes matched IDs and reported zero cache hits. This single pair leaves formal W5 and W6 unmeasured. The `w5-readiness.HtL1NRuR/diagnostic.json` SHA-256 is `e8bc241736684d67cfe6b4789395bcf5cbd7e447f04ce8d0a59d723ca3785a4a`.

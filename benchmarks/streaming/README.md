@@ -53,6 +53,9 @@ first-to-last ID interval by the actual output count minus one. E2E runs to
 Raw JSONL includes the SSE lines, read timestamps, output IDs, counts, and
 failures. Disk writes happen between requests.
 
+`--reference` applies saved thresholds when the reference includes them. A
+reference captured with one measured round supplies a throughput ratio.
+
 The original GPU3 protocol used the following statistics and limits.
 
 Report median and range of throughput, and p50/p95 per-request latencies

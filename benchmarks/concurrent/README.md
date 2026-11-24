@@ -75,8 +75,9 @@ packed recurrent GDN. Establish effective hardware, cache, and dispatched
 backend conditions independently for any paired run.
 Use native MXFP8 KV for the candidate as specified by the project benchmark contract.
 
-The archived capture used two warmups and five measured cohorts. Its replay
-checks the original wire and timing gates.
+The standalone client checks the measured cohort against the frozen thresholds
+and reports failure on a miss. The archived capture used two warmups and five
+measured cohorts. Its replay checks the original wire and timing gates.
 
 Require median cohort output IDs/s to **strictly exceed** the baseline median times
 `1 + max(0.01, 2 × sample SD / median)`. Require each request-level p95 to stay at or

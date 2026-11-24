@@ -178,3 +178,21 @@ width-five steps. An optional `TEACHER` file after `LOGITS` supplies 15
 whitespace-delimited IDs for the final three steps, ordered by step and ascending
 slot. To align the histories from the start of decode, put one additional ID at the
 beginning of the file. The check forces that ID as the first output in all five lanes.
+
+### K4 boundary crossings
+
+Build `long-decode-routes` with the commands above. Set `w5_fixtures` to the `W5`
+subdirectory from [frozen prompt generation](../../benchmarks/concurrent/README.md#regenerate-and-measure).
+Use `jq` to write one prompt per line in lane order.
+
+```bash
+for case in "$w5_fixtures"/*.request.json; do
+    jq -er '.prompt | join(" ")' "$case" || exit
+done > "$out/w5.ids"
+CUDA_VISIBLE_DEVICES="$GPU_UUID" \
+    "$out/bin/long-decode-routes" "$checkpoint" --mtp-crossings "$out/w5.ids"
+```
+
+The check requires full K4 acceptance and the expected output IDs. Each wave
+must launch one grouped long reader and combine per GQA layer, with zero legacy
+verification readers.

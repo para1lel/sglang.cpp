@@ -120,18 +120,20 @@ existing FP64 replay for flagged heads. Each row writes its own split partials.
 The SM100 reader can group 20–160 rows from complete four-lane K4 packets.
 It requires eager, unconstrained verification and the full 262,144-token context policy.
 Each lane supplies five consecutive positions starting at 32,768 or later.
-All five positions must fit in one 64-token chunk. Lanes can use different chunks.
+Those positions can cross a 64-token chunk or 128-token KV page boundary.
 Each lane needs a distinct page table, readable paged MXFP8 KV, and aligned buffers.
 A geometry decline leaves the existing packet dispatch eligible.
 [Group guard](../include/sglang/text/gqa_verify_batch.h#L100)<!-- prefix: "inline bool " --> ·
-[Page and buffer checks](../include/sglang/text/gqa_verify_batch.h#L134)<!-- prefix: "for (int pri" -->
+[Page and buffer checks](../include/sglang/text/gqa_verify_batch.h#L133)<!-- prefix: "for (int pri" -->
 
 One block per lane, KV head, and split shares each 64-token KV chunk across
-five rows and six query heads per row. TMA reads the existing paged payloads
-and scales into shared memory. Each row keeps its own causal mask and FP32
-split partials in the existing logits scratch. The combine retains FP64 replay
-for flagged heads.
+five rows and six query heads per row. The first position sets the split boundaries.
+The final split extends through the fifth position. TMA reads the paged payloads
+and scales into shared memory. Each row masks keys past its own position and
+writes FP32 split partials in the existing logits scratch. The combine retains
+FP64 replay for flagged heads.
 [Paged read](../src/text/gqa_decode_long.cu#L176)<!-- prefix: "__device__ v" --> ·
+[Split bounds](../src/text/gqa_decode_long.cu#L460-L462)<!-- prefix: "const int to" --> ·
 [Split partials](../src/text/gqa_decode_long.cu#L428)<!-- prefix: "auto& out = " --> ·
 [Combine](../include/sglang/text/gqa_target_split.cuh#L145)<!-- prefix: "cudaError_t " -->
 
@@ -163,8 +165,8 @@ Tensor Core read from launching. This decline requires clear CUDA state.
 On that decline, the decoder reuses the KV already appended for each packet.
 It reads through the existing split path before postgating. Pending errors and
 failed CUDA setup, read, or combine calls propagate without retry.
-[Long setup](../src/text/gqa_decode_long.cu#L556)<!-- prefix: "std::optiona" --> ·
-[Packet fallback](../include/sglang/text/gqa_verify_batch.h#L157)<!-- prefix: "if (const au" -->
+[Long setup](../src/text/gqa_decode_long.cu#L557)<!-- prefix: "std::optiona" --> ·
+[Packet fallback](../include/sglang/text/gqa_verify_batch.h#L156)<!-- prefix: "if (const au" -->
 
 ## Verification
 
@@ -216,8 +218,9 @@ Compare the long Tensor Core reader's fixed-history full BF16 vocabulary rows
 against a two-term control. In a separate native greedy run, compare continuation
 IDs with the same control. Separately apply the
 [numerical and quality checks](performance.md#operator-qualification) against
-independent attention and end-to-end oracles. Exercise remapped pages, distinct
-lane positions, and a group that crosses a 64-token boundary. Verify fallback
-after a clean setup decline and error propagation after a failed launch.
-Compare committed target and draft state through rejection and full acceptance.
-Restore a checkpoint and run a further K4 round.
+independent attention and end-to-end oracles. Exercise remapped pages and distinct
+lane positions. Run the [K4 boundary crossing check](../tests/decoder/README.md#k4-boundary-crossings)
+to verify the optimized route when some lanes cross chunk or page boundaries.
+Verify fallback after a clean setup decline and error propagation after a failed
+launch. Compare committed target and draft state through rejection and full
+acceptance. Restore a checkpoint and run a further K4 round.

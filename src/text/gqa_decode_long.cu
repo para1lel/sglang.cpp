@@ -456,9 +456,10 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
     const int split = blockIdx.x;
     const int splits = split_count(last_position);
     if (split >= splits) return;
-    const int total = last_position / keys + 1;
+    // Keep every early row's original split boundaries, then extend only the last split.
+    const int total = request.first / keys + 1;
     const int first = split * total / splits;
-    const int last = (split + 1) * total / splits;
+    const int last = split + 1 == splits ? last_position / keys + 1 : (split + 1) * total / splits;
     const int first_page = first * keys / mxfp8_page_size;
     const int last_page = (last - 1) * keys / mxfp8_page_size;
     for (int page = first_page + threadIdx.x; page <= last_page; page += threads) {

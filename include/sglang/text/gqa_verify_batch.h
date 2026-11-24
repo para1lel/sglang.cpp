@@ -121,8 +121,7 @@ inline bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* ro
         const auto& seed = rows[packet * verification_packet_rows + lane];
         if (row.request != seed.request || row.binding || row.constrained ||
             row.position != seed.position + depth || row.position < long_min_position ||
-            row.position >= split_end ||
-            row.position / split_chunk_tokens != seed.position / split_chunk_tokens) {
+            row.position >= split_end) {
             return false;
         }
         auto& request = read.requests[packet * width + lane];

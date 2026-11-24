@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -38,6 +39,13 @@ struct Routes {
 };
 Routes routes;
 bool watch = false;
+
+struct MtpRoutes {
+    int readers = 0;
+    int merges = 0;
+    int legacy = 0;
+};
+MtpRoutes* mtp_routes = nullptr;
 
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -270,6 +278,83 @@ void narrow_lengths(DecoderBatch& batch, const std::vector<int>& prompt, Decoder
     for (const int slot : {1, 9, 21}) batch.cancel(slot);
 }
 
+void check_crossing_tokens(const DecoderBatchStep& result, int& ordinal) {
+    constexpr std::array cycle{760, 45366, 369, 7629, 13, 198};
+    check(result.decode && !result.finish_reason && result.mtp_drafted_tokens == 4 &&
+              result.mtp_accepted_tokens == 4 && result.mtp_verified_rows == 5 &&
+              result.mtp_replayed_rows == 0 && result.extra_token_count == 4,
+          "W5 K4 acceptance changed");
+    check(result.token == cycle[ordinal++ % cycle.size()], "W5 first ID changed");
+    for (int index = 0; index < result.extra_token_count; ++index) {
+        check(result.extra_tokens[index] == cycle[ordinal++ % cycle.size()], "W5 draft ID changed");
+    }
+}
+
+void mtp_crossings(const char* checkpoint, const char* fixture) {
+    constexpr int prompt_length = 32768;
+    constexpr int quota = 8192;
+    constexpr std::array ahead{0, 2, 3, 4, 7, 10, 12, 24, 27, 29, 30, 31};
+    const Decoder decoder(checkpoint, 0, true);
+    check(slots == 32 && decoder.uses_b200_operators(), "W5 route check requires a B200");
+    DecoderBatch batch(decoder, {true, slots, 0, quota});
+    DecoderOptions options;
+    options.mtp_steps = 4;
+    options.max_new_tokens = 192;
+    options.ignore_eos = true;
+    std::ifstream file(fixture);
+    for (int slot = 0; slot < slots; ++slot) {
+        std::string line;
+        check(bool(std::getline(file, line)), "Missing W5 fixture lane");
+        std::istringstream ids(line);
+        std::vector<int> prompt{std::istream_iterator<int>(ids), {}};
+        check(ids.eof() && prompt.size() == prompt_length, "Invalid W5 fixture lane");
+        check(batch.admit(slot, std::move(prompt), options) == 0, "Unexpected W5 prefix hit");
+    }
+    Selection all;
+    all.fill(true);
+    DecoderBatchStepStats stats;
+    for (int start = 0; start < prompt_length; start += quota / slots) {
+        const auto steps = batch.advance_chunked(all, &stats);
+        check(stats.target_rows == quota && stats.verification_lanes == 0, "W5 prefill changed");
+        if (start + quota / slots == prompt_length) {
+            for (const auto& step : steps) check(step.token == 760, "W5 seed changed");
+        }
+    }
+    std::array<int, slots> ordinals;
+    ordinals.fill(1);
+    Selection lead{};
+    for (int slot : ahead) lead[slot] = true;
+    const auto first = batch.advance_chunked(lead, &stats);
+    check(stats.verification_lanes == int(ahead.size()), "W5 lead roster changed");
+    for (int slot : ahead) check_crossing_tokens(first[slot], ordinals[slot]);
+
+    int crossing_waves = 0;
+    for (int wave = 0; wave <= 25; ++wave) {
+        int crossings = 0;
+        for (int ordinal : ordinals) {
+            const int position = prompt_length + ordinal - 1;
+            crossings += position / 64 != (position + 4) / 64;
+        }
+        MtpRoutes launches;
+        mtp_routes = &launches;
+        const auto steps = batch.advance_chunked(all, &stats);
+        mtp_routes = nullptr;
+        check(stats.verification_lanes == slots && stats.verification_rows == 5 * slots &&
+                  std::all_of(stats.prefill_rows.begin(), stats.prefill_rows.end(),
+                              [](int rows) { return rows == 0; }), "W5 verify geometry changed");
+        check(launches.readers == gqa_layers && launches.merges == gqa_layers && !launches.legacy,
+              "W5 verification lost its grouped long reader or merge");
+        for (int slot = 0; slot < slots; ++slot) check_crossing_tokens(steps[slot], ordinals[slot]);
+        if (crossings) {
+            check(crossings == (crossing_waves % 2 == 0 ? 12 : 20), "W5 crossing setup changed");
+            ++crossing_waves;
+            std::cout << "K4 crossing lanes=" << crossings << " readers=" << launches.readers
+                      << " merges=" << launches.merges << " legacy=" << launches.legacy << '\n';
+        }
+    }
+    check(crossing_waves == 4, "Missing mixed K64 and P128 crossing waves");
+}
+
 }
 
 using namespace sglang::decoder;
@@ -317,6 +402,26 @@ extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, 
                                                cudaStream_t);
 
 static void record_launch(std::string_view symbol, dim3 grid, dim3 block) {
+    if (mtp_routes) {
+        const bool reader = symbol.find("decode_long") != symbol.npos;
+        const bool merge = symbol.find("target_split_combine") != symbol.npos && grid.z == 160;
+        const bool legacy = (symbol.find("gqa_decode") != symbol.npos &&
+                             symbol.find("split_kernel") != symbol.npos && grid.z != 4) ||
+                            symbol.find("reuse_split_kernel") != symbol.npos;
+        if (reader) {
+            check(grid.x == 16 && grid.y == 4 && grid.z == 32 && block.x == 480,
+                  "Unexpected W5 long reader geometry");
+            check(mtp_routes->readers == mtp_routes->merges, "Missing previous W5 merge");
+            ++mtp_routes->readers;
+        }
+        if (merge) {
+            check(grid.x == 24 && grid.y == 1 && block.x == 256 &&
+                      mtp_routes->readers == mtp_routes->merges + 1, "Unexpected W5 merge");
+            ++mtp_routes->merges;
+        }
+        mtp_routes->legacy += legacy;
+        return;
+    }
     const bool split = symbol.find("split_kernel") != symbol.npos &&
                        symbol.find("gqa_decode") != symbol.npos;
     const bool combine = symbol.find("target_split_combine") != symbol.npos;
@@ -336,7 +441,7 @@ extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 b
     static const auto launch = reinterpret_cast<decltype(&__cudaLaunchKernel)>(
         dlsym(RTLD_NEXT, "__cudaLaunchKernel"));
     check(launch != nullptr, "Cannot resolve CUDA kernel launch");
-    if (watch) {
+    if (watch || mtp_routes) {
         static void* const driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
         check(driver != nullptr, "Cannot load the CUDA driver");
         static const auto get_name = reinterpret_cast<decltype(&cuKernelGetName)>(
@@ -352,10 +457,11 @@ extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 b
 extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, dim3 block,
                                                void** args, std::size_t shared,
                                                cudaStream_t stream) {
-    if (watch) {
+    if (watch || mtp_routes) {
         const char* name = nullptr;
         check(cudaFuncGetName(&name, function) == cudaSuccess, "Cannot identify decode kernel");
         record_launch(name, grid, block);
+        if (mtp_routes) return __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
         const std::string_view symbol(name);
         const bool tensor = symbol.find("split_long_decode_tensor") != symbol.npos;
         const bool split = tensor || symbol.find("split_long_decode_attention") != symbol.npos;
@@ -379,8 +485,12 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
 }
 
 int main(int argc, char** argv) try {
+    if (argc == 4 && std::string_view(argv[2]) == "--mtp-crossings") {
+        mtp_crossings(argv[1], argv[3]);
+        return 0;
+    }
     check(argc >= 3 && argc <= 5,
-          "Usage: long-decode-routes CHECKPOINT PROMPT [LOGITS [TEACHER]]");
+          "Usage: long-decode-routes CHECKPOINT {PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5}");
     const Decoder decoder(argv[1], 0, false);
     check(decoder.uses_b200_operators(), "Long decode route check requires a B200");
     const DecoderBatchOptions options{.cuda_graphs = true, .max_lanes = slots,

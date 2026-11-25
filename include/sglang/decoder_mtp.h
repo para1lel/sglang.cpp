@@ -8,6 +8,7 @@ struct DraftOperatorCapabilities;
 struct DraftDepthScratch;
 struct PrefillProjections;
 struct PrefixCacheRead;
+struct PrefixCacheLayout;
 struct PrefixDeviceTransfer;
 
 inline constexpr int draft_projection_rows = 16;
@@ -96,9 +97,11 @@ private:
     static void enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
                                   cudaStream_t stream, bool defer_score, Bf16* packed = nullptr);
     friend PrefixDeviceTransfer restore_prefix_view(Request&, const PrefixCacheRead&,
-                                                     cudaStream_t, MtpDraftRequest*);
+                                                    cudaStream_t, MtpDraftRequest*,
+                                                    const PrefixCacheLayout*);
     friend PrefixDeviceTransfer export_prefix_view(const Request&, int, int, int, cudaStream_t,
-                                                    const MtpDraftRequest*, const Workspace*, bool);
+                                                   const MtpDraftRequest*, const Workspace*, bool,
+                                                   const PrefixCacheLayout*);
     friend int commit_restored_prefix(Request&, const PrefixDeviceTransfer&, MtpDraftRequest*);
     Mxfp8KvCache prefix_cache_view(int rows, bool storing) const;
     const Allocations& prefix_cache_memory() const;

@@ -31,6 +31,7 @@ HEADER = struct.Struct("!4sIQ")
 MAX_METADATA = 64 << 20
 MAX_KEYS = 1 << 20
 LOOKUP_BATCH = 4096
+MAX_DETAIL = 4096
 WORKERS = 16
 REQUEST_TIMEOUT = 10
 LOG = init_logger(__name__)
@@ -140,6 +141,18 @@ class PrefixLookup:
         return limit // PREFIX_CHUNK * PREFIX_CHUNK
 
     def resolve(self):
+        gqa, matched, eligible = self.coverage()
+        if not self.draft:
+            end = eligible[0][0] if eligible else 0
+            return gqa, end, 0, matched
+        end = next((candidate for candidate, draft_ok in eligible if draft_ok), 0)
+        return gqa, end, end - 1 if end else 0, matched
+
+    def detail(self):
+        gqa, matched, eligible = self.coverage()
+        return gqa, matched, len(eligible), eligible[:MAX_DETAIL]
+
+    def coverage(self):
         full = self.full_coverage(1, self.count)
         tail = range(min(self.count, full + PREFIX_CHUNK - 1), full, -1)
         gqa = next((end for end, found in zip(tail, self.present(1, tail)) if found), full)
@@ -147,18 +160,16 @@ class PrefixLookup:
         states = [end for end, found in zip(ends, self.present(2, ends)) if found]
         matched = states[0] if states else 0
         maximum = min(self.limit, gqa)
-        eligible = [end for end in states if end <= maximum]
-        if not self.draft:
-            return gqa, eligible[0] if eligible else 0, 0, matched
-        if eligible:
+        if self.draft:
             draft_full = self.full_coverage(3, maximum - 1)
-            eligible = [end for end in eligible if end <= draft_full + PREFIX_CHUNK]
-            tails = [end - 1 for end in eligible if (end - 1) % PREFIX_CHUNK]
+            states = [end for end in states if end <= draft_full + PREFIX_CHUNK]
+            tails = [end - 1 for end in states if (end - 1) % PREFIX_CHUNK]
             usable = {end for end, found in zip(tails, self.present(3, tails)) if found}
-            for end in eligible:
-                if (end - 1) % PREFIX_CHUNK == 0 or end - 1 in usable:
-                    return gqa, end, end - 1, matched
-        return gqa, 0, 0, matched
+            eligible = [(end, (end - 1) % PREFIX_CHUNK == 0 or end - 1 in usable)
+                        for end in states]
+        else:
+            eligible = [(end, False) for end in states]
+        return gqa, matched, [(end, draft_ok) for end, draft_ok in eligible if end <= maximum]
 
 
 class Request:
@@ -640,15 +651,20 @@ class Handler(socketserver.BaseRequestHandler):
         records = self.server.records
         if request.op == 2:
             records.lookup(request, namespace)
-        elif request.op in (3, 4):
+        elif request.op in (3, 4, 10, 11):
             if not self.server.gpu_slots.acquire(blocking=False):
                 request.reply(3)
                 return
             try:
                 metadata = TransferMetadata(request)
+                # Ranked transfers (ops 10 and 11) tag each MXFP8 section with
+                # its KV head count; the historical ops stay byte-compatible
+                # with TP1 clients and records.
+                legacy = request.op in (3, 4)
                 transfer = Transfer.parse(metadata, lambda family, identity, endpoint=0:
-                                          object_key(namespace, family, identity, endpoint))
-                operation = records.retrieve if request.op == 3 else records.store
+                                          object_key(namespace, family, identity, endpoint),
+                                          legacy)
+                operation = records.retrieve if request.op in (3, 10) else records.store
                 with self.server.lease(request):
                     result = operation(request, transfer)
                 request.release_reply(*result)
@@ -665,9 +681,15 @@ class Handler(socketserver.BaseRequestHandler):
             request.check_mutation()
             _, skipped = records.storage.delete_l1_keys([key])
             request.reply(1 if skipped else 0)
-        elif request.op == 7:
+        elif request.op in (7, 9):
             query = PrefixLookup(request, namespace, records)
-            request.reply(0, struct.pack("!IIII", *query.resolve()))
+            if request.op == 7:
+                request.reply(0, struct.pack("!IIII", *query.resolve()))
+            else:
+                gqa, matched, total, entries = query.detail()
+                request.reply(0, struct.pack("!IIII", gqa, matched, total, len(entries)) +
+                              b"".join(struct.pack("!IB", end, draft_ok)
+                                       for end, draft_ok in entries))
         else:
             raise ValueError("unknown LMCache operation")
 

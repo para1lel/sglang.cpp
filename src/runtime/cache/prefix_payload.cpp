@@ -1,6 +1,7 @@
 #include "sglang/runtime/cache/prefix_payload.h"
 
 #include "sglang/runtime/cache/mxfp8_cache_geometry.h"
+#include "sglang/runtime/cache/prefix_cache_layout.h"
 #include "sglang/runtime/model/qwen_text_model.h"
 #include "sglang/tokenizer/digest.h"
 
@@ -41,13 +42,6 @@ namespace {
 
 constexpr int model_rows = QwenTextModel::max_position_embeddings;
 constexpr auto kv_row_bytes = 2 * mxfp8_kv_heads * (mxfp8_head_dim + mxfp8_groups);
-constexpr auto gdn_qkv_width = (2 * QwenTextModel::gdn_key_heads +
-    QwenTextModel::gdn_value_heads) * QwenTextModel::gdn_head_dim;
-constexpr auto gdn_history_bytes = qwen_text_model.gdn_layers() * gdn_qkv_width *
-    (QwenTextModel::gdn_conv_kernel_dim - 1) * 2;
-constexpr auto gdn_recurrent_bytes = qwen_text_model.gdn_layers() *
-    QwenTextModel::gdn_value_heads * QwenTextModel::gdn_head_dim *
-    QwenTextModel::gdn_head_dim * 4;
 
 std::string media_digest(const DecoderMedia& media) {
     if (!media.cache_identity || !media.cache_identity->matches(media)) return {};
@@ -64,27 +58,57 @@ std::string media_digest(const DecoderMedia& media) {
 
 }
 
+std::string prefix_cache_domain(const PrefixCacheLayout& layout) {
+    if (layout.world_size == 1) return "sglang/qwen3_5/split-prefix-mxfp8-v2/";
+    std::string domain = "sglang/qwen3_5/split-prefix-mxfp8-v3/tp";
+    domain += std::to_string(layout.world_size);
+    domain += "-r";
+    domain += std::to_string(layout.rank);
+    domain += "/kv";
+    domain += std::to_string(layout.kv_heads);
+    domain += "/gdn";
+    domain += std::to_string(layout.gdn_key_heads);
+    domain += 'x';
+    domain += std::to_string(layout.gdn_value_heads);
+    domain += layout.draft_lane ? "/draft/" : "/target/";
+    return domain;
+}
+
 std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end) {
+    return prefix_payload_bytes(kind, begin, end, tp1_prefix_cache_layout);
+}
+
+std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end,
+                                 const PrefixCacheLayout& layout) {
     if (begin < 0 || end <= begin || end > model_rows) return 0;
     const bool kv_chunk = begin % prefix_gqa_chunk_tokens == 0 &&
         end - begin <= prefix_gqa_chunk_tokens;
     switch (kind) {
-    case PrefixPayloadKind::gqa:
+    case PrefixPayloadKind::gqa: {
+        const auto row = 2 * static_cast<std::size_t>(layout.kv_heads) *
+            (mxfp8_head_dim + mxfp8_groups);
         return kv_chunk
-            ? std::size_t(end - begin) * kv_row_bytes * qwen_text_model.full_attention_layers()
+            ? std::size_t(end - begin) * row * qwen_text_model.full_attention_layers()
             : 0;
-    case PrefixPayloadKind::gdn:
+    }
+    case PrefixPayloadKind::gdn: {
         if (begin) return 0;
-        return gdn_history_bytes + gdn_recurrent_bytes + 4 * qwen_text_model.hidden_size;
+        std::size_t total = 0;
+        for (const auto bytes : prefix_gdn_state_bytes(layout)) total += bytes;
+        return total;
+    }
     case PrefixPayloadKind::draft:
+        // The draft cache is full width on its single lane.
         return kv_chunk ? std::size_t(end - begin) * kv_row_bytes : 0;
     }
     return 0;
 }
 
 PrefixCacheKeys::PrefixCacheKeys(const std::vector<int>& prompt, std::string_view salt,
-                                  const std::vector<DecoderMedia>* media) {
-    std::string domain = "sglang/qwen3_5/split-prefix-mxfp8-v2/";
+                                  const std::vector<DecoderMedia>* media,
+                                  const PrefixCacheLayout* layout) {
+    std::string domain =
+        prefix_cache_domain(layout ? *layout : tp1_prefix_cache_layout);
     domain.append(salt);
     if (!media || media->empty()) {
         keys_.reserve(prompt.size() + 1);

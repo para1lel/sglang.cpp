@@ -2,6 +2,10 @@
 
 #include "sglang/decoder_mtp.h"
 
+#include "sglang/runtime/backend/cuda_resources.h"
+
+#include "sglang/runtime/cache/prefix_cache_layout.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -11,12 +15,9 @@
 namespace sglang::decoder {
 namespace {
 
-constexpr std::array<std::size_t, 4> state_bytes{
-    gdn_layers * gdn_history_elements * sizeof(Bf16),
-    gdn_layers * gdn_state_elements * sizeof(float),
-    hidden_size * sizeof(Bf16), hidden_size * sizeof(Bf16)};
-constexpr std::size_t state_version_bytes =
-    state_bytes[0] + state_bytes[1] + state_bytes[2] + state_bytes[3];
+std::array<std::size_t, 4> gdn_state_bytes(const PrefixCacheLayout* layout) {
+    return prefix_gdn_state_bytes(layout ? *layout : tp1_prefix_cache_layout);
+}
 
 cudaError_t consume_prefix_error(cudaError_t direct) noexcept {
     if (direct == cudaSuccess) return direct;
@@ -30,11 +31,12 @@ void check_prefix_cuda(cudaError_t status, const char* operation) {
 
 class PrefixStateVersion {
 public:
-    explicit PrefixStateVersion(std::array<std::shared_ptr<const void>, 4> sources)
-        : producer_(std::make_unique<Producer>(std::move(sources))) {
+    PrefixStateVersion(std::array<std::shared_ptr<const void>, 4> sources,
+                       const std::array<std::size_t, 4>& bytes)
+        : producer_(std::make_unique<Producer>(std::move(sources))), bytes_(bytes) {
         check(cudaGetDevice(&device_), "Identify decoder prefix version device");
         void* data = nullptr;
-        check_prefix_cuda(cudaMalloc(&data, state_version_bytes),
+        check_prefix_cuda(cudaMalloc(&data, version_bytes()),
                           "Allocate decoder prefix state version");
         data_ = static_cast<std::byte*>(data);
     }
@@ -65,11 +67,11 @@ public:
         producer_->started = true;
         try {
             auto* data = data_;
-            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
-                check_prefix_cuda(cudaMemcpyAsync(data, state[index], state_bytes[index],
+            for (std::size_t index = 0; index < bytes_.size(); ++index) {
+                check_prefix_cuda(cudaMemcpyAsync(data, state[index], bytes_[index],
                                                   cudaMemcpyDeviceToDevice, stream),
                                   "Version decoder prefix state");
-                data += state_bytes[index];
+                data += bytes_[index];
             }
             check_prefix_cuda(cudaEventRecord(static_cast<cudaEvent_t>(event.get()), stream),
                               "Record decoder prefix readiness");
@@ -85,6 +87,10 @@ public:
     }
 
 private:
+    std::size_t version_bytes() const {
+        return bytes_[0] + bytes_[1] + bytes_[2] + bytes_[3];
+    }
+
     struct Producer {
         explicit Producer(std::array<std::shared_ptr<const void>, 4> retained)
             : sources(std::move(retained)) {}
@@ -122,11 +128,13 @@ private:
     int device_ = 0;
     std::byte* data_ = nullptr;
     std::unique_ptr<Producer> producer_;
+    std::array<std::size_t, 4> bytes_{};
 };
 
 class PrefixViewBuilder {
 public:
-    explicit PrefixViewBuilder(bool store = false) {
+    explicit PrefixViewBuilder(const PrefixCacheLayout* layout, bool store = false)
+        : state_bytes_(gdn_state_bytes(layout)) {
         if (store) {
             owners_ = std::make_shared<Owners>();
             view_.store_owner = owners_;
@@ -148,12 +156,15 @@ public:
         return {index, 0};
     }
 
-    PrefixDeviceMxfp8 mxfp8(Mxfp8KvCache cache, int layers, int begin, int end,
+    PrefixDeviceMxfp8 mxfp8(Mxfp8KvCache cache, int layers, int begin, int end, int kv_heads,
                             const Allocations* memory = nullptr) {
         if (begin == end) return {};
         PrefixDeviceMxfp8 result{begin, end, layers, cache.page_count};
-        const auto payload = layers * cache.page_count * mxfp8_payload_bytes_per_page;
-        const auto scales = layers * cache.page_count * mxfp8_scale_bytes_per_page;
+        result.kv_heads = kv_heads;
+        const auto payload = std::size_t(layers) * cache.page_count * mxfp8_page_size *
+                             kv_heads * mxfp8_head_dim;
+        const auto scales = std::size_t(layers) * cache.page_count * mxfp8_page_size *
+                            kv_heads * mxfp8_groups;
         if (layers == full_attention_layers) {
             const auto slab = allocation(cache.key_payload, 2 * (payload + scales), memory);
             result.planes = {{slab, {slab.allocation, payload}, {slab.allocation, 2 * payload},
@@ -176,19 +187,24 @@ public:
             for (std::size_t index = 0; index < state_.size(); ++index) {
                 sources[index] = memory->retain_block(state_[index]);
             }
-            owners_->version = std::make_shared<PrefixStateVersion>(std::move(sources));
-            auto address = allocation(owners_->version->data(), state_version_bytes);
-            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
-                result.planes[index] = {address, state_bytes[index]};
-                address.offset += state_bytes[index];
+            owners_->version =
+                std::make_shared<PrefixStateVersion>(std::move(sources), state_bytes_);
+            auto address = allocation(owners_->version->data(), version_bytes());
+            for (std::size_t index = 0; index < state_bytes_.size(); ++index) {
+                result.planes[index] = {address, state_bytes_[index]};
+                address.offset += state_bytes_[index];
             }
         } else {
-            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
-                const auto bytes = state_bytes[index];
+            for (std::size_t index = 0; index < state_bytes_.size(); ++index) {
+                const auto bytes = state_bytes_[index];
                 result.planes[index] = {allocation(state_[index], bytes, memory), bytes};
             }
         }
         return result;
+    }
+
+    std::size_t version_bytes() const {
+        return state_bytes_[0] + state_bytes_[1] + state_bytes_[2] + state_bytes_[3];
     }
 
     PrefixDeviceTransfer finish(PrefixDeviceLayout layout, cudaStream_t stream) {
@@ -227,7 +243,8 @@ private:
         std::shared_ptr<PrefixStateVersion> version;
     };
 
-    std::array<const void*, state_bytes.size()> state_{};
+    std::array<std::size_t, 4> state_bytes_{};
+    std::array<const void*, 4> state_{};
     std::shared_ptr<Owners> owners_;
     PrefixDeviceTransfer view_;
 };
@@ -237,45 +254,63 @@ int capacity(const Request& request) { return request.pages.page_count * mxfp8_p
 }
 
 PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead& read,
-                                         cudaStream_t initialized, MtpDraftRequest* draft) {
+                                         cudaStream_t initialized, MtpDraftRequest* draft,
+                                         const PrefixCacheLayout* layout) {
     if (request.cached_gqa_tokens || (draft && draft->valid_prefix())) {
         throw std::logic_error("Restore an already initialized decoder prefix");
     }
+    if (draft && layout && !layout->draft_lane) {
+        throw std::logic_error("Restore a draft decoder prefix on a non-draft lane");
+    }
+    const int kv_heads = layout ? layout->kv_heads : mxfp8_kv_heads;
     const int coherent = read.usable_gdn;
     const int draft_rows = draft ? std::max(0, coherent - 1) : 0;
+    // The draft row count binds every lane except a ranked peer: TP1 (and a
+    // draft lane without a draft decoder) must still report no draft rows,
+    // while a peer lane ignores the composite read's rank 0 count.
+    const bool draft_count_binding =
+        draft != nullptr || !layout || layout->draft_lane;
     if (read.usable_gqa < 0 || read.usable_gqa > capacity(request) ||
         read.usable_gqa > read.matched_gqa || coherent < 0 || coherent > read.usable_gqa ||
-        coherent > read.matched_gdn || read.usable_draft != draft_rows) {
+        coherent > read.matched_gdn ||
+        (draft_count_binding && read.usable_draft != draft_rows)) {
         throw std::logic_error("Invalid decoder prefix restore extent");
     }
-    PrefixViewBuilder view;
-    PrefixDeviceLayout layout;
-    layout.gqa = view.mxfp8(request.caches.front(), full_attention_layers, 0, read.usable_gqa);
-    if (draft_rows) layout.draft = view.mxfp8(draft->prefix_cache_view(draft_rows, false),
-                                             1, 0, draft_rows);
-    if (coherent) layout.gdn = view.gdn(request.states.front(), request.work, coherent);
-    return view.finish(layout, initialized);
+    PrefixViewBuilder view(layout);
+    PrefixDeviceLayout payload;
+    payload.gqa = view.mxfp8(request.caches.front(), full_attention_layers, 0, read.usable_gqa,
+                             kv_heads);
+    if (draft_rows) {
+        payload.draft = view.mxfp8(draft->prefix_cache_view(draft_rows, false), 1, 0,
+                                   draft_rows, mxfp8_kv_heads);
+    }
+    if (coherent) payload.gdn = view.gdn(request.states.front(), request.work, coherent);
+    return view.finish(payload, initialized);
 }
 
 PrefixDeviceTransfer export_prefix_view(const Request& request, int gqa_begin, int draft_begin,
                                         int end, cudaStream_t source_ready,
                                         const MtpDraftRequest* draft, const Workspace* row,
-                                        bool terminal) {
+                                        bool terminal, const PrefixCacheLayout* layout) {
+    if (draft && layout && !layout->draft_lane) {
+        throw std::logic_error("Export a draft decoder prefix from a non-draft lane");
+    }
+    const int kv_heads = layout ? layout->kv_heads : mxfp8_kv_heads;
     if (end <= 0 || end > capacity(request) || gqa_begin < 0 || gqa_begin > end ||
         draft_begin < 0 || draft_begin > (draft ? end - 1 : 0)) {
         throw std::logic_error("Invalid decoder prefix checkpoint extent");
     }
-    PrefixViewBuilder view(true);
-    PrefixDeviceLayout layout;
-    layout.gqa = view.mxfp8(request.caches.front(), full_attention_layers, gqa_begin, end,
-                            &request.memory);
+    PrefixViewBuilder view(layout, true);
+    PrefixDeviceLayout payload;
+    payload.gqa = view.mxfp8(request.caches.front(), full_attention_layers, gqa_begin, end,
+                             kv_heads, &request.memory);
     if (draft && draft_begin < end - 1) {
-        layout.draft = view.mxfp8(draft->prefix_cache_view(end - 1, true), 1, draft_begin, end - 1,
-                                  &draft->prefix_cache_memory());
+        payload.draft = view.mxfp8(draft->prefix_cache_view(end - 1, true), 1, draft_begin,
+                                   end - 1, mxfp8_kv_heads, &draft->prefix_cache_memory());
     }
-    layout.gdn = view.gdn(request.states.front(), row ? *row : request.work, end,
-                          &request.memory, terminal);
-    return view.finish(layout, source_ready);
+    payload.gdn = view.gdn(request.states.front(), row ? *row : request.work, end,
+                           &request.memory, terminal);
+    return view.finish(payload, source_ready);
 }
 
 int commit_restored_prefix(Request& request, const PrefixDeviceTransfer& view,

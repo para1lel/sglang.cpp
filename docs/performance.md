@@ -178,9 +178,17 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-Formal direct GPU results are pending. The earlier private host-staging campaign applies to its own candidate.
+Formal direct GPU W1–W5 results are pending.
 
-In a traced, cold MTP4 probe on B200 GPU 6, four 131,072-token prompts generated one token each. Both arms recorded 15 mixed-start steps. Against parent `e2e07a51`, [singleton staging](flash-prefill.md#runtime-path) in `719a25ab` reduced total attention from 30.225588 to 16.827783 seconds and client makespan from 47.770831531 to 36.015000023 seconds. Each arm acknowledged 64 checkpoints covering 524,288 positions. The full W5 decode tail requires separate measurement.
+Traced cold MTP4, B200 GPU 6, four 131,072×1 requests. Each measurement recorded 15 mixed-start steps, 64 stores, and 524,288 written positions.
+
+| Reader (ELF) | Measured attention (s) | Client makespan (warmup / measured, s) |
+| --- | ---: | ---: |
+| Parent `e2e07a51` | 30.225588 | 34.103112 / 47.770832 |
+| [Singleton](flash-prefill.md#runtime-path) `719a25ab` | 16.827783 | 35.260373 / 36.015000 |
+| Paired `0d0a7132` | 16.023583 | 34.400717 / 34.439601 |
+
+Pairing cut attention by 0.804200 s. Time outside server GPU work also fell.
 
 <a id="current-single-round-v5"></a>
 ### Archived single-round v5

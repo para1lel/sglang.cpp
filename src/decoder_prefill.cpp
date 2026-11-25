@@ -477,67 +477,7 @@ bool prefill_causal_group_gqa(const Chunk& chunk, const GqaLayer& layer, int ban
     return true;
 }
 
-void prefill_group_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
-                       const PrefillGrant* grants, int count, int offset,
-                       bool staged_batch = false) {
-    static_assert(staged_prefill_batch_size >= max_layerwise_rows / 256);
-    std::array<PagedPrefillSequence, staged_prefill_batch_size> sequences;
-    int index = 0;
-    each_prefill_segment(grants, count, offset, [&](const PrefillGrant& grant, int row) {
-        const auto segment = prefill_attention_segment(chunk, grant, row);
-        const auto cache = grant.request->caches[bank];
-        const auto pages = grant.request->pages;
-        segment.gqa_append(layer, cache, pages);
-        sequences[index++] = {cache, pages, grant.position, grant.rows, segment.work.rope_queries,
-                              segment.work.attention};
-    });
-    const int position = sequences.front().position;
-    const bool long_lane = count == 1 && chunk.rows == grouped_prefill_max_rows &&
-        position >= 32768 && position <= staged_prefill_batch_long_max_position;
-    if (staged_batch || long_lane) {
-        const auto scratch = chunk.work.gqa_scratch();
-        if (position <= staged_prefill_batch_max_position) {
-            if (const auto staged = try_batched_staged_paged_prefill(sequences.data(), count,
-                                                                    chunk.stream, scratch)) {
-                check(*staged, "Read staged batched causal prefill MXFP8 attention");
-                return;
-            }
-            for (int lane = 0; lane < count; ++lane) {
-                read_paged_sequences(sequences.data() + lane, 1, chunk.stream, scratch);
-            }
-            return;
-        }
-        const int visible = position + batch_prefill_tile_rows;
-        const int subgroup = std::min(count, visible <= 32768 ? 4 : visible <= 65536 ? 2 : 1);
-        for (int lane = 0; lane < count; lane += subgroup) {
-            const auto* first = sequences.data() + lane;
-            if (const auto staged = try_long_staged_paged_prefill(first, subgroup, chunk.stream,
-                                                                  scratch)) {
-                check(*staged, "Read long staged causal prefill MXFP8 attention");
-                continue;
-            }
-            for (int index = 0; index < subgroup; ++index) {
-                read_paged_sequences(first + index, 1, chunk.stream, scratch);
-            }
-        }
-        return;
-    }
-    read_paged_sequences(sequences.data(), count, chunk.stream,
-                         count == 1 ? chunk.work.gqa_scratch() : PairedPrefillScratch{});
-}
-
-bool can_batch_staged_gqa(const PrefillGrant* grants, int count) {
-    if (count != staged_prefill_batch_size) {
-        return false;
-    }
-    const int position = grants[0].position;
-    return position >= staged_prefill_batch_min_position &&
-        position <= staged_prefill_batch_long_max_position &&
-        position % batch_prefill_tile_rows == 0 &&
-        std::all_of(grants, grants + count, [&](const PrefillGrant& grant) {
-            return grant.position == position && grant.rows == batch_prefill_tile_rows;
-        });
-}
+#include "sglang/runtime/execution/decoder_prefill_staged_gqa.h"
 
 void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
                        const PrefillGrant* grants, int count, int offset) {
@@ -652,6 +592,10 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     const bool wide_partial = !causal && serial_attention &&
         is_full_partial_prefill_group(grants, group);
     const bool full_group = attention_mode == PrefillAttentionMode::full_group;
+    const bool staged_group = grouped && !serial_attention &&
+        can_batch_staged_gqa(grants, group.grants);
+    const auto partners = full_group && !staged_group ? mixed_prefill_partners(grants, group.grants)
+                                                     : std::nullopt;
     const bool packed_preparation = full_group || wide_partial;
     const auto rms_launch = packed_preparation ? RmsQuantizeLaunch::full_group_prefill
                                                : RmsQuantizeLaunch::ordinary;
@@ -674,8 +618,10 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             if (serial_attention) {
                 prefill_serial_gqa(chunk, layer, bank, grants, group.grants, serial_capacity,
                                    causal, wide_partial);
-            } else if (grouped && can_batch_staged_gqa(grants, group.grants)) {
+            } else if (staged_group) {
                 prefill_group_gqa(chunk, layer, bank, grants, group.grants, 0, true);
+            } else if (partners) {
+                prefill_mixed_gqa(chunk, layer, bank, grants, *partners);
             } else {
                 each_attention_group(grants, group.grants,
                                      [&](const PrefillGrant* first, int count, int offset) {

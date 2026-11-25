@@ -15,21 +15,19 @@ The run exercised cold, warm, one-sided eviction, and a longer tail on one 18-to
 
 The raw receipts are `rank-receipts.json`; the counters are `metrics.json` in the same directory. Per-family byte counts follow the ranked geometry: 16,896 target bytes per token per rank and full-width draft bytes on rank 0 only.
 
-## First measured result
+## Campaign record
 
-The first official campaign measured W1 only. It missed the gate, so W2 through W5 were intentionally not run.
+The current campaign runs the published release `337edce7`. W1 passes the gate. W2 has a native measurement but no valid comparison. W3 through W5 are unrun.
 
-- **Identity.** Campaign `24c2e092-25c7-4945-a251-aa9cb03358cb`, mode measure, protocol `tp2-paired-v1` (manifest `c2c3480a…`), corpus `tp2-corpus-v1` (manifest `d65076eb…`). Native source tree `3a33e1c1…`, executable SHA-256 `fb03d111…`, checkpoint `Qwen3.8-27B-FP8` (`b54fe441…`). Evidence: `artifacts/tp2-bench/campaign-2345/W1/comparison.json`.
-- **Devices.** Both engines ran alone on the same two B200 devices in the same rank order: rank 0 `GPU-57c04c1a…`, rank 1 `GPU-b79a7675…`. The native server is one process with NCCL on both ranks. Rank 0 carries the LM head and the MTP draft: 19,031,037,824 weight bytes against rank 1's 14,734,676,480. Rank daemons listen on ports 17655 and 17656.
-- **Cohorts.** Each arm ran one warmup cohort, then one measured cohort of the two frozen W1 lanes: 128 prompt tokens, 128 output tokens, one request per GPU, two concurrent. The measured cohort is the single sample. Both arms verified all lanes generating before the first request finished.
-- **Receipts.** Native: `tp_size` 2, MTP4, sixteen slots, 32,768 tokens per step, eager flag off, batch CUDA graphs off, LMCache enabled and available, no resident prefix entries. vLLM pin `81a8cb06`: TP2, `kv_transfer=false`, `kv_offloading_size=null`, zero CPU offload, local prefix cache on, FP8 E4M3 KV, CUDA graphs on.
-- **Cache transfer.** The protocol reconciled each daemon's cold transfers with the joint receipt. Both ranks acknowledged every checkpoint store and restored nothing. GQA and GDN written bytes were equal on both ranks; draft bytes appeared only on rank 0.
-- **Result.** Native median 925.746744 ms; vLLM median 557.959022 ms; ratio 1.6591661887313294 against the ≤1.10 gate: W1 fails. Native served 276.5 output tokens per second against vLLM's 458.8. Optimization work continues; no TP2 row has passed.
-- **Untimed trace.** A separate traced cohort verified speculative decoding without timing claims. The native trace recorded 100 per-lane MTP rounds, 98 at depth four, with lane outputs matching the native warmup. The vLLM arm showed a draft-token delta of 840 and a depth-four verified-position delta of 210 over the timed arm's warmup and measured interval.
+- **Identity.** Campaign `92b206b0-16e8-4ad0-a600-463926e0d6df`, mode measure, protocol `tp2-paired-v1` (manifest `c2c3480a…`), corpus `tp2-corpus-v1` (manifest `d65076eb…`). Native source tree `337edce7…`, executable SHA-256 `0100f4e2…`, checkpoint `Qwen3.8-27B-FP8` (`b54fe441…`). Evidence: `artifacts/tp2-bench/campaign-0222/`.
+- **W1.** Native median 592.803737 ms; vLLM median 558.431928 ms; ratio 1.0615505798944935 against the ≤1.10 gate: W1 passes. Rank receipts are recorded for both ranks. Rank 0 `GPU-57c04c1a…` carries the LM head and MTP draft: 19,031,037,824 weight bytes. Rank 1 `GPU-b79a7675…` carries 14,734,676,480. A separate traced cohort accompanies the timed arms.
+- **W2.** Native measured 1699.082051 ms. The vLLM arm failed the protocol determinism check: warmup and measured outputs disagree, first mismatches at 0-based offsets 49 and 303. The row has no valid ratio and is neither passed nor failed.
+- **W3–W5.** Unrun on this campaign.
+- **Historical context.** The first campaign (`24c2e092-25c7-4945-a251-aa9cb03358cb`, source `3a33e1c1…`, binary `fb03d111…`) measured W1 only: 925.746744 ms against 557.959022 ms, ratio 1.6591661887313294, a miss, and stopped. The [diagnostic profile](#w1-diagnostic-profile) below attributes that gap. A separate clean production diagnostic on the current binary measured 594.644780 ms for W1 before this campaign; it is not a campaign row.
 
 ## W1 diagnostic profile
 
-A separate untimed profile traced both engines after the W1 miss. It guides optimization only and makes no campaign claim.
+A separate untimed profile traced both engines after the W1 miss. It guided optimization only and makes no campaign claim.
 
 - **Cohort.** Two fixed requests with five verified positions each (MTP4), run on the native TP2 server and the pinned vLLM reference. Receipts record the eager flag off and batch CUDA graphs off. LMCache ran enabled and available on the default socket, one rank-local daemon per rank.
 - **Sampling.** Both used the frozen 128-token W1 prompts. Native generated 24 output tokens per request and vLLM generated 128.
@@ -40,7 +38,7 @@ A separate untimed profile traced both engines after the W1 miss. It guides opti
 - **Rank 0 kernel-duration sums inside the target, width two.** FP8 projection 3.529 versus 4.024 ms. GQA attention 2.541 versus 0.451 ms. GDN attention 1.619 versus 1.048 ms.
 - **Reductions.** Cross-rank elapsed sums after the last rank arrives, width two: 1.531 ms native versus 0.753 ms reference across 128 reductions. Both rank clocks contribute; the sum ends at the later completion.
 - **Target head.** The native target head is a full-vocabulary BF16 projection on rank 0, outside the target span: two full-head grid launches, 31040 by one, 1.633 ms per width-2 step. The sharded reference spends 0.181 ms on the vocabulary GEMM plus 0.034 ms on the gather on rank 0, outside its span.
-- **Evidence.** `artifacts/tp2-bench/native-profile-d0029/` holds the Nsight Systems database, `steps.json`, and `vs-reference.json`. `artifacts/tp2-bench/vllm-profile-0013/` holds `scoring.json`, `reduction-skew.json`, and per-rank traces with `profile.sha256` and `repro.sha256`. The analysis scripts are in `artifacts/tp2-bench/w1-diagnostics/`. The diagnostic native binary is SHA-256 `0acf4c24…`; the official campaign binary is `fb03d111…`.
+- **Evidence.** `artifacts/tp2-bench/native-profile-d0029/` holds the Nsight Systems database, `steps.json`, and `vs-reference.json`. `artifacts/tp2-bench/vllm-profile-0013/` holds `scoring.json`, `reduction-skew.json`, and per-rank traces with `profile.sha256` and `repro.sha256`. The analysis scripts are in `artifacts/tp2-bench/w1-diagnostics/`. The diagnostic native binary is SHA-256 `0acf4c24…`; the first campaign's binary is `fb03d111…`.
 
 ## Prerequisites and command
 
@@ -51,7 +49,7 @@ sglang-server --checkpoint MODEL --device 0 --port PORT --tp 2 --eager \
   --mtp-steps 4 --lmcache-socket SOCKET
 ```
 
-The smoke run recorded under `artifacts/tp2-review/serving/cache-2328/complete/cache/` used this shape; `ranked-cache.argv.json` holds its exact arguments. The measured campaign server ran without `--eager`: its live argument record shows `--port 17393 --tp 2 --max-active 16`.
+The smoke run recorded under `artifacts/tp2-review/serving/cache-2328/complete/cache/` used this shape; `ranked-cache.argv.json` holds its exact arguments. The measured campaigns ran without `--eager`: the live argument record shows `--port 17393 --tp 2 --max-active 16`.
 
 ## Two-rank allreduce transport
 
@@ -73,7 +71,7 @@ No startup flag selects the transport. Selection is automatic in a build that in
 
 ## Acceptance target
 
-The first campaign stopped after the W1 miss. W2 through W5 remain unmeasured. A passing campaign must satisfy every condition below.
+W1 has passed the gate. W2 awaits a valid comparison. W3 through W5 are unrun. A passing campaign must satisfy every condition below.
 
 - **Devices.** Run both engines alone on the same two B200 devices in the same rank order. Record both UUIDs, the rank assignment, interconnect, and distributed library.
 - **Workloads.** Reuse the frozen W1–W5 fixture bytes. Offer 2, 2, 8, 16, and 8 requests total on W1–W5. This is one, one, four, eight, and four per GPU. Eight slots per GPU give sixteen slots total. W4 fills them exactly. W4 uses the first sixteen archived W5 lanes. W1 and W2 need one new distinct lane each. W3 and W5 need four more each. Freeze every new lane as distinct deterministic bytes in a separate additive TP2 corpus. Retain the TP1 lanes and bytes. Duplicate no request.

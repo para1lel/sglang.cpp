@@ -15,6 +15,15 @@ lmcache_port_free() {
     [[ -z $listeners ]] || { echo "Port $lmcache_port already has a listener." >&2; return 75; }
 }
 
+resolve_lmcache_pythonpath() {
+    "$client_python" -IB -c '
+import os
+import sys
+path = sys.argv[1]
+print(os.pathsep.join(os.path.realpath(p) for p in path.split(os.pathsep)) if path else "")
+' "$1"
+}
+
 record_lmcache_peer() {
     local run=$1 suffix=${2:-} options=()
     if [[ -n $suffix ]]; then options=(--once); fi
@@ -31,6 +40,7 @@ start_lmcache() {
     local -a daemon=(env -i PATH=/usr/bin:/bin LANG=C.UTF-8
         "HOME=$run/home" "TMPDIR=$run/tmp" "XDG_CACHE_HOME=$run/cache"
         "LMCACHE_PYTHON=$lmcache_python" "PYTHONPATH=$lmcache_pythonpath"
+        PYTHONSAFEPATH=1 PYTHONNOUSERSITE=1
         "LD_LIBRARY_PATH=$compat" "CUDA_VISIBLE_DEVICES=$gpu_uuid" CUDA_DEVICE_ORDER=PCI_BUS_ID
         OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
         numactl --localalloc taskset --cpu-list "$client_cpus"
@@ -38,23 +48,10 @@ start_lmcache() {
         --namespace sglang --memory-gib 64 --port "$lmcache_port")
     write_command "$run/lmcache-command.sh" "${daemon[@]}"
     sha256sum "${lmcache_sources[@]}" >"$run/lmcache-source.sha256" || return
-    "$client_python" -IB -c '
-import subprocess
-import sys
-from pathlib import Path
-
-process = subprocess.Popen(sys.argv[2:], start_new_session=True)
-Path(sys.argv[1]).write_text(f"{process.pid}\n")
-sys.exit(process.wait())
-' "$run/lmcache-pid.txt" "${daemon[@]}" >"$run/lmcache.log" 2>&1 9<&- &
-    lmcache_launch_pid=$!
-    for ((attempt = 0; attempt < 100; ++attempt)); do
-        [[ ! -s $run/lmcache-pid.txt ]] || break
-        kill -0 "$lmcache_launch_pid" 2>/dev/null || return 1
-        sleep .05
-    done
-    read -r lmcache_pid <"$run/lmcache-pid.txt" || return 1
+    launch_session "$run/lmcache-pid.txt" "${daemon[@]}" >"$run/lmcache.log" 2>&1 9<&- &
+    lmcache_pid=$!
     record_lmcache_peer "$run" || return
+    lmcache_socket_id=$(jq -er '.socket_id' "$run/lmcache-ready.json") || return
     for ((attempt = 0; attempt < 100; ++attempt)); do
         ss -Hlnpt "sport = :$lmcache_port" >"$run/lmcache-listener.txt" || return 1
         [[ ! -s $run/lmcache-listener.txt ]] || break
@@ -74,21 +71,7 @@ sys.exit(process.wait())
 
 stop_lmcache() {
     if [[ -n ${lmcache_pid:-} ]]; then
-        kill -TERM -- "-$lmcache_pid" 2>/dev/null || true
-        for ((attempt = 0; attempt < 40; ++attempt)); do
-            kill -0 -- "-$lmcache_pid" 2>/dev/null || break
-            sleep .25
-        done
-        kill -KILL -- "-$lmcache_pid" 2>/dev/null || true
-    fi
-    if [[ -n ${lmcache_launch_pid:-} ]]; then
-        if [[ -z ${lmcache_pid:-} ]]; then
-            kill -TERM "${lmcache_launch_pid}" 2>/dev/null || true
-        fi
-        wait "$lmcache_launch_pid" 2>/dev/null || true
-        lmcache_launch_pid=
-    fi
-    if [[ -n ${lmcache_pid:-} ]]; then
+        stop_session "$lmcache_pid"
         if kill -0 -- "-$lmcache_pid" 2>/dev/null; then
             echo "LMCache process group $lmcache_pid did not stop." >&2
             return 2
@@ -96,7 +79,11 @@ stop_lmcache() {
         lmcache_pid=
     fi
     if [[ -n ${lmcache_runtime:-} ]]; then
-        rm -f -- "$lmcache_runtime/sglang-lmcache.sock"
+        if [[ -n ${lmcache_socket_id:-} ]]; then
+            "$client_python" -IB "$project/tools/lmcache/sglang_socket.py" \
+                "$lmcache_runtime/sglang-lmcache.sock" "$lmcache_socket_id" || return 2
+            lmcache_socket_id=
+        fi
         rmdir -- "$lmcache_runtime" || return 2
         lmcache_runtime=
     fi

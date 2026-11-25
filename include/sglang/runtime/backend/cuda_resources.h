@@ -41,6 +41,15 @@ struct CudaError : std::runtime_error {
 
 std::size_t available_device_bytes();
 
+// The caller has fenced all uses of this cudaMalloc allocation before releasing it.
+inline cudaError_t release_cuda_block(void* pointer, cudaStream_t stream) noexcept {
+    const auto status = cudaFreeAsync(pointer, stream);
+    if (status != cudaErrorNotSupported) return status;
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess && pending != cudaErrorNotSupported) return pending;
+    return cudaFree(pointer);
+}
+
 inline void copy_cuda_async(void* destination, const void* source, std::size_t bytes,
                             cudaMemcpyKind kind, cudaStream_t stream, const char* operation) {
     check(cudaMemcpyAsync(destination, source, bytes, kind, stream), operation);

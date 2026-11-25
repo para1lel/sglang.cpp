@@ -12,6 +12,7 @@ RUNNING = "vllm:num_requests_running"
 WAITING = "vllm:num_requests_waiting"
 GENERATED = "vllm:generation_tokens_total"
 STORES = "sglang_cpp:lmcache_stores_total"
+PENDING_STORES = "sglang_cpp:lmcache_pending_stores"
 
 
 class Controls:
@@ -44,12 +45,14 @@ class Controls:
             metrics[key] = float(value)
         return metrics
 
-    def wait_for(self, name, running, waiting, generated=0):
+    def wait_for(self, name, running, waiting, generated=0, *, stores=None):
         deadline = time.monotonic() + 15
         while True:
             metrics = self.metrics(name)
             if ((metrics[RUNNING], metrics[WAITING]) == (running, waiting)
-                    and metrics[GENERATED] >= generated):
+                    and metrics[GENERATED] >= generated
+                    and (stores is None or
+                         (metrics[STORES] >= stores and metrics[PENDING_STORES] == 0))):
                 return metrics
             if time.monotonic() >= deadline:
                 raise AssertionError((name, metrics))

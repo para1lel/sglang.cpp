@@ -85,6 +85,10 @@ private:
 CopyGate* copy_gate = nullptr;
 std::atomic<CopyGate*> free_gate{nullptr};
 std::atomic<void*> watched_free{nullptr};
+std::atomic<void*> failed_free{nullptr};
+std::atomic<cudaError_t> free_error{cudaErrorNotSupported};
+std::atomic<void*> synchronous_free{nullptr};
+thread_local void* last_allocation = nullptr;
 enum class CheckpointFault { none, allocation, second_copy, event };
 CheckpointFault checkpoint_fault = CheckpointFault::none;
 std::size_t checkpoint_copies = 0;
@@ -181,20 +185,27 @@ Generation generate(const DecoderModel& model, Lane& lane, int position, cudaStr
 void compare_scores(const DecoderPromptLogprobs& cold, const DecoderPromptLogprobs& warm) {
     require(cold.size() == warm.size() && !cold.empty(), "Sparse score row count differs");
     double worst = 0;
+    const auto compare = [&](float a, float b) {
+        require(std::isfinite(a) && std::isfinite(b), "Non-finite sparse teacher score");
+        worst = std::max(worst, std::abs(double(a) - double(b)));
+    };
     int changed_top = 0;
     for (std::size_t i = 0; i < cold.size(); ++i) {
         require(cold[i] && warm[i] && cold[i]->selected.token_id == warm[i]->selected.token_id,
                 "Sparse teacher token differs");
-        worst = std::max(worst, std::abs(double(cold[i]->selected.value) -
-                                        double(warm[i]->selected.value)));
+        compare(cold[i]->selected.value, warm[i]->selected.value);
         const auto& a = cold[i]->alternatives;
         const auto& b = warm[i]->alternatives;
         require(a.size() == b.size(), "Sparse top alternatives count differs");
-        for (std::size_t j = 0; j < a.size(); ++j) changed_top += a[j].token_id != b[j].token_id;
+        for (std::size_t j = 0; j < a.size(); ++j) {
+            changed_top += a[j].token_id != b[j].token_id;
+            compare(a[j].value, b[j].value);
+        }
     }
     std::printf("teacher %zu max_logprob_difference %.9g changed_top_ids %d\n",
                 cold.size(), worst, changed_top);
-    require(worst <= 0.05 && changed_top == 0, "Sparse teacher scores exceeded tolerance");
+    require(changed_top == 0, "Sparse teacher top alternative IDs differ");
+    require(worst <= 0.05, "Sparse teacher scores exceeded tolerance");
 }
 
 void compare_generation(const Generation& cold, const Generation& warm) {
@@ -211,7 +222,7 @@ void compare_generation(const Generation& cold, const Generation& warm) {
 
 void check_history_gap(const LmCacheClient& cache, const std::vector<int>& prompt,
                        const DecoderModel& model, cudaStream_t stream, Lane& cold) {
-    const PrefixCacheKeys keys(prompt, "oracle-gap");
+    const PrefixCacheKeys keys(prompt, prefix_fixture::run_salt("oracle-gap"));
     auto first = export_prefix_view(cold.request, 0, 0, 512, stream);
     first.layout.gdn = {};
     store(cache, keys, first);
@@ -318,8 +329,8 @@ void check_guarded_ranges(const LmCacheClient& cache, const std::vector<int>& pr
     check(cudaEventRecord(done, memory.stream()), "Record guarded range ready event");
     for (const auto [begin, end] : {std::pair{0, 31}, {0, 33}, {0, 127}, {0, 129},
                                   {0, 255}, {0, 257}, {256, 257}}) {
-        const PrefixCacheKeys keys(prompt, "guarded-" + std::to_string(begin) + "-" +
-                                              std::to_string(end));
+        const PrefixCacheKeys keys(prompt, prefix_fixture::run_salt(
+            "guarded-" + std::to_string(begin) + "-" + std::to_string(end)));
         store(cache, keys, transfer(source, begin, end));
         check(cudaMemcpy(destination.device, destination.bytes.data(), destination.bytes.size(),
                          cudaMemcpyHostToDevice), "Initialize guarded range destination");
@@ -397,8 +408,16 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, std::s
     return __real_cudaMemcpyAsync(dst, src, size, kind, stream);
 }
 
+extern "C" cudaError_t __real_cudaFree(void*);
+extern "C" cudaError_t __wrap_cudaFree(void* memory) {
+    const auto status = __real_cudaFree(memory);
+    if (status == cudaSuccess && memory == failed_free.load()) synchronous_free = memory;
+    return status;
+}
+
 extern "C" cudaError_t __real_cudaFreeAsync(void*, cudaStream_t);
 extern "C" cudaError_t __wrap_cudaFreeAsync(void* memory, cudaStream_t stream) {
+    if (memory && memory == failed_free.load()) return free_error.load();
     if (memory == watched_free.load()) {
         if (auto* gate = free_gate.exchange(nullptr)) gate->wait();
     }
@@ -411,7 +430,9 @@ extern "C" cudaError_t __wrap_cudaMalloc(void** memory, std::size_t size) {
         checkpoint_fault = CheckpointFault::none;
         return __real_cudaMalloc(memory, std::numeric_limits<std::size_t>::max() / 2);
     }
-    return __real_cudaMalloc(memory, size);
+    const auto status = __real_cudaMalloc(memory, size);
+    if (status == cudaSuccess) last_allocation = *memory;
+    return status;
 }
 
 extern "C" cudaError_t __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
@@ -446,7 +467,8 @@ struct GraphCheckpointOracle {
                 "Peer replay did not overwrite shared graph state");
         require(prefix_fixture::recurrent_digest(owner, owned_row) == expected,
                 "Peer replay overwrote request-owned graph state");
-        const PrefixCacheKeys keys(history, verifier ? "pre-export-k1" : "pre-export-k0");
+        const PrefixCacheKeys keys(history, prefix_fixture::run_salt(
+            verifier ? "pre-export-k1" : "pre-export-k0"));
         store(cache, keys, export_prefix_view(owner, 0, 0, end, stream, nullptr, &owned_row));
         Request restored{model.device};
         restored.initialize(128, stream);
@@ -582,6 +604,12 @@ void check_terminal_detach(const DecoderModel& model, cudaStream_t stream,
 
 void check_detached_accounting() {
     constexpr std::size_t bytes = 1 << 20;
+    struct FreeGate : CopyGate {
+        ~FreeGate() {
+            free_gate.store(nullptr);
+            watched_free.store(nullptr);
+        }
+    } gate;  // Outlive the reclaimer, including a late entry into cudaFreeAsync.
     RequestBlockCache retired(0, true);
     Allocations original(0, &retired);
     auto* memory = original.allocate<std::byte>(bytes);
@@ -593,19 +621,46 @@ void check_detached_accounting() {
             "One physical block did not produce one detached charge");
     a.reset();
     require(retired.unavailable_bytes() == bytes, "One alias dropped the remaining lease");
-    CopyGate gate;
     watched_free.store(memory);
     free_gate.store(&gate);
     b.reset();
-    gate.wait_until_entered();
-    require(retired.unavailable_bytes() == bytes && retired.pending_bytes() == bytes,
-            "Moving a detached block to pending changed its single charge");
+    try {
+        gate.wait_until_entered();
+        require(retired.unavailable_bytes() == bytes && retired.pending_bytes() == bytes,
+                "Moving a detached block to pending changed its single charge");
+    } catch (...) {
+        gate.open();
+        throw;
+    }
     gate.open();
     gate.expect_released();
     retired.clear();
-    watched_free.store(nullptr);
     require(retired.unavailable_bytes() == 0, "Freed device block stayed charged");
     std::puts("one allocation charge across live, detached, pending and released states");
+}
+
+void check_failed_free(bool resident, cudaError_t error) {
+    constexpr std::size_t bytes = 1 << 20;
+    RequestBlockCache retired(0, resident);
+    Allocations original(0, &retired);
+    auto* memory = original.allocate<std::byte>(bytes);
+    auto lease = original.retain_block(memory);
+    original.recycle_after_completion();
+    require(retired.unavailable_bytes() == bytes, "Detached source was not charged");
+    free_error = error;
+    failed_free = memory;
+    lease.reset();
+    retired.clear();
+    failed_free = nullptr;
+    const auto released = synchronous_free.exchange(nullptr);
+    if (error == cudaErrorNotSupported) {
+        require(released == memory && retired.unavailable_bytes() == 0,
+                "Unsupported asynchronous free did not release the detached source and charge");
+    } else {
+        require(!released && retired.unavailable_bytes() == bytes && retired.pending_bytes() == 0,
+                "An unrelated CUDA error released or uncharged an uncertain source");
+        check(cudaFree(memory), "Release test allocation after injected failure");
+    }
 }
 
 std::array<const void*, 4> checkpoint_sources(const Request& request) {
@@ -686,7 +741,15 @@ void check_checkpoint_faults(const Lane& lane, const LmCacheClient& cache,
     }
     require(cache.lookup_prefix(keys, prompt_end, true).gqa == 0,
             "Failed checkpoint unexpectedly reached LMCache");
-    store(cache, keys, export_prefix_view(lane.request, 0, 0, prompt_end, stream, &lane.draft));
+    auto version = export_prefix_view(lane.request, 0, 0, prompt_end, stream, &lane.draft);
+    auto* const data = last_allocation;
+    store(cache, keys, version);
+    free_error = cudaErrorNotSupported;
+    failed_free = data;
+    version = {};
+    failed_free = nullptr;
+    require(data && synchronous_free.exchange(nullptr) == data,
+            "Unsupported asynchronous free leaked the checkpoint state version");
     require(cache.lookup_prefix(keys, prompt_end, true).gdn == prompt_end,
             "Same-thread publication failed after recoverable CUDA errors");
     std::puts("actual checkpoint allocation, second-copy and event failures drain; retry succeeds");
@@ -704,6 +767,14 @@ void check_continued_prefill(const Lane& cold, const Lane& warm,
             "Prefill GDN/terminal state differs");
 }
 
+auto allocate_score_readbacks() {
+    void* host = nullptr;
+    check(cudaMallocHost(&host, sizeof(GeneratedLogprobReadback) * decoder_batch_max_lanes),
+          "Allocate prompt score readbacks");
+    return std::unique_ptr<GeneratedLogprobReadback, decltype(&cudaFreeHost)>(
+        static_cast<GeneratedLogprobReadback*>(host), cudaFreeHost);
+}
+
 void check_model_state(const DecoderModel& model) {
     Allocations execution(0);
     execution.open_stream();
@@ -711,20 +782,16 @@ void check_model_state(const DecoderModel& model) {
     PrefillWorkspace workspace(stream, batch_prefill_tile_rows);
     require(workspace.data(), "Native tile arena unavailable");
     auto* score_scratch = execution.allocate<std::byte>(generated_logprob_workspace_bytes());
-    void* host = nullptr;
-    check(cudaMallocHost(&host, sizeof(GeneratedLogprobReadback) * decoder_batch_max_lanes),
-          "Allocate prompt score readbacks");
-    auto* score_host = static_cast<GeneratedLogprobReadback*>(host);
-    auto pinned = std::unique_ptr<GeneratedLogprobReadback, decltype(&cudaFreeHost)>(
-        score_host, cudaFreeHost);
+    const auto score_host = allocate_score_readbacks();
     std::vector<int> prompt(prompt_end);
     for (int i = 0; i < prompt_end; ++i) prompt[i] = 1000 + (i * 77 + i / 11) % 610;
     check_key_provenance(prompt);
     const auto cache = prefix_fixture::client();
     check_guarded_ranges(cache, prompt, execution);
-    const PrefixCacheKeys keys(prompt, "oracle-split");
+    const PrefixCacheKeys keys(prompt, prefix_fixture::run_salt("oracle-split"));
     const auto tile = [&](Lane& lane, int first, int rows, int terminal, int score = -1) {
-        PromptLogprobCapture capture{&prompt, &lane.scores, score_host, score_scratch, 3, score};
+        PromptLogprobCapture capture{&prompt, &lane.scores, score_host.get(), score_scratch,
+                                     3, score};
         model.prefill_chunk(lane.request, prompt.data() + first, rows, first, workspace,
                             &lane.draft, terminal - first, nullptr,
                             score >= 0 ? &capture : nullptr);
@@ -791,11 +858,12 @@ void check_model_state(const DecoderModel& model) {
     synchronize_cuda(stream, "Complete warm split-family prefill");
     check_continued_prefill(cold, warm, imported_target);
     check_terminal_detach(model, stream, cache, keys,
-                         PrefixCacheKeys(prompt, "oracle-detached-terminal"), read,
-                         cold, retired, extend);
-    check_delayed_periodic(model, cache, keys, PrefixCacheKeys(prompt, "oracle-delayed-periodic"),
-                           stream, read);
-    check_checkpoint_faults(cold, cache, PrefixCacheKeys(prompt, "oracle-copy-faults"), stream);
+        PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-detached-terminal")), read,
+        cold, retired, extend);
+    check_delayed_periodic(model, cache, keys,
+        PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-delayed-periodic")), stream, read);
+    check_checkpoint_faults(cold, cache,
+        PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-copy-faults")), stream);
     check_history_gap(cache, prompt, model, stream, cold);
     std::printf("split gqa %d gdn %d draft %d\n", matched.gqa, matched.gdn, checkpoint - 1);
 
@@ -815,6 +883,10 @@ int main(int argc, char** argv) try {
         argv[1], 0, model.memory, model.embedding, model.lm_head, model.backend.draft);
     model.tc_vocab = model.mtp_weights->shared_vocab();
     check_detached_accounting();
+    for (const bool resident : {false, true}) {
+        check_failed_free(resident, cudaErrorNotSupported);
+        check_failed_free(resident, cudaErrorInvalidValue);
+    }
     require(model.is_b200() && model.mtp_weights, "Requires real B200 and K4 weights");
     check_model_state(model);
     std::puts("PASS");

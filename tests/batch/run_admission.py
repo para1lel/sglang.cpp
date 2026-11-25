@@ -12,9 +12,13 @@ import re
 import subprocess
 import sys
 import threading
+import time
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
+from live_controls import STORES, Controls
 import run_native as native
 import test_batch_graph as http
 from media import http_routes as media
@@ -260,7 +264,8 @@ def check_eager_cache(args):
     flags = ["--eager", "--max-active", "4"]
     case = prompt_case("eager-cache", CHECKPOINT_INTERVAL + 1)
     body = {"model": media.MODEL, "prompt": case["prompt"], "max_tokens": 8,
-            "return_token_ids": True, "temperature": 0, "ignore_eos": True}
+            "return_token_ids": True, "temperature": 0, "ignore_eos": True,
+            "cache_salt": uuid4().hex}
     prime = body | {"prompt": case["prompt"][:-1], "max_tokens": 1}
     with server(args, "eager-cache", flags, lmcache_socket=args.lmcache_socket) as (
         port, log, out, health
@@ -273,8 +278,12 @@ def check_eager_cache(args):
         assert info_status == 200 and info["lmcache_enabled"] and info["lmcache_available"], info
         assert info["prefix_cache_entries"] == 0, info
         assert info["eager"] and not info["batch_cuda_graphs"] and info["mtp_steps"] == 4, info
-        cold = media.capture(evidence, "cold", port, media.TEXT, body | {"cache_salt": "cold"})
+        controls = Controls(port, out)
+        baseline = controls.metrics("before-cold")[STORES]
+        cold = media.capture(evidence, "cold", port, media.TEXT, body | {"cache_salt": uuid4().hex})
+        baseline = controls.wait_for("cold-stored", 0, 0, stores=baseline + 1)[STORES]
         media.capture(evidence, "prime", port, media.TEXT, prime)
+        controls.wait_for("prime-stored", 0, 0, stores=baseline + 1)
         warm = media.capture(evidence, "warm", port, media.TEXT, body)
         assert cold["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, cold
         assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] == CHECKPOINT_INTERVAL, warm
@@ -336,10 +345,16 @@ def build_fault_probe(args):
                                re.M | re.S))
     files = re.findall(r'"([^"\n]+)"', sections["files"])
     compiler, *flags = re.findall(r'"([^"\n]+)"', sections["values"])
-    target = (args.source / "xmake.lua").read_text().split('target("sglang-server")', 1)[1]
+    project = (args.source / "xmake.lua").read_text()
+    target = project.split('target("sglang-server")', 1)[1]
     target = re.split(r"\n(?:option|target)\(", target, maxsplit=1)[0]
-    sources = re.findall(r'"(apps/[^"]+\.cpp)"', target)
-    objects = [next(name for name in files if name.endswith(f"/{source}.o")) for source in sources]
+    codecs = project.split("local function add_media_codecs()", 1)[1].split("\nend", 1)[0]
+    # XMake sorts the dependency record but links in add_files declaration order.
+    sources = re.findall(r'"([^"\n]+\.cpp)"', target.replace("add_media_codecs()", codecs))
+    compiled = {name for name in files if name.endswith(".o")}
+    objects = [name for source in sources for name in compiled if name.endswith(f"/{source}.o")]
+    assert set(objects) == compiled and len(objects) == len(compiled), (
+        record, compiled - set(objects))
     assert objects and any("libsglang_decoder.a" in name for name in files), record
     baseline, wrapped, wrapper = (out / name for name in (
         "baseline-server", "fault-server", "kv_admission_fault.o"))
@@ -351,7 +366,8 @@ def build_fault_probe(args):
     command = [compiler, *objects]
     clean = [*command, *flags, "-o", str(baseline)]
     fault = [*command, str(wrapper), "-Wl,--wrap=cudaMalloc", "-Wl,--wrap=cudaFree",
-             "-Wl,--wrap=cudaStreamSynchronize", *flags, "-o", str(wrapped)]
+             "-Wl,--wrap=cudaFreeAsync", "-Wl,--wrap=cudaStreamSynchronize", *flags,
+             "-o", str(wrapped)]
     native.write_json(out / "link.json", [compile_wrapper, clean, fault])
     for step in (compile_wrapper, clean, fault):
         subprocess.run(step, cwd=args.source, check=True)
@@ -405,9 +421,9 @@ def check_fault(port, evidence, marker, log, case):
         assert health == 200, health
         check_caps(json.loads(caps), DEFAULT_ACTIVE, DEFAULT_TOKENS)
         messages = log.read_text()
-        assert messages.count("test: first KV payload allocated bytes=16777216\n") == 1
+        assert messages.count("test: KV page table allocated bytes=32\n") == 1
         code = 700 if case == "kv-context" else 2
-        fault_line = f"test: second KV payload fault bytes=16777216 status={code}\n".encode()
+        fault_line = f"test: KV allocation fault bytes=34603008 status={code}\n".encode()
         assert log.read_bytes().count(fault_line) == 1
         assert 500 <= status < 600 and b"[DONE]" not in body, (status, body)
         statuses = {"before": before[0], "fault": status, "fresh": after[0], "health": health}
@@ -423,7 +439,6 @@ def check_fault(port, evidence, marker, log, case):
         else:
             assert after == before, ("Fresh request must survive capacity failure", after)
             assert status == 503, (status, body)
-            assert messages.count("test: partial KV payload freed\n") == 1
             peer.choice(fixture["output"][1:2])
             after_fault = log.read_bytes().split(fault_line, maxsplit=1)[1]
             assert any(int(decode) > 0 for _, decode, _ in native.TRACE.findall(after_fault)), (
@@ -435,6 +450,12 @@ def check_fault(port, evidence, marker, log, case):
         reuse = exchange(port, evidence, "after-cancel", short)
         assert reuse == before, ("Cancelled slot must allow reuse", reuse)
         native.await_retirement(log, offset, DEFAULT_ACTIVE)
+        # Completed request blocks can remain in the recycler until the worker is idle.
+        freed = "test: partial KV page table freed\n"
+        deadline = time.monotonic() + 15
+        while freed not in log.read_text() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert log.read_text().count(freed) == 1, log
 
 
 def check_kv_fault(args, case):
@@ -468,6 +489,8 @@ def main():
     args.binary = args.binary.resolve()
     args.checkpoint = args.checkpoint.resolve()
     args.evidence = args.evidence.resolve()
+    if args.lmcache_socket:
+        args.lmcache_socket = args.lmcache_socket.resolve()
     selected = args.case or [name for name in checks if name != "pressure"
                              and (name != "eager-cache" or args.lmcache_socket)]
     if "eager-cache" in selected and not args.lmcache_socket:

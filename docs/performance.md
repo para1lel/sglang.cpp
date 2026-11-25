@@ -19,7 +19,7 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 Use MTP4, 32,768 tokens per step, eight slots per GPU, and cold prefixes.
 
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-scheduled-tokens 32768` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
-- **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon with 64 GiB CPU L1 on the same physical GPU. [Daemon launcher](../benchmarks/paired/lmcache_arm.sh#L26)<!-- prefix: "start_lmcach" -->
+- **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon with 64 GiB CPU L1 on the same physical GPU. [Daemon launcher](../benchmarks/paired/lmcache_arm.sh#L35)<!-- prefix: "start_lmcach" -->
 
 The pinned vLLM arm uses its local prefix cache. Verify `kv_transfer=false` and `kv_offloading_size=null` in the worker receipt. The same check requires zero CPU weight offload. [Worker receipt check](../benchmarks/paired/saved_evidence.py#L223)<!-- prefix: "and worker[\"" -->
 
@@ -154,13 +154,13 @@ To isolate layer-major verification, compare with row-wise MTP at the same depth
 
 Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. The W3-MTP variant uses four 8,192-token prompts with 1,024 outputs each. Its K1 start exceeds the verification graph's visible limit. [W3-MTP fixture](../benchmarks/variants/README.md) · [Graph limit](mtp.md#target-verification-graph)
 
-Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L242)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L190)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L927)<!-- prefix: "result.mtp_r" -->
+Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L242)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L190)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L949)<!-- prefix: "result.mtp_r" -->
 
 Use `--trace-batches` at any capacity in a separate run. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder_verify.cpp#L312)<!-- prefix: "bool MtpRoun" -->
 
 Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../include/sglang/server/batch_trace.h#L14)<!-- prefix: "inline void " -->
 
-See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L924)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L837)<!-- prefix: "if (stats) c" -->
+See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L946)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L847)<!-- prefix: "if (stats) c" -->
 
 ## Correctness, memory, and diagnosis
 

@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 from threading import Barrier
+from uuid import uuid4
 
+from live_controls import STORES, Controls
 from routes import MODEL, Routes
 
 
@@ -76,19 +78,32 @@ def check(routes, name, case, hit, salt=None, stream=False):
 
 
 def warm(routes, cases, reference):
+    controls = Controls(routes.port, routes.directory)
+    salts = {name: uuid4().hex for name in ("text", "chat", "unseen")}
+
+    def prime(case, domain):
+        route, body, _ = cases[case]
+        request = {key: value for key, value in body.items() if key != "ebnf"}
+        request.update(max_tokens=1, cache_salt=salts[domain])
+        baseline = controls.wait_for(f"{domain}-cold-idle", 0, 0, stores=0)[STORES]
+        routes.raw(f"prime-{domain}", request, route=route)
+        controls.wait_for(f"{domain}-prime-stored", 0, 0, stores=baseline + 1)
+
     def verify(name, case, hit, salt, stream=False):
-        actual = check(routes, name, cases[case], hit, salt, stream)
+        actual = check(routes, name, cases[case], hit, salts[salt], stream)
         assert actual == reference[case], (name, actual, reference[case])
         return actual
 
     text_hit = reference["exact"]["prompt"]
     chat_hit = reference["chat"]["prompt"]
     verify("cold-exact", "exact", 0, "text")
+    prime("exact", "text")
     verify("warm-exact", "exact", text_hit, "text", True)
     verify("cold-chat", "chat", 0, "chat")
+    prime("chat", "chat")
     verify("warm-chat", "chat", chat_hit, "chat", True)
     route, body, _ = cases["exact"]
-    invalid = body | {"cache_salt": "text", "ebnf": "root ::= [a-z]"}
+    invalid = body | {"cache_salt": salts["text"], "ebnf": "root ::= [a-z]"}
     routes.raw("invalid-grammar", invalid, code=400, route=route)
     verify("after-invalid", "exact", text_hit, "text")
 

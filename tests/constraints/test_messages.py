@@ -12,10 +12,13 @@ import socket
 import struct
 import sys
 from unittest.mock import patch
+from uuid import uuid4
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "text"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
 
+from live_controls import STORES, Controls
 from run_chat_layer1 import server
 from test_native_chat import CHAT, CHECKPOINT, MODEL, json_response, request
 
@@ -288,13 +291,17 @@ def exercise(port, mode):
     return result
 
 
-def cache(port):
-    payload = body(max_tokens=2, cache_salt="messages-1", messages=[{
+def cache(port, out):
+    controls = Controls(port, out)
+    payload = body(max_tokens=2, cache_salt=uuid4().hex, messages=[{
         "role": "user", "content": "blue green orange pink " * 45 + "Say one color.",
     }])
     cold = json_response(port, ROUTE, payload)["usage"]
+    baseline = controls.wait_for("messages-cold-idle", 0, 0, stores=0)[STORES]
+    json_response(port, ROUTE, payload | {"max_tokens": 1})
+    controls.wait_for("messages-prime-stored", 0, 0, stores=baseline + 1)
     hot = stream(port, payload)[0]["message"]["usage"]
-    different = json_response(port, ROUTE, payload | {"cache_salt": "messages-2"})["usage"]
+    different = json_response(port, ROUTE, payload | {"cache_salt": uuid4().hex})["usage"]
     assert hot["cache_read_input_tokens"] > 0 and hot["output_tokens"] == 0
     assert cold == different
     assert hot["input_tokens"] + hot["cache_read_input_tokens"] == cold["input_tokens"]
@@ -348,7 +355,7 @@ def main():
                    else ("--prefix-cache-entries", "0"))
     with server(args.binary, CHECKPOINT, args.out / "server", 1,
                 flags=PARSERS + cache_flags, mtp=args.mtp, graph=args.live) as port:
-        result = {"cache": cache(port)} if args.lmcache_socket else exercise(
+        result = {"cache": cache(port, args.out)} if args.lmcache_socket else exercise(
             port, "live" if args.live else "cpu",
         )
     if not args.live and not args.lmcache_socket:

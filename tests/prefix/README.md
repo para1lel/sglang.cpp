@@ -46,14 +46,16 @@ At exactly 8,192 prompt tokens, the length and text-stop routes each publish one
 
 ## Device state and graph controls
 
-Use the managed Pixi default environment, current Release archives, pinned checkpoint, and a reserved B200. Start the [LMCache daemon](../../docs/serving/lmcache.md#start-the-daemon) on the same GPU with namespace `sglang`. Pass its socket and a fresh evidence directory.
+Use the managed Pixi default environment, pinned checkpoint, and a reserved B200. Set `release_build` to the Release build directory containing the native archives under `lib/`. Start the [LMCache daemon](../../docs/serving/lmcache.md#start-the-daemon) on the same GPU with namespace `sglang`. Pass its socket and a fresh evidence directory.
 
 ```bash
 GPU_UUID="$GPU_UUID" LMCACHE_SOCKET="$LMCACHE_SOCKET" \
-    bash tests/prefix/run_lmcache_state.sh "$out" "$checkpoint" "$evidence"
+    bash tests/prefix/run_lmcache_state.sh "${release_build:?set the Release build directory}" "$checkpoint" "$evidence"
 ```
 
-Require `PASS` in both `state.log` and `graph.log`. The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks periodic views across allocation growth and a failed store, and verifies that terminal views incur no copy while retaining source blocks after retirement. It also checks single-charge accounting, queues a periodic copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. The graph check advances a K0 or K1 peer while a checkpoint transfer is held, then compares native state and continuation scores with the control. [Device runner](run_lmcache_state.sh#L4)<!-- prefix: "build=$(real" --> · [Periodic view](lmcache_state.cpp#L516)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L539)<!-- prefix: "void check_t" --> · [Accounting](lmcache_state.cpp#L583)<!-- prefix: "void check_d" --> · [Delayed copy](lmcache_state.cpp#L616)<!-- prefix: "void check_d" --> · [Copy failure](lmcache_state.cpp#L669)<!-- prefix: "void check_c" -->
+Require `PASS` in both `state.log` and `graph.log`. The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks periodic views across allocation growth and a failed store, and verifies that terminal views incur no copy while retaining source blocks after retirement. It also checks single-charge accounting, queues a periodic copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. The graph check advances a K0 or K1 peer while a checkpoint transfer is held, then compares native state and continuation scores with the control. [Device runner](run_lmcache_state.sh#L4)<!-- prefix: "build=$(real" --> · [Periodic view](lmcache_state.cpp#L538)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L561)<!-- prefix: "void check_t" --> · [Accounting](lmcache_state.cpp#L605)<!-- prefix: "void check_d" --> · [Delayed copy](lmcache_state.cpp#L671)<!-- prefix: "void check_d" --> · [Copy failure](lmcache_state.cpp#L724)<!-- prefix: "void check_c" -->
+
+The state fixture also injects `cudaErrorNotSupported` and `cudaErrorInvalidValue` during detached-block release. Only the unsupported operation permits a synchronous free and releases the byte charge. For direct K1 generation, the graph fixture exercises a restored hit and a cold restart after an exceptional GET, compares their output IDs with cache-off generation, and waits for the deferred terminal STORE receipt. A failed STORE must surface through its receipt and leave the successful-store count at zero.
 
 ## Historical resident-cache checks
 

@@ -16,7 +16,7 @@ for name in state graph; do
     wrap=()
     if [[ $name == state ]]; then
         wrap=(-Wl,--wrap="$append" -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaFreeAsync
-              -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord)
+              -Wl,--wrap=cudaFree -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord)
     fi
     "${CXX:-c++}" -std=c++17 -O3 -pthread -Iinclude -I"$toolkit/include" \
         "tests/prefix/lmcache_$name.cpp" src/runtime/cache/lmcache_client.cpp \

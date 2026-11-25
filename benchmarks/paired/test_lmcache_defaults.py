@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -393,3 +394,91 @@ def test_direct_pinned_replay_requires_solo_worker(direct_receipt):
     (run / "compute-measurement-end.csv").write_text(process_line(36) + process_line(35))
     with pytest.raises(ValueError, match="exactly compute PIDs"):
         lmcache_evidence.pinned(run, DIRECT, 36)
+
+
+def test_process_owns_receipt_before_starting_command(tmp_path):
+    paired = Path(__file__).resolve().parent
+    script = '''
+set -eu
+source "$1/common.sh"
+launch_session /dev/full touch "$2/started" &
+pid=$!
+if wait "$pid"; then exit 1; fi
+[[ ! -e $2/started ]]
+launch_session "$2/pid" bash -c '
+    trap "wait; exit" TERM
+    sleep 30 &
+    echo "$!" > "$1/child"
+    wait
+' bash "$2" &
+pid=$!
+trap 'stop_session "$pid"' EXIT
+for ((i = 0; i < 100; ++i)); do
+    [[ ! -s $2/child ]] || break
+    sleep .02
+done
+read -r receipt < "$2/pid"
+read -r child < "$2/child"
+[[ $receipt == "$pid" && $(ps -o sid= "$child") -eq $pid ]]
+stop_session "$pid"
+trap - EXIT
+! kill -0 -- "-$pid" 2>/dev/null
+'''
+    subprocess.run(["bash", "-c", script, "bash", str(paired), str(tmp_path)],
+                   check=True, timeout=18)
+
+
+@pytest.mark.parametrize("before_setsid", [False, True])
+def test_stop_session_before_command_exec(tmp_path, before_setsid):
+    paired = Path(__file__).resolve().parent
+    receipt = tmp_path / "pid"
+    environment = os.environ.copy()
+    if before_setsid:
+        wrapper = tmp_path / "python"
+        wrapper.write_text('#!/bin/sh\necho waiting > "$PAUSE_FIFO.ready"\n'
+                           'read -r _ < "$PAUSE_FIFO"\n')
+        wrapper.chmod(0o700)
+        environment.update(PAIRED_CLIENT_PYTHON=str(wrapper), PAUSE_FIFO=str(receipt))
+    os.mkfifo(receipt)
+    script = '''
+set -eu
+source "$1/common.sh"
+launch_session "$2/pid" touch "$2/started" &
+pid=$!
+trap 'stop_session "$pid"' EXIT
+for ((i = 0; i < 100; ++i)); do
+    sid=$(ps -o sid= "$pid")
+    if [[ -n ${PAUSE_FIFO:-} && -s $2/pid.ready ]] || [[ $sid -eq $pid ]]; then break; fi
+    sleep .02
+done
+if [[ -n ${PAUSE_FIFO:-} ]]; then
+    [[ -s $2/pid.ready && $sid -ne $pid ]]
+else
+    [[ $sid -eq $pid ]]
+fi
+stop_session "$pid"
+trap - EXIT
+[[ ! -d /proc/$pid && ! -e $2/started ]]
+'''
+    subprocess.run(["bash", "-c", script, "bash", str(paired), str(tmp_path)],
+                   check=True, env=environment, timeout=10)
+
+
+def test_lmcache_path_resolution_survives_arm_directory_change(tmp_path):
+    paired = Path(__file__).resolve().parent
+    for directory, value in [("deps", "verified"), ("arm/deps", "wrong")]:
+        package = tmp_path / directory / "lmcache"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(f"identity = '{value}'\n")
+    script = '''
+set -eu
+source "$1/common.sh"
+source "$1/lmcache_arm.sh"
+[[ -z $(resolve_lmcache_pythonpath "") ]]
+path=$(resolve_lmcache_pythonpath "deps::/opt/site")
+[[ $path == "$PWD/deps:$PWD:/opt/site" ]]
+cd arm
+PYTHONPATH="$path" "$client_python" -sPB -c 'import lmcache; assert lmcache.identity == "verified"'
+'''
+    subprocess.run(["bash", "-c", script, "bash", str(paired)], cwd=tmp_path,
+                   check=True, timeout=10)

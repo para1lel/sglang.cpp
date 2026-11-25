@@ -73,6 +73,12 @@ public:
         changed_.notify_all();
     }
 
+    void wait_released(const Gate& gate) {
+        std::unique_lock lock(mutex_);
+        require(changed_.wait_for(lock, timeout, [&] { return gate.released; }),
+                "Shutdown did not stop restores before joining completion workers");
+    }
+
     void record(Gate& gate, bool sent) {
         const std::lock_guard lock(mutex_);
         gate.sent = sent;
@@ -114,6 +120,7 @@ struct BufferedBurst {
 
 Gates gates;
 Gate reset_ack;
+Gate restore_stop;
 std::atomic<bool> delay_reset{false};
 std::atomic<int> cache_resets{0};
 std::atomic<bool> worker_failed{false};
@@ -139,6 +146,7 @@ std::optional<std::vector<DecoderResult>> BatchService::generate_batch(
 }
 
 bool BatchService::ready() const { return !worker_failed; }
+void BatchService::stop_cache_restores() noexcept { gates.release(restore_stop); }
 
 bool BatchService::wait_for_generation(Clock::time_point, Clock::time_point,
                                        const std::function<bool()>& cancelled) {
@@ -623,6 +631,7 @@ void check_shutdown(Server& server, bool reader_failure) {
     const auto wake = server.submit({});
     require(read_closed(queued).empty(), "Shutdown delivered a queued response");
     require(read_closed(partial).empty(), "Shutdown did not close the incomplete request");
+    gates.wait_released(restore_stop);
     require(!server.returned(), "Serving returned while completion gates were held");
     gates.release(server.gate(last_first));
     gates.release(server.gate(last_second));

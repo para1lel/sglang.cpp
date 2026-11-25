@@ -142,6 +142,7 @@ public:
     generate_batch(int slot, const std::vector<BatchPrompt>& prompts,
                    const BatchCallbacks& callbacks);
     void notify_abort();
+    void stop_cache_restores() noexcept;
     bool ready() const;
     bool wait_for_generation(std::chrono::steady_clock::time_point started,
                              std::chrono::steady_clock::time_point deadline,

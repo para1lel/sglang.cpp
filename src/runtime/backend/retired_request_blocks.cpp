@@ -33,7 +33,7 @@ struct RetiredBlockReclaimer::State {
                     quarantined += block.bytes;
                     continue;
                 }
-                const auto status = cudaFreeAsync(block.pointer, stream);
+                const auto status = release_cuda_block(block.pointer, stream);
                 if (status == cudaSuccess) {
                     released += block.bytes;
                 } else {

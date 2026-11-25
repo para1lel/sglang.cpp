@@ -43,6 +43,7 @@ BatchService::State::~State() {
         closing = true;
         for (auto& job : jobs) if (job) cancel_cache_read(*job);
     }
+    if (lmcache) lmcache->stop_restores();
     changed.notify_all();
     executor->join();
     lmcache.reset();
@@ -682,6 +683,10 @@ BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, 
 }
 
 BatchService::~BatchService() = default;
+
+void BatchService::stop_cache_restores() noexcept {
+    if (state_->lmcache) state_->lmcache->stop_restores();
+}
 
 bool BatchService::ready() const { return !state_->failed.load(); }
 

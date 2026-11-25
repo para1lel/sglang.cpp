@@ -1,11 +1,15 @@
 #include "sglang/runtime/server/batch_cache.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <sys/eventfd.h>
+#include <system_error>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -18,6 +22,23 @@ using Clock = std::chrono::steady_clock;
 std::uint64_t elapsed(Clock::time_point start) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
 }
+
+class RestoreStop {
+public:
+    RestoreStop() : fd(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {
+        if (fd < 0) throw std::system_error(errno, std::generic_category(), "restore eventfd");
+    }
+    ~RestoreStop() { close(fd); }
+    RestoreStop(const RestoreStop&) = delete;
+    RestoreStop& operator=(const RestoreStop&) = delete;
+
+    void signal() const noexcept {
+        // All GET workers observe the same latched event. None consumes it.
+        while (eventfd_write(fd, 1) < 0 && errno == EINTR) {}
+    }
+
+    const int fd;
+};
 
 struct StoreReservations {
     explicit StoreReservations(int limit) : limit(limit) {}
@@ -146,6 +167,7 @@ struct BatchCache::State {
     std::atomic_uint64_t misses{0}, errors{0}, stores{0}, declined{0}, gqa_written{0};
     std::atomic_uint64_t lookup_ns{0}, write_ns{0}, restore_ns{0};
     std::shared_ptr<StoreReservations> reservations;
+    RestoreStop restore_stop;
     Tasks readers, restores, stores_queue;
 };
 
@@ -188,7 +210,8 @@ std::shared_future<bool> BatchCache::restore(std::shared_ptr<const PrefixCacheKe
         bool success = false;
         try {
             LmCacheReceipt receipt;
-            const auto status = state->client->retrieve(*keys, view, &receipt);
+            const auto status = state->client->retrieve(*keys, view, &receipt,
+                                                        state->restore_stop.fd);
             success = state->record(status, receipt, true);
         } catch (const std::exception&) {
             ++state->errors;
@@ -244,6 +267,8 @@ void BatchCache::store(const PrefixCacheKeys& keys, PrefixDeviceTransfer&& view,
 }
 
 void BatchCache::wake_readers() { state_->readers.discard_cancelled(); }
+
+void BatchCache::stop_restores() noexcept { state_->restore_stop.signal(); }
 
 void BatchCache::reset() {
     state_->readers.drain();

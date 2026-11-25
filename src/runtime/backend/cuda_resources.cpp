@@ -71,7 +71,7 @@ struct ExportedDeviceBlock {
                 }
             }
             DeviceScope scope(device);
-            auto status = cudaFreeAsync(block.pointer, cudaStreamPerThread);
+            auto status = release_cuda_block(block.pointer, cudaStreamPerThread);
             if (status == cudaSuccess && bytes) status = cudaStreamSynchronize(cudaStreamPerThread);
             report_cleanup(status, "Release detached decoder allocation");
             if (status == cudaSuccess && bytes) {

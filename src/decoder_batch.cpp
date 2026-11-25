@@ -13,6 +13,8 @@
 #include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/tc_vocab.h"
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <utility>
 namespace sglang {
 namespace {
@@ -401,7 +403,15 @@ DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int slot) {
             retire(lane);
             return {};
         }
-        if (prefix.completion.get()) {
+        bool transferred = false;
+        try {
+            transferred = prefix.completion.get();
+        } catch (const CudaError&) {
+            throw;
+        } catch (...) {
+            // The transfer has ended. Reset any partially restored state before cold prefill.
+        }
+        if (transferred) {
             const int restored = commit_restored_prefix(*lane->request, prefix.command,
                                                         lane->draft.get());
             state_->finish_restore(*lane, restored);
@@ -916,7 +926,19 @@ void DecoderBatch::generate_mtp(const std::vector<int>& prompt, const DecoderOpt
     }
     result.output_token_ids.reserve(options.max_new_tokens);
     const auto model_bytes = result.peak_device_allocation_bytes;
-    while (!state_->cancelled()) {
+    const auto& lane = state_->storage->slots[0];
+    bool prefix_pending = bool(lane->prefix);
+    bool completion_claimed = false;
+    while (completion_claimed || !state_->cancelled()) {
+        if (prefix_pending) {
+            const auto update = poll_prefix(0);
+            if (update.pending) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (update.restored) result.cached_prompt_tokens = *update.restored;
+            if (!lane) return;  // Submitting a deferred terminal STORE retires the slot.
+        }
         DecoderBatchStepStats stats;
         const auto step = advance_chunked({true}, &stats).front();
         if (step.sampling_failed) throw DecoderSamplingError();
@@ -927,9 +949,11 @@ void DecoderBatch::generate_mtp(const std::vector<int>& prompt, const DecoderOpt
         result.mtp_rounds += step.mtp_drafted_tokens > 0;
         result.mtp_accepted_tokens += step.mtp_accepted_tokens;
         result.mtp_drafted_tokens += step.mtp_drafted_tokens;
+        prefix_pending = step.prefix_pending;
         if (step.finish_reason) {
             result.finish_reason = *step.finish_reason;
-            return;
+            if (!prefix_pending) return;
+            completion_claimed = bool(options.claim_completion);
         }
     }
     cancel(0);

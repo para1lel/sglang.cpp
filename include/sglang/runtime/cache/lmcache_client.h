@@ -67,8 +67,9 @@ public:
                         LmCacheReceipt* receipt = nullptr) const;
     LmCacheStatus store_prepared(std::string_view metadata,
                                  LmCacheReceipt* receipt = nullptr) const;
+    // A readable stop_fd interrupts the GET. Keep it open through lease reconciliation.
     LmCacheStatus retrieve(const PrefixCacheKeys& keys, const PrefixDeviceTransfer& transfer,
-                           LmCacheReceipt* receipt = nullptr) const;
+                           LmCacheReceipt* receipt = nullptr, int stop_fd = -1) const;
     void reset() const;
 
 private:

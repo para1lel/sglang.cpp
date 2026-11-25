@@ -58,6 +58,7 @@ public:
                std::shared_ptr<void> reservation, std::shared_ptr<std::atomic_uint64_t> stores,
                std::function<void()> done);
     void wake_readers();
+    void stop_restores() noexcept;
     void reset();
     LmCacheMetrics metrics() const;
 

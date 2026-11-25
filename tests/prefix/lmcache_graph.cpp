@@ -25,7 +25,8 @@ public:
         if (!armed_) return;
         held_ = true;
         changed_.notify_all();
-        changed_.wait_for(lock, 20s, [this] { return !armed_; });
+        if (!changed_.wait_for(lock, 20s, [this] { return !armed_; }))
+            throw std::runtime_error("Checkpoint STORE timed out before explicit release");
     }
 
     bool await() {
@@ -183,7 +184,8 @@ void cancelled_boundary(Decoder& model, const LmCacheClient& cache) {
     Selection selected{};
     selected[0] = true;
     for (const bool text_stop : {false, true}) {
-        const std::string salt = text_stop ? "boundary-stop-abort" : "boundary-length-abort";
+        const auto salt = prefix_fixture::run_salt(text_stop ? "boundary-stop-abort" :
+                                                               "boundary-length-abort");
         server::BatchRequestId id(salt);
         require(id.dispatch(), "Boundary request was not dispatched");
         DecoderOptions options;
@@ -219,6 +221,80 @@ void cancelled_boundary(Decoder& model, const LmCacheClient& cache) {
         require(match.gdn == 0 && match.gqa == 0, "Cancelled endpoint reached the daemon");
         std::cout << salt << " rows " << rows << " claims " << claims << " stores 0\n";
     }
+}
+
+void synchronous_mtp(const Decoder& model, const LmCacheClient& cache,
+                     const std::vector<int>& prompt, const std::string& salt) {
+    DecoderOptions options;
+    options.max_new_tokens = 4;
+    options.ignore_eos = true;
+    options.mtp_steps = 1;
+    const auto cold = model.generate(prompt, options);
+    const int end = static_cast<int>(prompt.size());
+    options.prefix_cache_read = prefix_fixture::read_checkpoint(cache, prompt, salt, end, true);
+    const PrefixCacheKeys keys(prompt, salt);
+    for (const bool fail_restore : {false, true}) {
+        const auto output_salt = prefix_fixture::run_salt(
+            fail_restore ? "sync-restart" : "sync-hit");
+        const auto stores = prefix_fixture::attach(options, cache, prompt, output_salt);
+        int restores = 0, reservations = 0;
+        options.restore_prefix = [&](const PrefixDeviceTransfer& view) {
+            ++restores;
+            require(cache.retrieve(keys, view) == LmCacheStatus::complete,
+                    "Could not populate the synchronous MTP restore destination");
+            std::promise<bool> completion;
+            if (fail_restore) {
+                completion.set_exception(std::make_exception_ptr(std::runtime_error("GET failed")));
+            } else {
+                completion.set_value(true);
+            }
+            return completion.get_future().share();
+        };
+        options.reserve_prefix_store = [&](std::shared_ptr<void>&) { return ++reservations >= 3; };
+        bool claimed = false;
+        options.claim_completion = [&] {
+            claimed = true;
+            return true;
+        };
+        DecoderCallbacks callbacks;
+        const auto deadline = std::chrono::steady_clock::now() + 20s;
+        callbacks.is_cancelled = [&] {
+            return claimed || std::chrono::steady_clock::now() >= deadline;
+        };
+        const auto result = model.generate(prompt, options, callbacks);
+        require(claimed && restores == 1 &&
+                result.cached_prompt_tokens == (fail_restore ? 0 : end) &&
+                result.finish_reason == DecoderFinishReason::length && result.mtp_rounds > 0 &&
+                result.output_token_ids == cold.output_token_ids,
+                "Synchronous MTP restore or cold restart changed generation");
+        require(reservations == 3 && stores->receipts.size() == 1,
+                "Synchronous MTP lost the deferred terminal STORE");
+        stores->wait();
+        auto history = prompt;
+        history.insert(history.end(), result.output_token_ids.begin(),
+                       result.output_token_ids.end() - 1);
+        prefix_fixture::read_checkpoint(cache, history, output_salt, int(history.size()), true);
+    }
+    DecoderBatch batch(model, {.max_lanes = 1});
+    DecoderOptions failed;
+    failed.mtp_steps = 1;
+    failed.prefix_cache_read = options.prefix_cache_read;
+    failed.restore_prefix = [](const PrefixDeviceTransfer&) {
+        std::promise<bool> completion;
+        completion.set_exception(std::make_exception_ptr(
+            CudaError(cudaErrorInvalidValue, "Injected CUDA restore failure")));
+        return completion.get_future().share();
+    };
+    batch.admit(0, prompt, failed);
+    bool propagated = false;
+    try {
+        batch.poll_prefix(0);
+    } catch (const CudaError& error) {
+        propagated = error.status == cudaErrorInvalidValue;
+    }
+    require(propagated, "CUDA restore failure did not propagate");
+    std::cout << "synchronous K1 hit and exceptional GET restart, exact cold IDs, "
+                 "deferred STORE acknowledged\n";
 }
 
 void failed_store_receipt(Decoder& model, const std::vector<int>& prompt) {
@@ -265,8 +341,8 @@ int main(int argc, char** argv) try {
         step(batch, 1, depth, false, false);
         step(batch, 1, depth, false, true);
 
-        const auto unheld_salt = "graph-unheld-K" + std::to_string(depth);
-        const auto held_salt = "graph-held-K" + std::to_string(depth);
+        const auto unheld_salt = prefix_fixture::run_salt("graph-unheld-K" + std::to_string(depth));
+        const auto held_salt = prefix_fixture::run_salt("graph-held-K" + std::to_string(depth));
         const auto baseline = capture(batch, cache, prompt, unheld_salt, depth, false);
         const auto overlap = capture(batch, cache, prompt, held_salt, depth, true);
         batch.cancel(1);
@@ -276,6 +352,7 @@ int main(int argc, char** argv) try {
                                                memory.stream());
         const auto actual = persisted_state(cache, overlap.history, held_salt, memory.stream());
         require(reference == actual, "Held graph export corrupted GQA/GDN or hidden/residual");
+        if (depth == 1) synchronous_mtp(model, cache, baseline.history, unheld_salt);
 
         constexpr int count = 5;
         const auto cold = generate(batch, cache, prompt, count + 1, "", depth == 0);

@@ -5,7 +5,6 @@ import re
 import select
 import socket
 import socketserver
-import stat
 import struct
 import threading
 import time
@@ -22,6 +21,7 @@ from lmcache.v1.distributed.storage_manager import _L1_WRITE_TAG, l1_owners_of
 from lmcache.v1.multiprocess.engine_module import DiscoverableModule
 
 from sglang_gpu_transfer import DIGEST_BYTES, GDN_END, PREFIX_CHUNK, DeviceCopies, Transfer
+from sglang_socket import OwnedUnixStreamServer
 
 
 VERSION = "0.5.8"
@@ -514,7 +514,7 @@ class Records:
         return 0, struct.pack("!QQQI", *tally, tokens)
 
 
-class SocketServer(socketserver.UnixStreamServer):
+class SocketServer(OwnedUnixStreamServer):
     request_queue_size = 64
 
     def __init__(self, endpoint, namespace, records):
@@ -530,9 +530,6 @@ class SocketServer(socketserver.UnixStreamServer):
         # Armed GPU operations cannot occupy every worker needed to report lease status.
         self.gpu_slots = threading.BoundedSemaphore(WORKERS - 4)
         super().__init__(endpoint, Handler)
-        info = os.stat(endpoint, follow_symlinks=False)
-        self.socket_identity = (info.st_dev, info.st_ino)
-        os.chmod(endpoint, 0o600, follow_symlinks=False)
 
     def verify_request(self, request, _address):
         credentials = request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
@@ -602,14 +599,11 @@ class SocketServer(socketserver.UnixStreamServer):
 
     def close(self):
         self.shutdown()
-        self.server_close()
         self.pool.shutdown()
         try:
-            info = os.stat(self.server_address, follow_symlinks=False)
-            if stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) == self.socket_identity:
-                os.unlink(self.server_address)
-        except FileNotFoundError:
-            pass
+            self.close_endpoint()
+        except FileExistsError:
+            LOG.warning("LMCache endpoint was replaced: %s", self.server_address)
 
 
 class Handler(socketserver.BaseRequestHandler):

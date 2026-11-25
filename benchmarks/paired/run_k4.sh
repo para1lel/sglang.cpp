@@ -103,14 +103,14 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 validate_run_settings
 if [[ $lmcache == true ]]; then
     source "$paired_dir/lmcache_arm.sh"
-    lmcache_pid= lmcache_launch_pid= lmcache_runtime=
+    lmcache_pid= lmcache_runtime= lmcache_socket_id=
     lmcache_launcher=$(realpath -e -- "$project/tools/lmcache/serve.sh")
     lmcache_sources=(
         "$project/tools/lmcache/"{serve.sh,sglang_lmcache.py}
-        "$project/tools/lmcache/"{sglang_gpu_transfer.py,requirements.txt}
+        "$project/tools/lmcache/"{sglang_gpu_transfer.py,sglang_socket.py,requirements.txt}
     )
     lmcache_python=$(realpath -es -- "${PAIRED_LMCACHE_PYTHON:?Set the LMCache 0.5.8 interpreter}")
-    lmcache_pythonpath=${PAIRED_LMCACHE_PYTHONPATH:-}
+    lmcache_pythonpath=$(resolve_lmcache_pythonpath "${PAIRED_LMCACHE_PYTHONPATH:-}")
     lmcache_wheel=$(realpath -e -- "${PAIRED_LMCACHE_WHEEL:?Set the official LMCache 0.5.8 wheel}")
     [[ -x $lmcache_python ]]
     lmcache_port=${PAIRED_LMCACHE_PORT:-17524}

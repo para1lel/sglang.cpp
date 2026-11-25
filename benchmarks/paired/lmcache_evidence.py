@@ -28,6 +28,7 @@ WHEEL_SHA256 = "4ec775bda3a8c5f1f5b1ef0bbc441b666db86b57c3c2a7bcba47a4f6550b07cd
 def ready(path, pid, wire="SLC2"):
     expected_magic = wire.encode()
     expected = (LMCACHE_SLC3_READY if wire == "SLC3" else LMCACHE_VERSION).encode()
+    before = os.lstat(path)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(1)
         connection.connect(str(path))
@@ -45,12 +46,14 @@ def ready(path, pid, wire="SLC2"):
             require((magic, status, size) == (expected_magic, 0, len(expected))
                     and payload == expected and reply.read(1) == b"",
                     "Unexpected LMCache readiness response")
+    require(os.path.samestat(before, os.lstat(path)), "LMCache readiness endpoint was replaced")
     stat = (Path("/proc") / str(peer) / "stat").read_text().rsplit(")", 1)[1].split()
     receipt = {"socket": str(path), "version": LMCACHE_VERSION, "namespace": "sglang",
                "group_pid": pid, "peer_pid": peer, "peer_uid": uid,
                "peer_start_ticks": int(stat[19]), "frame": (header + payload).hex()}
     if wire == "SLC3":
-        receipt.update(wire=wire, ready_version=payload.decode())
+        receipt.update(wire=wire, ready_version=payload.decode(),
+                       socket_id=f"{before.st_dev}:{before.st_ino}")
     return receipt
 
 
@@ -113,7 +116,7 @@ dist = distribution('lmcache')
 print(json.dumps([dist.version, str(dist.locate_file('')), find_spec('lmcache').origin]))
 """
     version, site, origin = json.loads(subprocess.check_output(
-        [python, "-B", "-c", script], env={"PATH": "/usr/bin:/bin", "PYTHONPATH": pythonpath},
+        [python, "-sPB", "-c", script], env={"PATH": "/usr/bin:/bin", "PYTHONPATH": pythonpath},
         text=True))
     require(version == LMCACHE_VERSION and Path(origin).resolve() ==
             (Path(site) / "lmcache/__init__.py").resolve(),
@@ -177,8 +180,11 @@ def verify_gpu(run, identity, daemon, argv, launch_log):
             "LMCache daemon Python environment differs from the verified installation")
     source = hash_manifest(run / "lmcache-source.sha256")
     expected = hash_manifest(run.parent / "protocol.sha256")
+    sources = DAEMON_SOURCES
+    if "tools/lmcache/sglang_socket.py" in expected:
+        sources += ("sglang_socket.py",)
     require(source == {str(launcher.with_name(name)): expected.get(f"tools/lmcache/{name}")
-                       for name in DAEMON_SOURCES},
+                       for name in sources},
             "LMCache daemon sources differ from the campaign source manifest")
     process = (run / "lmcache-live-argv.bin").read_bytes().split(b"\0")
     args = list(map(os.fsdecode, process[:-1]))

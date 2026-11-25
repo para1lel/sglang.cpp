@@ -13,6 +13,7 @@ import subprocess
 import sys
 from threading import Barrier
 import time
+from uuid import uuid4
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -352,8 +353,11 @@ def check_queue_and_reset(args):
     flags = ("--batch-cuda-graphs", "--lmcache-socket", str(args.lmcache_socket))
     with server(args, output, 2, 0, flags=flags, token_budget=CACHE_BOUNDARY) as (port, _):
         controls = Controls(port, output)
-        body = LONG | {"prompt": checkpoint_prompt(), "cache_salt": "sampled-queue"}
+        body = LONG | {"prompt": checkpoint_prompt(), "cache_salt": uuid4().hex}
+        baseline = controls.metrics("before-cold")[STORES]
         wanted = transcript(post(port, TEXT, body))
+        require(wanted["usage"]["prompt_tokens_details"] == {"cached_tokens": 0}, wanted)
+        controls.wait_for("cold-stored", 0, 0, stores=baseline + 1)
         with ExitStack() as streams:
             active = [streams.enter_context(sampled_stream(port, body | {"max_tokens": 4096}))
                       for _ in range(2)]
@@ -372,7 +376,7 @@ def check_queue_and_reset(args):
                 stream.reset()
             replay = finish_stream(survivor)
             records = [stream.evidence() for stream in [*active, queued, survivor]]
-        before = controls.wait_for("retired", 0, 0)
+        before = controls.wait_for("retired", 0, 0, stores=baseline + 1)
         controls.reset("idle-reset")
         after = controls.metrics("after-reset")
         replay_after_reset = transcript(post(port, TEXT, body))
@@ -390,13 +394,17 @@ def check_eager_cache(args):
     output = args.evidence / "w1-eager-prefix"
     flags = ("--eager", "--lmcache-socket", str(args.lmcache_socket))
     prompt = checkpoint_prompt()
-    body = LONG | {"prompt": prompt + [31], "cache_salt": "sampled-eager"}
+    body = LONG | {"prompt": prompt + [31], "cache_salt": uuid4().hex}
     prime = body | {"prompt": prompt, "max_tokens": 1}
     with server(args, output, 1, 4, flags=flags, token_budget=CACHE_BOUNDARY) as (port, log):
-        cold_wire = post(port, TEXT, body | {"cache_salt": "cold"})
+        controls = Controls(port, output)
+        baseline = controls.metrics("before-cold")[STORES]
+        cold_wire = post(port, TEXT, body | {"cache_salt": uuid4().hex})
         cold = transcript(cold_wire)
         offset = log.stat().st_size
+        baseline = controls.wait_for("cold-stored", 0, 0, stores=baseline + 1)[STORES]
         prime_wire = post(port, TEXT, prime)
+        controls.wait_for("prime-stored", 0, 0, stores=baseline + 1)
         warm_begin = log.stat().st_size
         warm_wire = post(port, TEXT, body)
         warm = transcript(warm_wire)

@@ -190,8 +190,7 @@ cancellation releases all request bytes.
 
 The row-accounting cases use explicit cache-off controls. For the separate eager K4
 case, pass `--case eager-cache --lmcache-socket "$LMCACHE_SOCKET"` to `run_admission.py`
-with an isolated, ready [daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon). It checks an
-8,192-token checkpoint hit, identical completion, draft verification, and zero graph replays.
+with an isolated, ready [daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon). Each run uses separate salts for the cold and primed requests. The runner waits for checkpoint publication before checking the 8,192-token hit. It also checks deterministic output, draft activity, and zero graph replays.
 
 Run `run_admission.py --case pressure` separately for 32 requests with
 32,769 prompt IDs in total. The trace records actual work per iteration, which
@@ -213,14 +212,16 @@ The runner replays the recorded XMake link and verifies the unmodified
 executable byte for byte. A second link wraps CUDA allocation, release and
 stream synchronization.
 The server runs with its default limits. A four-token prompt and a 1,021-token
-output budget allocate eight KV pages. The probe allows the key payload
-allocation and injects a failure on the value payload allocation while a
-peer is decoding.
+output budget reserve eight KV pages. The probe allows the 32-byte page table
+allocation, then fails the combined 34,603,008-byte GQA key, value, and scale
+allocation while a peer is decoding.
 
-A capacity failure must return HTTP 503, release the partial allocation,
-and let the peer decode and a fresh request complete. The peer is then
-cancelled, and the runner checks that request bytes return to zero and a new
-stream succeeds. One terminal control injects the CUDA illegal-address
+A capacity failure must return HTTP 503, queue the page table for recycling,
+and let the peer decode and a fresh request complete. The runner cancels the
+peer, checks that request bytes return to zero, and verifies a new stream succeeds.
+Once the active lanes retire, the runner requires confirmed release of that page table on the GPU.
+A successful synchronous free suffices. An asynchronous free must also complete on its owning stream.
+One terminal control injects the CUDA illegal-address
 status at the same allocation. The other injects a memory allocation
 failure there, then reports an illegal address during stream synchronization.
 Both require HTTP 500 for the triggering and fresh requests and an SSE

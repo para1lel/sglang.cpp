@@ -7,10 +7,21 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
+#include <random>
 #include <stdexcept>
 #include <thread>
 
 namespace prefix_fixture {
+
+inline std::string run_salt(std::string label) {
+    static const std::string prefix = [] {
+        std::random_device random;
+        std::string nonce;
+        for (int i = 0; i < 4; ++i) nonce += std::to_string(random()) + '-';
+        return nonce;
+    }();
+    return prefix + label;
+}
 
 inline sglang::DecoderBatchPrefixUpdate wait(sglang::DecoderBatch& batch, int slot) {
     using namespace std::chrono_literals;

@@ -45,7 +45,7 @@ public:
             DeviceScope device(device_);
             const auto status = complete_producer();
             if (status == cudaSuccess) {
-                report(consume_prefix_error(cudaFreeAsync(data_, cudaStreamPerThread)));
+                report(consume_prefix_error(release_cuda_block(data_, cudaStreamPerThread)));
             } else {
                 report(status);
             }

@@ -5,6 +5,7 @@ from pathlib import Path
 import socket
 import socketserver
 import struct
+from tempfile import mkdtemp
 import threading
 from time import monotonic, perf_counter_ns, sleep
 
@@ -231,7 +232,8 @@ class Relay(socketserver.ThreadingUnixStreamServer):
             if phase == "reply":
                 self.entries.append(entry)
             barrier = self.barrier
-            if (barrier is None or barrier.entered.is_set() or entry["opcode"] != barrier.opcode
+            if (barrier is None or barrier.release.is_set() or barrier.entered.is_set()
+                    or entry["opcode"] != barrier.opcode
                     or phase != barrier.phase or entry["status"] != (4 if phase == "arm" else 0)
                     or (barrier.family is not None and
                         not any(family == barrier.family for family, _ in entry["keys"]))):
@@ -252,7 +254,9 @@ class Relay(socketserver.ThreadingUnixStreamServer):
 
     def arm(self, opcode, family=None, *, phase="reply", drop=False, skip=0):
         with self.guard:
-            if self.barrier is not None and not self.barrier.finished.is_set():
+            previous = self.barrier
+            if previous and not previous.finished.is_set() and (
+                    previous.entered.is_set() or not previous.release.is_set()):
                 raise ValueError("LMCache relay already has an outstanding barrier")
             self.barrier = Barrier(opcode, family, phase=phase, drop=drop, skip=skip)
             return self.barrier
@@ -260,6 +264,15 @@ class Relay(socketserver.ThreadingUnixStreamServer):
     def since(self, index=0):
         with self.guard:
             return [dict(entry) for entry in self.entries[index:]]
+
+
+def arm_device_fence(directory):
+    # Give each GET its own signals, including when reusing a daemon after a failed run.
+    attempt = Path(mkdtemp(prefix="get-", dir=directory))
+    marker = attempt / "arm"
+    marker.symlink_to(attempt.resolve())
+    marker.replace(directory / "arm")
+    return attempt
 
 
 def install_device_fence(directory):
@@ -285,14 +298,16 @@ def install_device_fence(directory):
             return
         with claim:
             armed = path / "arm"
-            if not armed.exists():
+            try:
+                attempt = armed.readlink()
+            except FileNotFoundError:
                 return
             armed.unlink()
-        (path / "entered").touch()
+        (attempt / "entered").touch()
         deadline = monotonic() + TIMEOUT
-        while not (path / "release").exists() and monotonic() < deadline:
+        while not (attempt / "release").exists() and monotonic() < deadline:
             sleep(0.01)
-        if not (path / "release").exists():
+        if not (attempt / "release").exists():
             raise TimeoutError("Real LMCache stream fence was not released")
 
     def gated_batch(*args):

@@ -23,7 +23,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tests"), str(ROOT / "benchmarks" / "paire
 from cold_cache import LMCACHE_DRAIN, LMCACHE_METRICS, PENDING_STORES, RUNNING, WAITING, metrics
 from media import http_routes as http
 from lmcache_relay import DRAFT, ERASE, GET, GDN, GQA, LEASE, LOOKUP, PREFIX, PUT, READY, RESET
-from lmcache_relay import Relay, control, key_body
+from lmcache_relay import Relay, arm_device_fence, control, key_body
 
 
 LOW, HIGH, PROMPT = 1279, 1391, 1536
@@ -596,7 +596,7 @@ def abort_armed_get(witness, fence, source, unrelated):
     witness.stores("prime-armed-abort", prime)
     peer = Stream(witness, "peer-during-armed-abort", peer_prompt, 512)
     _, peer_count = peer.progress()
-    (fence / "arm").touch(exist_ok=False)
+    fence = arm_device_fence(fence)
     gate = witness.relay.arm(GET, GQA, phase="arm", drop=True)
     subject = Stream(witness, "abort-armed-get", prompt, 8)
     try:
@@ -635,6 +635,40 @@ def abort_armed_get(witness, fence, source, unrelated):
             "daemon_pid": admission["daemon_pid"], "lease": admission["lease"],
             "reuse_ns": replacement_ns, "peer_progress_after_reuse_ns": reused_peer_ns,
             "replacement_cached_tokens": HIGH}
+
+
+def shutdown_armed_get(args, relay, relay_path, source):
+    prefix, prompt = source[:HIGH], source[:PROMPT]
+    with http.server_process(args, "armed-shutdown", "--lmcache-socket", str(relay_path),
+                             "--max-active", "1") as (port, _, process):
+        witness = Witness(port, args.evidence, args.daemon, relay)
+        witness.reset()
+        witness.stores("prime-armed-shutdown", prefix)
+        begin = len(relay.since())
+        gate = relay.arm(GET, GQA, drop=True)
+        fence = arm_device_fence(args.device_fence_dir)
+        subject = Stream(witness, "shutdown-armed-get", prompt, 8)
+        try:
+            wait_until((fence / "entered").exists, "Shutdown GET did not reach its GPU fence")
+            process.terminate()
+            active = wait_until(lambda: next((entry for entry in relay.since(begin)
+                                if entry["opcode"] == LEASE and entry["status"] == 4), None),
+                                "Stopping native server did not query the active lease")
+            assert process.poll() is None and not gate.entered.is_set()
+            (fence / "release").touch()
+            admission = gate.wait()
+            assert (active["incarnation"], active["lease"]) == (
+                admission["incarnation"], admission["lease"])
+            assert process.wait(timeout=10) == 0
+            released = matching_lease(witness, admission, 0)
+            assert released and witness.action(READY) == (0, b"0.5.8+native-v3")
+            subject.thread.join(5)
+            assert not subject.thread.is_alive()
+            return {"active_ns": active["reply_ns"], "released_ns": released["reply_ns"],
+                    "held_reply_ns": admission["reply_ns"], "exit_code": process.returncode}
+        finally:
+            (fence / "release").touch()
+            gate.release.set()
 
 
 def fresh_worker(args, relay, relay_path, source):
@@ -695,6 +729,8 @@ def exercise(args, relay, path, source, unrelated):
             two = Witness(port, args.evidence, args.daemon, relay)
             capture_case(report, failures, "cancelled_armed_get", abort_armed_get, two,
                          args.device_fence_dir, source, unrelated)
+        capture_case(report, failures, "shutdown_armed_get", shutdown_armed_get,
+                     args, relay, path, source)
     capture_case(report, failures, "fresh_worker", fresh_worker, args, relay, path, source)
     return report | {"failures": failures}
 
@@ -725,9 +761,10 @@ def exact_terminal(witness, source, unrelated):
             assert status == 200 and not raw
             assert request.thread.is_alive() and witness.pending_stores() == 3
         finally:
+            release_ns = perf_counter_ns()
             gate.release.set()
         assert gate.finished.wait(10)
-        final = request.finish()
+        final = request.finish(release_ns)
         if label == "length":
             assert http.native_result(final, prompt, 1, 0)[0] == ids
         else:

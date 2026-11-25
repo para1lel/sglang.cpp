@@ -970,6 +970,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
         stop_on_error();
     }
     queue.stop();
+    service.stop_cache_restores();
     for (auto& worker : workers) {
         worker.join();
     }

@@ -30,6 +30,7 @@ constexpr std::size_t max_record = std::size_t{1} << 30;
 constexpr std::size_t max_metadata = std::size_t{64} << 20;
 constexpr std::size_t max_keys = std::size_t{1} << 20;
 constexpr std::size_t max_error = 1024;
+constexpr std::size_t max_namespace = 128;
 constexpr std::uint64_t error_status = 2;
 constexpr std::uint64_t active_status = 4;
 constexpr std::size_t receipt_size = 28;
@@ -86,8 +87,9 @@ void append_key(std::string& output, const LmCacheKey& key) {
 
 class Connection {
 public:
-    explicit Connection(const LmCacheConfig& config)
-        : deadline_(Clock::now() + std::chrono::milliseconds(config.timeout_ms)) {
+    explicit Connection(const LmCacheConfig& config, int stop_fd = -1)
+        : deadline_(Clock::now() + std::chrono::milliseconds(config.timeout_ms)),
+          stop_fd_(stop_fd) {
         sockaddr_un address{};
         address.sun_family = AF_UNIX;
         std::memcpy(address.sun_path, config.endpoint.c_str(), config.endpoint.size() + 1);
@@ -112,6 +114,8 @@ public:
     ~Connection() { close(fd_); }
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
+
+    void disconnect() const noexcept { shutdown(fd_, SHUT_RDWR); }
 
     void request(Operation op, std::string_view metadata) const {
         std::array<char, header_size> header{};
@@ -168,6 +172,7 @@ public:
     }
 
     void arm_transfer(int process_fd) {
+        if (stop_fd_ >= 0) wait_for(POLLOUT);
         const char armed = 1;
         send_all(&armed, 1);
         deadline_ = Clock::time_point::max();
@@ -212,19 +217,22 @@ private:
         }
     }
 
-    void check_deadline() const {
-        if (Clock::now() >= deadline_) transport_error("daemon request timed out");
+    void check_deadline(Clock::time_point now = Clock::now()) const {
+        if (now >= deadline_) transport_error("daemon request timed out");
     }
 
     void wait_for(short events) const {
-        std::array<pollfd, 2> wake{{{fd_, events, 0}, {process_fd_, POLLIN, 0}}};
+        std::array<pollfd, 3> wake{{{fd_, events, 0}, {process_fd_, POLLIN, 0},
+                                    {stop_fd_, POLLIN, 0}}};
         for (;;) {
-            check_deadline();
+            const auto now = Clock::now();
+            check_deadline(now);
             const int timeout = deadline_ == Clock::time_point::max() ? -1 :
-                static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(
-                    deadline_ - Clock::now()).count());
+                static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(deadline_ - now)
+                                     .count());
             const int status = poll(wake.data(), wake.size(), timeout);
             if (status > 0) {
+                if (wake[2].revents) transport_error("restore stopped");
                 if (wake[0].revents) return;
                 if (wake[1].revents & (POLLIN | POLLHUP)) transport_error("daemon process exited");
             }
@@ -235,6 +243,7 @@ private:
     Clock::time_point deadline_;
     int fd_;
     int process_fd_ = -1;
+    int stop_fd_;
 };
 
 std::string request_prefix(const LmCacheConfig& config) {
@@ -327,9 +336,12 @@ public:
     GpuLease& operator=(const GpuLease&) = delete;
     int process_fd() const { return pidfd_; }
 
-    void wait_for_release(const LmCacheConfig& config) const {
-        auto metadata = request_prefix(config);
-        metadata.append(admission_.data(), 32);
+    void wait_for_release(const LmCacheConfig& config) const noexcept {
+        std::array<char, 2 + max_namespace + 32> body;
+        encode_number(body.data(), 2, config.name_space.size());
+        auto next = std::copy(config.name_space.begin(), config.name_space.end(), body.data() + 2);
+        auto end = std::copy_n(admission_.begin(), 32, next);
+        const std::string_view metadata(body.data(), end - body.data());
         for (;;) {
             pollfd process{pidfd_, POLLIN, 0};
             if (poll(&process, 1, 100) > 0 && (process.revents & (POLLIN | POLLHUP))) return;
@@ -338,7 +350,7 @@ public:
                 status.request(Operation::lease, metadata);
                 const auto [state, bytes] = status.response_header();
                 if (state == 0 && bytes == 0) return;
-            } catch (const std::runtime_error&) {
+            } catch (const std::exception&) {
             }
         }
     }
@@ -349,10 +361,11 @@ private:
 };
 
 LmCacheStatus transfer_records(const LmCacheConfig& config, Operation operation,
-                               std::string_view metadata, LmCacheReceipt* receipt) {
+                               std::string_view metadata, LmCacheReceipt* receipt,
+                               int stop_fd = -1) {
     if (receipt) *receipt = {};
     constexpr std::size_t admission_bytes = 36;
-    Connection connection(config);
+    Connection connection(config, stop_fd);
     connection.request(operation, metadata);
     const auto [admission, size] = connection.response_header();
     if (admission == 3 && size == 0) return LmCacheStatus::declined;
@@ -376,6 +389,7 @@ LmCacheStatus transfer_records(const LmCacheConfig& config, Operation operation,
         }
         return status;
     } catch (...) {
+        connection.disconnect();
         lease.wait_for_release(config);
         throw;
     }
@@ -399,7 +413,7 @@ LmCacheClient::LmCacheClient(LmCacheConfig config) : config_(std::move(config)) 
     if (config_.endpoint.empty() || config_.endpoint.front() != '/' ||
         config_.endpoint.find('\0') != std::string::npos ||
         config_.endpoint.size() >= sizeof(sockaddr_un::sun_path) || config_.timeout_ms <= 0 ||
-        config_.name_space.empty() || config_.name_space.size() > 128 ||
+        config_.name_space.empty() || config_.name_space.size() > max_namespace ||
         config_.name_space.find_first_not_of(namespace_characters) != std::string::npos) {
         throw std::invalid_argument("Invalid LMCache endpoint, namespace, or timeout");
     }
@@ -487,9 +501,9 @@ LmCacheStatus LmCacheClient::store_prepared(std::string_view metadata,
 
 LmCacheStatus LmCacheClient::retrieve(const PrefixCacheKeys& keys,
                                        const PrefixDeviceTransfer& transfer,
-                                       LmCacheReceipt* receipt) const {
+                                       LmCacheReceipt* receipt, int stop_fd) const {
     return transfer_records(config_, Operation::retrieve, encode_transfer(config_, keys, transfer),
-                            receipt);
+                            receipt, stop_fd);
 }
 
 void LmCacheClient::reset() const {

@@ -90,26 +90,30 @@ struct DecoderPrefixCacheStats {
 };
 
 /// The Decoder must outlive the batch. Use one host thread to operate a batch.
-/// Each slot owns its request state until cancel() or a finishing step.
+/// Each slot owns its request until cancellation or a finishing step, including submission
+/// of any deferred final checkpoint.
 class DecoderBatch {
 public:
     explicit DecoderBatch(const Decoder& decoder);
     DecoderBatch(const Decoder& decoder, DecoderBatchOptions options);
     ~DecoderBatch();
 
-    /// Return the number of prompt positions restored from a completed checkpoint.
+    /// Return the restored prompt length. Use poll_prefix() to resolve a pending restore.
     int admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
     int admit_multimodal(int slot, std::vector<int> prompt, const DecoderOptions& options,
                          const std::vector<DecoderMedia>& media);
     void cancel(int slot);
+    /// Poll after admitting a restore or receiving prefix_pending from a step. When pending
+    /// clears, restored holds the cached token count for a completed restore (zero on a miss).
     DecoderBatchPrefixUpdate poll_prefix(int slot);
 
     /// Advance each selected slot by one position or one speculative round.
     /// Consume token and the first extra_token_count entries of extra_tokens in order.
     /// extra_token mirrors the first extra token for callers using depth one.
     /// A zero-budget slot finishes without work. A failed selection retires only its slot.
-    /// On a failed advance, all slots are retired
-    /// if the stream can be drained. A stream that cannot be drained disables the batch.
+    /// If an advance throws, check available(). After a recoverable failure, slots with
+    /// outstanding restores stay occupied. Poll each of those slots with poll_prefix() until
+    /// pending clears before readmitting it. All other slots have been retired.
     std::array<DecoderBatchStep, decoder_batch_max_lanes>
     advance(const std::array<bool, decoder_batch_max_lanes>& selected);
 

@@ -47,7 +47,7 @@ def wait_ready(process, port):
 
 
 @contextmanager
-def serve(args, label, *options):
+def server_process(args, label, *options):
     with closing(socket.socket()) as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -59,7 +59,7 @@ def serve(args, label, *options):
         process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT)
         try:
             wait_ready(process, port)
-            yield port, log
+            yield port, log, process
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -68,6 +68,12 @@ def serve(args, label, *options):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
+
+
+@contextmanager
+def serve(args, label, *options):
+    with server_process(args, label, *options) as (port, log, _):
+        yield port, log
 
 
 def visual(kind, width=32, height=32):
@@ -138,7 +144,11 @@ def received(reply, budget, cached=0):
 
 
 def stream_frames(raw):
-    frames = raw.rstrip(b"\n").split(b"\n\n")
+    frames = []
+    for block in raw.rstrip(b"\n").split(b"\n\n"):
+        lines = [line for line in block.split(b"\n") if not line.startswith(b":")]
+        if lines:
+            frames.append(b"\n".join(lines))
     assert frames.pop() == b"data: [DONE]"
     assert all(frame.startswith(b"data: ") for frame in frames)
     return [json.loads(frame[6:]) for frame in frames]

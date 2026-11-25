@@ -17,11 +17,16 @@ struct PrefillGroup {
 
 enum class PrefillAttentionMode { batched, full_group, serial_segments, causal_segments };
 
-inline PrefillGroup partial_projection_group(const PrefillGrant* grants, int count) {
+// Collects the run of consecutive grants that may share one partial-projection
+// group. `min_rows` is the smallest grant a caller allows to group: the TP2
+// planner passes prefill_chunk_rows so short (>=128-row) lanes fuse, while
+// single-model callers keep the tuned min_partial_prefill_rows floor.
+inline PrefillGroup partial_projection_group(const PrefillGrant* grants, int count,
+                                             int min_rows = min_partial_prefill_rows) {
     PrefillGroup group{};
     while (group.grants < count) {
         const auto& grant = grants[group.grants];
-        if (grant.rows < min_partial_prefill_rows || grant.rows > batch_prefill_tile_rows ||
+        if (grant.rows < min_rows || grant.rows > batch_prefill_tile_rows ||
             grant.rows != grant.tile_rows || grant.rows > grouped_prefill_max_rows - group.rows) {
             break;
         }
@@ -85,11 +90,12 @@ inline void peer_causal_segments(const PrefillGrant* peer_grants, int source, in
 template <typename RunGroup, typename RunNative>
 bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cudaStream_t stream,
                                        DecoderBatchStepStats& stats, RunGroup run_group,
-                                       RunNative run_native) {
+                                       RunNative run_native,
+                                       int min_rows = min_partial_prefill_rows) {
     int serial_capacity = 1;
     int grouped_capacity = 0;
     for (int index = 0; index < count;) {
-        const auto partial = partial_projection_group(grants + index, count - index);
+        const auto partial = partial_projection_group(grants + index, count - index, min_rows);
         const int consumed = std::max(1, partial.grants);
         for (int lane = 0; lane < consumed; ++lane) {
             serial_capacity = std::max(serial_capacity, grants[index + lane].tile_rows);
@@ -107,7 +113,7 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
     if (!workspace.data()) return false;
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
     for (int index = 0; index < count;) {
-        const auto partial = partial_projection_group(grants + index, count - index);
+        const auto partial = partial_projection_group(grants + index, count - index, min_rows);
         if (partial.grants >= 2) {
             run_group(index, 0, grants + index, partial, workspace,
                       PrefillAttentionMode::serial_segments, serial_capacity);

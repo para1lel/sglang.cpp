@@ -48,7 +48,8 @@ void check_tile(const PrefillGrant& tile, const PrefillGrant& owner, int offset,
     }
 }
 
-void run(const std::vector<Input>& inputs, const std::vector<Dispatch>& expected) {
+void run(const std::vector<Input>& inputs, const std::vector<Dispatch>& expected,
+         int min_rows = prefill_chunk_rows) {
     std::vector<std::unique_ptr<Request>> requests;
     std::vector<std::vector<int>> tokens;
     std::array<std::vector<PrefillGrant>, 2> grants;
@@ -91,7 +92,7 @@ void run(const std::vector<Input>& inputs, const std::vector<Dispatch>& expected
         [&](int source, const PrefillGrant* grant, PrefillWorkspace&, int, int offset) {
             need(grant == &grants[0].at(source), "Tail owner mismatch");
             observed.push_back({'T', source, offset, grant->rows - offset, 1});
-        });
+        }, min_rows);
     need(scheduled == !expected.empty() && observed == expected, "Unexpected dispatch sequence");
     int rows = 0, groups = 0;
     for (const auto& step : expected) {
@@ -105,6 +106,16 @@ void run(const std::vector<Input>& inputs, const std::vector<Dispatch>& expected
 }
 
 void check_tp2_prefill_plan() {
+    const std::vector<Input> short_pair{{128, 0, 128}, {128, 13, 129}};
+    run(short_pair, {{'S', 0, 0, 256, 2}});
+    run(short_pair, {}, min_partial_prefill_rows);
+    run({{128, 0, 128}}, {});
+    run({{128, 0, 128}, {127, 3, 128}, {129, 0, 129}}, {});
+    run({{127, 3, 127}, {128, 7, 129}, {129, 9, 129}, {17, 2, 17}},
+        {{'T', 0, 0, 127, 1}, {'S', 1, 0, 257, 2}, {'T', 3, 0, 17, 1}});
+    const std::vector<Input> long_pair{{257, 0, 257}, {511, 5, 512}};
+    run(long_pair, {{'S', 0, 0, 768, 2}});
+    run(long_pair, {{'S', 0, 0, 768, 2}}, min_partial_prefill_rows);
     run({{3071, 5, 3071}}, {});
     run({{3072, 262144 - 3072, 3072}}, {{'C', 0, 0, 3072, 3}});
     run({{4096, 33, 4097}}, {{'C', 0, 0, 4096, 4}});

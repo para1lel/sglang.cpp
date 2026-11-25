@@ -894,7 +894,10 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
             enqueue_native_prefill_grants_tp(model, peer, grant, peer_grants + source,
                                              1, workspace, *peer_workspace, capacity, offset,
                                              stream, peer_stream, group);
-        });
+        },
+        // TP2 fuses short (>= prefill_chunk_rows) lanes into one grouped pass;
+        // the single-model planner keeps the min_partial_prefill_rows floor.
+        prefill_chunk_rows);
     if (peer_workspace) {
         const DeviceScope scope(peer.device);
         peer_workspace->close();

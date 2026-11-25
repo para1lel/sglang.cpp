@@ -127,6 +127,18 @@ std::optional<cudaError_t> try_prefill_gqa_postgate_quantize(int rows,
                                                              cudaStream_t stream,
                                                              GqaGeometry geometry);
 
+/// Eager batched short-context verify for lanes whose positions sit
+/// strictly below the split range: one exact-scores pass and one replay
+/// pass over the whole batch, bit-identical to the per-lane vector read.
+/// Callers must only dispatch when the baseline read would be the vector
+/// read. Every lane's scratch buffer backs its score workspace, so the
+/// combined score bytes must fit paged_decode_scratch_bytes — checked by
+/// short_verify_supported, which is side-effect free so a caller can fall
+/// back before any preprocess or cache append.
+bool short_verify_supported(const PagedDecodeLane* lanes, int count);
+
+cudaError_t short_verify_gqa(const PagedDecodeLane* lanes, int count, cudaStream_t stream);
+
 }  // namespace decoder
 
 /// Rank-local text-side preprocess/postgate overloads of the entries declared

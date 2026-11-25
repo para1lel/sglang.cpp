@@ -95,6 +95,9 @@ struct TargetBatch {
 struct EagerTargetBatch {
     decoder::PagedDecodeLane lanes[decoder::target_split_eager_max_rows];
     int end;
+    /// Upper bound on lane positions the batch was built for; eager batches
+    /// derive it from live positions, so it only guards kernel grids.
+    int position_bound = text_attention_max_tokens;
 };
 
 /// Launches the split-KV pass. Each lane reads positions [0, position] of its cache and

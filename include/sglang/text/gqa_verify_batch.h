@@ -104,6 +104,57 @@ inline bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* r
     return true;
 }
 
+/// Eager short-context verify: the same staged pipeline as
+/// try_gqa_verify_batch, but for lanes below the split range, where the
+/// batched entry cannot run. Only dispatched on the TP2 vector backend
+/// (tensor_parallel gate at the call site, vector_attention here): the
+/// kernel pair is bit-identical to the per-lane vector read those lanes
+/// would otherwise take. Constrained rows keep the per-row route. Eligibility
+/// is checked before any side effect so the caller can still fall back.
+inline bool try_gqa_verify_short(const GqaLayer& layer, const VerificationRow* rows, int count,
+                                 int cache_index, bool vector_attention, cudaStream_t stream) {
+    if (!vector_attention || count <= 1 || count > target_split_eager_max_rows ||
+        rows[0].binding) {
+        return false;
+    }
+    const auto kv_heads = rows[0].request->caches[cache_index].kv_heads;
+    std::array<PagedDecodeLane, target_split_eager_max_rows> reads;
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        if (row.constrained || row.binding ||
+            row.request->caches[cache_index].kv_heads != kv_heads) {
+            return false;
+        }
+        auto& work = *row.work;
+        reads[index] = {row.request->caches[cache_index], row.request->pages, row.position,
+                        paged_gqa_buffers(work)};
+    }
+    if (!decoder::short_verify_supported(reads.data(), count)) {
+        return false;
+    }
+    GqaVerifyRows<GqaVerifyPreprocessRow> preprocess{};
+    GqaVerifyRows<GqaVerifyAppendRow> append{};
+    GqaVerifyRows<GqaVerifyGateRow> gate{};
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        auto& work = *row.work;
+        preprocess.rows[index] = {work.q_gate, work.keys, work.rope_queries, work.rope_keys,
+                                  row.rotary_position < 0 ? row.position : row.rotary_position};
+        append.rows[index] = {row.request->caches[cache_index], row.request->pages, work.rope_keys,
+                              work.values, row.position};
+        gate.rows[index] = {work.q_gate, work.attention};
+    }
+    const GqaGeometry geometry{gqa_query_heads(kv_heads), kv_heads};
+    check(gqa_verify_preprocess(preprocess, count, layer.query_norm, layer.key_norm, stream,
+                               geometry),
+          "Normalize and rotate grouped target Q/K");
+    check(gqa_verify_append(append, count, stream), "Append grouped target MXFP8 KV");
+    check(decoder::short_verify_gqa(reads.data(), count, stream),
+          "Read grouped target MXFP8 attention");
+    check(gqa_verify_postgate(gate, count, stream, geometry), "Gate grouped target attention");
+    return true;
+}
+
 struct LongVerifySequence {
     int indices[gqa_decode::long_rows];
     int count = 0;

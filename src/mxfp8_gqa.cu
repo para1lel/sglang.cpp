@@ -923,5 +923,6 @@ cudaError_t decoder::paged_decode_gqa(
 
 #include "sglang/text/mtp/gqa_attention.cuh"
 #include "sglang/text/gqa_target_split.cuh"
+#include "sglang/text/gqa/short_verify.cuh"
 
 }

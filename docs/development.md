@@ -32,7 +32,7 @@ Link `sglang_cuda`. Apply RoPE to Q and K. Append contiguous BF16 K and V `[toke
 
 For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. See the [scratch-free reader](singleton-gqa-decode.md#scratch-free-ordered-attention) for direct attention. [Scale calculation](../src/mxfp8_gqa.cu#L42)<!-- prefix: "__device__ i" -->
 
-Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L227)<!-- prefix: "__device__ f" --> · [Replay](../include/sglang/text/gqa/ordered_gqa_vector.cuh#L150)<!-- prefix: "__device__ _" -->
+Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L227)<!-- prefix: "__device__ f" --> · [Replay](../include/sglang/text/gqa/ordered_gqa_vector.cuh#L157)<!-- prefix: "__device__ _" -->
 
 [Singleton](batch-graphs.md#page-parallel-gqa-decode) and [legacy narrow decode](batch-graphs.md#legacy-narrow-paged-gqa-decode) group softmax and value reductions by KV pages.
 [Fused packed decode](long-paged-decode.md#fused-packed-gqa) groups reductions by 64-token chunks. [Legacy wide eager decode](long-paged-decode.md#legacy-wide-eager-decode) selects its split after compaction.

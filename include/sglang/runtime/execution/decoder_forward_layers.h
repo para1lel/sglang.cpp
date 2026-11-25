@@ -824,6 +824,11 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
 inline void attend_eager_verification(const GqaLayer& layer,
                                       const LayerBatch<VerificationRow>& batch, int cache_index) {
     const auto attend = [&](const auto& packet) {
+        if (packet.tensor_parallel &&
+            try_gqa_verify_short(layer, packet.lanes, packet.count, cache_index,
+                                 packet.vector_attention, packet.stream)) {
+            return;
+        }
         if (!try_gqa_verify_batch(layer, packet.lanes, packet.count, cache_index,
                                   packet.vector_attention, packet.target_split_end,
                                   packet.stream)) {

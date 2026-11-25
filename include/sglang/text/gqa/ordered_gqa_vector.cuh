@@ -58,31 +58,17 @@ __device__ float replay_vector_channel(
     return weighted;
 }
 
-template <bool SkipTargetSplit, typename Position, typename Cache, typename Pages, typename Scores>
-__global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Position position,
-                                     Scores score_binding, __nv_bfloat16* output, int split_end) {
+/// The replay pass shared by vector_replay_kernel and the batched verify
+/// kernels: `head` and `group` name the block coordinates the caller guards.
+__device__ __noinline__ void vector_replay_body(Mxfp8KvCache cache, const std::int32_t* pages,
+                                                int last, decoder::ExactGqaWorkspace workspace,
+                                                __nv_bfloat16* output, int head, int group) {
     __shared__ alignas(16) float values[replay_tile][vector_replay_channels];
     __shared__ float2 weights[replay_tile];
     __shared__ float denominator;
     __shared__ bool unit_history;
-    const auto cache = cache_value(cache_binding);
     const int query_heads = gqa_query_heads(cache.kv_heads);
-    const auto* pages = page_values(page_binding);
-    const int last = decoder::position_value(position);
-    if constexpr (SkipTargetSplit) {
-        if (decoder::target_split_position(last, split_end)) {
-            return;
-        }
-    }
-    const auto workspace = score_workspace(score_binding);
-    const int head = blockIdx.x;
-    // Bound descriptors launch the replay with the maximum head grid; the
-    // lane's own cache decides which blocks carry work.
-    if (head >= query_heads) {
-        return;
-    }
     const int kv_head = head / queries_per_kv_head;
-    const int group = blockIdx.y;
     const int thread = threadIdx.x;
     const int lane = thread % mxfp8_group_size;
     const int column = group * vector_replay_channels;
@@ -144,6 +130,27 @@ __global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Po
         output[row_offset(0, query_heads, head) + column + lane] =
             __float2bfloat16_rn(weighted / denominator);
     }
+}
+
+template <bool SkipTargetSplit, typename Position, typename Cache, typename Pages, typename Scores>
+__global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Position position,
+                                     Scores score_binding, __nv_bfloat16* output, int split_end) {
+    const auto cache = cache_value(cache_binding);
+    const auto* pages = page_values(page_binding);
+    const int last = decoder::position_value(position);
+    if constexpr (SkipTargetSplit) {
+        if (decoder::target_split_position(last, split_end)) {
+            return;
+        }
+    }
+    const auto workspace = score_workspace(score_binding);
+    const int head = blockIdx.x;
+    // Bound descriptors launch the replay with the maximum head grid; the
+    // lane's own cache decides which blocks carry work.
+    if (head >= gqa_query_heads(cache.kv_heads)) {
+        return;
+    }
+    vector_replay_body(cache, pages, last, workspace, output, head, blockIdx.y);
 }
 
 template <bool RecomputeScores>

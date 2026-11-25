@@ -633,6 +633,9 @@ std::optional<cudaError_t> launch_paired_tmem_prefill(
 
 namespace {
 
+constexpr int staged_causal_group_rows = 4 * flash_chunk;
+constexpr int staged_causal_early_context = 32768;
+
 template <int Count>
 std::optional<cudaError_t> prepare_long_page(const StagedRequests<Count>& requests,
                                             std::uint16_t* keys, std::uint16_t* values,
@@ -675,10 +678,11 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
         config.gridDim.z = Count;
         config.blockDim.x = staged_compact_threads;
     }
+    if constexpr (CausalGroup) config.gridDim.x = requests.rows[0] / flash_rows;
     StagedPairMaps maps{};
     const void* kernel = reinterpret_cast<const void*>(paired);
     bool single = false;
-    if constexpr (Count == 4 || CausalGroup) {
+    if constexpr ((Count == 4 || CausalGroup) && !LongPage) {
         if (Partial || position % flash_chunk == 0) {
             const auto local = Partial
                 ? reinterpret_cast<const void*>(tmem_staged_page_attention<Count>)
@@ -687,7 +691,6 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
             local_config.dynamicSmemBytes = sizeof(StagedSingleTile);
             if constexpr (CausalGroup) {
                 local_config.blockDim.x = staged_compact_threads;
-                local_config.gridDim.x = requests.rows[0] / flash_rows;
             }
             if constexpr (Partial) {
                 int rows = 0;
@@ -774,7 +777,10 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
             if (rows < min_partial_rows || rows > flash_chunk || sequence.position < 0 ||
                 sequence.position > 32768 - rows) return std::nullopt;
         } else if constexpr (CausalGroup) {
-            if (rows != 4 * flash_chunk || position < 0 || position > 32768 - rows ||
+            constexpr int context = LongPage
+                ? decoder::staged_prefill_batch_long_max_position + flash_chunk
+                : staged_causal_early_context;
+            if (rows != staged_causal_group_rows || position < 0 || position > context - rows ||
                 position % flash_chunk != 0) return std::nullopt;
         } else if (rows != flash_chunk || sequence.position != position) {
             return std::nullopt;
@@ -847,7 +853,9 @@ std::optional<cudaError_t> launch_staged_tmem_prefill(
 std::optional<cudaError_t> launch_causal_group_staged_tmem_prefill(
     const decoder::PagedPrefillSequence& sequence, cudaStream_t stream,
     decoder::PairedPrefillScratch scratch) {
-    const auto status = launch_staged_requests<1, false, true>(&sequence, stream, scratch);
+    const auto status = sequence.position <= staged_causal_early_context - staged_causal_group_rows
+        ? launch_staged_requests<1, false, true>(&sequence, stream, scratch)
+        : launch_staged_requests<1, false, true, true>(&sequence, stream, scratch);
     if (status && *status != cudaSuccess) return consume_prefill_submission(*status);
     return status;
 }

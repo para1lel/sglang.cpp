@@ -444,9 +444,10 @@ bool prefill_causal_group_gqa(const Chunk& chunk, const GqaLayer& layer, int ban
                               PairedPrefillScratch serial_scratch) {
     constexpr int tile_rows = batch_prefill_tile_rows;
     constexpr int group_rows = grouped_prefill_max_rows;
+    constexpr int long_context = staged_prefill_batch_long_max_position + tile_rows;
     const auto& first = grants[0];
     if (count != group_rows / tile_rows || first.position < 0 ||
-        first.position > 32768 - group_rows || first.position % tile_rows != 0) {
+        first.position > long_context - group_rows || first.position % tile_rows != 0) {
         return false;
     }
     for (int index = 0; index < count; ++index) {

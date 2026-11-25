@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <exception>
+#include <optional>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -153,7 +155,9 @@ LmCacheStatus LmCacheGroup::store_prepared(int rank, std::string_view metadata,
 
 LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& keys,
                                      const std::vector<const PrefixDeviceTransfer*>& transfers,
-                                     LmCacheReceipt* receipt, int stop_fd) const {
+                                     LmCacheReceipt* receipt,
+                                     std::vector<LmCacheReceipt>* per_rank,
+                                     int stop_fd) const {
     const auto world = static_cast<std::size_t>(world_size());
     if (keys.size() != world || transfers.size() != world) {
         throw std::invalid_argument("LMCache rank transfer count mismatch");
@@ -164,35 +168,59 @@ LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& 
         }
     }
     if (receipt) *receipt = {};
+    if (per_rank) per_rank->assign(world, LmCacheReceipt{});
     if (world == 1) {
-        LmCacheReceipt rank_receipt;
-        auto* sink = receipt ? &rank_receipt : nullptr;
+        auto* sink = per_rank ? &(*per_rank)[0] : receipt;
         const auto status =
             clients_.front()->retrieve(*keys.front(), *transfers.front(), sink, stop_fd);
-        if (receipt) *receipt = rank_receipt;
+        if (receipt && per_rank) *receipt = (*per_rank)[0];
         return status;
     }
 
     std::vector<LmCacheStatus> statuses(world, LmCacheStatus::declined);
     std::vector<LmCacheReceipt> receipts(world);
     std::vector<std::exception_ptr> errors(world);
-    std::vector<std::thread> workers;
-    workers.reserve(world);
-    for (std::size_t rank = 0; rank < world; ++rank) {
-        workers.emplace_back([this, rank, &keys, &transfers, &statuses, &receipts, &errors,
-                              stop_fd]() noexcept {
+    std::vector<std::optional<std::thread>> workers(world);
+    // Rank 0 runs inline; a rank whose worker thread cannot be created falls
+    // back to running inline after the others joined — destroying a joinable
+    // thread during unwinding would terminate the process.
+    for (std::size_t rank = 1; rank < world; ++rank) {
+        try {
+            workers[rank].emplace([this, rank, &keys, &transfers, &statuses, &receipts,
+                                   &errors, stop_fd]() noexcept {
+                try {
+                    statuses[rank] = clients_[rank]->retrieve(*keys[rank], *transfers[rank],
+                                                              &receipts[rank], stop_fd);
+                } catch (...) {
+                    errors[rank] = std::current_exception();
+                }
+            });
+        } catch (const std::system_error&) {
+            workers[rank].reset();
+        }
+    }
+    try {
+        statuses[0] = clients_.front()->retrieve(*keys.front(), *transfers.front(),
+                                                 &receipts[0], stop_fd);
+    } catch (...) {
+        errors[0] = std::current_exception();
+    }
+    for (std::size_t rank = 1; rank < world; ++rank) {
+        if (workers[rank]) {
+            workers[rank]->join();
+        } else {
             try {
                 statuses[rank] = clients_[rank]->retrieve(*keys[rank], *transfers[rank],
                                                           &receipts[rank], stop_fd);
             } catch (...) {
                 errors[rank] = std::current_exception();
             }
-        });
+        }
     }
-    for (auto& worker : workers) worker.join();
     for (const auto& error : errors) {
         if (error) std::rethrow_exception(error);
     }
+    if (per_rank) *per_rank = receipts;
     LmCacheStatus result = LmCacheStatus::complete;
     for (const auto status : statuses) {
         if (status == LmCacheStatus::complete) continue;
@@ -213,7 +241,18 @@ LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& 
 }
 
 void LmCacheGroup::reset() const {
-    for (const auto& client : clients_) client->reset();
+    // Best effort across every rank: a failed reset on one daemon must not
+    // skip the others, but any failure is rethrown so a caller can never
+    // claim a successful reset after a partial clear.
+    std::exception_ptr first;
+    for (const auto& client : clients_) {
+        try {
+            client->reset();
+        } catch (...) {
+            if (!first) first = std::current_exception();
+        }
+    }
+    if (first) std::rethrow_exception(first);
 }
 
 }  // namespace sglang::decoder

@@ -26,6 +26,9 @@ lmcache_api=()
 if [[ -f "$source/apps/server/batch_cache.cpp" ]]; then
     sources+=("$source"/apps/server/{batch_cache,batch_service_cache}.cpp
               "$source"/src/runtime/cache/{lmcache_client,lmcache_prefix,prefix_payload}.cpp)
+    if [[ -f "$source/src/runtime/cache/lmcache_group.cpp" ]]; then
+        sources+=("$source/src/runtime/cache/lmcache_group.cpp")
+    fi
     lmcache_api=(-DSGLANG_TEST_LMCACHE)
 fi
 
@@ -51,7 +54,7 @@ else
 fi
 
 cuda_headers=()
-if [[ -n ${CONDA_PREFIX:-} && ! -f "$source/include/sglang/runtime/model/serving_profile.h" ]]; then
+if [[ -n ${CONDA_PREFIX:-} ]]; then
     cuda_headers=(-isystem "$CONDA_PREFIX/targets/x86_64-linux/include")
 fi
 

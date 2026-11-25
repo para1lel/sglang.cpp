@@ -42,15 +42,15 @@ The public Qwen3.8-27B B200 recipe specifies MTP3 and LMCache 0.5.1. With the re
 
 ## Ranked TP2 transport
 
-Each rank in a two-GPU native group runs its own daemon on its own GPU. Pass `--rank N` to select the rank defaults. The client configuration names one daemon per rank. [Rank defaults](../../tools/lmcache/serve.sh#L47)<!-- prefix: "if (( rank >" --> · [Ranked configuration](../../src/runtime/cache/lmcache_group.cpp#L16)<!-- prefix: "std::vector<" -->
+Each rank in a two-GPU native group runs its own daemon on its own GPU. Pass `--rank N` to select the rank defaults. The client configuration names one daemon per rank. [Rank defaults](../../tools/lmcache/serve.sh#L47)<!-- prefix: "if (( rank >" --> · [Ranked configuration](../../src/runtime/cache/lmcache_group.cpp#L18)<!-- prefix: "std::vector<" -->
 
 Ranked clients select the operations `lookup_prefix_detail`, `retrieve_v4`, and `store_v4`. A `retrieve_v4` or `store_v4` frame matches the SLC3 frame and inserts the KV head count after the end row bound of each nonempty MXFP8 section. A daemon without these operations rejects the request, so the client reports an error instead of a partial restore. [Operations](../../src/runtime/cache/lmcache_client.cpp#L46)<!-- prefix: "lookup_prefi" --> · [KV head count](../../src/runtime/cache/lmcache_client.cpp#L282)<!-- prefix: "if (v4) appe" -->
 
 Ranked records live in per-rank key domains that name the world size, rank, KV head counts, and lane role. The TP1 domain stays unchanged, so TP1 and TP2 records do not mix. [Key domain](../../src/runtime/cache/prefix_payload.cpp#L61)<!-- prefix: "std::string " -->
 
-A ranked lookup asks every rank for its matched lengths and endpoint inventory. The group takes the minimum matched GQA and GDN lengths. It picks the largest GDN endpoint present on every rank, draft-eligible on the draft lane when a draft is requested. A truncated inventory reply is refused. [Composite lookup](../../src/runtime/cache/lmcache_group.cpp#L85)<!-- prefix: "PrefixCacheR" -->
+A ranked lookup asks every rank for its matched lengths and endpoint inventory. The group takes the minimum matched GQA and GDN lengths. It picks the largest GDN endpoint present on every rank, draft-eligible on the draft lane when a draft is requested. A truncated inventory reply is refused. [Composite lookup](../../src/runtime/cache/lmcache_group.cpp#L87)<!-- prefix: "PrefixCacheR" -->
 
-A ranked restore drives one transfer per rank and reports completion only when every rank completes. Byte receipts sum across ranks, and restored tokens are counted once. Native serving does not construct the ranked client yet. The standalone rank-client test exercises it. [Ranked restore](../../src/runtime/cache/lmcache_group.cpp#L154)<!-- prefix: "LmCacheStatu" --> · [Rank client test](../../tests/prefix/lmcache_rank_client.cpp#L58)<!-- prefix: "LmCacheGroup" -->
+A ranked restore drives one transfer per rank and reports completion only when every rank completes. Byte receipts sum across ranks, and restored tokens are counted once. Native serving does not construct the ranked client yet. The standalone rank-client test exercises it. [Ranked restore](../../src/runtime/cache/lmcache_group.cpp#L156)<!-- prefix: "LmCacheStatu" --> · [Rank client test](../../tests/prefix/lmcache_rank_client.cpp#L58)<!-- prefix: "LmCacheGroup" -->
 
 ## Standalone verification
 

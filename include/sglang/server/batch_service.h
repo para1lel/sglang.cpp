@@ -4,8 +4,10 @@
 #include "sglang/runtime/server/batch_executor.h"
 #include "sglang/runtime/server/batch_cache.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 
 namespace sglang::server {
 
@@ -132,6 +134,13 @@ public:
     BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps = 0);
     BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
                  std::unique_ptr<decoder::LmCacheClient> cache, std::string cache_identity);
+    // Ranked (TP2) serving: one per-rank daemon derived from `cache`, with
+    // rank_devices[rank] holding that rank's CUDA device UUID so lane views
+    // dispatch to their rank.
+    BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
+                 const decoder::LmCacheConfig& cache,
+                 std::vector<std::array<std::uint8_t, 16>> rank_devices,
+                 std::string cache_identity);
     ~BatchService();
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
                            const DecoderCallbacks& callbacks,

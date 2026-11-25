@@ -25,6 +25,25 @@ BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int
                                                       max_active);
 }
 
+BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int mtp_steps,
+                           const decoder::LmCacheConfig& cache,
+                           std::vector<std::array<std::uint8_t, 16>> devices,
+                           std::string identity)
+    : trace(trace), cuda_graphs(owner->options().cuda_graphs), mtp_steps(mtp_steps),
+      max_active(owner->options().max_active),
+      prefix_cache_entries(owner->options().prefix_cache_entries),
+      max_num_batched_tokens(owner->options().max_num_batched_tokens), executor(std::move(owner)) {
+    if (max_active < 1 || max_active > decoder_batch_max_lanes) {
+        throw std::invalid_argument("Invalid decoder batch service capacity");
+    }
+    counters.cache_capacity = prefix_cache_entries;
+    if (devices.size() < 2) {
+        throw std::invalid_argument("Ranked LMCache requires at least two rank devices");
+    }
+    lmcache = std::make_unique<BatchCache>(cache, std::move(devices), std::move(identity),
+                                           max_active);
+}
+
 void BatchService::State::start() {
     executor->start(
         [this](BatchSession& batch) { counters.cache = batch.prefix_cache_stats(); },
@@ -679,6 +698,16 @@ BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, 
     if (!executor) throw std::invalid_argument("Missing decoder batch executor");
     state_ = std::make_unique<State>(std::move(executor), trace, mtp_steps, std::move(cache),
                                      std::move(identity));
+    state_->start();
+}
+
+BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
+                           const decoder::LmCacheConfig& cache,
+                           std::vector<std::array<std::uint8_t, 16>> rank_devices,
+                           std::string identity) {
+    if (!executor) throw std::invalid_argument("Missing decoder batch executor");
+    state_ = std::make_unique<State>(std::move(executor), trace, mtp_steps, cache,
+                                     std::move(rank_devices), std::move(identity));
     state_->start();
 }
 

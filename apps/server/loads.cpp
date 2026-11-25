@@ -252,6 +252,26 @@ std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t
     emit("sglang_cpp:lmcache_lookup_nanoseconds_total", metrics.lmcache.lookup_ns);
     emit("sglang_cpp:lmcache_write_nanoseconds_total", metrics.lmcache.write_ns);
     emit("sglang_cpp:lmcache_restore_nanoseconds_total", metrics.lmcache.restore_ns);
+    for (std::size_t rank = 0; rank < metrics.lmcache.rank_stores.size(); ++rank) {
+        const auto prefix = "sglang_cpp:lmcache_rank" + std::to_string(rank);
+        emit(prefix + "_stores_total", metrics.lmcache.rank_stores[rank]);
+        if (rank < metrics.lmcache.rank_restores.size()) {
+            emit(prefix + "_restores_total", metrics.lmcache.rank_restores[rank]);
+        }
+        if (rank < metrics.lmcache.rank_read_bytes.size()) {
+            emit(prefix + "_gqa_read_bytes_total", metrics.lmcache.rank_read_bytes[rank][0]);
+            emit(prefix + "_gdn_read_bytes_total", metrics.lmcache.rank_read_bytes[rank][1]);
+            emit(prefix + "_draft_read_bytes_total", metrics.lmcache.rank_read_bytes[rank][2]);
+        }
+        if (rank < metrics.lmcache.rank_written_bytes.size()) {
+            emit(prefix + "_gqa_written_bytes_total",
+                 metrics.lmcache.rank_written_bytes[rank][0]);
+            emit(prefix + "_gdn_written_bytes_total",
+                 metrics.lmcache.rank_written_bytes[rank][1]);
+            emit(prefix + "_draft_written_bytes_total",
+                 metrics.lmcache.rank_written_bytes[rank][2]);
+        }
+    }
     return text;
 }
 

@@ -19,7 +19,7 @@ for name in state graph; do
         wrap=(-Wl,--wrap="$append" -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaFreeAsync
               -Wl,--wrap=cudaFree -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord
               -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaGetErrorString)
-        extra_sources=(apps/server/batch_cache.cpp)
+        extra_sources=(apps/server/batch_cache.cpp src/runtime/cache/lmcache_group.cpp)
     fi
     "${CXX:-c++}" -std=c++17 -O3 -pthread -Iinclude -I"$toolkit/include" \
         "tests/prefix/lmcache_$name.cpp" src/runtime/cache/lmcache_client.cpp \

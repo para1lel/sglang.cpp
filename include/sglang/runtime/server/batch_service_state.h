@@ -40,9 +40,24 @@ struct Job {
     bool retiring_prefix = false;
     BatchCache::Cancel cache_cancel;
     std::shared_ptr<BatchCacheRead> cache_read;
-    std::shared_ptr<decoder::PrefixCacheKeys> cache_keys;
+    // One key set per rank (rank r built with tp2_prefix_cache_layout(r));
+    // empty when the cache is disabled.
+    std::vector<std::shared_ptr<decoder::PrefixCacheKeys>> cache_keys;
+    // Joint restore across this request's rank lanes; created by the first
+    // lane that invokes restore_prefix and shared by all of them.
+    std::shared_ptr<BatchRestoreJoin> restore_join;
+    // Joint stores across this request's rank lanes; created by the first
+    // lane that stores a checkpoint and shared by all of them.
+    std::shared_ptr<BatchStorePairing> store_pairing;
     std::shared_future<bool> prefix_operation;
     std::optional<DecoderFinishReason> deferred_finish;
+
+    ~Job() {
+        // A joint restore that was never fully registered can never complete
+        // once the request is gone; break it so no decoder waiter blocks on
+        // its future. No-op for submitted joints.
+        if (restore_join) restore_join->fail();
+    }
 
     bool aborted() const { return request_id && request_id->aborted(); }
     bool discard_deferred_store() const {
@@ -97,6 +112,9 @@ using namespace batch_service_detail;
 struct BatchService::State {
     State(std::unique_ptr<BatchExecutor> owner, bool trace, int mtp_steps,
           std::unique_ptr<decoder::LmCacheClient> client, std::string identity);
+    State(std::unique_ptr<BatchExecutor> owner, bool trace, int mtp_steps,
+          const decoder::LmCacheConfig& cache, std::vector<std::array<std::uint8_t, 16>> devices,
+          std::string identity);
     ~State();
     void start();
     void process(BatchSession& batch);

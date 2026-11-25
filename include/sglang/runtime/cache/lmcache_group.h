@@ -60,9 +60,13 @@ public:
     // restored tokens once (not once per rank). A transport error on one rank
     // lets the other ranks settle first, then rethrows: the caller treats it
     // as a joint failure and resets every rank cold.
+    // `per_rank` (if set) receives each rank's own actual receipt, in rank
+    // order.
     LmCacheStatus retrieve(const std::vector<const PrefixCacheKeys*>& keys,
                            const std::vector<const PrefixDeviceTransfer*>& transfers,
-                           LmCacheReceipt* receipt = nullptr, int stop_fd = -1) const;
+                           LmCacheReceipt* receipt,
+                           std::vector<LmCacheReceipt>* per_rank = nullptr,
+                           int stop_fd = -1) const;
 
     // Reset every rank's namespace, in rank order.
     void reset() const;

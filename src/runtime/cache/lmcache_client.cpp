@@ -553,7 +553,7 @@ LmCachePrefixDetail LmCacheClient::lookup_prefix_detail(std::string_view digests
     LmCachePrefixDetail detail{static_cast<int>(gqa), static_cast<int>(matched_gdn), {}};
     detail.endpoints.reserve(listed);
     const auto bound = std::min(gqa, static_cast<std::uint64_t>(max_restore));
-    int previous = max_native_tokens + 1;
+    std::uint64_t previous = static_cast<std::uint64_t>(max_native_tokens) + 1;
     for (std::size_t index = 0; index < listed; ++index) {
         const auto offset = lead + index * 5;
         const auto end = decode_number(frame.substr(offset, 4));

@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Native generation | Assign one request ID per generated item and track its owner. | [ID input](../apps/server/native_generate.cpp#L523)<!-- prefix: "std::vector<" --> · [Registration](../apps/server/native_generate.cpp#L586)<!-- prefix: "NativeGenera" --> |
 | HTTP control | Dispatch `POST /abort_request` on the reader and release fully aborted queue entries. | [Control route](../apps/server/prefix_controls.cpp#L496)<!-- prefix: "if (abort_ &" --> · [Queue cleanup](../apps/server/prefix_controls.cpp#L821)<!-- prefix: "void Connect" --> |
-| Decoder service | Skip waiting items, retire running items, and apply abort delivery according to the job's overlap history. | [ID state](../include/sglang/server/batch_service.h#L44)<!-- prefix: "class BatchR" --> · [Retirement](../apps/server/batch_service.cpp#L207)<!-- prefix: "if (cancelle" --> · [Waiting items](../apps/server/batch_service.cpp#L548)<!-- prefix: "bool BatchSe" --> · [Abort delivery](../include/sglang/runtime/server/batch_service_state.h#L66)<!-- prefix: "bool has_out" --> |
+| Decoder service | Skip waiting items, retire running items, and apply abort delivery according to the job's overlap history. | [ID state](../include/sglang/server/batch_service.h#L49)<!-- prefix: "class BatchR" --> · [Retirement](../apps/server/batch_service.cpp#L207)<!-- prefix: "if (cancelle" --> · [Waiting items](../apps/server/batch_service.cpp#L548)<!-- prefix: "bool BatchSe" --> · [Abort delivery](../include/sglang/runtime/server/batch_service_state.h#L66)<!-- prefix: "bool has_out" --> |
 | Native response | Report each item's terminal abort on its original generation connection. | [Finish metadata](../apps/server/native_generate.cpp#L156)<!-- prefix: "if (terminal" --> · [Pre-admission response](../apps/server/native_generate.cpp#L366)<!-- prefix: "void complet" --> |
 
 ## Runtime path
@@ -53,7 +53,7 @@ Duplicate effective IDs within a batch or against live items return HTTP 400. A 
 
 For `n > 1`, the server validates caller-supplied IDs before assigning UUIDs. A string is checked as `rid_0` through `rid_<expanded_count - 1>`. An array supplies one ID per original prompt. Duplicate IDs in the array or IDs that match live items return HTTP 400. A terminal child's ID can pass this check while its original siblings are still running. The new request registers fresh child UUIDs, so the same base can serve independent parallel requests.
 
-If a request disconnects or fails, reuse its IDs after the associated work and queue entry have been cleaned up. A late named abort targets whichever live item currently owns that ID. Use distinct caller IDs when late control requests can overlap a replacement. [Cleanup](../apps/server/native_generate.cpp#L571)<!-- prefix: "~Registratio" --> · [Terminal state](../include/sglang/server/batch_service.h#L85)<!-- prefix: "bool finishe" -->
+If a request disconnects or fails, reuse its IDs after the associated work and queue entry have been cleaned up. A late named abort targets whichever live item currently owns that ID. Use distinct caller IDs when late control requests can overlap a replacement. [Cleanup](../apps/server/native_generate.cpp#L571)<!-- prefix: "~Registratio" --> · [Terminal state](../include/sglang/server/batch_service.h#L90)<!-- prefix: "bool finishe" -->
 
 ### Capacity
 

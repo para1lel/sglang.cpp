@@ -567,6 +567,14 @@ const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const {
     return tp_info_.world_size > 1 ? &tp_info_ : nullptr;
 }
 
+decoder::TpArCounters Decoder::tp_ar_counters() const {
+    decoder::TpArCounters counters;
+    if (tp_ != nullptr && tp_->group != nullptr) {
+        tp_->group->snapshot_transport(counters);
+    }
+    return counters;
+}
+
 Decoder::~Decoder() = default;
 
 const CudaBackendPolicy& Decoder::backend_policy() const {

@@ -461,3 +461,48 @@ if has_config("tp2-collective-check") and os.isfile("tests/decoder/tp2/collectiv
         add_files("tests/decoder/tp2/collective_check.cpp")
     target_end()
 end
+
+-- Optional MNNVL oneshot allreduce transport (FlashInfer 0.7.4 wheel).
+-- Discovered at configure time; every transitive input the transport TU
+-- needs is checked (vendor template header, bundled spdlog headers, our
+-- wrapper pair). Any miss leaves the build identical (NCCL-only), so the
+-- everyday build never requires the vendor package.
+local flashinfer_root = os.getenv("SGLANG_FLASHINFER_ROOT")
+if not flashinfer_root or flashinfer_root == "" then
+    -- Same host-root convention as tools/build.sh. HOME is deliberately not
+    -- used: it names a per-user home, not the shared host tree holding the
+    -- venvs, and differs on this workstation (/home vs /data1/shared).
+    local host_root = os.getenv("SGLANG_HOST_ROOT") or "/data1/shared/dongwu.chen"
+    flashinfer_root = path.join(host_root,
+        "environments/vllm-81a8cb063e62/venv/lib/python3.12/site-packages/flashinfer")
+end
+local mnnvl_vendor_header =
+    path.join(flashinfer_root, "data/include/flashinfer/comm/trtllm_mnnvl_allreduce.cuh")
+local mnnvl_spdlog_header =
+    path.join(flashinfer_root, "data/spdlog/include/spdlog/spdlog.h")
+if os.isfile(mnnvl_vendor_header) and os.isfile(mnnvl_spdlog_header)
+    and os.isfile("include/sglang/runtime/backend/mnnvl_ar.h")
+    and os.isfile("src/runtime/backend/mnnvl_ar.cu") then
+    target("sglang_mnnvl_ar")
+        set_kind("static")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/lib")
+        set_values("cuda.rdc", false)
+        add_cugencodes("sm_100a")
+        add_cuflags("--dependency-target-name=", {force = true})
+        -- The vendor LamportFlags templates call constexpr __host__
+        -- operators from __device__ code; nvcc only accepts that with the
+        -- relaxed-constexpr extension (same requirement as the vendor's
+        -- build examples).
+        add_cuflags("--expt-relaxed-constexpr", {force = true})
+        add_includedirs("include", path.join(toolkit, "include"))
+        add_sysincludedirs(path.join(flashinfer_root, "data/include"),
+                           path.join(flashinfer_root, "data/spdlog/include"))
+        add_syslinks("cuda", {public = true})
+        add_files("src/runtime/backend/mnnvl_ar.cu")
+    target_end()
+    target("sglang_decoder")
+        add_deps("sglang_mnnvl_ar")
+        add_defines("SGLANG_MNNVL_AR=1")
+    target_end()
+end

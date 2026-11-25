@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_media.h"
 #include "sglang/runtime/server/batch_executor.h"
+#include "sglang/runtime/backend/tensor_parallel.h"
 #include "sglang/runtime/server/batch_cache.h"
 
 #include <array>
@@ -20,7 +21,11 @@ struct BatchMetrics {
     std::uint64_t generation_tokens = 0;
     std::uint64_t prefill_requests = 0;
     LmCacheMetrics lmcache;
+    // Allreduce transport counters (empty on single-device servers).
+    decoder::TpArCounters tp_ar;
+    bool tp_ar_present = false;
 };
+
 
 struct BatchRuntimeState {
     bool ready;
@@ -163,10 +168,12 @@ public:
     bool start_profile(std::string name, std::size_t iterations);
     std::optional<BatchProfile> stop_profile();
     BatchTopology topology() const noexcept;
+    void set_tp_ar_source(const Decoder* decoder);
 
 private:
     struct State;
     std::unique_ptr<State> state_;
+    const Decoder* tp_ar_source_ = nullptr;
 };
 
 }

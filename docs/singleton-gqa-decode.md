@@ -10,7 +10,7 @@
 
 ## Runtime path
 
-Regular B200 batch replay supports one eligible direct decode lane. The first eligible step runs eagerly. The graph binds the live position, page table, KV, and score workspace for the selected request. At width one it requires inline score capacity through 5,120 visible tokens unless a shared score buffer is available. B200 does not use that buffer. Positive MTP uses a [separate verification graph policy](mtp.md#target-verification-graph). The standalone serial generator uses eager decode if its request can enter the split window. [Replay policy](../src/runtime/execution/decoder_execution_policy.cpp#L21)<!-- prefix: "bool Decoder" --> · [Warmup and score check](../src/text/decoder_graph.cpp#L30)<!-- prefix: "bool replay_" --> · [Serial selection](../src/decoder.cpp#L658)<!-- prefix: "bool Decoder" -->
+Regular B200 batch replay supports one eligible direct decode lane. The first eligible step runs eagerly. The graph binds the live position, page table, KV, and score workspace for the selected request. At width one it requires inline score capacity through 5,120 visible tokens unless a shared score buffer is available. B200 does not use that buffer. Positive MTP uses a [separate verification graph policy](mtp.md#target-verification-graph). The standalone serial generator uses eager decode if its request can enter the split window. [Replay policy](../src/runtime/execution/decoder_execution_policy.cpp#L21)<!-- prefix: "bool Decoder" --> · [Warmup and score check](../src/text/decoder_graph.cpp#L30)<!-- prefix: "bool replay_" --> · [Serial selection](../src/decoder.cpp#L666)<!-- prefix: "bool Decoder" -->
 
 ### Generic SM100 singleton
 

@@ -401,13 +401,18 @@ std::unique_ptr<BatchService> make_batch_service(const Arguments& arguments,
         ? std::make_unique<sglang::decoder::LmCacheClient>(arguments.lmcache) : nullptr;
     const auto identity = arguments.lmcache_enabled ? cache_identity(arguments.checkpoint)
                                                     : std::string{};
+    std::unique_ptr<BatchService> service;
     if (rank_devices.empty()) {
-        return std::make_unique<BatchService>(std::move(executor), arguments.trace_batches,
-                                              arguments.mtp_steps, std::move(cache), identity);
+        service = std::make_unique<BatchService>(std::move(executor), arguments.trace_batches,
+                                                 arguments.mtp_steps, std::move(cache), identity);
+    } else {
+        service = std::make_unique<BatchService>(std::move(executor), arguments.trace_batches,
+                                                 arguments.mtp_steps, arguments.lmcache,
+                                                 std::move(rank_devices), identity);
     }
-    return std::make_unique<BatchService>(std::move(executor), arguments.trace_batches,
-                                          arguments.mtp_steps, arguments.lmcache,
-                                          std::move(rank_devices), identity);
+    // Publish allreduce transport counters through /metrics.
+    service->set_tp_ar_source(&decoder);
+    return service;
 }
 
 }

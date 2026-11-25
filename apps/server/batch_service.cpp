@@ -778,8 +778,14 @@ BatchMetrics BatchService::metrics() const {
         // Transport receipts can arrive after the scheduler published its final step.
         metrics.cache.stores = metrics.lmcache.stores;
     }
+    if (tp_ar_source_ != nullptr) {
+        metrics.tp_ar = tp_ar_source_->tp_ar_counters();
+        metrics.tp_ar_present = true;
+    }
     return metrics;
 }
+
+void BatchService::set_tp_ar_source(const Decoder* decoder) { tp_ar_source_ = decoder; }
 
 BatchRuntimeState BatchService::runtime_state() const {
     const std::lock_guard lock(state_->mutex);

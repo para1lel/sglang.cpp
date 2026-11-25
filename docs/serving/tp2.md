@@ -53,6 +53,24 @@ sglang-server --checkpoint MODEL --device 0 --port PORT --tp 2 --eager \
 
 The smoke run recorded under `artifacts/tp2-review/serving/cache-2328/complete/cache/` used this shape; `ranked-cache.argv.json` holds its exact arguments. The measured campaign server ran without `--eager`: its live argument record shows `--port 17393 --tp 2 --max-active 16`.
 
+## Two-rank allreduce transport
+
+The build enables the vendor transport only when the flashinfer wheel headers exist. Set `SGLANG_FLASHINFER_ROOT` to use a non-default installed header root; point it at a location without the wheel headers to reproduce the optional-absence build. `SGLANG_HOST_ROOT` only changes the enclosing shared root. A build without the headers rides NCCL for every allreduce. [Build gate](../../xmake.lua#L470)<!-- prefix: "local flashi" -->
+
+The vendor transport embeds the FlashInfer TRT-LLM MNNVL one-shot kernel from flashinfer 0.7.4. It uses per-rank pinned allocations, a two-device multicast object, and triple Lamport buffers. One host thread enqueues both rank halves in rank order. [Transport](../../src/runtime/backend/mnnvl_ar.cu#L1)<!-- prefix: "// MNNVL one" -->
+
+A call uses the vendor transport only for whole hidden-width rows of 5,120 BF16 elements, counts up to 51 rows, 16-byte aligned buffers, and either eager execution or one joined stream capture. Counts of 52 or more rows, and two independent rank captures, ride NCCL. [Eligibility](../../src/runtime/backend/tensor_parallel.cpp#L323)<!-- prefix: "count \u003e mnnv" -->
+
+The rank sum normalizes negative zero to positive zero, so a zero result never aliases the Lamport sentinel bit pattern. [Sentinel](../../src/runtime/backend/mnnvl_ar.cu#L40)<!-- prefix: "constexpr st" -->
+
+The multicast workspace reserves 536,870,912 bytes per rank on this platform, although the one-shot dispatch cap is 1,048,576 aggregated bytes. [Envelope](../../src/runtime/backend/mnnvl_ar.cu#L36)<!-- prefix: "constexpr st" -->
+
+Six fallback reasons ride NCCL: disabled, setup unavailable, oversize, capture mismatch, unaligned, and after error. Each is counted per rank. [Fallback reasons](../../src/runtime/backend/tensor_parallel.cpp#L121)<!-- prefix: "enum class A" -->
+
+`/metrics` exposes the `tp2_ar_` counters per rank. Counters record completed enqueues per transport, not graph replays. [Counters](../../apps/server/loads.cpp#L235)<!-- prefix: "emit_rank(\"t" -->
+
+No startup flag selects the transport. Selection is automatic in a build that includes it.
+
 ## Acceptance target
 
 The first campaign stopped after the W1 miss. W2 through W5 remain unmeasured. A passing campaign must satisfy every condition below.

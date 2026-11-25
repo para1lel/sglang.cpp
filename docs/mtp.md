@@ -7,13 +7,13 @@ target model. It supports greedy decoding and sampling.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L59)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L436)<!-- prefix: "BatchService" --> |
+| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L59)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L441)<!-- prefix: "BatchService" --> |
 | MTP round | Draft proposals and commit target outputs in order. | [Proposals](../src/decoder_verify.cpp#L223)<!-- prefix: "bool MtpRoun" --> · [Commit](../src/decoder_verify.cpp#L345)<!-- prefix: "bool MtpRoun" --> |
 | Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_verify.cpp#L870)<!-- prefix: "bool Decoder" --> · [State commit](../src/decoder_verify.cpp#L532)<!-- prefix: "void TargetV" --> |
 
 ## Runtime path
 
-`sglang-server` and `sglang-generate` default to MTP depth four (K4). Use `--mtp-steps 0` to disable MTP (K0). Values `1`–`4` limit draft proposals per round. Both commands accept `--mtp-k` as an alias. C++ `DecoderOptions` defaults to K0. [Depth option](../apps/sglang-server.cpp#L155)<!-- prefix: "} else if (o" --> · [Server default](../apps/sglang-server.cpp#L52)<!-- prefix: "int mtp_step" --> · [Generator default](../apps/sglang-generate.cpp#L152)<!-- prefix: "arguments.op" --> · [C++ options](../include/sglang/decoder.h#L62)<!-- prefix: "int mtp_step" -->
+`sglang-server` and `sglang-generate` default to MTP depth four (K4). Use `--mtp-steps 0` to disable MTP (K0). Values `1`–`4` limit draft proposals per round. Both commands accept `--mtp-k` as an alias. C++ `DecoderOptions` defaults to K0. [Depth option](../apps/sglang-server.cpp#L155)<!-- prefix: "} else if (o" --> · [Server default](../apps/sglang-server.cpp#L52)<!-- prefix: "int mtp_step" --> · [Generator default](../apps/sglang-generate.cpp#L152)<!-- prefix: "arguments.op" --> · [C++ options](../include/sglang/decoder.h#L63)<!-- prefix: "int mtp_step" -->
 
 At capacities 1–32, text, media, and native generation use configured MTP depth. Greedy [token logprobs](native-generate.md#token-logprobs) can use MTP and score committed target rows. Sampling and [constraints](output-constraints.md) use their own verification paths. Pointwise scores and target-only options use K0. `Decoder::generate` uses one batch lane for MTP. [Effective depth](../src/decoder_batch.cpp#L129)<!-- prefix: "if (options." --> · [Verifier scores](../src/decoder_verify.cpp#L532)<!-- prefix: "void TargetV" -->
 
@@ -77,7 +77,7 @@ Direct `Decoder::generate` verification, ineligible batch groups, and K4 rounds 
 
 ### Sampled MTP
 
-An item with active [output penalties](output-penalties.md), [logit bias](serving/openai-logprobs.md#logit-bias), or a positive [output minimum](output-penalties.md#minimum-output) uses K0. Eligible peers in the same batch keep their configured depth. [Target-only selection](../include/sglang/decoder.h#L109)<!-- prefix: "bool require" -->
+An item with active [output penalties](output-penalties.md), [logit bias](serving/openai-logprobs.md#logit-bias), or a positive [output minimum](output-penalties.md#minimum-output) uses K0. Eligible peers in the same batch keep their configured depth. [Target-only selection](../include/sglang/decoder.h#L110)<!-- prefix: "bool require" -->
 
 The draft proposes greedy IDs. The target uses the [normal sampler](text-serving.md#sampling) on the first score and each verification row. It keys each draw by the request's resolved seed and the row's prospective output index. Discarded rows leave subsequent output indices available for recomputation on the corrected history. The same index drives the draw on that new row. [Verifier sampler](../src/decoder_verify.cpp#L510)<!-- prefix: "void TargetV" -->
 

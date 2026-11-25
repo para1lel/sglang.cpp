@@ -24,6 +24,7 @@ struct CudaBackendPolicy;
 struct PrefixCacheRead;
 struct PrefixDeviceTransfer;
 struct TpRuntimeInfo;
+struct TpArCounters;
 
 /// Evidence record for a tensor-parallel launch: one entry per rank.
 struct TpRuntimeInfo {
@@ -218,6 +219,9 @@ public:
     int paired_prefill_threshold() const;
     /// Rank/device receipt for tensor-parallel launches; nullptr for TP1.
     const decoder::TpRuntimeInfo* tensor_parallel_info() const;
+    /// Cumulative allreduce transport counters for the tensor-parallel group;
+    /// default (ranks 0) for single-device decoders.
+    decoder::TpArCounters tp_ar_counters() const;
 
 private:
     friend class DecoderBatch;

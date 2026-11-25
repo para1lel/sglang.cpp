@@ -104,6 +104,7 @@ class Request:
     def __init__(self, peer, deadline):
         self.peer = peer
         self.deadline = deadline
+        self.armed = False
         self.remaining = HEADER.size
         magic, self.op, self.remaining = HEADER.unpack(self.read(HEADER.size))
         if magic != MAGIC:
@@ -118,7 +119,8 @@ class Request:
         return left
 
     def check_mutation(self):
-        self.time_left()
+        if not self.armed:
+            self.time_left()
         hangup = select.POLLRDHUP | select.POLLHUP | select.POLLERR
         poller = select.poll()
         poller.register(self.peer, hangup)
@@ -169,6 +171,7 @@ class Request:
         self.peer.settimeout(self.time_left())
         if self.peer.recv(1) != b"\x01":
             raise EOFError("GPU operation was not armed")
+        self.armed = True
 
     def release_reply(self, status, data=b""):
         # GPU IPC leases end after device synchronization and unmapping, even after a deadline.

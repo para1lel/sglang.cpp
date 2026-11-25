@@ -74,5 +74,5 @@ LMCACHE_API_KEY=$("$python" -c 'import secrets; print(secrets.token_urlsafe(32))
 export LMCACHE_API_KEY
 exec "$python" -m lmcache.v1.multiprocess.server --host 127.0.0.1 --port "$port" \
     --supported-transfer-mode lmcache_driven --no-run-script-api-enabled --disable-metrics \
-    --l1-size-gb "$memory_gib" --l1-init-size-gb 0 --eviction-policy LRU \
+    --l1-size-gb "$memory_gib" --l1-init-size-gb "$memory_gib" --eviction-policy LRU \
     --l1-read-ttl-seconds 60 --l1-write-ttl-seconds 60 --server-module "$module_config"

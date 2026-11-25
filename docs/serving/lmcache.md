@@ -18,14 +18,16 @@ In the native server's shell, set `CUDA_VISIBLE_DEVICES` to the same physical `G
 | --- | --- |
 | `--socket PATH` | `$XDG_RUNTIME_DIR/sglang-lmcache.sock` if that variable is absolute, otherwise `/tmp/sglang-lmcache-<euid>.sock`. Use an absolute path shorter than 108 bytes under an existing directory. |
 | `--namespace NAME` | `sglang`. The module serves one namespace. The client and daemon must use the same value. |
-| `--memory-gib N` | `16`. Sets a finite positive limit for CPU L1 in GiB. |
+| `--memory-gib N` | `16`. Sets the initial and maximum CPU L1 capacity in GiB. Use a finite positive value. |
 | `--port N` | `17655`. This is the separate upstream LMCache TCP listener on `127.0.0.1`. |
 
-The launcher selects `--supported-transfer-mode lmcache_driven` and configures a dedicated lazy DRAM L1 with LRU eviction. L1 starts at zero allocated bytes. The module requires dedicated L1 storage. The upstream listener uses a generated API key. The Unix socket has mode `0600` and checks the peer's effective user ID. [Daemon invocation](../../tools/lmcache/serve.sh#L75)<!-- prefix: "exec \"$pytho" --> · [Storage binding](../../tools/lmcache/sglang_lmcache.py#L179)<!-- prefix: "class Record" --> · [Socket access](../../tools/lmcache/sglang_lmcache.py#L290)<!-- prefix: "os.chmod(end" -->
+The launcher selects `--supported-transfer-mode lmcache_driven` and configures a dedicated DRAM L1 with LRU eviction. It sets `--l1-init-size-gb` and `--l1-size-gb` to the configured capacity. LMCache allocates and registers that memory before opening the Unix socket. Allow startup to finish before starting native workers. The upstream listener uses a generated API key. The Unix socket has mode `0600` and checks the peer's effective user ID. [Daemon invocation](../../tools/lmcache/serve.sh#L75)<!-- prefix: "exec \"$pytho" --> · [Storage binding](../../tools/lmcache/sglang_lmcache.py#L182)<!-- prefix: "class Record" --> · [Socket access](../../tools/lmcache/sglang_lmcache.py#L293)<!-- prefix: "os.chmod(end" -->
 
 ## Native transport
 
-The application submits GPU allocation views and a CUDA readiness event. It keeps both alive until the daemon releases the views. The daemon imports the views and waits for the event. LMCache moves the payload between GPU memory and its CPU L1 records and closes the imported mappings before replying. Native sends transfer descriptions and receives receipts over the socket. The application allocates no host buffer for the cache payload. [GPU transfer](../../tools/lmcache/sglang_gpu_transfer.py#L146)<!-- prefix: "def run(self" --> · [Release reply](../../tools/lmcache/sglang_lmcache.py#L173)<!-- prefix: "def release_" -->
+The application submits GPU allocation views and a CUDA readiness event. It keeps both alive until the daemon releases the views. The daemon imports the views and waits for the event. LMCache moves the payload between GPU memory and its CPU L1 records and closes the imported mappings before replying. Native sends transfer descriptions and receives receipts over the socket. The application allocates no host buffer for the cache payload. [GPU transfer](../../tools/lmcache/sglang_gpu_transfer.py#L146)<!-- prefix: "def run(self" --> · [Release reply](../../tools/lmcache/sglang_lmcache.py#L176)<!-- prefix: "def release_" -->
+
+The daemon deadline covers command receipt and the client's ARM acknowledgement. It still applies to unarmed reset and delete requests. An armed GPU transfer can finish beyond that deadline. The daemon still checks for disconnects before changing records and releases the views after device synchronization and unmapping. [Deadline check](../../tools/lmcache/sglang_lmcache.py#L121)<!-- prefix: "def check_mu" --> · [ARM acknowledgement](../../tools/lmcache/sglang_lmcache.py#L169)<!-- prefix: "def arm(self" -->
 
 ## Standalone verification
 

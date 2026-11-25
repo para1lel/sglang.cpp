@@ -42,11 +42,11 @@ Prefill scores the first output. When the next forward pass consumes the output 
 
 ## Constraints and failure behavior
 
-Use `DecoderBatch::admit_multimodal` to mix media and text lanes, score tokens, or reuse a compatible prefix. The lane retains its feature owners through CUDA cleanup. `Decoder::generate_multimodal` supports serial generation. Positive depth uses the batch MTP path at width one. Teacher forcing and target-only controls use K0. [Batch admission](../src/decoder_batch.cpp#L215)<!-- prefix: "int DecoderB" --> · [Serial MTP](../src/media/decoder_media.cpp#L109)<!-- prefix: "const int pr" -->
+Use `DecoderBatch::admit_multimodal` to mix media and text lanes, score tokens, or reuse a compatible prefix. The lane retains its feature owners through CUDA cleanup. `Decoder::generate_multimodal` supports serial generation. Positive depth uses the batch MTP path at width one. Teacher forcing and target-only controls use K0. [Batch admission](../src/decoder_batch.cpp#L217)<!-- prefix: "int DecoderB" --> · [Serial MTP](../src/media/decoder_media.cpp#L109)<!-- prefix: "const int pr" -->
 
-Media lanes share the [prefill executor](native-prefill-workspace.md#runtime-path) and use eligible Tensor Core tiles. Each lane supplies its embeddings and rotary positions. Decode binds the physical KV position and rotary position separately. Eligible K0 decode can replay a graph. [Lane inputs](../include/sglang/runtime/model/decoder_batch_lane.h#L47)<!-- prefix: "ForwardLane " --> · [Graph binding](../src/text/decoder_graph.cpp#L67)<!-- prefix: "const int ro" -->
+Media lanes share the [prefill executor](native-prefill-workspace.md#runtime-path) and use eligible Tensor Core tiles. Each lane supplies its embeddings and rotary positions. Decode binds the physical KV position and rotary position separately. Eligible K0 decode can replay a graph. [Lane inputs](../include/sglang/runtime/model/decoder_batch_lane.h#L48)<!-- prefix: "ForwardLane " --> · [Graph binding](../src/text/decoder_graph.cpp#L67)<!-- prefix: "const int ro" -->
 
-The batch decoder accepts ordinary sampling and stop options. [Prefix reuse](prefix-cache.md#media-identity-and-prefill) matches the covered media as well as token IDs and salt. A hit reports restored prompt IDs as `cached_prompt_tokens`. [Batch restore](../src/decoder_batch.cpp#L275)<!-- prefix: "lane.restore" -->
+The batch decoder accepts ordinary sampling and stop options. [Prefix reuse](prefix-cache.md#media-identity-and-prefill) matches the covered media as well as token IDs and salt. A hit reports restored prompt IDs as `cached_prompt_tokens`. [Batch restore](../src/decoder_batch.cpp#L276)<!-- prefix: "lane.restore" -->
 
 - The grid requires a positive pair count and positive even spatial axes. Apply the encoder's separate patch limits when it produces the features.
 - Expanded prompt length plus output budget must fit 262,144 tokens. Use IDs in `[0, 248320)`.

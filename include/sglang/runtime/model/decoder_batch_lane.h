@@ -19,7 +19,7 @@ struct Lane {
     std::optional<SamplingParameters> sampling = std::nullopt;
     std::optional<MtpConstraintRound> constraint_round{};
     bool checkpoints() const {
-        return options.publish_prefix_checkpoints && bool(options.submit_prefix_transfer);
+        return options.publish_prefix_checkpoints && bool(options.store_prefix);
     }
     bool restored_prompt = false;
     std::shared_ptr<const MultimodalInput> media = nullptr;
@@ -27,6 +27,7 @@ struct Lane {
     MediaPrefill media_prefill{};
     std::size_t resident_bytes = 0;
     std::unique_ptr<PendingBatchPrefix> prefix = nullptr;
+    std::optional<DeferredPrefixStore> prefix_store = std::nullopt;
 
     int remaining_prompt() const { return progress.remaining_prompt(prompt_size); }
     int remaining_output() const { return progress.remaining_output(options); }

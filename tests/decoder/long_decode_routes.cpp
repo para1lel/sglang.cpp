@@ -442,11 +442,12 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
     const auto selected = select({0});
     DecoderOptions export_options{.max_new_tokens = 1, .ignore_eos = true};
     const std::vector<int> cached(tokens.begin(), tokens.begin() + prefix);
-    prefix_fixture::attach(export_options, cache, cached, salt);
+    const auto stores = prefix_fixture::attach(export_options, cache, cached, salt);
     check(batch.admit(0, cached, export_options) == 0,
           "Unexpected initial prefix hit");
-    check(batch.advance_chunked(selected)[0].prefix_pending, "Missing prefix checkpoint export");
-    prefix_fixture::wait(batch, 0);
+    const auto terminal = batch.advance_chunked(selected)[0];
+    check(terminal.finish_reason && !terminal.prefix_pending, "Terminal store blocked completion");
+    stores->wait();
     batch.release_retired_allocations();
     const auto tail = [&](int rows, bool without_arena, int* reads) {
         const std::vector<int> prompt(tokens.begin(), tokens.begin() + prefix + rows);

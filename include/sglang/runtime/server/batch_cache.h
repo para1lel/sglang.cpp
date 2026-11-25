@@ -19,6 +19,7 @@ struct LmCacheMetrics {
     std::uint64_t io_errors = 0;
     std::uint64_t stores = 0;
     std::uint64_t declined_stores = 0;
+    std::uint64_t pending_stores = 0;
     std::uint64_t gqa_written_tokens = 0;
     std::uint64_t gqa_read_bytes = 0, gdn_read_bytes = 0, draft_read_bytes = 0;
     std::uint64_t gqa_written_bytes = 0, gdn_written_bytes = 0, draft_written_bytes = 0;
@@ -47,9 +48,15 @@ public:
     ~BatchCache();
 
     void lookup(Keys keys, int score_start, bool draft, Cancel cancelled, ReadDone done);
-    std::shared_future<bool> transfer(std::shared_ptr<const decoder::PrefixCacheKeys> keys,
-                                      const decoder::PrefixDeviceTransfer& transfer, bool restore,
-                                      std::function<void()> done);
+    std::shared_future<bool> restore(std::shared_ptr<const decoder::PrefixCacheKeys> keys,
+                                     const decoder::PrefixDeviceTransfer& view,
+                                     std::function<void()> done);
+    bool reserve_store(std::shared_ptr<void>& reservation);
+    bool store_capacity() const;
+    bool stores_pending() const;
+    void store(const decoder::PrefixCacheKeys& keys, decoder::PrefixDeviceTransfer&& view,
+               std::shared_ptr<void> reservation, std::shared_ptr<std::atomic_uint64_t> stores,
+               std::function<void()> done);
     void wake_readers();
     void reset();
     LmCacheMetrics metrics() const;

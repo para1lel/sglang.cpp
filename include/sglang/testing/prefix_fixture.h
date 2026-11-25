@@ -32,26 +32,45 @@ inline sglang::decoder::LmCacheClient client() {
     return cache;
 }
 
-inline void attach(sglang::DecoderOptions& options, sglang::decoder::LmCacheClient cache,
-                   const std::vector<int>& prompt, std::string_view salt,
-                   std::function<void()> before_store = nullptr) {
+struct Stores {
+    std::vector<std::future<void>> receipts;
+
+    void wait() {
+        for (auto& receipt : receipts) receipt.get();
+        receipts.clear();
+    }
+};
+
+inline std::shared_ptr<Stores> attach(sglang::DecoderOptions& options,
+        sglang::decoder::LmCacheClient cache, const std::vector<int>& prompt,
+        std::string_view salt, std::function<void()> before_store = nullptr) {
     using namespace sglang::decoder;
-    options.submit_prefix_transfer = [cache = std::move(cache), before_store,
-                                      keys = PrefixCacheKeys(prompt, salt)](
-            const PrefixDeviceTransfer& view, bool restore, const int* generated, int count) {
-        auto current = keys;
-        for (int index = 0; index < count; ++index) current.append(generated[index]);
-        return std::async(std::launch::async, [cache, current = std::move(current), &view,
-                                                restore, before_store] {
-            if (!restore && before_store) before_store();
-            const auto status = restore ? cache.retrieve(current, view)
-                                        : cache.store(current, view);
-            if (status != LmCacheStatus::complete) {
-                throw std::runtime_error("Test LMCache transfer did not complete");
+    auto stores = std::make_shared<Stores>();
+    auto keys = std::make_shared<PrefixCacheKeys>(prompt, salt);
+    options.restore_prefix = [cache, keys](const PrefixDeviceTransfer& view) {
+        return std::async(std::launch::async, [cache, keys, &view] {
+            if (cache.retrieve(*keys, view) != LmCacheStatus::complete) {
+                throw std::runtime_error("Test LMCache restore did not complete");
             }
             return true;
         }).share();
     };
+    options.store_prefix = [cache, keys, stores, before_store = std::move(before_store)](
+            PrefixDeviceTransfer&& view, const int* generated, int count, std::shared_ptr<void>,
+            std::shared_ptr<std::atomic_uint64_t> acknowledged_stores) {
+        for (int index = 0; index < count; ++index) keys->append(generated[index]);
+        auto metadata = cache.prepare_store(*keys, view);
+        stores->receipts.push_back(std::async(std::launch::async,
+            [cache, metadata = std::move(metadata), view = std::move(view), before_store,
+             acknowledged_stores = std::move(acknowledged_stores)] {
+                if (before_store) before_store();
+                if (cache.store_prepared(metadata, nullptr) != LmCacheStatus::complete) {
+                    throw std::runtime_error("Test LMCache store did not complete");
+                }
+                ++*acknowledged_stores;
+            }));
+    };
+    return stores;
 }
 
 inline std::shared_ptr<sglang::decoder::PrefixCacheRead> read_checkpoint(

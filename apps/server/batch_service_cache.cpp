@@ -51,34 +51,39 @@ void BatchService::State::configure_checkpoint(Job& job) {
         job.cache_read, &job.cache_read->match);
     job.options.publish_prefix_checkpoints =
         job.cache_keys->tokens() == job.cache_keys->cacheable_tokens();
-    job.options.submit_prefix_transfer = [this, current = &job](
-        const decoder::PrefixDeviceTransfer& command, bool restore,
-        const int* generated, int count) {
-        auto keys = current->cache_keys;
-        for (int i = 0; i < count; ++i) keys->append(generated[i]);
-        auto completion = lmcache->transfer(std::move(keys), command, restore, [this] {
-            const std::lock_guard lock(mutex);
-            changed.notify_all();
-        });
+    auto notify = [this] {
+        const std::lock_guard lock(mutex);
+        changed.notify_all();
+    };
+    job.options.restore_prefix = [this, current = &job, notify](
+            const decoder::PrefixDeviceTransfer& view) {
+        auto completion = lmcache->restore(current->cache_keys, view, notify);
         const std::lock_guard lock(mutex);
         current->prefix_operation = completion;
         return completion;
     };
-}
-
-void BatchService::State::detach_terminal(int slot, Job& job) {
-    if (job.request_id && !job.request_id->finish() && !job.cancelled) {
-        job.request_id->finish_abort();
-        job.cache_finish = DecoderFinishReason::aborted;
-    }
-    job.request_id = nullptr;
-    job.finish = std::exchange(job.cache_finish, {});
-    jobs[slot].reset();
-    changed.notify_all();
+    job.options.reserve_prefix_store = [this](std::shared_ptr<void>& reservation) {
+        return lmcache->reserve_store(reservation);
+    };
+    job.options.store_prefix = [this, current = &job, notify](
+            decoder::PrefixDeviceTransfer&& view, const int* generated, int count,
+            std::shared_ptr<void> reservation, std::shared_ptr<std::atomic_uint64_t> stores) {
+        auto& keys = *current->cache_keys;
+        for (int i = 0; i < count; ++i) keys.append(generated[i]);
+        lmcache->store(keys, std::move(view), std::move(reservation), std::move(stores), notify);
+    };
 }
 
 bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
                                       const std::shared_ptr<Job>& job) {
+    {
+        const std::lock_guard lock(mutex);
+        if (job->discard_deferred_store()) {
+            job->prefix_pending = false;
+            return true;  // Let ordinary cancellation retire the unsubmitted checkpoint.
+        }
+        if (!prefix_ready(*job)) return false;
+    }
     DecoderBatchPrefixUpdate update;
     try {
         update = batch.poll_prefix(slot);
@@ -90,7 +95,7 @@ bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
         const std::lock_guard lock(mutex);
         job->prefix_pending = false;
         job->prefix_operation = {};
-        job->cache_finish.reset();
+        job->deferred_finish.reset();
         if (job->request_id && !job->request_id->finish()) {
             job->request_id->finish_abort();
             job->finish = DecoderFinishReason::aborted;
@@ -115,8 +120,9 @@ bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
         job->cache_read.reset();
         changed.notify_all();
     }
-    if (job->cache_finish) {
-        detach_terminal(slot, *job);
+    if (job->deferred_finish) {
+        publish(slot, *job, {std::nullopt, std::exchange(job->deferred_finish, {})});
+        changed.notify_all();
         return false;
     }
     return true;

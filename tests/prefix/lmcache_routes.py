@@ -20,7 +20,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / "tests"), str(ROOT / "benchmarks" / "paired")]
 
-from cold_cache import LMCACHE_METRICS, RUNNING, WAITING, metrics
+from cold_cache import LMCACHE_DRAIN, LMCACHE_METRICS, PENDING_STORES, RUNNING, WAITING, metrics
 from media import http_routes as http
 from lmcache_relay import DRAFT, ERASE, GET, GDN, GQA, LEASE, LOOKUP, PREFIX, PUT, READY, RESET
 from lmcache_relay import Relay, control, key_body
@@ -52,7 +52,14 @@ class Witness:
         assert status == 200, (route, status, raw)
         return raw
 
+    def pending_stores(self):
+        return metrics(self.get("/metrics").decode(), LMCACHE_DRAIN)[PENDING_STORES]
+
+    def drain(self):
+        wait_until(lambda: self.pending_stores() == 0, "LMCache stores did not settle")
+
     def snapshot(self, label):
+        self.drain()
         raw = self.get("/metrics")
         (self.evidence / f"{label}.prom").write_bytes(raw)
         summary = metrics(raw.decode(), "lmcache")
@@ -60,6 +67,7 @@ class Witness:
                 for name in LMCACHE_METRICS}
 
     def reset(self):
+        self.drain()
         count = len(self.relay.since())
         status, _, body = http.exchange(self.port, "/reset_prefix_cache", {})
         assert status == 200 and json.loads(body) == {"success": True}, (status, body)
@@ -80,6 +88,7 @@ class Witness:
         return response, keys
 
     def published_keys(self, begin):
+        self.drain()
         entries = [entry for entry in self.relay.since(begin) if entry["opcode"] == PUT]
         assert all(entry["status"] == 0 for entry in entries), entries
         return {key for entry in entries for key in entry["keys"]}
@@ -347,11 +356,12 @@ def event_receipt(relay):
 
 
 class Stream:
-    def __init__(self, witness, label, prompt, count, *, evidence_label=None):
+    def __init__(self, witness, label, prompt, count, *, evidence_label=None, **sampling):
         self.witness = witness
         self.label = label
         self.evidence_label = evidence_label or label
         self.body = http.native_text(prompt, count) | {"rid": label, "stream": True}
+        self.body["sampling_params"].update(sampling)
         self.events = queue.Queue()
         self.thread = Thread(target=self.read)
         self.thread.start()
@@ -402,7 +412,7 @@ class Stream:
             instant, frame = self.event(max(0.001, deadline - monotonic()))
             if frame == "[DONE]" or frame["meta_info"]["finish_reason"]:
                 assert instant > terminal_after, (
-                    self.label, "terminal before cache acknowledgment")
+                    self.label, "terminal before the held lease was released")
             if frame == "[DONE]":
                 break
         self.thread.join(5)
@@ -454,6 +464,7 @@ def abort_pending(witness, source):
     prompt = source[:PROMPT]
     witness.reset()
     witness.stores("prime-abort", source[:HIGH])
+    offset = len(witness.relay.since())
     gate = witness.relay.arm(PREFIX)
     waiting = Stream(witness, "cancel-held-lookup", prompt, 8)
     try:
@@ -468,9 +479,7 @@ def abort_pending(witness, source):
         replacement = Stream(witness, waiting.label, prompt, 8, evidence_label="reused-abort-id")
         admitted_ns = expect_load(witness, 1, 0)
         assert upstream["reply_ns"] < admitted_ns and not gate.release.is_set()
-        assert not any(entry["opcode"] in (GET, PUT)
-                       for entry in witness.relay.since() if entry["reply_ns"]
-                       >= upstream["reply_ns"])
+        assert not any(entry["opcode"] in (GET, PUT) for entry in witness.relay.since(offset))
     finally:
         gate.release.set()
     assert gate.finished.wait(10)
@@ -499,14 +508,19 @@ def held_put(witness, source, unrelated):
         peer = Stream(witness, "peer-before-put-ack", peer_prompt, budget)
         peer_ns, _ = peer.progress(upstream["reply_ns"])
         witness.lookup([periodic], (1,))
-        assert not gate.release.is_set() and writer.thread.is_alive()
+        written = http.native_result(writer.finish(), prompt, budget, 0)
+        finished_ns = perf_counter_ns()
+        assert not gate.release.is_set() and witness.pending_stores() > 0
+        status, _, body = http.exchange(witness.port, "/reset_prefix_cache", {})
+        assert status == 409, (status, body)
         released_ns = perf_counter_ns()
     finally:
         gate.release.set()
     assert gate.finished.wait(10) and upstream.get("forwarded") is True
-    written = http.native_result(writer.finish(released_ns), prompt, budget, 0)
+    assert upstream["reply_ns"] < finished_ns <= released_ns
     http.native_result(peer.finish(), peer_prompt, budget, 0)
     assert tokens(written) == tokens(expected)
+    witness.drain()
     states = [key for entry in witness.relay.since(offset) if entry["opcode"] == PUT
               for key in entry["keys"] if key[0] == GDN]
     assert len(states) == len(set(states)) == 3 and states[0] == periodic, states
@@ -526,6 +540,7 @@ def held_put(witness, source, unrelated):
     return {"periodic_rows": position, "periodic_gdn_bytes": periodic_bytes,
             "terminal_rows": len(terminal_prompt), "terminal_restore": delta,
             "periodic_ack_held_ns": upstream["reply_ns"], "peer_progress_ns": peer_ns,
+            "writer_finished_ns": finished_ns,
             "periodic_ack_released_ns": released_ns}
 
 
@@ -673,6 +688,7 @@ def exercise(args, relay, path, source, unrelated):
         one = Witness(port, args.evidence, args.daemon, relay)
         assert json.loads(one.get("/server_info"))["max_running_requests"] == 1
         capture_case(report, failures, "cancelled_lookup", abort_pending, one, source)
+        capture_case(report, failures, "exact_terminal", exact_terminal, one, source, unrelated)
     if args.device_fence_dir:
         with http.serve(args, "armed-abort", "--lmcache-socket", str(path),
                         "--max-active", "2") as (port, _):
@@ -681,6 +697,50 @@ def exercise(args, relay, path, source, unrelated):
                          args.device_fence_dir, source, unrelated)
     capture_case(report, failures, "fresh_worker", fresh_worker, args, relay, path, source)
     return report | {"failures": failures}
+
+
+def exact_terminal(witness, source, unrelated):
+    endpoint = http.CHECKPOINT_INTERVAL
+    prompt = source[:endpoint]
+    assert len(prompt) == endpoint
+    witness.reset()
+    assert json.loads(witness.get("/server_info"))["max_running_requests"] == 1
+    reference = witness.generate("boundary-length", prompt)
+    ids, text, _ = http.native_result(reference, prompt, 1, 0)
+    assert text, reference
+    for label in ("length", "stop"):
+        witness.reset()
+        gate = witness.relay.arm(PUT, GDN)
+        try:
+            first = Stream(witness, f"{label}-held-owner", unrelated[:97], 1)
+            gate.wait()
+            http.native_result(first.finish(), unrelated[:97], 1, 0)
+            witness.generate(f"{label}-queued-owner", unrelated[:98])
+            assert witness.pending_stores() == 2
+            begin = len(witness.relay.since())
+            count, sampling = (1, {}) if label == "length" else (4, {"stop": [text]})
+            request = Stream(witness, f"boundary-{label}-claim", prompt, count, **sampling)
+            wait_until(lambda: witness.pending_stores() == 3, "Terminal checkpoint never deferred")
+            status, _, raw = http.exchange(witness.port, "/abort_request", {"rid": request.label})
+            assert status == 200 and not raw
+            assert request.thread.is_alive() and witness.pending_stores() == 3
+        finally:
+            gate.release.set()
+        assert gate.finished.wait(10)
+        final = request.finish()
+        if label == "length":
+            assert http.native_result(final, prompt, 1, 0)[0] == ids
+        else:
+            assert final["meta_info"]["finish_reason"] == {"type": "stop", "matched": text}
+            assert final["output_ids"] == ids and final["text"] == "", final
+        witness.drain()
+        endpoints = [record["endpoint"] for entry in witness.relay.since(begin)
+                     if entry["opcode"] == PUT and entry["status"] == 0
+                     for record in entry["records"] if record.get("endpoint") == endpoint]
+        assert endpoints == [endpoint], (label, endpoints)
+        warm = witness.generate(f"boundary-{label}-warm", prompt + ids)
+        http.native_result(warm, prompt + ids, 1, endpoint)
+    return {"endpoint": endpoint, "first_id": ids[0], "matched_stop": text}
 
 
 def periodic_only(args, relay, path, source, unrelated):

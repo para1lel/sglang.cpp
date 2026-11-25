@@ -12,7 +12,9 @@ PROTOCOL_V5 = "matched-k4-native-defaults-cache-on-v5"
 LMCACHE_PROTOCOL = "matched-k4-native-defaults-lmcache-v6"
 LMCACHE_GPU_PROTOCOL = "matched-k4-native-defaults-lmcache-slc2"
 LMCACHE_GPU_SLC3_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3"
-LMCACHE_GPU_PROTOCOLS = (LMCACHE_GPU_PROTOCOL, LMCACHE_GPU_SLC3_PROTOCOL)
+LMCACHE_DRAIN_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3-drain"
+LMCACHE_SLC3_PROTOCOLS = (LMCACHE_GPU_SLC3_PROTOCOL, LMCACHE_DRAIN_PROTOCOL)
+LMCACHE_GPU_PROTOCOLS = (LMCACHE_GPU_PROTOCOL, *LMCACHE_SLC3_PROTOCOLS)
 LMCACHE_PROTOCOLS = (LMCACHE_PROTOCOL, *LMCACHE_GPU_PROTOCOLS)
 WIDE_BUDGET_PROTOCOLS = (PROTOCOL_V4, PROTOCOL_V5, *LMCACHE_PROTOCOLS)
 WORKLOAD_PROTOCOLS = (PROTOCOL, *WIDE_BUDGET_PROTOCOLS)
@@ -61,7 +63,7 @@ def validate_identity(identity):
         require(identity.get("lmcache_version") == LMCACHE_VERSION
                 and identity.get("sampling") == "single-round-v1",
                 "LMCache campaign requires the pinned daemon and single-round sampling")
-    if identity["protocol"] == LMCACHE_GPU_SLC3_PROTOCOL:
+    if identity["protocol"] in LMCACHE_SLC3_PROTOCOLS:
         require(identity.get("lmcache_wire") == "SLC3"
                 and identity.get("lmcache_ready_version") == LMCACHE_SLC3_READY,
                 "SLC3 campaign requires the native-v3 readiness identity")

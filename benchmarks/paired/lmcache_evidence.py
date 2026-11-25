@@ -14,7 +14,7 @@ from zipfile import ZipFile
 
 from saved_evidence import command, compute_owners, digest, hash_manifest, load, require
 from workload_suite import (
-    LMCACHE_GPU_PROTOCOLS, LMCACHE_GPU_SLC3_PROTOCOL, LMCACHE_SLC3_READY, LMCACHE_VERSION,
+    LMCACHE_GPU_PROTOCOLS, LMCACHE_SLC3_PROTOCOLS, LMCACHE_SLC3_READY, LMCACHE_VERSION,
 )
 
 
@@ -147,7 +147,7 @@ def verify_gpu(run, identity, daemon, argv, launch_log):
     uid = identity["lmcache_uid"]
     gpu = identity["gpu_uuid"]
     wheel_receipt(run.parent, identity)
-    if identity["protocol"] == LMCACHE_GPU_SLC3_PROTOCOL:
+    if identity["protocol"] in LMCACHE_SLC3_PROTOCOLS:
         require(daemon.get("wire") == identity.get("lmcache_wire") == "SLC3"
                 and daemon.get("ready_version") == identity.get("lmcache_ready_version")
                 == LMCACHE_SLC3_READY, "Incorrect SLC3 READY identity")

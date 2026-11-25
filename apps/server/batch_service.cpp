@@ -58,7 +58,7 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
     for (auto& job : jobs) {
         if (job && (!job->retiring_prefix || permanent)) {
             cancel_cache_read(*job);
-            job->cache_finish.reset();
+            job->deferred_finish.reset();
             if (job->request_id && !job->request_id->finish() && !job->cancelled &&
                 job->can_overlap_mtp_output()) {
                 job->request_id->finish_abort();
@@ -129,8 +129,9 @@ std::optional<Work> BatchService::State::wait_for_jobs(BatchSession& batch) {
     const auto ready = [&] {
         return closing || (reset_pending && !lmcache) || wide_decode_ready(true) ||
                decode_mailboxes_ready(false) || idle_for_health() ||
-               std::any_of(jobs.begin(), end, [](const auto& job) {
-                   return job && (job->ready() || job->prefix_ready());
+               (trace && lmcache && batch.prefix_cache_stats().stores != counters.cache.stores) ||
+               std::any_of(jobs.begin(), end, [this](const auto& job) {
+                   return job && (job->ready() || prefix_ready(*job));
                });
     };
     if (std::none_of(jobs.begin(), end, [](const auto& job) { return bool(job); }) &&
@@ -147,8 +148,8 @@ std::optional<Work> BatchService::State::wait_for_jobs(BatchSession& batch) {
     changed.wait_for(lock, mailbox_grace, [&] {
         return closing || reset_pending || wide_decode_ready(true) || wide_decode_ready(false) ||
                decode_mailboxes_ready(true) ||
-               std::all_of(jobs.begin(), end, [admitting](const auto& job) {
-                   return job ? job->ready() || job->prefix_ready() : !admitting;
+               std::all_of(jobs.begin(), end, [this, admitting](const auto& job) {
+                   return job ? job->ready() || prefix_ready(*job) : !admitting;
                });
     });
     if (closing) return std::nullopt;
@@ -281,9 +282,9 @@ void BatchService::State::publish_steps(const Jobs& snapshot, const Selection& s
         auto& step = steps[slot];
         job.prefix_pending = step.prefix_pending;
         if (job.prefix_pending) {
-            job.cache_finish = std::exchange(step.finish_reason, {});
+            job.deferred_finish = std::exchange(step.finish_reason, {});
         }
-        if (publish(slot, *snapshot[slot], steps[slot])) {
+        if (publish(slot, job, step)) {
             generated = true;
         }
     }
@@ -327,7 +328,7 @@ void BatchService::State::process(BatchSession& batch) {
                 continue;
             }
             cold &= !job->admitted;
-            if (job->prefix_pending && (!job->prefix_ready() || !poll_prefix(batch, slot, job))) {
+            if (job->prefix_pending && !poll_prefix(batch, slot, job)) {
                 continue;
             }
             selected[slot] = prepare(batch, slot, job, snapshot->buffered);
@@ -740,6 +741,7 @@ BatchMetrics BatchService::metrics() const {
     auto metrics = state_->counters;
     if (auto* cache = state_->lmcache.get()) {
         metrics.lmcache = cache->metrics();
+        // Transport receipts can arrive after the scheduler published its final step.
         metrics.cache.stores = metrics.lmcache.stores;
     }
     return metrics;
@@ -758,7 +760,8 @@ bool BatchService::reset_prefix_cache() {
         std::rethrow_exception(state_->failure);
     }
     const auto& first = state_->jobs.front();
-    if (state_->reset_pending || (first && first->health_check) ||
+    if (state_->reset_pending || (state_->lmcache && state_->lmcache->stores_pending()) ||
+        (first && first->health_check) ||
         std::any_of(state_->jobs.begin(), state_->jobs.end(),
                     [](const auto& job) { return job && job->retiring_prefix; }) ||
         std::any_of(state_->generating.begin(), state_->generating.end(),

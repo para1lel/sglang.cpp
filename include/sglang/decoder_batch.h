@@ -44,6 +44,7 @@ struct DecoderBatchStep {
         extra_generated_logprobs{};
     std::shared_ptr<const DecoderPromptLogprobs> prompt_logprobs = nullptr;
     std::shared_ptr<const std::vector<double>> label_logprobs = nullptr;
+    // The producer is waiting for space to submit its checkpoint, before any IPC begins.
     bool prefix_pending = false;
 };
 

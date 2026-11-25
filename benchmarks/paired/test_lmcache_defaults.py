@@ -26,6 +26,7 @@ DIRECT = IDENTITY | {"protocol": suite.LMCACHE_GPU_PROTOCOL, "lmcache_capacity_b
                      "memory": "localalloc"}
 SLC3 = DIRECT | {"protocol": suite.LMCACHE_GPU_SLC3_PROTOCOL, "lmcache_wire": "SLC3",
                  "lmcache_ready_version": "0.5.8+native-v3"}
+DRAIN = SLC3 | {"protocol": suite.LMCACHE_DRAIN_PROTOCOL}
 OTHER_GPU = GPU[:-1] + "1"
 
 
@@ -63,6 +64,94 @@ def test_cold_lmcache_replay_detects_errors_reuse_and_unacknowledged_stores():
             cold_cache.replay(cold_receipt(**{counter: 1}), "lmcache")
     with pytest.raises(ValueError, match="did not acknowledge"):
         cold_cache.replay(cold_receipt(**{cold_cache.STORES: 0}), "lmcache")
+
+
+def test_drain_campaign_keeps_existing_schedules_and_pinned_apc():
+    suite.validate_identity(DRAIN)
+    assert k4.cache_engine(DRAIN, "native-k4") == cold_cache.LMCACHE_DRAIN
+    assert k4.cache_engine(DRAIN, "native-k4-trace") == cold_cache.LMCACHE_DRAIN
+    assert k4.cache_engine(SLC3, "native-k4") == "lmcache"
+    assert k4.cache_engine(DRAIN, "vllm-k4") == "vllm"
+    assert k4.schedule("W4", "native-k4", DRAIN) == ["warmup-01", "measured-01"]
+
+
+def drain_metric_text(**changes):
+    values = dict.fromkeys((cold_cache.RUNNING, cold_cache.WAITING, cold_cache.HITS,
+                           cold_cache.STORES, *cold_cache.LMCACHE_METRICS,
+                           *cold_cache.LMCACHE_DRAIN_METRICS), 0)
+    return "".join(f"{name} {value}\n" for name, value in (values | changes).items())
+
+
+def drain_receipt(**changes):
+    # The first final cursor lands on a periodic checkpoint. The other needs two stores.
+    requests = [{"submit_ns": 40 + lane, "done_ns": 48 + lane, "eof_ns": 50 + lane,
+                 "usage": {"prompt_tokens": 8192, "completion_tokens": completion}}
+                for lane, completion in enumerate((1, 4))]
+    outcomes = {cold_cache.STORES: 3, cold_cache.LMCACHE_STORES: 3,
+                cold_cache.GQA_WRITTEN_TOKENS: 16387, cold_cache.LMCACHE_WRITE_NS: 17,
+                **dict.fromkeys(cold_cache.LMCACHE_WRITTEN_BYTES, 12)}
+    receipt = {"before": drain_metric_text(), "cleared": drain_metric_text(),
+               "after": drain_metric_text(**(outcomes | changes)),
+               "reset": {"status": 200, "body": '{"success":true}'},
+               "reset_started_ns": 10, "reset_completed_ns": 20, "ready_ns": 30,
+               "capture_finished_ns": 60, "settled_ns": 85}
+    return {"cold_cache": receipt, "requests": requests}
+
+
+def test_native_drain_checks_settled_writes_without_extending_wire_makespan():
+    raw = drain_receipt()
+    snapshots = cold_cache.replay(raw, cold_cache.LMCACHE_DRAIN)
+    assert snapshots["after"][cold_cache.LMCACHE_STORES] == 3
+    assert k4.cohort_makespan_ns(raw["requests"]) == 9
+    with pytest.raises(ValueError, match="between settled cohorts"):
+        cold_cache.replay(raw, cold_cache.LMCACHE_DRAIN, snapshots)
+
+
+@pytest.mark.parametrize(("change", "error"), [
+    ({cold_cache.PENDING_STORES: 1}, "pending LMCache stores"),
+    ({cold_cache.LMCACHE_STORES: 2}, "expected number"),
+    ({cold_cache.GQA_WRITTEN_TOKENS: 16386}, "every completed token"),
+    ({cold_cache.LMCACHE_WRITTEN_BYTES[-1]: 0}, "all three transfer families"),
+    ({cold_cache.DECLINED_STORES: 1}, "declined a checkpoint"),
+    ({cold_cache.LMCACHE_REUSE[0]: 1}, "reported an I/O error"),
+    *(({counter: 1}, "issued a restore") for counter in cold_cache.LMCACHE_READ_ACTIVITY),
+])
+def test_native_drain_rejects_incomplete_or_failed_transfers(change, error):
+    with pytest.raises(ValueError, match=error):
+        cold_cache.replay(drain_receipt(**change), cold_cache.LMCACHE_DRAIN)
+
+
+def test_native_drain_rejects_absent_gauge_and_premature_settlement():
+    with pytest.raises(ValueError, match="Missing cache metrics"):
+        cold_cache.replay(cold_receipt(), cold_cache.LMCACHE_DRAIN)
+    raw = drain_receipt()
+    raw["cold_cache"]["settled_ns"] = 49
+    with pytest.raises(ValueError, match="overlaps the timed cohort"):
+        cold_cache.replay(raw, cold_cache.LMCACHE_DRAIN)
+
+
+def test_native_drain_waits_before_reset_and_after_done(monkeypatch):
+    expected_requests = iter([
+        ("GET", "/metrics", drain_metric_text(**{cold_cache.PENDING_STORES: 2})),
+        ("GET", "/metrics", drain_metric_text()),
+        ("POST", "/reset_prefix_cache", '{"success":true}'),
+        ("GET", "/metrics", drain_metric_text()),
+        ("GET", "/metrics", drain_metric_text(**{cold_cache.PENDING_STORES: 1})),
+        ("GET", "/metrics", drain_receipt()["cold_cache"]["after"]),
+    ])
+
+    def request(url, method, path, body=None):
+        expected_method, expected_path, response = next(expected_requests)
+        assert (method, path) == (expected_method, expected_path)
+        return {"status": 200, "body": response}
+
+    monkeypatch.setattr(cold_cache, "request", request)
+    monkeypatch.setattr(cold_cache, "sleep", lambda seconds: None)
+    receipt = cold_cache.before_cohort(None, cold_cache.LMCACHE_DRAIN)
+    cold_cache.after_cohort(None, cold_cache.LMCACHE_DRAIN, receipt)
+    assert receipt["settled_ns"] > receipt["capture_finished_ns"] > receipt["ready_ns"]
+    assert cold_cache.metrics(receipt["after"], cold_cache.LMCACHE_DRAIN)[cold_cache.STORES] == 3
+    assert next(expected_requests, None) is None
 
 
 def test_pinned_vllm_must_have_local_apc_without_offload():

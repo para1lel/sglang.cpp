@@ -58,9 +58,15 @@ public:
     std::vector<bool> lookup(const std::vector<LmCacheKey>& keys) const;
     LmCachePrefix lookup_prefix(const PrefixCacheKeys& keys, int max_restore, bool draft) const;
 
+    // Encode store metadata while the prefix keys and transfer view are still stable.
+    std::string prepare_store(const PrefixCacheKeys& keys,
+                              const PrefixDeviceTransfer& transfer) const;
+
     // Keep exported allocations and the ready event alive until the operation returns.
     LmCacheStatus store(const PrefixCacheKeys& keys, const PrefixDeviceTransfer& transfer,
                         LmCacheReceipt* receipt = nullptr) const;
+    LmCacheStatus store_prepared(std::string_view metadata,
+                                 LmCacheReceipt* receipt = nullptr) const;
     LmCacheStatus retrieve(const PrefixCacheKeys& keys, const PrefixDeviceTransfer& transfer,
                            LmCacheReceipt* receipt = nullptr) const;
     void reset() const;

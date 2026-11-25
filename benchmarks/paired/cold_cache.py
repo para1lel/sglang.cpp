@@ -15,6 +15,9 @@ HITS = "vllm:prefix_cache_hits_total"
 ENTRIES = "sglang_cpp:prefix_cache_entries"
 PAGES = "sglang_cpp:prefix_cache_pages"
 STORES = "sglang_cpp:prefix_cache_stores_total"
+LMCACHE_DRAIN = "lmcache-drain"
+PENDING_STORES = "sglang_cpp:lmcache_pending_stores"
+CHECKPOINT_INTERVAL = 8192
 IDLE_TIMEOUT = 30
 METRIC = re.compile(r"([\w:]+)(?:\{.*\})?\s+(\S+)")
 LMCACHE_REUSE = tuple("sglang_cpp:lmcache_" + name + "_total" for name in (
@@ -24,6 +27,16 @@ LMCACHE_REUSE = tuple("sglang_cpp:lmcache_" + name + "_total" for name in (
 LMCACHE_METRICS = LMCACHE_REUSE + tuple("sglang_cpp:lmcache_" + name + "_total" for name in (
     "lookup_misses", "gqa_computed_tokens", "gqa_written_tokens", "gdn_computed_tokens",
 ))
+LMCACHE_STORES = "sglang_cpp:lmcache_stores_total"
+DECLINED_STORES = "sglang_cpp:lmcache_declined_stores_total"
+GQA_WRITTEN_TOKENS = "sglang_cpp:lmcache_gqa_written_tokens_total"
+LMCACHE_WRITTEN_BYTES = tuple(f"sglang_cpp:lmcache_{family}_written_bytes_total"
+                              for family in ("gqa", "gdn", "draft"))
+LMCACHE_WRITE_NS = "sglang_cpp:lmcache_write_nanoseconds_total"
+LMCACHE_READ_ACTIVITY = tuple(f"sglang_cpp:lmcache_{name}_total" for name in (
+    "gqa_read_bytes", "gdn_read_bytes", "draft_read_bytes", "restore_nanoseconds"))
+LMCACHE_DRAIN_METRICS = (PENDING_STORES, LMCACHE_STORES, DECLINED_STORES,
+                         *LMCACHE_WRITTEN_BYTES, LMCACHE_WRITE_NS, *LMCACHE_READ_ACTIVITY)
 NATIVE_METRICS = (
     ENTRIES, PAGES, "sglang_cpp:prefix_cache_device_bytes",
     "sglang_cpp:prefix_cache_hits_total", STORES,
@@ -38,8 +51,10 @@ def metrics(text, engine):
     names = (RUNNING, WAITING, HITS)
     if engine == "native":
         names += NATIVE_METRICS
-    elif engine == "lmcache":
+    elif engine in ("lmcache", LMCACHE_DRAIN):
         names += (*LMCACHE_METRICS, STORES)
+        if engine == LMCACHE_DRAIN:
+            names += LMCACHE_DRAIN_METRICS
     result = {}
     for line in text.splitlines():
         match = METRIC.fullmatch(line)
@@ -76,7 +91,7 @@ def idle_metrics(url, engine):
         response = request(url, "GET", "/metrics")
         require(response["status"] == 200, "Cache metrics endpoint failed")
         values = metrics(response["body"], engine)
-        if values[RUNNING] == values[WAITING] == 0:
+        if values[RUNNING] == values[WAITING] == values.get(PENDING_STORES, 0) == 0:
             return response["body"]
         require(perf_counter_ns() < deadline, "Server did not drain before cache control")
         sleep(0.05)
@@ -108,9 +123,37 @@ def before_cohort(url, engine):
 def after_cohort(url, engine, receipt):
     receipt["capture_finished_ns"] = perf_counter_ns()
     receipt["after"] = idle_metrics(url, engine)
+    if engine == LMCACHE_DRAIN:
+        receipt["settled_ns"] = perf_counter_ns()
 
 
-def replay(raw, engine):
+def verify_lmcache_drain(snapshots, requests, previous):
+    before, cleared, after = (snapshots[key] for key in ("before", "cleared", "after"))
+    require(all(sample[PENDING_STORES] == 0 for sample in snapshots.values()),
+            "Cache control receipt includes pending LMCache stores")
+    if previous is not None:
+        require(before == previous["after"],
+                "LMCache counters changed between settled cohorts")
+    require(before == cleared, "Cache counters changed during reset")
+    require(after[DECLINED_STORES] == cleared[DECLINED_STORES],
+            "LMCache declined a checkpoint store during the cold cohort")
+    require(all(after[name] == cleared[name] for name in LMCACHE_READ_ACTIVITY),
+            "LMCache issued a restore during the cold cohort")
+    # The last emitted token has not entered the model. A terminal store at
+    # a periodic boundary is the same checkpoint, so round the cursor up once.
+    ends = [request["usage"]["prompt_tokens"] + request["usage"]["completion_tokens"] - 1
+            for request in requests]
+    expected = sum((end + CHECKPOINT_INTERVAL - 1) // CHECKPOINT_INTERVAL for end in ends)
+    require(after[LMCACHE_STORES] - cleared[LMCACHE_STORES] == expected
+            and after[STORES] == after[LMCACHE_STORES],
+            "LMCache did not acknowledge the expected number of checkpoint stores")
+    require(after[GQA_WRITTEN_TOKENS] - cleared[GQA_WRITTEN_TOKENS] == sum(ends),
+            "LMCache checkpoint stores did not cover every completed token position")
+    require(all(after[name] > cleared[name] for name in (*LMCACHE_WRITTEN_BYTES, LMCACHE_WRITE_NS)),
+            "LMCache checkpoint stores did not report all three transfer families")
+
+
+def replay(raw, engine, previous=None):
     receipt = raw.get("cold_cache")
     require(isinstance(receipt, dict), "Missing cold cache control receipt")
     verify_reset(receipt["reset"])
@@ -123,18 +166,22 @@ def replay(raw, engine):
                for record in requests)
     times = (receipt["reset_started_ns"], receipt["reset_completed_ns"], receipt["ready_ns"],
              first, last, receipt["capture_finished_ns"])
+    if engine == LMCACHE_DRAIN:
+        times += (receipt.get("settled_ns"),)
     require(all(type(value) is int and value > 0 for value in times)
             and list(times) == sorted(times) and times[2] < first,
             "Reset or metrics snapshot overlaps the timed cohort")
     require(snapshots["cleared"][HITS] == snapshots["after"][HITS],
             "Prefix cache hit counter advanced during a cold cohort")
-    if engine == "lmcache":
+    if engine in ("lmcache", LMCACHE_DRAIN):
         require(all(snapshots["cleared"][name] == snapshots["after"][name]
                     for name in LMCACHE_REUSE),
                 "LMCache reused state or reported an I/O error during a cold cohort")
         require(snapshots["cleared"][STORES] == snapshots["before"][STORES]
                 and snapshots["after"][STORES] > snapshots["cleared"][STORES],
                 "LMCache did not acknowledge any checkpoint stores during the cold cohort")
+    if engine == LMCACHE_DRAIN:
+        verify_lmcache_drain(snapshots, requests, previous)
     if engine == "native":
         require(snapshots["cleared"][ENTRIES] == snapshots["cleared"][PAGES] == 0,
                 "Native cache is occupied after reset")

@@ -279,6 +279,8 @@ def native_info(run, identity, *, opt_in):
 def cache_engine(identity, arm):
     if arm == "vllm-k4":
         return "vllm"
+    if identity.get("protocol") == workload_suite.LMCACHE_DRAIN_PROTOCOL:
+        return cold_cache.LMCACHE_DRAIN
     if identity.get("protocol") in workload_suite.LMCACHE_PROTOCOLS:
         return "lmcache"
     return "native"
@@ -312,6 +314,7 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
         (directory / f'{lane["lane"]:02d}.request.json').write_bytes(body)
     cache_on = cache_on_campaign(selected)
     engine = cache_engine(identity, arm)
+    previous_cache = None
     for tag in schedule(row, arm, identity):
         cache_receipt = cold_cache.before_cohort(url, engine) if cache_on else None
         if row in streaming.SHAPES:
@@ -332,7 +335,7 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
                 json.dump(raw, stream, separators=(",", ":"), allow_nan=False)
         _, outputs = replay(raw, row, tag, lanes, policy, binding)
         if cache_on:
-            cold_cache.replay(raw, engine)
+            previous_cache = cold_cache.replay(raw, engine, previous_cache)
         if arm == EXACT_CONTROL:
             identity, _ = selected
             diagnostic = {"protocol": OPT_IN_PROTOCOL, "row": row, **binding,
@@ -494,11 +497,13 @@ def assess(row, fixtures, directory):
         if cache_on:
             cache_receipts[arm] = {}
         warmup_outputs = None
+        previous_cache = None
         for tag in tags:
             raw = read_raw(measurement, tag)
             duration, outputs, metrics = replay_cohort(raw, row, tag, lanes, policy, binding)
             if cache_on:
-                cache_receipts[arm][tag] = cold_cache.replay(raw, engine)
+                previous_cache = cold_cache.replay(raw, engine, previous_cache)
+                cache_receipts[arm][tag] = previous_cache
             if arm == "native-k0":
                 expected = outputs
             elif arm == EXACT_CONTROL:
@@ -524,7 +529,7 @@ def assess(row, fixtures, directory):
                       campaign_sha256=selected[1], vllm_role="timing-only")
         if cache_on:
             result.update(cache_policy=identity["cache_policy"], cache_receipts=cache_receipts)
-        if identity["protocol"] == workload_suite.LMCACHE_GPU_SLC3_PROTOCOL:
+        if identity["protocol"] in workload_suite.LMCACHE_SLC3_PROTOCOLS:
             result.update(lmcache_version=identity["lmcache_version"],
                           lmcache_wheel_sha256=defaults.lmcache_evidence.WHEEL_SHA256,
                           lmcache_wire=identity["lmcache_wire"],

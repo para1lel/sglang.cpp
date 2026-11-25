@@ -235,6 +235,7 @@ std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t
     emit("sglang_cpp:lmcache_io_errors_total", metrics.lmcache.io_errors);
     emit("sglang_cpp:lmcache_stores_total", metrics.lmcache.stores);
     emit("sglang_cpp:lmcache_declined_stores_total", metrics.lmcache.declined_stores);
+    emit("sglang_cpp:lmcache_pending_stores", metrics.lmcache.pending_stores);
     emit("sglang_cpp:lmcache_gqa_restored_tokens_total", metrics.cache.gqa_restored_tokens);
     emit("sglang_cpp:lmcache_gqa_read_only_tokens_total", metrics.cache.gqa_read_only_tokens);
     emit("sglang_cpp:lmcache_gqa_computed_tokens_total", metrics.cache.gqa_computed_tokens);

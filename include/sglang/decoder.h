@@ -66,9 +66,11 @@ struct DecoderOptions {
     std::function<int(const int*, int, bool)> text_stop = {};
     std::function<bool()> claim_completion = {};
     std::shared_ptr<const decoder::PrefixCacheRead> prefix_cache_read = nullptr;
-    // The completion must become ready only once the connector no longer borrows the view.
-    std::function<std::shared_future<bool>(const decoder::PrefixDeviceTransfer&, bool,
-                                           const int*, int)> submit_prefix_transfer = {};
+    std::function<std::shared_future<bool>(const decoder::PrefixDeviceTransfer&)> restore_prefix;
+    std::function<bool(std::shared_ptr<void>&)> reserve_prefix_store;
+    // Increment the shared counter once per acknowledged STORE, even after lane retirement.
+    std::function<void(decoder::PrefixDeviceTransfer&&, const int*, int,
+                       std::shared_ptr<void>, std::shared_ptr<std::atomic_uint64_t>)> store_prefix;
     bool publish_prefix_checkpoints = true;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }

@@ -42,12 +42,11 @@ struct Job {
     std::shared_ptr<BatchCacheRead> cache_read;
     std::shared_ptr<decoder::PrefixCacheKeys> cache_keys;
     std::shared_future<bool> prefix_operation;
-    std::optional<DecoderFinishReason> cache_finish;
+    std::optional<DecoderFinishReason> deferred_finish;
 
     bool aborted() const { return request_id && request_id->aborted(); }
-    bool prefix_ready() const {
-        return prefix_pending && prefix_operation.valid() &&
-            prefix_operation.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    bool discard_deferred_store() const {
+        return prefix_pending && !prefix_operation.valid() && (cancelled || aborted());
     }
     bool has_output() const { return !pending.empty() && !(output_overlapped && aborted()); }
     bool can_overlap_mtp_output() const {
@@ -113,8 +112,14 @@ struct BatchService::State {
     void begin_cache_read(int slot, const std::shared_ptr<Job>& job);
     void cancel_cache_read(Job& job);
     void configure_checkpoint(Job& job);
+    bool prefix_ready(const Job& job) const {
+        if (!job.prefix_pending) return false;
+        if (!job.prefix_operation.valid()) {
+            return job.discard_deferred_store() || (lmcache && lmcache->store_capacity());
+        }
+        return job.prefix_operation.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    }
     bool poll_prefix(BatchSession& batch, int slot, const std::shared_ptr<Job>& job);
-    void detach_terminal(int slot, Job& job);
     void fail_jobs(std::exception_ptr error, bool permanent);
     void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);
     DecoderResult consume(std::unique_lock<std::mutex>& lock, int slot, Job& job,

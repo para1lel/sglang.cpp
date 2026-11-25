@@ -469,11 +469,20 @@ LmCachePrefix LmCacheClient::lookup_prefix(std::string_view digests, int max_res
             static_cast<int>(matched_gdn)};
 }
 
+std::string LmCacheClient::prepare_store(const PrefixCacheKeys& keys,
+                                         const PrefixDeviceTransfer& transfer) const {
+    return encode_transfer(config_, keys, transfer);
+}
+
 LmCacheStatus LmCacheClient::store(const PrefixCacheKeys& keys,
                                     const PrefixDeviceTransfer& transfer,
                                     LmCacheReceipt* receipt) const {
-    return transfer_records(config_, Operation::store, encode_transfer(config_, keys, transfer),
-                            receipt);
+    return store_prepared(prepare_store(keys, transfer), receipt);
+}
+
+LmCacheStatus LmCacheClient::store_prepared(std::string_view metadata,
+                                           LmCacheReceipt* receipt) const {
+    return transfer_records(config_, Operation::store, metadata, receipt);
 }
 
 LmCacheStatus LmCacheClient::retrieve(const PrefixCacheKeys& keys,

@@ -42,6 +42,8 @@ busy replies, reader responsiveness, and separate reset acknowledgements after t
 
 Use the [real-daemon route procedure](../../docs/prefix-cache.md#verification) with a Release server and pinned checkpoint. It checks selective GQA and GDN coverage, shifted draft continuation, reuse across worker restarts, cancellation, and peer progress during held requests.
 
+At exactly 8,192 prompt tokens, the length and text-stop routes each publish one terminal state. The graph fixture gives cancellation the terminal claim at the same endpoint and checks that both exit paths leave the daemon empty for that request.
+
 ## Device state and graph controls
 
 Use the managed Pixi default environment, current Release archives, pinned checkpoint, and a reserved B200. Start the [LMCache daemon](../../docs/serving/lmcache.md#start-the-daemon) on the same GPU with namespace `sglang`. Pass its socket and a fresh evidence directory.

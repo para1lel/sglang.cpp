@@ -1,4 +1,5 @@
 #include "sglang/testing/prefix_fixture.h"
+#include "sglang/server/batch_service.h"
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
@@ -77,26 +78,34 @@ Capture capture(DecoderBatch& batch, const LmCacheClient& cache, const std::vect
     options.ignore_eos = depth == 0;
     options.mtp_steps = depth;
     if (depth) options.additional_stop_token_ids.insert(198);
-    prefix_fixture::attach(options, cache, prompt, salt, [] { gate.hold(); });
+    const auto acknowledged = batch.prefix_cache_stats().stores;
+    const auto stores = prefix_fixture::attach(options, cache, prompt, salt, [] { gate.hold(); });
     require(batch.admit(0, prompt, options) == 0, "Unexpected cold checkpoint admission");
     const auto initial = step(batch, 0, depth, false, false);
     require(!initial.prefix_pending, "Premature checkpoint export");
     if (held) gate.arm();
     try {
         const auto last = step(batch, 0, depth, true, true);
-        require(last.prefix_pending && last.finish_reason && !last.extra_token_count,
-                "Missing terminal single-input graph checkpoint export");
+        require(!last.prefix_pending && last.finish_reason && !last.extra_token_count,
+                "Terminal single-input graph checkpoint blocked completion");
         if (held) {
             require(gate.await(), "Daemon checkpoint store did not reach the hold");
-            require(batch.poll_prefix(0).pending, "Export did not remain pending at the hold");
+            require(batch.prefix_cache_stats().stores == acknowledged,
+                    "Pending transfer was counted as an acknowledged store");
+            DecoderOptions successor{.max_new_tokens = 1, .ignore_eos = true};
+            require(batch.admit(0, prompt, successor) == 0,
+                    "Detached terminal store retained the producer slot");
+            const auto reused = step(batch, 0, 0, false, false);
+            require(reused.finish_reason.has_value(), "Reused producer did not finish");
             const auto unrelated = step(batch, 1, depth, true, true, true);
             require(*unrelated.token != *last.token,
                     "Peer fixture did not produce a distinct token");
-            require(batch.poll_prefix(0).pending, "Export finished while peer replay accessed it");
             gate.release();
             std::cout << "K" << depth << " peer graph replay token " << *unrelated.token << '\n';
         }
-        prefix_fixture::wait(batch, 0);
+        stores->wait();
+        require(batch.prefix_cache_stats().stores == acknowledged + 1,
+                "Direct decoder did not count the acknowledged store exactly once");
         auto history = prompt;
         history.push_back(*initial.token);
         return {std::move(history), *last.token};
@@ -139,9 +148,10 @@ std::vector<Score> generate(DecoderBatch& batch, const LmCacheClient& cache,
     options.ignore_eos = true;
     options.generated_top_logprobs = 5;
     const int endpoint = static_cast<int>(prompt.size());
+    std::shared_ptr<prefix_fixture::Stores> stores;
     if (!salt.empty()) {
         options.prefix_cache_read = prefix_fixture::read_checkpoint(cache, prompt, salt, endpoint);
-        prefix_fixture::attach(options, cache, prompt, salt);
+        stores = prefix_fixture::attach(options, cache, prompt, salt);
     }
     require(batch.admit(0, prompt, options) == 0, "Unexpected synchronous admission");
     if (!salt.empty()) {
@@ -163,8 +173,72 @@ std::vector<Score> generate(DecoderBatch& batch, const LmCacheClient& cache,
         }
         output.push_back(std::move(score));
     }
-    if (!salt.empty()) prefix_fixture::wait(batch, 0);
+    if (stores) stores->wait();
     return output;
+}
+
+void cancelled_boundary(Decoder& model, const LmCacheClient& cache) {
+    DecoderBatch batch(model, {.max_lanes = 1});
+    const std::vector<int> prompt(decoder_batch_prefix_checkpoint_interval, 198);
+    Selection selected{};
+    selected[0] = true;
+    for (const bool text_stop : {false, true}) {
+        const std::string salt = text_stop ? "boundary-stop-abort" : "boundary-length-abort";
+        server::BatchRequestId id(salt);
+        require(id.dispatch(), "Boundary request was not dispatched");
+        DecoderOptions options;
+        options.max_new_tokens = text_stop ? 4 : 1;
+        options.ignore_eos = true;
+        int claims = 0;
+        options.claim_completion = [&] {
+            ++claims;
+            if (!text_stop) require(id.abort(), "Length completion already claimed");
+            return id.claim_completion();
+        };
+        if (text_stop) options.text_stop = [&](const int*, int count, bool terminal) {
+            require(count == 1 && !terminal && id.abort(), "Text stop already claimed");
+            return count;
+        };
+        const auto stores = prefix_fixture::attach(options, cache, prompt, salt);
+        require(batch.admit(0, prompt, options) == 0, "Unexpected boundary admission");
+        int rows = 0;
+        while (rows < int(prompt.size())) {
+            DecoderBatchStepStats stats;
+            const auto last = batch.advance_chunked(selected, &stats)[0];
+            require(stats.prefill_rows[0] > 0, "Boundary prefill did not advance");
+            rows += stats.prefill_rows[0];
+            if (rows == int(prompt.size())) {
+                require(last.finish_reason == DecoderFinishReason::cancelled &&
+                        !last.prefix_pending,
+                        "Lost terminal claim published a periodic or deferred checkpoint");
+            }
+        }
+        require(claims == 1 && stores->receipts.empty() && !batch.poll_prefix(0).pending,
+                "Cancelled boundary retained a store or claimed completion twice");
+        const auto match = cache.lookup_prefix(PrefixCacheKeys(prompt, salt), rows, false);
+        require(match.gdn == 0 && match.gqa == 0, "Cancelled endpoint reached the daemon");
+        std::cout << salt << " rows " << rows << " claims " << claims << " stores 0\n";
+    }
+}
+
+void failed_store_receipt(Decoder& model, const std::vector<int>& prompt) {
+    DecoderBatch batch(model, {.max_lanes = 1});
+    DecoderOptions options{.max_new_tokens = 1, .ignore_eos = true};
+    const auto path = std::string(std::getenv("LMCACHE_SOCKET")) + "/unreachable";
+    const auto stores = prefix_fixture::attach(options, LmCacheClient({path, "sglang", 1000}),
+                                               prompt, "failed-receipt");
+    require(batch.admit(0, prompt, options) == 0, "Unexpected failed-store admission");
+    const auto result = step(batch, 0, 0, false, false);
+    require(result.finish_reason && !result.prefix_pending && stores->receipts.size() == 1,
+            "A failed store did not submit and retire its source lane");
+    bool failed = false;
+    try {
+        stores->wait();
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    require(failed && batch.prefix_cache_stats().stores == 0,
+            "Failed transfer counted as a successful store");
 }
 
 }
@@ -179,6 +253,8 @@ int main(int argc, char** argv) try {
     Decoder model(argv[1], 0, true);
     Allocations memory(0);
     memory.open_stream();
+    cancelled_boundary(model, cache);
+    failed_store_receipt(model, prompt);
     for (const int depth : {0, 1}) {
         DecoderBatch batch(model, {.cuda_graphs = true, .max_lanes = 2});
         DecoderOptions peer_options;

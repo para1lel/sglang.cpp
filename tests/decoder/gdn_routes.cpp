@@ -107,11 +107,12 @@ void check_prefix_fallback(const Decoder& decoder, const std::vector<int>& promp
     constexpr auto salt = "gdn-routes";
     const std::vector<int> prefix(prompt.begin(), prompt.begin() + page);
     DecoderOptions export_options{.max_new_tokens = 1, .ignore_eos = true};
-    prefix_fixture::attach(export_options, cache, prefix, salt);
+    const auto stores = prefix_fixture::attach(export_options, cache, prefix, salt);
     require(batch.admit(0, prefix, export_options) == 0, "Unexpected prefix on export");
     const auto stored = advance(batch, Mask{true});
-    require(stored.lanes[0].prefix_pending, "Missing terminal prefix export");
-    prefix_fixture::wait(batch, 0);
+    require(stored.lanes[0].finish_reason && !stored.lanes[0].prefix_pending,
+            "Terminal prefix export blocked completion");
+    stores->wait();
     batch.release_retired_allocations();
     DecoderOptions options{.max_new_tokens = 4, .ignore_eos = true};
     require(batch.admit(0, prefix, options) == 0, "First peer unexpectedly restored");
@@ -123,7 +124,7 @@ void check_prefix_fallback(const Decoder& decoder, const std::vector<int>& promp
 
     options.max_new_tokens = 5;
     options.prefix_cache_read = prefix_fixture::read_checkpoint(cache, prompt, salt, page);
-    prefix_fixture::attach(options, cache, prompt, salt);
+    const auto restored_stores = prefix_fixture::attach(options, cache, prompt, salt);
     require(batch.admit(1, prompt, options) == 0, "Restore should complete asynchronously");
     require(prefix_fixture::wait(batch, 1).restored == page, "Incorrect restored prefix position");
     const auto live = batch.request_device_allocation_bytes();
@@ -158,10 +159,11 @@ void check_prefix_fallback(const Decoder& decoder, const std::vector<int>& promp
     require(retire.stats.graph_slots == (1u << 1) && retire.stats.prefill_workspace_bytes == 0,
             "Retiring prefix lane missed singleton replay or used prefill scratch");
     restored[4] = token(retire, 1, true, true);
-    prefix_fixture::wait(batch, 1);
+    restored_stores->wait();
     require(batch.request_device_allocation_bytes() == 0, "Retired lanes kept request storage");
     options.prefix_cache_read.reset();
-    options.submit_prefix_transfer = {};
+    options.restore_prefix = nullptr;
+    options.store_prefix = nullptr;
     require(batch.admit(1, prompt, options) == 0, "Fresh lane unexpectedly restored");
     const auto fresh = advance(batch, Mask{false, true});
     expect_tile(true, "reused lane cold prefill");

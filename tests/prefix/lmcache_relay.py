@@ -1,13 +1,14 @@
 """Observe and control the real LMCache Unix transport for live prefix tests."""
 
 from io import BytesIO
+import os
 from pathlib import Path
 import socket
 import socketserver
 import struct
 from tempfile import mkdtemp
 import threading
-from time import monotonic, perf_counter_ns, sleep
+from time import monotonic, perf_counter_ns, sleep, time_ns
 
 
 HEADER = struct.Struct("!4sIQ")
@@ -168,6 +169,8 @@ class Request(socketserver.BaseRequestHandler):
             return True
         if not barrier.release.wait(TIMEOUT):
             raise TimeoutError("LMCache relay barrier was not released")
+        if phase == "reply":
+            entry["barrier_open_unix_ns"] = time_ns()
         if barrier.drop:
             entry["forwarded"] = False
         return not barrier.drop
@@ -299,10 +302,12 @@ def install_device_fence(directory):
         with claim:
             armed = path / "arm"
             try:
-                attempt = armed.readlink()
+                # Rename consumes exactly the published marker, even if another process rearms.
+                claimed = armed.replace(path / f"claimed-{os.getpid()}")
             except FileNotFoundError:
                 return
-            armed.unlink()
+            attempt = claimed.readlink()
+            claimed.unlink()
         (attempt / "entered").touch()
         deadline = monotonic() + TIMEOUT
         while not (attempt / "release").exists() and monotonic() < deadline:
@@ -324,3 +329,10 @@ def install_device_fence(directory):
     DeviceCopies.run = gated_run
     runtime.cudaMemcpy3DBatchAsync = gated_batch
     device_ops.execute_object_group_transfer = gated_serial
+
+
+if __name__ == "__main__":
+    import runpy
+
+    install_device_fence(os.environ["SGLANG_TEST_FENCE_DIR"])
+    runpy.run_module("lmcache.v1.multiprocess.server", run_name="__main__", alter_sys=True)

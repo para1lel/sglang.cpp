@@ -45,7 +45,9 @@ public:
             DeviceScope device(device_);
             const auto status = complete_producer();
             if (status == cudaSuccess) {
-                report(consume_prefix_error(release_cuda_block(data_, cudaStreamPerThread)));
+                // CUDA reclaims a cudaMalloc block at the next sync on the freeing stream.
+                const auto released = release_cuda_block(data_, cudaStreamPerThread, true);
+                report(consume_prefix_error(released));
             } else {
                 report(status);
             }

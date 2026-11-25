@@ -13,7 +13,12 @@ import select
 import socket
 import struct
 import subprocess
+import sys
 import time
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
+from live_controls import STORES, Controls
 
 
 CHAT = "/v1/chat/completions"
@@ -302,8 +307,12 @@ def main(args):
                "--prefix-cache-entries", "0") as (port, _):
         assert ordinary(args, port, "media-k1", content) == (expected, prompt)
     for label, options in (("continuous", ["--max-active", "2", "--prefix-cache-entries", "0"]),
-                           ("cached", ["--max-active", "1", "--prefix-cache-entries", "1"])):
+                           ("cached", ["--max-active", "1", "--lmcache-socket",
+                                       str(args.lmcache_socket)])):
         with serve(args, label, *options) as (port, log):
+            if label == "cached":
+                cache_info(args, port, label, True)
+                Controls(port, args.evidence).reset("cached-reset")
             assert ordinary(args, port, f"{label}-media", content) == (expected, prompt)
             if label == "cached":
                 cancel_and_replace(args, port, log, content, (*expected, prompt), fragment=True)
@@ -380,23 +389,32 @@ def score_body(prompt, start):
         "return_logprob": True, "logprob_start_len": start, "top_logprobs_num": 5}
 
 
-def server_policy(args, port, label, entries):
+def cache_info(args, port, label, enabled):
     status, _, raw = exchange(port, "/server_info")
     (args.evidence / f"{label}-server-info.json").write_bytes(raw)
     info = json.loads(raw)
+    assert status == 200 and info["prefix_cache_entries"] == 0, info
+    assert info["lmcache_enabled"] is enabled and info["lmcache_available"] is enabled, info
+    return info
+
+
+def server_policy(args, port, label, enabled):
+    info = cache_info(args, port, label, enabled)
     expected = {"dp_size": 1, "tp_size": 1, "pp_size": 1, "mtp_steps": 4,
                 "max_running_requests": 8, "max_num_batched_tokens": 32768,
-                "prefix_cache_entries": entries, "enable_multimodal": True,
+                "enable_multimodal": True,
                 "fp8_prefill": "tensor-core", "paired_prefill": True,
                 "target_gqa": "grouped-split", "batch_cuda_graphs": True, "eager": False}
-    assert status == 200 and {key: info[key] for key in expected} == expected, info
+    assert {key: info[key] for key in expected} == expected, info
 
 
-def feature_media(args, port, log, request, image_or_video, media, controls):
+def feature_media(args, port, log, cache, image_or_video, media, controls):
     for name in ("image", "video"):
         output, prompt = controls[name]
         assert len(prompt) > CHECKPOINT_INTERVAL, len(prompt)
+        stores = cache.wait_for(f"before-{name}", 0, 0, stores=0)[STORES]
         assert image_or_video(port, f"default-cold-{name}", media[name], 0) == (output, prompt)
+        cache.wait_for(f"stored-{name}", 0, 0, stores=stores + 1)
         branch = f"{name}-branch"
         branch_prompt = controls[branch][1]
         assert branch_prompt != prompt
@@ -409,8 +427,10 @@ def feature_media(args, port, log, request, image_or_video, media, controls):
     assert controls["video"][1] != controls["changed-positions"][1]
     for name, base in (("changed-pixels", "image"), ("changed-grid", "image"),
                        ("changed-positions", "video"), ("salt-distinct", "image")):
-        assert request(port, f"reset-before-{name}", "/reset_prefix_cache", {}) == {"success": True}
+        stores = cache.wait_for(f"before-reset-{name}", 0, 0, stores=0)[STORES]
+        cache.reset(f"reset-before-{name}")
         assert image_or_video(port, f"prime-before-{name}", media[base], 0) == controls[base]
+        cache.wait_for(f"stored-before-{name}", 0, 0, stores=stores + 1)
         assert image_or_video(port, f"default-{name}", media[name], 0) == controls[name]
     cancelled = media["short"] | {"max_tokens": 1024, "stream": True, "cache_salt": "cancelled"}
     with closing(start(port, cancelled)) as active:
@@ -509,7 +529,7 @@ def feature_complete(args):
         return output, prompt
 
     with serve(args, "feature-cache-off", "--prefix-cache-entries", "0") as (port, _):
-        server_policy(args, port, "cache-off", 0)
+        server_policy(args, port, "cache-off", False)
         text_controls = {len(prompt): text(port, f"off-text-{len(prompt)}", prompt, 0)
                          for prompt in (prefix, extension)}
         boundary_control = text(port, "off-prompt-score-127", scoring, 0, start=127)
@@ -523,13 +543,20 @@ def feature_complete(args):
             "items": [item], "label_token_ids": [labels[index]],
         }) for index, item in enumerate(score["items"])]
 
-    with serve(args, "feature-default") as (port, log):
-        server_policy(args, port, "default", 4)
+    with serve(args, "feature-default", "--lmcache-socket",
+               str(args.lmcache_socket)) as (port, log):
+        server_policy(args, port, "default", True)
+        cache = Controls(port, args.evidence)
+        cache.reset("feature-reset")
         for name, prompt, hits in (("cold", prefix, 0), ("exact", prefix, len(prefix)),
                                    ("partial", extension, len(prefix))):
             assert text(port, f"default-text-{name}", prompt, hits, stream=name != "cold") == (
                 text_controls[len(prompt)])
+            if name == "cold":
+                cache.wait_for("stored-text-prefix", 0, 0, stores=1)
+        stores = cache.wait_for("before-score-prime", 0, 0, stores=0)[STORES]
         text(port, "prime-prompt-scores", scoring[:128], 0, start=-1, budget=1)
+        cache.wait_for("stored-score-prime", 0, 0, stores=stores + 1)
         for score_start, hits, control in ((128, 128, split_control), (127, 0, boundary_control)):
             for stream in (False, True):
                 assert text(port, f"default-prompt-score-{score_start}-{stream}", scoring, hits,
@@ -542,7 +569,7 @@ def feature_complete(args):
         reversed_labels = request(port, "default-labels-reversed", SCORE,
                                   score | {"label_token_ids": [row[::-1] for row in labels]})
         check_label_order(got, reversed_labels)
-        feature_media(args, port, log, request, image_or_video, media, controls)
+        feature_media(args, port, log, cache, image_or_video, media, controls)
     print("Default B200 cache, decoded media, and exact score route contract passed.")
 
 
@@ -551,10 +578,14 @@ if __name__ == "__main__":
     parser.add_argument("server", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("evidence", type=Path)
+    parser.add_argument("--lmcache-socket", type=lambda value: Path(value).absolute(),
+                        help="Dedicated LMCache daemon socket")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--mixed-service", action="store_true")
     modes.add_argument("--feature-complete", action="store_true")
     args = parser.parse_args()
+    if not args.mixed_service and not args.lmcache_socket:
+        parser.error("--lmcache-socket is required for the default and --feature-complete modes")
     if args.feature_complete:
         feature_complete(args)
     elif args.mixed_service:

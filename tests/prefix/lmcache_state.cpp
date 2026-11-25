@@ -3,6 +3,7 @@
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_prefix_cache.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/runtime/server/batch_cache.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/testing/prefix_fixture.h"
 
@@ -85,10 +86,21 @@ private:
 CopyGate* copy_gate = nullptr;
 std::atomic<CopyGate*> free_gate{nullptr};
 std::atomic<void*> watched_free{nullptr};
+std::atomic<void*> attempted_free{nullptr};
 std::atomic<void*> failed_free{nullptr};
 std::atomic<cudaError_t> free_error{cudaErrorNotSupported};
 std::atomic<void*> synchronous_free{nullptr};
 thread_local void* last_allocation = nullptr;
+struct WorkerRelease {
+    void* memory = nullptr;
+    cudaStream_t stream = nullptr;
+    int queued = 0, completed = 0, fallbacks = 0;
+    cudaError_t sync_error = cudaSuccess;
+    int reports = 0;
+};
+thread_local WorkerRelease worker_release;
+std::atomic<void*> worker_allocation{nullptr};
+std::atomic<bool> inject_sync_error{false};
 enum class CheckpointFault { none, allocation, second_copy, event };
 CheckpointFault checkpoint_fault = CheckpointFault::none;
 std::size_t checkpoint_copies = 0;
@@ -410,6 +422,7 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, std::s
 
 extern "C" cudaError_t __real_cudaFree(void*);
 extern "C" cudaError_t __wrap_cudaFree(void* memory) {
+    if (memory && memory == worker_allocation.load()) ++worker_release.fallbacks;
     const auto status = __real_cudaFree(memory);
     if (status == cudaSuccess && memory == failed_free.load()) synchronous_free = memory;
     return status;
@@ -417,11 +430,41 @@ extern "C" cudaError_t __wrap_cudaFree(void* memory) {
 
 extern "C" cudaError_t __real_cudaFreeAsync(void*, cudaStream_t);
 extern "C" cudaError_t __wrap_cudaFreeAsync(void* memory, cudaStream_t stream) {
-    if (memory && memory == failed_free.load()) return free_error.load();
+    if (memory && memory == failed_free.load()) {
+        attempted_free = memory;
+        return free_error.load();
+    }
     if (memory == watched_free.load()) {
         if (auto* gate = free_gate.exchange(nullptr)) gate->wait();
     }
-    return __real_cudaFreeAsync(memory, stream);
+    const auto status = __real_cudaFreeAsync(memory, stream);
+    if (status == cudaSuccess && memory && memory == worker_allocation.load()) {
+        worker_release.memory = memory;
+        worker_release.stream = stream;
+        ++worker_release.queued;
+    }
+    return status;
+}
+
+extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t);
+extern "C" cudaError_t __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
+extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
+    const auto status = __real_cudaStreamSynchronize(stream);
+    if (status == cudaSuccess && worker_release.memory && stream == worker_release.stream) {
+        ++worker_release.completed;
+        if (inject_sync_error) {
+            // Complete the actual release before creating a recoverable error on this worker.
+            worker_release.sync_error = __real_cudaEventRecord(nullptr, stream);
+            return worker_release.sync_error;
+        }
+    }
+    return status;
+}
+
+extern "C" const char* __real_cudaGetErrorString(cudaError_t);
+extern "C" const char* __wrap_cudaGetErrorString(cudaError_t status) {
+    if (status != cudaSuccess && status == worker_release.sync_error) ++worker_release.reports;
+    return __real_cudaGetErrorString(status);
 }
 
 extern "C" cudaError_t __real_cudaMalloc(void**, std::size_t);
@@ -435,7 +478,6 @@ extern "C" cudaError_t __wrap_cudaMalloc(void** memory, std::size_t size) {
     return status;
 }
 
-extern "C" cudaError_t __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
 extern "C" cudaError_t __wrap_cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
     if (checkpoint_fault == CheckpointFault::event) {
         checkpoint_fault = CheckpointFault::none;
@@ -652,6 +694,8 @@ void check_failed_free(bool resident, cudaError_t error) {
     lease.reset();
     retired.clear();
     failed_free = nullptr;
+    require(attempted_free.exchange(nullptr) == memory,
+            "Detached block did not attempt asynchronous free on the injected pointer");
     const auto released = synchronous_free.exchange(nullptr);
     if (error == cudaErrorNotSupported) {
         require(released == memory && retired.unavailable_bytes() == 0,
@@ -750,9 +794,48 @@ void check_checkpoint_faults(const Lane& lane, const LmCacheClient& cache,
     failed_free = nullptr;
     require(data && synchronous_free.exchange(nullptr) == data,
             "Unsupported asynchronous free leaked the checkpoint state version");
+    require(attempted_free.exchange(nullptr) == data, "Checkpoint free missed injected pointer");
     require(cache.lookup_prefix(keys, prompt_end, true).gdn == prompt_end,
             "Same-thread publication failed after recoverable CUDA errors");
     std::puts("actual checkpoint allocation, second-copy and event failures drain; retry succeeds");
+}
+
+void check_worker_release(const Lane& lane, const LmCacheClient& cache,
+                          const PrefixCacheKeys& keys, cudaStream_t stream) {
+    server::BatchCache worker(std::make_unique<LmCacheClient>(cache), "", 1);
+    for (const bool fail_sync : {false, true}) {
+        last_allocation = nullptr;
+        // Export only the versioned GDN planes so the worker owns this exact allocation.
+        auto view = export_prefix_view(lane.request, prompt_end, prompt_end - 1, prompt_end,
+                                       stream, &lane.draft);
+        auto* const data = last_allocation;
+        require(data && view.transfer.allocations.size() == 1, "Missing checkpoint state version");
+        cudaIpcMemHandle_t handle;
+        check(cudaIpcGetMemHandle(&handle, data), "Identify worker checkpoint allocation");
+        require(std::memcmp(&handle, view.transfer.allocations.front().handle.data(),
+                            sizeof(handle)) == 0, "Checkpoint handle differs from watched pointer");
+        std::shared_ptr<void> reservation;
+        require(worker.reserve_store(reservation), "Checkpoint worker declined reservation");
+        auto stores = std::make_shared<std::atomic_uint64_t>(0);
+        const auto caller = std::this_thread::get_id();
+        std::promise<bool> done;
+        worker_allocation = data;
+        inject_sync_error = fail_sync;
+        worker.store(keys, std::move(view), std::move(reservation), stores, [&] {
+            const auto release = std::exchange(worker_release, WorkerRelease{});
+            done.set_value(std::this_thread::get_id() != caller && release.memory == data &&
+                release.stream == cudaStreamPerThread && release.queued == 1 &&
+                release.completed == 1 && release.fallbacks == 0 &&
+                release.sync_error == (fail_sync ? cudaErrorInvalidResourceHandle : cudaSuccess) &&
+                release.reports == int(fail_sync) && cudaPeekAtLastError() == cudaSuccess);
+        });
+        const bool completed = done.get_future().get();
+        worker_allocation = nullptr;
+        require(completed && *stores == 1 && !worker.stores_pending(),
+                "STORE worker did not finish its version release before acknowledging completion");
+    }
+    std::puts(
+        "STORE worker completed the version free on its own stream; sync error reported once");
 }
 
 void check_continued_prefill(const Lane& cold, const Lane& warm,
@@ -864,6 +947,8 @@ void check_model_state(const DecoderModel& model) {
         PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-delayed-periodic")), stream, read);
     check_checkpoint_faults(cold, cache,
         PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-copy-faults")), stream);
+    check_worker_release(cold, cache,
+        PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-worker-release")), stream);
     check_history_gap(cache, prompt, model, stream, cold);
     std::printf("split gqa %d gdn %d draft %d\n", matched.gqa, matched.gdn, checkpoint - 1);
 

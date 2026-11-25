@@ -24,6 +24,7 @@ from cold_cache import LMCACHE_DRAIN, LMCACHE_METRICS, PENDING_STORES, RUNNING, 
 from media import http_routes as http
 from lmcache_relay import DRAFT, ERASE, GET, GDN, GQA, LEASE, LOOKUP, PREFIX, PUT, READY, RESET
 from lmcache_relay import Relay, arm_device_fence, control, key_body
+from lmcache_send_trace import require_deferred_send, terminal_times, traced_worker
 
 
 LOW, HIGH, PROMPT = 1279, 1391, 1536
@@ -717,12 +718,12 @@ def exercise(args, relay, path, source, unrelated):
             capture_case(report, failures, label, check, witness, *inputs)
         capture_case(report, failures, "scored_same_history", scored_reference,
                      args, witness, source)
-    with http.serve(args, "single-slot", "--lmcache-socket", str(path),
-                    "--max-active", "1") as (port, _):
+    with traced_worker(args, path) as (port, trace):
         one = Witness(port, args.evidence, args.daemon, relay)
         assert json.loads(one.get("/server_info"))["max_running_requests"] == 1
         capture_case(report, failures, "cancelled_lookup", abort_pending, one, source)
-        capture_case(report, failures, "exact_terminal", exact_terminal, one, source, unrelated)
+        capture_case(report, failures, "exact_terminal", exact_terminal,
+                     one, source, unrelated, trace)
     if args.device_fence_dir:
         with http.serve(args, "armed-abort", "--lmcache-socket", str(path),
                         "--max-active", "2") as (port, _):
@@ -735,7 +736,7 @@ def exercise(args, relay, path, source, unrelated):
     return report | {"failures": failures}
 
 
-def exact_terminal(witness, source, unrelated):
+def exact_terminal(witness, source, unrelated, trace):
     endpoint = http.CHECKPOINT_INTERVAL
     prompt = source[:endpoint]
     assert len(prompt) == endpoint
@@ -744,12 +745,13 @@ def exact_terminal(witness, source, unrelated):
     reference = witness.generate("boundary-length", prompt)
     ids, text, _ = http.native_result(reference, prompt, 1, 0)
     assert text, reference
+    ordering = {}
     for label in ("length", "stop"):
         witness.reset()
         gate = witness.relay.arm(PUT, GDN)
         try:
             first = Stream(witness, f"{label}-held-owner", unrelated[:97], 1)
-            gate.wait()
+            owner = gate.wait()
             http.native_result(first.finish(), unrelated[:97], 1, 0)
             witness.generate(f"{label}-queued-owner", unrelated[:98])
             assert witness.pending_stores() == 2
@@ -759,12 +761,18 @@ def exact_terminal(witness, source, unrelated):
             wait_until(lambda: witness.pending_stores() == 3, "Terminal checkpoint never deferred")
             status, _, raw = http.exchange(witness.port, "/abort_request", {"rid": request.label})
             assert status == 200 and not raw
-            assert request.thread.is_alive() and witness.pending_stores() == 3
+            assert witness.pending_stores() == 3
         finally:
-            release_ns = perf_counter_ns()
             gate.release.set()
-        assert gate.finished.wait(10)
-        final = request.finish(release_ns)
+        assert gate.finished.wait(10) and owner.get("forwarded") is True
+        final = request.finish()
+        opened = owner["barrier_open_unix_ns"]
+        _, owner_end = terminal_times(trace, first.label)
+        claimant_start, _ = terminal_times(trace, request.label)
+        assert owner_end < opened, (first.label, owner_end, opened)
+        require_deferred_send(request.label, claimant_start, opened)
+        ordering[label] = {"owner_send_end_unix_ns": owner_end, "barrier_open_unix_ns": opened,
+                           "claimant_send_start_unix_ns": claimant_start}
         if label == "length":
             assert http.native_result(final, prompt, 1, 0)[0] == ids
         else:
@@ -777,7 +785,7 @@ def exact_terminal(witness, source, unrelated):
         assert endpoints == [endpoint], (label, endpoints)
         warm = witness.generate(f"boundary-{label}-warm", prompt + ids)
         http.native_result(warm, prompt + ids, 1, endpoint)
-    return {"endpoint": endpoint, "first_id": ids[0], "matched_stop": text}
+    return {"endpoint": endpoint, "first_id": ids[0], "matched_stop": text, "ordering": ordering}
 
 
 def periodic_only(args, relay, path, source, unrelated):

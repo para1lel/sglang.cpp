@@ -84,6 +84,14 @@ stop_lmcache() {
                 "$lmcache_runtime/sglang-lmcache.sock" "$lmcache_socket_id" || return 2
             lmcache_socket_id=
         fi
+        # This arm exclusively owns the mktemp directory after its daemon group exits.
+        local locks=$lmcache_runtime/.sglang-lmcache-locks-$EUID
+        local endpoint=$lmcache_runtime/sglang-lmcache.sock
+        if [[ -d $locks && ! -L $locks && -O $locks && ! -e $endpoint && ! -L $endpoint ]]; then
+            find "$locks" -maxdepth 1 -type f -name sglang-lmcache.sock.lock \
+                -uid "$EUID" -perm 0600 -links 1 -delete || return 2
+            rmdir -- "$locks" || return 2
+        fi
         rmdir -- "$lmcache_runtime" || return 2
         lmcache_runtime=
     fi

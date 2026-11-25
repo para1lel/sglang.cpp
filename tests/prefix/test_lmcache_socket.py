@@ -1,4 +1,5 @@
 import errno
+import multiprocessing
 import os
 import socket
 import socketserver
@@ -7,15 +8,16 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/lmcache"))
-from sglang_socket import OwnedUnixStreamServer
+import sglang_socket
 
 
 def start(path):
-    return OwnedUnixStreamServer(str(path), socketserver.BaseRequestHandler)
+    return sglang_socket.OwnedUnixStreamServer(str(path), socketserver.BaseRequestHandler)
 
 
 def test_concurrent_restart_recovers_one_stale_socket(tmp_path):
@@ -107,3 +109,55 @@ def test_refuses_replacement_after_stale_probe(tmp_path, monkeypatch):
     with pytest.raises(FileExistsError):
         start(path)
     assert path.read_text() == "replacement"
+
+
+def hold_endpoint_lock(path, ready, release):
+    with sglang_socket.locked_directory(path):
+        ready.set()
+        assert release.wait(10)
+
+
+@pytest.fixture
+def private_socket_dir():
+    with TemporaryDirectory(dir="/tmp") as directory:
+        yield Path(directory)
+
+
+def test_private_endpoint_lock_across_processes_and_aliases(private_socket_dir, monkeypatch):
+    directory = private_socket_dir
+    alias = directory / "alias"
+    alias.symlink_to(directory, target_is_directory=True)
+    path = directory / "daemon.sock"
+    server = start(path)
+    private = directory / f".sglang-lmcache-locks-{os.geteuid()}"
+    lock = private / "daemon.sock.lock"
+    lock_info = lock.stat()
+    private_info = private.stat()
+    assert private_info.st_uid == lock_info.st_uid == os.geteuid()
+    assert private_info.st_mode & 0o777 == 0o700
+    assert stat.S_ISREG(lock_info.st_mode) and stat.S_IMODE(lock_info.st_mode) == 0o600
+
+    processes = multiprocessing.get_context("spawn")
+    ready, release = processes.Event(), processes.Event()
+    holder = processes.Process(target=hold_endpoint_lock, args=(alias / path.name, ready, release))
+    holder.start()
+    try:
+        assert ready.wait(5)
+        monkeypatch.setattr(sglang_socket, "LOCK_TIMEOUT_SECONDS", 0.05)
+        with pytest.raises(TimeoutError) as startup:
+            start(path)
+        assert startup.value.errno == errno.ETIMEDOUT
+        start(directory / "other.sock").close_endpoint()
+        with pytest.raises(TimeoutError) as shutdown:
+            server.close_endpoint()
+        assert shutdown.value.errno == errno.ETIMEDOUT
+        assert server.socket.fileno() == -1
+        assert path.is_socket()
+    finally:
+        release.set()
+        holder.join(10)
+        server.server_close()
+    assert holder.exitcode == 0
+    start(path).close_endpoint()
+    assert not path.exists()
+    assert os.path.samestat(lock_info, lock.stat())

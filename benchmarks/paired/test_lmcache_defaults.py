@@ -7,6 +7,7 @@ import struct
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -482,3 +483,48 @@ PYTHONPATH="$path" "$client_python" -sPB -c 'import lmcache; assert lmcache.iden
 '''
     subprocess.run(["bash", "-c", script, "bash", str(paired)], cwd=tmp_path,
                    check=True, timeout=10)
+
+
+@pytest.mark.parametrize("unexpected", [False, True])
+def test_stop_lmcache_retires_private_runtime_lock(unexpected):
+    paired = Path(__file__).resolve().parent
+    listener = '''
+import signal
+import socketserver
+import sys
+sys.path.insert(0, sys.argv[1])
+from sglang_socket import OwnedUnixStreamServer
+server = OwnedUnixStreamServer(sys.argv[2], socketserver.BaseRequestHandler)
+print("ready", flush=True)
+signal.pause()
+'''
+    script = '''
+set -eu
+source "$1/common.sh"
+source "$1/lmcache_arm.sh"
+lmcache_runtime=$(mktemp -d "$2/arm.XXXXXXXX")
+endpoint=$lmcache_runtime/sglang-lmcache.sock
+listener=("$client_python" -IB -c "$3" "$project/tools/lmcache" "$endpoint")
+launch_session "$2/pid" "${listener[@]}" >"$2/ready" &
+lmcache_pid=$!
+trap 'if [[ -n $lmcache_pid ]]; then stop_session "$lmcache_pid"; fi' EXIT
+for ((i = 0; i < 100; ++i)); do
+    [[ -s $2/ready ]] && break
+    sleep .02
+done
+[[ -s $2/ready ]]
+lmcache_socket_id=$(stat -c '%d:%i' -- "$endpoint")
+runtime=$lmcache_runtime
+if [[ $4 == keep ]]; then
+    touch "$runtime/retain"
+    if stop_lmcache; then exit 1; fi
+    [[ -f $runtime/retain && ! -e $endpoint ]]
+else
+    stop_lmcache
+    [[ ! -e $runtime && -z $lmcache_runtime ]]
+fi
+[[ -z $lmcache_pid && -z $lmcache_socket_id ]]
+'''
+    with TemporaryDirectory(dir="/tmp") as work:
+        subprocess.run(["bash", "-c", script, "bash", str(paired), work, listener,
+                        "keep" if unexpected else "clean"], check=True, timeout=20)

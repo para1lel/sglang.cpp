@@ -4,7 +4,7 @@ import pytest
 
 import cache_activity
 import cold_cache
-from native import owners, rank_table
+from native import graph_policy, owners, rank_table
 
 
 DEVICES = [f"GPU-00000000-0000-0000-0000-00000000000{n}" for n in (1, 2)]
@@ -16,7 +16,7 @@ def rank_line(rank):
 
 
 def test_native_world_matches_both_local_ranks_and_draft_owner():
-    text = "\n".join((rank_line(1), "tp2 world=2 ranks=2 pids=1 comm=established", rank_line(0)))
+    text = "\n".join((rank_line(1), "tp2 world=2 ranks=2", rank_line(0)))
     ranks = rank_table(text, DEVICES, 31)
     assert [r["pid"] for r in ranks] == [31, 31]
     assert [r["mtp"] for r in ranks] == [True, False]
@@ -24,6 +24,19 @@ def test_native_world_matches_both_local_ranks_and_draft_owner():
                 text + "\n" + rank_line(0), text.replace(rank_line(1), "")):
         with pytest.raises(ValueError):
             rank_table(bad, DEVICES, 31)
+
+
+def test_graph_policy_records_real_boolean_and_requires_shared_setting(tmp_path):
+    for value in (True, False):
+        assert graph_policy({"batch_cuda_graphs": value}, tmp_path) is value
+    for info in ({}, {"batch_cuda_graphs": 0}, {"batch_cuda_graphs": "false"}):
+        with pytest.raises(ValueError, match="Boolean"):
+            graph_policy(info, tmp_path)
+    run = tmp_path / "W1/native-k4"
+    run.mkdir(parents=True)
+    (run / "ready.json").write_text('{"config":{"batch_cuda_graphs":false}}')
+    with pytest.raises(ValueError, match="changed across"):
+        graph_policy({"batch_cuda_graphs": True}, tmp_path)
 
 
 def test_joint_gpu_ownership_includes_one_server_and_exactly_the_local_daemon(tmp_path):

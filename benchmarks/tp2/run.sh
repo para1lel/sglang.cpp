@@ -188,6 +188,7 @@ run_arm() {
         reference_snapshot "$run/effective-worker-end.json"
         verify_reference "$run" "$row" "$base/reservation" >"$run/verified-end.json"
     else
+        curl --noproxy '*' -fsS "$url/server_info" >"$run/server-info-end.json"
         for rank in 0 1; do
             lmcache_pid=${daemon_pids[rank]} lmcache_namespace=sglang-r$rank
             lmcache_endpoint=$lmcache_runtime/sglang-lmcache-r$rank.sock

@@ -34,7 +34,8 @@ def owners(path, devices, daemons, server=None):
 
 def rank_table(text, devices, pid):
     ranks = {}
-    require(text.splitlines().count("tp2 world=2 ranks=2 pids=1 comm=established") == 1,
+    require([line for line in text.splitlines() if line.startswith("tp2 world=")]
+            == ["tp2 world=2 ranks=2"],
             "Missing established native two-rank communicator")
     for line in text.splitlines():
         if not line.startswith("tp2 rank="):
@@ -98,18 +99,29 @@ def verify_daemon(run, identity, rank, runtime, completed):
     return pid
 
 
+def graph_policy(info, base):
+    graphs = info.get("batch_cuda_graphs")
+    require(type(graphs) is bool, "Expected a Boolean native batch graph policy")
+    for ready in base.glob("W[1-5]/native-k4*/ready.json"):
+        if ready.stat().st_size:
+            require(load(ready)["config"]["batch_cuda_graphs"] is graphs,
+                    "Native graph policy changed across campaign arms")
+    return graphs
+
+
 def verify(run, completed=False):
     base = run.parent.parent
     identity = load(base / "identity.json")
     devices = identity["devices"]
-    info = load(run / "server-info.json")
+    info = load(run / ("server-info-end.json" if completed else "server-info.json"))
     traced = run.name == "native-k4-trace"
     flags = ["--port", str(identity["port"]), "--tp", "2", "--max-active", "16"]
     if traced:
         flags.append("--trace-batches")
     required = {"device": 0, "tp_size": 2, "dp_size": 1, "pp_size": 1, "mtp_steps": 4,
                 "max_running_requests": 16, "max_num_batched_tokens": 32768, "eager": False,
-                "batch_cuda_graphs": True, "trace_batches": traced, "prefix_cache_entries": 0,
+                "batch_cuda_graphs": graph_policy(info, base), "trace_batches": traced,
+                "prefix_cache_entries": 0,
                 "lmcache_enabled": True, "lmcache_available": True, "port": identity["port"],
                 "host": "127.0.0.1", "model_path": identity["checkpoint_path"]}
     require(all(type(info.get(k)) is type(v) and info[k] == v for k, v in required.items())

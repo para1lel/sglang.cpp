@@ -1,6 +1,6 @@
 # Matched B200 benchmark agreement
 
-Compare both engines on the same participating B200 devices and immutable checkpoint. Freeze the workload and controls before timing. Follow the matched K4 driver's arm order for each row. [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 ## Implementations and controls
 
@@ -10,13 +10,13 @@ Compare both engines on the same participating B200 devices and immutable checkp
 | Candidate | Run the project binary built by XMake with the default Pixi toolchain. Record source, build options, and executable identity. | [Development contract](development.md). |
 | Architectural reference | Interpret service and cache behavior. Any separate SGLang timing needs its own result label. | `sgl-project/sglang` at `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. |
 
-Run each engine alone on the same selected device UUIDs in its own environment. Record drivers, runtimes, host and client settings, clocks, power, other GPU activity, and software differences.
+Run each engine alone on the selected UUIDs in its own environment. Record drivers, runtimes, host and client settings, clocks, power, competing GPU activity, and software differences.
 
-Match checkpoint, tokenizer, template, processor, weight precision, sampling, cache state, MTP, and media preprocessing. Freeze request bytes, input IDs, arrivals, seeds, and stops. Record dispatch and token counts. Mark missing modes unsupported.
+Match checkpoint, tokenizer, template, processor, weight precision, sampling, cache, MTP, and media preprocessing. Freeze request bytes, input IDs, arrivals, seeds, and stops. Record dispatch, token counts, and unsupported modes.
 
 ## Scheduler and reporting policy
 
-Use MTP4, a 32,768-token step budget, and capacity for eight active requests per participating GPU. Start each measured cohort with cold prefixes.
+Use MTP4, 32,768 tokens per step, eight slots per GPU, and cold prefixes.
 
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-scheduled-tokens 32768` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
 - **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon with 64 GiB CPU L1 on the same physical GPU. [Daemon launcher](../benchmarks/paired/lmcache_arm.sh#L26)<!-- prefix: "start_lmcach" -->
@@ -41,7 +41,7 @@ The archived eight-output greedy BF16 KV fixture has a separate offline recipe. 
 
 ## Named workloads
 
-Lengths are exact post-template tokens per request. Multiply offered requests per GPU by the number of participating GPUs. The current driver uses one B200. Keep request IDs, arrivals, and stop settings fixed. Test normal EOS separately.
+Lengths are exact post-template tokens per request. Scale offered requests by GPU count. The driver uses one B200. Freeze IDs, arrivals, and stops. Test normal EOS separately.
 
 | Workload | Input tokens per request | Output tokens per request | Offered requests per GPU |
 | --- | ---: | ---: | ---: |
@@ -55,7 +55,7 @@ Use the [matched K4 protocol](../benchmarks/paired/README.md#matched-k4-timing-p
 
 ## Measurement
 
-For each W1–W5 row, require native client makespan at most 1.10 times the pinned vLLM makespan. Stop tuning once every row passes. Keep the scheduling rule and workload settings fixed. Improve calculation through CUDA kernels, programmatic dependent launch (PDL), streams, and CUDA Graph replay.
+Require native makespan ≤1.10× pinned vLLM on each W1–W5 row. Stop tuning when all pass. Freeze scheduling and workloads. Tune kernels, programmatic dependent launch (PDL), streams, and CUDA Graph replay.
 
 Run one warmup and one measured cohort per item and engine. Use the measured verdict and retain the first miss. Profile long rows separately. W4 can open a campaign. W5 requires a W4 pass in that campaign. Run W1–W3 in order, advancing on each pass. Validate device, launch settings, and each stream’s request, counts, finish, usage, and drain. Measured IDs must match the engine’s warmup. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
@@ -178,7 +178,19 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-Formal direct GPU W1–W5 results are pending.
+All five rows passed (native/vLLM ≤1.10). Both engines used one B200, [cold MTP4](#scheduler-and-reporting-policy), eight slots, and 32,768 tokens per step. Each row had one warmup and one measurement per engine. Native used LMCache 0.5.8, vLLM its local cache. [Native release](https://github.com/para1lel/sglang.cpp/commit/c701d294b3823c655c6adc38bbd87d077147bbcc)
+
+| Row | Native (s) | Pinned vLLM (s) | Native/vLLM |
+| --- | ---: | ---: | ---: |
+| W1 | 0.575548348 | 0.621156755 | 0.926575045 |
+| W2 | 1.369969434 | 1.686546247 | 0.812292836 |
+| W3 | 3.965594404 | 3.954927060 | 1.002697229 |
+| W4 | 26.809497401 | 26.564937688 | 1.009206109 |
+| W5 | 38.396171943 | 35.940895116 | 1.068314293 |
+
+SSE replay independently reproduced makespans. Each engine repeated its warmup output IDs. Across engines, W1/W2 first differed at zero-based indices 28/0. All 16 W3–W5 lanes matched. Native W5 acknowledged 68 stores covering 528,380 positions. Its drain ended 0.113431875 seconds after the last `[DONE]`, outside makespan. See `artifacts/resume-paired-count2-official-B9PfsPRu/formal-summary.json`.
+
+### Traced one-output prefill diagnostic
 
 Traced cold MTP4, B200 GPU 6, four 131,072×1 requests. Each measurement recorded 15 mixed-start steps, 64 stores, and 524,288 written positions.
 
@@ -193,7 +205,7 @@ Pairing cut attention by 0.804200 s. Time outside server GPU work also fell.
 <a id="current-single-round-v5"></a>
 ### Archived single-round v5
 
-This campaign used the former native device-resident prefix cache. GPU 7 ran W1–W3 and GPU 6 ran W4–W5. Both engines used MTP4, a 32,768-token step budget, eight slots, and cold cache resets. Each engine ran one warmup and one measured cohort.
+The former native device-resident prefix cache ran W1–W3 on GPU 7 and W4–W5 on GPU 6. Both engines used MTP4, 32,768 tokens per step, eight slots, cold resets, one warmup, and one measurement.
 
 | Row | Native (s) | Pinned vLLM (s) | Native / vLLM | Verdict |
 | --- | ---: | ---: | ---: | --- |
@@ -203,12 +215,12 @@ This campaign used the former native device-resident prefix cache. GPU 7 ran W1�
 | W4 | 26.368189095 | 26.589718570 | 0.991669 | Pass |
 | W5 | 39.399096915 | 35.972035063 | 1.095270 | Pass |
 
-W5 passed after W4 in the same campaign, 0.170142 seconds inside the limit. Independent replay verified 73 cold SSE streams. Each engine repeated its warmup output IDs. The untimed W1 trace matched native output IDs. Every lane matched across engines on W3–W5. W1 and W2 differed across engines.
+W5 followed W4 and cleared the gate by 0.170142 seconds. Replay verified 73 cold SSE streams, per-engine repeat IDs, and W1 trace IDs. Across engines, all W3–W5 lanes matched. W1 and W2 differed.
 
-The Release binary SHA-256 was `ee39aef6c625c50d98eede8103a2b53e798f589d7c0e916db7f913bcb6d94a6d`. The frozen release matched 226 production files and 22 protocol files. [Native release](https://github.com/para1lel/sglang.cpp/commit/6865c175da560021f5724a869cb7f39061e1675c) · [vLLM pin](https://github.com/vllm-project/vllm/commit/81a8cb063e6247fe254d7caf7e98a6691d71022a)
+Release `ee39aef6c625c50d98eede8103a2b53e798f589d7c0e916db7f913bcb6d94a6d` matched 226 production and 22 protocol files. [Native release](https://github.com/para1lel/sglang.cpp/commit/6865c175da560021f5724a869cb7f39061e1675c) · [vLLM pin](https://github.com/vllm-project/vllm/commit/81a8cb063e6247fe254d7caf7e98a6691d71022a)
 
 ### Archived multi-cohort v4
 
-The final v4 campaign also passed W1–W5. It used three warmups and nine measured cohorts for W1–W2, and two warmups and five measured cohorts for W3–W5. W5 medians were 38.170671560 seconds native and 35.974923597 seconds vLLM (1.061036×). The archived guide records all five medians, launch settings, and replay results. [Full v4 results](https://github.com/para1lel/sglang.cpp/blob/6f4d54d3a07ea8ad5bae68ea020105b8ecaeba93/docs/performance.md#matched-k4-evidence) · [Measured v4 release](https://github.com/para1lel/sglang.cpp/commit/b8764ee28523c7223865a0e1de8ebc8041ca857a)
+Final v4 passed all five rows. W1–W2 used three warmups and nine measurements, W3–W5 two and five. W5 medians were 38.170671560 seconds native and 35.974923597 seconds vLLM (1.061036×). [Full v4 results](https://github.com/para1lel/sglang.cpp/blob/6f4d54d3a07ea8ad5bae68ea020105b8ecaeba93/docs/performance.md#matched-k4-evidence) · [Measured v4 release](https://github.com/para1lel/sglang.cpp/commit/b8764ee28523c7223865a0e1de8ebc8041ca857a)
 
 The previous v4 campaign passed W1–W4 and missed W5. [Prior v4 evidence](https://github.com/para1lel/sglang.cpp/blob/17d8634f1f9677bf4b2bc3dea93b7e5ca58eca5a/docs/performance.md#matched-k4-evidence)

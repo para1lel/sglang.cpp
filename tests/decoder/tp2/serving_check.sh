@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if (( $# < 5 || $# > 6 )) || [[ $3 == "$4" ]]; then
-    echo 'Usage: serving_check.sh BUILD CHECKPOINT UUID0 UUID1 OUTPUT [all|static|cache]' >&2
+    echo 'Usage: serving_check.sh BUILD CHECKPOINT UUID0 UUID1 OUTPUT [all|static|cache|store]' >&2
     exit 2
 fi
 build=$(realpath -- "$1")
@@ -10,14 +10,14 @@ checkpoint=$(realpath -- "$2")
 first=$3 second=$4
 output=$(realpath -m -- "$5")
 phase=${6:-all}
-[[ $phase == all || $phase == static || $phase == cache ]]
+[[ $phase == all || $phase == static || $phase == cache || $phase == store ]]
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd -P)
 shared=${SGLANG_HOST_ROOT:-/data1/shared/dongwu.chen}
 toolkit=${CONDA_PREFIX:?Run in the managed Pixi environment}/targets/x86_64-linux
 nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
 mkdir -p -- "$output"
 cd -- "$root"
-if [[ $phase != cache ]]; then
+if [[ $phase == all || $phase == static ]]; then
 "${CXX:?Missing Pixi host compiler}" -std=c++23 -O2 -Wall -Wextra -Werror \
     -Iinclude -isystem "$toolkit/include" -isystem "$nccl/include" \
     tests/decoder/tp2/serving_check.cpp tests/decoder/tp2/serving_probe.cpp \
@@ -51,7 +51,7 @@ compat="$shared/software/cuda-compat-13.4/usr/local/cuda-13.4/compat"
 export LD_LIBRARY_PATH="$compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONDONTWRITEBYTECODE=1
 failed=0
-if [[ $phase != cache ]]; then
+if [[ $phase == all || $phase == static ]]; then
 for tp in 1 2; do
     timeout -k 5s 180s "$output/serving-check" "$checkpoint" "$tp" "$output/tp$tp.tsv" \
         >"$output/tp$tp.log" 2>&1 || failed=1
@@ -90,7 +90,9 @@ print("Greedy IDs match across worlds. Every MTP4 row matches its same-world tar
 PY
 fi
 if [[ $phase != static ]]; then
+options=()
+if [[ $phase == store ]]; then options+=(--store-only); fi
 timeout -k 35s 200s python tests/decoder/tp2/serving_cache.py "$build/bin/sglang-server" \
-    "$checkpoint" "$output/cache" >"$output/cache.log" 2>&1 || failed=1
+    "$checkpoint" "$output/cache" "${options[@]}" >"$output/cache.log" 2>&1 || failed=1
 fi
 exit "$failed"

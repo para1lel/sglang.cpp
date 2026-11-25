@@ -124,7 +124,7 @@ def drain(port):
     raise TimeoutError("Pending LMCache stores did not drain")
 
 
-def delayed_store(args, port, prefix, relays, offsets):
+def delayed_store(args, port, prefix, relays, offsets, baseline, gpu):
     barrier = relays[1].arm(RANK_PUT)
     with ThreadPoolExecutor(max_workers=1) as worker:
         prime = worker.submit(capture, args, port, "prime", prefix, 1, 0, "subject")
@@ -133,18 +133,30 @@ def delayed_store(args, port, prefix, relays, offsets):
             deadline = monotonic() + 10
             while monotonic() < deadline:
                 completed = relays[0].since(offsets[0])
-                if any(e["opcode"] == RANK_PUT and e["forwarded"] for e in completed):
+                midpoint = metrics(port)
+                if (any(e["opcode"] == RANK_PUT and e["forwarded"] for e in completed)
+                        and midpoint["rank0_draft_written_bytes_total"]
+                        > baseline["rank0_draft_written_bytes_total"]):
                     break
                 sleep(0.02)
             else:
                 raise AssertionError("Rank 0 store did not retire before rank 1")
-            before = pending(port)
-            assert before > 0, "Pending stores drained while rank 1 reply was held"
+            physical = receipt(completed, 0, gpu, RANK_PUT, len(prefix))
+            deltas = {key: value - baseline[key] for key, value in midpoint.items()}
+            expected = {"pending_stores": 1, "rank0_stores_total": 1, "rank1_stores_total": 0,
+                        "stores_total": 0, "gqa_written_tokens_total": 0,
+                        "declined_stores_total": 0, "io_errors_total": 0}
+            for index, family in enumerate(("gqa", "gdn", "draft")):
+                expected[f"rank0_{family}_written_bytes_total"] = physical[index]
+                expected[f"rank1_{family}_written_bytes_total"] = 0
+                expected[f"{family}_written_bytes_total"] = 0
+            observed = {key: deltas[key] for key in expected}
+            assert observed == expected, (observed, expected)
         finally:
             barrier.release.set()
         prime.result()
     drain(port)
-    return {"held": before, "drained": pending(port)}
+    return {"held": midpoint["pending_stores"], "drained": pending(port), "deltas": observed}
 
 
 def exercise(args, work, devices, sockets, relays):
@@ -158,16 +170,27 @@ def exercise(args, work, devices, sockets, relays):
         info = json.loads(raw)
         assert status == 200 and info["tp_size"] == info["tensor_parallel"] == 2
         assert info["lmcache_available"] and info["lmcache_enabled"] and info["mtp_steps"] == 4
-        cold = capture(args, port, "cold", prompt, 8, 0, "reference")
-        drain(port)
+        if not args.store_only:
+            cold = capture(args, port, "cold", prompt, 8, 0, "reference")
+            drain(port)
         offsets = [len(relay.since()) for relay in relays]
         pre_prime = metrics(port)
-        totals = {"pending_store": delayed_store(args, port, prefix, relays, offsets)}
+        held = delayed_store(args, port, prefix, relays, offsets, pre_prime, devices[0])
+        totals = {"pending_store": held}
         for rank, relay in enumerate(relays):
             totals[f"rank{rank}_store"] = receipt(relay.since(offsets[rank]), rank,
                                                   devices[rank], RANK_PUT, len(prefix))
         pre_restore = metrics(port)
         check_counters(pre_prime, pre_restore, totals, "store")
+        assert pre_restore["stores_total"] - pre_prime["stores_total"] == 1
+        token_counter = "gqa_written_tokens_total"
+        assert pre_restore[token_counter] - pre_prime[token_counter] == len(prefix)
+        if args.store_only:
+            (args.evidence / "rank-receipts.json").write_text(json.dumps(totals, indent=2) + "\n")
+            (args.evidence / "metrics.json").write_text(json.dumps({
+                "baseline": pre_prime, "settled": pre_restore,
+            }, indent=2) + "\n")
+            return
         offsets = [len(relay.since()) for relay in relays]
         hit = capture(args, port, "restored", prompt, 8, len(prefix), "subject")
         drain(port)
@@ -206,6 +229,7 @@ def interrupted(signum, frame):
 def main():
     signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--store-only", action="store_true")
     for key in ("server", "checkpoint", "evidence"):
         parser.add_argument(key, type=Path)
     args = parser.parse_args()

@@ -244,6 +244,17 @@ void run_joint_store(CacheState* state,
         try {
             statuses[lane] = state->group->store_prepared(
                 static_cast<int>(lane), checkpoint->metadata[lane], &receipts[lane]);
+            if (statuses[lane] != LmCacheStatus::complete) return;
+            // Physical credit lands as each rank's daemon acknowledges its
+            // write, not when the whole checkpoint settles: the decoder
+            // asserts per-rank acknowledgement order against this counter.
+            if (checkpoint->stores) ++*checkpoint->stores;
+            if (lane < state->rank_stores.size()) {
+                ++state->rank_stores[lane];
+                for (int family = 0; family < 3; ++family) {
+                    state->rank_written_bytes[lane][family] += receipts[lane].bytes[family];
+                }
+            }
         } catch (...) {
             errors[lane] = std::current_exception();
         }
@@ -287,14 +298,8 @@ void run_joint_store(CacheState* state,
             logical = false;
             continue;
         }
-        // Physical credit: this rank's store actually completed.
-        if (checkpoint->stores) ++*checkpoint->stores;
-        if (lane < state->rank_stores.size()) {
-            ++state->rank_stores[lane];
-            for (int family = 0; family < 3; ++family) {
-                state->rank_written_bytes[lane][family] += receipts[lane].bytes[family];
-            }
-        }
+        // Joint aggregate: bytes summed across the rank daemons, tokens
+        // once (per-rank credit already landed inside each lane above).
         for (int family = 0; family < 3; ++family) {
             joint.bytes[family] += receipts[lane].bytes[family];
         }

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 
 using namespace sglang::decoder;
 using namespace sglang::server;
@@ -92,6 +93,17 @@ void store_case(BatchCache& cache, const Keys& keys, const std::string& mode) {
     ticket.reset();
     pair.reset();
     synchronize_delayed_daemon();
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (cache.metrics().rank_written_bytes[0][1] != 4 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const auto held = cache.metrics();
+    require(*physical == 1 && held.rank_stores == std::vector<std::uint64_t>({1, 0}) &&
+                held.rank_written_bytes[0][1] == 4 && held.rank_written_bytes[1][1] == 0,
+            "physical store receipt hidden behind delayed peer");
+    require(cache.stores_pending() && !held.gdn_written_bytes && !held.gqa_written_tokens,
+            "logical store receipt published before delayed peer finished");
     require(!cache.store_capacity() && owner.use_count() == 3 && !cache.metrics().stores,
             "released checkpoint before delayed peer finished");
     std::cout << "release" << std::endl;

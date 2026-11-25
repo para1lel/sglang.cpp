@@ -58,7 +58,11 @@ struct Workspace {
 };
 
 using GdnBank = std::array<TextGdnState, gdn_layers>;
-void allocate_gdn(Allocations& memory, GdnBank& states);
+// The per-layer state strides must match the prefix cache layout used for
+// export/restore: rank-local strides under tensor parallelism, full otherwise.
+void allocate_gdn(Allocations& memory, GdnBank& states,
+                  std::size_t history_elements = gdn_history_elements,
+                  std::size_t state_elements = gdn_state_elements);
 
 struct ConstraintWorkspace {
     int* ids = nullptr;
@@ -95,7 +99,8 @@ struct Request {
     Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false,
             int kv_limit = 0);
 
-    void initialize(int capacity, cudaStream_t stream, int kv_limit = 0);
+    void initialize(int capacity, cudaStream_t stream, int kv_limit = 0,
+                    int kv_heads = mxfp8_kv_heads);
     void grow_kv(int positions, int written, cudaStream_t stream);
     void reset(cudaStream_t stream);
     void reset();
@@ -110,6 +115,11 @@ struct Request {
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
     int kv_limit = 0;
+    int cache_kv_heads = mxfp8_kv_heads;
+    // Per-layer GDN state strides for this request's shard (rank-local under
+    // tensor parallelism, derived from the KV head count at initialize time).
+    std::size_t gdn_history_stride = gdn_history_elements;
+    std::size_t gdn_state_stride = gdn_state_elements;
     int cached_gqa_tokens = 0;
     bool prefix_checkpoint_outputs = false;
     GdnBank states;

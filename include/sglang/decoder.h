@@ -23,6 +23,24 @@ namespace decoder {
 struct CudaBackendPolicy;
 struct PrefixCacheRead;
 struct PrefixDeviceTransfer;
+struct TpRuntimeInfo;
+
+/// Evidence record for a tensor-parallel launch: one entry per rank.
+struct TpRuntimeInfo {
+    struct Rank {
+        int local_rank = -1;
+        int cuda_device = -1;
+        char uuid[16] = {};
+        long pid = 0;
+        bool nccl_established = false;
+        std::size_t weight_bytes = 0;
+        bool lm_head = false;
+        bool mtp = false;
+    };
+    int world_size = 0;
+    Rank ranks[2]{};
+};
+
 }
 
 inline constexpr int decoder_max_mtp_steps = 4;
@@ -173,6 +191,11 @@ class Decoder {
 public:
     explicit Decoder(const std::filesystem::path& checkpoint, int cuda_device = 0);
     Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp);
+    /// `tensor_parallel` must be 1 or 2. With 2, `cuda_device` hosts rank 0 and
+    /// `cuda_device + 1` hosts rank 1; MTP drafting and the vocabulary head stay
+    /// on rank 0.
+    Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
+            int tensor_parallel);
     ~Decoder();
 
     Decoder(const Decoder&) = delete;
@@ -193,6 +216,8 @@ public:
     bool has_int8_draft_head() const;
     bool has_certified_vocab() const;
     int paired_prefill_threshold() const;
+    /// Rank/device receipt for tensor-parallel launches; nullptr for TP1.
+    const decoder::TpRuntimeInfo* tensor_parallel_info() const;
 
 private:
     friend class DecoderBatch;
@@ -204,7 +229,10 @@ private:
                                            const DecoderCallbacks& callbacks,
                                            const std::vector<int>* teacher) const;
     struct Model;
+    struct TpRuntime;
     std::unique_ptr<Model> model_;
+    std::unique_ptr<TpRuntime> tp_;
+    decoder::TpRuntimeInfo tp_info_{};
 };
 
 namespace decoder {

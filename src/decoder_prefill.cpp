@@ -2,668 +2,100 @@
 
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_batch.h"
-
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
+#include "sglang/runtime/backend/tensor_parallel.h"
 #include "sglang/runtime/cache/prefill_cached_gqa.h"
 #include "sglang/prefill_fp8.h"
+#include "sglang/runtime/execution/decoder_prefill_tiles.h"
 #include "sglang/text/decoder_logprobs.h"
+#include "sglang/text/gdn_local.h"
 #include "sglang/text/prefill_attn_sm100.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace sglang {
-std::optional<cudaError_t> launch_partial_staged_tmem_prefill(
-    const decoder::PagedPrefillSequence*, int, cudaStream_t, decoder::PairedPrefillScratch);
-std::optional<cudaError_t> launch_causal_group_staged_tmem_prefill(
-    const decoder::PagedPrefillSequence&, cudaStream_t, decoder::PairedPrefillScratch);
-
 namespace {
 
 using namespace decoder;
 using namespace decoder::prefill_detail;
 
-struct ScratchLayout {
-    std::byte* data = nullptr;
-    std::size_t bytes = 0;
-
-    template <typename Element, std::size_t alignment = 16>
-    Element* take(std::size_t count) {
-        const auto offset = (bytes + alignment - 1) / alignment * alignment;
-        bytes = offset + count * sizeof(Element);
-        return data ? reinterpret_cast<Element*>(data + offset) : nullptr;
-    }
-};
-
-struct TileBuffers {
-    TileBuffers(ScratchLayout& layout, int rows)
-        : hidden(layout.take<Bf16>(rows * hidden_size)),
-          normalized(layout.take<Bf16>(rows * hidden_size)),
-          residual(layout.take<Bf16>(rows * hidden_size)),
-          projected_attention(layout.take<Bf16>(rows * hidden_size)),
-          attention(layout.take<Bf16>(rows * std::max(text_gdn_value_width, text_gqa_q_width))),
-          mlp_gate(layout.take<Bf16, 32>(rows * intermediate_size)),
-          mlp_up(layout.take<Bf16>(rows * intermediate_size)),
-          q_gate(layout.take<Bf16>(rows * text_gqa_q_gate_width)),
-          keys(layout.take<Bf16>(rows * text_gqa_kv_width)),
-          values(layout.take<Bf16>(rows * text_gqa_kv_width)),
-          rope_queries(layout.take<Bf16>(rows * text_gqa_q_width)),
-          rope_keys(layout.take<Bf16>(rows * text_gqa_kv_width)),
-          gdn_qkv(layout.take<Bf16>(rows * text_gdn_qkv_width)),
-          gdn_z(layout.take<Bf16>(rows * text_gdn_value_width)),
-          gdn_b(layout.take<Bf16>(rows * text_gdn_value_heads)),
-          gdn_a(layout.take<Bf16>(rows * text_gdn_value_heads)),
-          gdn_scratch(layout.take<Bf16>(text_gdn_workspace_bytes(rows) / sizeof(Bf16))),
-          activation{
-              layout.take<std::uint8_t>(rows * intermediate_size),
-              layout.take<float>(rows * text_fp8_group_count(intermediate_size))} {}
-
-    PairedPrefillScratch gqa_scratch() const {
-        const auto mlp_begin = reinterpret_cast<std::uintptr_t>(mlp_gate);
-        const auto mlp_end = reinterpret_cast<std::uintptr_t>(q_gate);
-        const auto gdn_begin = reinterpret_cast<std::uintptr_t>(gdn_qkv);
-        const auto gdn_end = reinterpret_cast<std::uintptr_t>(activation.values);
-        return {reinterpret_cast<std::byte*>(mlp_gate), mlp_end - mlp_begin,
-                reinterpret_cast<std::byte*>(gdn_qkv), gdn_end - gdn_begin};
-    }
-
-    TileBuffers attention_segment(int offset) const {
-        static_assert(text_gdn_value_width == text_gqa_q_width);
-        auto segment = *this;
-        segment.attention += offset * text_gqa_q_width;
-        segment.q_gate += offset * text_gqa_q_gate_width;
-        segment.keys += offset * text_gqa_kv_width;
-        segment.values += offset * text_gqa_kv_width;
-        segment.rope_queries += offset * text_gqa_q_width;
-        segment.rope_keys += offset * text_gqa_kv_width;
-        segment.gdn_qkv += offset * text_gdn_qkv_width;
-        segment.gdn_z += offset * text_gdn_value_width;
-        segment.gdn_b += offset * text_gdn_value_heads;
-        segment.gdn_a += offset * text_gdn_value_heads;
-        return segment;
-    }
-
-    Bf16* hidden;
-    Bf16* normalized;
-    Bf16* residual;
-    Bf16* projected_attention;
-    Bf16* attention;
-    Bf16* mlp_gate;
-    Bf16* mlp_up;
-    Bf16* q_gate;
-    Bf16* keys;
-    Bf16* values;
-    Bf16* rope_queries;
-    Bf16* rope_keys;
-    Bf16* gdn_qkv;
-    Bf16* gdn_z;
-    Bf16* gdn_b;
-    Bf16* gdn_a;
-    Bf16* gdn_scratch;
-    TextFp8Activation activation;
-};
-
-struct Chunk : PrefillProjections {
-    TileBuffers work;
-    int position;
-    const MropePosition* mrope;
-    int cached_gqa_tokens = 0;
-
-    bool project_packed(TextFp8ActivationView input,
-                        std::initializer_list<PrefillFp8Projection> projections) const {
-        if (!tensor_core_fp8) {
-            return false;
+/// Layer skeleton for one tensor-parallel prefill group: every layer's
+/// normalize, attention, and MLP steps run on both ranks before the callbacks
+/// return, so the callbacks reduce each layer's partials in place while both
+/// streams are still inside that layer.
+template <typename Normalize, typename Attention, typename Mlp>
+void execute_layers_tp(const std::array<Layer, layer_count>& primary_layers,
+                       const std::array<Layer, layer_count>& peer_layers, Normalize normalize,
+                       Attention attention, Mlp mlp) {
+    for (int index = 0; index < layer_count; ++index) {
+        const auto& primary = primary_layers[index];
+        const auto& peer = peer_layers[index];
+        const auto input = [first = index == 0](const auto& work) {
+            return first ? LayerResidual{work.residual, nullptr}
+                         : LayerResidual{work.hidden, work.residual};
+        };
+        normalize(primary.input_norm, peer.input_norm, input);
+        const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
+        if (full_attention) {
+            attention(primary.gqa, peer.gqa, bank);
+        } else {
+            attention(primary.gdn, peer.gdn, bank);
         }
-        const auto status = try_prefill_fp8_packed_sm100(input, rows, hidden_size,
-                                                         projections, stream, grouped_projection);
-        if (!status) {
-            return false;
-        }
-        check(*status, "Run packed FP8 prefill projections");
-        return true;
-    }
-
-    void seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
-                    const Bf16* final_norm, bool wmma, const MediaPrefill* media) const {
-        static_assert(intermediate_size >= 2 * hidden_size);
-        static_assert(std::max(text_gdn_value_width, text_gqa_q_width) >= hidden_size);
-        const PrefillProjections projections{activation, seed_rows, stream, false, false, wmma};
-        draft.seed_prefill(position, shifted_tokens, work.hidden, work.residual, final_norm,
-                           projections, {work.normalized, work.projected_attention, work.mlp_gate,
-                                         work.attention, work.keys, work.values, work.rope_keys},
-                           media);
-    }
-
-    void gdn_input(const GdnLayer& layer) const {
-        const TextFp8ActivationView input{activation.values, activation.scales};
-        if (!project_packed(input, {
-                {layer.qkv.values, layer.qkv.scales, work.gdn_qkv, layer.qkv.rows},
-                {layer.z.values, layer.z.scales, work.gdn_z, layer.z.rows},
-            })) {
-            project(layer.qkv, input, work.gdn_qkv);
-            project(layer.z, input, work.gdn_z);
-        }
-        if (tensor_core_fp8 && layer.b.rows == text_gdn_value_heads &&
-            layer.a.rows == text_gdn_value_heads && layer.b.columns == hidden_size &&
-            layer.a.columns == hidden_size) {
-            auto status = try_prefill_bf16_gdn_gates_sm100(
-                layer.b.values, layer.a.values, work.normalized, rows, work.gdn_b, work.gdn_a,
-                work.mlp_gate, rows * intermediate_size * sizeof(Bf16), stream);
-            if (!status) status = try_prefill_bf16_gdn_gates(
-                layer.b.values, layer.a.values, work.normalized, rows, work.gdn_b, work.gdn_a,
-                stream);
-            if (status) return check(*status, "Project BF16 prefill Gated DeltaNet gates");
-        }
-        project(layer.b, work.normalized, work.gdn_b);
-        project(layer.a, work.normalized, work.gdn_a);
-    }
-
-    void gdn_recur(const GdnLayer& layer, TextGdnState state, int bank,
-                   TextFp8Activation quantized) const {
-        static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
-        const bool chunked_recurrence = position != 0 || bank != 0;
-        auto* gates = reinterpret_cast<float2*>(work.keys);
-        auto* scratch = chunked_recurrence ? work.mlp_gate : nullptr;
-        const auto scratch_bytes = rows * intermediate_size * sizeof(Bf16);
-        if (quantized.values) {
-            check(tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                                          layer.recurrent, state, work.gdn_scratch, gates,
-                                          quantized, stream, scratch, scratch_bytes),
-                  "Advance and quantize prefill Gated DeltaNet");
-            return;
-        }
-        const auto status = tensor_core_fp8
-            ? tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                                      layer.recurrent, state, work.gdn_scratch, gates,
-                                      work.attention, stream, scratch, scratch_bytes)
-            : text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
-                               work.gdn_a, layer.recurrent, state, work.gdn_scratch,
-                               text_gdn_workspace_bytes(rows), work.attention, stream);
-        check(status, "Advance prefill Gated DeltaNet state");
-    }
-
-    void gdn_attention(const GdnLayer& layer, TextGdnState state, int bank) const {
-        const bool quantized = tensor_core_fp8;
-        gdn_recur(layer, state, bank, quantized ? activation : TextFp8Activation{});
-        const auto input = quantized
-            ? TextFp8ActivationView{activation.values, activation.scales}
-            : quantize(work.attention, text_gdn_value_width);
-        project(layer.output, input, work.projected_attention);
-    }
-
-    void gqa_input(const GqaLayer& layer, bool reuse_all = false) const {
-        const TextFp8ActivationView input{activation.values, activation.scales};
-        if (reuse_all || cached_gqa_tokens >= position + rows)
-            return project(layer.q_gate, input, work.q_gate);
-        if (!project_packed(input, {
-                {layer.q_gate.values, layer.q_gate.scales, work.q_gate, layer.q_gate.rows},
-                {layer.key.values, layer.key.scales, work.keys, layer.key.rows},
-                {layer.value.values, layer.value.scales, work.values, layer.value.rows},
-            })) {
-            project(layer.q_gate, input, work.q_gate);
-            project(layer.key, input, work.keys);
-            project(layer.value, input, work.values);
-        }
-    }
-
-    void gqa_append(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages) const {
-        prepare_prefill_gqa(layer, work, cache, pages, position, rows, cached_gqa_tokens,
-                            mrope, stream);
-    }
-
-    void gqa_gate() const {
-        check(text_gqa_postgate(rows, work.q_gate, work.attention, work.attention, stream),
-              "Gate prefill grouped-query attention");
-    }
-
-    void gqa_attention(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages,
-                       PairedPrefillScratch scratch, bool postgate = true) const {
-        gqa_append(layer, cache, pages);
-        const auto status = tensor_core_fp8
-            ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
-                                            work.attention, stream, scratch)
-            : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
-                                   work.attention, stream);
-        check(status, "Read causal prefill MXFP8 attention");
-        if (postgate) gqa_gate();
-    }
-
-    void project_scaled(Fp8Weight weight, TextFp8ActivationView input, Bf16* output,
-                        bool eligible) const {
-        if (eligible) {
-            const auto status = try_prefill_scaled_sm100(input, weight.values, weight.scales, rows,
-                weight.rows, weight.columns, output, work.mlp_gate, work.mlp_up, stream);
-            if (status) return check(*status, "Run scaled FP8 prefill projection");
-        }
-        project(weight, input, output);
-    }
-
-    void mlp(const Layer& layer) const {
-        const TextFp8ActivationView input{activation.values, activation.scales};
-        if (!project_packed(input, {
-                {layer.mlp_gate.values, layer.mlp_gate.scales, work.mlp_gate, layer.mlp_gate.rows},
-                {layer.mlp_up.values, layer.mlp_up.scales, work.mlp_up, layer.mlp_up.rows},
-            })) {
-            project(layer.mlp_gate, input, work.mlp_gate);
-            project(layer.mlp_up, input, work.mlp_up);
-        }
-        if (tensor_core_fp8) {
-            check(tensor_core_prefill_swiglu_quantize(work.mlp_gate, work.mlp_up,
-                                                      intermediate_size, rows, activation, stream),
-                  "Apply and quantize prefill SwiGLU");
-            project_scaled(layer.mlp_down, input, work.hidden,
-                           rows == 1024 ||
-                           (grouped_projection && rows == grouped_prefill_max_rows));
-            return;
-        }
-        check(text_swiglu(work.mlp_gate, work.mlp_up, rows * intermediate_size,
-                          work.mlp_gate, stream), "Apply prefill SwiGLU");
-        project(layer.mlp_down, quantize(work.mlp_gate, intermediate_size), work.hidden);
-    }
-
-    void normalize(const Bf16* branch, Bf16* residual, const Bf16* weight,
-                   RmsQuantizeLaunch launch = RmsQuantizeLaunch::ordinary) const {
-        if (tensor_core_fp8) {
-            check(tensor_core_prefill_rms_quantize(branch, residual, weight, hidden_size, rows,
-                                                   work.normalized, activation, stream, launch),
-                  "Normalize and quantize prefill residual");
-            return;
-        }
-        check(text_rms_norm_rows(branch, residual, weight, hidden_size, rows,
-                                 work.normalized, residual, stream), "Normalize prefill residual");
-        quantize(work.normalized, hidden_size);
-    }
-};
-
-void gather_embeddings(const Bf16* embedding, const int* tokens, int rows,
-                       Bf16* residual, cudaStream_t stream) {
-    for (int offset = 0; offset < rows; offset += text_embedding_max_rows) {
-        const int count = std::min(text_embedding_max_rows, rows - offset);
-        check(text_embedding_rows(embedding, vocab_size, hidden_size, tokens + offset, count,
-                                  residual + offset * hidden_size, stream),
-              "Gather prefill embeddings");
-    }
-}
-
-void stage_prefill_row(Request& request, const TileBuffers& work, int row, cudaStream_t stream) {
-    const int offset = row * hidden_size;
-    const auto bytes = hidden_size * sizeof(Bf16);
-    copy_cuda_async(request.work.hidden, work.hidden + offset, bytes,
-                    cudaMemcpyDeviceToDevice, stream, "Stage final prefill hidden row");
-    copy_cuda_async(request.work.residual, work.residual + offset, bytes,
-                    cudaMemcpyDeviceToDevice, stream, "Stage final prefill residual row");
-}
-
-void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant,
-                            const TileBuffers* buffers, int offset, cudaStream_t stream) {
-    if (!grant.scores) return;
-    const auto& capture = *grant.scores;
-    const int first = std::max(0, capture.start - grant.position);
-    const int end = capture.score_end(grant.position, grant.rows) - grant.position;
-    for (int start = first; start < end; start += decoder_batch_max_lanes) {
-        const int count = std::min(end - start, decoder_batch_max_lanes);
-        for (int index = 0; index < count; ++index) {
-            const int row = start + index;
-            auto work = grant.request->work;
-            if (buffers) {
-                work.hidden = buffers->hidden + (offset + row) * hidden_size;
-                work.residual = buffers->residual + (offset + row) * hidden_size;
-            }
-            capture.enqueue(model, work, grant.position + row, index, stream);
-        }
-        capture.collect(count, stream);
-    }
-}
-
-constexpr int layerwise_row_alignment = 128;
-constexpr int max_layerwise_rows = 1023;
-static_assert(max_layerwise_rows / 256 <= max_gdn_prefill_segments);
-static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
-
-int aligned_layerwise_rows(int rows) {
-    return (rows + layerwise_row_alignment - 1) / layerwise_row_alignment *
-        layerwise_row_alignment;
-}
-
-PrefillGroup prefill_group(const PrefillGrant* grants, int count) {
-    PrefillGroup group{0, 0};
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        if (grant.rows < 256 || grant.rows != grant.tile_rows ||
-            aligned_layerwise_rows(grant.rows) != grant.rows ||
-            grant.rows > max_layerwise_rows - group.rows) {
-            break;
-        }
-        ++group.grants;
-        group.rows += grant.rows;
-    }
-    return group.grants > 1 ? group : PrefillGroup{1, 0};
-}
-
-template <typename Run>
-void each_prefill_segment(const PrefillGrant* grants, int count, int offset, Run run) {
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        run(grant, offset);
-        offset += grant.rows;
-    }
-}
-
-template <typename Run>
-void each_attention_group(const PrefillGrant* grants, int count, Run run) {
-    int offset = 0;
-    for (int index = 0; index < count;) {
-        const auto group = prefill_group(grants + index, count - index);
-        run(grants + index, group.grants, offset);
-        offset += group.grants == 1 ? grants[index].rows : group.rows;
-        index += group.grants;
-    }
-}
-
-void read_paged_sequences(const PagedPrefillSequence* sequences, int count, cudaStream_t stream,
-                          PairedPrefillScratch scratch) {
-    if (const auto batched = try_batched_paged_prefill(sequences, count, stream)) {
-        check(*batched, "Read batched causal prefill MXFP8 attention");
-        return;
-    }
-    for (int index = 0; index < count; ++index) {
-        const auto& sequence = sequences[index];
-        check(tensor_core_model_prefill_gqa(sequence.cache, sequence.pages, sequence.position,
-                                           sequence.rows, sequence.queries, sequence.output,
-                                           stream, scratch), "Read causal prefill MXFP8 attention");
-    }
-}
-
-Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, int offset) {
-    return Chunk{{{}, grant.rows, chunk.stream, true}, chunk.work.attention_segment(offset),
-        grant.position, grant.media ? grant.media->positions + grant.position : nullptr,
-        grant.request->cached_gqa_tokens};
-}
-
-bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
-                                 const PrefillGrant* grants, int count,
-                                 PairedPrefillScratch scratch, PairedPrefillScratch staging,
-                                 bool postgate) {
-    constexpr int width = staged_prefill_batch_size;
-    if (count < width) return false;
-    const int rows = grants[0].rows;
-    const bool ordered = count % width == 0 && (rows == 256 || rows == 512) &&
-        std::all_of(grants, grants + count, [rows](const PrefillGrant& grant) {
-            return grant.rows == rows && grant.position >= 8192 && grant.position <= 32768 - rows;
+        normalize(primary.attention_norm, peer.attention_norm, [](const auto& work) {
+            return LayerResidual{work.projected_attention, work.residual};
         });
-    int offset = 0;
-    int first = 0;
-    for (; first + width <= count; first += width) {
-        std::array<PagedPrefillSequence, width> sequences;
-        int packet_end = offset;
-        for (int lane = 0; lane < width; ++lane) {
-            const auto& grant = grants[first + lane];
-            const auto segment = prefill_attention_segment(chunk, grant, packet_end);
-            const auto cache = grant.request->caches[bank];
-            const auto pages = grant.request->pages;
-            segment.gqa_append(layer, cache, pages);
-            sequences[lane] = {cache, pages, grant.position, grant.rows, segment.work.rope_queries,
-                               segment.work.attention};
-            packet_end += grant.rows;
-        }
-        auto submitted = launch_partial_staged_tmem_prefill(sequences.data(), width,
-                                                            chunk.stream, staging);
-        if (!submitted && ordered) {
-            submitted = try_batched_partial_paged_prefill(sequences.data(), width, chunk.stream);
-        }
-        if (submitted) check(*submitted, "Read grouped ordered partial prefill attention");
-        for (int lane = 0; lane < width; ++lane) {
-            const auto& grant = grants[first + lane];
-            const auto segment = prefill_attention_segment(chunk, grant, offset);
-            const auto& sequence = sequences[lane];
-            if (!submitted) {
-                check(tensor_core_model_prefill_gqa(sequence.cache, sequence.pages,
-                    sequence.position, sequence.rows, sequence.queries, sequence.output,
-                    chunk.stream, scratch), "Read causal prefill MXFP8 attention");
-            }
-            if (postgate) segment.gqa_gate();
-            offset += grant.rows;
-        }
+        mlp(primary, peer);
     }
-    for (; first < count; ++first) {
-        const auto& grant = grants[first];
-        const auto segment = prefill_attention_segment(chunk, grant, offset);
-        segment.gqa_attention(layer, grant.request->caches[bank], grant.request->pages,
-                              scratch, postgate);
-        offset += grant.rows;
-    }
-    return true;
 }
 
-bool prefill_causal_group_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
-                              const PrefillGrant* grants, int count,
-                              PairedPrefillScratch serial_scratch) {
-    constexpr int tile_rows = batch_prefill_tile_rows;
-    constexpr int group_rows = grouped_prefill_max_rows;
-    constexpr int long_context = staged_prefill_batch_long_max_position + tile_rows;
-    const auto& first = grants[0];
-    if (count != group_rows / tile_rows || first.position < 0 ||
-        first.position > long_context - group_rows || first.position % tile_rows != 0) {
-        return false;
-    }
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        if (grant.request != first.request || grant.media || grant.rows != tile_rows ||
-            grant.position != first.position + index * tile_rows) return false;
-    }
-    const auto cache = first.request->caches[bank];
-    const auto pages = first.request->pages;
-    each_prefill_segment(grants, count, 0, [&](const PrefillGrant& grant, int offset) {
-        prefill_attention_segment(chunk, grant, offset).gqa_append(layer, cache, pages);
-    });
-    const PagedPrefillSequence sequence{cache, pages, first.position, group_rows,
-                                     chunk.work.rope_queries, chunk.work.attention};
-    const auto submitted = launch_causal_group_staged_tmem_prefill(
-        sequence, chunk.stream, chunk.work.gqa_scratch());
-    if (submitted) check(*submitted, "Read staged single-request causal prefill group");
-    each_prefill_segment(grants, count, 0, [&](const PrefillGrant& grant, int offset) {
-        const auto segment = prefill_attention_segment(chunk, grant, offset);
-        if (!submitted) {
-            check(tensor_core_model_prefill_gqa(cache, pages, grant.position, grant.rows,
-                segment.work.rope_queries, segment.work.attention, chunk.stream, serial_scratch),
-                "Read causal prefill MXFP8 attention");
-        }
-        segment.gqa_gate();
-    });
-    return true;
-}
+/// Dispatch flags shared by the TP1 and tensor-parallel layerwise paths for
+/// one prefill group.
+struct PrefillGroupPlan {
+    bool grouped = false;
+    bool causal = false;
+    bool serial_attention = false;
+    bool wide_partial = false;
+    bool staged_group = false;
+    bool packed_preparation = false;
+    std::optional<PrefillPartners> partners;
+    RmsQuantizeLaunch rms_launch = RmsQuantizeLaunch::ordinary;
+};
 
-#include "sglang/runtime/execution/decoder_prefill_staged_gqa.h"
-
-void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
-                       const PrefillGrant* grants, int count, int offset) {
-    const auto& buffers = chunk.work;
-    GdnPrefillSegment segments[max_gdn_prefill_segments]{};
-    bool grouped_recurrence = count > 1;
-    int index = 0;
-    each_prefill_segment(grants, count, offset, [&](const PrefillGrant& grant, int row) {
-        const auto segment = buffers.attention_segment(row);
-        const TextFp8Activation fp8{
-            buffers.activation.values + std::size_t(row) * text_gdn_value_width,
-            buffers.activation.scales + std::size_t(row) * text_gdn_value_heads,
-        };
-        grouped_recurrence = grouped_recurrence &&
-            grant.rows % layerwise_row_alignment == 0 && (grant.position != 0 || bank != 0);
-        segments[index++] = {
-            grant.rows, segment.gdn_qkv, segment.gdn_z, segment.gdn_b, segment.gdn_a,
-            grant.request->states[bank],
-            buffers.gdn_scratch + text_gdn_workspace_bytes(row) / sizeof(Bf16),
-            reinterpret_cast<float2*>(segment.keys), fp8,
-            buffers.mlp_gate + row * intermediate_size,
-            std::size_t(grant.rows) * intermediate_size * sizeof(Bf16),
-        };
-    });
-    const auto status = grouped_recurrence
-        ? tensor_core_prefill_gdn_group(segments, count, layer.recurrent, chunk.stream)
-        : std::nullopt;
-    if (status) {
-        if (*status != cudaSuccess && cudaPeekAtLastError() == *status) {
-            (void)cudaGetLastError();
-        }
-        check(*status, "Advance grouped prefill Gated DeltaNet");
-        return;
-    }
-    index = 0;
-    each_prefill_segment(grants, count, offset, [&](const PrefillGrant& grant, int row) {
-        const auto& segment = segments[index++];
-        prefill_attention_segment(chunk, grant, row).gdn_recur(
-            layer, segment.state, bank, segment.output);
-    });
-}
-
-PairedPrefillScratch serial_gqa_scratch(const TileBuffers& buffers, int serial_capacity) {
-    ScratchLayout serial_layout{reinterpret_cast<std::byte*>(buffers.hidden)};
-    const auto sizes = TileBuffers(serial_layout, serial_capacity).gqa_scratch();
-    auto scratch = buffers.gqa_scratch();
-    scratch.key_bytes = sizes.key_bytes;
-    scratch.value_bytes = sizes.value_bytes;
-    return scratch;
-}
-
-bool is_full_partial_prefill_group(const PrefillGrant* grants, PrefillGroup group) {
-    const int rows = grants[0].rows;
-    if (group.rows != grouped_prefill_max_rows || (rows != 256 && rows != 512) ||
-        group.grants % max_gdn_prefill_segments != 0) {
-        return false;
-    }
-    for (int index = 1; index < group.grants; ++index) {
-        if (grants[index].rows != rows) return false;
-    }
-    return true;
-}
-
-void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
-                         const PrefillGrant* grants, int count, bool grouped) {
-    if (grouped) {
-        int offset = 0;
-        for (int index = 0; index < count; index += max_gdn_prefill_segments) {
-            prefill_group_gdn(chunk, layer, bank, grants + index, max_gdn_prefill_segments, offset);
-            offset += max_gdn_prefill_segments * grants[index].rows;
-        }
-        return;
-    }
-    const auto& activation = chunk.work.activation;
-    each_prefill_segment(grants, count, 0, [&](const PrefillGrant& grant, int row) {
-        const auto segment = prefill_attention_segment(chunk, grant, row);
-        const TextFp8Activation quantized{
-            activation.values + std::size_t(row) * text_gdn_value_width,
-            activation.scales + std::size_t(row) * text_gdn_value_heads,
-        };
-        segment.gdn_recur(layer, grant.request->states[bank], bank, quantized);
-    });
-}
-
-void prefill_serial_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
-                        const PrefillGrant* grants, int count, int serial_capacity,
-                        bool causal, bool wide_partial) {
-    const auto scratch = serial_gqa_scratch(chunk.work, serial_capacity);
-    if (causal) {
-        if (prefill_causal_group_gqa(chunk, layer, bank, grants, count, scratch)) return;
-    } else if (prefill_grouped_partial_gqa(
-                   chunk, layer, bank, grants, count, scratch, chunk.work.gqa_scratch(),
-                   !wide_partial)) {
-        return;
-    }
-    each_prefill_segment(grants, count, 0, [&](const PrefillGrant& grant, int offset) {
-        const auto segment = prefill_attention_segment(chunk, grant, offset);
-        segment.gqa_attention(layer, grant.request->caches[bank], grant.request->pages,
-                              scratch, !wide_partial);
-    });
-}
-
-void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, PrefillGroup group,
-                       PrefillWorkspace& workspace, PrefillAttentionMode attention_mode,
-                       int serial_capacity = 0) {
-    const auto stream = workspace.stream();
-    ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
-    const TileBuffers buffers(layout, workspace.capacity());
-    const bool grouped = group.rows > max_layerwise_rows;
-    const bool causal = attention_mode == PrefillAttentionMode::causal_segments;
-    const bool serial_attention = causal || attention_mode == PrefillAttentionMode::serial_segments;
-    const bool wide_partial = !causal && serial_attention &&
+PrefillGroupPlan plan_prefill_group(const PrefillGrant* grants, PrefillGroup group,
+                                    PrefillAttentionMode attention_mode) {
+    PrefillGroupPlan plan;
+    plan.grouped = group.rows > max_layerwise_rows;
+    plan.causal = attention_mode == PrefillAttentionMode::causal_segments;
+    plan.serial_attention = plan.causal ||
+        attention_mode == PrefillAttentionMode::serial_segments;
+    plan.wide_partial = !plan.causal && plan.serial_attention &&
         is_full_partial_prefill_group(grants, group);
     const bool full_group = attention_mode == PrefillAttentionMode::full_group;
-    const bool staged_group = grouped && !serial_attention &&
+    plan.staged_group = plan.grouped && !plan.serial_attention &&
         can_batch_staged_gqa(grants, group.grants);
-    const auto partners = full_group && !staged_group ? mixed_prefill_partners(grants, group.grants)
-                                                     : std::nullopt;
-    const bool packed_preparation = full_group || wide_partial;
-    const auto rms_launch = packed_preparation ? RmsQuantizeLaunch::full_group_prefill
-                                               : RmsQuantizeLaunch::ordinary;
-    const Chunk chunk{{buffers.activation, group.rows, stream, true,
-                       grouped || serial_attention}, buffers, 0, nullptr};
-    const bool scaled_output = group.rows == grouped_prefill_max_rows;
-    const bool reuse_all_gqa = std::all_of(grants, grants + group.grants, gqa_cached);
-    each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
-        auto* residual = buffers.residual + offset * hidden_size;
-        gather_embeddings(model.embedding, grant.tokens, grant.rows, residual, stream);
-        if (grant.media) grant.media->substitute(residual, grant.position, grant.rows, stream);
-    });
-    execute_layers(model.layers,
-        [&](const Bf16* weight, const char*, const auto& residuals) {
-            const auto [branch, residual] = residuals(buffers);
-            chunk.normalize(branch, residual, weight, rms_launch);
-        },
-        [&](const GqaLayer& layer, int bank) {
-            chunk.gqa_input(layer, reuse_all_gqa);
-            if (serial_attention) {
-                prefill_serial_gqa(chunk, layer, bank, grants, group.grants, serial_capacity,
-                                   causal, wide_partial);
-            } else if (staged_group) {
-                prefill_group_gqa(chunk, layer, bank, grants, group.grants, 0, true);
-            } else if (partners) {
-                prefill_mixed_gqa(chunk, layer, bank, grants, *partners);
-            } else {
-                each_attention_group(grants, group.grants,
-                                     [&](const PrefillGrant* first, int count, int offset) {
-                    prefill_group_gqa(chunk, layer, bank, first, count, offset);
-                });
-            }
-            if (packed_preparation) {
-                if (const auto status = try_prefill_gqa_postgate_quantize(
-                    group.rows, buffers.q_gate, buffers.attention, buffers.activation, stream)) {
-                    check(*status, "Gate and quantize prefill grouped-query attention");
-                    chunk.project_scaled(layer.output, {buffers.activation.values,
-                        buffers.activation.scales}, buffers.projected_attention, scaled_output);
-                    return;
-                }
-            }
-            if (wide_partial) {
-                each_prefill_segment(grants, group.grants, 0,
-                                     [&](const PrefillGrant& grant, int row) {
-                    prefill_attention_segment(chunk, grant, row).gqa_gate();
-                });
-            }
-            if (!serial_attention) chunk.gqa_gate();
-            chunk.project_scaled(layer.output, chunk.quantize(buffers.attention, text_gqa_q_width),
-                                 buffers.projected_attention, scaled_output);
-        },
-        [&](const GdnLayer& layer, int bank) {
-            chunk.gdn_input(layer);
-            if (serial_attention) {
-                prefill_partial_gdn(chunk, layer, bank, grants, group.grants, wide_partial);
-            } else if (grouped) {
-                prefill_group_gdn(chunk, layer, bank, grants, group.grants, 0);
-            } else {
-                each_attention_group(grants, group.grants,
-                                     [&](const PrefillGrant* first, int count, int offset) {
-                    prefill_group_gdn(chunk, layer, bank, first, count, offset);
-                });
-            }
-            chunk.project_scaled(layer.output, {buffers.activation.values,
-                buffers.activation.scales}, buffers.projected_attention, scaled_output);
-        },
-        [&](const Layer& layer) { chunk.mlp(layer); });
-    each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
+    plan.partners = full_group && !plan.staged_group
+        ? mixed_prefill_partners(grants, group.grants) : std::nullopt;
+    plan.packed_preparation = full_group || plan.wide_partial;
+    plan.rms_launch = plan.packed_preparation ? RmsQuantizeLaunch::full_group_prefill
+                                              : RmsQuantizeLaunch::ordinary;
+    return plan;
+}
+
+/// TP1 group epilogue: MTP draft seeding, score capture, and final-row
+/// staging for every grant in the group.
+void finish_prefill_group(const DecoderModel& model, const Chunk& chunk,
+                          const PrefillGrant* grants, int count, const TileBuffers& buffers,
+                          cudaStream_t stream) {
+    int offset = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
         if (grant.draft && grant.prompt_remaining > 1) {
             auto seed = chunk;
             seed.position = grant.position;
@@ -677,7 +109,360 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         }
         capture_prefill_scores(model, grant, &buffers, offset, stream);
         stage_prefill_row(*grant.request, buffers, offset + grant.rows - 1, stream);
+        offset += grant.rows;
+    }
+}
+/// Enqueues peer-rank work with the host thread bound to the peer device:
+/// streams, kernels, and allocations on the other GPU are invalid handles in
+/// this rank's current CUDA context.
+template <typename Enqueue>
+auto on_device(int device, Enqueue&& enqueue) {
+    const DeviceScope scope(device);
+    return enqueue();
+}
+
+/// Shared per-layer state for one tensor-parallel layerwise prefill group:
+/// both ranks' chunks plus the group dispatch flags, so every attention and
+/// MLP partial is reduced in place while both streams are still inside that
+/// layer.
+struct PrefillGroupTp {
+    const PrefillGrant* grants;
+    const PrefillGrant* peer_grants;
+    PrefillGroup group;
+    const PrefillGroupPlan& plan;
+    int serial_capacity;
+    const Chunk& chunk;
+    const Chunk& peer_chunk;
+    cudaStream_t stream;
+    cudaStream_t peer_stream;
+    TensorParallel* comm;
+    int peer_device;
+    bool scaled_output;
+    bool reuse_all_gqa;
+    /// Enqueues work on the peer rank's device: its streams and kernels are
+    /// invalid handles in this rank's current CUDA context.
+    template <typename Enqueue>
+    auto on_peer(Enqueue&& enqueue) const {
+        const DeviceScope scope(peer_device);
+        return enqueue();
+    }
+
+    void reduce(Bf16* primary, Bf16* mirror) const {
+        Bf16* const reduce_buffers[] = {primary, mirror};
+        const cudaStream_t reduce_streams[] = {stream, peer_stream};
+        comm->allreduce_bf16(reduce_buffers, reduce_streams,
+                             std::size_t(group.rows) * hidden_size);
+    }
+
+    template <typename Residuals>
+    void normalize(const Bf16* weight, const Bf16* peer_weight,
+                   const Residuals& residuals) const {
+        const auto [branch, residual] = residuals(chunk.work);
+        chunk.normalize(branch, residual, weight, plan.rms_launch);
+        const auto peer_state = residuals(peer_chunk.work);
+        on_peer([&] {
+            peer_chunk.normalize(peer_state.branch, peer_state.residual, peer_weight,
+                                 plan.rms_launch);
+        });
+    }
+
+    void attention(const GqaLayer& layer, const GqaLayer& peer_layer, int bank);
+    void attention(const GdnLayer& layer, const GdnLayer& peer_layer, int bank);
+
+    void mlp(const Layer& layer, const Layer& peer_layer) const {
+        chunk.mlp(layer);
+        on_peer([&] { peer_chunk.mlp(peer_layer); });
+        reduce(chunk.work.hidden, peer_chunk.work.hidden);
+    }
+};
+
+void PrefillGroupTp::attention(const GqaLayer& layer, const GqaLayer& peer_layer, int bank) {
+    const auto& buffers = chunk.work;
+    const auto& peer_buffers = peer_chunk.work;
+    const auto& dims = buffers.dims;
+    const auto& peer_dims = peer_buffers.dims;
+    chunk.gqa_input(layer, reuse_all_gqa);
+    on_peer([&] { peer_chunk.gqa_input(peer_layer, reuse_all_gqa); });
+    const auto run_rank = [&](const Chunk& c, const GqaLayer& l, const PrefillGrant* lane) {
+        if (plan.serial_attention) {
+            prefill_serial_gqa(c, l, bank, lane, group.grants, serial_capacity, plan.causal,
+                               plan.wide_partial);
+        } else if (plan.staged_group) {
+            prefill_group_gqa(c, l, bank, lane, group.grants, 0, true);
+        } else if (plan.partners) {
+            prefill_mixed_gqa(c, l, bank, lane, *plan.partners);
+        } else {
+            each_attention_group(lane, group.grants,
+                                 [&](const PrefillGrant* first, int count, int offset) {
+                prefill_group_gqa(c, l, bank, first, count, offset);
+            });
+        }
+    };
+    run_rank(chunk, layer, grants);
+    on_peer([&] { run_rank(peer_chunk, peer_layer, peer_grants); });
+    if (plan.packed_preparation) {
+        const auto primary = try_prefill_gqa_postgate_quantize(
+            group.rows, buffers.q_gate, buffers.attention, buffers.activation, stream,
+            dims.gqa_geometry());
+        const auto mirror = on_peer([&] {
+            return try_prefill_gqa_postgate_quantize(
+                group.rows, peer_buffers.q_gate, peer_buffers.attention,
+                peer_buffers.activation, peer_stream, peer_dims.gqa_geometry());
+        });
+        if (primary && mirror) {
+            check(*primary, "Gate and quantize prefill grouped-query attention");
+            check(*mirror, "Gate and quantize prefill grouped-query attention");
+            chunk.project_scaled(layer.output, {buffers.activation.values,
+                buffers.activation.scales}, buffers.projected_attention, scaled_output);
+            on_peer([&] {
+                peer_chunk.project_scaled(peer_layer.output,
+                    {peer_buffers.activation.values, peer_buffers.activation.scales},
+                    peer_buffers.projected_attention, scaled_output);
+            });
+            reduce(buffers.projected_attention, peer_buffers.projected_attention);
+            return;
+        }
+        if (primary) check(*primary, "Gate and quantize prefill grouped-query attention");
+        if (mirror) check(*mirror, "Gate and quantize prefill grouped-query attention");
+    }
+    if (plan.wide_partial) {
+        each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int row) {
+            prefill_attention_segment(chunk, grant, row).gqa_gate();
+        });
+        on_peer([&] {
+            each_prefill_segment(peer_grants, group.grants, 0,
+                                 [&](const PrefillGrant& grant, int row) {
+                prefill_attention_segment(peer_chunk, grant, row).gqa_gate();
+            });
+        });
+    }
+    if (!plan.serial_attention) {
+        chunk.gqa_gate();
+        on_peer([&] { peer_chunk.gqa_gate(); });
+    }
+    chunk.project_scaled(layer.output, chunk.quantize(buffers.attention, dims.q_width),
+                         buffers.projected_attention, scaled_output);
+    on_peer([&] {
+        peer_chunk.project_scaled(peer_layer.output,
+                                  peer_chunk.quantize(peer_buffers.attention, peer_dims.q_width),
+                                  peer_buffers.projected_attention, scaled_output);
     });
+    reduce(buffers.projected_attention, peer_buffers.projected_attention);
+}
+
+void PrefillGroupTp::attention(const GdnLayer& layer, const GdnLayer& peer_layer, int bank) {
+    const auto& buffers = chunk.work;
+    const auto& peer_buffers = peer_chunk.work;
+    chunk.gdn_input(layer);
+    on_peer([&] { peer_chunk.gdn_input(peer_layer); });
+    if (plan.serial_attention) {
+        prefill_partial_gdn(chunk, layer, bank, grants, group.grants, plan.wide_partial);
+        on_peer([&] {
+            prefill_partial_gdn(peer_chunk, peer_layer, bank, peer_grants, group.grants,
+                                plan.wide_partial);
+        });
+    } else if (plan.grouped) {
+        prefill_group_gdn(chunk, layer, bank, grants, group.grants, 0);
+        on_peer([&] {
+            prefill_group_gdn(peer_chunk, peer_layer, bank, peer_grants, group.grants, 0);
+        });
+    } else {
+        each_attention_group(grants, group.grants,
+                             [&](const PrefillGrant* first, int count, int offset) {
+            prefill_group_gdn(chunk, layer, bank, first, count, offset);
+        });
+        on_peer([&] {
+            each_attention_group(peer_grants, group.grants,
+                                 [&](const PrefillGrant* first, int count, int offset) {
+                prefill_group_gdn(peer_chunk, layer, bank, first, count, offset);
+            });
+        });
+    }
+    chunk.project_scaled(layer.output, {buffers.activation.values,
+        buffers.activation.scales}, buffers.projected_attention, scaled_output);
+    on_peer([&] {
+        peer_chunk.project_scaled(peer_layer.output, {peer_buffers.activation.values,
+            peer_buffers.activation.scales}, peer_buffers.projected_attention, scaled_output);
+    });
+    reduce(buffers.projected_attention, peer_buffers.projected_attention);
+}
+
+/// Tensor-parallel group epilogue. The MTP draft seed runs full geometry on
+/// the primary rank, so its widened scratch is carved from the tail slack of
+/// the rank-local tile layout instead of a per-group device allocation.
+void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
+                             const Chunk& peer_chunk, const PrefillGrant* grants,
+                             const PrefillGrant* peer_grants, int count, ScratchLayout& layout,
+                             const PrefillWorkspace& workspace, cudaStream_t stream,
+                             cudaStream_t peer_stream, int peer_device) {
+    int seed_tile_rows = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        if (grant.draft && grant.prompt_remaining > 1) {
+            seed_tile_rows = std::max(seed_tile_rows,
+                                      std::min({grant.rows, grant.prompt_remaining - 1,
+                                                prefill_chunk_rows}));
+        }
+    }
+    Bf16* seed_memory = nullptr;
+    if (seed_tile_rows) {
+        const std::size_t available = workspace.bytes() - layout.bytes;
+        if (seed_scratch_bytes(seed_tile_rows) > available) {
+            throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
+        }
+        seed_memory = layout.take<Bf16>(seed_scratch_bytes(seed_tile_rows) / sizeof(Bf16));
+    }
+    int offset = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        const auto& peer_grant = peer_grants[index];
+        if (grant.draft && grant.prompt_remaining > 1) {
+            auto seed = chunk;
+            seed.position = grant.position;
+            seed.work.hidden += offset * hidden_size;
+            seed.work.residual += offset * hidden_size;
+            const bool wmma = model.backend.draft.wmma_seed_fc &&
+                grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
+            const auto scratch = make_seed_scratch(seed_memory, seed_tile_rows);
+            seed.seed_draft(*grant.draft, grant.tokens + 1,
+                            std::min(grant.rows, grant.prompt_remaining - 1),
+                            model.final_norm, wmma, grant.media, &scratch);
+        }
+        capture_prefill_scores(model, grant, &chunk.work, offset, stream);
+        stage_prefill_row(*grant.request, chunk.work, offset + grant.rows - 1, stream);
+        on_device(peer_device, [&] {
+            stage_prefill_row(*peer_grant.request, peer_chunk.work,
+                              offset + grant.rows - 1, peer_stream);
+        });
+        offset += grant.rows;
+    }
+}
+
+void prefill_layerwise_tp(const DecoderModel& model, const DecoderModel& peer,
+                          const PrefillGrant* grants, const PrefillGrant* peer_grants,
+                          PrefillGroup group, const PrefillGroupPlan& plan, int serial_capacity,
+                          const Chunk& chunk, ScratchLayout& layout, PrefillWorkspace& workspace,
+                          PrefillWorkspace& peer_workspace, bool scaled_output,
+                          bool reuse_all_gqa, cudaStream_t stream, cudaStream_t peer_stream,
+                          TensorParallel& comm) {
+    const auto peer_dims = PrefillDims::from_layers(peer.layers);
+    ScratchLayout peer_layout{static_cast<std::byte*>(peer_workspace.data())};
+    const TileBuffers peer_buffers(peer_layout, peer_workspace.capacity(), peer_dims);
+    const Chunk peer_chunk{{peer_buffers.activation, group.rows, peer_stream,
+                            chunk.tensor_core_fp8, plan.grouped || plan.serial_attention},
+                           peer_buffers, 0, nullptr};
+    PrefillGroupTp run{grants, peer_grants, group, plan, serial_capacity, chunk, peer_chunk,
+                       stream, peer_stream, &comm, peer.device, scaled_output,
+                       reuse_all_gqa};
+    each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
+        auto* residual = chunk.work.residual + offset * hidden_size;
+        gather_embeddings(model.embedding, grant.tokens, grant.rows, residual, stream);
+    });
+    on_device(peer.device, [&] {
+        each_prefill_segment(peer_grants, group.grants, 0,
+                             [&](const PrefillGrant& grant, int offset) {
+            auto* residual = peer_buffers.residual + offset * hidden_size;
+            gather_embeddings(peer.embedding, grant.tokens, grant.rows, residual, peer_stream);
+        });
+    });
+    execute_layers_tp(model.layers, peer.layers,
+        [&](const Bf16* weight, const Bf16* peer_weight, const auto& residuals) {
+            run.normalize(weight, peer_weight, residuals);
+        },
+        [&](const auto& layer, const auto& peer_layer, int bank) {
+            run.attention(layer, peer_layer, bank);
+        },
+        [&](const Layer& layer, const Layer& peer_layer) { run.mlp(layer, peer_layer); });
+    finish_prefill_group_tp(model, chunk, peer_chunk, grants, peer_grants, group.grants, layout,
+                            workspace, stream, peer_stream, peer.device);
+}
+
+void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, PrefillGroup group,
+                       PrefillWorkspace& workspace, PrefillAttentionMode attention_mode,
+                       int serial_capacity = 0, const DecoderModel* peer = nullptr,
+                       const PrefillGrant* peer_grants = nullptr,
+                       PrefillWorkspace* peer_workspace = nullptr,
+                       cudaStream_t peer_stream = nullptr, TensorParallel* comm = nullptr) {
+    const auto stream = workspace.stream();
+    ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
+    const auto dims = PrefillDims::from_layers(model.layers);
+    const TileBuffers buffers(layout, workspace.capacity(), dims);
+    const auto plan = plan_prefill_group(grants, group, attention_mode);
+    const bool tensor_core = peer
+        ? model.backend.tensor_core_prefill && peer->backend.tensor_core_prefill
+        : true;
+    const Chunk chunk{{buffers.activation, group.rows, stream, tensor_core,
+                       plan.grouped || plan.serial_attention}, buffers, 0, nullptr};
+    const bool scaled_output = group.rows == grouped_prefill_max_rows;
+    const bool reuse_all_gqa = std::all_of(grants, grants + group.grants, gqa_cached);
+    if (peer) {
+        prefill_layerwise_tp(model, *peer, grants, peer_grants, group, plan, serial_capacity,
+                             chunk, layout, workspace, *peer_workspace, scaled_output,
+                             reuse_all_gqa, stream, peer_stream, *comm);
+        return;
+    }
+    each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
+        auto* residual = buffers.residual + offset * hidden_size;
+        gather_embeddings(model.embedding, grant.tokens, grant.rows, residual, stream);
+        if (grant.media) grant.media->substitute(residual, grant.position, grant.rows, stream);
+    });
+    execute_layers(model.layers,
+        [&](const Bf16* weight, const char*, const auto& residuals) {
+            const auto [branch, residual] = residuals(buffers);
+            chunk.normalize(branch, residual, weight, plan.rms_launch);
+        },
+        [&](const GqaLayer& layer, int bank) {
+            chunk.gqa_input(layer, reuse_all_gqa);
+            if (plan.serial_attention) {
+                prefill_serial_gqa(chunk, layer, bank, grants, group.grants, serial_capacity,
+                                   plan.causal, plan.wide_partial);
+            } else if (plan.staged_group) {
+                prefill_group_gqa(chunk, layer, bank, grants, group.grants, 0, true);
+            } else if (plan.partners) {
+                prefill_mixed_gqa(chunk, layer, bank, grants, *plan.partners);
+            } else {
+                each_attention_group(grants, group.grants,
+                                     [&](const PrefillGrant* first, int count, int offset) {
+                    prefill_group_gqa(chunk, layer, bank, first, count, offset);
+                });
+            }
+            if (plan.packed_preparation) {
+                if (const auto status = try_prefill_gqa_postgate_quantize(
+                        group.rows, buffers.q_gate, buffers.attention, buffers.activation,
+                        stream)) {
+                    check(*status, "Gate and quantize prefill grouped-query attention");
+                    chunk.project_scaled(layer.output, {buffers.activation.values,
+                        buffers.activation.scales}, buffers.projected_attention, scaled_output);
+                    return;
+                }
+            }
+            if (plan.wide_partial) {
+                each_prefill_segment(grants, group.grants, 0,
+                                     [&](const PrefillGrant& grant, int row) {
+                        prefill_attention_segment(chunk, grant, row).gqa_gate();
+                    });
+            }
+            if (!plan.serial_attention) chunk.gqa_gate();
+            chunk.project_scaled(layer.output, chunk.quantize(buffers.attention, dims.q_width),
+                                 buffers.projected_attention, scaled_output);
+        },
+        [&](const GdnLayer& layer, int bank) {
+            chunk.gdn_input(layer);
+            if (plan.serial_attention) {
+                prefill_partial_gdn(chunk, layer, bank, grants, group.grants, plan.wide_partial);
+            } else if (plan.grouped) {
+                prefill_group_gdn(chunk, layer, bank, grants, group.grants, 0);
+            } else {
+                each_attention_group(grants, group.grants,
+                                     [&](const PrefillGrant* first, int count, int offset) {
+                    prefill_group_gdn(chunk, layer, bank, first, count, offset);
+                });
+            }
+            chunk.project_scaled(layer.output, {buffers.activation.values,
+                buffers.activation.scales}, buffers.projected_attention, scaled_output);
+        },
+        [&](const Layer& layer) { chunk.mlp(layer); });
+    finish_prefill_group(model, chunk, grants, group.grants, buffers, stream);
 }
 
 bool prefill_projection_tiles(const DecoderModel& model, const PrefillGrant* grants, int count,
@@ -851,7 +636,8 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         return;
     }
     ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
-    const TileBuffers buffers(layout, capacity);
+    const auto dims = PrefillDims::from_layers(layers);
+    const TileBuffers buffers(layout, capacity, dims);
     const bool tensor_core = backend.tensor_core_prefill;
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
         media ? media->positions + position : nullptr, request.cached_gqa_tokens};
@@ -869,7 +655,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
                        chunk.gqa_input(layer);
                        chunk.gqa_attention(layer, request.caches[bank], request.pages,
                                            work.gqa_scratch());
-                       chunk.project(layer.output, chunk.quantize(work.attention, text_gqa_q_width),
+                       chunk.project(layer.output, chunk.quantize(work.attention, dims.q_width),
                                      work.projected_attention);
                    },
                    [&](const GdnLayer& layer, int bank) {
@@ -889,6 +675,107 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
 
 namespace {
 
+/// Single-request tensor-parallel prefill tile: the TP1 prefill_chunk layer
+/// pipeline with both ranks' partials reduced in place after every attention
+/// and MLP step.
+void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
+                      const PrefillGrant& grant, const PrefillGrant& peer_grant,
+                      PrefillWorkspace& workspace, PrefillWorkspace& peer_workspace,
+                      int capacity, cudaStream_t stream, cudaStream_t peer_stream,
+                      TensorParallel& group) {
+    auto& request = *grant.request;
+    auto& peer_request = *peer_grant.request;
+    const int rows = grant.rows;
+    if (!workspace.data() || !peer_workspace.data()) {
+        throw std::runtime_error("Prefill workspace unavailable under tensor parallelism");
+    }
+    ScratchLayout layout{static_cast<std::byte*>(workspace.data())};
+    ScratchLayout peer_layout{static_cast<std::byte*>(peer_workspace.data())};
+    const auto dims = PrefillDims::from_layers(model.layers);
+    const auto peer_dims = PrefillDims::from_layers(peer.layers);
+    const TileBuffers buffers(layout, capacity, dims);
+    const TileBuffers peer_buffers(peer_layout, peer_workspace.capacity(), peer_dims);
+    const bool tensor_core = model.backend.tensor_core_prefill &&
+        peer.backend.tensor_core_prefill;
+    const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, grant.position,
+                      nullptr, request.cached_gqa_tokens};
+    const Chunk peer_chunk{{peer_buffers.activation, rows, peer_stream, tensor_core},
+                           peer_buffers, grant.position, nullptr,
+                           peer_request.cached_gqa_tokens};
+    const auto& work = chunk.work;
+    const auto& peer_work = peer_chunk.work;
+    gather_embeddings(model.embedding, grant.tokens, rows, work.residual, stream);
+    on_device(peer.device, [&] {
+        gather_embeddings(peer.embedding, peer_grant.tokens, rows, peer_work.residual,
+                          peer_stream);
+    });
+    const auto reduce = [&](Bf16* primary, Bf16* mirror) {
+        Bf16* const reduce_buffers[] = {primary, mirror};
+        const cudaStream_t reduce_streams[] = {stream, peer_stream};
+        group.allreduce_bf16(reduce_buffers, reduce_streams, std::size_t(rows) * hidden_size);
+    };
+    execute_layers_tp(model.layers, peer.layers,
+        [&](const Bf16* weight, const Bf16* peer_weight, const auto& residuals) {
+            const auto [branch, residual] = residuals(buffers);
+            chunk.normalize(branch, residual, weight);
+            const auto peer_state = residuals(peer_buffers);
+            on_device(peer.device, [&] {
+                peer_chunk.normalize(peer_state.branch, peer_state.residual, peer_weight);
+            });
+        },
+        [&](const auto& layer, const auto& peer_layer, int bank) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(layer)>, GqaLayer>) {
+                chunk.gqa_input(layer);
+                on_device(peer.device, [&] { peer_chunk.gqa_input(peer_layer); });
+                chunk.gqa_attention(layer, request.caches[bank], request.pages,
+                                    work.gqa_scratch());
+                on_device(peer.device, [&] {
+                    peer_chunk.gqa_attention(peer_layer, peer_request.caches[bank],
+                                             peer_request.pages, peer_work.gqa_scratch());
+                });
+                chunk.project(layer.output, chunk.quantize(work.attention, dims.q_width),
+                              work.projected_attention);
+                on_device(peer.device, [&] {
+                    peer_chunk.project(peer_layer.output,
+                                       peer_chunk.quantize(peer_work.attention,
+                                                           peer_dims.q_width),
+                                       peer_work.projected_attention);
+                });
+            } else {
+                chunk.gdn_input(layer);
+                on_device(peer.device, [&] { peer_chunk.gdn_input(peer_layer); });
+                chunk.gdn_attention(layer, request.states[bank], bank);
+                on_device(peer.device, [&] {
+                    peer_chunk.gdn_attention(peer_layer, peer_request.states[bank], bank);
+                });
+            }
+            reduce(work.projected_attention, peer_work.projected_attention);
+        },
+        [&](const Layer& layer, const Layer& peer_layer) {
+            chunk.mlp(layer);
+            on_device(peer.device, [&] { peer_chunk.mlp(peer_layer); });
+            reduce(work.hidden, peer_work.hidden);
+        });
+    if (grant.draft && grant.prompt_remaining > 1) {
+        const bool wmma = tensor_core && model.backend.draft.wmma_seed_fc &&
+                          grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
+        const int seed_rows = std::min(rows, grant.prompt_remaining - 1);
+        const int tile_rows = std::min(seed_rows, prefill_chunk_rows);
+        const std::size_t available = workspace.bytes() - layout.bytes;
+        if (seed_scratch_bytes(tile_rows) > available) {
+            throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
+        }
+        const auto scratch = make_seed_scratch(
+            layout.take<Bf16>(seed_scratch_bytes(tile_rows) / sizeof(Bf16)), tile_rows);
+        chunk.seed_draft(*grant.draft, grant.tokens + 1, seed_rows, model.final_norm, wmma,
+                         nullptr, &scratch);
+    }
+    capture_prefill_scores(model, grant, &work, 0, stream);
+    stage_prefill_row(request, work, rows - 1, stream);
+    on_device(peer.device, [&] {
+        stage_prefill_row(peer_request, peer_work, rows - 1, peer_stream);
+    });
+}
 void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant* grants,
                                    int count, PrefillWorkspace& workspace, int capacity,
                                    int first_offset) {
@@ -897,8 +784,8 @@ void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant
         const auto& grant = grants[index];
         if (grant.rows == 1) {
             if (grant.draft && grant.prompt_remaining > 1) {
-                model.seed_draft(grant.request->work, *grant.draft, grant.position, grant.tokens[1],
-                                 stream, grant.media);
+                model.seed_draft(grant.request->work, *grant.draft, grant.position,
+                                 grant.tokens[1], stream, grant.media);
             }
             capture_prefill_scores(model, grant, nullptr, 0, stream);
         } else {
@@ -914,10 +801,93 @@ void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant
     }
 }
 
+
+void enqueue_native_prefill_grants_tp(const DecoderModel& model, const DecoderModel& peer,
+                                      const PrefillGrant* grants, const PrefillGrant* peer_grants,
+                                      int count, PrefillWorkspace& workspace,
+                                      PrefillWorkspace& peer_workspace, int capacity,
+                                      int first_offset, cudaStream_t stream,
+                                      cudaStream_t peer_stream, TensorParallel& group) {
+    for (int index = 0; index < count; ++index, first_offset = 0) {
+        const auto& grant = grants[index];
+        const auto& peer_grant = peer_grants[index];
+        if (grant.rows == 1) {
+            // Rank-0-only, mirroring the TP1 single-row body: the forward
+            // for single rows already ran on both ranks via forward_single,
+            // and rank 1 has no lm_head, so there are no peer calls here.
+            if (grant.draft && grant.prompt_remaining > 1) {
+                model.seed_draft(grant.request->work, *grant.draft, grant.position,
+                                 grant.tokens[1], stream, grant.media);
+            }
+            capture_prefill_scores(model, grant, nullptr, 0, stream);
+        } else {
+
+            for (int offset = first_offset; offset < grant.rows;) {
+                const int rows = std::min({grant.tile_rows, capacity, grant.rows - offset});
+                PrefillGrant tile = grant;
+                PrefillGrant peer_tile = peer_grant;
+                tile.tokens += offset;
+                tile.position += offset;
+                tile.rows = rows;
+                tile.tile_rows = rows;
+                tile.prompt_remaining = grant.prompt_remaining - offset;
+                peer_tile.tokens += offset;
+                peer_tile.position += offset;
+                peer_tile.rows = rows;
+                peer_tile.tile_rows = rows;
+                peer_tile.prompt_remaining = peer_grant.prompt_remaining - offset;
+                validate_prefill_tile(tile, workspace, capacity);
+                prefill_chunk_tp(model, peer, tile, peer_tile, workspace, peer_workspace, capacity,
+                                 stream, peer_stream, group);
+                offset += rows;
+            }
+        }
+    }
+}
+
+bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderModel& peer,
+                                      const PrefillGrant* grants, const PrefillGrant* peer_grants,
+                                      int count, cudaStream_t stream, cudaStream_t peer_stream,
+                                      TensorParallel& group, DecoderBatchStepStats& stats) {
+    if (!model.backend.tensor_core_prefill || !peer.backend.tensor_core_prefill) return false;
+    std::optional<PrefillWorkspace> peer_workspace;
+    const auto ensure_peer = [&](int capacity) {
+        if (peer_workspace) return;
+        const DeviceScope scope(peer.device);
+        peer_workspace.emplace(peer_stream, capacity);
+        if (!peer_workspace->data()) {
+            throw std::runtime_error("Prefill workspace unavailable under tensor parallelism");
+        }
+        stats.prefill_workspace_bytes =
+            std::max(stats.prefill_workspace_bytes, peer_workspace->bytes());
+    };
+    const auto scheduled = execute_partial_projection_groups(
+        grants, count, stream, stats,
+        [&](const PrefillGrant* group_grants, PrefillGroup rows, PrefillWorkspace& workspace,
+            PrefillAttentionMode attention, int capacity) {
+            ensure_peer(workspace.capacity());
+            prefill_layerwise(model, group_grants, rows, workspace, attention, capacity, &peer,
+                              peer_grants + (group_grants - grants), &*peer_workspace,
+                              peer_stream, &group);
+        },
+        [&](const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity, int offset) {
+            ensure_peer(workspace.capacity());
+            enqueue_native_prefill_grants_tp(model, peer, grant, peer_grants + (grant - grants),
+                                             1, workspace, *peer_workspace, capacity, offset,
+                                             stream, peer_stream, group);
+        });
+    if (peer_workspace) {
+        const DeviceScope scope(peer.device);
+        peer_workspace->close();
+    }
+    return scheduled;
+}
+
 }
 
 void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaStream_t stream,
                                    DecoderBatchStepStats& stats) const {
+    const DeviceScope local_scope(device);
     if (count == 0 || try_prefill_projection_groups(*this, grants, count, stream, stats)) return;
     int capacity = 1;
     for (int index = 0; index < count; ++index) {
@@ -930,6 +900,64 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
     enqueue_native_prefill_grants(*this, grants, count, *workspace, workspace->capacity());
     workspace->close();
+}
+
+void Decoder::Model::prefill_grants_tp(const Model& peer, const PrefillGrant* grants,
+                                       const PrefillGrant* peer_grants, int count,
+                                       cudaStream_t stream, cudaStream_t peer_stream,
+                                       TensorParallel& group,
+                                       DecoderBatchStepStats& stats) const {
+    const DeviceScope local_scope(device);
+    if (count == 0) return;
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        const auto& mirror = peer_grants[index];
+        if (grant.tokens != mirror.tokens || grant.position != mirror.position ||
+            grant.rows != mirror.rows || grant.tile_rows != mirror.tile_rows ||
+            grant.prompt_remaining != mirror.prompt_remaining ||
+            grant.request->cached_gqa_tokens != mirror.request->cached_gqa_tokens) {
+            throw std::invalid_argument("Mismatched prefill grants across tensor-parallel ranks");
+        }
+        if (mirror.draft || mirror.scores || mirror.media) {
+            throw std::invalid_argument(
+                "Peer prefill grants must not carry draft, media, or score captures");
+        }
+        if (grant.media) {
+            throw std::invalid_argument(
+                "Multimodal prefill is unsupported under tensor parallelism");
+        }
+    }
+    if (try_prefill_projection_groups_tp(*this, peer, grants, peer_grants, count, stream,
+                                         peer_stream, group, stats)) {
+        return;
+    }
+    int capacity = 1;
+    for (int index = 0; index < count; ++index) {
+        capacity = std::max(capacity, grants[index].tile_rows);
+    }
+    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity);
+    if (!workspace->data() && capacity > prefill_chunk_rows) {
+        workspace.emplace(stream, prefill_chunk_rows);
+    }
+    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
+    std::optional<PrefillWorkspace> peer_workspace;
+    {
+        const DeviceScope scope(peer.device);
+        peer_workspace.emplace(peer_stream, workspace->capacity());
+    }
+    if (workspace->data() && !peer_workspace->data()) {
+        throw std::runtime_error("Prefill workspace unavailable under tensor parallelism");
+    }
+    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes,
+                                             peer_workspace->bytes());
+    enqueue_native_prefill_grants_tp(*this, peer, grants, peer_grants, count, *workspace,
+                                     *peer_workspace, workspace->capacity(), 0, stream,
+                                     peer_stream, group);
+    workspace->close();
+    {
+        const DeviceScope scope(peer.device);
+        peer_workspace->close();
+    }
 }
 
 void PrefillProjections::project_seed_fc(

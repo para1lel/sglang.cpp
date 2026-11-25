@@ -1,8 +1,9 @@
 #include "sglang/decoder_verify.h"
 
 #include "sglang/decoder_media_internal.h"
-#include "sglang/decoder_mtp.h"
 #include "sglang/decoder_sampling.h"
+#include "sglang/decoder_mtp.h"
+#include "sglang/text/gdn_local.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
@@ -18,6 +19,33 @@ TextGdnReplayRows replay_rows(Bf16* storage, int count) {
     const int qkv = count * text_gdn_qkv_width;
     const int gates = count * text_gdn_value_heads;
     return {storage, storage + qkv, storage + 2 * qkv, storage + 2 * qkv + gates};
+}
+
+// Rank-local twin of replay_rows: same packing at GdnLocal widths.
+TextGdnReplayRows replay_rows_local(Bf16* storage, int count) {
+    const int qkv = count * GdnLocal::qkv_width;
+    const int gates = count * GdnLocal::value_heads;
+    return {storage, storage + qkv, storage + 2 * qkv, storage + 2 * qkv + gates};
+}
+
+// Re-lays out a full-width verification workspace with rank-local GDN
+// strides (TP2): replay rows pack at GdnLocal qkv/gate widths and the z /
+// attention rows stride at GdnLocal::value_width. Allocations stay
+// full-width (safe over-provision); only the strides change, so the TP1
+// layout and the k1 graph scratch stay byte-identical.
+void relayout_verification_workspace_local(VerificationWorkspace& scratch, int rows) {
+    const int full_layer_elements = 2 * rows * (text_gdn_qkv_width + text_gdn_value_heads);
+    auto* const base = scratch.replay[0].inputs.qkv;
+    for (int layer = 0; layer < gdn_layers; ++layer) {
+        scratch.replay[layer].inputs =
+            replay_rows_local(base + layer * full_layer_elements, rows);
+    }
+    auto* const z = scratch.work[0].gdn_z;
+    auto* const attention = scratch.work[0].attention;
+    for (int index = 0; index < rows; ++index) {
+        scratch.work[index].gdn_z = z + index * GdnLocal::value_width;
+        scratch.work[index].attention = attention + index * GdnLocal::value_width;
+    }
 }
 
 void free_pinned(void* results) {
@@ -353,9 +381,11 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
 TargetVerification::TargetVerification(Request& request, int capacity, int prefix, int rows,
                                        bool logits, cudaStream_t stream,
                                        std::shared_ptr<TextLogitCandidate> winners,
-                                       int generated_top_logprobs)
+                                       int generated_top_logprobs, bool rank_local_gdn)
     : request_(request), stream_(stream ? stream : request.memory.stream()),
-      capacity_(capacity), valid_prefix_(prefix), generated_top_logprobs_(generated_top_logprobs) {
+      capacity_(capacity), valid_prefix_(prefix),
+      generated_top_logprobs_(generated_top_logprobs),
+      rank_local_gdn_(rank_local_gdn) {
     auto& memory = request.memory;
     auto& host_owner = memory.transfers().verification_results;
     const int reserved = std::max(request.kv_limit, request.pages.page_count * mxfp8_page_size);
@@ -366,8 +396,11 @@ TargetVerification::TargetVerification(Request& request, int capacity, int prefi
         generated_top_logprobs > decoder_max_generated_top_logprobs) {
         throw std::invalid_argument("Invalid target verification storage");
     }
-    allocate_gdn(memory, tail_);
+    allocate_gdn(memory, tail_, request_.gdn_history_stride, request_.gdn_state_stride);
     eager_workspace_.emplace(memory, rows);
+    if (rank_local_gdn_) {
+        relayout_verification_workspace_local(*eager_workspace_, rows);
+    }
 
     const bool score = generated_top_logprobs >= 0;
     if (winners && !logits && !score) {
@@ -436,7 +469,17 @@ void TargetVerification::use_graph_workspace(VerificationWorkspace& graph_worksp
 }
 
 void TargetVerification::bind_gdn(int layer) {
-    workspace().bind_gdn(layer, pending_rows_);
+    if (!rank_local_gdn_) {
+        workspace().bind_gdn(layer, pending_rows_);
+        return;
+    }
+    const auto inputs = workspace().replay[layer].inputs;
+    for (int index = 0; index < pending_rows_; ++index) {
+        auto& work = workspace().work[index];
+        work.gdn_qkv = inputs.qkv + index * GdnLocal::qkv_width;
+        work.gdn_b = inputs.b + index * GdnLocal::value_heads;
+        work.gdn_a = inputs.a + index * GdnLocal::value_heads;
+    }
 }
 
 GdnVerificationLane TargetVerification::gdn_lane(int layer, TextGdnWeights weights) {
@@ -450,9 +493,12 @@ GdnVerificationLane TargetVerification::gdn_lane(int layer, TextGdnWeights weigh
 
 void TargetVerification::advance_gdn(int layer, TextGdnWeights weights) {
     const auto lane = gdn_lane(layer, weights);
-    check(text_gdn_verify_tail(pending_rows_, lane.inputs, lane.z, weights, lane.initial,
-                               lane.tail, lane.observable, lane.output, stream_),
-          "Advance target GDN and retain its tail");
+    const auto status = rank_local_gdn_
+        ? text_gdn_verify_tail_local(pending_rows_, lane.inputs, lane.z, weights, lane.initial,
+                                     lane.tail, lane.observable, lane.output, stream_)
+        : text_gdn_verify_tail(pending_rows_, lane.inputs, lane.z, weights, lane.initial,
+                               lane.tail, lane.observable, lane.output, stream_);
+    check(status, "Advance target GDN and retain its tail");
 }
 
 void TargetVerification::sample(const SamplingParameters& parameters, int first_output,
@@ -530,10 +576,12 @@ void TargetVerification::commit(int count) {
     if (count > 0 && count < pending_rows_) {
         for (int layer = 0; layer < gdn_layers; ++layer) {
             const auto& saved = workspace().replay[layer];
-            check(text_gdn_replay_prefix(count, saved.inputs, saved.weights,
-                                         request_.states[layer], tail_[layer],
-                                         stream_),
-                  "Replay committed target GDN prefix");
+            const auto status = rank_local_gdn_
+                ? text_gdn_replay_prefix_local(count, saved.inputs, saved.weights,
+                                               request_.states[layer], tail_[layer], stream_)
+                : text_gdn_replay_prefix(count, saved.inputs, saved.weights,
+                                         request_.states[layer], tail_[layer], stream_);
+            check(status, "Replay committed target GDN prefix");
         }
     }
     if (count > 0) {
@@ -595,6 +643,55 @@ void decoder::project_verification_bf16(Bf16Weight weight, const VerificationRow
     }
 }
 
+namespace {
+
+// Scores one verification packet on this rank: per-row final RMS norm, the
+// optional tc-vocabulary fast path, then the BF16 lm-head projection with
+// argmax for unconstrained rows. Shared by the single-device and
+// tensor-parallel verification paths.
+void score_verification_packet(const DecoderModel& model, const VerificationRow* first,
+                               int size, const TcVocabScratch* vocabulary,
+                               cudaStream_t stream) {
+    for (int index = 0; index < size; ++index) {
+        const auto& row = first[index];
+        model.normalize_final(*row.work, stream,
+                              row.binding ? &row.binding->final_states[index] : nullptr);
+    }
+    if (vocabulary && (size == tc_vocab_rows || size <= tc_vocab_narrow_rows)) {
+        std::array<VerificationRow, tc_vocab_rows> scored;
+        const auto end = std::copy_if(first, first + size, scored.begin(),
+            [](const VerificationRow& row) {
+                return row.verification && row.verification->needs_generated_logprobs();
+            });
+        const int scored_rows = static_cast<int>(end - scored.begin());
+        if (scored_rows == 0 || (size == tc_vocab_rows && scored_rows < size)) {
+            std::array<TcVocabRow, tc_vocab_rows> projection;
+            for (int index = 0; index < size; ++index) {
+                const auto& work = *first[index].work;
+                projection[index] = {work.normalized, work.argmax};
+            }
+            if (try_tc_vocab(*model.tc_vocab, *vocabulary, projection.data(), size, stream)) {
+                if (scored_rows != 0) {
+                    project_verification_bf16(model.lm_head, scored.data(), scored_rows,
+                                              &Workspace::logits, stream);
+                }
+                return;
+            }
+        }
+    }
+    project_verification_bf16(model.lm_head, first, size, &Workspace::logits, stream);
+    for (int index = 0; index < size; ++index) {
+        const auto& row = first[index];
+        const auto& work = *row.work;
+        if (!row.constrained) {
+            check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax, stream),
+                  "Select target verification winner");
+        }
+    }
+}
+
+}  // namespace
+
 bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
                                 void* sampling_scratch, cudaStream_t stream,
                                 VerificationGraph* graph, const TcVocabScratch* vocabulary,
@@ -633,6 +730,91 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
     }
     TargetVerification::read_all(verifiers.data(), count, stream);
     return replayed;
+}
+
+bool Decoder::Model::verify_mtp_tp(
+    const Model& peer, MtpRound* rounds, const MtpRound* peer_rounds, int count,
+    const ConstraintWorkspace& scratch, void* sampling_scratch, cudaStream_t stream,
+    cudaStream_t peer_stream, TensorParallel& group, const TpPartials& primary_partials,
+    const TpPartials& peer_partials, const TcVocabScratch* vocabulary,
+    void* logprob_workspace) const {
+    std::array<VerificationSequence, decoder_batch_max_mtp_lanes> sequences;
+    std::array<TargetVerification*, decoder_batch_max_mtp_lanes> verifiers;
+    std::array<TargetVerification*, decoder_batch_max_mtp_lanes> peer_verifiers;
+    if (count < 1 || count > decoder_batch_max_mtp_lanes || !rounds || !peer_rounds) {
+        throw std::invalid_argument("Invalid number of tensor-parallel MTP rounds");
+    }
+    int total = 0;
+    int longest = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& round = rounds[index];
+        const auto& peer_round = peer_rounds[index];
+        const int rows = round.rows();
+        if (!round.target || !peer_round.target || peer_round.constraint ||
+            peer_round.sampling || peer_round.position != round.position) {
+            throw std::invalid_argument("Invalid tensor-parallel MTP round");
+        }
+        verifiers[index] = round.target;
+        peer_verifiers[index] = peer_round.target;
+        sequences[index] = {round.target, round.position, round.tokens.data(), rows,
+                            round.constraint != nullptr, round.rotary_delta()};
+        if (round.constraint || round.sampling || round.target->needs_logits() ||
+            (count != 1 && rows != target_verify_max_rows)) {
+            vocabulary = nullptr;
+        }
+        total += rows;
+        longest = std::max(longest, rows);
+        round.target->begin(round.position, rows, stream);
+        peer_round.target->begin(round.position, rows, peer_stream);
+    }
+    std::array<VerificationRow, max_wide_mtp_rows> rows;
+    std::array<VerificationRow, max_wide_mtp_rows> peer_rows;
+    int next = 0;
+    for (int index = 0; index < longest; ++index) {
+        for (int lane = 0; lane < count; ++lane) {
+            const auto& sequence = sequences[lane];
+            if (index >= sequence.count) {
+                continue;
+            }
+            auto row = sequence.verification->row(index);
+            row.constrained = sequence.constrained;
+            row.rotary_position = row.position + sequence.rotary_delta;
+            rows[next] = row;
+            check(text_embedding(embedding, vocab_size, hidden_size, sequence.tokens[index],
+                                 row.work->residual, stream),
+                  "Look up verification input");
+            auto peer_row = peer_verifiers[lane]->row(index);
+            peer_row.constrained = sequence.constrained;
+            peer_row.rotary_position = peer_row.position + sequence.rotary_delta;
+            peer_rows[next++] = peer_row;
+            const DeviceScope peer_scope(peer.device);
+            check(text_embedding(peer.embedding, vocab_size, hidden_size, sequence.tokens[index],
+                                 peer_row.work->residual, peer_stream),
+                  "Look up peer verification input");
+        }
+    }
+    forward_layers_tp(peer, rows.data(), peer_rows.data(), total, stream, peer_stream, group,
+                      primary_partials, peer_partials);
+    score_verification_packet(*this, rows.data(), total, vocabulary, stream);
+    for (int index = 0; index < count; ++index) {
+        const auto& round = rounds[index];
+        if (round.constraint) {
+            round.target->constrain(*round.constraint, scratch, round.sampling, round.first_output,
+                                    sampling_scratch);
+        } else if (round.sampling) {
+            round.target->sample(*round.sampling, round.first_output, sampling_scratch);
+        }
+        round.target->enqueue_generated_logprobs(logprob_workspace);
+    }
+    TargetVerification::read_all(verifiers.data(), count, stream);
+    // Mirror the read_all fence on rank 1: the peer verifier's GDN commit,
+    // driven by the batch runner with the accepted row count, requires the
+    // same readiness state, and its pinned winners staging is peer-owned.
+    {
+        const DeviceScope peer_scope(peer.device);
+        TargetVerification::read_all(peer_verifiers.data(), count, peer_stream);
+    }
+    return false;
 }
 
 bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int count,
@@ -718,47 +900,8 @@ void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count
                                           const TcVocabScratch* vocabulary,
                                           std::uint8_t* packed_activation) const {
     forward_verification_layers(rows, count, stream, packed_activation);
-    const auto score_packet = [&](const VerificationRow* first, int size) {
-        for (int index = 0; index < size; ++index) {
-            const auto& row = first[index];
-            normalize_final(*row.work, stream, row.binding ? &row.binding->final_states[index]
-                                                            : nullptr);
-        }
-        if (vocabulary && (size == tc_vocab_rows || size <= tc_vocab_narrow_rows)) {
-            std::array<VerificationRow, tc_vocab_rows> scored;
-            const auto end = std::copy_if(first, first + size, scored.begin(),
-                [](const VerificationRow& row) {
-                    return row.verification && row.verification->needs_generated_logprobs();
-                });
-            const int scored_rows = static_cast<int>(end - scored.begin());
-            if (scored_rows == 0 || (size == tc_vocab_rows && scored_rows < size)) {
-                std::array<TcVocabRow, tc_vocab_rows> projection;
-                for (int index = 0; index < size; ++index) {
-                    const auto& work = *first[index].work;
-                    projection[index] = {work.normalized, work.argmax};
-                }
-                if (try_tc_vocab(*tc_vocab, *vocabulary, projection.data(), size, stream)) {
-                    if (scored_rows != 0) {
-                        project_verification_bf16(lm_head, scored.data(), scored_rows,
-                                                  &Workspace::logits, stream);
-                    }
-                    return;
-                }
-            }
-        }
-        project_verification_bf16(lm_head, first, size, &Workspace::logits, stream);
-        for (int index = 0; index < size; ++index) {
-            const auto& row = first[index];
-            const auto& work = *row.work;
-            if (!row.constrained) {
-                check(text_argmax(work.logits, vocab_size, work.argmax_scratch, work.argmax,
-                                  stream),
-                      "Select target verification winner");
-            }
-        }
-    };
     if (!packed_activation) {
-        score_packet(rows, count);
+        score_verification_packet(*this, rows, count, vocabulary, stream);
         return;
     }
     static_assert(tc_vocab_wide_rows == 2 * verification_packet_rows);
@@ -781,7 +924,8 @@ void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count
                 continue;
             }
         }
-        score_packet(packet, verification_packet_rows);
+        score_verification_packet(*this, packet, verification_packet_rows, vocabulary,
+                                  stream);
         first += verification_packet_rows;
     }
 }

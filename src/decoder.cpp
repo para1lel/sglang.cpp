@@ -5,16 +5,26 @@
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/runtime/backend/tensor_parallel.h"
 #include "sglang/prefill_fp8.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <random>
+
+#include <unistd.h>
 
 namespace sglang {
 namespace decoder {
 namespace {
 
+int check_tensor_parallel(int tensor_parallel) {
+    if (tensor_parallel != 1 && tensor_parallel != 2) {
+        throw std::invalid_argument("Tensor parallel size must be 1 or 2");
+    }
+    return tensor_parallel;
+}
 bool valid_token(int id) {
     return id >= 0 && id < vocab_size;
 }
@@ -445,17 +455,116 @@ bool SerialOutput::emit(int token, const Bf16* logits, const float* adjusted_log
     return keep_running;
 }
 
-Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device)
-    : Decoder(checkpoint, cuda_device, false) {}
-
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp)
-    : model_(std::make_unique<Model>(checkpoint, cuda_device)) {
+    : Decoder(checkpoint, cuda_device, enable_mtp, 1) {}
+
+Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
+                 int tensor_parallel)
+    : model_(std::make_unique<Model>(
+          checkpoint, cuda_device,
+          decoder::WeightSharding{0, check_tensor_parallel(tensor_parallel)})) {
+    if (tensor_parallel == 2) {
+        int device_count = 0;
+        check(cudaGetDeviceCount(&device_count), "Count CUDA devices for tensor parallel");
+        if (cuda_device < 0 || cuda_device + 1 >= device_count) {
+            throw std::invalid_argument("Tensor parallel size 2 requires two CUDA devices");
+        }
+        tp_ = std::make_unique<TpRuntime>();
+        tp_->device = cuda_device;
+        tp_->peer_device = cuda_device + 1;
+        tp_->group = decoder::TensorParallel::create({cuda_device, tp_->peer_device});
+        const std::size_t slab = std::size_t(decoder::tp_max_forward_lanes) * hidden_size *
+                                 sizeof(Bf16);
+        {
+            decoder::DeviceScope peer_scope(tp_->peer_device);
+            tp_->peer = std::make_unique<Model>(checkpoint, tp_->peer_device,
+                                                decoder::WeightSharding{1, 2});
+            check(cudaStreamCreate(&tp_->peer_stream), "Create rank-1 stream");
+            check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[1].attention), slab),
+                  "Allocate rank-1 attention slab");
+            check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[1].hidden), slab),
+                  "Allocate rank-1 hidden slab");
+        }
+        {
+            decoder::DeviceScope scope(cuda_device);
+            check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[0].attention), slab),
+                  "Allocate rank-0 attention slab");
+            check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[0].hidden), slab),
+                  "Allocate rank-0 hidden slab");
+        }
+        tp_->stream = model_->memory->stream();
+        model_->tp = tp_.get();
+        tp_->peer->tp = tp_.get();
+    }
     if (enable_mtp) {
-        model_->mtp_weights = std::make_shared<MtpDraftWeights>(
+        model_->mtp_weights = std::make_shared<decoder::MtpDraftWeights>(
             checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head,
             model_->backend.draft);
         model_->tc_vocab = model_->mtp_weights->shared_vocab();
     }
+    if (tensor_parallel == 2) {
+        // Records are generated only after rank-0 MTP construction so `mtp` and
+        // the weight totals reflect the actual allocations; any accidental
+        // rank-1 draft would surface here as well.
+        auto fill = [this](int rank, int device) {
+            const Model& model = rank == 0 ? *model_ : *tp_->peer;
+            auto& entry = tp_info_.ranks[rank];
+            entry.local_rank = rank;
+            entry.cuda_device = device;
+            cudaDeviceProp properties{};
+            check(cudaGetDeviceProperties(&properties, device), "Read CUDA device UUID");
+            std::memcpy(entry.uuid, properties.uuid.bytes, sizeof(entry.uuid));
+            entry.pid = static_cast<long>(getpid());
+            entry.nccl_established = true;
+            entry.weight_bytes = model.memory->bytes();
+            if (model.mtp_weights) {
+                entry.weight_bytes += model.mtp_weights->device_allocation_bytes();
+            }
+            entry.lm_head = model.lm_head.values != nullptr;
+            entry.mtp = model.mtp_weights != nullptr;
+        };
+        fill(0, cuda_device);
+        fill(1, tp_->peer_device);
+        tp_info_.world_size = 2;
+    }
+}
+
+Decoder::TpRuntime::~TpRuntime() {
+    if (stream) {
+        decoder::DeviceScope scope(device);
+        synchronize_cuda(stream, "Fence rank-0 stream for tensor-parallel teardown");
+    }
+    if (peer_stream) {
+        decoder::DeviceScope peer_scope(peer_device);
+        synchronize_cuda(peer_stream, "Fence rank-1 stream for tensor-parallel teardown");
+    }
+    group.reset();
+    peer.reset();
+    if (partials[1].attention || partials[1].hidden || peer_stream) {
+        decoder::DeviceScope peer_scope(peer_device);
+        if (partials[1].attention) {
+            check(cudaFree(partials[1].attention), "Free rank-1 attention slab");
+        }
+        if (partials[1].hidden) {
+            check(cudaFree(partials[1].hidden), "Free rank-1 hidden slab");
+        }
+        if (peer_stream) {
+            check(cudaStreamDestroy(peer_stream), "Destroy rank-1 stream");
+        }
+    }
+    if (partials[0].attention || partials[0].hidden) {
+        decoder::DeviceScope scope(device);
+        if (partials[0].attention) {
+            check(cudaFree(partials[0].attention), "Free rank-0 attention slab");
+        }
+        if (partials[0].hidden) {
+            check(cudaFree(partials[0].hidden), "Free rank-0 hidden slab");
+        }
+    }
+}
+
+const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const {
+    return tp_info_.world_size > 1 ? &tp_info_ : nullptr;
 }
 
 Decoder::~Decoder() = default;
@@ -557,6 +666,9 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
                                      DecoderResult& result,
                                      std::shared_ptr<const MultimodalInput> media,
                                      const std::vector<int>* teacher) const {
+    if (tp) {
+        throw std::runtime_error("Serial generation requires tensor parallel size 1");
+    }
     const int prompt_count = static_cast<int>(prompt.size());
     const int limit = RequestProgress::capacity(prompt_count, options);
     const int kv_limit = options.incremental_kv ? limit : 0;
@@ -670,10 +782,13 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     }
     DeviceScope selected_device(model_->device);
     reclaim_prefill_workspaces(model_->device);
-    if (proposals == 0) {
+    if (proposals == 0 && !tp_) {
         result.output_token_ids.reserve(options.max_new_tokens);
         model_->generate_serial(prompt_token_ids, options, callbacks, result);
     } else {
+        // The batch decoder fans every prefill, decode and verification step
+        // out to both ranks before rank 0 scores and commits; tensor-parallel
+        // generation always takes this path.
         const int tile = model_->execution.prefill_limit();
         const int limit = options.max_num_batched_tokens
             ? std::min(options.max_num_batched_tokens, tile) : tile;

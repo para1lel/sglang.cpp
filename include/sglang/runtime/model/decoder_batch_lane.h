@@ -16,11 +16,18 @@ struct Lane {
     RequestProgress progress{};
     std::unique_ptr<MtpDraftRequest> draft = nullptr;
     std::unique_ptr<TargetVerification> verification = nullptr;
+    // Tensor-parallel mirrors on rank 1 (rank 0 owns decisions and the draft).
+    std::unique_ptr<Request> peer_request = nullptr;
+    std::unique_ptr<TargetVerification> peer_verification = nullptr;
+    std::unique_ptr<PendingBatchPrefix> peer_prefix = nullptr;
     std::optional<SamplingParameters> sampling = std::nullopt;
     std::optional<MtpConstraintRound> constraint_round{};
     bool checkpoints() const {
         return options.publish_prefix_checkpoints && bool(options.store_prefix);
     }
+    // Rank-1 mirror of the rank-0 checkpoint row (the committed verification
+    // row during MTP, else the peer request workspace) used by prefix exports.
+    const Workspace* peer_checkpoint_row = nullptr;
     bool restored_prompt = false;
     std::shared_ptr<const MultimodalInput> media = nullptr;
     DecoderPromptLogprobs prompt_logprobs = {};

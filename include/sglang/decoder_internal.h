@@ -38,8 +38,10 @@ struct PromptLogprobCapture;
 struct MediaPrefill;
 struct MultimodalInput;
 class TargetVerification;
-struct TcVocabWeights;
+class TensorParallel;
 struct TcVocabScratch;
+struct TcVocabWeights;
+struct TpPartials;
 struct VerificationSequence;
 struct VerificationRow;
 struct VerificationGraph;
@@ -174,6 +176,17 @@ struct BatchGraphScratch {
     std::array<BatchDecodeBinding, decoder_batch_max_graph_lanes> bindings{};
 };
 
+// Tensor-parallel reduction staging, one set per rank. `attention` and `hidden`
+// hold that rank's row-parallel partials for the current layer boundary; the
+// allreduce replaces them in place with the reduced, full-model values before
+// the next residual accumulation. They are deliberately distinct from
+// Workspace::residual, which is per-rank, never reduced, and carries the
+// autoregressive residual stream.
+struct TpPartials {
+    Bf16* attention = nullptr;  // [tp_max_forward_lanes * hidden_size]
+    Bf16* hidden = nullptr;     // [tp_max_forward_lanes * hidden_size]
+};
+constexpr int tp_max_forward_lanes = 160;  // widest forward batch (verification packets)
 }
 
 namespace sglang {
@@ -185,12 +198,32 @@ struct Decoder::Model {
     bool is_b200() const { return backend.uses_b200_operators; }
     int target_split_end() const { return backend.target_split_end; }
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
+    void forward_tp(const Model& peer, const decoder::ForwardLane* primary_lanes,
+                    const decoder::ForwardLane* peer_lanes, int count, cudaStream_t stream,
+                    cudaStream_t peer_stream, decoder::TensorParallel& group,
+                    const decoder::TpPartials& primary_partials,
+                    const decoder::TpPartials& peer_partials) const;
     bool verify_mtp(decoder::MtpRound* rounds, int count,
                     const decoder::ConstraintWorkspace& scratch, void* sampling_scratch,
                     cudaStream_t stream, decoder::VerificationGraph* graph,
                     const decoder::TcVocabScratch* vocabulary,
                     std::uint8_t* packed_activation = nullptr,
                     void* logprob_workspace = nullptr) const;
+    // Tensor-parallel MTP verification. `rounds` drive rank 0 (draft
+    // proposals, sampling and scoring); `peer_rounds` mirror the same
+    // verification on rank 1 (peer targets and requests, null draft,
+    // constraint and sampling). Attention and MLP partials are reduced per
+    // layer across both ranks. Always returns false: verification graphs and
+    // packed activations are not used under tensor parallelism.
+    bool verify_mtp_tp(const Model& peer, decoder::MtpRound* rounds,
+                       const decoder::MtpRound* peer_rounds, int count,
+                       const decoder::ConstraintWorkspace& scratch, void* sampling_scratch,
+                       cudaStream_t stream, cudaStream_t peer_stream,
+                       decoder::TensorParallel& group,
+                       const decoder::TpPartials& primary_partials,
+                       const decoder::TpPartials& peer_partials,
+                       const decoder::TcVocabScratch* vocabulary,
+                       void* logprob_workspace = nullptr) const;
     bool forward_verify(const decoder::VerificationSequence* sequences, int count,
                         cudaStream_t stream, decoder::VerificationGraph* graph,
                         const decoder::TcVocabScratch* vocabulary,
@@ -209,6 +242,16 @@ struct Decoder::Model {
                        int logical_capacity = 0) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
                         DecoderBatchStepStats& stats) const;
+    // Tensor-parallel chunked prefill: `grants` and `peer_grants` describe the
+    // same prompt rows for rank 0 and rank 1 (identical tokens/position/rows;
+    // peer drafts, media and score captures are always null). Every layer runs
+    // on both ranks with the attention and MLP partials reduced in place over
+    // the contiguous chunk buffers.
+    void prefill_grants_tp(const Model& peer, const decoder::PrefillGrant* grants,
+                           const decoder::PrefillGrant* peer_grants, int count,
+                           cudaStream_t stream, cudaStream_t peer_stream,
+                           decoder::TensorParallel& group,
+                           DecoderBatchStepStats& stats) const;
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;
@@ -248,6 +291,18 @@ struct Decoder::Model {
     void forward_layers(const Lane* lanes, int count, cudaStream_t stream,
                         std::uint8_t* packed_activation = nullptr) const;
 
+    // Drives this model (rank r) and `peer` (rank r^1) through the layers with
+    // both ranks' row-parallel partials reduced after every attention output
+    // and MLP. Lanes must describe the same logical batch on both ranks.
+    template <typename Lane>
+    void forward_layers_tp(const Model& peer, const Lane* primary_lanes,
+                           const Lane* peer_lanes, int count, cudaStream_t stream,
+                           cudaStream_t peer_stream, decoder::TensorParallel& group,
+                           const decoder::TpPartials& primary_partials,
+                           const decoder::TpPartials& peer_partials) const;
+
+
+
     int device;
     std::string accelerator_name;
     decoder::CudaBackendPolicy backend{};
@@ -259,8 +314,26 @@ struct Decoder::Model {
     decoder::Bf16Weight lm_head{};
     std::shared_ptr<const decoder::MtpDraftWeights> mtp_weights;
     std::shared_ptr<const decoder::TcVocabWeights> tc_vocab;
+    // Set by the Decoder when tensor parallel is active; guards serial paths.
+    const TpRuntime* tp = nullptr;
     mutable std::atomic_flag request_in_use = ATOMIC_FLAG_INIT;
     mutable std::unique_ptr<decoder::Request> decode_request;
+};
+
+// Per-Decoder tensor-parallel state for a two-rank launch. `peer` is the rank-1
+// model on `peer_device`; `group` owns the NCCL communicator pair. `stream` is
+// rank 0's execution stream (borrowed from `model_`), `peer_stream` is rank 1's
+// (owned). `partials` holds the per-rank reduction slabs sized for
+// tp_max_forward_lanes rows of hidden state.
+struct Decoder::TpRuntime {
+    int device = 0;
+    int peer_device = 0;
+    cudaStream_t stream = nullptr;
+    cudaStream_t peer_stream = nullptr;
+    std::unique_ptr<Decoder::Model> peer;
+    std::unique_ptr<decoder::TensorParallel> group;
+    decoder::TpPartials partials[2]{};
+    ~TpRuntime();
 };
 
 // Names the private decoder model for the decode-step runner in src/text/.

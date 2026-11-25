@@ -136,6 +136,7 @@ private:
                       const std::vector<DecoderMedia>* media = nullptr);
     int admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& options,
                    const std::vector<DecoderMedia>* media);
+    struct TpDriver;
     struct State;
     std::unique_ptr<State> state_;
 };

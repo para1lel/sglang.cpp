@@ -21,6 +21,15 @@ inline constexpr int gdn_layers = qwen_text_model.gdn_layers();
 inline constexpr std::size_t gdn_history_elements = text_gdn_qkv_width * text_gdn_history_taps;
 inline constexpr std::size_t gdn_state_elements =
     text_gdn_value_heads * text_gdn_head_dim * text_gdn_head_dim;
+// Per-layer GDN state geometry for a rank-local shard under tensor parallel
+// size 2: half the QKV width and half the value heads, so state banks pack
+// contiguous rank-local planes at these strides (prefix cache layout).
+inline constexpr std::size_t gdn_local_history_elements =
+    text_gdn_qkv_width / 2 * text_gdn_history_taps;
+inline constexpr std::size_t gdn_local_state_elements =
+    text_gdn_value_heads / 2 * text_gdn_head_dim * text_gdn_head_dim;
+static_assert(gdn_local_history_elements * 2 == gdn_history_elements);
+static_assert(gdn_local_state_elements * 2 == gdn_state_elements);
 
 static_assert(mxfp8_query_heads == qwen_text_model.query_heads);
 static_assert(mxfp8_kv_heads == qwen_text_model.kv_heads);

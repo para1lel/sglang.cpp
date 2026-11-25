@@ -1,0 +1,230 @@
+#include "sglang/decoder_internal.h"
+
+#include "sglang/decoder_cuda.cuh"
+#include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/runtime/backend/tensor_parallel.h"
+#include "sglang/runtime/execution/decoder_forward_layers.h"
+
+#include <algorithm>
+
+namespace sglang {
+namespace {
+
+using namespace decoder;
+using namespace decoder::forward_detail;
+
+template <typename Lane>
+LayerBatch<Lane> tp_build_batch(const Lane* lanes, int count, cudaStream_t lane_stream,
+                                const CudaBackendPolicy& policy, Bf16* const* attention_output,
+                                Bf16* const* hidden_output, bool tensor_parallel) {
+    LayerBatch<Lane> batch{
+        lanes, count, lane_stream,
+        policy.ordered_attention,
+        policy.tensor_core_decode,
+        policy.vector_decode_attention,
+        policy.grouped_target_attention,
+        policy.target_split_end,
+    };
+    batch.attention_output = attention_output;
+    batch.hidden_output = hidden_output;
+    batch.tensor_parallel = tensor_parallel;
+    return batch;
+}
+
+// Shared RMS-normalization dispatch for both ranks of a tensor-parallel step.
+// `residuals(index, work)` supplies the (branch, residual) pair for lane
+// `index`, so the primary and peer ranks pass different slab views.
+template <typename Lane, typename Residuals>
+void tp_normalize(LayerBatch<Lane>& batch, int count, const Bf16* weight, const char* operation,
+                  const Residuals& residuals) {
+    const auto stream = batch.stream;
+    if (batch.fuse_verify_activation()) {
+        VerifyRmsQuantizeRows rows;
+        for (int index = 0; index < fused_verify_rows; ++index) {
+            auto& work = workspace(batch.lanes[index]);
+            const auto residual_pair = residuals(index, work);
+            rows.entries[index] = {
+                residual_pair.branch, residual_pair.residual, work.normalized,
+                batch.projection_activation(index, hidden_size)};
+        }
+        check(verify_rms_quantize(rows, weight, stream), operation);
+        return;
+    }
+    if (batch.fuse_wide_verify_norm()) {
+        const int capacity = batch.packed_activation ? WideVerifyRmsQuantizeRows::capacity
+                                                     : verification_packet_rows;
+        for (int first = 0; first < count; first += capacity) {
+            WideVerifyRmsQuantizeRows rows{};
+            const int size = std::min(count - first, capacity);
+            for (int index = 0; index < size; ++index) {
+                auto& work = workspace(batch.lanes[first + index]);
+                const auto residual_pair = residuals(first + index, work);
+                rows.entries[index] = {
+                    residual_pair.branch, residual_pair.residual, work.normalized,
+                    batch.projection_activation(first + index, hidden_size)};
+            }
+            check(verify_rms_quantize_wide(rows, size, weight, stream), operation);
+        }
+        return;
+    }
+    for (int index = 0; index < count; ++index) {
+        auto& work = workspace(batch.lanes[index]);
+        const auto residual_pair = residuals(index, work);
+        check(text_rms_norm(residual_pair.branch, residual_pair.residual, weight, hidden_size,
+                            work.normalized, residual_pair.residual, stream),
+              operation);
+    }
+}
+
+// Copy the reduced hidden rows from a rank's slab into its lane workspaces.
+template <typename Lane>
+void tp_scatter(LayerBatch<Lane>& batch, int count, cudaStream_t lane_stream,
+                const Bf16* const* reduced) {
+    for (int lane = 0; lane < count; ++lane) {
+        copy_cuda_async(workspace(batch.lanes[lane]).hidden, reduced[lane],
+                        hidden_size * sizeof(Bf16), cudaMemcpyDeviceToDevice, lane_stream,
+                        "Scatter tensor-parallel hidden state");
+    }
+}
+
+}
+
+void Decoder::Model::forward_tp(
+    const Model& peer, const decoder::ForwardLane* primary_lanes,
+    const decoder::ForwardLane* peer_lanes, int count, cudaStream_t stream,
+    cudaStream_t peer_stream, decoder::TensorParallel& group,
+    const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials) const {
+    if (!primary_lanes || !peer_lanes || count < 1 || count > decoder_batch_max_lanes) {
+        throw std::invalid_argument("Invalid decoder batch width");
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& lane = primary_lanes[index];
+        auto* residual = lane.request->work.residual;
+        if (lane.feature) {
+            copy_cuda_async(residual, lane.feature, hidden_size * sizeof(Bf16),
+                            cudaMemcpyDeviceToDevice, stream, "Substitute visual embedding");
+        } else {
+            check(text_embedding(embedding, vocab_size, hidden_size, lane.token_id, residual,
+                                 stream),
+                  "Look up token embedding");
+        }
+    }
+    decoder::DeviceScope peer_scope(peer.device);
+    for (int index = 0; index < count; ++index) {
+        const auto& lane = peer_lanes[index];
+        auto* residual = lane.request->work.residual;
+        if (lane.feature) {
+            copy_cuda_async(residual, lane.feature, hidden_size * sizeof(Bf16),
+                            cudaMemcpyDeviceToDevice, peer_stream, "Substitute visual embedding");
+        } else {
+            check(text_embedding(peer.embedding, vocab_size, hidden_size, lane.token_id, residual,
+                                 peer_stream),
+                  "Look up peer token embedding");
+        }
+    }
+    peer_scope.restore();
+    forward_layers_tp(peer, primary_lanes, peer_lanes, count, stream, peer_stream, group,
+                      primary_partials, peer_partials);
+}
+
+template <typename Lane>
+void Decoder::Model::forward_layers_tp(
+    const Model& peer, const Lane* primary_lanes, const Lane* peer_lanes, int count,
+    cudaStream_t stream, cudaStream_t peer_stream, decoder::TensorParallel& group,
+    const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials) const {
+    if (!primary_lanes || !peer_lanes || count < 1 || count > tp_max_forward_lanes) {
+        throw std::invalid_argument("Invalid tensor-parallel batch width");
+    }
+    static_assert(tp_max_forward_lanes >= verification_packet_rows);
+
+    std::array<Bf16*, tp_max_forward_lanes> primary_attention{};
+    std::array<Bf16*, tp_max_forward_lanes> primary_hidden{};
+    std::array<Bf16*, tp_max_forward_lanes> peer_attention{};
+    std::array<Bf16*, tp_max_forward_lanes> peer_hidden{};
+    for (int index = 0; index < count; ++index) {
+        primary_attention[index] = primary_partials.attention + index * hidden_size;
+        primary_hidden[index] = primary_partials.hidden + index * hidden_size;
+        peer_attention[index] = peer_partials.attention + index * hidden_size;
+        peer_hidden[index] = peer_partials.hidden + index * hidden_size;
+    }
+
+    auto primary = tp_build_batch(primary_lanes, count, stream, backend,
+                                  primary_attention.data(), primary_hidden.data(), tp != nullptr);
+    auto peer_batch = tp_build_batch(peer_lanes, count, peer_stream, peer.backend,
+                                     peer_attention.data(), peer_hidden.data(), tp != nullptr);
+
+    Bf16* attention_reduce[2] = {primary_partials.attention, peer_partials.attention};
+    Bf16* hidden_reduce[2] = {primary_partials.hidden, peer_partials.hidden};
+    cudaStream_t reduce_streams[2] = {stream, peer_stream};
+
+    const auto normalize = [&](LayerBatch<Lane>& batch, const Bf16* weight, const char* operation,
+                               const auto& residuals) {
+        tp_normalize(batch, count, weight, operation, residuals);
+    };
+
+    for (int index = 0; index < layer_count; ++index) {
+        const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
+        const auto& layer = layers[index];
+        const auto& peer_layer = peer.layers[index];
+        const bool first = index == 0;
+        const auto input = [&](int lane, Workspace& work) {
+            return LayerResidual{
+                first ? work.residual : primary_hidden[lane],
+                first ? nullptr : work.residual};
+        };
+        const auto peer_input = [&](int lane, Workspace& work) {
+            return LayerResidual{
+                first ? work.residual : peer_hidden[lane],
+                first ? nullptr : work.residual};
+        };
+        const auto attention = [&](int lane, Workspace& work) {
+            return LayerResidual{primary_attention[lane], work.residual};
+        };
+        const auto peer_attention_pair = [&](int lane, Workspace& work) {
+            return LayerResidual{peer_attention[lane], work.residual};
+        };
+        normalize(primary, layer.input_norm, "Normalize layer input", input);
+        {
+            decoder::DeviceScope peer_scope(peer.device);
+            normalize(peer_batch, peer_layer.input_norm, "Normalize peer layer input", peer_input);
+            if (full_attention) {
+                run_gqa(peer_layer.gqa, peer_batch, bank);
+            } else {
+                run_gdn(peer_layer.gdn, peer_batch, bank);
+            }
+        }
+        if (full_attention) {
+            run_gqa(layer.gqa, primary, bank);
+        } else {
+            run_gdn(layer.gdn, primary, bank);
+        }
+        group.allreduce_bf16(attention_reduce, reduce_streams,
+                             static_cast<std::size_t>(count) * hidden_size);
+        normalize(primary, layer.attention_norm, "Normalize attention output", attention);
+        {
+            decoder::DeviceScope peer_scope(peer.device);
+            normalize(peer_batch, peer_layer.attention_norm, "Normalize peer attention output",
+                      peer_attention_pair);
+            run_mlp(peer_layer, peer_batch);
+        }
+        run_mlp(layer, primary);
+        group.allreduce_bf16(hidden_reduce, reduce_streams,
+                             static_cast<std::size_t>(count) * hidden_size);
+    }
+
+    tp_scatter(primary, count, stream, primary_hidden.data());
+    decoder::DeviceScope peer_scope(peer.device);
+    tp_scatter(peer_batch, count, peer_stream, peer_hidden.data());
+    peer_scope.restore();
+}
+
+template void Decoder::Model::forward_layers_tp<decoder::ForwardLane>(
+    const Model&, const decoder::ForwardLane*, const decoder::ForwardLane*, int, cudaStream_t,
+    cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
+    const decoder::TpPartials&) const;
+template void Decoder::Model::forward_layers_tp<decoder::VerificationRow>(
+    const Model&, const decoder::VerificationRow*, const decoder::VerificationRow*, int,
+    cudaStream_t, cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
+    const decoder::TpPartials&) const;
+
+}

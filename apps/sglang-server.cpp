@@ -18,14 +18,19 @@
 #include "sglang/tokenizer/digest.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <string_view>
+#include <cstdint>
 #include <sys/stat.h>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -40,6 +45,7 @@ struct Arguments {
     SamplingDefaults sampling = SamplingDefaults::model;
     ChatParsers chat_parsers;
     int device = 0;
+    int tensor_parallel = 1;
     int port = 17384;
     int max_active = default_max_active;
     int max_num_batched_tokens = sglang::decoder_default_max_num_batched_tokens;
@@ -50,8 +56,34 @@ struct Arguments {
     bool trace_batches = false;
     bool enable_response_store = false;
 
-    bool enable_batch_cuda_graphs() const { return !eager; }
+    bool enable_batch_cuda_graphs() const { return !eager && tensor_parallel == 1; }
+
 };
+
+// Stable stderr receipt for tensor-parallel launches; one line per rank plus a
+// world summary. The benchmark suite pins this format.
+void print_tp_receipt(const sglang::Decoder& decoder) {
+    const auto* info = decoder.tensor_parallel_info();
+    if (info == nullptr) {
+        return;
+    }
+    for (int rank = 0; rank < info->world_size && rank < 2; ++rank) {
+        const auto& entry = info->ranks[rank];
+        char uuid[33];
+        for (int i = 0; i < 16; ++i) {
+            std::snprintf(uuid + 2 * i, 3, "%02x",
+                          static_cast<unsigned char>(entry.uuid[i]));
+        }
+        std::cerr << "tp2 rank=" << rank << " device=" << entry.cuda_device
+                  << " uuid=" << uuid << " pid=" << entry.pid
+                  << " nccl=" << (entry.nccl_established ? "ok" : "missing")
+                  << " weights=" << entry.weight_bytes
+                  << " lm_head=" << (entry.lm_head ? 1 : 0)
+                  << " mtp=" << (entry.mtp ? 1 : 0) << '\n';
+    }
+    std::cerr << "tp2 world=" << info->world_size << " ranks="
+              << info->world_size << '\n';
+}
 
 int parse_integer(std::string_view value, const char* error) {
     int number = 0;
@@ -83,7 +115,7 @@ void append_launch_option(std::string& command, std::string_view option,
         option == "--tool-call-parser" ||
         option == "--device" || option == "--port" || option == "--max-active" ||
         option == "--max-num-batched-tokens" || option == "--prefix-cache-entries" ||
-        option == "--mtp-steps" || option == "--mtp-k") {
+        option == "--mtp-steps" || option == "--mtp-k" || option == "--tp") {
         command += value;
     } else {
         command += "'<redacted>'";
@@ -136,6 +168,12 @@ Arguments parse_arguments(int argc, char** argv, const sglang::model::ServingPro
             arguments.chat_parsers.qwen3_coder_tools = true;
         } else if (option == "--device") {
             arguments.device = parse_integer(value, "Expected a nonnegative CUDA device ordinal");
+        } else if (option == "--tp") {
+            const auto error = "Expected --tp in [1, 2]";
+            arguments.tensor_parallel = parse_integer(value, error);
+            if (arguments.tensor_parallel == 0 || arguments.tensor_parallel > 2) {
+                throw std::invalid_argument(error);
+            }
         } else if (option == "--port") {
             arguments.port = parse_integer(value, "Expected a TCP port in [1, 65535]");
             if (arguments.port == 0 || arguments.port > 65535) {
@@ -261,6 +299,7 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
     sglang::json::append_quoted(body, profile.served_name);
     body += R"(,"port":)" + std::to_string(arguments.port);
     body += R"(,"device":)" + std::to_string(arguments.device);
+    body += R"(,"tensor_parallel":)" + std::to_string(arguments.tensor_parallel);
     body += R"(,"max_running_requests":)" + std::to_string(arguments.max_active);
     body += R"(,"max_num_batched_tokens":)" + std::to_string(arguments.max_num_batched_tokens);
     body += R"(,"mtp_steps":)" + std::to_string(arguments.mtp_steps);
@@ -314,12 +353,9 @@ Socket listen(const Arguments& arguments) {
     return listener;
 }
 
-}
-
-int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
-                     " [--max-active N] [--mtp-steps N] [--eager]\n"
+void print_usage() {
+    std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
+                     " [--max-active N] [--mtp-steps N] [--eager] [--tp N]\n"
                      "                     [--max-num-batched-tokens N] [--trace-batches]\n"
                      "                     [--lmcache-socket PATH] [--prefix-cache-entries 0]\n"
                      "                     [--reasoning-parser qwen3]\n"
@@ -330,11 +366,55 @@ int main(int argc, char** argv) {
                      "Target rows per step: " << sglang::decoder_default_max_num_batched_tokens
                   << " by default, range 1-32768.\n"
                      "MTP steps: 4 by default, range 0-4. --mtp-k is an alias.\n"
+                     "Tensor parallel: 1 by default. --tp 2 shards the model across\n"
+                     "the device and its successor; MTP drafting stays on rank 0 and\n"
+                     "decode runs eager (no CUDA graphs) under tensor parallel.\n"
                      "Default MTP uses 0 steps for output logprobs.\n"
                      "Batch graphs: enabled by default for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
                      "LMCache enabled by default. Set --prefix-cache-entries 0 to disable.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
+}
+
+std::unique_ptr<BatchService> make_batch_service(const Arguments& arguments,
+                                                 const sglang::Decoder& decoder) {
+    const BatchExecutor::Options batch_options{
+        arguments.enable_batch_cuda_graphs(), arguments.max_active, 0,
+        arguments.max_num_batched_tokens};
+    auto executor = std::make_unique<SingleDeviceBatchExecutor>(decoder, batch_options);
+    // Under tensor parallelism every rank exports from its own device, so
+    // the cache must fan out per rank; TP1 keeps the single client.
+    std::vector<std::array<std::uint8_t, 16>> rank_devices;
+    if (arguments.lmcache_enabled && arguments.tensor_parallel > 1) {
+        const auto* topology = decoder.tensor_parallel_info();
+        if (!topology || topology->world_size != arguments.tensor_parallel) {
+            throw std::runtime_error("Tensor-parallel cache requires rank device receipts");
+        }
+        rank_devices.reserve(static_cast<std::size_t>(arguments.tensor_parallel));
+        for (int rank = 0; rank < arguments.tensor_parallel; ++rank) {
+            std::array<std::uint8_t, 16> uuid{};
+            std::memcpy(uuid.data(), topology->ranks[rank].uuid, uuid.size());
+            rank_devices.push_back(uuid);
+        }
+    }
+    auto cache = arguments.lmcache_enabled && rank_devices.empty()
+        ? std::make_unique<sglang::decoder::LmCacheClient>(arguments.lmcache) : nullptr;
+    const auto identity = arguments.lmcache_enabled ? cache_identity(arguments.checkpoint)
+                                                    : std::string{};
+    if (rank_devices.empty()) {
+        return std::make_unique<BatchService>(std::move(executor), arguments.trace_batches,
+                                              arguments.mtp_steps, std::move(cache), identity);
+    }
+    return std::make_unique<BatchService>(std::move(executor), arguments.trace_batches,
+                                          arguments.mtp_steps, arguments.lmcache,
+                                          std::move(rank_devices), identity);
+}
+
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--help") {
+        print_usage();
         return 0;
     }
     try {
@@ -343,7 +423,8 @@ int main(int argc, char** argv) {
         const auto arguments = parse_arguments(argc, argv, profile);
         install_shutdown_handlers();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
-                                      arguments.mtp_steps != 0);
+                                      arguments.mtp_steps != 0, arguments.tensor_parallel);
+        print_tp_receipt(decoder);
         if (stopping()) {
             return 0;
         }
@@ -351,15 +432,8 @@ int main(int argc, char** argv) {
                                             arguments.chat_parsers, profile);
         const auto health = health_json(arguments);
         VisionCompletion vision(arguments.checkpoint, arguments.device);
-        const BatchExecutor::Options batch_options{
-            arguments.enable_batch_cuda_graphs(), arguments.max_active, 0,
-            arguments.max_num_batched_tokens};
-        auto executor = std::make_unique<SingleDeviceBatchExecutor>(decoder, batch_options);
-        auto cache = arguments.lmcache_enabled
-            ? std::make_unique<sglang::decoder::LmCacheClient>(arguments.lmcache) : nullptr;
-        const auto identity = cache ? cache_identity(arguments.checkpoint) : std::string{};
-        BatchService service(std::move(executor), arguments.trace_batches, arguments.mtp_steps,
-                             std::move(cache), identity);
+        auto service_storage = make_batch_service(arguments, decoder);
+        BatchService& service = *service_storage;
         if (stopping()) {
             return 0;
         }

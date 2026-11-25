@@ -153,7 +153,7 @@ public:
     TargetVerification(Request& request, int capacity, int prefix, int rows, bool logits,
                        cudaStream_t stream = nullptr,
                        std::shared_ptr<TextLogitCandidate> winners = nullptr,
-                       int generated_top_logprobs = -1);
+                       int generated_top_logprobs = -1, bool rank_local_gdn = false);
 
     void begin(int position, int count, cudaStream_t stream);
     VerificationRow row(int index);
@@ -195,6 +195,7 @@ private:
     Bf16* host_logits_;
     GeneratedLogprobReadback* host_generated_logprobs_ = nullptr;
     int generated_top_logprobs_;
+    bool rank_local_gdn_ = false;
 };
 
 std::shared_ptr<TextLogitCandidate> prepare_verification_winners(int slots);

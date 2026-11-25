@@ -188,10 +188,10 @@ slots ready on different iterations. The full batch runner also selects all
 rows, compares each lane's IDs with target-only decoding, and checks that
 cancellation releases all request bytes.
 
-The row-accounting cases use explicit cache-off controls. Run
-`run_admission.py --case eager-cache` for the separate eager K4 case with caching
-enabled. It checks an 8,192-token checkpoint hit, identical completion, actual
-draft verification, and zero graph replays.
+The row-accounting cases use explicit cache-off controls. For the separate eager K4
+case, pass `--case eager-cache --lmcache-socket "$LMCACHE_SOCKET"` to `run_admission.py`
+with an isolated, ready [daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon). It checks an
+8,192-token checkpoint hit, identical completion, draft verification, and zero graph replays.
 
 Run `run_admission.py --case pressure` separately for 32 requests with
 32,769 prompt IDs in total. The trace records actual work per iteration, which

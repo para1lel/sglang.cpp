@@ -5,12 +5,16 @@ usage() {
     echo "Usage: bash benchmarks/paired/run_k4.sh NATIVE_BINARY GPU_INDEX CAMPAIGN_DIR ROW"
     echo "Current rows are W1, W2, W3, W4, and W5. GPU_INDEX selects the single participating B200."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
+    echo "For direct LMCache, set PAIRED_LMCACHE_PYTHON," \
+        "PAIRED_LMCACHE_PYTHONPATH and PAIRED_LMCACHE_WHEEL."
     echo "The default profile, server-defaults, uses matched 32768-token cold-cache K4."
-    echo "W4 can start a fresh v5 campaign. W5 requires a passing v5 W4 in that campaign."
+    echo "Native uses direct GPU LMCache 0.5.8. Pinned vLLM uses local APC without KV offload."
+    echo "W4 can start a fresh SLC2 campaign. W5 requires a passing W4 in the same campaign."
     echo "Every live timing arm runs one warmup and one measured cohort. Controls remain untimed."
     echo "Each row passes when the measured native makespan is at most 110% of pinned vLLM."
     echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
-    echo "  server-defaults-cache-on-v3, server-defaults-cache-on-v2, server-defaults-cache-off,"
+    echo "  server-defaults-cache-on-v5, server-defaults-cache-on-v3,"
+    echo "  server-defaults-cache-on-v2, server-defaults-cache-off,"
     echo "  exact, ordered-tc-int8,"
     echo "  ordered-tc-int8-split-gqa, ordered-tc-int8-long-split-gqa."
 }
@@ -38,10 +42,14 @@ native_defaults=false
 cache_on=false
 current=false
 wide_budget=false
+lmcache=false
 max_seqs=32
 case "$native_profile" in
     exact) ;;
-    server-defaults) native_defaults=true; cache_on=true; current=true; wide_budget=true ;;
+    server-defaults)
+        native_defaults=true; cache_on=true; current=true; wide_budget=true; lmcache=true ;;
+    server-defaults-cache-on-v5)
+        native_defaults=true; cache_on=true; current=true; wide_budget=true ;;
     server-defaults-cache-on-v3) native_defaults=true; cache_on=true; current=true ;;
     server-defaults-cache-on-v2) native_defaults=true; cache_on=true ;;
     server-defaults-cache-off) native_defaults=true ;;
@@ -93,6 +101,25 @@ fi
 export PAIRED_PORT=${PAIRED_PORT:-17424}
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 validate_run_settings
+if [[ $lmcache == true ]]; then
+    source "$paired_dir/lmcache_arm.sh"
+    lmcache_pid= lmcache_launch_pid= lmcache_runtime=
+    lmcache_launcher=$(realpath -e -- "$project/tools/lmcache/serve.sh")
+    lmcache_sources=(
+        "$project/tools/lmcache/"{serve.sh,sglang_lmcache.py}
+        "$project/tools/lmcache/"{sglang_gpu_transfer.py,requirements.txt}
+    )
+    lmcache_python=$(realpath -es -- "${PAIRED_LMCACHE_PYTHON:?Set the LMCache 0.5.8 interpreter}")
+    lmcache_pythonpath=${PAIRED_LMCACHE_PYTHONPATH:-}
+    lmcache_wheel=$(realpath -e -- "${PAIRED_LMCACHE_WHEEL:?Set the official LMCache 0.5.8 wheel}")
+    [[ -x $lmcache_python ]]
+    lmcache_port=${PAIRED_LMCACHE_PORT:-17524}
+    if ! [[ $lmcache_port =~ ^[1-9][0-9]{0,4}$ ]] ||
+       (( lmcache_port > 65535 || lmcache_port == port )); then
+        echo "Choose a separate valid LMCache loopback port with PAIRED_LMCACHE_PORT." >&2
+        exit 2
+    fi
+fi
 
 [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 ))
 manifest=$(realpath -- "$manifest")
@@ -141,6 +168,11 @@ if [[ $cache_on == true ]]; then
     cache_protocol_hash=$(cd -- "$project" && sha256sum benchmarks/paired/cold_cache.py)
     protocol_hash+=$'\n'"$cache_protocol_hash"
 fi
+if [[ $lmcache == true ]]; then
+    lmcache_protocol_hash=$(cd -- "$project" && sha256sum \
+        benchmarks/paired/{lmcache_arm.sh,lmcache_evidence.py} "${lmcache_sources[@]#"$project/"}")
+    protocol_hash+=$'\n'"$lmcache_protocol_hash"
+fi
 protocol_sha=$(printf '%s\n' "$protocol_hash" | sha256sum)
 identity=$(jq -nc --arg source "$native_source" --arg binary "$native_sha" \
     --arg gpu "$uuid" --arg checkpoint "$model_sha" --arg vllm "$pin" \
@@ -164,6 +196,9 @@ if [[ $native_profile != exact ]]; then
             --argjson port "$port" --argjson cache_on "$cache_on" \
             --argjson current "$current" --argjson max_seqs "$max_seqs" \
             --argjson wide_budget "$wide_budget" --argjson token_budget "$token_budget" \
+            --argjson lmcache "$lmcache" --arg lmcache_port "${lmcache_port:-}" \
+            --arg lmcache_python "${lmcache_python:-}" --argjson lmcache_uid "$EUID" \
+            --arg lmcache_pythonpath "${lmcache_pythonpath:-}" \
             '. + {protocol:"matched-k4-native-defaults-v1",campaign_id:$campaign_id,
                   native_profile:"server-defaults",checkpoint_path:$model,port:$port}
              | if $cache_on then . + {protocol:"matched-k4-native-defaults-cache-on-v2",
@@ -171,7 +206,11 @@ if [[ $native_profile != exact ]]; then
              | if $current then . + {protocol:"matched-k4-native-defaults-cache-on-v3",
                  participating_gpus:[.gpu_uuid],max_running_requests:$max_seqs} else . end
              | if $wide_budget then . + {protocol:"matched-k4-native-defaults-cache-on-v5",
-                 max_num_batched_tokens:$token_budget} else . end' \
+                 max_num_batched_tokens:$token_budget} else . end
+             | if $lmcache then . + {protocol:"matched-k4-native-defaults-lmcache-slc2",
+                 lmcache_version:"0.5.8",lmcache_port:($lmcache_port | tonumber),
+                 lmcache_capacity_bytes:68719476736,lmcache_python:$lmcache_python,
+                 lmcache_uid:$lmcache_uid,lmcache_pythonpath:$lmcache_pythonpath} else . end' \
             <<<"$identity")
     else
         identity=$(jq -c --arg profile "$native_profile" --arg fp8 "$native_fp8" \
@@ -205,10 +244,16 @@ finish() {
     local status=$?
     trap - EXIT
     stop_group
+    if [[ $lmcache == true ]]; then
+        stop_lmcache || status=2
+    fi
     if (( lease_held )); then
         record_compute "$directory/compute-after.csv" || status=2
         check_idle || status=2
         port_free || status=2
+        if [[ $lmcache == true && ${lmcache_port_held:-0} == 1 ]]; then
+            lmcache_port_free || status=2
+        fi
     fi
     date -u +%FT%TZ >"$directory/finished-utc.txt"
     printf '%s\n' "$status" >"$directory/exit-code.txt"
@@ -228,6 +273,10 @@ cp -- "$vllm_root"/{artifact.txt,freeze.txt,native.sha256} \
     >"$directory/wheel-check.txt"
 (cd -- "$site" && sha256sum --check --strict "$directory/native.sha256") \
     >"$directory/vllm-native-check.txt"
+if [[ $lmcache == true ]]; then
+    PYTHONPATH="$project" "$client_python" -B "$paired_dir/lmcache_evidence.py" verify-wheel \
+        "$lmcache_wheel" "$lmcache_python" "$lmcache_pythonpath" >"$directory/lmcache-wheel.json"
+fi
 
 output=$directory
 if [[ $row == W1 || $row == W2 ]]; then
@@ -253,6 +302,12 @@ prepare_run "$index" "$directory/reservation"
 [[ $gpu_uuid == "$uuid" ]]
 lease_held=1
 port_free
+if [[ $lmcache == true ]]; then
+    exec 5>>"$vllm_root/loopback-$lmcache_port.lock"
+    flock -n -E 75 5
+    lmcache_port_held=1
+    lmcache_port_free
+fi
 numactl --localalloc taskset --cpu-list "$client_cpus" /usr/bin/true
 for observation in 1 2 3; do
     check_idle
@@ -348,7 +403,12 @@ start_native_defaults() {
         args+=(--trace-batches)
     fi
     mkdir "$run"/{home,cache,config,tmp}
-    start_group "$run" env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+    local environment=()
+    if [[ $lmcache == true ]]; then
+        start_lmcache "$run" || return
+        environment=("XDG_RUNTIME_DIR=$lmcache_runtime")
+    fi
+    start_group "$run" env -i PATH=/usr/bin:/bin LANG=C.UTF-8 "${environment[@]}" \
         "HOME=$run/home" "TMPDIR=$run/tmp" "XDG_CACHE_HOME=$run/cache" \
         "XDG_CONFIG_HOME=$run/config" "CUDA_CACHE_PATH=$run/cuda-cache" \
         "CUDA_VISIBLE_DEVICES=$gpu_uuid" CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -385,29 +445,61 @@ finish_arm() {
         "${fetch[@]}" "$url/metrics" >metrics-after.txt
         "${client[@]}" worker "$row" "$run" "$directory/reservation" "$checkpoint"
         "${client[@]}" activity "$run" vllm
+        if [[ $lmcache == true ]]; then
+            local engine_pid
+            engine_pid=$(jq -er '.worker_pid' worker-identity.json)
+            check_compute_owners compute-measurement-end.csv "$engine_pid"
+        fi
     else
         cat "/proc/$server_pid/cmdline" | cmp -s -- live-argv.bin -
         if [[ $native_defaults == true ]]; then
-            "${client[@]}" native-default-environment "$server_pid" >live-environment-end.bin
+            native_environment >live-environment-end.bin
             cmp -s live-environment.bin live-environment-end.bin
         else
             "${client[@]}" native-dispatch "$server_pid" >live-dispatch-end.bin
             cmp -s -- live-dispatch.bin live-dispatch-end.bin
         fi
-        for receipt in compute-ready.csv compute-measurement-end.csv; do
-            awk -F', *' -v uuid="$gpu_uuid" -v pid="$server_pid" \
-                '$1 == uuid {count++; if ($2 == pid) owned++}
-                 END {exit !(count == 1 && owned == 1)}' \
-                "$receipt"
-        done
+        if [[ $lmcache == true ]]; then
+            check_compute_owners compute-measurement-end.csv "$server_pid" "$lmcache_pid"
+            record_lmcache_peer "$run" -end
+            cmp -s lmcache-ready.json lmcache-ready-end.json
+            cmp -s lmcache-live-argv.bin lmcache-live-argv-end.bin
+        else
+            for receipt in compute-ready.csv compute-measurement-end.csv; do
+                awk -F', *' -v uuid="$gpu_uuid" -v pid="$server_pid" \
+                    '$1 == uuid {count++; if ($2 == pid) owned++}
+                     END {exit !(count == 1 && owned == 1)}' "$receipt"
+            done
+        fi
         if [[ $arm == native-k4-trace ]]; then
             "${client[@]}" activity "$run" native
         fi
     fi
     stop_group
+    if [[ $lmcache == true && $arm != vllm-k4 ]]; then
+        local endpoint=$lmcache_runtime/sglang-lmcache.sock
+        stop_lmcache
+        [[ ! -e $endpoint && ! -e ${endpoint%/*} ]]
+        jq -nc --arg socket "$endpoint" \
+            '{socket:$socket,runtime_absent:true,socket_absent:true}' >lmcache-retired.json
+    fi
     check_idle
     port_free
     record_compute "$run/compute-after.csv"
+    if [[ $lmcache == true ]]; then
+        check_compute_owners "$run/compute-after.csv"
+        ss -Hltn "sport = :$port" >listener-after.txt
+        ss -Hltn "sport = :$lmcache_port" >lmcache-listener-after.txt
+        [[ ! -s listener-after.txt && ! -s lmcache-listener-after.txt ]]
+    fi
+}
+
+native_environment() {
+    local options=()
+    if [[ $lmcache == true ]]; then
+        options=(--lmcache)
+    fi
+    "${client[@]}" native-default-environment "$server_pid" "${options[@]}"
 }
 
 run_arm() {
@@ -418,8 +510,9 @@ run_arm() {
     mkdir -- "$run"
     cd -- "$run"
     port_free
+    if [[ $lmcache == true ]]; then lmcache_port_free; fi
     if [[ $arm == vllm-k4 ]]; then
-        start_vllm "$run" 6>&- 7>&- 8<&-
+        start_vllm "$run" 5>&- 6>&- 7>&- 8<&-
         if [[ $native_defaults == true ]]; then
             cat "/proc/$server_pid/cmdline" >live-argv.bin
             cat "/proc/$server_pid/environ" >live-environment.bin
@@ -431,17 +524,20 @@ run_arm() {
             "$url/collective_rpc" >effective-worker.json
         "${fetch[@]}" "$url/metrics" >metrics-before.txt
         if [[ $native_defaults == true ]]; then
+            if [[ $lmcache == true ]]; then
+                check_compute_owners "$run/compute-before.csv"
+            fi
             "${client[@]}" worker "$row" "$run" "$directory/reservation" "$checkpoint" \
                 --before-measurement
         fi
     elif [[ $native_defaults == true ]]; then
         [[ $arm != native-k4-trace ]] || traced=true
-        start_native_defaults "$run" "$arm" 6>&- 7>&- 8<&-
+        start_native_defaults "$run" "$arm" 5>&- 6>&- 7>&- 8<&-
         check_digest "$native_sha" "/proc/$server_pid/exe"
         sha256sum "/proc/$server_pid/exe" >running-binary.sha256
         cat "/proc/$server_pid/cmdline" >live-argv.bin
         awk '/^Cpus_allowed_list:/ {print $2}' "/proc/$server_pid/status" >live-cpus.txt
-        "${client[@]}" native-default-environment "$server_pid" >live-environment.bin
+        native_environment >live-environment.bin
         "${fetch[@]}" "$url/server_info" >server-info.json
         "${client[@]}" native-default-check "$run" >server-check.txt
     else
@@ -471,7 +567,8 @@ run_arm() {
             "$binary" --checkpoint "$checkpoint" --device 0 --port "$port" \
             --batch-cuda-graphs --prefix-cache-entries 0 \
             --fp8-prefill "$fp8" \
-            --max-active 32 --max-num-batched-tokens "$token_budget" "${flags[@]}" 6>&- 7>&- 8<&-
+            --max-active 32 --max-num-batched-tokens "$token_budget" "${flags[@]}" \
+            5>&- 6>&- 7>&- 8<&-
         check_digest "$native_sha" "/proc/$server_pid/exe"
         sha256sum "/proc/$server_pid/exe" >running-binary.sha256
         cat "/proc/$server_pid/cmdline" >live-argv.bin
@@ -486,7 +583,7 @@ run_arm() {
         "${options[@]}")
     write_command "$run/client-command.sh" "${capture[@]}"
     date -u +%FT%TZ >measurement-started-utc.txt
-    "${capture[@]}" >client.log 2>&1 6>&- 7>&- 8<&- 9<&- || client_status=$?
+    "${capture[@]}" >client.log 2>&1 5>&- 6>&- 7>&- 8<&- 9<&- || client_status=$?
     printf '%s\n' "$client_status" >client-exit-code.txt
     date -u +%FT%TZ >measurement-finished-utc.txt
     finish_arm "$arm"

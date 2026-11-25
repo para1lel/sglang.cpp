@@ -341,18 +341,19 @@ def main():
     parser.add_argument("out", type=Path)
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--mtp", action="store_true")
-    parser.add_argument("--prefix", action="store_true")
+    parser.add_argument("--lmcache-socket", type=Path)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    flags = PARSERS + (("--prefix-cache-entries", "2") if args.prefix else ())
+    cache_flags = (("--lmcache-socket", str(args.lmcache_socket)) if args.lmcache_socket
+                   else ("--prefix-cache-entries", "0"))
     with server(args.binary, CHECKPOINT, args.out / "server", 1,
-                flags=flags, mtp=args.mtp, graph=args.live) as port:
-        result = {"cache": cache(port)} if args.prefix else exercise(
+                flags=PARSERS + cache_flags, mtp=args.mtp, graph=args.live) as port:
+        result = {"cache": cache(port)} if args.lmcache_socket else exercise(
             port, "live" if args.live else "cpu",
         )
-    if not args.live:
+    if not args.live and not args.lmcache_socket:
         result["runtime-errors"] = runtime_errors(args.binary, args.out)
-    if not args.prefix:
+    if not args.lmcache_socket:
         result["ollama-collision"] = ollama_collision(
             args.binary, args.out / "ollama-collision", graph=args.live, mtp=args.mtp)
     (args.out / "wire.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

@@ -71,6 +71,7 @@ struct VerificationGraphBinding {
     std::array<Mxfp8KvCache, full_attention_layers> caches;
     GdnBank initial;
     GdnBank tail;
+    std::array<TextModelStateRow, k1_verification_rows> final_states;
 };
 
 struct VerificationGraphScratch {

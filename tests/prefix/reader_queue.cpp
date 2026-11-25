@@ -29,9 +29,8 @@ constexpr int capacity = 2;
 
 class ReaderQueueExecutor final : public BatchExecutor {
 public:
-    explicit ReaderQueueExecutor(bool cached)
-        : BatchExecutor({false, capacity, cached ? 2 : 0,
-                         sglang::decoder_default_max_num_batched_tokens}) {}
+    ReaderQueueExecutor()
+        : BatchExecutor({false, capacity, 0, sglang::decoder_default_max_num_batched_tokens}) {}
     BatchTopology topology() const noexcept override { return single_device_batch_topology; }
     void start(Ready, Process) override { throw std::logic_error("Unexpected decoder startup"); }
     void join() noexcept override {}
@@ -128,10 +127,10 @@ constexpr int large_body_bytes = 48 * 1024;
 
 namespace sglang::server {
 
-struct BatchService::State { int cache_capacity; };
+struct BatchService::State {};
 
-BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool, int)
-    : state_(std::make_unique<State>(State{executor->options().prefix_cache_entries})) {}
+BatchService::BatchService(std::unique_ptr<BatchExecutor>, bool, int)
+    : state_(std::make_unique<State>()) {}
 BatchService::~BatchService() = default;
 
 std::optional<std::vector<DecoderResult>> BatchService::generate_batch(
@@ -152,11 +151,7 @@ void BatchService::rethrow_failure() const {
     }
 }
 
-BatchMetrics BatchService::metrics() const {
-    BatchMetrics metrics;
-    metrics.cache_capacity = state_->cache_capacity;
-    return metrics;
-}
+BatchMetrics BatchService::metrics() const { return {}; }
 
 bool BatchService::reset_prefix_cache() {
     rethrow_failure();
@@ -689,7 +684,7 @@ int main(int argc, char** argv) {
         const bool cached = mode == "--cache-on" || reader_failure || flush;
         require(cached || broken_worker || mode == "--cache-off", "Unknown transport test mode");
         const auto descriptors = fd_count();
-        BatchService service(std::make_unique<ReaderQueueExecutor>(cached), false);
+        BatchService service(std::make_unique<ReaderQueueExecutor>(), false);
         for (const int invalid : {0, sglang::decoder_batch_max_lanes + 1}) {
             bool rejected = false;
             try {

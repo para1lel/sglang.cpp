@@ -1,4 +1,4 @@
-#include "sglang/decoder_batch.h"
+#include "sglang/testing/prefix_fixture.h"
 #include "sglang/decoder_internal.h"
 #include "sglang/text_ops.h"
 #include "sglang/tokenizer/tokenizer.h"
@@ -432,19 +432,30 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
     constexpr int prefix = decoder_batch_prefix_checkpoint_interval;
     const Decoder decoder(checkpoint, 0, false);
     check(decoder.uses_b200_operators(), "Serial prefill route check requires a B200");
-    DecoderBatch batch(decoder, {.max_lanes = 1, .prefix_cache_entries = 1});
+    DecoderBatch batch(decoder, {.max_lanes = 1});
+    const auto cache = prefix_fixture::client();
+    constexpr auto salt = "serial-prefill";
     const auto tokens = read_prompt(fixture);
     check(tokens.size() >= prefix + 3, "Expected at least 8195 prompt IDs");
-    const DecoderOptions options{.max_new_tokens = 2, .generated_top_logprobs = 2,
-                                 .ignore_eos = true};
+    DecoderOptions options{.max_new_tokens = 2, .generated_top_logprobs = 2,
+                           .ignore_eos = true};
     const auto selected = select({0});
-    check(batch.admit(0, {tokens.begin(), tokens.begin() + prefix}, options) == 0,
+    DecoderOptions export_options{.max_new_tokens = 1, .ignore_eos = true};
+    const std::vector<int> cached(tokens.begin(), tokens.begin() + prefix);
+    prefix_fixture::attach(export_options, cache, cached, salt);
+    check(batch.admit(0, cached, export_options) == 0,
           "Unexpected initial prefix hit");
-    check(batch.advance_chunked(selected)[0].token.has_value(), "Missing warm-up token");
-    batch.cancel(0);
+    check(batch.advance_chunked(selected)[0].prefix_pending, "Missing prefix checkpoint export");
+    prefix_fixture::wait(batch, 0);
     batch.release_retired_allocations();
     const auto tail = [&](int rows, bool without_arena, int* reads) {
-        check(batch.admit(0, {tokens.begin(), tokens.begin() + prefix + rows}, options) == prefix,
+        const std::vector<int> prompt(tokens.begin(), tokens.begin() + prefix + rows);
+        auto restore = options;
+        restore.prefix_cache_read = prefix_fixture::read_checkpoint(cache, prompt, salt, prefix);
+        prefix_fixture::attach(restore, cache, prompt, salt);
+        check(batch.admit(0, prompt, restore) == 0,
+              "Restore should complete asynchronously");
+        check(prefix_fixture::wait(batch, 0).restored == prefix,
               "Missing restored 8192-token prefix");
         serial_reads = reads;
         arena_failures = 0;

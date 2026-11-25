@@ -31,13 +31,14 @@ NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
 
 
 @contextmanager
-def server(args, label, flags, *, binary=None, environment=None, cache_entries=0):
+def server(args, label, flags, *, binary=None, environment=None, lmcache_socket=None):
     output = args.evidence / label
     output.mkdir()
     port = native.choose_port()
+    cache_flags = (["--lmcache-socket", str(lmcache_socket)] if lmcache_socket
+                   else ["--prefix-cache-entries", "0"])
     command = [str(binary or args.binary), "--checkpoint", str(args.checkpoint),
-               "--port", str(port), "--trace-batches", "--prefix-cache-entries", str(cache_entries),
-               *flags]
+               "--port", str(port), "--trace-batches", *cache_flags, *flags]
     log_path = output / "server.log"
     native.write_json(output / "command.json", command)
     with log_path.open("wb") as log:
@@ -261,13 +262,16 @@ def check_eager_cache(args):
     body = {"model": media.MODEL, "prompt": case["prompt"], "max_tokens": 8,
             "return_token_ids": True, "temperature": 0, "ignore_eos": True}
     prime = body | {"prompt": case["prompt"][:-1], "max_tokens": 1}
-    with server(args, "eager-cache", flags, cache_entries=2) as (port, log, out, health):
+    with server(args, "eager-cache", flags, lmcache_socket=args.lmcache_socket) as (
+        port, log, out, health
+    ):
         check_caps(health, 4, DEFAULT_TOKENS)
         evidence = argparse.Namespace(evidence=out)
         info_status, _, raw = media.exchange(port, "/server_info")
         info = json.loads(raw)
         native.write_json(out / "server-info.json", info)
-        assert info_status == 200 and info["prefix_cache_entries"] == 2, info
+        assert info_status == 200 and info["lmcache_enabled"] and info["lmcache_available"], info
+        assert info["prefix_cache_entries"] == 0, info
         assert info["eager"] and not info["batch_cuda_graphs"] and info["mtp_steps"] == 4, info
         cold = media.capture(evidence, "cold", port, media.TEXT, body | {"cache_salt": "cold"})
         media.capture(evidence, "prime", port, media.TEXT, prime)
@@ -294,14 +298,14 @@ def check_cli(args):
              ["--max-active", "1", "--eager"], ["--max-active", "4", "--mtp-steps", "1"],
              ["--max-active", "4", "--mtp-steps", "1", "--eager"],
              ["--mtp-steps", "1"], ["--max-active", str(DEFAULT_ACTIVE), "--mtp-steps", "1"],
-             ["--mtp-steps", "1", "--prefix-cache-entries", "2"],
-             ["--eager", "--prefix-cache-entries", "2"],
+             ["--mtp-steps", "1", "--prefix-cache-entries", "0"],
              ["--max-active", str(DEFAULT_ACTIVE), "--mtp-k", "4"]]
     invalid = [([TOKEN_OPTION, value], TOKEN_OPTION)
                for value in ("0", "-1", "wide", str(MAX_TOKENS + 1), "2147483648")]
     invalid.extend([(["--max-active", "33"], "--max-active"),
                     (["--mtp-steps", "5"], "--mtp-steps"),
                     (["--mtp-k", "5"], "--mtp-steps")])
+    invalid.append((["--prefix-cache-entries", "2"], "Only --prefix-cache-entries 0 is supported"))
     command = [str(args.binary), "--checkpoint", str(args.evidence / "no-checkpoint")]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     records = []
@@ -451,6 +455,7 @@ def main():
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--source", type=Path, help="Matching XMake project for the KV fault cases")
     parser.add_argument("--small-tokens", type=int, default=SMALL_TOKENS)
+    parser.add_argument("--lmcache-socket", type=Path)
     checks = {"cli": check_cli, "default": check_default, "pressure": check_pressure,
               "width-1": lambda args: check_explicit(args, 1),
               "width-4": lambda args: check_explicit(args, 4), "bounded": check_bounded,
@@ -463,7 +468,10 @@ def main():
     args.binary = args.binary.resolve()
     args.checkpoint = args.checkpoint.resolve()
     args.evidence = args.evidence.resolve()
-    selected = args.case or [name for name in checks if name != "pressure"]
+    selected = args.case or [name for name in checks if name != "pressure"
+                             and (name != "eager-cache" or args.lmcache_socket)]
+    if "eager-cache" in selected and not args.lmcache_socket:
+        parser.error("--lmcache-socket is required for the eager-cache case")
     has_fault = any(name in faults for name in selected)
     if has_fault and not args.source:
         parser.error("--source is required for the KV fault cases")

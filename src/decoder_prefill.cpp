@@ -5,7 +5,7 @@
 
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
-#include "sglang/decoder_prefix_cache.h"
+#include "sglang/runtime/cache/prefill_cached_gqa.h"
 #include "sglang/prefill_fp8.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/prefill_attn_sm100.h"
@@ -111,6 +111,7 @@ struct Chunk : PrefillProjections {
     TileBuffers work;
     int position;
     const MropePosition* mrope;
+    int cached_gqa_tokens = 0;
 
     bool project_packed(TextFp8ActivationView input,
                         std::initializer_list<PrefillFp8Projection> projections) const {
@@ -194,8 +195,10 @@ struct Chunk : PrefillProjections {
         project(layer.output, input, work.projected_attention);
     }
 
-    void gqa_input(const GqaLayer& layer) const {
+    void gqa_input(const GqaLayer& layer, bool reuse_all = false) const {
         const TextFp8ActivationView input{activation.values, activation.scales};
+        if (reuse_all || cached_gqa_tokens >= position + rows)
+            return project(layer.q_gate, input, work.q_gate);
         if (!project_packed(input, {
                 {layer.q_gate.values, layer.q_gate.scales, work.q_gate, layer.q_gate.rows},
                 {layer.key.values, layer.key.scales, work.keys, layer.key.rows},
@@ -208,14 +211,8 @@ struct Chunk : PrefillProjections {
     }
 
     void gqa_append(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages) const {
-        const auto rotation = mrope
-            ? mrope_gqa_preprocess(mrope, rows, work.q_gate, work.keys, layer.query_norm,
-                                    layer.key_norm, work.rope_queries, work.rope_keys, stream)
-            : text_gqa_preprocess(position, rows, work.q_gate, work.keys, layer.query_norm,
-                                   layer.key_norm, work.rope_queries, work.rope_keys, stream);
-        check(rotation, "Normalize and rotate prefill Q/K");
-        check(mxfp8_kv_append(cache, pages, position, rows, work.rope_keys, work.values, stream),
-              "Append prefill MXFP8 KV");
+        prepare_prefill_gqa(layer, work, cache, pages, position, rows, cached_gqa_tokens,
+                            mrope, stream);
     }
 
     void gqa_gate() const {
@@ -383,7 +380,8 @@ void read_paged_sequences(const PagedPrefillSequence* sequences, int count, cuda
 
 Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, int offset) {
     return Chunk{{{}, grant.rows, chunk.stream, true}, chunk.work.attention_segment(offset),
-                 grant.position, grant.media ? grant.media->positions + grant.position : nullptr};
+        grant.position, grant.media ? grant.media->positions + grant.position : nullptr,
+        grant.request->cached_gqa_tokens};
 }
 
 bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
@@ -657,6 +655,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     const Chunk chunk{{buffers.activation, group.rows, stream, true,
                        grouped || serial_attention}, buffers, 0, nullptr};
     const bool scaled_output = group.rows == grouped_prefill_max_rows;
+    const bool reuse_all_gqa = std::all_of(grants, grants + group.grants, gqa_cached);
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
         auto* residual = buffers.residual + offset * hidden_size;
         gather_embeddings(model.embedding, grant.tokens, grant.rows, residual, stream);
@@ -668,7 +667,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             chunk.normalize(branch, residual, weight, rms_launch);
         },
         [&](const GqaLayer& layer, int bank) {
-            chunk.gqa_input(layer);
+            chunk.gqa_input(layer, reuse_all_gqa);
             if (serial_attention) {
                 prefill_serial_gqa(chunk, layer, bank, grants, group.grants, serial_capacity,
                                    causal, wide_partial);
@@ -906,7 +905,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     const TileBuffers buffers(layout, capacity);
     const bool tensor_core = backend.tensor_core_prefill;
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
-                      media ? media->positions + position : nullptr};
+        media ? media->positions + position : nullptr, request.cached_gqa_tokens};
     const auto& work = chunk.work;
     gather_embeddings(embedding, tokens, rows, work.residual, stream);
     if (media) {

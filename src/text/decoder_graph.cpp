@@ -65,8 +65,11 @@ bool replay_narrow(const DecoderModel& model, Allocations& execution, DecodeGrap
                 }
             }
             const int rotary = lane.rotary_position < 0 ? lane.position : lane.rotary_position;
+            const TextModelStateRow state = request.prefix_checkpoint_outputs
+                ? TextModelStateRow{request.work.hidden, request.work.residual}
+                : TextModelStateRow{};
             scratch.bindings[index] = {{0.0f, lane.token_id}, lane.position, rotary, scores,
-                                       request.pages, request.caches, request.states};
+                                       request.pages, request.caches, request.states, state};
         }
         check(cudaMemcpyAsync(scratch.device_bindings, scratch.bindings.data(),
                               count * sizeof(BatchDecodeBinding), cudaMemcpyHostToDevice,

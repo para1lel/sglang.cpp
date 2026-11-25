@@ -81,8 +81,10 @@ __global__ void rms_norm_pair_rows_kernel(const __nv_bfloat16* first, const __nv
 
 constexpr int rms_hidden_width = 5120;
 
-__device__ void stage_rms_vector(const __nv_bfloat16* input, __nv_bfloat16* shared) {
+__device__ void stage_rms_vector(const __nv_bfloat16* input, __nv_bfloat16* shared,
+                                 __nv_bfloat16* output = nullptr) {
     const uint4 vector = load_128(input);
+    if (output) *reinterpret_cast<uint4*>(output) = vector;
     const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(shared));
     asm("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
         :: "r"(address), "r"(vector.x), "r"(vector.y), "r"(vector.z), "r"(vector.w)
@@ -125,20 +127,25 @@ __device__ void store_rms(float value, float inverse_rms, const __nv_bfloat16* w
     output[col] = __float2bfloat16_rn((value * inverse_rms) * gain);
 }
 
-template <bool HasResidual, bool StoresResidual, bool Pack = false>
+template <bool HasResidual, bool StoresResidual, bool Pack = false, bool EmitsState = false>
 __device__ void rms_norm_vector(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
                                 const __nv_bfloat16* weight, __nv_bfloat16* output,
-                                __nv_bfloat16* residual_output, __nv_bfloat16* packed = nullptr) {
+                                __nv_bfloat16* residual_output, __nv_bfloat16* packed = nullptr,
+                                const TextModelStateRow* state = nullptr) {
     __shared__ alignas(16) __nv_bfloat16 branch_values[rms_hidden_width];
     __shared__ alignas(16) __nv_bfloat16 residual_values[HasResidual ? rms_hidden_width : 1];
     __shared__ alignas(16) __nv_bfloat16 gains[rms_hidden_width];
     constexpr int vector_width = sizeof(uint4) / sizeof(__nv_bfloat16);
     static_assert(rms_hidden_width % block_threads == 0 && rms_hidden_width % vector_width == 0);
+    TextModelStateRow destination{};
+    if constexpr (EmitsState) destination = *state;
     for (int col = threadIdx.x * vector_width; col < rms_hidden_width;
          col += block_threads * vector_width) {
-        stage_rms_vector(branch + col, branch_values + col);
+        stage_rms_vector(branch + col, branch_values + col,
+                         destination.hidden ? destination.hidden + col : nullptr);
         if constexpr (HasResidual) {
-            stage_rms_vector(residual + col, residual_values + col);
+            stage_rms_vector(residual + col, residual_values + col,
+                             destination.residual ? destination.residual + col : nullptr);
         }
         stage_rms_vector(weight + col, gains + col);
     }
@@ -177,6 +184,13 @@ __global__ void rms_norm_vector_kernel(const __nv_bfloat16* branch,
                                        const __nv_bfloat16* weight, __nv_bfloat16* output,
                                        __nv_bfloat16* residual_output) {
     rms_norm_vector<HasResidual, StoresResidual>(branch, residual, weight, output, residual_output);
+}
+
+__global__ void final_rms_bound(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                                const __nv_bfloat16* weight, __nv_bfloat16* output,
+                                const TextModelStateRow* state) {
+    rms_norm_vector<true, false, false, true>(branch, residual, weight, output, nullptr,
+                                             nullptr, state);
 }
 
 __global__ void draft_input_rms(const __grid_constant__ decoder::DraftRmsRows embeddings,
@@ -510,6 +524,13 @@ cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* resi
     }
     void* args[] = {&branch, &residual, &weight, &width, &output, &residual_output};
     return cudaLaunchKernel(rms_norm_kernel<false>, 1, block_threads, args, 0, stream);
+}
+
+cudaError_t text_final_rms_bound(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                                const __nv_bfloat16* weight, __nv_bfloat16* output,
+                                const TextModelStateRow* device_state, cudaStream_t stream) {
+    void* args[] = {&branch, &residual, &weight, &output, &device_state};
+    return cudaLaunchKernel(final_rms_bound, 1, block_threads, args, 0, stream);
 }
 
 cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16* residual,

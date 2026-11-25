@@ -11,7 +11,6 @@ struct MultimodalInput {
     std::shared_ptr<const Allocations> model;
     MultimodalPrompt prompt;
     std::vector<std::shared_ptr<const Bf16>> features;
-    std::vector<std::shared_ptr<const DecoderMediaCacheIdentity>> cache_identities;
 };
 
 struct MediaPrefill {

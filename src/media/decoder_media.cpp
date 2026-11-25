@@ -4,37 +4,6 @@
 
 #include <algorithm>
 
-namespace sglang {
-namespace {
-
-bool same_layout(const DecoderMediaLayout& left, const DecoderMediaLayout& right) {
-    return left.kind == right.kind && left.temporal_pairs == right.temporal_pairs &&
-        left.patch_height == right.patch_height && left.patch_width == right.patch_width &&
-        left.video_timestamp_tokens == right.video_timestamp_tokens;
-}
-
-}
-
-DecoderMediaCacheIdentity::DecoderMediaCacheIdentity(const DecoderMedia& media,
-                                                     std::shared_ptr<const void> encoder,
-                                                     std::string patches_digest)
-    : layout_(media.layout), features_(media.features), address_(media.features.get()),
-      elements_(media.feature_elements), encoder_(std::move(encoder)),
-      patches_digest_(std::move(patches_digest)) {}
-
-bool DecoderMediaCacheIdentity::matches(const DecoderMedia& media) const {
-    return address_ == media.features.get() && elements_ == media.feature_elements &&
-        !features_.owner_before(media.features) && !media.features.owner_before(features_) &&
-        same_layout(layout_, media.layout);
-}
-
-bool DecoderMediaCacheIdentity::same_content(const DecoderMediaCacheIdentity& other) const {
-    return encoder_ == other.encoder_ && patches_digest_ == other.patches_digest_ &&
-        same_layout(layout_, other.layout_);
-}
-
-}
-
 namespace sglang::decoder {
 namespace {
 
@@ -92,7 +61,6 @@ std::shared_ptr<MultimodalInput> prepare_input(
     std::vector<DecoderMediaLayout> layouts;
     layouts.reserve(media.size());
     input->features.reserve(media.size());
-    input->cache_identities.reserve(media.size());
     for (const auto& item : media) {
         const auto rows = decoder_media_feature_rows(item.layout);
         const auto address = reinterpret_cast<std::uintptr_t>(item.features.get());
@@ -102,8 +70,6 @@ std::shared_ptr<MultimodalInput> prepare_input(
         }
         layouts.push_back(item.layout);
         input->features.push_back(item.features);
-        input->cache_identities.push_back(item.cache_identity && item.cache_identity->matches(item)
-            ? item.cache_identity : nullptr);
     }
     input->prompt = prepare_multimodal_prompt(template_ids, layouts);
     return input;

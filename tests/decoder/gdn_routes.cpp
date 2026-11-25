@@ -1,4 +1,4 @@
-#include "sglang/decoder_batch.h"
+#include "sglang/testing/prefix_fixture.h"
 
 #include <cuda_runtime.h>
 
@@ -102,21 +102,33 @@ int token(const Step& step, int slot, bool decode, bool finished) {
 }
 
 void check_prefix_fallback(const Decoder& decoder, const std::vector<int>& prompt) {
-    DecoderBatch batch(decoder, {.cuda_graphs = true, .max_lanes = 2, .prefix_cache_entries = 2});
+    DecoderBatch batch(decoder, {.cuda_graphs = true, .max_lanes = 2});
+    const auto cache = prefix_fixture::client();
+    constexpr auto salt = "gdn-routes";
     const std::vector<int> prefix(prompt.begin(), prompt.begin() + page);
-    DecoderOptions options{.max_new_tokens = 4, .prefix_cache_salt = "gdn-routes"};
-    require(batch.admit(0, prefix, options) == 0, "First prefix unexpectedly restored");
+    DecoderOptions export_options{.max_new_tokens = 1, .ignore_eos = true};
+    prefix_fixture::attach(export_options, cache, prefix, salt);
+    require(batch.admit(0, prefix, export_options) == 0, "Unexpected prefix on export");
+    const auto stored = advance(batch, Mask{true});
+    require(stored.lanes[0].prefix_pending, "Missing terminal prefix export");
+    prefix_fixture::wait(batch, 0);
+    batch.release_retired_allocations();
+    DecoderOptions options{.max_new_tokens = 4, .ignore_eos = true};
+    require(batch.admit(0, prefix, options) == 0, "First peer unexpectedly restored");
     const auto prime = advance(batch, Mask{true});
-    expect_route(std::vector<Stage>(banks, Stage::exact), "first absolute tile");
+    expect_tile(true, "first absolute tile");
     require(prime.stats.prefill_rows[0] == page && prime.stats.graph_slots == 0 &&
             prime.stats.prefill_workspace_bytes > 0, "Wrong prefix prime scheduler step");
     token(prime, 0, false, false);
 
     options.max_new_tokens = 5;
-    require(batch.admit(1, prompt, options) == page, "Incorrect restored prefix position");
+    options.prefix_cache_read = prefix_fixture::read_checkpoint(cache, prompt, salt, page);
+    prefix_fixture::attach(options, cache, prompt, salt);
+    require(batch.admit(1, prompt, options) == 0, "Restore should complete asynchronously");
+    require(prefix_fixture::wait(batch, 1).restored == page, "Incorrect restored prefix position");
     const auto live = batch.request_device_allocation_bytes();
     const auto mixed = advance(batch, Mask{true, true});
-    expect_route(std::vector<Stage>(banks, Stage::exact), "restored tile with decode peer");
+    expect_tile(false, "restored tile with decode peer");
     require(mixed.stats.prefill_rows[0] == 0 && mixed.stats.prefill_rows[1] == page &&
             mixed.stats.graph_slots == 0 &&
             mixed.stats.prefill_workspace_bytes == prime.stats.prefill_workspace_bytes &&
@@ -137,24 +149,22 @@ void check_prefix_fallback(const Decoder& decoder, const std::vector<int>& promp
     token(decode, 0, true, true);
     restored[2] = token(decode, 1, true, false);
     const auto single_warm = advance(batch, Mask{false, true});
-    expect_route({}, "single-lane graph warmup");
-    require(single_warm.stats.graph_slots == 0 && single_warm.stats.prefill_workspace_bytes == 0,
-            "Wrong single-lane graph warmup");
+    expect_route({}, "single-lane graph replay");
+    require(single_warm.stats.graph_slots == (1u << 1) &&
+            single_warm.stats.prefill_workspace_bytes == 0, "Wrong singleton graph replay");
     restored[3] = token(single_warm, 1, true, false);
     const auto retire = advance(batch, Mask{false, true});
     expect_route({}, "retiring decode");
-    require(retire.stats.graph_slots == 0 && retire.stats.prefill_workspace_bytes == 0,
-            "Retiring prefix lane used a graph or prefill scratch");
+    require(retire.stats.graph_slots == (1u << 1) && retire.stats.prefill_workspace_bytes == 0,
+            "Retiring prefix lane missed singleton replay or used prefill scratch");
     restored[4] = token(retire, 1, true, true);
+    prefix_fixture::wait(batch, 1);
     require(batch.request_device_allocation_bytes() == 0, "Retired lanes kept request storage");
-    const auto cache = batch.prefix_cache_stats();
-    require(cache.hits == 1 && cache.cached_tokens == page && cache.prefill_tokens == 2 * page,
-            "Incorrect restored-prefix accounting");
-
-    batch.reset_prefix_cache();
-    require(batch.admit(1, prompt, options) == 0, "Reset prefix cache returned an entry");
+    options.prefix_cache_read.reset();
+    options.submit_prefix_transfer = {};
+    require(batch.admit(1, prompt, options) == 0, "Fresh lane unexpectedly restored");
     const auto fresh = advance(batch, Mask{false, true});
-    expect_route(std::vector<Stage>(banks, Stage::exact), "reused lane cold prefill");
+    expect_tile(true, "reused lane cold prefill");
     require(fresh.stats.prefill_rows[1] == 2 * page, "Wrong cold prefill grant");
     std::array cold{token(fresh, 1, false, false), -1, -1, -1, -1};
     for (std::size_t index = 1; index < cold.size(); ++index) {

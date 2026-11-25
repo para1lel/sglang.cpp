@@ -22,6 +22,13 @@ for name in batch_service completions flush_cache http loads text_request text_c
     fi
 done
 
+lmcache_api=()
+if [[ -f "$source/apps/server/batch_cache.cpp" ]]; then
+    sources+=("$source"/apps/server/{batch_cache,batch_service_cache}.cpp
+              "$source"/src/runtime/cache/{lmcache_client,lmcache_prefix,prefix_payload}.cpp)
+    lmcache_api=(-DSGLANG_TEST_LMCACHE)
+fi
+
 for name in qwen_chat_template qwen_chat_output qwen_tool_constraints qwen_serving_profile \
     qwen_tool_output; do
     file="$source/src/runtime/model/$name.cpp"
@@ -69,7 +76,7 @@ fi
 
 "${CXX:-c++}" -std=c++17 -O2 -pthread \
     -Wall -Wextra -Wpedantic -Werror -ffunction-sections -fdata-sections \
-    -I"$source/include" "${cuda_headers[@]}" "${media_api[@]}" "${sources[@]}" \
+    -I"$source/include" "${cuda_headers[@]}" "${media_api[@]}" "${lmcache_api[@]}" "${sources[@]}" \
     "$tests/chat_cpu_decoder.cpp" "${libraries[@]}" \
     -Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv \
     -Wl,--gc-sections,--print-gc-sections,--no-undefined,-Map,"$output.map" \

@@ -63,6 +63,8 @@ prefix-cache reset, and unchanged seeded output after an idle reset. The runner
 saves requests, transcripts, effective caps, startup results, and server traces.
 The depth-comparison matrix uses explicit cache-off controls. The startup
 matrix checks positive-depth admission through capacity 32, singleton batch
-graphs, and eager operation with an enabled cache. Use `--eager-cache-only` for
-the focused live K4 case. It checks a warm hit at 8,192 tokens, identical seeded
+graphs, and eager operation with an enabled cache. Pass `--eager-cache-only`
+and `--lmcache-socket "$LMCACHE_SOCKET"` to use an isolated, ready
+[daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon)
+for the focused live K4 case. It checks a warm hit at 8,192 tokens, identical seeded
 output, actual drafting before and after the hit, and zero graph replays.

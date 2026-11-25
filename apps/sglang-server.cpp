@@ -15,13 +15,16 @@
 #include "sglang/server/score.h"
 #include "sglang/server/tokenization.h"
 #include "sglang/server/vision_completion.h"
+#include "sglang/tokenizer/digest.h"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <string_view>
+#include <sys/stat.h>
 #include <utility>
 
 namespace {
@@ -41,7 +44,8 @@ struct Arguments {
     int max_active = default_max_active;
     int max_num_batched_tokens = sglang::decoder_default_max_num_batched_tokens;
     int mtp_steps = 4;
-    int prefix_cache_entries = sglang::decoder_batch_prefix_max_entries;
+    sglang::decoder::LmCacheConfig lmcache;
+    bool lmcache_enabled = true;
     bool eager = false;
     bool trace_batches = false;
     bool enable_response_store = false;
@@ -146,12 +150,13 @@ Arguments parse_arguments(int argc, char** argv, const sglang::model::ServingPro
             }
         } else if (option == "--max-num-batched-tokens") {
             arguments.max_num_batched_tokens = parse_target_rows(value);
+        } else if (option == "--lmcache-socket" && !value.empty()) {
+            arguments.lmcache.endpoint = value;
         } else if (option == "--prefix-cache-entries") {
-            const auto error = "Expected --prefix-cache-entries in [0, 4]";
-            arguments.prefix_cache_entries = parse_integer(value, error);
-            if (arguments.prefix_cache_entries > sglang::decoder_batch_prefix_max_entries) {
-                throw std::invalid_argument(error);
+            if (value != "0") {
+                throw std::invalid_argument("Only --prefix-cache-entries 0 is supported");
             }
+            arguments.lmcache_enabled = false;
         } else if (option == "--mtp-steps" || option == "--mtp-k") {
             const auto error = "Expected --mtp-steps in [0, 4]";
             arguments.mtp_steps = parse_integer(value, error);
@@ -164,6 +169,32 @@ Arguments parse_arguments(int argc, char** argv, const sglang::model::ServingPro
         append_launch_option(arguments.launch_command, option, value);
     }
     return arguments;
+}
+
+std::string cache_identity(const std::filesystem::path& directory) {
+    std::vector<std::filesystem::path> files{directory / "config.json",
+                                           directory / "model.safetensors.index.json"};
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().extension() == ".safetensors") files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    std::string identity = "sglang-qwen3.8-prefix-v1\n";
+    for (const auto& path : files) {
+        struct stat info{};
+        if (stat(path.c_str(), &info) != 0) {
+            throw std::runtime_error("Cannot identify checkpoint file " + path.string());
+        }
+        const auto name = path.filename().string();
+        identity += std::to_string(name.size()) + ':' + name;
+        for (const auto field : {static_cast<std::int64_t>(info.st_dev),
+                                 static_cast<std::int64_t>(info.st_ino), info.st_size,
+                                 info.st_mtim.tv_sec, info.st_mtim.tv_nsec,
+                                 info.st_ctim.tv_sec, info.st_ctim.tv_nsec}) {
+            identity += ':' + std::to_string(field);
+        }
+        identity += '\n';
+    }
+    return sglang::tokenizer::sha256(identity);
 }
 
 std::string health_json(const Arguments& arguments) {
@@ -240,7 +271,11 @@ std::string server_info_json(const Arguments& arguments, double startup_seconds,
         ? "true" : "false";
     body += R"(,"certified_int8_verify_head":)";
     body += decoder.has_certified_vocab() ? "true" : "false";
-    body += R"(,"prefix_cache_entries":)" + std::to_string(arguments.prefix_cache_entries);
+    const auto lmcache = service.metrics().lmcache;
+    body += R"(,"prefix_cache_entries":0,"lmcache_enabled":)";
+    body += lmcache.enabled ? "true" : "false";
+    body += R"(,"lmcache_available":)";
+    body += lmcache.available ? "true" : "false";
     body += R"(,"fp8_prefill":)";
     const bool tc_prefill = backend.tensor_core_prefill;
     sglang::json::append_quoted(body, tc_prefill ? "tensor-core" : "exact");
@@ -286,7 +321,7 @@ int main(int argc, char** argv) {
         std::cout << "Usage: sglang-server [--checkpoint PATH] [--device ORDINAL] [--port PORT]"
                      " [--max-active N] [--mtp-steps N] [--eager]\n"
                      "                     [--max-num-batched-tokens N] [--trace-batches]\n"
-                     "                     [--prefix-cache-entries 0..4]\n"
+                     "                     [--lmcache-socket PATH] [--prefix-cache-entries 0]\n"
                      "                     [--reasoning-parser qwen3]\n"
                      "                     [--tool-call-parser qwen3_coder]\n"
                      "                     [--enable-response-store]\n"
@@ -298,8 +333,7 @@ int main(int argc, char** argv) {
                      "Default MTP uses 0 steps for output logprobs.\n"
                      "Batch graphs: enabled by default for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
-                     "Prefix cache entries: " << sglang::decoder_batch_prefix_max_entries
-                  << " by default. Set --prefix-cache-entries 0 to disable.\n"
+                     "LMCache enabled by default. Set --prefix-cache-entries 0 to disable.\n"
                      "Serves on 127.0.0.1 only. Default port: 17384.\n";
         return 0;
     }
@@ -318,10 +352,14 @@ int main(int argc, char** argv) {
         const auto health = health_json(arguments);
         VisionCompletion vision(arguments.checkpoint, arguments.device);
         const BatchExecutor::Options batch_options{
-            arguments.enable_batch_cuda_graphs(), arguments.max_active,
-            arguments.prefix_cache_entries, arguments.max_num_batched_tokens};
+            arguments.enable_batch_cuda_graphs(), arguments.max_active, 0,
+            arguments.max_num_batched_tokens};
         auto executor = std::make_unique<SingleDeviceBatchExecutor>(decoder, batch_options);
-        BatchService service(std::move(executor), arguments.trace_batches, arguments.mtp_steps);
+        auto cache = arguments.lmcache_enabled
+            ? std::make_unique<sglang::decoder::LmCacheClient>(arguments.lmcache) : nullptr;
+        const auto identity = cache ? cache_identity(arguments.checkpoint) : std::string{};
+        BatchService service(std::move(executor), arguments.trace_batches, arguments.mtp_steps,
+                             std::move(cache), identity);
         if (stopping()) {
             return 0;
         }
@@ -338,7 +376,7 @@ int main(int argc, char** argv) {
                 } else {
                     complete(connection, service, slot, tokenizer, body);
                 }
-            }, health, arguments.prefix_cache_entries != 0,
+            }, health, arguments.lmcache_enabled,
             [&](std::string_view body) {
                 return native_generate.prepare(body);
             }, [&](const Socket& connection, TokenizationRoute route, std::string_view body) {

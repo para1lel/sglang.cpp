@@ -447,8 +447,7 @@ class NativeGenerate(unittest.TestCase):
     def test_batch_stream_admission_failure_before_and_after_headers(self):
         log = self.output / "batch-stream-error.log"
         with patch.dict("os.environ", SGLANG_TEST_BATCH_ADMISSION_FAILURE="-900"), \
-             server(self.binary, self.checkpoint, log, "--max-active", "2",
-                    "--prefix-cache-entries", "1") as port:
+             server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
             failing = {"max_new_tokens": 7, "sampling_seed": -900}
             early = {"text": ["A"], "stream": True, "sampling_params": failing}
             status, error = send(port, GENERATE, early)
@@ -477,8 +476,7 @@ class NativeGenerate(unittest.TestCase):
         log = self.output / "batch-stream-disconnect.log"
         payload = {"input_ids": [[32], [33, 33], [34]], "stream": True,
                    "sampling_params": {"max_new_tokens": 2048}}
-        with server(self.binary, self.checkpoint, log, "--max-active", "2",
-                    "--prefix-cache-entries", "1") as port, \
+        with server(self.binary, self.checkpoint, log, "--max-active", "2") as port, \
              generate_client(port, payload) as client:
             with http.client.HTTPResponse(client) as reply:
                 self.check_batch_headers(reply)
@@ -515,8 +513,7 @@ class NativeGenerate(unittest.TestCase):
     def test_batch_admission_failure_cancels_running_sibling(self):
         log = self.output / "batch-admission-failure.log"
         with patch.dict("os.environ", SGLANG_TEST_BATCH_ADMISSION_FAILURE="-900"), \
-             server(self.binary, self.checkpoint, log, "--max-active", "2",
-                    "--prefix-cache-entries", "1") as port:
+             server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
             status, result = send(port, GENERATE, {
                 "input_ids": [[32], [33, 33], [34], [35]],
                 "sampling_params": [{"max_new_tokens": 2048, "sampling_seed": 0},
@@ -539,8 +536,7 @@ class NativeGenerate(unittest.TestCase):
 
     def test_batch_disconnect_cancels_all_admitted_lanes(self):
         log = self.output / "batch-disconnect.log"
-        with server(self.binary, self.checkpoint, log, "--max-active", "2",
-                    "--prefix-cache-entries", "1") as port:
+        with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
             with generate_client(port, {
                 "input_ids": [[32], [33, 33], [34]],
                 "sampling_params": {"max_new_tokens": 2048, "sampling_seed": 0},
@@ -605,8 +601,7 @@ class NativeGenerate(unittest.TestCase):
             environment["SGLANG_TEST_BATCH_ADMISSION_FAILURE"] = "-900"
         self.enterContext(patch.dict("os.environ", environment))
         port = self.enterContext(server(self.binary, self.checkpoint, log,
-                                        "--max-active", str(active),
-                                        "--prefix-cache-entries", "1"))
+                                        "--max-active", str(active)))
         return port, gate, log
 
     def abort_request(self, port, payload, *, status=200):
@@ -952,8 +947,7 @@ class NativeGenerate(unittest.TestCase):
 
     def test_queue_overflow_disconnect_and_reuse(self):
         log = self.output / "queue.log"
-        with server(self.binary, self.checkpoint, log, "--max-active", "1",
-                    "--prefix-cache-entries", "1") as port:
+        with server(self.binary, self.checkpoint, log, "--max-active", "1") as port:
             with queue_client(port, 2048) as active, http.client.HTTPResponse(active) as reply:
                 reply.begin()
                 self.assertEqual(reply.status, 200)

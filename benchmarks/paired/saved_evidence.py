@@ -48,6 +48,24 @@ def device(capture):
                             if key not in {"uuid", "index"}}}
 
 
+def compute_owners(path, gpu, pids):
+    expected = {str(pid) for pid in pids}
+    require(len(expected) == len(pids) and all(pid.isdecimal() and int(pid) > 0
+                                             for pid in expected),
+            f"{path}: invalid expected compute process identities")
+    with path.open(newline="") as stream:
+        rows = [row for row in csv.reader(stream, skipinitialspace=True) if row]
+    require(all(len(row) == 4 and UUID.fullmatch(row[0].strip())
+                and row[1].strip().isdecimal() for row in rows),
+            f"{path}: malformed compute process inventory")
+    on_gpu = [row[1].strip() for row in rows if row[0].strip().lower() == gpu.lower()]
+    elsewhere = [(row[0], row[1]) for row in rows if row[0].strip().lower() != gpu.lower()
+                 and row[1].strip() in expected]
+    require(len(on_gpu) == len(expected) and set(on_gpu) == expected and not elsewhere,
+            f"{path}: expected exactly compute PIDs {sorted(expected)} on {gpu}; "
+            f"saw {on_gpu}, elsewhere {elsewhere}")
+
+
 def observed_device(run, pid, expected, *, before_measurement=False):
     names = ("compute-ready.csv",) if before_measurement else (
         "compute-ready.csv", "compute-measurement-end.csv")

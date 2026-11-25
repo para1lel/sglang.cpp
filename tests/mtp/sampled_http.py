@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batch.run_native import Stream, choose_port, require, stop_server, wait_until_ready, write_json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
-from live_controls import ENTRIES, Controls
+from live_controls import STORES, Controls
 
 
 CHECKPOINT = Path("/data0/shared/Qwen3.8-27B-FP8")
@@ -312,11 +312,10 @@ def check_startup(args):
         (["--mtp-steps", "1"], NO_DEVICE),
         (["--max-active", "5", "--mtp-steps", "1"], NO_DEVICE),
         (["--max-active", "32", "--mtp-k", "4"], NO_DEVICE),
-        (["--max-active", "32", "--prefix-cache-entries", "2"], NO_DEVICE),
+        (["--max-active", "32", "--prefix-cache-entries", "0"], NO_DEVICE),
         (["--max-active", "33", "--mtp-steps", "1"], "--max-active in [1, 32]"),
         (["--max-active", "32", "--mtp-steps", "5"], "--mtp-steps in [0, 4]"),
-        (["--max-active", "4", "--mtp-steps", "4", "--prefix-cache-entries", "2"], NO_DEVICE),
-        (["--mtp-steps", "1", "--prefix-cache-entries", "2", "--eager"], NO_DEVICE),
+        (["--prefix-cache-entries", "2"], "Only --prefix-cache-entries 0 is supported"),
         (["--max-active", "1", "--mtp-steps", "1", "--eager"], NO_DEVICE),
         (["--max-active", "4", "--mtp-steps", "4", "--eager", "--batch-cuda-graphs"],
          NO_DEVICE),
@@ -350,7 +349,7 @@ def checkpoint_prompt():
 
 def check_queue_and_reset(args):
     output = args.evidence / "w2-prefix-queue"
-    flags = ("--batch-cuda-graphs", "--prefix-cache-entries", "2")
+    flags = ("--batch-cuda-graphs", "--lmcache-socket", str(args.lmcache_socket))
     with server(args, output, 2, 0, flags=flags, token_budget=CACHE_BOUNDARY) as (port, _):
         controls = Controls(port, output)
         body = LONG | {"prompt": checkpoint_prompt(), "cache_salt": "sampled-queue"}
@@ -379,7 +378,7 @@ def check_queue_and_reset(args):
         replay_after_reset = transcript(post(port, TEXT, body))
         write_json(output / "wire.json", {"streams": records, "cold": wanted, "survivor": replay,
                                         "after_reset": replay_after_reset})
-        require(before[ENTRIES] > 0 and after[ENTRIES] == 0, (before, after))
+        require(before[STORES] == after[STORES] and before[STORES] > 0, (before, after))
         for key in ("prompt", "tokens", "text", "finish"):
             require(replay[key] == wanted[key] == replay_after_reset[key], key)
         warm_cache = replay["usage"]["prompt_tokens_details"]["cached_tokens"]
@@ -389,7 +388,7 @@ def check_queue_and_reset(args):
 
 def check_eager_cache(args):
     output = args.evidence / "w1-eager-prefix"
-    flags = ("--eager", "--prefix-cache-entries", "2")
+    flags = ("--eager", "--lmcache-socket", str(args.lmcache_socket))
     prompt = checkpoint_prompt()
     body = LONG | {"prompt": prompt + [31], "cache_salt": "sampled-eager"}
     prime = body | {"prompt": prompt, "max_tokens": 1}
@@ -422,7 +421,10 @@ def main():
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--eager-cache-only", action="store_true")
+    parser.add_argument("--lmcache-socket", type=Path)
     args = parser.parse_args()
+    if args.eager_cache_only and not args.lmcache_socket:
+        parser.error("--lmcache-socket is required for --eager-cache-only")
     args.evidence.mkdir(parents=True)
     check_startup(args)
     if args.eager_cache_only:
@@ -438,8 +440,9 @@ def main():
     eager = check_configuration(args, 4, "eager", depths, eager_flag)
     for depth in depths:
         require(graph[depth] == eager[depth], f"Default graph/eager K{depth} differs")
-    check_queue_and_reset(args)
-    check_eager_cache(args)
+    if args.lmcache_socket:
+        check_queue_and_reset(args)
+        check_eager_cache(args)
 
 
 if __name__ == "__main__":

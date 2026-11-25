@@ -142,6 +142,16 @@ cudaError_t text_rms_norm(const __nv_bfloat16* branch, const __nv_bfloat16* resi
                          const __nv_bfloat16* weight, int width, __nv_bfloat16* output,
                          __nv_bfloat16* residual_output, cudaStream_t stream);
 
+struct TextModelStateRow {
+    __nv_bfloat16* hidden = nullptr;
+    __nv_bfloat16* residual = nullptr;
+};
+
+// The bound decoder epilogue publishes its original BF16 model operands as outputs.
+cudaError_t text_final_rms_bound(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
+                                const __nv_bfloat16* weight, __nv_bfloat16* output,
+                                const TextModelStateRow* device_state, cudaStream_t stream);
+
 cudaError_t text_rms_norm_rows(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
                               const __nv_bfloat16* weight, int width, int rows,
                               __nv_bfloat16* output, __nv_bfloat16* residual_output,

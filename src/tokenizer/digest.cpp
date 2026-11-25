@@ -64,7 +64,7 @@ void compress(State& state, const char* block) {
 
 }
 
-std::string sha256(std::string_view bytes) {
+Sha256Digest sha256_digest(std::string_view bytes) {
     State state{
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
         0x1f83d9ab, 0x5be0cd19,
@@ -85,15 +85,29 @@ std::string sha256(std::string_view bytes) {
     if (padded > 64) {
         compress(state, tail.data() + 64);
     }
-    constexpr std::string_view hex = "0123456789abcdef";
-    std::string output;
-    output.reserve(64);
+    Sha256Digest digest;
+    auto* out = digest.data();
     for (const auto word : state) {
-        for (unsigned index = 8; index > 0; --index) {
-            output.push_back(hex[(word >> (4 * (index - 1))) & 0xfU]);
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            *out++ = static_cast<char>(word >> shift);
         }
     }
+    return digest;
+}
+
+std::string format_sha256(const Sha256Digest& digest) {
+    constexpr std::string_view hex = "0123456789abcdef";
+    std::string output(2 * digest.size(), '\0');
+    auto* out = output.data();
+    for (const unsigned char byte : digest) {
+        *out++ = hex[byte >> 4];
+        *out++ = hex[byte & 0xf];
+    }
     return output;
+}
+
+std::string sha256(std::string_view bytes) {
+    return format_sha256(sha256_digest(bytes));
 }
 
 }

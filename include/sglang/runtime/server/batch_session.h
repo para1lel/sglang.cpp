@@ -26,6 +26,7 @@ public:
                                  const DecoderOptions& options,
                                  const std::vector<DecoderMedia>& media) = 0;
     virtual void cancel(int slot) = 0;
+    virtual DecoderBatchPrefixUpdate poll_prefix(int) { return {}; }
     virtual Steps advance_chunked(const Selection& selected, DecoderBatchStepStats* stats) = 0;
 
     /// Report whether the session can continue after an admission or step exception.

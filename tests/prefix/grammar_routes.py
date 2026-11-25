@@ -81,21 +81,21 @@ def warm(routes, cases, reference):
         assert actual == reference[case], (name, actual, reference[case])
         return actual
 
-    chat_hit = reference["chat"]["prompt"] // 128 * 128
-    assert chat_hit > 0
+    text_hit = reference["exact"]["prompt"]
+    chat_hit = reference["chat"]["prompt"]
     verify("cold-exact", "exact", 0, "text")
-    verify("warm-exact", "exact", 128, "text", True)
+    verify("warm-exact", "exact", text_hit, "text", True)
     verify("cold-chat", "chat", 0, "chat")
     verify("warm-chat", "chat", chat_hit, "chat", True)
     route, body, _ = cases["exact"]
     invalid = body | {"cache_salt": "text", "ebnf": "root ::= [a-z]"}
     routes.raw("invalid-grammar", invalid, code=400, route=route)
-    verify("after-invalid", "exact", 128, "text")
+    verify("after-invalid", "exact", text_hit, "text")
 
     barrier = Barrier(4, timeout=10)
-    lanes = (("warm-new-grammar", "new-grammar", 128, "text"),
-             ("warm-suffix", "partial", 128, "text"),
-             ("warm-other-seed", "exact-other-seed", 128, "text"),
+    lanes = (("warm-new-grammar", "new-grammar", text_hit, "text"),
+             ("warm-suffix", "partial", text_hit, "text"),
+             ("warm-other-seed", "exact-other-seed", text_hit, "text"),
              ("cold-mixed", "exact", 0, "unseen"))
 
     def concurrent(lane):
@@ -104,7 +104,7 @@ def warm(routes, cases, reference):
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(concurrent, lanes))
-    verify("after-mixed", "exact", 128, "text")
+    verify("after-mixed", "exact", text_hit, "text")
 
 
 def main():

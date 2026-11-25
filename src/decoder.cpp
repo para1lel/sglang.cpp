@@ -689,7 +689,13 @@ void Decoder::Model::compute_logits(Request& request, bool decode) const {
     compute_logits(request.work, request.memory.stream(), decode);
 }
 
-void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream) const {
+void Decoder::Model::normalize_final(Workspace& work, cudaStream_t stream,
+                                     const TextModelStateRow* state) const {
+    if (state) {
+        check(text_final_rms_bound(work.hidden, work.residual, final_norm, work.normalized,
+                                   state, stream), "Normalize bound final residual");
+        return;
+    }
     check(text_rms_norm(work.hidden, work.residual, final_norm, hidden_size,
                         work.normalized, nullptr, stream), "Normalize final residual");
 }
@@ -707,12 +713,13 @@ bool Decoder::Model::compute_eager_decode_logits(const ForwardLane* lanes, int c
     return true;
 }
 
-void Decoder::Model::compute_decode_logits(const DecodeHeadRows& rows, cudaStream_t stream) const {
+void Decoder::Model::compute_decode_logits(const DecodeHeadRows& rows, cudaStream_t stream,
+                                           const DecodeStateRows* states) const {
     DecodeHeadProjections projections;
     static_assert(std::tuple_size_v<DecodeHeadRows> == std::tuple_size_v<DecodeHeadProjections>);
     for (std::size_t index = 0; index < rows.size(); ++index) {
         auto& work = *rows[index];
-        normalize_final(work, stream);
+        normalize_final(work, stream, states ? (*states)[index] : nullptr);
         projections[index] = {work.normalized, work.logits};
     }
     check(decode_bf16_lm_head_batch(lm_head.values, lm_head.rows, lm_head.columns, projections,
@@ -736,9 +743,10 @@ void Decoder::Model::enqueue_label_logits(Request& request, cudaStream_t stream)
                           cudaMemcpyDeviceToHost, stream), "Read final prompt logits");
 }
 
-void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode) const {
+void Decoder::Model::compute_logits(Workspace& work, cudaStream_t stream, bool decode,
+                                    const TextModelStateRow* state) const {
     if (decode) {
-        normalize_final(work, stream);
+        normalize_final(work, stream, state);
         check(decode_bf16_lm_head(lm_head.values, work.normalized, lm_head.rows, lm_head.columns,
                                   work.logits, stream), "Run decode LM head");
     } else {

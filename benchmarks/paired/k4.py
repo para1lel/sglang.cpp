@@ -18,7 +18,7 @@ import default_evidence as defaults
 import workload_suite
 from identity import verify_stream_end
 from makespan import cohort_makespan_ns, compare, makespan_criterion, validate_cohort
-from saved_evidence import check_native_dispatch, device, digest, fields, load
+from saved_evidence import check_native_dispatch, command, device, digest, fields, load
 from saved_evidence import native_process, read_native_dispatch, require, saved_worker
 
 
@@ -76,7 +76,8 @@ def single_round(identity):
     require("sampling" not in identity or sampling == SINGLE_ROUND_SAMPLING,
             "Unknown K4 sampling policy")
     return (sampling == SINGLE_ROUND_SAMPLING
-            or identity.get("protocol") == workload_suite.PROTOCOL_V5)
+            or identity.get("protocol") in (workload_suite.PROTOCOL_V5,
+                                               *workload_suite.LMCACHE_PROTOCOLS))
 
 
 def current_campaign(identity):
@@ -275,6 +276,14 @@ def native_info(run, identity, *, opt_in):
     return info, "long" if long_split else "1" if split else ""
 
 
+def cache_engine(identity, arm):
+    if arm == "vllm-k4":
+        return "vllm"
+    if identity.get("protocol") in workload_suite.LMCACHE_PROTOCOLS:
+        return "lmcache"
+    return "native"
+
+
 def capture(row, arm, endpoint, fixtures, directory, native_control=None):
     url = urlsplit(endpoint)
     require(url.scheme == "http" and url.hostname == "127.0.0.1" and url.port
@@ -302,7 +311,7 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
     for lane, body, _ in lanes:
         (directory / f'{lane["lane"]:02d}.request.json').write_bytes(body)
     cache_on = cache_on_campaign(selected)
-    engine = "vllm" if arm == "vllm-k4" else "native"
+    engine = cache_engine(identity, arm)
     for tag in schedule(row, arm, identity):
         cache_receipt = cold_cache.before_cohort(url, engine) if cache_on else None
         if row in streaming.SHAPES:
@@ -481,7 +490,7 @@ def assess(row, fixtures, directory):
         tags = schedule(row, arm, identity)
         require({path.name for path in measurement.glob("*.json.gz")}
                 == {f"{tag}.json.gz" for tag in tags}, f"{arm}: wrong cohort set")
-        engine = "vllm" if arm == "vllm-k4" else "native"
+        engine = cache_engine(identity, arm)
         if cache_on:
             cache_receipts[arm] = {}
         warmup_outputs = None
@@ -534,7 +543,7 @@ def assess(row, fixtures, directory):
 
 
 def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measurement=False,
-                         prefix_cache=False, max_seqs=32, token_budget=8192):
+                         prefix_cache=False, max_seqs=32, token_budget=8192, lmcache=False):
     cpus = fields(reservation / "cpus.txt")
     group = "W1-W2" if row in streaming.SHAPES else row
     evidence = saved_worker(run, run, cpus, device(reservation)["uuid"], group, speculative=True,
@@ -550,6 +559,8 @@ def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measuremen
     config = load(run / "server-info.json")["vllm_config"]
     if token_budget == workload_suite.V4_TOKEN_BUDGET:
         defaults.vllm_budget(config, worker, token_budget)
+    if lmcache:
+        defaults.require_vllm_local_apc(config, command(run, "server", cpus))
     spec = config["speculative_config"]
     attention = config["attention_config"]
     if prefix_cache:
@@ -577,11 +588,13 @@ def check_vllm_worker(row, run, reservation, checkpoint, *, before_measurement=F
     selected = campaign(run.parent)
     use_defaults = default_campaign(selected)
     max_seqs = defaults.serving_capacity(selected[0]) if use_defaults else 32
+    lmcache = use_defaults and selected[0]["protocol"] in workload_suite.LMCACHE_PROTOCOLS
     token_budget = defaults.token_budget(selected[0]) if use_defaults else 8192
     evidence, kernels = vllm_worker_evidence(row, run, reservation, checkpoint,
                                              before_measurement=before_measurement,
                                              prefix_cache=cache_on_campaign(selected),
-                                             max_seqs=max_seqs, token_budget=token_budget)
+                                             max_seqs=max_seqs, token_budget=token_budget,
+                                             lmcache=lmcache)
     if before_measurement:
         require(default_campaign(selected), "Expected a native defaults campaign")
         port = defaults.vllm_argv(run, fields(reservation / "cpus.txt"),
@@ -621,10 +634,14 @@ def verify_default_receipts(row, run, identity):
                                              Path(identity["checkpoint_path"]),
                                              prefix_cache=cache_on,
                                              max_seqs=defaults.serving_capacity(identity),
-                                             token_budget=token_budget)
+                                             token_budget=token_budget,
+                                             lmcache=identity["protocol"] in
+                                             workload_suite.LMCACHE_PROTOCOLS)
     require(load(run / "worker-identity.json") == evidence
             and load(run / "attention-kernels.json") == kernels,
             "Saved vLLM worker differs from the resolved receipts")
+    if identity["protocol"] == workload_suite.LMCACHE_GPU_PROTOCOL:
+        defaults.lmcache_evidence.pinned(run, identity, evidence["worker_pid"])
     saved_activity(run, "vllm", ("metrics-before.txt", "metrics-after.txt"), True)
 
 
@@ -756,6 +773,7 @@ def main():
     dispatch.add_argument("pid", type=int)
     environment = modes.add_parser("native-default-environment")
     environment.add_argument("pid", type=int)
+    environment.add_argument("--lmcache", action="store_true")
     native_check = modes.add_parser("native-default-check")
     native_check.add_argument("directory", type=Path)
     args = parser.parse_args()
@@ -783,7 +801,7 @@ def main():
         elif args.mode == "native-dispatch":
             sys.stdout.buffer.write(read_native_dispatch(args.pid))
         elif args.mode == "native-default-environment":
-            sys.stdout.buffer.write(defaults.read_environment(args.pid))
+            sys.stdout.buffer.write(defaults.read_environment(args.pid, lmcache=args.lmcache))
         elif args.mode == "native-default-check":
             selected = campaign(args.directory.parent)
             require(default_campaign(selected), "Expected a native defaults campaign")

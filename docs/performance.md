@@ -16,10 +16,12 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 
 ## Scheduler and reporting policy
 
-Use MTP4, a 32,768-token step budget, and capacity for eight active requests per participating GPU. Enable prefix caching on both engines and measure cold prefixes.
+Use MTP4, a 32,768-token step budget, and capacity for eight active requests per participating GPU. Start each measured cohort with cold prefixes.
 
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-scheduled-tokens 32768` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
-- **Native server.** Use the Release defaults and pass only `--port` for timing. Verify four prefix-cache slots, MTP4, the scheduler limits, and CUDA graphs. [Server information](native-model-info.md#server-information)
+- **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon with 64 GiB CPU L1 on the same physical GPU. [Daemon launcher](../benchmarks/paired/lmcache_arm.sh#L26)<!-- prefix: "start_lmcach" -->
+
+The pinned vLLM arm uses its local prefix cache. Verify `kv_transfer=false` and `kv_offloading_size=null` in the worker receipt. The same check requires zero CPU weight offload. [Worker receipt check](../benchmarks/paired/saved_evidence.py#L223)<!-- prefix: "and worker[\"" -->
 
 The pinned vLLM scheduler scans its running list before its FCFS waiting queue. That list can include an unfinished prompt. Native [reserves ready decode rows before FCFS prefill](batch-graphs.md#runtime-path). Match workload and capacity settings across the engines. [Pinned vLLM running scan](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/v1/core/sched/scheduler.py#L767) · [Waiting scan](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/v1/core/sched/scheduler.py#L1029)
 
@@ -49,13 +51,13 @@ Lengths are exact post-template tokens per request. Multiply offered requests pe
 | W4 | 32,768 | 4,096 | 8 |
 | W5 | 131,072 | 1,024 | 4 |
 
-Use the [server-defaults protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol) for `matched-k4-native-defaults-cache-on-v5`. W4 uses the first eight requests from archived W5. W5 uses all four archived W6 requests. Keep the [warm-prefix diagnostic](../benchmarks/paired/README.md#prefix-reuse-diagnostic) and media variants separate.
+Use the [matched K4 protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol). W4 uses the first eight requests from archived W5. W5 uses all four archived W6 requests. Keep the [warm-prefix diagnostic](../benchmarks/paired/README.md#prefix-reuse-diagnostic) and media variants separate.
 
 ## Measurement
 
 For each W1–W5 row, require native client makespan at most 1.10 times the pinned vLLM makespan. Stop tuning once every row passes. Keep the scheduling rule and workload settings fixed. Improve calculation through CUDA kernels, programmatic dependent launch (PDL), streams, and CUDA Graph replay.
 
-Run one warmup and one measured cohort per item and engine. Use the measured cohort for the verdict. Run long-row profiling separately. W4 can start a fresh formal campaign. Run W5 after W4 passes in that campaign. Run W1–W3 in order and advance after each pass. Validate device identity, launch settings, and every stream’s request, token counts, finish condition, usage, and drain. Require each engine's measured output IDs to match its warmup. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Run one warmup and one measured cohort per item and engine. Use the measured cohort for the verdict and retain the first miss. Run long-row profiling separately. W4 can start a fresh formal campaign. Run W5 after W4 passes in that campaign. Run W1–W3 in order and advance after each pass. Validate device identity, launch settings, and every stream’s request, token counts, finish condition, usage, and drain. Require each engine's measured output IDs to match its warmup. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 Use one streaming client and monotonic clock. Measure from earliest submit to last valid `[DONE]`. Preconnect lanes and release them with one barrier. Send all bodies before the first valid completion. Limit the submit span to 50 ms. Retain submit times, headers, token events, completion times, token counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and other empty events from token counts.
 
@@ -69,7 +71,7 @@ Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane s
 | End-to-end latency (ms) | Time from request submission to its terminal response. Record stream chunking when multiple tokens arrive together. |
 | Requests/s and aggregate tokens/s | Completed requests per cohort second, and total input plus output tokens per cohort second, respectively. |
 
-Exclude startup, model load, JIT compilation, and graph capture from steady measurements. Drain each engine before the warmup and measured cohorts. Send `{}` as `application/json` to its idle reset route. Require success and record cache counters. Start the timer after reset. Require zero cached tokens per request and unchanged prefix-hit counters. Report measured makespan and output throughput as point estimates. Label request-level latency statistics with the sample count and percentile method.
+Exclude startup, model load, JIT compilation, and graph capture from steady measurements. Drain both engines and require an idle reset before every cohort. Require zero cached tokens per request and unchanged prefix-hit counters. Native also requires zero reused GQA, GDN, and draft rows, zero daemon I/O errors, and at least one acknowledged store. Report makespan and throughput as point estimates. State the sample count and percentile method for request latency. [Cold-cache controls](../benchmarks/paired/cold_cache.py#L93)<!-- prefix: "def before_c" -->
 
 Report one row per engine, workload, and mode with absolute metrics and successful and attempted request counts. Use paired throughput ratios and latency differences for diagnosis. Keep archived statistics under their original protocols.
 
@@ -150,13 +152,13 @@ To isolate layer-major verification, compare with row-wise MTP at the same depth
 
 Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. The W3-MTP variant uses four 8,192-token prompts with 1,024 outputs each. Its K1 start exceeds the verification graph's visible limit. [W3-MTP fixture](../benchmarks/variants/README.md) · [Graph limit](mtp.md#target-verification-graph)
 
-Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L242)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L190)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L981)<!-- prefix: "result.mtp_r" -->
+Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L242)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L190)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L916)<!-- prefix: "result.mtp_r" -->
 
 Use `--trace-batches` at any capacity in a separate run. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder_verify.cpp#L312)<!-- prefix: "bool MtpRoun" -->
 
 Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../include/sglang/server/batch_trace.h#L14)<!-- prefix: "inline void " -->
 
-See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L978)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L893)<!-- prefix: "if (stats) c" -->
+See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L913)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L826)<!-- prefix: "if (stats) c" -->
 
 ## Correctness, memory, and diagnosis
 
@@ -174,9 +176,12 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-### Current single-round v5
+Formal direct GPU results are pending. The earlier private host-staging campaign applies to its own candidate.
 
-Both engines ran on the same B200 for each row. GPU 7 ran W1–W3 and GPU 6 ran W4–W5. Both used MTP4, a 32,768-token step budget, eight slots, and a cold reset of the enabled prefix cache before every cohort. Each engine ran one warmup and one measured cohort. The table shows the measured makespan.
+<a id="current-single-round-v5"></a>
+### Archived single-round v5
+
+This campaign used the former native device-resident prefix cache. GPU 7 ran W1–W3 and GPU 6 ran W4–W5. Both engines used MTP4, a 32,768-token step budget, eight slots, and cold cache resets. Each engine ran one warmup and one measured cohort.
 
 | Row | Native (s) | Pinned vLLM (s) | Native / vLLM | Verdict |
 | --- | ---: | ---: | ---: | --- |

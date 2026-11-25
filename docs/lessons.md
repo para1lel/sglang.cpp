@@ -14,9 +14,9 @@ The [commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check
 
 **Corrected.** Prefix store and restore assumed that logical and physical page indices matched. The identity case passed. With logical page zero at physical page one, the remapped case reported `Key payload mismatch`.
 
-The [page-map reader](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "GpuPrefixSna" --> now supplies physical indices for both transfers. Store gathers into logical order. Restore scatters into the destination mapping. The selected correction passed the remap and guard checks.
+The former resident cache fixed both transfers with one physical page-map reader. Store gathered into logical order. Restore scattered into the destination mapping. The fix passed the remap and guard checks. [Historical page-map reader](https://github.com/para1lel/sglang.cpp/blob/a7583f7b6346b5eb91aba2cba4748a6461e60fb4/src/decoder_prefix_cache.cpp#L151)<!-- prefix: "GpuPrefixSna" -->
 
-Run `prefix-state --remapped` and `prefix-state --guards` after changes to KV copies. Use the [B200 build and run procedure](../tests/prefix/README.md). Keep independent source and destination permutations and check all four KV planes and untouched tail pages.
+Keep independent source and destination permutations in KV-copy tests. Compare all four KV planes and untouched tail pages. [Former B200 remap and guard procedure](https://github.com/para1lel/sglang.cpp/blob/a7583f7b6346b5eb91aba2cba4748a6461e60fb4/tests/prefix/README.md#cuda-state-and-routes) · [Current LMCache verification](prefix-cache.md#verification)
 
 ## L003 · Patch and anchor provenance
 
@@ -88,7 +88,7 @@ The scripted clock advances by three seconds per decode step. Both text and chat
 
 ## L009 · Terminal error during first packed decode setup
 
-The original first-use handler caught every CUDA error from packed setup. An injected illegal-address status at setup synchronization reached legacy dispatch. The repair permits legacy dispatch only for packed scratch allocation OOM after the CUDA error check and release of partial allocations. A terminal status reaches the batch handler and disables the batch before any legacy submission or decode publication. [Batch error handler](../src/decoder_batch.cpp#L953)<!-- prefix: "} catch (con" -->
+The original first-use handler caught every CUDA error from packed setup. An injected illegal-address status at setup synchronization reached legacy dispatch. The repair permits legacy dispatch only for packed scratch allocation OOM after the CUDA error check and release of partial allocations. A terminal status reaches the batch handler and disables the batch before any legacy submission or decode publication. [Batch error handler](../src/decoder_batch.cpp#L888)<!-- prefix: "} catch (con" -->
 
 The initial repair still attempted setup for two one-row prefills or one decode with one one-row prefill. The independent fault probe disabled the batch in both cases. The second repair selects at least two packable lanes and a bucket before requesting scratch. It uses the same plan for binding. Both corrected controls published their expected results without hitting the fault. [Setup order](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L524)<!-- prefix: "if (!PackedD" -->
 

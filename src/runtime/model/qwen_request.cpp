@@ -56,9 +56,8 @@ void validate_batch_options(const DecoderBatchOptions& options) {
     if (options.max_lanes < 1 || options.max_lanes > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch capacity");
     }
-    if (options.prefix_cache_entries < 0 ||
-        options.prefix_cache_entries > decoder_batch_prefix_max_entries) {
-        throw std::invalid_argument("Invalid prefix cache capacity");
+    if (options.prefix_cache_entries != 0) {
+        throw std::invalid_argument("Local prefix cache capacity is unsupported with LMCache");
     }
     if (options.max_num_batched_tokens < 0 ||
         options.max_num_batched_tokens > decoder_batch_max_step_tokens) {
@@ -255,6 +254,7 @@ Request::Request(int device, int capacity, std::shared_ptr<const void> owners, b
 }
 
 void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv) {
+    cached_gqa_tokens = 0;
     kv_limit = maximum_kv;
     const int page_count = pages_for(capacity);
     const int table_pages = std::max(page_count, pages_for(maximum_kv));
@@ -270,6 +270,7 @@ void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv) {
 }
 
 void Request::grow_kv(int positions, int written, cudaStream_t stream) {
+    written = std::max(written, cached_gqa_tokens);
     const int needed = pages_for(positions);
     const int previous = pages.page_count;
     if (needed <= previous) {

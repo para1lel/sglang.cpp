@@ -229,6 +229,28 @@ std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t
     emit("sglang_cpp:prefix_cache_draft_cached_rows_total", metrics.cache.draft_cached_rows);
     emit("sglang_cpp:prefix_cache_draft_prefill_rows_total", metrics.cache.draft_prefill_rows);
     emit("sglang_cpp:prefix_cache_draft_misses_total", metrics.cache.draft_misses);
+    emit("sglang_cpp:lmcache_enabled", metrics.lmcache.enabled);
+    emit("sglang_cpp:lmcache_available", metrics.lmcache.available);
+    emit("sglang_cpp:lmcache_lookup_misses_total", metrics.lmcache.lookup_misses);
+    emit("sglang_cpp:lmcache_io_errors_total", metrics.lmcache.io_errors);
+    emit("sglang_cpp:lmcache_stores_total", metrics.lmcache.stores);
+    emit("sglang_cpp:lmcache_declined_stores_total", metrics.lmcache.declined_stores);
+    emit("sglang_cpp:lmcache_gqa_restored_tokens_total", metrics.cache.gqa_restored_tokens);
+    emit("sglang_cpp:lmcache_gqa_read_only_tokens_total", metrics.cache.gqa_read_only_tokens);
+    emit("sglang_cpp:lmcache_gqa_computed_tokens_total", metrics.cache.gqa_computed_tokens);
+    emit("sglang_cpp:lmcache_gqa_written_tokens_total", metrics.lmcache.gqa_written_tokens);
+    emit("sglang_cpp:lmcache_gdn_restored_tokens_total", metrics.cache.cached_tokens);
+    emit("sglang_cpp:lmcache_gdn_computed_tokens_total", metrics.cache.prefill_tokens);
+    emit("sglang_cpp:lmcache_draft_restored_rows_total", metrics.cache.draft_cached_rows);
+    emit("sglang_cpp:lmcache_gqa_read_bytes_total", metrics.lmcache.gqa_read_bytes);
+    emit("sglang_cpp:lmcache_gdn_read_bytes_total", metrics.lmcache.gdn_read_bytes);
+    emit("sglang_cpp:lmcache_draft_read_bytes_total", metrics.lmcache.draft_read_bytes);
+    emit("sglang_cpp:lmcache_gqa_written_bytes_total", metrics.lmcache.gqa_written_bytes);
+    emit("sglang_cpp:lmcache_gdn_written_bytes_total", metrics.lmcache.gdn_written_bytes);
+    emit("sglang_cpp:lmcache_draft_written_bytes_total", metrics.lmcache.draft_written_bytes);
+    emit("sglang_cpp:lmcache_lookup_nanoseconds_total", metrics.lmcache.lookup_ns);
+    emit("sglang_cpp:lmcache_write_nanoseconds_total", metrics.lmcache.write_ns);
+    emit("sglang_cpp:lmcache_restore_nanoseconds_total", metrics.lmcache.restore_ns);
     return text;
 }
 

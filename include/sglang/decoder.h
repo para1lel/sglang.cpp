@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -19,6 +21,8 @@ class MediaDecoderCheck;
 
 namespace decoder {
 struct CudaBackendPolicy;
+struct PrefixCacheRead;
+struct PrefixDeviceTransfer;
 }
 
 inline constexpr int decoder_max_mtp_steps = 4;
@@ -61,6 +65,11 @@ struct DecoderOptions {
     std::shared_ptr<const std::vector<int>> label_token_ids = nullptr;
     std::function<int(const int*, int, bool)> text_stop = {};
     std::function<bool()> claim_completion = {};
+    std::shared_ptr<const decoder::PrefixCacheRead> prefix_cache_read = nullptr;
+    // The completion must become ready only once the connector no longer borrows the view.
+    std::function<std::shared_future<bool>(const decoder::PrefixDeviceTransfer&, bool,
+                                           const int*, int)> submit_prefix_transfer = {};
+    bool publish_prefix_checkpoints = true;
 
     bool samples() const { return temperature >= 1e-6 && top_k != 1; }
 

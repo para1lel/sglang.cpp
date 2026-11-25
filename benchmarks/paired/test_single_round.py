@@ -41,7 +41,8 @@ def test_current_rounds_and_archived_rounds():
 
 
 @pytest.mark.parametrize("profile,row", [
-    ("server-defaults", "W4"), ("server-defaults-cache-on-v3", "W4"),
+    ("server-defaults", "W4"), ("server-defaults-cache-on-v5", "W4"),
+    ("server-defaults-cache-on-v3", "W4"),
     ("server-defaults-cache-on-v2", "W6"), ("server-defaults-cache-off", "W6"),
     ("exact", "W6"), ("ordered-tc-int8", "W6"),
     ("ordered-tc-int8-split-gqa", "W6"), ("ordered-tc-int8-long-split-gqa", "W6"),

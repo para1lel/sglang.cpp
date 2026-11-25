@@ -14,11 +14,19 @@ WAITING = "vllm:num_requests_waiting"
 HITS = "vllm:prefix_cache_hits_total"
 ENTRIES = "sglang_cpp:prefix_cache_entries"
 PAGES = "sglang_cpp:prefix_cache_pages"
+STORES = "sglang_cpp:prefix_cache_stores_total"
 IDLE_TIMEOUT = 30
 METRIC = re.compile(r"([\w:]+)(?:\{.*\})?\s+(\S+)")
+LMCACHE_REUSE = tuple("sglang_cpp:lmcache_" + name + "_total" for name in (
+    "io_errors", "gqa_restored_tokens", "gqa_read_only_tokens", "gdn_restored_tokens",
+    "draft_restored_rows",
+))
+LMCACHE_METRICS = LMCACHE_REUSE + tuple("sglang_cpp:lmcache_" + name + "_total" for name in (
+    "lookup_misses", "gqa_computed_tokens", "gqa_written_tokens", "gdn_computed_tokens",
+))
 NATIVE_METRICS = (
     ENTRIES, PAGES, "sglang_cpp:prefix_cache_device_bytes",
-    "sglang_cpp:prefix_cache_hits_total", "sglang_cpp:prefix_cache_stores_total",
+    "sglang_cpp:prefix_cache_hits_total", STORES,
     "sglang_cpp:prefix_cache_evictions_total", "sglang_cpp:prefix_cache_draft_device_bytes",
     "sglang_cpp:prefix_cache_draft_cached_rows_total",
     "sglang_cpp:prefix_cache_draft_prefill_rows_total",
@@ -30,6 +38,8 @@ def metrics(text, engine):
     names = (RUNNING, WAITING, HITS)
     if engine == "native":
         names += NATIVE_METRICS
+    elif engine == "lmcache":
+        names += (*LMCACHE_METRICS, STORES)
     result = {}
     for line in text.splitlines():
         match = METRIC.fullmatch(line)
@@ -118,6 +128,13 @@ def replay(raw, engine):
             "Reset or metrics snapshot overlaps the timed cohort")
     require(snapshots["cleared"][HITS] == snapshots["after"][HITS],
             "Prefix cache hit counter advanced during a cold cohort")
+    if engine == "lmcache":
+        require(all(snapshots["cleared"][name] == snapshots["after"][name]
+                    for name in LMCACHE_REUSE),
+                "LMCache reused state or reported an I/O error during a cold cohort")
+        require(snapshots["cleared"][STORES] == snapshots["before"][STORES]
+                and snapshots["after"][STORES] > snapshots["cleared"][STORES],
+                "LMCache did not acknowledge any checkpoint stores during the cold cohort")
     if engine == "native":
         require(snapshots["cleared"][ENTRIES] == snapshots["cleared"][PAGES] == 0,
                 "Native cache is occupied after reset")

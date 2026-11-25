@@ -195,6 +195,9 @@ cudaError_t mrope_gqa_preprocess(const MropePosition* positions, int rows,
                                 const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
                                 __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
                                 cudaStream_t stream);
+cudaError_t prefill_gqa_queries(int position, const MropePosition* positions, int rows,
+                                const __nv_bfloat16* q_gate, const __nv_bfloat16* norm,
+                                __nv_bfloat16* queries, cudaStream_t stream);
 cudaError_t mrope_gqa_preprocess_keys(const MropePosition* positions, int rows,
                                      const __nv_bfloat16* keys, const __nv_bfloat16* k_norm,
                                      __nv_bfloat16* rope_keys, cudaStream_t stream);

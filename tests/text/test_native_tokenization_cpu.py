@@ -128,7 +128,7 @@ class NativeTokenization(unittest.TestCase):
         with TemporaryDirectory(dir=self.output) as directory:
             checkpoint = Path(directory)
             log = self.output / "missing-tokenizer.log"
-            with server(self.binary, checkpoint, log) as port:
+            with server(self.binary, checkpoint, log, "--prefix-cache-entries", "0") as port:
                 self.check_error(post(port, TOKENIZE[0], {"prompt": "x"}),
                                  500, "InternalServerError")
                 self.check_error(post(port, DETOKENIZE[0], {"tokens": [87]}),
@@ -148,8 +148,7 @@ class NativeTokenization(unittest.TestCase):
                 gate = Path(directory) / "step"
                 log = self.output / f"queue-{index}.log"
                 with patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)), \
-                     server(self.binary, self.checkpoint, log, "--max-active", "1",
-                            "--prefix-cache-entries", "1") as port:
+                     server(self.binary, self.checkpoint, log, "--max-active", "1") as port:
                     self.check_queue(port, log, queued_route, body, expected,
                                      overflow, overflow_body)
                 self.assertEqual(log.read_text().count("cpu admit"), 1)

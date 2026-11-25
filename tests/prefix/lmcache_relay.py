@@ -1,0 +1,281 @@
+"""Observe and control the real LMCache Unix transport for live prefix tests."""
+
+from io import BytesIO
+from pathlib import Path
+import socket
+import socketserver
+import struct
+import threading
+from time import monotonic, perf_counter_ns, sleep
+
+
+HEADER = struct.Struct("!4sIQ")
+MAGIC = b"SLC2"
+READY, LOOKUP, GET, PUT, RESET, ERASE, PREFIX, LEASE = range(1, 9)
+ADMISSION = struct.Struct("!16s16sI")
+RECEIPT = struct.Struct("!QQQI")
+RECORD = struct.Struct("!QII")
+REGION = struct.Struct("!I5QI")
+GQA, GDN, DRAFT = range(1, 4)
+TIMEOUT = 30
+
+
+def receive(sock, size):
+    payload = bytearray(size)
+    pending = memoryview(payload)
+    while pending:
+        count = sock.recv_into(pending)
+        if not count:
+            raise EOFError("Incomplete LMCache frame")
+        pending = pending[count:]
+    return bytes(payload)
+
+
+def header(sock):
+    raw = receive(sock, HEADER.size)
+    magic, code, size = HEADER.unpack(raw)
+    if magic != MAGIC:
+        raise ValueError("Unexpected LMCache frame magic")
+    return raw, code, size
+
+
+def field(value):
+    return struct.pack("!H", len(value)) + value
+
+
+def key_body(key):
+    family, identity = key
+    return bytes((family,)) + field(identity)
+
+
+def send(sock, namespace, opcode, payload):
+    body = field(namespace.encode("utf-8")) + payload
+    sock.sendall(HEADER.pack(MAGIC, opcode, len(body)) + body)
+    _, status, size = header(sock)
+    return status, size
+
+
+def control(path, namespace, opcode, payload=b""):
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(TIMEOUT)
+        sock.connect(str(path))
+        status, size = send(sock, namespace, opcode, payload)
+        if size > 4096:
+            raise ValueError("Unexpected LMCache control reply size")
+        return status, receive(sock, size)
+
+
+def frame_metadata(opcode, payload):
+    view = BytesIO(payload)
+
+    def read(size):
+        part = view.read(size)
+        if len(part) != size:
+            raise ValueError("Incomplete LMCache request metadata")
+        return part
+
+    def number(size):
+        return int.from_bytes(read(size), "big")
+
+    def read_field():
+        return read(number(2))
+
+    def read_key():
+        return number(1), read_field()
+
+    entry = {"opcode": opcode, "namespace": read_field().decode(), "keys": []}
+    if opcode in (GET, PUT):
+        entry["device"] = read(16).hex()
+        read(64)
+        entry["allocations"] = number(4)
+        read(72 * entry["allocations"])
+        records = []
+        for _ in range(number(4)):
+            entry["keys"].append(read_key())
+            size, tokens, regions = RECORD.unpack(read(RECORD.size))
+            read(REGION.size * regions)
+            records.append({"bytes": size, "tokens": tokens, "regions": regions})
+        entry["records"] = records
+    elif opcode == PREFIX:
+        count, limit, draft = struct.unpack("!IIB", read(9))
+        read(64 * count)
+        entry["coverage_query"] = {"count": count, "limit": limit, "draft": draft}
+    elif opcode == LEASE:
+        entry["incarnation"], entry["lease"] = read(16).hex(), read(16).hex()
+    elif opcode in (LOOKUP, ERASE):
+        count = number(4) if opcode == LOOKUP else 1
+        entry["keys"] = [read_key() for _ in range(count)]
+    if view.read(1):
+        raise ValueError("Trailing LMCache request metadata")
+    return entry
+
+
+class Barrier:
+    def __init__(self, opcode, family, *, phase, drop, skip):
+        self.opcode = opcode
+        self.family = family
+        self.phase = phase
+        self.drop = drop
+        self.skip = skip
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.entry = None
+
+    def wait(self):
+        if not self.entered.wait(TIMEOUT):
+            raise TimeoutError("Expected real LMCache reply did not reach the relay")
+        return self.entry
+
+
+class Request(socketserver.BaseRequestHandler):
+    def forward_arm(self, remote, entry):
+        raw, status, size = header(remote)
+        body = receive(remote, size)
+        if status != 4:
+            return raw, status, body
+        incarnation, token, pid = ADMISSION.unpack(body)
+        peer, _, _ = struct.unpack(
+            "3i", remote.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if pid != peer:
+            raise ValueError("Lease admission does not name the upstream daemon")
+        self.request.sendall(raw + body)
+        arm = receive(self.request, 1)
+        if arm != b"\x01":
+            raise ValueError("Invalid native lease arm")
+        remote.sendall(arm)
+        entry.update(incarnation=incarnation.hex(), lease=token.hex(), daemon_pid=pid,
+                     status=4, armed_ns=perf_counter_ns())
+        if not self.deliver(entry, "arm"):
+            return None
+        raw, status, size = header(remote)
+        return raw, status, receive(remote, size)
+
+    def deliver(self, entry, phase):
+        barrier = self.server.observe(entry, phase)
+        if barrier is None:
+            return True
+        if not barrier.release.wait(TIMEOUT):
+            raise TimeoutError("LMCache relay barrier was not released")
+        if barrier.drop:
+            entry["forwarded"] = False
+        return not barrier.drop
+
+    def handle(self):
+        self.request.settimeout(TIMEOUT)
+        entry = None
+        try:
+            raw, opcode, size = header(self.request)
+            payload = receive(self.request, size)
+            entry = frame_metadata(opcode, payload)
+            with socket.socket(socket.AF_UNIX) as remote:
+                remote.settimeout(TIMEOUT)
+                remote.connect(str(self.server.upstream))
+                remote.sendall(raw + payload)
+                if opcode in (GET, PUT):
+                    result = self.forward_arm(remote, entry)
+                    if result is None:
+                        return
+                    reply, status, body = result
+                    if status == 0:
+                        entry["receipt"] = RECEIPT.unpack(body)
+                else:
+                    reply, status, length = header(remote)
+                    body = receive(remote, length)
+                    if opcode == PREFIX and status == 0:
+                        entry["coverage"] = struct.unpack("!IIII", body)
+                entry.update(status=status, response_bytes=len(body), reply_ns=perf_counter_ns())
+                if self.deliver(entry, "reply"):
+                    self.request.sendall(reply + body)
+                    entry["forwarded"] = True
+        except (ConnectionError, EOFError, TimeoutError, ValueError, struct.error) as error:
+            with self.server.guard:
+                self.server.errors.append(str(error))
+        finally:
+            self.server.completed(entry)
+
+
+class Relay(socketserver.ThreadingUnixStreamServer):
+    def __init__(self, path, upstream):
+        self.upstream = upstream
+        self.guard = threading.Lock()
+        self.entries = []
+        self.errors = []
+        self.barrier = None
+        super().__init__(str(path), Request)
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.serve_forever)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self.barrier is not None:
+            self.barrier.release.set()
+        self.shutdown()
+        self.thread.join()
+        self.server_close()
+
+    def observe(self, entry, phase):
+        with self.guard:
+            if phase == "reply":
+                self.entries.append(entry)
+            barrier = self.barrier
+            if (barrier is None or barrier.entered.is_set() or entry["opcode"] != barrier.opcode
+                    or phase != barrier.phase or entry["status"] != (4 if phase == "arm" else 0)
+                    or (barrier.family is not None and
+                        not any(family == barrier.family for family, _ in entry["keys"]))):
+                return None
+            if barrier.skip:
+                barrier.skip -= 1
+                return None
+            if phase == "arm":
+                self.entries.append(entry)
+            barrier.entry = entry
+            barrier.entered.set()
+            return barrier
+
+    def completed(self, entry):
+        with self.guard:
+            if entry is not None and self.barrier is not None and self.barrier.entry is entry:
+                self.barrier.finished.set()
+
+    def arm(self, opcode, family=None, *, phase="reply", drop=False, skip=0):
+        with self.guard:
+            if self.barrier is not None and not self.barrier.finished.is_set():
+                raise ValueError("LMCache relay already has an outstanding barrier")
+            self.barrier = Barrier(opcode, family, phase=phase, drop=drop, skip=skip)
+            return self.barrier
+
+    def since(self, index=0):
+        with self.guard:
+            return [dict(entry) for entry in self.entries[index:]]
+
+
+def install_device_fence(directory):
+    """Hold one real H2D operation before its stream fence and CUDA IPC unmap."""
+    from sglang_gpu_transfer import TransferDirection, device_ops
+
+    path = Path(directory)
+    execute = device_ops.execute_object_group_transfer
+    claim = threading.Lock()
+
+    def gated(direction, *args, **kwargs):
+        hold = False
+        if direction == TransferDirection.H2D:
+            with claim:
+                armed = path / "arm"
+                if armed.exists():
+                    armed.unlink()
+                    hold = True
+        result = execute(direction, *args, **kwargs)
+        if hold:
+            (path / "entered").touch()
+            deadline = monotonic() + TIMEOUT
+            while not (path / "release").exists() and monotonic() < deadline:
+                sleep(0.01)
+            if not (path / "release").exists():
+                raise TimeoutError("Real LMCache stream fence was not released")
+        return result
+
+    device_ops.execute_object_group_transfer = gated

@@ -249,6 +249,7 @@ void DecoderBatch::cancel(int) { std::abort(); }
 bool DecoderBatch::available() const { return true; }
 std::size_t DecoderBatch::request_device_allocation_bytes() const { return 0; }
 DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const { return {}; }
+DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int) { std::abort(); }
 
 void DecoderBatch::reset_prefix_cache() {
     std::lock_guard lock(fixture.mutex);

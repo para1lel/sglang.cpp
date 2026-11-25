@@ -180,6 +180,8 @@ void handle_errors(const Socket& connection, const Handle& handle) {
         handle();
     } catch (const HttpError& error) {
         write_error(connection, error.status, error.what());
+    } catch (const CacheResetUnavailable& error) {
+        write_error(connection, "503 Service Unavailable", error.what());
     } catch (const DecoderCapacityError& error) {
         const char* status = error.retryable ? "503 Service Unavailable" : "413 Content Too Large";
         write_error(connection, status, error.what());

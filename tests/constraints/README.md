@@ -33,6 +33,7 @@ unsupported patterns, and agreement of the dense mask with the ID list.
 
 The HTTP checks preserve raw JSON responses and event streams. Select an idle
 GPU before starting the server.
+Set `LMCACHE_SOCKET` to an isolated, ready [LMCache daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon) for the cache case.
 
 ```bash
 server="$build/bin/sglang-server"
@@ -47,7 +48,7 @@ for width in 1 4; do
     done
 done
 python "$tests/integration.py" "$server" "$checkpoint" "$evidence/tensor-prefix" \
-    --width 4 --graph --prefill tensor-core --cache-entries 4
+    --width 4 --graph --prefill tensor-core --lmcache-socket "$LMCACHE_SOCKET"
 ```
 
 The native probe compares serial and batched token IDs with depth-zero controls.

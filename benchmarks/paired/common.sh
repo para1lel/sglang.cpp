@@ -153,8 +153,13 @@ stop_group() {
 start_group() {
     local run=$1
     shift
-    check_idle || return
+    if [[ -z ${lmcache_pid:-} ]]; then
+        check_idle || return
+    fi
     record_compute "$run/compute-before.csv" || return
+    if [[ -n ${lmcache_pid:-} ]]; then
+        check_compute_owners "$run/compute-before.csv" "$lmcache_pid" || return
+    fi
     if curl --noproxy '*' -fsS --max-time 1 "$url/health" >/dev/null 2>&1; then
         echo "A server already responds on $url" >&2
         return 1

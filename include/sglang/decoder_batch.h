@@ -16,10 +16,14 @@ inline constexpr int decoder_batch_max_step_tokens = 32768;
 inline constexpr int decoder_batch_max_graph_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_steps = decoder_max_mtp_steps;
-inline constexpr int decoder_batch_prefix_max_entries = 4;
 inline constexpr int decoder_batch_prefix_checkpoint_interval = 8192;
 inline constexpr int decoder_batch_prefix_max_tokens =
     decoder::QwenTextModel::max_position_embeddings;
+
+struct DecoderBatchPrefixUpdate {
+    bool pending = false;
+    std::optional<int> restored;
+};
 
 struct DecoderBatchStep {
     std::optional<int> token;
@@ -40,6 +44,7 @@ struct DecoderBatchStep {
         extra_generated_logprobs{};
     std::shared_ptr<const DecoderPromptLogprobs> prompt_logprobs = nullptr;
     std::shared_ptr<const std::vector<double>> label_logprobs = nullptr;
+    bool prefix_pending = false;
 };
 
 struct DecoderBatchStepStats {
@@ -78,6 +83,9 @@ struct DecoderPrefixCacheStats {
     std::uint64_t draft_cached_rows = 0;
     std::uint64_t draft_prefill_rows = 0;
     std::uint64_t draft_misses = 0;
+    std::uint64_t gqa_restored_tokens = 0;
+    std::uint64_t gqa_read_only_tokens = 0;
+    std::uint64_t gqa_computed_tokens = 0;
 };
 
 /// The Decoder must outlive the batch. Use one host thread to operate a batch.
@@ -93,6 +101,7 @@ public:
     int admit_multimodal(int slot, std::vector<int> prompt, const DecoderOptions& options,
                          const std::vector<DecoderMedia>& media);
     void cancel(int slot);
+    DecoderBatchPrefixUpdate poll_prefix(int slot);
 
     /// Advance each selected slot by one position or one speculative round.
     /// Consume token and the first extra_token_count entries of extra_tokens in order.

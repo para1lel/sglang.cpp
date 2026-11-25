@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_media.h"
 #include "sglang/runtime/server/batch_executor.h"
+#include "sglang/runtime/server/batch_cache.h"
 
 #include <atomic>
 #include <chrono>
@@ -16,6 +17,7 @@ struct BatchMetrics {
     std::uint64_t prompt_tokens = 0;
     std::uint64_t generation_tokens = 0;
     std::uint64_t prefill_requests = 0;
+    LmCacheMetrics lmcache;
 };
 
 struct BatchRuntimeState {
@@ -128,6 +130,8 @@ struct BatchCallbacks {
 class BatchService {
 public:
     BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps = 0);
+    BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
+                 std::unique_ptr<decoder::LmCacheClient> cache, std::string cache_identity);
     ~BatchService();
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
                            const DecoderCallbacks& callbacks,

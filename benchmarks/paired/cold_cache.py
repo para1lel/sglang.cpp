@@ -55,6 +55,10 @@ def metrics(text, engine):
         names += (*LMCACHE_METRICS, STORES)
         if engine == LMCACHE_DRAIN:
             names += LMCACHE_DRAIN_METRICS
+    return parse_metrics(text, names)
+
+
+def parse_metrics(text, names):
     result = {}
     for line in text.splitlines():
         match = METRIC.fullmatch(line)

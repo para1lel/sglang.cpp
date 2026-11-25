@@ -74,6 +74,10 @@ def verify(run, reservation, devices, row, checkpoint, vllm_root, ready_only):
     workers = load(run / "effective-worker.json")["results"]
     inventories = [run / "compute-ready.csv"]
     if not ready_only:
+        end = load(run / "effective-worker-end.json")["results"]
+        order = lambda worker: worker["identity"]["rank"]
+        require(sorted(workers, key=order) == sorted(end, key=order),
+                "Changed TP2 worker identity, dispatch or configuration during measurement")
         inventories.append(run / "compute-measurement-end.csv")
         require((run / "live-environment-end.bin").read_bytes()
                 == (run / "live-environment.bin").read_bytes(), "Changed server environment")
@@ -105,7 +109,7 @@ def verify(run, reservation, devices, row, checkpoint, vllm_root, ready_only):
                 "Worker vLLM module outside pinned environment")
         worker_settings(run, worker, argv, group, speculative=True, prefix_cache=True,
                         max_seqs=suite.serving_capacity(2), paired_budget=budget, tp=2)
-        k4.verify_vllm_model(worker, config, checkpoint, budget, True)
+        k4.verify_vllm_model(worker, config, checkpoint, budget, True, tp=2)
         verify_dispatch(worker)
     return {"vllm_commit": revision, "stage": "ready" if ready_only else "completed",
             "ranks": ranks, "workload": suite.geometry(row, 2), "token_budget": budget,

@@ -567,7 +567,7 @@ def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measuremen
     return evidence, attention_kernels(run)
 
 
-def verify_vllm_model(worker, config, checkpoint, token_budget, prefix_cache):
+def verify_vllm_model(worker, config, checkpoint, token_budget, prefix_cache, *, tp=1):
     reference = concurrent.reference()["observed_vllm_settings"]
     require(all(worker[key] == reference[key] for key in ("vllm", "torch", "torch_cuda"))
             and worker["scheduler"]["max_num_scheduled_tokens_effective"] == token_budget,
@@ -579,9 +579,19 @@ def verify_vllm_model(worker, config, checkpoint, token_budget, prefix_cache):
     attention = config["attention_config"]
     if prefix_cache:
         cache = config["cache_config"]
-        require(all(cache[key] == worker["cache"][key] for key in (
-            "enable_prefix_caching", "mamba_cache_mode", "block_size", "mamba_block_size")),
-            "vLLM API and worker disagree about resolved hybrid prefix caching")
+        keys = ("enable_prefix_caching", "mamba_cache_mode", "block_size")
+        require(all(cache[key] == worker["cache"][key] for key in keys),
+                "vLLM API and worker disagree about resolved hybrid prefix caching")
+        if tp == 2:
+            # Multiproc workers align Mamba pages locally. The core's API handshake
+            # can retain the initial 64-token Mamba setting after updating block_size.
+            require(cache["mamba_cache_mode"] == "align" and not cache["user_specified_block_size"]
+                    and worker["cache"]["mamba_block_size"] == cache["block_size"]
+                    and cache["mamba_block_size"] in (64, cache["block_size"]),
+                    "Incorrect TP2 worker-local aligned Mamba pages")
+        else:
+            require(cache["mamba_block_size"] == worker["cache"]["mamba_block_size"],
+                    "vLLM API and worker disagree about resolved hybrid prefix caching")
     require(spec["method"] == "mtp" and type(spec["num_speculative_tokens"]) is int
             and spec["num_speculative_tokens"] == 4
             and Path(spec["model"]).resolve() == checkpoint

@@ -25,7 +25,7 @@ DAEMON_SOURCES = ("serve.sh", "sglang_lmcache.py", "sglang_gpu_transfer.py", "re
 WHEEL_SHA256 = "4ec775bda3a8c5f1f5b1ef0bbc441b666db86b57c3c2a7bcba47a4f6550b07cd"
 
 
-def ready(path, pid, wire="SLC2"):
+def ready(path, pid, wire="SLC2", namespace="sglang"):
     expected_magic = wire.encode()
     expected = (LMCACHE_SLC3_READY if wire == "SLC3" else LMCACHE_VERSION).encode()
     before = os.lstat(path)
@@ -36,7 +36,8 @@ def ready(path, pid, wire="SLC2"):
             socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
         if uid != os.geteuid() or peer != pid:
             raise ValueError("LMCache Unix socket peer differs from the launched daemon")
-        body = struct.pack("!H", 6) + b"sglang"
+        encoded = namespace.encode("ascii")
+        body = struct.pack("!H", len(encoded)) + encoded
         connection.sendall(FRAME.pack(expected_magic, 1, len(body)) + body)
         with connection.makefile("rb") as reply:
             header = reply.read(FRAME.size)
@@ -48,7 +49,7 @@ def ready(path, pid, wire="SLC2"):
                     "Unexpected LMCache readiness response")
     require(os.path.samestat(before, os.lstat(path)), "LMCache readiness endpoint was replaced")
     stat = (Path("/proc") / str(peer) / "stat").read_text().rsplit(")", 1)[1].split()
-    receipt = {"socket": str(path), "version": LMCACHE_VERSION, "namespace": "sglang",
+    receipt = {"socket": str(path), "version": LMCACHE_VERSION, "namespace": namespace,
                "group_pid": pid, "peer_pid": peer, "peer_uid": uid,
                "peer_start_ticks": int(stat[19]), "frame": (header + payload).hex()}
     if wire == "SLC3":
@@ -57,12 +58,12 @@ def ready(path, pid, wire="SLC2"):
     return receipt
 
 
-def wait_ready(path, pid, wire="SLC2"):
+def wait_ready(path, pid, wire="SLC2", namespace="sglang"):
     deadline = monotonic() + 90
     while True:
         os.kill(pid, 0)
         try:
-            return ready(path, pid, wire)
+            return ready(path, pid, wire, namespace)
         except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
             if monotonic() >= deadline:
                 raise
@@ -186,23 +187,28 @@ def verify_gpu(run, identity, daemon, argv, launch_log):
     require(source == {str(launcher.with_name(name)): expected.get(f"tools/lmcache/{name}")
                        for name in sources},
             "LMCache daemon sources differ from the campaign source manifest")
+    verify_process(run, identity["lmcache_python"], identity["lmcache_port"],
+                   daemon["socket"], "sglang")
+    compute_owners(run / "compute-before-daemon.csv", gpu, ())
+    compute_owners(run / "compute-before.csv", gpu, (pid,))
+    compute_owners(run / "compute-ready.csv", gpu, (native_pid, pid))
+
+
+def verify_process(run, python, port, endpoint, namespace):
     process = (run / "lmcache-live-argv.bin").read_bytes().split(b"\0")
     args = list(map(os.fsdecode, process[:-1]))
-    require(process[-1] == b"" and args[:4] == [identity["lmcache_python"], "-m",
+    require(process[-1] == b"" and args[:4] == [python, "-m",
                                                "lmcache.v1.multiprocess.server", "--host"],
             "LMCache daemon is not running the official multiprocess server")
-    expected_flags = ["127.0.0.1", "--port", str(identity["lmcache_port"]),
+    expected_flags = ["127.0.0.1", "--port", str(port),
                       "--supported-transfer-mode", "lmcache_driven", "--no-run-script-api-enabled",
                       "--disable-metrics", "--l1-size-gb", "64", "--l1-init-size-gb", "64",
                       "--eviction-policy", "LRU", "--l1-read-ttl-seconds", "60",
                       "--l1-write-ttl-seconds", "60", "--server-module"]
     require(args[4:-1] == expected_flags and json.loads(args[-1]) == {
         "module_path": "sglang_lmcache",
-        "config": {"socket": daemon["socket"], "namespace": "sglang"}},
+        "config": {"socket": endpoint, "namespace": namespace}},
         "Unexpected official LMCache daemon arguments")
-    compute_owners(run / "compute-before-daemon.csv", gpu, ())
-    compute_owners(run / "compute-before.csv", gpu, (pid,))
-    compute_owners(run / "compute-ready.csv", gpu, (native_pid, pid))
 
 
 def completed(run, identity):
@@ -243,6 +249,7 @@ if __name__ == "__main__":
     readiness.add_argument("pid", type=int)
     readiness.add_argument("--once", action="store_true")
     readiness.add_argument("--wire", choices=("SLC2", "SLC3"), default="SLC2")
+    readiness.add_argument("--namespace", default="sglang")
     ownership = actions.add_parser("owners")
     ownership.add_argument("csv", type=Path)
     ownership.add_argument("gpu")
@@ -254,7 +261,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.action == "ready":
         probe = ready if args.once else wait_ready
-        print(json.dumps(probe(args.socket, args.pid, args.wire)))
+        print(json.dumps(probe(args.socket, args.pid, args.wire, args.namespace)))
     elif args.action == "owners":
         compute_owners(args.csv, args.gpu, args.pids)
     else:

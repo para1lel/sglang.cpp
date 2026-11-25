@@ -1,6 +1,6 @@
 # Matched B200 benchmark agreement
 
-Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. Two-GPU acceptance is separate and unmeasured. See the [TP2 target](serving/tp2.md). [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 ## Implementations and controls
 
@@ -21,7 +21,7 @@ Use MTP4, 32,768 tokens per step, eight slots per GPU, and cold prefixes.
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-scheduled-tokens 32768` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
 - **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon with 64 GiB CPU L1 on the same physical GPU. [Daemon launcher](../benchmarks/paired/lmcache_arm.sh#L35)<!-- prefix: "start_lmcach" -->
 
-The pinned vLLM arm uses its local prefix cache. Verify `kv_transfer=false` and `kv_offloading_size=null` in the worker receipt. The same check requires zero CPU weight offload. [Worker receipt check](../benchmarks/paired/saved_evidence.py#L223)<!-- prefix: "and worker[\"" -->
+The pinned vLLM arm uses its local prefix cache. Verify `kv_transfer=false` and `kv_offloading_size=null` in the worker receipt. The same check requires zero CPU weight offload. [Worker receipt check](https://github.com/para1lel/sglang.cpp/blob/03ee22d849e6ef7bca723595a7c8e63c47187749/benchmarks/paired/saved_evidence.py#L223)<!-- prefix: "and worker[\"" -->
 
 The pinned vLLM scheduler scans its running list before its FCFS waiting queue. That list can include an unfinished prompt. Native [reserves ready decode rows before FCFS prefill](batch-graphs.md#runtime-path). Match workload and capacity settings across the engines. [Pinned vLLM running scan](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/v1/core/sched/scheduler.py#L767) · [Waiting scan](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/v1/core/sched/scheduler.py#L1029)
 
@@ -81,15 +81,15 @@ For new offline timing, use `--warmup 1 --repeats 1` and omit `--top-logits`. `l
 
 ### Operator qualification
 
-Operators may reorder arithmetic within their numerical contract. Compare outputs and state with an independent mathematical reference under the operation's established error criteria. Check causality where the operation uses token history. Check model quality on frozen inputs and shared token histories. Record free-running divergence separately. Require bitwise equality for copied bytes, exact replay, and comparisons that preserve arithmetic.
+Operators may reorder arithmetic within their numerical contract. Compare outputs and state with an independent mathematical reference under the operation's established error criteria. Check causality where the operation uses token history, and model quality on frozen inputs and shared token histories. Record free-running divergence separately. Require bitwise equality for copied bytes, exact replay, and comparisons that preserve arithmetic.
 
-Use repeated matched measurements to choose the fastest validated implementation for each supported case. Keep one production implementation per case. Use validated fallbacks where shape, device, or available resources prevent the primary route. Keep frozen fixtures and timing gates unchanged.
+Use repeated matched measurements to choose the fastest validated implementation per supported case. Keep one production implementation per case. Use validated fallbacks where shape, device, or resources prevent the primary route. Keep frozen fixtures and timing gates unchanged.
 
 ### Native text completions
 
 Reuse the current workload `benchmark` requests, token-ID SSE clients, and timing definitions under the [scheduler policy](#scheduler-and-reporting-policy). Compare cross-engine output IDs for diagnosis. Run [text verification](text-serving.md#verification) separately.
 
-For raw text, freeze UTF-8 requests, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Record streaming, usage, and diagnostic ID settings. Text can lag IDs. A text event can span several IDs, and an ID can produce no text. Count tokens from usage or diagnostic IDs. Calculate TTFT and TPOT from ID timestamps when available. Otherwise, mark them unavailable. Report time to first visible text separately. Give raw text its own result rows.
+For raw text, freeze UTF-8 requests, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Record streaming, usage, and diagnostic ID settings. A text event can span several IDs, and an ID can produce no text. Count tokens from usage or diagnostic IDs. Calculate TTFT and TPOT from ID timestamps when available. Otherwise, mark them unavailable. Report time to first visible text separately. Give raw text its own result rows.
 
 ### Serial W1 and W2 comparisons
 
@@ -122,8 +122,6 @@ Generator `peak_device_allocation_bytes` counts logical model, request, and scra
 Record pool used and reserved bytes after synchronization. Require zero live scratch after retirement, including recovered free-enqueue failures. Report peak HBM, headroom, lane mix, and KV capacity.
 
 Use a fresh process for cold allocator timing. Warm pools with a multirow request. Record tiles, lanes, and order. Report model load, tokenizer warmup, graph state, and prefix state separately.
-
-Qualify each production configuration under its applicable protocol.
 
 ### FP8 tensor-core prefill
 
@@ -164,7 +162,7 @@ See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The g
 
 ## Correctness, memory, and diagnosis
 
-Performance acceptance requires [native implementation correctness](development.md#verification), repeatability, and comparable memory and feature settings. Run correctness checks separately when instrumentation changes timing. Apply the remaining proposed checks at their applicable milestones.
+Performance acceptance requires [native implementation correctness](development.md#verification), repeatability, and comparable memory and feature settings. Run correctness checks separately when instrumentation changes timing. Apply remaining proposed checks at their applicable milestones.
 
 - **Memory.** Record HBM after load and peak HBM during prefill and decode. Budget weights and scales, GQA KV pages, GDN live state and checkpoints, activations, workspaces, graph pools, vision weights and buffers, and runtime allocations. State the measurement method, capacity, and headroom for each input length and concurrency.
 - **Cache.** Record reusable prefix tokens divided by eligible prompt tokens, the initial cache state, page occupancy, evictions, and recurrent checkpoint restores and replay lengths. Compare cold and primed continuations with fresh execution. Check reclamation after cancellation and memory pressure.

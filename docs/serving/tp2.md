@@ -27,6 +27,21 @@ The first official campaign measured W1 only. It missed the gate, so W2 through 
 - **Result.** Native median 925.746744 ms; vLLM median 557.959022 ms; ratio 1.6591661887313294 against the ≤1.10 gate: W1 fails. Native served 276.5 output tokens per second against vLLM's 458.8. Optimization work continues; no TP2 row has passed.
 - **Untimed trace.** A separate traced cohort verified speculative decoding without timing claims. The native trace recorded 100 per-lane MTP rounds, 98 at depth four, with lane outputs matching the native warmup. The vLLM arm showed a draft-token delta of 840 and a depth-four verified-position delta of 210 over the timed arm's warmup and measured interval.
 
+## W1 diagnostic profile
+
+A separate untimed profile traced both engines after the W1 miss. It guides optimization only and makes no campaign claim.
+
+- **Cohort.** Two fixed requests with five verified positions each (MTP4), run on the native TP2 server and the pinned vLLM reference. Receipts record the eager flag off and batch CUDA graphs off. LMCache ran enabled and available on the default socket, one rank-local daemon per rank.
+- **Sampling.** Both used the frozen 128-token W1 prompts. Native generated 24 output tokens per request and vLLM generated 128.
+- **Devices.** The native run reserved devices 1 and 5; the reference reserved devices 4 and 5. Both pairs are NV18 NVLink-bridged B200 devices. The rank 0 device differs between the runs.
+- **Width.** Width two means two active lanes; width one means one. Each lane carries five verified positions, independent of request length.
+- **Method.** Nsight Systems traced the native server as one process hosting both ranks, one CPU host with two GPU timelines. The native target verification interval runs from the first `verify_rms` kernel through the last of the 128 row sums. The reference target graph span is the whole captured target-forward CUDA graph, including the vocabulary embedding reduction and its 128 fused reductions. Neither boundary includes the output head, rejection sampling, the four drafts, or the final GDN rollback. The native period is target start-to-start; the reference period is first step kernel to first step kernel. The reference used PyTorch profiler traces, four sampled steps per rank and width. Native width-2 medians use six rounds.
+- **Rank 0 step medians at width two.** Period 18.746 ms native versus 10.237 ms reference. Native target verification interval 13.505 ms versus reference target graph span 8.016 ms. At width one: period 12.498 versus 10.177 ms; rank 0 target 9.828 versus 8.010 ms.
+- **Rank 0 kernel-duration sums inside the target, width two.** FP8 projection 3.529 versus 4.024 ms. GQA attention 2.541 versus 0.451 ms. GDN attention 1.619 versus 1.048 ms.
+- **Reductions.** Cross-rank elapsed sums after the last rank arrives, width two: 1.531 ms native versus 0.753 ms reference across 128 reductions. Both rank clocks contribute; the sum ends at the later completion.
+- **Target head.** The native target head is a full-vocabulary BF16 projection on rank 0, outside the target span: two full-head grid launches, 31040 by one, 1.633 ms per width-2 step. The sharded reference spends 0.181 ms on the vocabulary GEMM plus 0.034 ms on the gather on rank 0, outside its span.
+- **Evidence.** `artifacts/tp2-bench/native-profile-d0029/` holds the Nsight Systems database, `steps.json`, and `vs-reference.json`. `artifacts/tp2-bench/vllm-profile-0013/` holds `scoring.json`, `reduction-skew.json`, and per-rank traces with `profile.sha256` and `repro.sha256`. The analysis scripts are in `artifacts/tp2-bench/w1-diagnostics/`. The diagnostic native binary is SHA-256 `0acf4c24…`; the official campaign binary is `fb03d111…`.
+
 ## Prerequisites and command
 
 Use two visible GPUs, a sharded-checkpoint build, LMCache 0.5.8, and one daemon per rank started with `tools/lmcache/serve.sh --rank N`. Then run:

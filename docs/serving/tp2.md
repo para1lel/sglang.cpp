@@ -40,6 +40,25 @@ A separate untimed profile traced both engines after the W1 miss. It guided opti
 - **Target head.** The native target head is a full-vocabulary BF16 projection on rank 0, outside the target span: two full-head grid launches, 31040 by one, 1.633 ms per width-2 step. The sharded reference spends 0.181 ms on the vocabulary GEMM plus 0.034 ms on the gather on rank 0, outside its span.
 - **Evidence.** `artifacts/tp2-bench/native-profile-d0029/` holds the Nsight Systems database, `steps.json`, and `vs-reference.json`. `artifacts/tp2-bench/vllm-profile-0013/` holds `scoring.json`, `reduction-skew.json`, and per-rank traces with `profile.sha256` and `repro.sha256`. The analysis scripts are in `artifacts/tp2-bench/w1-diagnostics/`. The diagnostic native binary is SHA-256 `0acf4c24…`; the first campaign's binary is `fb03d111…`.
 
+## W2 divergence evidence
+
+The runs below reproduced the W2 divergence under controlled changes in request arrival. They are diagnostic only; the official W2 row keeps no ratio.
+
+- **Original-wire bursts.** Three cold, complete, original-wire W2 reference bursts with lane submissions 12.0–19.4 µs apart matched the earlier official warmup exactly: all 3×1024 tokens.
+- **Stagger replay.** A 64-token diagnostic replayed the divergence with staggered submissions of 73.7–141.6 ms. The first divergence reappeared at 0-based offset 49 in a cold cohort. Lane 1 held nine output IDs before lane 0 was sent and seventeen before lane 0's first token. A 64-token logprob pair measured the top-2 candidates at offset 49: 1788 and 5215 tie at −0.6938778162002563, on the stagger cell only.
+- **Submission-change rejections.** A true ordered submission and a symmetric final-byte burst each captured both complete W2 cohorts on the pinned vLLM reference. Both failed identically: lane 0 output 49 differs from warmup, expected 5215, observed 1788. The two lanes' final-byte writes started 6.382 µs apart in the warmup and 6.481 µs apart in the measured cohort. Neither change is released or installed, and no replacement protocol has qualified.
+- **Final-byte lane detail.** In the final-byte measured cohort, lane 0 first differs at 0-based offset 49, 5215 to 1788, with 346 of 512 outputs changed. Lane 1 first differs at offset 303, 760 to 1919, with 87 of 512 changed. The final-byte warmup equals the official warmup. The final-byte measured lane 1 differs from the official measured lane 1 at 82 IDs. Engine iteration token totals show one large iteration in (4096, 8192] tokens in the warmup. The measured cohort shows two iterations in (2048, 4096] instead, consistent with joint versus split processing of the two 2048-token prompts. Lane 1 led by one output ID in the warmup and by four in the measured cohort, independently observed on server-sent events.
+- **Evidence.** `artifacts/tp2-bench/w2-diagnostic-0239/outcomes.json` (SHA-256 `b5ef5b3a…`), `artifacts/tp2-bench/ordered-submit-0247/qualification.log`, and `artifacts/tp2-bench/final-byte-0255/` (`qualification-outcome.json`, `qualification-0308.log`).
+
+## W4 readiness diagnostic
+
+A bounded native-only diagnostic ran two cold cohorts on the long shapes. It is a readiness check only; no W4 campaign row exists.
+
+- **Shorter shape.** Sixteen lanes with 2048-token prompts and eight outputs each ran twice cold. All sixteen lanes produced identical output IDs across the two cohorts.
+- **Longer shape.** Sixteen lanes with 8192-token prompts and eight outputs each ran twice cold. Two of sixteen lanes differed between the cohorts. The first differing output was 24 to 2015 at offset 1 on one lane and 8156 to 279 at offset 0 on the other.
+- **Cache.** Both ranks acknowledged every store: sixteen per rank on the shorter shape and thirty-two on the longer one. GQA and GDN written bytes are equal across ranks.
+- **Evidence.** `artifacts/tp2-bench/long-readiness-0257/` (`results.json`, `analysis.log`).
+
 ## Prerequisites and command
 
 Use two visible GPUs, a sharded-checkpoint build, LMCache 0.5.8, and one daemon per rank started with `tools/lmcache/serve.sh --rank N`. Then run:

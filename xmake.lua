@@ -419,3 +419,39 @@ if has_config("generated-logprobs-check") then
         add_files("tests/text/generated_logprobs_check.cpp")
     target_end()
 end
+-- NCCL for tensor parallelism comes from the pixi env's nvidia wheel. (The
+-- wiring lives below the original targets so documented line anchors into
+-- this file keep pointing at the upstream lines.)
+local nccl_wheel = (os.dirs(path.join(prefix, "lib/python*/site-packages/nvidia/nccl")) or {})[1]
+if not nccl_wheel then
+    raise("pixi env is missing the nvidia/nccl wheel " ..
+          "(expected $CONDA_PREFIX/lib/python*/site-packages/nvidia/nccl)")
+end
+
+target("sglang_decoder")
+    -- The wheel's include dir holds only nccl*.h, so a normal system include
+    -- path cannot shadow the conda sysroot's glibc headers. The library is
+    -- linked by absolute SONAME path so the wheel's lib dir never joins the
+    -- -L search path (a -L into the host lib dir would shadow the sysroot
+    -- libc).
+    add_sysincludedirs(path.join(nccl_wheel, "include"))
+    add_ldflags(path.join(nccl_wheel, "lib/libnccl.so.2"), {force = true, public = true})
+    add_ldflags("-Wl,-rpath," .. path.join(nccl_wheel, "lib"), {force = true, public = true})
+    add_files("src/runtime/backend/tensor_parallel.cpp")
+target_end()
+
+option("tp2-collective-check")
+    set_default(false)
+option_end()
+
+if has_config("tp2-collective-check") and os.isfile("tests/decoder/tp2/collective_check.cpp") then
+    target("tp2-collective-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_sysincludedirs(path.join(nccl_wheel, "include"))
+        add_deps("sglang_decoder")
+        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_files("tests/decoder/tp2/collective_check.cpp")
+    target_end()
+end

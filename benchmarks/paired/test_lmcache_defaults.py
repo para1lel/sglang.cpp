@@ -24,6 +24,8 @@ DIRECT = IDENTITY | {"protocol": suite.LMCACHE_GPU_PROTOCOL, "lmcache_capacity_b
                      "lmcache_uid": os.geteuid(), "lmcache_python": "/frozen/bin/python",
                      "lmcache_pythonpath": "/frozen/site-packages", "client_cpus": "10-11",
                      "memory": "localalloc"}
+SLC3 = DIRECT | {"protocol": suite.LMCACHE_GPU_SLC3_PROTOCOL, "lmcache_wire": "SLC3",
+                 "lmcache_ready_version": "0.5.8+native-v3"}
 OTHER_GPU = GPU[:-1] + "1"
 
 
@@ -106,8 +108,15 @@ def test_lmcache_evidence_binds_native_environment_and_own_daemon(tmp_path):
         lmcache_evidence.verify(run, environment, identity)
 
 
-@pytest.mark.parametrize("magic", [b"SLC2", b"SLC1"])
-def test_direct_ready_checks_an_actual_socket_frame(tmp_path, magic):
+@pytest.mark.parametrize(("wire", "magic", "payload", "matches"), [
+    ("SLC2", b"SLC2", b"0.5.8", True),
+    ("SLC2", b"SLC1", b"0.5.8", False),
+    ("SLC2", b"SLC3", b"0.5.8+native-v3", False),
+    ("SLC3", b"SLC3", b"0.5.8+native-v3", True),
+    ("SLC3", b"SLC2", b"0.5.8", False),
+    ("SLC3", b"SLC3", b"0.5.8", False),
+])
+def test_direct_ready_checks_an_actual_socket_frame(tmp_path, wire, magic, payload, matches):
     endpoint = tmp_path / "daemon.sock"
     frame = lmcache_evidence.FRAME
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
@@ -118,19 +127,24 @@ def test_direct_ready_checks_an_actual_socket_frame(tmp_path, magic):
         def serve():
             connection, _ = listener.accept()
             with connection, connection.makefile("rb") as request:
-                assert frame.unpack(request.read(frame.size)) == (b"SLC2", 1, 8)
+                assert frame.unpack(request.read(frame.size)) == (wire.encode(), 1, 8)
                 assert request.read(8) == struct.pack("!H", 6) + b"sglang"
-                connection.sendall(frame.pack(magic, 0, 5) + b"0.5.8")
+                connection.sendall(frame.pack(magic, 0, len(payload)) + payload)
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             response = pool.submit(serve)
-            if magic == b"SLC2":
-                ready = lmcache_evidence.ready(endpoint, os.getpid())
+            if matches:
+                ready = lmcache_evidence.ready(endpoint, os.getpid(), wire)
+                assert ready["version"] == "0.5.8"
+                if wire == "SLC3":
+                    assert (ready["wire"], ready["ready_version"]) == (wire, payload.decode())
+                else:
+                    assert "wire" not in ready and "ready_version" not in ready
                 assert ready["peer_uid"] == os.geteuid()
                 assert ready["peer_pid"] == os.getpid() and ready["peer_start_ticks"] > 0
             else:
                 with pytest.raises(ValueError, match="Unexpected LMCache readiness response"):
-                    lmcache_evidence.ready(endpoint, os.getpid())
+                    lmcache_evidence.ready(endpoint, os.getpid(), wire)
             response.result(timeout=2)
 
 
@@ -212,6 +226,32 @@ def test_direct_receipt_distinguishes_history_and_validates_lifecycle(direct_rec
     lmcache_evidence.completed(run, DIRECT)
     with pytest.raises(ValueError, match="Incorrect LMCache storage"):
         lmcache_evidence.verify(run, environment, DIRECT | {"protocol": suite.LMCACHE_PROTOCOL})
+
+
+def test_slc3_replay_binds_package_version_and_ready_frame(direct_receipt):
+    run, environment = direct_receipt
+    suite.validate_identity(SLC3)
+    for wrong in ({"lmcache_version": "0.5.8+native-v3"}, {"lmcache_wire": "SLC2"},
+                  {"lmcache_ready_version": "0.5.8"}):
+        with pytest.raises(ValueError, match="pinned daemon|SLC3 campaign"):
+            suite.validate_identity(SLC3 | wrong)
+    with pytest.raises(ValueError, match="Incorrect SLC3 READY identity"):
+        lmcache_evidence.verify(run, environment, SLC3)
+
+    ready = k4.load(run / "lmcache-ready.json")
+    payload = b"0.5.8+native-v3"
+    ready.update(wire="SLC3", ready_version=payload.decode())
+    k4.save(run / "lmcache-ready.json", ready)
+    with pytest.raises(ValueError, match="launched SLC3 daemon identity"):
+        lmcache_evidence.verify(run, environment, SLC3)
+
+    ready["frame"] = (lmcache_evidence.FRAME.pack(b"SLC3", 0, len(payload)) + payload).hex()
+    for end in ("", "-end"):
+        k4.save(run / f"lmcache-ready{end}.json", ready)
+    lmcache_evidence.verify(run, environment, SLC3)
+    lmcache_evidence.completed(run, SLC3)
+    with pytest.raises(ValueError, match="launched SLC2 daemon identity"):
+        lmcache_evidence.verify(run, environment, DIRECT)
 
 
 def test_direct_replay_rejects_lazy_initial_allocation(direct_receipt):

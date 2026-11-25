@@ -9,7 +9,7 @@ usage() {
         "PAIRED_LMCACHE_PYTHONPATH and PAIRED_LMCACHE_WHEEL."
     echo "The default profile, server-defaults, uses matched 32768-token cold-cache K4."
     echo "Native uses direct GPU LMCache 0.5.8. Pinned vLLM uses local APC without KV offload."
-    echo "W4 can start a fresh SLC2 campaign. W5 requires a passing W4 in the same campaign."
+    echo "W4 can start a fresh SLC3 campaign. W5 requires a passing W4 in the same campaign."
     echo "Every live timing arm runs one warmup and one measured cohort. Controls remain untimed."
     echo "Each row passes when the measured native makespan is at most 110% of pinned vLLM."
     echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
@@ -207,8 +207,9 @@ if [[ $native_profile != exact ]]; then
                  participating_gpus:[.gpu_uuid],max_running_requests:$max_seqs} else . end
              | if $wide_budget then . + {protocol:"matched-k4-native-defaults-cache-on-v5",
                  max_num_batched_tokens:$token_budget} else . end
-             | if $lmcache then . + {protocol:"matched-k4-native-defaults-lmcache-slc2",
-                 lmcache_version:"0.5.8",lmcache_port:($lmcache_port | tonumber),
+             | if $lmcache then . + {protocol:"matched-k4-native-defaults-lmcache-slc3",
+                 lmcache_version:"0.5.8",lmcache_wire:"SLC3",
+                 lmcache_ready_version:"0.5.8+native-v3",lmcache_port:($lmcache_port | tonumber),
                  lmcache_capacity_bytes:68719476736,lmcache_python:$lmcache_python,
                  lmcache_uid:$lmcache_uid,lmcache_pythonpath:$lmcache_pythonpath} else . end' \
             <<<"$identity")

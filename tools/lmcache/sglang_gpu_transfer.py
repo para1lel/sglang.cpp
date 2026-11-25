@@ -13,8 +13,11 @@ from lmcache.v1.platform.devices.cuda.utils import cuda_ipc_handle_from_bytes
 
 
 MAX_RECORD = 1 << 30
-MAX_REGIONS = 1 << 20
 MAX_ALLOCATION = 1 << 40
+MAX_TOKENS = 1 << 18
+PREFIX_CHUNK = 256
+DIGEST_BYTES = 64
+GDN_END = "sglang_gdn_end"
 LOG = init_logger(__name__)
 
 
@@ -28,51 +31,104 @@ class Region:
     width: int
     rows: int
 
-    @classmethod
-    def parse(cls, request):
-        return cls(request.number(4), *(request.number(8) for _ in range(5)), request.number(4))
 
-    def validate(self, allocations, size):
-        if not (self.allocation < len(allocations) and 0 < self.rows <= MAX_REGIONS and
-                0 < self.width <= min(self.device_pitch, self.record_pitch)):
-            raise ValueError("invalid GPU region")
-        if self.device_offset + (self.rows - 1) * self.device_pitch + self.width > \
-                allocations[self.allocation][1]:
-            raise ValueError("GPU region exceeds allocation")
-        if self.record_offset + (self.rows - 1) * self.record_pitch + self.width > size:
-            raise ValueError("region exceeds record")
+@dataclass(frozen=True)
+class GdnRecord:
+    key: object
+    size: int
+    regions: tuple
+    tokens: int = 0
+
+    @classmethod
+    def parse(cls, request, allocations, key):
+        endpoint = request.number(4)
+        if not endpoint:
+            return None
+        if endpoint > MAX_TOKENS:
+            raise ValueError("invalid native GDN endpoint")
+        record_key = key(2, request.read(DIGEST_BYTES), endpoint)
+        size = 0
+        regions = []
+        for _ in range(4):
+            allocation, offset, width = (request.number(4), request.number(8), request.number(8))
+            if allocation >= len(allocations) or not width or \
+                    offset + width > allocations[allocation][1]:
+                raise ValueError("native GDN plane exceeds allocation")
+            regions.append(Region(allocation, offset, width, size, width, width, 1))
+            size += width
+        if size > MAX_RECORD:
+            raise ValueError("native GDN record exceeds size limit")
+        return cls(record_key, size, tuple(regions))
 
 
 @dataclass(frozen=True)
-class Record:
-    key: object
-    size: int
-    tokens: int
-    regions: list
+class NativeMxfp8:
+    layers: int
+    pages: int
+    planes: tuple
 
     @classmethod
-    def parse(cls, request, namespace, allocations):
-        key = request.key(namespace)
-        size = request.number(8)
-        tokens = request.number(4)
-        count = request.number(4)
-        if not 0 < size <= MAX_RECORD or not 0 < count <= min(MAX_REGIONS, request.remaining // 48):
-            raise ValueError("invalid GPU record")
-        regions = [Region.parse(request) for _ in range(count)]
-        if sum(region.rows for region in regions) > MAX_REGIONS:
-            raise ValueError("too many GPU region rows")
-        for region in regions:
-            region.validate(allocations, size)
-        intervals = sorted((region.record_offset + row * region.record_pitch, region.width)
-                           for region in regions for row in range(region.rows))
-        end = 0
-        for start, width in intervals:
-            if start != end:
-                raise ValueError("overlapping or incomplete GPU record")
-            end += width
-        if end != size:
-            raise ValueError("incomplete GPU record")
-        return cls(key, size, tokens, regions)
+    def parse_records(cls, request, allocations, family, key):
+        begin, end = request.number(4), request.number(4)
+        if begin == end == 0:
+            return []
+        pages = request.number(4)
+        planes = tuple((request.number(4), request.number(8)) for _ in range(4))
+        layers = 16 if family == 1 else 1
+        if not begin < end <= MAX_TOKENS or begin % PREFIX_CHUNK or not end <= pages * 128:
+            raise ValueError("invalid native MXFP8 extent")
+        if not 0 < pages <= MAX_TOKENS // 128:
+            raise ValueError("invalid native MXFP8 geometry")
+        for (allocation, offset), row_bytes in zip(planes, (1024, 1024, 32, 32), strict=True):
+            if allocation >= len(allocations) or \
+                    offset + layers * pages * 128 * row_bytes > allocations[allocation][1]:
+                raise ValueError("native MXFP8 plane exceeds allocation")
+        view = cls(layers, pages, planes)
+        return [NativeRecord(key(family, request.read(DIGEST_BYTES)),
+                             min(PREFIX_CHUNK, end - start), start, view)
+                for start in range(begin, end, PREFIX_CHUNK)]
+
+    def regions(self, begin, rows):
+        offset = 0
+        for index, (allocation, address) in enumerate(self.planes):
+            row_bytes = 1024 if index < 2 else 32
+            width = rows * row_bytes
+            pitch = self.pages * 128 * row_bytes
+            origin = address + begin * row_bytes
+            full = width if index < 2 else rows // 128 * 4096
+            if full:
+                yield Region(allocation, origin, pitch, offset, width, full, self.layers)
+            if full < width:
+                for layer in range(self.layers):
+                    device = origin + layer * pitch + full
+                    record = offset + layer * width + full
+                    complete = (rows % 128) // 32 * 8
+                    tail = rows % 32
+                    if complete:
+                        yield Region(allocation, device, 32, record, complete, complete, 128)
+                        record += complete * 128
+                    if tail:
+                        for head in range(4):
+                            yield Region(allocation, device + head * 1024 + complete,
+                                         32, record, 8, 8, tail)
+                            record += tail * 8
+            offset += width * self.layers
+
+
+@dataclass(frozen=True)
+class NativeRecord:
+    key: object
+    tokens: int
+    begin: int
+    view: NativeMxfp8
+
+    @property
+    def size(self):
+        return self.tokens * self.view.layers * 2 * (1024 + 32)
+
+    @property
+    def regions(self):
+        return self.view.regions(self.begin, self.tokens)
 
 
 @dataclass(frozen=True)
@@ -83,7 +139,7 @@ class Transfer:
     records: list
 
     @classmethod
-    def parse(cls, request, namespace):
+    def parse(cls, request, key):
         device = bytes(request.read(16))
         event = bytes(request.read(64))
         count = request.number(4)
@@ -94,13 +150,14 @@ class Transfer:
             raise ValueError("invalid CUDA IPC allocation size")
         if len({handle for handle, _ in allocations}) != count:
             raise ValueError("duplicate CUDA IPC allocation")
-        count = request.number(4)
-        if not 0 < count <= request.remaining // 68:
-            raise ValueError("invalid GPU record count")
-        records = [Record.parse(request, namespace, allocations) for _ in range(count)]
+        records = NativeMxfp8.parse_records(request, allocations, 1, key)
+        records += NativeMxfp8.parse_records(request, allocations, 3, key)
+        gdn = GdnRecord.parse(request, allocations, key)
+        if gdn:
+            records.append(gdn)
         request.end()
-        if len({record.key for record in records}) != count:
-            raise ValueError("duplicate GPU record")
+        if not records or len({record.key for record in records}) != len(records):
+            raise ValueError("empty or duplicate native GPU records")
         return cls(device, event, allocations, records)
 
 
@@ -132,12 +189,76 @@ def build_copies(records, objects, pointers, store):
     return copies
 
 
+def pin_rectangles(virtual, width, rows, pitch, chunk):
+    row = 0
+    while row < rows:
+        position = virtual + row * pitch
+        room = chunk - position % chunk
+        if room >= width:
+            count = min(rows - row, 1 + (room - width) // pitch)
+            yield row, 0, width, count
+            row += count
+            continue
+        column = 0
+        while column < width:
+            size = min(width - column, chunk - (position + column) % chunk)
+            yield row, column, size, 1
+            column += size
+        row += 1
+
+
+def make_copy(src, dst, width, rows):
+    op = runtime.cudaMemcpy3DBatchOp()
+    op.srcAccessOrder = runtime.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
+    for operand, (address, pitch) in ((op.src, src), (op.dst, dst)):
+        operand.type = runtime.cudaMemcpy3DOperandType.cudaMemcpyOperandTypePointer
+        operand.op.ptr.ptr = address
+        operand.op.ptr.rowLength = pitch if rows > 1 else width
+        operand.op.ptr.layerHeight = rows
+    op.extent.width = width
+    op.extent.height = rows
+    op.extent.depth = 1
+    return op
+
+
+def build_rectangles(records, objects, pointers, store):
+    copies = []
+    for record in records:
+        obj = objects[record.key]
+        if not isinstance(obj.parent(), LazyMemoryAllocator) or obj.get_size() != record.size:
+            raise ValueError("LMCache allocation is not a compatible lazy pinned record")
+        data, address = obj.data_ptr, obj.meta.address
+        for region in record.regions:
+            width, rows = region.width, region.rows
+            host_pitch, device_pitch = region.record_pitch, region.device_pitch
+            if width == host_pitch == device_pitch:
+                width, rows = width * rows, 1
+            rects = pin_rectangles(address + region.record_offset, width, rows, host_pitch,
+                                   LazyMemoryAllocator.PIN_CHUNK_SIZE)
+            for row, col, size, height in rects:
+                host = (data + region.record_offset + row * host_pitch + col, host_pitch)
+                device = (pointers[region.allocation] + region.device_offset +
+                          row * device_pitch + col, device_pitch)
+                src, dst = (device, host) if store else (host, device)
+                copies.append(make_copy(src, dst, size, height))
+    return copies
+
+
+def independent_destinations(records, pointers):
+    spans = sorted((pointers[region.allocation] + region.device_offset + row * region.device_pitch,
+                    region.width) for record in records for region in record.regions
+                   for row in range(region.rows))
+    return all(start + size <= next_start for (start, size), (next_start, _) in
+               zip(spans, spans[1:]))
+
+
 class DeviceCopies:
     def __init__(self):
         if torch.cuda.device_count() != 1:
             raise RuntimeError("sglang LMCache requires exactly one visible CUDA device")
         torch.cuda.init()
         device_ops.BatchStep([], [])
+        self.batched = device_ops.batch_memcpy_supported()
         self.device = torch.device("cuda:0")
         (uuid,) = cuda_check(driver.cuDeviceGetUuid(0), "read daemon CUDA UUID")
         self.uuid = bytes(uuid.bytes)
@@ -150,14 +271,20 @@ class DeviceCopies:
             event = self.backend.import_event(transfer.event, self.device)
             stream = torch.cuda.Stream(device=self.device)
             pointers = self.map_allocations(cleanup, transfer.allocations)
-            copies = build_copies(records, objects, pointers, store)
+            batched = self.batched and (store or independent_destinations(records, pointers))
+            build = build_rectangles if batched else build_copies
+            copies = build(records, objects, pointers, store)
             direction = TransferDirection.D2H if store else TransferDirection.H2D
             try:
                 self.backend.wait_event(event, stream)
                 with torch.cuda.stream(stream):
-                    device_ops.execute_object_group_transfer(
-                        direction, self.device, LazyMemoryAllocator.PIN_CHUNK_SIZE,
-                        [], [device_ops.BatchStep(copies, [])])
+                    if batched:
+                        cuda_check(runtime.cudaMemcpy3DBatchAsync(
+                            len(copies), copies, 0, stream.cuda_stream), "submit batched CUDA copy")
+                    else:
+                        device_ops.execute_object_group_transfer(
+                            direction, self.device, LazyMemoryAllocator.PIN_CHUNK_SIZE,
+                            [], [device_ops.BatchStep(copies, [])])
             finally:
                 try:
                     stream.synchronize()

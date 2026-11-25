@@ -38,9 +38,14 @@ struct PrefixDeviceMxfp8 {
     std::array<PrefixDeviceAddress, 4> planes{};
 };
 
+struct PrefixDeviceSpan {
+    PrefixDeviceAddress address;
+    std::uint64_t bytes = 0;
+};
+
 struct PrefixDeviceGdn {
     int end = 0;
-    std::array<LmCacheGpuRegion, 4> planes{};
+    std::array<PrefixDeviceSpan, 4> planes{};
 };
 
 struct PrefixDeviceLayout {

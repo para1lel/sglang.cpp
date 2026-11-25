@@ -10,12 +10,10 @@ from time import monotonic, perf_counter_ns, sleep
 
 
 HEADER = struct.Struct("!4sIQ")
-MAGIC = b"SLC2"
+MAGIC = b"SLC3"
 READY, LOOKUP, GET, PUT, RESET, ERASE, PREFIX, LEASE = range(1, 9)
 ADMISSION = struct.Struct("!16s16sI")
 RECEIPT = struct.Struct("!QQQI")
-RECORD = struct.Struct("!QII")
-REGION = struct.Struct("!I5QI")
 GQA, GDN, DRAFT = range(1, 4)
 TIMEOUT = 30
 
@@ -90,11 +88,23 @@ def frame_metadata(opcode, payload):
         entry["allocations"] = number(4)
         read(72 * entry["allocations"])
         records = []
-        for _ in range(number(4)):
-            entry["keys"].append(read_key())
-            size, tokens, regions = RECORD.unpack(read(RECORD.size))
-            read(REGION.size * regions)
-            records.append({"bytes": size, "tokens": tokens, "regions": regions})
+        for family, layers in ((GQA, 16), (DRAFT, 1)):
+            begin, end = number(4), number(4)
+            if begin == end == 0:
+                continue
+            read(4 + 4 * 12)
+            for start in range(begin, end, 256):
+                entry["keys"].append((family, read(64)))
+                tokens = min(256, end - start)
+                records.append({"bytes": tokens * layers * 2112, "tokens": tokens})
+        endpoint = number(4)
+        if endpoint:
+            entry["keys"].append((GDN, read(64)))
+            size = 0
+            for _ in range(4):
+                read(12)
+                size += number(8)
+            records.append({"bytes": size, "tokens": 0, "endpoint": endpoint})
         entry["records"] = records
     elif opcode == PREFIX:
         count, limit, draft = struct.unpack("!IIB", read(9))
@@ -254,28 +264,48 @@ class Relay(socketserver.ThreadingUnixStreamServer):
 
 def install_device_fence(directory):
     """Hold one real H2D operation before its stream fence and CUDA IPC unmap."""
-    from sglang_gpu_transfer import TransferDirection, device_ops
+    from sglang_gpu_transfer import DeviceCopies, device_ops, runtime
 
     path = Path(directory)
-    execute = device_ops.execute_object_group_transfer
+    local = threading.local()
+    run = DeviceCopies.run
+    batch = runtime.cudaMemcpy3DBatchAsync
+    serial = device_ops.execute_object_group_transfer
     claim = threading.Lock()
 
-    def gated(direction, *args, **kwargs):
-        hold = False
-        if direction == TransferDirection.H2D:
-            with claim:
-                armed = path / "arm"
-                if armed.exists():
-                    armed.unlink()
-                    hold = True
-        result = execute(direction, *args, **kwargs)
-        if hold:
-            (path / "entered").touch()
-            deadline = monotonic() + TIMEOUT
-            while not (path / "release").exists() and monotonic() < deadline:
-                sleep(0.01)
-            if not (path / "release").exists():
-                raise TimeoutError("Real LMCache stream fence was not released")
+    def gated_run(self, transfer, records, objects, store):
+        local.retrieve = not store
+        try:
+            return run(self, transfer, records, objects, store)
+        finally:
+            local.retrieve = False
+
+    def hold_retrieve():
+        if not getattr(local, "retrieve", False):
+            return
+        with claim:
+            armed = path / "arm"
+            if not armed.exists():
+                return
+            armed.unlink()
+        (path / "entered").touch()
+        deadline = monotonic() + TIMEOUT
+        while not (path / "release").exists() and monotonic() < deadline:
+            sleep(0.01)
+        if not (path / "release").exists():
+            raise TimeoutError("Real LMCache stream fence was not released")
+
+    def gated_batch(*args):
+        result = batch(*args)
+        if int(result[0]) == 0:
+            hold_retrieve()
         return result
 
-    device_ops.execute_object_group_transfer = gated
+    def gated_serial(*args):
+        result = serial(*args)
+        hold_retrieve()
+        return result
+
+    DeviceCopies.run = gated_run
+    runtime.cudaMemcpy3DBatchAsync = gated_batch
+    device_ops.execute_object_group_transfer = gated_serial

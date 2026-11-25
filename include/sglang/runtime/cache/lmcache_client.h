@@ -16,23 +16,6 @@ struct LmCacheKey {
     std::string identity;
 };
 
-struct LmCacheGpuRegion {
-    std::uint32_t allocation;
-    std::uint64_t device_offset;
-    std::uint64_t device_pitch;
-    std::uint64_t record_offset;
-    std::uint64_t record_pitch;
-    std::uint64_t width;
-    std::uint32_t rows;
-};
-
-struct LmCacheGpuRecord {
-    LmCacheKey key;
-    std::uint64_t bytes;
-    std::vector<LmCacheGpuRegion> regions;
-    std::uint32_t tokens = 0;
-};
-
 struct LmCacheGpuAllocation {
     std::array<std::uint8_t, 64> handle;
     std::uint64_t bytes;
@@ -42,7 +25,6 @@ struct LmCacheGpuTransfer {
     std::array<std::uint8_t, 16> device;
     std::array<std::uint8_t, 64> ready_event;
     std::vector<LmCacheGpuAllocation> allocations;
-    std::vector<LmCacheGpuRecord> records;
 };
 
 class PrefixCacheKeys;
@@ -77,10 +59,6 @@ public:
     LmCachePrefix lookup_prefix(const PrefixCacheKeys& keys, int max_restore, bool draft) const;
 
     // Keep exported allocations and the ready event alive until the operation returns.
-    LmCacheStatus store(const LmCacheGpuTransfer& transfer,
-                        LmCacheReceipt* receipt = nullptr) const;
-    LmCacheStatus retrieve(const LmCacheGpuTransfer& transfer,
-                           LmCacheReceipt* receipt = nullptr) const;
     LmCacheStatus store(const PrefixCacheKeys& keys, const PrefixDeviceTransfer& transfer,
                         LmCacheReceipt* receipt = nullptr) const;
     LmCacheStatus retrieve(const PrefixCacheKeys& keys, const PrefixDeviceTransfer& transfer,

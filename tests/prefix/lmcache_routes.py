@@ -701,7 +701,7 @@ def main():
                         help="Private directory passed to install_device_fence in the daemon")
     args = parser.parse_args()
     args.evidence.mkdir(parents=True)
-    assert control(args.daemon, NAMESPACE, READY) == (0, b"0.5.8")
+    assert control(args.daemon, NAMESPACE, READY) == (0, b"0.5.8+native-v3")
     source, unrelated = fixture(args.fixtures)
     with TemporaryDirectory(prefix="sglang-cache-test.", dir="/tmp") as work:
         relay_path = Path(work) / "cache.sock"

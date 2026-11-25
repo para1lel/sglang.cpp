@@ -13,7 +13,9 @@ from time import monotonic, sleep
 from zipfile import ZipFile
 
 from saved_evidence import command, compute_owners, digest, hash_manifest, load, require
-from workload_suite import LMCACHE_GPU_PROTOCOL, LMCACHE_VERSION
+from workload_suite import (
+    LMCACHE_GPU_PROTOCOLS, LMCACHE_GPU_SLC3_PROTOCOL, LMCACHE_SLC3_READY, LMCACHE_VERSION,
+)
 
 
 FRAME = struct.Struct("!4sIQ")
@@ -23,8 +25,9 @@ DAEMON_SOURCES = ("serve.sh", "sglang_lmcache.py", "sglang_gpu_transfer.py", "re
 WHEEL_SHA256 = "4ec775bda3a8c5f1f5b1ef0bbc441b666db86b57c3c2a7bcba47a4f6550b07cd"
 
 
-def ready(path, pid):
-    expected_magic = b"SLC2"
+def ready(path, pid, wire="SLC2"):
+    expected_magic = wire.encode()
+    expected = (LMCACHE_SLC3_READY if wire == "SLC3" else LMCACHE_VERSION).encode()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(1)
         connection.connect(str(path))
@@ -38,23 +41,25 @@ def ready(path, pid):
             header = reply.read(FRAME.size)
             require(len(header) == FRAME.size, "Incomplete LMCache readiness header")
             magic, status, size = FRAME.unpack(header)
-            expected = LMCACHE_VERSION.encode()
             payload = reply.read(size) if size == len(expected) else b""
             require((magic, status, size) == (expected_magic, 0, len(expected))
                     and payload == expected and reply.read(1) == b"",
                     "Unexpected LMCache readiness response")
     stat = (Path("/proc") / str(peer) / "stat").read_text().rsplit(")", 1)[1].split()
-    return {"socket": str(path), "version": LMCACHE_VERSION, "namespace": "sglang",
-            "group_pid": pid, "peer_pid": peer, "peer_uid": uid,
-            "peer_start_ticks": int(stat[19]), "frame": (header + payload).hex()}
+    receipt = {"socket": str(path), "version": LMCACHE_VERSION, "namespace": "sglang",
+               "group_pid": pid, "peer_pid": peer, "peer_uid": uid,
+               "peer_start_ticks": int(stat[19]), "frame": (header + payload).hex()}
+    if wire == "SLC3":
+        receipt.update(wire=wire, ready_version=payload.decode())
+    return receipt
 
 
-def wait_ready(path, pid):
+def wait_ready(path, pid, wire="SLC2"):
     deadline = monotonic() + 90
     while True:
         os.kill(pid, 0)
         try:
-            return ready(path, pid)
+            return ready(path, pid, wire)
         except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
             if monotonic() >= deadline:
                 raise
@@ -63,7 +68,7 @@ def wait_ready(path, pid):
 
 def verify(run, environment, identity):
     daemon = load(run / "lmcache-ready.json")
-    direct_gpu = identity["protocol"] == LMCACHE_GPU_PROTOCOL
+    direct_gpu = identity["protocol"] in LMCACHE_GPU_PROTOCOLS
     directory = Path(environment["XDG_RUNTIME_DIR"])
     require(directory.is_absolute() and daemon["socket"] == str(directory / SOCKET_NAME)
             and daemon["version"] == LMCACHE_VERSION and daemon["namespace"] == "sglang"
@@ -142,12 +147,18 @@ def verify_gpu(run, identity, daemon, argv, launch_log):
     uid = identity["lmcache_uid"]
     gpu = identity["gpu_uuid"]
     wheel_receipt(run.parent, identity)
-    version = LMCACHE_VERSION.encode()
-    frame = FRAME.pack(b"SLC2", 0, len(version)) + version
+    if identity["protocol"] == LMCACHE_GPU_SLC3_PROTOCOL:
+        require(daemon.get("wire") == identity.get("lmcache_wire") == "SLC3"
+                and daemon.get("ready_version") == identity.get("lmcache_ready_version")
+                == LMCACHE_SLC3_READY, "Incorrect SLC3 READY identity")
+        magic, version = b"SLC3", LMCACHE_SLC3_READY.encode()
+    else:
+        magic, version = b"SLC2", LMCACHE_VERSION.encode()
+    frame = FRAME.pack(magic, 0, len(version)) + version
     require(daemon["peer_pid"] == pid and type(daemon["peer_uid"]) is int
             and daemon["peer_uid"] == uid and type(daemon["peer_start_ticks"]) is int
             and daemon["peer_start_ticks"] > 0 and daemon["frame"] == frame.hex(),
-            "LMCache readiness does not prove the launched SLC2 daemon identity")
+            f"LMCache readiness does not prove the launched {magic.decode()} daemon identity")
     device_hex = gpu.removeprefix("GPU-").replace("-", "").lower()
     log_entries = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in launch_log.splitlines()
                    if "sglang GPU LMCache at" in line]
@@ -225,6 +236,7 @@ if __name__ == "__main__":
     readiness.add_argument("socket", type=Path)
     readiness.add_argument("pid", type=int)
     readiness.add_argument("--once", action="store_true")
+    readiness.add_argument("--wire", choices=("SLC2", "SLC3"), default="SLC2")
     ownership = actions.add_parser("owners")
     ownership.add_argument("csv", type=Path)
     ownership.add_argument("gpu")
@@ -236,7 +248,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.action == "ready":
         probe = ready if args.once else wait_ready
-        print(json.dumps(probe(args.socket, args.pid)))
+        print(json.dumps(probe(args.socket, args.pid, args.wire)))
     elif args.action == "owners":
         compute_owners(args.csv, args.gpu, args.pids)
     else:

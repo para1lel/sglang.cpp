@@ -44,10 +44,10 @@ public:
     }
 
     PrefixDeviceGdn gdn(TextGdnState state, const Workspace& row, int end) {
-        return {end, {{region(state.history, gdn_layers * gdn_history_elements * sizeof(Bf16)),
-                       region(state.recurrent, gdn_layers * gdn_state_elements * sizeof(float)),
-                       region(row.hidden, hidden_size * sizeof(Bf16)),
-                       region(row.residual, hidden_size * sizeof(Bf16))}}};
+        return {end, {{span(state.history, gdn_layers * gdn_history_elements * sizeof(Bf16)),
+                       span(state.recurrent, gdn_layers * gdn_state_elements * sizeof(float)),
+                       span(row.hidden, hidden_size * sizeof(Bf16)),
+                       span(row.residual, hidden_size * sizeof(Bf16))}}};
     }
 
     PrefixDeviceTransfer finish(PrefixDeviceLayout layout, cudaStream_t stream) {
@@ -75,9 +75,8 @@ public:
     }
 
 private:
-    LmCacheGpuRegion region(const void* base, std::size_t bytes) {
-        const auto address = allocation(base, bytes);
-        return {address.allocation, address.offset, bytes, 0, bytes, bytes, 1};
+    PrefixDeviceSpan span(const void* base, std::size_t bytes) {
+        return {allocation(base, bytes), bytes};
     }
 
     PrefixDeviceTransfer view_;

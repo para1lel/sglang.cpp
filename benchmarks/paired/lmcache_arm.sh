@@ -19,7 +19,7 @@ record_lmcache_peer() {
     local run=$1 suffix=${2:-} options=()
     if [[ -n $suffix ]]; then options=(--once); fi
     lmcache_evidence ready "$lmcache_runtime/sglang-lmcache.sock" "$lmcache_pid" \
-        "${options[@]}" >"$run/lmcache-ready$suffix.json" || return
+        --wire SLC3 "${options[@]}" >"$run/lmcache-ready$suffix.json" || return
     cat "/proc/$lmcache_pid/cmdline" >"$run/lmcache-live-argv$suffix.bin"
 }
 

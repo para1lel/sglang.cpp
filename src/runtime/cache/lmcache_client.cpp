@@ -1,4 +1,7 @@
 #include "sglang/runtime/cache/lmcache_client.h"
+#include "sglang/runtime/cache/mxfp8_cache_geometry.h"
+#include "sglang/runtime/cache/prefix_payload.h"
+#include "sglang/runtime/model/qwen_text_model.h"
 
 #include <algorithm>
 #include <array>
@@ -20,8 +23,9 @@ namespace sglang::decoder {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr std::string_view magic = "SLC2";
-constexpr std::string_view daemon_version = "0.5.8";
+constexpr std::string_view magic = "SLC3";
+constexpr std::string_view daemon_version = "0.5.8+native-v3";
+constexpr int max_native_tokens = QwenTextModel::max_position_embeddings;
 constexpr std::size_t max_record = std::size_t{1} << 30;
 constexpr std::size_t max_metadata = std::size_t{64} << 20;
 constexpr std::size_t max_keys = std::size_t{1} << 20;
@@ -78,12 +82,6 @@ void append_key(std::string& output, const LmCacheKey& key) {
     append_number(output, 1, family);
     append_number(output, 2, key.identity.size());
     output += key.identity;
-}
-
-void validate_record_size(std::size_t size) {
-    if (size == 0 || size > max_record) {
-        throw std::invalid_argument("Invalid LMCache record size");
-    }
 }
 
 class Connection {
@@ -251,23 +249,54 @@ void append_bytes(std::string& output, const std::array<std::uint8_t, N>& bytes)
     output.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
-void append_region(std::string& output, const LmCacheGpuRegion& region) {
-    if (output.size() > max_metadata - 56) {
-        throw std::invalid_argument("LMCache GPU metadata is too large");
-    }
-    append_number(output, 4, region.allocation);
-    append_number(output, 8, region.device_offset);
-    append_number(output, 8, region.device_pitch);
-    append_number(output, 8, region.record_offset);
-    append_number(output, 8, region.record_pitch);
-    append_number(output, 8, region.width);
-    append_number(output, 4, region.rows);
+void append_address(std::string& output, const PrefixDeviceAddress& address) {
+    append_number(output, 4, address.allocation);
+    append_number(output, 8, address.offset);
 }
 
-std::string encode_transfer(const LmCacheConfig& config, const LmCacheGpuTransfer& transfer) {
+void append_mxfp8(std::string& output, const PrefixCacheKeys& keys,
+                  const PrefixDeviceMxfp8& view, int layers, bool draft) {
+    constexpr int chunk = prefix_gqa_chunk_tokens;
+    const bool valid_shape = view.end == 0 ||
+        (view.begin < view.end && view.layers == layers && view.page_count > 0 &&
+         view.page_count <= max_native_tokens / mxfp8_page_size &&
+         view.end <= view.page_count * mxfp8_page_size);
+    if (view.begin < 0 || view.begin > view.end || view.end > max_native_tokens ||
+        view.begin % chunk || !valid_shape) {
+        throw std::invalid_argument("Invalid native MXFP8 transfer extent");
+    }
+    append_number(output, 4, view.begin);
+    append_number(output, 4, view.end);
+    if (!view.end) return;
+    append_number(output, 4, view.page_count);
+    for (const auto& plane : view.planes) append_address(output, plane);
+    for (int begin = view.begin; begin < view.end; begin += chunk) {
+        output += keys.key(std::min(begin + chunk, view.end) + draft);
+    }
+}
+
+void append_gdn(std::string& output, const PrefixCacheKeys& keys, const PrefixDeviceGdn& view) {
+    if (view.end < 0 || view.end > max_native_tokens) {
+        throw std::invalid_argument("Invalid native GDN endpoint");
+    }
+    append_number(output, 4, view.end);
+    if (!view.end) return;
+    output += keys.key(view.end);
+    for (const auto& plane : view.planes) {
+        if (plane.bytes == 0 || plane.bytes > max_record) {
+            throw std::invalid_argument("Invalid native GDN operand size");
+        }
+        append_address(output, plane.address);
+        append_number(output, 8, plane.bytes);
+    }
+}
+
+std::string encode_transfer(const LmCacheConfig& config, const PrefixCacheKeys& keys,
+                            const PrefixDeviceTransfer& view) {
+    const auto& transfer = view.transfer;
     if (transfer.allocations.empty() || transfer.allocations.size() > 64 ||
-        transfer.records.empty() || transfer.records.size() > max_keys) {
-        throw std::invalid_argument("Invalid LMCache GPU transfer size");
+        (!view.layout.gqa.end && !view.layout.draft.end && !view.layout.gdn.end)) {
+        throw std::invalid_argument("Invalid native LMCache transfer");
     }
     auto output = request_prefix(config);
     append_bytes(output, transfer.device);
@@ -278,18 +307,9 @@ std::string encode_transfer(const LmCacheConfig& config, const LmCacheGpuTransfe
         append_bytes(output, allocation.handle);
         append_number(output, 8, allocation.bytes);
     }
-    append_number(output, 4, transfer.records.size());
-    for (const auto& record : transfer.records) {
-        validate_record_size(record.bytes);
-        if (record.regions.empty() || record.regions.size() > max_keys) {
-            throw std::invalid_argument("Invalid LMCache GPU region count");
-        }
-        append_key(output, record.key);
-        append_number(output, 8, record.bytes);
-        append_number(output, 4, record.tokens);
-        append_number(output, 4, record.regions.size());
-        for (const auto& region : record.regions) append_region(output, region);
-    }
+    append_mxfp8(output, keys, view.layout.gqa, qwen_text_model.full_attention_layers(), false);
+    append_mxfp8(output, keys, view.layout.draft, 1, true);
+    append_gdn(output, keys, view.layout.gdn);
     return output;
 }
 
@@ -329,10 +349,9 @@ private:
 };
 
 LmCacheStatus transfer_records(const LmCacheConfig& config, Operation operation,
-                               const LmCacheGpuTransfer& transfer, LmCacheReceipt* receipt) {
+                               std::string_view metadata, LmCacheReceipt* receipt) {
     if (receipt) *receipt = {};
     constexpr std::size_t admission_bytes = 36;
-    const auto metadata = encode_transfer(config, transfer);
     Connection connection(config);
     connection.request(operation, metadata);
     const auto [admission, size] = connection.response_header();
@@ -389,7 +408,8 @@ LmCacheClient::LmCacheClient(LmCacheConfig config) : config_(std::move(config)) 
 bool LmCacheClient::ready() const {
     const Connection connection(config_);
     connection.request(Operation::ready, request_prefix(config_));
-    connection.response(daemon_version.size());
+    const auto [status, size] = connection.response_header();
+    if (status != 0 || size != daemon_version.size()) transport_error("unsupported daemon version");
     std::string version(daemon_version.size(), '\0');
     connection.read_all(version.data(), version.size());
     if (version != daemon_version) transport_error("unsupported daemon version");
@@ -449,14 +469,18 @@ LmCachePrefix LmCacheClient::lookup_prefix(std::string_view digests, int max_res
             static_cast<int>(matched_gdn)};
 }
 
-LmCacheStatus LmCacheClient::store(const LmCacheGpuTransfer& transfer,
+LmCacheStatus LmCacheClient::store(const PrefixCacheKeys& keys,
+                                    const PrefixDeviceTransfer& transfer,
                                     LmCacheReceipt* receipt) const {
-    return transfer_records(config_, Operation::store, transfer, receipt);
+    return transfer_records(config_, Operation::store, encode_transfer(config_, keys, transfer),
+                            receipt);
 }
 
-LmCacheStatus LmCacheClient::retrieve(const LmCacheGpuTransfer& transfer,
+LmCacheStatus LmCacheClient::retrieve(const PrefixCacheKeys& keys,
+                                       const PrefixDeviceTransfer& transfer,
                                        LmCacheReceipt* receipt) const {
-    return transfer_records(config_, Operation::retrieve, transfer, receipt);
+    return transfer_records(config_, Operation::retrieve, encode_transfer(config_, keys, transfer),
+                            receipt);
 }
 
 void LmCacheClient::reset() const {

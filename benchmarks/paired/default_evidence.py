@@ -141,7 +141,7 @@ def native_completed(run, identity):
     info = native(run, identity)
     client(run, identity, info["port"])
     pid = (run / "server-pid.txt").read_text().strip()
-    if identity["protocol"] == workload_suite.LMCACHE_GPU_PROTOCOL:
+    if identity["protocol"] in workload_suite.LMCACHE_GPU_PROTOCOLS:
         lmcache_evidence.completed(run, identity)
     else:
         observed_device(run, pid, identity["gpu_uuid"].lower())

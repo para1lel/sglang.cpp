@@ -9,7 +9,9 @@ import stat
 import struct
 import threading
 import time
+from collections import Counter
 from importlib.metadata import version
+from io import BytesIO
 
 import torch
 from lmcache.logging import init_logger
@@ -19,25 +21,90 @@ from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.distributed.storage_manager import _L1_WRITE_TAG, l1_owners_of
 from lmcache.v1.multiprocess.engine_module import DiscoverableModule
 
-from sglang_gpu_transfer import DeviceCopies, Transfer
+from sglang_gpu_transfer import DIGEST_BYTES, GDN_END, PREFIX_CHUNK, DeviceCopies, Transfer
 
 
 VERSION = "0.5.8"
-MAGIC = b"SLC2"
+WIRE_VERSION = VERSION + "+native-v3"
+MAGIC = b"SLC3"
 HEADER = struct.Struct("!4sIQ")
 MAX_METADATA = 64 << 20
 MAX_KEYS = 1 << 20
 LOOKUP_BATCH = 4096
-PREFIX_CHUNK = 256
-DIGEST_BYTES = 64
 WORKERS = 16
 REQUEST_TIMEOUT = 10
 LOG = init_logger(__name__)
 
 
-def object_key(namespace, family, identity):
-    return ObjectKey(chunk_hash=identity, model_name="sglang.cpp.gpu.v2", kv_rank=0,
-                     object_group_id=family, cache_salt=namespace)
+def object_key(namespace, family, identity, endpoint=0):
+    key = ObjectKey(chunk_hash=identity, model_name="sglang.cpp.gpu.v2", kv_rank=0,
+                    object_group_id=family, cache_salt=namespace)
+    if endpoint:
+        return ObjectKey(identity=key.identity, extra_attributes={GDN_END: endpoint})
+    return key
+
+
+class GdnEndpoints(L1ManagerListener):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.by_key = {}
+        self.counts = Counter()
+
+    def snapshot(self, limit):
+        # L1 callbacks take this lock, so release it before reserving any L1 reads.
+        with self.lock:
+            ends = tuple(self.counts)
+        return sorted((end for end in ends if end <= limit), reverse=True)
+
+    def on_l1_keys_write_finished(self, keys):
+        with self.lock:
+            for key in keys:
+                end = key.extra_attributes.get(GDN_END)
+                if end is not None and key not in self.by_key:
+                    self.by_key[key] = end
+                    self.counts[end] += 1
+
+    def on_l1_keys_deleted_by_manager(self, keys):
+        with self.lock:
+            for key in keys:
+                end = self.by_key.pop(key, None)
+                if end is not None:
+                    self.counts[end] -= 1
+                    if not self.counts[end]:
+                        del self.counts[end]
+
+    def on_l1_keys_reserved_read(self, keys):
+        pass
+
+    def on_l1_keys_read_finished(self, keys):
+        pass
+
+    def on_l1_keys_reserved_write(self, keys):
+        pass
+
+    def on_l1_keys_finish_write_and_reserve_read(self, keys):
+        self.on_l1_keys_write_finished(keys)
+
+    def on_l1_keys_accessed(self, keys):
+        pass
+
+
+class TransferMetadata:
+    def __init__(self, request):
+        self.body = BytesIO(request.read(request.remaining))
+
+    def read(self, size):
+        data = self.body.read(size)
+        if len(data) != size:
+            raise ValueError("truncated native GPU transfer")
+        return data
+
+    def number(self, width):
+        return int.from_bytes(self.read(width), "big")
+
+    def end(self):
+        if self.body.read(1):
+            raise ValueError("unexpected native GPU transfer bytes")
 
 
 class PrefixLookup:
@@ -59,6 +126,8 @@ class PrefixLookup:
 
     def present(self, family, ends):
         self.request.time_left()
+        if not ends:
+            return []
         keys = [self.key(family, end) for end in ends]
         with self.records.read(keys) as resident:
             return [key in resident for key in keys]
@@ -70,35 +139,26 @@ class PrefixLookup:
                 return end - PREFIX_CHUNK
         return limit // PREFIX_CHUNK * PREFIX_CHUNK
 
-    def matched_gdn(self):
-        for upper in range(self.count, 0, -LOOKUP_BATCH):
-            ends = range(upper, max(0, upper - LOOKUP_BATCH), -1)
-            match = next((end for end, found in zip(ends, self.present(2, ends)) if found), 0)
-            if match:
-                return match
-        return 0
-
     def resolve(self):
         full = self.full_coverage(1, self.count)
         tail = range(min(self.count, full + PREFIX_CHUNK - 1), full, -1)
         gqa = next((end for end, found in zip(tail, self.present(1, tail)) if found), full)
+        ends = self.records.gdn_endpoints.snapshot(self.count)
+        states = [end for end, found in zip(ends, self.present(2, ends)) if found]
+        matched = states[0] if states else 0
         maximum = min(self.limit, gqa)
-        draft_full = self.full_coverage(3, maximum - 1) if self.draft and maximum else 0
-        if self.draft:
-            maximum = min(maximum, draft_full + PREFIX_CHUNK)
-        for upper in range(maximum, 0, -LOOKUP_BATCH):
-            ends = range(upper, max(0, upper - LOOKUP_BATCH), -1)
-            states = [end for end, found in zip(ends, self.present(2, ends)) if found]
-            if not self.draft:
-                if states:
-                    return gqa, states[0], 0
-                continue
-            tails = [end - 1 for end in states if (end - 1) % PREFIX_CHUNK]
+        eligible = [end for end in states if end <= maximum]
+        if not self.draft:
+            return gqa, eligible[0] if eligible else 0, 0, matched
+        if eligible:
+            draft_full = self.full_coverage(3, maximum - 1)
+            eligible = [end for end in eligible if end <= draft_full + PREFIX_CHUNK]
+            tails = [end - 1 for end in eligible if (end - 1) % PREFIX_CHUNK]
             usable = {end for end, found in zip(tails, self.present(3, tails)) if found}
-            for end in states:
+            for end in eligible:
                 if (end - 1) % PREFIX_CHUNK == 0 or end - 1 in usable:
-                    return gqa, end, end - 1
-        return gqa, 0, 0
+                    return gqa, end, end - 1, matched
+        return gqa, 0, 0, matched
 
 
 class Request:
@@ -376,6 +436,8 @@ class Records:
         self.device = DeviceCopies()
         self.writes = threading.Lock()
         self.dma = DmaReservations(self.l1)
+        self.gdn_endpoints = GdnEndpoints()
+        self.l1.register_listener(self.gdn_endpoints)
 
     @contextlib.contextmanager
     def read(self, keys):
@@ -560,7 +622,7 @@ class Handler(socketserver.BaseRequestHandler):
                 raise ValueError("wrong LMCache namespace")
             if request.op == 1:
                 request.end()
-                request.reply(0, VERSION.encode("ascii"))
+                request.reply(0, WIRE_VERSION.encode("ascii"))
                 return
             if request.op == 8:
                 self.server.lease_status(request)
@@ -589,7 +651,9 @@ class Handler(socketserver.BaseRequestHandler):
                 request.reply(3)
                 return
             try:
-                transfer = Transfer.parse(request, namespace)
+                metadata = TransferMetadata(request)
+                transfer = Transfer.parse(metadata, lambda family, identity, endpoint=0:
+                                          object_key(namespace, family, identity, endpoint))
                 operation = records.retrieve if request.op == 3 else records.store
                 with self.server.lease(request):
                     result = operation(request, transfer)
@@ -609,10 +673,7 @@ class Handler(socketserver.BaseRequestHandler):
             request.reply(1 if skipped else 0)
         elif request.op == 7:
             query = PrefixLookup(request, namespace, records)
-            coverage = query.resolve()
-            # The second probe can race eviction of an already-observed usable checkpoint.
-            matched_gdn = max(coverage[1], query.matched_gdn())
-            request.reply(0, struct.pack("!IIII", *coverage, matched_gdn))
+            request.reply(0, struct.pack("!IIII", *query.resolve()))
         else:
             raise ValueError("unknown LMCache operation")
 

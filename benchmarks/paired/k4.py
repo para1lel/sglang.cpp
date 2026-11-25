@@ -524,6 +524,11 @@ def assess(row, fixtures, directory):
                       campaign_sha256=selected[1], vllm_role="timing-only")
         if cache_on:
             result.update(cache_policy=identity["cache_policy"], cache_receipts=cache_receipts)
+        if identity["protocol"] == workload_suite.LMCACHE_GPU_SLC3_PROTOCOL:
+            result.update(lmcache_version=identity["lmcache_version"],
+                          lmcache_wheel_sha256=defaults.lmcache_evidence.WHEEL_SHA256,
+                          lmcache_wire=identity["lmcache_wire"],
+                          lmcache_ready_version=identity["lmcache_ready_version"])
     elif selected:
         identity, fingerprint = selected
         result.update(protocol=OPT_IN_PROTOCOL, native_profile=identity["native_profile"],
@@ -640,7 +645,7 @@ def verify_default_receipts(row, run, identity):
     require(load(run / "worker-identity.json") == evidence
             and load(run / "attention-kernels.json") == kernels,
             "Saved vLLM worker differs from the resolved receipts")
-    if identity["protocol"] == workload_suite.LMCACHE_GPU_PROTOCOL:
+    if identity["protocol"] in workload_suite.LMCACHE_GPU_PROTOCOLS:
         defaults.lmcache_evidence.pinned(run, identity, evidence["worker_pid"])
     saved_activity(run, "vllm", ("metrics-before.txt", "metrics-after.txt"), True)
 

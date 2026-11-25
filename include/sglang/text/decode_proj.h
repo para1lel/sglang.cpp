@@ -35,7 +35,7 @@ std::optional<cudaError_t> try_text_bf16_decode_sm100(
 std::optional<cudaError_t> try_text_bf16_decode_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const __nv_bfloat16* input, int rows, __nv_bfloat16* output_b,
-    __nv_bfloat16* output_a, cudaStream_t stream);
+    __nv_bfloat16* output_a, int channels, cudaStream_t stream);
 
 namespace decode_proj {
 

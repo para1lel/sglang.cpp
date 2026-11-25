@@ -662,7 +662,8 @@ cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int ro
         return cudaErrorInvalidValue;
     }
     const __nv_bfloat16* up = nullptr;
-    if (rows == 1024 && width == text_gqa_q_width &&
+    if (rows == 1024 &&
+        (width == text_gqa_q_width || width == text_gqa_q_width / 2) &&
         aligned(input, alignof(__nv_bfloat162)) &&
         aligned(output.values, alignof(__nv_fp8x4_storage_t))) {
         const dim3 grid(divide_up(width / text_fp8_group_size, block_warps), rows);
@@ -960,9 +961,10 @@ cudaError_t text_bf16_decode_rows(const __nv_bfloat16* weight, const __nv_bfloat
         rows <= 0 || rows > 65535) {
         return cudaErrorInvalidValue;
     }
-    if (out_width == text_gdn_value_heads && in_width == decoder::hidden_size) {
+    if ((out_width == text_gdn_value_heads || out_width == text_gdn_value_heads / 2) &&
+        in_width == decoder::hidden_size) {
         if (const auto status = try_text_bf16_decode_gates(weight, nullptr, input, rows,
-                                                          output, nullptr, stream)) {
+                                                          output, nullptr, out_width, stream)) {
             return *status;
         }
     }
@@ -983,7 +985,8 @@ cudaError_t text_bf16_decode_gates(const __nv_bfloat16* weight_b,
         return cudaErrorInvalidValue;
     }
     if (const auto status = try_text_bf16_decode_gates(weight_b, weight_a, input, rows,
-                                                       output_b, output_a, stream)) {
+                                                       output_b, output_a,
+                                                       text_gdn_value_heads, stream)) {
         return *status;
     }
     const auto status = text_bf16_decode_rows(weight_b, input, text_gdn_value_heads,

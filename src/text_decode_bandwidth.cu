@@ -98,9 +98,10 @@ __device__ void accumulate_packed_gate(Bf16Dot& dot, uint4 weight, uint4 input) 
     accumulate_bf16_pair(dot.first, dot.second, weight.z, weight.w, input.z, input.w);
 }
 
+template <int Channels, bool FullTile>
 __global__ void bf16_gdn_prefill_gates(const __nv_bfloat16* weight_b,
                                       const __nv_bfloat16* weight_a,
-                                      const __nv_bfloat16* input,
+                                      const __nv_bfloat16* input, int rows,
                                       __nv_bfloat16* output_b, __nv_bfloat16* output_a) {
     constexpr int width = decoder::hidden_size;
     const int lane = threadIdx.x % warp_width;
@@ -110,25 +111,55 @@ __global__ void bf16_gdn_prefill_gates(const __nv_bfloat16* weight_b,
     const int first_row = blockIdx.y * prefill_gate_tile_rows;
     Bf16Dot dots_b[prefill_gate_tile_rows];
     Bf16Dot dots_a[prefill_gate_tile_rows];
+    if constexpr (FullTile) {
+        // The host only selects this specialization when
+        // rows % prefill_gate_tile_rows == 0, so every trip count is
+        // compile-time and the codegen matches the legacy hot path.
 #pragma unroll 4
-    for (int col = lane * 8; col < width; col += warp_width * 8) {
-        const uint4 packed_b = load_128(weight_b + col);
-        const uint4 packed_a = load_128(weight_a + col);
+        for (int col = lane * 8; col < width; col += warp_width * 8) {
+            const uint4 packed_b = load_128(weight_b + col);
+            const uint4 packed_a = load_128(weight_a + col);
+#pragma unroll
+            for (int item = 0; item < prefill_gate_tile_rows; ++item) {
+                const uint4 packed_input =
+                    load_128(input + (first_row + item) * width + col);
+                accumulate_packed_gate(dots_b[item], packed_b, packed_input);
+                accumulate_packed_gate(dots_a[item], packed_a, packed_input);
+            }
+        }
 #pragma unroll
         for (int item = 0; item < prefill_gate_tile_rows; ++item) {
-            const uint4 packed_input = load_128(input + (first_row + item) * width + col);
-            accumulate_packed_gate(dots_b[item], packed_b, packed_input);
-            accumulate_packed_gate(dots_a[item], packed_a, packed_input);
+            const float result_b = warp_sum(dots_b[item].sum());
+            const float result_a = warp_sum(dots_a[item].sum());
+            if (lane == 0) {
+                const int offset = (first_row + item) * Channels + channel;
+                output_b[offset] = __float2bfloat16_rn(result_b);
+                output_a[offset] = __float2bfloat16_rn(result_a);
+            }
         }
-    }
-#pragma unroll
-    for (int item = 0; item < prefill_gate_tile_rows; ++item) {
-        const float result_b = warp_sum(dots_b[item].sum());
-        const float result_a = warp_sum(dots_a[item].sum());
-        if (lane == 0) {
-            const int offset = (first_row + item) * text_gdn_value_heads + channel;
-            output_b[offset] = __float2bfloat16_rn(result_b);
-            output_a[offset] = __float2bfloat16_rn(result_a);
+    } else {
+        // Ragged launch (rows % tile height != 0): every CTA compiles this
+        // path; only the last CTA in y actually has a partial tile.
+        const int tile_rows = min(prefill_gate_tile_rows, rows - first_row);
+#pragma unroll 4
+        for (int col = lane * 8; col < width; col += warp_width * 8) {
+            const uint4 packed_b = load_128(weight_b + col);
+            const uint4 packed_a = load_128(weight_a + col);
+            for (int item = 0; item < tile_rows; ++item) {
+                const uint4 packed_input =
+                    load_128(input + (first_row + item) * width + col);
+                accumulate_packed_gate(dots_b[item], packed_b, packed_input);
+                accumulate_packed_gate(dots_a[item], packed_a, packed_input);
+            }
+        }
+        for (int item = 0; item < tile_rows; ++item) {
+            const float result_b = warp_sum(dots_b[item].sum());
+            const float result_a = warp_sum(dots_a[item].sum());
+            if (lane == 0) {
+                const int offset = (first_row + item) * Channels + channel;
+                output_b[offset] = __float2bfloat16_rn(result_b);
+                output_a[offset] = __float2bfloat16_rn(result_a);
+            }
         }
     }
 }
@@ -332,12 +363,13 @@ cudaError_t launch_draft_head_batch(const std::uint8_t* weights, const float* we
     }
 }
 
+template <int Channels>
 __global__ void bf16_gdn_gates_kernel(const __nv_bfloat16* weight_b,
                                      const __nv_bfloat16* weight_a,
                                      const __nv_bfloat16* input,
                                      __nv_bfloat16* output_b, __nv_bfloat16* output_a) {
-    const bool gate_b = blockIdx.x < text_gdn_value_heads;
-    const int row = blockIdx.x % text_gdn_value_heads;
+    const bool gate_b = blockIdx.x < Channels;
+    const int row = blockIdx.x % Channels;
     const auto* weight = (gate_b ? weight_b : weight_a) + row * decoder::hidden_size;
     Bf16Dot dot;
 #pragma unroll 4
@@ -350,6 +382,7 @@ __global__ void bf16_gdn_gates_kernel(const __nv_bfloat16* weight_b,
     }
 }
 
+template <int Channels>
 __global__ void bf16_gdn_decode_shared(const __nv_bfloat16* weight_b,
                                        const __nv_bfloat16* weight_a,
                                        const __nv_bfloat16* input, int rows,
@@ -357,8 +390,8 @@ __global__ void bf16_gdn_decode_shared(const __nv_bfloat16* weight_b,
     constexpr int width = decoder::hidden_size;
     constexpr int packs = width / 8;
     __shared__ uint4 row_weight[packs];
-    const bool gate_b = blockIdx.x < text_gdn_value_heads;
-    const int channel = blockIdx.x % text_gdn_value_heads;
+    const bool gate_b = blockIdx.x < Channels;
+    const int channel = blockIdx.x % Channels;
     const auto* weight = (gate_b ? weight_b : weight_a) + channel * width;
     auto* output = gate_b ? output_b : output_a;
     for (int pack = threadIdx.x; pack < packs; pack += blockDim.x) {
@@ -374,7 +407,7 @@ __global__ void bf16_gdn_decode_shared(const __nv_bfloat16* weight_b,
         }
         const auto result = warp_sum(dot.sum());
         if (lane == 0) {
-            output[row * text_gdn_value_heads + channel] = __float2bfloat16_rn(result);
+            output[row * Channels + channel] = __float2bfloat16_rn(result);
         }
     }
 }
@@ -387,14 +420,14 @@ struct VerifyGdnGateArguments {
     decoder::VerifyGdnGateRow rows[capacity];
 };
 
-template <int capacity>
+template <int capacity, int Channels>
 __global__ void bf16_gdn_verify_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const __grid_constant__ VerifyGdnGateArguments<capacity> args) {
     constexpr int packs = decoder::hidden_size / 8;
     __shared__ uint4 row_weight[packs];
-    const bool gate_b = blockIdx.x < text_gdn_value_heads;
-    const int channel = blockIdx.x % text_gdn_value_heads;
+    const bool gate_b = blockIdx.x < Channels;
+    const int channel = blockIdx.x % Channels;
     const auto* weight = (gate_b ? weight_b : weight_a) + channel * decoder::hidden_size;
     for (int pack = threadIdx.x; pack < packs; pack += blockDim.x) {
         row_weight[pack] = load_128(weight + pack * 8);
@@ -508,48 +541,21 @@ __global__ void quantize_fp8_warp(const __nv_bfloat16* input, TextFp8Activation 
 
 }
 
-std::optional<cudaError_t> try_text_bf16_decode_gates(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const __nv_bfloat16* input, int rows, __nv_bfloat16* output_b,
-    __nv_bfloat16* output_a, cudaStream_t stream) {
-    if (!aligned(weight_b, 16) || !aligned(weight_a, 16) || !aligned(input, 16)) {
-        return std::nullopt;
-    }
-    const int channels = (weight_a ? 2 : 1) * text_gdn_value_heads;
-    if (rows == 1) {
-        void* args[] = {&weight_b, &weight_a, &input, &output_b, &output_a};
-        return cudaLaunchKernel(bf16_gdn_gates_kernel, channels, warp_width, args, 0, stream);
-    }
-    void* args[] = {&weight_b, &weight_a, &input, &rows, &output_b, &output_a};
-    const int row_warps = rows <= 8 ? 8 : (rows <= 16 ? 16 : 32);
-    return cudaLaunchKernel(bf16_gdn_decode_shared, channels, row_warps * warp_width,
-                            args, 0, stream);
-}
+namespace {
 
-std::optional<cudaError_t> decoder::try_prefill_bf16_gdn_gates(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
-    int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream) {
-    if (rows < 16 || rows > 65535 || rows % prefill_gate_tile_rows != 0 ||
-        !weight_b || !weight_a || !input || !output_b || !output_a ||
-        !aligned(weight_b, 16) || !aligned(weight_a, 16) || !aligned(input, 16)) {
-        return std::nullopt;
-    }
-    void* args[] = {&weight_b, &weight_a, &input, &output_b, &output_a};
-    static_assert(text_gdn_value_heads % prefill_gate_warps == 0);
-    const dim3 grid(text_gdn_value_heads / prefill_gate_warps, rows / prefill_gate_tile_rows);
-    return cudaLaunchKernel(bf16_gdn_prefill_gates, grid, prefill_gate_warps * warp_width,
-                            args, 0, stream);
-}
+// TP2 rank-local GDN gate channels: half of the full value-head count.
+constexpr int local_gdn_gate_channels = text_gdn_value_heads / 2;
 
-cudaError_t decoder::decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
-                                          const __nv_bfloat16* weight_a,
-                                          const __nv_bfloat16* input, int rows, int width,
-                                          __nv_bfloat16* output_b, __nv_bfloat16* output_a,
-                                          cudaStream_t stream) {
+template <int Channels>
+cudaError_t decode_bf16_gdn_gates_impl(const __nv_bfloat16* weight_b,
+                                       const __nv_bfloat16* weight_a,
+                                       const __nv_bfloat16* input, int rows, int width,
+                                       __nv_bfloat16* output_b, __nv_bfloat16* output_a,
+                                       cudaStream_t stream) {
     if (!weight_b || !weight_a || !input || !output_b || !output_a || rows <= 0 || width <= 0) {
         return cudaErrorInvalidValue;
     }
-    if (rows != text_gdn_value_heads || width != hidden_size ||
+    if (rows != Channels || width != decoder::hidden_size ||
         !aligned(weight_b, 16) || !aligned(weight_a, 16) || !aligned(input, 16)) {
         const auto status = text_bf16_gemv(weight_b, input, rows, width, output_b, stream);
         if (status != cudaSuccess) {
@@ -558,13 +564,36 @@ cudaError_t decoder::decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
         return text_bf16_gemv(weight_a, input, rows, width, output_a, stream);
     }
     void* args[] = {&weight_b, &weight_a, &input, &output_b, &output_a};
-    return cudaLaunchKernel(bf16_gdn_gates_kernel, 2 * text_gdn_value_heads, warp_width,
+    return cudaLaunchKernel(bf16_gdn_gates_kernel<Channels>, 2 * Channels, warp_width,
                             args, 0, stream);
 }
 
-std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates(
+template <int Channels>
+std::optional<cudaError_t> try_prefill_bf16_gdn_gates_impl(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
+    int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream) {
+    if (rows < 16 || rows > 65535 ||
+        !weight_b || !weight_a || !input || !output_b || !output_a ||
+        !aligned(weight_b, 16) || !aligned(weight_a, 16) || !aligned(input, 16)) {
+        return std::nullopt;
+    }
+    void* args[] = {&weight_b, &weight_a, &input, &rows, &output_b, &output_a};
+    static_assert(Channels % prefill_gate_warps == 0);
+    const dim3 grid(Channels / prefill_gate_warps,
+                    divide_up(rows, prefill_gate_tile_rows));
+    // Host-selected specialization: rows divisible by the tile height run the
+    // fully constant full-tile kernel (legacy codegen); ragged tails launch
+    // the guarded twin instead.
+    const bool full_tiles = rows % prefill_gate_tile_rows == 0;
+    const auto kernel = full_tiles ? bf16_gdn_prefill_gates<Channels, true>
+                                   : bf16_gdn_prefill_gates<Channels, false>;
+    return cudaLaunchKernel(kernel, grid, prefill_gate_warps * warp_width, args, 0, stream);
+}
+
+template <int Channels>
+std::optional<cudaError_t> try_verify_bf16_gdn_gates_impl(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
+    const decoder::VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
     if (count < 2 || (count > text_fp8_max_batch && count != wide_gdn_gate_rows) ||
         !rows || !weight_b || !weight_a ||
         !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
@@ -582,17 +611,19 @@ std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates(
         }
         void* args[] = {&weight_b, &weight_a, &arguments};
         constexpr int capacity = sizeof(arguments.rows) / sizeof(*arguments.rows);
-        return cudaLaunchKernel(bf16_gdn_verify_gates<capacity>, 2 * text_gdn_value_heads,
+        return cudaLaunchKernel(bf16_gdn_verify_gates<capacity, Channels>, 2 * Channels,
                                 count * warp_width, args, 0, stream);
     };
     return count == wide_gdn_gate_rows ? launch(VerifyGdnGateArguments<wide_gdn_gate_rows>{})
                                        : launch(VerifyGdnGateArguments<text_fp8_max_batch>{});
 }
 
-std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact(
+template <int Channels>
+std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact_impl(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    constexpr int capacity = CompactGdnVerificationBatch::lanes * CompactGdnVerificationBatch::rows;
+    const decoder::VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
+    constexpr int capacity =
+        decoder::CompactGdnVerificationBatch::lanes * decoder::CompactGdnVerificationBatch::rows;
     const auto pending = cudaGetLastError();
     if (pending != cudaSuccess) {
         return pending;
@@ -610,14 +641,117 @@ std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact(
         arguments.rows[index] = row;
     }
     void* args[] = {&weight_b, &weight_a, &arguments};
-    const dim3 grid(2 * text_gdn_value_heads, count / wide_gdn_gate_rows);
-    const auto direct = cudaLaunchKernel(bf16_gdn_verify_gates<capacity>, grid,
+    const dim3 grid(2 * Channels, count / wide_gdn_gate_rows);
+    const auto direct = cudaLaunchKernel(bf16_gdn_verify_gates<capacity, Channels>, grid,
                                          wide_gdn_gate_rows * warp_width, args, 0, stream);
     const auto recorded = cudaGetLastError();
-    if (direct == cudaSuccess || (!CudaError::terminal(direct) && CudaError::terminal(recorded))) {
+    if (direct == cudaSuccess ||
+        (!decoder::CudaError::terminal(direct) && decoder::CudaError::terminal(recorded))) {
         return recorded;
     }
     return direct;
+}
+
+}
+
+std::optional<cudaError_t> try_text_bf16_decode_gates(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const __nv_bfloat16* input, int rows, __nv_bfloat16* output_b,
+    __nv_bfloat16* output_a, int channels, cudaStream_t stream) {
+    if (rows <= 0 || rows > 65535 || !weight_b || !input || !output_b ||
+        (weight_a && !output_a) ||
+        (channels != text_gdn_value_heads && channels != local_gdn_gate_channels) ||
+        !aligned(weight_b, 16) || !aligned(weight_a, 16) || !aligned(input, 16)) {
+        return std::nullopt;
+    }
+    const int outputs = (weight_a ? 2 : 1) * channels;
+    if (rows == 1) {
+        void* args[] = {&weight_b, &weight_a, &input, &output_b, &output_a};
+        const auto single = [&](auto kernel) {
+            return cudaLaunchKernel(kernel, outputs, warp_width, args, 0, stream);
+        };
+        if (channels == text_gdn_value_heads) {
+            return single(bf16_gdn_gates_kernel<text_gdn_value_heads>);
+        }
+        if (channels == local_gdn_gate_channels) {
+            return single(bf16_gdn_gates_kernel<local_gdn_gate_channels>);
+        }
+        return std::nullopt;
+    }
+    void* args[] = {&weight_b, &weight_a, &input, &rows, &output_b, &output_a};
+    const int row_warps = rows <= 8 ? 8 : (rows <= 16 ? 16 : 32);
+    const auto shared = [&](auto kernel) {
+        return cudaLaunchKernel(kernel, (weight_a ? 2 : 1) * channels, row_warps * warp_width,
+                                args, 0, stream);
+    };
+    if (channels == text_gdn_value_heads) {
+        return shared(bf16_gdn_decode_shared<text_gdn_value_heads>);
+    }
+    if (channels == local_gdn_gate_channels) {
+        return shared(bf16_gdn_decode_shared<local_gdn_gate_channels>);
+    }
+    return std::nullopt;
+}
+
+std::optional<cudaError_t> decoder::try_prefill_bf16_gdn_gates(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
+    int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream) {
+    return try_prefill_bf16_gdn_gates_impl<text_gdn_value_heads>(
+        weight_b, weight_a, input, rows, output_b, output_a, stream);
+}
+
+std::optional<cudaError_t> decoder::try_prefill_bf16_gdn_gates_local(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
+    int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream) {
+    return try_prefill_bf16_gdn_gates_impl<local_gdn_gate_channels>(
+        weight_b, weight_a, input, rows, output_b, output_a, stream);
+}
+
+cudaError_t decoder::decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
+                                          const __nv_bfloat16* weight_a,
+                                          const __nv_bfloat16* input, int rows, int width,
+                                          __nv_bfloat16* output_b, __nv_bfloat16* output_a,
+                                          cudaStream_t stream) {
+    return decode_bf16_gdn_gates_impl<text_gdn_value_heads>(
+        weight_b, weight_a, input, rows, width, output_b, output_a, stream);
+}
+
+cudaError_t decoder::decode_bf16_gdn_gates_local(const __nv_bfloat16* weight_b,
+                                                const __nv_bfloat16* weight_a,
+                                                const __nv_bfloat16* input, int rows, int width,
+                                                __nv_bfloat16* output_b,
+                                                __nv_bfloat16* output_a,
+                                                cudaStream_t stream) {
+    return decode_bf16_gdn_gates_impl<local_gdn_gate_channels>(
+        weight_b, weight_a, input, rows, width, output_b, output_a, stream);
+}
+
+std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
+    return try_verify_bf16_gdn_gates_impl<text_gdn_value_heads>(
+        weight_b, weight_a, rows, count, stream);
+}
+
+std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_local(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
+    return try_verify_bf16_gdn_gates_impl<local_gdn_gate_channels>(
+        weight_b, weight_a, rows, count, stream);
+}
+
+std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
+    return try_verify_bf16_gdn_gates_compact_impl<text_gdn_value_heads>(
+        weight_b, weight_a, rows, count, stream);
+}
+
+std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact_local(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
+    return try_verify_bf16_gdn_gates_compact_impl<local_gdn_gate_channels>(
+        weight_b, weight_a, rows, count, stream);
 }
 
 cudaError_t decoder::decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,

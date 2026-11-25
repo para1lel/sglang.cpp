@@ -39,7 +39,7 @@ launch and one MXFP8 append follow. Grouped prefill seeds each request
 separately. Single-row tiles and other devices project and append each slice
 separately. Seed scratch comes from the existing prefill workspace.
 [Slice preparation](../src/decoder_mtp.cpp#L764)<!-- prefix: "for (int off" --> ·
-[Paired projection](../src/text_ops.cu#L789)<!-- prefix: "cudaError_t " --> ·
+[Paired projection](../src/text_ops.cu#L790)<!-- prefix: "cudaError_t " --> ·
 [Grid banks](../include/sglang/text/prefill_fp8_exact.cuh#L209)<!-- prefix: "__global__ v" --> ·
 [Grouped seed](../src/decoder_prefill.cpp#L674)<!-- prefix: "seed.seed_dr" -->
 
@@ -49,7 +49,7 @@ Eligible B200 draft waves select [grouped online attention](native-model-info.md
 
 ### Draft winner readback
 
-On B200, if every lane has mapped pinned host storage, two to four unconstrained draft lanes share two argmax launches. The first launch reduces tiles within each lane. The second writes each lane's winning ID and score directly to that request's host record. The selection rules match the per-lane path, including lowest-ID ties and invalidation for nonfinite INT8 scores. [Dispatch](../src/decoder_mtp.cpp#L367)<!-- prefix: "void MtpDraf" --> · [Launcher](../src/text_ops.cu#L862)<!-- prefix: "cudaError_t " --> · [Selection](../src/text_ops.cu#L430)<!-- prefix: "__device__ T" -->
+On B200, if every lane has mapped pinned host storage, two to four unconstrained draft lanes share two argmax launches. The first launch reduces tiles within each lane. The second writes each lane's winning ID and score directly to that request's host record. The selection rules match the per-lane path, including lowest-ID ties and invalidation for nonfinite INT8 scores. [Dispatch](../src/decoder_mtp.cpp#L367)<!-- prefix: "void MtpDraf" --> · [Launcher](../src/text_ops.cu#L863)<!-- prefix: "cudaError_t " --> · [Selection](../src/text_ops.cu#L430)<!-- prefix: "__device__ T" -->
 
 Each request can reuse its mapping during stream capture. Outside capture, a request can allocate mapped storage on demand. Singleton and constrained lanes use per-lane selection and copy the winning ID. If capture prevents allocation or pinned allocation fails on any lane, the group uses per-lane selection. Other devices also use per-lane selection. Other CUDA errors propagate. [Mapping](../src/decoder_mtp.cpp#L347)<!-- prefix: "bool MtpDraf" --> · [Allocation](../src/decoder_verify.cpp#L562)<!-- prefix: "std::shared_" --> · [Per-lane selection](../src/decoder_mtp.cpp#L367)<!-- prefix: "void MtpDraf" -->
 

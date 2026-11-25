@@ -26,6 +26,11 @@ cudaError_t decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
                                   const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
                                   int rows, int width, __nv_bfloat16* output_b,
                                   __nv_bfloat16* output_a, cudaStream_t stream);
+cudaError_t decode_bf16_gdn_gates_local(const __nv_bfloat16* weight_b,
+                                        const __nv_bfloat16* weight_a,
+                                        const __nv_bfloat16* input, int rows, int width,
+                                        __nv_bfloat16* output_b, __nv_bfloat16* output_a,
+                                        cudaStream_t stream);
 struct VerifyGdnGateRow {
     const __nv_bfloat16* input;
     __nv_bfloat16* output_b;
@@ -36,6 +41,12 @@ std::optional<cudaError_t> try_verify_bf16_gdn_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
 std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
+std::optional<cudaError_t> try_verify_bf16_gdn_gates_local(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
+std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact_local(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
 cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,
@@ -124,6 +135,9 @@ std::optional<cudaError_t> try_prefill_bf16_gdn_gates_sm100(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
     int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, void* scratch,
     std::size_t scratch_bytes, cudaStream_t stream);
+std::optional<cudaError_t> try_prefill_bf16_gdn_gates_local(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
+    int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream);
 
 cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                                     const __nv_bfloat16* b, const __nv_bfloat16* a,
@@ -386,9 +400,10 @@ cudaError_t decode_fp8_project(TextFp8ActivationView input, DecodeFp8Projection 
 cudaError_t decode_fp8_qkv(TextFp8ActivationView input, DecodeFp8Projection query,
                            DecodeFp8Projection key, DecodeFp8Projection value, int width,
                            cudaStream_t stream);
-// The fused 5120-by-17408 path requires 16-byte-aligned FP8 values. It writes only gate.output and
-// accepts identical gate and up output spans. Fallback uses up.output as scratch and requires
-// disjoint spans. Both paths return SwiGLU in gate.output.
+// The fused paths (TP1 5120-by-17408 and TP2 5120-by-8704 gate rows) require 16-byte-aligned
+// FP8 values. They write only gate.output and accept identical gate and up output spans. Any
+// other geometry uses the fallback, which writes up.output as scratch and requires disjoint
+// spans. Both paths return SwiGLU in gate.output.
 cudaError_t decode_fp8_gate_up(TextFp8ActivationView input, DecodeFp8Projection gate,
                                DecodeFp8Projection up, int width, cudaStream_t stream);
 

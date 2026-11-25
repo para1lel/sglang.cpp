@@ -226,7 +226,8 @@ cudaError_t launch_fp8_rows(const std::uint8_t* weight, const __nv_bfloat16* wei
         constexpr int tile_rows = 4;
         constexpr int channels = 4;
         if ((in_width == decoder::hidden_size || in_width == decoder::intermediate_size ||
-             in_width == text_gqa_q_width) &&
+             in_width == text_gqa_q_width || in_width == text_gqa_q_width / 2 ||
+             in_width == decoder::intermediate_size / 2) &&
             out_width % channels == 0 && out_width <= 65535) {
             constexpr int reuse_channels = 8;
             if (rows >= 64 && rows <= 128 && out_width % reuse_channels == 0) {

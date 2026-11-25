@@ -33,16 +33,16 @@ static_assert(text_attention_max_tokens == qwen_text_model.max_position_embeddin
 static_assert(text_fp8_group_size == qwen_text_model.fp8_weight_block_size);
 
 struct Fp8Weight {
-    const std::uint8_t* values;
-    const Bf16* scales;
-    int rows;
-    int columns;
+    const std::uint8_t* values = nullptr;
+    const Bf16* scales = nullptr;
+    int rows = 0;
+    int columns = 0;
 };
 
 struct Bf16Weight {
-    const Bf16* values;
-    int rows;
-    int columns;
+    const Bf16* values = nullptr;
+    int rows = 0;
+    int columns = 0;
 };
 
 struct GdnLayer {

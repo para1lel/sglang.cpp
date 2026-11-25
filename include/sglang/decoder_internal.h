@@ -10,6 +10,7 @@
 #include "sglang/runtime/cache/kv_residency_policy.h"
 #include "sglang/runtime/execution/decoder_execution_policy.h"
 #include "sglang/runtime/model/qwen_request.h"
+#include "sglang/runtime/model/qwen_weight_shard.h"
 
 #include <algorithm>
 #include <array>
@@ -178,7 +179,8 @@ struct BatchGraphScratch {
 namespace sglang {
 
 struct Decoder::Model {
-    Model(const std::filesystem::path& checkpoint, int cuda_device);
+    Model(const std::filesystem::path& checkpoint, int cuda_device,
+          const decoder::WeightSharding& sharding = decoder::WeightSharding{});
 
     bool is_b200() const { return backend.uses_b200_operators; }
     int target_split_end() const { return backend.target_split_end; }

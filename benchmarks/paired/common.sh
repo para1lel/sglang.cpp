@@ -129,6 +129,30 @@ prepare_fixtures() {
     fi
 }
 
+# Run in the background. The shell's $! stays the session leader across exec.
+launch_session() {
+    exec "$client_python" -IB -c '
+import os
+import sys
+from pathlib import Path
+
+os.setsid()
+Path(sys.argv[1]).write_text(f"{os.getpid()}\n")
+os.execvp(sys.argv[2], sys.argv[2:])
+' "$@"
+}
+
+stop_session() {
+    local pid=$1 attempt
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 40; ++attempt)); do
+        kill -0 -- "-$pid" 2>/dev/null || break
+        sleep .25
+    done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 stop_group() {
     if [[ -n $monitor_pid ]]; then
         kill "$monitor_pid" 2>/dev/null || true
@@ -136,25 +160,21 @@ stop_group() {
         monitor_pid=
     fi
     if [[ -n $server_pid ]]; then
-        kill -TERM -- "-$server_pid" 2>/dev/null || true
-        for ((attempt = 0; attempt < 40; ++attempt)); do
-            kill -0 -- "-$server_pid" 2>/dev/null || break
-            sleep .25
-        done
-        kill -KILL -- "-$server_pid" 2>/dev/null || true
+        stop_session "$server_pid"
         server_pid=
-    fi
-    if [[ -n ${server_launcher_pid:-} ]]; then
-        wait "$server_launcher_pid" 2>/dev/null || true
-        server_launcher_pid=
     fi
 }
 
 start_group() {
     local run=$1
     shift
-    check_idle || return
+    if [[ -z ${lmcache_pid:-} ]]; then
+        check_idle || return
+    fi
     record_compute "$run/compute-before.csv" || return
+    if [[ -n ${lmcache_pid:-} ]]; then
+        check_compute_owners "$run/compute-before.csv" "$lmcache_pid" || return
+    fi
     if curl --noproxy '*' -fsS --max-time 1 "$url/health" >/dev/null 2>&1; then
         echo "A server already responds on $url" >&2
         return 1
@@ -164,22 +184,8 @@ start_group() {
     nvidia-smi --query-gpu="$gpu_fields" --format=csv -l 5 >"$run/gpu-samples.csv" 9<&- &
     monitor_pid=$!
     date -u +%FT%TZ >"$run/server-started-utc.txt"
-    "$client_python" -IB -c '
-import subprocess
-import sys
-from pathlib import Path
-
-server = subprocess.Popen(sys.argv[2:], start_new_session=True)
-Path(sys.argv[1]).write_text(f"{server.pid}\n")
-sys.exit(server.wait())
-' "$run/server-pid.txt" "${command[@]}" >"$run/server.log" 2>&1 9<&- &
-    server_launcher_pid=$!
-    for ((attempt = 0; attempt < 100; ++attempt)); do
-        [[ ! -s $run/server-pid.txt ]] || break
-        kill -0 "$server_launcher_pid" 2>/dev/null || { tail -40 "$run/server.log" >&2; return 1; }
-        sleep .05
-    done
-    read -r server_pid <"$run/server-pid.txt" || return
+    launch_session "$run/server-pid.txt" "${command[@]}" >"$run/server.log" 2>&1 9<&- &
+    server_pid=$!
     for ((attempt = 0; attempt < 480; ++attempt)); do
         kill -0 "$server_pid" 2>/dev/null || { tail -40 "$run/server.log" >&2; return 1; }
         if curl --noproxy '*' -fsS --max-time 1 "$url/health" >"$run/health.json" 2>/dev/null; then

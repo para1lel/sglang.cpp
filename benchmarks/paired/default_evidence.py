@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 
+import lmcache_evidence
 import workload_suite
 from saved_evidence import arg, command, fields, load, observed_device, require
 
@@ -31,20 +32,21 @@ NATIVE_ENVIRONMENT = {
 }
 
 
-def process_environment(raw):
+def process_environment(raw, *, lmcache=False):
     entries = raw.rstrip(b"\0").split(b"\0")
     names = [os.fsdecode(entry.split(b"=", 1)[0]) for entry in entries]
-    require(raw.endswith(b"\0") and set(names) == NATIVE_ENVIRONMENT
-            and len(names) == len(NATIVE_ENVIRONMENT)
+    expected = NATIVE_ENVIRONMENT | ({"XDG_RUNTIME_DIR"} if lmcache else set())
+    require(raw.endswith(b"\0") and set(names) == expected
+            and len(names) == len(expected)
             and all(b"=" in entry for entry in entries),
             "Live native default environment contains unexpected or missing settings")
     return dict(os.fsdecode(entry).split("=", 1) for entry in entries)
 
 
-def read_environment(pid):
+def read_environment(pid, *, lmcache=False):
     require(pid > 0, "Invalid native server PID")
     raw = Path(f"/proc/{pid}/environ").read_bytes()
-    environment = process_environment(raw)
+    environment = process_environment(raw, lmcache=lmcache)
     return b"".join(os.fsencode(f"{name}={value}") + b"\0"
                     for name, value in sorted(environment.items()))
 
@@ -85,14 +87,18 @@ def token_budget(identity):
 def native(run, identity):
     info = load(run / "server-info.json")
     trace = run.name == "native-k4-trace"
+    lmcache = identity["protocol"] in workload_suite.LMCACHE_PROTOCOLS
     expected = {
         "mtp_steps": 4, "max_running_requests": serving_capacity(identity),
         "max_num_batched_tokens": token_budget(identity),
-        "prefix_cache_entries": 4 if identity["protocol"] in CACHE_ON_PROTOCOLS else 0,
         "batch_cuda_graphs": True, "eager": False,
         "trace_batches": trace, "host": "127.0.0.1", "device": 0,
         "tp_size": 1, "dp_size": 1, "pp_size": 1, "model_path": identity["checkpoint_path"],
     }
+    if lmcache:
+        expected.update(lmcache_enabled=True, lmcache_available=True, prefix_cache_entries=0)
+    else:
+        expected["prefix_cache_entries"] = 4 if identity["protocol"] in CACHE_ON_PROTOCOLS else 0
     port = info["port"]
     require(all(type(info.get(key)) is type(value) and info[key] == value
                 for key, value in expected.items()) and type(port) is int and 1 <= port <= 65535,
@@ -105,7 +111,9 @@ def native(run, identity):
     cpus = {"server": identity["server_cpus"], "memory": identity["memory"]}
     wrapper = command(run, "server", cpus)
     begin = (run / "live-environment.bin").read_bytes()
-    environment = process_environment(begin)
+    environment = process_environment(begin, lmcache=lmcache)
+    if lmcache:
+        lmcache_evidence.verify(run, environment, identity)
     boundary = 2 + len(environment)
     require(wrapper[:2] == ["env", "-i"] and
             sorted(wrapper[2:boundary]) == sorted(
@@ -133,7 +141,10 @@ def native_completed(run, identity):
     info = native(run, identity)
     client(run, identity, info["port"])
     pid = (run / "server-pid.txt").read_text().strip()
-    observed_device(run, pid, identity["gpu_uuid"].lower())
+    if identity["protocol"] in workload_suite.LMCACHE_GPU_PROTOCOLS:
+        lmcache_evidence.completed(run, identity)
+    else:
+        observed_device(run, pid, identity["gpu_uuid"].lower())
     require((run / "live-environment-end.bin").read_bytes()
             == (run / "live-environment.bin").read_bytes(),
             f"{run.name}: native environment changed during use")
@@ -205,3 +216,13 @@ def vllm_budget(config, worker, budget):
             and bool(prefill_sizes) and max(prefill_sizes) <= budget
             and expected["max_num_seqs"] in decode_sizes,
             "vLLM API and worker disagree about resolved v4 CUDA graph settings")
+
+
+def require_vllm_local_apc(config, argv):
+    cache = config["cache_config"]
+    offload = ("--kv-offloading-size", "--kv-offloading-backend", "--kv-transfer-config")
+    require(cache.get("enable_prefix_caching") is True
+            and "kv_offloading_size" in cache and cache["kv_offloading_size"] is None
+            and "kv_transfer_config" in config and config["kv_transfer_config"] is None
+            and not any(item.split("=", 1)[0] in offload for item in argv),
+            "Pinned vLLM must use local APC with no KV offload or transfer connector")

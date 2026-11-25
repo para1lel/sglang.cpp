@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 from threading import Barrier
+from uuid import uuid4
 
+from live_controls import STORES, Controls
 from routes import MODEL, Routes
 
 
@@ -76,26 +78,39 @@ def check(routes, name, case, hit, salt=None, stream=False):
 
 
 def warm(routes, cases, reference):
+    controls = Controls(routes.port, routes.directory)
+    salts = {name: uuid4().hex for name in ("text", "chat", "unseen")}
+
+    def prime(case, domain):
+        route, body, _ = cases[case]
+        request = {key: value for key, value in body.items() if key != "ebnf"}
+        request.update(max_tokens=1, cache_salt=salts[domain])
+        baseline = controls.wait_for(f"{domain}-cold-idle", 0, 0, stores=0)[STORES]
+        routes.raw(f"prime-{domain}", request, route=route)
+        controls.wait_for(f"{domain}-prime-stored", 0, 0, stores=baseline + 1)
+
     def verify(name, case, hit, salt, stream=False):
-        actual = check(routes, name, cases[case], hit, salt, stream)
+        actual = check(routes, name, cases[case], hit, salts[salt], stream)
         assert actual == reference[case], (name, actual, reference[case])
         return actual
 
-    chat_hit = reference["chat"]["prompt"] // 128 * 128
-    assert chat_hit > 0
+    text_hit = reference["exact"]["prompt"]
+    chat_hit = reference["chat"]["prompt"]
     verify("cold-exact", "exact", 0, "text")
-    verify("warm-exact", "exact", 128, "text", True)
+    prime("exact", "text")
+    verify("warm-exact", "exact", text_hit, "text", True)
     verify("cold-chat", "chat", 0, "chat")
+    prime("chat", "chat")
     verify("warm-chat", "chat", chat_hit, "chat", True)
     route, body, _ = cases["exact"]
-    invalid = body | {"cache_salt": "text", "ebnf": "root ::= [a-z]"}
+    invalid = body | {"cache_salt": salts["text"], "ebnf": "root ::= [a-z]"}
     routes.raw("invalid-grammar", invalid, code=400, route=route)
-    verify("after-invalid", "exact", 128, "text")
+    verify("after-invalid", "exact", text_hit, "text")
 
     barrier = Barrier(4, timeout=10)
-    lanes = (("warm-new-grammar", "new-grammar", 128, "text"),
-             ("warm-suffix", "partial", 128, "text"),
-             ("warm-other-seed", "exact-other-seed", 128, "text"),
+    lanes = (("warm-new-grammar", "new-grammar", text_hit, "text"),
+             ("warm-suffix", "partial", text_hit, "text"),
+             ("warm-other-seed", "exact-other-seed", text_hit, "text"),
              ("cold-mixed", "exact", 0, "unseen"))
 
     def concurrent(lane):
@@ -104,7 +119,7 @@ def warm(routes, cases, reference):
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(concurrent, lanes))
-    verify("after-mixed", "exact", 128, "text")
+    verify("after-mixed", "exact", text_hit, "text")
 
 
 def main():

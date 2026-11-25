@@ -41,6 +41,17 @@ struct CudaError : std::runtime_error {
 
 std::size_t available_device_bytes();
 
+// The caller has fenced all uses of this cudaMalloc allocation before releasing it.
+inline cudaError_t release_cuda_block(void* pointer, cudaStream_t stream,
+                                      bool wait_for_release = false) noexcept {
+    const auto status = cudaFreeAsync(pointer, stream);
+    if (status == cudaSuccess && wait_for_release) return cudaStreamSynchronize(stream);
+    if (status != cudaErrorNotSupported) return status;
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess && pending != cudaErrorNotSupported) return pending;
+    return cudaFree(pointer);
+}
+
 inline void copy_cuda_async(void* destination, const void* source, std::size_t bytes,
                             cudaMemcpyKind kind, cudaStream_t stream, const char* operation) {
     check(cudaMemcpyAsync(destination, source, bytes, kind, stream), operation);
@@ -69,9 +80,13 @@ private:
     bool changed_ = false;
 };
 
+struct ExportedDeviceBlock;
+struct DetachedDeviceBytes;
+
 struct DeviceBlock {
     void* pointer;
     std::size_t bytes;
+    std::shared_ptr<ExportedDeviceBlock> export_owner{};
 };
 
 class RequestBlockCache;
@@ -101,6 +116,7 @@ public:
     void capture_graph(const std::function<void()>& enqueue);
     void discard_graph();
     void free_block(void* pointer, std::size_t bytes);
+    std::shared_ptr<const void> retain_block(const void* pointer) const;
     bool replay_batch_graph(int width, const std::function<void()>& prepare,
                             const std::function<void()>& capture,
                             const std::function<bool()>& bind, bool target_verify = false);
@@ -148,7 +164,8 @@ private:
     static constexpr std::size_t max_bytes = 768 * 1024 * 1024;
     static constexpr std::size_t max_blocks = 384;
     std::unique_ptr<Allocations::State> state_;
-    std::unique_ptr<RetiredBlockReclaimer> reclaimer_;
+    std::shared_ptr<RetiredBlockReclaimer> reclaimer_;
+    std::shared_ptr<DetachedDeviceBytes> detached_bytes_;
     std::size_t quarantined_bytes_ = 0;
     bool reusable_ = true;
 };
@@ -160,7 +177,7 @@ public:
 
     static std::unique_ptr<RetiredBlockReclaimer> create(int device);
     ~RetiredBlockReclaimer();
-    bool submit(DeviceBlock block);
+    bool submit(DeviceBlock block, bool detached = false);
     std::size_t unavailable_bytes() const;
     std::size_t pending_bytes() const;
     void drain();

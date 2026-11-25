@@ -174,7 +174,7 @@ class CompletionPrompts(unittest.TestCase):
         gate = controls / "step"
         self.enterContext(patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)))
         port = self.enterContext(server(self.binary, self.checkpoint, log, "--max-active",
-                                        str(width), "--prefix-cache-entries", "1", sampling=False))
+                                        str(width), sampling=False))
         return port, gate, log
 
     def connect(self, port, payload):

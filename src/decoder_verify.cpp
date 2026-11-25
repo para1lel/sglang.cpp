@@ -407,14 +407,7 @@ VerificationRow TargetVerification::row(int index) {
 }
 
 const Workspace* TargetVerification::checkpoint_row(int index) {
-    const auto& work = *row(index).work;
-    if (active_workspace_ == &*eager_workspace_) return &work;
-    // Later packets can replay into the same graph buffers before publication.
-    for (const auto field : {&Workspace::hidden, &Workspace::residual}) {
-        copy_cuda_async(request_.work.*field, work.*field, hidden_size * sizeof(Bf16),
-                        cudaMemcpyDeviceToDevice, stream_, "Retain checkpoint row");
-    }
-    return &request_.work;
+    return &eager_workspace_->work.at(index);
 }
 
 bool TargetVerification::graph_eligible(const VerificationSequence& sequence) const {
@@ -431,6 +424,11 @@ void TargetVerification::bind_graph(VerificationGraphBinding& binding) const {
     binding.caches = request_.caches;
     binding.initial = request_.states;
     binding.tail = tail_;
+    for (int index = 0; index < k1_verification_rows; ++index) {
+        const auto& work = eager_workspace_->work[index];
+        binding.final_states[index] = request_.prefix_checkpoint_outputs
+            ? TextModelStateRow{work.hidden, work.residual} : TextModelStateRow{};
+    }
 }
 
 void TargetVerification::use_graph_workspace(VerificationWorkspace& graph_workspace) {
@@ -722,7 +720,9 @@ void Decoder::Model::enqueue_verification(const VerificationRow* rows, int count
     forward_verification_layers(rows, count, stream, packed_activation);
     const auto score_packet = [&](const VerificationRow* first, int size) {
         for (int index = 0; index < size; ++index) {
-            normalize_final(*first[index].work, stream);
+            const auto& row = first[index];
+            normalize_final(*row.work, stream, row.binding ? &row.binding->final_states[index]
+                                                            : nullptr);
         }
         if (vocabulary && (size == tc_vocab_rows || size <= tc_vocab_narrow_rows)) {
             std::array<VerificationRow, tc_vocab_rows> scored;

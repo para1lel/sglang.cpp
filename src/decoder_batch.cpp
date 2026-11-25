@@ -8,11 +8,13 @@
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
-#include "sglang/decoder_prefix_cache.h"
+#include "sglang/runtime/model/decoder_batch_lane.h"
 #include "sglang/prefill_fp8.h"
 #include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/tc_vocab.h"
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <utility>
 namespace sglang {
 namespace {
@@ -20,115 +22,6 @@ namespace {
 using namespace decoder;
 
 static_assert(decoder_batch_max_mtp_steps + 1 == target_verify_max_rows);
-
-struct Lane {
-    std::unique_ptr<Request> request;
-    std::vector<int> prompt;
-    DecoderOptions options;
-    int prompt_size = static_cast<int>(prompt.size());
-    int checkpoint = 0;
-    RequestProgress progress{};
-    std::unique_ptr<MtpDraftRequest> draft = nullptr;
-    std::unique_ptr<TargetVerification> verification = nullptr;
-    std::optional<SamplingParameters> sampling = std::nullopt;
-    std::optional<MtpConstraintRound> constraint_round{};
-    int counted_draft_rows = 0;
-    bool restored_prompt = false;
-    std::shared_ptr<const MultimodalInput> media = nullptr;
-    MediaPrefill media_prefill{};
-    std::size_t resident_bytes = 0;
-    DecoderPromptLogprobs prompt_logprobs{};
-
-    int remaining_prompt() const { return progress.remaining_prompt(prompt_size); }
-    int remaining_output() const { return progress.remaining_output(options); }
-    int capacity() const { return RequestProgress::capacity(prompt_size, options); }
-    int checkpoint_room() const {
-        constexpr int interval = decoder_batch_prefix_checkpoint_interval;
-        return interval - progress.position % interval;
-    }
-    int prefill_rows(bool checkpoints) const {
-        return checkpoints ? std::min(remaining_prompt(), checkpoint_room()) : remaining_prompt();
-    }
-    int proposals(bool checkpoints = false) const {
-        const int available = checkpoints ? std::min(remaining_output(), checkpoint_room())
-                                          : remaining_output();
-        return std::min(options.mtp_steps, available - 1);
-    }
-
-    ForwardLane input() const {
-        const int position = progress.position;
-        if (remaining_prompt()) {
-            return {request.get(), prompt[position], position, TextGdnMode::prefill, false,
-                    media ? media_prefill.feature(position) : nullptr,
-                    media ? media_prefill.positions + position : nullptr};
-        }
-        const int rotary = media ? position + media->prompt.next_position - prompt_size : -1;
-        return {request.get(), progress.last_token, position, TextGdnMode::decode, false,
-                nullptr, nullptr, rotary};
-    }
-
-    void record_decode_input(cudaStream_t stream) {
-        prompt.push_back(progress.last_token);
-        if (!draft || draft->valid_prefix() >= progress.position) return;
-        // The last ordinary target step does not enter the verifier's draft preparation.
-        MtpRound tail{};
-        tail.draft = draft.get();
-        tail.media = media ? &media_prefill : nullptr;
-        auto input = tail.draft_input(progress.position - 1, progress.last_token,
-                                      request->work.normalized);
-        MtpDraftRequest::enqueue_wave(&input, 1, false, stream);
-    }
-
-    void finish_round(MtpRound& round, DecoderBatchStep& result, cudaStream_t stream,
-                      SerialOutput* output, const MtpRound::Cancel& cancel,
-                      MtpDraftInput* repair, const Workspace** committed_row) {
-        result.mtp_drafted_tokens = round.drafted;
-        result.mtp_verified_rows = round.rows();
-        try {
-            const bool scored = round.target->needs_generated_logprobs();
-            const int stop = options.text_stop && (!cancel || !cancel())
-                ? round.text_stop_after(options, progress) : 0;
-            const bool completed = round.commit([&](int token, const Bf16* logits, bool accepted,
-                                                    int row) {
-                if (!result.token) {
-                    result.token = token;
-                    if (scored) result.generated_logprobs = round.target->generated_logprobs(row);
-                } else {
-                    const int index = result.extra_token_count++;
-                    result.extra_tokens[index] = token;
-                    if (scored) {
-                        result.extra_generated_logprobs[index] =
-                            round.target->generated_logprobs(row);
-                    }
-                }
-                result.mtp_accepted_tokens += accepted;
-                result.finish_reason = progress.commit(options, token, logits, output);
-                if (row + 1 == stop && result.finish_reason != DecoderFinishReason::cancelled)
-                    result.finish_reason = DecoderFinishReason::stop;
-                return !result.finish_reason;
-            }, stream, cancel, repair, committed_row);
-            if (!completed) {
-                result.finish_reason = DecoderFinishReason::cancelled;
-            }
-        } catch (const DecoderSamplingError&) {
-            result.sampling_failed = true;
-            return;
-        } catch (const DecoderConstraintError&) {
-            result.constraint_failed = true;
-            return;
-        }
-        if (result.extra_token_count != 0) {
-            result.extra_token = result.extra_tokens.front();
-        }
-        result.mtp_replayed_rows = round.consumed < round.rows() ? round.consumed : 0;
-        progress.advance(round.consumed);
-        if (committed_row) {
-            // The final sampled ID is the unprocessed input of the next turn.
-            prompt.insert(prompt.end(), round.tokens.begin(),
-                          round.tokens.begin() + round.consumed);
-        }
-    }
-};
 
 struct BatchStorage {
     BatchStorage(int device, std::shared_ptr<const Allocations> memory, bool resident, int lanes)
@@ -139,11 +32,11 @@ struct BatchStorage {
     BatchAdmissionOrder admission;
     DecodeGraphs decode_graphs;
     std::optional<VerificationGraph> verification_graph;
-    std::optional<PrefixCache> prefix_cache;
     std::shared_ptr<const TcVocabScratch> tc_vocab;
     std::shared_ptr<TextLogitCandidate> verification_winners;
 };
 void retire(std::optional<Lane>& lane) {
+    if (lane) lane->prefix.reset();
     if (lane && lane->request) lane->request->memory.recycle_after_completion();
     if (lane && lane->draft && lane->resident_bytes) lane->draft->recycle_after_completion();
     lane.reset();
@@ -171,13 +64,12 @@ static_assert(prefill_chunk_rows == mxfp8_page_size);
 StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int lanes,
                    int budget, bool chunked, WideMtpCandidates* wide) {
     BudgetLanes work{};
-    const bool checkpoints = storage.prefix_cache.has_value();
     for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
         if (!selected[slot] || !lane || !lane->request || lane->restored_prompt) continue;
         work[slot] = lane->remaining_prompt()
-            ? BudgetLane{chunked ? lane->prefill_rows(checkpoints) : 1}
-            : BudgetLane{0, std::max(0, lane->proposals(checkpoints)), true};
+            ? BudgetLane{chunked ? lane->prefill_rows(lane->checkpoints()) : 1}
+            : BudgetLane{0, std::max(0, lane->proposals(lane->checkpoints())), true};
         if (wide && work[slot].decode && lane->draft && lane->remaining_output() > 1) {
             const auto bit = std::uint32_t{1} << slot;
             wide->speculative |= bit;
@@ -203,10 +95,6 @@ struct DecoderBatch::State {
           execution(model.device) {
         validate_batch_options(options);
         DeviceScope device(model.device);
-        if (options.prefix_cache_entries != 0) {
-            storage->prefix_cache.emplace(model.device, options.prefix_cache_entries,
-                                          model.mtp_weights != nullptr);
-        }
         if (options.cuda_graphs) storage->verification_graph.emplace(execution);
         if (residency.resident() && model.mtp_weights)
             storage->verification_winners = prepare_verification_winners(options.max_lanes);
@@ -230,8 +118,10 @@ struct DecoderBatch::State {
                 DecoderBatchStepStats& stats, bool& contains_mtp, CheckpointRows* checkpoint_rows,
                 const WideMtpGroups& wide_groups);
     void prefill(const PrefillRows& rows, DecoderBatchStepStats& stats);
-    void publish_checkpoint(PrefixCache& cache, Lane& lane, DecoderBatchStep& result,
-                            const Workspace* row, bool& publishing);
+    void publish_checkpoint(Lane& lane, DecoderBatchStep& result, const Workspace* row,
+                            bool& publishing);
+    bool submit_checkpoint(Lane& lane);
+    void finish_restore(Lane& lane, int restored);
     void score(int slot, Lane& lane, Workspace& work, bool logits_ready, bool decode);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats, const WideMtpGroups& wide_groups,
@@ -259,7 +149,13 @@ struct DecoderBatch::State {
             return;
         }
         drain("Drain failed decoder batch step");
-        storage->slots = {};
+        for (auto& lane : storage->slots) {
+            if (lane && lane->prefix && lane->prefix->completion.valid()) {
+                lane->prefix->discard = true;
+            } else {
+                lane.reset();
+            }
+        }
     }
     std::optional<Lane>& slot_at(int slot) {
         if (slot < 0 || slot >= options.max_lanes) {
@@ -285,7 +181,6 @@ struct DecoderBatch::State {
         storage->slots = {};
         storage->decode_graphs = {};
         storage->verification_graph.reset();
-        storage->prefix_cache.reset();
     }
 
     const Decoder::Model& model;
@@ -295,6 +190,8 @@ struct DecoderBatch::State {
     Allocations execution;
     std::uint8_t* wide_mtp_activation = nullptr;
     DraftDepthScratch draft_depth;
+    DecoderPrefixCacheStats prefix_stats;
+    std::shared_ptr<std::atomic_uint64_t> acknowledged_stores;
     int wide_mtp_capacity = 0;
     int wide_mtp_limit = 0;
     std::byte* sampling_workspace = nullptr;
@@ -331,17 +228,6 @@ std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
     for (const auto& lane : storage->slots) {
         charged += lane ? lane->resident_bytes : 0;
     }
-    if (auto& cache = storage->prefix_cache) {
-        const auto capacity = residency.capacity();
-        request.max_new_tokens = limit_resident_output(prompt, request, capacity, capacity,
-                                                       extra_bytes);
-        const auto bytes = extra_bytes + request_resident_bytes(
-            RequestProgress::capacity(prompt, request),
-            reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
-            request.mtp_steps != 0);
-        const auto headroom = capacity - std::min(capacity, charged);
-        if (bytes <= headroom) cache->reclaim_for_admission(bytes, storage->retired.bytes());
-    }
     return reserve_request_memory(storage->retired, request, prompt, residency.capacity(),
                                   charged, extra_bytes);
 }
@@ -361,19 +247,9 @@ void DecoderBatch::State::initialize(Lane& lane, int slot) {
     if (lane.media) {
         lane.media_prefill = upload_media_positions(*lane.request, *lane.media, stream);
     }
-    if (auto& cache = storage->prefix_cache) {
-        const int cache_limit = opts.score_prompt
-            ? std::min(prompt - 1, opts.prompt_logprob_start) : prompt;
-        lane.progress.advance(cache->restore(*lane.request, lane.prompt, opts.prefix_cache_salt,
-                                             stream, lane.draft.get(), cache_limit,
-                                             lane.media.get()));
-        lane.checkpoint = lane.progress.position;
-        lane.counted_draft_rows = lane.draft ? lane.draft->valid_prefix() : 0;
-    }
-    if (lane.progress.position == 0) {
-        lane.request->reset(stream);
-    }
-    lane.restored_prompt = lane.remaining_prompt() == 0;
+    lane.request->prefix_checkpoint_outputs = lane.checkpoints();
+    lane.request->reset(stream);
+    auto read = std::exchange(lane.options.prefix_cache_read, {});
     if (lane.resident_bytes) {
         if (const int rows = reserved_verification_rows(opts.max_new_tokens, opts.mtp_steps)) {
             const auto& winners = storage->verification_winners;
@@ -389,6 +265,25 @@ void DecoderBatch::State::initialize(Lane& lane, int slot) {
             constraint_workspace.allocate(execution, opts.constraint->uses_wide_mask());
     }
     check(cudaStreamSynchronize(stream), "Initialize decoder batch slot");
+    if (read && read->usable_gqa && opts.restore_prefix) {
+        auto view = restore_prefix_view(*lane.request, *read, stream, lane.draft.get());
+        lane.prefix = std::make_unique<PendingBatchPrefix>(std::move(view));
+        lane.prefix->completion = opts.restore_prefix(lane.prefix->command);
+    }
+}
+
+void DecoderBatch::State::finish_restore(Lane& lane, int restored) {
+    lane.progress.advance(restored);
+    lane.checkpoint = restored;
+    lane.restored_prompt = lane.remaining_prompt() == 0;
+    const int gqa = lane.request->cached_gqa_tokens;
+    const int draft = lane.draft ? lane.draft->valid_prefix() : 0;
+    prefix_stats.hits += restored != 0;
+    prefix_stats.cached_tokens += restored;
+    prefix_stats.gqa_restored_tokens += gqa;
+    prefix_stats.gqa_read_only_tokens += gqa - restored;
+    prefix_stats.draft_cached_rows += draft;
+    prefix_stats.draft_misses += lane.draft && restored == 0;
 }
 int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& requested,
                              const std::vector<DecoderMedia>* media) {
@@ -490,6 +385,49 @@ void DecoderBatch::cancel(int slot) {
     }
 }
 
+DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int slot) {
+    auto& lane = state_->slot_at(slot);
+    if (!lane) return {};
+    try {
+        DeviceScope device(state_->model.device);
+        if (lane->prefix_store) {
+            const bool terminal = lane->prefix_store->terminal;
+            if (!state_->submit_checkpoint(*lane)) return {true, {}};
+            if (terminal) retire(lane);
+            return {};
+        }
+        if (!lane->prefix) return {};
+        const auto& prefix = *lane->prefix;
+        if (!prefix.ready()) return {true, {}};
+        if (prefix.discard) {
+            retire(lane);
+            return {};
+        }
+        bool transferred = false;
+        try {
+            transferred = prefix.completion.get();
+        } catch (const CudaError&) {
+            throw;
+        } catch (...) {
+            // The transfer has ended. Reset any partially restored state before cold prefill.
+        }
+        if (transferred) {
+            const int restored = commit_restored_prefix(*lane->request, prefix.command,
+                                                        lane->draft.get());
+            state_->finish_restore(*lane, restored);
+        } else {
+            const auto stream = state_->execution.stream();
+            lane->request->reset(stream);
+            check(cudaStreamSynchronize(stream), "Reset decoder after failed prefix restore");
+        }
+        lane->prefix.reset();
+        return {false, lane->progress.position};
+    } catch (const CudaError& error) {
+        if (CudaError::terminal(error.status)) state_->disable();
+        throw;
+    }
+}
+
 std::size_t DecoderBatch::request_device_allocation_bytes() const {
     return request_bytes(*state_->storage);
 }
@@ -501,8 +439,9 @@ void DecoderBatch::release_retired_allocations() try {
 }
 
 DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {
-    const auto& cache = state_->storage->prefix_cache;
-    return cache ? cache->stats() : DecoderPrefixCacheStats{};
+    auto stats = state_->prefix_stats;
+    if (state_->acknowledged_stores) stats.stores = state_->acknowledged_stores->load();
+    return stats;
 }
 
 void DecoderBatch::reset_prefix_cache() {
@@ -511,9 +450,6 @@ void DecoderBatch::reset_prefix_cache() {
     if (std::any_of(storage.slots.begin(), storage.slots.end(),
                     [](const auto& slot) { return slot.has_value(); })) {
         throw std::logic_error("Cannot reset prefix cache with active decoder slots");
-    }
-    if (storage.prefix_cache) {
-        storage.prefix_cache->reset();
     }
 }
 
@@ -558,7 +494,6 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
     const auto stream = execution.stream();
     const auto& rows = stats.prefill_rows;
     auto& slots = storage->slots;
-    const bool checkpoints = checkpoint_rows != nullptr;
     const auto& policy = model.execution;
     std::array<ForwardLane, decoder_batch_max_lanes> work;
     std::array<ForwardLane, decoder_batch_max_lanes> single_prefill;
@@ -580,7 +515,7 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         }
         const int remaining = lane.remaining_prompt();
         const int decode_rows = options.max_num_batched_tokens || remaining
-            ? decode[slot] : lane.proposals(checkpoints) + 1;
+            ? decode[slot] : lane.proposals(lane.checkpoints()) + 1;
         if (rows[slot] == 0 && decode_rows == 0) {
             continue;
         }
@@ -601,8 +536,9 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
         }
         results[slot].mtp_boundary = results[slot].decode && lane.draft != nullptr;
         if (results[slot].decode) {
-            if (checkpoints) lane.record_decode_input(stream);
+            if (lane.checkpoints()) lane.record_decode_input(stream);
             packed_slots[slot] = count;
+            if (lane.checkpoints()) (*checkpoint_rows)[slot] = &lane.request->work;
             work[count++] = lane.input();
         } else if (rows[slot] == 1) {
             single_prefill[single_count++] = lane.input();
@@ -624,7 +560,6 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
             auto& lane = *slots[slot];
             const int index = lane.restored_prompt ? -1 : packed_slots[slot];
             auto* ready = index < 0 ? nullptr : run.ready[index];
-            if (checkpoint_rows && index >= 0) (*checkpoint_rows)[slot] = ready;
             if (lane.options.label_token_ids) {
                 model.enqueue_label_logits(*request, stream);
             } else {
@@ -821,9 +756,10 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
             const int slot = slots[first + index];
             stats.verification_rows += round.rows();
             auto* repair = size > 1 && !round.constraint ? repairs[index].data() : nullptr;
-            storage->slots[slot]->finish_round(round, results[slot], stream, output, cancel,
-                                               repair, checkpoint_rows ? &(*checkpoint_rows)[slot]
-                                                                       : nullptr);
+            auto& lane = *storage->slots[slot];
+            const auto saved = checkpoint_rows && lane.checkpoints() ? &(*checkpoint_rows)[slot]
+                                                                     : nullptr;
+            lane.finish_round(round, results[slot], stream, output, cancel, repair, saved);
         }
         auto* packed = size > packet ? wide_mtp_activation : nullptr;
         MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed), stream);
@@ -848,36 +784,54 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         first += width;
     }
 }
-void DecoderBatch::State::publish_checkpoint(PrefixCache& cache, Lane& lane,
-                                             DecoderBatchStep& result, const Workspace* row,
-                                             bool& publishing) {
-    const int position = lane.progress.position;
-    if (!lane.request || position <= lane.checkpoint) return;
-    const bool periodic = position % decoder_batch_prefix_checkpoint_interval == 0;
-    if (!periodic) {
-        if (!result.finish_reason || result.finish_reason == DecoderFinishReason::cancelled ||
-            result.sampling_failed || result.constraint_failed) return;
-        if (lane.options.claim_completion && !lane.options.claim_completion()) {
-            result.finish_reason = DecoderFinishReason::cancelled;
-            return;
-        }
+void DecoderBatch::State::publish_checkpoint(Lane& lane, DecoderBatchStep& result,
+                                             const Workspace* row, bool& publishing) {
+    const int end = lane.progress.position;
+    if (!lane.request || end <= lane.checkpoint ||
+        result.finish_reason == DecoderFinishReason::cancelled) return;
+    const bool terminal = result.finish_reason.has_value();
+    if (!terminal && end % decoder_batch_prefix_checkpoint_interval != 0) return;
+    if (terminal && lane.options.claim_completion && !lane.options.claim_completion()) {
+        result.finish_reason = DecoderFinishReason::cancelled;
+        return;
     }
+    lane.prefix_store.emplace(DeferredPrefixStore{row, nullptr, terminal});
     publishing = true;
-    const int terminal = periodic && !result.finish_reason ? lane.capacity() : position;
-    cache.store(*lane.request, lane.prompt, lane.options.prefix_cache_salt, position,
-                execution.stream(), lane.draft.get(), lane.media.get(), row,
-                residency.resident() ? terminal : 0);
+    result.prefix_pending = !submit_checkpoint(lane);
     publishing = false;
-    lane.checkpoint = position;
 }
-Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
+
+bool DecoderBatch::State::submit_checkpoint(Lane& lane) {
+    auto& checkpoint = *lane.prefix_store;
+    const auto& opts = lane.options;
+    if (opts.reserve_prefix_store && !opts.reserve_prefix_store(checkpoint.reservation)) {
+        return false;
+    }
+    auto reservation = std::move(checkpoint.reservation);
+    const int end = lane.progress.position;
+    const int generated = std::max(lane.prompt_size, lane.checkpoint);
+    const int count = std::max(0, end - generated);
+    auto view = export_prefix_view(*lane.request, 0, 0, end, execution.stream(),
+                                   lane.draft.get(), checkpoint.row, checkpoint.terminal);
+    if (!acknowledged_stores) acknowledged_stores = std::make_shared<std::atomic_uint64_t>(0);
+    opts.store_prefix(std::move(view), count ? lane.prompt.data() + generated : nullptr, count,
+                      std::move(reservation), acknowledged_stores);
+    lane.checkpoint = end;
+    lane.prefix_store.reset();
+    return true;
+}
+Steps DecoderBatch::State::advance(const Selection& requested, bool chunked,
                                    DecoderBatchStepStats* stats) {
     require_ready();
     bool contains_mtp = false, publishing_prefix = false;
     try {
         DeviceScope device(model.device);
         auto& slots = storage->slots;
-        auto& cache = storage->prefix_cache;
+        auto selected = requested;
+        for (int slot = 0; slot < options.max_lanes; ++slot) {
+            const auto& lane = slots[slot];
+            if (lane && (lane->prefix || lane->prefix_store)) selected[slot] = false;
+        }
         CheckpointRows checkpoint_rows{};
         Steps results{};
         DecoderBatchStepStats current;
@@ -889,7 +843,7 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
         const auto live_before = stats ? request_bytes(*storage) : 0;
         const auto wide_groups = prepare_wide_groups(plan.decode, wide, contains_mtp);
         submit(selected, plan.decode, results, current, contains_mtp,
-               cache ? &checkpoint_rows : nullptr, wide_groups);
+               &checkpoint_rows, wide_groups);
         if (stats) current.peak_request_bytes = std::max(
             live_before + current.prefill_workspace_bytes, request_bytes(*storage));
         // Commit every lane before publishing successful final checkpoints.
@@ -909,11 +863,9 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
                        result.finish_reason != DecoderFinishReason::cancelled &&
                        (lane->restored_prompt || result.decode || current.prefill_rows[slot])) {
                 const int rows = current.prefill_rows[slot];
-                if (cache && rows != 0) {
-                    const int draft_rows = lane->draft ? lane->draft->valid_prefix() : 0;
-                    cache->count_prefill(rows, draft_rows - lane->counted_draft_rows);
-                    lane->counted_draft_rows = draft_rows;
-                }
+                prefix_stats.prefill_tokens += rows;
+                prefix_stats.gqa_computed_tokens += std::clamp(
+                    lane->progress.position + rows - lane->request->cached_gqa_tokens, 0, rows);
                 if (result.token) {
                     if (cancelled()) {
                         result.finish_reason = DecoderFinishReason::cancelled;
@@ -935,9 +887,13 @@ Steps DecoderBatch::State::advance(const Selection& selected, bool chunked,
             auto& lane = slots[slot];
             auto& result = results[slot];
             if (!selected[slot] || !lane) continue;
-            if (cache) publish_checkpoint(*cache, *lane, result, checkpoint_rows[slot],
-                                          publishing_prefix);
-            if (result.finish_reason) retire(lane);
+            if (result.sampling_failed || result.constraint_failed) {
+                retire(lane);
+                continue;
+            }
+            if (lane->checkpoints()) publish_checkpoint(*lane, result, checkpoint_rows[slot],
+                                                         publishing_prefix);
+            if (result.finish_reason && !result.prefix_pending) retire(lane);
         }
         device.restore();
         if (stats) {
@@ -970,7 +926,19 @@ void DecoderBatch::generate_mtp(const std::vector<int>& prompt, const DecoderOpt
     }
     result.output_token_ids.reserve(options.max_new_tokens);
     const auto model_bytes = result.peak_device_allocation_bytes;
-    while (!state_->cancelled()) {
+    const auto& lane = state_->storage->slots[0];
+    bool prefix_pending = bool(lane->prefix);
+    bool completion_claimed = false;
+    while (completion_claimed || !state_->cancelled()) {
+        if (prefix_pending) {
+            const auto update = poll_prefix(0);
+            if (update.pending) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (update.restored) result.cached_prompt_tokens = *update.restored;
+            if (!lane) return;  // Submitting a deferred terminal STORE retires the slot.
+        }
         DecoderBatchStepStats stats;
         const auto step = advance_chunked({true}, &stats).front();
         if (step.sampling_failed) throw DecoderSamplingError();
@@ -981,9 +949,11 @@ void DecoderBatch::generate_mtp(const std::vector<int>& prompt, const DecoderOpt
         result.mtp_rounds += step.mtp_drafted_tokens > 0;
         result.mtp_accepted_tokens += step.mtp_accepted_tokens;
         result.mtp_drafted_tokens += step.mtp_drafted_tokens;
+        prefix_pending = step.prefix_pending;
         if (step.finish_reason) {
             result.finish_reason = *step.finish_reason;
-            return;
+            if (!prefix_pending) return;
+            completion_claimed = bool(options.claim_completion);
         }
     }
     cancel(0);

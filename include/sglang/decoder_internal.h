@@ -156,6 +156,7 @@ struct BatchDecodeBinding {
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
     std::array<TextGdnState, gdn_layers> states;
+    TextModelStateRow final_state;
 };
 
 struct BatchGraphLane {
@@ -210,17 +211,21 @@ struct Decoder::Model {
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;
     using DecodeHeadRows = std::array<decoder::Workspace*, 4>;
-    void compute_decode_logits(const DecodeHeadRows& rows, cudaStream_t stream) const;
+    using DecodeStateRows = std::array<const TextModelStateRow*, 4>;
+    void compute_decode_logits(const DecodeHeadRows& rows, cudaStream_t stream,
+                               const DecodeStateRows* states = nullptr) const;
     bool compute_eager_decode_logits(const decoder::ForwardLane* lanes, int count,
                                    cudaStream_t stream) const;
     void seed_draft(decoder::Workspace& work, decoder::MtpDraftRequest& draft, int position,
                     int shifted_token, cudaStream_t stream,
                     const decoder::MediaPrefill* media = nullptr) const;
-    void normalize_final(decoder::Workspace& work, cudaStream_t stream) const;
+    void normalize_final(decoder::Workspace& work, cudaStream_t stream,
+                         const TextModelStateRow* state = nullptr) const;
     void compute_prefill_logits(decoder::Workspace& work, cudaStream_t stream) const;
     void enqueue_label_logits(decoder::Request& request, cudaStream_t stream) const;
     void compute_logits(decoder::Request& request, bool decode = false) const;
-    void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false) const;
+    void compute_logits(decoder::Workspace& work, cudaStream_t stream, bool decode = false,
+                        const TextModelStateRow* state = nullptr) const;
     bool prefill_serial(decoder::Request& request, decoder::RequestProgress& progress,
                         const std::vector<int>& prompt, const decoder::SerialOutput& output,
                         DecoderResult& result, const decoder::MediaPrefill* media,

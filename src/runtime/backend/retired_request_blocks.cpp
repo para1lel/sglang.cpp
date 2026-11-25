@@ -33,7 +33,7 @@ struct RetiredBlockReclaimer::State {
                     quarantined += block.bytes;
                     continue;
                 }
-                const auto status = cudaFreeAsync(block.pointer, stream);
+                const auto status = release_cuda_block(block.pointer, stream);
                 if (status == cudaSuccess) {
                     released += block.bytes;
                 } else {
@@ -118,12 +118,13 @@ RetiredBlockReclaimer::~RetiredBlockReclaimer() {
     }
 }
 
-bool RetiredBlockReclaimer::submit(DeviceBlock block) {
+bool RetiredBlockReclaimer::submit(DeviceBlock block, bool detached) {
     const std::lock_guard lock(state_->mutex);
     if (CudaError::terminal(state_->failure))
         check(state_->failure, "Retire decoder allocation");
     if (state_->failure != cudaSuccess || state_->pending_blocks == block_limit ||
-        block.bytes > byte_limit - state_->pending_bytes)
+        (!detached && (state_->pending_bytes >= byte_limit ||
+                       block.bytes > byte_limit - state_->pending_bytes)))
         return false;
     state_->queued.push_back(block);
     state_->pending_bytes += block.bytes;

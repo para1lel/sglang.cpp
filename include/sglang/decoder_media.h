@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
 
 struct __nv_bfloat16;
 
@@ -19,18 +20,16 @@ struct DecoderMedia;
 class DecoderMediaCacheIdentity {
 public:
     bool matches(const DecoderMedia& media) const;
-    bool same_content(const DecoderMediaCacheIdentity& other) const;
+    std::string_view patches_digest() const { return patches_digest_; }
 
 private:
     friend class server::VisionCompletion;
-    DecoderMediaCacheIdentity(const DecoderMedia& media, std::shared_ptr<const void> encoder,
-                              std::string patches_digest);
+    DecoderMediaCacheIdentity(const DecoderMedia& media, std::string patches_digest);
 
     DecoderMediaLayout layout_;
     std::weak_ptr<const __nv_bfloat16> features_;
     const __nv_bfloat16* address_;
     std::size_t elements_;
-    std::shared_ptr<const void> encoder_;
     std::string patches_digest_;
 };
 

@@ -14,9 +14,9 @@ The [commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check
 
 **Corrected.** Prefix store and restore assumed that logical and physical page indices matched. The identity case passed. With logical page zero at physical page one, the remapped case reported `Key payload mismatch`.
 
-The [page-map reader](../src/decoder_prefix_cache.cpp#L151)<!-- prefix: "GpuPrefixSna" --> now supplies physical indices for both transfers. Store gathers into logical order. Restore scatters into the destination mapping. The selected correction passed the remap and guard checks.
+The former resident cache fixed both transfers with one physical page-map reader. Store gathered into logical order. Restore scattered into the destination mapping. The fix passed the remap and guard checks. [Historical page-map reader](https://github.com/para1lel/sglang.cpp/blob/a7583f7b6346b5eb91aba2cba4748a6461e60fb4/src/decoder_prefix_cache.cpp#L151)<!-- prefix: "GpuPrefixSna" -->
 
-Run `prefix-state --remapped` and `prefix-state --guards` after changes to KV copies. Use the [B200 build and run procedure](../tests/prefix/README.md). Keep independent source and destination permutations and check all four KV planes and untouched tail pages.
+Keep independent source and destination permutations in KV-copy tests. Compare all four KV planes and untouched tail pages. [Former B200 remap and guard procedure](https://github.com/para1lel/sglang.cpp/blob/a7583f7b6346b5eb91aba2cba4748a6461e60fb4/tests/prefix/README.md#cuda-state-and-routes) · [Current LMCache verification](prefix-cache.md#verification)
 
 ## L003 · Patch and anchor provenance
 
@@ -88,7 +88,7 @@ The scripted clock advances by three seconds per decode step. Both text and chat
 
 ## L009 · Terminal error during first packed decode setup
 
-The original first-use handler caught every CUDA error from packed setup. An injected illegal-address status at setup synchronization reached legacy dispatch. The repair permits legacy dispatch only for packed scratch allocation OOM after the CUDA error check and release of partial allocations. A terminal status reaches the batch handler and disables the batch before any legacy submission or decode publication. [Batch error handler](../src/decoder_batch.cpp#L953)<!-- prefix: "} catch (con" -->
+The original first-use handler caught every CUDA error from packed setup. An injected illegal-address status at setup synchronization reached legacy dispatch. The repair permits legacy dispatch only for packed scratch allocation OOM after the CUDA error check and release of partial allocations. A terminal status reaches the batch handler and disables the batch before any legacy submission or decode publication. [Batch error handler](../src/decoder_batch.cpp#L909)<!-- prefix: "} catch (con" -->
 
 The initial repair still attempted setup for two one-row prefills or one decode with one one-row prefill. The independent fault probe disabled the batch in both cases. The second repair selects at least two packable lanes and a bucket before requesting scratch. It uses the same plan for binding. Both corrected controls published their expected results without hitting the fault. [Setup order](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L524)<!-- prefix: "if (!PackedD" -->
 
@@ -154,3 +154,17 @@ Keep the launch typed when changing a migrated kernel signature. In the selected
 before an object was emitted. The positive Release exercised the chunked draft
 path and ordinary generation. The retained compile control is
 `artifacts/continue-w3-long-target-independent/main-selected-gate.IahPUCPH/arity/compile.log`.
+
+## L013 · Shared HTTP cache fixture changes missed public runners
+
+The LMCache migration updated constraints, batch admission, and sampled MTP in `f38f03a`.
+The next fix updated the media runner in `7e349bb`. The batch lifecycle runner still passed
+the former resident entry count `4` to `server_policy`. Its Boolean identity check rejected
+even a healthy daemon before the first W1 turn. Later assertions still expected resident
+store events on individual scheduler steps. [First migration](https://github.com/para1lel/sglang.cpp/commit/f38f03af03450904c1fd4a8499687ee69d214cb4) · [Lifecycle call at the reviewed revision](https://github.com/para1lel/sglang.cpp/blob/7e349bb224fbb5715a2c5ff937d513d860fe6d01/tests/batch/checkpoint_lifecycle.py#L246)<!-- prefix: "http.server_" --> · [Review finding](https://github.com/para1lel/sglang.cpp/pull/1#discussion_r4694496532)
+
+When the shared fixture changes, trace its imports and calls across test directories. Exercise
+each affected public entry point in its documented cache mode. For this change, the media
+runner checks both daemon-enabled and explicit cache-off workers. The batch runner requires a
+dedicated daemon and proves that the saved W1 endpoint restores the exact rows and produces
+the same continuation IDs as a cold request. [Media controls](../tests/media/http-contract.md) · [Lifecycle reproducer](../tests/batch/README.md#checkpoint-lifecycle)

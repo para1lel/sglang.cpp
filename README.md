@@ -41,10 +41,13 @@ if you use older launch options.
 
 The HTTP server enables CUDA Graph replay for eligible decode steps by default.
 Pass `--eager` to disable graph replay, including when `--batch-cuda-graphs` is present.
-The server enables four prefix cache entries by default. Set `--prefix-cache-entries 0`
-to disable caching. Both graph and eager decode can use the cache.
-See [prefix cache checkpoints](docs/prefix-cache.md#checkpoint-boundaries) for periodic
-saves and reuse across completed requests.
+The HTTP server attempts [LMCache prefix reuse](docs/prefix-cache.md#runtime-path) by default.
+Basic generation works without the daemon. To reuse prefixes across requests, start the
+[LMCache 0.5.8 daemon](docs/serving/lmcache.md#start-the-daemon) before starting the server.
+Run both as the same Linux user with the same physical GPU UUID. Both use `$XDG_RUNTIME_DIR/sglang-lmcache.sock` when `XDG_RUNTIME_DIR`
+is absolute, or `/tmp/sglang-lmcache-<euid>.sock` otherwise. For a custom socket,
+pass `--socket /absolute/path.sock` to the daemon and `--lmcache-socket /absolute/path.sock`
+to the server. Pass `--prefix-cache-entries 0` to disable reuse.
 
 ## Serve token IDs over HTTP
 
@@ -60,7 +63,8 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
 When the server listens on `127.0.0.1:17384`, send a chat request from another shell.
 The example streams assistant output as server-sent events and ends with `[DONE]`.
 Use [`GET /server_info`](docs/native-model-info.md#server-information) to verify
-the resolved settings.
+the resolved settings. `lmcache_enabled` reports configuration and `lmcache_available`
+reports whether the server can reach the daemon.
 
 ```bash
 curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
@@ -94,6 +98,4 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 ## Development and performance
 
 - Find the current component responsibilities in the [native architecture guide](docs/development.md#current-architecture-and-scope).
-- Direct C++ `DecoderBatch` callers can enable prefix caching through
-  `DecoderBatchOptions::prefix_cache_entries`, which defaults to zero in the library.
 - Find the benchmark results and archived run records in [Matched K4 evidence](docs/performance.md#matched-k4-evidence).

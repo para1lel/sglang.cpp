@@ -38,7 +38,7 @@ class GenerationHealth(unittest.TestCase):
         }))
         self.port, self.process = self.enterContext(server(
             self.binary, self.checkpoint, self.log,
-            "--max-active", "1", "--prefix-cache-entries", "1", with_process=True,
+            "--max-active", "1", with_process=True,
         ))
 
     def set_clock(self, seconds):
@@ -89,6 +89,12 @@ class GenerationHealth(unittest.TestCase):
         self.assertEqual(status, 200, response)
         self.assertEqual(len(response["output_ids"]), 1)
 
+    def check_idle_reset(self):
+        status, response = send(self.port, "/reset_prefix_cache", {})
+        self.assertEqual(status, 503, response)
+        self.assertEqual(response["error"]["message"],
+                         "LMCache namespace reset was not acknowledged")
+
     def test_idle_probe_executes_one_greedy_token(self):
         probe = self.connection()
         self.wait_receipt(HEALTH_ADMIT)
@@ -105,7 +111,7 @@ class GenerationHealth(unittest.TestCase):
         self.assertEqual(receipt["budget"], 1)
         self.assertIs(receipt["sampled"], False)
         self.assertEqual(self.log.read_text().count(HEALTH_TOKEN), 1)
-        self.assertEqual(send(self.port, "/reset_prefix_cache", {})[0], 200)
+        self.check_idle_reset()
 
     def test_idle_terminal_without_token_is_unhealthy(self):
         self.mark("finish-empty")
@@ -195,7 +201,7 @@ class GenerationHealth(unittest.TestCase):
         self.check_probe(probe, 503)
         self.wait_receipt(HEALTH_CANCEL)
         self.assertNotIn(HEALTH_TOKEN, self.log.read_text())
-        self.assertEqual(send(self.port, "/reset_prefix_cache", {})[0], 200)
+        self.check_idle_reset()
         self.check_reuse()
 
     def test_failed_worker_rejects_new_and_waiting_probes(self):

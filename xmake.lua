@@ -145,7 +145,7 @@ target("sglang_decoder")
     set_toolchains("host-pixi")
     set_targetdir("$(builddir)/lib")
     add_includedirs("include", {public = true})
-    add_deps("sglang_checkpoint", "sglang_cuda", "sglang_prefill_fp8_sm100")
+    add_deps("sglang_checkpoint", "sglang_cuda", "sglang_prefill_fp8_sm100", "sglang_tokenizer")
     add_files("src/decoder.cpp", "src/decoder_forward.cpp",
               "src/decoder_batch.cpp", "src/decoder_prefix_cache.cpp",
               "src/decoder_mtp.cpp", "src/decoder_prefill.cpp", "src/decoder_verify.cpp",
@@ -157,7 +157,7 @@ target("sglang_decoder")
               "src/runtime/backend/cuda_backend_policy.cpp",
               "src/runtime/execution/decoder_execution_policy.cpp",
               "src/runtime/execution/decoder_prefill_workspace.cpp",
-              "src/runtime/cache/kv_residency_policy.cpp")
+              "src/runtime/cache/kv_residency_policy.cpp", "src/runtime/cache/prefix_payload.cpp")
 
 target("sglang-generate")
     set_kind("binary")
@@ -192,6 +192,8 @@ target("sglang-server")
     add_deps("sglang_decoder", "sglang_tokenizer", "sglang_media_preprocess", "sglang_vision")
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
+              "apps/server/batch_cache.cpp", "apps/server/batch_service_cache.cpp",
+              "src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp",
               "apps/server/completions.cpp",
               "apps/server/flush_cache.cpp", "apps/server/http.cpp", "apps/server/loads.cpp",
               "src/runtime/server/single_device_batch_executor.cpp",
@@ -284,10 +286,11 @@ if has_config("gdn-check") then
         set_kind("binary")
         set_toolchains("host-pixi")
         set_targetdir("$(builddir)/bin")
-        add_deps("sglang_decoder")
+        add_deps("sglang_decoder", "sglang_tokenizer")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
         add_files("tests/decoder/gdn_routes.cpp")
+        add_files("src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp")
     target_end()
 end
 
@@ -389,7 +392,7 @@ if has_config("long-decode-check") then
         set_kind("binary")
         set_toolchains("host-pixi")
         set_targetdir("$(builddir)/bin")
-        add_deps("sglang_decoder")
+        add_deps("sglang_decoder", "sglang_tokenizer")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
         add_ldflags("-Wl,--wrap=cudaMallocFromPoolAsync", {force = true})
@@ -398,6 +401,7 @@ if has_config("long-decode-check") then
                     "18SamplingParametersEPvP11CUstream_stPKNS0_23AdjustedLogitsWorkspaceE",
                     {force = true})
         add_files("tests/decoder/long_decode_routes.cpp")
+        add_files("src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp")
     target_end()
 end
 

@@ -7,6 +7,8 @@ Build the CPU probes with the same commands and add
 `jsonschema` package supplies the Draft 2020-12 oracle. The validated
 version is 4.26.0 and is required only in the test environment.
 
+Set `LMCACHE_SOCKET` to an isolated, ready [LMCache daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon) for the cache case.
+
 ```bash
 "$build/bin/mtp-guard" "$checkpoint/tokenizer.json"
 python "$tests/schema_oracle.py" "$build/bin/token-probe" \
@@ -20,7 +22,7 @@ python "$tests/schema_integration.py" "$server" "$checkpoint" "$evidence/schema-
 python "$tests/schema_integration.py" "$server" "$checkpoint" "$evidence/schema-depth-mixed" \
     --width 4 --graph --mtp 1
 python "$tests/schema_integration.py" "$server" "$checkpoint" "$evidence/schema-tensor-prefix" \
-    --width 4 --graph --prefill tensor-core --cache-entries 4
+    --width 4 --graph --prefill tensor-core --lmcache-socket "$LMCACHE_SOCKET"
 ```
 
 The checks validate values with the independent evaluator and verify compact

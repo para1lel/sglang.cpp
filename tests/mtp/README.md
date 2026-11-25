@@ -57,12 +57,12 @@ depths, and replay of discarded verifier state.
 
 Decoded RGB8 chat uses the configured depth. The check compares media output with the
 depth-0 control, verifies draft activity at positive depths, and checks rejection of a
-per-request depth. The width-two
-sampled depth-0 case checks active and queued cancellation, rejection of a busy
-prefix-cache reset, and unchanged seeded output after an idle reset. The runner
-saves requests, transcripts, effective caps, startup results, and server traces.
-The depth-comparison matrix uses explicit cache-off controls. The startup
-matrix checks positive-depth admission through capacity 32, singleton batch
-graphs, and eager operation with an enabled cache. Use `--eager-cache-only` for
-the focused live K4 case. It checks a warm hit at 8,192 tokens, identical seeded
-output, actual drafting before and after the hit, and zero graph replays.
+per-request depth. The runner saves requests, transcripts, effective caps, startup results, and server traces.
+
+Each invocation checks startup options with CUDA hidden. Select the live checks as follows.
+
+- The example above runs the depth-comparison matrix with prefix reuse disabled.
+- Add `--lmcache-socket "$LMCACHE_SOCKET"` to run that matrix and both cache checks. Use an isolated, ready [daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon).
+- Add both `--lmcache-socket "$LMCACHE_SOCKET"` and `--eager-cache-only` to run just the eager K4 live check.
+
+The width-two K0 cache check covers active and queued cancellation, HTTP 409 on busy reset, and seeded output after idle reset. The eager K4 check requires an 8,192-token warm hit, identical seeded output, draft activity on both arms, and zero graph replays.

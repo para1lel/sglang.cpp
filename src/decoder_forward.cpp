@@ -665,6 +665,8 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         const auto cache = request.caches[cache_index];
         bool narrow_gqa = false;
         ExactGqaWorkspace singleton_scores{};
+        bool reuse = false;
+        int cached_rotary_position = 0;
         const MropePosition* mrope = nullptr;
         if constexpr (!std::is_same_v<Lane, VerificationRow>) {
             narrow_gqa = lane.narrow_gqa && !batch.ordered_attention;
@@ -672,9 +674,19 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
             mrope = lane.mrope;
             singleton_scores = lane.singleton_scores;
+            reuse = lane.mode == TextGdnMode::prefill &&
+                lane.position < request.cached_gqa_tokens;
+            cached_rotary_position = lane.rotary_position < 0 ? lane.position
+                                                              : lane.rotary_position;
         }
-        append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
-                   lane.rotary_position);
+        if (reuse) {
+            check(prefill_gqa_queries(cached_rotary_position, mrope, 1, work.q_gate,
+                                      layer.query_norm, work.rope_queries, batch.stream),
+                  "Normalize cached prefill Q");
+        } else {
+            append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
+                       lane.rotary_position);
+        }
         if constexpr (std::is_same_v<Lane, ForwardLane>) {
             if (!batch.ordered_attention && lane.mode == TextGdnMode::decode &&
                 batch.count > 1 && batch.count <= paged_decode_lanes &&
@@ -756,7 +768,18 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
     if (!batch.fuse_verify_activation() && !batch.fuse_wide_verify_norm()) {
         batch.quantize(&Workspace::normalized, hidden_size);
     }
-    if (!batch.tensor_core_lane(0) && batch.single_decode() &&
+    const bool reuse = [&] {
+        if constexpr (std::is_same_v<Lane, ForwardLane>) {
+            return std::all_of(batch.lanes, batch.lanes + batch.count, [](const ForwardLane& lane) {
+                return lane.mode == TextGdnMode::prefill &&
+                    lane.position < lane.request->cached_gqa_tokens;
+            });
+        }
+        return false;
+    }();
+    if (reuse) {
+        batch.project(layer.q_gate, &Workspace::q_gate);
+    } else if (!batch.tensor_core_lane(0) && batch.single_decode() &&
         layer.q_gate.columns == hidden_size &&
         layer.key.columns == hidden_size && layer.value.columns == hidden_size) {
         const auto& work = workspace(batch.lanes[0]);
@@ -877,14 +900,16 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
     forward_layers(lanes, count, stream);
     DecodeHeadRows rows;
     if (count == static_cast<int>(rows.size())) {
+        DecodeStateRows states;
         for (int index = 0; index < count; ++index) {
             rows[index] = lanes[index].work;
+            states[index] = &lanes[index].binding->final_state;
         }
-        compute_decode_logits(rows, stream);
+        compute_decode_logits(rows, stream, &states);
         return;
     }
-    batch.each([&](const BatchGraphLane&, Workspace& work) {
-        compute_logits(work, stream, true);
+    batch.each([&](const BatchGraphLane& lane, Workspace& work) {
+        compute_logits(work, stream, true, &lane.binding->final_state);
     });
 }
 

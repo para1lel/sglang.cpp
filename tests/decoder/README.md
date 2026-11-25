@@ -103,6 +103,8 @@ Each file contains one full BF16 logit row per returned token in the order print
 
 In the managed Pixi environment, enable the opt-in GDN checks and reserve a B200.
 The operator check uses synthetic inputs and the route check loads the local checkpoint.
+Start an isolated [LMCache daemon](../../docs/serving/lmcache.md#start-the-daemon) on the same GPU
+with namespace `sglang` for the route check.
 
 ```bash
 out="$PWD/build/gdn-checks"
@@ -114,7 +116,7 @@ export CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}"
 "$out/bin/gdn-check"
 "$out/bin/gdn-check" short paired "$out/ordered.bin"
 "$out/bin/gdn-check" chunked
-"$out/bin/gdn-routes" "$checkpoint" "$out/prompt.ids"
+LMCACHE_SOCKET="$LMCACHE_SOCKET" "$out/bin/gdn-routes" "$checkpoint" "$out/prompt.ids"
 ```
 
 The chunked check observes the matrix and recurrence launches, compares outputs and state with

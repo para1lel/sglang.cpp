@@ -11,7 +11,6 @@ namespace {
 
 using Finish = sglang::DecoderFinishReason;
 using Service = sglang::server::BatchService;
-constexpr int cached_media_rows = 5;
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -113,7 +112,7 @@ bool check(const Scenario& scenario) {
     return exact;
 }
 
-void check_media_cache_usage() {
+void check_media_callbacks() {
     const sglang::Decoder decoder("unused");
     auto executor = std::make_unique<sglang::server::SingleDeviceBatchExecutor>(decoder,
         sglang::server::BatchExecutor::Options{
@@ -131,15 +130,15 @@ void check_media_cache_usage() {
         return true;
     };
     const auto result = service.generate(3, {7}, options, single, media, expanded_rows);
-    require(admitted == cached_media_rows && result.cached_prompt_tokens == cached_media_rows &&
+    require(admitted == 0 && result.cached_prompt_tokens == 0 &&
                 result.output_token_ids == std::vector{100},
-            "Media cache count was lost in the single-request result or admission callback");
+            "Uncached media admission or scalar output was lost");
 
     bool emitted = false;
     sglang::server::BatchCallbacks indexed;
     indexed.on_output = [&](std::size_t index, const sglang::DecoderResult& output, bool final) {
-        require(!emitted && index == 0 && final && output.cached_prompt_tokens == cached_media_rows,
-                "Media cache count was lost from the indexed output callback");
+        require(!emitted && index == 0 && final && output.cached_prompt_tokens == 0 &&
+                    output.output_token_ids == std::vector{100}, "Unexpected indexed media output");
         emitted = true;
         return true;
     };
@@ -148,10 +147,10 @@ void check_media_cache_usage() {
     prompt.expanded_tokens = expanded_rows;
     const auto results = service.generate_batch(3, {prompt}, indexed);
     require(emitted && results && results->size() == 1 &&
-                results->front().cached_prompt_tokens == cached_media_rows &&
+                results->front().cached_prompt_tokens == 0 &&
                 results->front().output_token_ids == std::vector{100},
-            "Media cache count was lost from the indexed result");
-    std::cout << "Media admission and indexed results preserved cached prompt tokens\n";
+            "Uncached media admission or indexed output was lost");
+    std::cout << "Media admission and indexed output passed with LMCache disabled\n";
 }
 
 }
@@ -191,8 +190,7 @@ int DecoderBatch::admit_multimodal(int slot, std::vector<int> prompt,
                                   const DecoderOptions& options,
                                   const std::vector<DecoderMedia>& media) {
     require(media.size() == 1, "Unexpected media count");
-    admit(slot, std::move(prompt), options);
-    return cached_media_rows;
+    return admit(slot, std::move(prompt), options);
 }
 
 void DecoderBatch::cancel(int slot) {
@@ -246,6 +244,7 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
 
 std::size_t DecoderBatch::request_device_allocation_bytes() const { return 0; }
 DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const { return {}; }
+DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int) { std::abort(); }
 void DecoderBatch::reset_prefix_cache() {
     throw std::logic_error("Unexpected prefix cache reset");
 }
@@ -273,7 +272,7 @@ int main() {
             {100, 101, 102}, 2, Finish::cancelled, true});
         const bool scored_poll = check({"scored mid-round cancel", Interrupt::poll,
             {100, 101, 102, 103}, 3, Finish::cancelled, true});
-        check_media_cache_usage();
+        check_media_callbacks();
         return seed && callback && poll && full && scored_full && scored_callback && scored_poll
             ? 0 : 1;
     } catch (const std::exception& error) {

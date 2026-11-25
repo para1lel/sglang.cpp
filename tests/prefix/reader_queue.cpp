@@ -29,9 +29,8 @@ constexpr int capacity = 2;
 
 class ReaderQueueExecutor final : public BatchExecutor {
 public:
-    explicit ReaderQueueExecutor(bool cached)
-        : BatchExecutor({false, capacity, cached ? 2 : 0,
-                         sglang::decoder_default_max_num_batched_tokens}) {}
+    ReaderQueueExecutor()
+        : BatchExecutor({false, capacity, 0, sglang::decoder_default_max_num_batched_tokens}) {}
     BatchTopology topology() const noexcept override { return single_device_batch_topology; }
     void start(Ready, Process) override { throw std::logic_error("Unexpected decoder startup"); }
     void join() noexcept override {}
@@ -72,6 +71,12 @@ public:
         const std::lock_guard lock(mutex_);
         gate.released = true;
         changed_.notify_all();
+    }
+
+    void wait_released(const Gate& gate) {
+        std::unique_lock lock(mutex_);
+        require(changed_.wait_for(lock, timeout, [&] { return gate.released; }),
+                "Shutdown did not stop restores before joining completion workers");
     }
 
     void record(Gate& gate, bool sent) {
@@ -115,6 +120,7 @@ struct BufferedBurst {
 
 Gates gates;
 Gate reset_ack;
+Gate restore_stop;
 std::atomic<bool> delay_reset{false};
 std::atomic<int> cache_resets{0};
 std::atomic<bool> worker_failed{false};
@@ -128,10 +134,10 @@ constexpr int large_body_bytes = 48 * 1024;
 
 namespace sglang::server {
 
-struct BatchService::State { int cache_capacity; };
+struct BatchService::State {};
 
-BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool, int)
-    : state_(std::make_unique<State>(State{executor->options().prefix_cache_entries})) {}
+BatchService::BatchService(std::unique_ptr<BatchExecutor>, bool, int)
+    : state_(std::make_unique<State>()) {}
 BatchService::~BatchService() = default;
 
 std::optional<std::vector<DecoderResult>> BatchService::generate_batch(
@@ -140,6 +146,7 @@ std::optional<std::vector<DecoderResult>> BatchService::generate_batch(
 }
 
 bool BatchService::ready() const { return !worker_failed; }
+void BatchService::stop_cache_restores() noexcept { gates.release(restore_stop); }
 
 bool BatchService::wait_for_generation(Clock::time_point, Clock::time_point,
                                        const std::function<bool()>& cancelled) {
@@ -152,11 +159,7 @@ void BatchService::rethrow_failure() const {
     }
 }
 
-BatchMetrics BatchService::metrics() const {
-    BatchMetrics metrics;
-    metrics.cache_capacity = state_->cache_capacity;
-    return metrics;
-}
+BatchMetrics BatchService::metrics() const { return {}; }
 
 bool BatchService::reset_prefix_cache() {
     rethrow_failure();
@@ -628,6 +631,7 @@ void check_shutdown(Server& server, bool reader_failure) {
     const auto wake = server.submit({});
     require(read_closed(queued).empty(), "Shutdown delivered a queued response");
     require(read_closed(partial).empty(), "Shutdown did not close the incomplete request");
+    gates.wait_released(restore_stop);
     require(!server.returned(), "Serving returned while completion gates were held");
     gates.release(server.gate(last_first));
     gates.release(server.gate(last_second));
@@ -689,7 +693,7 @@ int main(int argc, char** argv) {
         const bool cached = mode == "--cache-on" || reader_failure || flush;
         require(cached || broken_worker || mode == "--cache-off", "Unknown transport test mode");
         const auto descriptors = fd_count();
-        BatchService service(std::make_unique<ReaderQueueExecutor>(cached), false);
+        BatchService service(std::make_unique<ReaderQueueExecutor>(), false);
         for (const int invalid : {0, sglang::decoder_batch_max_lanes + 1}) {
             bool rejected = false;
             try {

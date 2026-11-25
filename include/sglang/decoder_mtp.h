@@ -7,6 +7,8 @@ namespace sglang::decoder {
 struct DraftOperatorCapabilities;
 struct DraftDepthScratch;
 struct PrefillProjections;
+struct PrefixCacheRead;
+struct PrefixDeviceTransfer;
 
 inline constexpr int draft_projection_rows = 16;
 
@@ -93,9 +95,14 @@ private:
                             const MropePosition* mrope, int rotary_position, const Bf16* feature);
     static void enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
                                   cudaStream_t stream, bool defer_score, Bf16* packed = nullptr);
-    friend class GpuPrefixSnapshotStore;
-    void snapshot_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream) const;
-    void restore_prefix(Mxfp8KvCache snapshot, int rows, cudaStream_t stream);
+    friend PrefixDeviceTransfer restore_prefix_view(Request&, const PrefixCacheRead&,
+                                                     cudaStream_t, MtpDraftRequest*);
+    friend PrefixDeviceTransfer export_prefix_view(const Request&, int, int, int, cudaStream_t,
+                                                    const MtpDraftRequest*, const Workspace*, bool);
+    friend int commit_restored_prefix(Request&, const PrefixDeviceTransfer&, MtpDraftRequest*);
+    Mxfp8KvCache prefix_cache_view(int rows, bool storing) const;
+    const Allocations& prefix_cache_memory() const;
+    void commit_restored_prefix(int rows);
 
     struct State;
     std::unique_ptr<State> state_;

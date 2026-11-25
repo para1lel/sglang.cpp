@@ -110,6 +110,8 @@ struct Request {
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
     int kv_limit = 0;
+    int cached_gqa_tokens = 0;
+    bool prefix_checkpoint_outputs = false;
     GdnBank states;
     std::optional<ExactGqaWorkspace> long_graph_scores;
     std::byte* sampling_workspace = nullptr;

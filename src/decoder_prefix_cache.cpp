@@ -1,478 +1,288 @@
 #include "sglang/decoder_prefix_cache.h"
-#include "sglang/decoder_media_internal.h"
+
 #include "sglang/decoder_mtp.h"
-#include "sglang/runtime/cache/mxfp8_prefix_copy.h"
 
 #include <algorithm>
-#include <bitset>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
 #include <utility>
 
 namespace sglang::decoder {
 namespace {
 
-static_assert(decoder_batch_prefix_max_tokens == text_attention_max_tokens);
-static_assert(decoder_batch_prefix_checkpoint_interval % mxfp8_page_size == 0);
+constexpr std::array<std::size_t, 4> state_bytes{
+    gdn_layers * gdn_history_elements * sizeof(Bf16),
+    gdn_layers * gdn_state_elements * sizeof(float),
+    hidden_size * sizeof(Bf16), hidden_size * sizeof(Bf16)};
+constexpr std::size_t state_version_bytes =
+    state_bytes[0] + state_bytes[1] + state_bytes[2] + state_bytes[3];
 
-void drain_snapshot_failure(cudaStream_t stream, const char* operation) {
-    const auto pending = cudaGetLastError();
-    check(cudaStreamSynchronize(stream), operation);
-    if (CudaError::terminal(pending)) check(pending, operation);
+cudaError_t consume_prefix_error(cudaError_t direct) noexcept {
+    if (direct == cudaSuccess) return direct;
+    const auto recorded = cudaGetLastError();
+    return !CudaError::terminal(direct) && CudaError::terminal(recorded) ? recorded : direct;
 }
 
-template <typename Copy>
-void copy_page_runs(const GpuPrefixSnapshotStore::PageMapping& mapping, int pages, Copy copy) {
-    for (int logical = 0; logical < pages;) {
-        const int physical = mapping.physical[logical];
-        int length = 1;
-        while (logical + length < pages &&
-               mapping.physical[logical + length] == physical + length) {
-            ++length;
-        }
-        copy(logical, physical, length);
-        logical += length;
-    }
+void check_prefix_cuda(cudaError_t status, const char* operation) {
+    check(consume_prefix_error(status), operation);
 }
 
-void copy_layers(std::uint8_t* dst, int dst_pages, int dst_page,
-                 const std::uint8_t* src, int src_pages, int src_page,
-                 std::size_t width, std::size_t page_bytes, cudaStream_t stream) {
-    check(cudaMemcpy2DAsync(dst + dst_page * page_bytes, dst_pages * page_bytes,
-                            src + src_page * page_bytes, src_pages * page_bytes,
-                            width, full_attention_layers, cudaMemcpyDeviceToDevice,
-                            stream), "Copy prefix KV layers");
-}
-
-void copy_kv(Mxfp8KvCache dst, int dst_page, Mxfp8KvCache src, int src_page,
-             int rows, cudaStream_t stream) {
-    const auto payload_width = rows * (mxfp8_payload_bytes_per_page / mxfp8_page_size);
-    const auto payload = [&](auto* to, const auto* from) {
-        copy_layers(to, dst.page_count, dst_page, from, src.page_count, src_page,
-                    payload_width, mxfp8_payload_bytes_per_page, stream);
-    };
-    const auto scales = [&](auto* to, const auto* from) {
-        if (rows % mxfp8_page_size == 0) {
-            copy_layers(to, dst.page_count, dst_page, from, src.page_count, src_page,
-                        rows / mxfp8_page_size * mxfp8_scale_bytes_per_page,
-                        mxfp8_scale_bytes_per_page, stream);
-        } else {
-            copy_mxfp8_scale_tail(to + dst_page * mxfp8_scale_bytes_per_page, dst.page_count,
-                                  from + src_page * mxfp8_scale_bytes_per_page, src.page_count,
-                                  full_attention_layers, rows, stream, "Copy prefix KV scales");
-        }
-    };
-    payload(dst.key_payload, src.key_payload);
-    payload(dst.value_payload, src.value_payload);
-    scales(dst.key_scales, src.key_scales);
-    scales(dst.value_scales, src.value_scales);
-}
-
-void copy_target_prefix(Mxfp8KvCache snapshot, Mxfp8KvCache live,
-                        const GpuPrefixSnapshotStore::PageMapping& mapping, int tokens,
-                        bool restoring, cudaStream_t stream) {
-    const auto copy = [&](int logical, int physical, int rows) {
-        if (restoring) copy_kv(live, physical, snapshot, logical, rows, stream);
-        else copy_kv(snapshot, logical, live, physical, rows, stream);
-    };
-    const int pages = tokens / mxfp8_page_size;
-    copy_page_runs(mapping, pages, [&](int logical, int physical, int count) {
-        copy(logical, physical, count * mxfp8_page_size);
-    });
-    if (const int tail = tokens % mxfp8_page_size) copy(pages, mapping.physical[pages], tail);
-}
-
-template <typename Element>
-void copy_state(Element* dst, const Element* src, std::size_t elements, cudaStream_t stream) {
-    check(cudaMemcpyAsync(dst, src, elements * sizeof(Element), cudaMemcpyDeviceToDevice, stream),
-          "Copy prefix decoder state");
-}
-
-void copy_gdn(TextGdnState dst, TextGdnState src, cudaStream_t stream) {
-    copy_state(dst.history, src.history, gdn_layers * gdn_history_elements, stream);
-    copy_state(dst.recurrent, src.recurrent, gdn_layers * gdn_state_elements, stream);
-}
-
-std::size_t kv_bytes(int layers, int pages) {
-    return 2 * layers * pages * (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
-}
-
-constexpr auto target_state_bytes = gdn_layers * (gdn_history_elements * sizeof(Bf16) +
-    gdn_state_elements * sizeof(float)) + 2 * hidden_size * sizeof(Bf16);
-
-Mxfp8KvCache allocate_kv(Allocations& memory, int layers, int pages) {
-    const auto payload = layers * pages * mxfp8_payload_bytes_per_page;
-    const auto scales = layers * pages * mxfp8_scale_bytes_per_page;
-    auto* const storage = memory.allocate<std::uint8_t>(kv_bytes(layers, pages));
-    return {storage, storage + payload, storage + 2 * payload,
-            storage + 2 * payload + scales, pages};
-}
-
-std::size_t available_snapshot_bytes(std::size_t reusable_bytes = 0) {
-    const auto free = available_device_bytes() + reusable_bytes;
-    return free - std::min(free, decoder_shared_reserve);
-}
-
-}
-
-void copy_mxfp8_scale_tail(std::uint8_t* dst, int dst_pages, const std::uint8_t* src,
-                           int src_pages, int layers, int rows, cudaStream_t stream,
-                           const char* operation) {
-    constexpr auto head_bytes = mxfp8_page_size * mxfp8_groups;
-    constexpr auto lane_bytes = head_bytes / mxfp8_group_size;
-    const auto copy = [&](std::size_t offset, std::size_t pitch, std::size_t width,
-                          std::size_t height) {
-        if (layers == 1) {
-            check(cudaMemcpy2DAsync(dst + offset, pitch, src + offset, pitch, width, height,
-                                    cudaMemcpyDeviceToDevice, stream), operation);
-        } else {
-            cudaMemcpy3DParms params{};
-            params.srcPtr = {const_cast<std::uint8_t*>(src + offset), pitch, pitch,
-                             src_pages * mxfp8_scale_bytes_per_page / pitch};
-            params.dstPtr = {dst + offset, pitch, pitch,
-                             dst_pages * mxfp8_scale_bytes_per_page / pitch};
-            params.extent = {width, height, static_cast<std::size_t>(layers)};
-            params.kind = cudaMemcpyDeviceToDevice;
-            check(cudaMemcpy3DAsync(&params, stream), operation);
-        }
-    };
-    if (rows == mxfp8_page_size - 1) {
-        copy(0, head_bytes, head_bytes - mxfp8_groups, mxfp8_kv_heads);
-        return;
-    }
-    // Each lane stores one scale row per group of 32 tokens.
-    const auto complete = (rows / mxfp8_group_size) * mxfp8_groups;
-    if (complete) copy(0, lane_bytes, complete, mxfp8_group_size * mxfp8_kv_heads);
-    if (const int tail = rows % mxfp8_group_size) {
-        for (int head = 0; head < mxfp8_kv_heads; ++head) {
-            copy(head * head_bytes + complete, lane_bytes, mxfp8_groups, tail);
-        }
-    }
-}
-
-GpuPrefixSnapshotStore::PageMapping GpuPrefixSnapshotStore::read_request_pages(
-    const Request& request, int pages, cudaStream_t stream) {
-    const auto table = request.pages;
-    const int physical_pages = request.caches.front().page_count;
-    if (!table.device_pages || pages < 1 || pages > max_request_pages ||
-        table.page_count < pages || table.page_count > max_request_pages ||
-        physical_pages < pages || physical_pages > max_request_pages) {
-        throw std::invalid_argument("Invalid prefix KV page capacity");
-    }
-    PageMapping mapping{{}, pages};
-    try {
-        check(cudaMemcpyAsync(mapping.physical.data(), table.device_pages,
-                              table.page_count * sizeof(mapping.physical[0]),
-                              cudaMemcpyDeviceToHost, stream), "Read prefix KV page mapping");
-        check(cudaStreamSynchronize(stream), "Complete prefix KV page mapping read");
-    } catch (const CudaError&) {
-        drain_snapshot_failure(stream, "Drain interrupted prefix KV page mapping read");
-        throw;
+class PrefixStateVersion {
+public:
+    explicit PrefixStateVersion(std::array<std::shared_ptr<const void>, 4> sources)
+        : producer_(std::make_unique<Producer>(std::move(sources))) {
+        check(cudaGetDevice(&device_), "Identify decoder prefix version device");
+        void* data = nullptr;
+        check_prefix_cuda(cudaMalloc(&data, state_version_bytes),
+                          "Allocate decoder prefix state version");
+        data_ = static_cast<std::byte*>(data);
     }
 
-    std::bitset<max_request_pages> used;
-    for (int logical = 0; logical < pages; ++logical) {
-        const int physical = mapping.physical[logical];
-        if (physical < 0 || physical >= physical_pages || used.test(physical)) {
-            throw std::invalid_argument("Invalid prefix KV page mapping");
-        }
-        used.set(physical);
-    }
-    for (int logical = pages; logical < table.page_count; ++logical) {
-        const int physical = mapping.physical[logical];
-        if (physical >= 0 && physical < physical_pages && used.test(physical)) {
-            throw std::invalid_argument("Prefix KV page aliases a suffix page");
-        }
-    }
-    return mapping;
-}
-
-GpuPrefixSnapshotStore::KvAllocation::KvAllocation(int device, int layers, int pages)
-    : memory(device), kv(allocate_kv(memory, layers, pages)) {}
-
-GpuPrefixSnapshotStore::Target::Target(int device, int pages)
-    : KvAllocation(device, full_attention_layers, pages),
-      gdn{memory.allocate<Bf16>(gdn_layers * gdn_history_elements),
-          memory.allocate<float>(gdn_layers * gdn_state_elements)},
-      hidden(memory.allocate<Bf16>(hidden_size)),
-      residual(memory.allocate<Bf16>(hidden_size)) {}
-
-GpuPrefixSnapshotStore::GpuPrefixSnapshotStore(int device, int capacity, bool with_draft)
-    : device_(device), with_draft_(with_draft) {
-    if (capacity < 1 || capacity > decoder_batch_prefix_max_entries) {
-        throw std::invalid_argument("Invalid prefix cache capacity");
-    }
-}
-
-std::size_t GpuPrefixSnapshotStore::device_bytes() const {
-    std::size_t bytes = draft_device_bytes();
-    for (const auto& slot : slots_) {
-        if (slot.target) bytes += slot.target->memory.bytes();
-    }
-    return bytes;
-}
-
-std::size_t GpuPrefixSnapshotStore::draft_device_bytes() const {
-    std::size_t bytes = 0;
-    for (const auto& slot : slots_) {
-        if (slot.draft) bytes += slot.draft->memory.bytes();
-    }
-    return bytes;
-}
-
-std::optional<GpuPrefixSnapshotStore::Snapshot> GpuPrefixSnapshotStore::prepare(
-    int slot, int tokens, int capacity, bool with_draft) const {
-    constexpr int interval_pages = decoder_batch_prefix_checkpoint_interval / mxfp8_page_size;
-    const auto reusable = [capacity](const auto& allocation, int pages) {
-        if (!allocation) return false;
-        const int allocated = allocation->kv.page_count;
-        return allocated == pages || (capacity > 0 && pages >= interval_pages &&
-                                      allocated > pages && allocated - pages <= interval_pages);
-    };
-    const auto& old = slots_[slot];
-    std::optional<std::size_t> available;
-    const auto prepare_capacity = [&](int rows) -> std::optional<Snapshot> {
-        const int target_pages = prefix_kv_pages(rows);
-        const int draft_pages = with_draft ? prefix_kv_pages(rows - 1) : 0;
-        const bool target_needed = !reusable(old.target, target_pages);
-        const bool draft_needed = draft_pages && !reusable(old.draft, draft_pages);
-        const auto bytes = (target_needed ? kv_bytes(full_attention_layers, target_pages) +
-                            target_state_bytes : 0) + (draft_needed ? kv_bytes(1, draft_pages) : 0);
-        Snapshot prepared;
-        if (!bytes) return prepared;
-        DeviceScope device(device_);
-        if (!available) available = available_snapshot_bytes();
-        if (bytes > *available) return std::nullopt;
+    ~PrefixStateVersion() {
+        if (!producer_) return;
         try {
-            if (target_needed) prepared.target = std::make_unique<Target>(device_, target_pages);
-            if (draft_needed) {
-                prepared.draft = std::make_unique<KvAllocation>(device_, 1, draft_pages);
+            DeviceScope device(device_);
+            const auto status = complete_producer();
+            if (status == cudaSuccess) {
+                // CUDA reclaims a cudaMalloc block at the next sync on the freeing stream.
+                const auto released = release_cuda_block(data_, cudaStreamPerThread, true);
+                report(consume_prefix_error(released));
+            } else {
+                report(status);
             }
         } catch (const CudaError& error) {
-            if (error.status != cudaErrorMemoryAllocation) throw;
-            const auto pending = cudaGetLastError();
-            if (pending != cudaErrorMemoryAllocation) {
-                check(pending, "Check CUDA error after prefix snapshot allocation");
+            if (producer_->started) quarantine_producer();
+            report(error.status);
+        }
+    }
+
+    std::byte* data() const { return data_; }
+
+    void submit(const std::array<const void*, 4>& state, cudaStream_t stream,
+                const std::shared_ptr<void>& event) {
+        producer_->stream = stream;
+        producer_->started = true;
+        try {
+            auto* data = data_;
+            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
+                check_prefix_cuda(cudaMemcpyAsync(data, state[index], state_bytes[index],
+                                                  cudaMemcpyDeviceToDevice, stream),
+                                  "Version decoder prefix state");
+                data += state_bytes[index];
             }
-            return std::nullopt;
+            check_prefix_cuda(cudaEventRecord(static_cast<cudaEvent_t>(event.get()), stream),
+                              "Record decoder prefix readiness");
+            producer_->ready = event;
+        } catch (const CudaError& error) {
+            const auto drained = complete_producer();
+            if (CudaError::terminal(drained) && !CudaError::terminal(error.status)) {
+                check(drained, "Drain failed decoder prefix copy");
+            }
+            report(drained);
+            throw;
         }
-        return prepared;
+    }
+
+private:
+    struct Producer {
+        explicit Producer(std::array<std::shared_ptr<const void>, 4> retained)
+            : sources(std::move(retained)) {}
+        std::array<std::shared_ptr<const void>, 4> sources;
+        std::shared_ptr<void> ready;
+        cudaStream_t stream = nullptr;
+        bool started = false;
     };
-    if (capacity > tokens) {
-        if (auto reserved = prepare_capacity(capacity)) return reserved;
-    }
-    return prepare_capacity(tokens);
-}
 
-void GpuPrefixSnapshotStore::release(int slot) { slots_[slot] = {}; }
-
-void GpuPrefixSnapshotStore::clear() { slots_ = {}; }
-
-void GpuPrefixSnapshotStore::store(int slot, Snapshot prepared, const Request& request,
-                                  const Workspace& row, const PageMapping& mapping, int tokens,
-                                  cudaStream_t stream, const MtpDraftRequest* draft,
-                                  int draft_rows) {
-    auto& snapshot = slots_[slot];
-    if (prepared.target) snapshot.target = std::move(prepared.target);
-    if (prepared.draft || draft_rows <= 0) snapshot.draft = std::move(prepared.draft);
-    const auto& target = *snapshot.target;
-    copy_target_prefix(target.kv, request.caches.front(), mapping, tokens, false, stream);
-    copy_gdn(target.gdn, request.states.front(), stream);
-    copy_state(target.hidden, row.hidden, hidden_size, stream);
-    copy_state(target.residual, row.residual, hidden_size, stream);
-    if (draft_rows > 0) {
-        draft->snapshot_prefix(snapshot.draft->kv, draft_rows, stream);
-    }
-    check(cudaStreamSynchronize(stream), "Complete decoder prefix checkpoint");
-}
-
-void GpuPrefixSnapshotStore::restore(int slot, Request& request, int tokens, bool restore_workspace,
-                                    cudaStream_t stream, MtpDraftRequest* draft,
-                                    int draft_rows) const {
-    const auto& snapshot = slots_[slot];
-    const auto& target = *snapshot.target;
-    const auto mapping = read_request_pages(request, prefix_kv_pages(tokens), stream);
-    try {
-        copy_target_prefix(target.kv, request.caches.front(), mapping, tokens, true, stream);
-        copy_gdn(request.states.front(), target.gdn, stream);
-        if (restore_workspace) {
-            copy_state(request.work.hidden, target.hidden, hidden_size, stream);
-            copy_state(request.work.residual, target.residual, hidden_size, stream);
+    cudaError_t complete_producer() noexcept {
+        if (!producer_->started) return cudaSuccess;
+        const auto ready = static_cast<cudaEvent_t>(producer_->ready.get());
+        auto status = consume_prefix_error(ready ? cudaEventQuery(ready)
+                                                 : cudaStreamSynchronize(producer_->stream));
+        if (ready && status == cudaErrorNotReady) {
+            status = consume_prefix_error(cudaEventSynchronize(ready));
         }
-        if (draft && draft_rows > 0) {
-            draft->restore_prefix(snapshot.draft->kv, draft_rows, stream);
+        if (status == cudaSuccess) producer_->started = false;
+        else quarantine_producer();
+        return status;
+    }
+
+    void quarantine_producer() noexcept {
+        // A failed fence cannot authorize reusing the source or destination allocations.
+        (void)producer_.release();
+    }
+
+    static void report(cudaError_t status) noexcept {
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "sglang decoder: Release prefix state version: %s\n",
+                         cudaGetErrorString(status));
+        }
+    }
+
+    int device_ = 0;
+    std::byte* data_ = nullptr;
+    std::unique_ptr<Producer> producer_;
+};
+
+class PrefixViewBuilder {
+public:
+    explicit PrefixViewBuilder(bool store = false) {
+        if (store) {
+            owners_ = std::make_shared<Owners>();
+            view_.store_owner = owners_;
+        }
+    }
+
+    PrefixDeviceAddress allocation(const void* base, std::size_t bytes,
+                                   const Allocations* memory = nullptr) {
+        if (memory) owners_->blocks.push_back(memory->retain_block(base));
+        cudaIpcMemHandle_t handle;
+        check_prefix_cuda(cudaIpcGetMemHandle(&handle, const_cast<void*>(base)),
+                          "Export decoder prefix allocation handle");
+        auto& allocations = view_.transfer.allocations;
+        const auto index = static_cast<std::uint32_t>(allocations.size());
+        auto& allocation = allocations.emplace_back();
+        static_assert(sizeof(handle) == sizeof(allocation.handle));
+        std::memcpy(allocation.handle.data(), &handle, sizeof(handle));
+        allocation.bytes = bytes;
+        return {index, 0};
+    }
+
+    PrefixDeviceMxfp8 mxfp8(Mxfp8KvCache cache, int layers, int begin, int end,
+                            const Allocations* memory = nullptr) {
+        if (begin == end) return {};
+        PrefixDeviceMxfp8 result{begin, end, layers, cache.page_count};
+        const auto payload = layers * cache.page_count * mxfp8_payload_bytes_per_page;
+        const auto scales = layers * cache.page_count * mxfp8_scale_bytes_per_page;
+        if (layers == full_attention_layers) {
+            const auto slab = allocation(cache.key_payload, 2 * (payload + scales), memory);
+            result.planes = {{slab, {slab.allocation, payload}, {slab.allocation, 2 * payload},
+                              {slab.allocation, 2 * payload + scales}}};
         } else {
-            check(cudaStreamSynchronize(stream), "Complete decoder prefix restoration");
+            result.planes = {{allocation(cache.key_payload, payload, memory),
+                              allocation(cache.value_payload, payload, memory),
+                              allocation(cache.key_scales, scales, memory),
+                              allocation(cache.value_scales, scales, memory)}};
         }
-    } catch (...) {
-        drain_snapshot_failure(stream, "Drain interrupted prefix restoration");
-        throw;
+        return result;
     }
-}
 
-std::optional<PrefixMediaKey> PrefixMediaKey::capture(const MultimodalInput* media, int tokens) {
-    PrefixMediaKey key;
-    if (!media) return key;
-    const auto& prompt = media->prompt;
-    const auto input_tokens = std::min(std::size_t(tokens), prompt.positions.size());
-    for (const auto& span : prompt.spans) {
-        if (span.token_begin >= tokens) break;
-        if (span.media_index >= media->cache_identities.size()) return std::nullopt;
-        const auto& identity = media->cache_identities[span.media_index];
-        if (!identity) return std::nullopt;
-        key.spans_.push_back({span.token_begin, std::min(span.rows, tokens - span.token_begin),
-                              span.feature_begin, identity});
+    PrefixDeviceGdn gdn(TextGdnState state, const Workspace& row, int end,
+                        const Allocations* memory = nullptr, bool terminal = false) {
+        state_ = {state.history, state.recurrent, row.hidden, row.residual};
+        PrefixDeviceGdn result{end, {}};
+        if (memory && !terminal) {
+            std::array<std::shared_ptr<const void>, 4> sources;
+            for (std::size_t index = 0; index < state_.size(); ++index) {
+                sources[index] = memory->retain_block(state_[index]);
+            }
+            owners_->version = std::make_shared<PrefixStateVersion>(std::move(sources));
+            auto address = allocation(owners_->version->data(), state_version_bytes);
+            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
+                result.planes[index] = {address, state_bytes[index]};
+                address.offset += state_bytes[index];
+            }
+        } else {
+            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
+                const auto bytes = state_bytes[index];
+                result.planes[index] = {allocation(state_[index], bytes, memory), bytes};
+            }
+        }
+        return result;
     }
-    key.positions_.assign(prompt.positions.begin(), prompt.positions.begin() + input_tokens);
-    key.next_position_ = prompt.next_position;
-    return key;
-}
 
-bool PrefixMediaKey::matches(const MultimodalInput* media, int tokens) const {
-    if (!media) return positions_.empty();
-    if (positions_.empty()) return false;
-    const auto& prompt = media->prompt;
-    const auto input_tokens = std::min(std::size_t(tokens), prompt.positions.size());
-    std::size_t index = 0;
-    for (const auto& span : prompt.spans) {
-        if (span.token_begin >= tokens) break;
-        if (index == spans_.size() || span.media_index >= media->cache_identities.size()) {
-            return false;
+    PrefixDeviceTransfer finish(PrefixDeviceLayout layout, cudaStream_t stream) {
+        view_.layout = layout;
+        if (view_.transfer.allocations.empty()) return std::move(view_);
+        int device;
+        check(cudaGetDevice(&device), "Identify decoder prefix CUDA device");
+        cudaDeviceProp properties;
+        check(cudaGetDeviceProperties(&properties, device), "Read decoder prefix CUDA UUID");
+        static_assert(sizeof(properties.uuid.bytes) == sizeof(view_.transfer.device));
+        std::memcpy(view_.transfer.device.data(), properties.uuid.bytes,
+                    sizeof(properties.uuid.bytes));
+        cudaEvent_t ready;
+        check_prefix_cuda(cudaEventCreateWithFlags(&ready, cudaEventInterprocess |
+                                                   cudaEventDisableTiming),
+                          "Create decoder prefix IPC event");
+        view_.ready = std::shared_ptr<void>(ready, [](void* event) noexcept {
+            cudaEventDestroy(static_cast<cudaEvent_t>(event));
+        });
+        cudaIpcEventHandle_t handle;
+        check_prefix_cuda(cudaIpcGetEventHandle(&handle, ready),
+                          "Export decoder prefix readiness handle");
+        static_assert(sizeof(handle) == sizeof(view_.transfer.ready_event));
+        std::memcpy(view_.transfer.ready_event.data(), &handle, sizeof(handle));
+        if (owners_ && owners_->version) {
+            owners_->version->submit(state_, stream, view_.ready);
+        } else {
+            check_prefix_cuda(cudaEventRecord(ready, stream), "Record decoder prefix readiness");
         }
-        const auto& saved = spans_[index++];
-        const auto& identity = media->cache_identities[span.media_index];
-        if (saved.token_begin != span.token_begin || saved.feature_begin != span.feature_begin ||
-            saved.rows != std::min(span.rows, tokens - span.token_begin) ||
-            !identity || !saved.identity->same_content(*identity)) {
-            return false;
-        }
+        return std::move(view_);
     }
-    if (index != spans_.size()) return false;
-    const auto common = std::min(positions_.size(), input_tokens);
-    for (std::size_t i = 0; i < common; ++i) {
-        const auto& saved = positions_[i];
-        const auto& current = prompt.positions[i];
-        if (saved.temporal != current.temporal || saved.height != current.height ||
-            saved.width != current.width) return false;
-    }
-    // Generated rows use one rotary position on all axes, starting at next_position.
-    const auto diagonal = [](const auto& positions, std::size_t from, std::size_t to, int start) {
-        for (; from < to; ++from, ++start) {
-            const auto& position = positions[from];
-            if (position.temporal != start || position.height != start ||
-                position.width != start) return false;
-        }
-        return true;
+
+private:
+    struct Owners {
+        std::vector<std::shared_ptr<const void>> blocks;
+        std::shared_ptr<PrefixStateVersion> version;
     };
-    if (!diagonal(positions_, common, positions_.size(), prompt.next_position) ||
-        !diagonal(prompt.positions, common, input_tokens, next_position_)) return false;
-    if (std::size_t(tokens) == std::max(positions_.size(), input_tokens)) return true;
-    return next_position_ - int(positions_.size()) == prompt.next_position - int(input_tokens);
+
+    std::array<const void*, state_bytes.size()> state_{};
+    std::shared_ptr<Owners> owners_;
+    PrefixDeviceTransfer view_;
+};
+
+int capacity(const Request& request) { return request.pages.page_count * mxfp8_page_size; }
+
 }
 
-PrefixCache::PrefixCache(int device, int capacity, bool with_draft)
-    : snapshots_(device, capacity, with_draft), index_(capacity) {}
-
-int PrefixCache::checkpoint(int tokens) {
-    return std::clamp(tokens, 0, decoder_batch_prefix_max_tokens);
+PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead& read,
+                                         cudaStream_t initialized, MtpDraftRequest* draft) {
+    if (request.cached_gqa_tokens || (draft && draft->valid_prefix())) {
+        throw std::logic_error("Restore an already initialized decoder prefix");
+    }
+    const int coherent = read.usable_gdn;
+    const int draft_rows = draft ? std::max(0, coherent - 1) : 0;
+    if (read.usable_gqa < 0 || read.usable_gqa > capacity(request) ||
+        read.usable_gqa > read.matched_gqa || coherent < 0 || coherent > read.usable_gqa ||
+        coherent > read.matched_gdn || read.usable_draft != draft_rows) {
+        throw std::logic_error("Invalid decoder prefix restore extent");
+    }
+    PrefixViewBuilder view;
+    PrefixDeviceLayout layout;
+    layout.gqa = view.mxfp8(request.caches.front(), full_attention_layers, 0, read.usable_gqa);
+    if (draft_rows) layout.draft = view.mxfp8(draft->prefix_cache_view(draft_rows, false),
+                                             1, 0, draft_rows);
+    if (coherent) layout.gdn = view.gdn(request.states.front(), request.work, coherent);
+    return view.finish(layout, initialized);
 }
 
-int PrefixCache::restore(Request& request, const std::vector<int>& prompt, std::string_view salt,
-                         cudaStream_t stream, MtpDraftRequest* draft, int max_tokens,
-                         const MultimodalInput* media) {
-    const int limit = checkpoint(std::min(static_cast<int>(prompt.size()), max_tokens));
-    if (!limit) return 0;
-    const auto match = index_.find(prompt, salt, 1, limit, draft != nullptr, media);
-    if (match.slot == -1) {
-        counters_.draft_misses += match.draft_miss;
-        return 0;
+PrefixDeviceTransfer export_prefix_view(const Request& request, int gqa_begin, int draft_begin,
+                                        int end, cudaStream_t source_ready,
+                                        const MtpDraftRequest* draft, const Workspace* row,
+                                        bool terminal) {
+    if (end <= 0 || end > capacity(request) || gqa_begin < 0 || gqa_begin > end ||
+        draft_begin < 0 || draft_begin > (draft ? end - 1 : 0)) {
+        throw std::logic_error("Invalid decoder prefix checkpoint extent");
     }
-    if (request.kv_limit && prefix_kv_pages(match.tokens) > request.pages.page_count) {
-        request.grow_kv(match.tokens, 0, stream);
+    PrefixViewBuilder view(true);
+    PrefixDeviceLayout layout;
+    layout.gqa = view.mxfp8(request.caches.front(), full_attention_layers, gqa_begin, end,
+                            &request.memory);
+    if (draft && draft_begin < end - 1) {
+        layout.draft = view.mxfp8(draft->prefix_cache_view(end - 1, true), 1, draft_begin, end - 1,
+                                  &draft->prefix_cache_memory());
     }
-    snapshots_.restore(match.slot, request, match.tokens,
-                       draft || match.tokens == static_cast<int>(prompt.size()), stream,
-                       draft, match.draft_rows);
-    if (draft) {
-        counters_.draft_cached_rows += match.draft_rows;
-    }
-    index_.touch(match);
-    ++counters_.hits;
-    counters_.cached_tokens += match.tokens;
-    return match.tokens;
+    layout.gdn = view.gdn(request.states.front(), row ? *row : request.work, end,
+                          &request.memory, terminal);
+    return view.finish(layout, source_ready);
 }
 
-void PrefixCache::store(const Request& request, const std::vector<int>& prompt,
-                        std::string_view salt, int tokens, cudaStream_t stream,
-                        const MtpDraftRequest* draft, const MultimodalInput* media,
-                        const Workspace* row, int terminal_tokens) {
-    if (tokens < 1 || tokens > decoder_batch_prefix_max_tokens ||
-        std::size_t(tokens) > prompt.size() || salt.size() > decoder_prefix_max_salt_bytes ||
-        (draft && (!snapshots_.supports_draft() || draft->valid_prefix() < tokens - 1))) {
-        throw std::invalid_argument("Invalid prefix cache checkpoint");
-    }
-    const auto exact = index_.find(prompt, salt, tokens, tokens, false, media);
-    const int draft_rows = draft ? tokens - 1 : -1;
-    if (index_.touch_if_covered(exact, draft_rows)) return;
-    auto media_key = PrefixMediaKey::capture(media, tokens);
-    if (!media_key) return;
-    const auto pages = prefix_kv_pages(tokens);
-    const auto mapping = GpuPrefixSnapshotStore::read_request_pages(request, pages, stream);
-    const auto write = index_.select_write(exact);
-    index_.prepare(write, tokens);
-    constexpr int interval = decoder_batch_prefix_checkpoint_interval;
-    // A live periodic checkpoint can reserve the pages for its final checkpoint in this interval.
-    const bool terminal_in_interval = tokens % interval == 0 && terminal_tokens > tokens &&
-        terminal_tokens - tokens < interval && terminal_tokens <= decoder_batch_prefix_max_tokens &&
-        prefix_kv_pages(terminal_tokens) <= request.pages.page_count;
-    const int capacity = terminal_in_interval ? terminal_tokens
-                                              : (terminal_tokens > 0 ? tokens : 0);
-    auto prepared = snapshots_.prepare(write.slot, tokens, capacity, draft);
-    if (!prepared) return;
-    index_.invalidate(write.slot);
-    counters_.evictions += write.evicted;
-    try {
-        snapshots_.store(write.slot, std::move(*prepared), request, row ? *row : request.work,
-                         mapping, tokens, stream, draft, draft_rows);
-    } catch (...) {
-        drain_snapshot_failure(stream, "Drain interrupted prefix checkpoint");
-        snapshots_.release(write.slot);
-        throw;
-    }
-    ++counters_.stores;
-    index_.publish(write, prompt, salt, tokens, pages, draft_rows, std::move(*media_key));
-}
-
-void PrefixCache::count_prefill(int tokens, int draft_rows) {
-    counters_.prefill_tokens += tokens;
-    counters_.draft_prefill_rows += draft_rows;
-}
-
-void PrefixCache::reclaim_for_admission(std::size_t bytes, std::size_t reusable_bytes) {
-    int slot = index_.oldest();
-    const auto recoverable = reusable_bytes + snapshots_.device_bytes();
-    if (slot == -1 || bytes > available_snapshot_bytes(recoverable)) {
-        return;
-    }
-    while (slot != -1 && bytes > available_snapshot_bytes(reusable_bytes)) {
-        index_.invalidate(slot);
-        snapshots_.release(slot);
-        ++counters_.evictions;
-        slot = index_.oldest();
-    }
-}
-
-void PrefixCache::reset() {
-    index_.reset();
-    snapshots_.clear();
-}
-
-DecoderPrefixCacheStats PrefixCache::stats() const {
-    auto stats = counters_;
-    stats.device_bytes = snapshots_.device_bytes();
-    stats.draft_device_bytes = snapshots_.draft_device_bytes();
-    const auto occupancy = index_.occupancy();
-    stats.entries = occupancy.entries;
-    stats.pages = occupancy.pages;
-    return stats;
+int commit_restored_prefix(Request& request, const PrefixDeviceTransfer& view,
+                           MtpDraftRequest* draft) {
+    if (draft) draft->commit_restored_prefix(view.layout.draft.end);
+    request.cached_gqa_tokens = view.layout.gqa.end;
+    return view.layout.gdn.end;
 }
 
 }

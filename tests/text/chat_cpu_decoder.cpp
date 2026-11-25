@@ -455,6 +455,12 @@ DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {
 
 void DecoderBatch::reset_prefix_cache() {}
 
+#ifdef SGLANG_TEST_LMCACHE
+DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int) {
+    throw std::logic_error("Unexpected CPU prefix transfer");
+}
+#endif
+
 #ifdef SGLANG_TEST_RETIRED_ALLOCATIONS
 void DecoderBatch::release_retired_allocations() {}
 #endif

@@ -64,7 +64,8 @@ def server(binary, checkpoint, log, *flags, sampling=True, with_process=False):
         environment["SGLANG_TEST_SAMPLING_RECEIPTS"] = "1"
     else:
         environment.pop("SGLANG_TEST_SAMPLING_RECEIPTS", None)
-    with log.open("wb") as output:
+    with TemporaryDirectory(prefix="sglang-cpu-") as runtime, log.open("wb") as output:
+        environment["XDG_RUNTIME_DIR"] = runtime
         process = subprocess.Popen(command, env=environment, stdout=output, stderr=output)
         try:
             deadline = time.monotonic() + 15
@@ -443,8 +444,7 @@ class Routes(unittest.TestCase):
             for flags, reasoning, tools in cases:
                 with self.subTest(reasoning=reasoning, tools=tools):
                     log = self.output / f"model-info-{reasoning}-{tools}.log"
-                    with server(self.binary, checkpoint, log, "--prefix-cache-entries", "1",
-                                *flags) as port:
+                    with server(self.binary, checkpoint, log, *flags) as port:
                         self.check_model_info(port, checkpoint, reasoning=reasoning, tools=tools)
                     self.assertEqual(receipts(log), [])
 
@@ -548,56 +548,64 @@ class Routes(unittest.TestCase):
     def test_cuda_graph_launch_defaults_and_eager_override(self):
         graph = ("--batch-cuda-graphs",)
         eager = ("--eager",)
-        prefix = ("--prefix-cache-entries", "1")
+        runtime = Path(self.enterContext(TemporaryDirectory(prefix="sglang-socket-")))
+        lmcache_socket = ("--lmcache-socket", str(runtime / "missing.sock"))
         no_prefix = ("--prefix-cache-entries", "0")
         cases = (
-            ("default", (), True, 4),
-            ("legacy", graph, True, 4),
-            ("eager", eager, False, 4),
-            ("legacy-then-eager", (*graph, *eager), False, 4),
-            ("eager-then-legacy", (*eager, *graph), False, 4),
-            ("prefix", prefix, True, 1),
-            ("eager-prefix", (*eager, *prefix), False, 1),
-            ("no-prefix", no_prefix, True, 0),
-            ("eager-no-prefix", (*eager, *no_prefix), False, 0),
+            ("default", (), True, True),
+            ("legacy", graph, True, True),
+            ("eager", eager, False, True),
+            ("legacy-then-eager", (*graph, *eager), False, True),
+            ("eager-then-legacy", (*eager, *graph), False, True),
+            ("lmcache-socket", lmcache_socket, True, True),
+            ("eager-lmcache-socket", (*eager, *lmcache_socket), False, True),
+            ("no-prefix", no_prefix, True, False),
+            ("eager-no-prefix", (*eager, *no_prefix), False, False),
         )
-        for name, flags, graphs, entries in cases:
+        for name, flags, graphs, lmcache_enabled in cases:
             with self.subTest(name=name):
                 log = self.output / f"graphs-launch-{name}.log"
                 with server(self.binary, self.checkpoint, log, *flags) as port:
                     info = self.control(port, "/server_info")
                     self.assertIs(info["batch_cuda_graphs"], graphs)
                     self.assertIs(info["eager"], not graphs)
-                    self.assertEqual(info["prefix_cache_entries"], entries)
+                    self.assertIs(info["lmcache_enabled"], lmcache_enabled)
+                    self.assertIs(info["lmcache_available"], False)
+                    self.assertEqual(info["prefix_cache_entries"], 0)
                     self.assertIs(info["enable_multimodal"], True)
                     expected_receipt = f"cpu batch cuda_graphs={int(graphs)}"
                     self.assertIn(expected_receipt, log.read_text().splitlines())
 
-    def test_mtp_launch_depth_with_prefix_cache(self):
-        prefix = ("--prefix-cache-entries", "1")
-        cases = (
-            ("prefix", prefix, 4),
-            ("prefix-target-only", (*prefix, "--mtp-k", "0"), 0),
-        )
+    def test_mtp_launch_depth_with_lmcache(self):
+        runtime = Path(self.enterContext(TemporaryDirectory(prefix="sglang-socket-")))
+        socket_flag = ("--lmcache-socket", str(runtime / "missing.sock"))
+        cases = (("lmcache", socket_flag, 4),
+                 ("lmcache-target-only", (*socket_flag, "--mtp-k", "0"), 0))
         for name, flags, depth in cases:
             with self.subTest(name=name):
                 log = self.output / f"mtp-launch-{name}.log"
                 with server(self.binary, self.checkpoint, log, *flags) as port:
                     info = self.control(port, "/server_info")
                     self.assertEqual(info["mtp_steps"], depth)
-                    self.assertEqual(info["prefix_cache_entries"], 1)
+                    self.assertIs(info["lmcache_enabled"], True)
+                    self.assertIs(info["lmcache_available"], False)
 
     def test_flush_cache_methods_and_timeout(self):
         flushed = (b"Cache flushed.\nPlease check backend logs for more details. "
                    b"(When there are running or waiting requests, the operation will not be "
                    b"performed.)\n")
+        log = self.output / "flush-disabled.log"
+        port = self.enterContext(server(self.binary, self.checkpoint, log,
+                                        "--prefix-cache-entries", "0"))
         for method, query in (("GET", ""), ("POST", "?timeout=bad&time%6Fut=0"),
                               ("GET", "?timeout=1e%2B3")):
             with self.subTest(method=method, query=query):
-                status, headers, data = self.wire(self.port, method, "/flush%5fcache" + query)
+                status, headers, data = self.wire(port, method, "/flush%5fcache" + query)
                 self.assertEqual((status, data), (200, flushed))
                 self.assertEqual(headers["Content-Length"], str(len(flushed)))
                 self.assertIsNone(headers["Content-Type"])
+        error = self.control(self.port, "/flush_cache", status=503)
+        self.assertEqual(error["error"]["message"], "LMCache namespace reset was not acknowledged")
         self.assert_redirect("POST", "/flush_cache%2F?timeout=%FF", "/flush_cache?timeout=%FF")
         status, headers, data = self.wire(self.port, "HEAD", "/flush_cache")
         self.assertEqual((status, set(headers["Allow"].split(", ")), data),
@@ -671,7 +679,8 @@ class Routes(unittest.TestCase):
             config = {**self.config, "temperature": 0.625, "top_k": 7, "top_p": 0.8,
                       "repetition_penalty": 1.25}
             (checkpoint / "generation_config.json").write_text(json.dumps(config))
-            with server(self.binary, checkpoint, log, "--max-active", "1") as port:
+            with server(self.binary, checkpoint, log, "--max-active", "1",
+                        "--prefix-cache-entries", "0") as port:
                 _, chat = self.exchange(CHAT, body(CHAT, max_tokens=1), port=port, log=log)
                 with self.subTest(route=CHAT):
                     self.check_model_defaults(chat, config)

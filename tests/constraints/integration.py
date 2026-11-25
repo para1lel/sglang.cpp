@@ -4,19 +4,25 @@ from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import json
+from pathlib import Path
 import re
+import sys
 from threading import Barrier
+from uuid import uuid4
 
 from http_contract import (SAMPLED, arguments, assert_piece_text, body, media_guard, serve,
                            trace_slice, verify_verifier)
 from token_oracle import checkpoint_bytes
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
+from live_controls import STORES, Controls
 
 
 def grammars():
     sentence = "The café serves tea and many kinds of coffee"
     ebnf = f'root ::= "{sentence}." | "{sentence}!"'
     return {"ebnf": (ebnf, 'root ::= "other"', "other"),
-            "regex": (r"^[A-Za-z ,.!]{23,36}$", "^other$", "other")}
+            "regex": (r"^[A-Fa-f ,.!]{23,36}$", "^other$", "other")}
 
 
 def field_pattern(field):
@@ -108,19 +114,25 @@ def mixed(http, log, cases, ordinary, control, depth):
 
 def check_prefix(http, fields, validate):
     prompt = "Hello" + " hello" * 127
+    controls = Controls(http.port, http.output)
     for field, (spec, other, expected) in fields.items():
         def request(pattern, salt):
             return body("text", 32, prompt=prompt, cache_salt=salt,
                         **{field: pattern}, **SAMPLED)
 
-        cold = request(spec, field)
+        salt = uuid4().hex
+        cold = request(spec, salt)
         initial = http.call(f"{field}-cold", "text", cold)
         assert initial["usage"]["prompt_tokens"] == 128
+        baseline = controls.wait_for(f"{field}-cold-idle", 0, 0, stores=0)[STORES]
+        prime = body("text", 1, prompt=prompt, cache_salt=salt)
+        http.call(f"{field}-prime", "text", prime)
+        controls.wait_for(f"{field}-prime-stored", 0, 0, stores=baseline + 1)
         warm = http.call(f"{field}-warm", "text", cold, stream=True)
         assert normalize_cache(initial, 0) == normalize_cache(warm, 128)
         validate(field, cold, warm)
-        changed = request(other, field)
-        fresh = request(other, f"{field}-fresh")
+        changed = request(other, salt)
+        fresh = request(other, uuid4().hex)
         result = http.call(f"{field}-changed-warm", "text", changed, stream=True)
         reference = http.call(f"{field}-changed-cold", "text", fresh)
         assert normalize_cache(result, 128) == normalize_cache(reference, 0)
@@ -133,14 +145,14 @@ def run(args, fields, schema_validator=None):
     pieces, _ = checkpoint_bytes(args.checkpoint / "tokenizer.json")
     validate = partial(validate_constraint, pieces, schema_validator)
     with serve(args, pieces) as http:
-        if args.cache_entries:
+        if args.lmcache_socket:
             assert args.width > 1 and args.graph
             check_prefix(http, fields, validate)
         else:
             check_mtp(http, args, fields, validate)
         (args.output / "summary.json").write_text(json.dumps(http.summary, ensure_ascii=True))
         candidate = http.summary
-    if not args.cache_entries and args.mtp:
+    if not args.lmcache_socket and args.mtp:
         control = Namespace(**(vars(args) | {"mtp": 0, "output": args.output / "k0"}))
         run(control, fields, schema_validator)
         expected = json.loads((control.output / "summary.json").read_text())

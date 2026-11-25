@@ -5,8 +5,8 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | CUDA backend policy | Chooses the B200 split-KV policy or the generic SM100 path. | [Device policy](../src/runtime/backend/cuda_backend_policy.cpp#L17)<!-- prefix: "const bool b" --> |
-| Batch executor | Selects direct decode lanes, binds scores and request state, and owns graph and scratch lifetimes. | [Batch selection](../src/decoder_batch.cpp#L616)<!-- prefix: "const auto r" --> · [Graph dispatch](../src/text/decoder_graph.cpp#L80)<!-- prefix: "DecodeRun ru" --> · [Score allocation](../src/runtime/backend/cuda_resources.cpp#L440)<!-- prefix: "ExactGqaWork" --> |
-| Target attention | Appends KV, reads each row's causal prefix, and gates the attention output before projection. | [Eager attention](../src/decoder_forward.cpp#L689)<!-- prefix: "if (batch.ta" --> · [Bound singleton](../src/decoder_forward.cpp#L582)<!-- prefix: "if (batch.ta" --> · [Bound verification](../src/decoder_forward.cpp#L600)<!-- prefix: "void attend_" --> |
+| Batch executor | Selects direct decode lanes, binds scores and request state, and owns graph and scratch lifetimes. | [Batch selection](../src/decoder_batch.cpp#L552)<!-- prefix: "const auto r" --> · [Graph dispatch](../src/text/decoder_graph.cpp#L83)<!-- prefix: "DecodeRun ru" --> · [Score allocation](../src/runtime/backend/cuda_resources.cpp#L509)<!-- prefix: "ExactGqaWork" --> |
+| Target attention | Appends KV, reads each row's causal prefix, and gates the attention output before projection. | [Eager attention](../src/decoder_forward.cpp#L701)<!-- prefix: "if (batch.ta" --> · [Bound singleton](../src/decoder_forward.cpp#L582)<!-- prefix: "if (batch.ta" --> · [Bound verification](../src/decoder_forward.cpp#L600)<!-- prefix: "void attend_" --> |
 
 ## Runtime path
 
@@ -14,7 +14,7 @@ Regular B200 batch replay supports one eligible direct decode lane. The first el
 
 ### Generic SM100 singleton
 
-The generic policy enables narrow attention for one direct batch decode lane. With sufficient workspace the page-parallel reader covers 1,536–2,560 visible tokens. Other rows with inline scores use ordered score and replay kernels. Eager rows beyond inline capacity use the scratch-free reader unless they qualify for shared scores. [Narrow selection](../src/text/decoder_graph.cpp#L89)<!-- prefix: "first.narrow" --> · [Narrow window](../src/mxfp8_gqa.cu#L189)<!-- prefix: "constexpr in" --> · [Inline scores](../src/runtime/model/qwen_request.cpp#L196)<!-- prefix: "ExactGqaWork" --> · [Direct reader](../src/decoder_forward.cpp#L515)<!-- prefix: "return mxfp8" -->
+The generic policy enables narrow attention for one direct batch decode lane. With sufficient workspace the page-parallel reader covers 1,536–2,560 visible tokens. Other rows with inline scores use ordered score and replay kernels. Eager rows beyond inline capacity use the scratch-free reader unless they qualify for shared scores. [Narrow selection](../src/text/decoder_graph.cpp#L92)<!-- prefix: "first.narrow" --> · [Narrow window](../src/mxfp8_gqa.cu#L189)<!-- prefix: "constexpr in" --> · [Inline scores](../src/runtime/model/qwen_request.cpp#L195)<!-- prefix: "ExactGqaWork" --> · [Direct reader](../src/decoder_forward.cpp#L515)<!-- prefix: "return mxfp8" -->
 
 From 32,768 through 36,864 visible tokens, the generic batch can bind a single shared score buffer for eager or graph decode. Every GQA cache and the page table must cover the live rows. The batch allocates 3,538,944 bytes on first use for 24 FP32 scores per position. Each bind rounds its stride to a 128-token page. GQA layers and later requests reuse the buffer in stream order. [Eligibility and stride](../src/text/decoder_graph.cpp#L9)<!-- prefix: "ExactGqaWork" --> · [Replay binding](../src/text/decoder_graph.cpp#L57)<!-- prefix: "if (lane.sin" --> · [Score and replay](../include/sglang/text/gqa_ordered_launch.cuh#L4)<!-- prefix: "cudaError_t " -->
 
@@ -24,11 +24,11 @@ Restored singleton prefill and allocation-limited prefill can reach the same rea
 
 ## Split-KV target attention
 
-B200 selects split-KV attention for eligible eager and bound text target rows from 2,048 through 262,144 visible tokens, including the current token. Bound kernels check the live position on device. Inside the window the reader decodes paged MXFP8 K/V to BF16 for Tensor Core attention, merges FP32 split partials, and rounds to BF16. Flagged heads use FP64 replay. Outside the window the target uses ordered attention. The split reductions can change scores and greedy IDs. [Window](../include/sglang/decoder_cuda.cuh#L295)<!-- prefix: "inline const" --> · [Bound route and fallback](../include/sglang/text/gqa_target_split.cuh#L81)<!-- prefix: "cudaError_t " --> · [Combine and FP64 replay](../include/sglang/text/gqa_target_split.cuh#L6)<!-- prefix: "__global__ v" -->
+B200 selects split-KV attention for eligible eager and bound text target rows from 2,048 through 262,144 visible tokens, including the current token. Bound kernels check the live position on device. Inside the window the reader decodes paged MXFP8 K/V to BF16 for Tensor Core attention, merges FP32 split partials, and rounds to BF16. Flagged heads use FP64 replay. Outside the window the target uses ordered attention. The split reductions can change scores and greedy IDs. [Window](../include/sglang/decoder_cuda.cuh#L298)<!-- prefix: "inline const" --> · [Bound route and fallback](../include/sglang/text/gqa_target_split.cuh#L81)<!-- prefix: "cudaError_t " --> · [Combine and FP64 replay](../include/sglang/text/gqa_target_split.cuh#L6)<!-- prefix: "__global__ v" -->
 
 ### Batched eager verification
 
-The batched path requires vector attention, the full-context policy, and 2–20 rows inside the split window. It runs Q/K normalization and RoPE, KV append, split reads, and sigmoid gating in stream order. Each row keeps its workspace, KV page table, and causal position. Other groups run preprocessing, append, and gating per row. They can still group eligible reads. Bound replay uses its own dispatch. The [MTP verifier](mtp.md#runtime-path) owns acceptance and the committed KV prefix. [Eligibility and launch order](../include/sglang/text/gqa_verify_batch.h#L67)<!-- prefix: "inline bool " --> · [Eager fallback](../src/decoder_forward.cpp#L724)<!-- prefix: "if (!try_gqa" -->
+The batched path requires vector attention, the full-context policy, and 2–20 rows inside the split window. It runs Q/K normalization and RoPE, KV append, split reads, and sigmoid gating in stream order. Each row keeps its workspace, KV page table, and causal position. Other groups run preprocessing, append, and gating per row. They can still group eligible reads. Bound replay uses its own dispatch. The [MTP verifier](mtp.md#runtime-path) owns acceptance and the committed KV prefix. [Eligibility and launch order](../include/sglang/text/gqa_verify_batch.h#L67)<!-- prefix: "inline bool " --> · [Eager fallback](../src/decoder_forward.cpp#L736)<!-- prefix: "if (!try_gqa" -->
 
 Under the full-context policy, ordinary eager launches can group 10–20 rows. All inputs must satisfy Tensor Core alignment, and each row must average at most ten 64-token chunks per split. This route uses one shared-memory copy stage. It transposes QK across 16 keys and eight head slots (six active and two padded), then restores token order before masking and softmax. Other valid eager groups use at most five rows per launch. Narrow, singleton, and bound launches use two stages. Each row reserves scratch for up to 16 splits. [Grouping](../include/sglang/text/gqa_target_split.cuh#L48)<!-- prefix: "int eager_ta" --> · [Launch geometry](../src/text/gqa_decode_split.cu#L645)<!-- prefix: "cudaError_t " --> · [Transposed scores](../src/text/gqa_decode_split.cu#L297)<!-- prefix: "__device__ v" -->
 
@@ -46,7 +46,7 @@ The reader uses one expanded BF16 K slot and alternates between two expanded BF1
 
 ## Constraints and failure behavior
 
-A clean shared-score OOM makes the generic batch remember the allocation failure. Long singleton steps use direct eager attention, while short replay remains eligible. Other allocation errors reach batch recovery. A recoverable graph rejection drains the stream, destroys its graph handles, and disables replay for that width. Eager decode can still use the retained score buffer. Batch cleanup drains the stream and destroys graphs before freeing it. [Allocation fallback](../src/runtime/backend/cuda_resources.cpp#L440)<!-- prefix: "ExactGqaWork" --> · [Graph recovery](../src/runtime/backend/cuda_resources.cpp#L499)<!-- prefix: "const auto f" --> · [Teardown](../src/runtime/backend/cuda_resources.cpp#L187)<!-- prefix: "CleanupError" -->
+A clean shared-score OOM makes the generic batch remember the allocation failure. Long singleton steps use direct eager attention, while short replay remains eligible. Other allocation errors reach batch recovery. A recoverable graph rejection drains the stream, destroys its graph handles, and disables replay for that width. Eager decode can still use the retained score buffer. Batch cleanup drains the stream and destroys graphs before freeing it. [Allocation fallback](../src/runtime/backend/cuda_resources.cpp#L509)<!-- prefix: "ExactGqaWork" --> · [Graph recovery](../src/runtime/backend/cuda_resources.cpp#L568)<!-- prefix: "const auto f" --> · [Teardown](../src/runtime/backend/cuda_resources.cpp#L247)<!-- prefix: "CleanupError" -->
 
 For the 20-row shared reader, a clean decline or a recognized optional setup or launch rejection returns that packet to the ordinary split route. A later packet can try again. A preexisting or distinct recorded CUDA error prevents fallback and remains recorded. The code clears only a recorded status matching the failed call and gives the returned status precedence on hard failure. [Rejection handling](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L133)<!-- prefix: "std::optiona" -->
 
@@ -60,11 +60,11 @@ A clean device, shared-memory, or tensor-map setup decline sends the selected ro
 
 ### Scratch-free attention checks
 
-Build both binaries with the [long decode runbook](../tests/decoder/README.md#wide-long-context-decode). Set `serial_ids` to a whitespace-delimited file of at least 8,195 valid checkpoint token IDs. Keep the reserved B200 and the `out` and `checkpoint` settings from that runbook.
+Build both binaries with the [long decode runbook](../tests/decoder/README.md#wide-long-context-decode). Set `serial_ids` to a whitespace-delimited file of at least 8,195 valid checkpoint token IDs. Keep the reserved B200 and the `out` and `checkpoint` settings from that runbook. For the checkpoint fixture, start an isolated [LMCache daemon](serving/lmcache.md#start-the-daemon) on the same GPU with namespace `sglang`.
 
 ```bash
 CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/bin/long-decode-check" serial
-CUDA_VISIBLE_DEVICES="$GPU_UUID" \
+CUDA_VISIBLE_DEVICES="$GPU_UUID" LMCACHE_SOCKET="$LMCACHE_SOCKET" \
     "$out/bin/long-decode-routes" "$checkpoint" --serial-prefill "$serial_ids"
 ```
 

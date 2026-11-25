@@ -33,6 +33,7 @@ unsupported patterns, and agreement of the dense mask with the ID list.
 
 The HTTP checks preserve raw JSON responses and event streams. Select an idle
 GPU before starting the server.
+Set `LMCACHE_SOCKET` to an isolated, ready [LMCache daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon) for the cache case.
 
 ```bash
 server="$build/bin/sglang-server"
@@ -46,17 +47,17 @@ for width in 1 4; do
             "$evidence/w$width-k$depth" --width "$width" --graph --mtp "$depth"
     done
 done
-python "$tests/integration.py" "$server" "$checkpoint" "$evidence/tensor-prefix" \
-    --width 4 --graph --prefill tensor-core --cache-entries 4
+python "$tests/integration.py" "$server" "$checkpoint" "$evidence/prefix" \
+    --width 4 --graph --lmcache-socket "$LMCACHE_SOCKET"
 ```
 
 The native probe compares serial and batched token IDs with depth-zero controls.
 Its counters cover full, partial, and zero proposal acceptance, replay, terminal
 drafts, and a batch with both positive-depth and depth-zero lanes.
 
-The HTTP integration requires `jsonschema` 4.26.0. Each positive-depth run
-starts a matching depth-zero server with exact prefill and compares the full
-lists of token IDs and the finish reasons. The trace shows draft and verification
+The HTTP integration requires `jsonschema` 4.26.0. Each cache-off positive-depth run
+starts a matching depth-zero server and compares the full token ID lists and finish reasons.
+The trace shows draft and verification
 activity for finite-choice EBNF, regular expressions, and JSON Schema on both
 routes. At capacity four, the integration check also verifies joint verification
 and retirement after mixed requests.

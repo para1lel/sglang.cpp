@@ -50,6 +50,66 @@ void finish_retired_cleanup(CleanupError error) {
 
 }
 
+struct DetachedDeviceBytes {
+    std::mutex mutex;
+    std::size_t value = 0;
+};
+
+struct ExportedDeviceBlock {
+    ExportedDeviceBlock(int device, std::shared_ptr<RetiredBlockReclaimer> reclaimer,
+                        std::shared_ptr<DetachedDeviceBytes> bytes)
+        : device(device), reclaimer(std::move(reclaimer)), bytes(std::move(bytes)) {}
+
+    ~ExportedDeviceBlock() {
+        if (!block.pointer) return;
+        try {
+            if (reclaimer) {
+                const std::lock_guard lock(bytes->mutex);
+                if (reclaimer->submit({block.pointer, block.bytes}, true)) {
+                    bytes->value -= block.bytes;
+                    return;
+                }
+            }
+            DeviceScope scope(device);
+            auto status = release_cuda_block(block.pointer, cudaStreamPerThread);
+            if (status == cudaSuccess && bytes) status = cudaStreamSynchronize(cudaStreamPerThread);
+            report_cleanup(status, "Release detached decoder allocation");
+            if (status == cudaSuccess && bytes) {
+                const std::lock_guard lock(bytes->mutex);
+                bytes->value -= block.bytes;
+            }
+        } catch (const CudaError& error) {
+            report_cleanup(error.status, "Release detached decoder allocation");
+        }
+    }
+
+    void detach(void* pointer, std::size_t size) {
+        block = {pointer, size};
+        if (bytes) {
+            const std::lock_guard lock(bytes->mutex);
+            bytes->value += size;
+        }
+    }
+
+    int device;
+    std::shared_ptr<RetiredBlockReclaimer> reclaimer;
+    std::shared_ptr<DetachedDeviceBytes> bytes;
+    DeviceBlock block{};
+};
+
+namespace {
+
+bool detach_exported_block(DeviceBlock& block) {
+    if (block.export_owner.use_count() <= 1) {
+        block.export_owner.reset();
+        return false;
+    }
+    block.export_owner->detach(block.pointer, block.bytes);
+    return true;
+}
+
+}
+
 struct Allocations::State {
     struct BatchGraph {
         cudaGraph_t capture = nullptr;
@@ -226,7 +286,11 @@ CleanupError Allocations::State::release_selected(std::shared_ptr<const void>& d
     const auto logprobs = release_pinned(generated_logprobs, "Free generated logprob readback");
     if (terminal) return terminal;
     while (blocks.size() > uncertain_blocks) {
-        const CleanupError freed{cudaFree(blocks.back().pointer), "Free decoder allocation"};
+        auto& block = blocks.back();
+        CleanupError freed;
+        if (!detach_exported_block(block)) {
+            freed = {cudaFree(block.pointer), "Free decoder allocation"};
+        }
         if (!freed) {
             bytes -= blocks.back().bytes;
             blocks.pop_back();
@@ -310,7 +374,8 @@ void DeviceScope::restore() {
 
 RequestBlockCache::RequestBlockCache(int device, bool resident)
     : state_(std::make_unique<Allocations::State>(device, nullptr, true)),
-      reclaimer_(resident ? RetiredBlockReclaimer::create(device) : nullptr) {
+      reclaimer_(resident ? RetiredBlockReclaimer::create(device) : nullptr),
+      detached_bytes_(std::make_shared<DetachedDeviceBytes>()) {
     state_->blocks.reserve(resident_blocks_limit());
 }
 
@@ -336,7 +401,9 @@ std::size_t RequestBlockCache::bytes() const {
 }
 
 std::size_t RequestBlockCache::unavailable_bytes() const {
+    const std::lock_guard lock(detached_bytes_->mutex);
     return quarantined_bytes_ + (state_->bytes - bytes()) +
+        detached_bytes_->value +
         (reclaimer_ ? reclaimer_->unavailable_bytes() : 0);
 }
 
@@ -379,11 +446,13 @@ std::size_t RequestBlockCache::resident_blocks_limit() const {
 
 void RequestBlockCache::release_blocks(Allocations::State& state, bool keep) {
     for (std::size_t count = state.blocks.size(); count > state.uncertain_blocks; --count) {
-        const auto block = state.blocks[count - 1];
-        if ((keep && retain(block)) || (reclaimer_ && reclaimer_->submit(block))) {
-            state.blocks[count - 1] = state.blocks.back();
+        auto& block = state.blocks[count - 1];
+        if (detach_exported_block(block) || (keep && retain(block)) ||
+            (reclaimer_ && reclaimer_->submit(block))) {
+            const auto bytes = block.bytes;
+            if (count != state.blocks.size()) block = std::move(state.blocks.back());
             state.blocks.pop_back();
-            state.bytes -= block.bytes;
+            state.bytes -= bytes;
         }
     }
 }
@@ -635,6 +704,21 @@ void Allocations::discard_graph() {
     state_->destroy_capture(state_->capture).raise();
 }
 
+std::shared_ptr<const void> Allocations::retain_block(const void* pointer) const {
+    auto& blocks = state_->blocks;
+    const auto block = std::find_if(blocks.begin() + state_->uncertain_blocks, blocks.end(),
+                                    [pointer](const DeviceBlock& item) {
+        return item.pointer == pointer;
+    });
+    if (block == blocks.end()) throw std::logic_error("Unknown decoder export allocation");
+    if (!block->export_owner) {
+        const auto* cache = state_->cache;
+        block->export_owner = std::make_shared<ExportedDeviceBlock>(state_->device,
+            cache ? cache->reclaimer_ : nullptr, cache ? cache->detached_bytes_ : nullptr);
+    }
+    return block->export_owner;
+}
+
 void Allocations::free_block(void* pointer, std::size_t bytes) {
     auto& blocks = state_->blocks;
     const auto block = std::find_if(blocks.begin() + state_->uncertain_blocks, blocks.end(),
@@ -644,7 +728,10 @@ void Allocations::free_block(void* pointer, std::size_t bytes) {
     if (block == blocks.end()) {
         throw std::logic_error("Unknown decoder allocation");
     }
-    const CleanupError freed{cudaFree(pointer), "Free replaced decoder allocation"};
+    CleanupError freed;
+    if (!detach_exported_block(*block)) {
+        freed = {cudaFree(pointer), "Free replaced decoder allocation"};
+    }
     if (freed) {
         state_->uncertain = freed;
         std::iter_swap(blocks.begin() + state_->uncertain_blocks++, block);

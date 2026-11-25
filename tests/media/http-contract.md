@@ -1,11 +1,15 @@
 # Decoded media HTTP contract
 
-Build the default release server in the project Pixi environment. Run on a reserved SM100
-GPU with the pinned checkpoint and a fresh evidence directory.
+Build the Release server in the project Pixi environment. Reserve a B200 and export its
+UUID as `CUDA_VISIBLE_DEVICES`. For the default and `--feature-complete` runs, start a
+dedicated [LMCache daemon](../../docs/serving/lmcache.md#start-the-daemon) on that GPU
+with namespace `sglang`. Set `LMCACHE_SOCKET` to its absolute socket path. Both runs
+reset the daemon store. Give each run a new evidence directory under an existing parent.
 
 ```bash
 checkpoint=/data0/shared/Qwen3.8-27B-FP8
-python tests/media/http_routes.py build/bin/sglang-server "$checkpoint" /tmp/media-http
+python tests/media/http_routes.py build/bin/sglang-server "$checkpoint" /tmp/media-http \
+    --lmcache-socket "$LMCACHE_SOCKET"
 ```
 
 The test creates small RGB8 frames in memory. It sends a mixed image, video and text request
@@ -18,13 +22,23 @@ rejected requests or the zero-budget request starts decode. It resets a live str
 and a pending connection, then checks that the surviving request returns identical IDs. Plain
 chat and text completions remain usable.
 
-Append `--mixed-service` to compare image, video, text, and pointwise label results between
-isolated and concurrent requests with the cache explicitly disabled.
+Use `--mixed-service` with a fresh evidence directory to compare image, video, text,
+and pointwise label results between isolated and concurrent requests. It runs cache-off
+and needs no daemon.
 
-Append `--feature-complete` on B200 to compare default serving and explicit cache-off
-controls. The test verifies K4 and the 32,768-row budget, cold text and checkpoint
-hits, ordered label scores, and exact prompt and output logprobs against cache-off
-with matched prefill grants. Decoded image and video branches reuse the first
+Run `--feature-complete` against the dedicated daemon with a fresh evidence directory.
+
+```bash
+python tests/media/http_routes.py build/bin/sglang-server "$checkpoint" /tmp/media-feature \
+    --lmcache-socket "$LMCACHE_SOCKET" --feature-complete
+```
+
+In the saved `/server_info` responses, require `prefix_cache_entries` to equal zero in
+both modes. `lmcache_enabled` and `lmcache_available` must both be true for the daemon
+worker and false for the explicit cache-off control. The test verifies K4, the
+32,768-row budget, cold text, and checkpoint hits. It compares ordered label scores
+and exact prompt and output logprobs with cache-off workers using matched prefill grants.
+Decoded image and video branches reuse the first
 8,192 processed tokens and return identical IDs over JSON and SSE. Changing
 pixels, grid geometry, video positions, or a binary cache salt prevents reuse.
 The test also cancels a live media stream and checks that a replacement succeeds.

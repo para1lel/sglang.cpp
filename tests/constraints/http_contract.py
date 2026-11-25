@@ -169,8 +169,8 @@ def serve(args, pieces):
         command.append("--batch-cuda-graphs")
     if args.eager:
         command.append("--eager")
-    if args.cache_entries:
-        command += ["--prefix-cache-entries", str(args.cache_entries)]
+    command += (["--lmcache-socket", str(args.lmcache_socket)] if args.lmcache_socket
+                else ["--prefix-cache-entries", "0"])
     (args.output / "command.json").write_text(json.dumps(command))
     with (args.output / "server.log").open("wb") as log:
         process = subprocess.Popen(command, stdout=log, stderr=log)
@@ -297,7 +297,7 @@ def arguments():
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--standin", action="store_true")
     parser.add_argument("--integrated", action="store_true")
-    parser.add_argument("--cache-entries", type=int, choices=(0, 2, 4), default=0)
+    parser.add_argument("--lmcache-socket", type=Path)
     parser.add_argument("--media-body", type=Path)
     parser.add_argument("--media-sha256")
     return parser.parse_args()

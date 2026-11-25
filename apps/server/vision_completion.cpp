@@ -59,7 +59,7 @@ std::optional<std::vector<DecoderMedia>> VisionCompletion::encode(
             reinterpret_cast<const char*>(part.patches.data()),
             part.patches.size() * sizeof(float));
         item.cache_identity.reset(new DecoderMediaCacheIdentity(
-            item, encoder_identity_, tokenizer::sha256(patch_bytes)));
+            item, tokenizer::sha256(patch_bytes)));
     }
     return media;
 }

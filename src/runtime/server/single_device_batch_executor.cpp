@@ -23,6 +23,7 @@ public:
     }
 
     void cancel(int slot) override { batch_.cancel(slot); }
+    DecoderBatchPrefixUpdate poll_prefix(int slot) override { return batch_.poll_prefix(slot); }
 
     Steps advance_chunked(const Selection& selected, DecoderBatchStepStats* stats) override {
         return batch_.advance_chunked(selected, stats);

@@ -188,10 +188,9 @@ slots ready on different iterations. The full batch runner also selects all
 rows, compares each lane's IDs with target-only decoding, and checks that
 cancellation releases all request bytes.
 
-The row-accounting cases use explicit cache-off controls. Run
-`run_admission.py --case eager-cache` for the separate eager K4 case with caching
-enabled. It checks an 8,192-token checkpoint hit, identical completion, actual
-draft verification, and zero graph replays.
+The row-accounting cases use explicit cache-off controls. For the separate eager K4
+case, pass `--case eager-cache --lmcache-socket "$LMCACHE_SOCKET"` to `run_admission.py`
+with an isolated, ready [daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon). Each run uses separate salts for the cold and primed requests. The runner waits for checkpoint publication before checking the 8,192-token hit. It also checks deterministic output, draft activity, and zero graph replays.
 
 Run `run_admission.py --case pressure` separately for 32 requests with
 32,769 prompt IDs in total. The trace records actual work per iteration, which
@@ -213,14 +212,16 @@ The runner replays the recorded XMake link and verifies the unmodified
 executable byte for byte. A second link wraps CUDA allocation, release and
 stream synchronization.
 The server runs with its default limits. A four-token prompt and a 1,021-token
-output budget allocate eight KV pages. The probe allows the key payload
-allocation and injects a failure on the value payload allocation while a
-peer is decoding.
+output budget reserve eight KV pages. The probe allows the 32-byte page table
+allocation, then fails the combined 34,603,008-byte GQA key, value, and scale
+allocation while a peer is decoding.
 
-A capacity failure must return HTTP 503, release the partial allocation,
-and let the peer decode and a fresh request complete. The peer is then
-cancelled, and the runner checks that request bytes return to zero and a new
-stream succeeds. One terminal control injects the CUDA illegal-address
+A capacity failure must return HTTP 503, queue the page table for recycling,
+and let the peer decode and a fresh request complete. The runner cancels the
+peer, checks that request bytes return to zero, and verifies a new stream succeeds.
+Once the active lanes retire, the runner requires confirmed release of that page table on the GPU.
+A successful synchronous free suffices. An asynchronous free must also complete on its owning stream.
+One terminal control injects the CUDA illegal-address
 status at the same allocation. The other injects a memory allocation
 failure there, then reports an illegal address during stream synchronization.
 Both require HTTP 500 for the triggering and fresh requests and an SSE
@@ -228,20 +229,31 @@ error for the active peer.
 
 ## Checkpoint lifecycle
 
-Run on a reserved B200 with a fresh evidence directory. Use the default
-cache, K4 and row budget.
+Start a dedicated [LMCache 0.5.8 daemon](../../docs/serving/lmcache.md#start-the-daemon) on the reserved B200.
+Use a private absolute path for `LMCACHE_SOCKET` and wait for the daemon to be ready.
+The runner rejects the standard daemon sockets. It drains requests and pending stores,
+then clears the daemon store before W1 and between independent cases. This removes other
+workers' records too. Keep the daemon exclusive to this run and use a fresh evidence directory.
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" CUDA_DEVICE_ORDER=PCI_BUS_ID \
     python3 -IB tests/batch/checkpoint_lifecycle.py "$out/bin/sglang-server" \
-    "$checkpoint" "$out/checkpoint-lifecycle"
+    "$checkpoint" "$out/checkpoint-lifecycle" --lmcache-socket "${LMCACHE_SOCKET:?}"
 ```
 
-The test checks one terminal save at 255 processed tokens for W1, two session
-branches that restore target and draft state, and saves at each 8,192-token
-boundary reached during prefill or decode. An abort leaves no terminal
-checkpoint. A disconnect after the first boundary preserves the periodic
-checkpoint. Reversing two stop strings that match distinct tokens in one K4
-packet selects a different endpoint. Both endpoints restore for continuation.
-The evidence includes requests, raw SSE, scheduler traces, and cache metrics.
+The runner checks LMCache availability, K4, and the default 32,768-row budget.
+It compares successful STORE counts after running and waiting requests and pending stores reach zero.
+The saved HTTP metrics must show zero LMCache I/O errors and zero declined stores.
+Batch traces show K4 verification, the one-row decode at a crossed boundary, and terminal retirement.
+A daemon STORE receipt can arrive after retirement.
+
+- W1 saves one terminal checkpoint at 255 processed tokens. Two session branches restore 255 target rows and 254 draft rows.
+  Both must emit the same token IDs as their cold controls.
+  Replaying W1 must acknowledge one duplicate STORE with zero new GQA tokens and zero bytes written for GQA, GDN, or draft data.
+- The periodic cases probe the terminal endpoint and every 8,192-token boundary reached in prefill or decode. Divergent prompts probe the deepest boundary first.
+- An abort leaves no terminal checkpoint. A disconnect after the first boundary preserves its periodic checkpoint.
+  Both interrupted turns are ineligible as session parents.
+- Reversing two stop strings selects different endpoints in one K4 packet. Each continuation restores the selected endpoint and matches cold output IDs.
+
+The evidence directory contains the server arguments, requests, responses, raw SSE, scheduler traces, and cache metrics.
 

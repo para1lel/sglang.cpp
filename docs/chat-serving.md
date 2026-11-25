@@ -215,7 +215,7 @@ Verify rejection before SSE for malformed media. Cancel a live stream and check 
 
 ### Codec checks
 
-For compressed media, configure an absolute `codec_prefix` containing libpng and FFmpeg headers and libraries. The server links `png16`, `avformat`, `avcodec`, `swscale`, and `avutil`. The default build accepts decoded RGB8. [Build option](../xmake.lua#L171)<!-- prefix: "option(\"medi" --> · [Codec setup](../xmake.lua#L177)<!-- prefix: "local functi" -->
+For compressed media, configure an absolute `codec_prefix` containing libpng and FFmpeg headers and libraries. The server links `png16`, `avformat`, `avcodec`, `swscale`, and `avutil`. The default build accepts decoded RGB8. [Build option](../xmake.lua#L172)<!-- prefix: "option(\"medi" --> · [Codec setup](../xmake.lua#L178)<!-- prefix: "local functi" -->
 
 ```bash
 xmake f -P . -m release --media-codec-prefix="$codec_prefix" -o build/media-server

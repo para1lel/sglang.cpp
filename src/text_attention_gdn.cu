@@ -2,7 +2,7 @@
 #include "sglang/text/gdn/gdn_chunk.cuh"
 #include "sglang/text/gdn_local.h"
 #include "sglang/text/text_cuda_primitives.cuh"
-#include "sglang/text/gdn/gdn_prefill_kernels.cuh"
+#include "sglang/text/gdn/gdn_finish_history.cuh"
 
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -115,16 +115,9 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
     }
 }
 
-template <typename S>
-__device__ void finish_history(int token_count, const __nv_bfloat16* qkv,
-                                const __nv_bfloat16* history, __nv_bfloat16* final_history,
-                                int feature) {
-    #pragma unroll
-    for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
-        final_history[feature * text_gdn_history_taps + tap] =
-            raw_sample<S>(qkv, history, token_count - text_gdn_history_taps + tap, feature);
-    }
-}
+// finish_history now lives in the shared private header
+// include/sglang/text/gdn/gdn_finish_history.cuh (used verbatim by the
+// batched replay twin in src/text/text_gdn_batched_replay.cu).
 
 __device__ __nv_bfloat16 finish_value(float value, float inverse_rms, __nv_bfloat16 norm,
                                       __nv_bfloat16 z) {

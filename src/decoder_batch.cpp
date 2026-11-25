@@ -589,6 +589,12 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     };
     const auto commit = [&](int first, int size) {
         std::array<DraftRepairs, draft_projection_rows> repairs{};
+        // Both ranks collect their per-layer GDN prefix replays for one
+        // address-table dispatch after the lane loop; allocation failure or
+        // per-verifier ineligibility falls back to the per-layer launches.
+        TextGdnReplayBatch* gdn_batch = prepare_gdn_replays();
+        TextGdnReplayBatch* peer_gdn_batch =
+            tp_driver ? tp_driver->prepare_peer_gdn_replays() : nullptr;
         for (int index = 0; index < size; ++index) {
             auto& round = rounds[first + index];
             const int slot = slots[first + index];
@@ -597,12 +603,17 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
             auto& lane = *storage->slots[slot];
             const auto saved = checkpoint_rows && lane.checkpoints() ? &(*checkpoint_rows)[slot]
                                                                      : nullptr;
-            lane.finish_round(round, results[slot], stream, output, cancel, repair, saved);
-            if (tp_driver) tp_driver->commit_peer_round(lane, round, saved);
+            lane.finish_round(round, results[slot], stream, output, cancel, repair, saved,
+                              gdn_batch);
+            if (tp_driver) tp_driver->commit_peer_round(lane, round, saved, peer_gdn_batch);
         }
         auto* packed = size > packet ? wide_mtp_activation : nullptr;
-        MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed), stream);
-        check(cudaStreamSynchronize(stream), "Complete batched MTP commits");
+        MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed),
+                                     stream);
+        if (gdn_batch) {
+            check(gdn_batch->launch(tp != nullptr, stream), "Batched GDN prefix replay");
+        }
+        if (tp_driver) tp_driver->finish_peer_gdn_replays();
         stats.verification_lanes += size;
     };
     const bool full = count > packet && full_verification(rounds.data(), count);

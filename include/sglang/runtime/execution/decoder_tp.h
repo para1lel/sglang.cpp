@@ -6,6 +6,7 @@
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_prefill.h"
 #include "sglang/runtime/cache/prefix_cache_layout.h"
+#include "sglang/text/gdn/gdn_replay_batch.h"
 #include "sglang/runtime/model/decoder_batch_checkpoint.h"
 #include "sglang/runtime/model/decoder_batch_lane.h"
 
@@ -71,8 +72,16 @@ struct DecoderBatch::TpDriver {
                 const decoder::TcVocabScratch* vocabulary) const;
     /// Rank 1 rewinds its verification state by rank 0's accepted count and
     /// mirrors any committed checkpoint row so exported planes stay current.
+    /// gdn_batch, when set, collects the rank-1 GDN prefix replays for one
+    /// address-table dispatch by finish_peer_gdn_replays().
     void commit_peer_round(decoder::Lane& lane, const decoder::MtpRound& round,
-                           const decoder::Workspace* const* saved) const;
+                           const decoder::Workspace* const* saved,
+                           TextGdnReplayBatch* gdn_batch = nullptr) const;
+    /// Reset the rank-1 replay collector for a commit group (lazily allocating
+    /// under the peer device scope); null on allocation failure.
+    TextGdnReplayBatch* prepare_peer_gdn_replays() const;
+    /// Dispatch the collected rank-1 replays on the peer stream.
+    void finish_peer_gdn_replays() const;
 
     /// Export and store rank 1's copy of a checkpoint through its own layout.
     void store_peer_checkpoint(decoder::Lane& lane, int end, int generated, int count,
@@ -81,6 +90,8 @@ struct DecoderBatch::TpDriver {
 
     const Decoder::Model& model;
     Decoder::TpRuntime& tp;
+    mutable TextGdnReplayBatch peer_replays;
+    mutable bool peer_replays_broken = false;
 };
 
 }

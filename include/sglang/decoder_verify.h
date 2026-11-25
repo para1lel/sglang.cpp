@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/decoder_internal.h"
+#include "sglang/text/gdn/gdn_replay_batch.h"
 
 namespace sglang::decoder {
 
@@ -150,7 +151,8 @@ struct MtpRound {
                               cudaStream_t stream);
     int text_stop_after(const DecoderOptions& options, const RequestProgress& progress) const;
     bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
-                MtpDraftInput* repair, const Workspace** committed_row = nullptr);
+                MtpDraftInput* repair, const Workspace** committed_row = nullptr,
+                TextGdnReplayBatch* gdn_batch = nullptr);
 };
 
 class TargetVerification {
@@ -175,7 +177,7 @@ public:
     void enqueue_generated_logprobs(void* scratch);
     void read();
     static void read_all(TargetVerification* const* verifiers, int count, cudaStream_t stream);
-    void commit(int count);
+    void commit(int count, TextGdnReplayBatch* gdn_batch = nullptr);
 
     int winner(int index, bool sampled = false, bool constrained = false) const;
     bool needs_logits() const { return host_logits_ != nullptr; }

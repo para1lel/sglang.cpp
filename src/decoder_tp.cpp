@@ -6,6 +6,7 @@
 #include "sglang/runtime/backend/cuda_resources.h"
 
 #include <utility>
+#include <cstdlib>
 
 namespace sglang {
 namespace decoder {
@@ -163,12 +164,38 @@ void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound
                               tp.partials[0], tp.partials[1], vocabulary, logprob_workspace);
 }
 
+TextGdnReplayBatch* DecoderBatch::TpDriver::prepare_peer_gdn_replays() const {
+    // SGLANG_DISABLE_GDN_REPLAY_BATCH is the supported escape hatch that
+    // forces the per-layer dispatch on BOTH ranks (see
+    // decoder_batch_state.h); the per-layer path is the exact reference
+    // behavior, so disabling never changes results.
+    static const bool batch_disabled =
+        std::getenv("SGLANG_DISABLE_GDN_REPLAY_BATCH") != nullptr;
+    if (batch_disabled || peer_replays_broken) return nullptr;
+    if (peer_replays.capacity() == 0) {
+        decoder::DeviceScope peer(tp.peer_device);
+        if (!peer_replays.reserve(decoder::gdn_layers * decoder::max_wide_mtp_lanes)) {
+            peer_replays_broken = true;
+            return nullptr;
+        }
+    }
+    peer_replays.reset();
+    return &peer_replays;
+}
+
+void DecoderBatch::TpDriver::finish_peer_gdn_replays() const {
+    if (peer_replays_broken || peer_replays.size() == 0) return;
+    decoder::DeviceScope peer(tp.peer_device);
+    decoder::check(peer_replays.launch(true, tp.peer_stream), "Batched peer GDN prefix replay");
+}
+
 void DecoderBatch::TpDriver::commit_peer_round(decoder::Lane& lane,
                                                const decoder::MtpRound& round,
-                                               const decoder::Workspace* const* saved) const {
+                                               const decoder::Workspace* const* saved,
+                                               TextGdnReplayBatch* gdn_batch) const {
     if (!lane.peer_verification) return;
     decoder::DeviceScope peer(tp.peer_device);
-    lane.peer_verification->commit(round.consumed);
+    lane.peer_verification->commit(round.consumed, gdn_batch);
     if (saved && *saved != &lane.request->work) {
         // Rank 0 committed a verification row for this checkpoint;
         // mirror it on rank 1 so exported planes are not stale.

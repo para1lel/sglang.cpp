@@ -81,7 +81,8 @@ target("sglang_cuda")
     add_files("src/text/gdn_verify.cu")
     add_files("src/mxfp8_gqa_prefill.cu")
     add_files("src/text_decode_bandwidth.cu")
-    add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
+    add_files("src/text_ops.cu", "src/text_attention_gdn.cu",
+              "src/text/text_gdn_batched_replay.cu", "src/text_attention_gqa.cu")
     add_files("src/text_normalization.cu")
     add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu",
               "src/text/decoder_logprobs.cu")

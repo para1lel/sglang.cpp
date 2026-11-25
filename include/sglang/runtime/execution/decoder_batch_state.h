@@ -1,4 +1,5 @@
 #pragma once
+#include "sglang/text/gdn/gdn_replay_batch.h"
 
 #include "sglang/runtime/execution/decoder_tp.h"
 #include "sglang/decoder_internal.h"
@@ -14,6 +15,7 @@
 #include "sglang/mxfp8_gqa.h"
 #include "sglang/decoder_sampling.h"
 #include "sglang/runtime/backend/cuda_resources.h"
+#include <cstdlib>
 #include <array>
 #include <memory>
 #include <optional>
@@ -212,6 +214,29 @@ struct DecoderBatch::State {
         storage->verification_graph.reset();
     }
 
+    /// Reset the rank-0 replay collector for a commit group (lazily
+    /// allocating on the batch device); null on allocation failure, which
+    /// keeps the per-layer GDN replay dispatch. Setting the
+    /// SGLANG_DISABLE_GDN_REPLAY_BATCH environment variable forces the
+    /// per-layer dispatch on BOTH ranks (cached after the first commit
+    /// group). It is a supported escape hatch: the per-layer path is the
+    /// exact reference behavior, so this switches off the optimization
+    /// without changing results.
+    TextGdnReplayBatch* prepare_gdn_replays() {
+        static const bool batch_disabled =
+            std::getenv("SGLANG_DISABLE_GDN_REPLAY_BATCH") != nullptr;
+        if (batch_disabled || gdn_replays_broken) return nullptr;
+        if (gdn_replays.capacity() == 0) {
+            DeviceScope device(model.device);
+            if (!gdn_replays.reserve(decoder::gdn_layers * decoder::max_wide_mtp_lanes)) {
+                gdn_replays_broken = true;
+                return nullptr;
+            }
+        }
+        gdn_replays.reset();
+        return &gdn_replays;
+    }
+
     const Decoder::Model& model;
     const DecoderBatchOptions options;
     KvResidencyPolicy residency;
@@ -230,6 +255,8 @@ struct DecoderBatch::State {
     GeneratedLogprobReadback* logprob_readback = nullptr;
     ConstraintWorkspace constraint_workspace;
     AdjustedLogitsWorkspace adjusted_workspace;
+    TextGdnReplayBatch gdn_replays;
+    bool gdn_replays_broken = false;
     bool failed = false;
     SerialOutput* output = nullptr;
     MtpRound::Cancel no_cancel;

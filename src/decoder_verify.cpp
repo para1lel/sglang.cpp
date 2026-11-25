@@ -343,7 +343,8 @@ int MtpRound::text_stop_after(const DecoderOptions& options,
 }
 
 bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
-                      MtpDraftInput* repair, const Workspace** committed_row) {
+                      MtpDraftInput* repair, const Workspace** committed_row,
+                      TextGdnReplayBatch* gdn_batch) {
     if (draft->valid_prefix() > position) {
         draft->rewind(position);
     }
@@ -351,7 +352,7 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
     bool continuing = true;
     for (int index = 0; index < count; ++index) {
         if (cancel && cancel()) {
-            target->commit(consumed);
+            target->commit(consumed, gdn_batch);
             return false;
         }
         const int token = target->winner(index, sampling != nullptr, constraint != nullptr);
@@ -379,7 +380,7 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
         copy_cuda_async(request->work.normalized, hidden, hidden_size * sizeof(Bf16),
                         cudaMemcpyDeviceToDevice, stream, "Carry committed MTP hidden row");
     }
-    target->commit(consumed);
+    target->commit(consumed, gdn_batch);
     return true;
 }
 
@@ -574,19 +575,28 @@ void TargetVerification::enqueue_results() {
     }
 }
 
-void TargetVerification::commit(int count) {
+void TargetVerification::commit(int count, TextGdnReplayBatch* gdn_batch) {
     if (!ready_ || count < 0 || count > pending_rows_) {
         throw std::logic_error("Invalid target verification commit");
     }
     if (count > 0 && count < pending_rows_) {
-        for (int layer = 0; layer < gdn_layers; ++layer) {
-            const auto& saved = workspace().replay[layer];
-            const auto status = rank_local_gdn_
-                ? text_gdn_replay_prefix_local(count, saved.inputs, saved.weights,
-                                               request_.states[layer], tail_[layer], stream_)
-                : text_gdn_replay_prefix(count, saved.inputs, saved.weights,
-                                         request_.states[layer], tail_[layer], stream_);
-            check(status, "Replay committed target GDN prefix");
+        const bool batched = try_fill_gdn_replay_batch(
+            gdn_batch, count, gdn_layers, [&](int layer) {
+                const auto& saved = workspace().replay[layer];
+                return TextGdnReplayEntry{saved.inputs, saved.weights, request_.states[layer],
+                                          tail_[layer], count};
+            });
+        if (!batched) {
+            for (int layer = 0; layer < gdn_layers; ++layer) {
+                const auto& saved = workspace().replay[layer];
+                const auto status = rank_local_gdn_
+                    ? text_gdn_replay_prefix_local(count, saved.inputs, saved.weights,
+                                                   request_.states[layer], tail_[layer],
+                                                   stream_)
+                    : text_gdn_replay_prefix(count, saved.inputs, saved.weights,
+                                             request_.states[layer], tail_[layer], stream_);
+                check(status, "Replay committed target GDN prefix");
+            }
         }
     }
     if (count > 0) {

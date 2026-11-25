@@ -78,7 +78,8 @@ struct Lane {
 
     void finish_round(MtpRound& round, DecoderBatchStep& result, cudaStream_t stream,
                       SerialOutput* output, const MtpRound::Cancel& cancel,
-                      MtpDraftInput* repair, const Workspace** committed_row) {
+                      MtpDraftInput* repair, const Workspace** committed_row,
+                      TextGdnReplayBatch* gdn_batch = nullptr) {
         result.mtp_drafted_tokens = round.drafted;
         result.mtp_verified_rows = round.rows();
         try {
@@ -103,7 +104,7 @@ struct Lane {
                 if (row + 1 == stop && result.finish_reason != DecoderFinishReason::cancelled)
                     result.finish_reason = DecoderFinishReason::stop;
                 return !result.finish_reason;
-            }, stream, cancel, repair, committed_row);
+            }, stream, cancel, repair, committed_row, gdn_batch);
             if (!completed) {
                 result.finish_reason = DecoderFinishReason::cancelled;
             }

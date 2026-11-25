@@ -180,7 +180,13 @@ def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False, ma
                   paired_budget=None):
     workers = load(run / "effective-worker.json")["results"]
     require(len(workers) == 1, f"{run}: expected one observed vLLM worker")
-    worker = workers[0]
+    return worker_settings(run, workers[0], args, group, speculative=speculative,
+                           prefix_cache=prefix_cache, max_seqs=max_seqs,
+                           paired_budget=paired_budget)
+
+
+def worker_settings(run, worker, args, group, *, speculative, prefix_cache, max_seqs,
+                    paired_budget, tp=1):
     scheduler = worker["scheduler"]
     cap = scheduler["max_num_batched_tokens"]
     context = 2560 if group == "W1-W2" else 132096
@@ -216,7 +222,7 @@ def vllm_settings(run, args, group, *, speculative=False, prefix_cache=False, ma
     cache = worker["cache"]
     attention = worker["attention"]
     compilation = worker["compilation"]
-    require(worker["parallel"] == {"tp": 1, "dp": 1, "pp": 1}
+    require(worker["parallel"] == {"tp": tp, "dp": 1, "pp": 1}
             and worker["model_dtype"] == "torch.bfloat16" and worker["quantization"] == "fp8"
             and worker["flashinfer"] == "0.7.4"
             and worker["enforce_eager"] is False and worker["speculative"] is speculative

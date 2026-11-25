@@ -560,17 +560,21 @@ def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measuremen
                             before_measurement=before_measurement, prefix_cache=prefix_cache,
                             max_seqs=max_seqs, paired_budget=token_budget)
     worker = evidence["effective"]
+    config = load(run / "server-info.json")["vllm_config"]
+    if lmcache:
+        defaults.require_vllm_local_apc(config, command(run, "server", cpus))
+    verify_vllm_model(worker, config, checkpoint, token_budget, prefix_cache)
+    return evidence, attention_kernels(run)
+
+
+def verify_vllm_model(worker, config, checkpoint, token_budget, prefix_cache):
     reference = concurrent.reference()["observed_vllm_settings"]
     require(all(worker[key] == reference[key] for key in ("vllm", "torch", "torch_cuda"))
             and worker["scheduler"]["max_num_scheduled_tokens_effective"] == token_budget,
             "Unexpected vLLM runtime or target row cap")
-    check_vllm.audit(load(run / "effective-worker.json"), speculative=True,
-                     prefix_cache=prefix_cache)
-    config = load(run / "server-info.json")["vllm_config"]
+    check_vllm.audit({"results": [worker]}, speculative=True, prefix_cache=prefix_cache)
     if token_budget == workload_suite.V4_TOKEN_BUDGET:
         defaults.vllm_budget(config, worker, token_budget)
-    if lmcache:
-        defaults.require_vllm_local_apc(config, command(run, "server", cpus))
     spec = config["speculative_config"]
     attention = config["attention_config"]
     if prefix_cache:
@@ -585,13 +589,16 @@ def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measuremen
             and attention["use_trtllm_attention"] is True
             and attention["disable_flashinfer_q_quantization"] is True,
             "Unexpected resolved vLLM model, MTP, or attention configuration")
+
+
+def attention_kernels(run):
     kernels = re.findall(r"FlashInfer resolved query dtypes: ([^\n]+)",
                          (run / "server.log").read_text())
     require(kernels and all(line.startswith(
         "prefill=torch.bfloat16, decode=torch.bfloat16, decode_backend=trtllm-gen")
         and "torch.float8_e4m3fn" in line for line in kernels),
         "Unexpected FlashInfer attention kernel")
-    return evidence, kernels
+    return kernels
 
 
 def check_vllm_worker(row, run, reservation, checkpoint, *, before_measurement=False):

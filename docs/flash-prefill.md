@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select target prefill and append uncovered KV before attention. | [Policy](../src/decoder_prefill.cpp#L907)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L226)<!-- prefix: "const auto s" --> |
+| Decoder | Select target prefill and append uncovered KV before attention. | [Policy](../src/decoder_prefill.cpp#L909)<!-- prefix: "const bool t" --> · [Attention call](../src/decoder_prefill.cpp#L226)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../src/mxfp8_gqa_prefill.cu#L924)<!-- prefix: "cudaError_t " --> |
 | Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L655)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L549)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L752)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
@@ -22,7 +22,9 @@ Eligible B200 prefill uses the native Flash dispatcher. The full-tile path check
 
 On 148-SM SM100 devices, automatic lane-local dispatch tries ordered TMEM before regular Flash. Both scale bases need eight-byte alignment. It tries 144–255 rows at 8,192–32,768 visible tokens. It tries 256–512 rows from start positions of at least 8,192, up to 32,768 visible tokens. Eligible partial-grant groups try [grouped attention](ordered-gqa-prefill.md#grouped-partial-grants) before per-lane dispatch. [Partial TMEM selection](../src/mxfp8_gqa_prefill.cu#L936)<!-- prefix: "if ((ragged " -->
 
-Inside a [whole-tile MTP projection group](native-prefill-workspace.md#projection-pairs-for-mtp), staged attention needs four 1,024-row tiles at the same aligned start from 1,024 through 130,048. The decoder appends each lane's new KV first. With visibility of at most 32,768 tokens it stages all four lanes together. Through 65,536 it stages two at a time, then one at a time through 131,072. Each subgroup uses one predecode and one attention launch. A declined subgroup uses the ordinary per-lane dispatcher on the same stream. Later subgroups can still stage. [Shape guard](../src/decoder_prefill.cpp#L527)<!-- prefix: "bool can_bat" --> · [Subgroup selection](../src/decoder_prefill.cpp#L509)<!-- prefix: "const int su" --> · [Long staged launcher](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L877)<!-- prefix: "std::optiona" -->
+Inside a [whole-tile MTP projection group](native-prefill-workspace.md#projection-pairs-for-mtp), the decoder can stage four 1,024-row tiles at the same aligned start from 1,024 through 130,048. The decoder appends each lane's new KV first. With visibility of at most 32,768 tokens it stages all four lanes together. Through 65,536 it stages two at a time, then one at a time through 131,072. Each subgroup uses one predecode and one attention launch. A declined subgroup uses the ordinary per-lane dispatcher on the same stream. Later subgroups can still stage. [Shape guard](../src/decoder_prefill.cpp#L529)<!-- prefix: "bool can_bat" --> · [Subgroup selection](../src/decoder_prefill.cpp#L511)<!-- prefix: "const int su" --> · [Long staged launcher](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L877)<!-- prefix: "std::optiona" -->
+
+When the four starts differ, attention reads each 1,024-row tile against its own pages. A tile starting on a 1,024-token boundary from 32,768 through 130,048 can stage by itself using the same 4,096-row projection workspace. The decoder appends uncovered KV first. A clean setup decline sends that tile to the lane-local reader on the same stream. [Mixed starts](../src/decoder_prefill.cpp#L677)<!-- prefix: "} else if (g" --> · [Singleton selection](../src/decoder_prefill.cpp#L495)<!-- prefix: "const bool l" --> · [Lane fallback](../src/decoder_prefill.cpp#L520)<!-- prefix: "read_paged_s" -->
 
 Use the batch planner and serial tile rules for current tile caps. [Batch planner](batch-graphs.md#runtime-path) · [Serial prefill](text-serving.md#serial-prefill)
 
@@ -76,7 +78,7 @@ Hold grants and projection policy fixed. Use the segment-by-segment path as the 
 
 ## Constraints and failure behavior
 
-Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L942)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L877)<!-- prefix: "if (rows == " -->
+Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../src/mxfp8_gqa_prefill.cu#L942)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L879)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 
@@ -123,6 +125,10 @@ For paired changes, replay aligned and unaligned 1,024-row checkpoint captures w
 Time raw paired graph replay in A/B/B/A order. Weight starts by launch count. See [eager staging checks](native-prefill-workspace.md#verification) and [serving gates](performance.md#scheduler-and-reporting-policy).
 
 Check raw dispatch at zero and the singleton staging boundary at starts 31,744 and 32,768. For grouped staging, check starts 1,024, 7,168, and 8,192, both visible-length subgroup transitions, start 130,048, and off-grid starts. For one- and two-lane long subgroups, compare all BF16 outputs with the paired reader on identical staged inputs. Check that a clean setup decline preserves the paired path. Check that page submission errors propagate. For 256- and 512-row grants, see the [partial-grant checks](ordered-gqa-prefill.md#verification).
+
+On B200, the mixed-start fixture ran one 8,192-row grant, then six steps with four 8,192-row grants each. Rotating grant order and remapping pages preserved all 25 full-vocabulary BF16 rows, GDN state, hidden and residual rows, final target KV, and draft lengths against the parent. The candidate executed 1,152 singleton predecode and page-reader pairs. Forcing 16 clean declines preserved the same outputs.
+
+At starts 32,768, 40,960, and 130,048, all 6,291,456 BF16 output values per case matched raw paired attention. Mutating visible V left the masked prefix intact and changed the live suffix. Independent FP64 checks sampled 12,800 values per run. Across these cases, the largest absolute error was 0.042160236 and the largest normalized RMSE was 0.0008262025. The retained evidence manifest is `resume-uneven-proof-WcSDa7zv/singleton.sha256` (SHA-256 `23de3a9f9eb11a500d0f7f02e92a4e769baca2afb38ca7e531123c3b24d32d52`).
 
 ### Ordered TMEM operator verification
 

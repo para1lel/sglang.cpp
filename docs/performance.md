@@ -180,6 +180,8 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 Formal direct GPU results are pending. The earlier private host-staging campaign applies to its own candidate.
 
+In a traced, cold MTP4 probe on B200 GPU 6, four 131,072-token prompts generated one token each. Both arms recorded 15 mixed-start steps. Against parent `e2e07a51`, [singleton staging](flash-prefill.md#runtime-path) in `719a25ab` reduced total attention from 30.225588 to 16.827783 seconds and client makespan from 47.770831531 to 36.015000023 seconds. Each arm acknowledged 64 checkpoints covering 524,288 positions. The full W5 decode tail requires separate measurement.
+
 <a id="current-single-round-v5"></a>
 ### Archived single-round v5
 

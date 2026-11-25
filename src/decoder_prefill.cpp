@@ -491,9 +491,11 @@ void prefill_group_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
         sequences[index++] = {cache, pages, grant.position, grant.rows, segment.work.rope_queries,
                               segment.work.attention};
     });
-    if (staged_batch) {
+    const int position = sequences.front().position;
+    const bool long_lane = count == 1 && chunk.rows == grouped_prefill_max_rows &&
+        position >= 32768 && position <= staged_prefill_batch_long_max_position;
+    if (staged_batch || long_lane) {
         const auto scratch = chunk.work.gqa_scratch();
-        const int position = sequences.front().position;
         if (position <= staged_prefill_batch_max_position) {
             if (const auto staged = try_batched_staged_paged_prefill(sequences.data(), count,
                                                                     chunk.stream, scratch)) {
@@ -506,7 +508,7 @@ void prefill_group_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
             return;
         }
         const int visible = position + batch_prefill_tile_rows;
-        const int subgroup = visible <= 32768 ? 4 : visible <= 65536 ? 2 : 1;
+        const int subgroup = std::min(count, visible <= 32768 ? 4 : visible <= 65536 ? 2 : 1);
         for (int lane = 0; lane < count; lane += subgroup) {
             const auto* first = sequences.data() + lane;
             if (const auto staged = try_long_staged_paged_prefill(first, subgroup, chunk.stream,

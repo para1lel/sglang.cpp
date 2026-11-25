@@ -13,14 +13,12 @@ using namespace decode_proj;
 
 constexpr int min_rows = 512;
 constexpr int max_rows = grouped_prefill_max_rows;
-constexpr int channels = text_gdn_value_heads;
-constexpr int gates = 2 * channels;
 constexpr int columns = 32;
 constexpr int copy_stages = 3;
 constexpr int splits = 10;
 constexpr int chunks_per_split = hidden_size * sizeof(Bf16) / 128 / splits;
 constexpr int reduction_threads = 256;
-static_assert(channels == 48 && hidden_size == 5120);
+static_assert(hidden_size == 5120);
 static_assert((hidden_size * sizeof(Bf16) / 128) % splits == 0);
 
 __device__ void copy_gate_tiles(DecodePipeline<copy_stages>& pipe, unsigned tiles,
@@ -41,11 +39,15 @@ __device__ void copy_gate_tiles(DecodePipeline<copy_stages>& pipe, unsigned tile
     }
 }
 
+template <int Channels>
 __global__ __launch_bounds__(threads) void project_gdn_gate_partials(
     const __grid_constant__ CUtensorMap weight_b, const __grid_constant__ CUtensorMap weight_a,
     const __grid_constant__ CUtensorMap input, int rows, float* partials) {
     constexpr unsigned instruction = ((tile_rows / 16) << 24) | ((columns / 8) << 17) |
                                      (1u << 10) | (1u << 7) | (1u << 4);
+    constexpr int channels = Channels;
+    constexpr int gates = 2 * channels;
+
     alignas(1024) extern __shared__ unsigned char tiles[];
     __shared__ DecodePipeline<copy_stages> pipe;
     alignas(16) __shared__ float results[columns][tile_rows + 2];
@@ -95,19 +97,22 @@ __global__ __launch_bounds__(threads) void project_gdn_gate_partials(
     }
 }
 
+template <int Channels>
 __device__ Bf16* gate_output(Bf16* b, Bf16* a, int row, int gate) {
-    return (gate < channels ? b : a) + row * channels + gate % channels;
+    return (gate < Channels ? b : a) + row * Channels + gate % Channels;
 }
 
+template <int Channels>
 __global__ void round_gdn_gates(const float* partials, int elements, Bf16* b, Bf16* a) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= elements) return;
+    constexpr int gates = 2 * Channels;
     float sum = partials[index];
     #pragma unroll
     for (int split = 1; split < splits; ++split) {
         sum += partials[split * elements + index];
     }
-    *gate_output(b, a, index / gates, index % gates) = __float2bfloat16_rn(sum);
+    *gate_output<Channels>(b, a, index / gates, index % gates) = __float2bfloat16_rn(sum);
 }
 
 CUresult encode_gate_map(const LaunchTarget& target, CUtensorMap& map, const Bf16* data,
@@ -151,11 +156,12 @@ std::optional<cudaError_t> descriptor_error(CUresult result) {
     }
 }
 
-}
-
-std::optional<cudaError_t> try_prefill_bf16_gdn_gates_sm100(
+template <int Channels>
+std::optional<cudaError_t> prefill_bf16_gdn_gates_sm100(
     const Bf16* weight_b, const Bf16* weight_a, const Bf16* input, int rows, Bf16* b, Bf16* a,
     void* scratch, std::size_t scratch_bytes, cudaStream_t stream) {
+    static_assert(Channels == text_gdn_value_heads || Channels == text_gdn_value_heads / 2);
+    constexpr int gates = 2 * Channels;
     if (rows < min_rows || rows > max_rows) return std::nullopt;
     if (const auto pending = cudaGetLastError(); pending != cudaSuccess) return pending;
     int elements = rows * gates;
@@ -174,14 +180,15 @@ std::optional<cudaError_t> try_prefill_bf16_gdn_gates_sm100(
     if (*prepared != cudaSuccess) return take_launch_status(*prepared);
     constexpr int shared_bytes = copy_stages * stage_bytes<columns>;
     int shared_limit = 0;
-    const void* kernel = reinterpret_cast<const void*>(project_gdn_gate_partials);
-    const auto configured = configure(kernel, 19, target.device, shared_limit);
+    constexpr int smem_slot = Channels == text_gdn_value_heads ? 19 : 18;
+    const void* kernel = reinterpret_cast<const void*>(project_gdn_gate_partials<Channels>);
+    const auto configured = configure(kernel, smem_slot, target.device, shared_limit);
     if (configured != cudaSuccess) return take_launch_status(configured);
     if (shared_limit < shared_bytes) return std::nullopt;
     alignas(64) CUtensorMap maps[3];
-    auto encoded = encode_gate_map(target, maps[0], weight_b, channels, tile_rows / 2);
+    auto encoded = encode_gate_map(target, maps[0], weight_b, Channels, tile_rows / 2);
     if (encoded == CUDA_SUCCESS) {
-        encoded = encode_gate_map(target, maps[1], weight_a, channels, tile_rows / 2);
+        encoded = encode_gate_map(target, maps[1], weight_a, Channels, tile_rows / 2);
     }
     if (encoded == CUDA_SUCCESS) {
         encoded = encode_gate_map(target, maps[2], input, rows, columns);
@@ -189,13 +196,28 @@ std::optional<cudaError_t> try_prefill_bf16_gdn_gates_sm100(
     if (encoded != CUDA_SUCCESS) return descriptor_error(encoded);
     auto* partials = static_cast<float*>(scratch);
     void* project_args[] = {&maps[0], &maps[1], &maps[2], &rows, &partials};
-    const auto status = take_launch_status(cudaLaunchKernel(project_gdn_gate_partials,
+    const auto status = take_launch_status(cudaLaunchKernel(project_gdn_gate_partials<Channels>,
         dim3((rows + columns - 1) / columns, splits), threads, project_args, shared_bytes, stream));
     if (status != cudaSuccess) return status;
     void* round_args[] = {&partials, &elements, &b, &a};
-    return take_launch_status(cudaLaunchKernel(round_gdn_gates,
+    return take_launch_status(cudaLaunchKernel(round_gdn_gates<Channels>,
         (elements + reduction_threads - 1) / reduction_threads, reduction_threads,
         round_args, 0, stream));
+}
+}
+
+std::optional<cudaError_t> try_prefill_bf16_gdn_gates_sm100(
+    const Bf16* weight_b, const Bf16* weight_a, const Bf16* input, int rows, Bf16* b, Bf16* a,
+    void* scratch, std::size_t scratch_bytes, cudaStream_t stream) {
+    return prefill_bf16_gdn_gates_sm100<text_gdn_value_heads>(
+        weight_b, weight_a, input, rows, b, a, scratch, scratch_bytes, stream);
+}
+
+std::optional<cudaError_t> try_prefill_bf16_gdn_gates_sm100_local(
+    const Bf16* weight_b, const Bf16* weight_a, const Bf16* input, int rows, Bf16* b, Bf16* a,
+    void* scratch, std::size_t scratch_bytes, cudaStream_t stream) {
+    return prefill_bf16_gdn_gates_sm100<text_gdn_value_heads / 2>(
+        weight_b, weight_a, input, rows, b, a, scratch, scratch_bytes, stream);
 }
 
 }

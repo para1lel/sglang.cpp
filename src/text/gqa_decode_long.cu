@@ -175,7 +175,7 @@ __device__ __forceinline__ bool expand(std::uint16_t* target, int swizzled,
 }
 
 template <int Operand>
-__device__ void issue_raw(Shared& shared, const TensorMaps& maps, int kv_head,
+__device__ void issue_raw(Shared& shared, const TensorMaps& maps, int kv_head, int kv_heads,
                           int begin, int chunks) {
     constexpr int tiles_per_page = mxfp8_page_size / raw_tokens;
     for (int tile = 0; tile < chunks; ++tile) {
@@ -199,7 +199,7 @@ __device__ void issue_raw(Shared& shared, const TensorMaps& maps, int kv_head,
                      "mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
                      :: "r"(shared_address(raw.scale[Operand])),
                         "l"(&maps.scale[Operand]), "r"(page_tile * raw_scale_width), "r"(0),
-                        "r"(page * mxfp8_kv_heads + kv_head), "r"(barrier) : "memory");
+                        "r"(page * kv_heads + kv_head), "r"(barrier) : "memory");
     }
 }
 
@@ -484,9 +484,11 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
     } else if (warp >= raw_warp) {
         if (threadIdx.x % 32 == 0) {
             if (warp == raw_warp) {
-                issue_raw<0>(shared, maps.requests[blockIdx.z], kv_head, first, last - first);
+                issue_raw<0>(shared, maps.requests[blockIdx.z], kv_head,
+                             request.cache.kv_heads, first, last - first);
             } else {
-                issue_raw<1>(shared, maps.requests[blockIdx.z], kv_head, first, last - first);
+                issue_raw<1>(shared, maps.requests[blockIdx.z], kv_head,
+                             request.cache.kv_heads, first, last - first);
             }
         }
     } else if (warp < value_warp) {
@@ -512,9 +514,7 @@ std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, Bat
     }
     if (!symbol || query != cudaDriverEntryPointSuccess) return std::nullopt;
     const auto encode = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(symbol);
-    constexpr cuuint64_t payload_width = mxfp8_kv_heads * columns;
     constexpr cuuint64_t scale_width = mxfp8_page_size / mxfp8_group_size * mxfp8_groups;
-    constexpr cuuint64_t payload_strides[]{payload_width};
     constexpr cuuint64_t scale_strides[]{scale_width, scale_width * mxfp8_group_size};
     constexpr cuuint32_t payload_box[]{columns, raw_tokens};
     constexpr cuuint32_t scale_box[]{raw_scale_width, mxfp8_group_size, 1};
@@ -522,8 +522,12 @@ std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, Bat
     for (int request = 0; request < requests; ++request) {
         const auto& cache = batch.requests[request].cache;
         const auto pages = static_cast<cuuint64_t>(cache.page_count);
+        const cuuint64_t payload_width =
+            static_cast<cuuint64_t>(cache.kv_heads) * columns;
+        const cuuint64_t payload_strides[]{payload_width};
         const cuuint64_t payload_shape[]{payload_width, pages * mxfp8_page_size};
-        const cuuint64_t scale_shape[]{scale_width, mxfp8_group_size, pages * mxfp8_kv_heads};
+        const cuuint64_t scale_shape[]{scale_width, mxfp8_group_size,
+                                       pages * cache.kv_heads};
         void* payload[]{cache.key_payload, cache.value_payload};
         void* scale[]{cache.key_scales, cache.value_scales};
         auto& map = maps.requests[request];
@@ -587,7 +591,8 @@ std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int reques
     if (status != cudaSuccess) return status;
     void* arguments[] = {const_cast<LongBatch*>(&batch), &maps};
     status = long_decode_status(cudaLaunchKernel(decode_long,
-        dim3(max_splits, mxfp8_kv_heads, requests), threads, arguments, sizeof(Shared), stream));
+        dim3(max_splits, batch.requests[0].cache.kv_heads, requests), threads, arguments,
+        sizeof(Shared), stream));
     if (status != cudaSuccess) return status;
     return long_decode_status(combine_long_decode(batch, requests, stream));
 }

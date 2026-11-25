@@ -21,13 +21,14 @@ static_assert(offsetof(StagedPageTile, key) % 1024 == 0 &&
 static_assert(sizeof(StagedPageTile) == sizeof(StagedSingleTile));
 
 __device__ void stage_page_keys(StagedPageTile& tile, const StagedPairMaps& maps,
-                               const int* invalid, int page_base, int kv_head, int pages) {
+                               const int* invalid, int page_base, int kv_head, int pages,
+                               int kv_heads) {
     for (int page = 0; page < pages; ++page) {
         if (page) {
             const int previous = page - 1;
             tmem_copy_wait(tmem_smem(&tile.scores_ready[previous & 1]), (previous >> 1) & 1);
         }
-        const int page_head = (page_base + page) * mxfp8_kv_heads + kv_head;
+        const int page_head = (page_base + page) * kv_heads + kv_head;
         const int bad = invalid[page_head];
         if (bad != INT_MAX) atomicMin(&tile.bad_key, bad);
         const Word barrier = tmem_smem(&tile.key_ready[page & 1]);
@@ -168,9 +169,11 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_page_attention(
     if (threadIdx.x < flash_queries) {
         staged_page_softmax(tile, request, row, head, position, active_rows, chunks);
     } else if (threadIdx.x == 128) {
-        stage_page_keys(tile, maps, invalid, page_base, head / ratio, (chunks + 1) / 2);
+        stage_page_keys(tile, maps, invalid, page_base, head / ratio, (chunks + 1) / 2,
+                        request.cache.kv_heads);
     } else if (threadIdx.x == 160) {
-        single_stage<false>(tile, maps, invalid, page_base, head / ratio, end);
+        single_stage<false>(tile, maps, invalid, page_base, head / ratio,
+                            request.cache.kv_heads, end);
     } else if (warp == 6) {
         // CuTe elects an issuer within the converged warp for each MMA.
         issue_page_mmas(tile, chunks);

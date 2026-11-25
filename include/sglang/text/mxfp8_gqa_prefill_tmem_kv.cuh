@@ -93,8 +93,9 @@ __device__ __forceinline__ void pair_decode_tail(
     int channel, bool& bad) {
     const auto* payload = Key ? cache.key_payload : cache.value_payload;
     const auto* scales = Key ? cache.key_scales : cache.value_scales;
-    const auto offset = payload_offset(page, token, kv_head) + channel;
-    const auto scale = scale_offset(page, token, kv_head) + channel / mxfp8_group_size;
+    const auto offset = payload_offset(cache.kv_heads, page, token, kv_head) + channel;
+    const auto scale = scale_offset(cache.kv_heads, page, token, kv_head)
+        + channel / mxfp8_group_size;
     tmem_decode(output, *reinterpret_cast<const uint4*>(payload + offset), scales[scale], bad);
 }
 

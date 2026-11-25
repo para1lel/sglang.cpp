@@ -10,9 +10,32 @@ __global__ void target_split_combine(const __grid_constant__ Binding binding) {
         return;
     }
     const int head = blockIdx.x;
+    // Bound descriptors launch the combine with the maximum head grid; the
+    // lane's own cache decides which blocks carry work.
+    if (head >= gqa_query_heads(lane.cache.kv_heads)) {
+        return;
+    }
     if (!gqa_decode::tensor_aligned(lane) || !gqa_decode::combine_head<FixedSplits>(lane, head)) {
         wide_decode_head(lane, head);
     }
+}
+
+/// Rank-local combine width: a TP2 lane owns `gqa_query_heads(cache.kv_heads)`
+/// query heads instead of the full 24, so the combine grid must shrink to
+/// match the lane's own cache or blocks would write past its output rows.
+/// Bound descriptors keep their cache on the device; the host cannot read its
+/// head count, so they use the maximum grid and rely on the kernel guard.
+int target_split_heads(const decoder::PagedDecodeLane& lane) {
+    return gqa_query_heads(lane.cache.kv_heads);
+}
+
+int target_split_heads(const decoder::BoundPagedDecodeLane&) {
+    return mxfp8_query_heads;
+}
+
+int target_split_heads(const gqa_decode::TargetLane& lane) {
+    return lane.bound.position ? target_split_heads(lane.bound)
+                               : target_split_heads(lane.eager);
 }
 
 cudaError_t launch_target_split(gqa_decode::TargetLane lane, cudaStream_t stream) {
@@ -20,7 +43,7 @@ cudaError_t launch_target_split(gqa_decode::TargetLane lane, cudaStream_t stream
     if (status != cudaSuccess) {
         return status;
     }
-    target_split_combine<<<mxfp8_query_heads, mxfp8_head_dim, 0, stream>>>(lane);
+    target_split_combine<<<target_split_heads(lane), mxfp8_head_dim, 0, stream>>>(lane);
     return cudaGetLastError();
 }
 
@@ -30,7 +53,8 @@ cudaError_t launch_target_batch(const Batch& batch, int count, cudaStream_t stre
     if (status != cudaSuccess) {
         return status;
     }
-    target_split_combine<<<dim3(mxfp8_query_heads, 1, count), mxfp8_head_dim, 0, stream>>>(
+    target_split_combine<<<dim3(target_split_heads(batch.lanes[0]), 1, count),
+                          mxfp8_head_dim, 0, stream>>>(
         batch);
     return cudaGetLastError();
 }
@@ -123,7 +147,8 @@ cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, i
             if (*status != cudaSuccess) {
                 return *status;
             }
-            target_split_combine<<<dim3(mxfp8_query_heads, 1, count), mxfp8_head_dim, 0, stream>>>(
+            target_split_combine<<<
+                dim3(target_split_heads(batch.lanes[0]), 1, count), mxfp8_head_dim, 0, stream>>>(
                 batch);
             return cudaGetLastError();
         }
@@ -148,7 +173,8 @@ cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests
     static_assert(long_min_position >= (max_splits - 1) * min_split_chunks * split_chunk_tokens);
     void* arguments[] = {const_cast<LongBatch*>(&batch)};
     return cudaLaunchKernel(target_split_combine<LongBatch, max_splits>,
-                            dim3(mxfp8_query_heads, 1, requests * long_rows),
+                            dim3(gqa_query_heads(batch.requests[0].cache.kv_heads), 1,
+                                 requests * long_rows),
                             mxfp8_head_dim, arguments, 0, stream);
 }
 
@@ -172,12 +198,14 @@ cudaError_t decoder::gqa_verify_append(const GqaVerifyRows<GqaVerifyAppendRow, C
     for (int index = 0; index < count; ++index) {
         const auto& row = batch.rows[index];
         if (row.position < 0 || !row.keys || !row.values ||
+            row.cache.kv_heads != batch.rows[0].cache.kv_heads ||
             !cache_covers(row.cache, row.pages, static_cast<std::int64_t>(row.position) + 1)) {
             return cudaErrorInvalidValue;
         }
     }
     void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyAppendRow, Capacity>*>(&batch)};
-    return cudaLaunchKernel(gqa_verify_append_kernel<Capacity>, dim3(count, mxfp8_kv_heads),
+    return cudaLaunchKernel(gqa_verify_append_kernel<Capacity>,
+                            dim3(count, batch.rows[0].cache.kv_heads),
                             mxfp8_head_dim, arguments, 0, stream);
 }
 

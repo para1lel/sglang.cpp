@@ -14,11 +14,13 @@ __global__ void recompute_replay_kernel(
 
 cudaError_t decoder::mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
                                       const __nv_bfloat16* queries, __nv_bfloat16* output,
-                                      ExactGqaWorkspace workspace, cudaStream_t stream) {
+                                      ExactGqaWorkspace workspace, cudaStream_t stream,
+                                      GqaGeometry geometry) {
     constexpr int min_tiled_tokens = 8;
     constexpr int max_tiled_tokens = 2 * mxfp8_page_size;
     const auto visible = static_cast<std::int64_t>(position) + 1;
-    if (!queries || !output || !cache_covers(cache, pages, visible)) {
+    if (!queries || !output || !cache_covers(cache, pages, visible)
+        || !gqa_geometry_matches(geometry, cache)) {
         return cudaErrorInvalidValue;
     }
     if (visible > max_tiled_tokens && workspace.scores && visible <= workspace.capacity) {
@@ -34,10 +36,10 @@ cudaError_t decoder::mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages,
     }
     if (visible < min_tiled_tokens || visible > max_tiled_tokens) {
         return mxfp8_gqa_attention(cache, pages, static_cast<int>(visible), position, 1,
-                                  queries, output, stream);
+                                  queries, output, stream, geometry);
     }
     return launch_gqa_kernel(recompute_replay_kernel,
-        dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
+        dim3(gqa_query_heads(cache.kv_heads), mxfp8_head_dim / replay_channels),
         replay_threads, stream, cache, pages.device_pages, position, queries, output);
 }
 

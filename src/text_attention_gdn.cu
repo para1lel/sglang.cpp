@@ -1,6 +1,8 @@
 #include "sglang/decoder_cuda.cuh"
-#include "sglang/text/gdn_chunk.cuh"
+#include "sglang/text/gdn/gdn_chunk.cuh"
+#include "sglang/text/gdn_local.h"
 #include "sglang/text/text_cuda_primitives.cuh"
+#include "sglang/text/gdn/gdn_prefill_kernels.cuh"
 
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -9,381 +11,18 @@
 namespace sglang {
 namespace {
 
-constexpr int warp_size = 32;
-constexpr int value_rows_per_block = 8;
-constexpr int recurrent_threads = value_rows_per_block * warp_size;
-constexpr int value_blocks_per_head = text_gdn_head_dim / value_rows_per_block;
-constexpr int value_heads_per_qk_head = text_gdn_value_heads / text_gdn_qk_heads;
-constexpr int keys_per_lane = text_gdn_head_dim / warp_size;
-constexpr int conv_threads = 128;
-constexpr int conv_taps = text_gdn_history_taps + 1;
-constexpr int conv_blocks_per_token = text_gdn_qkv_width / conv_threads;
-constexpr int prefill_rows_per_block = 4;
-constexpr float norm_epsilon = 1.0e-6f;
-
-static_assert(recurrent_threads == 2 * text_gdn_head_dim);
-static_assert(text_gdn_head_dim % warp_size == 0);
-static_assert(text_gdn_value_heads % text_gdn_qk_heads == 0);
-static_assert(text_gdn_qkv_width % conv_threads == 0);
-static_assert(conv_threads == text_gdn_head_dim);
-static_assert(conv_taps == 4);
-
-__device__ float warp_sum(float value) {
-    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
-        value += __shfl_xor_sync(0xffffffffu, value, offset);
-    }
-    return value;
-}
-
-__device__ float sigmoid(float value) {
-    return 1.0f / (1.0f + expf(-value));
-}
-
-__device__ float softplus(float value) {
-    return fmaxf(value, 0.0f) + log1pf(expf(-fabsf(value)));
-}
-
-__device__ __nv_bfloat16 raw_sample(const __nv_bfloat16* qkv,
-                                    const __nv_bfloat16* history, int row, int channel) {
-    if (row < 0) {
-        return history[channel * text_gdn_history_taps + row + text_gdn_history_taps];
-    }
-    return qkv[static_cast<std::size_t>(row) * text_gdn_qkv_width + channel];
-}
-
-__device__ __nv_bfloat16* history_value(TextGdnState state) { return state.history; }
-__device__ __nv_bfloat16* history_value(const TextGdnState* state) { return state->history; }
-__device__ float* recurrent_value(TextGdnState state) { return state.recurrent; }
-__device__ float* recurrent_value(const TextGdnState* state) { return state->recurrent; }
-
-__device__ __nv_bfloat16 convolve(const __nv_bfloat16* qkv, const __nv_bfloat16* history,
-                                  const __nv_bfloat16* weights, int row, int channel) {
-    float value = 0.0f;
-    #pragma unroll
-    for (int tap = 0; tap < conv_taps; ++tap) {
-        const int sample_row = row - text_gdn_history_taps + tap;
-        const float raw = __bfloat162float(raw_sample(qkv, history, sample_row, channel));
-        value = fmaf(raw, __bfloat162float(weights[channel * conv_taps + tap]), value);
-    }
-    return __float2bfloat16(value * sigmoid(value));
-}
-
-template <typename State>
+template <typename S, typename State>
 __global__ void gdn_convolve(const __nv_bfloat16* qkv, State binding,
                              const __nv_bfloat16* weights, __nv_bfloat16* convolved) {
+    constexpr int conv_blocks_per_token = S::qkv_width / conv_threads;
     const auto* history = history_value(binding);
     const int row = blockIdx.x / conv_blocks_per_token;
     const int channel = (blockIdx.x % conv_blocks_per_token) * conv_threads + threadIdx.x;
-    convolved[static_cast<std::size_t>(row) * text_gdn_qkv_width + channel] =
-        convolve(qkv, history, weights, row, channel);
+    convolved[static_cast<std::size_t>(row) * S::qkv_width + channel] =
+        convolve<S>(qkv, history, weights, row, channel);
 }
 
-__global__ void gdn_prefill_prepare(const __nv_bfloat16* qkv, const __nv_bfloat16* history,
-                                    TextGdnWeights weights, const __nv_bfloat16* a,
-                                    const __nv_bfloat16* b, __nv_bfloat16* convolved,
-                                    float2* gates) {
-    constexpr int blocks_per_row = conv_blocks_per_token + 1;
-    const int row = blockIdx.x / blocks_per_row;
-    const int block = blockIdx.x % blocks_per_row;
-    const int feature = threadIdx.x;
-    if (block == conv_blocks_per_token) {
-        if (feature < text_gdn_value_heads) {
-            const int index = row * text_gdn_value_heads + feature;
-            const float negative_a = -expf(__bfloat162float(weights.a_log[feature]));
-            const float dt_bias = __bfloat162float(weights.dt_bias[feature]);
-            gates[index] = {expf(negative_a * softplus(__bfloat162float(a[index]) + dt_bias)),
-                            sigmoid(__bfloat162float(b[index]))};
-        }
-        return;
-    }
-    const int channel = block * conv_threads + feature;
-    auto mixed = convolve(qkv, history, weights.convolution, row, channel);
-    if (channel < 2 * text_gdn_qk_width) {
-        constexpr int warps = conv_threads / warp_size;
-        __shared__ float warp_squares[warps];
-        const float component = __bfloat162float(mixed);
-        const float partial = warp_sum(component * component);
-        if (feature % warp_size == 0) {
-            warp_squares[feature / warp_size] = partial;
-        }
-        __syncthreads();
-        float squares = 0.0f;
-        #pragma unroll
-        for (int warp = 0; warp < warps; ++warp) {
-            squares += warp_squares[warp];
-        }
-        mixed = __float2bfloat16(component * rsqrtf(squares + norm_epsilon));
-    }
-    convolved[static_cast<std::size_t>(row) * text_gdn_qkv_width + channel] = mixed;
-}
-
-__device__ __forceinline__ void gdn_prepare_aligned_rows(
-    const __nv_bfloat16* qkv, const __nv_bfloat16* history, TextGdnWeights weights,
-    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* convolved, float2* gates) {
-    constexpr int blocks_per_group = conv_blocks_per_token + 1;
-    constexpr int warps = conv_threads / warp_size;
-    const int first = blockIdx.x / blocks_per_group * prefill_rows_per_block;
-    const int block = blockIdx.x % blocks_per_group;
-    const int feature = threadIdx.x;
-    if (block == conv_blocks_per_token) {
-        if (feature < text_gdn_value_heads) {
-            const float negative_a = -expf(__bfloat162float(weights.a_log[feature]));
-            const float dt_bias = __bfloat162float(weights.dt_bias[feature]);
-            #pragma unroll
-            for (int row = 0; row < prefill_rows_per_block; ++row) {
-                const int index = (first + row) * text_gdn_value_heads + feature;
-                gates[index] = {
-                    expf(negative_a * softplus(__bfloat162float(a[index]) + dt_bias)),
-                    sigmoid(__bfloat162float(b[index]))};
-            }
-        }
-        return;
-    }
-
-    const int channel = block * conv_threads + feature;
-    const auto* taps = weights.convolution + channel * conv_taps;
-    const float weight0 = __bfloat162float(taps[0]);
-    const float weight1 = __bfloat162float(taps[1]);
-    const float weight2 = __bfloat162float(taps[2]);
-    const float weight3 = __bfloat162float(taps[3]);
-    float oldest = __bfloat162float(raw_sample(qkv, history, first - 3, channel));
-    float middle = __bfloat162float(raw_sample(qkv, history, first - 2, channel));
-    float latest = __bfloat162float(raw_sample(qkv, history, first - 1, channel));
-    __nv_bfloat16 mixed[prefill_rows_per_block];
-    #pragma unroll
-    for (int row = 0; row < prefill_rows_per_block; ++row) {
-        const float current = __bfloat162float(raw_sample(qkv, history, first + row, channel));
-        float value = fmaf(oldest, weight0, 0.0f);
-        value = fmaf(middle, weight1, value);
-        value = fmaf(latest, weight2, value);
-        value = fmaf(current, weight3, value);
-        mixed[row] = __float2bfloat16(value * sigmoid(value));
-        oldest = middle;
-        middle = latest;
-        latest = current;
-    }
-    if (channel < 2 * text_gdn_qk_width) {
-        __shared__ float warp_squares[prefill_rows_per_block][warps];
-        #pragma unroll
-        for (int row = 0; row < prefill_rows_per_block; ++row) {
-            const float component = __bfloat162float(mixed[row]);
-            const float partial = warp_sum(component * component);
-            if (feature % warp_size == 0) {
-                warp_squares[row][feature / warp_size] = partial;
-            }
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int row = 0; row < prefill_rows_per_block; ++row) {
-            float squares = 0.0f;
-            #pragma unroll
-            for (int warp = 0; warp < warps; ++warp) {
-                squares += warp_squares[row][warp];
-            }
-            const float component = __bfloat162float(mixed[row]);
-            mixed[row] = __float2bfloat16(component * rsqrtf(squares + norm_epsilon));
-        }
-    }
-    #pragma unroll
-    for (int row = 0; row < prefill_rows_per_block; ++row) {
-        convolved[static_cast<std::size_t>(first + row) * text_gdn_qkv_width + channel] =
-            mixed[row];
-    }
-}
-
-__global__ void gdn_prefill_prepare_grouped(
-    const __nv_bfloat16* qkv, const __nv_bfloat16* history, TextGdnWeights weights,
-    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* convolved, float2* gates) {
-    gdn_prepare_aligned_rows(qkv, history, weights, a, b, convolved, gates);
-}
-
-__global__ void gdn_prefill_recur(int rows, const __nv_bfloat16* convolved, const float2* gates,
-                                  float* recurrent, __nv_bfloat16* observable) {
-    const int head = blockIdx.x / value_blocks_per_head;
-    const int qk_head = head / value_heads_per_qk_head;
-    const int lane = threadIdx.x % warp_size;
-    const int value = (blockIdx.x % value_blocks_per_head) * value_rows_per_block +
-                      threadIdx.x / warp_size;
-    const int feature = head * text_gdn_head_dim + value;
-    const int q_offset = qk_head * text_gdn_head_dim + lane;
-    const int k_offset = q_offset + text_gdn_qk_width;
-    auto* state = recurrent + feature * text_gdn_head_dim + lane;
-    float state_keys[keys_per_lane];
-    #pragma unroll
-    for (int part = 0; part < keys_per_lane; ++part) {
-        state_keys[part] = state[part * warp_size];
-    }
-    for (int row = 0; row < rows; ++row) {
-        const auto* mixed = convolved + static_cast<std::size_t>(row) * text_gdn_qkv_width;
-        const auto gate = gates[row * text_gdn_value_heads + head];
-        const float target = __bfloat162float(mixed[2 * text_gdn_qk_width + feature]);
-        float keys[keys_per_lane];
-        float queries[keys_per_lane];
-        float prediction = 0.0f;
-        #pragma unroll
-        for (int part = 0; part < keys_per_lane; ++part) {
-            const int key = part * warp_size;
-            constexpr float query_scale = 0.08838834764831845f;
-            keys[part] = __bfloat162float(mixed[k_offset + key]);
-            queries[part] = __bfloat162float(mixed[q_offset + key]) * query_scale;
-            state_keys[part] *= gate.x;
-            prediction = fmaf(state_keys[part], keys[part], prediction);
-        }
-        const float correction = gate.y * (target - warp_sum(prediction));
-        float result = 0.0f;
-        #pragma unroll
-        for (int part = 0; part < keys_per_lane; ++part) {
-            state_keys[part] = fmaf(correction, keys[part], state_keys[part]);
-            result = fmaf(state_keys[part], queries[part], result);
-        }
-        const float sum = warp_sum(result);
-        if (lane == 0) {
-            observable[static_cast<std::size_t>(row) * text_gdn_value_width + feature] =
-                __float2bfloat16(sum);
-        }
-    }
-    #pragma unroll
-    for (int part = 0; part < keys_per_lane; ++part) {
-        state[part * warp_size] = state_keys[part];
-    }
-}
-
-constexpr int paired_recurrent_threads = recurrent_threads / 2;
-constexpr int paired_recurrent_min_rows = 32;
-constexpr int recurrent_tile_rows = 8;
-constexpr int value_pairs_per_block = value_rows_per_block / 2;
-
-__device__ float2 multiply_channels(float2 values, float factor) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
-    return __fmul2_rn(values, {factor, factor});
-#else
-    return {values.x * factor, values.y * factor};
-#endif
-}
-
-__device__ float2 multiply_add_channels(float2 values, float factor, float2 addends) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
-    return __ffma2_rn(values, {factor, factor}, addends);
-#else
-    return {fmaf(values.x, factor, addends.x), fmaf(values.y, factor, addends.y)};
-#endif
-}
-
-__device__ float2 add_channels(float2 values, float2 addends) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
-    return __fadd2_rn(values, addends);
-#else
-    return {values.x + addends.x, values.y + addends.y};
-#endif
-}
-
-__device__ float2 warp_sum_channels(float2 value) {
-    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
-        const float2 peer = {__shfl_xor_sync(0xffffffffu, value.x, offset),
-                             __shfl_xor_sync(0xffffffffu, value.y, offset)};
-        value = add_channels(value, peer);
-    }
-    return value;
-}
-
-__global__ void gdn_prefill_recur_paired(int rows, const __nv_bfloat16* convolved,
-                                        const float2* gates, float* recurrent,
-                                        __nv_bfloat16* observable) {
-    constexpr int components_per_vector = sizeof(uint4) / sizeof(__nv_bfloat16);
-    constexpr int vectors_per_head = text_gdn_head_dim / components_per_vector;
-    __shared__ uint4 packed_qk[recurrent_tile_rows][2][vectors_per_head];
-    __shared__ float2 tile_gates[recurrent_tile_rows];
-    __shared__ __nv_bfloat162 tile_targets[recurrent_tile_rows][value_pairs_per_block];
-    const int head = blockIdx.x / value_blocks_per_head;
-    const int qk_head = head / value_heads_per_qk_head;
-    const int lane = threadIdx.x % warp_size;
-    const int warp = threadIdx.x / warp_size;
-    const int first_feature = head * text_gdn_head_dim +
-                              (blockIdx.x % value_blocks_per_head) * value_rows_per_block;
-    const int feature = first_feature + 2 * warp;
-    auto* first_state = recurrent + feature * text_gdn_head_dim + lane;
-    auto* second_state = first_state + text_gdn_head_dim;
-    float2 state_keys[keys_per_lane];
-    #pragma unroll
-    for (int part = 0; part < keys_per_lane; ++part) {
-        state_keys[part] = {first_state[part * warp_size], second_state[part * warp_size]};
-    }
-    for (int first = 0; first < rows; first += recurrent_tile_rows) {
-        const int count = min(recurrent_tile_rows, rows - first);
-        constexpr int vectors_per_row = 2 * vectors_per_head;
-        #pragma unroll
-        for (int index = threadIdx.x; index < recurrent_tile_rows * vectors_per_row;
-             index += paired_recurrent_threads) {
-            const int local_row = index / vectors_per_row;
-            const int plane = index / vectors_per_head % 2;
-            const int vector = index % vectors_per_head;
-            if (local_row < count) {
-                const auto* mixed =
-                    convolved + static_cast<std::size_t>(first + local_row) * text_gdn_qkv_width;
-                const auto* source = reinterpret_cast<const uint4*>(
-                    mixed + plane * text_gdn_qk_width + qk_head * text_gdn_head_dim);
-                packed_qk[local_row][plane][vector] = source[vector];
-            }
-        }
-        if (threadIdx.x < count * value_pairs_per_block) {
-            const int local_row = threadIdx.x / value_pairs_per_block;
-            const int pair = threadIdx.x % value_pairs_per_block;
-            const int row = first + local_row;
-            const auto* mixed = convolved + static_cast<std::size_t>(row) * text_gdn_qkv_width;
-            const auto* target = reinterpret_cast<const __nv_bfloat162*>(
-                mixed + 2 * text_gdn_qk_width + first_feature);
-            tile_targets[local_row][pair] = target[pair];
-            if (pair == 0) {
-                tile_gates[local_row] = gates[row * text_gdn_value_heads + head];
-            }
-        }
-        __syncthreads();
-        for (int local_row = 0; local_row < count; ++local_row) {
-            const auto* queries_bf16 =
-                reinterpret_cast<const __nv_bfloat16*>(packed_qk[local_row][0]);
-            const auto* keys_bf16 =
-                reinterpret_cast<const __nv_bfloat16*>(packed_qk[local_row][1]);
-            const auto gate = tile_gates[local_row];
-            const auto targets = __bfloat1622float2(tile_targets[local_row][warp]);
-            float keys[keys_per_lane], queries[keys_per_lane];
-            float2 prediction = {0.0f, 0.0f};
-            #pragma unroll
-            for (int part = 0; part < keys_per_lane; ++part) {
-                const int key = part * warp_size + lane;
-                constexpr float query_scale = 0.08838834764831845f;
-                keys[part] = __bfloat162float(keys_bf16[key]);
-                queries[part] = __bfloat162float(queries_bf16[key]) * query_scale;
-                state_keys[part] = multiply_channels(state_keys[part], gate.x);
-                prediction = multiply_add_channels(state_keys[part], keys[part], prediction);
-            }
-            const float2 predicted = warp_sum_channels(prediction);
-            const auto correction = multiply_channels(
-                add_channels(targets, {-predicted.x, -predicted.y}), gate.y);
-            float2 result = {0.0f, 0.0f};
-            #pragma unroll
-            for (int part = 0; part < keys_per_lane; ++part) {
-                state_keys[part] =
-                    multiply_add_channels(correction, keys[part], state_keys[part]);
-                result = multiply_add_channels(state_keys[part], queries[part], result);
-            }
-            const float2 sum = warp_sum_channels(result);
-            if (lane == 0) {
-                auto* row_output =
-                    observable + static_cast<std::size_t>(first + local_row) * text_gdn_value_width;
-                reinterpret_cast<__nv_bfloat162*>(row_output)[feature / 2] =
-                    __float22bfloat162_rn(sum);
-            }
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (int part = 0; part < keys_per_lane; ++part) {
-        first_state[part * warp_size] = state_keys[part].x;
-        second_state[part * warp_size] = state_keys[part].y;
-    }
-}
-
-template <bool round_qk, bool observe, typename State>
+template <typename S, bool round_qk, bool observe, typename State>
 __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
                           const __nv_bfloat16* b, const __nv_bfloat16* a,
                           TextGdnWeights weights, State initial, State final,
@@ -394,14 +33,14 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
     __shared__ float beta;
 
     const int head = blockIdx.x / value_blocks_per_head;
-    const int qk_head = head / value_heads_per_qk_head;
+    const int qk_head = head / S::heads_per_qk;
     const int warp = threadIdx.x / warp_size;
     const int lane = threadIdx.x % warp_size;
     const int value = (blockIdx.x % value_blocks_per_head) * value_rows_per_block + warp;
     const int feature = head * text_gdn_head_dim + value;
     const int q_or_k = threadIdx.x / text_gdn_head_dim;
     const int qk_channel = threadIdx.x % text_gdn_head_dim;
-    const int qk_offset = q_or_k * text_gdn_qk_width + qk_head * text_gdn_head_dim;
+    const int qk_offset = q_or_k * S::qk_width + qk_head * text_gdn_head_dim;
     const int first_warp = q_or_k * (text_gdn_head_dim / warp_size);
     const float negative_a = -expf(__bfloat162float(weights.a_log[head]));
     const float dt_bias = __bfloat162float(weights.dt_bias[head]);
@@ -415,14 +54,14 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
 
     for (int row = 0; row < token_count; ++row) {
         const __nv_bfloat16* const mixed =
-            convolved + static_cast<std::size_t>(row) * text_gdn_qkv_width;
+            convolved + static_cast<std::size_t>(row) * S::qkv_width;
         const float component = __bfloat162float(mixed[qk_offset + qk_channel]);
         const float partial = warp_sum(component * component);
         if (lane == 0) {
             warp_squares[warp] = partial;
         }
         if (threadIdx.x == 0) {
-            const int gate = row * text_gdn_value_heads + head;
+            const int gate = row * S::value_heads + head;
             decay = expf(negative_a * softplus(__bfloat162float(a[gate]) + dt_bias));
             beta = sigmoid(__bfloat162float(b[gate]));
         }
@@ -447,7 +86,7 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
             state_keys[part] *= decay;
             prediction = fmaf(state_keys[part], qk[1][part * warp_size + lane], prediction);
         }
-        const float target = __bfloat162float(mixed[2 * text_gdn_qk_width + feature]);
+        const float target = __bfloat162float(mixed[2 * S::qk_width + feature]);
         const float correction = beta * (target - warp_sum(prediction));
         float result = 0.0f;
         #pragma unroll
@@ -461,7 +100,7 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
         if constexpr (observe) {
             const float sum = warp_sum(result);
             if (lane == 0) {
-                observable[static_cast<std::size_t>(row) * text_gdn_value_width + feature] =
+                observable[static_cast<std::size_t>(row) * S::value_width + feature] =
                     __float2bfloat16(sum);
             }
         }
@@ -476,13 +115,14 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
     }
 }
 
+template <typename S>
 __device__ void finish_history(int token_count, const __nv_bfloat16* qkv,
                                 const __nv_bfloat16* history, __nv_bfloat16* final_history,
                                 int feature) {
     #pragma unroll
     for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
         final_history[feature * text_gdn_history_taps + tap] =
-            raw_sample(qkv, history, token_count - text_gdn_history_taps + tap, feature);
+            raw_sample<S>(qkv, history, token_count - text_gdn_history_taps + tap, feature);
     }
 }
 
@@ -493,15 +133,16 @@ __device__ __nv_bfloat16 finish_value(float value, float inverse_rms, __nv_bfloa
                             * (gate * sigmoid(gate)));
 }
 
-template <typename State>
+template <typename S, typename State>
 __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                            const __nv_bfloat16* norm, const __nv_bfloat16* observable,
                            State initial, State final, __nv_bfloat16* output) {
-    const int norm_blocks = output ? token_count * text_gdn_value_heads : 0;
+    const int norm_blocks = output ? token_count * S::value_heads : 0;
     const int channel = threadIdx.x;
     if (blockIdx.x >= norm_blocks) {
         const int feature = (blockIdx.x - norm_blocks) * text_gdn_head_dim + channel;
-        finish_history(token_count, qkv, history_value(initial), history_value(final), feature);
+        finish_history<S>(token_count, qkv, history_value(initial), history_value(final),
+                          feature);
         return;
     }
 
@@ -525,21 +166,23 @@ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv
 constexpr int finish_heads_per_block = 4;
 constexpr int finish_threads = finish_heads_per_block * warp_size;
 
+template <typename S>
 __host__ __device__ constexpr int quantized_finish_blocks(int rows) {
-    return rows * (text_gdn_value_heads / finish_heads_per_block) +
-           text_gdn_qkv_width / finish_threads;
+    return rows * (S::value_heads / finish_heads_per_block) +
+           S::qkv_width / finish_threads;
 }
 
+template <typename S>
 __device__ __forceinline__ void gdn_write_quantized(
     int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* norm,
     const __nv_bfloat16* observable, TextGdnState state, TextFp8Activation output) {
     static_assert(text_gdn_head_dim == text_fp8_group_size);
-    static_assert(text_gdn_value_heads % finish_heads_per_block == 0);
+    static_assert(S::value_heads % finish_heads_per_block == 0);
     constexpr int parts = text_gdn_head_dim / warp_size;
-    const int norm_blocks = rows * (text_gdn_value_heads / finish_heads_per_block);
+    const int norm_blocks = rows * (S::value_heads / finish_heads_per_block);
     if (blockIdx.x >= norm_blocks) {
         const int feature = (blockIdx.x - norm_blocks) * finish_threads + threadIdx.x;
-        finish_history(rows, qkv, state.history, state.history, feature);
+        finish_history<S>(rows, qkv, state.history, state.history, feature);
         return;
     }
 
@@ -580,34 +223,39 @@ __device__ __forceinline__ void gdn_write_quantized(
     }
 }
 
-__global__ void gdn_finish_quantized(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
-                                     const __nv_bfloat16* norm, const __nv_bfloat16* observable,
-                                     TextGdnState state, TextFp8Activation output) {
-    gdn_write_quantized(rows, qkv, z, norm, observable, state, output);
+template <typename S>
+__global__ void gdn_finish_quantized(int rows, const __nv_bfloat16* qkv,
+                                     const __nv_bfloat16* z, const __nv_bfloat16* norm,
+                                     const __nv_bfloat16* observable, TextGdnState state,
+                                     TextFp8Activation output) {
+    gdn_write_quantized<S>(rows, qkv, z, norm, observable, state, output);
 }
 
 struct GdnPrefillSegments {
     decoder::GdnPrefillSegment values[decoder::max_gdn_prefill_segments];
 };
 
+template <typename S>
 __global__ void gdn_prepare_segments(const __grid_constant__ GdnPrefillSegments segments,
                                      TextGdnWeights weights) {
+    constexpr int conv_blocks_per_token = S::qkv_width / conv_threads;
     const auto& segment = segments.values[blockIdx.z];
     constexpr int blocks_per_row_group = conv_blocks_per_token + 1;
     if (blockIdx.x < segment.rows / prefill_rows_per_block * blocks_per_row_group) {
-        gdn_prepare_aligned_rows(segment.qkv, segment.state.history, weights, segment.a, segment.b,
-                                 segment.workspace, segment.gates);
+        gdn_prepare_aligned_rows<S>(segment.qkv, segment.state.history, weights, segment.a,
+                                    segment.b, segment.workspace, segment.gates);
     }
 }
 
+template <typename S>
 __global__ void gdn_finish_segments(const __grid_constant__ GdnPrefillSegments segments,
                                     const __nv_bfloat16* norm) {
     const auto& segment = segments.values[blockIdx.z];
-    if (blockIdx.x < quantized_finish_blocks(segment.rows)) {
+    if (blockIdx.x < quantized_finish_blocks<S>(segment.rows)) {
         const auto* observable = segment.workspace +
-                                 static_cast<std::size_t>(segment.rows) * text_gdn_qkv_width;
-        gdn_write_quantized(segment.rows, segment.qkv, segment.z, norm, observable,
-                            segment.state, segment.output);
+                                 static_cast<std::size_t>(segment.rows) * S::qkv_width;
+        gdn_write_quantized<S>(segment.rows, segment.qkv, segment.z, norm, observable,
+                               segment.state, segment.output);
     }
 }
 
@@ -618,15 +266,15 @@ struct GdnInputs {
     const __nv_bfloat16* a;
 };
 
-template <bool observe, typename State>
+template <typename S, bool observe, typename State>
 cudaError_t recur_and_finish(int token_count, TextGdnMode mode, GdnInputs rows,
                              const __nv_bfloat16* z, TextGdnWeights weights,
                              State initial, State final,
                              __nv_bfloat16* observable, __nv_bfloat16* output,
                              cudaStream_t stream) {
-    constexpr int recurrent_blocks = text_gdn_value_heads * value_blocks_per_head;
-    const auto recur = mode == TextGdnMode::prefill ? gdn_recur<true, observe, State> :
-                                                    gdn_recur<false, observe, State>;
+    constexpr int recurrent_blocks = S::value_heads * value_blocks_per_head;
+    const auto recur = mode == TextGdnMode::prefill ? gdn_recur<S, true, observe, State> :
+                                                    gdn_recur<S, false, observe, State>;
     void* recurrent_arguments[] = {
         &token_count, &rows.convolved, &rows.b, &rows.a, &weights, &initial, &final, &observable};
     const auto status = cudaLaunchKernel(recur, dim3(recurrent_blocks), dim3(recurrent_threads),
@@ -635,88 +283,91 @@ cudaError_t recur_and_finish(int token_count, TextGdnMode mode, GdnInputs rows,
         return status;
     }
     const int finish_blocks =
-        (observe ? token_count * text_gdn_value_heads : 0) +
-        text_gdn_qkv_width / text_gdn_head_dim;
+        (observe ? token_count * S::value_heads : 0) +
+        S::qkv_width / text_gdn_head_dim;
     void* finish_arguments[] = {
         &token_count, &rows.qkv, &z, &weights.norm, &observable, &initial, &final, &output};
-    return cudaLaunchKernel(gdn_finish<State>, dim3(finish_blocks), dim3(text_gdn_head_dim),
+    return cudaLaunchKernel(gdn_finish<S, State>, dim3(finish_blocks), dim3(text_gdn_head_dim),
                             finish_arguments, 0, stream);
 }
 
-template <typename Output>
+template <typename S, typename Output>
 cudaError_t prefill_gdn(
     int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
     const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
     __nv_bfloat16* workspace, float2* gates, Output output, cudaStream_t stream,
     void* chunk_scratch, std::size_t chunk_bytes) {
-    bool chunked = gdn_chunk::eligible(rows, chunk_scratch, chunk_bytes);
+    constexpr int conv_blocks_per_token = S::qkv_width / conv_threads;
+    bool chunked = gdn_chunk::eligible<S>(rows, chunk_scratch, chunk_bytes);
     if (chunked) {
-        const auto status = gdn_chunk::configure(chunked);
+        const auto status = gdn_chunk::configure<S>(chunked);
         if (status != cudaSuccess) {
             return status;
         }
     }
     void* prepare_arguments[] = {&qkv, &state.history, &weights, &a, &b, &workspace, &gates};
     const bool grouped = rows >= gdn_chunk::min_count && rows % prefill_rows_per_block == 0;
-    const auto prepare = grouped ? gdn_prefill_prepare_grouped : gdn_prefill_prepare;
+    const auto prepare = grouped ? gdn_prefill_prepare_grouped<S> : gdn_prefill_prepare<S>;
     const int prepare_groups = grouped ? rows / prefill_rows_per_block : rows;
     auto status = cudaLaunchKernel(prepare, dim3(prepare_groups * (conv_blocks_per_token + 1)),
                                    dim3(conv_threads), prepare_arguments, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }
-    auto* observable = workspace + static_cast<std::size_t>(rows) * text_gdn_qkv_width;
+    auto* observable = workspace + static_cast<std::size_t>(rows) * S::qkv_width;
     void* recurrent_arguments[] = {&rows, &workspace, &gates, &state.recurrent, &observable};
     const bool paired = rows >= paired_recurrent_min_rows &&
                         reinterpret_cast<std::uintptr_t>(workspace) % alignof(uint4) == 0;
-    const auto recur = paired ? gdn_prefill_recur_paired : gdn_prefill_recur;
+    const auto recur = paired ? gdn_prefill_recur_paired<S> : gdn_prefill_recur<S>;
     const int threads = paired ? paired_recurrent_threads : recurrent_threads;
     if (chunked) {
-        status = gdn_chunk::launch(rows, workspace, gates, chunk_scratch,
-                                   state.recurrent, observable, stream);
+        status = gdn_chunk::launch<S>(rows, workspace, gates, chunk_scratch,
+                                      state.recurrent, observable, stream);
     } else {
-        status = cudaLaunchKernel(recur, dim3(text_gdn_value_heads * value_blocks_per_head),
+        status = cudaLaunchKernel(recur, dim3(S::value_heads * value_blocks_per_head),
                                   dim3(threads), recurrent_arguments, 0, stream);
     }
     if (status != cudaSuccess) {
         return status;
     }
     if constexpr (std::is_same_v<Output, TextFp8Activation>) {
-        const int blocks = quantized_finish_blocks(rows);
+        const int blocks = quantized_finish_blocks<S>(rows);
         void* arguments[] = {&rows, &qkv, &z, &weights.norm, &observable, &state, &output};
-        return cudaLaunchKernel(gdn_finish_quantized, dim3(blocks), dim3(finish_threads),
+        return cudaLaunchKernel(gdn_finish_quantized<S>, dim3(blocks), dim3(finish_threads),
                                 arguments, 0, stream);
     } else {
         const int finish_blocks =
-            rows * text_gdn_value_heads + text_gdn_qkv_width / text_gdn_head_dim;
+            rows * S::value_heads + S::qkv_width / text_gdn_head_dim;
         void* finish_arguments[] = {
             &rows, &qkv, &z, &weights.norm, &observable, &state, &state, &output};
-        return cudaLaunchKernel(gdn_finish<TextGdnState>, dim3(finish_blocks),
+        return cudaLaunchKernel(gdn_finish<S, TextGdnState>, dim3(finish_blocks),
                                 dim3(text_gdn_head_dim), finish_arguments, 0, stream);
     }
 }
 
-template <typename State>
+template <typename S, typename State>
 cudaError_t convolve(int token_count, GdnInputs rows, TextGdnWeights weights, State initial,
                      cudaStream_t stream) {
+    constexpr int conv_blocks_per_token = S::qkv_width / conv_threads;
     void* args[] = {&rows.qkv, &initial, &weights.convolution, &rows.convolved};
-    return cudaLaunchKernel(gdn_convolve<State>, dim3(token_count * conv_blocks_per_token),
+    return cudaLaunchKernel(gdn_convolve<S, State>, dim3(token_count * conv_blocks_per_token),
                             dim3(conv_threads), args, 0, stream);
 }
 
-template <typename State>
+template <typename S, typename State>
 cudaError_t enqueue_gdn(int token_count, TextGdnMode mode, GdnInputs rows,
                          const __nv_bfloat16* z, TextGdnWeights weights, State initial,
                          State final, __nv_bfloat16* observable, __nv_bfloat16* output,
                          cudaStream_t stream) {
-    const auto status = convolve(token_count, rows, weights, initial, stream);
+    const auto status = convolve<S>(token_count, rows, weights, initial, stream);
     if (status != cudaSuccess) {
         return status;
     }
-    return recur_and_finish<true>(token_count, mode, rows, z, weights, initial, final,
+    return recur_and_finish<S, true>(token_count, mode, rows, z, weights, initial, final,
                                   observable, output, stream);
 }
 
+template <typename S>
 cudaError_t convolve_and_advance(int token_count, TextGdnMode mode, GdnInputs rows,
                                   const __nv_bfloat16* z, TextGdnWeights weights,
                                   TextGdnState initial, TextGdnState final,
@@ -728,8 +379,8 @@ cudaError_t convolve_and_advance(int token_count, TextGdnMode mode, GdnInputs ro
         !initial.history || !initial.recurrent || !observable || !output) {
         return cudaErrorInvalidValue;
     }
-    return enqueue_gdn(token_count, mode, rows, z, weights, initial, final, observable, output,
-                        stream);
+    return enqueue_gdn<S>(token_count, mode, rows, z, weights, initial, final, observable,
+                          output, stream);
 }
 
 bool valid_replay(int count, TextGdnReplayRows rows, TextGdnWeights weights,
@@ -739,34 +390,37 @@ bool valid_replay(int count, TextGdnReplayRows rows, TextGdnWeights weights,
            initial.recurrent && result.history && result.recurrent &&
            result.history != initial.history && result.recurrent != initial.recurrent;
 }
-
+template <typename S>
+std::size_t workspace_bytes(int rows) {
+    return rows > 0 && rows <= text_attention_max_tokens
+               ? sizeof(__nv_bfloat16) * static_cast<std::size_t>(rows) *
+                     (S::qkv_width + S::value_width)
+               : 0;
 }
 
-cudaError_t decoder::tensor_core_prefill_gdn(
-    int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
-    const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
-    __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream,
-    void* chunk_scratch, std::size_t chunk_bytes) {
-    return prefill_gdn(rows, qkv, z, b, a, weights, state, workspace, gates, output, stream,
-                       chunk_scratch, chunk_bytes);
-}
-
-cudaError_t decoder::tensor_core_prefill_gdn(
-    int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
-    const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
-    __nv_bfloat16* workspace, float2* gates, TextFp8Activation output, cudaStream_t stream,
-    void* chunk_scratch, std::size_t chunk_bytes) {
-    if (text_gdn_workspace_bytes(rows) == 0 || !output.values || !output.scales) {
+template <typename S>
+cudaError_t forward_gdn(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
+                        const __nv_bfloat16* z, const __nv_bfloat16* b, const __nv_bfloat16* a,
+                        TextGdnWeights weights, TextGdnState state, __nv_bfloat16* workspace,
+                        std::size_t bytes, __nv_bfloat16* output, cudaStream_t stream) {
+    if (token_count == 0) {
+        return cudaSuccess;
+    }
+    const auto required_bytes = workspace_bytes<S>(token_count);
+    if (!workspace || required_bytes == 0 || bytes < required_bytes) {
         return cudaErrorInvalidValue;
     }
-    return prefill_gdn(rows, qkv, z, b, a, weights, state, workspace, gates, output, stream,
-                       chunk_scratch, chunk_bytes);
+    auto* observable = workspace + static_cast<std::size_t>(token_count) * S::qkv_width;
+    const GdnInputs rows{qkv, workspace, b, a};
+    return convolve_and_advance<S>(token_count, mode, rows, z, weights, state, state, observable,
+                                   output, stream);
 }
 
-std::optional<cudaError_t> decoder::tensor_core_prefill_gdn_group(
-    const GdnPrefillSegment* input, int count, TextGdnWeights weights, cudaStream_t stream) {
-    if (!input || count < 2 || count > max_gdn_prefill_segments || !weights.convolution ||
-        !weights.a_log || !weights.dt_bias || !weights.norm) {
+template <typename S>
+std::optional<cudaError_t> prefill_gdn_group(const decoder::GdnPrefillSegment* input, int count,
+                                             TextGdnWeights weights, cudaStream_t stream) {
+    if (!input || count < 2 || count > decoder::max_gdn_prefill_segments ||
+        !weights.convolution || !weights.a_log || !weights.dt_bias || !weights.norm) {
         return cudaErrorInvalidValue;
     }
     GdnPrefillSegments segments{};
@@ -775,12 +429,12 @@ std::optional<cudaError_t> decoder::tensor_core_prefill_gdn_group(
     for (int index = 0; index < count; ++index) {
         const auto& segment = input[index];
         const auto rows = segment.rows;
-        if (text_gdn_workspace_bytes(rows) == 0 || rows % prefill_rows_per_block ||
-            !segment.qkv || !segment.z || !segment.b || !segment.a || !segment.workspace ||
+        if (workspace_bytes<S>(rows) == 0 || rows % prefill_rows_per_block || !segment.qkv ||
+            !segment.z || !segment.b || !segment.a || !segment.workspace ||
             reinterpret_cast<std::uintptr_t>(segment.workspace) % alignof(uint4) ||
             !segment.gates || !segment.state.history || !segment.state.recurrent ||
             !segment.output.values || !segment.output.scales ||
-            !gdn_chunk::eligible(rows, segment.chunk_scratch, segment.chunk_bytes)) {
+            !gdn_chunk::eligible<S>(rows, segment.chunk_scratch, segment.chunk_bytes)) {
             return cudaErrorInvalidValue;
         }
         if (rows > max_rows) {
@@ -790,12 +444,12 @@ std::optional<cudaError_t> decoder::tensor_core_prefill_gdn_group(
         chunk.values[index] = {
             rows, segment.workspace, segment.gates,
             static_cast<gdn_chunk::Matrices*>(segment.chunk_scratch), segment.state.recurrent,
-            segment.workspace + static_cast<std::size_t>(rows) * text_gdn_qkv_width,
+            segment.workspace + static_cast<std::size_t>(rows) * S::qkv_width,
         };
     }
 
     bool supported = true;
-    auto status = gdn_chunk::configure(supported, true);
+    auto status = gdn_chunk::configure<S>(supported, true);
     if (status != cudaSuccess) {
         return status;
     }
@@ -803,38 +457,94 @@ std::optional<cudaError_t> decoder::tensor_core_prefill_gdn_group(
         return std::nullopt;
     }
     void* prepare_args[] = {&segments, &weights};
-    const int prepare_blocks = max_rows / prefill_rows_per_block * (conv_blocks_per_token + 1);
-    status = cudaLaunchKernel(gdn_prepare_segments, dim3(prepare_blocks, 1, count),
+    const int prepare_blocks =
+        max_rows / prefill_rows_per_block * (S::qkv_width / conv_threads + 1);
+    status = cudaLaunchKernel(gdn_prepare_segments<S>, dim3(prepare_blocks, 1, count),
                               dim3(conv_threads), prepare_args, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }
-    status = gdn_chunk::launch_segments(chunk, count, max_rows, stream);
+    status = gdn_chunk::launch_segments<S>(chunk, count, max_rows, stream);
     if (status != cudaSuccess) {
         return status;
     }
     void* finish_args[] = {&segments, &weights.norm};
-    return cudaLaunchKernel(gdn_finish_segments, dim3(quantized_finish_blocks(max_rows), 1, count),
+    return cudaLaunchKernel(gdn_finish_segments<S>,
+                            dim3(quantized_finish_blocks<S>(max_rows), 1, count),
                             dim3(finish_threads), finish_args, 0, stream);
+}
+
+}
+
+cudaError_t decoder::tensor_core_prefill_gdn(
+    int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
+    const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
+    __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream,
+    void* chunk_scratch, std::size_t chunk_bytes) {
+    return prefill_gdn<GdnFull>(rows, qkv, z, b, a, weights, state, workspace, gates, output,
+                                stream, chunk_scratch, chunk_bytes);
+}
+
+cudaError_t decoder::tensor_core_prefill_gdn_local(
+    int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
+    const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
+    __nv_bfloat16* workspace, float2* gates, __nv_bfloat16* output, cudaStream_t stream,
+    void* chunk_scratch, std::size_t chunk_bytes) {
+    return prefill_gdn<GdnLocal>(rows, qkv, z, b, a, weights, state, workspace, gates, output,
+                                 stream, chunk_scratch, chunk_bytes);
+}
+
+cudaError_t decoder::tensor_core_prefill_gdn(
+    int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
+    const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
+    __nv_bfloat16* workspace, float2* gates, TextFp8Activation output, cudaStream_t stream,
+    void* chunk_scratch, std::size_t chunk_bytes) {
+    if (workspace_bytes<GdnFull>(rows) == 0 || !output.values || !output.scales) {
+        return cudaErrorInvalidValue;
+    }
+    return prefill_gdn<GdnFull>(rows, qkv, z, b, a, weights, state, workspace, gates, output,
+                                stream, chunk_scratch, chunk_bytes);
+}
+
+cudaError_t decoder::tensor_core_prefill_gdn_local(
+    int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z, const __nv_bfloat16* b,
+    const __nv_bfloat16* a, TextGdnWeights weights, TextGdnState state,
+    __nv_bfloat16* workspace, float2* gates, TextFp8Activation output, cudaStream_t stream,
+    void* chunk_scratch, std::size_t chunk_bytes) {
+    if (workspace_bytes<GdnLocal>(rows) == 0 || !output.values || !output.scales) {
+        return cudaErrorInvalidValue;
+    }
+    return prefill_gdn<GdnLocal>(rows, qkv, z, b, a, weights, state, workspace, gates, output,
+                                 stream, chunk_scratch, chunk_bytes);
+}
+
+std::optional<cudaError_t> decoder::tensor_core_prefill_gdn_group(
+    const GdnPrefillSegment* input, int count, TextGdnWeights weights, cudaStream_t stream) {
+    return prefill_gdn_group<GdnFull>(input, count, weights, stream);
+}
+
+std::optional<cudaError_t> decoder::tensor_core_prefill_gdn_group_local(
+    const GdnPrefillSegment* input, int count, TextGdnWeights weights, cudaStream_t stream) {
+    return prefill_gdn_group<GdnLocal>(input, count, weights, stream);
 }
 
 cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
                              const __nv_bfloat16* z, const __nv_bfloat16* b,
                              const __nv_bfloat16* a, TextGdnWeights weights,
                              TextGdnState state, __nv_bfloat16* workspace,
-                             std::size_t workspace_bytes, __nv_bfloat16* output,
-                             cudaStream_t stream) {
-    if (token_count == 0) {
-        return cudaSuccess;
-    }
-    const auto required_bytes = text_gdn_workspace_bytes(token_count);
-    if (!workspace || required_bytes == 0 || workspace_bytes < required_bytes) {
-        return cudaErrorInvalidValue;
-    }
-    auto* observable = workspace + static_cast<std::size_t>(token_count) * text_gdn_qkv_width;
-    const GdnInputs rows{qkv, workspace, b, a};
-    return convolve_and_advance(token_count, mode, rows, z, weights, state, state, observable,
-                                output, stream);
+                             std::size_t bytes, __nv_bfloat16* output, cudaStream_t stream) {
+    return forward_gdn<GdnFull>(token_count, mode, qkv, z, b, a, weights, state, workspace,
+                                bytes, output, stream);
+}
+
+cudaError_t text_gdn_forward_local(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
+                                   const __nv_bfloat16* z, const __nv_bfloat16* b,
+                                   const __nv_bfloat16* a, TextGdnWeights weights,
+                                   TextGdnState state, __nv_bfloat16* workspace,
+                                   std::size_t bytes, __nv_bfloat16* output,
+                                   cudaStream_t stream) {
+    return forward_gdn<GdnLocal>(token_count, mode, qkv, z, b, a, weights, state, workspace,
+                                 bytes, output, stream);
 }
 
 cudaError_t text_gdn_verify_tail(int token_count, TextGdnReplayRows rows,
@@ -845,9 +555,22 @@ cudaError_t text_gdn_verify_tail(int token_count, TextGdnReplayRows rows,
     if (!valid_replay(token_count, rows, weights, initial, tail)) {
         return cudaErrorInvalidValue;
     }
-    return convolve_and_advance(token_count, TextGdnMode::decode,
-                                {rows.qkv, rows.convolved, rows.b, rows.a}, z, weights,
-                                initial, tail, observable, output, stream);
+    return convolve_and_advance<GdnFull>(token_count, TextGdnMode::decode,
+                                         {rows.qkv, rows.convolved, rows.b, rows.a}, z, weights,
+                                         initial, tail, observable, output, stream);
+}
+
+cudaError_t text_gdn_verify_tail_local(int token_count, TextGdnReplayRows rows,
+                                       const __nv_bfloat16* z, TextGdnWeights weights,
+                                       TextGdnState initial, TextGdnState tail,
+                                       __nv_bfloat16* observable, __nv_bfloat16* output,
+                                       cudaStream_t stream) {
+    if (!valid_replay(token_count, rows, weights, initial, tail)) {
+        return cudaErrorInvalidValue;
+    }
+    return convolve_and_advance<GdnLocal>(token_count, TextGdnMode::decode,
+                                          {rows.qkv, rows.convolved, rows.b, rows.a}, z,
+                                          weights, initial, tail, observable, output, stream);
 }
 
 cudaError_t text_gdn_replay_prefix(int token_count, TextGdnReplayRows rows, TextGdnWeights weights,
@@ -855,9 +578,21 @@ cudaError_t text_gdn_replay_prefix(int token_count, TextGdnReplayRows rows, Text
     if (!valid_replay(token_count, rows, weights, initial, result)) {
         return cudaErrorInvalidValue;
     }
-    return recur_and_finish<false>(token_count, TextGdnMode::decode,
-                                   {rows.qkv, rows.convolved, rows.b, rows.a}, nullptr,
-                                   weights, initial, result, nullptr, nullptr, stream);
+    return recur_and_finish<GdnFull, false>(token_count, TextGdnMode::decode,
+                                            {rows.qkv, rows.convolved, rows.b, rows.a}, nullptr,
+                                            weights, initial, result, nullptr, nullptr, stream);
+}
+
+cudaError_t text_gdn_replay_prefix_local(int token_count, TextGdnReplayRows rows,
+                                         TextGdnWeights weights, TextGdnState initial,
+                                         TextGdnState result, cudaStream_t stream) {
+    if (!valid_replay(token_count, rows, weights, initial, result)) {
+        return cudaErrorInvalidValue;
+    }
+    return recur_and_finish<GdnLocal, false>(token_count, TextGdnMode::decode,
+                                             {rows.qkv, rows.convolved, rows.b, rows.a},
+                                             nullptr, weights, initial, result, nullptr,
+                                             nullptr, stream);
 }
 
 cudaError_t decoder::decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
@@ -865,8 +600,19 @@ cudaError_t decoder::decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z
                                  TextGdnWeights weights, const TextGdnState* state,
                                  __nv_bfloat16* workspace, __nv_bfloat16* output,
                                  cudaStream_t stream) {
-    return enqueue_gdn(1, TextGdnMode::decode, {qkv, workspace, b, a}, z, weights, state, state,
-                        workspace + text_gdn_qkv_width, output, stream);
+    return enqueue_gdn<GdnFull, const TextGdnState*>(
+        1, TextGdnMode::decode, {qkv, workspace, b, a}, z, weights, state, state,
+        workspace + GdnFull::qkv_width, output, stream);
+}
+
+cudaError_t decoder::decode_gdn_local(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
+                                      const __nv_bfloat16* b, const __nv_bfloat16* a,
+                                      TextGdnWeights weights, const TextGdnState* state,
+                                      __nv_bfloat16* workspace, __nv_bfloat16* output,
+                                      cudaStream_t stream) {
+    return enqueue_gdn<GdnLocal, const TextGdnState*>(
+        1, TextGdnMode::decode, {qkv, workspace, b, a}, z, weights, state, state,
+        workspace + GdnLocal::qkv_width, output, stream);
 }
 
 cudaError_t decoder::decode_verify_gdn(int rows, TextGdnReplayRows inputs,
@@ -875,8 +621,25 @@ cudaError_t decoder::decode_verify_gdn(int rows, TextGdnReplayRows inputs,
                                       __nv_bfloat16* observable, __nv_bfloat16* output,
                                       cudaStream_t stream) {
     const GdnInputs replay{inputs.qkv, inputs.convolved, inputs.b, inputs.a};
-    return enqueue_gdn(rows, TextGdnMode::decode, replay, z, weights, initial, tail, observable,
-                        output, stream);
+    return enqueue_gdn<GdnFull, const TextGdnState*>(rows, TextGdnMode::decode, replay, z,
+                                                      weights, initial, tail, observable, output,
+                                                      stream);
+}
+
+cudaError_t decoder::decode_verify_gdn_local(int rows, TextGdnReplayRows inputs,
+                                            const __nv_bfloat16* z, TextGdnWeights weights,
+                                            const TextGdnState* initial,
+                                            const TextGdnState* tail,
+                                            __nv_bfloat16* observable, __nv_bfloat16* output,
+                                            cudaStream_t stream) {
+    const GdnInputs replay{inputs.qkv, inputs.convolved, inputs.b, inputs.a};
+    return enqueue_gdn<GdnLocal, const TextGdnState*>(rows, TextGdnMode::decode, replay, z,
+                                                       weights, initial, tail, observable,
+                                                       output, stream);
+}
+
+std::size_t text_gdn_local_chunk_scratch_bytes(int rows) {
+    return gdn_chunk::scratch_bytes<GdnLocal>(rows);
 }
 
 }

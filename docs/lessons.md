@@ -42,7 +42,7 @@ The [current HTTP reader](http-server.md#http-admission-and-shutdown) advances m
 
 **Correction verified in Candidate B.** Candidate A divided Q by its largest channel and narrowed to FP16. With Q channels `1` and `2^-40`, and K nonzero only in the second channel at `±448 × 2^33`, the scaled scores are `±0.21875`. The split returned zero instead of the FP64 result `tanh(0.21875) = 0.215326`. Ordered BF16 returned `0.214844`. The well-conditioned `2^-16` control used K at `±448 × 2^9` and returned `0.215820` in the split. PV had a second loss when narrowing probability times relative V scale to FP16.
 
-The repair preserves Q in BF16, expands unscaled E4M3 K and V exactly to BF16, and rounds the weighted V operands to BF16. It uses FP32 accumulation and sends a flagged head to FP64 replay when range checks fire. The corrected split returns `0.215820` for both Q controls. Run from the repository root in the managed environment on a reserved B200. [Query load](../src/text/gqa_decode_split.cu#L178)<!-- prefix: "__device__ v" --> · [Regression cases](../tests/decoder/gqa_split_fp64_check.cpp#L181)<!-- prefix: "int main() t" -->
+The repair preserves Q in BF16, expands unscaled E4M3 K and V exactly to BF16, and rounds the weighted V operands to BF16. It uses FP32 accumulation and sends a flagged head to FP64 replay when range checks fire. The corrected split returns `0.215820` for both Q controls. Run from the repository root in the managed environment on a reserved B200. [Query load](../src/text/gqa_decode_split.cu#L179)<!-- prefix: "__device__ v" --> · [Regression cases](../tests/decoder/gqa_split_fp64_check.cpp#L181)<!-- prefix: "int main() t" -->
 
 ```bash
 out="$PWD/build/long-decode"
@@ -147,7 +147,7 @@ In the unpublished long-target composition, `exact_scores_kernel` gained a
 sixth parameter, `split_end`. The chunked draft path still packed five arguments
 and crashed after one token per lane. The selected repair derives the host
 argument pack from the kernel function pointer and passes `0` explicitly for
-the chunked draft path. [Typed launcher](../include/sglang/text/gqa_decode_split.cuh#L18)<!-- prefix: "cudaError_t " --> · [Draft call](../include/sglang/text/mtp/gqa_long.cuh#L162)<!-- prefix: "auto status " -->
+the chunked draft path. [Typed launcher](../include/sglang/text/gqa_decode_split.cuh#L18)<!-- prefix: "cudaError_t " --> · [Draft call](../include/sglang/text/mtp/gqa_long.cuh#L163)<!-- prefix: "auto status " -->
 
 Keep the launch typed when changing a migrated kernel signature. In the selected
 `8e4f210b` verification, removing the sixth argument failed NVCC compilation

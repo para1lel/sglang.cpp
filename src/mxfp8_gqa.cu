@@ -26,14 +26,15 @@ __device__ std::size_t row_offset(std::size_t token, int heads, int head) {
     return (token * heads + head) * mxfp8_head_dim;
 }
 
-__device__ std::size_t payload_offset(int physical_page, int token, int head) {
-    return static_cast<std::size_t>(physical_page) * mxfp8_payload_bytes_per_page
-         + row_offset(token, mxfp8_kv_heads, head);
+__device__ std::size_t payload_offset(int kv_heads, int physical_page, int token, int head) {
+    return static_cast<std::size_t>(physical_page) * gqa_payload_bytes_per_page(kv_heads)
+         + row_offset(token, kv_heads, head);
 }
 
-__device__ std::size_t scale_offset(int physical_page, int token, int head, int group) {
+__device__ std::size_t scale_offset(int kv_heads, int physical_page, int token, int head,
+                                    int group) {
     constexpr int token_groups = mxfp8_page_size / mxfp8_group_size;
-    const auto page_head = static_cast<std::size_t>(physical_page) * mxfp8_kv_heads + head;
+    const auto page_head = static_cast<std::size_t>(physical_page) * kv_heads + head;
     const auto token_lane = page_head * mxfp8_group_size + token % mxfp8_group_size;
     return (token_lane * token_groups + token / mxfp8_group_size) * mxfp8_groups + group;
 }
@@ -73,9 +74,12 @@ __device__ __forceinline__ void append_head(
     const int token = position % mxfp8_page_size;
     const int physical_page = pages[position / mxfp8_page_size];
     const int head = blockIdx.y;
+    if (head >= cache.kv_heads) {
+        return;
+    }
     const int channel = threadIdx.x;
-    const auto input = row_offset(input_row, mxfp8_kv_heads, head) + channel;
-    const auto payload = payload_offset(physical_page, token, head) + channel;
+    const auto input = row_offset(input_row, cache.kv_heads, head) + channel;
+    const auto payload = payload_offset(cache.kv_heads, physical_page, token, head) + channel;
     const float key = __bfloat162float(keys[input]);
     const float value = __bfloat162float(values[input]);
     const int key_exponent = scale_exponent(key);
@@ -83,7 +87,8 @@ __device__ __forceinline__ void append_head(
     cache.key_payload[payload] = encode(key, key_exponent);
     cache.value_payload[payload] = encode(value, value_exponent);
     if (channel % mxfp8_group_size == 0) {
-        const auto scale = scale_offset(physical_page, token, head, channel / mxfp8_group_size);
+        const auto scale =
+            scale_offset(cache.kv_heads, physical_page, token, head, channel / mxfp8_group_size);
         cache.key_scales[scale] = static_cast<std::uint8_t>(key_exponent);
         cache.value_scales[scale] = static_cast<std::uint8_t>(value_exponent);
     }
@@ -117,7 +122,8 @@ __global__ void tiny_attention_kernel(Mxfp8KvCache cache, const std::int32_t* pa
     const int kv_head = query_head / queries_per_kv_head;
     const int channel = threadIdx.x;
     const int group = channel / mxfp8_group_size;
-    const auto row = row_offset(blockIdx.x, mxfp8_query_heads, query_head) + channel;
+    const int query_heads = gqa_query_heads(cache.kv_heads);
+    const auto row = row_offset(blockIdx.x, query_heads, query_head) + channel;
     const int last_position = first_query_position + static_cast<int>(blockIdx.x);
     const float query = __bfloat162float(queries[row]);
     float max_score = -CUDART_INF_F;
@@ -127,8 +133,9 @@ __global__ void tiny_attention_kernel(Mxfp8KvCache cache, const std::int32_t* pa
     for (int position = 0; position <= last_position; ++position) {
         const int physical_page = pages[position / mxfp8_page_size];
         const int token = position % mxfp8_page_size;
-        const auto payload = payload_offset(physical_page, token, kv_head) + channel;
-        const auto scale = scale_offset(physical_page, token, kv_head, group);
+        const auto payload =
+            payload_offset(cache.kv_heads, physical_page, token, kv_head) + channel;
+        const auto scale = scale_offset(cache.kv_heads, physical_page, token, kv_head, group);
         const float key = decode(cache.key_payload[payload], cache.key_scales[scale]);
         const float product = warp_sum(query * key);
         if (channel % mxfp8_group_size == 0) {
@@ -190,8 +197,9 @@ constexpr int narrow_min_tokens = 1536;
 constexpr int narrow_max_tokens = 2560;
 constexpr int partial_stride = mxfp8_head_dim + 2;
 constexpr int max_partitions = narrow_max_tokens / mxfp8_page_size;
-constexpr std::size_t narrow_workspace_bytes =
-    mxfp8_query_heads * max_partitions * partial_stride * sizeof(float);
+constexpr std::size_t narrow_workspace_bytes(int query_heads) {
+    return static_cast<std::size_t>(query_heads) * max_partitions * partial_stride * sizeof(float);
+}
 static_assert(max_partitions <= mxfp8_group_size);
 static_assert(score_warps * mxfp8_group_size == mxfp8_head_dim);
 static_assert(replay_channels >= mxfp8_group_size);
@@ -207,19 +215,19 @@ __device__ float warp_max(float value) {
     return value;
 }
 
-__device__ void load_query(const __nv_bfloat16* queries, int head, int lane,
+__device__ void load_query(int query_heads, const __nv_bfloat16* queries, int head, int lane,
                            float (&query)[mxfp8_groups]) {
     #pragma unroll
     for (int group = 0; group < mxfp8_groups; ++group) {
         const int channel = group * mxfp8_group_size + lane;
-        query[group] = __bfloat162float(queries[row_offset(0, mxfp8_query_heads, head) + channel]);
+        query[group] = __bfloat162float(queries[row_offset(0, query_heads, head) + channel]);
     }
 }
 
 __device__ float attention_score(Mxfp8KvCache cache, int physical_page, int token, int kv_head,
                                  int lane, const float (&query)[mxfp8_groups]) {
-    const auto payload = payload_offset(physical_page, token, kv_head) + lane;
-    const auto scale = scale_offset(physical_page, token, kv_head, 0);
+    const auto payload = payload_offset(cache.kv_heads, physical_page, token, kv_head) + lane;
+    const auto scale = scale_offset(cache.kv_heads, physical_page, token, kv_head, 0);
     float dot = 0.0f;
     #pragma unroll
     for (int group = 0; group < mxfp8_groups; ++group) {
@@ -245,6 +253,9 @@ __device__ void partition_attention(Mxfp8KvCache cache, const std::int32_t* page
         return;
     }
     const int head = blockIdx.y;
+    if (head >= gqa_query_heads(cache.kv_heads)) {
+        return;
+    }
     const int kv_head = head / queries_per_kv_head;
     const int thread = threadIdx.x;
     const int warp = thread / mxfp8_group_size;
@@ -253,7 +264,7 @@ __device__ void partition_attention(Mxfp8KvCache cache, const std::int32_t* page
     const int page = pages[partition];
     auto* partial = workspace + (head * partitions + partition) * partial_stride;
     float query[mxfp8_groups];
-    load_query(queries, head, lane, query);
+    load_query(gqa_query_heads(cache.kv_heads), queries, head, lane, query);
     for (int token = warp; token < count; token += score_warps) {
         const float score = attention_score(cache, page, token, kv_head, lane, query);
         if (lane == 0) {
@@ -299,8 +310,9 @@ __device__ void partition_attention(Mxfp8KvCache cache, const std::int32_t* page
     float even = 0.0f;
     float odd = 0.0f;
     for (int token = first; token < min(count, first + half_page); ++token) {
-        const auto payload = payload_offset(page, token, kv_head) + channel;
-        const auto scale = scale_offset(page, token, kv_head, channel / mxfp8_group_size);
+        const auto payload = payload_offset(cache.kv_heads, page, token, kv_head) + channel;
+        const auto scale =
+            scale_offset(cache.kv_heads, page, token, kv_head, channel / mxfp8_group_size);
         const auto exponent = cache.value_scales[scale];
         even = fmaf(weights[token], decode_e8m0(cache.value_payload[payload], exponent), even);
         odd = fmaf(weights[token], decode_e8m0(cache.value_payload[payload + 1], exponent), odd);
@@ -316,7 +328,8 @@ __device__ void partition_attention(Mxfp8KvCache cache, const std::int32_t* page
     }
 }
 
-__device__ bool merge_attention(const float* workspace, int last, __nv_bfloat16* output) {
+__device__ bool merge_attention(const float* workspace, int last, __nv_bfloat16* output,
+                                int query_heads) {
     __shared__ float rescale[max_partitions];
     __shared__ float denominator;
     const int partitions = last / mxfp8_page_size + 1;
@@ -351,7 +364,7 @@ __device__ bool merge_attention(const float* workspace, int last, __nv_bfloat16*
     }
     if (thread < replay_channels) {
         const int channel = blockIdx.y * replay_channels + thread;
-        output[row_offset(0, mxfp8_query_heads, head) + channel] =
+        output[row_offset(0, query_heads, head) + channel] =
             __float2bfloat16_rn(numerator / denominator);
     }
     return true;
@@ -363,13 +376,16 @@ __device__ void exact_scores(Mxfp8KvCache cache, const std::int32_t* pages, int 
     const int warp = threadIdx.x / mxfp8_group_size;
     const int lane = threadIdx.x % mxfp8_group_size;
     const int query_head = blockIdx.y;
+    if (query_head >= gqa_query_heads(cache.kv_heads)) {
+        return;
+    }
     const int kv_head = query_head / queries_per_kv_head;
     const int first = blockIdx.x * score_warps + warp;
     if (first > last) {
         return;
     }
     float query[mxfp8_groups];
-    load_query(queries, query_head, lane, query);
+    load_query(gqa_query_heads(cache.kv_heads), queries, query_head, lane, query);
     auto* scores = workspace.scores + query_head * workspace.capacity;
     const int stride = gridDim.x * score_warps;
     for (int index = first; index <= last; index += stride) {
@@ -405,115 +421,22 @@ __global__ void exact_scores_kernel(
     exact_scores(cache, pages, last, queries, workspace);
 }
 
-template <bool RecomputeScores>
-__device__ __noinline__ void ordered_replay(
-    Mxfp8KvCache cache, const std::int32_t* pages, int last, const float* scores,
-    const __nv_bfloat16* queries, __nv_bfloat16* output) {
-    __shared__ float history_weight[replay_tile];
-    __shared__ float token_weight[replay_tile];
-    __shared__ float denominator;
-    __shared__ float values[replay_tile][replay_channels];
-    __shared__ float tile_scores[RecomputeScores ? replay_tile : 1];
-
-    const int query_head = blockIdx.x;
-    const int kv_head = query_head / queries_per_kv_head;
-    const int thread = threadIdx.x;
-    const int column = thread % replay_channels;
-    const int channel = blockIdx.y * replay_channels + column;
-    const int group = channel / mxfp8_group_size;
-    const int warp = thread / mxfp8_group_size;
-    const int lane = thread % mxfp8_group_size;
-    float query[mxfp8_groups];
-    if constexpr (RecomputeScores) {
-        load_query(queries, query_head, lane, query);
-    }
-    float maximum = -CUDART_INF_F;
-    float weight_sum = 0.0f;
-    float weighted_value = 0.0f;
-    constexpr int tokens_per_load = replay_threads / replay_channels;
-    constexpr int payload_stride = mxfp8_kv_heads * mxfp8_head_dim;
-    constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
-
-    for (int first = 0; first <= last; first += replay_tile) {
-        const int count = min(replay_tile, last - first + 1);
-        const int physical_page = pages[first / mxfp8_page_size];
-        const int token = first % mxfp8_page_size;
-        const auto payload = payload_offset(physical_page, token, kv_head) + channel;
-        const auto scale = scale_offset(physical_page, token, kv_head, group);
-        if constexpr (RecomputeScores) {
-            for (int index = warp; index < count; index += score_warps) {
-                const float score =
-                    attention_score(cache, physical_page, token + index, kv_head, lane, query);
-                if (lane == 0) {
-                    tile_scores[index] = score;
-                }
-            }
-            __syncthreads();
-        }
-        #pragma unroll
-        for (int index = thread / replay_channels; index < replay_tile; index += tokens_per_load) {
-            if (index < count) {
-                values[index][column] = decode_e8m0(
-                    cache.value_payload[payload + index * payload_stride],
-                    cache.value_scales[scale + index * scale_stride]);
-            }
-        }
-        if (thread < mxfp8_group_size) {
-            float score = -CUDART_INF_F;
-            if (thread < count) {
-                if constexpr (RecomputeScores) {
-                    score = tile_scores[thread];
-                } else {
-                    score = scores[first + thread];
-                }
-            }
-            float prefix = fmaxf(maximum, score);
-            #pragma unroll
-            for (int offset = 1; offset < replay_tile; offset *= 2) {
-                const float earlier = __shfl_up_sync(warp_mask, prefix, offset);
-                if (thread >= offset) {
-                    prefix = fmaxf(earlier, prefix);
-                }
-            }
-            const float previous = __shfl_up_sync(warp_mask, prefix, 1);
-            if (thread < count) {
-                history_weight[thread] = expf((thread == 0 ? maximum : previous) - prefix);
-                token_weight[thread] = expf(score - prefix);
-            }
-            maximum = __shfl_sync(warp_mask, prefix, replay_tile - 1);
-        }
-        __syncthreads();
-
-        if (thread < replay_channels) {
-            #pragma unroll 4
-            for (int index = 0; index < count; ++index) {
-                weighted_value = fmaf(token_weight[index], values[index][column],
-                                      history_weight[index] * weighted_value);
-            }
-        }
-        if (thread == 0) {
-            for (int index = 0; index < count; ++index) {
-                weight_sum = fmaf(history_weight[index], weight_sum, token_weight[index]);
-            }
-            denominator = weight_sum;
-        }
-        __syncthreads();
-    }
-    if (thread < replay_channels) {
-        output[row_offset(0, mxfp8_query_heads, query_head) + channel] =
-            __float2bfloat16_rn(weighted_value / denominator);
-    }
-}
+#include "sglang/text/gqa/ordered_gqa_vector.cuh"
 
 template <bool Narrow, typename Position, typename Cache, typename Pages, typename Scores>
 __global__ void exact_replay_kernel(
     Cache cache_binding, Pages page_binding, Position position,
     Scores score_binding, const __nv_bfloat16* queries, __nv_bfloat16* output) {
     const int last = decoder::position_value(position);
+    if (static_cast<int>(blockIdx.x) >=
+        gqa_query_heads(cache_value(cache_binding).kv_heads)) {
+        return;
+    }
     const auto workspace = score_workspace(score_binding);
     if constexpr (Narrow) {
         if (narrow_position(last)) {
-            if (!merge_attention(workspace.scores, last, output)) {
+            if (!merge_attention(workspace.scores, last, output,
+                                 gqa_query_heads(cache_value(cache_binding).kv_heads))) {
                 ordered_replay<true>(cache_value(cache_binding), page_values(page_binding), last,
                                      nullptr, queries, output);
             }
@@ -526,7 +449,6 @@ __global__ void exact_replay_kernel(
 }
 
 #include "sglang/text/gqa_prefill_replay.cuh"
-#include "sglang/text/ordered_gqa_vector.cuh"
 
 constexpr int decode_splits = decoder::paged_decode_partitions;
 constexpr int split_tokens = decoder::paged_decode_max_visible / decode_splits;
@@ -569,6 +491,7 @@ __global__ void split_decode_attention(PagedDecodeBatch<Lane> batch) {
     __shared__ float values[split_warps][mxfp8_head_dim];
     __shared__ float maximum;
     const int head = blockIdx.y;
+    if (head >= gqa_query_heads(input.cache.kv_heads)) return;
     const int thread = threadIdx.x;
     const int warp = thread / mxfp8_group_size;
     const int lane = thread % mxfp8_group_size;
@@ -580,7 +503,7 @@ __global__ void split_decode_attention(PagedDecodeBatch<Lane> batch) {
     const int count = end - first;
     auto& partial = decode_partials(input.buffers, head)[blockIdx.x];
     float query[mxfp8_groups];
-    load_query(input.buffers.queries, head, lane, query);
+    load_query(gqa_query_heads(input.cache.kv_heads), input.buffers.queries, head, lane, query);
     float local_max = -CUDART_INF_F;
     bool invalid = false;
     for (int index = warp; index < count; index += split_warps) {
@@ -616,8 +539,8 @@ __global__ void split_decode_attention(PagedDecodeBatch<Lane> batch) {
         const int token = first + index;
         const int slot = token % mxfp8_page_size;
         const int page = input.pages.device_pages[token / mxfp8_page_size];
-        const auto data = payload_offset(page, slot, kv_head) + lane;
-        const auto scale = scale_offset(page, slot, kv_head, 0);
+        const auto data = payload_offset(input.cache.kv_heads, page, slot, kv_head) + lane;
+        const auto scale = scale_offset(input.cache.kv_heads, page, slot, kv_head, 0);
         const float weight = expf(weights[index] - maximum);
         mass += weight;
         #pragma unroll
@@ -666,6 +589,9 @@ __global__ void merge_decode_attention(PagedDecodeBatch<Lane> batch) {
     __shared__ float weights[decode_splits];
     __shared__ float mass;
     const int head = blockIdx.x;
+    if (head >= gqa_query_heads(input.cache.kv_heads)) {
+        return;
+    }
     const int channel = threadIdx.x;
     auto* partials = decode_partials(input.buffers, head);
     const float maximum = channel < decode_splits ? partials[channel].maximum : -CUDART_INF_F;
@@ -717,7 +643,7 @@ __device__ __noinline__ void wide_decode_head(decoder::PagedDecodeLane input, in
     const int lane = thread % tile;
     const int kv_head = head / queries_per_kv_head;
     float query[mxfp8_groups];
-    load_query(input.buffers.queries, head, lane, query);
+    load_query(gqa_query_heads(input.cache.kv_heads), input.buffers.queries, head, lane, query);
     double maximum = -CUDART_INF;
     double value = 0.0;
     double denominator = 0.0;
@@ -727,8 +653,9 @@ __device__ __noinline__ void wide_decode_head(decoder::PagedDecodeLane input, in
         const int slot = first % mxfp8_page_size;
         for (int index = warp; index < count; index += split_warps) {
             double dot = 0.0;
-            const auto data = payload_offset(page, slot + index, kv_head) + lane;
-            const auto scale = scale_offset(page, slot + index, kv_head, 0);
+            const auto data =
+                payload_offset(input.cache.kv_heads, page, slot + index, kv_head) + lane;
+            const auto scale = scale_offset(input.cache.kv_heads, page, slot + index, kv_head, 0);
             #pragma unroll
             for (int group = 0; group < mxfp8_groups; ++group) {
                 const auto exponent = input.cache.key_scales[scale + group];
@@ -760,8 +687,10 @@ __device__ __noinline__ void wide_decode_head(decoder::PagedDecodeLane input, in
         __syncthreads();
         value *= history;
         for (int index = 0; index < count; ++index) {
-            const auto data = payload_offset(page, slot + index, kv_head) + thread;
-            const auto scale = scale_offset(page, slot + index, kv_head, warp);
+            const auto data =
+                payload_offset(input.cache.kv_heads, page, slot + index, kv_head) + thread;
+            const auto scale =
+                scale_offset(input.cache.kv_heads, page, slot + index, kv_head, warp);
             const float decoded =
                 decode_e8m0(input.cache.value_payload[data], input.cache.value_scales[scale]);
             value = fma(weights[index], double(decoded), value);
@@ -785,6 +714,9 @@ __global__ void replay_paged_decode(PagedDecodeBatch<Lane> batch) {
     const auto binding = batch.lanes[blockIdx.z];
     const auto input = resolve_lane(binding);
     const int head = blockIdx.x;
+    if (head >= gqa_query_heads(input.cache.kv_heads)) {
+        return;
+    }
     if (decoder::paged_decode_position(input.position)) {
         if (blockIdx.y == 0 && !isfinite(decode_partials(input.buffers, head)[0].maximum)) {
             wide_decode_head(input, head);
@@ -812,29 +744,31 @@ int score_grid_capacity(const decoder::ExactGqaWorkspace* workspace) {
 
 cudaError_t mxfp8_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, int first_position,
                            int token_count, const __nv_bfloat16* keys,
-                           const __nv_bfloat16* values, cudaStream_t stream) {
+                           const __nv_bfloat16* values, cudaStream_t stream,
+                           GqaGeometry geometry) {
     if (token_count == 0) {
         return cudaSuccess;
     }
     const auto end = static_cast<std::int64_t>(first_position) + token_count;
     if (first_position < 0 || token_count < 0 || !keys || !values
-        || !cache_covers(cache, pages, end)) {
+        || !gqa_geometry_matches(geometry, cache) || !cache_covers(cache, pages, end)) {
         return cudaErrorInvalidValue;
     }
     const auto kernel = append_kernel<int, Mxfp8KvCache, const std::int32_t*>;
-    return launch_gqa_kernel(kernel, dim3(token_count, mxfp8_kv_heads), mxfp8_head_dim, stream,
+    return launch_gqa_kernel(kernel, dim3(token_count, cache.kv_heads), mxfp8_head_dim, stream,
                              cache, pages.device_pages, first_position, keys, values);
 }
 
 cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int valid_tokens,
                                int first_query_position, int query_count,
                                const __nv_bfloat16* queries, __nv_bfloat16* output,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, GqaGeometry geometry) {
     if (query_count == 0) {
         return cudaSuccess;
     }
     const auto end = static_cast<std::int64_t>(first_query_position) + query_count;
     if (first_query_position < 0 || query_count < 0 || end > valid_tokens || !queries || !output
+        || !gqa_geometry_matches(geometry, cache)
         || !cache_covers(cache, pages, valid_tokens)) {
         return cudaErrorInvalidValue;
     }
@@ -843,7 +777,8 @@ cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int va
         return decoder::tensor_core_prefill_gqa(cache, pages, first_query_position, query_count,
                                                 queries, output, stream);
     }
-    return launch_gqa_kernel(tiny_attention_kernel, dim3(query_count, mxfp8_query_heads),
+    return launch_gqa_kernel(tiny_attention_kernel,
+                             dim3(query_count, gqa_query_heads(cache.kv_heads)),
                              mxfp8_head_dim, stream, cache, pages.device_pages,
                              first_query_position, queries, output);
 }
@@ -851,8 +786,11 @@ cudaError_t mxfp8_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int va
 cudaError_t decoder::decode_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages,
                                       const int* position, const __nv_bfloat16* keys,
                                       const __nv_bfloat16* values, cudaStream_t stream) {
+    if (!gqa_geometry_valid({gqa_query_heads(cache.kv_heads), cache.kv_heads})) {
+        return cudaErrorInvalidValue;
+    }
     const auto kernel = append_kernel<const int*, Mxfp8KvCache, const std::int32_t*>;
-    return launch_gqa_kernel(kernel, dim3(1, mxfp8_kv_heads), mxfp8_head_dim, stream,
+    return launch_gqa_kernel(kernel, dim3(1, cache.kv_heads), mxfp8_head_dim, stream,
                              cache, pages.device_pages, position, keys, values);
 }
 
@@ -872,7 +810,8 @@ cudaError_t decoder::exact_decode_gqa_attention(
     if (!cache_covers(cache, pages, workspace.capacity)) {
         return cudaErrorInvalidValue;
     }
-    if (workspace_bytes >= narrow_workspace_bytes && narrow_position(position)) {
+    if (workspace_bytes >= narrow_workspace_bytes(gqa_query_heads(cache.kv_heads))
+        && narrow_position(position)) {
         return launch_exact_attention<true>(cache, pages.device_pages, position, queries, output,
                                             workspace, stream);
     }
@@ -896,7 +835,8 @@ cudaError_t decoder::exact_decode_gqa_attention(
     if (!cache_covers(cache, pages, workspace.capacity)) {
         return cudaErrorInvalidValue;
     }
-    if (workspace_bytes >= narrow_workspace_bytes && workspace.capacity >= narrow_min_tokens) {
+    if (workspace_bytes >= narrow_workspace_bytes(gqa_query_heads(cache.kv_heads))
+        && workspace.capacity >= narrow_min_tokens) {
         return launch_exact_attention<true>(cache, pages.device_pages, position, queries, output,
                                             workspace, stream);
     }
@@ -907,6 +847,11 @@ cudaError_t decoder::exact_decode_gqa_attention(
 cudaError_t decoder::decode_kv_append(const Mxfp8KvCache* cache, const Mxfp8PageTable* pages,
                                       const int* position, const __nv_bfloat16* keys,
                                       const __nv_bfloat16* values, cudaStream_t stream) {
+    if (!cache) {
+        return cudaErrorInvalidValue;
+    }
+    // The descriptor cache lives on the device, so the geometry cannot be
+    // validated here; the kernel's per-head guard rejects surplus blocks.
     const auto kernel = append_kernel<const int*, const Mxfp8KvCache*, const Mxfp8PageTable*>;
     return launch_gqa_kernel(kernel, dim3(1, mxfp8_kv_heads), mxfp8_head_dim, stream,
                              cache, pages, position, keys, values);
@@ -926,7 +871,10 @@ cudaError_t decoder::exact_decode_gqa_attention(
     if (!cache || !pages || !position) {
         return cudaErrorInvalidValue;
     }
-    return workspace_bytes >= narrow_workspace_bytes
+    // The descriptor cache lives on the device; require the full-geometry
+    // narrow workspace rather than reading its head count. A rank-local
+    // workspace simply skips the narrow path and uses the ordered replay.
+    return workspace_bytes >= narrow_workspace_bytes(mxfp8_query_heads)
         ? launch_exact_attention<true>(cache, pages, position, queries, output, workspace, stream)
         : launch_exact_attention(cache, pages, position, queries, output, workspace, stream);
 }

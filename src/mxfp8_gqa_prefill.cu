@@ -25,7 +25,6 @@ __global__ void protected_prefill_attention(Attention request) {
 constexpr int wide_rows = 4;
 constexpr int paired_rows = 2;
 constexpr int score_warps = channels / mxfp8_group_size;
-constexpr int payload_stride = mxfp8_kv_heads * channels;
 constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
 constexpr int score_lanes = 8;
 constexpr int groups_per_warp = mxfp8_group_size / score_lanes;
@@ -45,7 +44,7 @@ __device__ void tile_scores(OrderedTile<float, Heads>& shared, Mxfp8KvCache cach
             const int group = pass * groups_per_warp + group_in_warp;
             const int channel = group * mxfp8_group_size + lane % score_lanes;
             const auto* key = Staged ? &raw->key[token][channel] :
-                cache.key_payload + payload + token * payload_stride + channel;
+                cache.key_payload + payload + token * (cache.kv_heads * channels) + channel;
             const auto exponent = Staged ? raw->key_scale[token][group] :
                 cache.key_scales[scale + token * scale_stride + group];
             const float key0 = ordered_decode(key[0], exponent);
@@ -113,7 +112,8 @@ __device__ __forceinline__ float tile_value(Mxfp8KvCache cache, std::size_t payl
                                             std::size_t scale, int token, int channel, int warp,
                                             const PrefillPayload<keys_per_tile>* raw) {
     return Staged ? ordered_decode(raw->value[token][channel], raw->value_scale[token][warp]) :
-        ordered_decode(cache.value_payload[payload + token * payload_stride + channel],
+        ordered_decode(cache.value_payload[payload + token * (cache.kv_heads * channels)
+                                           + channel],
                        cache.value_scales[scale + token * scale_stride + warp]);
 }
 
@@ -159,12 +159,13 @@ __device__ int tile_attention(OrderedTile<float, Heads>& shared, Attention reque
     const int lane = channel % mxfp8_group_size;
     const int kv_head = head / ratio;
     const int last = request.position + row;
+    const int query_heads = gqa_query_heads(request.cache.kv_heads);
     float4 query[group_passes][Heads];
     float weighted[Heads]{};
     #pragma unroll
     for (int member = 0; member < Heads; ++member) {
-        const auto offset = row_offset(row + member / ordered_heads,
-                                       head + member % ordered_heads);
+        const auto offset =
+            row_offset(query_heads, row + member / ordered_heads, head + member % ordered_heads);
         #pragma unroll
         for (int pass = 0; pass < group_passes; ++pass) {
             const int group = pass * groups_per_warp + lane / score_lanes;
@@ -201,8 +202,8 @@ __device__ int tile_attention(OrderedTile<float, Heads>& shared, Attention reque
         if constexpr (!Staged) {
             const int page = request.pages[first / mxfp8_page_size];
             const int token = first % mxfp8_page_size;
-            payload = payload_offset(page, token, kv_head);
-            scale = scale_offset(page, token, kv_head);
+            payload = payload_offset(request.cache.kv_heads, page, token, kv_head);
+            scale = scale_offset(request.cache.kv_heads, page, token, kv_head);
         }
         const auto* raw = Staged ? stages + stage : nullptr;
         tile_scores<Heads, Staged>(shared, request.cache, payload, scale, end, warp, lane,
@@ -235,14 +236,12 @@ __device__ int tile_attention(OrderedTile<float, Heads>& shared, Attention reque
         }
         __syncthreads();
     }
-    if (warp < Heads && lane == 0) {
-        shared.denominator[warp] = mass;
-    }
+    if (warp < Heads && lane == 0) shared.denominator[warp] = mass;
     int invalid = score_recovery_mask<Heads>(warp, lane, invalid_score);
     #pragma unroll
     for (int member = 0; member < Heads; ++member) {
-        const auto offset = row_offset(row + member / ordered_heads,
-                                       head + member % ordered_heads);
+        const auto offset =
+            row_offset(query_heads, row + member / ordered_heads, head + member % ordered_heads);
         const float result = weighted[member] / shared.denominator[member];
         request.output[offset + channel] = __float2bfloat16_rn(result);
         invalid |= static_cast<int>(!isfinite(result)) << member;
@@ -406,8 +405,8 @@ __device__ void flash_stage_kv(FlashTile<Rows>& tile, const FlashPayload* raw, A
                                 raw->value_scale[index][group], bad);
         } else if (index < visible) {
             const int token = (first + index) % mxfp8_page_size;
-            const auto payload = payload_offset(page, token, kv_head) + channel;
-            const auto scale = scale_offset(page, token, kv_head) + group;
+            const auto payload = payload_offset(cache.kv_heads, page, token, kv_head) + channel;
+            const auto scale = scale_offset(cache.kv_heads, page, token, kv_head) + group;
             flash_decode_vector(&tile.key[index][channel], cache.key_payload + payload,
                                 cache.key_scales[scale], bad);
             flash_decode_vector(&tile.value[index][channel], cache.value_payload + payload,
@@ -435,7 +434,9 @@ __device__ void flash_stage_query(FlashTile<Rows>& tile, Attention request, int 
     }
     for (int member = warp; member < Rows * ordered_heads; member += flash_threads<Rows> / 32) {
         const bool active = !Partial || member / ordered_heads < active_rows;
-        const auto offset = row_offset(row + member / ordered_heads, head + member % ordered_heads);
+        const auto offset = row_offset(gqa_query_heads(request.cache.kv_heads),
+                                       row + member / ordered_heads,
+                                       head + member % ordered_heads);
         bool bad = false;
         #pragma unroll
         for (int channel = lane; channel < channels; channel += 32) {
@@ -578,7 +579,9 @@ __device__ void flash_store(Attention request, int row, int head, int active_row
                 continue;
             }
         }
-        const auto output = row_offset(row + member / ordered_heads, head + member % ordered_heads);
+        const auto output = row_offset(gqa_query_heads(request.cache.kv_heads),
+                                       row + member / ordered_heads,
+                                       head + member % ordered_heads);
         const float inverse_mass = __frcp_rn(state[half].mass);
         #pragma unroll
         for (int column = 0; column < channels; column += 8) {
@@ -716,8 +719,8 @@ std::optional<cudaError_t> launch_paged_batch(PagedAttentionBatch& batch, int sh
         batch.tile_end[index] = tiles;
     }
     void* args[] = {&batch};
-    return cudaLaunchKernel(kernel, dim3(tiles, head_pairs), flash_threads<Rows>, args,
-                            bytes, stream);
+    return cudaLaunchKernel(kernel, dim3(tiles, gqa_head_pairs(batch.requests[0].cache)),
+                            flash_threads<Rows>, args, bytes, stream);
 }
 
 std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
@@ -751,7 +754,8 @@ std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
         if (status != cudaSuccess) {
             return status;
         }
-        const dim3 blocks((rows + tile_rows - 1) / tile_rows, mxfp8_query_heads / ordered_heads);
+        const dim3 blocks((rows + tile_rows - 1) / tile_rows,
+                          gqa_head_pairs(request.cache));
         return cudaLaunchKernel(kernel, blocks, threads, args, bytes, stream);
     };
     if (aligned_scales && rows == flash_chunk && request.position >= flash_chunk) {
@@ -767,7 +771,8 @@ std::optional<cudaError_t> launch_flash_prefill(Attention request, int rows,
         if (status != cudaSuccess) {
             return status;
         }
-        const int tile_rows = long_flash_tile_rows(rows, multiprocessors / head_pairs);
+        const int tile_rows =
+            long_flash_tile_rows(rows, multiprocessors / gqa_head_pairs(request.cache));
         if (tile_rows == flash_short_rows) {
             if (const auto short_tile = launch(
                     flash_prefill_attention<flash_short_rows, true, true>, flash_short_rows,
@@ -859,7 +864,9 @@ std::optional<cudaError_t> decoder::try_batched_paged_prefill(
             continue;
         }
         const int shape = sequence.position >= min_long_prefix
-            ? long_flash_tile_rows(sequence.rows, multiprocessors / head_pairs) : flash_rows;
+            ? long_flash_tile_rows(sequence.rows,
+                                  multiprocessors / gqa_head_pairs(first.cache))
+            : flash_rows;
         const bool tail = shape != flash_rows || sequence.rows % flash_rows != 0;
         if ((shape != flash_rows && shape != flash_short_rows) ||
             (index && (tile_rows != shape || partial != tail))) {
@@ -905,96 +912,14 @@ std::optional<cudaError_t> decoder::try_batched_partial_paged_prefill(
     return *submitted == cudaSuccess ? recorded : *submitted;
 }
 
+#include "sglang/text/gqa/multirow_prefill.cuh"
 cudaError_t decoder::tensor_core_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const Bf16* queries, Bf16* output, cudaStream_t stream, const int* device_position) {
     Attention request{cache, pages.device_pages, position, queries, output};
     void* args[] = {&request, &device_position};
-    return cudaLaunchKernel(tiled_prefill_attention, dim3(rows, mxfp8_query_heads / ordered_heads),
+    return cudaLaunchKernel(tiled_prefill_attention, dim3(rows, gqa_head_pairs(cache)),
                             channels, args, 0, stream);
 }
 
-cudaError_t decoder::tensor_core_multirow_prefill_gqa(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const Bf16* queries, Bf16* output, cudaStream_t stream) {
-    return tensor_core_multirow_prefill_gqa(cache, pages, position, rows, queries, output,
-                                           stream, PairedPrefillScratch{});
-}
-
-cudaError_t decoder::tensor_core_multirow_prefill_gqa(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const Bf16* queries, Bf16* output, cudaStream_t stream, PairedPrefillScratch scratch) {
-    if (rows == 0) return cudaSuccess;
-    if (position < 0 || rows < 0 || position > INT_MAX - rows) return cudaErrorInvalidValue;
-    Attention request{cache, pages.device_pages, position, queries, output};
-    const int visible = position + rows;
-    const int flash_limit = rows == flash_chunk ? max_flash_visible_tokens :
-                                                  max_multirow_visible_tokens;
-    const bool ragged = default_ragged_prefill(cache, position, rows) ||
-        default_ragged_prefill_tail({cache, pages, position, rows, queries, output},
-                                   max_multirow_visible_tokens);
-    if ((ragged || raw_pipeline_before_flash(cache, rows, visible)) && visible <= flash_limit) {
-        if (const auto status = launch_tmem_prefill(cache, pages, position, queries, output,
-                                                   stream, true, rows, true)) {
-            return *status;
-        }
-    }
-    if (rows >= min_flash_rows && rows <= flash_chunk && visible <= flash_limit &&
-        (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
-        (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
-        if (rows == flash_chunk &&
-            (position >= 8192 || position % flash_chunk == 0)) {
-            constexpr int max_default_paired_position = 31744;
-            const bool default_paired = position <= max_default_paired_position &&
-                (position % flash_chunk == 0 || position % mxfp8_page_size != 0);
-            if (default_paired && scratch.keys && scratch.values) {
-                if (const auto status = launch_staged_tmem_prefill(cache, pages, position,
-                                                                  queries, output, stream,
-                                                                  scratch)) {
-                    return *status;
-                }
-            }
-            if (default_paired || (position % flash_chunk == 0 &&
-                                   position >= max_multirow_visible_tokens)) {
-                if (const auto status = launch_paired_tmem_prefill(cache, pages, position, queries,
-                                                                  output, stream)) {
-                    return *status;
-                }
-            }
-        }
-        if (const auto status = launch_flash_prefill(request, rows, stream)) {
-            return *status;
-        }
-    }
-    void* args[] = {&request, &rows};
-    constexpr int min_paired_rows = 64;
-    constexpr int min_staged_visible = 8192;
-    constexpr int min_wide_tail_rows = 32;
-    constexpr int min_paired_tail_rows = 12;
-    if (rows >= 2 && rows < min_flash_rows &&
-        visible >= min_staged_visible && visible <= max_multirow_visible_tokens &&
-        reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0 &&
-        reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0 &&
-        reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) == 0 &&
-        reinterpret_cast<std::uintptr_t>(cache.value_scales) % alignof(std::uint64_t) == 0) {
-        const int tile_rows = rows >= min_wide_tail_rows ? wide_rows :
-            rows >= min_paired_tail_rows && rows % paired_rows == 0 ? paired_rows : 1;
-        const dim3 blocks(rows / tile_rows + rows % tile_rows, mxfp8_query_heads / ordered_heads);
-        const auto kernel = tile_rows == wide_rows ?
-            multirow_prefill_attention<wide_rows, 2, true> : tile_rows == paired_rows ?
-            multirow_prefill_attention<paired_rows, 3, true> :
-            multirow_prefill_attention<1, 4, true>;
-        return cudaLaunchKernel(kernel, blocks, channels, args, 0, stream);
-    }
-    if (rows < min_paired_rows || visible > max_multirow_visible_tokens) {
-        const dim3 blocks(rows, mxfp8_query_heads / ordered_heads);
-        return cudaLaunchKernel(protected_prefill_attention, blocks, channels, args, 0, stream);
-    }
-    constexpr int min_wide_rows = 128;
-    const int tile_rows = rows >= min_wide_rows ? wide_rows : paired_rows;
-    const dim3 blocks(rows / tile_rows + rows % tile_rows, mxfp8_query_heads / ordered_heads);
-    const auto kernel = tile_rows == wide_rows ? multirow_prefill_attention<wide_rows, 2> :
-                                                multirow_prefill_attention<paired_rows, 3>;
-    return cudaLaunchKernel(kernel, blocks, channels, args, 0, stream);
-}
 }

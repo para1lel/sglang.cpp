@@ -1,6 +1,7 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/gdn_local.h"
 
 #include <cuda_runtime.h>
 
@@ -12,7 +13,6 @@ constexpr int warp_width = 32;
 constexpr int parts = text_gdn_head_dim / warp_width;
 constexpr int conv_threads = 128;
 constexpr int tap_count = text_gdn_history_taps + 1;
-constexpr int value_heads_per_qk = text_gdn_value_heads / text_gdn_qk_heads;
 constexpr int recurrent_threads = 2 * text_gdn_head_dim;
 constexpr int values_per_warp = 2;
 constexpr int tile_values = recurrent_threads / warp_width * values_per_warp;
@@ -34,7 +34,7 @@ __device__ float sigmoid(float value) {
     return 1.0f / (1.0f + expf(-value));
 }
 
-template <typename Rows, bool StoreHistory = false>
+template <typename S, typename Rows, bool StoreHistory = false>
 __global__ void gdn_verify_convolve(const __grid_constant__ Rows batch,
                                     const __nv_bfloat16* weights) {
     const auto& job = batch.entries[blockIdx.z];
@@ -53,14 +53,14 @@ __global__ void gdn_verify_convolve(const __grid_constant__ Rows batch,
     #pragma unroll
     for (int row = 0; row < Batch::rows; ++row) {
         samples[row + text_gdn_history_taps] =
-            __bfloat162float(job.inputs.qkv[row * text_gdn_qkv_width + channel]);
+            __bfloat162float(job.inputs.qkv[row * S::qkv_width + channel]);
     }
     if constexpr (StoreHistory) {
         #pragma unroll
         for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
             constexpr int first = Batch::rows - text_gdn_history_taps;
             job.tail.history[channel * text_gdn_history_taps + tap] =
-                job.inputs.qkv[(first + tap) * text_gdn_qkv_width + channel];
+                job.inputs.qkv[(first + tap) * S::qkv_width + channel];
         }
     }
     #pragma unroll
@@ -70,7 +70,7 @@ __global__ void gdn_verify_convolve(const __grid_constant__ Rows batch,
         for (int tap = 0; tap < tap_count; ++tap) {
             value = fmaf(samples[row + tap], taps[tap], value);
         }
-        job.inputs.convolved[row * text_gdn_qkv_width + channel] =
+        job.inputs.convolved[row * S::qkv_width + channel] =
             __float2bfloat16(value * sigmoid(value));
     }
 }
@@ -82,19 +82,19 @@ struct RecurrentInputs {
     float beta[Batch::rows];
 };
 
+template <typename S>
 __device__ void prepare_recurrent(const GdnVerificationLane& job, TextGdnWeights weights,
-                                   int head, RecurrentInputs& shared) {
+                                  int head, RecurrentInputs& shared) {
     const int warp = threadIdx.x / warp_width;
     const int lane = threadIdx.x % warp_width;
     const int q_or_k = threadIdx.x / text_gdn_head_dim;
     const int channel = threadIdx.x % text_gdn_head_dim;
-    const int qk_offset = q_or_k * text_gdn_qk_width +
-                          head / value_heads_per_qk * text_gdn_head_dim;
+    const int qk_offset = q_or_k * S::qk_width + head / S::heads_per_qk * text_gdn_head_dim;
     float components[Batch::rows];
     #pragma unroll
     for (int row = 0; row < Batch::rows; ++row) {
         const float component =
-            __bfloat162float(job.inputs.convolved[row * text_gdn_qkv_width + qk_offset + channel]);
+            __bfloat162float(job.inputs.convolved[row * S::qkv_width + qk_offset + channel]);
         components[row] = component;
         const float partial = sum_warp(component * component);
         if (lane == 0) {
@@ -103,7 +103,7 @@ __device__ void prepare_recurrent(const GdnVerificationLane& job, TextGdnWeights
     }
     if (threadIdx.x < Batch::rows) {
         const int row = threadIdx.x;
-        const int gate = row * text_gdn_value_heads + head;
+        const int gate = row * S::value_heads + head;
         const float negative_a = -expf(__bfloat162float(weights.a_log[head]));
         const float value = __bfloat162float(job.inputs.a[gate]) +
                             __bfloat162float(weights.dt_bias[head]);
@@ -143,7 +143,7 @@ __device__ float2 multiply_add_channels(float2 values, float factor, float2 adde
 #endif
 }
 
-template <typename Rows>
+template <typename S, typename Rows>
 __global__ void gdn_verify_recur(const __grid_constant__ Rows batch, TextGdnWeights weights) {
     const auto& job = batch.entries[blockIdx.z];
     const int head = blockIdx.x / tiles_per_head;
@@ -161,7 +161,7 @@ __global__ void gdn_verify_recur(const __grid_constant__ Rows batch, TextGdnWeig
     }
 
     __shared__ RecurrentInputs shared;
-    prepare_recurrent(job, weights, head, shared);
+    prepare_recurrent<S>(job, weights, head, shared);
     #pragma unroll
     for (int row = 0; row < Batch::rows; ++row) {
         float2 prediction{};
@@ -171,8 +171,8 @@ __global__ void gdn_verify_recur(const __grid_constant__ Rows batch, TextGdnWeig
             state[part] = multiply_channels(state[part], shared.decay[row]);
             prediction = multiply_add_channels(state[part], shared.qk[row][1][key], prediction);
         }
-        const auto* target = job.inputs.convolved + row * text_gdn_qkv_width +
-                             2 * text_gdn_qk_width + first_value;
+        const auto* target = job.inputs.convolved + row * S::qkv_width +
+                             2 * S::qk_width + first_value;
         const float2 correction{
             shared.beta[row] * (__bfloat162float(target[0]) - sum_warp(prediction.x)),
             shared.beta[row] * (__bfloat162float(target[warps]) - sum_warp(prediction.y)),
@@ -187,7 +187,7 @@ __global__ void gdn_verify_recur(const __grid_constant__ Rows batch, TextGdnWeig
         const float sum0 = sum_warp(result.x);
         const float sum1 = sum_warp(result.y);
         if (lane == 0) {
-            auto* out = job.observable + row * text_gdn_value_width + first_value;
+            auto* out = job.observable + row * S::value_width + first_value;
             out[0] = __float2bfloat16(sum0);
             out[warps] = __float2bfloat16(sum1);
         }
@@ -202,19 +202,18 @@ __global__ void gdn_verify_recur(const __grid_constant__ Rows batch, TextGdnWeig
     }
 }
 
-constexpr int finish_norm_blocks = Batch::rows * text_gdn_value_heads / finish_heads_per_block;
-
-template <typename Rows, bool Quantize = false>
+template <typename S, typename Rows, bool Quantize = false>
 __device__ __forceinline__ void gdn_verify_finish_impl(const Rows& batch,
     const __nv_bfloat16* norm, const CompactGdnFp8Rows* packed) {
     const auto& job = batch.entries[blockIdx.z];
-    if (!Quantize && blockIdx.x >= finish_norm_blocks) {
-        const int feature = (blockIdx.x - finish_norm_blocks) * finish_threads + threadIdx.x;
+    constexpr int norm_blocks = Rows::rows * S::value_heads / finish_heads_per_block;
+    if (!Quantize && blockIdx.x >= norm_blocks) {
+        const int feature = (blockIdx.x - norm_blocks) * finish_threads + threadIdx.x;
         #pragma unroll
         for (int tap = 0; tap < text_gdn_history_taps; ++tap) {
             const int row = Batch::rows - text_gdn_history_taps + tap;
             job.tail.history[feature * text_gdn_history_taps + tap] =
-                job.inputs.qkv[row * text_gdn_qkv_width + feature];
+                job.inputs.qkv[row * S::qkv_width + feature];
         }
         return;
     }
@@ -242,9 +241,9 @@ __device__ __forceinline__ void gdn_verify_finish_impl(const Rows& batch,
     }
     if constexpr (Quantize) {
         static_assert(text_fp8_group_size == text_gdn_head_dim);
-        const int row = compact_gdn_row(blockIdx.z, group / text_gdn_value_heads);
-        const int head = group % text_gdn_value_heads;
-        const int offset = row * text_gdn_value_width + head * text_fp8_group_size + lane;
+        const int row = compact_gdn_row(blockIdx.z, group / S::value_heads);
+        const int head = group % S::value_heads;
+        const int offset = row * S::value_width + head * text_fp8_group_size + lane;
         float elements[parts];
         float maximum = text_kernel::quant_epsilon;
         #pragma unroll
@@ -267,38 +266,50 @@ __device__ __forceinline__ void gdn_verify_finish_impl(const Rows& batch,
     }
 }
 
+template <typename S>
 __global__ void gdn_verify_finish(const __grid_constant__ Batch batch,
                                   const __nv_bfloat16* norm) {
-    gdn_verify_finish_impl<Batch>(batch, norm, nullptr);
+    gdn_verify_finish_impl<S, Batch>(batch, norm, nullptr);
 }
 
+template <typename S>
 __global__ void gdn_verify_finish_compact(const __grid_constant__ CompactGdnVerificationBatch batch,
                                          const __nv_bfloat16* norm,
                                          const __grid_constant__ CompactGdnFp8Rows packed) {
-    gdn_verify_finish_impl<CompactGdnVerificationBatch, true>(batch, norm, &packed);
+    gdn_verify_finish_impl<S, CompactGdnVerificationBatch, true>(batch, norm, &packed);
 }
 
-}
-
-cudaError_t decode_verify_gdn_batch(Batch batch, TextGdnWeights weights, cudaStream_t stream) {
+template <typename S>
+cudaError_t decode_verify_batch(Batch batch, TextGdnWeights weights, cudaStream_t stream) {
+    constexpr int norm_blocks = Batch::rows * S::value_heads / finish_heads_per_block;
     void* conv_args[] = {&batch, &weights.convolution};
-    auto status = cudaLaunchKernel(gdn_verify_convolve<Batch>,
-                                   dim3(text_gdn_qkv_width / conv_threads, 1, Batch::lanes),
+    auto status = cudaLaunchKernel(gdn_verify_convolve<S, Batch>,
+                                   dim3(S::qkv_width / conv_threads, 1, Batch::lanes),
                                    conv_threads, conv_args, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }
     void* recur_args[] = {&batch, &weights};
-    status = cudaLaunchKernel(gdn_verify_recur<Batch>,
-                              dim3(text_gdn_value_heads * tiles_per_head, 1, Batch::lanes),
+    status = cudaLaunchKernel(gdn_verify_recur<S, Batch>,
+                              dim3(S::value_heads * tiles_per_head, 1, Batch::lanes),
                               recurrent_threads, recur_args, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }
-    constexpr int finish_blocks = finish_norm_blocks + text_gdn_qkv_width / finish_threads;
+    constexpr int finish_blocks = norm_blocks + S::qkv_width / finish_threads;
     void* finish_args[] = {&batch, &weights.norm};
-    return cudaLaunchKernel(gdn_verify_finish, dim3(finish_blocks, 1, Batch::lanes),
+    return cudaLaunchKernel(gdn_verify_finish<S>, dim3(finish_blocks, 1, Batch::lanes),
                             finish_threads, finish_args, 0, stream);
+}
+}
+
+cudaError_t decode_verify_gdn_batch(Batch batch, TextGdnWeights weights, cudaStream_t stream) {
+    return decode_verify_batch<GdnFull>(batch, weights, stream);
+}
+
+cudaError_t decode_verify_gdn_batch_local(Batch batch, TextGdnWeights weights,
+                                          cudaStream_t stream) {
+    return decode_verify_batch<GdnLocal>(batch, weights, stream);
 }
 
 namespace {
@@ -311,31 +322,44 @@ cudaError_t compact_launch_status(cudaError_t direct) {
     return direct;
 }
 
-}
-
-cudaError_t decode_verify_gdn_compact(CompactGdnVerificationBatch batch, int lanes,
-                                      TextGdnWeights weights, CompactGdnFp8Rows output,
-                                      cudaStream_t stream) {
+template <typename S>
+cudaError_t decode_verify_compact(CompactGdnVerificationBatch batch, int lanes,
+                                  TextGdnWeights weights, CompactGdnFp8Rows output,
+                                  cudaStream_t stream) {
     using Compact = CompactGdnVerificationBatch;
     if ((lanes != Compact::lanes / 2 && lanes != Compact::lanes) || !output.values) {
         return cudaErrorInvalidValue;
     }
+    constexpr int norm_blocks = Compact::rows * S::value_heads / finish_heads_per_block;
     void* conv_args[] = {&batch, &weights.convolution};
-    auto status = compact_launch_status(cudaLaunchKernel(gdn_verify_convolve<Compact, true>,
-        dim3(text_gdn_qkv_width / conv_threads, 1, lanes), conv_threads, conv_args, 0, stream));
+    auto status = compact_launch_status(cudaLaunchKernel(gdn_verify_convolve<S, Compact, true>,
+        dim3(S::qkv_width / conv_threads, 1, lanes), conv_threads, conv_args, 0, stream));
     if (status != cudaSuccess) {
         return status;
     }
     void* recur_args[] = {&batch, &weights};
-    status = compact_launch_status(cudaLaunchKernel(gdn_verify_recur<Compact>,
-        dim3(text_gdn_value_heads * tiles_per_head, 1, lanes), recurrent_threads,
+    status = compact_launch_status(cudaLaunchKernel(gdn_verify_recur<S, Compact>,
+        dim3(S::value_heads * tiles_per_head, 1, lanes), recurrent_threads,
         recur_args, 0, stream));
     if (status != cudaSuccess) {
         return status;
     }
     void* finish_args[] = {&batch, &weights.norm, &output};
-    return compact_launch_status(cudaLaunchKernel(gdn_verify_finish_compact,
-        dim3(finish_norm_blocks, 1, lanes), finish_threads, finish_args, 0, stream));
+    return compact_launch_status(cudaLaunchKernel(gdn_verify_finish_compact<S>,
+        dim3(norm_blocks, 1, lanes), finish_threads, finish_args, 0, stream));
+}
+}
+
+cudaError_t decode_verify_gdn_compact(CompactGdnVerificationBatch batch, int lanes,
+                                      TextGdnWeights weights, CompactGdnFp8Rows output,
+                                      cudaStream_t stream) {
+    return decode_verify_compact<GdnFull>(batch, lanes, weights, output, stream);
+}
+
+cudaError_t decode_verify_gdn_compact_local(CompactGdnVerificationBatch batch, int lanes,
+                                            TextGdnWeights weights, CompactGdnFp8Rows output,
+                                            cudaStream_t stream) {
+    return decode_verify_compact<GdnLocal>(batch, lanes, weights, output, stream);
 }
 
 }

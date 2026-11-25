@@ -14,14 +14,15 @@ __device__ void load_prefill_replay(PrefillReplayTile& tile, Mxfp8KvCache cache,
     const int page = pages[first / mxfp8_page_size];
     const int slot = (first + token) % mxfp8_page_size;
     const bool visible = first + token <= last;
-    const auto payload = payload_offset(page, slot, kv_head) + first_channel + column;
+    const auto payload =
+        payload_offset(cache.kv_heads, page, slot, kv_head) + first_channel + column;
     const auto values =
         static_cast<unsigned>(__cvta_generic_to_shared(&tile.values[token][column]));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
                  :: "r"(values), "l"(cache.value_payload + payload), "r"(visible ? 16 : 0)
                  : "memory");
     if (column == 0) {
-        const auto scale = scale_offset(page, slot, kv_head, 0);
+        const auto scale = scale_offset(cache.kv_heads, page, slot, kv_head, 0);
         const auto exponents =
             static_cast<unsigned>(__cvta_generic_to_shared(tile.exponents[token]));
         asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;"
@@ -42,6 +43,12 @@ __global__ void prefill_replay_kernel(Mxfp8KvCache cache, const std::int32_t* pa
     const int first_channel = blockIdx.y * replay_channels;
     const int group = (first_channel + thread) / mxfp8_group_size;
     const int kv_head = head / queries_per_kv_head;
+    const int query_heads = gqa_query_heads(cache.kv_heads);
+    // Bound descriptors launch the replay with the maximum head grid; the
+    // lane's own cache decides which blocks carry work.
+    if (head >= query_heads) {
+        return;
+    }
     const auto* scores = workspace.scores + head * workspace.capacity;
     float maximum = -CUDART_INF_F;
     float mass = 0.0f;
@@ -110,7 +117,7 @@ __global__ void prefill_replay_kernel(Mxfp8KvCache cache, const std::int32_t* pa
     }
     __syncthreads();
     if (thread < replay_channels) {
-        output[row_offset(0, mxfp8_query_heads, head) + first_channel + thread] =
+        output[row_offset(0, query_heads, head) + first_channel + thread] =
             __float2bfloat16_rn(weighted / denominator);
     }
 }

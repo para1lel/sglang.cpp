@@ -77,8 +77,8 @@ std::optional<cudaError_t> decoder::launch_batched_ragged_tmem(
         batch.tiles.tile_end[index] = tiles;
     }
     void* args[] = {&batch};
-    return cudaLaunchKernel(kernel, dim3(tiles, head_pairs), tmem_threads, args,
-                            dynamic_shared, stream);
+    return cudaLaunchKernel(kernel, dim3(tiles, gqa_head_pairs(sequences[0].cache)),
+                            tmem_threads, args, dynamic_shared, stream);
 }
 
 }

@@ -66,18 +66,18 @@ struct Attention {
     Bf16* output;
 };
 
-__device__ std::size_t row_offset(int row, int head) {
-    return (static_cast<std::size_t>(row) * mxfp8_query_heads + head) * channels;
+__device__ std::size_t row_offset(int query_heads, int row, int head) {
+    return (static_cast<std::size_t>(row) * query_heads + head) * channels;
 }
 
-__device__ std::size_t payload_offset(int page, int token, int head) {
-    return static_cast<std::size_t>(page) * mxfp8_payload_bytes_per_page
-        + (token * mxfp8_kv_heads + head) * channels;
+__device__ std::size_t payload_offset(int kv_heads, int page, int token, int head) {
+    return static_cast<std::size_t>(page) * gqa_payload_bytes_per_page(kv_heads)
+        + (token * kv_heads + head) * channels;
 }
 
-__device__ std::size_t scale_offset(int page, int token, int head) {
+__device__ std::size_t scale_offset(int kv_heads, int page, int token, int head) {
     constexpr int token_groups = mxfp8_page_size / mxfp8_group_size;
-    const auto page_head = static_cast<std::size_t>(page) * mxfp8_kv_heads + head;
+    const auto page_head = static_cast<std::size_t>(page) * kv_heads + head;
     const auto token_lane = page_head * mxfp8_group_size + token % mxfp8_group_size;
     return (token_lane * token_groups + token / mxfp8_group_size) * mxfp8_groups;
 }
@@ -118,11 +118,12 @@ __device__ void prefetch_payload(PrefillPayload<Tokens>& raw, Attention request,
     for (int index = threadIdx.x / flash_token_lanes; index < Tokens;
          index += Threads / flash_token_lanes) {
         const int token = (first + index) % mxfp8_page_size;
-        const auto payload = payload_offset(page, token, kv_head) + channel;
+        const auto payload =
+            payload_offset(request.cache.kv_heads, page, token, kv_head) + channel;
         flash_copy<16>(&raw.key[index][channel], cache.key_payload + payload, index < visible);
         flash_copy<16>(&raw.value[index][channel], cache.value_payload + payload, index < visible);
         if (channel == 0) {
-            const auto scale = scale_offset(page, token, kv_head);
+            const auto scale = scale_offset(request.cache.kv_heads, page, token, kv_head);
             flash_copy<8>(raw.key_scale[index], cache.key_scales + scale, index < visible);
             flash_copy<8>(raw.value_scale[index], cache.value_scales + scale, index < visible);
         }
@@ -230,7 +231,7 @@ __device__ int ordered_attention(OrderedTile<Real>& shared, Attention request, i
     const int warp = channel / mxfp8_group_size;
     const int lane = channel % mxfp8_group_size;
     const int kv_head = query_head / ratio;
-    const auto row = row_offset(row_index, query_head);
+    const auto row = row_offset(gqa_query_heads(request.cache.kv_heads), row_index, query_head);
     const int last = request.position + row_index;
     const auto cache = request.cache;
     float query[ordered_heads][mxfp8_groups];
@@ -250,9 +251,9 @@ __device__ int ordered_attention(OrderedTile<Real>& shared, Attention request, i
         const int count = min(keys_per_tile, last - first + 1);
         const int page = request.pages[first / mxfp8_page_size];
         const int token = first % mxfp8_page_size;
-        const auto payload = payload_offset(page, token, kv_head);
-        const auto scale = scale_offset(page, token, kv_head);
-        constexpr int payload_stride = mxfp8_kv_heads * channels;
+        const auto payload = payload_offset(cache.kv_heads, page, token, kv_head);
+        const auto scale = scale_offset(cache.kv_heads, page, token, kv_head);
+        const int payload_stride = cache.kv_heads * channels;
         constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
         for (int index = warp; index < count; index += channels / mxfp8_group_size) {
             Real dot[ordered_heads]{};

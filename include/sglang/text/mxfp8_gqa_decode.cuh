@@ -17,14 +17,14 @@ struct PairedSplit {
 
 using PairedQuery = float[split_query_heads][score_passes][groups_per_warp];
 
-__device__ void load_paired_query(const __nv_bfloat16* queries, int head, int lane,
-                                  PairedQuery& query) {
+__device__ void load_paired_query(int query_heads, const __nv_bfloat16* queries, int head,
+                                  int lane, PairedQuery& query) {
     #pragma unroll
     for (int pair = 0; pair < split_query_heads; ++pair) {
         #pragma unroll
         for (int pass = 0; pass < score_passes; ++pass) {
             const int group = pass * groups_per_warp + lane / score_lanes;
-            const auto row = row_offset(0, mxfp8_query_heads, head + pair);
+            const auto row = row_offset(0, query_heads, head + pair);
             #pragma unroll
             for (int value = 0; value < groups_per_warp; ++value) {
                 const auto offset = group * mxfp8_group_size + lane % score_lanes;
@@ -48,8 +48,8 @@ __device__ float reduce_group_score(const float (&products)[groups_per_warp]) {
 __device__ void paired_decode_scores(Mxfp8KvCache cache, int page, int slot, int kv_head,
                                      int lane, const PairedQuery& query,
                                      float (&scores)[split_query_heads]) {
-    const auto data = payload_offset(page, slot, kv_head) + lane % score_lanes;
-    const auto scale = scale_offset(page, slot, kv_head, 0);
+    const auto data = payload_offset(cache.kv_heads, page, slot, kv_head) + lane % score_lanes;
+    const auto scale = scale_offset(cache.kv_heads, page, slot, kv_head, 0);
     #pragma unroll
     for (int pass = 0; pass < score_passes; ++pass) {
         const int group = pass * groups_per_warp + lane / score_lanes;
@@ -90,8 +90,8 @@ __device__ void paired_decode_values(decoder::PagedDecodeLane input,
         const int token = first + index;
         const int slot = token % mxfp8_page_size;
         const int page = input.pages.device_pages[token / mxfp8_page_size];
-        const auto data = payload_offset(page, slot, kv_head) + lane;
-        const auto scale = scale_offset(page, slot, kv_head, 0);
+        const auto data = payload_offset(input.cache.kv_heads, page, slot, kv_head) + lane;
+        const auto scale = scale_offset(input.cache.kv_heads, page, slot, kv_head, 0);
         float weights[split_query_heads];
         #pragma unroll
         for (int pair = 0; pair < split_query_heads; ++pair) {
@@ -155,6 +155,9 @@ __global__ void split_decode_attention_paired(PagedDecodeBatch<Lane> batch) {
     }
     __shared__ PairedSplit state[split_query_heads];
     const int head = blockIdx.y * split_query_heads;
+    if (head >= gqa_query_heads(input.cache.kv_heads)) {
+        return;
+    }
     const int thread = threadIdx.x;
     const int warp = thread / mxfp8_group_size;
     const int lane = thread % mxfp8_group_size;
@@ -167,7 +170,8 @@ __global__ void split_decode_attention_paired(PagedDecodeBatch<Lane> batch) {
     PairedQuery query;
     float local_max[split_query_heads] = {-CUDART_INF_F, -CUDART_INF_F};
     bool invalid[split_query_heads]{};
-    load_paired_query(input.buffers.queries, head, lane, query);
+    load_paired_query(gqa_query_heads(input.cache.kv_heads), input.buffers.queries, head, lane,
+                      query);
     for (int index = warp; index < count; index += split_warps) {
         const int token = first + index;
         const int page = input.pages.device_pages[token / mxfp8_page_size];
@@ -210,14 +214,28 @@ __global__ void split_decode_attention_paired(PagedDecodeBatch<Lane> batch) {
     }
 }
 
+/// Rank-local query-head count of a decode lane. Bound descriptors keep their
+/// cache on the device, so the host cannot read its head count; size their
+/// grid for the maximum geometry and let the kernels' per-head guards skip
+/// the surplus blocks.
+template <typename Lane>
+int lane_query_heads(const Lane& lane) {
+    if constexpr (std::is_same_v<Lane, decoder::BoundPagedDecodeLane>) {
+        return mxfp8_query_heads;
+    } else {
+        return gqa_query_heads(lane.cache.kv_heads);
+    }
+}
+
 template <typename Lane>
 void launch_decode_split(const PagedDecodeBatch<Lane>& batch, int count, cudaStream_t stream) {
+    const int query_heads = lane_query_heads(batch.lanes[0]);
     if (count == decoder::paged_decode_lanes) {
         split_decode_attention_paired
-            <<<dim3(decode_splits, mxfp8_query_heads / split_query_heads, count),
+            <<<dim3(decode_splits, query_heads / split_query_heads, count),
                mxfp8_head_dim, 0, stream>>>(batch);
     } else {
-        split_decode_attention<<<dim3(decode_splits, mxfp8_query_heads, count),
+        split_decode_attention<<<dim3(decode_splits, query_heads, count),
                                  mxfp8_head_dim, 0, stream>>>(batch);
     }
 }
@@ -228,34 +246,39 @@ cudaError_t launch_paged_decode(const Lane* lanes, int count, cudaStream_t strea
         return cudaErrorInvalidValue;
     }
     PagedDecodeBatch<Lane> batch{};
+    const int query_heads = lane_query_heads(lanes[0]);
     for (int index = 0; index < count; ++index) {
         const auto buffers = lanes[index].buffers;
         const auto address = reinterpret_cast<std::uintptr_t>(buffers.scratch);
-        if (!buffers.queries || !buffers.output || !address || address % alignof(DecodePartial)) {
+        bool missing_cache = false;
+        if constexpr (std::is_same_v<Lane, decoder::BoundPagedDecodeLane>) {
+            missing_cache = !lanes[index].cache;
+        }
+        if (!buffers.queries || !buffers.output || !address || address % alignof(DecodePartial)
+            || missing_cache || lane_query_heads(lanes[index]) != query_heads) {
             return cudaErrorInvalidValue;
         }
         batch.lanes[index] = lanes[index];
     }
-    launch_decode_split(batch, count, stream);
     auto status = cudaGetLastError();
     if (status != cudaSuccess) {
         return status;
     }
-    merge_decode_attention<<<dim3(mxfp8_query_heads, 1, count),
+    merge_decode_attention<<<dim3(query_heads, 1, count),
                              mxfp8_head_dim, 0, stream>>>(batch);
     status = cudaGetLastError();
     if (status != cudaSuccess) {
         return status;
     }
     if constexpr (std::is_same_v<Lane, decoder::BoundPagedDecodeLane>) {
-        bound_exact_decode_scores<<<dim3(32, mxfp8_query_heads, count),
+        bound_exact_decode_scores<<<dim3(32, query_heads, count),
                                     mxfp8_head_dim, 0, stream>>>(batch);
         status = cudaGetLastError();
         if (status != cudaSuccess) {
             return status;
         }
     }
-    replay_paged_decode<<<dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels, count),
+    replay_paged_decode<<<dim3(query_heads, mxfp8_head_dim / replay_channels, count),
                           mxfp8_head_dim, 0, stream>>>(batch);
     return cudaGetLastError();
 }

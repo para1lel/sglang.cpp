@@ -4,7 +4,8 @@ template <bool Packed = false>
 __device__ __forceinline__ void tmem_store_output(
     Word row_address, FlashSoftmax state, Attention request, int row, int head,
     int rows = flash_rows, int member = threadIdx.x) {
-    const auto output = row_offset(row + max(0, member) / ordered_heads,
+    const auto output = row_offset(gqa_query_heads(request.cache.kv_heads),
+                                   row + max(0, member) / ordered_heads,
                                    head + max(0, member) % ordered_heads);
     const float inverse = __frcp_rn(state.mass);
     #pragma unroll 1
@@ -65,12 +66,15 @@ template <int Count>
 bool valid_staged_ranges(const decoder::PagedPrefillSequence* sequences,
                          StagedRange keys, StagedRange values) {
     constexpr auto head_bytes = channels * sizeof(Bf16);
-    constexpr auto row_bytes = mxfp8_query_heads * head_bytes;
-    static_assert(head_bytes % alignof(uint4) == 0 && row_bytes % alignof(uint4) == 0);
+    const auto row_bytes = static_cast<std::size_t>(
+        gqa_query_heads(sequences[0].cache.kv_heads)) * head_bytes;
+    static_assert(head_bytes % alignof(uint4) == 0);
     static_assert(mxfp8_payload_bytes_per_page % alignof(uint4) == 0 &&
                   mxfp8_scale_bytes_per_page % alignof(std::uint64_t) == 0);
-    static_assert(flash_chunk * row_bytes > 0 &&
-                  SIZE_MAX / mxfp8_payload_bytes_per_page >= INT_MAX);
+    static_assert(SIZE_MAX / mxfp8_payload_bytes_per_page >= INT_MAX);
+    if (row_bytes == 0) {
+        return false;
+    }
     if (!keys.valid() || !values.valid() || keys.overlaps(values)) {
         return false;
     }
@@ -90,11 +94,14 @@ bool valid_staged_ranges(const decoder::PagedPrefillSequence* sequences,
                 {other.queries, other.rows * row_bytes, alignof(Bf16)},
                 {other.pages.device_pages, logical_pages * sizeof(std::int32_t),
                  alignof(std::int32_t)},
-                {other.cache.key_payload, pages * mxfp8_payload_bytes_per_page, alignof(uint4)},
-                {other.cache.value_payload, pages * mxfp8_payload_bytes_per_page, alignof(uint4)},
-                {other.cache.key_scales, pages * mxfp8_scale_bytes_per_page,
-                 alignof(std::uint64_t)},
-                {other.cache.value_scales, pages * mxfp8_scale_bytes_per_page,
+                {other.cache.key_payload,
+                 pages * gqa_payload_bytes_per_page(other.cache.kv_heads), alignof(uint4)},
+                {other.cache.value_payload,
+                 pages * gqa_payload_bytes_per_page(other.cache.kv_heads), alignof(uint4)},
+                {other.cache.key_scales,
+                 pages * gqa_scale_bytes_per_page(other.cache.kv_heads), alignof(std::uint64_t)},
+                {other.cache.value_scales,
+                 pages * gqa_scale_bytes_per_page(other.cache.kv_heads),
                  alignof(std::uint64_t)},
             };
             for (const auto& input : inputs) {

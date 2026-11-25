@@ -144,8 +144,9 @@ __device__ void issue_warp_tile(const int* pages, Stage& stage,
     const int half = chunk % chunks_per_page;
     const auto physical = static_cast<std::size_t>(pages[chunk / chunks_per_page - first_page]);
     const int first = chunk * chunk_tokens;
-    const std::size_t payload = physical * mxfp8_payload_bytes_per_page +
-        (static_cast<std::size_t>(half * chunk_tokens) * mxfp8_kv_heads + kv_head) *
+    const std::size_t payload =
+        physical * gqa_payload_bytes_per_page(lane.cache.kv_heads) +
+        (static_cast<std::size_t>(half * chunk_tokens) * lane.cache.kv_heads + kv_head) *
             mxfp8_head_dim;
     #pragma unroll
     for (int step = 0; step < tile_tokens * copies_per_token / 32; ++step) {
@@ -153,7 +154,7 @@ __device__ void issue_warp_tile(const int* pages, Stage& stage,
         const int token = warp * tile_tokens + index / copies_per_token;
         const int column = index % copies_per_token * 16;
         const bool valid = first + token <= lane.position;
-        const auto source = payload + token * mxfp8_kv_heads * mxfp8_head_dim + column;
+        const auto source = payload + token * lane.cache.kv_heads * mxfp8_head_dim + column;
         copy_16(stage.keys + token * key_stride + column, lane.cache.key_payload + source, valid);
         copy_16(stage.values + token * value_stride + column, lane.cache.value_payload + source,
                 valid);
@@ -164,7 +165,7 @@ __device__ void issue_warp_tile(const int* pages, Stage& stage,
                        token / mxfp8_group_size * mxfp8_groups;
     const bool value = lane_id >= tile_tokens;
     const std::size_t source =
-        (physical * mxfp8_kv_heads + kv_head) * mxfp8_scale_bytes_per_page / mxfp8_kv_heads +
+        (physical * lane.cache.kv_heads + kv_head) * mxfp8_page_size * mxfp8_groups +
         token % mxfp8_group_size * (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups +
         half * scale_row + token / mxfp8_group_size * mxfp8_groups;
     const auto dest = __cvta_generic_to_shared(
@@ -550,6 +551,9 @@ split_kernel(const __grid_constant__ Input input) {
         return;
     }
     const int kv_head = static_cast<int>(blockIdx.y);
+    if (kv_head >= lane.cache.kv_heads) {
+        return;
+    }
     const int first = split * chunks / splits;
     const int last = (split + 1) * chunks / splits;
     const int first_page = first / chunks_per_page;
@@ -611,6 +615,22 @@ split_kernel(const __grid_constant__ Input input) {
     }
 }
 
+/// Rank-local KV-head count of a split launch input: TP2 lanes carry half the
+/// heads of the full-geometry cache. Bound descriptors keep their cache on the
+/// device, so the host cannot read its head count; size their grid for the
+/// maximum and let the kernel's per-lane guard skip the surplus blocks.
+int input_kv_heads(const TargetLane& lane) {
+    return lane.bound.position ? mxfp8_kv_heads : lane.eager.cache.kv_heads;
+}
+
+int input_kv_heads(const TargetBatch&) {
+    return mxfp8_kv_heads;
+}
+
+int input_kv_heads(const EagerTargetBatch& batch) {
+    return batch.lanes[0].cache.kv_heads;
+}
+
 template <bool SingleStage = false, typename Input>
 cudaError_t launch_split(const Input& input, int count, cudaStream_t stream) {
     constexpr std::size_t shared_bytes = sizeof(Shared<SingleStage ? 1 : stages>);
@@ -621,7 +641,7 @@ cudaError_t launch_split(const Input& input, int count, cudaStream_t stream) {
         return status;
     }
     split_kernel<Input, SingleStage>
-        <<<dim3(max_splits, mxfp8_kv_heads, count), threads, shared_bytes, stream>>>(input);
+        <<<dim3(max_splits, input_kv_heads(input), count), threads, shared_bytes, stream>>>(input);
     return cudaGetLastError();
 }
 

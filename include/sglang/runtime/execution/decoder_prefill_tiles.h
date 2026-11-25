@@ -100,7 +100,11 @@ struct PrefillDims {
 
 /// Full-geometry MTP draft seeding scratch for rank-local tile buffers. The
 /// draft model always runs full geometry on the primary rank, so the widened
-/// draft buffers live outside the rank-local tile layout.
+/// draft buffers live outside the rank-local tile layout. `concatenated` is
+/// reused per prefill chunk, so it needs only `prefill_chunk_rows` rows;
+/// `keys`, `values`, and `rope_keys` must hold every row of one paired seed
+/// launch, because the paired path projects and appends the full seed row
+/// count in a single call (see MtpDraftRequest::seed_prefill).
 struct SeedScratch {
     Bf16* concatenated = nullptr;
     Bf16* keys = nullptr;
@@ -108,15 +112,16 @@ struct SeedScratch {
     Bf16* rope_keys = nullptr;
 };
 
-inline std::size_t seed_scratch_bytes(int tile_rows) {
-    return std::size_t(tile_rows) * (2 * hidden_size + 3 * text_gqa_kv_width) * sizeof(Bf16);
+inline std::size_t seed_scratch_bytes(int concat_rows, int kv_rows) {
+    return std::size_t(concat_rows) * 2 * hidden_size * sizeof(Bf16) +
+           std::size_t(kv_rows) * 3 * text_gqa_kv_width * sizeof(Bf16);
 }
 
-inline SeedScratch make_seed_scratch(Bf16* memory, int tile_rows) {
-    const auto rows = std::size_t(tile_rows);
-    const auto stride = rows * text_gqa_kv_width;
-    return {memory, memory + rows * 2 * hidden_size, memory + rows * 2 * hidden_size + stride,
-            memory + rows * 2 * hidden_size + 2 * stride};
+inline SeedScratch make_seed_scratch(Bf16* memory, int concat_rows, int kv_rows) {
+    const auto concatenated = std::size_t(concat_rows) * 2 * hidden_size;
+    const auto stride = std::size_t(kv_rows) * text_gqa_kv_width;
+    return {memory, memory + concatenated, memory + concatenated + stride,
+            memory + concatenated + 2 * stride};
 }
 
 struct TileBuffers {

@@ -37,7 +37,7 @@ slices of up to 128 rows on the prefill stream. One exact FP8 kernel projects
 K and V in separate grid banks for the tile. One key normalization and RoPE
 launch and one MXFP8 append follow. Grouped prefill seeds each request
 separately. Single-row tiles and other devices project and append each slice
-Seed scratch comes from the existing prefill workspace.
+Seed scratch comes from the [existing prefill workspace](native-prefill-workspace.md#seed-scratch).
 [Slice preparation](../src/decoder_mtp.cpp#L764)<!-- prefix: "for (int off" --> ·
 [Paired projection](../src/text_ops.cu#L790)<!-- prefix: "cudaError_t " --> ·
 [Grid banks](../include/sglang/text/prefill_fp8_exact.cuh#L209)<!-- prefix: "__global__ v" --> ·

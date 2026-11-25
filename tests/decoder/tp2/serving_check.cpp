@@ -7,6 +7,7 @@
 
 void watch_draft_upload(const std::filesystem::path&);
 void inspect_serving(const sglang::Decoder&, int);
+void check_tp2_prefill_plan();
 void check_serving_reductions(const char*, std::size_t);
 
 namespace {
@@ -106,7 +107,10 @@ int main(int argc, char** argv) try {
     need(world == 1 || world == 2, "Invalid world size");
     std::ofstream output(argv[3]);
     output.exceptions(std::ios::badbit | std::ios::failbit);
-    if (world == 2) watch_draft_upload(argv[1]);
+    if (world == 2) {
+        check_tp2_prefill_plan();
+        watch_draft_upload(argv[1]);
+    }
     sglang::Decoder decoder(argv[1], 0, true, world);
     inspect_serving(decoder, world);
     for (int slot = 0; slot < 2; ++slot) {

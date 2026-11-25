@@ -21,6 +21,7 @@ if [[ $phase == all || $phase == static ]]; then
 "${CXX:?Missing Pixi host compiler}" -std=c++23 -O2 -Wall -Wextra -Werror \
     -Iinclude -isystem "$toolkit/include" -isystem "$nccl/include" \
     tests/decoder/tp2/serving_check.cpp tests/decoder/tp2/serving_probe.cpp \
+    tests/decoder/tp2/prefill_plan_check.cpp \
     -Wl,--wrap=ncclAllReduce -Wl,--wrap=cudaMemcpyAsync \
     -Wl,--start-group "$build"/lib/libsglang*.a -Wl,--end-group \
     -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart "$nccl/lib/libnccl.so.2" \

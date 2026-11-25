@@ -60,7 +60,28 @@ inline void record_projection_group(DecoderBatchStepStats& stats, int rows) {
     ++stats.layerwise_prefill_groups;
     stats.layerwise_prefill_rows += rows;
 }
+// Mirrors the causal tile group of grants[source] onto the mirrored peer grant
+// array: lane `lane` covers rows [offset + lane * batch_prefill_tile_rows,
+// +batch_prefill_tile_rows) of peer_grants[source], with the peer's own
+// request state. Pure host-side remapping; `segments` must hold `lanes`
+// entries.
+inline void peer_causal_segments(const PrefillGrant* peer_grants, int source, int offset,
+                                 PrefillGrant* segments, int lanes) {
+    for (int lane = 0; lane < lanes; ++lane) {
+        segments[lane] =
+            prefill_tile(peer_grants[source], offset + lane * batch_prefill_tile_rows);
+    }
+}
 
+// Runs each partial or causal projection group through `run_group` and any
+// leftover single-grant tail through `run_native`. `source` is always the
+// index of the group's first grant in the original `grants` array, so a
+// tensor-parallel caller can locate the mirrored peer grant without pointer
+// arithmetic on callback arguments. `offset` is the first row of the group
+// within grants[source]: 0 for serial segments (each grant starts at its own
+// row 0) and the causal tile offset for causal segments (lane `lane` covers
+// rows [offset + lane * batch_prefill_tile_rows, +batch_prefill_tile_rows) of
+// grants[source]). `run_native` receives the grant's own row offset.
 template <typename RunGroup, typename RunNative>
 bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cudaStream_t stream,
                                        DecoderBatchStepStats& stats, RunGroup run_group,
@@ -88,12 +109,13 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
     for (int index = 0; index < count;) {
         const auto partial = partial_projection_group(grants + index, count - index);
         if (partial.grants >= 2) {
-            run_group(grants + index, partial, workspace, PrefillAttentionMode::serial_segments,
-                      serial_capacity);
+            run_group(index, 0, grants + index, partial, workspace,
+                      PrefillAttentionMode::serial_segments, serial_capacity);
             record_projection_group(stats, partial.rows);
             index += partial.grants;
             continue;
         }
+        const int source = index;
         const auto& grant = grants[index++];
         int offset = 0;
         if (grant.tile_rows == batch_prefill_tile_rows) {
@@ -106,13 +128,13 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
                     validate_prefill_tile(segment, workspace, serial_capacity);
                 }
                 // Each layer visits the request's cache and recurrent state in token order.
-                run_group(segments.data(), group, workspace, PrefillAttentionMode::causal_segments,
-                          serial_capacity);
+                run_group(source, offset, segments.data(), group, workspace,
+                          PrefillAttentionMode::causal_segments, serial_capacity);
                 record_projection_group(stats, group.rows);
                 offset += group.rows;
             }
         }
-        if (offset < grant.rows) run_native(&grant, workspace, serial_capacity, offset);
+        if (offset < grant.rows) run_native(source, &grant, workspace, serial_capacity, offset);
     }
     workspace.close();
     return true;

@@ -296,21 +296,26 @@ void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
                              const PrefillWorkspace& workspace, cudaStream_t stream,
                              cudaStream_t peer_stream, int peer_device) {
     int seed_tile_rows = 0;
+    int seed_kv_rows = 0;
     for (int index = 0; index < count; ++index) {
         const auto& grant = grants[index];
         if (grant.draft && grant.prompt_remaining > 1) {
             seed_tile_rows = std::max(seed_tile_rows,
                                       std::min({grant.rows, grant.prompt_remaining - 1,
                                                 prefill_chunk_rows}));
+            seed_kv_rows = std::max(seed_kv_rows,
+                                    std::min(grant.rows, grant.prompt_remaining - 1));
         }
     }
     Bf16* seed_memory = nullptr;
     if (seed_tile_rows) {
         const std::size_t available = workspace.bytes() - layout.bytes;
-        if (seed_scratch_bytes(seed_tile_rows) > available) {
+        if (seed_scratch_bytes(seed_tile_rows, seed_kv_rows) > available) {
             throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
         }
-        seed_memory = layout.take<Bf16>(seed_scratch_bytes(seed_tile_rows) / sizeof(Bf16));
+        seed_memory =
+            layout.take<Bf16>(seed_scratch_bytes(seed_tile_rows, seed_kv_rows) /
+                              sizeof(Bf16));
     }
     int offset = 0;
     for (int index = 0; index < count; ++index) {
@@ -323,7 +328,7 @@ void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
             seed.work.residual += offset * hidden_size;
             const bool wmma = model.backend.draft.wmma_seed_fc &&
                 grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
-            const auto scratch = make_seed_scratch(seed_memory, seed_tile_rows);
+            const auto scratch = make_seed_scratch(seed_memory, seed_tile_rows, seed_kv_rows);
             seed.seed_draft(*grant.draft, grant.tokens + 1,
                             std::min(grant.rows, grant.prompt_remaining - 1),
                             model.final_norm, wmma, grant.media, &scratch);
@@ -519,11 +524,12 @@ bool decoder::try_prefill_projection_groups(
     }
     if (!model.backend.tensor_core_prefill) return false;
     return execute_partial_projection_groups(grants, count, stream, stats,
-        [&](const PrefillGrant* group, PrefillGroup rows, PrefillWorkspace& workspace,
-            PrefillAttentionMode attention, int capacity) {
+        [&](int, int, const PrefillGrant* group, PrefillGroup rows,
+            PrefillWorkspace& workspace, PrefillAttentionMode attention, int capacity) {
             prefill_layerwise(model, group, rows, workspace, attention, capacity);
         },
-        [&](const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity, int offset) {
+        [&](int, const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity,
+            int offset) {
             enqueue_native_prefill_grants(model, grant, 1, workspace, capacity, offset);
         });
 }
@@ -760,13 +766,14 @@ void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
         const bool wmma = tensor_core && model.backend.draft.wmma_seed_fc &&
                           grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
         const int seed_rows = std::min(rows, grant.prompt_remaining - 1);
-        const int tile_rows = std::min(seed_rows, prefill_chunk_rows);
+        const int concat_rows = std::min(seed_rows, prefill_chunk_rows);
         const std::size_t available = workspace.bytes() - layout.bytes;
-        if (seed_scratch_bytes(tile_rows) > available) {
+        if (seed_scratch_bytes(concat_rows, seed_rows) > available) {
             throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
         }
         const auto scratch = make_seed_scratch(
-            layout.take<Bf16>(seed_scratch_bytes(tile_rows) / sizeof(Bf16)), tile_rows);
+            layout.take<Bf16>(seed_scratch_bytes(concat_rows, seed_rows) / sizeof(Bf16)),
+            concat_rows, seed_rows);
         chunk.seed_draft(*grant.draft, grant.tokens + 1, seed_rows, model.final_norm, wmma,
                          nullptr, &scratch);
     }
@@ -863,16 +870,28 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
     };
     const auto scheduled = execute_partial_projection_groups(
         grants, count, stream, stats,
-        [&](const PrefillGrant* group_grants, PrefillGroup rows, PrefillWorkspace& workspace,
-            PrefillAttentionMode attention, int capacity) {
+        [&](int source, int offset, const PrefillGrant* group_grants, PrefillGroup rows,
+            PrefillWorkspace& workspace, PrefillAttentionMode attention, int capacity) {
             ensure_peer(workspace.capacity());
+            // The callback grants are tiles of grants[source] starting at
+            // `offset`; mirror them from the peer grant with identical
+            // offsets and rows so rank 1 replays the same causal dispatch
+            // with its own request state. Serial groups span
+            // [source, source + rows.grants) directly.
+            std::array<PrefillGrant, causal_full_group.grants> peer_segments;
+            const PrefillGrant* peer_group = peer_grants + source;
+            if (attention == PrefillAttentionMode::causal_segments) {
+                peer_causal_segments(peer_grants, source, offset, peer_segments.data(),
+                                     rows.grants);
+                peer_group = peer_segments.data();
+            }
             prefill_layerwise(model, group_grants, rows, workspace, attention, capacity, &peer,
-                              peer_grants + (group_grants - grants), &*peer_workspace,
-                              peer_stream, &group);
+                              peer_group, &*peer_workspace, peer_stream, &group);
         },
-        [&](const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity, int offset) {
+        [&](int source, const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity,
+            int offset) {
             ensure_peer(workspace.capacity());
-            enqueue_native_prefill_grants_tp(model, peer, grant, peer_grants + (grant - grants),
+            enqueue_native_prefill_grants_tp(model, peer, grant, peer_grants + source,
                                              1, workspace, *peer_workspace, capacity, offset,
                                              stream, peer_stream, group);
         });

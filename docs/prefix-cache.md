@@ -9,7 +9,7 @@ Native reuses GQA, GDN, and draft checkpoints through a local LMCache daemon. Th
 | Server | Configure prefix reuse, validate salts, and report usage. | [Salt validation](../apps/server/text_request.cpp#L615)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L50)<!-- prefix: "void append_" --> |
 | HTTP controls | Dispatch cache reset, metrics, and bounded scheduler profiling. | [Control routes](../apps/server/prefix_controls.cpp#L483)<!-- prefix: "void Connect" --> |
 | Native cache | Builds prefix identities and describes GPU allocation regions. | [Prefix keys](../src/runtime/cache/prefix_payload.cpp#L85)<!-- prefix: "PrefixCacheK" --> · [Client](../include/sglang/runtime/cache/lmcache_client.h#L71)<!-- prefix: "class LmCach" --> |
-| LMCache | Resolves coverage, executes transfers, and retains CPU L1 records across native workers. | [Lookup](../tools/lmcache/sglang_lmcache.py#L80)<!-- prefix: "def resolve(" --> · [Storage](../tools/lmcache/sglang_lmcache.py#L182)<!-- prefix: "class Record" --> |
+| LMCache | Resolves coverage, executes transfers, and retains CPU L1 records across native workers. | [Lookup](../tools/lmcache/sglang_lmcache.py#L81)<!-- prefix: "def resolve(" --> · [Storage](../tools/lmcache/sglang_lmcache.py#L370)<!-- prefix: "class Record" --> |
 
 ## LMCache daemon
 
@@ -35,7 +35,7 @@ The request-end checkpoint holds the latest committed target state. A request ca
 
 GQA and draft records hold contiguous MXFP8 chunks of up to 256 rows. A GDN checkpoint holds convolution history, recurrent state, and the final BF16 hidden and residual rows. Each record is keyed by its prefix end. [Record construction](../src/runtime/cache/lmcache_prefix.cpp#L76)<!-- prefix: "void append_" -->
 
-The lookup reports the longest contiguous GQA match and the highest matching GDN boundary. The usable GDN boundary requires contiguous GQA through that row and respects the request's restore limit. At an MTP boundary `P`, it also requires contiguous draft coverage of `P-1` rows. GQA coverage can extend beyond the usable GDN boundary. [Coverage selection](../tools/lmcache/sglang_lmcache.py#L80)<!-- prefix: "def resolve(" --> · [Coverage reply](../tools/lmcache/sglang_lmcache.py#L430)<!-- prefix: "elif request" -->
+The lookup reports the longest contiguous GQA match and the highest matching GDN boundary. The usable GDN boundary requires contiguous GQA through that row and respects the request's restore limit. At an MTP boundary `P`, it also requires contiguous draft coverage of `P-1` rows. GQA coverage can extend beyond the usable GDN boundary. [Coverage selection](../tools/lmcache/sglang_lmcache.py#L81)<!-- prefix: "def resolve(" --> · [Coverage reply](../tools/lmcache/sglang_lmcache.py#L610)<!-- prefix: "elif request" -->
 
 Resume at the usable GDN boundary, or row zero when there is none. Recompute intervening GDN rows and use restored GQA read-only through its coverage. Append GQA only for uncovered rows. Native commits these extents after a successful transfer. [Restore view](../src/decoder_prefix_cache.cpp#L90)<!-- prefix: "PrefixDevice" --> · [Commit](../src/decoder_prefix_cache.cpp#L128)<!-- prefix: "int commit_r" -->
 
@@ -55,7 +55,7 @@ Cold and restored suffix rows use the same [prefill planner](native-prefill-work
 
 Each request keeps its page-rounded GPU allocation. Native exports allocation views and a readiness event. The daemon imports the views, waits for readiness, and moves the payload. CPU L1 retains records across native workers. [Request reservation](batch-graphs.md#resident-memory-admission) · [GPU transport](serving/lmcache.md#native-transport)
 
-Native uses separate pools for lookups and transfers, each with up to four workers. The daemon serializes writers and acknowledges a checkpoint after storing its records. A clean reservation or admission refusal skips that checkpoint. [Native pools](../apps/server/batch_cache.cpp#L97)<!-- prefix: "State(std::u" --> · [Daemon store](../tools/lmcache/sglang_lmcache.py#L224)<!-- prefix: "def store(se" -->
+Native uses separate pools for lookups and transfers, each with up to four workers. The daemon serializes writers and acknowledges a checkpoint after storing its records. A clean reservation or admission refusal skips that checkpoint. [Native pools](../apps/server/batch_cache.cpp#L97)<!-- prefix: "State(std::u" --> · [Daemon store](../tools/lmcache/sglang_lmcache.py#L408)<!-- prefix: "def store(se" -->
 
 A pending transfer holds its request's slot and allocation views. The scheduler skips that lane and advances ready peers. Normal completion waits for its pending checkpoint transfer. Abort or disconnect can abandon a lookup. An armed transfer holds the slot through cancellation until release. If the socket drops, the client waits for the daemon to release its lease or exit. [Scheduler](../apps/server/batch_service.cpp#L330)<!-- prefix: "if (job->pre" --> · [Slot retirement](../src/decoder_batch.cpp#L385)<!-- prefix: "DecoderBatch" --> · [Lease release](../src/runtime/cache/lmcache_client.cpp#L310)<!-- prefix: "void wait_fo" -->
 

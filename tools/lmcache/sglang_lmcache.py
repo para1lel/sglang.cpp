@@ -14,8 +14,9 @@ from importlib.metadata import version
 import torch
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.storage_manager import l1_owners_of
+from lmcache.v1.distributed.l1_manager.dram import DramL1Manager
+from lmcache.v1.distributed.internal_api import L1ManagerListener
+from lmcache.v1.distributed.storage_manager import _L1_WRITE_TAG, l1_owners_of
 from lmcache.v1.multiprocess.engine_module import DiscoverableModule
 
 from sglang_gpu_transfer import DeviceCopies, Transfer
@@ -179,24 +180,207 @@ class Request:
         self.peer.sendall(HEADER.pack(MAGIC, status, len(data)) + data)
 
 
+class DmaLock:
+    def __init__(self, ttl, finishing):
+        self.ttl = ttl
+        self.finishing = finishing
+        self.pins = 0
+
+    def is_locked(self):
+        return self.pins > 0 or self.ttl.is_locked()
+
+    def lock(self):
+        self.ttl.lock()
+
+    def unlock(self):
+        locks = getattr(self.finishing, "locks", None)
+        if locks is not None and self in locks:
+            locks.remove(self)
+            self.pins -= 1
+        else:
+            self.ttl.unlock()
+
+
+class DmaReservations(L1ManagerListener):
+    """Keep eviction and reservation under the pinned manager's own mutex."""
+
+    def __init__(self, manager):
+        self.manager = manager
+        self.finishing = threading.local()
+        self.writing = threading.local()
+        self.activity_lock = threading.Lock()
+        self.active = 0
+        self.clear_l1 = manager.clear
+        self.delete_l1 = manager.delete
+        manager.clear = self.clear
+        manager.delete = self.delete
+        # These 0.5.8 callbacks run under _lock. Capture the reservation before
+        # another notification can fail and interrupt the StorageManager call.
+        with manager._lock:
+            manager._registered_listeners.insert(0, self)
+
+    @contextlib.contextmanager
+    def activity(self):
+        with self.activity_lock:
+            self.active += 1
+        try:
+            yield
+        finally:
+            with self.activity_lock:
+                self.active -= 1
+
+    def clear(self, force=False):
+        return self.reclaim(self.clear_l1, force)
+
+    def delete(self, keys, force=False):
+        return self.reclaim(self.delete_l1, force, keys)
+
+    def reclaim(self, operation, force, *args):
+        if not force:
+            return operation(*args)
+        # The upstream force path bypasses the L1 lock state. Serialize only
+        # that path with reservation creation and refuse it while any are live.
+        with self.activity_lock:
+            if self.active:
+                raise RuntimeError("Cannot force reclaim during an active sglang DMA reservation")
+            return operation(*args, force=True)
+
+    def pin(self, entry, field):
+        lock = getattr(entry, field)
+        if not isinstance(lock, DmaLock):
+            lock = DmaLock(lock, self.finishing)
+            setattr(entry, field, lock)
+        lock.pins += 1
+        return lock
+
+    @contextlib.contextmanager
+    def read(self, keys):
+        with self.activity(), self.read_pinned(keys) as entries:
+            yield entries
+
+    @contextlib.contextmanager
+    def read_pinned(self, keys):
+        entries = {}
+        try:
+            with self.manager._lock:
+                for key in dict.fromkeys(keys):
+                    entry = self.manager._objects.get(key)
+                    if entry is not None:
+                        entries[key] = (entry, self.pin(entry, "read_lock"))
+                self.manager._report_read_reserved(list(entries))
+            yield {key: entry.memory_obj for key, (entry, _) in entries.items()}
+        finally:
+            if entries:
+                self.finish_read(entries)
+
+    def finish_read(self, entries):
+        with self.manager._lock:
+            pending = {key: lock for key, (entry, lock) in entries.items()
+                       if self.manager._objects.get(key) is entry and entry.read_lock is lock}
+        # A pin prevents ordinary eviction until finish_read consumes it. Other
+        # readers finishing on different threads still release their native TTL lock.
+        self.finishing.locks = set(pending.values())
+        try:
+            if pending:
+                self.manager.finish_read(list(pending))
+        finally:
+            unconsumed = self.finishing.locks
+            del self.finishing.locks
+            with self.manager._lock:
+                for key, (entry, lock) in entries.items():
+                    if key not in pending or lock in unconsumed:
+                        lock.pins -= 1
+                    if lock.pins == 0 and entry.read_lock is lock:
+                        entry.read_lock = lock.ttl
+
+    @contextlib.contextmanager
+    def write(self, storage, reserved):
+        with self.activity(), self.write_pinned(storage, reserved):
+            yield
+
+    @contextlib.contextmanager
+    def write_pinned(self, storage, reserved):
+        self.writing.reserved = reserved
+        self.writing.entries = {}
+        self.writing.published = set()
+        self.writing.key = None
+        try:
+            yield
+        finally:
+            entries = self.writing.entries
+            try:
+                with self.manager._lock:
+                    aborted = {key: obj for key, obj in reserved.items()
+                               if self.manager._get_staging(key, _L1_WRITE_TAG) is entries[key][0]}
+                if aborted:
+                    storage.abort_write(list(aborted), l1_owners_of(aborted))
+            finally:
+                with self.manager._lock:
+                    for entry, lock in entries.values():
+                        if entry.write_lock is lock:
+                            entry.write_lock = lock.ttl
+                del self.writing.entries, self.writing.published, self.writing.key
+                del self.writing.reserved
+
+    def reserve_write(self, storage, key, layout, reserved):
+        with self.manager._lock:
+            if self.manager._get_staging(key, _L1_WRITE_TAG) is not None:
+                return False
+        self.writing.key = key
+        try:
+            objects = storage.reserve_write([key], layout)
+            return key in self.writing.entries and objects.get(key) is reserved[key]
+        finally:
+            self.writing.key = None
+
+    def finish_write(self, storage, key, reserved):
+        storage.finish_write([key], l1_owners_of({key: reserved[key]}))
+        return key in self.writing.published
+
+    def on_l1_keys_reserved_write(self, keys):
+        key = getattr(self.writing, "key", None)
+        if key is not None and key in keys:
+            entry = self.manager._get_staging(key, _L1_WRITE_TAG)
+            if entry is not None:
+                self.writing.entries[key] = (entry, self.pin(entry, "write_lock"))
+                self.writing.reserved[key] = entry.memory_obj
+
+    def on_l1_keys_write_finished(self, keys):
+        entries = getattr(self.writing, "entries", {})
+        for key in keys:
+            if key in entries and self.manager._objects.get(key) is entries[key][0]:
+                self.writing.published.add(key)
+
+    def on_l1_keys_reserved_read(self, keys):
+        pass
+
+    def on_l1_keys_read_finished(self, keys):
+        pass
+
+    def on_l1_keys_finish_write_and_reserve_read(self, keys):
+        pass
+
+    def on_l1_keys_deleted_by_manager(self, keys):
+        pass
+
+    def on_l1_keys_accessed(self, keys):
+        pass
+
+
 class Records:
     def __init__(self, storage):
         self.storage = storage
         (self.l1,) = storage.l1_managers()
-        if storage.l2_adapters():
-            raise ValueError("sglang LMCache requires a dedicated L1 daemon")
+        if not isinstance(self.l1, DramL1Manager) or storage.l2_adapters():
+            raise ValueError("sglang LMCache requires a dedicated DRAM L1 daemon")
         self.device = DeviceCopies()
         self.writes = threading.Lock()
+        self.dma = DmaReservations(self.l1)
 
     @contextlib.contextmanager
     def read(self, keys):
-        results = self.l1.reserve_read(keys)
-        locked = {key: obj for key, (error, obj) in results.items() if error == L1Error.SUCCESS}
-        try:
-            yield locked
-        finally:
-            if locked:
-                self.l1.finish_read(list(locked))
+        with self.dma.read(keys) as resident:
+            yield resident
 
     def lookup(self, request, namespace):
         count = request.number(4)
@@ -236,24 +420,20 @@ class Records:
 
     def write(self, request, transfer, pending):
         reserved = {}
-        try:
+        with self.dma.write(self.storage, reserved):
             for record in pending:
                 request.check_mutation()
                 layout = MemoryLayoutDesc([torch.Size([record.size])], [torch.uint8])
-                reserved.update(self.storage.reserve_write([record.key], layout))
-                if record.key not in reserved:
+                if not self.dma.reserve_write(self.storage, record.key, layout, reserved):
                     return 3, b""
             if pending:
                 self.device.run(transfer, pending, reserved, store=True)
             request.check_mutation()
             for record in pending:
-                key = record.key
-                self.storage.finish_write([key], l1_owners_of({key: reserved[key]}))
-                del reserved[key]
+                if not self.dma.finish_write(self.storage, record.key, reserved):
+                    return 3, b""
+                del reserved[record.key]
             return self.receipt(pending, store=True)
-        finally:
-            if reserved:
-                self.storage.abort_write(list(reserved), l1_owners_of(reserved))
 
     @staticmethod
     def fits(resident, record):

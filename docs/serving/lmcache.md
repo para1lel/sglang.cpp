@@ -1,26 +1,32 @@
 # LMCache daemon
 
-The launcher runs LMCache 0.5.8 with a dedicated CPU L1 store for sglang prefix payloads. It exposes a Unix socket for the native client. Use a separate Python environment for the daemon. [Dependency pin](../../tools/lmcache/requirements.txt#L1)<!-- prefix: "lmcache==0.5" --> · [Upstream v0.5.8](https://github.com/LMCache/LMCache/commit/651617efcd556edf27387b646997869a2805fad2)
+Run a dedicated LMCache 0.5.8 daemon for the native server's GPU. The daemon moves GQA, GDN, and draft checkpoint data between native GPU allocations and its CPU L1 store. [Dependency pin](../../tools/lmcache/requirements.txt#L1)<!-- prefix: "lmcache==0.5" --> · [Upstream v0.5.8](https://github.com/LMCache/LMCache/commit/651617efcd556edf27387b646997869a2805fad2)
 
 ## Start the daemon
 
-Install `tools/lmcache/requirements.txt` in an environment that can import the LMCache multiprocess server. Set `LMCACHE_PYTHON` to that environment's interpreter. The launcher uses `python3` if the variable is unset. It checks the installed version before starting the daemon. Run these commands from the repository root under the same Linux user as the client. [Version check](../../tools/lmcache/serve.sh#L43)<!-- prefix: "path, namesp" -->
+Install `tools/lmcache/requirements.txt` in a CUDA-capable Python environment. Set `LMCACHE_PYTHON` to its interpreter, or leave it unset to use `python3`. Run from the repository root under the same Linux user as the native server. Set `GPU_UUID` to the reserved physical GPU UUID and `LMCACHE_SOCKET` to a private absolute socket path. [Version check](../../tools/lmcache/serve.sh#L44)<!-- prefix: "path, namesp" -->
 
 ```bash
 export LMCACHE_PYTHON=/path/to/lmcache-environment/bin/python
-"$LMCACHE_PYTHON" -c 'from importlib.metadata import version; import lmcache.v1.multiprocess.server; assert version("lmcache") == "0.5.8"'
-bash tools/lmcache/serve.sh
+CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved GPU UUID}" \
+    bash tools/lmcache/serve.sh --socket "${LMCACHE_SOCKET:?set an absolute socket path}"
 ```
+
+In the native server's shell, set `CUDA_VISIBLE_DEVICES` to the same physical `GPU_UUID` and add `--lmcache-socket "$LMCACHE_SOCKET"` to the usual server command. Expose exactly one GPU to the daemon. Keep the daemon running while restarting a native worker to preserve reusable checkpoints. Start a fresh daemon when you need an empty L1 store or change the checkpoint. Stop native workers before shutting down their daemon. [GPU validation](../../tools/lmcache/sglang_gpu_transfer.py#L137)<!-- prefix: "if torch.cud" -->
 
 | Option | Default and behavior |
 | --- | --- |
 | `--socket PATH` | `$XDG_RUNTIME_DIR/sglang-lmcache.sock` if that variable is absolute, otherwise `/tmp/sglang-lmcache-<euid>.sock`. Use an absolute path shorter than 108 bytes under an existing directory. |
 | `--namespace NAME` | `sglang`. The module serves one namespace. The client and daemon must use the same value. |
-| `--memory-gib N` | `16`. Set a finite positive CPU L1 limit in GiB. Use `64` for the formal benchmark daemon configuration. |
+| `--memory-gib N` | `16`. Sets a finite positive limit for CPU L1 in GiB. |
 | `--port N` | `17655`. This is the separate upstream LMCache TCP listener on `127.0.0.1`. |
 
-The launcher hides GPUs, starts with zero allocated L1 bytes, and selects LRU eviction. It authenticates the upstream TCP listener with a generated key. The Unix socket has mode `0600` and checks the client's effective user ID. [Defaults](../../tools/lmcache/serve.sh#L4)<!-- prefix: "case ${XDG_R" --> · [Daemon invocation](../../tools/lmcache/serve.sh#L74)<!-- prefix: "exec \"$pytho" --> · [Socket access](../../tools/lmcache/sglang_lmcache.py#L203)<!-- prefix: "def verify_r" -->
+The launcher selects `--supported-transfer-mode lmcache_driven` and configures a dedicated lazy DRAM L1 with LRU eviction. L1 starts at zero allocated bytes. The module requires dedicated L1 storage. The upstream listener uses a generated API key. The Unix socket has mode `0600` and checks the peer's effective user ID. [Daemon invocation](../../tools/lmcache/serve.sh#L75)<!-- prefix: "exec \"$pytho" --> · [Storage binding](../../tools/lmcache/sglang_lmcache.py#L179)<!-- prefix: "class Record" --> · [Socket access](../../tools/lmcache/sglang_lmcache.py#L290)<!-- prefix: "os.chmod(end" -->
 
 ## Native transport
 
-The client checks the daemon version with `ready()`, checks keys with `lookup()`, and transfers opaque bytes with `get()` and `put()`. Keys distinguish GQA, GDN, and draft payloads. A successful `put()` means LMCache committed the bytes and a read reservation found the expected record. `reset()` clears the dedicated L1 store. The module requires a dedicated store without L2 adapters. [Native client](../../include/sglang/runtime/cache/lmcache_client.h#L25)<!-- prefix: "class LmCach" --> · [Storage binding](../../tools/lmcache/sglang_lmcache.py#L108)<!-- prefix: "class Record" --> · [Store acknowledgement](../../tools/lmcache/sglang_lmcache.py#L177)<!-- prefix: "def acknowle" --> · [Reset](../../tools/lmcache/sglang_lmcache.py#L299)<!-- prefix: "records.stor" -->
+The application submits GPU allocation views and a CUDA readiness event. It keeps both alive until the daemon releases the views. The daemon imports the views and waits for the event. LMCache moves the payload between GPU memory and its CPU L1 records and closes the imported mappings before replying. Native sends transfer descriptions and receives receipts over the socket. The application allocates no host buffer for the cache payload. [GPU transfer](../../tools/lmcache/sglang_gpu_transfer.py#L146)<!-- prefix: "def run(self" --> · [Release reply](../../tools/lmcache/sglang_lmcache.py#L173)<!-- prefix: "def release_" -->
+
+## Standalone verification
+
+The B200 standalone proof stored and retrieved all three payload families into separate GPU allocations. It compared the region contents and untouched guards byte for byte. The GQA record held 459 rows across 16 layers, the draft record held 458 rows, and a single GDN span crossed a 64 MiB pinning boundary. This proof covers the daemon transport. Check worker restart, serving correctness, and request performance separately with the integrated implementation.

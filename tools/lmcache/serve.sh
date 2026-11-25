@@ -13,6 +13,7 @@ python=${LMCACHE_PYTHON:-python3}
 usage() {
     echo 'Usage: serve.sh [--socket PATH] [--namespace NAME] [--memory-gib N] [--port N]'
     echo 'Set LMCACHE_PYTHON to the interpreter with LMCache 0.5.8 installed.'
+    echo 'Expose exactly one CUDA device to the daemon, matching the native server GPU.'
 }
 
 while (($#)); do
@@ -66,7 +67,7 @@ PY
 umask 077
 export PYTHONPATH="$module_dir${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1
-export CUDA_VISIBLE_DEVICES=
+unset LMCACHE_ISOLATED_IPC LMCACHE_USE_VMM_API
 export LMCACHE_TRACK_USAGE=false
 unset LMCACHE_API_KEY_FILE LMCACHE_HTTP_API_KEY LMCACHE_HTTP_API_KEY_FILE
 LMCACHE_API_KEY=$("$python" -c 'import secrets; print(secrets.token_urlsafe(32))')

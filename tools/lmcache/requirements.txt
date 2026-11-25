@@ -1,1 +1,3 @@
 lmcache==0.5.8
+cupy-cuda13x==14.1.0
+cuda-python==13.5.0

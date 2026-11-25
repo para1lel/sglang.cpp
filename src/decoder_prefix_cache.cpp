@@ -3,6 +3,7 @@
 #include "sglang/decoder_mtp.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -10,12 +11,132 @@
 namespace sglang::decoder {
 namespace {
 
+constexpr std::array<std::size_t, 4> state_bytes{
+    gdn_layers * gdn_history_elements * sizeof(Bf16),
+    gdn_layers * gdn_state_elements * sizeof(float),
+    hidden_size * sizeof(Bf16), hidden_size * sizeof(Bf16)};
+constexpr std::size_t state_version_bytes =
+    state_bytes[0] + state_bytes[1] + state_bytes[2] + state_bytes[3];
+
+cudaError_t consume_prefix_error(cudaError_t direct) noexcept {
+    if (direct == cudaSuccess) return direct;
+    const auto recorded = cudaGetLastError();
+    return !CudaError::terminal(direct) && CudaError::terminal(recorded) ? recorded : direct;
+}
+
+void check_prefix_cuda(cudaError_t status, const char* operation) {
+    check(consume_prefix_error(status), operation);
+}
+
+class PrefixStateVersion {
+public:
+    explicit PrefixStateVersion(std::array<std::shared_ptr<const void>, 4> sources)
+        : producer_(std::make_unique<Producer>(std::move(sources))) {
+        check(cudaGetDevice(&device_), "Identify decoder prefix version device");
+        void* data = nullptr;
+        check_prefix_cuda(cudaMalloc(&data, state_version_bytes),
+                          "Allocate decoder prefix state version");
+        data_ = static_cast<std::byte*>(data);
+    }
+
+    ~PrefixStateVersion() {
+        if (!producer_) return;
+        try {
+            DeviceScope device(device_);
+            const auto status = complete_producer();
+            if (status == cudaSuccess) {
+                report(consume_prefix_error(cudaFreeAsync(data_, cudaStreamPerThread)));
+            } else {
+                report(status);
+            }
+        } catch (const CudaError& error) {
+            if (producer_->started) quarantine_producer();
+            report(error.status);
+        }
+    }
+
+    std::byte* data() const { return data_; }
+
+    void submit(const std::array<const void*, 4>& state, cudaStream_t stream,
+                const std::shared_ptr<void>& event) {
+        producer_->stream = stream;
+        producer_->started = true;
+        try {
+            auto* data = data_;
+            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
+                check_prefix_cuda(cudaMemcpyAsync(data, state[index], state_bytes[index],
+                                                  cudaMemcpyDeviceToDevice, stream),
+                                  "Version decoder prefix state");
+                data += state_bytes[index];
+            }
+            check_prefix_cuda(cudaEventRecord(static_cast<cudaEvent_t>(event.get()), stream),
+                              "Record decoder prefix readiness");
+            producer_->ready = event;
+        } catch (const CudaError& error) {
+            const auto drained = complete_producer();
+            if (CudaError::terminal(drained) && !CudaError::terminal(error.status)) {
+                check(drained, "Drain failed decoder prefix copy");
+            }
+            report(drained);
+            throw;
+        }
+    }
+
+private:
+    struct Producer {
+        explicit Producer(std::array<std::shared_ptr<const void>, 4> retained)
+            : sources(std::move(retained)) {}
+        std::array<std::shared_ptr<const void>, 4> sources;
+        std::shared_ptr<void> ready;
+        cudaStream_t stream = nullptr;
+        bool started = false;
+    };
+
+    cudaError_t complete_producer() noexcept {
+        if (!producer_->started) return cudaSuccess;
+        const auto ready = static_cast<cudaEvent_t>(producer_->ready.get());
+        auto status = consume_prefix_error(ready ? cudaEventQuery(ready)
+                                                 : cudaStreamSynchronize(producer_->stream));
+        if (ready && status == cudaErrorNotReady) {
+            status = consume_prefix_error(cudaEventSynchronize(ready));
+        }
+        if (status == cudaSuccess) producer_->started = false;
+        else quarantine_producer();
+        return status;
+    }
+
+    void quarantine_producer() noexcept {
+        // A failed fence cannot authorize reusing the source or destination allocations.
+        (void)producer_.release();
+    }
+
+    static void report(cudaError_t status) noexcept {
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "sglang decoder: Release prefix state version: %s\n",
+                         cudaGetErrorString(status));
+        }
+    }
+
+    int device_ = 0;
+    std::byte* data_ = nullptr;
+    std::unique_ptr<Producer> producer_;
+};
+
 class PrefixViewBuilder {
 public:
-    PrefixDeviceAddress allocation(const void* base, std::size_t bytes) {
+    explicit PrefixViewBuilder(bool store = false) {
+        if (store) {
+            owners_ = std::make_shared<Owners>();
+            view_.store_owner = owners_;
+        }
+    }
+
+    PrefixDeviceAddress allocation(const void* base, std::size_t bytes,
+                                   const Allocations* memory = nullptr) {
+        if (memory) owners_->blocks.push_back(memory->retain_block(base));
         cudaIpcMemHandle_t handle;
-        check(cudaIpcGetMemHandle(&handle, const_cast<void*>(base)),
-              "Export decoder prefix allocation handle");
+        check_prefix_cuda(cudaIpcGetMemHandle(&handle, const_cast<void*>(base)),
+                          "Export decoder prefix allocation handle");
         auto& allocations = view_.transfer.allocations;
         const auto index = static_cast<std::uint32_t>(allocations.size());
         auto& allocation = allocations.emplace_back();
@@ -25,29 +146,47 @@ public:
         return {index, 0};
     }
 
-    PrefixDeviceMxfp8 mxfp8(Mxfp8KvCache cache, int layers, int begin, int end) {
+    PrefixDeviceMxfp8 mxfp8(Mxfp8KvCache cache, int layers, int begin, int end,
+                            const Allocations* memory = nullptr) {
         if (begin == end) return {};
         PrefixDeviceMxfp8 result{begin, end, layers, cache.page_count};
         const auto payload = layers * cache.page_count * mxfp8_payload_bytes_per_page;
         const auto scales = layers * cache.page_count * mxfp8_scale_bytes_per_page;
         if (layers == full_attention_layers) {
-            const auto slab = allocation(cache.key_payload, 2 * (payload + scales));
+            const auto slab = allocation(cache.key_payload, 2 * (payload + scales), memory);
             result.planes = {{slab, {slab.allocation, payload}, {slab.allocation, 2 * payload},
                               {slab.allocation, 2 * payload + scales}}};
         } else {
-            result.planes = {{allocation(cache.key_payload, payload),
-                              allocation(cache.value_payload, payload),
-                              allocation(cache.key_scales, scales),
-                              allocation(cache.value_scales, scales)}};
+            result.planes = {{allocation(cache.key_payload, payload, memory),
+                              allocation(cache.value_payload, payload, memory),
+                              allocation(cache.key_scales, scales, memory),
+                              allocation(cache.value_scales, scales, memory)}};
         }
         return result;
     }
 
-    PrefixDeviceGdn gdn(TextGdnState state, const Workspace& row, int end) {
-        return {end, {{span(state.history, gdn_layers * gdn_history_elements * sizeof(Bf16)),
-                       span(state.recurrent, gdn_layers * gdn_state_elements * sizeof(float)),
-                       span(row.hidden, hidden_size * sizeof(Bf16)),
-                       span(row.residual, hidden_size * sizeof(Bf16))}}};
+    PrefixDeviceGdn gdn(TextGdnState state, const Workspace& row, int end,
+                        const Allocations* memory = nullptr, bool terminal = false) {
+        state_ = {state.history, state.recurrent, row.hidden, row.residual};
+        PrefixDeviceGdn result{end, {}};
+        if (memory && !terminal) {
+            std::array<std::shared_ptr<const void>, 4> sources;
+            for (std::size_t index = 0; index < state_.size(); ++index) {
+                sources[index] = memory->retain_block(state_[index]);
+            }
+            owners_->version = std::make_shared<PrefixStateVersion>(std::move(sources));
+            auto address = allocation(owners_->version->data(), state_version_bytes);
+            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
+                result.planes[index] = {address, state_bytes[index]};
+                address.offset += state_bytes[index];
+            }
+        } else {
+            for (std::size_t index = 0; index < state_bytes.size(); ++index) {
+                const auto bytes = state_bytes[index];
+                result.planes[index] = {allocation(state_[index], bytes, memory), bytes};
+            }
+        }
+        return result;
     }
 
     PrefixDeviceTransfer finish(PrefixDeviceLayout layout, cudaStream_t stream) {
@@ -61,24 +200,33 @@ public:
         std::memcpy(view_.transfer.device.data(), properties.uuid.bytes,
                     sizeof(properties.uuid.bytes));
         cudaEvent_t ready;
-        check(cudaEventCreateWithFlags(&ready, cudaEventInterprocess | cudaEventDisableTiming),
-              "Create decoder prefix IPC event");
+        check_prefix_cuda(cudaEventCreateWithFlags(&ready, cudaEventInterprocess |
+                                                   cudaEventDisableTiming),
+                          "Create decoder prefix IPC event");
         view_.ready = std::shared_ptr<void>(ready, [](void* event) noexcept {
             cudaEventDestroy(static_cast<cudaEvent_t>(event));
         });
-        check(cudaEventRecord(ready, stream), "Record decoder prefix readiness");
         cudaIpcEventHandle_t handle;
-        check(cudaIpcGetEventHandle(&handle, ready), "Export decoder prefix readiness handle");
+        check_prefix_cuda(cudaIpcGetEventHandle(&handle, ready),
+                          "Export decoder prefix readiness handle");
         static_assert(sizeof(handle) == sizeof(view_.transfer.ready_event));
         std::memcpy(view_.transfer.ready_event.data(), &handle, sizeof(handle));
+        if (owners_ && owners_->version) {
+            owners_->version->submit(state_, stream, view_.ready);
+        } else {
+            check_prefix_cuda(cudaEventRecord(ready, stream), "Record decoder prefix readiness");
+        }
         return std::move(view_);
     }
 
 private:
-    PrefixDeviceSpan span(const void* base, std::size_t bytes) {
-        return {allocation(base, bytes), bytes};
-    }
+    struct Owners {
+        std::vector<std::shared_ptr<const void>> blocks;
+        std::shared_ptr<PrefixStateVersion> version;
+    };
 
+    std::array<const void*, state_bytes.size()> state_{};
+    std::shared_ptr<Owners> owners_;
     PrefixDeviceTransfer view_;
 };
 
@@ -109,18 +257,22 @@ PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead
 
 PrefixDeviceTransfer export_prefix_view(const Request& request, int gqa_begin, int draft_begin,
                                         int end, cudaStream_t source_ready,
-                                        const MtpDraftRequest* draft, const Workspace* row) {
+                                        const MtpDraftRequest* draft, const Workspace* row,
+                                        bool terminal) {
     if (end <= 0 || end > capacity(request) || gqa_begin < 0 || gqa_begin > end ||
         draft_begin < 0 || draft_begin > (draft ? end - 1 : 0)) {
         throw std::logic_error("Invalid decoder prefix checkpoint extent");
     }
-    PrefixViewBuilder view;
+    PrefixViewBuilder view(true);
     PrefixDeviceLayout layout;
-    layout.gqa = view.mxfp8(request.caches.front(), full_attention_layers, gqa_begin, end);
+    layout.gqa = view.mxfp8(request.caches.front(), full_attention_layers, gqa_begin, end,
+                            &request.memory);
     if (draft && draft_begin < end - 1) {
-        layout.draft = view.mxfp8(draft->prefix_cache_view(end - 1, true), 1, draft_begin, end - 1);
+        layout.draft = view.mxfp8(draft->prefix_cache_view(end - 1, true), 1, draft_begin, end - 1,
+                                  &draft->prefix_cache_memory());
     }
-    layout.gdn = view.gdn(request.states.front(), row ? *row : request.work, end);
+    layout.gdn = view.gdn(request.states.front(), row ? *row : request.work, end,
+                          &request.memory, terminal);
     return view.finish(layout, source_ready);
 }
 

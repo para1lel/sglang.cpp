@@ -51,7 +51,7 @@ GPU_UUID="$GPU_UUID" LMCACHE_SOCKET="$LMCACHE_SOCKET" \
     bash tests/prefix/run_lmcache_state.sh "$out" "$checkpoint" "$evidence"
 ```
 
-Require `PASS` in both `state.log` and `graph.log`. The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. The graph check advances a K0 peer while the checkpoint transfer is held. It compares the checkpoint state and continuation scores with the control after the copy completes. [Device runner](run_lmcache_state.sh#L4)<!-- prefix: "build=$(real" -->
+Require `PASS` in both `state.log` and `graph.log`. The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks periodic views across allocation growth and a failed store, and verifies that terminal views incur no copy while retaining source blocks after retirement. It also checks single-charge accounting, queues a periodic copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. The graph check advances a K0 or K1 peer while a checkpoint transfer is held, then compares native state and continuation scores with the control. [Device runner](run_lmcache_state.sh#L4)<!-- prefix: "build=$(real" --> · [Periodic view](lmcache_state.cpp#L516)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L539)<!-- prefix: "void check_t" --> · [Accounting](lmcache_state.cpp#L583)<!-- prefix: "void check_d" --> · [Delayed copy](lmcache_state.cpp#L616)<!-- prefix: "void check_d" --> · [Copy failure](lmcache_state.cpp#L669)<!-- prefix: "void check_c" -->
 
 ## Historical resident-cache checks
 

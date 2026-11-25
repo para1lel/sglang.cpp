@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | CUDA backend policy | Chooses the B200 split-KV policy or the generic SM100 path. | [Device policy](../src/runtime/backend/cuda_backend_policy.cpp#L17)<!-- prefix: "const bool b" --> |
-| Batch executor | Selects direct decode lanes, binds scores and request state, and owns graph and scratch lifetimes. | [Batch selection](../src/decoder_batch.cpp#L542)<!-- prefix: "const auto r" --> · [Graph dispatch](../src/text/decoder_graph.cpp#L83)<!-- prefix: "DecodeRun ru" --> · [Score allocation](../src/runtime/backend/cuda_resources.cpp#L440)<!-- prefix: "ExactGqaWork" --> |
+| Batch executor | Selects direct decode lanes, binds scores and request state, and owns graph and scratch lifetimes. | [Batch selection](../src/decoder_batch.cpp#L542)<!-- prefix: "const auto r" --> · [Graph dispatch](../src/text/decoder_graph.cpp#L83)<!-- prefix: "DecodeRun ru" --> · [Score allocation](../src/runtime/backend/cuda_resources.cpp#L509)<!-- prefix: "ExactGqaWork" --> |
 | Target attention | Appends KV, reads each row's causal prefix, and gates the attention output before projection. | [Eager attention](../src/decoder_forward.cpp#L701)<!-- prefix: "if (batch.ta" --> · [Bound singleton](../src/decoder_forward.cpp#L582)<!-- prefix: "if (batch.ta" --> · [Bound verification](../src/decoder_forward.cpp#L600)<!-- prefix: "void attend_" --> |
 
 ## Runtime path
@@ -46,7 +46,7 @@ The reader uses one expanded BF16 K slot and alternates between two expanded BF1
 
 ## Constraints and failure behavior
 
-A clean shared-score OOM makes the generic batch remember the allocation failure. Long singleton steps use direct eager attention, while short replay remains eligible. Other allocation errors reach batch recovery. A recoverable graph rejection drains the stream, destroys its graph handles, and disables replay for that width. Eager decode can still use the retained score buffer. Batch cleanup drains the stream and destroys graphs before freeing it. [Allocation fallback](../src/runtime/backend/cuda_resources.cpp#L440)<!-- prefix: "ExactGqaWork" --> · [Graph recovery](../src/runtime/backend/cuda_resources.cpp#L499)<!-- prefix: "const auto f" --> · [Teardown](../src/runtime/backend/cuda_resources.cpp#L187)<!-- prefix: "CleanupError" -->
+A clean shared-score OOM makes the generic batch remember the allocation failure. Long singleton steps use direct eager attention, while short replay remains eligible. Other allocation errors reach batch recovery. A recoverable graph rejection drains the stream, destroys its graph handles, and disables replay for that width. Eager decode can still use the retained score buffer. Batch cleanup drains the stream and destroys graphs before freeing it. [Allocation fallback](../src/runtime/backend/cuda_resources.cpp#L509)<!-- prefix: "ExactGqaWork" --> · [Graph recovery](../src/runtime/backend/cuda_resources.cpp#L568)<!-- prefix: "const auto f" --> · [Teardown](../src/runtime/backend/cuda_resources.cpp#L247)<!-- prefix: "CleanupError" -->
 
 For the 20-row shared reader, a clean decline or a recognized optional setup or launch rejection returns that packet to the ordinary split route. A later packet can try again. A preexisting or distinct recorded CUDA error prevents fallback and remains recorded. The code clears only a recorded status matching the failed call and gives the returned status precedence on hard failure. [Rejection handling](../include/sglang/text/gqa/gqa_decode_reuse.cuh#L133)<!-- prefix: "std::optiona" -->
 

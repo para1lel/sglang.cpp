@@ -54,11 +54,12 @@ struct PrefixDeviceLayout {
     PrefixDeviceGdn gdn;
 };
 
-// Keep the request and its ready event alive through connector completion.
+// A STORE owns its native blocks. The caller keeps a borrowed GET destination alive.
 struct PrefixDeviceTransfer {
     LmCacheGpuTransfer transfer;
     PrefixDeviceLayout layout;
     std::shared_ptr<void> ready;
+    std::shared_ptr<const void> store_owner;
 };
 
 std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end);

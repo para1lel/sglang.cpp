@@ -91,7 +91,7 @@ Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decima
 
 The CLI defaults to greedy selection, with ties going to the lowest ID. It uses the [K4 default](mtp.md#runtime-path). `--stop-token` emits a match and returns `stop`, even at the budget. Exhaustion returns `length`. There is no implicit EOS. Failures print to stderr and exit 1. See [sampling](text-serving.md#sampling) and [C++ and HTTP constraints](text-serving.md#finite-choice-constraints). [Greedy selection](../src/text_ops.cu#L430)<!-- prefix: "__device__ T" -->
 
-The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/runtime/backend/cuda_resources.cpp#L70)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/runtime/backend/cuda_resources.cpp#L407)<!-- prefix: "Allocations:" -->
+The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/runtime/backend/cuda_resources.cpp#L130)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/runtime/backend/cuda_resources.cpp#L476)<!-- prefix: "Allocations:" -->
 
 Workspace sizing, row-wise fallback, and pool retention are documented with the prefill allocation contract. [Prefill workspace](native-prefill-workspace.md#constraints-and-failure-behavior)
 

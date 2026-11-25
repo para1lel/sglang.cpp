@@ -69,9 +69,13 @@ private:
     bool changed_ = false;
 };
 
+struct ExportedDeviceBlock;
+struct DetachedDeviceBytes;
+
 struct DeviceBlock {
     void* pointer;
     std::size_t bytes;
+    std::shared_ptr<ExportedDeviceBlock> export_owner{};
 };
 
 class RequestBlockCache;
@@ -101,6 +105,7 @@ public:
     void capture_graph(const std::function<void()>& enqueue);
     void discard_graph();
     void free_block(void* pointer, std::size_t bytes);
+    std::shared_ptr<const void> retain_block(const void* pointer) const;
     bool replay_batch_graph(int width, const std::function<void()>& prepare,
                             const std::function<void()>& capture,
                             const std::function<bool()>& bind, bool target_verify = false);
@@ -148,7 +153,8 @@ private:
     static constexpr std::size_t max_bytes = 768 * 1024 * 1024;
     static constexpr std::size_t max_blocks = 384;
     std::unique_ptr<Allocations::State> state_;
-    std::unique_ptr<RetiredBlockReclaimer> reclaimer_;
+    std::shared_ptr<RetiredBlockReclaimer> reclaimer_;
+    std::shared_ptr<DetachedDeviceBytes> detached_bytes_;
     std::size_t quarantined_bytes_ = 0;
     bool reusable_ = true;
 };
@@ -160,7 +166,7 @@ public:
 
     static std::unique_ptr<RetiredBlockReclaimer> create(int device);
     ~RetiredBlockReclaimer();
-    bool submit(DeviceBlock block);
+    bool submit(DeviceBlock block, bool detached = false);
     std::size_t unavailable_bytes() const;
     std::size_t pending_bytes() const;
     void drain();

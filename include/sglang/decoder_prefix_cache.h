@@ -15,7 +15,7 @@ PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead
 PrefixDeviceTransfer export_prefix_view(const Request& request, int gqa_begin, int draft_begin,
                                         int end, cudaStream_t source_ready,
                                         const MtpDraftRequest* draft = nullptr,
-                                        const Workspace* row = nullptr);
+                                        const Workspace* row = nullptr, bool terminal = false);
 int commit_restored_prefix(Request& request, const PrefixDeviceTransfer& view,
                            MtpDraftRequest* draft = nullptr);
 

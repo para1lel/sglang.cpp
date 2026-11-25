@@ -98,9 +98,10 @@ private:
     friend PrefixDeviceTransfer restore_prefix_view(Request&, const PrefixCacheRead&,
                                                      cudaStream_t, MtpDraftRequest*);
     friend PrefixDeviceTransfer export_prefix_view(const Request&, int, int, int, cudaStream_t,
-                                                    const MtpDraftRequest*, const Workspace*);
+                                                    const MtpDraftRequest*, const Workspace*, bool);
     friend int commit_restored_prefix(Request&, const PrefixDeviceTransfer&, MtpDraftRequest*);
     Mxfp8KvCache prefix_cache_view(int rows, bool storing) const;
+    const Allocations& prefix_cache_memory() const;
     void commit_restored_prefix(int rows);
 
     struct State;

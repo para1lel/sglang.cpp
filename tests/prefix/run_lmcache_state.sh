@@ -14,7 +14,10 @@ append=_ZN6sglang15mxfp8_kv_appendENS_12Mxfp8KvCacheENS_14Mxfp8PageTableEii
 append+=PK13__nv_bfloat16S4_P11CUstream_st
 for name in state graph; do
     wrap=()
-    if [[ $name == state ]]; then wrap=(-Wl,--wrap="$append"); fi
+    if [[ $name == state ]]; then
+        wrap=(-Wl,--wrap="$append" -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaFreeAsync
+              -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord)
+    fi
     "${CXX:-c++}" -std=c++17 -O3 -pthread -Iinclude -I"$toolkit/include" \
         "tests/prefix/lmcache_$name.cpp" src/runtime/cache/lmcache_client.cpp \
         src/runtime/cache/lmcache_prefix.cpp \

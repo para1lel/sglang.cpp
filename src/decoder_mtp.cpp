@@ -861,6 +861,8 @@ Mxfp8KvCache MtpDraftRequest::prefix_cache_view(int rows, bool storing) const {
     return state_->cache;
 }
 
+const Allocations& MtpDraftRequest::prefix_cache_memory() const { return state_->memory; }
+
 void MtpDraftRequest::commit_restored_prefix(int rows) {
     state_->prefix = rows;
 }

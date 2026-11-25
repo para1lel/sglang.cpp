@@ -154,3 +154,17 @@ Keep the launch typed when changing a migrated kernel signature. In the selected
 before an object was emitted. The positive Release exercised the chunked draft
 path and ordinary generation. The retained compile control is
 `artifacts/continue-w3-long-target-independent/main-selected-gate.IahPUCPH/arity/compile.log`.
+
+## L013 · Shared HTTP cache fixture changes missed public runners
+
+The LMCache migration updated constraints, batch admission, and sampled MTP in `f38f03a`.
+The next fix updated the media runner in `7e349bb`. The batch lifecycle runner still passed
+the former resident entry count `4` to `server_policy`. Its Boolean identity check rejected
+even a healthy daemon before the first W1 turn. Later assertions still expected resident
+store events on individual scheduler steps. [First migration](https://github.com/para1lel/sglang.cpp/commit/f38f03af03450904c1fd4a8499687ee69d214cb4) · [Lifecycle call at the reviewed revision](https://github.com/para1lel/sglang.cpp/blob/7e349bb224fbb5715a2c5ff937d513d860fe6d01/tests/batch/checkpoint_lifecycle.py#L246)<!-- prefix: "http.server_" --> · [Review finding](https://github.com/para1lel/sglang.cpp/pull/1#discussion_r4694496532)
+
+When the shared fixture changes, trace its imports and calls across test directories. Exercise
+each affected public entry point in its documented cache mode. For this change, the media
+runner checks both daemon-enabled and explicit cache-off workers. The batch runner requires a
+dedicated daemon and proves that the saved W1 endpoint restores the exact rows and produces
+the same continuation IDs as a cold request. [Media controls](../tests/media/http-contract.md) · [Lifecycle reproducer](../tests/batch/README.md#checkpoint-lifecycle)

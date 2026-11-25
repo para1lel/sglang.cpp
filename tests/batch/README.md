@@ -229,20 +229,31 @@ error for the active peer.
 
 ## Checkpoint lifecycle
 
-Run on a reserved B200 with a fresh evidence directory. Use the default
-cache, K4 and row budget.
+Start a dedicated [LMCache 0.5.8 daemon](../../docs/serving/lmcache.md#start-the-daemon) on the reserved B200.
+Use a private absolute path for `LMCACHE_SOCKET` and wait for the daemon to be ready.
+The runner rejects the standard daemon sockets. It drains requests and pending stores,
+then clears the daemon store before W1 and between independent cases. This removes other
+workers' records too. Keep the daemon exclusive to this run and use a fresh evidence directory.
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" CUDA_DEVICE_ORDER=PCI_BUS_ID \
     python3 -IB tests/batch/checkpoint_lifecycle.py "$out/bin/sglang-server" \
-    "$checkpoint" "$out/checkpoint-lifecycle"
+    "$checkpoint" "$out/checkpoint-lifecycle" --lmcache-socket "${LMCACHE_SOCKET:?}"
 ```
 
-The test checks one terminal save at 255 processed tokens for W1, two session
-branches that restore target and draft state, and saves at each 8,192-token
-boundary reached during prefill or decode. An abort leaves no terminal
-checkpoint. A disconnect after the first boundary preserves the periodic
-checkpoint. Reversing two stop strings that match distinct tokens in one K4
-packet selects a different endpoint. Both endpoints restore for continuation.
-The evidence includes requests, raw SSE, scheduler traces, and cache metrics.
+The runner checks LMCache availability, K4, and the default 32,768-row budget.
+It compares successful STORE counts after running and waiting requests and pending stores reach zero.
+The saved HTTP metrics must show zero LMCache I/O errors and zero declined stores.
+Batch traces show K4 verification, the one-row decode at a crossed boundary, and terminal retirement.
+A daemon STORE receipt can arrive after retirement.
+
+- W1 saves one terminal checkpoint at 255 processed tokens. Two session branches restore 255 target rows and 254 draft rows.
+  Both must emit the same token IDs as their cold controls.
+  Replaying W1 must acknowledge one duplicate STORE with zero new GQA tokens and zero bytes written for GQA, GDN, or draft data.
+- The periodic cases probe the terminal endpoint and every 8,192-token boundary reached in prefill or decode. Divergent prompts probe the deepest boundary first.
+- An abort leaves no terminal checkpoint. A disconnect after the first boundary preserves its periodic checkpoint.
+  Both interrupted turns are ineligible as session parents.
+- Reversing two stop strings selects different endpoints in one K4 packet. Each continuation restores the selected endpoint and matches cold output IDs.
+
+The evidence directory contains the server arguments, requests, responses, raw SSE, scheduler traces, and cache metrics.
 

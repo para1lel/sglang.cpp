@@ -237,7 +237,7 @@ xmake build -P . generated-logprobs-check
 ./build/bin/generated-logprobs-check "$checkpoint"
 ```
 
-Require exit status zero for reducer and checkpoint cases. On captured target rows, compare selected and ranked scores against an independent full-vocabulary log-softmax. [Build target](../xmake.lua#L413)<!-- prefix: "target(\"gene" --> · [Checkpoint check](../tests/text/generated_logprobs_check.cpp#L248)<!-- prefix: "int main(int" -->
+Require exit status zero for reducer and checkpoint cases. On captured target rows, compare selected and ranked scores against an independent full-vocabulary log-softmax. [Build target](../xmake.lua#L414)<!-- prefix: "target(\"gene" --> · [Checkpoint check](../tests/text/generated_logprobs_check.cpp#L248)<!-- prefix: "int main(int" -->
 
 Build the [CPU fixture](../tests/text/README.md#native-generate-on-cpu). Run the score suite against that binary.
 

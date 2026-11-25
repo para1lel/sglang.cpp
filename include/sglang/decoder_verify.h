@@ -58,8 +58,13 @@ struct VerificationWorkspace {
 
     std::array<ReplayLayer, gdn_layers> replay;
     std::vector<Workspace> work;
-    Bf16* observable;
-    TextLogitCandidate* winners;
+Bf16* observable;
+TextLogitCandidate* winners;
+    // Packet-capacity staging for the single-read BF16 head projection:
+    // packed inputs followed by packed logits, carved from one allocation
+    // owned by this workspace's arena (freed with it, never resized).
+    Bf16* bf16_head_packed = nullptr;
+    Bf16* bf16_head_packed_logits = nullptr;
 };
 
 struct VerificationGraphBinding {
@@ -178,6 +183,12 @@ public:
     bool needs_generated_logprobs() const { return host_generated_logprobs_ != nullptr; }
     std::shared_ptr<const DecoderTokenLogprobs> generated_logprobs(int index) const;
 
+    Bf16* bf16_head_staging() const {
+        return active_workspace_ ? active_workspace_->bf16_head_packed : nullptr;
+    }
+    Bf16* bf16_head_logits_staging() const {
+        return active_workspace_ ? active_workspace_->bf16_head_packed_logits : nullptr;
+    }
 private:
     void enqueue_results();
     VerificationWorkspace& workspace() { return *active_workspace_; }

@@ -6,6 +6,7 @@
 #include "sglang/text/gdn_local.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/mtp/tc_vocab.h"
+#include "sglang/text/bf16_head_projection.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -69,6 +70,10 @@ VerificationWorkspace::VerificationWorkspace(Allocations& memory, int rows) {
     auto* attention = memory.allocate<Bf16>(rows * text_gdn_value_width);
     observable = memory.allocate<Bf16>(rows * text_gdn_value_width);
     winners = memory.allocate<TextLogitCandidate>(rows);
+    bf16_head_packed = memory.allocate<Bf16>(
+        static_cast<std::size_t>(verification_packet_rows) * (hidden_size + vocab_size));
+    bf16_head_packed_logits =
+        bf16_head_packed + static_cast<std::size_t>(verification_packet_rows) * hidden_size;
     work.reserve(rows);
     for (int index = 0; index < rows; ++index) {
         auto& row = work.emplace_back(memory, attention + index * text_gdn_value_width,
@@ -645,6 +650,7 @@ void decoder::project_verification_bf16(Bf16Weight weight, const VerificationRow
 
 namespace {
 
+
 // Scores one verification packet on this rank: per-row final RMS norm, the
 // optional tc-vocabulary fast path, then the BF16 lm-head projection with
 // argmax for unconstrained rows. Shared by the single-device and
@@ -679,7 +685,41 @@ void score_verification_packet(const DecoderModel& model, const VerificationRow*
             }
         }
     }
-    project_verification_bf16(model.lm_head, first, size, &Workspace::logits, stream);
+    bool projected = false;
+    if (size >= 2 && size <= verification_packet_rows) {
+        // One full-weight read across all rows (the grouped path reads the
+        // head once per five-row group). Staging comes from the packet's own
+        // workspace arena — eager and bound rows alike — so concurrent
+        // verifiers never share scratch and captures bake arena addresses
+        // that exist before capture begins. Fall back to the grouped path
+        // unchanged when staging is unavailable or the operator declines.
+        Bf16* staging = nullptr;
+        Bf16* staging_logits = nullptr;
+        if (first->verification != nullptr) {
+            staging = first->verification->bf16_head_staging();
+            staging_logits = first->verification->bf16_head_logits_staging();
+        } else if (first->graph_workspace != nullptr) {
+            staging = first->graph_workspace->bf16_head_packed;
+            staging_logits = first->graph_workspace->bf16_head_packed_logits;
+        }
+        if (staging != nullptr && staging_logits != nullptr) {
+            std::array<Bf16HeadRow, verification_packet_rows> rows;
+            for (int index = 0; index < size; ++index) {
+                const auto& work = *first[index].work;
+                rows[index] = {work.normalized, work.logits};
+            }
+            const auto status = project_bf16_head(
+                model.lm_head.values, model.lm_head.rows, model.lm_head.columns, rows.data(),
+                size, staging, staging_logits, stream);
+            if (status) {
+                check(*status, "Project verification packet through the BF16 head");
+                projected = true;
+            }
+        }
+    }
+    if (!projected) {
+        project_verification_bf16(model.lm_head, first, size, &Workspace::logits, stream);
+    }
     for (int index = 0; index < size; ++index) {
         const auto& row = first[index];
         const auto& work = *row.work;

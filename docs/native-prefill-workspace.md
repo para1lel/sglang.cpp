@@ -112,3 +112,15 @@ For whole-tile pairs, check both lane offsets and cover mixed, partial, and per-
 Use the default 32,768-row scheduler budget. Check four 8,192-row grants and four equal grants with distinct restored starts. Compare score captures, target and draft KV and scales, GDN carry and history, saved hidden and residual state, and output IDs. Include unequal grants and mixed decode. Deny the 4,096-row workspace at and above the 8,192-row pair limit. At the limit, check paired fallback. Above it, check causal fallback and then ordinary prefill if that arena also fails. Remove the failure and check four-grant recovery. Record group counts and active workspace bytes separately from retained GPU memory.
 
 Historical K0 comparisons exercised pairing on the reduced-output W4 fixture. W3 cohorts exercised no pairs. W5 and W6 used host replay. Inspect traced grant sizes and admission and decode overlap before attributing serving timing changes to pairing. [Historical pairing evidence](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#verification)
+
+### TP2 long down projection replay
+
+The [CUTLASS down route](fp8-prefill-projections.md#large-prefill-tiles) replayed each rank shard separately on a single B200 using Qwen3.8-27B-FP8 checkpoint layers 0, 3, and 32 and fixed synthetic input activations. Eight alternating CUDA-event trials measured warm graph replay per layer from residual reset and RMSNorm through gate/up, SwiGLU, and down, including scale preparation. Eager compared all three layers, and graph replay compared layer 32. BF16 down outputs, SwiGLU E4M3 values, and FP32 scales matched bitwise.
+
+| Rows | Rank shard | Native median (µs) | CUTLASS median (µs) |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 0 | 730.556 | 691.593 |
+| 4,096 | 1 | 730.008 | 686.147 |
+| 1,024 | 1 | 202.757 | 192.767 |
+
+The forced fallback linked the pre-change archive and required the scaled launcher to decline. At 4,096 rows, its medians were within 2.765 µs of native on both shards, with bitwise parity. The shape guard also declined 1,004 rows on rank 1, with native and fallback medians of 204.579 and 205.278 µs and bitwise parity. See `artifacts/tp2-resume/long-gemm/receipts/` (`summary.json`, `ab-*-down-only.log`, `ab-*-down-control.log`). W4 and W5 serving makespan remain unmeasured for this route.

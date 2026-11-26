@@ -11,7 +11,6 @@ struct TensorMapError {
     CUresult status;
 };
 
-// CuTe's descriptor builder only asserts on driver errors. Preserve the status in Release.
 template <class Function, class... Args>
 CUresult checked_tensor_map(Function encode, Args... args) {
     const auto status = encode(args...);
@@ -156,7 +155,7 @@ std::optional<cudaError_t> try_prefill_scaled_sm100(
     if (pending != cudaSuccess) return pending;
     const bool attention_output = row_count == grouped_prefill_max_rows && input_width == 6144;
     const bool down = (row_count == grouped_prefill_max_rows || row_count == 1024) &&
-                      input_width == 17408;
+                      (input_width == 17408 || input_width == 8704);
     if (output_width != out_width || !(attention_output || down)) return std::nullopt;
     if (!aligned(input.values, 16) || !aligned(input.scales, alignof(float)) ||
         !aligned(weight, 16) || !aligned(weight_scales, alignof(__nv_bfloat16)) ||
@@ -183,9 +182,13 @@ std::optional<cudaError_t> try_prefill_scaled_sm100(
     }
     const int groups = input_width / scale_group;
     dim3 scale_grid((groups + scale_tile - 1) / scale_tile, row_count / scale_tile);
-    const auto scale_kernel = attention_output ? prepare_scales<4096, 6144 / scale_group> :
+    auto scale_kernel = attention_output ? prepare_scales<4096, 6144 / scale_group> :
         row_count == 1024 ? prepare_scales<1024, 17408 / scale_group> :
                            prepare_scales<4096, 17408 / scale_group>;
+    if (input_width == 8704) {
+        scale_kernel = row_count == 1024 ? prepare_scales<1024, 8704 / scale_group> :
+                                           prepare_scales<4096, 8704 / scale_group>;
+    }
     void* scale_args[] = {&input.scales, &weight_scales, &transposed, &converted};
     const auto status = submit_status(cudaLaunchKernel(
         scale_kernel, scale_grid, dim3(scale_tile, scale_tile), scale_args, 0, stream));

@@ -169,6 +169,33 @@ cudaError_t plan_splits(const void* kernel, int slot, const LaunchTarget& target
     return cudaSuccess;
 }
 
+std::optional<cudaError_t> prepare_gate_cluster(const void* kernel, const LaunchTarget& target,
+                                                int clusters, int shared_bytes) {
+    static std::mutex mutex;
+    static int resident[max_devices]{};
+    if (static_cast<unsigned>(target.device) >= max_devices) return cudaErrorInvalidDevice;
+    std::lock_guard lock(mutex);
+    auto& active_ctas = resident[target.device];
+    if (active_ctas == 0) {
+        int cluster_launch = 0;
+        auto status = cudaDeviceGetAttribute(&cluster_launch, cudaDevAttrClusterLaunch,
+                                             target.device);
+        if (status != cudaSuccess) return status;
+        if (!cluster_launch) {
+            active_ctas = -1;
+            return std::nullopt;
+        }
+        int limit = 0;
+        status = configure(kernel, 20, target.device, limit);
+        if (status != cudaSuccess) return status;
+        active_ctas = shared_bytes <= limit
+            ? resident_ctas(kernel, 2, shared_bytes, target.sm_count) : 0;
+        if (active_ctas == 0) active_ctas = -1;
+    }
+    if (active_ctas < 2 * clusters) return std::nullopt;
+    return cudaSuccess;
+}
+
 CUresult encode_map(const LaunchTarget& target, CUtensorMap& map, const void* data,
                     CUtensorMapDataType type, int element_bytes, int rows, int width,
                     int box_rows) {
@@ -204,7 +231,7 @@ cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void**
 
 cudaError_t configure(const void* kernel, int slot, int device, int& limit) {
     static std::mutex mutex;
-    constexpr unsigned slot_count = 20;
+    constexpr unsigned slot_count = 21;
     static int limits[max_devices][slot_count] = {};
     if (static_cast<unsigned>(slot) >= slot_count) return cudaErrorInvalidValue;
     if (static_cast<unsigned>(device) >= max_devices) return cudaErrorInvalidDevice;

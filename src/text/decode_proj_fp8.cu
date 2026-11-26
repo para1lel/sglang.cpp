@@ -1,5 +1,6 @@
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/decode_proj_sm100.cuh"
+#include "sglang/text/quantize_warp.cuh"
 #include "sglang/text/target_fp8.h"
 
 #include <algorithm>
@@ -17,6 +18,9 @@ constexpr int mlp_slots = 4;
 constexpr int hidden_width = 5120;
 constexpr int intermediate_width = 17408;
 constexpr int local_intermediate_width = intermediate_width / 2;
+constexpr int m10_rows = text_target_fp8_m10_rows;
+constexpr int m10_columns = 16;
+constexpr int gate_cluster = 2;
 
 template <int Columns>
 constexpr int scale_bytes = (Columns + 1) * int(sizeof(float));
@@ -47,6 +51,11 @@ template <int Capacity>
 struct Fp8RowJob : Fp8Job {
     Fp8RowPointers<Capacity> lanes[max_targets];
     const float* scales[Capacity];
+};
+
+struct Fp8GateUpJob : Fp8Job {
+    const float* scales[m10_rows];
+    TextFp8Activation quantized[m10_rows];
 };
 
 template <int Columns, typename Job>
@@ -110,35 +119,49 @@ __device__ void consume_single(DecodePipeline<Slots>& pipe, const float* scales,
     }
 }
 
-template <int Columns, int Slots>
+__device__ __forceinline__ void load_tmem10(unsigned source, unsigned (&out)[m10_rows]) {
+    asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+                 : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
+                   "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7])
+                 : "r"(source) : "memory");
+    asm volatile("tcgen05.ld.sync.aligned.32x32b.x2.b32 {%0,%1}, [%2];"
+                 "\ntcgen05.wait::ld.sync.aligned;"
+                 : "=r"(out[8]), "=r"(out[9]) : "r"(source + 8) : "memory");
+}
+
+template <int Columns, int ResultRows, int Slots>
 __device__ __forceinline__ void consume(DecodePipeline<Slots>& pipe, const float* scales,
                                         const float* weight_scales,
-                                        int count, int active, float (&result)[Columns]) {
+                                        int count, int active, float (&result)[ResultRows]) {
     constexpr bool compact = Columns == 80 || Columns == 160;
+    constexpr bool packed_m10 = ResultRows == m10_rows;
     const int warp = threadIdx.x / warp_size;
     const unsigned lane_base = pipe.tmem + (static_cast<unsigned>(warp * warp_size) << 16);
-    if constexpr (!compact) {
+    if constexpr (!compact && !packed_m10) {
         if (active == 1) {
             consume_single<Columns>(pipe, scales, weight_scales, count, lane_base, result[0]);
             return;
         }
     }
-    constexpr int fragment = Columns == 8 ? 8 : 16;
+    constexpr int fragment = packed_m10 ? m10_rows : Columns == 8 ? 8 : 16;
     for (int index = 0; index < count; ++index) {
         const int slot = index % Slots;
         const float scale = weight_scales[index];
         wait_barrier(&pipe.accum_ready[slot], (index / Slots) & 1);
         fence_after_sync();
         #pragma unroll
-        for (int block = 0; block < Columns; block += fragment) {
-            if (compact || block < active) {
+        for (int block = 0; block < ResultRows; block += fragment) {
+            if (compact || packed_m10 || block < active) {
                 unsigned partial[fragment];
-                if constexpr (fragment == 8) {
+                if constexpr (packed_m10) {
+                    load_tmem10(lane_base + slot * Columns, partial);
+                } else if constexpr (fragment == 8) {
                     load_tmem8(lane_base + slot * Columns + block, partial);
                 } else {
                     load_tmem16(lane_base + slot * Columns + block, partial);
                 }
-                promote<compact>(partial, scales + index * Columns + block, scale, result + block);
+                promote<compact || packed_m10>(partial, scales + index * Columns + block,
+                                               scale, result + block);
             }
         }
         release_slot(&pipe.accum_empty[slot]);
@@ -216,6 +239,48 @@ __device__ __forceinline__ void store_compact(const float (&result)[Columns], fl
     cluster_sync();
 }
 
+__device__ __forceinline__ uint2 load_cluster_bf16x4(const __nv_bfloat16* local, unsigned rank) {
+    if (rank == blockIdx.x) return *reinterpret_cast<const uint2*>(local);
+    unsigned remote;
+    uint2 value;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                 : "=r"(remote) : "r"(shared_address(local)), "r"(rank));
+    asm volatile("ld.shared::cluster.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(value.x), "=r"(value.y) : "r"(remote) : "memory");
+    return value;
+}
+
+__device__ __forceinline__ __nv_bfloat162 swiglu_pair(unsigned gate_bits, unsigned up_bits) {
+    const __nv_bfloat162 gate = __nv_bfloat162_raw{
+        static_cast<unsigned short>(gate_bits), static_cast<unsigned short>(gate_bits >> 16)};
+    const __nv_bfloat162 up = __nv_bfloat162_raw{
+        static_cast<unsigned short>(up_bits), static_cast<unsigned short>(up_bits >> 16)};
+    return {text_kernel::swiglu(gate.x, up.x), text_kernel::swiglu(gate.y, up.y)};
+}
+
+__device__ void store_gate_up(const float (&result)[m10_columns], __nv_bfloat16* tile,
+                              int target, int row_block, int warp, const Fp8GateUpJob& job) {
+    const int row_base = row_block * tile_rows;
+    if (threadIdx.x < tile_rows) {
+        #pragma unroll
+        for (int row = 0; row < m10_rows; ++row) {
+            tile[row * tile_rows + threadIdx.x] = __float2bfloat16_rn(result[row]);
+        }
+    }
+    cluster_sync();
+    constexpr int rows_per_cta = m10_rows / gate_cluster;
+    if (warp < rows_per_cta) {
+        const int row = target * rows_per_cta + warp;
+        const int lane = threadIdx.x % warp_size;
+        const auto* values = tile + row * tile_rows + lane * 4;
+        const auto gate = load_cluster_bf16x4(values, 0);
+        const auto up = load_cluster_bf16x4(values, 1);
+        text_kernel::quantize_warp_pairs(swiglu_pair(gate.x, up.x), swiglu_pair(gate.y, up.y),
+                                         row_block, row_base + lane * 4, lane, job.quantized[row]);
+    }
+    cluster_sync();
+}
+
 template <int Columns, int Slots = stages, typename Job = Fp8Job>
 __global__ __launch_bounds__(threads, 1)
 void fp8_decode(const __grid_constant__ Job job) {
@@ -223,20 +288,28 @@ void fp8_decode(const __grid_constant__ Job job) {
         ((tile_rows / 16) << 24) | ((Columns / 8) << 17) | (1u << 4);
     alignas(1024) extern __shared__ unsigned char tiles[];
     __shared__ DecodePipeline<Slots> pipe;
-    const int splits = gridDim.x;
-    const int first = blockIdx.x * job.groups / splits;
-    const int count = (blockIdx.x + 1) * job.groups / splits - first;
+    constexpr bool gate_up = std::is_same_v<Job, Fp8GateUpJob>;
+    constexpr bool packed_m10 = std::is_same_v<Job, Fp8RowJob<m10_rows>>;
+    const int splits = gate_up ? 1 : gridDim.x;
+    const int split = gate_up ? 0 : blockIdx.x;
+    const int first = split * job.groups / splits;
+    const int count = (split + 1) * job.groups / splits - first;
     const int act_row = blockIdx.z * Columns;
     constexpr bool compact = Columns == 80 || Columns == 160;
-    const int active = compact ? Columns : min(Columns, job.rows - act_row);
+    const int active = gate_up || packed_m10 ? m10_rows
+        : compact ? Columns : min(Columns, job.rows - act_row);
     const int warp = threadIdx.x / warp_size;
-    int target = 0;
-    for (int index = 1; index < job.targets; ++index) {
-        if (blockIdx.y >= unsigned(job.first_block[index])) {
-            target = index;
+    int target = blockIdx.x;
+    int row_block = blockIdx.y;
+    if constexpr (!gate_up) {
+        target = 0;
+        for (int index = 1; index < job.targets; ++index) {
+            if (blockIdx.y >= unsigned(job.first_block[index])) {
+                target = index;
+            }
         }
+        row_block -= job.first_block[target];
     }
-    const int row_block = blockIdx.y - job.first_block[target];
     const int row_base = row_block * tile_rows;
     auto* scales = reinterpret_cast<float*>(tiles + Slots * stage_bytes<Columns>);
     auto* weight_scales = scales + count * Columns;
@@ -248,7 +321,7 @@ void fp8_decode(const __grid_constant__ Job job) {
     }
     __syncthreads();
     const unsigned shared = shared_address(tiles);
-    float result[Columns] = {};
+    float result[packed_m10 ? m10_rows : Columns] = {};
     if (warp < consumer_warps) {
         const auto* source = job.weight_scales[target] + std::size_t(row_block) * job.groups;
         for (int index = threadIdx.x; index < count; index += tile_rows) {
@@ -256,7 +329,7 @@ void fp8_decode(const __grid_constant__ Job job) {
         }
         wait_dependencies();
         load_scales<Columns>(job, scales, act_row, first, count, active);
-        consume(pipe, scales, weight_scales, count, active, result);
+        consume<Columns>(pipe, scales, weight_scales, count, active, result);
     } else if (warp == mma_warp && threadIdx.x % warp_size == 0) {
         multiply<instruction, true, Columns>(pipe, shared, count);
     } else if (warp == copy_warp && threadIdx.x % warp_size == 0) {
@@ -268,7 +341,10 @@ void fp8_decode(const __grid_constant__ Job job) {
     if (warp == mma_warp) {
         free_tmem<Columns>(pipe);
     }
-    if constexpr (compact) {
+    if constexpr (gate_up) {
+        store_gate_up(result, reinterpret_cast<__nv_bfloat16*>(tiles),
+                      target, row_block, warp, job);
+    } else if constexpr (compact || packed_m10) {
         store_compact(result, reinterpret_cast<float*>(tiles), splits, row_base,
                       job.out_width[target], job.lanes[target]);
     } else if constexpr (!std::is_same_v<Job, Fp8Job>) {
@@ -321,6 +397,12 @@ bool supported_targets(const TextFp8DecodeTarget* targets, int count, int in_wid
         }
     }
     return true;
+}
+
+bool tp2_gate_up_shape(const TextFp8DecodeTarget* targets, int count, int in_width) {
+    return count == 2 && in_width == hidden_width &&
+           targets[0].out_width == local_intermediate_width &&
+           targets[1].out_width == local_intermediate_width;
 }
 
 bool use_mlp_pipeline(const TextFp8DecodeTarget* targets, int count, int in_width, int rows) {
@@ -435,6 +517,15 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
         return launch_rows<8, stages, 8>(
             target, projections, target_count, input, in_width, rows, count, 11, stream);
     }
+    if (count == m10_rows && !tp2_gate_up_shape(projections, target_count, in_width) &&
+        std::all_of(projections, projections + target_count, [](const auto& projection) {
+            return projection.out_width > 0 && projection.out_width % group_size == 0;
+        })) {
+        if (auto packed = launch_rows<m10_columns, stages, m10_rows>(
+                target, projections, target_count, input, in_width, rows, count, 19, stream)) {
+            return packed;
+        }
+    }
     if (count <= 16) {
         return launch_rows<16, stages, 16>(
             target, projections, target_count, input, in_width, rows, count, 12, stream);
@@ -445,6 +536,45 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
     }
     return launch_rows<32, stages, text_target_fp8_max_rows>(
         target, projections, target_count, input, in_width, rows, count, 14, stream);
+}
+
+std::optional<cudaError_t> try_target_fp8_gate_up(
+    const TextFp8DecodeTarget (&targets)[2], int in_width,
+    const TextFp8Activation (&inputs)[m10_rows],
+    const TextFp8Activation (&quantized)[m10_rows], cudaStream_t stream) {
+    if (!tp2_gate_up_shape(targets, 2, in_width)) return std::nullopt;
+    const TextFp8ActivationView input{inputs[0].values, nullptr};
+    if (!input.values || !supported_targets(targets, 2, in_width, input)) return std::nullopt;
+    for (const auto& target : targets) {
+        if (!target.weight || !target.weight_scales) return std::nullopt;
+    }
+    Fp8GateUpJob job{};
+    for (int row = 0; row < m10_rows; ++row) {
+        const auto& activation = inputs[row];
+        if (activation.values != input.values + row * in_width || !activation.scales ||
+            !quantized[row].values || !quantized[row].scales ||
+            !aligned16(quantized[row].values)) return std::nullopt;
+        job.scales[row] = activation.scales;
+        job.quantized[row] = quantized[row];
+    }
+    LaunchTarget target{};
+    if (auto ready = prepare_launch(stream, target); !ready || *ready != cudaSuccess) return ready;
+    constexpr int tiles = local_intermediate_width / tile_rows;
+    constexpr int groups = hidden_width / group_size;
+    SplitPlan plan{};
+    auto status = plan_fp8_splits(target, gate_cluster * tiles, groups, plan);
+    if (status != cudaSuccess) return status;
+    if (plan.splits != 1) return std::nullopt;
+    const auto* kernel = reinterpret_cast<const void*>(
+        fp8_decode<m10_columns, stages, Fp8GateUpJob>);
+    constexpr int shared = stages * stage_bytes<m10_columns> + groups * scale_bytes<m10_columns>;
+    if (const auto support = prepare_gate_cluster(kernel, target, tiles, shared);
+        !support || *support != cudaSuccess) return support;
+    int blocks = 0;
+    if (auto encoded = encode_job(target, targets, 2, input, in_width, m10_rows, m10_columns,
+                                  job, blocks); !encoded || *encoded != cudaSuccess) return encoded;
+    void* args[] = {&job};
+    return launch_split(kernel, dim3(gate_cluster, tiles, 1), shared, args, stream, gate_cluster);
 }
 
 std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* targets,

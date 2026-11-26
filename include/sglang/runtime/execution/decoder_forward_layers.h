@@ -78,19 +78,12 @@ struct LayerBatch {
     int target_split_end = 0;
     std::uint8_t* packed_activation = nullptr;
     
-    
-    
-    
     Bf16* const* attention_output = nullptr;
     Bf16* const* hidden_output = nullptr;
     
-    
-    
-    
     bool tensor_parallel = false;
+    const TextFp8Activation* projection_override = nullptr;
 
-    
-    
     int gqa_attention_width() const {
         return tensor_parallel ? tp2_sharding.local_q_width() : text_gqa_q_width;
     }
@@ -153,6 +146,7 @@ struct LayerBatch {
     }
 
     TextFp8Activation projection_activation(int index, int width) const {
+        if (projection_override) return projection_override[index];
         auto activation = workspace(lanes[index]).activation;
         if (packs_projection_activation(width)) {
             static_assert(verification_packet_rows * intermediate_size <=
@@ -226,6 +220,42 @@ struct LayerBatch {
             check(verify_quantize_fp8_wide(rows, size, width, stream),
                   "Quantize wide verification rows");
         }
+    }
+
+    bool project_fused_mlp(const Layer& layer) const {
+        if constexpr (!std::is_same_v<Lane, VerificationRow>) return false;
+        constexpr int rows = text_target_fp8_m10_rows;
+        constexpr int width = tp2_sharding.local_intermediate_size();
+        if (!tensor_parallel || !target_tc || count != rows || packed_activation ||
+            layer.mlp_gate.columns != hidden_size || layer.mlp_up.columns != hidden_size ||
+            layer.mlp_down.columns != width) return false;
+        auto* logits = workspace(lanes[0]).logits;
+        if (!logits) return false;
+        constexpr int groups = width / text_fp8_group_size;
+        constexpr int norm_value_bytes = rows * hidden_size;
+        constexpr int down_bytes = rows * width;
+        static_assert(norm_value_bytes % 16 == 0 && down_bytes % 16 == 0);
+        static_assert(norm_value_bytes + down_bytes + rows * groups * sizeof(float) <=
+                      vocab_size * sizeof(Bf16));
+        auto* down_values = reinterpret_cast<std::uint8_t*>(logits) + norm_value_bytes;
+        auto* down_scales = reinterpret_cast<float*>(down_values + down_bytes);
+        TextFp8Activation down[rows];
+        TextFp8Activation inputs[rows];
+        for (int row = 0; row < rows; ++row) {
+            inputs[row] = projection_activation(row, hidden_size);
+            down[row] = {down_values + row * width, down_scales + row * groups};
+        }
+        const TextFp8DecodeTarget targets[] = {
+            {layer.mlp_gate.values, layer.mlp_gate.scales, layer.mlp_gate.rows, nullptr},
+            {layer.mlp_up.values, layer.mlp_up.scales, layer.mlp_up.rows, nullptr},
+        };
+        const auto result = try_target_fp8_gate_up(targets, hidden_size, inputs, down, stream);
+        if (!result) return false;
+        check(*result, "Run fused target FP8 gate, up, and SwiGLU");
+        auto projection = *this;
+        projection.projection_override = down;
+        projection.project(layer.mlp_down, &Workspace::hidden);
+        return true;
     }
 
     void project(Fp8Weight weight, Bf16* Workspace::*output) const {
@@ -926,6 +956,7 @@ void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
     const bool five = batch.fuse_verify_activation();
     const bool wide = batch.fuse_wide_verify_norm();
     if (five || wide) {
+        if (wide && batch.project_fused_mlp(layer)) return;
         batch.project_group({{layer.mlp_gate, &Workspace::mlp_gate},
                              {layer.mlp_up, &Workspace::mlp_up}});
         if (five) {

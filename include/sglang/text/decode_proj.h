@@ -54,6 +54,9 @@ struct SplitPlan {
 
 cudaError_t configure(const void* kernel, int slot, int device, int& limit);
 
+std::optional<cudaError_t> prepare_gate_cluster(const void* kernel, const LaunchTarget& target,
+                                                int clusters, int shared_bytes);
+
 cudaError_t plan_splits(const void* kernel, int slot, const LaunchTarget& target,
                         int row_blocks, int k_blocks, int fixed_bytes, int bytes_per_block,
                         SplitPlan& plan);

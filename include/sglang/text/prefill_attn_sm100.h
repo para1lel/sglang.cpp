@@ -36,6 +36,17 @@ inline constexpr int staged_prefill_batch_size = 4;
 inline constexpr int staged_prefill_batch_min_position = 1024;
 inline constexpr int staged_prefill_batch_max_position = 7168;
 inline constexpr int staged_prefill_batch_long_max_position = 130048;
+inline constexpr int staged_serial_min_position = 32768;
+inline constexpr int staged_serial_max_tokens = 131072;
+inline constexpr int staged_serial_min_rows = 1024 - mxfp8_group_size;
+
+constexpr bool wants_long_serial_staging(int position, int rows) {
+    return rows >= staged_serial_min_rows && rows <= 1024 && position >= 0 &&
+        position <= staged_serial_max_tokens - rows && position + rows > staged_serial_min_position;
+}
+
+std::optional<cudaError_t> try_long_serial_staged_paged_prefill(
+    const PagedPrefillSequence& sequence, cudaStream_t stream, PairedPrefillScratch scratch);
 
 std::optional<cudaError_t> try_batched_staged_paged_prefill(
     const PagedPrefillSequence* sequences, int count, cudaStream_t stream,

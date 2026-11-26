@@ -24,9 +24,9 @@ C++ callers set depth per lane. Positive-depth lanes can [restore paired prefixe
 
 On B200, loaded draft weights support [INT8 draft scoring](native-model-info.md#int8-draft-head).
 
-Eligible B200 MTP prompt tiles hold up to 1,024 rows. Other devices cap tiles at 128. Draft seeding pairs each final-normalized target row with the next prompt token's embedding. A media lane supplies its own embedding and rotary coordinates. Single rows or unavailable scratch use scalar prefill. [Tile cap](../src/runtime/execution/decoder_execution_policy.cpp#L25)<!-- prefix: "int DecoderE" --> · [Draft input](../src/decoder_prefill.cpp#L100)<!-- prefix: "seed.seed_dr" -->
+Eligible B200 MTP prompt tiles hold up to 1,024 rows. Other devices cap tiles at 128. Draft seeding pairs each final-normalized target row with the next prompt token's embedding. A media lane supplies its own embedding and rotary coordinates. Single rows or unavailable scratch use scalar prefill. [Tile cap](../src/runtime/execution/decoder_execution_policy.cpp#L25)<!-- prefix: "int DecoderE" --> · [Draft input](../src/decoder_prefill.cpp#L75)<!-- prefix: "seed.seed_dr" -->
 
-B200 Tensor Core prefill can prefer TMA and `tcgen05` for draft seed FC on prompts of at least 4,096 tokens. Each FC call needs 64–128 effective rows, 10,240 input and 5,120 output channels, and 16-byte-aligned input and weights. Other shapes and input alignments use SIMT row GEMV. [Prefill selection](../src/decoder_prefill.cpp#L98)<!-- prefix: "const bool w" --> · [FC dispatch](../src/text/draft_seed_fc.cu#L124)<!-- prefix: "cudaError_t " -->
+B200 Tensor Core prefill can prefer TMA and `tcgen05` for draft seed FC on prompts of at least 4,096 tokens. Each FC call needs 64–128 effective rows, 10,240 input and 5,120 output channels, and 16-byte-aligned input and weights. Other shapes and input alignments use SIMT row GEMV. [Prefill selection](../src/decoder_prefill.cpp#L73)<!-- prefix: "const bool w" --> · [FC dispatch](../src/text/draft_seed_fc.cu#L124)<!-- prefix: "cudaError_t " -->
 
 TMA requires 4-byte-aligned output, a matching image and tensor-map encoder, and enough shared memory. Unaligned output or unsupported preflight selects the 32×64 WMMA tile. CUDA errors, including stream/device mismatch and launch failure, propagate without retry. SIMT accumulation can change draft KV and proposals. [TMA preflight](../src/text/draft_seed_fc_sm100.cu#L195)<!-- prefix: "std::optiona" --> · [Submission](../src/text/draft_seed_fc_sm100.cu#L241)<!-- prefix: "return submi" --> · [WMMA tile](../src/text/draft_seed_fc.cu#L24)<!-- prefix: "constexpr in" -->
 
@@ -41,7 +41,7 @@ Seed scratch comes from the [existing prefill workspace](native-prefill-workspac
 [Slice preparation](../src/decoder_mtp.cpp#L809)<!-- prefix: "for (int off" --> ·
 [Paired projection](../src/text_ops.cu#L748)<!-- prefix: "cudaError_t " --> ·
 [Grid banks](../include/sglang/text/prefill_fp8_exact.cuh#L209)<!-- prefix: "__global__ v" --> ·
-[Grouped seed](../src/decoder_prefill.cpp#L100)<!-- prefix: "seed.seed_dr" -->
+[Grouped seed](../src/decoder_prefill.cpp#L75)<!-- prefix: "seed.seed_dr" -->
 
 The target scores the last prompt row and selects the first token. If generation continues, that token and the last normalized target row start the draft round at `L-1`. Later proposals use the previous draft's final-normalized row and prediction. The proposal loop synchronizes the stream before reading winners and again before reading BF16 retry results. [Proposal loop](../src/decoder_verify.cpp#L156)<!-- prefix: "bool MtpRoun" -->
 

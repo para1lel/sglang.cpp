@@ -640,7 +640,7 @@ constexpr int staged_causal_group_rows = 4 * flash_chunk;
 constexpr int staged_causal_early_context = 32768;
 constexpr int staged_rank_page_min_position = 8192 - staged_causal_group_rows;
 
-template <int Count, bool CausalGroup>
+template <int Count, bool CausalGroup, bool Partial>
 std::optional<cudaError_t> prepare_long_page(const StagedRequests<Count>& requests,
                                             std::uint16_t* keys, std::uint16_t* values,
                                             int total_pages, StagedPairMaps& maps,
@@ -652,7 +652,7 @@ std::optional<cudaError_t> prepare_long_page(const StagedRequests<Count>& reques
     }
     const int kv_heads = requests.items[0].cache.kv_heads;
     auto kernel = reinterpret_cast<const void*>(tmem_staged_page_attention<Count>);
-    if constexpr (CausalGroup) {
+    if constexpr (CausalGroup || Partial) {
         if (kv_heads == gqa_rank_geometry.kv_heads) {
             kernel = reinterpret_cast<const void*>(tmem_staged_page_attention<Count, true>);
         }
@@ -700,6 +700,9 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
         config.blockDim.x = staged_compact_threads;
     }
     if constexpr (CausalGroup) config.gridDim.x = requests.rows[0] / flash_rows;
+    if constexpr (Partial && LongPage) {
+        config.gridDim.x = (requests.rows[0] + flash_rows - 1) / flash_rows;
+    }
     StagedPairMaps maps{};
     const void* kernel = reinterpret_cast<const void*>(paired);
     bool single = false;
@@ -736,7 +739,7 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
         }
     }
     if constexpr (LongPage) {
-        const auto prepared = prepare_long_page<Count, CausalGroup>(
+        const auto prepared = prepare_long_page<Count, CausalGroup, Partial>(
             requests, keys, values, total_pages, maps, kernel, config);
         if (prepared && *prepared != cudaSuccess) return prepared;
         single = prepared.has_value();
@@ -782,7 +785,8 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
                                                  cudaStream_t stream,
                                                  decoder::PairedPrefillScratch scratch) {
     const int position = sequences[0].position;
-    constexpr int min_partial_rows = 256;
+    constexpr int min_partial_rows = LongPage ? decoder::staged_serial_min_rows : 256;
+    constexpr int max_partial_visible = LongPage ? decoder::staged_serial_max_tokens : 32768;
     if (!StagedRange(scratch.keys, scratch.key_bytes, 1).valid() ||
         !StagedRange(scratch.values, scratch.value_bytes, 1).valid()) return std::nullopt;
     if constexpr (!Partial && !CausalGroup) {
@@ -798,7 +802,7 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
         const int rows = sequence.rows;
         if constexpr (Partial) {
             if (rows < min_partial_rows || rows > flash_chunk || sequence.position < 0 ||
-                sequence.position > 32768 - rows) return std::nullopt;
+                sequence.position > max_partial_visible - rows) return std::nullopt;
         } else if constexpr (CausalGroup) {
             constexpr int context = LongPage
                 ? decoder::staged_prefill_batch_long_max_position + flash_chunk
@@ -922,6 +926,13 @@ std::optional<cudaError_t> decoder::try_long_staged_paged_prefill(
         return launch_staged_requests<2, false, false, true>(sequences, stream, scratch);
     }
     return launch_staged_requests<1, false, false, true>(sequences, stream, scratch);
+}
+
+std::optional<cudaError_t> decoder::try_long_serial_staged_paged_prefill(
+    const PagedPrefillSequence& sequence, cudaStream_t stream, PairedPrefillScratch scratch) {
+    if (sequence.cache.kv_heads != gqa_rank_geometry.kv_heads ||
+        !wants_long_serial_staging(sequence.position, sequence.rows)) return std::nullopt;
+    return launch_staged_requests<1, true, false, true>(&sequence, stream, scratch);
 }
 
 std::optional<cudaError_t> launch_partial_staged_tmem_prefill(

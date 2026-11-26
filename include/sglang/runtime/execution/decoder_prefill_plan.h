@@ -43,6 +43,25 @@ inline PrefillGroup causal_projection_group(int rows) {
     return {};
 }
 
+inline int long_serial_visible(const PrefillGrant* grants, int count, bool grouped) {
+    int visible = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        if (grant.tile_rows < staged_serial_min_rows) continue;
+        const int grouped_rows = grouped && grant.tile_rows == batch_prefill_tile_rows &&
+                grant.position % batch_prefill_tile_rows == 0
+            ? grant.rows / grouped_prefill_max_rows * grouped_prefill_max_rows : 0;
+        for (int offset = grouped_rows; offset < grant.rows; offset += grant.tile_rows) {
+            const int rows = std::min(grant.tile_rows, grant.rows - offset);
+            const int position = grant.position + offset;
+            if (wants_long_serial_staging(position, rows)) {
+                visible = std::max(visible, position + rows);
+            }
+        }
+    }
+    return visible;
+}
+
 inline void validate_prefill_tile(const PrefillGrant& grant, const PrefillWorkspace& workspace,
                                   int capacity) {
     const auto rows = grant.rows;
@@ -92,7 +111,8 @@ template <typename RunGroup, typename RunNative>
 bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cudaStream_t stream,
                                        DecoderBatchStepStats& stats, RunGroup run_group,
                                        RunNative run_native,
-                                       int min_rows = min_partial_prefill_rows) {
+                                       int min_rows = min_partial_prefill_rows,
+                                       int staged_visible = 0) {
     int serial_capacity = 1;
     int grouped_capacity = 0;
     for (int index = 0; index < count;) {
@@ -110,7 +130,7 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
     }
     if (!grouped_capacity) return false;
 
-    PrefillWorkspace workspace(stream, std::max(serial_capacity, grouped_capacity));
+    PrefillWorkspace workspace(stream, std::max(serial_capacity, grouped_capacity), staged_visible);
     if (!workspace.data()) return false;
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
     for (int index = 0; index < count;) {

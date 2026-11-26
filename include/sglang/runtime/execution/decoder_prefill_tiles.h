@@ -29,6 +29,31 @@ std::optional<cudaError_t> launch_causal_group_staged_tmem_prefill(
 
 namespace decoder::prefill_detail {
 
+template <typename Normalize, typename Attention, typename Mlp>
+void execute_layers_tp(const std::array<Layer, layer_count>& primary_layers,
+                       const std::array<Layer, layer_count>& peer_layers, Normalize normalize,
+                       Attention attention, Mlp mlp) {
+    for (int index = 0; index < layer_count; ++index) {
+        const auto& primary = primary_layers[index];
+        const auto& peer = peer_layers[index];
+        const auto input = [first = index == 0](const auto& work) {
+            return first ? LayerResidual{work.residual, nullptr}
+                         : LayerResidual{work.hidden, work.residual};
+        };
+        const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
+        normalize(primary.input_norm, peer.input_norm, input, !full_attention);
+        if (full_attention) {
+            attention(primary.gqa, peer.gqa, bank);
+        } else {
+            attention(primary.gdn, peer.gdn, bank);
+        }
+        normalize(primary.attention_norm, peer.attention_norm, [](const auto& work) {
+            return LayerResidual{work.projected_attention, work.residual};
+        }, false);
+        mlp(primary, peer);
+    }
+}
+
 struct ScratchLayout {
     std::byte* data = nullptr;
     std::size_t bytes = 0;
@@ -184,6 +209,7 @@ struct Chunk : PrefillProjections {
     int position;
     const MropePosition* mrope;
     int cached_gqa_tokens = 0;
+    PairedPrefillScratch long_staging{};
 
     bool project_packed(TextFp8ActivationView input,
                         std::initializer_list<PrefillFp8Projection> projections) const {
@@ -390,15 +416,26 @@ struct Chunk : PrefillProjections {
               "Gate prefill grouped-query attention");
     }
 
+    void gqa_read(Mxfp8KvCache cache, Mxfp8PageTable pages, PairedPrefillScratch scratch) const {
+        auto staged = long_staging.keys && tensor_core_fp8
+            ? try_long_serial_staged_paged_prefill(
+                  {cache, pages, position, rows, work.rope_queries, work.attention}, stream,
+                  long_staging)
+            : std::nullopt;
+        if (!staged) {
+            staged = tensor_core_fp8
+                ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
+                                                work.attention, stream, scratch)
+                : mxfp8_gqa_attention(cache, pages, position + rows, position, rows,
+                    work.rope_queries, work.attention, stream, work.dims.gqa_geometry());
+        }
+        check(*staged, "Read causal prefill MXFP8 attention");
+    }
+
     void gqa_attention(const GqaLayer& layer, Mxfp8KvCache cache, Mxfp8PageTable pages,
                        PairedPrefillScratch scratch, bool postgate = true) const {
         gqa_append(layer, cache, pages);
-        const auto status = tensor_core_fp8
-            ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
-                                            work.attention, stream, scratch)
-            : mxfp8_gqa_attention(cache, pages, position + rows, position, rows, work.rope_queries,
-                                   work.attention, stream, work.dims.gqa_geometry());
-        check(status, "Read causal prefill MXFP8 attention");
+        gqa_read(cache, pages, scratch);
         if (postgate) gqa_gate();
     }
 
@@ -564,7 +601,7 @@ inline void read_paged_sequences(const PagedPrefillSequence* sequences, int coun
 inline Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, int offset) {
     return Chunk{{{}, grant.rows, chunk.stream, true}, chunk.work.attention_segment(offset),
         grant.position, grant.media ? grant.media->positions + grant.position : nullptr,
-        grant.request->cached_gqa_tokens};
+        grant.request->cached_gqa_tokens, chunk.long_staging};
 }
 
 inline bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
@@ -603,11 +640,7 @@ inline bool prefill_grouped_partial_gqa(const Chunk& chunk, const GqaLayer& laye
             const auto& grant = grants[first + lane];
             const auto segment = prefill_attention_segment(chunk, grant, offset);
             const auto& sequence = sequences[lane];
-            if (!submitted) {
-                check(tensor_core_model_prefill_gqa(sequence.cache, sequence.pages,
-                    sequence.position, sequence.rows, sequence.queries, sequence.output,
-                    chunk.stream, scratch), "Read causal prefill MXFP8 attention");
-            }
+            if (!submitted) segment.gqa_read(sequence.cache, sequence.pages, scratch);
             if (postgate) segment.gqa_gate();
             offset += grant.rows;
         }

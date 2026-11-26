@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/decoder_internal.h"
+#include "sglang/text/prefill_attn_sm100.h"
 
 #include <memory>
 
@@ -61,25 +62,31 @@ public:
     enum class Retention { existing, transient };
 
     PrefillWorkspace(cudaStream_t stream, int capacity);
+    PrefillWorkspace(cudaStream_t stream, int capacity, int staged_visible);
     PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention);
     ~PrefillWorkspace();
     PrefillWorkspace(const PrefillWorkspace&) = delete;
     PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
 
     std::size_t bytes() const { return bytes_; }
+    std::size_t layout_bytes() const { return layout_bytes_; }
     void close();
 
     cudaStream_t stream() const { return stream_; }
     int capacity() const { return capacity_; }
     void* data() const { return data_; }
+    PairedPrefillScratch long_gqa_staging() const { return staging_; }
 
 private:
+    PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention, int staged_visible);
     cudaError_t release() noexcept;
 
     cudaStream_t stream_;
     int capacity_;
     void* data_ = nullptr;
     std::size_t bytes_ = 0;
+    std::size_t layout_bytes_ = 0;
+    PairedPrefillScratch staging_{};
     cudaError_t release_status_ = cudaSuccess;
     std::unique_ptr<PrefillPool> pool_;
 };

@@ -2,6 +2,7 @@
 
 #include "sglang/prefill_fp8.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <mutex>
@@ -179,6 +180,13 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
     : PrefillWorkspace(stream, capacity, Retention::existing) {}
 
 PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention)
+    : PrefillWorkspace(stream, capacity, retention, 0) {}
+
+PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, int staged_visible)
+    : PrefillWorkspace(stream, capacity, Retention::existing, staged_visible) {}
+
+PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention,
+                                     int staged_visible)
     : stream_(stream), capacity_(capacity) {
     if (!stream || capacity < 1 || capacity > grouped_prefill_max_rows) {
         throw std::invalid_argument("Invalid decoder prefill workspace");
@@ -210,19 +218,40 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, Retention 
         check_prefill_pool_result(configured, false, "Configure prefill workspace pool");
         if (!transient) pools.configure_retention(*pool);
     }
-    const auto bytes = prefill_workspace_bytes(capacity);
+    const auto recycle = [&pools](PrefillPool* idle) noexcept {
+        pools.put(std::unique_ptr<PrefillPool>(idle));
+    };
+    std::unique_ptr<PrefillPool, decltype(recycle)> reservation(pool.release(), recycle);
+    const auto base = prefill_workspace_bytes(capacity);
+    constexpr std::size_t alignment = 128;
+    const auto offset = (base + alignment - 1) / alignment * alignment;
+    const auto visible = std::clamp(staged_visible, 0, staged_serial_max_tokens);
+    const auto pages = (visible + mxfp8_page_size - 1) / mxfp8_page_size;
+    const auto page_heads = std::size_t(pages) * gqa_rank_geometry.kv_heads;
+    const auto plane = page_heads * mxfp8_page_size * mxfp8_head_dim * sizeof(__nv_bfloat16);
+    const auto values = plane + page_heads * sizeof(int);
+    auto bytes = plane ? offset + plane + values : base;
     void* data = nullptr;
     check(cudaGetLastError(), "Check CUDA state before allocating prefill workspace");
-    const auto status = cudaMallocFromPoolAsync(&data, bytes, pool->handle, stream);
+    auto status = cudaMallocFromPoolAsync(&data, bytes, reservation->handle, stream);
+    if (plane && prefill_allocation_unavailable(status)) {
+        check_prefill_pool_result(status, true, "Reserve long prefill staging");
+        bytes = base;
+        status = cudaMallocFromPoolAsync(&data, bytes, reservation->handle, stream);
+    }
     if (status != cudaSuccess) {
-        pools.put(std::move(pool));
         check_prefill_pool_result(status, prefill_allocation_unavailable(status),
                                   "Allocate prefill workspace");
         return;
     }
-    pool_ = std::move(pool);
+    pool_.reset(reservation.release());
     data_ = data;
     bytes_ = bytes;
+    layout_bytes_ = base;
+    if (bytes != base) {
+        auto* keys = static_cast<std::byte*>(data) + offset;
+        staging_ = {keys, plane, keys + plane, values};
+    }
 }
 
 PrefillWorkspace::~PrefillWorkspace() {
@@ -243,6 +272,7 @@ cudaError_t PrefillWorkspace::release() noexcept {
         }
         prefill_pools().put(std::move(pool_));
         data_ = nullptr;
+        staging_ = {};
     }
     stream_ = nullptr;
     return release_status_;

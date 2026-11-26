@@ -26,31 +26,6 @@ namespace {
 using namespace decoder;
 using namespace decoder::prefill_detail;
 
-template <typename Normalize, typename Attention, typename Mlp>
-void execute_layers_tp(const std::array<Layer, layer_count>& primary_layers,
-                       const std::array<Layer, layer_count>& peer_layers, Normalize normalize,
-                       Attention attention, Mlp mlp) {
-    for (int index = 0; index < layer_count; ++index) {
-        const auto& primary = primary_layers[index];
-        const auto& peer = peer_layers[index];
-        const auto input = [first = index == 0](const auto& work) {
-            return first ? LayerResidual{work.residual, nullptr}
-                         : LayerResidual{work.hidden, work.residual};
-        };
-        const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
-        normalize(primary.input_norm, peer.input_norm, input, !full_attention);
-        if (full_attention) {
-            attention(primary.gqa, peer.gqa, bank);
-        } else {
-            attention(primary.gdn, peer.gdn, bank);
-        }
-        normalize(primary.attention_norm, peer.attention_norm, [](const auto& work) {
-            return LayerResidual{work.projected_attention, work.residual};
-        }, false);
-        mlp(primary, peer);
-    }
-}
-
 struct PrefillGroupPlan {
     bool grouped = false;
     bool causal = false;
@@ -291,7 +266,7 @@ void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
     }
     Bf16* seed_memory = nullptr;
     if (seed_tile_rows) {
-        const std::size_t available = workspace.bytes() - layout.bytes;
+        const std::size_t available = workspace.layout_bytes() - layout.bytes;
         if (seed_scratch_bytes(seed_tile_rows, seed_kv_rows) > available) {
             throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
         }
@@ -325,6 +300,12 @@ void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
     }
 }
 
+PairedPrefillScratch paired_long_staging(const PrefillWorkspace& local,
+                                        const PrefillWorkspace& peer) {
+    const auto scratch = local.long_gqa_staging();
+    return scratch.keys && peer.long_gqa_staging().keys ? scratch : PairedPrefillScratch{};
+}
+
 void prefill_layerwise_tp(const DecoderModel& model, const DecoderModel& peer,
                           const PrefillGrant* grants, const PrefillGrant* peer_grants,
                           PrefillGroup group, const PrefillGroupPlan& plan, int serial_capacity,
@@ -337,7 +318,8 @@ void prefill_layerwise_tp(const DecoderModel& model, const DecoderModel& peer,
     const TileBuffers peer_buffers(peer_layout, peer_workspace.capacity(), peer_dims);
     const Chunk peer_chunk{{peer_buffers.activation, group.rows, peer_stream,
                             chunk.tensor_core_fp8, plan.grouped || plan.serial_attention},
-                           peer_buffers, 0, nullptr};
+                           peer_buffers, 0, nullptr, 0,
+                           paired_long_staging(peer_workspace, workspace)};
     PrefillGroupTp run{grants, peer_grants, group, plan, serial_capacity, chunk, peer_chunk,
                        stream, peer_stream, &comm, peer.device, scaled_output,
                        reuse_all_gqa};
@@ -380,7 +362,9 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
         ? model.backend.tensor_core_prefill && peer->backend.tensor_core_prefill
         : true;
     const Chunk chunk{{buffers.activation, group.rows, stream, tensor_core,
-                       plan.grouped || plan.serial_attention}, buffers, 0, nullptr};
+                       plan.grouped || plan.serial_attention}, buffers, 0, nullptr, 0,
+                      peer ? paired_long_staging(workspace, *peer_workspace)
+                           : PairedPrefillScratch{}};
     const bool scaled_output = group.rows == grouped_prefill_max_rows;
     const bool reuse_all_gqa = std::all_of(grants, grants + group.grants, gqa_cached);
     if (peer) {
@@ -683,10 +667,11 @@ void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
     const bool tensor_core = model.backend.tensor_core_prefill &&
         peer.backend.tensor_core_prefill;
     const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, grant.position,
-                      nullptr, request.cached_gqa_tokens};
+                      nullptr, request.cached_gqa_tokens,
+                      paired_long_staging(workspace, peer_workspace)};
     const Chunk peer_chunk{{peer_buffers.activation, rows, peer_stream, tensor_core},
-                           peer_buffers, grant.position, nullptr,
-                           peer_request.cached_gqa_tokens};
+                           peer_buffers, grant.position, nullptr, peer_request.cached_gqa_tokens,
+                           paired_long_staging(peer_workspace, workspace)};
     const auto& work = chunk.work;
     const auto& peer_work = peer_chunk.work;
     gather_embeddings(model.embedding, grant.tokens, rows, work.residual, stream);
@@ -746,7 +731,7 @@ void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
                           grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
         const int seed_rows = std::min(rows, grant.prompt_remaining - 1);
         const int concat_rows = std::min(seed_rows, prefill_chunk_rows);
-        const std::size_t available = workspace.bytes() - layout.bytes;
+        const std::size_t available = workspace.layout_bytes() - layout.bytes;
         if (seed_scratch_bytes(concat_rows, seed_rows) > available) {
             throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
         }
@@ -866,11 +851,12 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
     if (!model.backend.tensor_core_prefill || !peer.backend.tensor_core_prefill) return false;
     if (try_prefill_paired_tiles_tp(model, peer, grants, peer_grants, count, stream, peer_stream,
                                     group, stats)) return true;
+    const int staged_visible = long_serial_visible(grants, count, true);
     std::optional<PrefillWorkspace> peer_workspace;
     const auto ensure_peer = [&](int capacity) {
         if (peer_workspace) return;
         const DeviceScope scope(peer.device);
-        peer_workspace.emplace(peer_stream, capacity);
+        peer_workspace.emplace(peer_stream, capacity, staged_visible);
         if (!peer_workspace->data()) {
             throw std::runtime_error("Prefill workspace unavailable under tensor parallelism");
         }
@@ -899,7 +885,7 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
                                              1, workspace, *peer_workspace, capacity, offset,
                                              stream, peer_stream, group);
         },
-        prefill_chunk_rows);
+        prefill_chunk_rows, staged_visible);
     if (peer_workspace) {
         const DeviceScope scope(peer.device);
         peer_workspace->close();
@@ -959,15 +945,17 @@ void Decoder::Model::prefill_grants_tp(const Model& peer, const PrefillGrant* gr
     for (int index = 0; index < count; ++index) {
         capacity = std::max(capacity, grants[index].tile_rows);
     }
-    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity);
+    const int staged_visible = backend.tensor_core_prefill && peer.backend.tensor_core_prefill
+        ? long_serial_visible(grants, count, false) : 0;
+    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity, staged_visible);
     if (!workspace->data() && capacity > prefill_chunk_rows) {
-        workspace.emplace(stream, prefill_chunk_rows);
+        workspace.emplace(stream, prefill_chunk_rows, staged_visible);
     }
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
     std::optional<PrefillWorkspace> peer_workspace;
     {
         const DeviceScope scope(peer.device);
-        peer_workspace.emplace(peer_stream, workspace->capacity());
+        peer_workspace.emplace(peer_stream, workspace->capacity(), staged_visible);
     }
     if (workspace->data() && !peer_workspace->data()) {
         throw std::runtime_error("Prefill workspace unavailable under tensor parallelism");

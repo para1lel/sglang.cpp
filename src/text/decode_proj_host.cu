@@ -212,9 +212,14 @@ CUresult encode_map(const LaunchTarget& target, CUtensorMap& map, const void* da
 
 cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,
                          cudaStream_t stream, unsigned cluster) {
+    return launch_split(kernel, grid, shared_bytes, args, stream, cluster, threads);
+}
+
+cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,
+                         cudaStream_t stream, unsigned cluster, int block_threads) {
     cudaLaunchConfig_t config{};
     config.gridDim = grid;
-    config.blockDim = dim3(threads);
+    config.blockDim = dim3(block_threads);
     config.dynamicSmemBytes = shared_bytes;
     config.stream = stream;
     cudaLaunchAttribute attributes[2]{};
@@ -231,7 +236,7 @@ cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void**
 
 cudaError_t configure(const void* kernel, int slot, int device, int& limit) {
     static std::mutex mutex;
-    constexpr unsigned slot_count = 22;
+    constexpr unsigned slot_count = 23;
     static int limits[max_devices][slot_count] = {};
     if (static_cast<unsigned>(slot) >= slot_count) return cudaErrorInvalidValue;
     if (static_cast<unsigned>(device) >= max_devices) return cudaErrorInvalidDevice;

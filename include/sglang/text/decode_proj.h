@@ -70,6 +70,8 @@ CUresult encode_map(const LaunchTarget& target, CUtensorMap& map, const void* da
 
 cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,
                          cudaStream_t stream, unsigned cluster);
+cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,
+                         cudaStream_t stream, unsigned cluster, int block_threads);
 
 }
 

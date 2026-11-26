@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L613)<!-- prefix: "const bool t" --> · [First-layer guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L299)<!-- prefix: "const bool c" --> |
+| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L626)<!-- prefix: "const bool t" --> · [First-layer guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L299)<!-- prefix: "const bool c" --> |
 | GDN operator | Prepare rows, advance each layer's recurrent state, and finish output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L339)<!-- prefix: "cudaError_t " --> |
 | Verification | Check ordered parity, chunked numerical error, and causal continuation. | [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L101)<!-- prefix: "int main(int" --> |
 
@@ -25,7 +25,7 @@ finish launches across up to four segments. The large
 [projection groups](native-prefill-workspace.md#projection-pairs-for-mtp) pass
 four 1,024-row tiles at 4,096 rows or two at 2,048 rows. The regular layerwise
 path can group two or three eligible grants. The same provider handles eligible [partial-grant groups](#grouped-partial-grants).
-[Segment limit](../include/sglang/decoder_cuda.cuh#L160)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L350)<!-- prefix: "void prefill" -->
+[Segment limit](../include/sglang/decoder_cuda.cuh#L160)<!-- prefix: "inline const" --> · [Decoder dispatch](../src/decoder_prefill.cpp#L363)<!-- prefix: "void prefill" -->
 
 The grid Z coordinate selects a grant with its own state, row slices, and
 scratch spans. Each block uses its grant's row count, including when aligned

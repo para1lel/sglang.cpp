@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select target prefill and append uncovered KV before attention. | [Policy](../src/decoder_prefill.cpp#L613)<!-- prefix: "const bool t" --> · [Attention call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L333)<!-- prefix: "const auto s" --> |
+| Decoder | Select target prefill and append uncovered KV before attention. | [Policy](../src/decoder_prefill.cpp#L626)<!-- prefix: "const bool t" --> · [Attention call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L333)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../include/sglang/text/gqa/multirow_prefill.cuh#L12)<!-- prefix: "cudaError_t " --> |
 | Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L662)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L556)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L759)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
@@ -82,7 +82,7 @@ Hold grants and projection policy fixed. Use the segment-by-segment path as the 
 
 ## Constraints and failure behavior
 
-Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 131,072. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../include/sglang/text/gqa/multirow_prefill.cuh#L29)<!-- prefix: "if (rows >= " --> · [Decoder](../src/decoder_prefill.cpp#L582)<!-- prefix: "if (rows == " -->
+Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 131,072. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../include/sglang/text/gqa/multirow_prefill.cuh#L29)<!-- prefix: "if (rows >= " --> · [Decoder](../src/decoder_prefill.cpp#L595)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 

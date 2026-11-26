@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model prefill | Append uncovered KV and select the attention path. | [Caller](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L333)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L613)<!-- prefix: "const bool t" --> |
+| Model prefill | Append uncovered KV and select the attention path. | [Caller](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L333)<!-- prefix: "const auto s" --> · [Policy](../src/decoder_prefill.cpp#L626)<!-- prefix: "const bool t" --> |
 | Native dispatcher | Select Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../include/sglang/text/gqa/multirow_prefill.cuh#L12)<!-- prefix: "cudaError_t " --> |
 | Ordered tile | Apply causal FP32 scoring and token-ordered accumulation. | [Score](../src/mxfp8_gqa_prefill.cu#L35)<!-- prefix: "__device__ v" --> · [Tile loop](../src/mxfp8_gqa_prefill.cu#L189)<!-- prefix: "for (int fir" --> |
 
@@ -12,7 +12,7 @@
 
 After KV append, the Tensor Core model path uses native attention dispatch at the same position and row count. Exact multirow tiles use direct MXFP8 attention. See the [Flash dispatcher](flash-prefill.md#runtime-path) for shape and device selection.
 
-[Batched staged attention](flash-prefill.md#runtime-path) is available for eligible full-tile and partial-grant groups. A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L582)<!-- prefix: "if (rows == " -->.
+[Batched staged attention](flash-prefill.md#runtime-path) is available for eligible full-tile and partial-grant groups. A one-row model tile uses [ordinary forward execution](../src/decoder_prefill.cpp#L595)<!-- prefix: "if (rows == " -->.
 
 Staged tiles double-buffer packed K/V and scales in 32-key blocks. The loads follow the page table and zero-fill slots outside the tile's visible span. Scoring and accumulation apply each row's causal limit. [Copies](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L112)<!-- prefix: "__device__ v" -->
 
@@ -30,7 +30,7 @@ On B200, eager Tensor Core TP2 prefill can stage native MXFP8 GQA for 992–1,02
 
 A mixed 4,096-row projection group can use this reader for an eligible lane after grouped readers decline. A contiguous 4,096-row causal attention group continues to use its [causal reader](flash-prefill.md#same-request-causal-gqa). A clean reader setup decline resumes ordinary per-lane GQA. CUDA errors propagate. [Lane fallback](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L643)<!-- prefix: "if (!submitt" --> · [Reader dispatch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L419)<!-- prefix: "void gqa_rea" -->
 
-Each rank sizes optional workspace for the largest eligible visible span in the step. Page-rounded BF16 K and V planes and per-page metadata add up to 268,443,648 bytes per rank. If either rank hits a clean allocation OOM, that rank retries with the base arena. Both ranks then use ordinary attention for these tiles. A rank that allocated the extra space releases it at normal stream-ordered close. The existing pool policy governs retention. [Span planning](../include/sglang/runtime/execution/decoder_prefill_plan.h#L46)<!-- prefix: "inline int l" --> · [Workspace sizing](../src/runtime/execution/decoder_prefill_workspace.cpp#L225)<!-- prefix: "const auto b" --> · [Base retry](../src/runtime/execution/decoder_prefill_workspace.cpp#L237)<!-- prefix: "if (plane &&" --> · [Both-rank gate](../src/decoder_prefill.cpp#L303)<!-- prefix: "PairedPrefil" --> · [Release](../src/runtime/execution/decoder_prefill_workspace.cpp#L266)<!-- prefix: "cudaError_t " -->
+Each rank sizes optional workspace for the largest eligible visible span in the step. Page-rounded BF16 K and V planes and per-page metadata add up to 268,443,648 bytes per rank. If either rank hits a clean allocation OOM, that rank retries with the base arena. Both ranks then use ordinary attention for these tiles. A rank that allocated the extra space releases it at normal stream-ordered close. The existing pool policy governs retention. [Span planning](../include/sglang/runtime/execution/decoder_prefill_plan.h#L46)<!-- prefix: "inline int l" --> · [Workspace sizing](../src/runtime/execution/decoder_prefill_workspace.cpp#L260)<!-- prefix: "const auto b" --> · [Base retry](../src/runtime/execution/decoder_prefill_workspace.cpp#L272)<!-- prefix: "if (plane &&" --> · [Both-rank gate](../src/decoder_prefill.cpp#L309)<!-- prefix: "PairedPrefil" --> · [Release](../src/runtime/execution/decoder_prefill_workspace.cpp#L382)<!-- prefix: "cudaError_t " -->
 
 ## Constraints and failure behavior
 

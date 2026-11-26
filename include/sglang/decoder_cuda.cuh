@@ -199,6 +199,17 @@ cudaError_t tensor_core_prefill_rms_quantize(
 std::optional<cudaError_t> try_prefill_rms_quantize_vector(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     __nv_bfloat16* normalized, TextFp8Activation activation, cudaStream_t stream);
+struct PrefillPeerNormRow {
+    const __nv_bfloat16* branch;
+    __nv_bfloat16* residual;
+    const __nv_bfloat16* gain;
+    __nv_bfloat16* normalized;
+    TextFp8Activation activation;
+};
+
+bool aligned_prefill_peer_norm(const PrefillPeerNormRow& row);
+cudaError_t prefill_peer_rms_quantize(PrefillPeerNormRow row, const __nv_bfloat16* peer,
+                                     cudaStream_t stream);
 cudaError_t tensor_core_decode_rms_project(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,

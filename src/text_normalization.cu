@@ -343,31 +343,57 @@ cudaError_t decoder::verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, in
                                                        stream));
 }
 
+namespace {
+
+bool aligned_prefill_norm(const decoder::PrefillPeerNormRow& row) {
+    return row.branch && row.gain && row.activation.values && row.activation.scales &&
+        aligned(row.branch, alignof(uint4)) && aligned(row.residual, alignof(uint4)) &&
+        aligned(row.gain, alignof(uint4)) && aligned(row.normalized, alignof(uint4)) &&
+        aligned(row.activation.values, alignof(uint2)) &&
+        aligned(row.activation.scales, alignof(float));
+}
+
+template <bool Peer>
+cudaError_t launch_prefill_norm_vector(decoder::PrefillPeerNormRow row,
+                                       const __nv_bfloat16* remote, cudaStream_t stream) {
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess) return pending;
+    using decoder::prefill_rms_detail::vector_rms;
+    const auto kernel = (Peer || row.residual)
+        ? (row.normalized ? vector_rms<true, true, Peer> : vector_rms<true, false, Peer>)
+        : (row.normalized ? vector_rms<false, true, Peer> : vector_rms<false, false, Peer>);
+    void* args[] = {
+        &row.branch, &row.residual, &row.gain, &row.normalized, &row.activation, &remote};
+    const auto submitted = cudaLaunchKernel(kernel, grouped_prefill_max_rows,
+                                            block_threads, args, 0, stream);
+    const auto recorded = cudaGetLastError();
+    if (decoder::CudaError::terminal(recorded) && !decoder::CudaError::terminal(submitted)) {
+        return recorded;
+    }
+    return submitted == cudaSuccess ? recorded : submitted;
+}
+
+}
+
+bool decoder::aligned_prefill_peer_norm(const PrefillPeerNormRow& row) {
+    return row.residual && aligned_prefill_norm(row);
+}
+
+cudaError_t decoder::prefill_peer_rms_quantize(PrefillPeerNormRow row, const __nv_bfloat16* peer,
+                                              cudaStream_t stream) {
+    return launch_prefill_norm_vector<true>(row, peer, stream);
+}
+
 std::optional<cudaError_t> decoder::try_prefill_rms_quantize_vector(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     __nv_bfloat16* normalized, TextFp8Activation activation, cudaStream_t stream) {
-    if (!branch || !weight || !activation.values || !activation.scales ||
-        !aligned(branch, alignof(uint4)) || !aligned(residual, alignof(uint4)) ||
-        !aligned(weight, alignof(uint4)) || !aligned(normalized, alignof(uint4)) ||
-        !aligned(activation.values, alignof(uint2)) ||
-        !aligned(activation.scales, alignof(float))) {
-        return std::nullopt;
-    }
+    const PrefillPeerNormRow row{branch, residual, weight, normalized, activation};
+    if (!aligned_prefill_norm(row)) return std::nullopt;
     cudaStreamCaptureStatus capture{};
     const auto query = cudaStreamIsCapturing(stream, &capture);
     if (query != cudaSuccess) return query;
     if (capture != cudaStreamCaptureStatusNone) return std::nullopt;
-    const auto pending = cudaGetLastError();
-    if (pending != cudaSuccess) return pending;
-    using prefill_rms_detail::vector_rms;
-    const auto kernel = residual
-        ? (normalized ? vector_rms<true, true> : vector_rms<true, false>)
-        : (normalized ? vector_rms<false, true> : vector_rms<false, false>);
-    void* args[] = {&branch, &residual, &weight, &normalized, &activation};
-    const auto submitted = cudaLaunchKernel(kernel, grouped_prefill_max_rows,
-                                            block_threads, args, 0, stream);
-    const auto recorded = cudaGetLastError();
-    return submitted == cudaSuccess ? recorded : submitted;
+    return launch_prefill_norm_vector<false>(row, nullptr, stream);
 }
 
 cudaError_t decoder::tensor_core_prefill_rms_quantize(

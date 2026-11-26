@@ -101,6 +101,7 @@ struct PrefillGroupTp {
     int peer_device;
     bool scaled_output;
     bool reuse_all_gqa;
+    const PrefillPeerNorm& peer_norm;
     template <typename Enqueue>
     auto on_peer(Enqueue&& enqueue) const {
         const DeviceScope scope(peer_device);
@@ -118,8 +119,16 @@ struct PrefillGroupTp {
     void normalize(const Bf16* weight, const Bf16* peer_weight,
                    const Residuals& residuals, bool save_normalized) const {
         const auto [branch, residual] = residuals(chunk.work);
-        chunk.normalize_tp(branch, residual, weight, plan.rms_launch, save_normalized);
         const auto peer_state = residuals(peer_chunk.work);
+        if (residual) {
+            const PrefillPeerNormRow root{branch, residual, weight,
+                save_normalized ? chunk.work.normalized : nullptr, chunk.activation};
+            const PrefillPeerNormRow mirror{peer_state.branch, peer_state.residual, peer_weight,
+                save_normalized ? peer_chunk.work.normalized : nullptr, peer_chunk.activation};
+            if (peer_norm.enqueue({root, mirror})) return;
+            reduce(const_cast<Bf16*>(branch), const_cast<Bf16*>(peer_state.branch));
+        }
+        chunk.normalize_tp(branch, residual, weight, plan.rms_launch, save_normalized);
         on_peer([&] {
             peer_chunk.normalize_tp(peer_state.branch, peer_state.residual, peer_weight,
                                     plan.rms_launch, save_normalized);
@@ -129,10 +138,10 @@ struct PrefillGroupTp {
     void attention(const GqaLayer& layer, const GqaLayer& peer_layer, int bank);
     void attention(const GdnLayer& layer, const GdnLayer& peer_layer, int bank);
 
-    void mlp(const Layer& layer, const Layer& peer_layer) const {
+    void mlp(const Layer& layer, const Layer& peer_layer, bool last) const {
         chunk.mlp(layer);
         on_peer([&] { peer_chunk.mlp(peer_layer); });
-        reduce(chunk.work.hidden, peer_chunk.work.hidden);
+        if (last) reduce(chunk.work.hidden, peer_chunk.work.hidden);
     }
 };
 
@@ -179,7 +188,6 @@ void PrefillGroupTp::attention(const GqaLayer& layer, const GqaLayer& peer_layer
                     {peer_buffers.activation.values, peer_buffers.activation.scales},
                     peer_buffers.projected_attention, scaled_output);
             });
-            reduce(buffers.projected_attention, peer_buffers.projected_attention);
             return;
         }
         if (primary) check(*primary, "Gate and quantize prefill grouped-query attention");
@@ -207,7 +215,6 @@ void PrefillGroupTp::attention(const GqaLayer& layer, const GqaLayer& peer_layer
                                   peer_chunk.quantize(peer_buffers.attention, peer_dims.q_width),
                                   peer_buffers.projected_attention, scaled_output);
     });
-    reduce(buffers.projected_attention, peer_buffers.projected_attention);
 }
 
 void PrefillGroupTp::attention(const GdnLayer& layer, const GdnLayer& peer_layer, int bank) {
@@ -244,7 +251,6 @@ void PrefillGroupTp::attention(const GdnLayer& layer, const GdnLayer& peer_layer
         peer_chunk.project_scaled(peer_layer.output, {peer_buffers.activation.values,
             peer_buffers.activation.scales}, peer_buffers.projected_attention, scaled_output);
     });
-    reduce(buffers.projected_attention, peer_buffers.projected_attention);
 }
 
 void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
@@ -320,9 +326,14 @@ void prefill_layerwise_tp(const DecoderModel& model, const DecoderModel& peer,
                             chunk.tensor_core_fp8, plan.grouped || plan.serial_attention},
                            peer_buffers, 0, nullptr, 0,
                            paired_long_staging(peer_workspace, workspace)};
+    PrefillPeerNorm peer_norm;
+    if (plan.full_causal && chunk.tensor_core_fp8 && comm.rank_count() == 2 &&
+        comm.device(0) == model.device && comm.device(1) == peer.device) {
+        peer_norm.prepare(workspace, peer_workspace, model.device, peer.device);
+    }
     PrefillGroupTp run{grants, peer_grants, group, plan, serial_capacity, chunk, peer_chunk,
                        stream, peer_stream, &comm, peer.device, scaled_output,
-                       reuse_all_gqa};
+                       reuse_all_gqa, peer_norm};
     each_prefill_segment(grants, group.grants, 0, [&](const PrefillGrant& grant, int offset) {
         auto* residual = chunk.work.residual + offset * hidden_size;
         gather_embeddings(model.embedding, grant.tokens, grant.rows, residual, stream);
@@ -342,7 +353,9 @@ void prefill_layerwise_tp(const DecoderModel& model, const DecoderModel& peer,
         [&](const auto& layer, const auto& peer_layer, int bank) {
             run.attention(layer, peer_layer, bank);
         },
-        [&](const Layer& layer, const Layer& peer_layer) { run.mlp(layer, peer_layer); });
+        [&](const Layer& layer, const Layer& peer_layer) {
+            run.mlp(layer, peer_layer, &layer == &model.layers.back());
+        });
     finish_prefill_group_tp(model, chunk, peer_chunk, grants, peer_grants, group.grants, layout,
                             workspace, stream, peer_stream, peer.device);
 }

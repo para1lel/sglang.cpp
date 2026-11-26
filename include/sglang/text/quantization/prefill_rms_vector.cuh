@@ -25,6 +25,21 @@ __device__ __forceinline__ uint2 round_bf16(float4 v) {
             static_cast<unsigned>(cd.x) | static_cast<unsigned>(cd.y) << 16};
 }
 
+__device__ __forceinline__ uint4 prefill_bf16_sum(uint4 local, uint4 peer) {
+    uint4 output;
+    asm("{ .reg .b32 first, second, third, fourth;\n\t"
+        "add.rn.bf16x2 first, %4, %8;\n\t"
+        "add.rn.bf16x2 second, %5, %9;\n\t"
+        "add.rn.bf16x2 third, %6, %10;\n\t"
+        "add.rn.bf16x2 fourth, %7, %11;\n\t"
+        "mov.b32 %0, first; mov.b32 %1, second;\n\t"
+        "mov.b32 %2, third; mov.b32 %3, fourth; }"
+        : "=r"(output.x), "=r"(output.y), "=r"(output.z), "=r"(output.w)
+        : "r"(local.x), "r"(local.y), "r"(local.z), "r"(local.w),
+          "r"(peer.x), "r"(peer.y), "r"(peer.z), "r"(peer.w));
+    return output;
+}
+
 template <bool Residual>
 __device__ __forceinline__ uint2 normalize4(uint2 branch, uint2 residual, uint2 gains,
                                              float inverse, uint2& updated) {
@@ -62,11 +77,13 @@ __device__ __forceinline__ float4 prepare_half(const Bf16* branch, const Bf16* r
     return rms_quant_values(result.lower);
 }
 
-template <bool Residual, bool SaveNormalized>
+template <bool Residual, bool SaveNormalized, bool Peer = false>
 __global__ __launch_bounds__(block_threads) void vector_rms(const Bf16* branch, Bf16* residual,
-                const Bf16* gain, Bf16* normalized, TextFp8Activation activation) {
+                const Bf16* gain, Bf16* normalized, TextFp8Activation activation,
+                const Bf16* remote) {
     const auto offset = static_cast<std::size_t>(blockIdx.x) * rms_hidden_width;
     branch += offset;
+    if constexpr (Peer) remote += offset;
     if constexpr (Residual) residual += offset;
     if constexpr (SaveNormalized) normalized += offset;
     activation.values += offset;
@@ -76,7 +93,13 @@ __global__ __launch_bounds__(block_threads) void vector_rms(const Bf16* branch, 
     __shared__ alignas(16) Bf16 staged_residual[Residual ? rms_hidden_width : 1];
     for (int col = threadIdx.x * vector_width; col < rms_hidden_width;
          col += block_threads * vector_width) {
-        stage_rms_vector_async(branch + col, staged_branch + col);
+        if constexpr (Peer) {
+            const auto local = reinterpret_cast<const uint4*>(branch + col)[0];
+            const auto peer = reinterpret_cast<const uint4*>(remote + col)[0];
+            reinterpret_cast<uint4*>(staged_branch + col)[0] = prefill_bf16_sum(local, peer);
+        } else {
+            stage_rms_vector_async(branch + col, staged_branch + col);
+        }
         if constexpr (Residual) stage_rms_vector_async(residual + col, staged_residual + col);
     }
     asm volatile("cp.async.commit_group;" ::: "memory");

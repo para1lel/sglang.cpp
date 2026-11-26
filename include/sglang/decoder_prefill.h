@@ -3,6 +3,7 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/text/prefill_attn_sm100.h"
 
+#include <array>
 #include <memory>
 
 namespace sglang::decoder {
@@ -78,6 +79,8 @@ public:
     PairedPrefillScratch long_gqa_staging() const { return staging_; }
 
 private:
+    friend class PrefillPeerNorm;
+    bool allow_peer_access(int peer_device);
     PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention, int staged_visible);
     cudaError_t release() noexcept;
 
@@ -89,6 +92,27 @@ private:
     PairedPrefillScratch staging_{};
     cudaError_t release_status_ = cudaSuccess;
     std::unique_ptr<PrefillPool> pool_;
+};
+
+class PrefillPeerNorm {
+public:
+    PrefillPeerNorm() = default;
+    ~PrefillPeerNorm();
+    PrefillPeerNorm(const PrefillPeerNorm&) = delete;
+    PrefillPeerNorm& operator=(const PrefillPeerNorm&) = delete;
+
+    void prepare(PrefillWorkspace& root, PrefillWorkspace& peer, int root_device, int peer_device);
+    bool enqueue(const std::array<PrefillPeerNormRow, 2>& rows) const;
+
+private:
+    struct Rank {
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        cudaEvent_t produced = nullptr;
+        cudaEvent_t consumed = nullptr;
+    };
+    std::array<Rank, 2> ranks_{};
+    bool ready_ = false;
 };
 
 std::size_t prefill_workspace_bytes(int rows);

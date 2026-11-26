@@ -34,7 +34,7 @@ A bounded paired W4 replay on two B200s matched all 3,200 output IDs across cold
 
 ## Split-KV target attention
 
-B200 selects split-KV attention for eligible eager and bound text target rows from 2,048 through 262,144 visible tokens, including the current token. Bound kernels check the live position on device. Inside the window the reader decodes paged MXFP8 K/V to BF16 for Tensor Core attention, merges FP32 split partials, and rounds to BF16. Flagged heads use FP64 replay. Outside the window the target uses ordered attention. The split reductions can change scores and greedy IDs. [Window](../include/sglang/decoder_cuda.cuh#L321)<!-- prefix: "inline const" --> · [Bound route and fallback](../include/sglang/text/gqa_target_split.cuh#L97)<!-- prefix: "cudaError_t " --> · [Combine and FP64 replay](../include/sglang/text/gqa_target_split.cuh#L6)<!-- prefix: "__global__ v" -->
+B200 selects split-KV attention for eligible eager and bound text target rows from 2,048 through 262,144 visible tokens, including the current token. Bound kernels check the live position on device. Inside the window the reader decodes paged MXFP8 K/V to BF16 for Tensor Core attention, merges FP32 split partials, and rounds to BF16. Flagged heads use FP64 replay. Outside the window the target uses ordered attention. The split reductions can change scores and greedy IDs. [Window](../include/sglang/decoder_cuda.cuh#L332)<!-- prefix: "inline const" --> · [Bound route and fallback](../include/sglang/text/gqa_target_split.cuh#L97)<!-- prefix: "cudaError_t " --> · [Combine and FP64 replay](../include/sglang/text/gqa_target_split.cuh#L6)<!-- prefix: "__global__ v" -->
 
 ### Batched eager verification
 

@@ -396,7 +396,7 @@ inline bool run_compact_gdn(const GdnLayer& layer, const LayerBatch<Verification
                             int state_index) {
     constexpr int rows_per_lane = CompactGdnVerificationBatch::rows;
     constexpr int row_capacity = CompactGdnVerificationBatch::lanes * rows_per_lane;
-    if (batch.tensor_parallel || !batch.packed_activation || !batch.target_tc ||
+    if (!batch.packed_activation || !batch.target_tc ||
         batch.lanes[0].binding ||
         (batch.count != row_capacity / 2 && batch.count != row_capacity) ||
         layer.b.rows != batch.gdn_gate_heads() || layer.a.rows != batch.gdn_gate_heads() ||

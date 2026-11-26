@@ -316,7 +316,7 @@ struct Decoder::Model {
         cudaStream_t stream, cudaStream_t peer_stream, decoder::TensorParallel& group,
         const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials,
         std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool greedy, bool capture,
-        bool& eager_twoshot) const;
+        bool& eager_replicated) const;
 
     int device;
     std::string accelerator_name;

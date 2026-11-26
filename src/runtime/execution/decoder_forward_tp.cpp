@@ -6,6 +6,7 @@
 #include "sglang/runtime/backend/tensor_parallel.h"
 #include "sglang/runtime/execution/decoder_forward_layers.h"
 #include "sglang/runtime/execution/verification_row_copy.h"
+#include "sglang/text/mtp/tc_vocab.h"
 
 #include <algorithm>
 #include <type_traits>
@@ -53,7 +54,7 @@ struct TpReduceNorm {
     cudaStream_t streams[2];
     std::size_t count;
     bool fused = false;
-    bool all_twoshot = true;
+    bool all_replicated = true;
     MnnvlRmsQuantizeRows rows[2];
 
     template <typename Lane>
@@ -75,11 +76,15 @@ struct TpReduceNorm {
             const Bf16* gains[] = {gain, peer_gain};
             fused = group.try_allreduce_rms_quantize(buffers, streams, rows, gains);
             if (fused) {
-                all_twoshot = false;
+                all_replicated = false;
                 return true;
             }
         }
-        all_twoshot = group.allreduce_bf16(buffers, streams, count) && all_twoshot;
+        constexpr auto one_shot_count = std::size_t(tc_vocab_wide_rows) * hidden_size;
+        constexpr auto two_shot_count = 2 * one_shot_count;
+        const auto route = group.allreduce_bf16(buffers, streams, count);
+        all_replicated &= (count == one_shot_count && route == TpAllReduceRoute::mnnvl_one_shot) ||
+                          (count == two_shot_count && route == TpAllReduceRoute::mnnvl_two_shot);
         return false;
     }
 };
@@ -89,32 +94,40 @@ struct TpReduceNorm40 {
     cudaStream_t streams[2];
     MnnvlRmsQuantizeRows40 rows[2];
     bool fused = true;
-    bool all_twoshot = true;
+    int fused_calls = 0;
+    int ordinary_calls = 0;
+
+    bool replicated() const {
+        constexpr int reductions = 2 * layer_count;
+        return (fused_calls == reductions - 1 && ordinary_calls == 1) ||
+               (fused_calls == 0 && ordinary_calls == reductions);
+    }
 
     bool operator()(Bf16* const buffers[], const Bf16* gain, const Bf16* peer_gain) {
         if (fused && gain) {
             const Bf16* gains[] = {gain, peer_gain};
             fused = group.try_allreduce_rms_quantize_m40(buffers, streams, rows, gains);
             if (fused) {
-                all_twoshot = false;
+                ++fused_calls;
                 return true;
             }
         }
-        constexpr std::size_t count = MnnvlRmsQuantizeRows40::size * hidden_size;
-        all_twoshot = group.allreduce_bf16(buffers, streams, count) && all_twoshot;
+        const auto route = group.allreduce_bf16(buffers, streams,
+                                                MnnvlRmsQuantizeRows40::size * hidden_size);
+        ordinary_calls += route == TpAllReduceRoute::mnnvl_one_shot;
         return false;
     }
 };
 
 template <typename Run>
 [[gnu::noinline]] bool tp_run_m40(TensorParallel& group,
-                                const LayerBatch<VerificationRow>& primary,
-                                const LayerBatch<VerificationRow>& peer, const Run& run) {
+                                  const LayerBatch<VerificationRow>& primary,
+                                  const LayerBatch<VerificationRow>& peer, const Run& run) {
     TpReduceNorm40 reduce{group, {primary.stream, peer.stream},
         {tp_mnnvl_rms_rows<MnnvlRmsQuantizeRows40>(primary),
          tp_mnnvl_rms_rows<MnnvlRmsQuantizeRows40>(peer)}};
     run(reduce);
-    return reduce.all_twoshot;
+    return reduce.replicated();
 }
 
 template <typename Lane, typename Run>
@@ -132,7 +145,7 @@ bool tp_run_reductions(TensorParallel& group, const LayerBatch<Lane>& primary,
                         static_cast<std::size_t>(primary.count) * hidden_size};
     reduce.prepare(primary, peer);
     run(reduce);
-    return reduce.all_twoshot;
+    return reduce.all_replicated;
 }
 
 template <typename Lane, typename Residuals>
@@ -277,15 +290,16 @@ bool Decoder::Model::forward_layers_tp(
     }
     Bf16* attention_reduce[2] = {primary_partials.attention, peer_partials.attention};
     Bf16* hidden_reduce[2] = {primary_partials.hidden, peer_partials.hidden};
-    const auto normalize = [&](LayerBatch<Lane>& batch, const Bf16* weight, const char* operation,
-                               Bf16* const* branches) {
-        tp_normalize(batch, count, weight, operation, [&](int lane, Workspace& work) {
-            return branches ? LayerResidual{branches[lane], work.residual}
-                            : LayerResidual{work.residual, nullptr};
-        });
-    };
     const auto run = [&](auto& reduce_norm) {
+        const auto normalize = [&](LayerBatch<Lane>& batch, const Bf16* weight,
+                                   const char* operation, Bf16* const* branches) {
+            tp_normalize(batch, count, weight, operation, [&](int lane, Workspace& work) {
+                return branches ? LayerResidual{branches[lane], work.residual}
+                                : LayerResidual{work.residual, nullptr};
+            });
+        };
         bool input_fused = false;
+
         for (int index = 0; index < layer_count; ++index) {
             const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
             const auto& layer = layers[index];
@@ -332,13 +346,13 @@ bool Decoder::Model::forward_layers_tp(
                                       last ? nullptr : peer.layers[index + 1].input_norm);
         }
     };
-    const bool all_twoshot = tp_run_reductions(group, primary, peer_batch, run);
+    const bool replicated = tp_run_reductions(group, primary, peer_batch, run);
 
     tp_scatter(primary, count, stream, primary_partials.hidden);
     decoder::DeviceScope peer_scope(peer.device);
     tp_scatter(peer_batch, count, peer_stream, peer_partials.hidden);
     peer_scope.restore();
-    return all_twoshot;
+    return replicated;
 }
 
 template bool Decoder::Model::forward_layers_tp<decoder::ForwardLane>(

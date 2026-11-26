@@ -390,7 +390,7 @@ tp_verify_graph::Graph* Decoder::Model::forward_verification_tp(
     int count, int total, cudaStream_t stream, cudaStream_t peer_stream, TensorParallel& group,
     const TpPartials& primary_partials, const TpPartials& peer_partials,
     std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool greedy, bool capture,
-    bool& eager_twoshot) const {
+    bool& eager_replicated) const {
     const tp_verify_graph::Input input{rows, peer_rows};
     const auto forward = [&](const tp_verify_graph::Input& live) {
         return forward_layers_tp(peer, live[0], live[1], total, stream, peer_stream, group,
@@ -408,7 +408,7 @@ tp_verify_graph::Graph* Decoder::Model::forward_verification_tp(
             return tp->verification_capture.get();
         }
     }
-    eager_twoshot = forward(input);
+    eager_replicated = forward(input);
     return nullptr;
 }
 }

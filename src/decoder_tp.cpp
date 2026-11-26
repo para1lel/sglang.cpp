@@ -155,10 +155,13 @@ decoder::MtpRound DecoderBatch::TpDriver::peer_round(const decoder::Lane& lane, 
 }
 
 bool DecoderBatch::TpDriver::prepare_peer_repair(const decoder::MtpRound* rounds, int count) {
-    constexpr std::size_t elements = std::size_t(decoder::draft_projection_rows) *
-        decoder::target_verify_max_rows * decoder::hidden_size;
+    const std::size_t elements = std::size_t(count) * decoder::target_verify_max_rows *
+                                 decoder::hidden_size;
     if (!decoder::PeerDraftRepair::eligible(rounds, count) || !model.is_b200() ||
-        !tp.peer->is_b200() || !tp.group->supports_mnnvl_twoshot(elements)) return false;
+        !tp.peer->is_b200()) return false;
+    const bool transport = count == decoder::wide_mtp_lanes
+        ? tp.group->supports_mnnvl_oneshot(elements) : tp.group->supports_mnnvl_twoshot(elements);
+    if (!transport) return false;
     if (!peer_repair_prepared) {
         peer_repair = decoder::PeerDraftRepair::prepare(*model.mtp_weights, tp.peer_device);
         peer_repair_prepared = true;
@@ -181,8 +184,8 @@ void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound
         count > decoder_batch_max_mtp_lanes ? tp.packed[0] : nullptr;
     std::uint8_t* const peer_packed =
         count > decoder_batch_max_mtp_lanes ? tp.packed[1] : nullptr;
-    auto* repair = allow_peer_repair && !capture && count == decoder::draft_projection_rows
-        ? peer_repair.get() : nullptr;
+    auto* repair = allow_peer_repair && !capture &&
+        decoder::PeerDraftRepair::eligible(rounds, count) ? peer_repair.get() : nullptr;
     (void)model.verify_mtp_tp(*tp.peer, rounds, peer_rounds, count, constraints,
                               sampling_workspace, stream, tp.peer_stream, *tp.group,
                               tp.partials[0], tp.partials[1], vocabulary, primary_packed,

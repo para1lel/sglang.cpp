@@ -147,9 +147,9 @@ struct Fixture {
     bool reduce(TensorParallel& group, int count, int offset = 0) {
         check(cudaSetDevice(devices[0]), "select collective caller");
         __nv_bfloat16* shifted[ranks]{buffers[0] + offset, buffers[1] + offset};
-        const bool submitted_twoshot = group.allreduce_bf16(shifted, streams, count);
+        const auto route = group.allreduce_bf16(shifted, streams, count);
         check_caller(devices[0], "allreduce changed the caller device");
-        return submitted_twoshot;
+        return route == sglang::decoder::TpAllReduceRoute::mnnvl_two_shot;
     }
 
     void capture(TensorParallel& group, int count) {

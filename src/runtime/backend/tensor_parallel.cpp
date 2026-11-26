@@ -432,8 +432,8 @@ void TensorParallel::ensure_healthy() {
     }
 }
 
-bool TensorParallel::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
-                                   std::size_t count) {
+TpAllReduceRoute TensorParallel::allreduce_bf16(
+    __nv_bfloat16* const buffers[], const cudaStream_t streams[], std::size_t count) {
     const std::size_t ranks = state_->devices.size();
     if (count == 0) {
         throw std::invalid_argument(
@@ -455,7 +455,7 @@ bool TensorParallel::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
     if (state_->vendor_allreduce(buffers, streams, count, capture_state, two_shot)) {
         if (tp_verify_graph::binding(streams[0])) tp_verify_graph::record_regular(streams[0]);
         else state_->record_vendor_success(count, payload, two_shot);
-        return two_shot;
+        return two_shot ? TpAllReduceRoute::mnnvl_two_shot : TpAllReduceRoute::mnnvl_one_shot;
     }
     if (tp_verify_graph::binding(streams[0])) {
         throw CudaError(cudaErrorNotSupported, "Capture TP verification allreduce");
@@ -466,7 +466,16 @@ bool TensorParallel::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
 #endif
     state_->enqueue_nccl_allreduce(buffers, streams, count);
     state_->record_nccl_success(count, payload, reason);
+    return TpAllReduceRoute::nccl;
+}
+
+bool TensorParallel::supports_mnnvl_oneshot([[maybe_unused]] std::size_t count) const noexcept {
+#if SGLANG_USE_MNNVL_AR
+    return state_->mnnvl && !state_->mnnvl_sticky && state_->mnnvl->healthy() &&
+           count <= state_->mnnvl->max_count() && count % mnnvl_ar_hidden_width == 0;
+#else
     return false;
+#endif
 }
 
 bool TensorParallel::supports_mnnvl_twoshot([[maybe_unused]] std::size_t count) const noexcept {

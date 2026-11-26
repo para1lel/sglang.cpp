@@ -44,6 +44,8 @@ struct TpArCounters {
     std::vector<TpArWidthCounters> widths;
 };
 
+enum class TpAllReduceRoute { nccl, mnnvl_one_shot, mnnvl_two_shot };
+
 class TensorParallel {
 public:
     static std::unique_ptr<TensorParallel> create(std::vector<int> devices);
@@ -55,8 +57,9 @@ public:
     int rank_count() const noexcept;
     int device(int rank) const;
 
-    bool allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
-                       std::size_t count);
+    TpAllReduceRoute allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
+                                   std::size_t count);
+    bool supports_mnnvl_oneshot(std::size_t count) const noexcept;
     bool supports_mnnvl_twoshot(std::size_t count) const noexcept;
     bool try_allreduce_rms_quantize(
         __nv_bfloat16* const buffers[], const cudaStream_t streams[],

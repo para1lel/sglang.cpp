@@ -857,13 +857,13 @@ bool Decoder::Model::verify_mtp_tp(
               "Look up peer verification inputs");
         peer_scope.restore();
     }
-    bool eager_twoshot = false;
+    bool eager_replicated = false;
     const tp_verify_graph::Submission submitted(group,
         forward_verification_tp(peer, rows.data(), peer_rows.data(), count, total, stream,
                                 peer_stream, group, primary_partials, peer_partials, primary_packed,
-                                peer_packed, vocabulary != nullptr, capture, eager_twoshot));
-    if (peer_repair && eager_twoshot) {
-        peer_repair->submit(rounds, peer_rows.data(), peer.embedding, peer.final_norm,
+                                peer_packed, vocabulary != nullptr, capture, eager_replicated));
+    if (peer_repair && eager_replicated && total == count * target_verify_max_rows) {
+        peer_repair->submit(rounds, count, peer_rows.data(), peer.embedding, peer.final_norm,
                             stream, peer_stream);
     }
     if (count <= decoder_batch_max_mtp_lanes) {

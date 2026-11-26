@@ -113,10 +113,10 @@ public:
     static std::unique_ptr<PeerDraftRepair> prepare(const MtpDraftWeights& weights, int peer);
     ~PeerDraftRepair();
 
-    void submit(const MtpRound* rounds, const VerificationRow* peer_rows,
+    void submit(const MtpRound* rounds, int count, const VerificationRow* peer_rows,
                 const Bf16* peer_embedding, const Bf16* peer_norm, cudaStream_t primary_stream,
                 cudaStream_t peer_stream);
-    bool apply(const DraftRepairs* repairs, cudaStream_t primary_stream);
+    bool apply(const DraftRepairs* repairs, int count, cudaStream_t primary_stream);
     void discard();
     void drain() noexcept;
 

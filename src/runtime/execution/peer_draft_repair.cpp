@@ -123,7 +123,7 @@ struct PeerDraftRepair::State {
     Bf16 *primary_kv{}, *seeds{}, *projected{}, *packed{};
     std::array<RepairProjectionRow, repair_lanes> projection;
     std::array<DraftRepairs, repair_lanes> expected;
-    bool submitted = false;
+    int submitted_lanes = 0;
     bool consume_recorded = false;
 };
 
@@ -132,7 +132,8 @@ PeerDraftRepair::PeerDraftRepair(std::unique_ptr<State> state) : state_(std::mov
 PeerDraftRepair::~PeerDraftRepair() { drain(); }
 
 bool PeerDraftRepair::eligible(const MtpRound* rounds, int count) {
-    return count == repair_lanes && std::all_of(rounds, rounds + count, [](const MtpRound& row) {
+    if (count != wide_mtp_lanes && count != repair_lanes) return false;
+    return std::all_of(rounds, rounds + count, [](const MtpRound& row) {
         return row.draft && row.position <= text_attention_max_tokens - target_verify_max_rows &&
                row.proposal_limit == repair_depth && row.remaining > target_verify_max_rows &&
                !row.media && !row.constraint && !row.sampling;
@@ -183,21 +184,23 @@ std::unique_ptr<PeerDraftRepair> PeerDraftRepair::prepare(const MtpDraftWeights&
     }
 }
 
-void PeerDraftRepair::submit(const MtpRound* rounds, const VerificationRow* peer_rows,
+void PeerDraftRepair::submit(const MtpRound* rounds, int count, const VerificationRow* peer_rows,
                              const Bf16* peer_embedding, const Bf16* peer_norm,
                              cudaStream_t primary_stream, cudaStream_t peer_stream) {
     auto& state = *state_;
-    if (state.submitted) throw std::logic_error("Peer draft repair is still pending");
+    if (state.submitted_lanes) throw std::logic_error("Peer draft repair is still pending");
     if (!use_streaming_projection(true, primary_stream)) return;
     DeviceScope scope(state.peer);
     if (!use_streaming_projection(true, peer_stream)) return;
     const auto stream = state.peer_memory.stream();
-    state.submitted = true;
+    state.submitted_lanes = count;
     state.target_done.record(peer_stream);
     state.target_done.wait(stream);
     if (state.consume_recorded) state.consumed.wait(stream);
 
-    for (int first = 0; first < repair_seed_rows; first += tc_vocab_wide_rows) {
+    static_assert(wide_mtp_lanes * target_verify_max_rows == tc_vocab_wide_rows);
+    const int seed_rows = count * target_verify_max_rows;
+    for (int first = 0; first < seed_rows; first += tc_vocab_wide_rows) {
         TcVocabRmsRows batch{};
         for (int row = 0; row < tc_vocab_wide_rows; ++row) {
             const auto& work = *peer_rows[first + row].work;
@@ -210,9 +213,9 @@ void PeerDraftRepair::submit(const MtpRound* rounds, const VerificationRow* peer
 
     std::array<RepairProjectionRow*, repair_lanes> lanes;
     std::array<MtpDraftInput, repair_lanes> inputs{};
-    for (int lane = 0; lane < repair_lanes; ++lane) lanes[lane] = &state.projection[lane];
+    for (int lane = 0; lane < count; ++lane) lanes[lane] = &state.projection[lane];
     for (int depth = 0; depth < repair_depth; ++depth) {
-        for (int lane = 0; lane < repair_lanes; ++lane) {
+        for (int lane = 0; lane < count; ++lane) {
             const auto& round = rounds[lane];
             const int token = round.tokens[depth + 1];
             const auto row = round.target->row(depth);
@@ -220,13 +223,13 @@ void PeerDraftRepair::submit(const MtpRound* rounds, const VerificationRow* peer
                 round.draft_input(row.position, token, row.work->normalized);
             inputs[lane].token = token;
             inputs[lane].hidden = state.seeds + repair_seed_index(lane, depth) * hidden_size;
-            auto* kv = state.projected + (depth * repair_lanes + lane) * 2 * repair_kv_width;
+            auto* kv = state.projected + (depth * count + lane) * 2 * repair_kv_width;
             lanes[lane]->work.keys = kv;
             lanes[lane]->work.values = kv + repair_kv_width;
         }
         using Work = RepairProjectionRow::Work;
         DraftProjectionBatch<RepairProjectionRow, Work> batch(
-            lanes.data(), repair_lanes, state.packed, stream, true, false);
+            lanes.data(), count, state.packed, stream, true, false);
         batch.prepare_fc(inputs.data(), peer_embedding, state.embedding_gain, state.hidden_gain,
                          state.fc);
         batch.rms_activation(&Work::residual, state.input_gain, false);
@@ -234,15 +237,19 @@ void PeerDraftRepair::submit(const MtpRound* rounds, const VerificationRow* peer
     }
 
     check(cudaMemcpyPeerAsync(state.primary_kv, state.primary, state.projected, state.peer,
-                             repair_kv_values * sizeof(Bf16), stream),
+                             count * repair_depth * 2 * repair_kv_width * sizeof(Bf16), stream),
           "Return peer draft repair KV");
     state.returned.record(stream);
 }
 
-bool PeerDraftRepair::apply(const DraftRepairs* repairs, cudaStream_t stream) {
+bool PeerDraftRepair::apply(const DraftRepairs* repairs, int count, cudaStream_t stream) {
     auto& state = *state_;
-    if (!state.submitted) return false;
-    for (int lane = 0; lane < repair_lanes; ++lane) {
+    if (!state.submitted_lanes) return false;
+    if (state.submitted_lanes != count) {
+        discard();
+        return false;
+    }
+    for (int lane = 0; lane < count; ++lane) {
         for (int depth = 0; depth < repair_depth; ++depth) {
             const auto& row = repairs[lane][depth];
             const auto& saved = state.expected[lane][depth];
@@ -269,10 +276,10 @@ bool PeerDraftRepair::apply(const DraftRepairs* repairs, cudaStream_t stream) {
         for (int depth = 0; depth < repair_depth; ++depth) {
             GqaVerifyRows<GqaVerifyPreprocessRow> preprocess{};
             GqaVerifyRows<GqaVerifyAppendRow> append{};
-            for (int lane = 0; lane < repair_lanes; ++lane) {
+            for (int lane = 0; lane < count; ++lane) {
                 const auto& row = repairs[lane][depth];
                 auto& request = *row.request->state_;
-                const int offset = (depth * repair_lanes + lane) * 2 * repair_kv_width;
+                const int offset = (depth * count + lane) * 2 * repair_kv_width;
                 const auto* kv = state.primary_kv + offset;
                 preprocess.rows[lane] = {nullptr, kv, nullptr, request.work.rope_keys,
                                          row.position};
@@ -280,40 +287,41 @@ bool PeerDraftRepair::apply(const DraftRepairs* repairs, cudaStream_t stream) {
                                      kv + repair_kv_width, row.position};
             }
             check_draft_submission(
-                draft_verify_preprocess_keys(preprocess, repair_lanes, gain, stream),
+                draft_verify_preprocess_keys(preprocess, count, gain, stream),
                 "Rotate accepted peer draft repair keys");
-            check_draft_submission(gqa_verify_append(append, repair_lanes, stream),
+            check_draft_submission(gqa_verify_append(append, count, stream),
                                    "Append accepted peer draft repair KV");
         }
         state.consumed.record(stream);
     } catch (...) {
         (void)cudaStreamSynchronize(stream);
-        for (int lane = 0; lane < repair_lanes; ++lane) {
+        for (int lane = 0; lane < count; ++lane) {
             repairs[lane][0].request->state_->failed = true;
         }
         throw;
     }
-    for (int lane = 0; lane < repair_lanes; ++lane) {
+    for (int lane = 0; lane < count; ++lane) {
         repairs[lane][0].request->state_->prefix += repair_depth;
     }
-    state.submitted = false;
+    state.submitted_lanes = 0;
     state.consume_recorded = true;
     return true;
 }
 
 void PeerDraftRepair::discard() {
     auto& state = *state_;
-    if (!state.submitted) return;
+    if (!state.submitted_lanes) return;
     const DeviceScope scope(state.peer);
     synchronize_cuda(state.peer_memory.stream(), "Discard provisional peer draft repair");
-    state.submitted = false;
+    state.submitted_lanes = 0;
 }
 
 void PeerDraftRepair::drain() noexcept {
     auto& state = *state_;
-    if (state.submitted) (void)cudaStreamSynchronize(state.peer_memory.stream());
+    if (state.submitted_lanes) (void)cudaStreamSynchronize(state.peer_memory.stream());
     if (state.consume_recorded) (void)cudaEventSynchronize(state.consumed.event);
-    state.submitted = state.consume_recorded = false;
+    state.submitted_lanes = 0;
+    state.consume_recorded = false;
 }
 
 }

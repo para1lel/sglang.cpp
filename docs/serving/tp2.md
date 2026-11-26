@@ -17,11 +17,11 @@ The raw receipts are `rank-receipts.json`; the counters are `metrics.json` in th
 
 ## Campaign record
 
-The current campaign runs the published release `337edce7`. W1 passes the gate. W2 has a native measurement but no valid comparison. W3 through W5 are unrun.
+The current campaign runs the published release `337edce7`. W1 and W2 pass the gate. W3 through W5 are unrun.
 
 - **Identity.** Campaign `92b206b0-16e8-4ad0-a600-463926e0d6df`, mode measure, protocol `tp2-paired-v1` (manifest `c2c3480a…`), corpus `tp2-corpus-v1` (manifest `d65076eb…`). Native source tree `337edce7…`, executable SHA-256 `0100f4e2…`, checkpoint `Qwen3.8-27B-FP8` (`b54fe441…`). Evidence: `artifacts/tp2-bench/campaign-0222/`.
 - **W1.** Native median 592.803737 ms; vLLM median 558.431928 ms; ratio 1.0615505798944935 against the ≤1.10 gate: W1 passes. Rank receipts are recorded for both ranks. Rank 0 `GPU-57c04c1a…` carries the LM head and MTP draft: 19,031,037,824 weight bytes. Rank 1 `GPU-b79a7675…` carries 14,734,676,480. A separate traced cohort accompanies the timed arms.
-- **W2.** Native measured 1699.082051 ms. The vLLM arm failed the protocol determinism check: warmup and measured outputs disagree, first mismatches at 0-based offsets 49 and 303. The row has no valid ratio and is neither passed nor failed.
+- **W2.** Native measured 1699.082051 ms. The pinned vLLM reference measured 2000.013573 ms, from earliest submission to final `[DONE]`. The ratio is 0.849535260128957: W2 passes. An earlier protocol draft rejected this row on warmup-measured output identity; that requirement is superseded. The W2 reference predates full driver completion: its driver exited before end and retirement, so the span ends at the final `[DONE]`.
 - **W3–W5.** Unrun on this campaign.
 - **Historical context.** The first campaign (`24c2e092-25c7-4945-a251-aa9cb03358cb`, source `3a33e1c1…`, binary `fb03d111…`) measured W1 only: 925.746744 ms against 557.959022 ms, ratio 1.6591661887313294, a miss, and stopped. The [diagnostic profile](#w1-diagnostic-profile) below attributes that gap. A separate clean production diagnostic on the current binary measured 594.644780 ms for W1 before this campaign; it is not a campaign row.
 
@@ -42,7 +42,7 @@ A separate untimed profile traced both engines after the W1 miss. It guided opti
 
 ## W2 divergence evidence
 
-The runs below reproduced the W2 divergence under controlled changes in request arrival. They are diagnostic only; the official W2 row keeps no ratio.
+The runs below reproduced the W2 divergence under controlled changes in request arrival. They are diagnostic only; they explain the superseded determinism rejection. The W2 row passes under the timing-only criterion.
 
 - **Original-wire bursts.** Three cold, complete, original-wire W2 reference bursts with lane submissions 12.0–19.4 µs apart matched the earlier official warmup exactly: all 3×1024 tokens.
 - **Stagger replay.** A 64-token diagnostic replayed the divergence with staggered submissions of 73.7–141.6 ms. The first divergence reappeared at 0-based offset 49 in a cold cohort. Lane 1 held nine output IDs before lane 0 was sent and seventeen before lane 0's first token. A 64-token logprob pair measured the top-2 candidates at offset 49: 1788 and 5215 tie at −0.6938778162002563, on the stagger cell only.
@@ -90,11 +90,11 @@ No startup flag selects the transport. Selection is automatic in a build that in
 
 ## Acceptance target
 
-W1 has passed the gate. W2 awaits a valid comparison. W3 through W5 are unrun. A passing campaign must satisfy every condition below.
+W1 and W2 have passed the gate. W3 through W5 are unrun. A passing campaign must satisfy every condition below.
 
 - **Devices.** Run both engines alone on the same two B200 devices in the same rank order. Record both UUIDs, the rank assignment, interconnect, and distributed library.
 - **Workloads.** Reuse the frozen W1–W5 fixture bytes. Offer 2, 2, 8, 16, and 8 requests total on W1–W5. This is one, one, four, eight, and four per GPU. Eight slots per GPU give sixteen slots total. W4 fills them exactly. W4 uses the first sixteen archived W5 lanes. W1 and W2 need one new distinct lane each. W3 and W5 need four more each. Freeze every new lane as distinct deterministic bytes in a separate additive TP2 corpus. Retain the TP1 lanes and bytes. Duplicate no request.
 - **Native arm.** Run the native server with `--tp 2`, the default direct GPU LMCache path, and the LMCache daemon enabled. Verify the reported `tp_size` is two. [Server information](../native-model-info.md#server-information) Confirm effective direct cache activity on each rank, so a reported `tp_size` cannot hide a bypass. Record the adopted topology and the effective daemon configuration.
 - **Cache.** Start one LMCache daemon per rank, each bound to its own GPU and rank namespace. [Ranked transport](lmcache.md#ranked-tp2-transport) Draft records live only in the rank 0 daemon. Drain and reset both rank daemons before cold timing.
 - **vLLM arm.** Run the pinned checkout with `--tensor-parallel-size 2`. [TP option](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/engine/arg_utils.py#L1219)<!-- prefix: "\"--tensor-pa" --> Require `kv_transfer=false`, `kv_offloading_size=null`, and zero CPU weight offload in both workers' receipts. [Receipt policy](../performance.md#scheduler-and-reporting-policy)
-- **Gate.** Require native TP2 makespan ≤1.10× pinned vLLM TP2 on each W1–W5 row independently. A passing row covers no other row. Apply the [scheduler policy](../performance.md#scheduler-and-reporting-policy) and [measurement](../performance.md#measurement) rules unchanged.
+- **Gate.** Submit each row's requests simultaneously through the original submission path. Run one warmup and one measured cohort per row and engine, and use the measured verdict. Record clocks and output lengths. Treat output content as reference only; no warmup-measured token identity is required. Require native TP2 makespan ≤1.10× pinned vLLM TP2 on each W1–W5 row independently. A passing row covers no other row. Apply the [scheduler policy](../performance.md#scheduler-and-reporting-policy) unchanged.

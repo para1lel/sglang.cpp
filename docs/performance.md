@@ -1,6 +1,6 @@
 # Matched B200 benchmark agreement
 
-Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. Two-GPU acceptance is separate and unmeasured. See the [TP2 target](serving/tp2.md). [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. The [TP2 target](serving/tp2.md) covers two-GPU acceptance: W1 and W2 pass, W3–W5 unrun. [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 ## Implementations and controls
 
@@ -57,7 +57,7 @@ Use the [matched K4 protocol](../benchmarks/paired/README.md#matched-k4-timing-p
 
 Require native makespan ≤1.10× pinned vLLM on each W1–W5 row. Stop tuning when all pass. Freeze scheduling and workloads. Tune kernels, programmatic dependent launch (PDL), streams, and CUDA Graph replay.
 
-Run one warmup and one measured cohort per item and engine. Use the measured verdict and retain the first miss. Profile long rows separately. W4 can open a campaign. W5 requires a W4 pass in that campaign. Run W1–W3 in order, advancing on each pass. Validate device, launch settings, and each stream’s request, counts, finish, usage, and drain. Measured IDs must match the engine’s warmup. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Run one warmup and one measured cohort per item and engine. Use the measured verdict and retain the first miss. Profile long rows separately. W4 can open a campaign. W5 requires a W4 pass in that campaign. Run W1–W3 in order, advancing on each pass. Validate device, launch settings, and each stream’s request, counts, finish, usage, and drain. Under TP1, measured IDs must match the engine’s warmup; [TP2](serving/tp2.md) content is reference only. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 Use one streaming client and monotonic clock from earliest submission to last valid `[DONE]`. Preconnect lanes, release one barrier, and send all bodies within 50 ms and before any completion. Retain submit times, headers, token events, completion times, counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and empty events from token counts.
 

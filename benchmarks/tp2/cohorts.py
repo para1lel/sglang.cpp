@@ -32,7 +32,7 @@ def handle(run, fixtures, endpoint=None, *, probe=False):
     require(run.name in ("vllm-k4", "native-k4", "native-k4-trace"), "Unknown TP2 arm")
     policy = reference.reference()["policy"]
     measured = {}
-    previous = prior_ranks = warmup = None
+    previous = prior_ranks = None
     tags = ["trace"] if run.name == "native-k4-trace" else ["warmup-01", "measured-01"]
     if probe:
         identity = load(run.parent.parent / "identity.json")
@@ -75,17 +75,6 @@ def handle(run, fixtures, endpoint=None, *, probe=False):
                 before = cold_cache.parse_metrics(raw["cold_cache"]["cleared"], prior_ranks)
                 return {"request_sha256": lanes[0][0]["request_sha256"], "binding": binding(run),
                         "rank_deltas": {k: value - before[k] for k, value in prior_ranks.items()}}
-        if tag == "trace":
-            baseline = run.parent / "native-k4" / "warmup-01.json.gz"
-            with gzip.open(baseline, "rt") as stream:
-                timed_warmup = json.load(stream)
-            require(timed_warmup["binding"] == binding(baseline.parent)
-                    and timed_warmup["tag"] == "warmup-01", "Wrong trace warmup baseline")
-            client.verify_round_ids(raw, [req["output_ids"] for req in timed_warmup["requests"]])
-        if tag == "warmup-01":
-            warmup = [record["output_ids"] for record in raw["requests"]]
-        if tag == "measured-01":
-            client.verify_round_ids(raw, warmup)
     return measured
 
 

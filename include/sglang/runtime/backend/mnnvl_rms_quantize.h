@@ -21,4 +21,9 @@ struct MnnvlRmsQuantizeRows {
     Row entries[size];
 };
 
+struct MnnvlRmsQuantizeRows40 {
+    static constexpr int size = 40;
+
+    MnnvlRmsQuantizeRows::Row entries[size];
+};
 }

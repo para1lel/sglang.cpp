@@ -138,6 +138,8 @@ struct TensorParallel::State {
                           std::size_t count, const CollectiveStreams& capture_state, bool two_shot,
                           const MnnvlRmsQuantizeRows* rms_rows = nullptr,
                           const __nv_bfloat16* const* gains = nullptr);
+    template <typename Submit>
+    bool submit_vendor(const Submit& submit);
     void note_vendor_failure();
     void record_vendor_success(std::size_t count, std::size_t payload, bool two_shot,
                                std::size_t calls = 1);
@@ -284,11 +286,17 @@ bool TensorParallel::State::vendor_allreduce(
             return false;
         }
     }
-    try {
-        if (rms_rows) {
-            return mnnvl->try_allreduce_rms_quantize(buffers, streams, rms_rows, gains);
-        }
+    return submit_vendor([&] {
+        if (rms_rows) return mnnvl->try_allreduce_rms_quantize(buffers, streams, rms_rows, gains);
         mnnvl->allreduce_bf16(buffers, streams, count, two_shot);
+        return true;
+    });
+}
+
+template <typename Submit>
+bool TensorParallel::State::submit_vendor(const Submit& submit) {
+    try {
+        return submit();
     } catch (const std::invalid_argument&) {
         throw;
     } catch (const MnnvlArError& error) {
@@ -304,7 +312,6 @@ bool TensorParallel::State::vendor_allreduce(
         note_vendor_failure();
         throw;
     }
-    return true;
 }
 
 void TensorParallel::State::note_vendor_failure() {
@@ -492,6 +499,27 @@ bool TensorParallel::try_allreduce_rms_quantize(
     }
     if (owned_capture) tp_verify_graph::record_fused(streams[0]);
     else state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool TensorParallel::try_allreduce_rms_quantize_m40(
+    [[maybe_unused]] __nv_bfloat16* const buffers[], [[maybe_unused]] const cudaStream_t streams[],
+    [[maybe_unused]] const MnnvlRmsQuantizeRows40 rows[],
+    [[maybe_unused]] const __nv_bfloat16* const gains[]) {
+#if SGLANG_USE_MNNVL_AR
+    ensure_healthy();
+    if (!state_->mnnvl || state_->mnnvl_sticky || !state_->mnnvl->healthy() ||
+        !streams[0] || !streams[1]) return false;
+    if (validate_collective_streams(state_->devices, streams, 2).status !=
+        cudaStreamCaptureStatusNone) return false;
+    if (!state_->submit_vendor([&] {
+        return state_->mnnvl->try_allreduce_rms_quantize_m40(buffers, streams, rows, gains);
+    })) return false;
+    constexpr std::size_t count = MnnvlRmsQuantizeRows40::size * mnnvl_ar_hidden_width;
+    state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
     return true;
 #else
     return false;

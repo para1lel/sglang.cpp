@@ -4,14 +4,17 @@
 #include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <cuda.h>
+#include <cuda/atomic>
 
 #include <flashinfer/comm/trtllm_mnnvl_allreduce.cuh>
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <new>
 
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace sglang::decoder {
@@ -91,33 +94,60 @@ using namespace text_kernel;
 
 namespace transport = flashinfer::trtllm_mnnvl_allreduce::utils;
 using PackedBf16 = transport::PackedVec<float4, Bf16>;
-constexpr int reduce_rows = MnnvlRmsQuantizeRows::size;
 static_assert(kTokenDim == rms_hidden_width);
 constexpr int packs_per_row = kTokenDim / 8;
 constexpr int packs_per_thread = (packs_per_row + block_threads - 1) / block_threads;
 
-struct ReduceNorm {
+template <typename Rows>
+struct ReduceNormArgs {
     Bf16* branch;
     const Bf16* gain;
     void** rank_buffers;
     void* multicast;
     std::uint32_t* flags;
-    MnnvlRmsQuantizeRows rows;
+    Rows rows;
 };
 
-template <int Rank>
+template <typename Rows>
+struct ReduceNorm {
+    ReduceNormArgs<Rows> args;
+};
+
+using PairAtomic = cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system>;
+
+template <>
+struct ReduceNorm<MnnvlRmsQuantizeRows40> {
+    ReduceNormArgs<MnnvlRmsQuantizeRows40> args;
+    std::uint64_t* rejected;
+    std::uint64_t epoch;
+};
+
+__device__ bool poll_m40_rank0(PackedBf16* remote, Bf16* local, int row, int packed,
+                               std::uint64_t* rejected, std::uint64_t epoch) {
+    unsigned misses = 0;
+    while (!transport::pollOneshotRemoteRank<1, 2, 0, Bf16, float4, 8>(
+            remote, local, row, kTokenDim, packed)) {
+        if ((++misses & 255) == 0 &&
+            PairAtomic(*rejected).load(cuda::memory_order_acquire) == epoch) return false;
+    }
+    return true;
+}
+
+template <int Rank, typename Rows>
 __global__ __launch_bounds__(block_threads) void reduce_norm_rows(
-    const __grid_constant__ ReduceNorm params) {
+    const __grid_constant__ ReduceNorm<Rows> params) {
+    constexpr bool can_cancel = Rank == 0 && std::is_same_v<Rows, MnnvlRmsQuantizeRows40>;
+    const auto& args = params.args;
     const int row = blockIdx.x;
-    const auto& output = params.rows.entries[row];
-    auto* branch = params.branch + row * kTokenDim;
+    const auto& output = args.rows.entries[row];
+    auto* branch = args.branch + row * kTokenDim;
     __shared__ alignas(16) Bf16 branch_values[kTokenDim];
     __shared__ alignas(16) Bf16 residual_values[kTokenDim];
     __shared__ alignas(16) Bf16 gains[kTokenDim];
 
-    transport::LamportFlags<float4, false> flags(params.flags, 1);
-    auto* const multicast = static_cast<float4*>(flags.getCurLamportBuf(params.multicast));
-    auto* const local = static_cast<Bf16*>(flags.getCurLamportBuf(params.rank_buffers[Rank]));
+    transport::LamportFlags<float4, false> flags(args.flags, 1);
+    auto* const multicast = static_cast<float4*>(flags.getCurLamportBuf(args.multicast));
+    auto* const local = static_cast<Bf16*>(flags.getCurLamportBuf(args.rank_buffers[Rank]));
     PackedBf16 values[packs_per_thread];
 #pragma unroll
     for (int index = 0; index < packs_per_thread; ++index) {
@@ -128,19 +158,28 @@ __global__ __launch_bounds__(block_threads) void reduce_norm_rows(
             transport::sanitizeLamportPayload(value);
             multicast[(row * kRanks + Rank) * packs_per_row + packed] = value.packed;
             stage_rms_vector_async(output.residual + packed * 8, residual_values + packed * 8);
-            stage_rms_vector_async(params.gain + packed * 8, gains + packed * 8);
+            stage_rms_vector_async(args.gain + packed * 8, gains + packed * 8);
         }
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
     flags.ctaArrive();
-    flags.clearDirtyLamportBuf(params.rank_buffers[Rank], -1);
+    flags.clearDirtyLamportBuf(args.rank_buffers[Rank], -1);
+    bool cancelled = false;
 #pragma unroll
     for (int index = 0; index < packs_per_thread; ++index) {
         const int packed = threadIdx.x + index * block_threads;
         if (packed < packs_per_row) {
             PackedBf16 remote[2];
-            transport::waitOneshotRemoteRanks<2, Rank, Bf16, float4, 8>(
-                remote, local, row, kTokenDim, packed);
+            if constexpr (can_cancel) {
+                if (cancelled || !poll_m40_rank0(remote, local, row, packed, params.rejected,
+                                                 params.epoch)) {
+                    cancelled = true;
+                    continue;
+                }
+            } else {
+                transport::waitOneshotRemoteRanks<2, Rank, Bf16, float4, 8>(
+                    remote, local, row, kTokenDim, packed);
+            }
             const auto reduced = transport::reduceOneshotDeterministic<2, Rank, Bf16, float4, 8>(
                 remote, values[index]);
             reinterpret_cast<float4*>(branch)[packed] = reduced.packed;
@@ -148,20 +187,26 @@ __global__ __launch_bounds__(block_threads) void reduce_norm_rows(
         }
     }
     asm volatile("cp.async.wait_group 0;" ::: "memory");
-    __syncthreads();
+    if constexpr (can_cancel) {
+        if (__syncthreads_or(cancelled)) return;
+    } else {
+        __syncthreads();
+    }
     rms_quantize_staged<true, true>(branch_values, residual_values, gains, output.residual,
                                     output.normalized, output.activation);
     flags.waitAndUpdate({static_cast<std::uint32_t>(gridDim.x * kTokenDim * kRanks * sizeof(Bf16)),
                          0, 0, 0});
 }
 
-constexpr auto reduce_kernels = std::array{reduce_norm_rows<0>, reduce_norm_rows<1>};
+template <typename Rows>
+constexpr auto reduce_kernels = std::array{reduce_norm_rows<0, Rows>, reduce_norm_rows<1, Rows>};
 
+template <typename Rows>
 bool reduce_norm_ready(int device, int rank) {
     cudaFuncAttributes attributes{};
     int resident = 0;
     int multiprocessors = 0;
-    const auto kernel = reduce_kernels[rank];
+    const auto kernel = reduce_kernels<Rows>[rank];
     if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess ||
         attributes.maxThreadsPerBlock < block_threads ||
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, block_threads, 0) !=
@@ -171,7 +216,7 @@ bool reduce_norm_ready(int device, int rank) {
         (void)cudaGetLastError();
         return false;
     }
-    return resident * multiprocessors >= reduce_rows;
+    return resident * multiprocessors >= Rows::size;
 }
 
 }   
@@ -181,6 +226,10 @@ struct MnnvlAllReduce::State {
     bool failed = false;
     bool twoshot_supported = false;
     bool reduce_norm_supported = true;
+    bool reduce_norm_m40_supported = true;
+    std::uint64_t* m40_rejected = nullptr;
+    std::uint64_t* m40_device_word = nullptr;
+    std::uint64_t m40_epoch = 0;
 
     CUmemGenericAllocationHandle physical[kRanks]{};
     CUmemGenericAllocationHandle multicast{};
@@ -202,6 +251,7 @@ struct MnnvlAllReduce::State {
     bool reserved_mc = false;
     bool mapped_mc = false;
 
+    bool map_m40_submission();
     ~State();
 
     void release();
@@ -234,6 +284,27 @@ MnnvlAllReduce::State::~State() {
     release();
 }
 
+bool MnnvlAllReduce::State::map_m40_submission() {
+    void* memory = nullptr;
+    constexpr unsigned flags = cudaHostAllocMapped | cudaHostAllocPortable;
+    if (cudaHostAlloc(&memory, sizeof(std::uint64_t), flags) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    m40_rejected = new (memory) std::uint64_t{0};
+    CallerDevice device_scope;
+    void* device_word = nullptr;
+    if (cudaSetDevice(devices[0]) != cudaSuccess ||
+        cudaHostGetDevicePointer(&device_word, memory, 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFreeHost(memory);
+        m40_rejected = nullptr;
+        return false;
+    }
+    m40_device_word = static_cast<std::uint64_t*>(device_word);
+    return true;
+}
+
 void MnnvlAllReduce::State::release() {
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
@@ -247,6 +318,10 @@ void MnnvlAllReduce::State::release() {
             cudaFree(ptrs_dev[r]);
             ptrs_dev[r] = nullptr;
         }
+    }
+    if (m40_rejected) {
+        (void)cudaFreeHost(m40_rejected);
+        m40_rejected = nullptr;
     }
     if (mapped_mc) {
         (void)cuMemUnmap(mc_va, allocation_size);
@@ -451,7 +526,12 @@ void MnnvlAllReduce::init_lamport(State& state) {
                                      cudaGetErrorString(status));
         }
         state.twoshot_supported = state.twoshot_supported && twoshot_grid_fits(state.devices[r]);
-        state.reduce_norm_supported &= reduce_norm_ready(state.devices[r], r);
+        state.reduce_norm_supported &= reduce_norm_ready<MnnvlRmsQuantizeRows>(state.devices[r], r);
+        state.reduce_norm_m40_supported &=
+            reduce_norm_ready<MnnvlRmsQuantizeRows40>(state.devices[r], r);
+    }
+    if (state.reduce_norm_m40_supported) {
+        state.reduce_norm_m40_supported = state.map_m40_submission();
     }
 }
 
@@ -619,8 +699,23 @@ bool MnnvlAllReduce::try_allreduce_rms_quantize(
     const MnnvlRmsQuantizeRows rows[], const Bf16* const gains[]) {
     const int width = rows[0].count;
     if (!MnnvlRmsQuantizeRows::supports(width) || rows[1].count != width) return false;
+    return try_reduce_norm(buffers, streams, rows, gains, width);
+}
+
+bool MnnvlAllReduce::try_allreduce_rms_quantize_m40(
+    Bf16* const buffers[], const cudaStream_t streams[],
+    const MnnvlRmsQuantizeRows40 rows[], const Bf16* const gains[]) {
+    return try_reduce_norm(buffers, streams, rows, gains, MnnvlRmsQuantizeRows40::size);
+}
+
+template <typename Rows>
+bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t streams[],
+                                    const Rows rows[], const Bf16* const gains[], int width) {
+    constexpr bool narrow = std::is_same_v<Rows, MnnvlRmsQuantizeRows>;
     const std::size_t count = width * kTokenDim;
-    if (!state_->reduce_norm_supported || count > state_->max_elements) return false;
+    const bool supported = narrow ? state_->reduce_norm_supported
+                                  : state_->reduce_norm_m40_supported;
+    if (!supported || count > state_->max_elements) return false;
     for (int rank = 0; rank < kRanks; ++rank) {
         if (!buffers[rank] || !streams[rank] || !gains[rank] ||
             !aligned(buffers[rank], sizeof(float4)) || !aligned(gains[rank], sizeof(float4))) {
@@ -638,14 +733,26 @@ bool MnnvlAllReduce::try_allreduce_rms_quantize(
         }
     }
     ensure_healthy();
-    if (preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone &&
-        (width != tp_verify_graph::rows || !tp_verify_graph::binding(streams[0]) ||
-         !tp_verify_graph::binding(streams[1]))) return false;
+    if (preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone) {
+        if constexpr (!narrow) return false;
+        if (width != tp_verify_graph::rows || !tp_verify_graph::binding(streams[0]) ||
+            !tp_verify_graph::binding(streams[1])) return false;
+    }
+    std::uint64_t epoch = 0;
+    if constexpr (!narrow) {
+        if (state_->m40_epoch == UINT64_MAX) return false;
+        epoch = ++state_->m40_epoch;
+    }
 
-    ReduceNorm launch[kRanks];
+    ReduceNorm<Rows> launch[kRanks];
     for (int rank = 0; rank < kRanks; ++rank) {
-        launch[rank] = {buffers[rank], gains[rank], state_->ptrs_dev[rank],
-                        reinterpret_cast<void*>(state_->mc_va), state_->flags[rank], rows[rank]};
+        launch[rank].args = {buffers[rank], gains[rank], state_->ptrs_dev[rank],
+                             reinterpret_cast<void*>(state_->mc_va), state_->flags[rank],
+                             rows[rank]};
+        if constexpr (!narrow) {
+            launch[rank].rejected = state_->m40_device_word;
+            launch[rank].epoch = epoch;
+        }
     }
 
     CallerDevice device_scope;
@@ -653,11 +760,19 @@ bool MnnvlAllReduce::try_allreduce_rms_quantize(
         cudaError_t status = cudaSetDevice(state_->devices[rank]);
         if (status == cudaSuccess) {
             void* args[]{&launch[rank]};
-            status = cudaLaunchKernel(reduce_kernels[rank], width, block_threads, args, 0,
+            status = cudaLaunchKernel(reduce_kernels<Rows>[rank], width, block_threads, args, 0,
                                       streams[rank]);
         }
         if (status != cudaSuccess) {
             state_->failed = true;
+            if constexpr (!narrow) {
+                if (rank > 0) {
+                    PairAtomic(*state_->m40_rejected).store(epoch, cuda::memory_order_release);
+                    for (int peer = 0; peer < kRanks; ++peer) {
+                        (void)cudaStreamSynchronize(streams[peer]);
+                    }
+                }
+            }
             throw MnnvlArError(
                 std::string("Enqueue the MNNVL BF16 reduction and RMS quantization: ") +
                     cudaGetErrorString(status), rank > 0);

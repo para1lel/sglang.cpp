@@ -45,7 +45,6 @@ def write_receipts(capture, index, uuid):
     (capture / "devices.csv").write_text(
         f"index, uuid, name, driver_version\n{index}, {uuid}, NVIDIA B200, 590.48.01\n")
 
-
 def write_compute(run, uuid, pid):
     for sample in ("ready", "measurement-end"):
         (run / f"compute-{sample}.csv").write_text(f"{uuid}, {pid}, worker, 80000 MiB\n")
@@ -285,6 +284,8 @@ def replace_stream_ids(record, offset):
         payload["choices"][0]["token_ids"] = tokens
         event["lines"] = ["data: " + json.dumps(payload)]
 
+SAMPLE_ACTIVITY_LOG = ("batch verify lanes=1 rows=5 peak_request_bytes=4096\n"
+                       "batch mtp slot=0 drafted=4 accepted=2 verified=5 replayed=3 boundary=0\n")
 
 def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None, opt_in=False,
                  profile=k4.ORDERED_PROFILE, receipt_version=0, row="W1"):
@@ -305,6 +306,7 @@ def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None, opt_in
     for arm in arms:
         measurement = directory / arm / "measurement"
         measurement.mkdir(parents=True)
+        (directory / arm / "server.log").write_text(SAMPLE_ACTIVITY_LOG)
         if opt_in or receipt_version:
             write_opt_in_arm(measurement.parent, arm, identity)
     if receipt_version:
@@ -350,7 +352,6 @@ def write_k4_row(directory, native_ns=70, fault=None, trailing_line=None, opt_in
             with gzip.open(measurement / f"{tag}.json.gz", "wt") as stream:
                 json.dump(raw, stream)
 
-
 def write_k4_runtime_receipts(directory, arms, *, opt_in, receipt_version=1):
     for arm in arms:
         run = directory / arm
@@ -374,9 +375,7 @@ def write_k4_runtime_receipts(directory, arms, *, opt_in, receipt_version=1):
                 "--max-active", "32", "--max-num-batched-tokens", "8192"]
         if arm == "native-k4-trace":
             args += ["--trace-batches"]
-            (run / "server.log").write_text(
-                "batch verify lanes=1 rows=5 peak_request_bytes=4096\n"
-                "batch mtp slot=0 drafted=4 accepted=2 verified=5 replayed=3 boundary=0\n")
+            (run / "server.log").write_text(SAMPLE_ACTIVITY_LOG)
             k4.activity(run, "native")
         if opt_in or info["mtp_steps"] == 0:
             args += ["--mtp-steps", str(info["mtp_steps"])]
@@ -867,6 +866,7 @@ class PairedIdentityTest(unittest.TestCase):
         run = output / GROUP
         run.mkdir()
         (run / "server-pid.txt").write_text("2000\n")
+        (run / "server.log").write_text(SAMPLE_ACTIVITY_LOG)
         write_compute(run, GPU, 2000)
         launch = [
             "sglang-server", "--checkpoint", str(self.args.checkpoint), "--device", "0",

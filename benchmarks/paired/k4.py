@@ -15,6 +15,7 @@ from benchmarks.concurrent import client as concurrent
 from benchmarks.streaming import check_vllm, client as streaming
 import cold_cache
 import default_evidence as defaults
+from driver_health import require_healthy_driver_log
 import workload_suite
 from identity import verify_stream_end
 from makespan import cohort_makespan_ns, compare, makespan_criterion, validate_cohort
@@ -489,6 +490,9 @@ def assess(row, fixtures, directory):
             verify_arm_receipts(measurement.parent, identity, opt_in=selected is not None,
                                 version=version)
         binding = arm_binding(measurement, arm, selected, version)
+        server_log = measurement.parent / "server.log"
+        require(server_log.is_file(), f"{arm}: missing server log")
+        require_healthy_driver_log(server_log.read_text(), arm)
         verify_request_files(measurement, lanes)
         tags = schedule(row, arm, identity)
         require({path.name for path in measurement.glob("*.json.gz")}

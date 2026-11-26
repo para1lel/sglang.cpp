@@ -114,6 +114,10 @@ process arguments, vLLM activity counters, and client exit status. The saved
 identity selects the profile and cohort schedule. Captures without the sampling
 field retain their original sample counts, controls, and verdicts.
 
+### Driver health
+
+On TP2, each arm's server log is scanned for authentic CUDA launch failures at entry and after each cohort's capture is written. Paired assessment and legacy replay re-check the same log. Any invalid-handle, launch-failure, launch-timeout, misaligned- or illegal-address, illegal-instruction, hardware-stack-error, or assert marker rejects the whole arm. A failed-launch record also rejects: a `launch failed: CUresult` line with a non-success code counts as a failure whatever its error class. A rejected arm certifies no time, even when every request returned HTTP 200 with `[DONE]`. The rejection is run-level: merged stdout and stderr do not attribute a lane or rank. Benign capacity probes — a bare invalid-value or out-of-resources mention outside a failed-launch record — never reject, and a missing server log rejects. Warmup and measured cohorts are treated alike. A clean log proves only the absence of these markers, not positive dispatch or numerical accuracy. Output token contents remain reference only. [Serious markers](driver_health.py#L6)<!-- prefix: "\"CUDA_ERROR_" --> · [Failed-launch record](driver_health.py#L25)<!-- prefix: "_FAILED_LAUN" --> · [Health gate](driver_health.py#L45)<!-- prefix: "def require_" -->
+
 ### Historical K4 profiles
 
 Set `PAIRED_K4_NATIVE_PROFILE` on a fresh campaign to launch a compatible

@@ -52,7 +52,7 @@ lmcache_evidence verify-wheel "$wheel" "$lmcache_python" "$lmcache_pythonpath" \
     benchmarks/paired/{common.sh,lmcache_arm.sh,lmcache_evidence.py,tp2_vllm.py} \
     benchmarks/paired/{tp2_corpus.py,tp2-corpus-v1.json,k4.py,vllm_worker.py,default_evidence.py} \
     benchmarks/paired/{saved_evidence.py,cold_cache.py,makespan.py,workload_suite.py} \
-    benchmarks/paired/{measure_concurrent.py,identity.py} \
+    benchmarks/paired/{measure_concurrent.py,identity.py,driver_health.py} \
     benchmarks/streaming/{client.py,vllm_observer.py,check_vllm.py,gpu3-reference.json} \
     benchmarks/concurrent/{client.py,reference.py,freeze_prompts.py} \
     benchmarks/concurrent/{gpu2-reference.json,fixture-manifest.json} \

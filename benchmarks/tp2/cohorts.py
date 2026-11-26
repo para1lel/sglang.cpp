@@ -15,6 +15,7 @@ import k4
 import lifecycle
 from makespan import compare, K4_MAKESPAN_CRITERION, validate_cohort
 from saved_evidence import digest, load, require
+from driver_health import require_healthy_driver_log
 from tp2_corpus import load_lanes
 from workload_suite import ROWS
 
@@ -30,6 +31,9 @@ def handle(run, fixtures, endpoint=None, *, probe=False):
     lanes = load_lanes(fixtures, row)
     engine = "vllm" if run.name == "vllm-k4" else cold_cache.LMCACHE_DRAIN
     require(run.name in ("vllm-k4", "native-k4", "native-k4-trace"), "Unknown TP2 arm")
+    server_log = run / "server.log"
+    require(server_log.is_file(), f"{run.name}: missing server log")
+    require_healthy_driver_log(server_log.read_text(), run.name)
     policy = reference.reference()["policy"]
     measured = {}
     previous = prior_ranks = None
@@ -58,6 +62,7 @@ def handle(run, fixtures, endpoint=None, *, probe=False):
             finally:
                 with gzip.open(path, "xt", compresslevel=3) as stream:
                     json.dump(raw, stream, separators=(",", ":"), allow_nan=False)
+            require_healthy_driver_log(server_log.read_text(), f"{run.name}/{tag}")
         else:
             with gzip.open(path, "rt") as stream:
                 raw = json.load(stream)

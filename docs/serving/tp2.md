@@ -54,7 +54,7 @@ A separate untimed profile traced both engines after the W1 miss. It guided opti
 
 ## W2 divergence evidence
 
-The runs below reproduced the W2 divergence under controlled changes in request arrival. They are diagnostic only; they explain the superseded determinism rejection. The W2 row passes under the timing-only criterion.
+The runs below reproduced the W2 divergence under controlled changes in request arrival. They are diagnostic only; they explain the superseded determinism rejection. The `337edce7` W2 row passed under the timing-only criterion; the `168fdb1a` cohort missed.
 
 - **Original-wire bursts.** Three cold, complete, original-wire W2 reference bursts with lane submissions 12.0–19.4 µs apart matched the earlier official warmup exactly: all 3×1024 tokens.
 - **Stagger replay.** A 64-token diagnostic replayed the divergence with staggered submissions of 73.7–141.6 ms. The first divergence reappeared at 0-based offset 49 in a cold cohort. Lane 1 held nine output IDs before lane 0 was sent and seventeen before lane 0's first token. A 64-token logprob pair measured the top-2 candidates at offset 49: 1788 and 5215 tie at −0.6938778162002563, on the stagger cell only.
@@ -110,7 +110,7 @@ No startup flag selects the transport. Selection is automatic in a build that in
 
 ## Acceptance target
 
-W1 and W2 have passed the gate; W3, W4, and W5 have missed it. A passing campaign must satisfy every condition below.
+W1 and W2 passed on `337edce7`; W3–W5 missed on their releases. The `168fdb1a` cohort missed all five rows. A passing campaign must satisfy every condition below.
 
 - **Devices.** Run both engines alone on the same two B200 devices in the same rank order. Record both UUIDs, the rank assignment, interconnect, and distributed library.
 - **Workloads.** Reuse the frozen W1–W5 fixture bytes. Offer 2, 2, 8, 16, and 8 requests total on W1–W5. This is one, one, four, eight, and four per GPU. Eight slots per GPU give sixteen slots total. W4 fills them exactly. W4 uses the first sixteen archived W5 lanes. W1 and W2 need one new distinct lane each. W3 and W5 need four more each. Freeze every new lane as distinct deterministic bytes in a separate additive TP2 corpus. Retain the TP1 lanes and bytes. Duplicate no request.

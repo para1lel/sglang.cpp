@@ -152,6 +152,7 @@ exec 7>>"$root/campaign.lock"
 flock -n -E 75 7
 protocol_hash=$(cd -- "$project" && sha256sum \
     benchmarks/paired/{run_k4.sh,k4.py,common.sh,default_evidence.py,saved_evidence.py} \
+    benchmarks/paired/driver_health.py \
     benchmarks/paired/{identity.py,makespan.py} \
     benchmarks/paired/{measure_concurrent.py,vllm_worker.py} \
     benchmarks/streaming/{client.py,check_vllm.py,vllm_observer.py,W1.json,W2.json} \

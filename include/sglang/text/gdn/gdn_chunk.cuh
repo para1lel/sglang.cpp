@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mma.h>
+#include <type_traits>
 
 #include "sglang/text/gdn_local.h"
 
@@ -227,6 +228,13 @@ inline bool eligible(int count, const void* scratch, std::size_t bytes) {
            reinterpret_cast<std::uintptr_t>(scratch) % alignof(Matrices) == 0;
 }
 
+template <typename S>
+inline constexpr int recurrence_warps = std::is_same_v<S, GdnLocal> ? 4 : warp_mma::block_warps;
+
+template <typename S>
+inline constexpr auto recurrence_kernel =
+    warp_mma::recur_warp<S, recurrence_warps<S>, std::is_same_v<S, GdnLocal>>;
+
 template <typename S = GdnFull>
 inline cudaError_t configure(bool& enabled, bool grouped = false) {
     int device = 0, major = 0, minor = 0;
@@ -248,7 +256,7 @@ inline cudaError_t configure(bool& enabled, bool grouped = false) {
         return cudaFuncSetAttribute(warp_mma::recur_segments<S>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, warp_mma::dynamic_bytes);
     }
-    return cudaFuncSetAttribute(warp_mma::recur_warp<S>,
+    return cudaFuncSetAttribute(recurrence_kernel<S>,
                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 warp_mma::dynamic_bytes);
 }
@@ -266,10 +274,10 @@ inline cudaError_t launch(int count, const Bf16* convolved, const float2* gates,
         return status;
     }
     void* recur_args[] = {&count, &convolved, &matrices, &recurrent, &observable};
-    return cudaLaunchKernel(warp_mma::recur_warp<S>,
-                            dim3(S::value_heads, warp_mma::warp_value_tiles),
-                            dim3(warp_mma::block_threads), recur_args,
-                            warp_mma::dynamic_bytes, stream);
+    return cudaLaunchKernel(
+        recurrence_kernel<S>,
+        dim3(S::value_heads, dimension / (warp_mma::columns * recurrence_warps<S>)),
+        dim3(recurrence_warps<S> * 32), recur_args, warp_mma::dynamic_bytes, stream);
 }
 
 template <typename S = GdnFull>

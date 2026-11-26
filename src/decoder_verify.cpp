@@ -5,6 +5,7 @@
 #include "sglang/decoder_mtp.h"
 #include "sglang/text/gdn_local.h"
 #include "sglang/runtime/execution/decoder_verify_workspace.h"
+#include "sglang/runtime/execution/verification_row_copy.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/mtp/tc_vocab.h"
 #include "sglang/text/bf16_head_projection.h"
@@ -717,11 +718,11 @@ namespace {
 
 
 
-void gather_tp_packet(const Bf16* embedding, const Bf16* peer_embedding,
-                      const auto& peer_device, const VerificationSequence* sequences,
+void gather_tp_packet(const VerificationSequence* sequences,
                       TargetVerification* const* peer_verifiers, int first_lane, int end_lane,
-                      int longest, cudaStream_t stream, cudaStream_t peer_stream,
-                      VerificationRow* rows, VerificationRow* peer_rows, int& next) {
+                      int longest, VerificationRow* rows, VerificationRow* peer_rows,
+                      VerificationEmbeddingTokens& tokens, VerificationCopyRows& inputs,
+                      VerificationCopyRows& peer_inputs, int& next) {
     for (int index = 0; index < longest; ++index) {
         for (int lane = first_lane; lane < end_lane; ++lane) {
             const auto& sequence = sequences[lane];
@@ -732,18 +733,14 @@ void gather_tp_packet(const Bf16* embedding, const Bf16* peer_embedding,
             row.constrained = sequence.constrained;
             row.rotary_position = row.position + sequence.rotary_delta;
             rows[next] = row;
-            check(text_embedding(embedding, vocab_size, hidden_size,
-                                 sequence.tokens[index], row.work->residual, stream),
-                  "Look up verification input");
             auto peer_row = peer_verifiers[lane]->row(index);
             peer_row.constrained = sequence.constrained;
             peer_row.rotary_position = peer_row.position + sequence.rotary_delta;
-            peer_rows[next++] = peer_row;
-            const DeviceScope peer_scope(peer_device);
-            check(text_embedding(peer_embedding, vocab_size, hidden_size,
-                                 sequence.tokens[index], peer_row.work->residual,
-                                 peer_stream),
-                  "Look up peer verification input");
+            peer_rows[next] = peer_row;
+            tokens.id[next] = sequence.tokens[index];
+            inputs.destination[next] = row.work->residual;
+            peer_inputs.destination[next] = peer_row.work->residual;
+            ++next;
         }
     }
 }
@@ -837,18 +834,24 @@ bool Decoder::Model::verify_mtp_tp(
     }
     std::array<VerificationRow, max_wide_mtp_rows> rows;
     std::array<VerificationRow, max_wide_mtp_rows> peer_rows;
+    static_assert(max_wide_mtp_rows <= VerificationCopyRows::capacity);
+    VerificationEmbeddingTokens tokens{};
+    VerificationCopyRows inputs{};
+    VerificationCopyRows peer_inputs{};
     int next = 0;
-    if (count > decoder_batch_max_mtp_lanes) {
-        for (int first_lane = 0; first_lane < count; first_lane += decoder_batch_max_mtp_lanes) {
-            gather_tp_packet(embedding, peer.embedding, peer.device, sequences.data(),
-                             peer_verifiers.data(), first_lane,
-                             std::min(first_lane + decoder_batch_max_mtp_lanes, count), longest,
-                             stream, peer_stream, rows.data(), peer_rows.data(), next);
-        }
-    } else {
-        gather_tp_packet(embedding, peer.embedding, peer.device, sequences.data(),
-                         peer_verifiers.data(), 0, count, longest, stream, peer_stream,
-                         rows.data(), peer_rows.data(), next);
+    for (int first_lane = 0; first_lane < count; first_lane += decoder_batch_max_mtp_lanes) {
+        gather_tp_packet(sequences.data(), peer_verifiers.data(), first_lane,
+                         std::min(first_lane + decoder_batch_max_mtp_lanes, count), longest,
+                         rows.data(), peer_rows.data(), tokens, inputs, peer_inputs, next);
+    }
+    check(gather_verification_embeddings(embedding, vocab_size, tokens, inputs, next, stream),
+          "Look up verification inputs");
+    {
+        DeviceScope peer_scope(peer.device);
+        check(gather_verification_embeddings(peer.embedding, vocab_size, tokens, peer_inputs,
+                                             next, peer_stream),
+              "Look up peer verification inputs");
+        peer_scope.restore();
     }
     forward_layers_tp(peer, rows.data(), peer_rows.data(), total, stream, peer_stream, group,
                       primary_partials, peer_partials, primary_packed, peer_packed);

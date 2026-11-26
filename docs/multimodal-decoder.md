@@ -56,7 +56,7 @@ The batch decoder accepts ordinary sampling and stop options. [Prefix reuse](pre
 
 ## Verification
 
-Use the managed Pixi default environment. Run from the repository root. Build [`sglang_decoder`](../xmake.lua#L145)<!-- prefix: "target(\"sgla" --> before linking the fixture program. Call `prepare_multimodal_prompt` in the CPU planner check. Supply the same template IDs, grid, and timestamp IDs as the reference.
+Use the managed Pixi default environment. Run from the repository root. Build [`sglang_decoder`](../xmake.lua#L146)<!-- prefix: "target(\"sgla" --> before linking the fixture program. Call `prepare_multimodal_prompt` in the CPU planner check. Supply the same template IDs, grid, and timestamp IDs as the reference.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=''

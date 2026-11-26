@@ -17,7 +17,7 @@ the intended contents of every added or modified file. List paths relative to th
 snapshot root. For each expected deletion, check `test ! -e "$path" && test ! -L "$path"`.
 Stop if any check fails.
 
-XMake uses a checksum-pinned source archive for CUTLASS v4.9.0dev at commit `f8acf1aa78f96ff2f1ba7662fe495e5535c461bf`. The shared SM100 prefill projection compiles with the CUTLASS/CuTe headers. The server has no CUTLASS runtime library dependency. [Package pin](../../xmake.lua#L16)<!-- prefix: "add_versions" --> · [SM100 binding](../../xmake.lua#L105)<!-- prefix: "add_packages" -->
+XMake uses a checksum-pinned source archive for CUTLASS v4.9.0dev at commit `f8acf1aa78f96ff2f1ba7662fe495e5535c461bf`. The shared SM100 prefill projection compiles with the CUTLASS/CuTe headers. The server has no CUTLASS runtime library dependency. [Package pin](../../xmake.lua#L16)<!-- prefix: "add_versions" --> · [SM100 binding](../../xmake.lua#L106)<!-- prefix: "add_packages" -->
 
 The wrapper uses private XMake repository mode and installs from a local CUTLASS archive. Without an archive override, it reuses `$SGLANG_HOST_ROOT/cache/cutlass/<sha256>/cutlass-4.9.0dev.tar.gz` after verifying its hash. It fetches the pinned archive if the cached file is missing or fails verification. [Archive cache](../../tools/build-probe.sh#L35)<!-- prefix: "cached_cutla" --> · [Private configure](../../tools/build-probe.sh#L83)<!-- prefix: "\"$xmake\" g -" -->
 

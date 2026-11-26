@@ -79,6 +79,7 @@ target("sglang_cuda")
     add_files("src/text/bf16_head_projection.cu")
     add_files("src/text/target_fp8.cu")
     add_files("src/text/gdn_verify.cu")
+    add_files("src/runtime/execution/verification_row_copy.cu")
     add_files("src/mxfp8_gqa_prefill.cu")
     add_files("src/text_decode_bandwidth.cu")
     add_files("src/text_ops.cu", "src/text_attention_gdn.cu",
@@ -451,6 +452,20 @@ if has_config("tp2-collective-check") and os.isfile("tests/decoder/tp2/collectiv
         add_deps("sglang_decoder")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_files("tests/decoder/tp2/collective_check.cpp")
+    target_end()
+end
+
+option("tp2-verification-row-copy-check")
+    set_default(false)
+option_end()
+
+if has_config("tp2-verification-row-copy-check") then
+    target("tp2-verification-row-copy-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_cuda")
+        add_files("tests/decoder/tp2/verification_row_copy_check.cpp")
     target_end()
 end
 

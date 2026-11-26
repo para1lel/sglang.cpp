@@ -4,8 +4,10 @@
 #include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/runtime/backend/tensor_parallel.h"
 #include "sglang/runtime/execution/decoder_forward_layers.h"
+#include "sglang/runtime/execution/verification_row_copy.h"
 
 #include <algorithm>
+#include <type_traits>
 
 namespace sglang {
 namespace {
@@ -81,11 +83,21 @@ void tp_normalize(LayerBatch<Lane>& batch, int count, const Bf16* weight, const 
 
 template <typename Lane>
 void tp_scatter(LayerBatch<Lane>& batch, int count, cudaStream_t lane_stream,
-                const Bf16* const* reduced) {
-    for (int lane = 0; lane < count; ++lane) {
-        copy_cuda_async(workspace(batch.lanes[lane]).hidden, reduced[lane],
-                        hidden_size * sizeof(Bf16), cudaMemcpyDeviceToDevice, lane_stream,
-                        "Scatter tensor-parallel hidden state");
+                const Bf16* reduced) {
+    if constexpr (std::is_same_v<Lane, VerificationRow>) {
+        static_assert(tp_max_forward_lanes <= VerificationCopyRows::capacity);
+        VerificationCopyRows destinations{};
+        for (int lane = 0; lane < count; ++lane) {
+            destinations.destination[lane] = workspace(batch.lanes[lane]).hidden;
+        }
+        check(scatter_verification_hidden(reduced, destinations, count, lane_stream),
+              "Scatter tensor-parallel verification hidden states");
+    } else {
+        for (int lane = 0; lane < count; ++lane) {
+            copy_cuda_async(workspace(batch.lanes[lane]).hidden, reduced + lane * hidden_size,
+                            hidden_size * sizeof(Bf16), cudaMemcpyDeviceToDevice, lane_stream,
+                            "Scatter tensor-parallel hidden state");
+        }
     }
 }
 
@@ -217,9 +229,9 @@ void Decoder::Model::forward_layers_tp(
                              static_cast<std::size_t>(count) * hidden_size);
     }
 
-    tp_scatter(primary, count, stream, primary_hidden.data());
+    tp_scatter(primary, count, stream, primary_partials.hidden);
     decoder::DeviceScope peer_scope(peer.device);
-    tp_scatter(peer_batch, count, peer_stream, peer_hidden.data());
+    tp_scatter(peer_batch, count, peer_stream, peer_partials.hidden);
     peer_scope.restore();
 }
 

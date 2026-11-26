@@ -37,8 +37,9 @@ LayerBatch<Lane> tp_build_batch(const Lane* lanes, int count, cudaStream_t lane_
 }
 
 MnnvlRmsQuantizeRows tp_mnnvl_rms_rows(const LayerBatch<VerificationRow>& batch) {
-    MnnvlRmsQuantizeRows rows;
-    for (int index = 0; index < MnnvlRmsQuantizeRows::size; ++index) {
+    MnnvlRmsQuantizeRows rows{};
+    rows.count = batch.count;
+    for (int index = 0; index < batch.count; ++index) {
         auto& work = workspace(batch.lanes[index]);
         rows.entries[index] = {work.residual, work.normalized,
                                batch.projection_activation(index, hidden_size)};
@@ -56,7 +57,8 @@ struct TpReduceNorm {
     template <typename Lane>
     void prepare(const LayerBatch<Lane>& primary, const LayerBatch<Lane>& peer) {
         if constexpr (std::is_same_v<Lane, VerificationRow>) {
-            fused = primary.count == MnnvlRmsQuantizeRows::size &&
+            fused = (primary.count == MnnvlRmsQuantizeRows::size ||
+                     (primary.singleton_verify_activation && peer.singleton_verify_activation)) &&
                     primary.packs_projection_activation(hidden_size) &&
                     peer.packs_projection_activation(hidden_size);
             if (fused) {
@@ -69,7 +71,7 @@ struct TpReduceNorm {
     bool operator()(Bf16* const buffers[], const Bf16* gain, const Bf16* peer_gain) {
         if (fused && gain) {
             const Bf16* gains[] = {gain, peer_gain};
-            fused = group.try_allreduce_rms_quantize_m10(buffers, streams, rows, gains);
+            fused = group.try_allreduce_rms_quantize(buffers, streams, rows, gains);
             if (fused) return true;
         }
         group.allreduce_bf16(buffers, streams, count);
@@ -82,15 +84,18 @@ void tp_normalize(LayerBatch<Lane>& batch, int count, const Bf16* weight, const 
                   const Residuals& residuals) {
     const auto stream = batch.stream;
     if (batch.fuse_verify_activation()) {
-        VerifyRmsQuantizeRows rows;
-        for (int index = 0; index < fused_verify_rows; ++index) {
+        VerifyRmsQuantizeRows rows{};
+        for (int index = 0; index < count; ++index) {
             auto& work = workspace(batch.lanes[index]);
             const auto residual_pair = residuals(index, work);
             rows.entries[index] = {
                 residual_pair.branch, residual_pair.residual, work.normalized,
                 batch.projection_activation(index, hidden_size)};
         }
-        check(verify_rms_quantize(rows, weight, stream), operation);
+        const auto status = count == fused_verify_rows
+            ? verify_rms_quantize(rows, weight, stream)
+            : verify_rms_quantize_partial(rows, count, weight, stream);
+        check(status, operation);
         return;
     }
     if (batch.fuse_wide_verify_norm()) {
@@ -185,12 +190,11 @@ void Decoder::Model::forward_layers_tp(
     const Model& peer, const Lane* primary_lanes, const Lane* peer_lanes, int count,
     cudaStream_t stream, cudaStream_t peer_stream, decoder::TensorParallel& group,
     const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials,
-    std::uint8_t* primary_packed, std::uint8_t* peer_packed) const {
+    std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool singleton_verify) const {
     if (!primary_lanes || !peer_lanes || count < 1 || count > tp_max_forward_lanes) {
         throw std::invalid_argument("Invalid tensor-parallel batch width");
     }
     static_assert(tp_max_forward_lanes >= verification_packet_rows);
-
     std::array<Bf16*, tp_max_forward_lanes> primary_attention{};
     std::array<Bf16*, tp_max_forward_lanes> primary_hidden{};
     std::array<Bf16*, tp_max_forward_lanes> peer_attention{};
@@ -201,13 +205,20 @@ void Decoder::Model::forward_layers_tp(
         peer_attention[index] = peer_partials.attention + index * hidden_size;
         peer_hidden[index] = peer_partials.hidden + index * hidden_size;
     }
-
     auto primary = tp_build_batch(primary_lanes, count, stream, backend,
                                   primary_attention.data(), primary_hidden.data(),
                                   tp != nullptr, primary_packed);
     auto peer_batch = tp_build_batch(peer_lanes, count, peer_stream, peer.backend,
                                      peer_attention.data(), peer_hidden.data(),
                                      tp != nullptr, peer_packed);
+    if constexpr (std::is_same_v<Lane, VerificationRow>) {
+        const bool narrow = singleton_verify && count >= 3 && count <= fused_verify_rows &&
+            primary.tensor_parallel && peer_batch.tensor_parallel && primary.target_tc &&
+            peer_batch.target_tc && !primary_packed && !peer_packed &&
+            !primary_lanes[0].binding && !peer_lanes[0].binding;
+        primary.singleton_verify_activation = narrow;
+        peer_batch.singleton_verify_activation = narrow;
+    }
 
     Bf16* attention_reduce[2] = {primary_partials.attention, peer_partials.attention};
     Bf16* hidden_reduce[2] = {primary_partials.hidden, peer_partials.hidden};
@@ -278,10 +289,10 @@ void Decoder::Model::forward_layers_tp(
 template void Decoder::Model::forward_layers_tp<decoder::ForwardLane>(
     const Model&, const decoder::ForwardLane*, const decoder::ForwardLane*, int, cudaStream_t,
     cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
-    const decoder::TpPartials&, std::uint8_t*, std::uint8_t*) const;
+    const decoder::TpPartials&, std::uint8_t*, std::uint8_t*, bool) const;
 template void Decoder::Model::forward_layers_tp<decoder::VerificationRow>(
     const Model&, const decoder::VerificationRow*, const decoder::VerificationRow*, int,
     cudaStream_t, cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
-    const decoder::TpPartials&, std::uint8_t*, std::uint8_t*) const;
+    const decoder::TpPartials&, std::uint8_t*, std::uint8_t*, bool) const;
 
 }

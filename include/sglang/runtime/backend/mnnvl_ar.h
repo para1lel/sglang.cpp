@@ -34,7 +34,7 @@ public:
     void allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
                         std::size_t count, bool two_shot);
 
-    bool try_allreduce_rms_quantize_m10(
+    bool try_allreduce_rms_quantize(
         __nv_bfloat16* const buffers[], const cudaStream_t streams[],
         const MnnvlRmsQuantizeRows rows[], const __nv_bfloat16* const gains[]);
 

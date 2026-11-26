@@ -283,7 +283,7 @@ bool TensorParallel::State::vendor_allreduce(
     }
     try {
         if (rms_rows) {
-            return mnnvl->try_allreduce_rms_quantize_m10(buffers, streams, rms_rows, gains);
+            return mnnvl->try_allreduce_rms_quantize(buffers, streams, rms_rows, gains);
         }
         mnnvl->allreduce_bf16(buffers, streams, count, two_shot);
     } catch (const std::invalid_argument&) {
@@ -454,7 +454,7 @@ void TensorParallel::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
     state_->record_nccl_success(count, payload, reason);
 }
 
-bool TensorParallel::try_allreduce_rms_quantize_m10(
+bool TensorParallel::try_allreduce_rms_quantize(
     [[maybe_unused]] __nv_bfloat16* const buffers[], [[maybe_unused]] const cudaStream_t streams[],
     [[maybe_unused]] const MnnvlRmsQuantizeRows rows[],
     [[maybe_unused]] const __nv_bfloat16* const gains[]) {
@@ -462,7 +462,9 @@ bool TensorParallel::try_allreduce_rms_quantize_m10(
     ensure_healthy();
     if (!state_->mnnvl || state_->mnnvl_sticky || !state_->mnnvl->healthy() ||
         !streams[0] || !streams[1]) return false;
-    constexpr std::size_t count = MnnvlRmsQuantizeRows::size * mnnvl_ar_hidden_width;
+    const auto width = rows[0].count;
+    if (!MnnvlRmsQuantizeRows::supports(width) || rows[1].count != width) return false;
+    const std::size_t count = width * mnnvl_ar_hidden_width;
     const auto capture = validate_collective_streams(state_->devices, streams, 2);
     if (capture.status != cudaStreamCaptureStatusNone ||
         !state_->vendor_allreduce(buffers, streams, count, capture, false, rows, gains)) {

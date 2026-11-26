@@ -82,6 +82,7 @@ struct LayerBatch {
     Bf16* const* hidden_output = nullptr;
     
     bool tensor_parallel = false;
+    bool singleton_verify_activation = false;
     const TextFp8Activation* projection_override = nullptr;
 
     int gqa_attention_width() const {
@@ -132,7 +133,8 @@ struct LayerBatch {
     }
 
     bool fuse_verify_activation() const {
-        return std::is_same_v<Lane, VerificationRow> && count == fused_verify_rows;
+        return std::is_same_v<Lane, VerificationRow> &&
+               (count == fused_verify_rows || singleton_verify_activation);
     }
 
     bool fuse_wide_verify_norm() const {
@@ -196,13 +198,16 @@ struct LayerBatch {
 
     void quantize_verification(Bf16* Workspace::*source, int width,
                                Bf16* Workspace::*up = nullptr) const {
-        VerifyQuantizeRows rows;
-        for (int index = 0; index < fused_verify_rows; ++index) {
+        VerifyQuantizeRows rows{};
+        for (int index = 0; index < count; ++index) {
             auto& work = workspace(lanes[index]);
             rows.entries[index] = {
                 work.*source, up ? work.*up : nullptr, projection_activation(index, width)};
         }
-        check(verify_quantize_fp8(rows, width, stream), "Quantize five verification rows");
+        const auto status = count == fused_verify_rows
+            ? verify_quantize_fp8(rows, width, stream)
+            : verify_quantize_partial_fp8(rows, count, width, stream);
+        check(status, "Quantize verification activation");
     }
 
     void quantize_wide_verification(Bf16* Workspace::*source, int width,
@@ -953,13 +958,13 @@ void run_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_ind
 
 template <typename Lane>
 void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
-    const bool five = batch.fuse_verify_activation();
+    const bool narrow = batch.fuse_verify_activation();
     const bool wide = batch.fuse_wide_verify_norm();
-    if (five || wide) {
+    if (narrow || wide) {
         if (wide && batch.project_fused_mlp(layer)) return;
         batch.project_group({{layer.mlp_gate, &Workspace::mlp_gate},
                              {layer.mlp_up, &Workspace::mlp_up}});
-        if (five) {
+        if (narrow) {
             batch.quantize_verification(&Workspace::mlp_gate, batch.intermediate_width(),
                                         &Workspace::mlp_up);
         } else {

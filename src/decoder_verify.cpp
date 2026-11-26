@@ -787,8 +787,7 @@ bool Decoder::Model::verify_mtp_tp(
     const ConstraintWorkspace& scratch, void* sampling_scratch, cudaStream_t stream,
     cudaStream_t peer_stream, TensorParallel& group, const TpPartials& primary_partials,
     const TpPartials& peer_partials, const TcVocabScratch* vocabulary,
-    std::uint8_t* primary_packed, std::uint8_t* peer_packed,
-    void* logprob_workspace) const {
+    std::uint8_t* primary_packed, std::uint8_t* peer_packed, void* logprob_workspace) const {
     std::array<VerificationSequence, max_wide_mtp_lanes> sequences;
     std::array<TargetVerification*, max_wide_mtp_lanes> verifiers;
     std::array<TargetVerification*, max_wide_mtp_lanes> peer_verifiers;
@@ -855,7 +854,8 @@ bool Decoder::Model::verify_mtp_tp(
         peer_scope.restore();
     }
     forward_layers_tp(peer, rows.data(), peer_rows.data(), total, stream, peer_stream, group,
-                      primary_partials, peer_partials, primary_packed, peer_packed);
+                      primary_partials, peer_partials, primary_packed, peer_packed,
+                      count == 1 && vocabulary != nullptr);
     if (count <= decoder_batch_max_mtp_lanes) {
         score_verification_packet(*this, rows.data(), total, vocabulary, stream, count == 2);
     } else {

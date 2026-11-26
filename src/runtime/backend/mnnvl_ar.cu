@@ -105,7 +105,7 @@ struct ReduceNorm {
 };
 
 template <int Rank>
-__global__ __launch_bounds__(block_threads) void reduce_norm_m10(
+__global__ __launch_bounds__(block_threads) void reduce_norm_rows(
     const __grid_constant__ ReduceNorm params) {
     const int row = blockIdx.x;
     const auto& output = params.rows.entries[row];
@@ -150,10 +150,11 @@ __global__ __launch_bounds__(block_threads) void reduce_norm_m10(
     __syncthreads();
     rms_quantize_staged<true, true>(branch_values, residual_values, gains, output.residual,
                                     output.normalized, output.activation);
-    flags.waitAndUpdate({reduce_rows * kTokenDim * kRanks * sizeof(Bf16), 0, 0, 0});
+    flags.waitAndUpdate({static_cast<std::uint32_t>(gridDim.x * kTokenDim * kRanks * sizeof(Bf16)),
+                         0, 0, 0});
 }
 
-constexpr auto reduce_kernels = std::array{reduce_norm_m10<0>, reduce_norm_m10<1>};
+constexpr auto reduce_kernels = std::array{reduce_norm_rows<0>, reduce_norm_rows<1>};
 
 bool reduce_norm_ready(int device, int rank) {
     cudaFuncAttributes attributes{};
@@ -612,17 +613,20 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
     }
 }
 
-bool MnnvlAllReduce::try_allreduce_rms_quantize_m10(
+bool MnnvlAllReduce::try_allreduce_rms_quantize(
     Bf16* const buffers[], const cudaStream_t streams[],
     const MnnvlRmsQuantizeRows rows[], const Bf16* const gains[]) {
-    constexpr std::size_t count = reduce_rows * kTokenDim;
+    const int width = rows[0].count;
+    if (!MnnvlRmsQuantizeRows::supports(width) || rows[1].count != width) return false;
+    const std::size_t count = width * kTokenDim;
     if (!state_->reduce_norm_supported || count > state_->max_elements) return false;
     for (int rank = 0; rank < kRanks; ++rank) {
         if (!buffers[rank] || !streams[rank] || !gains[rank] ||
             !aligned(buffers[rank], sizeof(float4)) || !aligned(gains[rank], sizeof(float4))) {
             return false;
         }
-        for (const auto& row : rows[rank].entries) {
+        for (int index = 0; index < width; ++index) {
+            const auto& row = rows[rank].entries[index];
             if (!row.residual || !row.normalized || !row.activation.values ||
                 !row.activation.scales ||
                 !aligned(row.residual, sizeof(float4)) || !aligned(row.normalized, alignof(Bf16)) ||
@@ -646,7 +650,7 @@ bool MnnvlAllReduce::try_allreduce_rms_quantize_m10(
         cudaError_t status = cudaSetDevice(state_->devices[rank]);
         if (status == cudaSuccess) {
             void* args[]{&launch[rank]};
-            status = cudaLaunchKernel(reduce_kernels[rank], reduce_rows, block_threads, args, 0,
+            status = cudaLaunchKernel(reduce_kernels[rank], width, block_threads, args, 0,
                                       streams[rank]);
         }
         if (status != cudaSuccess) {

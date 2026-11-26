@@ -306,7 +306,8 @@ struct Decoder::Model {
                            const decoder::TpPartials& primary_partials,
                            const decoder::TpPartials& peer_partials,
                            std::uint8_t* primary_packed = nullptr,
-                           std::uint8_t* peer_packed = nullptr) const;
+                           std::uint8_t* peer_packed = nullptr,
+                           bool singleton_verify = false) const;
 
 
 

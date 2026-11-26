@@ -296,6 +296,14 @@ cudaError_t decoder::verify_quantize_fp8(VerifyQuantizeRows rows, int width, cud
     return launch_verify_quantize(rows, fused_verify_rows, width, stream);
 }
 
+cudaError_t decoder::verify_quantize_partial_fp8(VerifyQuantizeRows rows, int count, int width,
+                                                 cudaStream_t stream) {
+    if (count < 3 || count >= fused_verify_rows || width <= 0 || width % text_fp8_group_size) {
+        return cudaErrorInvalidValue;
+    }
+    return launch_verify_quantize(rows, count, width, stream);
+}
+
 cudaError_t decoder::verify_quantize_fp8_wide(WideVerifyQuantizeRows rows, int count, int width,
                                              cudaStream_t stream) {
     if (count <= fused_verify_rows || count > WideVerifyQuantizeRows::capacity ||
@@ -311,6 +319,15 @@ cudaError_t decoder::verify_rms_quantize(VerifyRmsQuantizeRows rows, const __nv_
     const auto kernel = rows.entries[0].residual ? verify_rms_kernel<true, VerifyRmsQuantizeRows>
                                                  : verify_rms_kernel<false, VerifyRmsQuantizeRows>;
     return cudaLaunchKernel(kernel, fused_verify_rows, block_threads, args, 0, stream);
+}
+
+cudaError_t decoder::verify_rms_quantize_partial(VerifyRmsQuantizeRows rows, int count,
+                                                 const __nv_bfloat16* weight, cudaStream_t stream) {
+    if (count < 3 || count >= fused_verify_rows) return cudaErrorInvalidValue;
+    void* args[] = {&rows, &weight};
+    const auto kernel = rows.entries[0].residual ? verify_rms_kernel<true, VerifyRmsQuantizeRows>
+                                                 : verify_rms_kernel<false, VerifyRmsQuantizeRows>;
+    return cudaLaunchKernel(kernel, count, block_threads, args, 0, stream);
 }
 
 cudaError_t decoder::verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, int count,

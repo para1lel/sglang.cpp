@@ -129,7 +129,6 @@ prepare_fixtures() {
     fi
 }
 
-# Run in the background. The shell's $! stays the session leader across exec.
 launch_session() {
     exec "$client_python" -IB -c '
 import os

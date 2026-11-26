@@ -73,7 +73,6 @@ void SingleDeviceBatchExecutor::join() noexcept {
 
 BatchTopology SingleDeviceBatchExecutor::topology() const noexcept {
     if (decoder_.tensor_parallel_info()) {
-        // Two rank-local target workers behind one admission lane.
         return BatchTopology{1, 2, 1};
     }
     return single_device_batch_topology;

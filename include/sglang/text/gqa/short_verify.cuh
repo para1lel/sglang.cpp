@@ -1,11 +1,5 @@
 #pragma once
 
-// Eager batched short-context verification: the exact-scores/replay kernel
-// pair over EagerTargetBatch value lanes. Mid-translation-unit fragment like
-// gqa_target_split.cuh — include it where that header is included, after the
-// mxfp8_gqa.cu helpers (exact_scores, vector_replay_body, score_warps,
-// launch_gqa_kernel) are visible.
-
 namespace {
 
 namespace gqa_verify {
@@ -17,11 +11,8 @@ __device__ decoder::ExactGqaWorkspace verify_scores(const gqa_decode::EagerTarge
                                                     int lane) {
     return {static_cast<float*>(input.lanes[lane].buffers.scratch), input.position_bound};
 }
-}  // namespace gqa_verify
+}
 
-/// Exact scores for the lanes of one batch: each block serves score_warps
-/// tokens of one query head. Lanes outside the batch contract (position in
-/// the split range, unreadable, or past the position bound) are skipped.
 __global__ void verify_scores_kernel(const __grid_constant__ gqa_decode::EagerTargetBatch input) {
     const auto lane = gqa_verify::verify_lane(input);
     const int head = static_cast<int>(blockIdx.y);
@@ -35,8 +26,6 @@ __global__ void verify_scores_kernel(const __grid_constant__ gqa_decode::EagerTa
                  gqa_verify::verify_scores(input, static_cast<int>(blockIdx.z)));
 }
 
-/// Value replay for the same lanes; consumes the scores written by
-/// verify_scores_kernel under the identical skip conditions.
 __global__ void verify_replay_kernel(const __grid_constant__ gqa_decode::EagerTargetBatch input) {
     const auto lane = gqa_verify::verify_lane(input);
     const int head = static_cast<int>(blockIdx.x);
@@ -51,12 +40,8 @@ __global__ void verify_replay_kernel(const __grid_constant__ gqa_decode::EagerTa
                        lane.buffers.output, head, static_cast<int>(blockIdx.y));
 }
 
-}  // namespace
+}
 
-/// Pure eligibility check for short_verify_gqa so callers can fall back
-/// before running any side effects (preprocess or cache appends). Eligible
-/// lanes sit strictly below the split range and their combined score
-/// workspace fits each lane's scratch buffer.
 bool decoder::short_verify_supported(const PagedDecodeLane* lanes, int count) {
     if (!lanes || count < 1 || count > target_split_eager_max_rows) {
         return false;
@@ -77,10 +62,6 @@ bool decoder::short_verify_supported(const PagedDecodeLane* lanes, int count) {
     return score_bytes <= paged_decode_scratch_bytes;
 }
 
-/// Eager batched short-context verify: the scores/replay kernel pair over
-/// value lanes whose positions sit strictly below the split range. Each
-/// lane's scratch buffer backs its score workspace; short_verify_supported
-/// (including the room requirement) gates the entry before any side effect.
 cudaError_t decoder::short_verify_gqa(const PagedDecodeLane* lanes, int count,
                                       cudaStream_t stream) {
     if (!short_verify_supported(lanes, count)) {

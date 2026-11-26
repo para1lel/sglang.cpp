@@ -39,9 +39,6 @@ __device__ int rotary_position(const MropePosition* positions, std::size_t row, 
     return position.temporal;
 }
 
-/// Normalizes and rotates one head. `query_heads` is 0 for keys-only launches;
-/// row strides follow the head counts, so a rank-local geometry reads and
-/// writes half-width activation rows.
 template <typename Position>
 __device__ __forceinline__ void gqa_preprocess_head(
     Position first_position, std::size_t row, int head, int query_heads, int kv_heads,
@@ -187,8 +184,6 @@ __global__ void gqa_verify_postgate_kernel(
     gqa_postgate_head(blockIdx.y, row.q_gate, row.attention, row.attention);
 }
 
-/// Geometry-driven head counts for a preprocess/postgate launch. Returns
-/// false for geometries that are not the full or the half checkpoint layout.
 bool gqa_heads(GqaGeometry geometry, int& query_heads, int& kv_heads) {
     if (!gqa_geometry_valid(geometry)) {
         return false;

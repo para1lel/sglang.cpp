@@ -16,7 +16,6 @@ struct Lane {
     RequestProgress progress{};
     std::unique_ptr<MtpDraftRequest> draft = nullptr;
     std::unique_ptr<TargetVerification> verification = nullptr;
-    // Tensor-parallel mirrors on rank 1 (rank 0 owns decisions and the draft).
     std::unique_ptr<Request> peer_request = nullptr;
     std::unique_ptr<TargetVerification> peer_verification = nullptr;
     std::unique_ptr<PendingBatchPrefix> peer_prefix = nullptr;
@@ -25,8 +24,6 @@ struct Lane {
     bool checkpoints() const {
         return options.publish_prefix_checkpoints && bool(options.store_prefix);
     }
-    // Rank-1 mirror of the rank-0 checkpoint row (the committed verification
-    // row during MTP, else the peer request workspace) used by prefix exports.
     const Workspace* peer_checkpoint_row = nullptr;
     bool restored_prompt = false;
     std::shared_ptr<const MultimodalInput> media = nullptr;
@@ -67,7 +64,6 @@ struct Lane {
     void record_decode_input(cudaStream_t stream) {
         prompt.push_back(progress.last_token);
         if (!draft || draft->valid_prefix() >= progress.position) return;
-        // The last ordinary target step does not enter the verifier's draft preparation.
         MtpRound tail{};
         tail.draft = draft.get();
         tail.media = media ? &media_prefill : nullptr;
@@ -121,7 +117,6 @@ struct Lane {
         result.mtp_replayed_rows = round.consumed < round.rows() ? round.consumed : 0;
         progress.advance(round.consumed);
         if (committed_row) {
-            // The final sampled ID is the unprocessed input of the next turn.
             prompt.insert(prompt.end(), round.tokens.begin(),
                           round.tokens.begin() + round.consumed);
         }

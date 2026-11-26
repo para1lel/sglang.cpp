@@ -60,8 +60,6 @@ struct Arguments {
 
 };
 
-// Stable stderr receipt for tensor-parallel launches; one line per rank plus a
-// world summary. The benchmark suite pins this format.
 void print_tp_receipt(const sglang::Decoder& decoder) {
     const auto* info = decoder.tensor_parallel_info();
     if (info == nullptr) {
@@ -382,8 +380,6 @@ std::unique_ptr<BatchService> make_batch_service(const Arguments& arguments,
         arguments.enable_batch_cuda_graphs(), arguments.max_active, 0,
         arguments.max_num_batched_tokens};
     auto executor = std::make_unique<SingleDeviceBatchExecutor>(decoder, batch_options);
-    // Under tensor parallelism every rank exports from its own device, so
-    // the cache must fan out per rank; TP1 keeps the single client.
     std::vector<std::array<std::uint8_t, 16>> rank_devices;
     if (arguments.lmcache_enabled && arguments.tensor_parallel > 1) {
         const auto* topology = decoder.tensor_parallel_info();
@@ -410,7 +406,6 @@ std::unique_ptr<BatchService> make_batch_service(const Arguments& arguments,
                                                  arguments.mtp_steps, arguments.lmcache,
                                                  std::move(rank_devices), identity);
     }
-    // Publish allreduce transport counters through /metrics.
     service->set_tp_ar_source(&decoder);
     return service;
 }

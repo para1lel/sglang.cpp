@@ -61,7 +61,7 @@ def verify_progress(text, requests):
         for slot, tokens in enumerate(map(int, row.split(','))):
             if tokens:
                 require(slot not in slots, 'Duplicate W1 prompt slot')
-                slots[slot] = 1  # The final prompt row produces the first returned token.
+                slots[slot] = 1
     for line in text.splitlines():
         match = NATIVE_MTP_LINE.fullmatch(line)
         if match:

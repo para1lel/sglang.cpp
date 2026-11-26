@@ -26,8 +26,6 @@ void check(cudaError_t status, const char* operation) {
     }
 }
 
-// Managed allocations keep the fixture in a single address space. Different poison bytes
-// for full and local outputs distinguish two incompletely written results.
 template <typename T>
 class Array {
     static constexpr std::size_t guard = 256;
@@ -58,8 +56,6 @@ public:
     }
 };
 
-// Independent checkpoint-layout oracle. Q, K and V are separate planes even though
-// their channels are contiguous in the local projection.
 int full_channel(int channel, int rank, bool qkv, int local_width) {
     if (rank < 0) return channel;
     if (!qkv) return rank * local_width + channel;
@@ -220,7 +216,6 @@ GdnResult gdn(int rows, int rank) {
         }
     } else {
         Array<float2> gates(rows * heads, poison);
-        // The 32-row chunk stores two 32x32 BF16 matrices and three 32-element FP32 vectors.
         const auto scratch_bytes = ((rows + 31) / 32) * heads * (2 * 32 * 32 * 2 + 3 * 32 * 4);
         Array<std::uint8_t> scratch(scratch_bytes, poison);
         using Prefill = cudaError_t (*)(int, const Bf16*, const Bf16*, const Bf16*, const Bf16*,
@@ -334,7 +329,6 @@ GqaResult gqa(int rank) {
     Array<int> map(pages - 1);
     for (int i = 0; i < pages - 1; ++i) map.data()[i] = pages - 1 - i;
     const Mxfp8PageTable table{map.data(), pages - 1};
-    // Page zero and the tail of the last logical page are deliberately untouched.
     Array<std::uint8_t> kp(pages * 128 * heads * 256, 0xa5), vp(pages * 128 * heads * 256, 0xa5);
     Array<std::uint8_t> ks(pages * heads * 128 * 8, 0xa5), vs(pages * heads * 128 * 8, 0xa5);
     const Mxfp8KvCache cache{kp.data(), vp.data(), ks.data(), vs.data(), pages, heads};
@@ -396,7 +390,6 @@ void gqa_check() {
     for (int rank = 0; rank < 2; ++rank) {
         const auto local = gqa(rank);
         for (int plane = 0; plane < 4; ++plane) {
-            // Payload [page,slot,head,256], scales [page,head,slot%32,slot/32,group].
             compare("GQA cache", full.cache[plane], local.cache[plane],
                     plane < 2 ? pages * 128 : pages, 2, plane < 2 ? 256 : 128 * 8, rank);
         }
@@ -416,7 +409,7 @@ void gqa_check() {
     }
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
     try {

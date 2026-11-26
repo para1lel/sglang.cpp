@@ -13,13 +13,6 @@
 
 namespace sglang::decoder {
 
-/// One row slice of an FP8 checkpoint matrix inside a packed bank.
-/// `stem` names the checkpoint tensor pair stem+".weight"/stem+".weight_scale_inv";
-/// `full_rows` is the checkpoint row count (validation keeps checkpoint
-/// dimensions global); `first_row`/`row_count` select the rank-local rows.
-/// A slice with `joined` set appends its rows and scale rows to the previous
-/// returned weight instead of starting a new one, so several slices of one
-/// checkpoint tensor can form a single device matrix.
 struct Fp8PackSlice {
     std::string stem;
     int full_rows;
@@ -28,7 +21,6 @@ struct Fp8PackSlice {
     bool joined = false;
 };
 
-/// One row slice of a BF16 checkpoint tensor (see QwenWeightUpload::bf16_packed_rows).
 struct Bf16RowSlice {
     int first_row;
     int row_count;
@@ -56,8 +48,6 @@ public:
         return {values, scales, rows, columns};
     }
 
-    /// Row-slice variant of bf16_matrix: takes rows [first_row, first_row + row_count)
-    /// of a [full_rows, columns] matrix into a [row_count, columns] device weight.
     Bf16Weight bf16_matrix_rows(const std::string& name, int full_rows, int columns,
                                 int first_row, int row_count) {
         return {reinterpret_cast<const Bf16*>(upload_rows(name, TensorDtype::BF16,
@@ -66,11 +56,6 @@ public:
                 row_count, columns};
     }
 
-    /// Packs the given row slices of one row-major BF16 tensor end to end and
-    /// returns the device allocation. The first shape dimension counts rows;
-    /// every row is the product of the remaining dimensions wide (a [48]
-    /// vector has 48 one-element rows, a [10240,1,4] conv has 10240
-    /// four-element rows).
     const Bf16* bf16_packed_rows(const std::string& name,
                                  std::initializer_list<std::uint64_t> shape,
                                  std::initializer_list<Bf16RowSlice> slices) {
@@ -100,10 +85,6 @@ public:
         return destination;
     }
 
-    /// Column-slice variant of fp8_matrix: takes columns
-    /// [first_column, first_column + column_count) of a [rows, full_columns]
-    /// matrix into a [rows, column_count] device weight. The slice must land
-    /// on whole FP8 scale blocks.
     Fp8Weight fp8_matrix_columns(const std::string& stem, int rows, int full_columns,
                                  int first_column, int column_count) {
         if (first_column % text_fp8_group_size != 0 || column_count % text_fp8_group_size != 0) {
@@ -120,11 +101,6 @@ public:
         return {values, scales, rows, column_count};
     }
 
-    /// Packs row slices of FP8 checkpoint matrices into one contiguous value
-    /// buffer and one contiguous scale buffer, in listed order. Returns one
-    /// Fp8Weight per run of slices: a slice with `joined` set extends the
-    /// previous weight instead of starting a new one. Row slices and their
-    /// scale blocks must align to whole 128-row groups.
     std::vector<Fp8Weight> packed_fp8(std::initializer_list<Fp8PackSlice> slices, int columns) {
         if (columns % text_fp8_group_size != 0) {
             throw std::invalid_argument("FP8 bank width must align to " +
@@ -191,8 +167,6 @@ private:
                            destination);
     }
 
-    /// Copies rows [first_row, first_row + row_count) of a row-major tensor
-    /// whose first shape dimension counts rows; one contiguous run of bytes.
     const std::uint8_t* upload_rows(const std::string& name, TensorDtype dtype,
                                     std::initializer_list<std::uint64_t> shape, int first_row,
                                     int row_count, std::uint8_t* destination = nullptr) {
@@ -212,8 +186,6 @@ private:
         return destination;
     }
 
-    /// Copies columns [first_column, first_column + column_count) of a
-    /// row-major 2-D tensor: `rows` strided runs of `column_count` elements.
     const std::uint8_t* upload_columns(const std::string& name, TensorDtype dtype,
                                        std::initializer_list<std::uint64_t> shape,
                                        int first_column, int column_count,
@@ -253,4 +225,4 @@ private:
     cudaStream_t stream_;
 };
 
-}  // namespace sglang::decoder
+}

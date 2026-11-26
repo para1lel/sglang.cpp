@@ -107,13 +107,6 @@ inline bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* r
     return true;
 }
 
-/// Eager short-context verify: the same staged pipeline as
-/// try_gqa_verify_batch, but for lanes below the split range, where the
-/// batched entry cannot run. Only dispatched on the TP2 vector backend
-/// (tensor_parallel gate at the call site, vector_attention here): the
-/// kernel pair is bit-identical to the per-lane vector read those lanes
-/// would otherwise take. Constrained rows keep the per-row route. Eligibility
-/// is checked before any side effect so the caller can still fall back.
 inline bool try_gqa_verify_short(const GqaLayer& layer, const VerificationRow* rows, int count,
                                  int cache_index, bool vector_attention, cudaStream_t stream) {
     if (!vector_attention || count <= 1 || count > target_split_eager_max_rows ||
@@ -243,7 +236,6 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
                                geometry_cache.kv_heads};
 
     check(cudaPeekAtLastError(), "Prepare long grouped target attention");
-    // Earlier rows of a crossing request must append before its selected suffix reads KV.
     if (selected_count != count) attend_remainder(selected);
 
     GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows> preprocess{};

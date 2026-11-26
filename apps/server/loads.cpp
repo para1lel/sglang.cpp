@@ -202,9 +202,6 @@ void write_loads(const Socket& connection, const HttpRequest& request, LoadSnaps
 
 namespace {
 
-// Per-rank tensor-parallel allreduce transport counters. The label set is
-// frozen for the W1 evidence pipeline: rank plus, for the width histograms,
-// width and transport.
 void append_tp_ar_metrics(std::string& text, const decoder::TpArCounters& counters) {
     const auto emit_rank = [&text](std::string_view name, std::size_t rank, auto value) {
         text += name;
@@ -261,7 +258,7 @@ void append_tp_ar_metrics(std::string& text, const decoder::TpArCounters& counte
     }
 }
 
-}  // namespace
+}
 
 std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t waiting) {
     std::string text = "# Native sglang.cpp metrics with frozen W3-prefix compatibility names\n";

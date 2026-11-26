@@ -52,7 +52,6 @@ class GdnEndpoints(L1ManagerListener):
         self.counts = Counter()
 
     def snapshot(self, limit):
-        # L1 callbacks take this lock, so release it before reserving any L1 reads.
         with self.lock:
             ends = tuple(self.counts)
         return sorted((end for end in ends if end <= limit), reverse=True)
@@ -246,7 +245,6 @@ class Request:
         self.armed = True
 
     def release_reply(self, status, data=b""):
-        # GPU IPC leases end after device synchronization and unmapping, even after a deadline.
         self.peer.settimeout(REQUEST_TIMEOUT)
         self.peer.sendall(HEADER.pack(MAGIC, status, len(data)) + data)
 
@@ -285,8 +283,6 @@ class DmaReservations(L1ManagerListener):
         self.delete_l1 = manager.delete
         manager.clear = self.clear
         manager.delete = self.delete
-        # These 0.5.8 callbacks run under _lock. Capture the reservation before
-        # another notification can fail and interrupt the StorageManager call.
         with manager._lock:
             manager._registered_listeners.insert(0, self)
 
@@ -309,8 +305,6 @@ class DmaReservations(L1ManagerListener):
     def reclaim(self, operation, force, *args):
         if not force:
             return operation(*args)
-        # The upstream force path bypasses the L1 lock state. Serialize only
-        # that path with reservation creation and refuse it while any are live.
         with self.activity_lock:
             if self.active:
                 raise RuntimeError("Cannot force reclaim during an active sglang DMA reservation")
@@ -348,8 +342,6 @@ class DmaReservations(L1ManagerListener):
         with self.manager._lock:
             pending = {key: lock for key, (entry, lock) in entries.items()
                        if self.manager._objects.get(key) is entry and entry.read_lock is lock}
-        # A pin prevents ordinary eviction until finish_read consumes it. Other
-        # readers finishing on different threads still release their native TTL lock.
         self.finishing.locks = set(pending.values())
         try:
             if pending:
@@ -480,7 +472,6 @@ class Records:
 
     def store(self, request, transfer):
         keys = [record.key for record in transfer.records]
-        # Serialize writers to keep immutable records and their state marker coherent.
         with self.writes, self.read(keys) as resident:
             pending = [record for record in transfer.records if record.key not in resident]
             if any(not self.fits(resident, record) for record in transfer.records
@@ -538,7 +529,6 @@ class SocketServer(OwnedUnixStreamServer):
         self.pending_mutations = 0
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
         self.slots = threading.BoundedSemaphore(WORKERS)
-        # Armed GPU operations cannot occupy every worker needed to report lease status.
         self.gpu_slots = threading.BoundedSemaphore(WORKERS - 4)
         super().__init__(endpoint, Handler)
 
@@ -657,9 +647,6 @@ class Handler(socketserver.BaseRequestHandler):
                 return
             try:
                 metadata = TransferMetadata(request)
-                # Ranked transfers (ops 10 and 11) tag each MXFP8 section with
-                # its KV head count; the historical ops stay byte-compatible
-                # with TP1 clients and records.
                 legacy = request.op in (3, 4)
                 transfer = Transfer.parse(metadata, lambda family, identity, endpoint=0:
                                           object_key(namespace, family, identity, endpoint),

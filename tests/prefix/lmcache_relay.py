@@ -279,7 +279,6 @@ class Relay(socketserver.ThreadingUnixStreamServer):
 
 
 def arm_device_fence(directory):
-    # Give each GET its own signals, including when reusing a daemon after a failed run.
     attempt = Path(mkdtemp(prefix="get-", dir=directory))
     marker = attempt / "arm"
     marker.symlink_to(attempt.resolve())
@@ -311,7 +310,6 @@ def install_device_fence(directory):
         with claim:
             armed = path / "arm"
             try:
-                # Rename consumes exactly the published marker, even if another process rearms.
                 claimed = armed.replace(path / f"claimed-{os.getpid()}")
             except FileNotFoundError:
                 return

@@ -40,7 +40,6 @@ void check_tile(const PrefillGrant& tile, const PrefillGrant& owner, int offset,
          tile.prompt_remaining == owner.prompt_remaining - offset, "Tile span mismatch");
     need(tile.tokens[0] == owner.tokens[offset] &&
          tile.tokens[rows - 1] == owner.tokens[offset + rows - 1], "Token endpoints mismatch");
-    // Draft row j consumes token j+1. The final prompt token has no successor.
     const int seed = std::min(rows, tile.prompt_remaining - 1);
     need(seed == std::min(rows, owner.prompt_remaining - offset - 1), "Draft boundary mismatch");
     if (seed) {
@@ -53,7 +52,6 @@ void run(const std::vector<Input>& inputs, const std::vector<Dispatch>& expected
     std::vector<std::unique_ptr<Request>> requests;
     std::vector<std::vector<int>> tokens;
     std::array<std::vector<PrefillGrant>, 2> grants;
-    // The planner preserves this opaque identity without calling the draft model.
     alignas(MtpDraftRequest) std::byte draft_identity[sizeof(MtpDraftRequest)];
     auto* draft = reinterpret_cast<MtpDraftRequest*>(draft_identity);
     for (int rank = 0; rank < 2; ++rank) {

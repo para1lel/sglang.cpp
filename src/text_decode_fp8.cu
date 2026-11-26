@@ -18,7 +18,6 @@ constexpr int fp8_groups_per_warp = warp_width * fp8_pack_bytes / text_fp8_group
 constexpr int decode_hidden_width = 5120;
 constexpr int decode_attention_width = 6144;
 constexpr int decode_intermediate_width = 17408;
-// TP2 rank-local projection widths (half of the full attention/intermediate widths).
 constexpr int decode_local_attention_width = decode_attention_width / 2;
 constexpr int decode_local_intermediate_width = decode_intermediate_width / 2;
 
@@ -184,11 +183,6 @@ __global__ void fp8_decode_gate_up_kernel(TextFp8ActivationView input, DecodeFp8
                                        __float2bfloat16_rn(up_sum));
     }
 }
-// Column contract for the packed FP8 decode kernels: a warp covers
-// fp8_groups_per_warp scale groups per iteration, so Width must be a multiple
-// of text_fp8_group_size * fp8_groups_per_warp. Widths that do not satisfy
-// this (or are not listed in decode_fp8_project) fall back to the generic
-// text_fp8_gemv path, which handles arbitrary group counts.
 static_assert(decode_hidden_width % (text_fp8_group_size * fp8_groups_per_warp) == 0);
 
 template <int Width, bool Qkv>
@@ -319,8 +313,6 @@ cudaError_t decode_fp8_qkv(TextFp8ActivationView input, DecodeFp8Projection quer
     if (!valid_buffers(input, width, projections)) {
         return cudaErrorInvalidValue;
     }
-    // Fused only for the exact TP1/TP2 QKV geometries; anything else falls back
-    // to per-projection GEMVs (also avoiding unchecked row-count arithmetic).
     const bool tp1_geometry = query.rows == 2 * decode_attention_width &&
                               key.rows == text_gqa_kv_width &&
                               value.rows == text_gqa_kv_width;

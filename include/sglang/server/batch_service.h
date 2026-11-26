@@ -21,7 +21,6 @@ struct BatchMetrics {
     std::uint64_t generation_tokens = 0;
     std::uint64_t prefill_requests = 0;
     LmCacheMetrics lmcache;
-    // Allreduce transport counters (empty on single-device servers).
     decoder::TpArCounters tp_ar;
     bool tp_ar_present = false;
 };
@@ -139,9 +138,6 @@ public:
     BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps = 0);
     BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
                  std::unique_ptr<decoder::LmCacheClient> cache, std::string cache_identity);
-    // Ranked (TP2) serving: one per-rank daemon derived from `cache`, with
-    // rank_devices[rank] holding that rank's CUDA device UUID so lane views
-    // dispatch to their rank.
     BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
                  const decoder::LmCacheConfig& cache,
                  std::vector<std::array<std::uint8_t, 16>> rank_devices,

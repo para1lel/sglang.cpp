@@ -8,13 +8,6 @@
 
 namespace sglang::decoder {
 
-/// Rank identity for native tensor-parallel weight upload.
-///
-/// world_size 1 keeps the historical single-rank layout: every helper below
-/// returns the full checkpoint width. world_size 2 splits every parallel axis
-/// of the text model in half; rank r owns slice [r*n,(r+1)*n) of each logical
-/// axis of local length n (docs/research/tp2.md). The embedding is replicated
-/// on both ranks; the LM head and the MTP draft belong to the primary rank.
 struct WeightSharding {
     int rank = 0;
     int world_size = 1;
@@ -22,7 +15,6 @@ struct WeightSharding {
     constexpr WeightSharding() = default;
     constexpr WeightSharding(int rank_, int world_size_) : rank(rank_), world_size(world_size_) {}
 
-    /// Throws unless the sharding is one this loader implements.
     void validate() const {
         if (world_size != 1 && world_size != 2) {
             throw std::invalid_argument("Weight sharding supports world sizes 1 and 2");
@@ -46,12 +38,9 @@ struct WeightSharding {
         }
     }
 
-    /// True when every axis keeps its full checkpoint width.
     constexpr bool single_rank() const { return world_size == 1; }
 
-    /// The rank that owns the LM head and the MTP draft weights.
     constexpr bool primary_rank() const { return rank == 0; }
-    /// Width of the rank-local query projection input (o_proj column slice).
     constexpr int local_q_width() const { return local_query_heads() * mxfp8_head_dim; }
 
     constexpr int local_query_heads() const { return qwen_text_model.query_heads / world_size; }
@@ -81,4 +70,4 @@ struct WeightSharding {
     }
 };
 
-}  // namespace sglang::decoder
+}

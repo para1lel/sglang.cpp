@@ -327,7 +327,6 @@ __device__ void single_stage(Tile& tile, const StagedPairMaps& maps,
     for (int chunk = 0; chunk * flash_keys < end; ++chunk) {
         const int stage = chunk & 1;
         if (chunk >= 2) {
-            // QK retires a K slot, while only PV retires a V slot.
             const int old = chunk - 2;
             const Word retired = Key ? tmem_smem(&tile.scores_ready[old % 3]) :
                                         tmem_smem(&tile.output_ready[stage]);
@@ -379,7 +378,6 @@ __device__ void issue_staged_value(Tile& tile, int chunk, Word probability) {
 __device__ void single_issue_mmas(StagedSingleTile& tile, int end) {
     single_issue_score(tile, 0);
     if (end > flash_keys) single_issue_score(tile, 1);
-    // PV(n-1) was issued after softmax(n-1) published, so score(n-1) is no longer read.
     for (int chunk = 0; chunk * flash_keys < end; ++chunk) {
         if ((chunk + 2) * flash_keys < end) single_issue_score(tile, chunk + 2);
         const int stage = chunk & 1;
@@ -444,7 +442,6 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_single_attention(
                 tmem_mma_wait(tmem_smem(&tile.output_ready[1 - stage]), ((chunk - 1) >> 1) & 1);
                 tmem_correct_output(row_address, history);
             }
-            // Publish packed P and the corrected accumulator together before PV can acquire them.
             asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
             __syncwarp();
             if ((threadIdx.x & 31) == 0) {

@@ -844,7 +844,6 @@ std::optional<cudaError_t> launch_tmem_prefill(
     const auto stock = ragged_rows ? tmem_flash_attention<true, true> :
         ordered ? tmem_flash_attention<true> : tmem_flash_attention<false>;
     const bool before_flash = automatic && raw_pipeline_before_flash(cache, ragged_rows, visible);
-    // A 32-row pipeline tile doubles row parallelism. Keep it within one resident wave.
     const bool one_wave = (rows + pipeline_rows - 1) / pipeline_rows
         * gqa_head_pairs(cache) <= properties.multiProcessorCount;
     bool pipeline = automatic && (before_flash || ragged_rows == pipeline_query_rows ||

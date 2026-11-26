@@ -38,7 +38,7 @@ constexpr std::size_t header_size = 16;
 #if defined(SYS_pidfd_open)
 constexpr long pidfd_open_syscall = SYS_pidfd_open;
 #elif defined(__x86_64__)
-constexpr long pidfd_open_syscall = 434;  // Linux x86_64 UAPI, absent in old sysroots.
+constexpr long pidfd_open_syscall = 434;   
 #else
 #error "Linux pidfd_open syscall definition is required"
 #endif
@@ -416,7 +416,7 @@ LmCacheStatus transfer_records(const LmCacheConfig& config, Operation operation,
     }
 }
 
-}  // namespace
+}   
 
 std::string default_lmcache_endpoint() {
     const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
@@ -433,8 +433,6 @@ namespace {
 std::string insert_rank_suffix(std::string endpoint, int rank) {
     if (rank < 0) throw std::invalid_argument("Invalid LMCache rank");
     const auto suffix = "-r" + std::to_string(rank);
-    // C++17: the existing test harness compiles these translation units with
-    // -std=c++17, so avoid std::string_view::ends_with here.
     constexpr std::string_view extension = ".sock";
     const auto tail = endpoint.size() > extension.size()
                           ? std::string_view(endpoint).substr(
@@ -448,7 +446,7 @@ std::string insert_rank_suffix(std::string endpoint, int rank) {
     return endpoint;
 }
 
-}  // namespace
+}   
 
 std::string rank_lmcache_endpoint(int rank) {
     return insert_rank_suffix(default_lmcache_endpoint(), rank);
@@ -546,8 +544,6 @@ LmCachePrefixDetail LmCacheClient::lookup_prefix_detail(std::string_view digests
         transport_error("invalid prefix coverage inventory");
     }
     if (total > listed) {
-        // The daemon capped its reply, so the inventory is incomplete and the
-        // composite pick could silently miss the common endpoint; refuse.
         transport_error("LMCache prefix coverage inventory is truncated");
     }
     LmCachePrefixDetail detail{static_cast<int>(gqa), static_cast<int>(matched_gdn), {}};
@@ -599,4 +595,4 @@ void LmCacheClient::reset() const {
     connection.response(0);
 }
 
-}  // namespace sglang::decoder
+}   

@@ -98,9 +98,6 @@ class NativeMxfp8:
             width = rows * row_bytes
             pitch = self.pages * 128 * row_bytes
             origin = address + begin * row_bytes
-            # A full page's scales are contiguous across heads; only the tail
-            # of a partial page is stored per head (1024 bytes per head per
-            # page, independent of the head count).
             full = width if index < 2 else rows // 128 * 128 * self.kv_heads * 8
             if full:
                 yield Region(allocation, origin, pitch, offset, width, full, self.layers)

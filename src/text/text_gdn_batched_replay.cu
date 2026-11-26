@@ -11,9 +11,6 @@
 
 namespace sglang {
 
-// Eligibility for the batched GDN prefix replay: mirrors valid_replay
-// (src/text_attention_gdn.cu), which gates the per-layer launches. The
-// batched kernels dereference exactly the buffers checked here.
 bool text_gdn_replay_batchable(int count, const TextGdnReplayEntry& entry) {
     return count >= 1 && count <= text_gdn_max_verify_rows && entry.rows.qkv &&
            entry.rows.convolved && entry.rows.b && entry.rows.a && entry.weights.a_log &&
@@ -25,9 +22,6 @@ bool text_gdn_replay_batchable(int count, const TextGdnReplayEntry& entry) {
 
 namespace {
 
-/// Per-block entry view: selects this block's table entry once, then hands
-/// the recur kernel the same locals the per-layer kernel derives from its
-/// arguments.
 struct GdnReplayPreamble {
     int local_block;
     int token_count;
@@ -46,11 +40,6 @@ __device__ GdnReplayPreamble gdn_replay_preamble(const TextGdnReplayEntry* table
             entry.rows.a, entry.weights, entry.initial, entry.result};
 }
 
-/// Batched twin of gdn_recur (src/text_attention_gdn.cu) for the prefix
-/// replay instantiation: round_qk = false, observe = false. The per-block
-/// entry is selected by blockIdx.x; the arithmetic after the indirection is
-/// unchanged, so each entry's recurrent state is bit-identical to the per-layer
-/// kernel.
 template <typename S, bool round_qk, bool observe>
 __global__ void gdn_batched_recur(const TextGdnReplayEntry* table) {
     __shared__ float qk[2][text_gdn_head_dim];
@@ -146,13 +135,6 @@ __global__ void gdn_batched_recur(const TextGdnReplayEntry* table) {
     }
 }
 
-// finish_history comes from the shared private header
-// include/sglang/text/gdn/gdn_finish_history.cuh (identical definition to the
-// one src/text_attention_gdn.cu used to carry privately).
-
-/// Batched twin of gdn_finish for the replay case (z == nullptr,
-/// observable == nullptr, output == nullptr): every block writes one feature's
-/// history taps.
 template <typename S>
 __global__ void gdn_batched_finish(const TextGdnReplayEntry* table) {
     constexpr int finish_blocks_per_entry = S::qkv_width / text_gdn_head_dim;
@@ -181,8 +163,6 @@ cudaError_t launch_batched_replay(const TextGdnReplayEntry* table, int entries,
 }
 
 TextGdnReplayBatch::~TextGdnReplayBatch() {
-    // An in-flight host-to-device copy reads the pinned table; wait for it
-    // before the allocations go away.
     if (copy_pending_ && copy_done_) {
         (void)cudaEventSynchronize(copy_done_);
         copy_pending_ = false;
@@ -194,10 +174,6 @@ TextGdnReplayBatch::~TextGdnReplayBatch() {
 
 bool TextGdnReplayBatch::reserve(int capacity) {
     if (capacity <= capacity_) return true;
-    // Pre-size the host staging vector first: add() must never allocate on
-    // the commit path, and a staging failure must leave the old tables (and
-    // the previous capacity contract) intact so the caller can keep the
-    // per-layer dispatch.
     try {
         entries_.reserve(capacity);
     } catch (const std::bad_alloc&) {
@@ -218,7 +194,6 @@ bool TextGdnReplayBatch::reserve(int capacity) {
         if (copy_done) (void)cudaEventDestroy(copy_done);
         return false;
     }
-    // The old pinned table may still be the source of an in-flight upload.
     if (copy_pending_) {
         (void)cudaEventSynchronize(copy_done_);
         copy_pending_ = false;
@@ -237,9 +212,6 @@ bool TextGdnReplayBatch::reserve(int capacity) {
 cudaError_t TextGdnReplayBatch::launch(bool rank_local, cudaStream_t stream) {
     const int count = size();
     if (count == 0) return cudaSuccess;
-    // A previous launch's host-to-device copy may still be executing; the
-    // stream orders device work, not this host-side table write, so gate the
-    // overwrite on the recorded completion event (a no-op once it finished).
     if (copy_pending_) {
         const auto waited = cudaEventSynchronize(copy_done_);
         if (waited != cudaSuccess) return waited;
@@ -252,8 +224,6 @@ cudaError_t TextGdnReplayBatch::launch(bool rank_local, cudaStream_t stream) {
     if (status != cudaSuccess) return status;
     status = cudaEventRecord(copy_done_, stream);
     if (status != cudaSuccess) {
-        // The copy is enqueued but unfenced: re-establish safety with a full
-        // stream sync before handing the error back.
         (void)cudaStreamSynchronize(stream);
         return status;
     }

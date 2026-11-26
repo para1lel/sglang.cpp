@@ -146,10 +146,6 @@ __global__ void gdn_recur_lanes(int token_count, const __grid_constant__ GdnVeri
         job.tail, job.observable);
 }
 
-// finish_history now lives in the shared private header
-// include/sglang/text/gdn/gdn_finish_history.cuh (used verbatim by the
-// batched replay twin in src/text/text_gdn_batched_replay.cu).
-
 __device__ __nv_bfloat16 finish_value(float value, float inverse_rms, __nv_bfloat16 norm,
                                       __nv_bfloat16 z) {
     const float gate = __bfloat162float(z);

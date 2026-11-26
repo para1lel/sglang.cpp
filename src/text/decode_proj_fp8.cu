@@ -324,9 +324,6 @@ bool supported_targets(const TextFp8DecodeTarget* targets, int count, int in_wid
 }
 
 bool use_mlp_pipeline(const TextFp8DecodeTarget* targets, int count, int in_width, int rows) {
-    // Four-slot pipeline is measured faster only for the equal-width MLP
-    // gate/up pairs (TP1 17408, TP2-rank 8704); other equal-width pairs
-    // (e.g. local K/V at 512) run faster on the generic slot count.
     return rows >= 16 && rows <= 32 && in_width == hidden_width && count == 2 &&
            targets[0].out_width == targets[1].out_width &&
            (targets[0].out_width == local_intermediate_width ||

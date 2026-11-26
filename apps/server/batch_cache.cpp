@@ -35,7 +35,6 @@ public:
     RestoreStop& operator=(const RestoreStop&) = delete;
 
     void signal() const noexcept {
-        // All GET workers observe the same latched event. None consumes it.
         while (eventfd_write(fd, 1) < 0 && errno == EINTR) {}
     }
 
@@ -141,8 +140,6 @@ struct BatchRestoreJoin::State {
     explicit State(int world) : views(static_cast<std::size_t>(world), nullptr) {}
 
     std::mutex mutex;
-    // Per-rank destination views, registered by each lane under its own
-    // device. The lanes keep the views alive until the shared future settles.
     std::vector<const PrefixDeviceTransfer*> views;
     std::vector<std::shared_ptr<const PrefixCacheKeys>> keys;
     std::promise<bool> completion;
@@ -156,36 +153,24 @@ BatchRestoreJoin::~BatchRestoreJoin() = default;
 void BatchRestoreJoin::fail() noexcept {
     auto& join = *state_;
     const std::lock_guard lock(join.mutex);
-    // Only a join that never submitted can be broken: a submitted worker
-    // owns the settlement, and its in-flight GET holds the borrowed rank
-    // buffers until every rank's transfer finished — settling early here
-    // would let lanes free those buffers mid-DMA.
     if (join.submitted) return;
     join.submitted = true;
     try {
         join.completion.set_exception(std::make_exception_ptr(
             std::runtime_error("LMCache joint prefix restore was abandoned")));
     } catch (const std::future_error&) {
-        // Already settled; nothing to break.
     }
 }
 
 void BatchRestoreJoin::abandon() noexcept {
-    // Queue admission failed after submission: the joint worker provably
-    // never runs, so this is the sole settlement path and cannot race an
-    // in-flight transfer.
     auto& join = *state_;
     const std::lock_guard lock(join.mutex);
     try {
         join.completion.set_exception(std::make_exception_ptr(
             std::runtime_error("LMCache joint prefix restore was abandoned")));
     } catch (const std::future_error&) {
-        // Already settled; nothing to break.
     }
 }
-// One checkpoint's joint store across the rank lanes: each lane registers
-// its prepared metadata, exported view, reservation, and completion; the
-// joint worker runs once every lane registered.
 struct StoreCheckpoint {
     explicit StoreCheckpoint(int world)
         : attached(static_cast<std::size_t>(world), false),
@@ -204,8 +189,6 @@ struct StoreCheckpoint {
 
 struct BatchStorePairing::State {
     std::mutex mutex;
-    // Incomplete checkpoint pairs, oldest first. A lane's k-th store always
-    // attaches to the oldest pair still missing that lane.
     std::deque<std::shared_ptr<StoreCheckpoint>> pending;
 };
 
@@ -214,23 +197,12 @@ BatchStorePairing::BatchStorePairing() : state_(std::make_shared<State>()) {}
 BatchStorePairing::~BatchStorePairing() {
     if (!state_) return;
     const std::lock_guard lock(state_->mutex);
-    // The request died with an incomplete checkpoint pair: release the
-    // shared reservations so store capacity recovers. The completion
-    // callbacks are dropped — the request is gone, and invoking them here
-    // could deadlock (jobs are destroyed under the service mutex while a
-    // done re-locks it).
     for (const auto& checkpoint : state_->pending) {
         for (auto& reservation : checkpoint->reservations) reservation.reset();
     }
 }
 
 namespace {
-// Joint store worker for one checkpoint: settles the per-rank
-// store_prepared calls (in parallel across the independent daemons),
-// credits physical per-rank counters from the actual receipts, and
-// records the logical checkpoint exactly once when every rank completed.
-// Templatized on the cache state so this translation-unit-local helper
-// never names the private nested type.
 template <typename CacheState>
 void run_joint_store(CacheState* state,
                      const std::shared_ptr<StoreCheckpoint>& checkpoint) {
@@ -245,9 +217,6 @@ void run_joint_store(CacheState* state,
             statuses[lane] = state->group->store_prepared(
                 static_cast<int>(lane), checkpoint->metadata[lane], &receipts[lane]);
             if (statuses[lane] != LmCacheStatus::complete) return;
-            // Physical credit lands as each rank's daemon acknowledges its
-            // write, not when the whole checkpoint settles: the decoder
-            // asserts per-rank acknowledgement order against this counter.
             if (checkpoint->stores) ++*checkpoint->stores;
             if (lane < state->rank_stores.size()) {
                 ++state->rank_stores[lane];
@@ -262,11 +231,6 @@ void run_joint_store(CacheState* state,
     if (ranks == 1) {
         run_rank(0);
     } else {
-        // Independent per-rank daemons: settle them in parallel so one
-        // slow rank does not serialize the checkpoint. Lane 0 always
-        // runs inline; a lane whose thread cannot be created falls back
-        // to running inline after the others joined — destroying a
-        // joinable thread during unwinding would terminate the process.
         std::vector<std::optional<std::thread>> workers(ranks);
         for (std::size_t lane = 1; lane < ranks; ++lane) {
             try {
@@ -298,8 +262,6 @@ void run_joint_store(CacheState* state,
             logical = false;
             continue;
         }
-        // Joint aggregate: bytes summed across the rank daemons, tokens
-        // once (per-rank credit already landed inside each lane above).
         for (int family = 0; family < 3; ++family) {
             joint.bytes[family] += receipts[lane].bytes[family];
         }
@@ -310,8 +272,6 @@ void run_joint_store(CacheState* state,
         ++state->errors;
         state->available = false;
     } else if (logical) {
-        // One logical checkpoint: tokens counted once, aggregate bytes
-        // are the physical total across the rank daemons.
         state->record(LmCacheStatus::complete, joint, false);
     } else {
         state->record(first_incomplete, joint, false);
@@ -325,7 +285,7 @@ void run_joint_store(CacheState* state,
         notify();
     }
 }
-}  // namespace
+}
 
 struct BatchCache::State {
     State(std::unique_ptr<LmCacheClient> connection, std::string identity, int lanes)
@@ -358,10 +318,6 @@ struct BatchCache::State {
         try { available = group->ready(); } catch (const std::exception&) {}
     }
 
-    // Rank owning the device a view was exported on. A world of one keeps the
-    // historical behavior of trusting the caller; a ranked world rejects
-    // unknown devices so a misrouted view cannot silently hit the wrong
-    // daemon namespace.
     int rank_of(const PrefixDeviceTransfer& view) const {
         for (std::size_t rank = 0; rank < devices.size(); ++rank) {
             if (std::memcmp(devices[rank].data(), view.transfer.device.data(),
@@ -426,10 +382,6 @@ void BatchCache::lookup(Keys keys, int score_start, bool draft, Cancel cancelled
         const auto start = Clock::now();
         try {
             result.keys = keys(state->identity);
-            // A cancelled read or an expired request (no keys at all) leaves
-            // without a completion, matching the historical protocol; any
-            // other malformed key set still completes cold so a live request
-            // can never hang on `cache_reading`.
             if (*cancelled || result.keys.empty()) return;
             if (result.keys.size() != static_cast<std::size_t>(state->group->world_size())) {
                 result.keys.clear();
@@ -475,9 +427,6 @@ std::shared_future<bool> BatchCache::restore(
     const auto world = static_cast<std::size_t>(state->group->world_size());
     bool submit = false;
     try {
-        // Validation lives inside the guard: any throw (bad key set, unknown
-        // device, duplicate rank) must fail the join so lanes already
-        // holding the future cannot hang.
         if (keys.size() != world) {
             throw std::invalid_argument("LMCache rank key count mismatch");
         }
@@ -495,17 +444,10 @@ std::shared_future<bool> BatchCache::restore(
         if (!join_state.submitted &&
             std::find(join_state.views.begin(), join_state.views.end(), nullptr) ==
                 join_state.views.end()) {
-            // Every lane registered its view: one joint GPU transfer. Until
-            // then the future stays pending on all lanes; the decoder's lane
-            // build guarantees (every lane invokes, or the request is torn
-            // down) plus fail() on registration errors keep the join from
-            // hanging.
             join_state.submitted = true;
             submit = true;
         }
     } catch (...) {
-        // The joint can never complete, so settle the future before the
-        // exception unwinds the caller.
         join->fail();
         throw;
     }
@@ -526,10 +468,6 @@ std::shared_future<bool> BatchCache::restore(
                     success = state->record(status, receipt, true);
                     if (success && state->rank_restores.size() == join->views.size() &&
                         state->rank_read_bytes.size() == join->views.size()) {
-                        // Credit every participating lane from its own actual
-                        // receipt before the future resolves: lanes may drop
-                        // their views once it does. A joint success means
-                        // every rank's GET completed.
                         for (std::size_t lane = 0; lane < join->views.size(); ++lane) {
                             if (!join->views[lane]) continue;
                             ++state->rank_restores[lane];
@@ -553,10 +491,6 @@ std::shared_future<bool> BatchCache::restore(
                 if (notify) notify();
             });
         } catch (...) {
-            // The joint worker was never admitted to the queue and provably
-            // cannot run: settle the future so no decoder waiter hangs, then
-            // surface the failure. In-flight workers are NOT broken this
-            // way — they own their settlement.
             join->abandon();
             throw;
         }
@@ -567,7 +501,6 @@ std::shared_future<bool> BatchCache::restore(
 bool BatchCache::reserve_store(std::shared_ptr<void>& reservation) {
     if (!reservation) reservation = std::make_shared<StoreReservation>(state_->reservations);
     auto& ticket = *static_cast<StoreReservation*>(reservation.get());
-    // Only the decoder worker reserves a view. Connector workers return reservations.
     if (ticket.reserved) return true;
     if (!store_capacity()) return false;
     ticket.reserved = true;
@@ -606,8 +539,6 @@ void BatchCache::store(const std::shared_ptr<BatchStorePairing>& pairing,
     bool submit = false;
     {
         const std::lock_guard lock(pairing->state_->mutex);
-        // Lanes enqueue their checkpoints in order, so the oldest pair still
-        // missing this lane is this lane's current checkpoint.
         for (const auto& candidate : pairing->state_->pending) {
             if (!candidate->attached[lane]) {
                 checkpoint = candidate;
@@ -629,9 +560,6 @@ void BatchCache::store(const std::shared_ptr<BatchStorePairing>& pairing,
             pairing->state_->pending.erase(
                 std::find(pairing->state_->pending.begin(), pairing->state_->pending.end(),
                           checkpoint));
-            // Every lane registered: one joint store per checkpoint. The
-            // shared reservation lives in the checkpoint, so pending store
-            // capacity stays held until BOTH ranks settled.
             submit = true;
         }
     }

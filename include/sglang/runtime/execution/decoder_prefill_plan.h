@@ -17,10 +17,6 @@ struct PrefillGroup {
 
 enum class PrefillAttentionMode { batched, full_group, serial_segments, causal_segments };
 
-// Collects the run of consecutive grants that may share one partial-projection
-// group. `min_rows` is the smallest grant a caller allows to group: the TP2
-// planner passes prefill_chunk_rows so short (>=128-row) lanes fuse, while
-// single-model callers keep the tuned min_partial_prefill_rows floor.
 inline PrefillGroup partial_projection_group(const PrefillGrant* grants, int count,
                                              int min_rows = min_partial_prefill_rows) {
     PrefillGroup group{};
@@ -42,7 +38,6 @@ inline constexpr PrefillGroup causal_full_group{
 inline constexpr PrefillGroup causal_three_tile_group{3, 3 * batch_prefill_tile_rows};
 
 inline PrefillGroup causal_projection_group(int rows) {
-    // Mixed tile sizes select different projection kernels and can change restored state.
     if (rows >= causal_full_group.rows) return causal_full_group;
     if (rows >= causal_three_tile_group.rows) return causal_three_tile_group;
     return {};
@@ -65,11 +60,6 @@ inline void record_projection_group(DecoderBatchStepStats& stats, int rows) {
     ++stats.layerwise_prefill_groups;
     stats.layerwise_prefill_rows += rows;
 }
-// Mirrors the causal tile group of grants[source] onto the mirrored peer grant
-// array: lane `lane` covers rows [offset + lane * batch_prefill_tile_rows,
-// +batch_prefill_tile_rows) of peer_grants[source], with the peer's own
-// request state. Pure host-side remapping; `segments` must hold `lanes`
-// entries.
 inline void peer_causal_segments(const PrefillGrant* peer_grants, int source, int offset,
                                  PrefillGrant* segments, int lanes) {
     for (int lane = 0; lane < lanes; ++lane) {
@@ -78,15 +68,6 @@ inline void peer_causal_segments(const PrefillGrant* peer_grants, int source, in
     }
 }
 
-// Runs each partial or causal projection group through `run_group` and any
-// leftover single-grant tail through `run_native`. `source` is always the
-// index of the group's first grant in the original `grants` array, so a
-// tensor-parallel caller can locate the mirrored peer grant without pointer
-// arithmetic on callback arguments. `offset` is the first row of the group
-// within grants[source]: 0 for serial segments (each grant starts at its own
-// row 0) and the causal tile offset for causal segments (lane `lane` covers
-// rows [offset + lane * batch_prefill_tile_rows, +batch_prefill_tile_rows) of
-// grants[source]). `run_native` receives the grant's own row offset.
 template <typename RunGroup, typename RunNative>
 bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cudaStream_t stream,
                                        DecoderBatchStepStats& stats, RunGroup run_group,
@@ -133,7 +114,6 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
                     segment = prefill_tile(grant, offset + lane * batch_prefill_tile_rows);
                     validate_prefill_tile(segment, workspace, serial_capacity);
                 }
-                // Each layer visits the request's cache and recurrent state in token order.
                 run_group(source, offset, segments.data(), group, workspace,
                           PrefillAttentionMode::causal_segments, serial_capacity);
                 record_projection_group(stats, group.rows);

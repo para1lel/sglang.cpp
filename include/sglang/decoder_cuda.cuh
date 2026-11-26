@@ -392,18 +392,11 @@ struct DecodeFp8Projection {
     int rows;
 };
 
-// Read-only activation and weight spans may overlap. Output spans must be disjoint from every
-// input span and from each other, including when they are views of one allocation. Invalid spans
-// return cudaErrorInvalidValue before launch. Gate/up has the fused exception documented below.
 cudaError_t decode_fp8_project(TextFp8ActivationView input, DecodeFp8Projection projection,
                                int width, cudaStream_t stream);
 cudaError_t decode_fp8_qkv(TextFp8ActivationView input, DecodeFp8Projection query,
                            DecodeFp8Projection key, DecodeFp8Projection value, int width,
                            cudaStream_t stream);
-// The fused paths (TP1 5120-by-17408 and TP2 5120-by-8704 gate rows) require 16-byte-aligned
-// FP8 values. They write only gate.output and accept identical gate and up output spans. Any
-// other geometry uses the fallback, which writes up.output as scratch and requires disjoint
-// spans. Both paths return SwiGLU in gate.output.
 cudaError_t decode_fp8_gate_up(TextFp8ActivationView input, DecodeFp8Projection gate,
                                DecodeFp8Projection up, int width, cudaStream_t stream);
 

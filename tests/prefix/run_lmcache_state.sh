@@ -29,7 +29,6 @@ for name in state graph; do
         "${wrap[@]}" -lsglang_decoder -lsglang_checkpoint -lsglang_cuda \
         -lsglang_prefill_fp8_sm100 -lsglang_tokenizer -lsglang_json \
         -lcudart -lcudadevrt -lcudart_static -lrt -ldl -o "$output/lmcache-$name"
-    # A STORE can hold IPC leases indefinitely. Bound the test process, including its workers.
     CUDA_VISIBLE_DEVICES="$gpu" timeout --verbose --kill-after=5s "${LMCACHE_TEST_TIMEOUT:-5m}" \
         "$output/lmcache-$name" "$checkpoint" 2>&1 | tee "$output/$name.log"
 done

@@ -36,7 +36,6 @@ void check_caller(const char* operation) {
     require(actual == caller, operation);
 }
 
-// All input values, sums and guards are exactly representable in BF16.
 int input(int rank, int index, int generation) {
     if (index == count) return 100 + rank;
     if (rank == 0) return (index % 23) - 13 + generation;
@@ -134,7 +133,7 @@ struct Fixture {
     }
 };
 
-}  // namespace
+}
 
 int main() try {
     int visible = 0;

@@ -26,8 +26,6 @@ struct Slice {
     int row, rows, column, columns;
 };
 
-// Independent oracle for this pinned checkpoint, from config.json and docs/research/tp2.md.
-// All offsets below are in checkpoint elements, never upload-plan entries or CUDA spans.
 class Readback {
 public:
     Readback(const std::filesystem::path& path, int rank, int world)

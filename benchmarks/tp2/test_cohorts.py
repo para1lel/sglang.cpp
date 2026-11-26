@@ -16,7 +16,6 @@ from tests.test_concurrent_baseline import loopback, mutate_payload, wire_fixtur
 
 
 def metrics(rounds):
-    # Two lanes each write one four-position checkpoint after two inputs and three outputs.
     values = {cold_cache.STORES: 2, cold_cache.LMCACHE_STORES: 2,
               cold_cache.GQA_WRITTEN_TOKENS: 8, cold_cache.LMCACHE_WRITE_NS: 1}
     for rank in (0, 1):

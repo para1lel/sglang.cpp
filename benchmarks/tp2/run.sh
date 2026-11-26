@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Usage: run.sh qualify|measure GPU0 GPU1 W1|W2|W3|W4|W5|all NATIVE_BINARY CAMPAIGN_DIR
-# Require PAIRED_NATIVE_SOURCE, PAIRED_NATIVE_SHA256, PAIRED_FIXTURES,
-# PAIRED_LMCACHE_PYTHON, PAIRED_LMCACHE_PYTHONPATH and PAIRED_LMCACHE_WHEEL.
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/session.sh"
 source "$paired_dir/lmcache_arm.sh"

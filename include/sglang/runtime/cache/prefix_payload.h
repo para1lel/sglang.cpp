@@ -58,7 +58,6 @@ struct PrefixDeviceLayout {
     PrefixDeviceGdn gdn;
 };
 
-// A STORE owns its native blocks. The caller keeps a borrowed GET destination alive.
 struct PrefixDeviceTransfer {
     LmCacheGpuTransfer transfer;
     PrefixDeviceLayout layout;
@@ -66,8 +65,6 @@ struct PrefixDeviceTransfer {
     std::shared_ptr<const void> store_owner;
 };
 
-// Byte size of one record's payload under a rank-local layout. The default
-// overload reports the TP1 (full-width) layout.
 std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end);
 std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end,
                                  const PrefixCacheLayout& layout);

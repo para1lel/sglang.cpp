@@ -92,9 +92,6 @@ struct VerificationWorkspace {
     std::vector<Workspace> work;
 Bf16* observable;
 TextLogitCandidate* winners;
-    // Packet-capacity staging for the single-read BF16 head projection:
-    // packed inputs followed by packed logits, carved from one allocation
-    // owned by this workspace's arena (freed with it, never resized).
     Bf16* bf16_head_packed = nullptr;
     Bf16* bf16_head_packed_logits = nullptr;
 };
@@ -129,7 +126,6 @@ struct VerificationGraph {
     bool warmed = false;
 };
 
-// Holds candidate uploads for draft and target scores on one speculative branch.
 class MtpConstraintRound {
 public:
     MtpConstraintRound(Request& request, const TokenConstraint& constraint, int rows);

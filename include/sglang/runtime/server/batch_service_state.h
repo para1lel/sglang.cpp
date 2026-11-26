@@ -40,22 +40,13 @@ struct Job {
     bool retiring_prefix = false;
     BatchCache::Cancel cache_cancel;
     std::shared_ptr<BatchCacheRead> cache_read;
-    // One key set per rank (rank r built with tp2_prefix_cache_layout(r));
-    // empty when the cache is disabled.
     std::vector<std::shared_ptr<decoder::PrefixCacheKeys>> cache_keys;
-    // Joint restore across this request's rank lanes; created by the first
-    // lane that invokes restore_prefix and shared by all of them.
     std::shared_ptr<BatchRestoreJoin> restore_join;
-    // Joint stores across this request's rank lanes; created by the first
-    // lane that stores a checkpoint and shared by all of them.
     std::shared_ptr<BatchStorePairing> store_pairing;
     std::shared_future<bool> prefix_operation;
     std::optional<DecoderFinishReason> deferred_finish;
 
     ~Job() {
-        // A joint restore that was never fully registered can never complete
-        // once the request is gone; break it so no decoder waiter blocks on
-        // its future. No-op for submitted joints.
         if (restore_join) restore_join->fail();
     }
 
@@ -72,7 +63,6 @@ struct Job {
             (buffered || can_overlap_mtp_output() ? !pending.full() : pending.empty())));
     }
     bool can_buffer(bool per_token = false) const {
-        // Per-token consumers drain published output before reporting worker errors.
         const bool eligible = options.mtp_steps > 0
             ? per_token && !options.requires_target_only() && !options.label_token_ids
             : prompt.size() >= decoder_batch_max_step_tokens;

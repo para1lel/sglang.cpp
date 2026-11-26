@@ -358,7 +358,6 @@ void BatchService::State::process(BatchSession& batch) {
         }
         int width = std::count(selected.begin(), selected.end(), true);
         const int capacity = std::min(max_active, max_num_batched_tokens) - width;
-        // Pick up already-published arrivals once before the first long prefill grant.
         if (cold && starts_long_prefill && has_empty_slot && capacity > 0) {
             const auto added = refresh_prefill_roster(*snapshot, capacity);
             for (const int slot : snapshot->admission) {
@@ -775,7 +774,6 @@ BatchMetrics BatchService::metrics() const {
     auto metrics = state_->counters;
     if (auto* cache = state_->lmcache.get()) {
         metrics.lmcache = cache->metrics();
-        // Transport receipts can arrive after the scheduler published its final step.
         metrics.cache.stores = metrics.lmcache.stores;
     }
     if (tp_ar_source_ != nullptr) {

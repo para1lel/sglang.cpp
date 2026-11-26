@@ -214,10 +214,6 @@ __global__ void split_decode_attention_paired(PagedDecodeBatch<Lane> batch) {
     }
 }
 
-/// Rank-local query-head count of a decode lane. Bound descriptors keep their
-/// cache on the device, so the host cannot read its head count; size their
-/// grid for the maximum geometry and let the kernels' per-head guards skip
-/// the surplus blocks.
 template <typename Lane>
 int lane_query_heads(const Lane& lane) {
     if constexpr (std::is_same_v<Lane, decoder::BoundPagedDecodeLane>) {

@@ -453,7 +453,6 @@ extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
     if (status == cudaSuccess && worker_release.memory && stream == worker_release.stream) {
         ++worker_release.completed;
         if (inject_sync_error) {
-            // Complete the actual release before creating a recoverable error on this worker.
             worker_release.sync_error = __real_cudaEventRecord(nullptr, stream);
             return worker_release.sync_error;
         }
@@ -651,7 +650,7 @@ void check_detached_accounting() {
             free_gate.store(nullptr);
             watched_free.store(nullptr);
         }
-    } gate;  // Outlive the reclaimer, including a late entry into cudaFreeAsync.
+    } gate;
     RequestBlockCache retired(0, true);
     Allocations original(0, &retired);
     auto* memory = original.allocate<std::byte>(bytes);
@@ -807,7 +806,6 @@ void check_worker_release(const Lane& lane, const LmCacheClient& cache,
     const std::vector rank_keys{std::make_shared<PrefixCacheKeys>(keys)};
     for (const bool fail_sync : {false, true}) {
         last_allocation = nullptr;
-        // Export only the versioned GDN planes so the worker owns this exact allocation.
         auto view = export_prefix_view(lane.request, prompt_end, prompt_end - 1, prompt_end,
                                        stream, &lane.draft);
         auto* const data = last_allocation;

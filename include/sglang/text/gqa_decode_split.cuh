@@ -27,17 +27,12 @@ cudaError_t launch_gqa_kernel(void (*kernel)(Parameters...), dim3 grid, dim3 blo
 
 namespace sglang::gqa_decode {
 
-/// Upper bound on KV splits per lane; each split owns one partial per query head.
 inline constexpr int max_splits = 16;
-/// Tokens per pipeline chunk; splits own whole chunks.
 inline constexpr int split_chunk_tokens = 64;
-/// Minimum chunks per split before a lane uses another split.
 inline constexpr int min_split_chunks = 4;
 
 static_assert(mxfp8_page_size % split_chunk_tokens == 0);
 
-/// Unnormalized split result for one query head. `maximum` is in the log2 domain.
-/// A nonfinite `maximum` at split 0 after the combine requests an FP64 replay of the head.
 struct alignas(16) Partial {
     float value[mxfp8_head_dim];
     float maximum;
@@ -51,14 +46,12 @@ __host__ __device__ inline Partial* partials(void* scratch, int head) {
     return static_cast<Partial*>(scratch) + head * max_splits;
 }
 
-/// Number of splits used for a lane reading positions [0, position].
 __host__ __device__ inline int split_count(int position) {
     const int chunks = position / split_chunk_tokens + 1;
     const int splits = (chunks + min_split_chunks - 1) / min_split_chunks;
     return splits < max_splits ? splits : max_splits;
 }
 
-/// Device-side lane check. Unreadable lanes are skipped and their output is left untouched.
 __host__ __device__ inline bool readable(const decoder::PagedDecodeLane& lane) {
     const int last_page = lane.position / mxfp8_page_size;
     return lane.position >= 0 && lane.position < text_attention_max_tokens &&
@@ -95,13 +88,9 @@ struct TargetBatch {
 struct EagerTargetBatch {
     decoder::PagedDecodeLane lanes[decoder::target_split_eager_max_rows];
     int end;
-    /// Upper bound on lane positions the batch was built for; eager batches
-    /// derive it from live positions, so it only guards kernel grids.
     int position_bound = text_attention_max_tokens;
 };
 
-/// Launches the split-KV pass. Each lane reads positions [0, position] of its cache and
-/// writes one Partial per query head and split; combine_head finishes the head.
 cudaError_t launch(TargetLane lane, cudaStream_t stream);
 cudaError_t launch(const TargetBatch& batch, int count, cudaStream_t stream);
 cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream);
@@ -123,8 +112,6 @@ __device__ inline decoder::PagedDecodeLane resolve(const EagerTargetBatch& batch
     return batch.lanes[blockIdx.z];
 }
 
-/// Combines the splits of one head with 256 threads (one channel each) and writes the output.
-/// Returns false (block-uniform) and marks split 0 nonfinite when the head needs a replay.
 template <int FixedSplits = 0>
 __device__ inline bool combine_head(const decoder::PagedDecodeLane& lane, int head) {
     __shared__ float weights[max_splits];

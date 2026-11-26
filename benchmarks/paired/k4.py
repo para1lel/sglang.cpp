@@ -583,8 +583,6 @@ def verify_vllm_model(worker, config, checkpoint, token_budget, prefix_cache, *,
         require(all(cache[key] == worker["cache"][key] for key in keys),
                 "vLLM API and worker disagree about resolved hybrid prefix caching")
         if tp == 2:
-            # Multiproc workers align Mamba pages locally. The core's API handshake
-            # can retain the initial 64-token Mamba setting after updating block_size.
             require(cache["mamba_cache_mode"] == "align" and not cache["user_specified_block_size"]
                     and worker["cache"]["mamba_block_size"] == cache["block_size"]
                     and cache["mamba_block_size"] in (64, cache["block_size"]),

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Source for a paired run, or execute for an untimed pinned-vLLM readiness check.
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/../paired/common.sh"
 

@@ -48,7 +48,7 @@ struct Rank {
         keys(std::vector<int>(prompt_rows, 42), "cpu-rank-test", nullptr, &layout) {}
 };
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
     if (argc != 7) throw std::invalid_argument("expected op world rank end draft swap");

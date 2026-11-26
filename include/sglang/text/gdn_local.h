@@ -1,18 +1,9 @@
 #pragma once
 
-// Rank-local GDN kernels for TP2. Every rank runs the full GDN recurrence on
-// its own half of the key heads (8) and value heads (24); the packed local
-// QKV row is [Q_r(1024), K_r(1024), V_r(3072)] sliced from the full
-// [10240,5120] projection, and the local value-head range drives z, gates,
-// out_proj, history and recurrent state slicing. All shapes derive from
-// GdnShape below; the GdnFull instantiation reproduces the TP1 16/48 kernels.
-
 #include "sglang/decoder_cuda.cuh"
 
 namespace sglang {
 
-/// Compile-time GDN geometry. qk_width is the width of each of the Q and K
-/// planes; qkv_width is 2 * qk_width + value_width.
 template <int QkHeads, int ValueHeads>
 struct GdnShape {
     static constexpr int qk_heads = QkHeads;
@@ -27,23 +18,15 @@ struct GdnShape {
     static_assert(qk_heads > 0 && value_heads > 0);
     static_assert(value_heads % qk_heads == 0);
     static_assert(qk_width % head_dim == 0 && value_width % head_dim == 0);
-    // Finish kernels process 4 value heads per block; verify packs 8 heads.
     static_assert(value_heads % 4 == 0 && value_heads % 8 == 0);
 };
 
-/// Rank-local chunked-prefill scratch (gdn_chunk Matrices), 32-byte aligned:
-/// ceil(rows/32) * 24 * sizeof(gdn_chunk::Matrices). Size grouped-prefill
-/// scratch by the largest segment's rows.
 std::size_t text_gdn_local_chunk_scratch_bytes(int rows);
 
 using GdnFull = GdnShape<text_gdn_qk_heads, text_gdn_value_heads>;
-// TP2 halves both head counts; three adjacent value heads still share one
-// local key head, exactly as in the full shape.
 using GdnLocal = GdnShape<text_gdn_qk_heads / 2, text_gdn_value_heads / 2>;
 static_assert(GdnLocal::heads_per_qk == GdnFull::heads_per_qk);
 
-/// Rank-local per-layer state sizes: BF16 history [qkv_width,3] per channel
-/// plus FP32 recurrent [value_heads,128,128] indexed [head,value,key].
 inline constexpr std::size_t text_gdn_local_history_bytes() {
     return sizeof(__nv_bfloat16) * static_cast<std::size_t>(GdnLocal::qkv_width) *
            GdnLocal::history_taps;
@@ -52,24 +35,12 @@ inline constexpr std::size_t text_gdn_local_recurrent_bytes() {
     return sizeof(float) * static_cast<std::size_t>(GdnLocal::value_heads) * GdnLocal::head_dim *
            GdnLocal::head_dim;
 }
-/// Rank-local prefill/decode workspace: rows * (qkv_width + value_width) BF16.
 inline constexpr std::size_t text_gdn_local_workspace_bytes(int rows) {
     return rows > 0 && rows <= text_attention_max_tokens
                ? sizeof(__nv_bfloat16) * static_cast<std::size_t>(rows) *
                      (GdnLocal::qkv_width + GdnLocal::value_width)
                : 0;
 }
-
-// Rank-local twins of the GDN entry points. Pointer-only argument structs
-// (TextGdnWeights, TextGdnState, TextGdnReplayRows, GdnPrefillSegment(s),
-// GdnVerificationBatch, CompactGdnVerificationBatch, CompactGdnFp8Rows) are
-// the TP1 types; every buffer behind them is sized for GdnLocal instead:
-// qkv [tokens,5120], z [tokens,3072], b/a [tokens,24], gates float2
-// [tokens,24], history [5120,3], recurrent [24,128,128], workspace
-// text_gdn_local_workspace_bytes(tokens), output [tokens,3072]. The contracts
-// documented on the TP1 entry points in sglang/text_attention.h and
-// sglang/decoder_cuda.cuh (aliasing, ordering, finiteness, error handling)
-// carry over unchanged.
 
 cudaError_t text_gdn_forward_local(int token_count, TextGdnMode mode,
                                    const __nv_bfloat16* qkv, const __nv_bfloat16* z,
@@ -130,14 +101,8 @@ cudaError_t decode_verify_gdn_compact_local(CompactGdnVerificationBatch batch, i
                                             TextGdnWeights weights, CompactGdnFp8Rows output,
                                             cudaStream_t stream);
 
-}  // namespace decoder
+}
 
-/// Packed multi-lane form of text_gdn_verify_tail_local for the TP2 eager
-/// verify advance: one call per GDN layer replays every lane, replacing one
-/// call per lane. Lanes carry per-lane pointers (replay rows, states,
-/// observable and output are per-lane); all lanes replay the same
-/// token_count rows. Additive TP2 path: the per-lane entries stay
-/// authoritative for TP1 and for rounds the packed form declines.
 constexpr int gdn_verify_tail_max_lanes = 16;
 
 struct GdnVerifyTailLanes {
@@ -148,4 +113,4 @@ struct GdnVerifyTailLanes {
 cudaError_t text_gdn_verify_tail_local_lanes(int token_count, const GdnVerifyTailLanes& jobs,
                                              TextGdnWeights weights, cudaStream_t stream);
 
-}  // namespace sglang
+}

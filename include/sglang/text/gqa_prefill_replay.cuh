@@ -44,8 +44,6 @@ __global__ void prefill_replay_kernel(Mxfp8KvCache cache, const std::int32_t* pa
     const int group = (first_channel + thread) / mxfp8_group_size;
     const int kv_head = head / queries_per_kv_head;
     const int query_heads = gqa_query_heads(cache.kv_heads);
-    // Bound descriptors launch the replay with the maximum head grid; the
-    // lane's own cache decides which blocks carry work.
     if (head >= query_heads) {
         return;
     }

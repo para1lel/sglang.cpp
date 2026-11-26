@@ -10,9 +10,6 @@ cudaError_t launch_exact_attention(
     }
     const int query_heads = [&] {
         if constexpr (std::is_pointer_v<Cache>) {
-            // Bound descriptors keep their cache on the device, so the host
-            // cannot read its head count. Size the grid for the maximum
-            // geometry; the kernels' per-lane guards skip surplus head blocks.
             return mxfp8_query_heads;
         } else {
             return gqa_query_heads(cache.kv_heads);

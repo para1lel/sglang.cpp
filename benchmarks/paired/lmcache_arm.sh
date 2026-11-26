@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-# The daemon is owned by the native arm and has its own process group.
 lmcache_evidence() {
     PYTHONPATH="$project" "$client_python" -B "$paired_dir/lmcache_evidence.py" "$@"
 }
@@ -93,7 +92,6 @@ stop_lmcache() {
                 "$lmcache_runtime/sglang-lmcache.sock" "$lmcache_socket_id" || return 2
             lmcache_socket_id=
         fi
-        # This arm exclusively owns the mktemp directory after its daemon group exits.
         local locks=$lmcache_runtime/.sglang-lmcache-locks-$EUID
         local endpoint=$lmcache_runtime/sglang-lmcache.sock
         if [[ -d $locks && ! -L $locks && -O $locks && ! -e $endpoint && ! -L $endpoint ]]; then

@@ -23,8 +23,6 @@ void BatchService::State::begin_cache_read(int slot, const std::shared_ptr<Job>&
         if (!current) return std::vector<std::shared_ptr<decoder::PrefixCacheKeys>>{};
         std::string domain = std::to_string(identity.size()) + ':';
         domain.append(identity).append(current->options.prefix_cache_salt);
-        // One key set per rank, each chained under that rank's layout
-        // identity; a world of one keeps the historical unranked domain.
         std::vector<std::shared_ptr<decoder::PrefixCacheKeys>> keys;
         keys.reserve(static_cast<std::size_t>(world));
         for (int rank = 0; rank < world; ++rank) {
@@ -69,9 +67,6 @@ void BatchService::State::configure_checkpoint(Job& job) {
     };
     job.options.restore_prefix = [this, current = &job, notify](
             const decoder::PrefixDeviceTransfer& view) {
-        // Every rank lane of this request joins the same restore; the future
-        // settles only once all lanes registered their view and the joint
-        // transfer completed.
         if (!current->restore_join) current->restore_join = lmcache->begin_restore();
         auto completion = lmcache->restore(current->restore_join, current->cache_keys, view,
                                            notify);
@@ -85,9 +80,6 @@ void BatchService::State::configure_checkpoint(Job& job) {
     job.options.store_prefix = [this, current = &job, notify](
             decoder::PrefixDeviceTransfer&& view, const int* generated, int count,
             std::shared_ptr<void> reservation, std::shared_ptr<std::atomic_uint64_t> stores) {
-        // Every rank lane of this request joins the same checkpoint pairing:
-        // rank dispatch and key append happen once per physical rank store,
-        // and the shared reservation is held until both ranks settled.
         if (!current->store_pairing) {
             current->store_pairing = std::make_shared<BatchStorePairing>();
         }
@@ -102,7 +94,7 @@ bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
         const std::lock_guard lock(mutex);
         if (job->discard_deferred_store()) {
             job->prefix_pending = false;
-            return true;  // Let ordinary cancellation retire the unsubmitted checkpoint.
+            return true;
         }
         if (!prefix_ready(*job)) return false;
     }

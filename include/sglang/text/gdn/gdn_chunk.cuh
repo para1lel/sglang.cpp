@@ -139,8 +139,6 @@ __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved
     segment_qk_dots<SharedHeads>(qk, dots, warp);
     __syncthreads();
 
-    // QK staging is no longer live. Pad the shared rows for column writes,
-    // then store contiguous BF16 pairs into the existing scratch layout.
     constexpr bool grouped = SharedHeads > 1;
     constexpr int stride = rows + (grouped ? 2 : 0);
     constexpr int plane_size = rows * stride;

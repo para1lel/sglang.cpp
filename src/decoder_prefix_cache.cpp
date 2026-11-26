@@ -47,7 +47,6 @@ public:
             DeviceScope device(device_);
             const auto status = complete_producer();
             if (status == cudaSuccess) {
-                // CUDA reclaims a cudaMalloc block at the next sync on the freeing stream.
                 const auto released = release_cuda_block(data_, cudaStreamPerThread, true);
                 report(consume_prefix_error(released));
             } else {
@@ -114,7 +113,6 @@ private:
     }
 
     void quarantine_producer() noexcept {
-        // A failed fence cannot authorize reusing the source or destination allocations.
         (void)producer_.release();
     }
 
@@ -265,9 +263,6 @@ PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead
     const int kv_heads = layout ? layout->kv_heads : mxfp8_kv_heads;
     const int coherent = read.usable_gdn;
     const int draft_rows = draft ? std::max(0, coherent - 1) : 0;
-    // The draft row count binds every lane except a ranked peer: TP1 (and a
-    // draft lane without a draft decoder) must still report no draft rows,
-    // while a peer lane ignores the composite read's rank 0 count.
     const bool draft_count_binding =
         draft != nullptr || !layout || layout->draft_lane;
     if (read.usable_gqa < 0 || read.usable_gqa > capacity(request) ||

@@ -4,9 +4,6 @@
 
 #include <cstddef>
 
-// Private prefill kernel definitions for src/text_attention_gdn.cu. The file
-// opens the enclosing sglang anonymous namespace itself.
-
 namespace sglang {
 namespace {
 
@@ -379,5 +376,5 @@ __global__ void gdn_prefill_recur_paired(int rows, const __nv_bfloat16* convolve
     }
 }
 
-}  // namespace
-}  // namespace sglang
+}
+}

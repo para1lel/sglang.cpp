@@ -21,7 +21,6 @@ cd -- "$root"
     -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart \
     "$nccl/lib/libnccl.so.2" -Wl,-rpath,"$nccl/lib" -o "$out/collective-check"
 
-# Keep both existing lock namespaces in a stable order for overlapping pairs.
 mapfile -t ordered < <(printf '%s\n' "$first" "$second" | LC_ALL=C sort)
 for gpu in "${ordered[@]}"; do
     if [[ ! $gpu =~ ^GPU-[0-9a-fA-F-]{36}$ ]]; then

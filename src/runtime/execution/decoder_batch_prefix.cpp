@@ -56,7 +56,6 @@ DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int slot) {
         } catch (const CudaError&) {
             throw;
         } catch (...) {
-            // The transfer has ended. Reset any partially restored state before cold prefill.
         }
         if (transferred) {
             const int restored = commit_restored_prefix(*lane->request, prefix.command,
@@ -67,7 +66,6 @@ DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int slot) {
             const auto stream = state_->execution.stream();
             lane->request->reset(stream);
             check(cudaStreamSynchronize(stream), "Reset decoder after failed prefix restore");
-            // A failed joint GET may have dirtied either rank; both reset cold.
             if (state_->tp_driver) state_->tp_driver->reset_peer_cold(*lane);
         }
         lane->prefix.reset();
@@ -103,9 +101,6 @@ bool DecoderBatch::State::submit_checkpoint(Lane& lane) {
         return false;
     }
     auto reservation = std::move(checkpoint.reservation);
-    // Both rank lanes share one reservation ticket: the request allocations
-    // stay reserved until BOTH physical stores acknowledge, so a lagged
-    // rank-1 daemon copy cannot outlive the pending-store gate.
     const auto peer_reservation = reservation;
     const int end = lane.progress.position;
     const int generated = std::max(lane.prompt_size, lane.checkpoint);

@@ -15,8 +15,6 @@ struct Fp8DecodeInputProducer {
     cudaError_t (*launch)(const void* context, bool prefetch_weights);
 };
 
-/// Swap-AB tcgen05 decode projections for SM 10.0. An empty result means the
-/// device, shape or alignment is unsupported and the caller should fall back.
 std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* targets,
                                                      int count, TextFp8ActivationView input,
                                                      int in_width, int rows,

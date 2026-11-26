@@ -29,8 +29,6 @@ void check_nccl(ncclResult_t status, const char* operation) {
     }
 }
 
-// Preserves the caller's current CUDA device across the scope. Selection
-// failures throw; restoration is best effort because the scope may unwind.
 class CallerDevice {
 public:
     CallerDevice() { check(cudaGetDevice(&previous_), "Read the current CUDA device"); }
@@ -44,14 +42,6 @@ private:
     int previous_ = 0;
 };
 
-// A collective is only well-formed when every rank's stream belongs to that
-// rank's device and all ranks share one capture state. NCCL notices some of
-// these violations only after enqueueing (or never), and a mismatch can
-// leave one rank spinning inside a kernel its peer will never enter, so
-// every path — vendor or NCCL — validates this before launching anything.
-// Under an active capture the query also returns the capture session id,
-// which distinguishes one joined capture session from two independent
-// captures that merely happen to be in progress at the same time.
 struct CollectiveStreams {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     bool same_capture = true;
@@ -89,9 +79,6 @@ CollectiveStreams validate_collective_streams(const std::vector<int>& devices,
                 throw std::invalid_argument(
                     "TensorParallel collectives require one capture state across ranks.");
             }
-            // Two ranks reporting Active may still belong to two independent
-            // capture sessions; only an equal capture id proves one session,
-            // and an unidentifiable capture proves nothing.
             if (status == cudaStreamCaptureStatusActive &&
                 (id == 0 || id != capture_id)) {
                 state.same_capture = false;
@@ -101,74 +88,42 @@ CollectiveStreams validate_collective_streams(const std::vector<int>& devices,
     return state;
 }
 
-// NCCL 2.9 added CUDA-graph capture support for collectives.
 #if defined(NCCL_MAJOR) && defined(NCCL_MINOR)
 constexpr bool nccl_supports_cuda_graphs = NCCL_MAJOR > 2 || (NCCL_MAJOR == 2 && NCCL_MINOR >= 9);
 #else
 constexpr bool nccl_supports_cuda_graphs = false;
 #endif
 
-// Reason a given allreduce ran through NCCL instead of the oneshot
-// transport. Exactly one is recorded per NCCL-served call. `Oversize` covers
-// every count outside the vendor one-shot envelope: above max_count() or not
-// a whole multiple of the model hidden width. `CaptureMismatch` covers calls
-// whose ranks sit in two independent capture sessions: one-shot replay of a
-// single side would strand the other rank's Lamport wait. `Unaligned` covers
-// the one in-envelope geometry NCCL accepts but the vendor transport does
-// not: a buffer that is not 16-byte aligned. The vendor transport's
-// remaining preflight rejections (wrong-device stream, mismatched capture
-// state) are invalid for NCCL as well and propagate to the caller unchanged.
 enum class ArFallback {
     Disabled, SetupUnavailable, Oversize, CaptureMismatch, Unaligned, AfterError
 };
 
-// The vendor one-shot envelope accepts whole rows of the model hidden width
-// (mnnvl_ar.h contract); other counts must ride NCCL.
 constexpr std::size_t mnnvl_ar_hidden_width = 5120;
 
-}  // namespace
+}   
 
 struct TensorParallel::State {
     std::vector<int> devices;
     std::vector<ncclComm_t> comms;
-    // A host-side enqueue failed or a communicator reported an asynchronous
-    // error: the communicators must abort, not destroy, on shutdown.
     bool failed = false;
 
 #if SGLANG_USE_MNNVL_AR
-    // Optional MNNVL oneshot transport for small allreduces. Null after a
-    // setup failure; `mnnvl_sticky` records a vendor enqueue failure, after
-    // which every allreduce runs through NCCL.
     std::unique_ptr<MnnvlAllReduce> mnnvl;
     bool mnnvl_sticky = false;
 #endif
 
-    // Mirror of the dispatch-thread transport decision, written only under
-    // counter_mutex (together with the counters) so the metrics thread never
-    // reads vendor or sticky state while the dispatch thread mutates it.
     bool mnnvl_active_mirror = false;
 
-    // Cumulative transport counters, one entry per rank. Guarded by
-    // counter_mutex: the metrics endpoint snapshots from another thread.
     std::mutex counter_mutex;
-    // One struct per rank (never per-field vectors) so every counter is
-    // sized together when ranks are assigned.
     std::vector<TpArRankCounters> ar_counters;
-    // Completed enqueues per allreduce width (element count), split by
-    // transport, one entry per rank. std::map keeps entries ascending by
-    // width for snapshots.
     struct ArWidthEntry {
         std::vector<std::uint64_t> mnnvl_calls;
         std::vector<std::uint64_t> nccl_calls;
         std::vector<std::uint64_t> payload_bytes;
     };
     std::map<std::size_t, ArWidthEntry> ar_widths;
-    // Widths whose first use has been reported on stderr.
     std::set<std::size_t> logged_widths;
 
-    // Allreduce dispatch helpers, defined below: the vendor attempt (with
-    // its failure semantics), the grouped NCCL enqueue, and the counter
-    // recorders.
     void enqueue_nccl_allreduce(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
                                 std::size_t count);
     void bump_transport_width(std::size_t count, std::size_t payload, bool vendor);
@@ -182,8 +137,6 @@ struct TensorParallel::State {
     void record_vendor_success(std::size_t count, std::size_t payload);
 #endif
 
-    // Best effort and never throws: this runs while the owning thread may be
-    // unwinding. The caller has already fenced all enqueued collectives.
     ~State() {
         int restore = -1;
         if (cudaGetDevice(&restore) != cudaSuccess) restore = -1;
@@ -202,9 +155,6 @@ struct TensorParallel::State {
     }
 };
 
-// Group the per-rank enqueues: collectives on multiple communicators from
-// one host thread must be grouped or the thread can block inside an enqueue
-// waiting for the other communicator's progress.
 void TensorParallel::State::enqueue_nccl_allreduce(__nv_bfloat16* const buffers[],
                                                    const cudaStream_t streams[],
                                                    std::size_t count) {
@@ -234,7 +184,6 @@ void TensorParallel::State::enqueue_nccl_allreduce(__nv_bfloat16* const buffers[
     }
 }
 
-// Bump the per-width histogram; counter_mutex must already be held.
 void TensorParallel::State::bump_transport_width(std::size_t count, std::size_t payload,
                                                  bool vendor) {
     ArWidthEntry& width = ar_widths[count];
@@ -287,9 +236,6 @@ void TensorParallel::State::record_nccl_success(std::size_t count, std::size_t p
     }
     bump_transport_width(count, payload, false);
 #if SGLANG_USE_MNNVL_AR
-    // Refresh the mirror from the same decision inputs the dispatch just
-    // used, so a transport that went unhealthy without throwing (or a
-    // recovered width mix) reports the truth at the next snapshot.
     mnnvl_active_mirror = mnnvl != nullptr && !mnnvl_sticky && mnnvl->healthy();
 #endif
     if (logged_widths.insert(count).second) {
@@ -327,9 +273,6 @@ bool TensorParallel::State::vendor_allreduce(__nv_bfloat16* const buffers[],
         return false;
     }
     for (std::size_t rank = 0; rank < devices.size(); ++rank) {
-        // The oneshot kernel performs 16-byte vectorized accesses. A buffer
-        // starting at an odd BF16 element is legal for NCCL but not for the
-        // vendor transport; such a call rides NCCL with the group intact.
         if (reinterpret_cast<std::uintptr_t>(buffers[rank]) % 16 != 0) {
             return false;
         }
@@ -337,27 +280,16 @@ bool TensorParallel::State::vendor_allreduce(__nv_bfloat16* const buffers[],
     try {
         mnnvl->allreduce_bf16(buffers, streams, count);
     } catch (const std::invalid_argument&) {
-        // Wrong-device stream or mismatched capture state: invalid for
-        // NCCL too — one rank may already be spinning while its peer is
-        // captured. Surface the rejection unchanged: no counter, no
-        // poison, no fallback.
         throw;
     } catch (const MnnvlArError& error) {
         if (error.peer_enqueued) {
-            // A peer already entered this boundary; the other rank can
-            // never match it on any transport. Later collectives would
-            // hang, so the group must abort.
             failed = true;
         } else {
-            // Nothing was enqueued on any rank: fall back to NCCL for
-            // later calls.
             mnnvl_sticky = true;
         }
         note_vendor_failure();
         throw;
     } catch (...) {
-        // Unrecognized vendor failure: assume the worst, one rank may
-        // already be inside the boundary.
         failed = true;
         note_vendor_failure();
         throw;
@@ -408,9 +340,6 @@ TensorParallel::TensorParallel(std::vector<int> devices) : state_(new State) {
         }
     }
 
-    // Validate every ordinal before entering the NCCL rendezvous: a rank
-    // rejected inside the group would leave the other ranks waiting for it in
-    // ncclGroupEnd.
     {
         CallerDevice validation_scope;
         for (const int device : state_->devices) {
@@ -422,9 +351,6 @@ TensorParallel::TensorParallel(std::vector<int> devices) : state_(new State) {
     check_nccl(ncclGetUniqueId(&id), "Create an NCCL communicator id");
     state_->comms.assign(ranks, nullptr);
 
-    // All ranks live in this process, so every communicator must be created
-    // inside one NCCL group; a grouped init from a single host thread is the
-    // documented rendezvous for multiple per-device communicators.
     check_nccl(ncclGroupStart(), "Open the NCCL communicator group");
     ncclResult_t first = ncclSuccess;
     try {
@@ -448,12 +374,9 @@ TensorParallel::TensorParallel(std::vector<int> devices) : state_(new State) {
                                  ncclGetErrorString(first != ncclSuccess ? first : grouped));
     }
 
-    // One struct per rank sizes every counter together.
     state_->ar_counters.assign(ranks, TpArRankCounters{});
 
 #if SGLANG_USE_MNNVL_AR
-    // Best effort: the transport reports its own setup outcome (nullptr on
-    // any failure) and every allreduce then runs through NCCL.
     if (ranks == 2) {
         state_->mnnvl = MnnvlAllReduce::create(state_->devices);
         const std::lock_guard<std::mutex> lock(state_->counter_mutex);
@@ -558,7 +481,6 @@ void TensorParallel::broadcast_int32(std::int32_t* const buffers[], const cudaSt
     ensure_healthy();
     validate_collective_streams(state_->devices, streams, ranks);
 
-    // Same grouping rule as allreduce_bf16: multiple communicators, one thread.
     check_nccl(ncclGroupStart(), "Open the NCCL operation group");
     try {
         CallerDevice device_scope;
@@ -587,4 +509,4 @@ void TensorParallel::broadcast_int32(std::int32_t* const buffers[], const cudaSt
 
 bool TensorParallel::graph_eligible() const noexcept { return nccl_supports_cuda_graphs; }
 
-}  // namespace sglang::decoder
+}   

@@ -98,7 +98,6 @@ std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end,
         return total;
     }
     case PrefixPayloadKind::draft:
-        // The draft cache is full width on its single lane.
         return kv_chunk ? std::size_t(end - begin) * kv_row_bytes : 0;
     }
     return 0;

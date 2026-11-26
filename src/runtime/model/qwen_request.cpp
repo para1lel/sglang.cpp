@@ -71,8 +71,6 @@ int reserved_verification_rows(int output, int mtp_steps) {
 }
 
 std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft) {
-    // Full-geometry GDN bytes: conservative under tensor parallelism (the
-    // rank-local shard is half), used only for capacity budgeting.
     constexpr std::size_t gdn_bytes = gdn_layers *
         (gdn_history_elements * sizeof(Bf16) + gdn_state_elements * sizeof(float));
     constexpr std::size_t workspace_allowance = 16 * 1024 * 1024;
@@ -263,9 +261,6 @@ void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv, int 
     cached_gqa_tokens = 0;
     kv_limit = maximum_kv;
     cache_kv_heads = kv_heads;
-    // A rank-local KV head count implies a rank-local GDN shard: pack state
-    // planes at the local strides so the prefix cache layout's contiguous
-    // per-layer walk matches this allocation exactly.
     const bool rank_local = kv_heads != mxfp8_kv_heads;
     gdn_history_stride = rank_local ? gdn_local_history_elements : gdn_history_elements;
     gdn_state_stride = rank_local ? gdn_local_state_elements : gdn_state_elements;

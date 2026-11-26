@@ -1,17 +1,3 @@
-// MNNVL one-shot allreduce transport: FlashInfer TRT-LLM MNNVL kernel
-// embedded from source (Apache-2.0, flashinfer 0.7.4,
-// trtllm_mnnvl_allreduce.cuh). Workspace mirrors
-// flashinfer/comm/mnnvl.py McastGPUBuffer and
-// flashinfer/comm/trtllm_mnnvl_ar.py MNNVLAllReduceFusionWorkspace: per-rank
-// pinned allocations, a two-device multicast object, and triple Lamport
-// buffers. Single process, one host thread enqueues both rank halves in rank
-// order (the TensorParallel::allreduce_bf16 contract).
-//
-// Build: this TU must be compiled by nvcc (the embedded header carries device
-// templates) with the flashinfer wheel headers on the include path, e.g.
-//   -I<flashinfer>/data/include -I<flashinfer>/data/spdlog/include
-// and linked against the CUDA driver (-lcuda).
-
 #include "sglang/runtime/backend/mnnvl_ar.h"
 
 #include <cuda.h>
@@ -30,22 +16,18 @@ namespace {
 using Bf16 = __nv_bfloat16;
 
 constexpr int kRanks = 2;
-constexpr int kTokenDim = 5120;  // model hidden width; counts are whole rows
-// Upstream MNNVL one-shot threshold (MNNVL_ONE_SHOT_THRESHOLD,
-// trtllm_mnnvl_ar.py): tokens * hidden * ranks * element_size bytes.
+constexpr int kTokenDim = 5120;   
 constexpr std::uint64_t kOneshotMaxBytes = 1024 * 1024;
 constexpr std::size_t kElementSize = sizeof(Bf16);
-constexpr std::uint32_t kSignalPad = 2048;    // SIGNAL_PAD_SIZE
-constexpr int kNumLamportBuffers = 3;         // NUM_LAMPORT_BUFFERS
-constexpr std::uint32_t kLamportSentinel = 0x80000000u;  // fp32 -0.0 bits
-// TWOSHOT_NUM_STAGES * PACKED_ALIGNMENT_BYTES from the upstream layout.
+constexpr std::uint32_t kSignalPad = 2048;     
+constexpr int kNumLamportBuffers = 3;          
+constexpr std::uint32_t kLamportSentinel = 0x80000000u;   
 constexpr std::uint32_t kBufferAlignment = 2 * 16;
 
 std::uint64_t round_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
-// Restores the caller's current CUDA device on scope exit.
 class CallerDevice {
 public:
     CallerDevice() { cudaGetDevice(&saved_); }
@@ -79,25 +61,23 @@ void require_cu(CUresult status, const char* what) {
     }
 }
 
-}  // namespace
+}   
 
 struct MnnvlAllReduce::State {
-    std::vector<int> devices;  // rank r -> CUDA device ordinal
+    std::vector<int> devices;   
     bool failed = false;
 
-    // Multicast workspace (all zero/empty until created).
     CUmemGenericAllocationHandle physical[kRanks]{};
     CUmemGenericAllocationHandle multicast{};
-    CUdeviceptr uc_base = 0;          // one VA range holding both ranks' buffers
-    std::uint64_t uc_ptrs[kRanks]{};  // rank r buffer VA, readable from both devices
-    CUdeviceptr mc_va = 0;            // multicast VA; writes land in every bound buffer
+    CUdeviceptr uc_base = 0;           
+    std::uint64_t uc_ptrs[kRanks]{};   
+    CUdeviceptr mc_va = 0;             
     std::uint64_t allocation_size = 0;
-    std::uint32_t buffer_size_bytes = 0;  // usable bytes per Lamport buffer
-    std::uint64_t max_elements = 0;       // oneshot envelope in elements
+    std::uint32_t buffer_size_bytes = 0;   
+    std::uint64_t max_elements = 0;        
 
-    // Per-rank device side of the Lamport protocol.
-    std::uint32_t* flags[kRanks]{};  // 9-word Lamport flag state per rank
-    void** ptrs_dev[kRanks]{};       // device array of both ranks' buffer VAs
+    std::uint32_t* flags[kRanks]{};   
+    void** ptrs_dev[kRanks]{};        
 
     bool created_physical[kRanks] = {false, false};
     bool created_multicast = false;
@@ -107,14 +87,8 @@ struct MnnvlAllReduce::State {
     bool reserved_mc = false;
     bool mapped_mc = false;
 
-    // RAII: every workspace resource is released when the state dies, so a
-    // failed create() (including an outer allocation failure after setup)
-    // cannot leak driver handles.
     ~State();
 
-    // Releases every workspace resource this state created; safe on partial
-    // state and idempotent (defined below; driver handles are freed even
-    // when an unmap fails, because we are already tearing down).
     void release();
 };
 
@@ -142,9 +116,6 @@ MnnvlAllReduce::State::~State() {
 }
 
 void MnnvlAllReduce::State::release() {
-    // Flags and pointer arrays are ordinary per-rank allocations; the driver
-    // workspace resources are freed even if the cudaFree calls fail (we are
-    // already tearing down).
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
         if (flags[r] != nullptr) {
@@ -196,9 +167,6 @@ void MnnvlAllReduce::State::release() {
 
 MnnvlAllReduce::~MnnvlAllReduce() = default;
 
-// Probe both devices before anything is set up: this TU carries an sm_100a
-// image, so a non-SM100 device would only fail at the first enqueue. Reject
-// up front and let the dispatcher fall back to NCCL.
 void MnnvlAllReduce::probe_devices(State& state) {
     for (int r = 0; r < kRanks; ++r) {
         int major = 0;
@@ -215,11 +183,6 @@ void MnnvlAllReduce::probe_devices(State& state) {
     }
 }
 
-// Round the requested allocation up to the allocation and multicast
-// granularities. The multicast object must cover the final rounded
-// allocation; its size field is refreshed after every round-up (a stale,
-// smaller value is only latent while the Lamport data fits under it).
-// Returns the multicast granularity, which also paces VA reservations.
 std::uint64_t MnnvlAllReduce::size_workspace(State& state, std::uint64_t requested) {
     CUmemAllocationProp alloc_prop{};
     alloc_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -235,7 +198,7 @@ std::uint64_t MnnvlAllReduce::size_workspace(State& state, std::uint64_t request
     CUmulticastObjectProp mc_prop{};
     mc_prop.numDevices = kRanks;
     mc_prop.size = state.allocation_size;
-    mc_prop.handleTypes = 0;  // single process: no shareable handle
+    mc_prop.handleTypes = 0;   
     mc_prop.flags = 0;
     std::size_t mc_granularity = 0;
     require_cu(cuMulticastGetGranularity(&mc_granularity, &mc_prop,
@@ -251,8 +214,6 @@ std::uint64_t MnnvlAllReduce::size_workspace(State& state, std::uint64_t request
     return mc_granularity;
 }
 
-// Allocate the per-rank pinned buffers and the multicast object, then add
-// both devices and bind each rank buffer into it.
 void MnnvlAllReduce::create_physical(State& state) {
     CallerDevice device_scope;
     CUmemAllocationProp alloc_prop{};
@@ -263,7 +224,7 @@ void MnnvlAllReduce::create_physical(State& state) {
     CUmulticastObjectProp mc_prop{};
     mc_prop.numDevices = kRanks;
     mc_prop.size = state.allocation_size;
-    mc_prop.handleTypes = 0;  // single process: no shareable handle
+    mc_prop.handleTypes = 0;   
     mc_prop.flags = 0;
 
     for (int r = 0; r < kRanks; ++r) {
@@ -287,8 +248,6 @@ void MnnvlAllReduce::create_physical(State& state) {
     }
 }
 
-// Map the unicast VA range (both ranks' buffers, accessible from both
-// devices) and the multicast VA range.
 void MnnvlAllReduce::map_workspace(State& state, std::uint64_t mc_granularity) {
     require_cu(cuMemAddressReserve(&state.uc_base, state.allocation_size * kRanks,
                                    mc_granularity, 0, 0),
@@ -310,7 +269,6 @@ void MnnvlAllReduce::map_workspace(State& state, std::uint64_t mc_granularity) {
     require_cu(cuMemSetAccess(state.uc_base, state.allocation_size * kRanks, access, kRanks),
                "Grant unicast access");
 
-    // Multicast VA, accessible from both devices.
     require_cu(cuMemAddressReserve(&state.mc_va, state.allocation_size, mc_granularity, 0, 0),
                "Reserve the multicast range");
     state.reserved_mc = true;
@@ -321,12 +279,6 @@ void MnnvlAllReduce::map_workspace(State& state, std::uint64_t mc_granularity) {
                "Grant multicast access");
 }
 
-// Per-Lamport-buffer bytes, mirroring upstream exactly: usable size is the
-// allocation minus the signal pad (McastGPUBuffer::get_size, mnnvl.py), and
-// each buffer is a third of that, aligned down to 32 bytes
-// (trtllm_mnnvl_ar.py). The uint32 bound is checked where the flag word is
-// derived. Then prime the per-rank Lamport flag state and buffer-pointer
-// arrays, and pre-dirty the data area with the sentinel.
 void MnnvlAllReduce::init_lamport(State& state) {
     const std::uint64_t usable = state.allocation_size - kSignalPad;
     const std::uint64_t per_buffer =
@@ -349,8 +301,6 @@ void MnnvlAllReduce::init_lamport(State& state) {
             throw std::runtime_error(std::string("Allocate the buffer pointers: ") +
                                      cudaGetErrorString(status));
         }
-        // [cur, dirty, bytesPerBuffer, dirtyNumStages, numBytesToClear x4,
-        //  accessCountPtr]
         const std::uint32_t flag_host[9] = {0, 2, state.buffer_size_bytes, 0, 0, 0, 0, 0, 0};
         status = cudaMemcpy(state.flags[r], flag_host, sizeof(flag_host), cudaMemcpyHostToDevice);
         if (status != cudaSuccess) {
@@ -393,17 +343,12 @@ std::unique_ptr<MnnvlAllReduce> MnnvlAllReduce::create(std::vector<int> devices)
 
     auto state = std::make_unique<State>();
     state->devices = std::move(devices);
-    // Coarse failure category for the setup line (mirrors the dispatch
-    // layer's fallback reasons); refined as setup progresses. Declared before
-    // the try so the catch handler can report it.
     const char* reason = "no_vmm";
     try {
         reason = "device_unsupported";
         probe_devices(*state);
 
         reason = "multicast_create_failed";
-        // Size the workspace to the one-shot envelope so any count up to
-        // max_count() dispatches without reallocation.
         state->max_elements = kOneshotMaxBytes / (kElementSize * kRanks);
         const std::uint64_t oneshot_bytes = state->max_elements * kElementSize * kRanks;
         const std::uint64_t buffer_size = round_up(oneshot_bytes, kBufferAlignment);
@@ -432,16 +377,6 @@ std::unique_ptr<MnnvlAllReduce> MnnvlAllReduce::create(std::vector<int> devices)
     return std::unique_ptr<MnnvlAllReduce>(new MnnvlAllReduce(std::move(state)));
 }
 
-// Preflight before the first launch: a stream on the wrong device, a stream
-// that already carries an error, or a half-capturing rank pair would leave a
-// kernel spinning on Lamport flags (a graph-recorded kernel cannot
-// synchronize with an eager peer), so both ranks are checked before anything
-// is enqueued. All checks are cheap host-side calls that alter no pending
-// error state; cudaStreamGetDevice is plain metadata and runs in every mode,
-// while the pending-error probe via cudaStreamQuery is only legal on a
-// stream that is not capturing. The capture-state query itself fails
-// closed: an error return or an invalidated capture rejects the call
-// instead of guessing.
 void MnnvlAllReduce::preflight(State& state, __nv_bfloat16* const buffers[],
                                const cudaStream_t streams[]) {
     cudaStreamCaptureStatus capture_status[kRanks];
@@ -515,9 +450,6 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
     const int tokens = static_cast<int>(count / kTokenDim);
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
-        // Both ranks' decisions were made before any launch; a failure here
-        // poisons the group and the operation surfaces an error rather than
-        // retrying the collective through NCCL.
         device_scope.select(state_->devices[r], "Select a rank device");
         flashinfer::trtllm_mnnvl_allreduce::AllReduceFusionParams params{};
         params.nRanks = kRanks;
@@ -537,7 +469,7 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
         params.weightBias = 0.0f;
         params.quantType = flashinfer::trtllm_mnnvl_allreduce::QuantType::kNone;
         params.residualOut = nullptr;
-        params.output = buffers[r];  // in-place: input == output
+        params.output = buffers[r];   
         params.quantOut = nullptr;
         params.scalingFactorOut = nullptr;
         params.stream = streams[r];
@@ -552,4 +484,4 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
     }
 }
 
-}  // namespace sglang::decoder
+}   

@@ -1,4 +1,3 @@
-// One QK instruction sequence per cache page, with two ordered K64 PV updates.
 constexpr int staged_page_keys = mxfp8_page_size;
 static_assert(staged_page_keys == 2 * flash_keys &&
               tmem_scores + 2 * staged_page_keys == tmem_cols);
@@ -90,8 +89,6 @@ __device__ void issue_page_mmas(StagedPageTile& tile, int chunks) {
         tmem_copy_wait(tmem_smem(&tile.value_ready[stage]), phase);
         tmem_mma_wait(tmem_smem(&tile.probability_ready[stage]), phase);
         issue_page_values(tile, chunk);
-        // Current P was published after the prior PV completed. The next score page
-        // can overwrite the preceding page while the current page is still live.
         if (stage == 0 && chunk + 2 < chunks) issue_page_scores(tile, (chunk >> 1) + 1);
     }
 }
@@ -175,7 +172,6 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_page_attention(
         single_stage<false>(tile, maps, invalid, page_base, head / ratio,
                             request.cache.kv_heads, end);
     } else if (warp == 6) {
-        // CuTe elects an issuer within the converged warp for each MMA.
         issue_page_mmas(tile, chunks);
     }
     __syncthreads();

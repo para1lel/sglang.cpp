@@ -27,4 +27,4 @@ LmCachePrefixDetail LmCacheClient::lookup_prefix_detail(const PrefixCacheKeys& k
     return lookup_prefix_detail(digests, std::clamp(max_restore, 0, limit), draft);
 }
 
-}  // namespace sglang::decoder
+}   

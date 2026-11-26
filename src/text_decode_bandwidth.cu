@@ -112,9 +112,6 @@ __global__ void bf16_gdn_prefill_gates(const __nv_bfloat16* weight_b,
     Bf16Dot dots_b[prefill_gate_tile_rows];
     Bf16Dot dots_a[prefill_gate_tile_rows];
     if constexpr (FullTile) {
-        // The host only selects this specialization when
-        // rows % prefill_gate_tile_rows == 0, so every trip count is
-        // compile-time and the codegen matches the legacy hot path.
 #pragma unroll 4
         for (int col = lane * 8; col < width; col += warp_width * 8) {
             const uint4 packed_b = load_128(weight_b + col);
@@ -138,8 +135,6 @@ __global__ void bf16_gdn_prefill_gates(const __nv_bfloat16* weight_b,
             }
         }
     } else {
-        // Ragged launch (rows % tile height != 0): every CTA compiles this
-        // path; only the last CTA in y actually has a partial tile.
         const int tile_rows = min(prefill_gate_tile_rows, rows - first_row);
 #pragma unroll 4
         for (int col = lane * 8; col < width; col += warp_width * 8) {
@@ -543,7 +538,6 @@ __global__ void quantize_fp8_warp(const __nv_bfloat16* input, TextFp8Activation 
 
 namespace {
 
-// TP2 rank-local GDN gate channels: half of the full value-head count.
 constexpr int local_gdn_gate_channels = text_gdn_value_heads / 2;
 
 template <int Channels>
@@ -581,9 +575,6 @@ std::optional<cudaError_t> try_prefill_bf16_gdn_gates_impl(
     static_assert(Channels % prefill_gate_warps == 0);
     const dim3 grid(Channels / prefill_gate_warps,
                     divide_up(rows, prefill_gate_tile_rows));
-    // Host-selected specialization: rows divisible by the tile height run the
-    // fully constant full-tile kernel (legacy codegen); ragged tails launch
-    // the guarded twin instead.
     const bool full_tiles = rows % prefill_gate_tile_rows == 0;
     const auto kernel = full_tiles ? bf16_gdn_prefill_gates<Channels, true>
                                    : bf16_gdn_prefill_gates<Channels, false>;

@@ -1,11 +1,5 @@
 #pragma once
 
-// Single-include implementation detail of
-// include/sglang/runtime/execution/decoder_forward_layers.h: the GDN
-// verification-gate projection lives here so that header stays under the
-// canonical file-size limit. Include only from decoder_forward_layers.h at
-// the marked site; the include site provides LayerBatch, workspace(),
-// project_verification_bf16 and the decoder_cuda declarations.
 inline void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
                               bool batched) {
     if (!batch.target_tc || batch.count < 2 ||
@@ -28,10 +22,6 @@ inline void project_gdn_gates(const GdnLayer& layer, const LayerBatch<Verificati
         return gates_kernel(layer.b.values, layer.a.values, gates.data(), rows, batch.stream);
     };
     if (batched) {
-        // The dedicated gate kernels accept 2..text_fp8_max_batch rows or one
-        // wide gdn_packet_rows batch; a wider packet is filled in 20-row
-        // chunks so the width-40 TP2 verify keeps the dedicated kernels
-        // instead of silently falling back to the grouped loop.
         bool dedicated = (batch.count >= 2 && batch.count <= text_fp8_max_batch) ||
                          batch.count % gdn_packet_rows == 0;
         for (int first = 0; dedicated && first < batch.count; first += gdn_packet_rows) {

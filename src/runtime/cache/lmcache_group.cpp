@@ -13,7 +13,7 @@ namespace {
 
 constexpr int draft_rank = 0;
 
-}  // namespace
+}   
 
 std::vector<LmCacheConfig> ranked_lmcache_configs(int world_size, int timeout_ms) {
     if (world_size <= 0) throw std::invalid_argument("Invalid LMCache world size");
@@ -58,7 +58,7 @@ std::vector<std::unique_ptr<LmCacheClient>> connect(std::vector<LmCacheConfig> c
     return clients;
 }
 
-}  // namespace
+}   
 
 LmCacheGroup::LmCacheGroup(std::vector<LmCacheConfig> configs)
     : LmCacheGroup(connect(std::move(configs))) {}
@@ -109,10 +109,6 @@ PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheK
         read.matched_gqa = std::min(read.matched_gqa, details[rank].gqa);
         read.matched_gdn = std::min(read.matched_gdn, details[rank].matched_gdn);
     }
-    // Largest GDN endpoint present on every rank, draft-eligible on the draft
-    // lane when a draft is requested. Endpoint intersection, not a min of
-    // per-rank maxima: a rank with no record at the other's endpoint must not
-    // silently truncate the restore.
     int endpoint = 0;
     for (const auto& candidate : details[draft_rank].endpoints) {
         if (draft && !candidate.draft) continue;
@@ -128,7 +124,7 @@ PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheK
         }
         if (common) {
             endpoint = candidate.end;
-            break;  // endpoints arrive in descending order
+            break;   
         }
     }
     read.usable_gqa = read.matched_gqa;
@@ -181,9 +177,6 @@ LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& 
     std::vector<LmCacheReceipt> receipts(world);
     std::vector<std::exception_ptr> errors(world);
     std::vector<std::optional<std::thread>> workers(world);
-    // Rank 0 runs inline; a rank whose worker thread cannot be created falls
-    // back to running inline after the others joined — destroying a joinable
-    // thread during unwinding would terminate the process.
     for (std::size_t rank = 1; rank < world; ++rank) {
         try {
             workers[rank].emplace([this, rank, &keys, &transfers, &statuses, &receipts,
@@ -232,7 +225,6 @@ LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& 
             for (std::size_t family = 0; family < receipt->bytes.size(); ++family) {
                 receipt->bytes[family] += rank_receipt.bytes[family];
             }
-            // The ranks restore the same tokens; count them once.
             receipt->gqa_written_tokens =
                 std::max(receipt->gqa_written_tokens, rank_receipt.gqa_written_tokens);
         }
@@ -241,9 +233,6 @@ LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& 
 }
 
 void LmCacheGroup::reset() const {
-    // Best effort across every rank: a failed reset on one daemon must not
-    // skip the others, but any failure is rethrown so a caller can never
-    // claim a successful reset after a partial clear.
     std::exception_ptr first;
     for (const auto& client : clients_) {
         try {
@@ -255,4 +244,4 @@ void LmCacheGroup::reset() const {
     if (first) std::rethrow_exception(first);
 }
 
-}  // namespace sglang::decoder
+}   

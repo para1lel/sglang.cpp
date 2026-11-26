@@ -20,8 +20,6 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// Stable stderr receipt for tensor-parallel launches; one line per rank plus a
-// world summary. The benchmark suite pins this format.
 void print_tp_receipt(const sglang::Decoder& decoder) {
     const auto* info = decoder.tensor_parallel_info();
     if (info == nullptr) {

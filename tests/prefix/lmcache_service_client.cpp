@@ -149,7 +149,7 @@ void restore_case(BatchCache& cache, const Keys& keys, const std::string& mode) 
     cache.reset();
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
     if (argc != 4) return 1;

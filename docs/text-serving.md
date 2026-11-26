@@ -70,7 +70,7 @@ If `is_cancelled` returns true at entry, direct C++ generation finishes with `ca
 
 ## Sampling
 
-Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L199)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L59)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L62)<!-- prefix: "void validat" -->
+Native HTTP uses these controls for JSON and SSE. C++ and the generator use the same controls and default to greedy selection. [HTTP validation](../apps/server/text_request.cpp#L199)<!-- prefix: "void set_sam" --> · [C++ options](../include/sglang/decoder.h#L58)<!-- prefix: "struct Decod" --> · [C++ validation](../src/decoder.cpp#L62)<!-- prefix: "void validat" -->
 
 | Field | Valid values |
 | --- | --- |
@@ -84,7 +84,7 @@ Raw text defaults to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. 
 
 The decoder validates options even on the greedy path. CUDA ranks scores in descending order and breaks ties by ascending token ID. It divides score differences by temperature before exponentiation. For `top_p < 1`, the nucleus includes the token where cumulative weight first exceeds `top_p` times the selection row's total weight. The unconstrained row covers the vocabulary. Selection draws from the nucleus intersected with top-k and weights at or above the `min_p` threshold. Each draw depends on the resolved seed and zero-based output index. Identical rows and options preserve draws across slot changes. [Seed resolution](../src/decoder.cpp#L120)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L195)<!-- prefix: "__global__ v" -->
 
-Native text requests can use configured [sampled MTP](mtp.md#sampled-mtp), including requests with an output constraint. The frozen benchmark ID route stays greedy. K0 sampling runs on the decoder stream after eager scoring or [eligible graph replay](batch-graphs.md#runtime-path). [Batch dispatch](../apps/server/batch_service.cpp#L851)<!-- prefix: "DecoderResul" -->
+Native text requests can use configured [sampled MTP](mtp.md#sampled-mtp), including requests with an output constraint. The frozen benchmark ID route stays greedy. K0 sampling runs on the decoder stream after eager scoring or [eligible graph replay](batch-graphs.md#runtime-path). [Batch dispatch](../apps/server/batch_service.cpp#L849)<!-- prefix: "DecoderResul" -->
 
 Negative infinity masks a token. NaN, positive infinity, or a row without any finite logits fails the sampled request. In batch mode, the decoder retires the failed lane and preserves its peers. For unconstrained requests, serial C++ generation throws `DecoderSamplingError`, and the batch step sets `sampling_failed`. If generation fails before the response starts, HTTP returns 500. Once SSE starts, the server attempts an error event and closes the stream. [Sample readback](../src/decoder.cpp#L359)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L690)<!-- prefix: "if (result.s" -->
 

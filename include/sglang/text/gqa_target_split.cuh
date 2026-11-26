@@ -10,8 +10,6 @@ __global__ void target_split_combine(const __grid_constant__ Binding binding) {
         return;
     }
     const int head = blockIdx.x;
-    // Bound descriptors launch the combine with the maximum head grid; the
-    // lane's own cache decides which blocks carry work.
     if (head >= gqa_query_heads(lane.cache.kv_heads)) {
         return;
     }
@@ -20,11 +18,6 @@ __global__ void target_split_combine(const __grid_constant__ Binding binding) {
     }
 }
 
-/// Rank-local combine width: a TP2 lane owns `gqa_query_heads(cache.kv_heads)`
-/// query heads instead of the full 24, so the combine grid must shrink to
-/// match the lane's own cache or blocks would write past its output rows.
-/// Bound descriptors keep their cache on the device; the host cannot read its
-/// head count, so they use the maximum grid and rely on the kernel guard.
 int target_split_heads(const decoder::PagedDecodeLane& lane) {
     return gqa_query_heads(lane.cache.kv_heads);
 }
@@ -169,7 +162,6 @@ cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, i
 
 cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests,
                                             cudaStream_t stream) {
-    // The long verifier starts beyond the position that saturates split_count.
     static_assert(long_min_position >= (max_splits - 1) * min_split_chunks * split_chunk_tokens);
     void* arguments[] = {const_cast<LongBatch*>(&batch)};
     return cudaLaunchKernel(target_split_combine<LongBatch, max_splits>,

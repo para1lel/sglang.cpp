@@ -249,7 +249,6 @@ __device__ void load_operands(Shared& shared, const LongRequest& request, int be
         const int first = (begin + chunk) * keys;
         const int end = request.first + request.count;
         wait(&shared.raw_ready[Operand][raw_slot], raw_epoch);
-        // Only the last asynchronous consumer of this decoded slot can block its refill.
         constexpr int decoded_slots = Operand == 0 ? key_slots : value_slots;
         const int previous = chunk - decoded_slots;
         if (previous >= 0) {
@@ -463,7 +462,6 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
     const int split = blockIdx.x;
     const int splits = split_count(last_position);
     if (split >= splits) return;
-    // Keep every early row's original split boundaries, then extend only the last split.
     const int total = request.first / keys + 1;
     const int first = split * total / splits;
     const int last = split + 1 == splits ? last_position / keys + 1 : (split + 1) * total / splits;
@@ -556,7 +554,7 @@ std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, Bat
     return cudaSuccess;
 }
 
-}  // namespace
+}   
 
 cudaError_t long_decode_status(cudaError_t status) {
     const auto pending = cudaGetLastError();

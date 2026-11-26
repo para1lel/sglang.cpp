@@ -1,8 +1,8 @@
 # TP2 serving status and acceptance target
 
-Tensor parallelism 2 is implemented for eager serving. Launch with `--tp 2`; the option accepts 1 or 2. [TP option](../../apps/sglang-server.cpp#L171)<!-- prefix: "} else if (o" --> Decode runs eager under tensor parallel: batch CUDA graphs stay TP1-only. [Graph policy](../../apps/sglang-server.cpp#L59)<!-- prefix: "bool enable_" --> TP1 keeps the single-device default topology. [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> The historical `benchmarks/paired` launcher supports one GPU. [Launcher limit](../../benchmarks/paired/README.md#L71)<!-- prefix: "the number o" --> `benchmarks/tp2/run.sh` is the separate two-B200 campaign entry point.
+Tensor parallelism 2 is implemented for eager serving. Launch with `--tp 2`; the option accepts 1 or 2. [TP option](../../apps/sglang-server.cpp#L169)<!-- prefix: "} else if (o" --> Decode runs eager under tensor parallel: batch CUDA graphs stay TP1-only. [Graph policy](../../apps/sglang-server.cpp#L59)<!-- prefix: "bool enable_" --> TP1 keeps the single-device default topology. [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> The historical `benchmarks/paired` launcher supports one GPU. [Launcher limit](../../benchmarks/paired/README.md#L71)<!-- prefix: "the number o" --> `benchmarks/tp2/run.sh` is the separate two-B200 campaign entry point.
 
-With LMCache enabled, TP2 requires rank device receipts from the loaded topology. The server derives one daemon endpoint per rank from the base socket path. [Rank endpoints](../../include/sglang/runtime/cache/lmcache_client.h#L64)<!-- prefix: "std::string " --> Each rank owns a private namespace and daemon. [Ranked transport](lmcache.md#ranked-tp2-transport)
+With LMCache enabled, TP2 requires rank device receipts from the loaded topology. The server derives one daemon endpoint per rank from the base socket path. [Rank endpoints](../../include/sglang/runtime/cache/lmcache_client.h#L58)<!-- prefix: "std::string " --> Each rank owns a private namespace and daemon. [Ranked transport](lmcache.md#ranked-tp2-transport)
 
 A two-rank run is recorded under `artifacts/tp2-review/serving/cache-2328/complete/cache/`. The server reported `tp_size` 2 with `dp_size` 1 and `pp_size` 1, MTP4, and ranked LMCache active. [Server information](../native-model-info.md#server-information) The topology runs two rank-local target workers with a rank0-only full MTP draft; the receipts below carry draft bytes only on rank 0.
 
@@ -89,17 +89,17 @@ The smoke run recorded under `artifacts/tp2-review/serving/cache-2328/complete/c
 
 The build enables the vendor transport only when the flashinfer wheel headers exist. Set `SGLANG_FLASHINFER_ROOT` to use a non-default installed header root; point it at a location without the wheel headers to reproduce the optional-absence build. `SGLANG_HOST_ROOT` only changes the enclosing shared root. A build without the headers rides NCCL for every allreduce. [Build gate](../../xmake.lua#L457)<!-- prefix: "local flashi" -->
 
-The vendor transport embeds the FlashInfer TRT-LLM MNNVL one-shot kernel from flashinfer 0.7.4. It uses per-rank pinned allocations, a two-device multicast object, and triple Lamport buffers. One host thread enqueues both rank halves in rank order. [Transport](../../src/runtime/backend/mnnvl_ar.cu#L1)<!-- prefix: "// MNNVL one" -->
+The vendor transport embeds the FlashInfer TRT-LLM MNNVL one-shot kernel from flashinfer 0.7.4. It uses per-rank pinned allocations, a two-device multicast object, and triple Lamport buffers. One host thread enqueues both rank halves in rank order. [Transport](../../src/runtime/backend/mnnvl_ar.cu#L5)<!-- prefix: "#include <fl" -->
 
-A call uses the vendor transport only for whole hidden-width rows of 5,120 BF16 elements, counts up to 51 rows, 16-byte aligned buffers, and either eager execution or one joined stream capture. Counts of 52 or more rows, and two independent rank captures, ride NCCL. [Eligibility](../../src/runtime/backend/tensor_parallel.cpp#L323)<!-- prefix: "count \u003e mnnv" -->
+A call uses the vendor transport only for whole hidden-width rows of 5,120 BF16 elements, counts up to 51 rows, 16-byte aligned buffers, and either eager execution or one joined stream capture. Counts of 52 or more rows, and two independent rank captures, ride NCCL. [Eligibility](../../src/runtime/backend/tensor_parallel.cpp#L269)<!-- prefix: "count \u003e mnnv" -->
 
-The rank sum normalizes negative zero to positive zero, so a zero result never aliases the Lamport sentinel bit pattern. [Sentinel](../../src/runtime/backend/mnnvl_ar.cu#L40)<!-- prefix: "constexpr st" -->
+The rank sum normalizes negative zero to positive zero, so a zero result never aliases the Lamport sentinel bit pattern. [Sentinel](../../src/runtime/backend/mnnvl_ar.cu#L24)<!-- prefix: "constexpr st" -->
 
-The multicast workspace reserves 536,870,912 bytes per rank on this platform, although the one-shot dispatch cap is 1,048,576 aggregated bytes. [Envelope](../../src/runtime/backend/mnnvl_ar.cu#L36)<!-- prefix: "constexpr st" -->
+The multicast workspace reserves 536,870,912 bytes per rank on this platform, although the one-shot dispatch cap is 1,048,576 aggregated bytes. [Envelope](../../src/runtime/backend/mnnvl_ar.cu#L20)<!-- prefix: "constexpr st" -->
 
-Six fallback reasons ride NCCL: disabled, setup unavailable, oversize, capture mismatch, unaligned, and after error. Each is counted per rank. [Fallback reasons](../../src/runtime/backend/tensor_parallel.cpp#L121)<!-- prefix: "enum class A" -->
+Six fallback reasons ride NCCL: disabled, setup unavailable, oversize, capture mismatch, unaligned, and after error. Each is counted per rank. [Fallback reasons](../../src/runtime/backend/tensor_parallel.cpp#L97)<!-- prefix: "enum class A" -->
 
-`/metrics` exposes the `tp2_ar_` counters per rank. Counters record completed enqueues per transport, not graph replays. [Counters](../../apps/server/loads.cpp#L235)<!-- prefix: "emit_rank(\"t" -->
+`/metrics` exposes the `tp2_ar_` counters per rank. Counters record completed enqueues per transport, not graph replays. [Counters](../../apps/server/loads.cpp#L232)<!-- prefix: "emit_rank(\"t" -->
 
 No startup flag selects the transport. Selection is automatic in a build that includes it.
 

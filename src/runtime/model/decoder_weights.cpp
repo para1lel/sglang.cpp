@@ -15,9 +15,6 @@ using namespace decoder;
 
 GdnLayer load_gdn(QwenWeightUpload& weights, const QwenTextModel& model,
                   const WeightSharding& shard, const std::string& prefix) {
-    // The checkpoint stores Q, K and V in that channel order inside one
-    // in_proj_qkv matrix; each rank packs its contiguous halves of the three
-    // sections into one local qkv matrix, followed by its half of z.
     const int rank = shard.rank;
     const int qk_width = shard.local_gdn_qk_width();
     const int value_width = shard.local_gdn_value_width();
@@ -58,8 +55,6 @@ GdnLayer load_gdn(QwenWeightUpload& weights, const QwenTextModel& model,
 
 GqaLayer load_gqa(QwenWeightUpload& weights, const QwenTextModel& model,
                   const WeightSharding& shard, const std::string& prefix) {
-    // q_proj interleaves q and gate per head, so the rank's contiguous block
-    // of heads is one contiguous row range; K and V split by kv head.
     const int rank = shard.rank;
     const int q_gate_width = shard.local_q_gate_width();
     const int kv_width = shard.local_gqa_kv_width();
@@ -127,8 +122,6 @@ Decoder::Model::Model(const std::filesystem::path& directory, int cuda_device,
     const std::string root = "model.language_model.";
     const auto model_vocab = static_cast<std::uint64_t>(model.vocab_size);
     const auto model_hidden = static_cast<std::uint64_t>(model.hidden_size);
-    // The embedding is replicated so every rank embeds its tokens locally; the
-    // LM head stays whole only on the rank that scores logits.
     embedding = weights.bf16(root + "embed_tokens.weight", {model_vocab, model_hidden});
     final_norm = weights.bf16(root + "norm.weight", {model_hidden});
     if (sharding.primary_rank()) {

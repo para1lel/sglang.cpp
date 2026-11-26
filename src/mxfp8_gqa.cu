@@ -850,8 +850,6 @@ cudaError_t decoder::decode_kv_append(const Mxfp8KvCache* cache, const Mxfp8Page
     if (!cache) {
         return cudaErrorInvalidValue;
     }
-    // The descriptor cache lives on the device, so the geometry cannot be
-    // validated here; the kernel's per-head guard rejects surplus blocks.
     const auto kernel = append_kernel<const int*, const Mxfp8KvCache*, const Mxfp8PageTable*>;
     return launch_gqa_kernel(kernel, dim3(1, mxfp8_kv_heads), mxfp8_head_dim, stream,
                              cache, pages, position, keys, values);
@@ -871,9 +869,6 @@ cudaError_t decoder::exact_decode_gqa_attention(
     if (!cache || !pages || !position) {
         return cudaErrorInvalidValue;
     }
-    // The descriptor cache lives on the device; require the full-geometry
-    // narrow workspace rather than reading its head count. A rank-local
-    // workspace simply skips the narrow path and uses the ordered replay.
     return workspace_bytes >= narrow_workspace_bytes(mxfp8_query_heads)
         ? launch_exact_attention<true>(cache, pages, position, queries, output, workspace, stream)
         : launch_exact_attention(cache, pages, position, queries, output, workspace, stream);

@@ -58,8 +58,6 @@ __device__ float replay_vector_channel(
     return weighted;
 }
 
-/// The replay pass shared by vector_replay_kernel and the batched verify
-/// kernels: `head` and `group` name the block coordinates the caller guards.
 __device__ __noinline__ void vector_replay_body(Mxfp8KvCache cache, const std::int32_t* pages,
                                                 int last, decoder::ExactGqaWorkspace workspace,
                                                 __nv_bfloat16* output, int head, int group) {
@@ -145,8 +143,6 @@ __global__ void vector_replay_kernel(Cache cache_binding, Pages page_binding, Po
     }
     const auto workspace = score_workspace(score_binding);
     const int head = blockIdx.x;
-    // Bound descriptors launch the replay with the maximum head grid; the
-    // lane's own cache decides which blocks carry work.
     if (head >= gqa_query_heads(cache.kv_heads)) {
         return;
     }
@@ -165,7 +161,6 @@ __device__ __noinline__ void ordered_replay(
     const int query_head = blockIdx.x;
     const int kv_head = query_head / queries_per_kv_head;
     const int query_heads = gqa_query_heads(cache.kv_heads);
-    // Bound descriptors use the maximum head grid; the lane's cache guards.
     if (query_head >= query_heads) return;
     const int thread = threadIdx.x;
     const int column = thread % replay_channels;

@@ -26,10 +26,6 @@ namespace {
 using namespace decoder;
 using namespace decoder::prefill_detail;
 
-/// Layer skeleton for one tensor-parallel prefill group: every layer's
-/// normalize, attention, and MLP steps run on both ranks before the callbacks
-/// return, so the callbacks reduce each layer's partials in place while both
-/// streams are still inside that layer.
 template <typename Normalize, typename Attention, typename Mlp>
 void execute_layers_tp(const std::array<Layer, layer_count>& primary_layers,
                        const std::array<Layer, layer_count>& peer_layers, Normalize normalize,
@@ -55,8 +51,6 @@ void execute_layers_tp(const std::array<Layer, layer_count>& primary_layers,
     }
 }
 
-/// Dispatch flags shared by the TP1 and tensor-parallel layerwise paths for
-/// one prefill group.
 struct PrefillGroupPlan {
     bool grouped = false;
     bool causal = false;
@@ -88,8 +82,6 @@ PrefillGroupPlan plan_prefill_group(const PrefillGrant* grants, PrefillGroup gro
     return plan;
 }
 
-/// TP1 group epilogue: MTP draft seeding, score capture, and final-row
-/// staging for every grant in the group.
 void finish_prefill_group(const DecoderModel& model, const Chunk& chunk,
                           const PrefillGrant* grants, int count, const TileBuffers& buffers,
                           cudaStream_t stream) {
@@ -112,19 +104,12 @@ void finish_prefill_group(const DecoderModel& model, const Chunk& chunk,
         offset += grant.rows;
     }
 }
-/// Enqueues peer-rank work with the host thread bound to the peer device:
-/// streams, kernels, and allocations on the other GPU are invalid handles in
-/// this rank's current CUDA context.
 template <typename Enqueue>
 auto on_device(int device, Enqueue&& enqueue) {
     const DeviceScope scope(device);
     return enqueue();
 }
 
-/// Shared per-layer state for one tensor-parallel layerwise prefill group:
-/// both ranks' chunks plus the group dispatch flags, so every attention and
-/// MLP partial is reduced in place while both streams are still inside that
-/// layer.
 struct PrefillGroupTp {
     const PrefillGrant* grants;
     const PrefillGrant* peer_grants;
@@ -139,8 +124,6 @@ struct PrefillGroupTp {
     int peer_device;
     bool scaled_output;
     bool reuse_all_gqa;
-    /// Enqueues work on the peer rank's device: its streams and kernels are
-    /// invalid handles in this rank's current CUDA context.
     template <typename Enqueue>
     auto on_peer(Enqueue&& enqueue) const {
         const DeviceScope scope(peer_device);
@@ -287,9 +270,6 @@ void PrefillGroupTp::attention(const GdnLayer& layer, const GdnLayer& peer_layer
     reduce(buffers.projected_attention, peer_buffers.projected_attention);
 }
 
-/// Tensor-parallel group epilogue. The MTP draft seed runs full geometry on
-/// the primary rank, so its widened scratch is carved from the tail slack of
-/// the rank-local tile layout instead of a per-group device allocation.
 void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
                              const Chunk& peer_chunk, const PrefillGrant* grants,
                              const PrefillGrant* peer_grants, int count, ScratchLayout& layout,
@@ -517,7 +497,6 @@ bool decoder::try_prefill_projection_groups(
             prefill_projection_tiles(model, grants, count, full_group_lanes, stream, stats)) {
             return true;
         }
-        // Keep the original budget for two-lane groups when the full workspace is unavailable.
         if (grants[0].rows <= max_paired_grant_rows / count) {
             return prefill_projection_tiles(model, grants, count, 2, stream, stats);
         }
@@ -681,9 +660,6 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
 
 namespace {
 
-/// Single-request tensor-parallel prefill tile: the TP1 prefill_chunk layer
-/// pipeline with both ranks' partials reduced in place after every attention
-/// and MLP step.
 void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
                       const PrefillGrant& grant, const PrefillGrant& peer_grant,
                       PrefillWorkspace& workspace, PrefillWorkspace& peer_workspace,
@@ -819,9 +795,6 @@ void enqueue_native_prefill_grants_tp(const DecoderModel& model, const DecoderMo
         const auto& grant = grants[index];
         const auto& peer_grant = peer_grants[index];
         if (grant.rows == 1) {
-            // Rank-0-only, mirroring the TP1 single-row body: the forward
-            // for single rows already ran on both ranks via forward_single,
-            // and rank 1 has no lm_head, so there are no peer calls here.
             if (grant.draft && grant.prompt_remaining > 1) {
                 model.seed_draft(grant.request->work, *grant.draft, grant.position,
                                  grant.tokens[1], stream, grant.media);
@@ -873,11 +846,6 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
         [&](int source, int offset, const PrefillGrant* group_grants, PrefillGroup rows,
             PrefillWorkspace& workspace, PrefillAttentionMode attention, int capacity) {
             ensure_peer(workspace.capacity());
-            // The callback grants are tiles of grants[source] starting at
-            // `offset`; mirror them from the peer grant with identical
-            // offsets and rows so rank 1 replays the same causal dispatch
-            // with its own request state. Serial groups span
-            // [source, source + rows.grants) directly.
             std::array<PrefillGrant, causal_full_group.grants> peer_segments;
             const PrefillGrant* peer_group = peer_grants + source;
             if (attention == PrefillAttentionMode::causal_segments) {
@@ -895,8 +863,6 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
                                              1, workspace, *peer_workspace, capacity, offset,
                                              stream, peer_stream, group);
         },
-        // TP2 fuses short (>= prefill_chunk_rows) lanes into one grouped pass;
-        // the single-model planner keeps the min_partial_prefill_rows floor.
         prefill_chunk_rows);
     if (peer_workspace) {
         const DeviceScope scope(peer.device);

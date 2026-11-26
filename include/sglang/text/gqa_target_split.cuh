@@ -41,15 +41,17 @@ cudaError_t launch_target_split(gqa_decode::TargetLane lane, cudaStream_t stream
 }
 
 template <typename Batch>
-cudaError_t launch_target_batch(const Batch& batch, int count, cudaStream_t stream) {
-    const auto status = gqa_decode::launch(batch, count, stream);
-    if (status != cudaSuccess) {
-        return status;
-    }
+cudaError_t launch_target_batch_combine(const Batch& batch, int count, cudaStream_t stream) {
     target_split_combine<<<dim3(target_split_heads(batch.lanes[0]), 1, count),
                           mxfp8_head_dim, 0, stream>>>(
         batch);
     return cudaGetLastError();
+}
+
+template <typename Batch>
+cudaError_t launch_target_batch(const Batch& batch, int count, cudaStream_t stream) {
+    const auto status = gqa_decode::launch(batch, count, stream);
+    return status == cudaSuccess ? launch_target_batch_combine(batch, count, stream) : status;
 }
 
 bool valid_target_lane(const decoder::PagedDecodeLane& lane, int end) {

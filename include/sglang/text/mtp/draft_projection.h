@@ -169,16 +169,11 @@ public:
     }
 
     void read_attention(const MtpDraftInput* rows, bool online) const {
-        for (int first = 0; first < count_; first += draft_wave_rows) {
-            const int size = std::min(count_ - first, draft_wave_rows);
-            std::array<DraftAttentionRow, draft_wave_rows> attention;
-            for (int index = 0; index < size; ++index) {
-                const int lane = first + index;
-                attention[index] = states_[lane]->attention_row(rows[lane].position);
-            }
-            check_draft_submission(mtp_gqa_attention_batch(attention.data(), size, online, stream_),
-                                   "Read batched MTP MXFP8 attention");
+        if (online && count_ == draft_attention_batch_rows) {
+            read_attention_packets<draft_attention_batch_rows>(rows, online);
+            return;
         }
+        read_attention_packets<draft_wave_rows>(rows, online);
     }
 
     void gate_attention() const {
@@ -203,6 +198,20 @@ public:
     }
 
 private:
+    template <int Width>
+    void read_attention_packets(const MtpDraftInput* rows, bool online) const {
+        for (int first = 0; first < count_; first += Width) {
+            const int size = std::min(count_ - first, Width);
+            std::array<DraftAttentionRow, Width> attention;
+            for (int index = 0; index < size; ++index) {
+                const int lane = first + index;
+                attention[index] = states_[lane]->attention_row(rows[lane].position);
+            }
+            check_draft_submission(mtp_gqa_attention_batch(attention.data(), size, online, stream_),
+                                   "Read batched MTP MXFP8 attention");
+        }
+    }
+
     void submit_joined_kv(const TextFp8DecodeTarget* targets, const TextFp8Projection* rows,
                           int first, int columns) const {
         if (first == 1) {

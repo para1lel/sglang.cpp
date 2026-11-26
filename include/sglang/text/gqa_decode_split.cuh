@@ -101,6 +101,7 @@ struct EagerTargetBatch {
 cudaError_t launch(TargetLane lane, cudaStream_t stream);
 cudaError_t launch(const TargetBatch& batch, int count, cudaStream_t stream);
 cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream);
+cudaError_t launch_multistage(const EagerTargetBatch& batch, int count, cudaStream_t stream);
 std::optional<cudaError_t> try_launch_reuse(const EagerTargetBatch& batch, int count,
                                            cudaStream_t stream);
 

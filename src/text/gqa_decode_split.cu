@@ -651,6 +651,10 @@ cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream
     if (count >= 2 * text_gdn_max_verify_rows && batch.end == text_attention_max_tokens) {
         return launch_split<true>(batch, count, stream);
     }
+    return launch_multistage(batch, count, stream);
+}
+
+cudaError_t launch_multistage(const EagerTargetBatch& batch, int count, cudaStream_t stream) {
     return launch_split(batch, count, stream);
 }
 

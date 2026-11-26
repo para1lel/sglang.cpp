@@ -243,6 +243,8 @@ struct DraftAttentionRow {
     ExactGqaWorkspace workspace;
 };
 
+inline constexpr int draft_attention_batch_rows = 16;
+
 cudaError_t mtp_gqa_attention_batch(const DraftAttentionRow* rows, int count, bool b200,
                                     cudaStream_t stream);
 

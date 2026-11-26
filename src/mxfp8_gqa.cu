@@ -916,8 +916,8 @@ cudaError_t decoder::paged_decode_gqa(
     return launch_paged_decode(lanes, count, stream);
 }
 
-#include "sglang/text/mtp/gqa_attention.cuh"
 #include "sglang/text/gqa_target_split.cuh"
+#include "sglang/text/mtp/gqa_attention.cuh"
 #include "sglang/text/gqa/short_verify.cuh"
 
 }

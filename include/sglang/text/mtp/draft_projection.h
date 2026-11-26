@@ -4,6 +4,7 @@
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/text/mtp/draft_batch_ops.h"
+#include "sglang/text/mtp/draft_stream.h"
 #include "sglang/text/target_fp8.h"
 
 #include <algorithm>
@@ -27,8 +28,9 @@ public:
     using Projection = std::pair<Fp8Weight, Output>;
 
     DraftProjectionBatch(State* const* states, int count, Bf16* packed, cudaStream_t stream,
-                         bool exact)
-        : states_(states), count_(count), packed_(packed), stream_(stream), exact_(exact) {}
+                         bool exact, bool streaming)
+        : states_(states), count_(count), packed_(packed), stream_(stream), exact_(exact),
+          streaming_(streaming) {}
 
     void prepare_fc(const MtpDraftInput* input, const Bf16* embedding,
                     const Bf16* embedding_norm, const Bf16* hidden_norm, Bf16Weight fc) {
@@ -64,6 +66,12 @@ public:
                                                : state.work.concatenated;
             projections[lane] = {concatenated, state.work.residual};
         }
+        if (streaming_) {
+            check_draft_submission(draft_stream::project_fc(fc.values, projections.data(), 2,
+                                                           stream_),
+                                   "Run streaming batched BF16 MTP FC");
+            return;
+        }
         const int width = exact_ ? count_ : draft_wave_rows;
         for (int first = 0; first < count_; first += width) {
             const int size = std::min(count_ - first, width);
@@ -94,6 +102,12 @@ public:
                 check_draft_submission(*status, "Run depth-major MTP FP8");
                 return;
             }
+        }
+        if (streaming_ && (target == 2 || target == 3) &&
+            stage.begin()[target - 2].second == &Work::keys &&
+            stage.begin()[target - 1].second == &Work::values) {
+            submit_joined_kv(targets.data(), rows.data(), target - 2, columns);
+            return;
         }
         target = 0;
         const int width = exact_ ? count_ : draft_wave_rows;
@@ -189,6 +203,20 @@ public:
     }
 
 private:
+    void submit_joined_kv(const TextFp8DecodeTarget* targets, const TextFp8Projection* rows,
+                          int first, int columns) const {
+        if (first == 1) {
+            const auto& q = targets[0];
+            check_draft_submission(text_fp8_gemm(q.weight, q.weight_scales, q.out_width, columns,
+                rows, count_, stream_), "Run batched MTP Q");
+        }
+        const auto& key = targets[first];
+        const auto& value = targets[first + 1];
+        check_draft_submission(draft_stream::project_kv(key.weight, key.weight_scales,
+            value.weight, value.weight_scales, rows + first * count_, count_, stream_),
+            "Run joined MTP KV");
+    }
+
     Bf16* residual(int lane) const {
         return dense_residual_ ? dense_residual_ + lane * hidden_size
                                : states_[lane]->work.residual;
@@ -200,6 +228,7 @@ private:
     Bf16* dense_residual_ = nullptr;
     cudaStream_t stream_;
     bool exact_;
+    bool streaming_;
 };
 
 }

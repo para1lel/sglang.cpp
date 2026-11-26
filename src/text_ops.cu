@@ -996,3 +996,4 @@ cudaError_t text_bf16_decode_gates(const __nv_bfloat16* weight_b,
 }
 
 }
+#include "sglang/text/mtp/draft_stream.cuh"

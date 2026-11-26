@@ -82,6 +82,24 @@ void project(Fp8Weight weight, const DraftWorkspace& work, Bf16* output, cudaStr
                         stream), "Run MTP FP8 projection");
 }
 
+bool prepare_streaming_projection(int device) {
+    if (!read_cuda_backend_device(device).policy.uses_b200_operators) return false;
+    check(cudaGetLastError(), "Check draft projection setup status");
+    const auto status = draft_stream::prepare();
+    if (status == cudaSuccess) return true;
+    const auto recorded = cudaGetLastError();
+    if (CudaError::terminal(status)) check(status, "Prepare Blackwell MTP projections");
+    if (CudaError::terminal(recorded)) check(recorded, "Prepare Blackwell MTP projections");
+    return false;
+}
+
+bool use_streaming_projection(bool supported, cudaStream_t stream) {
+    if (!supported) return false;
+    cudaStreamCaptureStatus status;
+    check(cudaStreamIsCapturing(stream, &status), "Check draft projection capture status");
+    return status == cudaStreamCaptureStatusNone;
+}
+
 }
 
 struct MtpDraftWeights::State {
@@ -95,6 +113,7 @@ struct MtpDraftWeights::State {
             throw std::invalid_argument("Invalid MTP target embedding or LM head");
         }
         DeviceScope selected_device(device);
+        streaming_projection = prepare_streaming_projection(device);
         auto& checkpoint = memory.transfers().checkpoint;
         checkpoint = std::make_unique<Checkpoint>(directory);
         memory.open_stream();
@@ -145,6 +164,7 @@ struct MtpDraftWeights::State {
 
     int device;
     const DraftOperatorCapabilities capabilities;
+    bool streaming_projection = false;
     std::shared_ptr<const Allocations> target_weights;
     Allocations memory;
     const Bf16* embedding;
@@ -465,15 +485,29 @@ const Bf16* MtpDraftRequest::enqueue_impl(int position, int shifted_token, const
     const auto& model = *request.weights->state_;
     const auto& gqa = model.gqa;
     try {
+        const bool streaming = use_streaming_projection(model.streaming_projection, stream);
         request.embed(shifted_token, hidden, stream, feature);
-        check(text_bf16_gemv(model.fc.values, work.concatenated, model.fc.rows, model.fc.columns,
-                             work.residual, stream), "Run BF16 MTP FC");
+        if (streaming) {
+            const TextBf16Projection row{work.concatenated, work.residual};
+            check_draft_submission(draft_stream::project_fc(model.fc.values, &row, 1, stream),
+                                   "Run streaming BF16 MTP FC");
+        } else {
+            check(text_bf16_gemv(model.fc.values, work.concatenated, model.fc.rows,
+                                 model.fc.columns, work.residual, stream), "Run BF16 MTP FC");
+        }
         request.prepare_attention(stream);
         if (score) {
             project(gqa.q_gate, work, work.q_gate, stream);
         }
-        project(gqa.key, work, work.keys, stream);
-        project(gqa.value, work, work.values, stream);
+        if (streaming) {
+            const TextFp8ActivationView input{work.activation.values, work.activation.scales};
+            const TextFp8Projection rows[]{{input, work.keys}, {input, work.values}};
+            check_draft_submission(draft_stream::project_kv(gqa.key.values, gqa.key.scales,
+                gqa.value.values, gqa.value.scales, rows, 1, stream), "Run joined MTP KV");
+        } else {
+            project(gqa.key, work, work.keys, stream);
+            project(gqa.value, work, work.values, stream);
+        }
         request.append(position, score, mrope, rotary_position, stream);
         if (score) {
             const DraftAttentionRow attention = request.attention_row(position);
@@ -532,7 +566,6 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
         states[index] = &request;
     }
     const auto& model = *weights->state_;
-    DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream, exact);
     const auto apply = [&](void (State::* function)(cudaStream_t)) {
         for (int index = 0; index < count; ++index) {
             std::invoke(function, states[index], stream);
@@ -544,6 +577,10 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
             return !row.mrope && rotary < text_attention_max_tokens;
         });
     try {
+        const bool streaming = use_streaming_projection(
+            count == 2 && !packed && model.streaming_projection, stream);
+        DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream,
+                                                           exact, streaming);
         batch.prepare_fc(rows, model.embedding, model.embedding_norm, model.hidden_norm, model.fc);
         if (packed) {
             batch.rms_activation(&DraftWorkspace::residual, model.input_norm, false);

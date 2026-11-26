@@ -17,12 +17,14 @@ The raw receipts are `rank-receipts.json`; the counters are `metrics.json` in th
 
 ## Campaign record
 
-The current campaign runs the published release `337edce7`. W1 and W2 pass the gate. W3 through W5 are unrun.
+The current campaign runs the published release `337edce7`. W1 and W2 pass the gate; W3, W4, and W5 miss it.
 
 - **Identity.** Campaign `92b206b0-16e8-4ad0-a600-463926e0d6df`, mode measure, protocol `tp2-paired-v1` (manifest `c2c3480a…`), corpus `tp2-corpus-v1` (manifest `d65076eb…`). Native source tree `337edce7…`, executable SHA-256 `0100f4e2…`, checkpoint `Qwen3.8-27B-FP8` (`b54fe441…`). Evidence: `artifacts/tp2-bench/campaign-0222/`.
 - **W1.** Native median 592.803737 ms; vLLM median 558.431928 ms; ratio 1.0615505798944935 against the ≤1.10 gate: W1 passes. Rank receipts are recorded for both ranks. Rank 0 `GPU-57c04c1a…` carries the LM head and MTP draft: 19,031,037,824 weight bytes. Rank 1 `GPU-b79a7675…` carries 14,734,676,480. A separate traced cohort accompanies the timed arms.
 - **W2.** Native measured 1699.082051 ms. The pinned vLLM reference measured 2000.013573 ms, from earliest submission to final `[DONE]`. The ratio is 0.849535260128957: W2 passes. An earlier protocol draft rejected this row on warmup-measured output identity; that requirement is superseded. The W2 reference predates full driver completion: its driver exited before end and retirement, so the span ends at the final `[DONE]`.
-- **W3–W5.** Unrun on this campaign.
+- **W3.** A second campaign (`4e83b2ac-a36d-45dc-ab54-c4cc889bda5c`) measured W3: protocol name `tp2-paired-v1`, a distinct 36-file manifest `6d38e692…`, same corpus, source, binary, and devices. Native measured 6862.178762 ms; vLLM measured 4113.792758 ms; ratio 1.6680905348611146: W3 misses the gate. From earliest submission to latest first token, native spans 2125.991606 ms and vLLM 1605.194380 ms. The remaining spans through final `[DONE]` are 4736.187156 ms and 2508.598378 ms. Both arms completed eight 8192-token prompts to 1024 outputs with retirement verified. Evidence: `artifacts/tp2-bench/campaign-timing-0826/W3/comparison.json`.
+- **W4.** Native measured 57338.227570 ms; vLLM measured 26346.666432 ms; ratio 2.176299142739304: W4 misses the gate. All sixteen lanes completed 32768-token prompts to 4096 outputs on both engines, with full backend and retirement verified; no request timed out. From earliest submission to the last lane's first token, native spans 18079.484509 ms and vLLM 14347.504268 ms. From that first token to final `[DONE]`, native spends 39258.743061 ms and vLLM 11999.162164 ms. Evidence: `artifacts/tp2-bench/campaign-timing-0826/W4/` and `artifacts/tp2-review/campaign/timing-only-0825/W4-phases.log`.
+- **W5.** Native measured 66235.146069 ms; vLLM measured 39459.475211 ms; ratio 1.6785612508738035: W5 misses the gate. All eight lanes completed 131072-token prompts to 1024 outputs in warmup and measurement on both engines, with full process and daemon retirement; nothing timed out. From earliest submission to the last lane's first token, native spans 60009.979660 ms and vLLM 36172.205609 ms. From that first token to final `[DONE]`, native spends 6225.166409 ms and vLLM 3287.269602 ms. Evidence: `artifacts/tp2-bench/campaign-timing-0826/W5/` and `artifacts/tp2-review/campaign/timing-only-0825/W5-phases.log`.
 - **Historical context.** The first campaign (`24c2e092-25c7-4945-a251-aa9cb03358cb`, source `3a33e1c1…`, binary `fb03d111…`) measured W1 only: 925.746744 ms against 557.959022 ms, ratio 1.6591661887313294, a miss, and stopped. The [diagnostic profile](#w1-diagnostic-profile) below attributes that gap. A separate clean production diagnostic on the current binary measured 594.644780 ms for W1 before this campaign; it is not a campaign row.
 
 ## W1 diagnostic profile
@@ -90,7 +92,7 @@ No startup flag selects the transport. Selection is automatic in a build that in
 
 ## Acceptance target
 
-W1 and W2 have passed the gate. W3 through W5 are unrun. A passing campaign must satisfy every condition below.
+W1 and W2 have passed the gate; W3, W4, and W5 have missed it. A passing campaign must satisfy every condition below.
 
 - **Devices.** Run both engines alone on the same two B200 devices in the same rank order. Record both UUIDs, the rank assignment, interconnect, and distributed library.
 - **Workloads.** Reuse the frozen W1–W5 fixture bytes. Offer 2, 2, 8, 16, and 8 requests total on W1–W5. This is one, one, four, eight, and four per GPU. Eight slots per GPU give sixteen slots total. W4 fills them exactly. W4 uses the first sixteen archived W5 lanes. W1 and W2 need one new distinct lane each. W3 and W5 need four more each. Freeze every new lane as distinct deterministic bytes in a separate additive TP2 corpus. Retain the TP1 lanes and bytes. Duplicate no request.

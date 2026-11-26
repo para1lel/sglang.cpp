@@ -127,6 +127,12 @@ The [native 4,096-row gate/up route](fp8-prefill-projections.md#large-prefill-ti
 
 On two B200s, warm direct decoder priming of one 32,768-token W4 prompt used eight 4,096-row groups. Time fell from 1,087.120 to 1,058.156 ms, a 2.66% reduction. The harness recorded rank hidden and residual state in both arms. Those states, token IDs, and MTP acceptance matched. HTTP serving makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-gate/` (`gpu-0.jI3uJ3/rank-{0,1}.log`, `prime-4-5.dYtCZR/prime-{0,4}.log`).
 
+### TP2 grouped attention output replay
+
+The [native 3,072-input route](fp8-prefill-projections.md#large-prefill-tiles) matched every BF16 output for early and late W4 and W5 captures. Replays covered both TP2 rank shards and checkpoint layers 0, 3, and 32. Eager, CUDA graph, and clean fallback comparisons matched.
+
+On two B200s, warm direct eager decoder priming for one 32,768-token W4 prompt fell from 999.533 to 981.236 ms. The ABBA and BAAB sequences had four observations per arm. Sampled rank hidden and residual state, token IDs, and MTP acceptance matched. For the 131,072-token W5 prompt, caller state and token records matched. The single observation per arm was unpaired. W4 HTTP makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-output/receipt.txt`.
+
 ### TP2 long down projection replay
 
 The [CUTLASS down route](fp8-prefill-projections.md#large-prefill-tiles) replayed each rank shard separately on a single B200 using Qwen3.8-27B-FP8 checkpoint layers 0, 3, and 32 and fixed synthetic input activations. Eight alternating CUDA-event trials measured warm graph replay per layer from residual reset and RMSNorm through gate/up, SwiGLU, and down, including scale preparation. Eager compared all three layers, and graph replay compared layer 32. BF16 down outputs, SwiGLU E4M3 values, and FP32 scales matched bitwise.

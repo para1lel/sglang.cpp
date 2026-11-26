@@ -577,6 +577,13 @@ std::optional<cudaError_t> try_text_fp8_gemm_sm100(
             return paired;
         }
     }
+    if (grouped_projection && rows == 4096 && in_width == 3072 && out_width == 5120) {
+        const auto wide = launch_tma<Tile<128, packed_wide_tile_cols, 3, 1, 1>>(
+            weight, weight_scales, input, rows, out_width, in_width, output, stream, device);
+        if (wide) {
+            return wide;
+        }
+    }
     if (grouped_projection && rows == 4096 && in_width == 6144 && out_width == 5120) {
         const auto wide = launch_tma<Tile<128, packed_wide_tile_cols, 4, 1, 1>>(
             weight, weight_scales, input, rows, out_width, in_width, output, stream, device,

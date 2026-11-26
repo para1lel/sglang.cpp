@@ -1,6 +1,6 @@
 # Matched B200 benchmark agreement
 
-Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. The [TP2 target](serving/tp2.md) covers two-GPU acceptance: W1–W2 pass, W3–W5 miss. [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. The [TP2 target](serving/tp2.md) covers two-GPU acceptance: W1–W2 pass, W3–W5 miss (W5 re-measured). [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 ## Implementations and controls
 

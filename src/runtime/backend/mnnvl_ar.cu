@@ -18,11 +18,33 @@ using Bf16 = __nv_bfloat16;
 constexpr int kRanks = 2;
 constexpr int kTokenDim = 5120;   
 constexpr std::uint64_t kOneshotMaxBytes = 1024 * 1024;
+constexpr int kTwoshotRows = 80;
+constexpr int kTwoshotThreads = 128;
 constexpr std::size_t kElementSize = sizeof(Bf16);
 constexpr std::uint32_t kSignalPad = 2048;     
 constexpr int kNumLamportBuffers = 3;          
 constexpr std::uint32_t kLamportSentinel = 0x80000000u;   
 constexpr std::uint32_t kBufferAlignment = 2 * 16;
+constexpr std::size_t kTwoshotCount = kTwoshotRows * kTokenDim;
+constexpr std::size_t kTwoshotBufferBytes = 2 * kTwoshotCount * kElementSize;
+constexpr int kTwoshotElementsPerCta = kTwoshotThreads * sizeof(float4) / kElementSize;
+constexpr int kTwoshotGrid =
+    kTwoshotRows * ((kTokenDim + kTwoshotElementsPerCta - 1) / kTwoshotElementsPerCta);
+
+bool twoshot_grid_fits(int device) {
+    using flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel;
+    int multiprocessors = 0;
+    int active_blocks = 0;
+    if (cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device) !=
+            cudaSuccess ||
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active_blocks, twoshotAllreduceKernel<kRanks, Bf16, true>, kTwoshotThreads, 0) !=
+            cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return active_blocks * multiprocessors >= kTwoshotGrid;
+}
 
 std::uint64_t round_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -66,6 +88,7 @@ void require_cu(CUresult status, const char* what) {
 struct MnnvlAllReduce::State {
     std::vector<int> devices;   
     bool failed = false;
+    bool twoshot_supported = false;
 
     CUmemGenericAllocationHandle physical[kRanks]{};
     CUmemGenericAllocationHandle multicast{};
@@ -102,6 +125,10 @@ int MnnvlAllReduce::rank_count() const noexcept { return kRanks; }
 int MnnvlAllReduce::device(int rank) const { return state_->devices.at(rank); }
 
 std::size_t MnnvlAllReduce::max_count() const noexcept { return state_->max_elements; }
+
+bool MnnvlAllReduce::supports_twoshot(std::size_t count) const noexcept {
+    return count == kTwoshotCount && state_->twoshot_supported;
+}
 
 bool MnnvlAllReduce::healthy() const noexcept { return !state_->failed; }
 
@@ -287,6 +314,7 @@ void MnnvlAllReduce::init_lamport(State& state) {
         throw std::runtime_error("The multicast workspace exceeds the Lamport flag width.");
     }
     state.buffer_size_bytes = static_cast<std::uint32_t>(per_buffer);
+    state.twoshot_supported = per_buffer >= kTwoshotBufferBytes;
 
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
@@ -330,6 +358,7 @@ void MnnvlAllReduce::init_lamport(State& state) {
             throw std::runtime_error(std::string("Finish the Lamport initialization: ") +
                                      cudaGetErrorString(status));
         }
+        state.twoshot_supported = state.twoshot_supported && twoshot_grid_fits(state.devices[r]);
     }
 }
 
@@ -378,7 +407,7 @@ std::unique_ptr<MnnvlAllReduce> MnnvlAllReduce::create(std::vector<int> devices)
 }
 
 void MnnvlAllReduce::preflight(State& state, __nv_bfloat16* const buffers[],
-                               const cudaStream_t streams[]) {
+                               const cudaStream_t streams[], bool two_shot) {
     cudaStreamCaptureStatus capture_status[kRanks];
     for (int r = 0; r < kRanks; ++r) {
         int stream_device = -1;
@@ -421,10 +450,13 @@ void MnnvlAllReduce::preflight(State& state, __nv_bfloat16* const buffers[],
             "state; a graph-recorded kernel cannot Lamport-synchronize with an "
             "eager peer.");
     }
+    if (two_shot && capture_status[0] != cudaStreamCaptureStatusNone) {
+        throw std::invalid_argument("The two-shot MNNVL allreduce requires eager streams.");
+    }
 }
 
 void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
-                                    std::size_t count) {
+                                    std::size_t count, bool two_shot) {
     if (count == 0) {
         throw std::invalid_argument(
             "MnnvlAllReduce::allreduce_bf16 requires a positive element count.");
@@ -440,12 +472,15 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
         throw std::invalid_argument(
             "MnnvlAllReduce::allreduce_bf16 requires a whole number of hidden-width rows.");
     }
-    if (count > state_->max_elements) {
+    if (!two_shot && count > state_->max_elements) {
         throw std::invalid_argument(
             "MnnvlAllReduce::allreduce_bf16 requires a count within the one-shot envelope.");
     }
+    if (two_shot && !supports_twoshot(count)) {
+        throw std::invalid_argument("Unsupported two-shot MNNVL allreduce count or device.");
+    }
     ensure_healthy();
-    preflight(*state_, buffers, streams);
+    preflight(*state_, buffers, streams, two_shot);
 
     const int tokens = static_cast<int>(count / kTokenDim);
     CallerDevice device_scope;
@@ -473,8 +508,9 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
         params.quantOut = nullptr;
         params.scalingFactorOut = nullptr;
         params.stream = streams[r];
-        const cudaError_t status =
-            flashinfer::trtllm_mnnvl_allreduce::oneshotAllreduceFusionDispatch<Bf16>(params);
+        using namespace flashinfer::trtllm_mnnvl_allreduce;
+        const cudaError_t status = two_shot ? twoshotAllreduceFusionDispatch<Bf16>(params)
+                                            : oneshotAllreduceFusionDispatch<Bf16>(params);
         if (status != cudaSuccess) {
             state_->failed = true;
             throw MnnvlArError(std::string("Enqueue the MNNVL BF16 allreduce: ") +

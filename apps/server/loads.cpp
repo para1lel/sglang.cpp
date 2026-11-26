@@ -231,6 +231,7 @@ void append_tp_ar_metrics(std::string& text, const decoder::TpArCounters& counte
         const auto& per_rank = counters.per_rank[rank];
         emit_rank("tp2_ar_calls_total", rank, per_rank.ar_calls_total);
         emit_rank("tp2_ar_mnnvl_oneshot_total", rank, per_rank.ar_mnnvl_oneshot_total);
+        emit_rank("tp2_ar_mnnvl_twoshot_total", rank, per_rank.ar_mnnvl_twoshot_total);
         emit_rank("tp2_ar_nccl_total", rank, per_rank.ar_nccl_total);
         emit_rank("tp2_ar_fallback_disabled_total", rank, per_rank.ar_fallback_disabled_total);
         emit_rank("tp2_ar_fallback_setup_unavailable_total", rank,

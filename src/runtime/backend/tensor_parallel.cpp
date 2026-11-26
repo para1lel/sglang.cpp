@@ -130,11 +130,11 @@ struct TensorParallel::State {
     void record_nccl_success(std::size_t count, std::size_t payload, ArFallback reason);
 #if SGLANG_USE_MNNVL_AR
     ArFallback vendor_fallback_reason(std::size_t count,
-                                      const CollectiveStreams& capture_state) const;
+                                      const CollectiveStreams& capture_state, bool two_shot) const;
     bool vendor_allreduce(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
-                          std::size_t count, const CollectiveStreams& capture_state);
+                          std::size_t count, const CollectiveStreams& capture_state, bool two_shot);
     void note_vendor_failure();
-    void record_vendor_success(std::size_t count, std::size_t payload);
+    void record_vendor_success(std::size_t count, std::size_t payload, bool two_shot);
 #endif
 
     ~State() {
@@ -245,15 +245,15 @@ void TensorParallel::State::record_nccl_success(std::size_t count, std::size_t p
 
 #if SGLANG_USE_MNNVL_AR
 ArFallback TensorParallel::State::vendor_fallback_reason(std::size_t count,
-                                                         const CollectiveStreams& capture_state)
-    const {
+                                                         const CollectiveStreams& capture_state,
+                                                         bool two_shot) const {
     if (mnnvl == nullptr) {
         return ArFallback::SetupUnavailable;
     }
     if (mnnvl_sticky || !mnnvl->healthy()) {
         return ArFallback::AfterError;
     }
-    if (count > mnnvl->max_count() || count % mnnvl_ar_hidden_width != 0) {
+    if (!two_shot && (count > mnnvl->max_count() || count % mnnvl_ar_hidden_width != 0)) {
         return ArFallback::Oversize;
     }
     if (capture_state.status == cudaStreamCaptureStatusActive && !capture_state.same_capture) {
@@ -262,11 +262,11 @@ ArFallback TensorParallel::State::vendor_fallback_reason(std::size_t count,
     return ArFallback::Unaligned;
 }
 
-bool TensorParallel::State::vendor_allreduce(__nv_bfloat16* const buffers[],
-                                             const cudaStream_t streams[], std::size_t count,
-                                             const CollectiveStreams& capture_state) {
+bool TensorParallel::State::vendor_allreduce(
+    __nv_bfloat16* const buffers[], const cudaStream_t streams[], std::size_t count,
+    const CollectiveStreams& capture_state, bool two_shot) {
     if (mnnvl == nullptr || mnnvl_sticky || !mnnvl->healthy() ||
-        count > mnnvl->max_count() || count % mnnvl_ar_hidden_width != 0) {
+        (!two_shot && (count > mnnvl->max_count() || count % mnnvl_ar_hidden_width != 0))) {
         return false;
     }
     if (capture_state.status == cudaStreamCaptureStatusActive && !capture_state.same_capture) {
@@ -278,7 +278,7 @@ bool TensorParallel::State::vendor_allreduce(__nv_bfloat16* const buffers[],
         }
     }
     try {
-        mnnvl->allreduce_bf16(buffers, streams, count);
+        mnnvl->allreduce_bf16(buffers, streams, count, two_shot);
     } catch (const std::invalid_argument&) {
         throw;
     } catch (const MnnvlArError& error) {
@@ -305,12 +305,15 @@ void TensorParallel::State::note_vendor_failure() {
     mnnvl_active_mirror = false;
 }
 
-void TensorParallel::State::record_vendor_success(std::size_t count, std::size_t payload) {
+void TensorParallel::State::record_vendor_success(std::size_t count, std::size_t payload,
+                                                  bool two_shot) {
+    const auto transport = two_shot ? &TpArRankCounters::ar_mnnvl_twoshot_total
+                                     : &TpArRankCounters::ar_mnnvl_oneshot_total;
     const std::lock_guard<std::mutex> lock(counter_mutex);
     for (std::size_t rank = 0; rank < devices.size(); ++rank) {
         TpArRankCounters& counter = ar_counters[rank];
         ++counter.ar_calls_total;
-        ++counter.ar_mnnvl_oneshot_total;
+        ++(counter.*transport);
         counter.ar_bytes_payload_total += payload;
         counter.ar_bytes_aggregated_total += payload * devices.size();
     }
@@ -430,11 +433,13 @@ void TensorParallel::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
         validate_collective_streams(state_->devices, streams, ranks);
     const std::size_t payload = count * sizeof(__nv_bfloat16);
 #if SGLANG_USE_MNNVL_AR
-    if (state_->vendor_allreduce(buffers, streams, count, capture_state)) {
-        state_->record_vendor_success(count, payload);
+    const bool two_shot = capture_state.status == cudaStreamCaptureStatusNone &&
+                          state_->mnnvl != nullptr && state_->mnnvl->supports_twoshot(count);
+    if (state_->vendor_allreduce(buffers, streams, count, capture_state, two_shot)) {
+        state_->record_vendor_success(count, payload, two_shot);
         return;
     }
-    const ArFallback reason = state_->vendor_fallback_reason(count, capture_state);
+    const ArFallback reason = state_->vendor_fallback_reason(count, capture_state, two_shot);
 #else
     const ArFallback reason = ArFallback::Disabled;
 #endif

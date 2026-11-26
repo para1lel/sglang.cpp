@@ -13,6 +13,7 @@ namespace sglang::decoder {
 struct TpArRankCounters {
     std::uint64_t ar_calls_total = 0;
     std::uint64_t ar_mnnvl_oneshot_total = 0;
+    std::uint64_t ar_mnnvl_twoshot_total = 0;
     std::uint64_t ar_nccl_total = 0;
     std::uint64_t ar_fallback_disabled_total = 0;
     std::uint64_t ar_fallback_setup_unavailable_total = 0;

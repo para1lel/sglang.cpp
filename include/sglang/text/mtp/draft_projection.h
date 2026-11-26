@@ -26,8 +26,9 @@ public:
     using Output = decltype(&Work::attention);
     using Projection = std::pair<Fp8Weight, Output>;
 
-    DraftProjectionBatch(State* const* states, int count, Bf16* packed, cudaStream_t stream)
-        : states_(states), count_(count), packed_(packed), stream_(stream) {}
+    DraftProjectionBatch(State* const* states, int count, Bf16* packed, cudaStream_t stream,
+                         bool exact)
+        : states_(states), count_(count), packed_(packed), stream_(stream), exact_(exact) {}
 
     void prepare_fc(const MtpDraftInput* input, const Bf16* embedding,
                     const Bf16* embedding_norm, const Bf16* hidden_norm, Bf16Weight fc) {
@@ -44,14 +45,16 @@ public:
             check_draft_submission(normalize_draft_inputs(embeddings, hidden, embedding_norm,
                                    hidden_norm, count_, stream_),
                                    "Normalize grouped MTP FC inputs");
-            auto* output = packed_ + draft_fc_input_values;
-            if (const auto status = try_text_bf16_decode_sm100(fc.values, packed_, fc.rows,
-                                    fc.columns, count_, output, stream_)) {
-                check_draft_submission(*status, "Run dense BF16 MTP FC");
-                dense_residual_ = output;
-                return;
+            if (!exact_) {
+                auto* output = packed_ + draft_fc_input_values;
+                if (const auto status = try_text_bf16_decode_sm100(fc.values, packed_, fc.rows,
+                                        fc.columns, count_, output, stream_)) {
+                    check_draft_submission(*status, "Run dense BF16 MTP FC");
+                    dense_residual_ = output;
+                    return;
+                }
+                check(cudaGetLastError(), "Check declined dense MTP FC status");
             }
-            check(cudaGetLastError(), "Check declined dense MTP FC status");
         }
         std::array<TextBf16Projection, draft_projection_rows> projections;
         for (int lane = 0; lane < count_; ++lane) {
@@ -61,8 +64,9 @@ public:
                                                : state.work.concatenated;
             projections[lane] = {concatenated, state.work.residual};
         }
-        for (int first = 0; first < count_; first += draft_wave_rows) {
-            const int size = std::min(count_ - first, draft_wave_rows);
+        const int width = exact_ ? count_ : draft_wave_rows;
+        for (int first = 0; first < count_; first += width) {
+            const int size = std::min(count_ - first, width);
             check_draft_submission(text_bf16_gemm(fc.values, fc.rows, fc.columns,
                 projections.data() + first, size, stream_), "Run batched BF16 MTP FC");
         }
@@ -82,7 +86,7 @@ public:
             ++target;
         }
         const int columns = stage.begin()->first.columns;
-        if (packed_) {
+        if (packed_ && !exact_) {
             check(cudaGetLastError(), "Check draft projection stream status");
             const auto status = try_target_fp8_tc(targets.data(), target, columns, rows.data(),
                                                  count_, packed_, stream_);
@@ -92,10 +96,11 @@ public:
             }
         }
         target = 0;
+        const int width = exact_ ? count_ : draft_wave_rows;
         for (const auto& projection : stage) {
             const auto& weight = projection.first;
-            for (int first = 0; first < count_; first += draft_wave_rows) {
-                const int size = std::min(count_ - first, draft_wave_rows);
+            for (int first = 0; first < count_; first += width) {
+                const int size = std::min(count_ - first, width);
                 check_draft_submission(text_fp8_gemm(weight.values, weight.scales, weight.rows,
                     weight.columns, rows.data() + target * count_ + first, size, stream_),
                     "Run batched MTP FP8");
@@ -194,6 +199,7 @@ private:
     Bf16* packed_;
     Bf16* dense_residual_ = nullptr;
     cudaStream_t stream_;
+    bool exact_;
 };
 
 }

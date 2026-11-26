@@ -1,29 +1,22 @@
 #include "sglang/text_ops.h"
-
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_internal.h"
-
+#include "sglang/decoder_mtp.h"
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/text_cuda_primitives.cuh"
 #include "sglang/text/quantize_warp.cuh"
-
 #include <algorithm>
 #include <cstddef>
-
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
-
 namespace sglang {
 namespace {
-
 using namespace text_kernel;
-
 constexpr int argmax_tile = 4 * block_threads;
 constexpr int nonfinite_token = -2;
 static_assert(text_argmax_scratch_count(argmax_tile) == 1);
 static_assert(text_argmax_scratch_count(argmax_tile + 1) == 2);
-
 constexpr int divide_up(int count, int tile) {
     return count / tile + (count % tile != 0);
 }
@@ -608,11 +601,12 @@ cudaError_t text_bf16_gemv_rows(const __nv_bfloat16* weight, const __nv_bfloat16
     return cudaLaunchKernel(kernel, dim3(divide_up(out_width, block_warps), rows),
                             block_threads, args, 0, stream);
 }
-
 cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_width,
                            const TextBf16Projection* projections, int count, cudaStream_t stream) {
+    const bool exact = count == decoder::draft_projection_rows && out_width == decoder::hidden_size
+        && in_width == 2 * decoder::hidden_size;
     if (!weight || !projections || out_width <= 0 || in_width <= 0 ||
-        count < 1 || count > text_fp8_max_batch) {
+        count < 1 || (count > text_fp8_max_batch && !exact)) {
         return cudaErrorInvalidValue;
     }
     bool packed = in_width % 8 == 0 && aligned(weight, 16);
@@ -624,6 +618,9 @@ cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_wi
     }
     if (packed) {
         switch (count) {
+        case decoder::draft_projection_rows:
+            return launch_bf16_batch<decoder::draft_projection_rows>(weight, out_width, in_width,
+                                                                     projections, stream);
         case 5:
             return launch_bf16_batch<5>(weight, out_width, in_width, projections, stream);
         case 4:
@@ -710,12 +707,13 @@ cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weigh
     return cudaLaunchKernel(kernel, divide_up(out_width, rows_per_block),
                             rows_per_block * warp_width, args, 0, stream);
 }
-
 cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
                           int out_width, int in_width, const TextFp8Projection* projections,
                           int count, cudaStream_t stream) {
+    const bool exact = count == decoder::draft_projection_rows && out_width == text_gqa_kv_width
+        && in_width == decoder::hidden_size;
     if (!weight || !weight_scales || !projections || out_width <= 0 || in_width <= 0 ||
-        count < 1 || count > text_fp8_max_batch) {
+        count < 1 || (count > text_fp8_max_batch && !exact)) {
         return cudaErrorInvalidValue;
     }
     bool wide = true;
@@ -726,20 +724,21 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
         }
         wide = wide && supports_wide_fp8(weight, entry.input, in_width);
     }
-    if (wide && count == mlp_verify_rows) {
+    switch (wide ? count : 0) {
+    case decoder::draft_projection_rows:
+        return launch_fp8_batch<decoder::draft_projection_rows>(
+            weight, weight_scales, out_width, in_width, projections, stream);
+    case mlp_verify_rows:
         if (is_fp8_mlp_or_gdn_shape(out_width, in_width)) {
-            return launch_fp8_mlp_staged(weight, weight_scales, out_width, in_width, projections,
-                                        stream);
+            return launch_fp8_mlp_staged(weight, weight_scales, out_width, in_width,
+                                         projections, stream);
         }
         return launch_fp8_batch<5>(weight, weight_scales, out_width, in_width, projections, stream);
-    }
-    if (wide && count == 4) {
+    case 4:
         return launch_fp8_batch<4>(weight, weight_scales, out_width, in_width, projections, stream);
-    }
-    if (wide && count == 3) {
+    case 3:
         return launch_fp8_batch<3>(weight, weight_scales, out_width, in_width, projections, stream);
-    }
-    if (wide && count == 2) {
+    case 2:
         return launch_fp8_batch<2>(weight, weight_scales, out_width, in_width, projections, stream);
     }
     for (int index = 0; index < count; ++index) {
@@ -752,7 +751,6 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
     }
     return cudaSuccess;
 }
-
 cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
                                TextFp8ActivationView input, int out_width, int in_width, int rows,
                                __nv_bfloat16* output, cudaStream_t stream) {

@@ -504,7 +504,8 @@ void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
 }
 
 void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
-                                       cudaStream_t stream, bool defer_score, Bf16* packed) {
+                                       cudaStream_t stream, bool defer_score, Bf16* packed,
+                                       bool exact) {
     if (count == 0) return;
     static_assert(draft_wave_rows == decoder_batch_max_mtp_lanes);
     if (!rows || count < 0 || (count > draft_wave_rows &&
@@ -531,7 +532,7 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
         states[index] = &request;
     }
     const auto& model = *weights->state_;
-    DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream);
+    DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream, exact);
     const auto apply = [&](void (State::* function)(cudaStream_t)) {
         for (int index = 0; index < count; ++index) {
             std::invoke(function, states[index], stream);
@@ -689,7 +690,7 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
 }
 
 void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* packed,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, bool exact) {
     if (!repairs || count <= 0 || (count > draft_wave_rows &&
                                   (!packed || count > draft_projection_rows ||
                                    count % draft_wave_rows != 0))) {
@@ -702,8 +703,13 @@ void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* 
             if (const auto& row = repairs[lane][depth]; row.request) rows[size++] = row;
         }
         if (size == 0) break;
-        if (packed && size == count) {
-            enqueue_wave_impl(rows.data(), size, false, stream, false, packed);
+        const bool grouped = !exact || (count == draft_projection_rows &&
+            std::all_of(rows.begin(), rows.begin() + size, [](const MtpDraftInput& row) {
+                const int rotary = row.rotary_position < 0 ? row.position : row.rotary_position;
+                return !row.mrope && rotary < text_attention_max_tokens;
+            }));
+        if (packed && size == count && grouped) {
+            enqueue_wave_impl(rows.data(), size, false, stream, false, packed, exact);
         } else if (count <= draft_wave_rows) {
             enqueue_wave(rows.data(), size, false, stream);
         } else {

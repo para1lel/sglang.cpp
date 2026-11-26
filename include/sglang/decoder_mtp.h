@@ -67,7 +67,7 @@ public:
     static void enqueue_depth(MtpDraftInput* rows, int count, const DraftDepthScratch& scratch,
                               cudaStream_t stream);
     static void repair_wave(const DraftRepairs* repairs, int count, Bf16* packed,
-                            cudaStream_t stream);
+                            cudaStream_t stream, bool exact = false);
 
     void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                       const Bf16* residual, const Bf16* final_norm,
@@ -88,7 +88,8 @@ private:
                             const ConstraintCandidates* allowed, bool defer_score,
                             const MropePosition* mrope, int rotary_position, const Bf16* feature);
     static void enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
-                                  cudaStream_t stream, bool defer_score, Bf16* packed = nullptr);
+                                  cudaStream_t stream, bool defer_score, Bf16* packed = nullptr,
+                                  bool exact = false);
     friend PrefixDeviceTransfer restore_prefix_view(Request&, const PrefixCacheRead&,
                                                     cudaStream_t, MtpDraftRequest*,
                                                     const PrefixCacheLayout*);

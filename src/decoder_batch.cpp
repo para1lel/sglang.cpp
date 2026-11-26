@@ -615,10 +615,11 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                               gdn_batch);
             if (tp_driver) tp_driver->commit_peer_round(lane, round, saved, peer_gdn_batch);
         }
-        auto* packed = size > packet && !tp ? wide_mtp_activation : nullptr;
+        const bool exact = tp && size == draft_projection_rows && wide_mtp_capacity >= size;
+        auto* packed = size > packet && (!tp || exact) ? wide_mtp_activation : nullptr;
         if (packed) {
             MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed),
-                                         stream);
+                                         stream, exact);
         } else {
             for (int lane = 0; lane < size; lane += packet) {
                 MtpDraftRequest::repair_wave(repairs.data() + lane, std::min(size - lane, packet),

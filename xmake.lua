@@ -421,9 +421,6 @@ if has_config("generated-logprobs-check") then
         add_files("tests/text/generated_logprobs_check.cpp")
     target_end()
 end
--- NCCL for tensor parallelism comes from the pixi env's nvidia wheel. (The
--- wiring lives below the original targets so documented line anchors into
--- this file keep pointing at the upstream lines.)
 local nccl_wheel = (os.dirs(path.join(prefix, "lib/python*/site-packages/nvidia/nccl")) or {})[1]
 if not nccl_wheel then
     raise("pixi env is missing the nvidia/nccl wheel " ..
@@ -431,11 +428,6 @@ if not nccl_wheel then
 end
 
 target("sglang_decoder")
-    -- The wheel's include dir holds only nccl*.h, so a normal system include
-    -- path cannot shadow the conda sysroot's glibc headers. The library is
-    -- linked by absolute SONAME path so the wheel's lib dir never joins the
-    -- -L search path (a -L into the host lib dir would shadow the sysroot
-    -- libc).
     add_sysincludedirs(path.join(nccl_wheel, "include"))
     add_ldflags(path.join(nccl_wheel, "lib/libnccl.so.2"), {force = true, public = true})
     add_ldflags("-Wl,-rpath," .. path.join(nccl_wheel, "lib"), {force = true, public = true})
@@ -462,16 +454,8 @@ if has_config("tp2-collective-check") and os.isfile("tests/decoder/tp2/collectiv
     target_end()
 end
 
--- Optional MNNVL oneshot allreduce transport (FlashInfer 0.7.4 wheel).
--- Discovered at configure time; every transitive input the transport TU
--- needs is checked (vendor template header, bundled spdlog headers, our
--- wrapper pair). Any miss leaves the build identical (NCCL-only), so the
--- everyday build never requires the vendor package.
 local flashinfer_root = os.getenv("SGLANG_FLASHINFER_ROOT")
 if not flashinfer_root or flashinfer_root == "" then
-    -- Same host-root convention as tools/build.sh. HOME is deliberately not
-    -- used: it names a per-user home, not the shared host tree holding the
-    -- venvs, and differs on this workstation (/home vs /data1/shared).
     local host_root = os.getenv("SGLANG_HOST_ROOT") or "/data1/shared/dongwu.chen"
     flashinfer_root = path.join(host_root,
         "environments/vllm-81a8cb063e62/venv/lib/python3.12/site-packages/flashinfer")
@@ -490,10 +474,6 @@ if os.isfile(mnnvl_vendor_header) and os.isfile(mnnvl_spdlog_header)
         set_values("cuda.rdc", false)
         add_cugencodes("sm_100a")
         add_cuflags("--dependency-target-name=", {force = true})
-        -- The vendor LamportFlags templates call constexpr __host__
-        -- operators from __device__ code; nvcc only accepts that with the
-        -- relaxed-constexpr extension (same requirement as the vendor's
-        -- build examples).
         add_cuflags("--expt-relaxed-constexpr", {force = true})
         add_includedirs("include", path.join(toolkit, "include"))
         add_sysincludedirs(path.join(flashinfer_root, "data/include"),
@@ -504,5 +484,44 @@ if os.isfile(mnnvl_vendor_header) and os.isfile(mnnvl_spdlog_header)
     target("sglang_decoder")
         add_deps("sglang_mnnvl_ar")
         add_defines("SGLANG_MNNVL_AR=1")
+    target_end()
+end
+
+local host_root_default = os.getenv("SGLANG_HOST_ROOT") or "/data1/shared/dongwu.chen"
+local gdn_vendor_dir = path.join(host_root_default, "environments",
+                                 "vllm-81a8cb063e62", "gdn_vendor_object")
+local gdn_vendor_archive = path.join(gdn_vendor_dir, "libgdn_cute_bf16_8_24.a")
+local site_packages = path.directory(flashinfer_root)
+local tvm_ffi_include = path.join(site_packages, "tvm_ffi", "include")
+local tvm_ffi_lib = path.join(site_packages, "tvm_ffi", "lib")
+local cute_dsl_lib = path.join(site_packages, "nvidia_cutlass_dsl", "cu13", "lib")
+local tvm_ffi_header = path.join(tvm_ffi_include, "tvm", "ffi", "c_api.h")
+local tvm_ffi_so = path.join(tvm_ffi_lib, "libtvm_ffi.so")
+local cute_dsl_so = path.join(cute_dsl_lib, "libcute_dsl_runtime.so")
+if os.getenv("SGLANG_GDN_VENDOR_BUILD") ~= "0"
+    and os.isfile(gdn_vendor_archive)
+    and os.isfile(tvm_ffi_header) and os.isfile(tvm_ffi_so) and os.isfile(cute_dsl_so)
+    and os.isfile("include/sglang/runtime/backend/gdn_vendor_prefill.h")
+    and os.isfile("src/runtime/backend/gdn_vendor_prefill.cu") then
+    print("vendor GDN prefill: enabled (archive " .. gdn_vendor_archive .. ")")
+    target("sglang_gdn_vendor")
+        set_kind("static")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/lib")
+        set_values("cuda.rdc", false)
+        add_cugencodes("sm_100a")
+        add_cuflags("--expt-relaxed-constexpr", {force = true})
+        add_defines("SGLANG_GDN_VENDOR=1")
+        add_includedirs("include", path.join(toolkit, "include"))
+        add_sysincludedirs(tvm_ffi_include)
+        add_linkdirs(tvm_ffi_lib, cute_dsl_lib, gdn_vendor_dir)
+        add_links("tvm_ffi", "cute_dsl_runtime", "gdn_cute_bf16_8_24",
+                  {public = true})
+        add_rpathdirs(tvm_ffi_lib, cute_dsl_lib, {public = true})
+        add_files("src/runtime/backend/gdn_vendor_prefill.cu")
+    target_end()
+    target("sglang_decoder")
+        add_deps("sglang_gdn_vendor")
+        add_defines("SGLANG_GDN_VENDOR=1")
     target_end()
 end

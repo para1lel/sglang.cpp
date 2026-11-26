@@ -87,7 +87,7 @@ The smoke run recorded under `artifacts/tp2-review/serving/cache-2328/complete/c
 
 ## Two-rank allreduce transport
 
-The build enables the vendor transport only when the flashinfer wheel headers exist. Set `SGLANG_FLASHINFER_ROOT` to use a non-default installed header root; point it at a location without the wheel headers to reproduce the optional-absence build. `SGLANG_HOST_ROOT` only changes the enclosing shared root. A build without the headers rides NCCL for every allreduce. [Build gate](../../xmake.lua#L470)<!-- prefix: "local flashi" -->
+The build enables the vendor transport only when the flashinfer wheel headers exist. Set `SGLANG_FLASHINFER_ROOT` to use a non-default installed header root; point it at a location without the wheel headers to reproduce the optional-absence build. `SGLANG_HOST_ROOT` only changes the enclosing shared root. A build without the headers rides NCCL for every allreduce. [Build gate](../../xmake.lua#L457)<!-- prefix: "local flashi" -->
 
 The vendor transport embeds the FlashInfer TRT-LLM MNNVL one-shot kernel from flashinfer 0.7.4. It uses per-rank pinned allocations, a two-device multicast object, and triple Lamport buffers. One host thread enqueues both rank halves in rank order. [Transport](../../src/runtime/backend/mnnvl_ar.cu#L1)<!-- prefix: "// MNNVL one" -->
 

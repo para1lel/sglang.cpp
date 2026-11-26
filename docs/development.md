@@ -105,7 +105,9 @@ Use the [operator qualification procedure](performance.md#operator-qualification
 
 Use the [P2 verifier](#p2-gqa-verification) for MXFP8 encoding, causal attention, and page reuse. Check KV positions and ownership through append and decode. Check BF16 convolution history and FP32 recurrent state. Compare supported cache restores and continuations with fresh native execution under the same precision policy. [Independent GDN check](../tests/decoder/gdn_check.cu#L239)<!-- prefix: "void verify_" -->
 
-Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to its path and `GPU_UUID` to the reserved B200 UUID. CUDA exposes it as ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L105)<!-- prefix: "\"$xmake\" bui" -->
+Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to its path and `GPU_UUID` to the reserved B200 UUID. CUDA exposes it as ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L110)<!-- prefix: "\"$xmake\" bui" -->
+
+The optional vendor GDN prefill kernel is provisioned ahead of time. `tools/aot_build_vendor_gdn.py` compiles the pinned CuTe kernel into `libgdn_cute_bf16_8_24.a`. The build links that archive when it exists, unless `SGLANG_GDN_VENDOR_BUILD` is `0`. [AOT provisioning](../tools/aot_build_vendor_gdn.py#L1)<!-- prefix: "\"\"\"Reproduci" --> · [Build gate](../xmake.lua#L501)<!-- prefix: "if os.getenv" -->
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \

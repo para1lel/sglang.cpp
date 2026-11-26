@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder prefill | Lay out the arena and lend two scratch spans during GQA. | [Tile layout](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L128)<!-- prefix: "TileBuffers(" --> · [Scratch view](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L151)<!-- prefix: "PairedPrefil" --> |
+| Decoder prefill | Lay out the arena and lend two scratch spans during GQA. | [Tile layout](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L114)<!-- prefix: "TileBuffers(" --> · [Scratch view](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L137)<!-- prefix: "PairedPrefil" --> |
 | Attention dispatch | Stage eligible singleton and four-lane groups. Partial-grant groups can use staged, raw grouped, or per-lane attention. | [Singleton selection](../include/sglang/text/gqa/multirow_prefill.cuh#L35)<!-- prefix: "const bool d" --> · [Grouped dispatch](../src/decoder_prefill.cpp#L385)<!-- prefix: "void prefill" --> |
 | Paired launcher | Check bounds and capture state, then submit predecode and attention on the caller's stream. | [Staged launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L770)<!-- prefix: "std::optiona" --> |
 
@@ -67,13 +67,13 @@ The step reuses one workspace across all groups. Four-grant grouping adds 511,11
 
 ### Seed scratch
 
-MTP draft seeding uses a full-geometry scratch outside the rank-local tile layout. The draft model runs full geometry on the primary rank. Paired seeding allocates `concatenated` for up to 128 rows and `keys`, `values`, and `rope_keys` for every row of one paired seed launch. Each seeding path throws `runtime_error` when the scratch does not fit the workspace. [Seed scratch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L101)<!-- prefix: "/// Full-geo" -->
+MTP draft seeding uses a full-geometry scratch outside the rank-local tile layout. The draft model runs full geometry on the primary rank. Paired seeding allocates `concatenated` for up to 128 rows and `keys`, `values`, and `rope_keys` for every row of one paired seed launch. Each seeding path throws `runtime_error` when the scratch does not fit the workspace. [Seed scratch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L101)<!-- prefix: "inline std::" -->
 
 ### Partial-grant projection groups
 
 The partial-grant planner can pack consecutive complete grants up to 1,024 rows each. The minimum is 256 rows on one rank and 128 rows on two ranks. Each grant must fit its own native tile. A group needs at least two grants and fits at most 4,096 rows. The planner leaves grant order intact. Ungrouped grants use ordinary prefill. [Plan and dispatch](../include/sglang/runtime/execution/decoder_prefill_plan.h#L91)<!-- prefix: "bool execute" -->
 
-The group shares dense projections and MLP work. Uniform 4,096-row groups of eight 512-row or sixteen 256-row grants can also share [RMSNorm and GQA postgate preparation](fp8-prefill-projections.md#attention-output-quantization). [Grouped staged and ordered GQA](ordered-gqa-prefill.md#grouped-partial-grants) and [grouped GDN](gdn-prefill.md#grouped-partial-grants) qualify independently. Other attention and recurrence use per-lane dispatch. Each lane keeps its positions, KV pages, and recurrent state. All work uses the same stream and existing workspace. Draft seeding uses the lane's own rows where applicable. [Layer dispatch](../src/decoder_prefill.cpp#L385)<!-- prefix: "void prefill" --> · [GQA selection](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L745)<!-- prefix: "} else if (p" -->
+The group shares dense projections and MLP work. Uniform 4,096-row groups of eight 512-row or sixteen 256-row grants can also share [RMSNorm and GQA postgate preparation](fp8-prefill-projections.md#attention-output-quantization). [Grouped staged and ordered GQA](ordered-gqa-prefill.md#grouped-partial-grants) and [grouped GDN](gdn-prefill.md#grouped-partial-grants) qualify independently. Other attention and recurrence use per-lane dispatch. Each lane keeps its positions, KV pages, and recurrent state. All work uses the same stream and existing workspace. Draft seeding uses the lane's own rows where applicable. [Layer dispatch](../src/decoder_prefill.cpp#L385)<!-- prefix: "void prefill" --> · [GQA selection](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L812)<!-- prefix: "} else if (p" -->
 
 One arena fits the largest planned group and ordinary tile in the step. The executor reuses it for the other grants. If no group qualifies or its allocation is unavailable, the executor falls back before submitting grouped work. [Allocation and fallback](../include/sglang/runtime/execution/decoder_prefill_plan.h#L112)<!-- prefix: "PrefillWorks" -->
 
@@ -85,7 +85,7 @@ largest active prefill workspace in the step.
 ### Causal segments within one grant
 
 Whole-tile pairing and complete groups of distinct grants take precedence. This path requires a Tensor Core grant with a native tile size of 1,024 rows. The executor packs four complete tiles when at least four remain. It packs three when exactly three remain. On the workspace stream, each layer shares dense projections and MLP work across the combined rows. GDN state advances one segment at a time in prompt order. Eligible four-tile groups try the [staged same-request GQA reader](flash-prefill.md#same-request-causal-gqa). A ready grant can stage its own group when peer grants have different sizes. Other shapes append and read GQA KV one segment at a time. The scheduler’s grant stays intact. Ordinary prefill resumes at the first unprocessed row.
-[Segment selection](../include/sglang/runtime/execution/decoder_prefill_plan.h#L44)<!-- prefix: "inline Prefi" --> · [GQA selection](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L744)<!-- prefix: "if (prefill_" --> · [GDN order](../src/decoder_prefill.cpp#L457)<!-- prefix: "prefill_part" --> · [Native remainder](../include/sglang/runtime/execution/decoder_prefill_plan.h#L143)<!-- prefix: "if (offset \u003c" -->
+[Segment selection](../include/sglang/runtime/execution/decoder_prefill_plan.h#L44)<!-- prefix: "inline Prefi" --> · [GQA selection](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L811)<!-- prefix: "if (prefill_" --> · [GDN order](../src/decoder_prefill.cpp#L457)<!-- prefix: "prefill_part" --> · [Native remainder](../include/sglang/runtime/execution/decoder_prefill_plan.h#L143)<!-- prefix: "if (offset \u003c" -->
 
 Causal segments reuse the same arena sizing and allocation fallback. Unexpected CUDA errors propagate.
 

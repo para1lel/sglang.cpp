@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L647)<!-- prefix: "const bool t" --> · [First-layer guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L287)<!-- prefix: "const bool c" --> |
+| Decoder | Select the precision policy and provide tile scratch when the GDN layer qualifies. | [Policy](../src/decoder_prefill.cpp#L647)<!-- prefix: "const bool t" --> · [First-layer guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L273)<!-- prefix: "const bool c" --> |
 | GDN operator | Prepare rows, advance each layer's recurrent state, and finish output and convolution history. | [Prefill submission](../src/text_attention_gdn.cu#L335)<!-- prefix: "cudaError_t " --> |
 | Verification | Check ordered parity, chunked numerical error, and causal continuation. | [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" --> · [Checkpoint probe](../tests/decoder/gdn_checkpoint.cpp#L101)<!-- prefix: "int main(int" --> |
 
@@ -33,7 +33,7 @@ grant lengths differ. Each grant's absolute start determines bank-zero
 eligibility. If any grant starts at position zero, the first GDN layer runs
 per grant for the whole group. A declined grouped submission also runs
 per grant. A CUDA error from the grouped provider propagates.
-[Position guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L665)<!-- prefix: "grant.rows %" --> · [Grouped submission](../src/text_attention_gdn.cu#L602)<!-- prefix: "std::optiona" -->
+[Position guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L691)<!-- prefix: "grant.rows %" --> · [Grouped submission](../src/text_attention_gdn.cu#L602)<!-- prefix: "std::optiona" -->
 
 Grouped matrix preparation uses one 384-thread block per Q and K head and row group. The three associated value heads share Q and K staging and the FP32 dot products. Each value head applies its own gates and solves its own triangular system. [Grouped matrix launch](../include/sglang/text/gdn/gdn_chunk.cuh#L282)<!-- prefix: "const auto s" -->
 
@@ -45,9 +45,23 @@ The ordered tensor-core fallback uses the paired kernel for at least 32 rows wit
 
 ### Grouped partial grants
 
-A [partial-grant projection group](native-prefill-workspace.md#partial-grant-projection-groups) can share GDN launches at 4,096 rows on SM100. It needs eight 512-row grants or sixteen 256-row grants. The decoder submits four grants at a time, with separate convolution history, FP32 carry, and scratch for each grant. The groups use the existing prefill arena. [Shape guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L705)<!-- prefix: "inline bool " --> · [Four-grant dispatch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L717)<!-- prefix: "inline void " -->
+A [partial-grant projection group](native-prefill-workspace.md#partial-grant-projection-groups) can share GDN launches at 4,096 rows on SM100. It needs eight 512-row grants or sixteen 256-row grants. The decoder submits four grants at a time, with separate convolution history, FP32 carry, and scratch for each grant. The groups use the existing prefill arena. [Shape guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L733)<!-- prefix: "inline bool " --> · [Four-grant dispatch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L745)<!-- prefix: "inline void " -->
 
-If any of the four starts at position zero, bank zero uses the existing per-grant path for those four. The decoder also uses that path when the provider declines before GDN submission. A returned CUDA error propagates. The decoder clears the CUDA last-error value if it matches the reported error. [Bank guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L665)<!-- prefix: "grant.rows %" --> · [Error handling](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L681)<!-- prefix: "if (status) " -->
+If any of the four starts at position zero, bank zero uses the existing per-grant path for those four. The decoder also uses that path when the provider declines before GDN submission. A returned CUDA error propagates. The decoder clears the CUDA last-error value if it matches the reported error. [Bank guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L691)<!-- prefix: "grant.rows %" --> · [Error handling](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L709)<!-- prefix: "if (status) " -->
+
+## Vendor prefill opt-in
+
+An optional vendor kernel serves rank-local GDN prefill. Set `SGLANG_GDN_VENDOR_PREFILL` to exactly `1`; any other value keeps the native path. The flag is read once per process. [Opt-in check](../src/runtime/backend/gdn_vendor_prefill.cu#L462)<!-- prefix: "bool gdn_ven" -->
+
+The device must report compute capability 10.0 with 148 streaming multiprocessors, cached per device. [Device support](../src/runtime/backend/gdn_vendor_prefill.cu#L37)<!-- prefix: "bool vendor_" -->
+
+Eligible calls carry positive row counts up to 262,144, in multiples of four. Local GDN layers route BF16 and FP8 advances, grouped segments, and coalesced partial-grant runs through the vendor kernel. [Eligibility](../src/runtime/backend/gdn_vendor_prefill.cu#L474)<!-- prefix: "bool gdn_ven" --> · [FP8 advance](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L278)<!-- prefix: "if (quantize" --> · [Grouped segments](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L658)<!-- prefix: "if (dims.is_" --> · [Partial runs](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L762)<!-- prefix: "chunk.tensor" -->
+
+The workspace reserves the larger of the native and vendor layouts, independent of the runtime flag. Toggling the environment variable needs no rebuild. [Workspace sizing](../src/runtime/backend/gdn_vendor_prefill.cu#L479)<!-- prefix: "std::size_t " -->
+
+Builds without the vendor archive compile the same interfaces as stubs. Stubs report disabled and not-supported, leaving dispatch native. [No-asset stubs](../include/sglang/runtime/backend/gdn_vendor_prefill.h#L39)<!-- prefix: "inline bool " -->
+
+Qualification compared matched-layer BF16 outputs against the pinned vLLM/FlashInfer reference. The vendor kernel was closer on all twelve matched outputs. Native was closer on the one 248,320-entry complete-vocabulary row. No blanket parity or speed claim is made.
 
 ## Grouped target verification
 
@@ -67,9 +81,9 @@ MTP commit-phase GDN prefix replay is dispatched as one batched address-table la
 
 ## Constraints and failure behavior
 
-The B/A fast paths require tensor-core prefill policy and two BF16 weight matrices of 48 rows by 5,120 columns. The SM100 projection accepts 512–4,096 rows, including a partial final 32-row block. It needs nonnull buffers, 16-byte-aligned weights, input, and scratch, and supported TMA setup. It borrows 3,840 scratch bytes per token row from the MLP gate buffer. Reduction consumes those bytes on the same stream before recurrence or the MLP reuses them. [Decoder dispatch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L255)<!-- prefix: "if (tensor_c" --> · [SM100 preflight](../src/text/prefill_gdn_gates_sm100.cu#L209)<!-- prefix: "std::optiona" -->
+The B/A fast paths require tensor-core prefill policy and two BF16 weight matrices of 48 rows by 5,120 columns. The SM100 projection accepts 512–4,096 rows, including a partial final 32-row block. It needs nonnull buffers, 16-byte-aligned weights, input, and scratch, and supported TMA setup. It borrows 3,840 scratch bytes per token row from the MLP gate buffer. Reduction consumes those bytes on the same stream before recurrence or the MLP reuses them. [Decoder dispatch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L241)<!-- prefix: "if (tensor_c" --> · [SM100 preflight](../src/text/prefill_gdn_gates_sm100.cu#L209)<!-- prefix: "std::optiona" -->
 
-A clean SM100 setup decline tries the fused SIMT projection. That path accepts multiples of four from 16 through 65,535 rows with aligned weights and input. If it also declines, the decoder projects B and A separately in that order. CUDA errors propagate from either fused path. [SIMT preflight](../src/text_decode_bandwidth.cu#L575)<!-- prefix: "if (rows < 1" --> · [Descriptor errors](../src/text/prefill_gdn_gates_sm100.cu#L138)<!-- prefix: "std::optiona" --> · [Separate fallback](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L276)<!-- prefix: "project(laye" -->
+A clean SM100 setup decline tries the fused SIMT projection. That path accepts multiples of four from 16 through 65,535 rows with aligned weights and input. If it also declines, the decoder projects B and A separately in that order. CUDA errors propagate from either fused path. [SIMT preflight](../src/text_decode_bandwidth.cu#L575)<!-- prefix: "if (rows < 1" --> · [Descriptor errors](../src/text/prefill_gdn_gates_sm100.cu#L138)<!-- prefix: "std::optiona" --> · [Separate fallback](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L262)<!-- prefix: "project(laye" -->
 
 The first GDN layer uses ordered recurrence for a tile that starts at prompt position zero. Later GDN layers in that tile and all GDN layers in subsequent tiles may use chunked recurrence. A tile that resumes a saved prefix uses the absolute restored position. An earlier recurrence experiment on W2 found that reordering only the first GDN call could change later model scores. The guard preserves that call's update order.
 

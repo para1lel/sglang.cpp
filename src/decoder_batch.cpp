@@ -489,11 +489,15 @@ bool DecoderBatch::State::prepare_wide_mtp(int lanes) {
 WideMtpGroups DecoderBatch::State::prepare_wide_groups(const PrefillRows& decode,
         const WideMtpCandidates& candidates, bool& contains_mtp) {
     auto groups = wide_mtp_groups(decode, candidates, wide_mtp_limit);
-    // The TP2 wide route never consumes the packed wide activation (peer
-    // verification ignores it, wide scoring is unused, and draft repair runs
-    // per row); skip the rank-0 scratch reservation. TP1 keeps it.
+    // Under TP2 verification ignores the packed wide activation and repair
+    // runs per row, but the rank-0 depth-scoring draft reuses the same arena
+    // for its packed FC staging, FP8 activation packs, and INT8 head scratch
+    // (same multi-purpose layout and lifetime as TP1). Reserve it with the
+    // existing formula, best effort. On failure the wide verification group
+    // is unchanged and the draft falls back to the wave-major packets.
     if (tp) {
         contains_mtp = groups.largest > 0;
+        if (groups.largest) prepare_wide_mtp(groups.largest);
         return groups;
     }
     while (groups.largest) {
@@ -565,8 +569,10 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     if (count == 0) return;
     const auto& cancel = cancel_probe();
     // Reuse the verification activation block before target verification starts.
+    // When the reservation is unavailable (including under TP2) the draft
+    // keeps the wave-major packets.
     const bool score_together = count >= draft_projection_rows ||
-        (count == wide_mtp_lanes && !tp);
+        (count == wide_mtp_lanes && wide_mtp_activation != nullptr);
     const bool depth_scoring = score_together && !output && MtpDraftRequest::prepare_depth(
         *rounds.front().draft, draft_depth, wide_mtp_activation, stream);
     if (depth_scoring) {
@@ -640,7 +646,8 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         }
         verify(first, width, width > packet ? wide_mtp_activation : nullptr);
         const int commit_width = !output && width >= draft_projection_rows
-            ? draft_projection_rows : (depth_scoring && width == wide_mtp_lanes ? width : packet);
+            ? draft_projection_rows
+            : (depth_scoring && !tp && width == wide_mtp_lanes ? width : packet);
         for (int next = 0; next < width; next += commit_width) {
             commit(first + next, std::min(width - next, commit_width));
         }

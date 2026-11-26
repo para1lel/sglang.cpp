@@ -17,11 +17,13 @@ See `rank-receipts.json` and `metrics.json`. Target storage is 16,896 bytes per 
 
 ## Campaign record
 
-Latest formal W1 (`a5f76d36`, B200s 4/5) missed by 19.838109 ms (545.106259/477.516500 ms native/vLLM, 1.1415443424468055×). See `artifacts/tp2-resume/combined-release/a5f76d36af3641e4f7f3f1fff2d6a5651a76bbac/official-campaign/W1/comparison.json`. Earlier `6e71fceb` missed at 1.142710×. The `edca6a` 6/3 run was interrupted before the scored 4/5 miss (592.471368/474.298792 ms, 1.249152×). That campaign skipped W2–W5. See `artifacts/tp2-resume/w1-draft-caller/release-3d2cf7dc02238cd79c0abe87582422eb057bd6ba/qualification-45/W1/comparison.json`.
+Official `0d745375` ran both engines on B200s 4/5. Makespans are native/pinned vLLM in ms. W1 passed at 498.339692/474.724356 (1.049745364×). W2 passed at 1286.342700/1214.911601 (1.058795306×). W3 missed by 42.308 ms at 4261.832270/3835.931200 (1.111029382×), with 16 LMCache stores per rank and zero restores or I/O errors. W4–W5 pending. See `artifacts/tp2-resume/w1-graph-qualification/0d7453751ddf1699a50f5370ecc6a7b9a02e8623/official-4-5/W{1,2,3}/comparison.json` (`dd2aa96c`, `0925c245`, `f8b6d66b`).
 
-A bounded native W1 HTTP diagnostic based on `432daa8f` with six runs per arm on B200s 4/5 measured 508.721→499.538 ms median wire time and matched IDs and rank-state bytes. See `artifacts/tp2-resume/w1-fused-http/timed.x1bMco3R/graph-comparison.json`.
+Earlier W1 misses on B200s 4/5 included `a5f76d36` (545.106259/477.516500 ms, 1.141544342×) and `edca6a` (592.471368/474.298792 ms, 1.249152×) after its 6/3 interruption. `edca6a` skipped W2–W5. `6e71fceb` missed at 1.142710×. Receipts under `artifacts/tp2-resume/` include `combined-release/a5f76d36af3641e4f7f3f1fff2d6a5651a76bbac/official-campaign/W1/comparison.json` and `w1-draft-caller/release-3d2cf7dc02238cd79c0abe87582422eb057bd6ba/qualification-45/W1/comparison.json`.
 
-Release `36cb430a` missed W1 by 0.513175 ms (524.241268/476.116448 ms, 1.101077835×). W2 passed (1302.201491/1218.488949 ms, 1.068702×). Both had two LMCache stores per rank and zero restores. See `artifacts/tp2-resume/w1-fusion-release/36cb430a3fddd479ce787aa34926cb6f46480f81/` (`requalified-campaign/W1`, `official-campaign/W2`).
+The bounded `432daa8f` W1 HTTP diagnostic measured 508.721→499.538 ms median wire time over six runs per arm on B200s 4/5, with exact IDs and rank-state bytes. See `artifacts/tp2-resume/w1-fused-http/timed.x1bMco3R/graph-comparison.json`.
+
+Release `36cb430a` missed W1 by 0.513175 ms (524.241268/476.116448 ms, 1.101077835×) and passed W2 (1302.201491/1218.488949 ms, 1.068702×). Both had two LMCache stores per rank, zero restores. See `artifacts/tp2-resume/w1-fusion-release/36cb430a3fddd479ce787aa34926cb6f46480f81/` (`requalified-campaign/W1`, `official-campaign/W2`).
 
 Historical `168fdb1a`: TP2 MTP4, ranked LMCache, vendor GDN, native GQA, eager flag and batch graphs off. Pinned vLLM `81a8cb06…` disabled KV offload, KV transfer, and CPU offload. Binary `8385a2ba…`, manifest `fda8adff…`. All five missed. See `artifacts/tp2-bench/campaign-W124-GDN-168fdb1a-45-1559/five-rows.json` (`e33f270b…`).
 
@@ -40,8 +42,8 @@ Historical `168fdb1a`: TP2 MTP4, ranked LMCache, vendor GDN, native GQA, eager f
 
 ## W4 wide-verification release
 
-One cold W4 comparison used sixteen 32,768-token prompts and 4,096 outputs each. Rank-local packed staging with sixteen lanes reduced charged makespan from 50.815826650 s to 38.788724911 s (23.67%) against the eight-lane control. All-lane overlap throughput rose from 2026.02 to 3564.05 tokens/s. Time from earliest submission to latest first token rose from 18.492582 s to 20.007657 s. The remaining span through final `[DONE]` fell from 32.323245 s to 18.781068 s. The named W4 row records this release. See `artifacts/tp2-bench/w4-named-1219/ordinary-W4-independent-replay.json` (`c38195a7…`) and binaries `ab8a1e45…` and `425fbffd…`.
-A paired W3 session (`283cbb84-…`) priced the same candidate lineage. Native median 5119.357970 ms faced a fresh vLLM 4104.882148 ms: ratio 1.2471388423402796, missing the gate by 603.9876072 ms. The eight-lane control measured 6168.325329 ms. The named W3 row above prices the released executable. Evidence: `artifacts/tp2-bench/w3-scratch-final-after-lock-1241/W3-candidate/W3/comparison.json` (`9c4e8c85…`).
+In a cold W4 comparison with sixteen 32,768-token prompts and 4,096 outputs each, sixteen-lane rank-local staging cut makespan from 50.815826650 to 38.788724911 s (23.67%) versus eight lanes. All-lane overlap rose from 2026.02 to 3564.05 tokens/s. Time from earliest submission to latest first token rose from 18.492582 to 20.007657 s. The span through final `[DONE]` fell from 32.323245 to 18.781068 s. See `artifacts/tp2-bench/w4-named-1219/ordinary-W4-independent-replay.json` (`c38195a7…`) and binaries `ab8a1e45…`, `425fbffd…`.
+Paired W3 (`283cbb84-…`) on that lineage missed by 603.9876072 ms (5119.357970/4104.882148 ms, 1.2471388423402796×). The eight-lane native control took 6168.325329 ms. See `artifacts/tp2-bench/w3-scratch-final-after-lock-1241/W3-candidate/W3/comparison.json` (`9c4e8c85…`).
 
 ## W1 diagnostic profile
 

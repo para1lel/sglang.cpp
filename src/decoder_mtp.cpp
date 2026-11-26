@@ -740,7 +740,8 @@ void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* 
             if (const auto& row = repairs[lane][depth]; row.request) rows[size++] = row;
         }
         if (size == 0) break;
-        const bool grouped = !exact || (count == draft_projection_rows &&
+        const bool grouped = !exact || ((count == wide_mtp_lanes ||
+                                         count == draft_projection_rows) &&
             std::all_of(rows.begin(), rows.begin() + size, [](const MtpDraftInput& row) {
                 const int rotary = row.rotary_position < 0 ? row.position : row.rotary_position;
                 return !row.mrope && rotary < text_attention_max_tokens;

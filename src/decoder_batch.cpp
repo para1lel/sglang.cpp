@@ -514,6 +514,15 @@ static bool full_verification(const MtpRound* rounds, int count) {
                        [](const auto& round) { return round.rows() == target_verify_max_rows; });
 }
 
+static int verification_width(const MtpRound* rounds, int count, int first, bool full) {
+    if (full) return count;
+    if (first % wide_mtp_lanes == 0 && count - first >= wide_mtp_lanes &&
+        full_verification(rounds + first, wide_mtp_lanes)) {
+        return wide_mtp_lanes;
+    }
+    return std::min(count - first, decoder_batch_max_mtp_lanes);
+}
+
 int DecoderBatch::State::collect_rounds(const PrefillRows& verification_rows, int& next_slot,
                                         const WideMtpGroups& wide_groups,
                                         std::array<MtpRound, max_wide_mtp_lanes>& rounds,
@@ -553,6 +562,20 @@ int DecoderBatch::State::collect_rounds(const PrefillRows& verification_rows, in
         slots[count++] = slot;
     }
     return count;
+}
+
+static void repair_rounds(const DraftRepairs* repairs, int size, std::uint8_t* packed, bool exact,
+                          cudaStream_t stream) {
+    if (packed) {
+        MtpDraftRequest::repair_wave(repairs, size, reinterpret_cast<Bf16*>(packed), stream,
+                                     exact);
+        return;
+    }
+    constexpr int packet = decoder_batch_max_mtp_lanes;
+    for (int lane = 0; lane < size; lane += packet) {
+        MtpDraftRequest::repair_wave(repairs + lane, std::min(size - lane, packet), nullptr,
+                                     stream);
+    }
 }
 
 void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, int& next_slot,
@@ -598,8 +621,10 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
             stats.verification_graph_slots |= std::uint32_t{1} << slots[first];
         }
     };
-    const auto commit = [&](int first, int size) {
-        std::array<DraftRepairs, draft_projection_rows> repairs{};
+    const auto commit = [&](int first, int size, DraftRepairs* deferred) {
+        std::array<DraftRepairs, draft_projection_rows> packet_repairs;
+        auto* repairs = deferred ? deferred : packet_repairs.data();
+        if (!deferred) std::fill_n(repairs, size, DraftRepairs{});
         TextGdnReplayBatch* gdn_batch = prepare_gdn_replays();
         TextGdnReplayBatch* peer_gdn_batch =
             tp_driver ? tp_driver->prepare_peer_gdn_replays() : nullptr;
@@ -615,16 +640,10 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                               gdn_batch);
             if (tp_driver) tp_driver->commit_peer_round(lane, round, saved, peer_gdn_batch);
         }
-        const bool exact = tp && size == draft_projection_rows && wide_mtp_capacity >= size;
-        auto* packed = size > packet && (!tp || exact) ? wide_mtp_activation : nullptr;
-        if (packed) {
-            MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed),
-                                         stream, exact);
-        } else {
-            for (int lane = 0; lane < size; lane += packet) {
-                MtpDraftRequest::repair_wave(repairs.data() + lane, std::min(size - lane, packet),
-                                             nullptr, stream);
-            }
+        if (!deferred) {
+            const bool exact = tp && size == draft_projection_rows && wide_mtp_capacity >= size;
+            auto* packed = size > packet && (!tp || exact) ? wide_mtp_activation : nullptr;
+            repair_rounds(repairs, size, packed, exact, stream);
         }
         if (gdn_batch) {
             check(gdn_batch->launch(tp != nullptr, stream), "Batched GDN prefix replay");
@@ -637,20 +656,23 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         (!tp || count == wide_mtp_lanes || count == wide_mtp_lanes * 2) &&
         full_verification(rounds.data(), count);
     for (int first = 0; first < count;) {
-        int width = std::min(count - first, packet);
-        if (full) {
-            width = count;
-        } else if (first % wide_mtp_lanes == 0 && count - first >= wide_mtp_lanes &&
-                   full_verification(rounds.data() + first, wide_mtp_lanes)) {
-            width = wide_mtp_lanes;
-        }
+        const int width = verification_width(rounds.data(), count, first, full);
         verify(first, width, width > packet ? wide_mtp_activation : nullptr);
+        const bool group_repair = tp && !output && width == wide_mtp_lanes &&
+            wide_mtp_capacity >= width && std::none_of(rounds.data() + first,
+                rounds.data() + first + width, [](const auto& round) {
+                    return round.media || round.sampling || round.constraint;
+                });
+        std::array<DraftRepairs, wide_mtp_lanes> repairs;
+        if (group_repair) repairs = {};
         const int commit_width = !output && width >= draft_projection_rows
             ? draft_projection_rows
             : (depth_scoring && !tp && width == wide_mtp_lanes ? width : packet);
         for (int next = 0; next < width; next += commit_width) {
-            commit(first + next, std::min(width - next, commit_width));
+            commit(first + next, std::min(width - next, commit_width),
+                   group_repair ? repairs.data() + next : nullptr);
         }
+        if (group_repair) repair_rounds(repairs.data(), width, wide_mtp_activation, true, stream);
         first += width;
     }
 }

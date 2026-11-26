@@ -64,15 +64,13 @@ bool valid_target_binding(const decoder::BoundPagedDecodeLane& lane) {
 
 int eager_target_batch_width(const decoder::PagedDecodeLane* lanes, int count, int end) {
     constexpr int reference_width = text_gdn_max_verify_rows;
-    constexpr int max_average_chunks_per_split = 10;
     if (end != text_attention_max_tokens || count < 2 * reference_width) {
         return reference_width;
     }
     for (int index = 0; index < count; ++index) {
         const auto& lane = lanes[index];
-        const int chunks = lane.position / gqa_decode::split_chunk_tokens + 1;
         if (!gqa_decode::tensor_aligned(lane) ||
-            chunks > max_average_chunks_per_split * gqa_decode::split_count(lane.position)) {
+            !gqa_decode::supports_eager_wide_split(lane.position)) {
             return reference_width;
         }
     }

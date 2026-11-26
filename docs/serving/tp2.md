@@ -73,7 +73,9 @@ A bounded native-only diagnostic ran two cold cohorts on the long shapes before 
 
 ## W3 wide-verify diagnostic
 
-A W3-shaped diagnostic ran one candidate binary with the two-rank wide verifier enabled and disabled. The wide verifier combines eight greedy lanes into one forty-row round. Worst-lane end-to-end time fell from 7039.4 ms to 6573.9 ms; median per-output time fell from 5.171 ms to 4.925 ms. Both arms produced identical outputs. This single-cohort diagnostic is not a paired campaign measurement. Evidence: `artifacts/tp2-w3-throughput-dev/bench/w3_wide_verify_evidence.json`.
+One W3-shaped cohort tested the same binary with and without wide verification. Eight greedy lanes formed forty-row rounds. Worst-lane makespan fell from 7039.4 to 6573.9 ms. Median time per output fell from 5.171 to 4.925 ms. Outputs matched. See `artifacts/tp2-w3-throughput-dev/bench/w3_wide_verify_evidence.json`.
+
+The proposed [W3 shared-KV route](../singleton-gqa-decode.md#tensor-core-reads-across-long-k4-packets) covers first positions 8,191–10,235 for eight complete five-row groups with 12Q/2KV per rank. Its [operator probe](../singleton-gqa-decode.md#w3-shared-kv-operator-probe) measured 35–39% lower stream time. Candidate W3 makespan awaits measurement.
 
 ## Two-rank wide verification
 

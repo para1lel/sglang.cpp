@@ -52,6 +52,12 @@ __host__ __device__ inline int split_count(int position) {
     return splits < max_splits ? splits : max_splits;
 }
 
+inline bool supports_eager_wide_split(int position) {
+    constexpr int max_average_chunks_per_split = 10;
+    const int chunks = position / split_chunk_tokens + 1;
+    return chunks <= max_average_chunks_per_split * split_count(position);
+}
+
 __host__ __device__ inline bool readable(const decoder::PagedDecodeLane& lane) {
     const int last_page = lane.position / mxfp8_page_size;
     return lane.position >= 0 && lane.position < text_attention_max_tokens &&

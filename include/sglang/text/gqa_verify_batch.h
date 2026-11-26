@@ -187,6 +187,23 @@ inline int collect_long_verify_sequences(const VerificationRow* rows, int count,
     return sequence_count;
 }
 
+inline constexpr int rank_batch_min_position = 8191;
+
+inline bool is_rank_long_verify_batch(const VerificationRow* rows, int count, int cache_index,
+    const std::array<LongVerifySequence, gqa_decode::long_requests>& sequences,
+    int sequence_count) {
+    return count == wide_mtp_rows && sequence_count == wide_mtp_lanes &&
+        std::all_of(sequences.begin(), sequences.begin() + sequence_count,
+                    [&](const LongVerifySequence& sequence) {
+        const auto& first = rows[sequence.indices[0]];
+        return sequence.count == gqa_decode::long_rows &&
+               first.position >= rank_batch_min_position &&
+               gqa_decode::supports_eager_wide_split(
+                   rows[sequence.indices[gqa_decode::long_rows - 1]].position) &&
+               first.request->caches[cache_index].kv_heads == gqa_rank_geometry.kv_heads;
+    });
+}
+
 template <typename Remainder>
 bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int count,
                          int cache_index, bool vector_attention, int split_end,
@@ -199,6 +216,9 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
 
     std::array<LongVerifySequence, long_requests> sequences;
     const int sequence_count = collect_long_verify_sequences(rows, count, sequences);
+    const bool rank_batch = is_rank_long_verify_batch(rows, count, cache_index, sequences,
+                                                     sequence_count);
+    const int minimum_position = rank_batch ? rank_batch_min_position : long_min_position;
 
     LongBatch read{};
     std::array<bool, max_wide_mtp_rows> selected{};
@@ -208,7 +228,7 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
         const auto& sequence = sequences[lane];
         int begin = 0;
         while (begin < sequence.count &&
-               rows[sequence.indices[begin]].position < long_min_position) ++begin;
+               rows[sequence.indices[begin]].position < minimum_position) ++begin;
         if (begin == sequence.count) continue;
         const auto& seed = rows[sequence.indices[begin]];
         auto& request = read.requests[requests];
@@ -229,7 +249,7 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
         for (int i = begin; i < sequence.count; ++i) selected[sequence.indices[i]] = true;
         selected_count += request.count;
     }
-    if (!requests) return false;
+    if (!requests || (rank_batch && selected_count != count)) return false;
 
     const auto& geometry_cache = rows[0].request->caches[cache_index];
     const GqaGeometry geometry{gqa_query_heads(geometry_cache.kv_heads),

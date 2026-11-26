@@ -81,15 +81,21 @@ __device__ void issue_page_values(StagedPageTile& tile, int chunk) {
     if (cute::elect_one_sync()) tmem_commit(tmem_smem(&tile.output_ready[stage]));
 }
 
+template <bool ScoreLookahead>
 __device__ void issue_page_mmas(StagedPageTile& tile, int chunks) {
     issue_page_scores(tile, 0);
     for (int chunk = 0; chunk < chunks; ++chunk) {
         const int stage = chunk & 1;
         const Word phase = (chunk >> 1) & 1;
+        if constexpr (ScoreLookahead) {
+            if (stage == 0 && chunk + 2 < chunks) issue_page_scores(tile, (chunk >> 1) + 1);
+        }
         tmem_copy_wait(tmem_smem(&tile.value_ready[stage]), phase);
         tmem_mma_wait(tmem_smem(&tile.probability_ready[stage]), phase);
         issue_page_values(tile, chunk);
-        if (stage == 0 && chunk + 2 < chunks) issue_page_scores(tile, (chunk >> 1) + 1);
+        if constexpr (!ScoreLookahead) {
+            if (stage == 0 && chunk + 2 < chunks) issue_page_scores(tile, (chunk >> 1) + 1);
+        }
     }
 }
 
@@ -128,7 +134,7 @@ __device__ void staged_page_softmax(StagedPageTile& tile, const Attention& reque
     tmem_store_output<true>(row_address, state, request, row, head, active_rows);
 }
 
-template <int Count>
+template <int Count, bool ScoreLookahead = false>
 __global__ __launch_bounds__(256, 1) void tmem_staged_page_attention(
     const __grid_constant__ StagedRequests<Count> requests,
     const __grid_constant__ StagedPairMaps maps, const int* invalid) {
@@ -172,7 +178,7 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_page_attention(
         single_stage<false>(tile, maps, invalid, page_base, head / ratio,
                             request.cache.kv_heads, end);
     } else if (warp == 6) {
-        issue_page_mmas(tile, chunks);
+        issue_page_mmas<ScoreLookahead>(tile, chunks);
     }
     __syncthreads();
     if (warp == 0) {

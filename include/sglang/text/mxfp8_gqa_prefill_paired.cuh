@@ -638,18 +638,25 @@ namespace {
 
 constexpr int staged_causal_group_rows = 4 * flash_chunk;
 constexpr int staged_causal_early_context = 32768;
+constexpr int staged_rank_page_min_position = 8192 - staged_causal_group_rows;
 
-template <int Count>
+template <int Count, bool CausalGroup>
 std::optional<cudaError_t> prepare_long_page(const StagedRequests<Count>& requests,
                                             std::uint16_t* keys, std::uint16_t* values,
                                             int total_pages, StagedPairMaps& maps,
-                                            cudaLaunchConfig_t& config) {
+                                            const void*& selected, cudaLaunchConfig_t& config) {
     for (const auto& request : requests.items) {
         if (reinterpret_cast<std::uintptr_t>(request.output) % alignof(uint4) != 0) {
             return std::nullopt;
         }
     }
-    const auto kernel = reinterpret_cast<const void*>(tmem_staged_page_attention<Count>);
+    const int kv_heads = requests.items[0].cache.kv_heads;
+    auto kernel = reinterpret_cast<const void*>(tmem_staged_page_attention<Count>);
+    if constexpr (CausalGroup) {
+        if (kv_heads == gqa_rank_geometry.kv_heads) {
+            kernel = reinterpret_cast<const void*>(tmem_staged_page_attention<Count, true>);
+        }
+    }
     auto local = config;
     local.blockDim.x = staged_compact_threads;
     local.dynamicSmemBytes = sizeof(StagedPageTile);
@@ -657,11 +664,20 @@ std::optional<cudaError_t> prepare_long_page(const StagedRequests<Count>& reques
     if (const auto status = consume_prefill_submission(prepared.value_or(cudaSuccess));
         status != cudaSuccess) return status;
     if (!prepared) return std::nullopt;
-    const auto encoded = encode_staged_maps(total_pages, requests.items[0].cache.kv_heads,
-                                            keys, values, maps, true, true, true);
+    const auto encoded = encode_staged_maps(total_pages, kv_heads, keys, values, maps,
+                                            true, true, true);
     if (const auto status = consume_prefill_submission(encoded.value_or(cudaSuccess));
-        status != cudaSuccess) return status;
-    if (encoded) config = local;
+        status != cudaSuccess) {
+        const bool early_causal_group = CausalGroup &&
+            requests.items[0].position <= staged_causal_early_context - staged_causal_group_rows;
+        if (early_causal_group && encoded == cudaErrorMemoryAllocation &&
+            status == cudaErrorMemoryAllocation) return std::nullopt;
+        return status;
+    }
+    if (encoded) {
+        selected = kernel;
+        config = local;
+    }
     return encoded;
 }
 
@@ -720,12 +736,10 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
         }
     }
     if constexpr (LongPage) {
-        const auto prepared = prepare_long_page(requests, keys, values, total_pages, maps, config);
+        const auto prepared = prepare_long_page<Count, CausalGroup>(
+            requests, keys, values, total_pages, maps, kernel, config);
         if (prepared && *prepared != cudaSuccess) return prepared;
-        if (prepared) {
-            kernel = reinterpret_cast<const void*>(tmem_staged_page_attention<Count>);
-            single = true;
-        }
+        single = prepared.has_value();
     }
     if constexpr (Partial || CausalGroup) {
         if (!single) return std::nullopt;
@@ -862,9 +876,16 @@ std::optional<cudaError_t> launch_staged_tmem_prefill(
 std::optional<cudaError_t> launch_causal_group_staged_tmem_prefill(
     const decoder::PagedPrefillSequence& sequence, cudaStream_t stream,
     decoder::PairedPrefillScratch scratch) {
-    const auto status = sequence.position <= staged_causal_early_context - staged_causal_group_rows
-        ? launch_staged_requests<1, false, true>(&sequence, stream, scratch)
-        : launch_staged_requests<1, false, true, true>(&sequence, stream, scratch);
+    constexpr int last_single_position = staged_causal_early_context - staged_causal_group_rows;
+    if (sequence.position > last_single_position ||
+        (sequence.cache.kv_heads == gqa_rank_geometry.kv_heads &&
+         sequence.position >= staged_rank_page_min_position)) {
+        const auto status = launch_staged_requests<1, false, true, true>(
+            &sequence, stream, scratch);
+        if (status) return consume_prefill_submission(*status);
+        if (sequence.position > last_single_position) return std::nullopt;
+    }
+    const auto status = launch_staged_requests<1, false, true>(&sequence, stream, scratch);
     if (status && *status != cudaSuccess) return consume_prefill_submission(*status);
     return status;
 }

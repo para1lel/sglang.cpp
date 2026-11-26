@@ -46,4 +46,4 @@ for readiness. Native omits upstream token-pool, throughput, utilization,
 cache-hit-rate, memory, speculation, adapter, and disaggregation measures
 that this endpoint cannot derive with the same definitions. Prefix cache
 metrics remain available separately through [`/metrics`](../prefix-cache.md#native-http-controls).
-[Queue snapshot](../../apps/server/prefix_controls.cpp#L655)<!-- prefix: "const LoadSn" --> · [CUDA device properties](../../src/runtime/backend/cuda_backend_policy.cpp#L39)<!-- prefix: "check(cudaGe" -->
+[Queue snapshot](../../apps/server/prefix_controls.cpp#L655)<!-- prefix: "const LoadSn" --> · [CUDA device properties](../../src/runtime/backend/cuda_backend_policy.cpp#L40)<!-- prefix: "check(cudaGe" -->

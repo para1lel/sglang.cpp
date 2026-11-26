@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 extern "C" int vendor_aot_entry(void* handle, const TVMFFIAny* args, int32_t num_args,
                                 TVMFFIAny* result)
@@ -459,16 +460,41 @@ cudaError_t gdn_vendor_prefill_run(int rows, const Bf16* qkv, const Bf16* z, con
 
 }
 
-bool gdn_vendor_prefill_enabled() {
-    static const bool enabled = [] {
+bool gdn_vendor_prefill_requested() {
+    static const bool requested = [] {
         const char* mode = std::getenv("SGLANG_GDN_VENDOR_PREFILL");
         return mode != nullptr && mode[0] == '1' && mode[1] == '\0';
     }();
-    if (!enabled) {
+    return requested;
+}
+
+bool gdn_vendor_prefill_enabled() {
+    if (!gdn_vendor_prefill_requested()) {
         return false;
     }
     int device = 0;
     return cudaGetDevice(&device) == cudaSuccess && vendor_device_supported(device);
+}
+
+std::string gdn_vendor_prefill_identity_tag(const int* devices, int count) {
+    if (!gdn_vendor_prefill_requested() || devices == nullptr || count <= 0) {
+        return {};
+    }
+    std::string mask(static_cast<std::size_t>(count), '0');
+    bool supported = false;
+    for (int index = 0; index < count; ++index) {
+        if (devices[index] >= 0 && vendor_device_supported(devices[index])) {
+            mask[static_cast<std::size_t>(index)] = '1';
+            supported = true;
+        }
+    }
+    if (!supported) {
+        return {};
+    }
+    std::string tag = "\ngdn-recurrence-vendor-v1 mask=";
+    tag += mask;
+    tag += '\n';
+    return tag;
 }
 
 bool gdn_vendor_prefill_eligible_rows(int rows) {

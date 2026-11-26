@@ -51,15 +51,15 @@ If any of the four starts at position zero, bank zero uses the existing per-gran
 
 ## Vendor prefill opt-in
 
-An optional vendor kernel serves rank-local GDN prefill. Set `SGLANG_GDN_VENDOR_PREFILL` to exactly `1`; any other value keeps the native path. The flag is read once per process. [Opt-in check](../src/runtime/backend/gdn_vendor_prefill.cu#L462)<!-- prefix: "bool gdn_ven" -->
+An optional vendor kernel serves rank-local GDN prefill. Set `SGLANG_GDN_VENDOR_PREFILL` to exactly `1`; any other value keeps the native path. The flag is read once per process. [Opt-in check](../src/runtime/backend/gdn_vendor_prefill.cu#L463)<!-- prefix: "bool gdn_ven" -->
 
-The device must report compute capability 10.0 with 148 streaming multiprocessors, cached per device. [Device support](../src/runtime/backend/gdn_vendor_prefill.cu#L37)<!-- prefix: "bool vendor_" -->
+The device must report compute capability 10.0 with 148 streaming multiprocessors, cached per device. [Device support](../src/runtime/backend/gdn_vendor_prefill.cu#L38)<!-- prefix: "bool vendor_" -->
 
-Eligible calls carry positive row counts up to 262,144, in multiples of four. Local GDN layers route BF16 and FP8 advances, grouped segments, and coalesced partial-grant runs through the vendor kernel. [Eligibility](../src/runtime/backend/gdn_vendor_prefill.cu#L474)<!-- prefix: "bool gdn_ven" --> · [FP8 advance](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L278)<!-- prefix: "if (quantize" --> · [Grouped segments](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L658)<!-- prefix: "if (dims.is_" --> · [Partial runs](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L762)<!-- prefix: "chunk.tensor" -->
+Eligible calls carry positive row counts up to 262,144, in multiples of four. Local GDN layers route BF16 and FP8 advances, grouped segments, and coalesced partial-grant runs through the vendor kernel. [Eligibility](../src/runtime/backend/gdn_vendor_prefill.cu#L500)<!-- prefix: "bool gdn_ven" --> · [FP8 advance](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L278)<!-- prefix: "if (quantize" --> · [Grouped segments](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L658)<!-- prefix: "if (dims.is_" --> · [Partial runs](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L762)<!-- prefix: "chunk.tensor" -->
 
-The workspace reserves the larger of the native and vendor layouts, independent of the runtime flag. Toggling the environment variable needs no rebuild. [Workspace sizing](../src/runtime/backend/gdn_vendor_prefill.cu#L479)<!-- prefix: "std::size_t " -->
+The workspace reserves the larger of the native and vendor layouts, independent of the runtime flag. Toggling the environment variable needs no rebuild. [Workspace sizing](../src/runtime/backend/gdn_vendor_prefill.cu#L505)<!-- prefix: "std::size_t " -->
 
-Builds without the vendor archive compile the same interfaces as stubs. Stubs report disabled and not-supported, leaving dispatch native. [No-asset stubs](../include/sglang/runtime/backend/gdn_vendor_prefill.h#L39)<!-- prefix: "inline bool " -->
+Builds without the vendor archive compile the same interfaces as stubs. Stubs report disabled and not-supported, leaving dispatch native. [No-asset stubs](../include/sglang/runtime/backend/gdn_vendor_prefill.h#L46)<!-- prefix: "inline bool " -->
 
 Qualification compared matched-layer BF16 outputs against the pinned vLLM/FlashInfer reference. The vendor kernel was closer on all twelve matched outputs. Native was closer on the one 248,320-entry complete-vocabulary row. No blanket parity or speed claim is made.
 

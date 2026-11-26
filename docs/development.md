@@ -5,7 +5,7 @@ The supported deployment uses one physical NVIDIA B200 and the Qwen3.8-27B-FP8 c
 <a id="scope-at-adoption"></a>
 ## Current architecture and scope
 
-The CUDA backend accepts `sm_100` devices. The exact `NVIDIA B200` name enables the B200 operator set. Project headers belong in `include/sglang/`. [Device resolution](../src/runtime/backend/cuda_backend_policy.cpp#L13)<!-- prefix: "CudaBackendP" --> · [Repository rules](../AGENTS.md)
+The CUDA backend accepts `sm_100` devices. The exact `NVIDIA B200` name enables the B200 operator set. Project headers belong in `include/sglang/`. [Device resolution](../src/runtime/backend/cuda_backend_policy.cpp#L14)<!-- prefix: "CudaBackendP" --> · [Repository rules](../AGENTS.md)
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
@@ -129,7 +129,7 @@ Run the [prefill checks](../tests/prefill/README.md). Compare exact scoring and 
 
 Use `--max-active` for the 1–32 HTTP lane limit and `--max-num-batched-tokens` for the 1–32,768 aggregate step budget. Verify the effective values at `/health` and the resolved graph and MTP settings at `/server_info`. See the transport guide for admission, overload, readiness, and shutdown. [CLI limits](../apps/sglang-server.cpp#L180)<!-- prefix: "} else if (o" --> · [HTTP transport](http-server.md) · [Server information](native-model-info.md#server-information)
 
-Server startup selects the Qwen serving profile and passes a single-device executor to `BatchService`. The executor creates and destroys `DecoderBatch` on its worker thread. Startup waits for the first cache snapshot and propagates initialization failures. On shutdown the service marks the queue closed and wakes the worker before joining. [Composition](../apps/sglang-server.cpp#L382)<!-- prefix: "auto executo" --> · [Executor lifecycle](../src/runtime/server/single_device_batch_executor.cpp#L81)<!-- prefix: "void SingleD" --> · [Startup handshake](../apps/server/batch_service.cpp#L47)<!-- prefix: "void BatchSe" --> · [Shutdown](../apps/server/batch_service.cpp#L59)<!-- prefix: "BatchService" -->
+Server startup selects the Qwen serving profile and passes a single-device executor to `BatchService`. The executor creates and destroys `DecoderBatch` on its worker thread. Startup waits for the first cache snapshot and propagates initialization failures. On shutdown the service marks the queue closed and wakes the worker before joining. [Composition](../apps/sglang-server.cpp#L356)<!-- prefix: "auto executo" --> · [Executor lifecycle](../src/runtime/server/single_device_batch_executor.cpp#L81)<!-- prefix: "void SingleD" --> · [Startup handshake](../apps/server/batch_service.cpp#L47)<!-- prefix: "void BatchSe" --> · [Shutdown](../apps/server/batch_service.cpp#L59)<!-- prefix: "BatchService" -->
 
 The scheduler uses the session for admission, cancellation, and whole batch steps. The [batch planner](batch-graphs.md#runtime-path) allocates rows. Operator dispatch runs within each planned step. Lanes share device weights and own request KV, GDN state, and output. The [resident-memory limit](batch-graphs.md#resident-memory-admission) applies separately from row and lane limits. [Scheduler loop](../apps/server/batch_service.cpp#L333)<!-- prefix: "void BatchSe" -->
 

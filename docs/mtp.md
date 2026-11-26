@@ -7,7 +7,7 @@ target model. It supports greedy decoding and sampling.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L57)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L436)<!-- prefix: "BatchService" --> |
+| Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L57)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L417)<!-- prefix: "BatchService" --> |
 | MTP round | Draft proposals and commit target outputs in order. | [Proposals](../src/decoder_verify.cpp#L155)<!-- prefix: "bool MtpRoun" --> · [Commit](../src/decoder_verify.cpp#L277)<!-- prefix: "bool MtpRoun" --> |
 | Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_verify.cpp#L882)<!-- prefix: "bool Decoder" --> · [State commit](../src/decoder_verify.cpp#L464)<!-- prefix: "void TargetV" --> |
 

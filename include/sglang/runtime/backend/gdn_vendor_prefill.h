@@ -4,8 +4,15 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
+#include <string>
 
 #include "sglang/text/gdn_local.h"
+
+namespace sglang::decoder {
+
+std::string gdn_vendor_prefill_identity_tag(const int* devices, int count);
+
+}
 
 #if defined(SGLANG_GDN_VENDOR) && SGLANG_GDN_VENDOR
 

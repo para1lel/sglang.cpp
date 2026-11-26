@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| CUDA backend policy | Chooses the B200 split-KV policy or the generic SM100 path. | [Device policy](../src/runtime/backend/cuda_backend_policy.cpp#L17)<!-- prefix: "const bool b" --> |
+| CUDA backend policy | Chooses the B200 split-KV policy or the generic SM100 path. | [Device policy](../src/runtime/backend/cuda_backend_policy.cpp#L18)<!-- prefix: "const bool b" --> |
 | Batch executor | Selects direct decode lanes, binds scores and request state, and owns graph and scratch lifetimes. | [Batch selection](../src/decoder_batch.cpp#L354)<!-- prefix: "run = run_de" --> · [Graph dispatch](../src/text/decoder_graph.cpp#L83)<!-- prefix: "DecodeRun ru" --> · [Score allocation](../src/runtime/backend/cuda_resources.cpp#L509)<!-- prefix: "ExactGqaWork" --> |
 | Target attention | Appends KV, reads each row's causal prefix, and gates the attention output before projection. | [Eager attention](../include/sglang/runtime/execution/decoder_forward_layers.h#L810)<!-- prefix: "if (batch.ta" --> · [Bound singleton](../include/sglang/runtime/execution/decoder_forward_layers.h#L686)<!-- prefix: "if (batch.ta" --> · [Bound verification](../include/sglang/runtime/execution/decoder_forward_layers.h#L706)<!-- prefix: "inline void " --> |
 

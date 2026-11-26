@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Resolve graph policy and pass the single-device executor to the batch service. | [Effective policy](../apps/sglang-server.cpp#L59)<!-- prefix: "bool enable_" --> · [Startup composition](../apps/sglang-server.cpp#L382)<!-- prefix: "auto executo" --> · [Trace](../include/sglang/server/batch_trace.h#L70)<!-- prefix: "inline void " --> |
+| Server | Resolve graph policy and pass the single-device executor to the batch service. | [Effective policy](../apps/sglang-server.cpp#L59)<!-- prefix: "bool enable_" --> · [Startup composition](../apps/sglang-server.cpp#L356)<!-- prefix: "auto executo" --> · [Trace](../include/sglang/server/batch_trace.h#L70)<!-- prefix: "inline void " --> |
 | Decoder batch | Select eligible decode steps, bind lane state, and return winners by slot. | [Batch options](../include/sglang/decoder_batch.h#L65)<!-- prefix: "struct Decod" --> · [Dispatch](../src/decoder_batch.cpp#L354)<!-- prefix: "run = run_de" --> · [Readback](../src/decoder_batch.cpp#L427)<!-- prefix: "void Decoder" --> |
 | CUDA resources | Recover from eligible pre-submission failures and retain resources while completion is uncertain. | [Fallback](../src/runtime/backend/cuda_resources.cpp#L553)<!-- prefix: "bool Allocat" --> · [Cleanup](../src/runtime/backend/cuda_resources.cpp#L247)<!-- prefix: "CleanupError" --> |
 

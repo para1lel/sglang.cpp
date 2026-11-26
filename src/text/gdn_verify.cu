@@ -1,6 +1,6 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/runtime/backend/cuda_resources.h"
-#include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/quantization/quantize_warp.cuh"
 #include "sglang/text/gdn_local.h"
 
 #include <cuda_runtime.h>

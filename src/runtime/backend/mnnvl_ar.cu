@@ -1,8 +1,11 @@
 #include "sglang/runtime/backend/mnnvl_ar.h"
+#include "sglang/runtime/backend/mnnvl_rms_quantize.h"
+#include "sglang/text/quantization/rms_quantize.cuh"
 
 #include <cuda.h>
 
 #include <flashinfer/comm/trtllm_mnnvl_allreduce.cuh>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 
@@ -83,12 +86,99 @@ void require_cu(CUresult status, const char* what) {
     }
 }
 
+using namespace text_kernel;
+
+namespace transport = flashinfer::trtllm_mnnvl_allreduce::utils;
+using PackedBf16 = transport::PackedVec<float4, Bf16>;
+constexpr int reduce_rows = MnnvlRmsQuantizeRows::size;
+static_assert(kTokenDim == rms_hidden_width);
+constexpr int packs_per_row = kTokenDim / 8;
+constexpr int packs_per_thread = (packs_per_row + block_threads - 1) / block_threads;
+
+struct ReduceNorm {
+    Bf16* branch;
+    const Bf16* gain;
+    void** rank_buffers;
+    void* multicast;
+    std::uint32_t* flags;
+    MnnvlRmsQuantizeRows rows;
+};
+
+template <int Rank>
+__global__ __launch_bounds__(block_threads) void reduce_norm_m10(
+    const __grid_constant__ ReduceNorm params) {
+    const int row = blockIdx.x;
+    const auto& output = params.rows.entries[row];
+    auto* branch = params.branch + row * kTokenDim;
+    __shared__ alignas(16) Bf16 branch_values[kTokenDim];
+    __shared__ alignas(16) Bf16 residual_values[kTokenDim];
+    __shared__ alignas(16) Bf16 gains[kTokenDim];
+
+    transport::LamportFlags<float4, false> flags(params.flags, 1);
+    auto* const multicast = static_cast<float4*>(flags.getCurLamportBuf(params.multicast));
+    auto* const local = static_cast<Bf16*>(flags.getCurLamportBuf(params.rank_buffers[Rank]));
+    PackedBf16 values[packs_per_thread];
+#pragma unroll
+    for (int index = 0; index < packs_per_thread; ++index) {
+        const int packed = threadIdx.x + index * block_threads;
+        if (packed < packs_per_row) {
+            auto& value = values[index];
+            value.packed = transport::loadPacked<float4>(branch + packed * 8);
+            transport::sanitizeLamportPayload(value);
+            multicast[(row * kRanks + Rank) * packs_per_row + packed] = value.packed;
+            stage_rms_vector_async(output.residual + packed * 8, residual_values + packed * 8);
+            stage_rms_vector_async(params.gain + packed * 8, gains + packed * 8);
+        }
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    flags.ctaArrive();
+    flags.clearDirtyLamportBuf(params.rank_buffers[Rank], -1);
+#pragma unroll
+    for (int index = 0; index < packs_per_thread; ++index) {
+        const int packed = threadIdx.x + index * block_threads;
+        if (packed < packs_per_row) {
+            PackedBf16 remote[2];
+            transport::waitOneshotRemoteRanks<2, Rank, Bf16, float4, 8>(
+                remote, local, row, kTokenDim, packed);
+            const auto reduced = transport::reduceOneshotDeterministic<2, Rank, Bf16, float4, 8>(
+                remote, values[index]);
+            reinterpret_cast<float4*>(branch)[packed] = reduced.packed;
+            reinterpret_cast<float4*>(branch_values)[packed] = reduced.packed;
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    rms_quantize_staged<true, true>(branch_values, residual_values, gains, output.residual,
+                                    output.normalized, output.activation);
+    flags.waitAndUpdate({reduce_rows * kTokenDim * kRanks * sizeof(Bf16), 0, 0, 0});
+}
+
+constexpr auto reduce_kernels = std::array{reduce_norm_m10<0>, reduce_norm_m10<1>};
+
+bool reduce_norm_ready(int device, int rank) {
+    cudaFuncAttributes attributes{};
+    int resident = 0;
+    int multiprocessors = 0;
+    const auto kernel = reduce_kernels[rank];
+    if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess ||
+        attributes.maxThreadsPerBlock < block_threads ||
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, block_threads, 0) !=
+            cudaSuccess ||
+        cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device) !=
+            cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return resident * multiprocessors >= reduce_rows;
+}
+
 }   
 
 struct MnnvlAllReduce::State {
     std::vector<int> devices;   
     bool failed = false;
     bool twoshot_supported = false;
+    bool reduce_norm_supported = true;
 
     CUmemGenericAllocationHandle physical[kRanks]{};
     CUmemGenericAllocationHandle multicast{};
@@ -359,6 +449,7 @@ void MnnvlAllReduce::init_lamport(State& state) {
                                      cudaGetErrorString(status));
         }
         state.twoshot_supported = state.twoshot_supported && twoshot_grid_fits(state.devices[r]);
+        state.reduce_norm_supported &= reduce_norm_ready(state.devices[r], r);
     }
 }
 
@@ -406,8 +497,8 @@ std::unique_ptr<MnnvlAllReduce> MnnvlAllReduce::create(std::vector<int> devices)
     return std::unique_ptr<MnnvlAllReduce>(new MnnvlAllReduce(std::move(state)));
 }
 
-void MnnvlAllReduce::preflight(State& state, __nv_bfloat16* const buffers[],
-                               const cudaStream_t streams[], bool two_shot) {
+cudaStreamCaptureStatus MnnvlAllReduce::preflight(State& state, __nv_bfloat16* const buffers[],
+                                                  const cudaStream_t streams[], bool two_shot) {
     cudaStreamCaptureStatus capture_status[kRanks];
     for (int r = 0; r < kRanks; ++r) {
         int stream_device = -1;
@@ -453,6 +544,7 @@ void MnnvlAllReduce::preflight(State& state, __nv_bfloat16* const buffers[],
     if (two_shot && capture_status[0] != cudaStreamCaptureStatusNone) {
         throw std::invalid_argument("The two-shot MNNVL allreduce requires eager streams.");
     }
+    return capture_status[0];
 }
 
 void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
@@ -518,6 +610,53 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
                                r > 0);
         }
     }
+}
+
+bool MnnvlAllReduce::try_allreduce_rms_quantize_m10(
+    Bf16* const buffers[], const cudaStream_t streams[],
+    const MnnvlRmsQuantizeRows rows[], const Bf16* const gains[]) {
+    constexpr std::size_t count = reduce_rows * kTokenDim;
+    if (!state_->reduce_norm_supported || count > state_->max_elements) return false;
+    for (int rank = 0; rank < kRanks; ++rank) {
+        if (!buffers[rank] || !streams[rank] || !gains[rank] ||
+            !aligned(buffers[rank], sizeof(float4)) || !aligned(gains[rank], sizeof(float4))) {
+            return false;
+        }
+        for (const auto& row : rows[rank].entries) {
+            if (!row.residual || !row.normalized || !row.activation.values ||
+                !row.activation.scales ||
+                !aligned(row.residual, sizeof(float4)) || !aligned(row.normalized, alignof(Bf16)) ||
+                !aligned(row.activation.values, alignof(uint2)) ||
+                !aligned(row.activation.scales, alignof(float))) {
+                return false;
+            }
+        }
+    }
+    ensure_healthy();
+    if (preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone) return false;
+
+    ReduceNorm launch[kRanks];
+    for (int rank = 0; rank < kRanks; ++rank) {
+        launch[rank] = {buffers[rank], gains[rank], state_->ptrs_dev[rank],
+                        reinterpret_cast<void*>(state_->mc_va), state_->flags[rank], rows[rank]};
+    }
+
+    CallerDevice device_scope;
+    for (int rank = 0; rank < kRanks; ++rank) {
+        cudaError_t status = cudaSetDevice(state_->devices[rank]);
+        if (status == cudaSuccess) {
+            void* args[]{&launch[rank]};
+            status = cudaLaunchKernel(reduce_kernels[rank], reduce_rows, block_threads, args, 0,
+                                      streams[rank]);
+        }
+        if (status != cudaSuccess) {
+            state_->failed = true;
+            throw MnnvlArError(
+                std::string("Enqueue the MNNVL BF16 reduction and RMS quantization: ") +
+                    cudaGetErrorString(status), rank > 0);
+        }
+    }
+    return true;
 }
 
 }   

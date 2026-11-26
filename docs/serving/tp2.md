@@ -1,19 +1,19 @@
 # TP2 serving status and acceptance target
 
-Tensor parallelism 2 is implemented for eager serving. Launch with `--tp 2`; the option accepts 1 or 2. [TP option](../../apps/sglang-server.cpp#L169)<!-- prefix: "} else if (o" --> Decode runs eager under tensor parallel: batch CUDA graphs stay TP1-only. [Graph policy](../../apps/sglang-server.cpp#L59)<!-- prefix: "bool enable_" --> TP1 keeps the single-device default topology. [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> The historical `benchmarks/paired` launcher supports one GPU. [Launcher limit](../../benchmarks/paired/README.md#L71)<!-- prefix: "the number o" --> `benchmarks/tp2/run.sh` is the separate two-B200 campaign entry point.
+TP2 serving uses eager decode. `--tp` accepts 1 or 2 and defaults to 1. Batch CUDA graphs are TP1-only. The `benchmarks/paired` launcher supports one GPU. Use `benchmarks/tp2/run.sh` for two-B200 campaigns. [TP option](../../apps/sglang-server.cpp#L169)<!-- prefix: "} else if (o" --> · [Graph policy](../../apps/sglang-server.cpp#L59)<!-- prefix: "bool enable_" --> · [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> · [Launcher limit](../../benchmarks/paired/README.md#L71)<!-- prefix: "the number o" -->
 
-With LMCache enabled, TP2 requires rank device receipts from the loaded topology. The server derives one daemon endpoint per rank from the base socket path. [Rank endpoints](../../include/sglang/runtime/cache/lmcache_client.h#L58)<!-- prefix: "std::string " --> Each rank owns a private namespace and daemon. [Ranked transport](lmcache.md#ranked-tp2-transport)
+TP2 with LMCache requires rank device receipts. The server derives one endpoint per rank from the base socket path. Each rank uses a private namespace and daemon. [Rank endpoints](../../include/sglang/runtime/cache/lmcache_client.h#L58)<!-- prefix: "std::string " --> · [Ranked transport](lmcache.md#ranked-tp2-transport)
 
-A two-rank run is recorded under `artifacts/tp2-review/serving/cache-2328/complete/cache/`. The server reported `tp_size` 2 with `dp_size` 1 and `pp_size` 1, MTP4, and ranked LMCache active. [Server information](../native-model-info.md#server-information) The topology runs two rank-local target workers with a rank0-only full MTP draft; the receipts below carry draft bytes only on rank 0.
+The run at `artifacts/tp2-review/serving/cache-2328/complete/cache/` reported TP2, DP1, PP1, MTP4, and ranked LMCache. Each rank runs a target worker. Rank 0 alone owns the full MTP draft and its cache bytes. [Server information](../native-model-info.md#server-information)
 
-The run exercised cold, warm, one-sided eviction, and a longer tail on one 18-token input.
+The run used one 18-token input and a longer extension.
 
-- **Cold.** The first request missed. Both ranks stored the 13-token prefix: rank 0 wrote 219,648 GQA bytes, 76,992,512 GDN bytes, and 25,344 draft bytes; rank 1 wrote the same GQA and GDN bytes and no draft bytes. Both receipts count 13 stored tokens.
-- **Warm.** The repeated request restored the same prefix. The joint GET returned the stored bytes on both ranks: 219,648 and 76,992,512 per rank, draft only on rank 0.
-- **One-sided eviction.** After rank 1 lost its records, the same request ran cold again. A prefix restores only when both ranks hold the same GDN endpoint.
+- **Cold.** After a miss, both ranks stored 13 tokens, writing 219,648 GQA and 76,992,512 GDN bytes each. Rank 0 also wrote 25,344 draft bytes.
+- **Warm.** The joint GET restored the same prefix and byte counts.
+- **One-sided eviction.** Evicting rank 1 forced a cold run. Restore needs the same GDN endpoint on both ranks.
 - **Longer tail.** A 25-token extension restored 422,400 GQA bytes and 76,992,512 GDN bytes per rank, with 50,688 draft bytes on rank 0.
 
-The raw receipts are `rank-receipts.json`; the counters are `metrics.json` in the same directory. Per-family byte counts follow the ranked geometry: 16,896 target bytes per token per rank and full-width draft bytes on rank 0 only.
+See `rank-receipts.json` and `metrics.json` in that directory. Each token uses 16,896 target bytes per rank, with full-width draft storage on rank 0.
 
 ## Campaign record
 
@@ -34,22 +34,22 @@ The current campaign measured all five rows on one release, `168fdb1a`, against 
 
 ## W4 wide-verification release
 
-An isolated sixteen-lane build with rank-local packed activation staging ran one cold attribution against its eight-lane control on the full W4 shape, sixteen 32768-token prompts to 4096 outputs. Charged makespan fell from 50.815826650 s to 38.788724911 s, 23.67 percent shorter. All-lane overlap throughput rose from 2026.02 to 3564.05 tokens per second. From the last lane's first token to final `[DONE]`, the span fell from 32.323245 s to 18.781068 s; from earliest submission to the last lane's first token, the span rose from 18.492582 s to 20.007657 s. The named W4 row above records this release. Evidence: `artifacts/tp2-bench/w4-named-1219/ordinary-W4-independent-replay.json` (`c38195a7…`), binaries `ab8a1e45…` control and `425fbffd…` sixteen-lane.
+One cold W4 comparison used sixteen 32,768-token prompts and 4,096 outputs each. Rank-local packed staging with sixteen lanes reduced charged makespan from 50.815826650 s to 38.788724911 s (23.67%) against the eight-lane control. All-lane overlap throughput rose from 2026.02 to 3564.05 tokens/s. Time from earliest submission to latest first token rose from 18.492582 s to 20.007657 s. The remaining span through final `[DONE]` fell from 32.323245 s to 18.781068 s. The named W4 row records this release. See `artifacts/tp2-bench/w4-named-1219/ordinary-W4-independent-replay.json` (`c38195a7…`) and binaries `ab8a1e45…` and `425fbffd…`.
 A paired W3 session (`283cbb84-…`) priced the same candidate lineage. Native median 5119.357970 ms faced a fresh vLLM 4104.882148 ms: ratio 1.2471388423402796, missing the gate by 603.9876072 ms. The eight-lane control measured 6168.325329 ms. The named W3 row above prices the released executable. Evidence: `artifacts/tp2-bench/w3-scratch-final-after-lock-1241/W3-candidate/W3/comparison.json` (`9c4e8c85…`).
 
 ## W1 diagnostic profile
 
 An untimed profile traced both engines after the W1 miss.
 
-- **Cohort.** Two fixed MTP4 requests, five verification rows each, on native TP2 and pinned vLLM. Receipts record eager and batch graphs off. LMCache was available and enabled through the default socket, with one daemon per rank.
+- **Cohort.** Two fixed MTP4 requests on native TP2 and pinned vLLM. Eager and batch graphs were off. LMCache used the default socket and one daemon per rank.
 - **Sampling.** Frozen 128-token W1 prompts generated 24 native or 128 vLLM output tokens per request.
 - **Devices.** Native used B200 devices 1 and 5 and vLLM used 4 and 5. Both pairs used NV18 NVLink.
 - **Width.** One or two active lanes, five verification rows per lane.
-- **Method.** Nsight Systems traced both native GPU timelines in one process. The native target spans first `verify_rms` through last of 128 row sums. The vLLM target CUDA graph includes the embedding reduction and 128 fused reductions. Both spans exclude scoring, rejection sampling, four drafts, and final GDN rollback. Period uses target starts on native and first step kernels on vLLM. PyTorch profiler sampled four steps per rank and width. Native width-two medians use six rounds.
-- **Rank 0 step medians at width two.** Period 18.746 ms native versus 10.237 ms reference. Native target verification interval 13.505 ms versus reference target graph span 8.016 ms. At width one: period 12.498 versus 10.177 ms; rank 0 target 9.828 versus 8.010 ms.
+- **Method.** Nsight Systems traced both native GPU timelines together. The native span starts at `verify_rms` and ends at the 128th sum. The vLLM target graph includes the embedding sum and 128 fused reductions. Both exclude scoring, rejection sampling, four drafts, and final GDN rollback. Period uses native target starts and vLLM first step kernels. PyTorch sampled four steps per rank and width. Native width-two medians cover six rounds.
+- **Rank 0 medians.** At width two, native and reference periods were 18.746 and 10.237 ms, with target spans of 13.505 and 8.016 ms. At width one, periods were 12.498 and 10.177 ms, with target spans of 9.828 and 8.010 ms.
 - **Rank 0 kernel-duration sums inside the target, width two.** FP8 projection 3.529 versus 4.024 ms. GQA attention 2.541 versus 0.451 ms. GDN attention 1.619 versus 1.048 ms. See [M10 projection replay](../long-paged-decode.md#ten-row-tp2-verification-projections).
-- **Reductions.** Cross-rank elapsed sums after the last rank arrives, width two: 1.531 ms native versus 0.753 ms reference across 128 reductions. Both rank clocks contribute; the sum ends at the later completion.
-- **Target head.** The native target head is a full-vocabulary BF16 projection on rank 0, outside the target span: two full-head grid launches, 31040 by one, 1.633 ms per width-2 step. The sharded reference spends 0.181 ms on the vocabulary GEMM plus 0.034 ms on the gather on rank 0, outside its span.
+- **Reductions.** At width two, 128 cross-rank spans sum to 1.531 ms native and 0.753 ms reference. Each span runs from the last arrival to the last completion. See [M10 fusion](#ten-row-verification-reduction-fusion).
+- **Target head.** Outside the target span, native rank 0 spent 1.633 ms per width-two step on two full BF16 vocabulary grids of 31040 by one. Reference rank 0 spent 0.181 ms on sharded GEMM and 0.034 ms on gather.
 - **M10 operator replay.** Rank 0 can use the [M10 certificate](../native-model-info.md#certified-tensor-core-target-head) for two complete eager greedy TP2 K4 lanes. Scored, sampled, constrained, or partial packets keep ordinary scoring. On one B200, four captured W1 packets averaged 577.210 µs direct packed BF16 versus 432.327 µs certified across their host-visible medians, with exact IDs and BF16 scores for all 40 winners. An independent check covered bounds for 14,899,200 BF16 logits and matched 60 winners. Serving latency remains unmeasured. See `artifacts/tp2-resume/short-score/candidate/result.log` and `artifacts/tp2-resume/short-review/run-3.log`.
 - **Evidence.** `artifacts/tp2-bench/native-profile-d0029/` holds the Nsight Systems database, `steps.json`, and `vs-reference.json`. `artifacts/tp2-bench/vllm-profile-0013/` holds `scoring.json`, `reduction-skew.json`, and per-rank traces with `profile.sha256` and `repro.sha256`. The analysis scripts are in `artifacts/tp2-bench/w1-diagnostics/`. The diagnostic native binary is SHA-256 `0acf4c24…`; the first campaign's binary is `fb03d111…`.
 
@@ -65,11 +65,11 @@ The runs below reproduced the W2 divergence under controlled changes in request 
 
 ## W4 readiness diagnostic
 
-A bounded native-only diagnostic ran two cold cohorts on the long shapes before W4 was measured. It was a readiness check only; the W4 campaign row is recorded above.
+Two cold native-only cohorts checked long-shape readiness before the W4 campaign.
 
-- **Shorter shape.** Sixteen lanes with 2048-token prompts and eight outputs each ran twice cold. All sixteen lanes produced identical output IDs across the two cohorts.
-- **Longer shape.** Sixteen lanes with 8192-token prompts and eight outputs each ran twice cold. Two of sixteen lanes differed between the cohorts. The first differing output was 24 to 2015 at offset 1 on one lane and 8156 to 279 at offset 0 on the other.
-- **Cache.** Both ranks acknowledged every store: sixteen per rank on the shorter shape and thirty-two on the longer one. GQA and GDN written bytes are equal across ranks.
+- **Shorter shape.** All sixteen lanes matched across cold cohorts of 2,048-token prompts and eight outputs.
+- **Longer shape.** With 8,192-token prompts and eight outputs, two of sixteen lanes differed. First differences were 24 to 2015 at offset 1 and 8156 to 279 at offset 0.
+- **Cache.** Each rank acknowledged sixteen stores at the shorter shape and thirty-two at the longer shape. GQA and GDN byte counts matched across ranks.
 - **Evidence.** `artifacts/tp2-bench/long-readiness-0257/` (`results.json`, `analysis.log`).
 
 ## W3 wide-verify diagnostic
@@ -82,7 +82,7 @@ The proposed [W3 shared-KV route](../singleton-gqa-decode.md#tensor-core-reads-a
 
 The root owns greedy policy and drafts, and the peer mirrors its rounds. Eligible groups of eight or sixteen draft depth-major when reserves fit (696,320 or 1,392,640 bytes). Eight lanes use 409,600 bytes for live depth scoring. Otherwise drafting stays wave-major. Both ranks preflight mirrored storage, streams, and positions. Only complete greedy groups of eight or sixteen verify together, subject to native width, and score in certified forty-row passes. At sixteen lanes both ranks stage packed activations. Sampled, constrained, partial, and logprob groups keep four-lane packets. Commit can batch [sixteen-row draft repair](../long-paged-decode.md#sixteen-row-tp2-draft-repair). `SGLANG_DISABLE_TP2_WIDE_VERIFY` forces four-lane dispatch. [Wide lane cap](../../include/sglang/runtime/execution/decoder_batch_state.h#L117)<!-- prefix: "wide_mtp_lim" --> · [Group dispatch](../../src/decoder_batch.cpp#L635)<!-- prefix: "const bool f" --> · [Peer preflight](../../src/decoder_verify.cpp#L813)<!-- prefix: "throw std::i" --> · [Vocabulary pass](../../src/decoder_verify.cpp#L753)<!-- prefix: "void score_t" -->
 
-Narrow and wide TP2 verification gather embeddings and scatter reduced hidden states into row-owned buffers, with one launch per stage per rank. Separate warm probes on one B200 against `e0a56f4` measured paired median stream savings of 13.504/18.464 µs at 10 rows and 131.712/170.464 µs at 80 rows, respectively. Serving remains unmeasured. See `artifacts/tp2-resume/verify-scatter/receipt.txt`. [Gather](../../src/decoder_verify.cpp#L848)<!-- prefix: "check(gather" --> · [Scatter](../../src/runtime/execution/decoder_forward_tp.cpp#L93)<!-- prefix: "check(scatte" -->
+Narrow and wide TP2 verification gather embeddings and scatter reduced hidden states into row-owned buffers, with one launch per stage per rank. Separate warm probes on one B200 against `e0a56f4` measured paired median stream savings of 13.504/18.464 µs at 10 rows and 131.712/170.464 µs at 80 rows, respectively. Serving remains unmeasured. See `artifacts/tp2-resume/verify-scatter/receipt.txt`. [Gather](../../src/decoder_verify.cpp#L848)<!-- prefix: "check(gather" --> · [Scatter](../../src/runtime/execution/decoder_forward_tp.cpp#L132)<!-- prefix: "check(scatte" -->
 
 ## Prerequisites and command
 
@@ -93,21 +93,31 @@ sglang-server --checkpoint MODEL --device 0 --port PORT --tp 2 --eager \
   --mtp-steps 4 --lmcache-socket SOCKET
 ```
 
-The smoke run recorded under `artifacts/tp2-review/serving/cache-2328/complete/cache/` used this shape; `ranked-cache.argv.json` holds its exact arguments. The measured campaigns ran without `--eager`: the live argument record shows `--port 17393 --tp 2 --max-active 16`.
+The smoke arguments are in `artifacts/tp2-review/serving/cache-2328/complete/cache/ranked-cache.argv.json`. The campaigns omitted `--eager` and used `--port 17393 --tp 2 --max-active 16`.
 
 ## Two-rank allreduce transport
 
 The optional transport embeds FlashInfer 0.7.4 TRT-LLM MNNVL kernels. Set `SGLANG_FLASHINFER_ROOT` to override the wheel header path. `SGLANG_HOST_ROOT` changes the enclosing shared root. Builds without headers use NCCL. [Build gate](../../xmake.lua#L472)<!-- prefix: "local flashi" -->
 
-Both kernels require 16-byte aligned buffers and whole 5,120-element BF16 rows. One shot accepts up to 51 rows under its 1,048,576-byte aggregate cap, in eager execution or joined capture. Exactly 80 eager rows use two shot when each Lamport slot holds both 819,200-byte stages and both GPUs can run all 400 blocks concurrently. [Dispatch](../../src/runtime/backend/tensor_parallel.cpp#L436)<!-- prefix: "const bool t" --> · [Workspace check](../../src/runtime/backend/mnnvl_ar.cu#L317)<!-- prefix: "state.twosho" --> · [Occupancy check](../../src/runtime/backend/mnnvl_ar.cu#L34)<!-- prefix: "bool twoshot" -->
+Both kernels require 16-byte aligned buffers and whole 5,120-element BF16 rows. One shot accepts up to 51 rows under its 1,048,576-byte aggregate cap, in eager execution or joined capture. Exactly 80 eager rows use two shot when each Lamport slot holds both 819,200-byte stages and both GPUs can run all 400 blocks concurrently. [Dispatch](../../src/runtime/backend/tensor_parallel.cpp#L443)<!-- prefix: "const bool t" --> · [Workspace check](../../src/runtime/backend/mnnvl_ar.cu#L407)<!-- prefix: "state.twosho" --> · [Occupancy check](../../src/runtime/backend/mnnvl_ar.cu#L37)<!-- prefix: "bool twoshot" -->
 
-NCCL handles other oversize calls, independent captures, and captured 80-row calls. Mixed eager and captured streams are rejected. A vendor enqueue error propagates. Later calls use NCCL if neither rank enqueued. A partial enqueue marks the backend failed. [Error handling](../../src/runtime/backend/tensor_parallel.cpp#L285)<!-- prefix: "if (error.pe" -->
+NCCL handles other oversize calls, independent captures, and captured 80-row calls. Mixed eager and captured streams are rejected. A vendor enqueue error propagates. Later calls use NCCL if neither rank enqueued. A partial enqueue marks the backend failed. [Error handling](../../src/runtime/backend/tensor_parallel.cpp#L292)<!-- prefix: "if (error.pe" -->
 
-One host thread enqueues both ranks in order. The multicast workspace reserves 536,870,912 bytes per rank with triple Lamport buffers. The rank sum normalizes negative zero to protect the Lamport sentinel. [Sentinel](../../src/runtime/backend/mnnvl_ar.cu#L26)<!-- prefix: "constexpr st" -->
+One host thread enqueues both ranks in order. The multicast workspace reserves 536,870,912 bytes per rank with triple Lamport buffers. The rank sum normalizes negative zero to protect the Lamport sentinel. [Sentinel](../../src/runtime/backend/mnnvl_ar.cu#L29)<!-- prefix: "constexpr st" -->
 
-`/metrics` counts successful enqueues per rank by transport and six NCCL fallback reasons. Graph replays do not increment these counters. [Counters](../../apps/server/loads.cpp#L234)<!-- prefix: "emit_rank(\"t" --> · [Fallback reasons](../../src/runtime/backend/tensor_parallel.cpp#L97)<!-- prefix: "enum class A" -->
+`/metrics` counts successful enqueues per rank by transport and six NCCL fallback reasons. Graph replays do not increment these counters. [Counters](../../apps/server/loads.cpp#L234)<!-- prefix: "emit_rank(\"t" --> · [Fallback reasons](../../src/runtime/backend/tensor_parallel.cpp#L98)<!-- prefix: "enum class A" -->
 
 The 80-row operator probe on two B200s measured a 4.032 µs saving per collective. Median worst-rank stream time fell from 21.472 µs with NCCL to 17.440 µs across 81 samples without induced lag. W4 makespan awaits measurement. See `artifacts/tp2-resume/w4-ar/` (`stock-45.log`, `vendor-45.log`).
+
+### Ten-row verification reduction fusion
+
+Eager TP2 uses one-shot MNNVL plus RMSNorm and quantization for ten packed verification rows of width 5,120 on both ranks. It requires healthy MNNVL, ten resident blocks per GPU, and aligned operands. Capture and other clean declines use ordinary collective dispatch and normalization. In joined capture, the protocol test used MNNVL at ten rows and NCCL at 52. [Selection](../../src/runtime/execution/decoder_forward_tp.cpp#L49)<!-- prefix: "struct TpRed" --> · [Capture](../../src/runtime/backend/tensor_parallel.cpp#L457)<!-- prefix: "bool TensorP" --> · [Preflight](../../src/runtime/backend/mnnvl_ar.cu#L615)<!-- prefix: "bool MnnvlAl" -->
+
+Each rank fuses 64 attention reductions with MLP input normalization and 63 MLP reductions with the next layer’s input normalization. The last MLP reduction stays separate before scatter. The kernel preserves the BF16 sum and residual and quantizes the BF16 normalized row to E4M3 with one FP32 scale per 128 channels. [Layer loop](../../src/runtime/execution/decoder_forward_tp.cpp#L252)<!-- prefix: "const bool a" --> · [Arithmetic](../../include/sglang/text/quantization/rms_quantize.cuh#L99)<!-- prefix: "template \u003cbo" -->
+
+The host prepares both rank launches before submission. A partial enqueue fails the group and propagates the error without an NCCL retry. An already-running kernel can wait indefinitely for its peer, which can require process termination. [Submission](../../src/runtime/backend/mnnvl_ar.cu#L638)<!-- prefix: "ReduceNorm l" --> · [Failure](../../src/runtime/backend/tensor_parallel.cpp#L292)<!-- prefix: "if (error.pe" -->
+
+On two B200s in both rank orders, 32 paired isolated target traversals saved a median 0.562 ms (8.32%). Both ranks’ greedy and sampled digests and MTP work matched, including forced NCCL and alignment refusal controls. An independent operator audit matched 921,600 entries each for reduced BF16, residual BF16, and E4M3 activations, plus 7,200 FP32 scales. Full W1 serving remains unmeasured. See `artifacts/tp2-resume/w1-reduce-norm/production/tracked/target.5ns0DEvu/` and `artifacts/tp2-resume/reduce-norm-review/review.md`.
 
 ## Acceptance target
 

@@ -4,7 +4,7 @@
 #include "sglang/decoder_mtp.h"
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/text_cuda_primitives.cuh"
-#include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/quantization/quantize_warp.cuh"
 #include <algorithm>
 #include <cstddef>
 #include <cuda_fp8.h>

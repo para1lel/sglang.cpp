@@ -10,6 +10,8 @@
 
 namespace sglang::decoder {
 
+struct MnnvlRmsQuantizeRows;
+
 struct TpArRankCounters {
     std::uint64_t ar_calls_total = 0;
     std::uint64_t ar_mnnvl_oneshot_total = 0;
@@ -54,6 +56,9 @@ public:
 
     void allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
                         std::size_t count);
+    bool try_allreduce_rms_quantize_m10(
+        __nv_bfloat16* const buffers[], const cudaStream_t streams[],
+        const MnnvlRmsQuantizeRows rows[], const __nv_bfloat16* const gains[]);
 
     void broadcast_int32(std::int32_t* const buffers[], const cudaStream_t streams[],
                          std::size_t count, int root);

@@ -12,6 +12,8 @@
 
 namespace sglang::decoder {
 
+struct MnnvlRmsQuantizeRows;
+
 struct MnnvlArError : std::runtime_error {
     MnnvlArError(const std::string& what, bool peer_enqueued_arg);
 
@@ -32,6 +34,10 @@ public:
     void allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
                         std::size_t count, bool two_shot);
 
+    bool try_allreduce_rms_quantize_m10(
+        __nv_bfloat16* const buffers[], const cudaStream_t streams[],
+        const MnnvlRmsQuantizeRows rows[], const __nv_bfloat16* const gains[]);
+
     std::size_t max_count() const noexcept;
     bool supports_twoshot(std::size_t count) const noexcept;
 
@@ -48,8 +54,8 @@ private:
     static void create_physical(State& state);
     static void map_workspace(State& state, std::uint64_t mc_granularity);
     static void init_lamport(State& state);
-    static void preflight(State& state, __nv_bfloat16* const buffers[],
-                          const cudaStream_t streams[], bool two_shot);
+    static cudaStreamCaptureStatus preflight(State& state, __nv_bfloat16* const buffers[],
+                                             const cudaStream_t streams[], bool two_shot);
 
     std::unique_ptr<State> state_;
 };

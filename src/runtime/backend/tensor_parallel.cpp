@@ -14,6 +14,7 @@
 #include "sglang/runtime/backend/cuda_resources.h"
 
 #if defined(SGLANG_MNNVL_AR) && SGLANG_MNNVL_AR
+#include "sglang/runtime/backend/mnnvl_rms_quantize.h"
 #include "sglang/runtime/backend/mnnvl_ar.h"
 #define SGLANG_USE_MNNVL_AR 1
 #else
@@ -132,7 +133,9 @@ struct TensorParallel::State {
     ArFallback vendor_fallback_reason(std::size_t count,
                                       const CollectiveStreams& capture_state, bool two_shot) const;
     bool vendor_allreduce(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
-                          std::size_t count, const CollectiveStreams& capture_state, bool two_shot);
+                          std::size_t count, const CollectiveStreams& capture_state, bool two_shot,
+                          const MnnvlRmsQuantizeRows* rms_rows = nullptr,
+                          const __nv_bfloat16* const* gains = nullptr);
     void note_vendor_failure();
     void record_vendor_success(std::size_t count, std::size_t payload, bool two_shot);
 #endif
@@ -264,7 +267,8 @@ ArFallback TensorParallel::State::vendor_fallback_reason(std::size_t count,
 
 bool TensorParallel::State::vendor_allreduce(
     __nv_bfloat16* const buffers[], const cudaStream_t streams[], std::size_t count,
-    const CollectiveStreams& capture_state, bool two_shot) {
+    const CollectiveStreams& capture_state, bool two_shot, const MnnvlRmsQuantizeRows* rms_rows,
+    const __nv_bfloat16* const* gains) {
     if (mnnvl == nullptr || mnnvl_sticky || !mnnvl->healthy() ||
         (!two_shot && (count > mnnvl->max_count() || count % mnnvl_ar_hidden_width != 0))) {
         return false;
@@ -278,6 +282,9 @@ bool TensorParallel::State::vendor_allreduce(
         }
     }
     try {
+        if (rms_rows) {
+            return mnnvl->try_allreduce_rms_quantize_m10(buffers, streams, rms_rows, gains);
+        }
         mnnvl->allreduce_bf16(buffers, streams, count, two_shot);
     } catch (const std::invalid_argument&) {
         throw;
@@ -445,6 +452,27 @@ void TensorParallel::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
 #endif
     state_->enqueue_nccl_allreduce(buffers, streams, count);
     state_->record_nccl_success(count, payload, reason);
+}
+
+bool TensorParallel::try_allreduce_rms_quantize_m10(
+    [[maybe_unused]] __nv_bfloat16* const buffers[], [[maybe_unused]] const cudaStream_t streams[],
+    [[maybe_unused]] const MnnvlRmsQuantizeRows rows[],
+    [[maybe_unused]] const __nv_bfloat16* const gains[]) {
+#if SGLANG_USE_MNNVL_AR
+    ensure_healthy();
+    if (!state_->mnnvl || state_->mnnvl_sticky || !state_->mnnvl->healthy() ||
+        !streams[0] || !streams[1]) return false;
+    constexpr std::size_t count = MnnvlRmsQuantizeRows::size * mnnvl_ar_hidden_width;
+    const auto capture = validate_collective_streams(state_->devices, streams, 2);
+    if (capture.status != cudaStreamCaptureStatusNone ||
+        !state_->vendor_allreduce(buffers, streams, count, capture, false, rows, gains)) {
+        return false;
+    }
+    state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
+    return true;
+#else
+    return false;
+#endif
 }
 
 void TensorParallel::snapshot_transport(TpArCounters& out) const {

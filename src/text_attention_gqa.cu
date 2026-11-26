@@ -3,7 +3,7 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/text/mtp/draft_batch_ops.h"
-#include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/quantization/quantize_warp.cuh"
 
 #include <cuda_runtime.h>
 

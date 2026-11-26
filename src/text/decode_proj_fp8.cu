@@ -1,6 +1,6 @@
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/decode_proj_sm100.cuh"
-#include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/quantization/quantize_warp.cuh"
 #include "sglang/text/target_fp8.h"
 
 #include <algorithm>

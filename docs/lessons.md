@@ -8,7 +8,7 @@ Record verified failures from [session review](../.agents/skills/main-mode/refer
 
 The relocation moved all nine headers under `include/sglang/`. The first gate let an unchanged misplaced header pass when only Markdown was staged.
 
-The [commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check_he" --> now checks every entry in the selected index. It rejects project headers outside `include/sglang/`. The [retained-header regression](../tests/test_gate_contract.py#L138)<!-- prefix: "def test_hea" --> passed.
+The [commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check_he" --> now checks every entry in the selected index. It rejects project headers outside `include/sglang/`. The [retained-header regression](../tests/test_gate_contract.py#L140)<!-- prefix: "def test_hea" --> passed.
 
 ## L002 · Remapped KV pages
 

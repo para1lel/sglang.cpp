@@ -15,6 +15,7 @@ from markdown_it import MarkdownIt
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import comment_rules
 import gate_config
 
 
@@ -329,11 +330,12 @@ def incremental_paths(root, paths, changed):
         selected.update(incoming)
 
 
-def check(root, paths=None, all_paths=None, changed=None, configuration=None):
+def check(root, paths=None, all_paths=None, changed=None, configuration=None, policy=None):
     failures = []
     documents = 0
     skills = 0
     maximum = 0
+    policy = set() if policy is None else set(policy)
     paths = repository_files(root) if paths is None else paths
     all_paths = paths if all_paths is None else all_paths
     configuration = gate_config.load(root) if configuration is None else configuration
@@ -346,23 +348,28 @@ def check(root, paths=None, all_paths=None, changed=None, configuration=None):
         if not path.is_file():
             continue
         is_code = gate_config.is_code(path, CODE_SUFFIXES, configuration, root)
-        if path.suffix not in DOCUMENT_SUFFIXES and not is_code:
+        selected = relative.as_posix() in policy
+        if path.suffix not in DOCUMENT_SUFFIXES and not is_code and not selected:
             continue
-        text = path.read_text(encoding="utf-8")
-        errors = code_errors(path, text, configuration) if is_code else []
-        if path.suffix in DOCUMENT_SUFFIXES:
-            documents += 1
-            count = len(re.findall(r"\S+", rendered_text(text, path.suffix)))
-            maximum = max(maximum, count)
-            if count > 3000:
-                errors.append(f"The document has {count} visible words. The limit is 3,000.")
-        if path.suffix == ".md":
-            errors.extend(link_errors(root, path, text, configuration))
-        if path.name == "requirements.txt":
-            errors.extend(requirement_errors(root, path, text))
-        if path.name == "SKILL.md":
-            skills += 1
-            errors.extend(skill_errors(path, text))
+        errors = []
+        if path.suffix in DOCUMENT_SUFFIXES or is_code:
+            text = path.read_text(encoding="utf-8")
+            errors = code_errors(path, text, configuration) if is_code else []
+            if path.suffix in DOCUMENT_SUFFIXES:
+                documents += 1
+                count = len(re.findall(r"\S+", rendered_text(text, path.suffix)))
+                maximum = max(maximum, count)
+                if count > 3000:
+                    errors.append(f"The document has {count} visible words. The limit is 3,000.")
+            if path.suffix == ".md":
+                errors.extend(link_errors(root, path, text, configuration))
+            if path.name == "requirements.txt":
+                errors.extend(requirement_errors(root, path, text))
+            if path.name == "SKILL.md":
+                skills += 1
+                errors.extend(skill_errors(path, text))
+        if selected:
+            errors.extend(comment_rules.comment_errors(path, is_code))
         failures.extend(f"{relative}: {error}" for error in errors)
     for failure in failures:
         print(failure, file=sys.stderr)
@@ -470,7 +477,7 @@ def main():
             paths = [root / name for name in selection["files"]]
             changed = None if selection["full"] else selection["changed"]
             selected = paths if changed is None else incremental_paths(root, paths, changed)
-            return check(root, selected, paths, changed)
+            return check(root, selected, paths, changed, policy=selection["changed"])
         return check(root) if arguments.command == "check" else code_link(root, arguments)
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as error:
         print(f"Error: {error}", file=sys.stderr)

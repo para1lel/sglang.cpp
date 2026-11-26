@@ -44,8 +44,12 @@ Keep weights at `/data0/shared/Qwen3.8-27B-FP8`.
 
 Install local hooks with `git config --local core.hooksPath .githooks` and install
 `.agents/checks/requirements.txt` with the default Pixi Python. Hooks check the selected
-index and commit message. Perform semantic and English review separately. Keep raw results
-in `artifacts/`.
+index and commit message. Keep comments out of project code files: the pre-commit hook
+rejects any added or changed code file whose staged content contains a comment, including
+comments that predate the change. Shebangs, preprocessor directives, quoted literals, and
+here-documents are not comments. Remove comments only from code files you actually touch;
+do not clean up untouched legacy files. Perform semantic and English review separately.
+Keep raw results in `artifacts/`.
 
 Run tests only when concrete evidence strongly supports the expected outcome.
 Prioritize operator and framework tuning and focused local measurements.

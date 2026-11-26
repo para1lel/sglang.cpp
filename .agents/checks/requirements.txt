@@ -6,3 +6,11 @@ tree-sitter-bash==0.25.1
 tree-sitter-cpp==0.23.4
 tree-sitter-cuda==0.21.2
 tree-sitter-lua==0.5.0
+tree-sitter-go==0.25.0
+tree-sitter-java==0.23.5
+tree-sitter-javascript==0.25.0
+tree-sitter-powershell==0.26.4
+tree-sitter-rust==0.24.2
+tree-sitter-toml==0.7.0
+tree-sitter-typescript==0.23.2
+tree-sitter-yaml==0.7.2

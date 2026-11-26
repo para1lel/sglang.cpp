@@ -3,6 +3,7 @@
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_sampling.h"
 #include "sglang/prefill_fp8.h"
+#include "sglang/runtime/backend/tensor_parallel.h"
 #include "sglang/text/decoder_logprobs.h"
 #include <algorithm>
 #include <chrono>
@@ -31,7 +32,25 @@ void DecoderBatch::State::retire(std::optional<Lane>& lane, const TpDriver* tp_d
     lane.reset();
 }
 
-DecoderBatch::~DecoderBatch() = default;
+DecoderBatch::~DecoderBatch() {
+    auto* tp = state_->tp;
+    const auto stream = state_->execution.stream();
+    if (!tp || !stream || tp->verification_capture_stream != stream) return;
+    if (tp->verification_capture) {
+        try {
+            DeviceScope rank0(tp->device);
+            synchronize_cuda(stream, "Fence rank-0 TP verifier graph");
+            DeviceScope rank1(tp->peer_device);
+            synchronize_cuda(tp->peer_stream, "Fence rank-1 TP verifier graph");
+        } catch (const CudaError&) {
+            tp->group->fail_fused_graph_replay();
+            return;
+        }
+        tp->verification_capture.reset();
+    }
+    tp->verification_capture_stream = nullptr;
+    tp->verification_capture_disabled = false;
+}
 int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
     return admit_impl(slot, std::move(prompt), options, nullptr);
 }
@@ -610,13 +629,15 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     auto* graph = storage->verification_graph ? &*storage->verification_graph : nullptr;
     const auto verify = [&](int first, int size, std::uint8_t* activation = nullptr) {
         if (tp_driver) {
+            const bool capture = options.tp_verification_graphs && size == 2 &&
+                !storage->slots[slots[first]]->options.eager &&
+                !storage->slots[slots[first + 1]]->options.eager;
             tp_driver->verify(rounds.data() + first, peer_rounds.data() + first, size, stream,
                               constraint_workspace, sampling_workspace, logprob_workspace,
-                              storage->tc_vocab.get());
-            return;
-        }
-        if (model.verify_mtp(rounds.data() + first, size, constraint_workspace, sampling_workspace,
-                             stream, graph, storage->tc_vocab.get(), activation,
+                              storage->tc_vocab.get(), capture);
+        } else if (model.verify_mtp(rounds.data() + first, size, constraint_workspace,
+                                    sampling_workspace, stream, graph,
+                                    storage->tc_vocab.get(), activation,
                              logprob_workspace)) {
             stats.verification_graph_slots |= std::uint32_t{1} << slots[first];
         }

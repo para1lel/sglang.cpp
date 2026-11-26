@@ -9,6 +9,7 @@
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/mtp/tc_vocab.h"
 #include "sglang/text/bf16_head_projection.h"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -570,7 +571,6 @@ std::shared_ptr<TextLogitCandidate> prepare_verification_winners(int slots) {
 }
 
 }
-
 namespace sglang {
 
 using namespace decoder;
@@ -590,7 +590,6 @@ void decoder::project_verification_bf16(Bf16Weight weight, const VerificationRow
         first += rows;
     }
 }
-
 namespace {
 static_assert(tc_vocab_short_rows == 2 * target_verify_max_rows);
 
@@ -787,7 +786,8 @@ bool Decoder::Model::verify_mtp_tp(
     const ConstraintWorkspace& scratch, void* sampling_scratch, cudaStream_t stream,
     cudaStream_t peer_stream, TensorParallel& group, const TpPartials& primary_partials,
     const TpPartials& peer_partials, const TcVocabScratch* vocabulary,
-    std::uint8_t* primary_packed, std::uint8_t* peer_packed, void* logprob_workspace) const {
+    std::uint8_t* primary_packed, std::uint8_t* peer_packed, void* logprob_workspace,
+    bool capture) const {
     std::array<VerificationSequence, max_wide_mtp_lanes> sequences;
     std::array<TargetVerification*, max_wide_mtp_lanes> verifiers;
     std::array<TargetVerification*, max_wide_mtp_lanes> peer_verifiers;
@@ -853,9 +853,10 @@ bool Decoder::Model::verify_mtp_tp(
               "Look up peer verification inputs");
         peer_scope.restore();
     }
-    forward_layers_tp(peer, rows.data(), peer_rows.data(), total, stream, peer_stream, group,
-                      primary_partials, peer_partials, primary_packed, peer_packed,
-                      count == 1 && vocabulary != nullptr);
+    const tp_verify_graph::Submission submitted(group,
+        forward_verification_tp(peer, rows.data(), peer_rows.data(), count, total, stream,
+                                peer_stream, group, primary_partials, peer_partials, primary_packed,
+                                peer_packed, vocabulary != nullptr, capture));
     if (count <= decoder_batch_max_mtp_lanes) {
         score_verification_packet(*this, rows.data(), total, vocabulary, stream, count == 2);
     } else {
@@ -876,10 +877,8 @@ bool Decoder::Model::verify_mtp_tp(
         round.target->enqueue_generated_logprobs(logprob_workspace);
     }
     TargetVerification::read_all(verifiers.data(), count, stream);
-    {
-        const DeviceScope peer_scope(peer.device);
-        TargetVerification::read_all(peer_verifiers.data(), count, peer_stream);
-    }
+    const DeviceScope peer_scope(peer.device);
+    TargetVerification::read_all(peer_verifiers.data(), count, peer_stream);
     return false;
 }
 

@@ -46,6 +46,7 @@ struct VerificationSequence;
 struct VerificationRow;
 struct VerificationGraph;
 struct MtpRound;
+namespace tp_verify_graph { class Graph; }
 struct GeneratedLogprobReadback;
 
 class SerialOutput {
@@ -226,9 +227,9 @@ struct Decoder::Model {
                        const decoder::TpPartials& primary_partials,
                        const decoder::TpPartials& peer_partials,
                        const decoder::TcVocabScratch* vocabulary,
-                       std::uint8_t* primary_packed = nullptr,
-                       std::uint8_t* peer_packed = nullptr,
-                       void* logprob_workspace = nullptr) const;
+                       std::uint8_t* primary_packed, std::uint8_t* peer_packed,
+                       void* logprob_workspace,
+                       bool capture) const;
     bool forward_verify(const decoder::VerificationSequence* sequences, int count,
                         cudaStream_t stream, decoder::VerificationGraph* graph,
                         const decoder::TcVocabScratch* vocabulary,
@@ -308,8 +309,12 @@ struct Decoder::Model {
                            std::uint8_t* primary_packed = nullptr,
                            std::uint8_t* peer_packed = nullptr,
                            bool singleton_verify = false) const;
-
-
+    decoder::tp_verify_graph::Graph* forward_verification_tp(
+        const Model& peer, const decoder::VerificationRow* rows,
+        const decoder::VerificationRow* peer_rows, int count, int total,
+        cudaStream_t stream, cudaStream_t peer_stream, decoder::TensorParallel& group,
+        const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials,
+        std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool greedy, bool capture) const;
 
     int device;
     std::string accelerator_name;
@@ -347,6 +352,9 @@ struct Decoder::TpRuntime {
     
     
     std::uint8_t* packed[2] = {};
+    mutable std::shared_ptr<decoder::tp_verify_graph::Graph> verification_capture;
+    mutable cudaStream_t verification_capture_stream = nullptr;
+    mutable bool verification_capture_disabled = false;
     ~TpRuntime();
 };
 

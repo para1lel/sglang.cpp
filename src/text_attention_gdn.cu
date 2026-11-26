@@ -3,6 +3,7 @@
 #include "sglang/text/gdn_local.h"
 #include "sglang/text/text_cuda_primitives.cuh"
 #include "sglang/text/gdn/gdn_finish_history.cuh"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -10,6 +11,14 @@
 
 namespace sglang {
 namespace {
+
+__device__ const decoder::GdnVerificationLane& lane_job(const GdnVerifyTailLanes& jobs) {
+    return jobs.lanes[blockIdx.z];
+}
+
+__device__ const decoder::GdnVerificationLane& lane_job(const decoder::GdnVerificationLane* jobs) {
+    return jobs[blockIdx.z];
+}
 
 template <typename S, typename State>
 __global__ void gdn_convolve(const __nv_bfloat16* qkv, State binding,
@@ -22,12 +31,11 @@ __global__ void gdn_convolve(const __nv_bfloat16* qkv, State binding,
         convolve<S>(qkv, history, weights, row, channel);
 }
 
-template <typename S>
-__global__ void gdn_convolve_lanes(int token_count,
-                                   const __grid_constant__ GdnVerifyTailLanes jobs,
+template <typename S, typename Jobs = GdnVerifyTailLanes>
+__global__ void gdn_convolve_lanes(int token_count, const __grid_constant__ Jobs jobs,
                                    const __nv_bfloat16* weights) {
     constexpr int conv_blocks_per_token = S::qkv_width / conv_threads;
-    const auto& job = jobs.lanes[blockIdx.z];
+    const auto& job = lane_job(jobs);
     const auto* history = history_value(job.initial);
     const int row = blockIdx.x / conv_blocks_per_token;
     const int channel = (blockIdx.x % conv_blocks_per_token) * conv_threads + threadIdx.x;
@@ -137,10 +145,10 @@ __global__ void gdn_recur(int token_count, const __nv_bfloat16* convolved,
                                                 final, observable);
 }
 
-template <typename S, bool round_qk, bool observe>
-__global__ void gdn_recur_lanes(int token_count, const __grid_constant__ GdnVerifyTailLanes jobs,
+template <typename S, bool round_qk, bool observe, typename Jobs = GdnVerifyTailLanes>
+__global__ void gdn_recur_lanes(int token_count, const __grid_constant__ Jobs jobs,
                                 TextGdnWeights weights) {
-    const auto& job = jobs.lanes[blockIdx.z];
+    const auto& job = lane_job(jobs);
     gdn_recur_core<S, round_qk, observe, TextGdnState>(
         token_count, job.inputs.convolved, job.inputs.b, job.inputs.a, weights, job.initial,
         job.tail, job.observable);
@@ -191,10 +199,10 @@ __global__ void gdn_finish(int token_count, const __nv_bfloat16* qkv, const __nv
     gdn_finish_core<S, State>(token_count, qkv, z, norm, observable, initial, final, output);
 }
 
-template <typename S>
-__global__ void gdn_finish_lanes(int token_count, const __grid_constant__ GdnVerifyTailLanes jobs,
+template <typename S, typename Jobs = GdnVerifyTailLanes>
+__global__ void gdn_finish_lanes(int token_count, const __grid_constant__ Jobs jobs,
                                  const __nv_bfloat16* norm) {
-    const auto& job = jobs.lanes[blockIdx.z];
+    const auto& job = lane_job(jobs);
     gdn_finish_core<S, TextGdnState>(token_count, job.inputs.qkv, job.z, norm, job.observable,
                                      job.initial, job.tail, job.output);
 }
@@ -654,6 +662,26 @@ cudaError_t text_gdn_verify_tail_local(int token_count, TextGdnReplayRows rows,
 cudaError_t text_gdn_verify_tail_local_lanes(int token_count, const GdnVerifyTailLanes& jobs,
                                              TextGdnWeights weights, cudaStream_t stream) {
     return verify_tail_lanes<GdnLocal>(token_count, jobs, weights, stream);
+}
+
+cudaError_t decoder::tp_verify_graph::gdn(const GdnVerificationLane* live, TextGdnWeights weights,
+                                         cudaStream_t stream) {
+    using S = GdnLocal;
+    using Jobs = const GdnVerificationLane*;
+    constexpr int conv_blocks = S::qkv_width / conv_threads;
+    constexpr int recurrent_blocks = S::value_heads * value_blocks_per_head;
+    constexpr int finish_blocks = depth * S::value_heads + S::qkv_width / text_gdn_head_dim;
+    gdn_convolve_lanes<S, Jobs><<<dim3(depth * conv_blocks, 1, lanes), conv_threads, 0, stream>>>(
+        depth, live, weights.convolution);
+    auto status = cudaPeekAtLastError();
+    if (status != cudaSuccess) return status;
+    gdn_recur_lanes<S, false, true, Jobs><<<dim3(recurrent_blocks, 1, lanes), recurrent_threads,
+                                           0, stream>>>(depth, live, weights);
+    status = cudaPeekAtLastError();
+    if (status != cudaSuccess) return status;
+    gdn_finish_lanes<S, Jobs><<<dim3(finish_blocks, 1, lanes), text_gdn_head_dim, 0, stream>>>(
+        depth, live, weights.norm);
+    return cudaPeekAtLastError();
 }
 
 cudaError_t text_gdn_replay_prefix(int token_count, TextGdnReplayRows rows, TextGdnWeights weights,

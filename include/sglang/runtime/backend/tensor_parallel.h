@@ -66,6 +66,9 @@ public:
     void snapshot_transport(TpArCounters& out) const;
 
     bool graph_eligible() const noexcept;
+    bool fused_graph_eligible() const noexcept;
+    void record_fused_graph_replay();
+    void fail_fused_graph_replay() noexcept;
 
 private:
     void ensure_healthy();

@@ -1,10 +1,5 @@
 #pragma once
 
-
-
-
-
-
 #include "sglang/decoder_internal.h"
 
 #include "sglang/decoder_batch.h"
@@ -13,6 +8,7 @@
 #include "sglang/text/gdn_local.h"
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/text/target_fp8.h"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -22,8 +18,6 @@
 namespace sglang {
 namespace decoder {
 namespace forward_detail {
-
-
 
 inline constexpr WeightSharding tp2_sharding{0, 2};
 
@@ -566,6 +560,7 @@ inline bool run_gdn_packed_local(const GdnLayer& layer,
             return false;
         }
     }
+    if (tp_verify_graph::run_gdn(batch.stream, state_index, layer.recurrent)) return true;
     GdnVerifyTailLanes jobs;
     jobs.lane_count = lane_count;
     for (int lane = 0; lane < lane_count; ++lane) {
@@ -584,11 +579,11 @@ inline void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& ba
         scratch.bind_gdn(state_index, batch.count);
         scratch.replay[state_index].weights = layer.recurrent;
     }
-    batch.each([&](const VerificationRow& row, Workspace&) {
-        if (row.first && !row.binding) {
-            row.verification->bind_gdn(state_index);
-        }
-    });
+    if (!tp_verify_graph::bind_gdn_inputs(batch.stream, batch.lanes, state_index)) {
+        batch.each([&](const VerificationRow& row, Workspace&) {
+            if (row.first && !row.binding) row.verification->bind_gdn(state_index);
+        });
+    }
     if (!batch.fuse_verify_activation() && !batch.fuse_wide_verify_norm()) {
         batch.quantize(&Workspace::normalized, hidden_size);
     }
@@ -876,6 +871,10 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
 
 inline void attend_eager_verification(const GqaLayer& layer,
                                       const LayerBatch<VerificationRow>& batch, int cache_index) {
+    if (auto* live = tp_verify_graph::binding(batch.stream)) {
+        tp_verify_graph::attend_gqa(*live, layer, batch.lanes, cache_index, batch.gqa_geometry());
+        return;
+    }
     const auto attend = [&](const auto& packet) {
         if (packet.tensor_parallel &&
             try_gqa_verify_short(layer, packet.lanes, packet.count, cache_index,

@@ -5,6 +5,7 @@
 #include "sglang/text/gqa/gqa_decode_long.cuh"
 #include "sglang/text/gqa_decode_split.cuh"
 #include "sglang/text/gqa_verify_batch.h"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <algorithm>
 #include <type_traits>

@@ -30,9 +30,9 @@ Each 128-token page holds 131,072 payload bytes and 4,096 scale bytes per tensor
 
 Link `sglang_cuda`. Apply RoPE to Q and K. Append contiguous BF16 K and V `[tokens, 4, 256]`. Pass the ready prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Retain storage through stream completion. [Library](../xmake.lua#L65)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L53)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L58)<!-- prefix: "cudaError_t " -->
 
-For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. See the [scratch-free reader](singleton-gqa-decode.md#scratch-free-ordered-attention) for direct attention. [Scale calculation](../src/mxfp8_gqa.cu#L42)<!-- prefix: "__device__ i" -->
+For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. See the [scratch-free reader](singleton-gqa-decode.md#scratch-free-ordered-attention) for direct attention. [Scale calculation](../src/mxfp8_gqa.cu#L43)<!-- prefix: "__device__ i" -->
 
-Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L227)<!-- prefix: "__device__ f" --> · [Replay](../include/sglang/text/gqa/ordered_gqa_vector.cuh#L153)<!-- prefix: "__device__ _" -->
+Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L228)<!-- prefix: "__device__ f" --> · [Replay](../include/sglang/text/gqa/ordered_gqa_vector.cuh#L153)<!-- prefix: "__device__ _" -->
 
 [Singleton](batch-graphs.md#page-parallel-gqa-decode) and [legacy narrow decode](batch-graphs.md#legacy-narrow-paged-gqa-decode) group softmax and value reductions by KV pages.
 [Fused packed decode](long-paged-decode.md#fused-packed-gqa) groups reductions by 64-token chunks. [Legacy wide eager decode](long-paged-decode.md#legacy-wide-eager-decode) selects its split after compaction.
@@ -74,7 +74,7 @@ The [checkpoint loader](../include/sglang/checkpoint.h#L24)<!-- prefix: "class C
 
 The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../include/sglang/runtime/model/qwen_text_model.h#L40)<!-- prefix: "constexpr La" --> · [Execution bank selection](../include/sglang/runtime/model/qwen_layers.h#L96)<!-- prefix: "const auto [" --> · [Tile adapter](../src/decoder_prefill.cpp#L625)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L83)<!-- prefix: "void Decoder" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L684)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L316)<!-- prefix: "void Request" -->
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L685)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L316)<!-- prefix: "void Request" -->
 
 Use the feature contracts for dispatch and numerical details.
 
@@ -107,7 +107,7 @@ Use the [P2 verifier](#p2-gqa-verification) for MXFP8 encoding, causal attention
 
 Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to its path and `GPU_UUID` to the reserved B200 UUID. CUDA exposes it as ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L110)<!-- prefix: "\"$xmake\" bui" -->
 
-The optional vendor GDN prefill kernel is provisioned ahead of time. `tools/aot_build_vendor_gdn.py` compiles the pinned CuTe kernel into `libgdn_cute_bf16_8_24.a`. The build links that archive when it exists, unless `SGLANG_GDN_VENDOR_BUILD` is `0`. [AOT provisioning](../tools/aot_build_vendor_gdn.py#L1)<!-- prefix: "\"\"\"Reproduci" --> · [Build gate](../xmake.lua#L516)<!-- prefix: "if os.getenv" -->
+The optional vendor GDN prefill kernel is provisioned ahead of time. `tools/aot_build_vendor_gdn.py` compiles the pinned CuTe kernel into `libgdn_cute_bf16_8_24.a`. The build links that archive when it exists, unless `SGLANG_GDN_VENDOR_BUILD` is `0`. [AOT provisioning](../tools/aot_build_vendor_gdn.py#L1)<!-- prefix: "\"\"\"Reproduci" --> · [Build gate](../xmake.lua#L518)<!-- prefix: "if os.getenv" -->
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \

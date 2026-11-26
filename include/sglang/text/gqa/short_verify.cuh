@@ -40,6 +40,21 @@ __global__ void verify_replay_kernel(const __grid_constant__ gqa_decode::EagerTa
                        lane.buffers.output, head, static_cast<int>(blockIdx.y));
 }
 
+__global__ void live_scores(const decoder::tp_verify_graph::GqaBinding* binding) {
+    const auto& lane = binding->reads[blockIdx.z];
+    constexpr int capacity = decoder::tp_verify_graph::score_capacity;
+    exact_scores(lane.cache, lane.pages.device_pages, lane.position, lane.buffers.queries,
+                 {static_cast<float*>(lane.buffers.scratch), capacity});
+}
+
+__global__ void live_replay(const decoder::tp_verify_graph::GqaBinding* binding) {
+    const auto& lane = binding->reads[blockIdx.z];
+    constexpr int capacity = decoder::tp_verify_graph::score_capacity;
+    vector_replay_body(lane.cache, lane.pages.device_pages, lane.position,
+                       {static_cast<float*>(lane.buffers.scratch), capacity},
+                       lane.buffers.output, blockIdx.x, blockIdx.y);
+}
+
 }
 
 bool decoder::short_verify_supported(const PagedDecodeLane* lanes, int count) {
@@ -90,6 +105,20 @@ cudaError_t decoder::short_verify_gqa(const PagedDecodeLane* lanes, int count,
             verify_replay_kernel,
             dim3(geometry.query_heads, mxfp8_head_dim / vector_replay_channels, count),
             dim3(vector_replay_threads), stream, batch);
+    }
+    return status;
+}
+
+cudaError_t decoder::tp_verify_graph::read(const GqaBinding* live, int query_heads,
+                                          cudaStream_t stream) {
+    static_assert(score_capacity % score_warps == 0);
+    constexpr int score_threads = score_warps * mxfp8_group_size;
+    auto status = launch_gqa_kernel(live_scores,
+        dim3(score_capacity / score_warps, query_heads, rows), dim3(score_threads), stream, live);
+    if (status == cudaSuccess) {
+        status = launch_gqa_kernel(live_replay,
+            dim3(query_heads, mxfp8_head_dim / vector_replay_channels, rows),
+            dim3(vector_replay_threads), stream, live);
     }
     return status;
 }

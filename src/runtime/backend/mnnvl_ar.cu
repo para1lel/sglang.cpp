@@ -1,6 +1,7 @@
 #include "sglang/runtime/backend/mnnvl_ar.h"
 #include "sglang/runtime/backend/mnnvl_rms_quantize.h"
 #include "sglang/text/quantization/rms_quantize.cuh"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <cuda.h>
 
@@ -637,7 +638,9 @@ bool MnnvlAllReduce::try_allreduce_rms_quantize(
         }
     }
     ensure_healthy();
-    if (preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone) return false;
+    if (preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone &&
+        (width != tp_verify_graph::rows || !tp_verify_graph::binding(streams[0]) ||
+         !tp_verify_graph::binding(streams[1]))) return false;
 
     ReduceNorm launch[kRanks];
     for (int rank = 0; rank < kRanks; ++rank) {

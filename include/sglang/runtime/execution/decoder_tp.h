@@ -51,7 +51,7 @@ struct DecoderBatch::TpDriver {
     void verify(decoder::MtpRound* rounds, decoder::MtpRound* peer_rounds, int count,
                 cudaStream_t stream, decoder::ConstraintWorkspace& constraints,
                 std::byte* sampling_workspace, std::byte* logprob_workspace,
-                const decoder::TcVocabScratch* vocabulary) const;
+                const decoder::TcVocabScratch* vocabulary, bool capture) const;
     void commit_peer_round(decoder::Lane& lane, const decoder::MtpRound& round,
                            const decoder::Workspace* const* saved,
                            TextGdnReplayBatch* gdn_batch = nullptr) const;

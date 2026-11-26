@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 
 #if defined(SGLANG_MNNVL_AR) && SGLANG_MNNVL_AR
 #include "sglang/runtime/backend/mnnvl_rms_quantize.h"
@@ -127,7 +128,8 @@ struct TensorParallel::State {
 
     void enqueue_nccl_allreduce(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
                                 std::size_t count);
-    void bump_transport_width(std::size_t count, std::size_t payload, bool vendor);
+    void bump_transport_width(std::size_t count, std::size_t payload, bool vendor,
+                              std::size_t calls = 1);
     void record_nccl_success(std::size_t count, std::size_t payload, ArFallback reason);
 #if SGLANG_USE_MNNVL_AR
     ArFallback vendor_fallback_reason(std::size_t count,
@@ -137,7 +139,8 @@ struct TensorParallel::State {
                           const MnnvlRmsQuantizeRows* rms_rows = nullptr,
                           const __nv_bfloat16* const* gains = nullptr);
     void note_vendor_failure();
-    void record_vendor_success(std::size_t count, std::size_t payload, bool two_shot);
+    void record_vendor_success(std::size_t count, std::size_t payload, bool two_shot,
+                               std::size_t calls = 1);
 #endif
 
     ~State() {
@@ -188,7 +191,7 @@ void TensorParallel::State::enqueue_nccl_allreduce(__nv_bfloat16* const buffers[
 }
 
 void TensorParallel::State::bump_transport_width(std::size_t count, std::size_t payload,
-                                                 bool vendor) {
+                                                 bool vendor, std::size_t calls) {
     ArWidthEntry& width = ar_widths[count];
     if (width.mnnvl_calls.empty()) {
         width.mnnvl_calls.assign(devices.size(), 0);
@@ -197,11 +200,11 @@ void TensorParallel::State::bump_transport_width(std::size_t count, std::size_t 
     }
     for (std::size_t rank = 0; rank < devices.size(); ++rank) {
         if (vendor) {
-            ++width.mnnvl_calls[rank];
+            width.mnnvl_calls[rank] += calls;
         } else {
-            ++width.nccl_calls[rank];
+            width.nccl_calls[rank] += calls;
         }
-        width.payload_bytes[rank] += payload;
+        width.payload_bytes[rank] += calls * payload;
     }
 }
 
@@ -313,18 +316,18 @@ void TensorParallel::State::note_vendor_failure() {
 }
 
 void TensorParallel::State::record_vendor_success(std::size_t count, std::size_t payload,
-                                                  bool two_shot) {
+                                                  bool two_shot, std::size_t calls) {
     const auto transport = two_shot ? &TpArRankCounters::ar_mnnvl_twoshot_total
                                      : &TpArRankCounters::ar_mnnvl_oneshot_total;
     const std::lock_guard<std::mutex> lock(counter_mutex);
     for (std::size_t rank = 0; rank < devices.size(); ++rank) {
         TpArRankCounters& counter = ar_counters[rank];
-        ++counter.ar_calls_total;
-        ++(counter.*transport);
-        counter.ar_bytes_payload_total += payload;
-        counter.ar_bytes_aggregated_total += payload * devices.size();
+        counter.ar_calls_total += calls;
+        (counter.*transport) += calls;
+        counter.ar_bytes_payload_total += calls * payload;
+        counter.ar_bytes_aggregated_total += calls * payload * devices.size();
     }
-    bump_transport_width(count, payload, true);
+    bump_transport_width(count, payload, true, calls);
     mnnvl_active_mirror = true;
     if (logged_widths.insert(count).second) {
         std::cerr << "tp2_transport width=" << count << " transport=mnnvl" << std::endl;
@@ -443,8 +446,12 @@ void TensorParallel::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
     const bool two_shot = capture_state.status == cudaStreamCaptureStatusNone &&
                           state_->mnnvl != nullptr && state_->mnnvl->supports_twoshot(count);
     if (state_->vendor_allreduce(buffers, streams, count, capture_state, two_shot)) {
-        state_->record_vendor_success(count, payload, two_shot);
+        if (tp_verify_graph::binding(streams[0])) tp_verify_graph::record_regular(streams[0]);
+        else state_->record_vendor_success(count, payload, two_shot);
         return;
+    }
+    if (tp_verify_graph::binding(streams[0])) {
+        throw CudaError(cudaErrorNotSupported, "Capture TP verification allreduce");
     }
     const ArFallback reason = state_->vendor_fallback_reason(count, capture_state, two_shot);
 #else
@@ -466,11 +473,15 @@ bool TensorParallel::try_allreduce_rms_quantize(
     if (!MnnvlRmsQuantizeRows::supports(width) || rows[1].count != width) return false;
     const std::size_t count = width * mnnvl_ar_hidden_width;
     const auto capture = validate_collective_streams(state_->devices, streams, 2);
-    if (capture.status != cudaStreamCaptureStatusNone ||
+    const bool owned_capture = capture.status == cudaStreamCaptureStatusActive &&
+        capture.same_capture && width == tp_verify_graph::rows &&
+        tp_verify_graph::binding(streams[0]) && tp_verify_graph::binding(streams[1]);
+    if ((capture.status != cudaStreamCaptureStatusNone && !owned_capture) ||
         !state_->vendor_allreduce(buffers, streams, count, capture, false, rows, gains)) {
         return false;
     }
-    state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
+    if (owned_capture) tp_verify_graph::record_fused(streams[0]);
+    else state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
     return true;
 #else
     return false;
@@ -543,5 +554,22 @@ void TensorParallel::broadcast_int32(std::int32_t* const buffers[], const cudaSt
 }
 
 bool TensorParallel::graph_eligible() const noexcept { return nccl_supports_cuda_graphs; }
+
+bool TensorParallel::fused_graph_eligible() const noexcept {
+#if SGLANG_USE_MNNVL_AR
+    return !state_->failed && !state_->mnnvl_sticky && state_->mnnvl && state_->mnnvl->healthy();
+#else
+    return false;
+#endif
+}
+
+void TensorParallel::record_fused_graph_replay() {
+#if SGLANG_USE_MNNVL_AR
+    constexpr std::size_t count = tp_verify_graph::rows * mnnvl_ar_hidden_width;
+    state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false, 128);
+#endif
+}
+
+void TensorParallel::fail_fused_graph_replay() noexcept { state_->failed = true; }
 
 }   

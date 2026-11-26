@@ -17,7 +17,7 @@ Start a dedicated LMCache 0.5.8 daemon as the same Linux user as the native serv
 
 ## Runtime path
 
-The server attempts daemon-backed reuse by default. Use `--lmcache-socket PATH` to select an absolute Unix socket and `--prefix-cache-entries 0` to opt out. Positive entry counts are invalid. `--eager` controls graph replay independently.
+The server attempts daemon-backed reuse by default. Use `--lmcache-socket PATH` to select an absolute Unix socket and `--prefix-cache-entries 0` to opt out. Positive entry counts are invalid. `--eager` controls TP1 batch and [TP2 verification replay](batch-graphs.md#tp2-target-verification-graph) independently.
 
 Native text, chat, benchmark ID, and `/generate` requests accept an optional `cache_salt` string of up to 256 UTF-8 bytes. Omission uses an empty string. See [native generation options](native-generate.md#constraints-and-failure-behavior) for null and per-item salts. Invalid salts return HTTP 400 even when reuse is disabled. Native text, chat, and `/generate` support greedy and sampled requests with prefix reuse. Text and chat also support finite-choice requests. The benchmark ID route keeps its greedy policy.
 
@@ -43,7 +43,9 @@ The next shifted draft row at `P-1` uses the next token's embedding. A partial h
 
 Prompt token scores need the target row before each scored token. Restore stops at `logprob_start_len` and leaves at least the last prompt row to compute. An offset of zero, including OpenAI echo scoring, restores no rows. Generated-only scores and [pointwise label scores](serving/pointwise-score.md#runtime-path) can use a full hit. [Lookup limit](../apps/server/batch_service_cache.cpp#L14)<!-- prefix: "const int ma" -->
 
-On a full hit, the target computes the next-token logits from the restored hidden and residual rows. The current [grammar](text-serving.md#finite-choice-constraints) and [seed and sampler](text-serving.md#sampling) control selection. Restore and full-hit scoring stay outside the target row cap. Other lanes retain their normal decode selection. At positive depth, any later verification seeds draft position `P-1` with the first committed output ID. [Full hit](../src/decoder_batch.cpp#L282)<!-- prefix: "if (lane.res" --> · [MTP row accounting](mtp.md#runtime-path)
+On a full hit, the target computes the next-token logits from the restored hidden and residual rows. The current [grammar](text-serving.md#finite-choice-constraints) and [seed and sampler](text-serving.md#sampling) control selection. Restore and full-hit scoring stay outside the target row cap. Other lanes retain their normal decode selection. At positive depth, any later verification seeds draft position `P-1` with the first committed output ID. [Full hit](../src/decoder_batch.cpp#L301)<!-- prefix: "if (lane.res" --> · [MTP row accounting](mtp.md#runtime-path)
+
+A focused two-B200 [TP2 verifier replay](batch-graphs.md#tp2-target-verification-graph) check matched eight cohorts with replay on and off, including cancel and readmission, 73 target calls, and four ranked checkpoint payload digests. Restores at 139 and 148 tokens replayed with fresh bindings. Separate controls covered capture-begin and stream-join refusal with exact eager fallback, and terminal peer dispatch, launch, completion, and readback failures. See `artifacts/tp2-resume/w1-graph-review/` (`qualification.GbksgLNn`, `qualification.hGhMxsO9`).
 
 ### Media identity and prefill
 
@@ -67,7 +69,7 @@ If a restore reports failure or its completed future throws a non-CUDA exception
 
 A daemon refusal increments the declined-store count. A transport failure increments the I/O error count. An asynchronous write failure leaves the checkpoint unacknowledged and preserves any result already delivered to the client. Previously submitted checkpoints can finish after the request aborts.
 
-With C++ prefix callbacks, direct MTP generation polls the restore before advancing and reports the restored prompt count in `cached_prompt_tokens`. It checks cancellation while waiting. Once `claim_completion` accepts a terminal finish, later cancellation cannot abandon that checkpoint. Returning `false` from `reserve_prefix_store` requests a retry, so synchronous callers must release capacity independently. Successful generation waits for terminal STORE submission. The daemon may acknowledge later. [Direct MTP generation](../src/decoder_batch.cpp#L775)<!-- prefix: "void Decoder" -->
+With C++ prefix callbacks, direct MTP generation polls the restore before advancing and reports the restored prompt count in `cached_prompt_tokens`. It checks cancellation while waiting. Once `claim_completion` accepts a terminal finish, later cancellation cannot abandon that checkpoint. Returning `false` from `reserve_prefix_store` requests a retry, so synchronous callers must release capacity independently. Successful generation waits for terminal STORE submission. The daemon may acknowledge later. [Direct MTP generation](../src/decoder_batch.cpp#L796)<!-- prefix: "void Decoder" -->
 
 ### Native HTTP controls
 

@@ -68,6 +68,7 @@ struct DecoderBatchOptions {
     int prefix_cache_entries = 0;
     int max_num_batched_tokens = decoder_default_max_num_batched_tokens;
     std::optional<std::size_t> resident_memory_limit = std::nullopt;
+    bool tp_verification_graphs = false;
 };
 
 struct DecoderPrefixCacheStats {

@@ -352,7 +352,7 @@ std::unique_ptr<BatchService> make_batch_service(const Arguments& arguments,
                                                  const sglang::Decoder& decoder) {
     const BatchExecutor::Options batch_options{
         arguments.enable_batch_cuda_graphs(), arguments.max_active, 0,
-        arguments.max_num_batched_tokens};
+        arguments.max_num_batched_tokens, !arguments.eager};
     auto executor = std::make_unique<SingleDeviceBatchExecutor>(decoder, batch_options);
     std::vector<std::array<std::uint8_t, 16>> rank_devices;
     std::vector<int> rank_cuda_devices;

@@ -158,7 +158,7 @@ void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound
                                     decoder::ConstraintWorkspace& constraints,
                                     std::byte* sampling_workspace,
                                     std::byte* logprob_workspace,
-                                    const decoder::TcVocabScratch* vocabulary) const {
+                                    const decoder::TcVocabScratch* vocabulary, bool capture) const {
     
     
     
@@ -170,7 +170,7 @@ void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound
     (void)model.verify_mtp_tp(*tp.peer, rounds, peer_rounds, count, constraints,
                               sampling_workspace, stream, tp.peer_stream, *tp.group,
                               tp.partials[0], tp.partials[1], vocabulary, primary_packed,
-                              peer_packed, logprob_workspace);
+                              peer_packed, logprob_workspace, capture);
 }
 
 TextGdnReplayBatch* DecoderBatch::TpDriver::prepare_peer_gdn_replays() const {

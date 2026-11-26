@@ -13,6 +13,7 @@ public:
         int max_active;
         int prefix_cache_entries;
         int max_num_batched_tokens;
+        bool tp_verification_graphs = false;
     };
 
     using Ready = std::function<void(BatchSession&)>;
@@ -23,12 +24,7 @@ public:
     const Options& options() const noexcept { return options_; }
     virtual BatchTopology topology() const noexcept = 0;
 
-    /// Start once with valid callbacks, both invoked on the session's worker.
-    /// Return after Ready succeeds.
-    /// A startup exception reaches the caller after worker and session teardown.
     virtual void start(Ready ready, Process process) = 0;
-    /// Wait for worker and session teardown after the service signals closure.
-    /// Safe to call before startup and after a previous join.
     virtual void join() noexcept = 0;
 
 protected:

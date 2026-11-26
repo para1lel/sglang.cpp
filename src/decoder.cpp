@@ -544,6 +544,7 @@ Decoder::TpRuntime::~TpRuntime() {
         decoder::DeviceScope peer_scope(peer_device);
         synchronize_cuda(peer_stream, "Fence rank-1 stream for tensor-parallel teardown");
     }
+    verification_capture.reset();
     group.reset();
     peer.reset();
     if (partials[1].attention || partials[1].hidden || peer_stream || packed[1]) {

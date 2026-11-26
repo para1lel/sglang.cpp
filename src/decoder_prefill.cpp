@@ -828,11 +828,44 @@ void enqueue_native_prefill_grants_tp(const DecoderModel& model, const DecoderMo
     }
 }
 
+bool try_prefill_paired_tiles_tp(const DecoderModel& model, const DecoderModel& peer,
+                                const PrefillGrant* grants, const PrefillGrant* peer_grants,
+                                int count, cudaStream_t stream, cudaStream_t peer_stream,
+                                TensorParallel& group, DecoderBatchStepStats& stats) {
+    if (!can_pack_paired_tiles(grants, count) || !can_pack_paired_tiles(peer_grants, count) ||
+        gdn_vendor_prefill_enabled() ||
+        on_device(peer.device, [] { return gdn_vendor_prefill_enabled(); })) return false;
+    constexpr auto retention = PrefillWorkspace::Retention::transient;
+    PrefillWorkspace workspace(stream, paired_tile_group.rows, retention);
+    if (!workspace.data()) return false;
+    auto peer_workspace = on_device(peer.device, [&] {
+        return PrefillWorkspace(peer_stream, paired_tile_group.rows, retention);
+    });
+    if (!peer_workspace.data()) {
+        workspace.close();
+        check(cudaStreamSynchronize(stream), "Release provisional TP prefill workspace");
+        return false;
+    }
+    const auto primary = paired_tile_segments(grants, workspace);
+    const auto mirror = paired_tile_segments(peer_grants, peer_workspace);
+    prefill_layerwise(model, primary.data(), paired_tile_group, workspace,
+                      PrefillAttentionMode::serial_segments, batch_prefill_tile_rows, &peer,
+                      mirror.data(), &peer_workspace, peer_stream, &group);
+    stats.prefill_workspace_bytes = std::max({stats.prefill_workspace_bytes, workspace.bytes(),
+                                              peer_workspace.bytes()});
+    record_projection_group(stats, paired_tile_group.rows);
+    workspace.close();
+    on_device(peer.device, [&] { peer_workspace.close(); });
+    return true;
+}
+
 bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderModel& peer,
                                       const PrefillGrant* grants, const PrefillGrant* peer_grants,
                                       int count, cudaStream_t stream, cudaStream_t peer_stream,
                                       TensorParallel& group, DecoderBatchStepStats& stats) {
     if (!model.backend.tensor_core_prefill || !peer.backend.tensor_core_prefill) return false;
+    if (try_prefill_paired_tiles_tp(model, peer, grants, peer_grants, count, stream, peer_stream,
+                                    group, stats)) return true;
     std::optional<PrefillWorkspace> peer_workspace;
     const auto ensure_peer = [&](int capacity) {
         if (peer_workspace) return;

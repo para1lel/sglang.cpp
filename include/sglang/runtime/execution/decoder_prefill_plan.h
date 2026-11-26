@@ -56,6 +56,26 @@ inline void validate_prefill_tile(const PrefillGrant& grant, const PrefillWorksp
     }
 }
 
+inline constexpr int paired_tile_grant_rows = 2 * batch_prefill_tile_rows;
+inline constexpr PrefillGroup paired_tile_group{4, 2 * paired_tile_grant_rows};
+static_assert(paired_tile_group.rows == grouped_prefill_max_rows);
+
+inline bool can_pack_paired_tiles(const PrefillGrant* grants, int count) {
+    return count == 2 && grants[0].rows == paired_tile_grant_rows &&
+        full_tile_prefill_grants(grants, count) && grants[0].request != grants[1].request &&
+        std::all_of(grants, grants + count, [](const PrefillGrant& grant) {
+            return grant.position == 0 && grant.prompt_remaining == paired_tile_grant_rows &&
+                grant.request && grant.request->cached_gqa_tokens == 0;
+        });
+}
+
+inline auto paired_tile_segments(const PrefillGrant* grants, const PrefillWorkspace& workspace) {
+    validate_prefill_tile(grants[0], workspace, paired_tile_grant_rows);
+    validate_prefill_tile(grants[1], workspace, paired_tile_grant_rows);
+    return std::array{prefill_tile(grants[0], 0), prefill_tile(grants[0], batch_prefill_tile_rows),
+                      prefill_tile(grants[1], 0), prefill_tile(grants[1], batch_prefill_tile_rows)};
+}
+
 inline void record_projection_group(DecoderBatchStepStats& stats, int rows) {
     ++stats.layerwise_prefill_groups;
     stats.layerwise_prefill_rows += rows;

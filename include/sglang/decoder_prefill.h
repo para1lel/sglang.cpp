@@ -58,7 +58,10 @@ struct PrefillProjections {
 
 class PrefillWorkspace {
 public:
+    enum class Retention { existing, transient };
+
     PrefillWorkspace(cudaStream_t stream, int capacity);
+    PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention);
     ~PrefillWorkspace();
     PrefillWorkspace(const PrefillWorkspace&) = delete;
     PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;

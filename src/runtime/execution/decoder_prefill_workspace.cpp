@@ -10,7 +10,8 @@
 namespace sglang::decoder {
 
 struct PrefillPool {
-    PrefillPool(int ordinal, bool large) : device(ordinal), large(large) {}
+    PrefillPool(int ordinal, bool large, bool transient)
+        : device(ordinal), large(large), transient(transient) {}
 
     ~PrefillPool() {
         if (handle) {
@@ -20,6 +21,7 @@ struct PrefillPool {
 
     const int device;
     const bool large;
+    const bool transient;
     cudaMemPool_t handle = nullptr;
     void* pending = nullptr;
     bool retains_backing = false;
@@ -76,12 +78,12 @@ public:
                                   "Configure prefill pool retention");
     }
 
-    std::unique_ptr<PrefillPool> take_idle(int device, bool large) {
+    std::unique_ptr<PrefillPool> take_idle(int device, bool large, bool transient) {
         const std::lock_guard<std::mutex> lock(mutex_);
-        if (auto pool = take(idle_, device, large, true)) {
-            return pool;
+        if (!transient) {
+            if (auto pool = take(idle_, device, large, false, true)) return pool;
         }
-        return take(idle_, device, large);
+        return take(idle_, device, large, transient);
     }
 
     std::unique_ptr<PrefillPool> take_pending(int device) {
@@ -111,10 +113,12 @@ public:
 private:
     static std::unique_ptr<PrefillPool> take(std::unique_ptr<PrefillPool>& list, int device,
                                              std::optional<bool> large = std::nullopt,
+                                             std::optional<bool> transient = std::nullopt,
                                              bool must_retain_backing = false) {
         auto* link = &list;
         while (*link && ((*link)->device != device ||
                         (large && (*link)->large != *large) ||
+                        (transient && (*link)->transient != *transient) ||
                         (must_retain_backing && !(*link)->retains_backing))) {
             link = &(*link)->next;
         }
@@ -172,6 +176,9 @@ void decoder::reclaim_prefill_workspaces(int device) {
 }
 
 PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
+    : PrefillWorkspace(stream, capacity, Retention::existing) {}
+
+PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention)
     : stream_(stream), capacity_(capacity) {
     if (!stream || capacity < 1 || capacity > grouped_prefill_max_rows) {
         throw std::invalid_argument("Invalid decoder prefill workspace");
@@ -182,12 +189,13 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
     check(cudaGetLastError(), "Check CUDA state before allocating prefill workspace");
     int device = 0;
     check(cudaGetDevice(&device), "Get CUDA device for prefill workspace");
-    reclaim_prefill_workspaces(device);
+    const bool transient = retention == Retention::transient;
+    if (!transient) reclaim_prefill_workspaces(device);
     const bool large = capacity > prefill_chunk_rows;
     auto& pools = prefill_pools();
-    auto pool = pools.take_idle(device, large);
+    auto pool = pools.take_idle(device, large, transient);
     if (!pool) {
-        pool = std::make_unique<PrefillPool>(device, large);
+        pool = std::make_unique<PrefillPool>(device, large, transient);
         cudaMemPoolProps props{};
         props.allocType = cudaMemAllocationTypePinned;
         props.location.type = cudaMemLocationTypeDevice;
@@ -200,7 +208,7 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
         const auto configured = cudaMemPoolSetAttribute(
             pool->handle, cudaMemPoolReuseAllowInternalDependencies, &disabled);
         check_prefill_pool_result(configured, false, "Configure prefill workspace pool");
-        pools.configure_retention(*pool);
+        if (!transient) pools.configure_retention(*pool);
     }
     const auto bytes = prefill_workspace_bytes(capacity);
     void* data = nullptr;
@@ -231,7 +239,7 @@ cudaError_t PrefillWorkspace::release() noexcept {
         release_status_ = cudaFreeAsync(data_, stream_);
         if (release_status_ != cudaSuccess) {
             pool_->pending = data_;
-            recover_prefill_pool(*pool_);
+            if (!pool_->transient) recover_prefill_pool(*pool_);
         }
         prefill_pools().put(std::move(pool_));
         data_ = nullptr;

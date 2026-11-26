@@ -72,7 +72,7 @@ The [checkpoint loader](../include/sglang/checkpoint.h#L24)<!-- prefix: "class C
 
 ### Runtime path
 
-The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../include/sglang/runtime/model/qwen_text_model.h#L40)<!-- prefix: "constexpr La" --> · [Execution bank selection](../include/sglang/runtime/model/qwen_layers.h#L96)<!-- prefix: "const auto [" --> · [Tile adapter](../src/decoder_prefill.cpp#L638)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L83)<!-- prefix: "void Decoder" -->
+The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../include/sglang/runtime/model/qwen_text_model.h#L40)<!-- prefix: "constexpr La" --> · [Execution bank selection](../include/sglang/runtime/model/qwen_layers.h#L96)<!-- prefix: "const auto [" --> · [Tile adapter](../src/decoder_prefill.cpp#L640)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L83)<!-- prefix: "void Decoder" -->
 
 Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L684)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L316)<!-- prefix: "void Request" -->
 

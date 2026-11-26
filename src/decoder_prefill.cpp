@@ -54,6 +54,7 @@ void execute_layers_tp(const std::array<Layer, layer_count>& primary_layers,
 struct PrefillGroupPlan {
     bool grouped = false;
     bool causal = false;
+    bool full_causal = false;
     bool serial_attention = false;
     bool wide_partial = false;
     bool staged_group = false;
@@ -67,6 +68,7 @@ PrefillGroupPlan plan_prefill_group(const PrefillGrant* grants, PrefillGroup gro
     PrefillGroupPlan plan;
     plan.grouped = group.rows > max_layerwise_rows;
     plan.causal = attention_mode == PrefillAttentionMode::causal_segments;
+    plan.full_causal = plan.causal && group.rows == grouped_prefill_max_rows;
     plan.serial_attention = plan.causal ||
         attention_mode == PrefillAttentionMode::serial_segments;
     plan.wide_partial = !plan.causal && plan.serial_attention &&
@@ -169,7 +171,7 @@ void PrefillGroupTp::attention(const GqaLayer& layer, const GqaLayer& peer_layer
     const auto run_rank = [&](const Chunk& c, const GqaLayer& l, const PrefillGrant* lane) {
         if (plan.serial_attention) {
             prefill_serial_gqa(c, l, bank, lane, group.grants, serial_capacity, plan.causal,
-                               plan.wide_partial);
+                               !plan.wide_partial && !plan.full_causal);
         } else if (plan.staged_group) {
             prefill_group_gqa(c, l, bank, lane, group.grants, 0, true);
         } else if (plan.partners) {
@@ -183,7 +185,7 @@ void PrefillGroupTp::attention(const GqaLayer& layer, const GqaLayer& peer_layer
     };
     run_rank(chunk, layer, grants);
     on_peer([&] { run_rank(peer_chunk, peer_layer, peer_grants); });
-    if (plan.packed_preparation) {
+    if (plan.packed_preparation || plan.full_causal) {
         const auto primary = try_prefill_gqa_postgate_quantize(
             group.rows, buffers.q_gate, buffers.attention, buffers.activation, stream,
             dims.gqa_geometry());
@@ -219,7 +221,7 @@ void PrefillGroupTp::attention(const GqaLayer& layer, const GqaLayer& peer_layer
             });
         });
     }
-    if (!plan.serial_attention) {
+    if (!plan.serial_attention || plan.full_causal) {
         chunk.gqa_gate();
         on_peer([&] { peer_chunk.gqa_gate(); });
     }
@@ -400,7 +402,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
             chunk.gqa_input(layer, reuse_all_gqa);
             if (plan.serial_attention) {
                 prefill_serial_gqa(chunk, layer, bank, grants, group.grants, serial_capacity,
-                                   plan.causal, plan.wide_partial);
+                                   plan.causal, !plan.wide_partial && !plan.full_causal);
             } else if (plan.staged_group) {
                 prefill_group_gqa(chunk, layer, bank, grants, group.grants, 0, true);
             } else if (plan.partners) {
@@ -411,7 +413,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                     prefill_group_gqa(chunk, layer, bank, first, count, offset);
                 });
             }
-            if (plan.packed_preparation) {
+            if (plan.packed_preparation || plan.full_causal) {
                 if (const auto status = try_prefill_gqa_postgate_quantize(
                         group.rows, buffers.q_gate, buffers.attention, buffers.activation,
                         stream)) {
@@ -427,7 +429,7 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
                         prefill_attention_segment(chunk, grant, row).gqa_gate();
                     });
             }
-            if (!plan.serial_attention) chunk.gqa_gate();
+            if (!plan.serial_attention || plan.full_causal) chunk.gqa_gate();
             chunk.project_scaled(layer.output, chunk.quantize(buffers.attention, dims.q_width),
                                  buffers.projected_attention, scaled_output);
         },

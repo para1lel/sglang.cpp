@@ -52,6 +52,7 @@ struct TpReduceNorm {
     cudaStream_t streams[2];
     std::size_t count;
     bool fused = false;
+    bool all_twoshot = true;
     MnnvlRmsQuantizeRows rows[2];
 
     template <typename Lane>
@@ -72,9 +73,12 @@ struct TpReduceNorm {
         if (fused && gain) {
             const Bf16* gains[] = {gain, peer_gain};
             fused = group.try_allreduce_rms_quantize(buffers, streams, rows, gains);
-            if (fused) return true;
+            if (fused) {
+                all_twoshot = false;
+                return true;
+            }
         }
-        group.allreduce_bf16(buffers, streams, count);
+        all_twoshot = group.allreduce_bf16(buffers, streams, count) && all_twoshot;
         return false;
     }
 };
@@ -186,7 +190,7 @@ void Decoder::Model::forward_tp(
 }
 
 template <typename Lane>
-void Decoder::Model::forward_layers_tp(
+bool Decoder::Model::forward_layers_tp(
     const Model& peer, const Lane* primary_lanes, const Lane* peer_lanes, int count,
     cudaStream_t stream, cudaStream_t peer_stream, decoder::TensorParallel& group,
     const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials,
@@ -219,7 +223,6 @@ void Decoder::Model::forward_layers_tp(
         primary.singleton_verify_activation = narrow;
         peer_batch.singleton_verify_activation = narrow;
     }
-
     Bf16* attention_reduce[2] = {primary_partials.attention, peer_partials.attention};
     Bf16* hidden_reduce[2] = {primary_partials.hidden, peer_partials.hidden};
     TpReduceNorm reduce_norm{group, {stream, peer_stream},
@@ -284,13 +287,14 @@ void Decoder::Model::forward_layers_tp(
     decoder::DeviceScope peer_scope(peer.device);
     tp_scatter(peer_batch, count, peer_stream, peer_partials.hidden);
     peer_scope.restore();
+    return reduce_norm.all_twoshot;
 }
 
-template void Decoder::Model::forward_layers_tp<decoder::ForwardLane>(
+template bool Decoder::Model::forward_layers_tp<decoder::ForwardLane>(
     const Model&, const decoder::ForwardLane*, const decoder::ForwardLane*, int, cudaStream_t,
     cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
     const decoder::TpPartials&, std::uint8_t*, std::uint8_t*, bool) const;
-template void Decoder::Model::forward_layers_tp<decoder::VerificationRow>(
+template bool Decoder::Model::forward_layers_tp<decoder::VerificationRow>(
     const Model&, const decoder::VerificationRow*, const decoder::VerificationRow*, int,
     cudaStream_t, cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
     const decoder::TpPartials&, std::uint8_t*, std::uint8_t*, bool) const;

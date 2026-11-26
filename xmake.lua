@@ -438,6 +438,7 @@ target("sglang_decoder")
     add_files("src/decoder_tp.cpp")
     add_files("src/runtime/execution/decoder_forward_tp.cpp")
     add_files("src/runtime/execution/tp_verify_graph.cpp")
+    add_files("src/runtime/execution/peer_draft_repair.cpp")
     add_files("src/runtime/execution/decoder_batch_prefix.cpp")
 target_end()
 

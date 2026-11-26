@@ -597,6 +597,21 @@ static void repair_rounds(const DraftRepairs* repairs, int size, std::uint8_t* p
     }
 }
 
+bool DecoderBatch::State::prepare_peer_repair(const MtpRound* rounds, int count) {
+    return tp_driver && !output && !options.cuda_graphs && residency.resident() &&
+        wide_mtp_activation && wide_mtp_capacity >= draft_projection_rows &&
+        tp_driver->prepare_peer_repair(rounds, count);
+}
+
+void DecoderBatch::State::repair_verification_group(const DraftRepairs* repairs, int count,
+                                                    cudaStream_t stream) {
+    const bool exact = tp && count == draft_projection_rows && wide_mtp_capacity >= count;
+    if (exact && tp_driver->peer_repair && tp_driver->peer_repair->apply(repairs, stream)) return;
+    auto* packed = count > decoder_batch_max_mtp_lanes && (!tp || exact)
+        ? wide_mtp_activation : nullptr;
+    repair_rounds(repairs, count, packed, exact, stream);
+}
+
 void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, int& next_slot,
                                           Steps& results, DecoderBatchStepStats& stats,
                                           const WideMtpGroups& wide_groups,
@@ -609,6 +624,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     const int count =
         collect_rounds(verification_rows, next_slot, wide_groups, rounds, peer_rounds, slots);
     if (count == 0) return;
+    const bool allow_peer_repair = prepare_peer_repair(rounds.data(), count);
     const auto& cancel = cancel_probe();
     const bool score_together = count >= draft_projection_rows ||
         (count == wide_mtp_lanes && wide_mtp_activation != nullptr);
@@ -634,7 +650,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                 !storage->slots[slots[first + 1]]->options.eager;
             tp_driver->verify(rounds.data() + first, peer_rounds.data() + first, size, stream,
                               constraint_workspace, sampling_workspace, logprob_workspace,
-                              storage->tc_vocab.get(), capture);
+                              storage->tc_vocab.get(), capture, allow_peer_repair);
         } else if (model.verify_mtp(rounds.data() + first, size, constraint_workspace,
                                     sampling_workspace, stream, graph,
                                     storage->tc_vocab.get(), activation,
@@ -661,11 +677,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                               gdn_batch);
             if (tp_driver) tp_driver->commit_peer_round(lane, round, saved, peer_gdn_batch);
         }
-        if (!deferred) {
-            const bool exact = tp && size == draft_projection_rows && wide_mtp_capacity >= size;
-            auto* packed = size > packet && (!tp || exact) ? wide_mtp_activation : nullptr;
-            repair_rounds(repairs, size, packed, exact, stream);
-        }
+        if (!deferred) repair_verification_group(repairs, size, stream);
         if (gdn_batch) {
             check(gdn_batch->launch(tp != nullptr, stream), "Batched GDN prefix replay");
         }
@@ -785,9 +797,11 @@ Steps DecoderBatch::State::advance(const Selection& requested, bool chunked,
         }
         return results;
     } catch (const CudaError& error) {
+        if (tp_driver && tp_driver->peer_repair) tp_driver->peer_repair->drain();
         fail_step(!CudaError::terminal(error.status) && (contains_mtp || publishing_prefix));
         throw;
     } catch (...) {
+        if (tp_driver && tp_driver->peer_repair) tp_driver->peer_repair->drain();
         fail_step(contains_mtp && !publishing_prefix);
         throw;
     }

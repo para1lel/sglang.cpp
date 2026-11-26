@@ -389,12 +389,13 @@ tp_verify_graph::Graph* Decoder::Model::forward_verification_tp(
     const Model& peer, const VerificationRow* rows, const VerificationRow* peer_rows,
     int count, int total, cudaStream_t stream, cudaStream_t peer_stream, TensorParallel& group,
     const TpPartials& primary_partials, const TpPartials& peer_partials,
-    std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool greedy, bool capture) const {
+    std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool greedy, bool capture,
+    bool& eager_twoshot) const {
     const tp_verify_graph::Input input{rows, peer_rows};
     const auto forward = [&](const tp_verify_graph::Input& live) {
-        forward_layers_tp(peer, live[0], live[1], total, stream, peer_stream, group,
-                          primary_partials, peer_partials, primary_packed, peer_packed,
-                          count == 1 && greedy);
+        return forward_layers_tp(peer, live[0], live[1], total, stream, peer_stream, group,
+                                 primary_partials, peer_partials, primary_packed, peer_packed,
+                                 count == 1 && greedy);
     };
     if (capture && tp && count == 2 && total == tp_verify_graph::rows && greedy &&
         !primary_packed && !peer_packed && backend.vector_decode_attention &&
@@ -407,7 +408,7 @@ tp_verify_graph::Graph* Decoder::Model::forward_verification_tp(
             return tp->verification_capture.get();
         }
     }
-    forward(input);
+    eager_twoshot = forward(input);
     return nullptr;
 }
 }

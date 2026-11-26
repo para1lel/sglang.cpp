@@ -1,14 +1,13 @@
-#include "sglang/decoder_mtp.h"
+#include "sglang/text/mtp/draft_state.h"
 
-#include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_verify.h"
-#include "sglang/runtime/backend/cuda_backend_policy.h"
 #include "sglang/runtime/model/qwen_weight_upload.h"
 #include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/draft_projection.h"
 #include "sglang/text/mtp/tc_vocab.h"
+#include "sglang/runtime/cache/kv_residency_policy.h"
 
 #include <cmath>
 #include <cstdio>
@@ -18,59 +17,31 @@
 #include <utility>
 
 namespace sglang::decoder {
+
+DraftWorkspace::DraftWorkspace(Allocations& memory)
+    : embedding(memory.allocate<Bf16>(hidden_size)),
+      concatenated(memory.allocate<Bf16>(2 * hidden_size)),
+      residual(memory.allocate<Bf16>(hidden_size)),
+      normalized(memory.allocate<Bf16>(hidden_size)),
+      branch(memory.allocate<Bf16>(hidden_size)),
+      q_gate(memory.allocate<Bf16>(text_gqa_q_gate_width)),
+      keys(memory.allocate<Bf16>(text_gqa_kv_width)),
+      values(memory.allocate<Bf16>(text_gqa_kv_width)),
+      rope_queries(memory.allocate<Bf16>(text_gqa_q_width)),
+      rope_keys(memory.allocate<Bf16>(text_gqa_kv_width)),
+      attention(memory.allocate<Bf16>(text_gqa_q_width)),
+      gate(memory.allocate<Bf16>(intermediate_size)),
+      up(memory.allocate<Bf16>(intermediate_size)),
+      score_storage(memory.allocate<float>(score_storage_count)),
+      logits(reinterpret_cast<Bf16*>(score_storage)),
+      activation{memory.allocate<std::uint8_t>(intermediate_size),
+                 memory.allocate<float>(text_fp8_group_count(intermediate_size))},
+      argmax_scratch(memory.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
+      argmax(memory.allocate<TextLogitCandidate>(1)) {}
+
 namespace {
 
 static_assert(draft_projection_rows % draft_wave_rows == 0);
-
-struct DraftWorkspace {
-    static constexpr int score_storage_count = vocab_size * sizeof(Bf16) / sizeof(float);
-    static_assert(score_storage_count * sizeof(float) == vocab_size * sizeof(Bf16));
-
-    explicit DraftWorkspace(Allocations& memory)
-        : embedding(memory.allocate<Bf16>(hidden_size)),
-          concatenated(memory.allocate<Bf16>(2 * hidden_size)),
-          residual(memory.allocate<Bf16>(hidden_size)),
-          normalized(memory.allocate<Bf16>(hidden_size)),
-          branch(memory.allocate<Bf16>(hidden_size)),
-          q_gate(memory.allocate<Bf16>(text_gqa_q_gate_width)),
-          keys(memory.allocate<Bf16>(text_gqa_kv_width)),
-          values(memory.allocate<Bf16>(text_gqa_kv_width)),
-          rope_queries(memory.allocate<Bf16>(text_gqa_q_width)),
-          rope_keys(memory.allocate<Bf16>(text_gqa_kv_width)),
-          attention(memory.allocate<Bf16>(text_gqa_q_width)),
-          gate(memory.allocate<Bf16>(intermediate_size)),
-          up(memory.allocate<Bf16>(intermediate_size)),
-          score_storage(memory.allocate<float>(score_storage_count)),
-          logits(reinterpret_cast<Bf16*>(score_storage)),
-          activation{memory.allocate<std::uint8_t>(intermediate_size),
-                     memory.allocate<float>(text_fp8_group_count(intermediate_size))},
-          argmax_scratch(
-              memory.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
-          argmax(memory.allocate<TextLogitCandidate>(1)) {}
-
-    ExactGqaWorkspace attention_scores() const {
-        return {score_storage, score_storage_count / mxfp8_query_heads};
-    }
-
-    Bf16* embedding;
-    Bf16* concatenated;
-    Bf16* residual;
-    Bf16* normalized;
-    Bf16* branch;
-    Bf16* q_gate;
-    Bf16* keys;
-    Bf16* values;
-    Bf16* rope_queries;
-    Bf16* rope_keys;
-    Bf16* attention;
-    Bf16* gate;
-    Bf16* up;
-    float* score_storage;
-    Bf16* logits;
-    TextFp8Activation activation;
-    TextLogitCandidate* argmax_scratch;
-    TextLogitCandidate* argmax;
-};
 
 void quantize(const Bf16* input, int width, const DraftWorkspace& work, cudaStream_t stream) {
     check(text_quantize_fp8(input, width, work.activation, stream), "Quantize MTP activation");
@@ -93,135 +64,66 @@ bool prepare_streaming_projection(int device) {
     return false;
 }
 
-bool use_streaming_projection(bool supported, cudaStream_t stream) {
-    if (!supported) return false;
-    cudaStreamCaptureStatus status;
-    check(cudaStreamIsCapturing(stream, &status), "Check draft projection capture status");
-    return status == cudaStreamCaptureStatusNone;
 }
 
-}
-
-struct MtpDraftWeights::State {
-    State(const std::filesystem::path& directory, int device,
-          std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-          Bf16Weight lm_head, DraftOperatorCapabilities capabilities)
-        : device(device), capabilities(capabilities), target_weights(std::move(target_weights)),
-          memory(device), embedding(embedding), lm_head(lm_head) {
-        if (!this->target_weights || !embedding || !lm_head.values ||
-            lm_head.rows != vocab_size || lm_head.columns != hidden_size) {
-            throw std::invalid_argument("Invalid MTP target embedding or LM head");
-        }
-        DeviceScope selected_device(device);
-        streaming_projection = prepare_streaming_projection(device);
-        auto& checkpoint = memory.transfers().checkpoint;
-        checkpoint = std::make_unique<Checkpoint>(directory);
-        memory.open_stream();
-        QwenWeightUpload upload(*checkpoint, memory, memory.stream());
-        embedding_norm = upload.bf16("mtp.pre_fc_norm_embedding.weight", {hidden_size});
-        hidden_norm = upload.bf16("mtp.pre_fc_norm_hidden.weight", {hidden_size});
-        fc = upload.bf16_matrix("mtp.fc.weight", hidden_size, 2 * hidden_size);
-        input_norm = upload.bf16("mtp.layers.0.input_layernorm.weight", {hidden_size});
-        attention_norm = upload.bf16("mtp.layers.0.post_attention_layernorm.weight", {hidden_size});
-        const std::string attention = "mtp.layers.0.self_attn.";
-        gqa = {
-            upload.fp8_matrix(attention + "q_proj", text_gqa_q_gate_width, hidden_size),
-            upload.fp8_matrix(attention + "k_proj", text_gqa_kv_width, hidden_size),
-            upload.fp8_matrix(attention + "v_proj", text_gqa_kv_width, hidden_size),
-            upload.bf16(attention + "q_norm.weight", {mxfp8_head_dim}),
-            upload.bf16(attention + "k_norm.weight", {mxfp8_head_dim}),
-            upload.fp8_matrix(attention + "o_proj", hidden_size, text_gqa_q_width),
-        };
-        const std::string mlp = "mtp.layers.0.mlp.";
-        mlp_gate = upload.fp8_matrix(mlp + "gate_proj", intermediate_size, hidden_size);
-        mlp_up = upload.fp8_matrix(mlp + "up_proj", intermediate_size, hidden_size);
-        mlp_down = upload.fp8_matrix(mlp + "down_proj", hidden_size, intermediate_size);
-        final_norm = upload.bf16("mtp.norm.weight", {hidden_size});
-        if (capabilities.int8_head) {
-            auto* values = memory.allocate<std::uint8_t>(
-                static_cast<std::size_t>(vocab_size) * hidden_size);
-            auto* maxima = memory.allocate<float>(vocab_size);
-            check(quantize_draft_head_int8(lm_head.values, vocab_size, values, maxima,
-                                          memory.stream()), "Quantize MTP vocabulary head");
-            quantized_head = values;
-            quantized_head_maxima = maxima;
-            shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
-        }
-        memory.close_stream();
-        if (capabilities.int8_head) {
-            std::vector<float> maxima(vocab_size);
-            check(cudaMemcpy(maxima.data(), quantized_head_maxima, maxima.size() * sizeof(float),
-                             cudaMemcpyDeviceToHost), "Read INT8 MTP vocabulary row maxima");
-            for (int token = 0; token < vocab_size; ++token) {
-                if (!std::isfinite(maxima[token])) {
-                    throw std::runtime_error("Nonfinite INT8 MTP vocabulary weight at token " +
-                                             std::to_string(token));
-                }
+MtpDraftWeights::State::State(const std::filesystem::path& directory, int device,
+                             std::shared_ptr<const Allocations> target_weights,
+                             const Bf16* embedding, Bf16Weight lm_head,
+                             DraftOperatorCapabilities capabilities)
+    : device(device), capabilities(capabilities), target_weights(std::move(target_weights)),
+      memory(device), embedding(embedding), lm_head(lm_head) {
+    if (!this->target_weights || !embedding || !lm_head.values ||
+        lm_head.rows != vocab_size || lm_head.columns != hidden_size) {
+        throw std::invalid_argument("Invalid MTP target embedding or LM head");
+    }
+    DeviceScope selected_device(device);
+    streaming_projection = prepare_streaming_projection(device);
+    auto& checkpoint = memory.transfers().checkpoint;
+    checkpoint = std::make_unique<Checkpoint>(directory);
+    memory.open_stream();
+    QwenWeightUpload upload(*checkpoint, memory, memory.stream());
+    embedding_norm = upload.bf16("mtp.pre_fc_norm_embedding.weight", {hidden_size});
+    hidden_norm = upload.bf16("mtp.pre_fc_norm_hidden.weight", {hidden_size});
+    fc = upload.bf16_matrix("mtp.fc.weight", hidden_size, 2 * hidden_size);
+    input_norm = upload.bf16("mtp.layers.0.input_layernorm.weight", {hidden_size});
+    attention_norm = upload.bf16("mtp.layers.0.post_attention_layernorm.weight", {hidden_size});
+    const std::string attention = "mtp.layers.0.self_attn.";
+    gqa = {
+        upload.fp8_matrix(attention + "q_proj", text_gqa_q_gate_width, hidden_size),
+        upload.fp8_matrix(attention + "k_proj", text_gqa_kv_width, hidden_size),
+        upload.fp8_matrix(attention + "v_proj", text_gqa_kv_width, hidden_size),
+        upload.bf16(attention + "q_norm.weight", {mxfp8_head_dim}),
+        upload.bf16(attention + "k_norm.weight", {mxfp8_head_dim}),
+        upload.fp8_matrix(attention + "o_proj", hidden_size, text_gqa_q_width),
+    };
+    const std::string mlp = "mtp.layers.0.mlp.";
+    mlp_gate = upload.fp8_matrix(mlp + "gate_proj", intermediate_size, hidden_size);
+    mlp_up = upload.fp8_matrix(mlp + "up_proj", intermediate_size, hidden_size);
+    mlp_down = upload.fp8_matrix(mlp + "down_proj", hidden_size, intermediate_size);
+    final_norm = upload.bf16("mtp.norm.weight", {hidden_size});
+    if (capabilities.int8_head) {
+        auto* values = memory.allocate<std::uint8_t>(std::size_t(vocab_size) * hidden_size);
+        auto* maxima = memory.allocate<float>(vocab_size);
+        check(quantize_draft_head_int8(lm_head.values, vocab_size, values, maxima,
+                                      memory.stream()), "Quantize MTP vocabulary head");
+        quantized_head = values;
+        quantized_head_maxima = maxima;
+        shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
+    }
+    memory.close_stream();
+    if (capabilities.int8_head) {
+        std::vector<float> maxima(vocab_size);
+        check(cudaMemcpy(maxima.data(), quantized_head_maxima, maxima.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost), "Read INT8 MTP vocabulary row maxima");
+        for (int token = 0; token < vocab_size; ++token) {
+            if (!std::isfinite(maxima[token])) {
+                throw std::runtime_error("Nonfinite INT8 MTP vocabulary weight at token " +
+                                         std::to_string(token));
             }
         }
-        selected_device.restore();
     }
-
-    int device;
-    const DraftOperatorCapabilities capabilities;
-    bool streaming_projection = false;
-    std::shared_ptr<const Allocations> target_weights;
-    Allocations memory;
-    const Bf16* embedding;
-    Bf16Weight lm_head;
-    const std::uint8_t* quantized_head = nullptr;
-    const float* quantized_head_maxima = nullptr;
-    std::shared_ptr<const TcVocabWeights> shared_vocab;
-    const Bf16* embedding_norm;
-    const Bf16* hidden_norm;
-    Bf16Weight fc;
-    const Bf16* input_norm;
-    const Bf16* attention_norm;
-    GqaLayer gqa;
-    Fp8Weight mlp_gate;
-    Fp8Weight mlp_up;
-    Fp8Weight mlp_down;
-    const Bf16* final_norm;
-};
-
-struct MtpDraftRequest::State {
-    State(std::shared_ptr<const MtpDraftWeights> weights, int capacity, RequestBlockCache* cache);
-    void validate(int position, int token, const Bf16* hidden) const;
-    void embed(int shifted_token, const Bf16* hidden, cudaStream_t stream,
-               const Bf16* feature = nullptr);
-    void prepare_attention(cudaStream_t stream);
-    void append(int position, bool score, const MropePosition* mrope, int rotary_position,
-                cudaStream_t stream);
-    DraftAttentionRow attention_row(int position);
-    void gate_attention(cudaStream_t stream);
-    void prepare_mlp(cudaStream_t stream);
-    void activate_mlp(cudaStream_t stream);
-    void normalize_output(cudaStream_t stream);
-    void score(cudaStream_t stream, const ConstraintWorkspace* scratch,
-               const ConstraintCandidates* allowed);
-    void select_score(cudaStream_t stream, const ConstraintWorkspace* scratch,
-                      const ConstraintCandidates* allowed);
-    bool prepare_mapped_score(cudaStream_t stream);
-    int score_token();
-    static void score_wave(State* const* batch, int count, cudaStream_t stream);
-    static void select_wave(State* const* batch, int count, cudaStream_t stream);
-
-    std::shared_ptr<const MtpDraftWeights> weights;
-    Allocations memory;
-    DraftWorkspace work;
-    int capacity;
-    Mxfp8KvCache cache;
-    Mxfp8PageTable pages;
-    int prefix = 0;
-    bool scored = false;
-    bool constrained_score = false;
-    bool int8_score = false;
-    bool retried_score = false;
-    bool mapped_score = false;
-    TextLogitCandidate* device_score = nullptr;
-    TextLogitCandidate retry_winner{};
-    bool failed = false;
-};
+    selected_device.restore();
+}
 
 MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
                               RequestBlockCache* block_cache)

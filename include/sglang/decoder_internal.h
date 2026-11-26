@@ -46,6 +46,7 @@ struct VerificationSequence;
 struct VerificationRow;
 struct VerificationGraph;
 struct MtpRound;
+class PeerDraftRepair;
 namespace tp_verify_graph { class Graph; }
 struct GeneratedLogprobReadback;
 
@@ -229,7 +230,7 @@ struct Decoder::Model {
                        const decoder::TcVocabScratch* vocabulary,
                        std::uint8_t* primary_packed, std::uint8_t* peer_packed,
                        void* logprob_workspace,
-                       bool capture) const;
+                       bool capture, decoder::PeerDraftRepair* peer_repair) const;
     bool forward_verify(const decoder::VerificationSequence* sequences, int count,
                         cudaStream_t stream, decoder::VerificationGraph* graph,
                         const decoder::TcVocabScratch* vocabulary,
@@ -301,7 +302,7 @@ struct Decoder::Model {
     
     
     template <typename Lane>
-    void forward_layers_tp(const Model& peer, const Lane* primary_lanes,
+    bool forward_layers_tp(const Model& peer, const Lane* primary_lanes,
                            const Lane* peer_lanes, int count, cudaStream_t stream,
                            cudaStream_t peer_stream, decoder::TensorParallel& group,
                            const decoder::TpPartials& primary_partials,
@@ -314,7 +315,8 @@ struct Decoder::Model {
         const decoder::VerificationRow* peer_rows, int count, int total,
         cudaStream_t stream, cudaStream_t peer_stream, decoder::TensorParallel& group,
         const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials,
-        std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool greedy, bool capture) const;
+        std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool greedy, bool capture,
+        bool& eager_twoshot) const;
 
     int device;
     std::string accelerator_name;

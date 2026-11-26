@@ -144,11 +144,12 @@ struct Fixture {
         }
     }
 
-    void reduce(TensorParallel& group, int count, int offset = 0) {
+    bool reduce(TensorParallel& group, int count, int offset = 0) {
         check(cudaSetDevice(devices[0]), "select collective caller");
         __nv_bfloat16* shifted[ranks]{buffers[0] + offset, buffers[1] + offset};
-        group.allreduce_bf16(shifted, streams, count);
+        const bool submitted_twoshot = group.allreduce_bf16(shifted, streams, count);
         check_caller(devices[0], "allreduce changed the caller device");
+        return submitted_twoshot;
     }
 
     void capture(TensorParallel& group, int count) {
@@ -157,7 +158,7 @@ struct Fixture {
             check(cudaStreamBeginCapture(streams[r], cudaStreamCaptureModeThreadLocal),
                   "begin rank stream capture");
         }
-        reduce(group, count);
+        require(!reduce(group, count), "captured split submission certified eager two-shot");
         for (int r = ranks - 1; r >= 0; --r) {
             check(cudaSetDevice(devices[r]), "select graph device");
             check(cudaStreamEndCapture(streams[r], &graphs[r]), "end rank stream capture");
@@ -175,7 +176,7 @@ struct Fixture {
         check(cudaEventRecord(fork, streams[0]), "record capture fork");
         check(cudaSetDevice(devices[1]), "select capture peer");
         check(cudaStreamWaitEvent(streams[1], fork), "join peer to capture");
-        reduce(group, count);
+        require(!reduce(group, count), "captured joined submission certified eager two-shot");
         check(cudaSetDevice(devices[1]), "select capture peer after reduce");
         check(cudaEventRecord(join, streams[1]), "record capture join");
         check(cudaSetDevice(devices[0]), "select capture root after reduce");
@@ -245,7 +246,8 @@ void check_eager(TensorParallel& group, bool vendor, RankCounter unavailable) {
             const auto transport = vendor ? test.transport : nccl;
             const auto before = snapshot(group);
             fixture.upload(generation);
-            fixture.reduce(group, test.count, test.offset);
+            require(fixture.reduce(group, test.count, test.offset) == (transport == two_shot),
+                    "eager two-shot certificate disagrees with submitted transport");
             expect_route(group, before, transport, vendor ? test.fallback : unavailable);
             fixture.verify(generation++, test.count, transport, test.offset);
         }

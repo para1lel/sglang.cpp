@@ -4,6 +4,7 @@
 #include "sglang/decoder_prefix_cache.h"
 #include "sglang/mxfp8_gqa.h"
 #include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/runtime/backend/tensor_parallel.h"
 
 #include <utility>
 #include <cstdlib>
@@ -153,12 +154,25 @@ decoder::MtpRound DecoderBatch::TpDriver::peer_round(const decoder::Lane& lane, 
             lane.remaining_output(), rows};
 }
 
+bool DecoderBatch::TpDriver::prepare_peer_repair(const decoder::MtpRound* rounds, int count) {
+    constexpr std::size_t elements = std::size_t(decoder::draft_projection_rows) *
+        decoder::target_verify_max_rows * decoder::hidden_size;
+    if (!decoder::PeerDraftRepair::eligible(rounds, count) || !model.is_b200() ||
+        !tp.peer->is_b200() || !tp.group->supports_mnnvl_twoshot(elements)) return false;
+    if (!peer_repair_prepared) {
+        peer_repair = decoder::PeerDraftRepair::prepare(*model.mtp_weights, tp.peer_device);
+        peer_repair_prepared = true;
+    }
+    return peer_repair != nullptr;
+}
+
 void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound* peer_rounds,
                                     int count, cudaStream_t stream,
                                     decoder::ConstraintWorkspace& constraints,
                                     std::byte* sampling_workspace,
                                     std::byte* logprob_workspace,
-                                    const decoder::TcVocabScratch* vocabulary, bool capture) const {
+                                    const decoder::TcVocabScratch* vocabulary, bool capture,
+                                    bool allow_peer_repair) const {
     
     
     
@@ -167,10 +181,12 @@ void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound
         count > decoder_batch_max_mtp_lanes ? tp.packed[0] : nullptr;
     std::uint8_t* const peer_packed =
         count > decoder_batch_max_mtp_lanes ? tp.packed[1] : nullptr;
+    auto* repair = allow_peer_repair && !capture && count == decoder::draft_projection_rows
+        ? peer_repair.get() : nullptr;
     (void)model.verify_mtp_tp(*tp.peer, rounds, peer_rounds, count, constraints,
                               sampling_workspace, stream, tp.peer_stream, *tp.group,
                               tp.partials[0], tp.partials[1], vocabulary, primary_packed,
-                              peer_packed, logprob_workspace, capture);
+                              peer_packed, logprob_workspace, capture, repair);
 }
 
 TextGdnReplayBatch* DecoderBatch::TpDriver::prepare_peer_gdn_replays() const {

@@ -672,7 +672,21 @@ void score_verification_packet(const DecoderModel& model, const VerificationRow*
     }
 }
 
-}  
+void enqueue_round_results(const MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
+                           void* sampling_scratch, void* logprob_workspace) {
+    for (int index = 0; index < count; ++index) {
+        const auto& round = rounds[index];
+        if (round.constraint) {
+            round.target->constrain(*round.constraint, scratch, round.sampling, round.first_output,
+                                    sampling_scratch);
+        } else if (round.sampling) {
+            round.target->sample(*round.sampling, round.first_output, sampling_scratch);
+        }
+        round.target->enqueue_generated_logprobs(logprob_workspace);
+    }
+}
+
+}
 
 bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
                                 void* sampling_scratch, cudaStream_t stream,
@@ -700,16 +714,7 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
     }
     const bool replayed = forward_verify(sequences.data(), count, stream, graph, vocabulary,
                                          packed_activation);
-    for (int index = 0; index < count; ++index) {
-        const auto& round = rounds[index];
-        if (round.constraint) {
-            round.target->constrain(*round.constraint, scratch, round.sampling, round.first_output,
-                                    sampling_scratch);
-        } else if (round.sampling) {
-            round.target->sample(*round.sampling, round.first_output, sampling_scratch);
-        }
-        round.target->enqueue_generated_logprobs(logprob_workspace);
-    }
+    enqueue_round_results(rounds, count, scratch, sampling_scratch, logprob_workspace);
     TargetVerification::read_all(verifiers.data(), count, stream);
     return replayed;
 }
@@ -745,13 +750,10 @@ void gather_tp_packet(const VerificationSequence* sequences,
     }
 }
 
-
-
-
-
-void score_tp_rows(const auto& tc_vocab, const auto& final_norm, const VerificationRow* rows,
+bool score_tp_rows(const auto& tc_vocab, const auto& final_norm, const VerificationRow* rows,
                    int total, const TcVocabScratch* vocabulary, cudaStream_t stream,
                    const auto& score_packet) {
+    bool packed = true;
     static_assert(tc_vocab_wide_rows == 2 * verification_packet_rows);
     for (int first = 0; first < total;) {
         const auto* packet = rows + first;
@@ -774,9 +776,11 @@ void score_tp_rows(const auto& tc_vocab, const auto& final_norm, const Verificat
                 continue;
             }
         }
+        packed = false;
         score_packet(packet, verification_packet_rows);
         first += verification_packet_rows;
     }
+    return packed;
 }
 
 }
@@ -787,7 +791,7 @@ bool Decoder::Model::verify_mtp_tp(
     cudaStream_t peer_stream, TensorParallel& group, const TpPartials& primary_partials,
     const TpPartials& peer_partials, const TcVocabScratch* vocabulary,
     std::uint8_t* primary_packed, std::uint8_t* peer_packed, void* logprob_workspace,
-    bool capture) const {
+    bool capture, PeerDraftRepair* peer_repair) const {
     std::array<VerificationSequence, max_wide_mtp_lanes> sequences;
     std::array<TargetVerification*, max_wide_mtp_lanes> verifiers;
     std::array<TargetVerification*, max_wide_mtp_lanes> peer_verifiers;
@@ -853,29 +857,25 @@ bool Decoder::Model::verify_mtp_tp(
               "Look up peer verification inputs");
         peer_scope.restore();
     }
+    bool eager_twoshot = false;
     const tp_verify_graph::Submission submitted(group,
         forward_verification_tp(peer, rows.data(), peer_rows.data(), count, total, stream,
                                 peer_stream, group, primary_partials, peer_partials, primary_packed,
-                                peer_packed, vocabulary != nullptr, capture));
+                                peer_packed, vocabulary != nullptr, capture, eager_twoshot));
+    if (peer_repair && eager_twoshot) {
+        peer_repair->submit(rounds, peer_rows.data(), peer.embedding, peer.final_norm,
+                            stream, peer_stream);
+    }
     if (count <= decoder_batch_max_mtp_lanes) {
         score_verification_packet(*this, rows.data(), total, vocabulary, stream, count == 2);
     } else {
-        score_tp_rows(tc_vocab, final_norm, rows.data(), total, vocabulary, stream,
-                      [&](const VerificationRow* packet, int packet_rows) {
-                          score_verification_packet(*this, packet, packet_rows, vocabulary,
-                                                    stream);
-                      });
+        const bool packed = score_tp_rows(tc_vocab, final_norm, rows.data(), total, vocabulary,
+            stream, [&](const VerificationRow* packet, int packet_rows) {
+                score_verification_packet(*this, packet, packet_rows, vocabulary, stream);
+            });
+        if (peer_repair && !packed) peer_repair->discard();
     }
-    for (int index = 0; index < count; ++index) {
-        const auto& round = rounds[index];
-        if (round.constraint) {
-            round.target->constrain(*round.constraint, scratch, round.sampling, round.first_output,
-                                    sampling_scratch);
-        } else if (round.sampling) {
-            round.target->sample(*round.sampling, round.first_output, sampling_scratch);
-        }
-        round.target->enqueue_generated_logprobs(logprob_workspace);
-    }
+    enqueue_round_results(rounds, count, scratch, sampling_scratch, logprob_workspace);
     TargetVerification::read_all(verifiers.data(), count, stream);
     const DeviceScope peer_scope(peer.device);
     TargetVerification::read_all(peer_verifiers.data(), count, peer_stream);

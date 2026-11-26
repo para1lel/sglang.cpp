@@ -48,10 +48,12 @@ struct DecoderBatch::TpDriver {
 
     void prepare_peer_verification(decoder::Lane& lane, int capacity) const;
     static decoder::MtpRound peer_round(const decoder::Lane& lane, int rows);
+    bool prepare_peer_repair(const decoder::MtpRound* rounds, int count);
     void verify(decoder::MtpRound* rounds, decoder::MtpRound* peer_rounds, int count,
                 cudaStream_t stream, decoder::ConstraintWorkspace& constraints,
                 std::byte* sampling_workspace, std::byte* logprob_workspace,
-                const decoder::TcVocabScratch* vocabulary, bool capture) const;
+                const decoder::TcVocabScratch* vocabulary, bool capture,
+                bool allow_peer_repair) const;
     void commit_peer_round(decoder::Lane& lane, const decoder::MtpRound& round,
                            const decoder::Workspace* const* saved,
                            TextGdnReplayBatch* gdn_batch = nullptr) const;
@@ -66,6 +68,8 @@ struct DecoderBatch::TpDriver {
     Decoder::TpRuntime& tp;
     mutable TextGdnReplayBatch peer_replays;
     mutable bool peer_replays_broken = false;
+    std::unique_ptr<decoder::PeerDraftRepair> peer_repair;
+    bool peer_repair_prepared = false;
 };
 
 }

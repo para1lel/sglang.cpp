@@ -165,6 +165,8 @@ struct DecoderBatch::State {
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats, const WideMtpGroups& wide_groups,
                          CheckpointRows* checkpoint_rows);
+    bool prepare_peer_repair(const MtpRound* rounds, int count);
+    void repair_verification_group(const DraftRepairs* repairs, int count, cudaStream_t stream);
     int collect_rounds(const PrefillRows& verification_rows, int& next_slot,
                        const WideMtpGroups& wide_groups,
                        std::array<MtpRound, max_wide_mtp_lanes>& rounds,

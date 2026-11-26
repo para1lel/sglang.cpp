@@ -48,6 +48,7 @@ private:
     struct State;
     std::unique_ptr<const State> state_;
     friend class MtpDraftRequest;
+    friend class PeerDraftRepair;
 };
 
 class MtpDraftRequest {
@@ -90,6 +91,7 @@ private:
     static void enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
                                   cudaStream_t stream, bool defer_score, Bf16* packed = nullptr,
                                   bool exact = false);
+    friend class PeerDraftRepair;
     friend PrefixDeviceTransfer restore_prefix_view(Request&, const PrefixCacheRead&,
                                                     cudaStream_t, MtpDraftRequest*,
                                                     const PrefixCacheLayout*);
@@ -102,6 +104,25 @@ private:
     void commit_restored_prefix(int rows);
 
     struct State;
+    std::unique_ptr<State> state_;
+};
+
+class PeerDraftRepair {
+public:
+    static bool eligible(const MtpRound* rounds, int count);
+    static std::unique_ptr<PeerDraftRepair> prepare(const MtpDraftWeights& weights, int peer);
+    ~PeerDraftRepair();
+
+    void submit(const MtpRound* rounds, const VerificationRow* peer_rows,
+                const Bf16* peer_embedding, const Bf16* peer_norm, cudaStream_t primary_stream,
+                cudaStream_t peer_stream);
+    bool apply(const DraftRepairs* repairs, cudaStream_t primary_stream);
+    void discard();
+    void drain() noexcept;
+
+private:
+    struct State;
+    explicit PeerDraftRepair(std::unique_ptr<State> state);
     std::unique_ptr<State> state_;
 };
 

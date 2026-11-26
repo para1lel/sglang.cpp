@@ -54,8 +54,9 @@ public:
     int rank_count() const noexcept;
     int device(int rank) const;
 
-    void allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
-                        std::size_t count);
+    bool allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
+                       std::size_t count);
+    bool supports_mnnvl_twoshot(std::size_t count) const noexcept;
     bool try_allreduce_rms_quantize(
         __nv_bfloat16* const buffers[], const cudaStream_t streams[],
         const MnnvlRmsQuantizeRows rows[], const __nv_bfloat16* const gains[]);

@@ -264,6 +264,10 @@ struct SplitOutput {
     OutputSlice slices[3];
 };
 
+bool packed_mlp_slices(const SplitOutput& output, std::size_t count, int width) {
+    return count == 2 && output.slices[0].width == width && output.slices[1].width == width;
+}
+
 __device__ OutputSlice locate_output(__nv_bfloat16* output, int width, int&) {
     return {output, width};
 }
@@ -661,11 +665,10 @@ std::optional<cudaError_t> try_prefill_fp8_packed_sm100(
     if (const auto status = tma_device(stream, device); status != cudaSuccess) {
         return status;
     }
-    const bool packed_mlp_chunk = projections.size() == 2 &&
-                                  output.slices[0].width == 17408 &&
-                                  output.slices[1].width == 17408;
+    const bool packed_mlp_chunk = packed_mlp_slices(output, projections.size(), 17408);
     if (grouped_projection && (rows == 2048 || rows == 4096) && in_width == 5120 && wide_slices &&
-        (packed_mlp_chunk || total_width == 16384 || total_width == 14336)) {
+        (packed_mlp_chunk || total_width == 16384 || total_width == 14336 ||
+         (rows == 4096 && packed_mlp_slices(output, projections.size(), 8704)))) {
         const auto wide = launch_tma<Tile<128, packed_wide_tile_cols, 4, 1, 1>>(
             first.weight, first.scales, input, rows, total_width, in_width, output, stream,
             device, rows / 128);

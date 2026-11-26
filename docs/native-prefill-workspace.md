@@ -121,6 +121,12 @@ On one B200, a separate 4,096-row probe with 12 query heads and two KV heads tim
 
 The integrated caller check used two logical ranks on one B200 with the collective replaced by a trace. All 20 baseline/candidate full-plane digests matched across the 12Q/2KV and 24Q/4KV layouts. The digests cover rotated Q/K, activation codes and scales, projected outputs, and both owners’ KV planes. Injected staged-reader and epilogue errors propagated. See `artifacts/tp2-resume/native-causal-integrated/hardware-gpu0.log` and its paired result logs. Serving makespan remains unmeasured.
 
+### TP2 grouped gate/up replay
+
+The [native 4,096-row gate/up route](fp8-prefill-projections.md#large-prefill-tiles) matched every BF16 output for checkpoint layers 0, 3, and 32 on both rank shards. With captured W4 activations on one B200, median operator time fell from 356.736 to 314.432 µs for rank 0 and from 356.288 to 314.240 µs for rank 1.
+
+On two B200s, warm direct decoder priming of one 32,768-token W4 prompt used eight 4,096-row groups. Time fell from 1,087.120 to 1,058.156 ms, a 2.66% reduction. The harness recorded rank hidden and residual state in both arms. Those states, token IDs, and MTP acceptance matched. HTTP serving makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-gate/` (`gpu-0.jI3uJ3/rank-{0,1}.log`, `prime-4-5.dYtCZR/prime-{0,4}.log`).
+
 ### TP2 long down projection replay
 
 The [CUTLASS down route](fp8-prefill-projections.md#large-prefill-tiles) replayed each rank shard separately on a single B200 using Qwen3.8-27B-FP8 checkpoint layers 0, 3, and 32 and fixed synthetic input activations. Eight alternating CUDA-event trials measured warm graph replay per layer from residual reset and RMSNorm through gate/up, SwiGLU, and down, including scale preparation. Eager compared all three layers, and graph replay compared layer 32. BF16 down outputs, SwiGLU E4M3 values, and FP32 scales matched bitwise.

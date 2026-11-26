@@ -476,8 +476,9 @@ const Bf16* MtpDraftRequest::enqueue_impl(int position, int shifted_token, const
         project(gqa.value, work, work.values, stream);
         request.append(position, score, mrope, rotary_position, stream);
         if (score) {
-            check(mtp_gqa_attention(request.cache, request.pages, position, work.rope_queries,
-                                    work.attention, work.attention_scores(), stream),
+            const DraftAttentionRow attention = request.attention_row(position);
+            check(mtp_gqa_attention_batch(&attention, 1, model.capabilities.online_attention,
+                                          stream),
                   "Read MTP MXFP8 attention");
             request.gate_attention(stream);
             project(gqa.output, work, work.branch, stream);

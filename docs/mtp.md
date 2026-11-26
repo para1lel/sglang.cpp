@@ -30,7 +30,7 @@ B200 Tensor Core prefill can prefer TMA and `tcgen05` for draft seed FC on promp
 
 TMA requires 4-byte-aligned output, a matching image and tensor-map encoder, and enough shared memory. Unaligned output or unsupported preflight selects the 32×64 WMMA tile. CUDA errors, including stream/device mismatch and launch failure, propagate without retry. SIMT accumulation can change draft KV and proposals. [TMA preflight](../src/text/draft_seed_fc_sm100.cu#L195)<!-- prefix: "std::optiona" --> · [Submission](../src/text/draft_seed_fc_sm100.cu#L241)<!-- prefix: "return submi" --> · [WMMA tile](../src/text/draft_seed_fc.cu#L24)<!-- prefix: "constexpr in" -->
 
-Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L720)<!-- prefix: "void MtpDraf" -->
+Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L721)<!-- prefix: "void MtpDraf" -->
 
 For a multi-row seed tile on B200, each request prepares FP8 activations in
 slices of up to 128 rows on the prefill stream. One exact FP8 kernel projects
@@ -38,14 +38,14 @@ K and V in separate grid banks for the tile. One key normalization and RoPE
 launch and one MXFP8 append follow. Grouped prefill seeds each request
 separately. Single-row tiles and other devices project and append each slice
 Seed scratch comes from the [existing prefill workspace](native-prefill-workspace.md#seed-scratch).
-[Slice preparation](../src/decoder_mtp.cpp#L764)<!-- prefix: "for (int off" --> ·
+[Slice preparation](../src/decoder_mtp.cpp#L765)<!-- prefix: "for (int off" --> ·
 [Paired projection](../src/text_ops.cu#L790)<!-- prefix: "cudaError_t " --> ·
 [Grid banks](../include/sglang/text/prefill_fp8_exact.cuh#L209)<!-- prefix: "__global__ v" --> ·
 [Grouped seed](../src/decoder_prefill.cpp#L98)<!-- prefix: "seed.seed_dr" -->
 
 The target scores the last prompt row and selects the first token. If generation continues, that token and the last normalized target row start the draft round at `L-1`. Later proposals use the previous draft's final-normalized row and prediction. The proposal loop synchronizes the stream before reading winners and again before reading BF16 retry results. [Proposal loop](../src/decoder_verify.cpp#L155)<!-- prefix: "bool MtpRoun" -->
 
-Eligible B200 draft waves select [grouped online attention](native-model-info.md#draft-attention) automatically.
+Eligible B200 draft lanes select [grouped online attention](native-model-info.md#draft-attention) automatically.
 
 ### Draft winner readback
 
@@ -102,9 +102,9 @@ fails in a later slice, the paired path attempts to append the prepared prefix
 before reporting the error. A draft preparation, projection, or append error
 marks the draft failed. A target final-normalization error leaves the draft's
 failure flag clear if the prepared prefix flush succeeds.
-[Append](../src/decoder_mtp.cpp#L743)<!-- prefix: "check(mxfp8_" --> ·
-[Target normalization failure](../src/decoder_mtp.cpp#L776)<!-- prefix: "append_prepa" --> ·
-[Draft preparation failure](../src/decoder_mtp.cpp#L801)<!-- prefix: "append_prepa" -->
+[Append](../src/decoder_mtp.cpp#L744)<!-- prefix: "check(mxfp8_" --> ·
+[Target normalization failure](../src/decoder_mtp.cpp#L777)<!-- prefix: "append_prepa" --> ·
+[Draft preparation failure](../src/decoder_mtp.cpp#L802)<!-- prefix: "append_prepa" -->
 
 For a recoverable verification graph setup failure, eager fallback requires ended capture, a drained stream, and successful handle cleanup. This disables only the verifier executable. A binding upload failure follows speculative step recovery without replaying the failed round. A verification launch error or unconfirmed capture cleanup disables the batch without reevaluating the target. Resources stay live until safe cleanup. [Graph recovery](../src/runtime/backend/cuda_resources.cpp#L568)<!-- prefix: "const auto f" --> · [Launch](../src/runtime/backend/cuda_resources.cpp#L645)<!-- prefix: "const auto l" -->
 

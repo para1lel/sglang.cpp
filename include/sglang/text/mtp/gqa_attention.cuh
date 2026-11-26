@@ -56,14 +56,16 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
     for (int index = 0; index < count; ++index) {
         const auto& row = rows[index];
         const auto visible = static_cast<std::int64_t>(row.position) + 1;
-        if (!row.queries || !row.output || !cache_covers(row.cache, row.pages, visible)) {
+        if (!row.queries || !row.output || !cache_covers(row.cache, row.pages, visible) ||
+            !gqa_geometry_matches(gqa_full_geometry, row.cache)) {
             return cudaErrorInvalidValue;
         }
-        if (row.workspace.scores && visible > row.workspace.capacity &&
+        const bool long_row = visible > row.workspace.capacity;
+        if (row.workspace.scores && visible > target_split_first_position &&
             visible <= text_attention_max_tokens &&
-            row.workspace.capacity >= draft_score_chunk + draft_carry_per_head && count > 1) {
+            row.workspace.capacity >= draft_score_chunk + draft_carry_per_head) {
             static_assert(sizeof(float) * mxfp8_query_heads *
-                          (draft_score_chunk + draft_carry_per_head) >=
+                              (draft_score_chunk + draft_carry_per_head) >=
                           sizeof(gqa_decode::Partial) * gqa_decode::max_splits * mxfp8_query_heads);
             const PagedDecodeLane lane{row.cache, row.pages, row.position,
                 {row.queries, row.output, row.workspace.scores}};
@@ -72,14 +74,16 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
                 online_lanes[online_count++] = lane;
                 continue;
             }
-            long_rows.rows[long_count++] = row;
-            longest = std::max(longest, static_cast<int>(visible));
-        } else {
-            const auto status = mtp_gqa_attention(row.cache, row.pages, row.position, row.queries,
-                                                  row.output, row.workspace, stream);
-            if (status != cudaSuccess) {
-                return status;
+            if (long_row) {
+                long_rows.rows[long_count++] = row;
+                longest = std::max(longest, static_cast<int>(visible));
+                continue;
             }
+        }
+        const auto status = mtp_gqa_attention(row.cache, row.pages, row.position, row.queries,
+                                              row.output, row.workspace, stream);
+        if (status != cudaSuccess) {
+            return status;
         }
     }
     if (online_count > 0) {

@@ -5,7 +5,7 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Decoder prefill | Lay out the arena and lend two scratch spans during GQA. | [Tile layout](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L128)<!-- prefix: "TileBuffers(" --> · [Scratch view](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L151)<!-- prefix: "PairedPrefil" --> |
-| Attention dispatch | Stage eligible singleton and four-lane groups. Partial-grant groups can use staged, raw grouped, or per-lane attention. | [Singleton selection](../include/sglang/text/gqa/multirow_prefill.cuh#L36)<!-- prefix: "const bool d" --> · [Grouped dispatch](../src/decoder_prefill.cpp#L385)<!-- prefix: "void prefill" --> |
+| Attention dispatch | Stage eligible singleton and four-lane groups. Partial-grant groups can use staged, raw grouped, or per-lane attention. | [Singleton selection](../include/sglang/text/gqa/multirow_prefill.cuh#L35)<!-- prefix: "const bool d" --> · [Grouped dispatch](../src/decoder_prefill.cpp#L385)<!-- prefix: "void prefill" --> |
 | Paired launcher | Check bounds and capture state, then submit predecode and attention on the caller's stream. | [Staged launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L770)<!-- prefix: "std::optiona" --> |
 
 ## Runtime path

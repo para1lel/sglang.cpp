@@ -15,12 +15,12 @@ Eligible B200 prefill uses the native Flash dispatcher. The full-tile path check
 
 | Automatic single-lane TMEM route | Start position for 1,024 query rows |
 | --- | --- |
-| [Raw paired ordered](../include/sglang/text/gqa/multirow_prefill.cuh#L33)<!-- prefix: "if (rows == " --> | 0 |
+| [Raw paired ordered](../include/sglang/text/gqa/multirow_prefill.cuh#L32)<!-- prefix: "if (rows == " --> | 0 |
 | [Staged or raw paired ordered](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L857)<!-- prefix: "if (position" --> | 1,024–7,168, at 1,024-token boundaries |
 | Staged or raw paired ordered | 8,192–31,744, at 1,024-token boundaries or inside a 128-token page |
-| [Raw paired ordered](../include/sglang/text/gqa/multirow_prefill.cuh#L45)<!-- prefix: "if (default_" --> | 32,768–130,048, at 1,024-token boundaries |
+| [Raw paired ordered](../include/sglang/text/gqa/multirow_prefill.cuh#L44)<!-- prefix: "if (default_" --> | 32,768–130,048, at 1,024-token boundaries |
 
-On 148-SM SM100 devices, automatic lane-local dispatch tries ordered TMEM before regular Flash. Both scale bases need eight-byte alignment. It tries 144–255 rows at 8,192–32,768 visible tokens. It tries 256–512 rows from start positions of at least 8,192, up to 32,768 visible tokens. Eligible partial-grant groups try [grouped attention](ordered-gqa-prefill.md#grouped-partial-grants) before per-lane dispatch. [Partial TMEM selection](../include/sglang/text/gqa/multirow_prefill.cuh#L24)<!-- prefix: "if ((ragged " -->
+On 148-SM SM100 devices, automatic lane-local dispatch tries ordered TMEM before regular Flash. Both scale bases need eight-byte alignment. It tries 144–255 rows at 8,192–32,768 visible tokens. It tries 256–512 rows from start positions of at least 8,192, up to 32,768 visible tokens. Eligible partial-grant groups try [grouped attention](ordered-gqa-prefill.md#grouped-partial-grants) before per-lane dispatch. [Partial TMEM selection](../include/sglang/text/gqa/multirow_prefill.cuh#L22)<!-- prefix: "if ((ragged " -->
 
 Inside a [whole-tile MTP projection group](native-prefill-workspace.md#projection-pairs-for-mtp), the decoder can stage four 1,024-row tiles at the same aligned start from 1,024 through 130,048. The decoder appends each lane's new KV first. With visibility of at most 32,768 tokens it stages all four lanes together. Through 65,536 it stages two at a time, then one at a time through 131,072. Each subgroup uses one predecode and one attention launch. A declined subgroup uses the ordinary per-lane dispatcher on the same stream. Later subgroups can still stage. [Shape guard](../include/sglang/runtime/execution/decoder_prefill_staged_gqa.h#L116)<!-- prefix: "bool can_bat" --> · [Subgroup selection](../include/sglang/runtime/execution/decoder_prefill_staged_gqa.h#L33)<!-- prefix: "const int su" --> · [Long staged launcher](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L889)<!-- prefix: "std::optiona" -->
 
@@ -80,7 +80,7 @@ Hold grants and projection policy fixed. Use the segment-by-segment path as the 
 
 ## Constraints and failure behavior
 
-Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 32,768, or 131,072 for full tiles. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../include/sglang/text/gqa/multirow_prefill.cuh#L30)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L616)<!-- prefix: "if (rows == " -->
+Regular Flash needs 16-byte-aligned payloads and 144–1,024 rows. Visibility caps at 131,072. Visibility equals start plus rows. One row uses ordinary forward execution. [Eligibility](../include/sglang/text/gqa/multirow_prefill.cuh#L29)<!-- prefix: "if (rows \u003e= " --> · [Decoder](../src/decoder_prefill.cpp#L616)<!-- prefix: "if (rows == " -->
 
 The 32-, 48-, and 88-row variants need 135,440, 152,464, and 195,024 dynamic shared-memory bytes respectively. The 64-row variants need 169,488 bytes asynchronously or 135,696 synchronously. Each needs static allocation as well. Asynchronous staging needs 8-byte alignment for both scale bases. Capacity or alignment can select another variant when it fits.
 

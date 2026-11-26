@@ -16,18 +16,17 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     if (position < 0 || rows < 0 || position > INT_MAX - rows) return cudaErrorInvalidValue;
     Attention request{cache, pages.device_pages, position, queries, output};
     const int visible = position + rows;
-    const int flash_limit = rows == flash_chunk ? max_flash_visible_tokens :
-                                                  max_multirow_visible_tokens;
     const bool ragged = default_ragged_prefill(cache, position, rows) ||
         default_ragged_prefill_tail({cache, pages, position, rows, queries, output},
                                    max_multirow_visible_tokens);
-    if ((ragged || raw_pipeline_before_flash(cache, rows, visible)) && visible <= flash_limit) {
+    if ((ragged || raw_pipeline_before_flash(cache, rows, visible)) &&
+        visible <= max_multirow_visible_tokens) {
         if (const auto status = launch_tmem_prefill(cache, pages, position, queries, output,
                                                    stream, true, rows, true)) {
             return *status;
         }
     }
-    if (rows >= min_flash_rows && rows <= flash_chunk && visible <= flash_limit &&
+    if (rows >= min_flash_rows && rows <= flash_chunk && visible <= max_flash_visible_tokens &&
         (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
         (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
         if (rows == flash_chunk &&
@@ -60,7 +59,7 @@ cudaError_t decoder::tensor_core_multirow_prefill_gqa(
     constexpr int min_wide_tail_rows = 32;
     constexpr int min_paired_tail_rows = 12;
     if (rows >= 2 && rows < min_flash_rows &&
-        visible >= min_staged_visible && visible <= max_multirow_visible_tokens &&
+        visible >= min_staged_visible && visible <= max_flash_visible_tokens &&
         reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0 &&
         reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0 &&
         reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) == 0 &&

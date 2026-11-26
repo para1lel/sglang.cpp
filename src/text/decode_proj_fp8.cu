@@ -19,6 +19,8 @@ constexpr int hidden_width = 5120;
 constexpr int intermediate_width = 17408;
 constexpr int local_intermediate_width = intermediate_width / 2;
 constexpr int m10_rows = text_target_fp8_m10_rows;
+constexpr int m40_rows = text_target_fp8_m40_rows;
+constexpr int m40_columns = 48;
 constexpr int m10_columns = 16;
 constexpr int gate_cluster = 2;
 
@@ -133,7 +135,8 @@ template <int Columns, int ResultRows, int Slots>
 __device__ __forceinline__ void consume(DecodePipeline<Slots>& pipe, const float* scales,
                                         const float* weight_scales,
                                         int count, int active, float (&result)[ResultRows]) {
-    constexpr bool compact = Columns == 80 || Columns == 160;
+    constexpr bool packed_m40 = Columns == m40_columns && ResultRows == m40_rows;
+    constexpr bool compact = packed_m40 || Columns == 80 || Columns == 160;
     constexpr bool packed_m10 = ResultRows == m10_rows;
     const int warp = threadIdx.x / warp_size;
     const unsigned lane_base = pipe.tmem + (static_cast<unsigned>(warp * warp_size) << 16);
@@ -144,13 +147,14 @@ __device__ __forceinline__ void consume(DecodePipeline<Slots>& pipe, const float
         }
     }
     constexpr int fragment = packed_m10 ? m10_rows : Columns == 8 ? 8 : 16;
+    constexpr int last_full_fragment = packed_m40 ? ResultRows - 8 : ResultRows;
     for (int index = 0; index < count; ++index) {
         const int slot = index % Slots;
         const float scale = weight_scales[index];
         wait_barrier(&pipe.accum_ready[slot], (index / Slots) & 1);
         fence_after_sync();
         #pragma unroll
-        for (int block = 0; block < ResultRows; block += fragment) {
+        for (int block = 0; block < last_full_fragment; block += fragment) {
             if (compact || packed_m10 || block < active) {
                 unsigned partial[fragment];
                 if constexpr (packed_m10) {
@@ -163,6 +167,12 @@ __device__ __forceinline__ void consume(DecodePipeline<Slots>& pipe, const float
                 promote<compact || packed_m10>(partial, scales + index * Columns + block,
                                                scale, result + block);
             }
+        }
+        if constexpr (packed_m40) {
+            unsigned partial[8];
+            load_tmem8(lane_base + slot * Columns + last_full_fragment, partial);
+            promote<true>(partial, scales + index * Columns + last_full_fragment,
+                          scale, result + last_full_fragment);
         }
         release_slot(&pipe.accum_empty[slot]);
     }
@@ -290,6 +300,7 @@ void fp8_decode(const __grid_constant__ Job job) {
     __shared__ DecodePipeline<Slots> pipe;
     constexpr bool gate_up = std::is_same_v<Job, Fp8GateUpJob>;
     constexpr bool packed_m10 = std::is_same_v<Job, Fp8RowJob<m10_rows>>;
+    constexpr bool packed_m40 = Columns == m40_columns && std::is_same_v<Job, Fp8RowJob<m40_rows>>;
     const int splits = gate_up ? 1 : gridDim.x;
     const int split = gate_up ? 0 : blockIdx.x;
     const int first = split * job.groups / splits;
@@ -297,7 +308,7 @@ void fp8_decode(const __grid_constant__ Job job) {
     const int act_row = blockIdx.z * Columns;
     constexpr bool compact = Columns == 80 || Columns == 160;
     const int active = gate_up || packed_m10 ? m10_rows
-        : compact ? Columns : min(Columns, job.rows - act_row);
+        : packed_m40 ? m40_rows : compact ? Columns : min(Columns, job.rows - act_row);
     const int warp = threadIdx.x / warp_size;
     int target = blockIdx.x;
     int row_block = blockIdx.y;
@@ -321,7 +332,7 @@ void fp8_decode(const __grid_constant__ Job job) {
     }
     __syncthreads();
     const unsigned shared = shared_address(tiles);
-    float result[packed_m10 ? m10_rows : Columns] = {};
+    float result[packed_m10 ? m10_rows : packed_m40 ? m40_rows : Columns] = {};
     if (warp < consumer_warps) {
         const auto* source = job.weight_scales[target] + std::size_t(row_block) * job.groups;
         for (int index = threadIdx.x; index < count; index += tile_rows) {
@@ -344,7 +355,7 @@ void fp8_decode(const __grid_constant__ Job job) {
     if constexpr (gate_up) {
         store_gate_up(result, reinterpret_cast<__nv_bfloat16*>(tiles),
                       target, row_block, warp, job);
-    } else if constexpr (compact || packed_m10) {
+    } else if constexpr (compact || packed_m10 || packed_m40) {
         store_compact(result, reinterpret_cast<float*>(tiles), splits, row_base,
                       job.out_width[target], job.lanes[target]);
     } else if constexpr (!std::is_same_v<Job, Fp8Job>) {
@@ -505,6 +516,13 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
             projections[1].out_width == intermediate_width) {
             return launch_rows<64, mlp_slots, text_target_fp8_m40_rows>(
                 target, projections, target_count, input, in_width, rows, count, 15, stream);
+        }
+        if (!tp2_gate_up_shape(projections, target_count, in_width)) {
+            if (const auto pending = cudaGetLastError(); pending != cudaSuccess) return pending;
+            if (auto packed = compact_status(launch_rows<m40_columns, 4, m40_rows>(
+                    target, projections, target_count, input, in_width, rows, count, 21, stream))) {
+                return packed;
+            }
         }
         return launch_rows<64, stages, text_target_fp8_m40_rows>(
             target, projections, target_count, input, in_width, rows, count, 16, stream);

@@ -231,7 +231,7 @@ cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void**
 
 cudaError_t configure(const void* kernel, int slot, int device, int& limit) {
     static std::mutex mutex;
-    constexpr unsigned slot_count = 21;
+    constexpr unsigned slot_count = 22;
     static int limits[max_devices][slot_count] = {};
     if (static_cast<unsigned>(slot) >= slot_count) return cudaErrorInvalidValue;
     if (static_cast<unsigned>(device) >= max_devices) return cudaErrorInvalidDevice;

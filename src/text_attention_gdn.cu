@@ -335,8 +335,9 @@ cudaError_t prefill_gdn(
     void* chunk_scratch, std::size_t chunk_bytes) {
     constexpr int conv_blocks_per_token = S::qkv_width / conv_threads;
     bool chunked = gdn_chunk::eligible<S>(rows, chunk_scratch, chunk_bytes);
+    bool staged_values = gdn_chunk::stage_values<S>(rows);
     if (chunked) {
-        const auto status = gdn_chunk::configure<S>(chunked);
+        const auto status = gdn_chunk::configure<S>(chunked, false, &staged_values);
         if (status != cudaSuccess) {
             return status;
         }
@@ -358,7 +359,7 @@ cudaError_t prefill_gdn(
     const int threads = paired ? paired_recurrent_threads : recurrent_threads;
     if (chunked) {
         status = gdn_chunk::launch<S>(rows, workspace, gates, chunk_scratch,
-                                      state.recurrent, observable, stream);
+                                      state.recurrent, observable, stream, staged_values);
     } else {
         status = cudaLaunchKernel(recur, dim3(S::value_heads * value_blocks_per_head),
                                   dim3(threads), recurrent_arguments, 0, stream);

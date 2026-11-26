@@ -120,15 +120,22 @@ struct Stage {
     float beta[rows];
 };
 
+constexpr int value_stage_warps = 4;
+
+struct ValueStage : Stage {
+    alignas(32) Bf16 values[rows * value_stage_warps * columns];
+};
+
 __device__ __forceinline__ void copy_async(Bf16* target, const Bf16* source, int bytes) {
     const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(target));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
                  :: "r"(address), "l"(source), "r"(bytes) : "memory");
 }
 
-template <typename S, int BlockWarps>
-__device__ __forceinline__ void prefetch(Stage& target, const Matrices& matrix,
-                                         const Bf16* convolved, int first, int valid, int head) {
+template <typename S, int BlockWarps, typename Frame>
+__device__ __forceinline__ void prefetch(Frame& target, const Matrices& matrix,
+                                         const Bf16* convolved, int first, int valid, int head,
+                                         int first_feature) {
     constexpr int vectors_per_row = dimension / vector_elements;
     for (int vector = threadIdx.x; vector < 2 * rows * vectors_per_row; vector += BlockWarps * 32) {
         const int row = vector / vectors_per_row;
@@ -139,6 +146,19 @@ __device__ __forceinline__ void prefetch(Stage& target, const Matrices& matrix,
         const auto offset = static_cast<std::size_t>(first + min(position, valid - 1));
         const auto* source = convolved + offset * S::qkv_width + feature;
         copy_async(target.qk + row * key_stride + column, source,
+                   position < valid ? sizeof(uint4) : 0);
+    }
+    if constexpr (std::is_same_v<Frame, ValueStage>) {
+        static_assert(BlockWarps == value_stage_warps);
+        constexpr int width = BlockWarps * columns;
+        constexpr int vectors = width / vector_elements;
+        static_assert(rows * vectors == BlockWarps * 32);
+        const int position = threadIdx.x / vectors;
+        const int component = threadIdx.x % vectors * vector_elements;
+        const auto offset = static_cast<std::size_t>(first + min(position, valid - 1));
+        const auto* source = convolved + offset * S::qkv_width + 2 * S::qk_width +
+                             first_feature + component;
+        copy_async(target.values + position * width + component, source,
                    position < valid ? sizeof(uint4) : 0);
     }
     for (int index = threadIdx.x * vector_elements; index < rows * rows;
@@ -156,6 +176,11 @@ __device__ __forceinline__ void prefetch(Stage& target, const Matrices& matrix,
 }
 
 constexpr int dynamic_bytes = 2 * sizeof(Stage);
+constexpr int value_dynamic_bytes = 2 * sizeof(ValueStage);
+constexpr int local_static_bytes = sizeof(Bf16) *
+    (rows * key_stride + value_stage_warps * (dimension + rows) * columns);
+constexpr int local_shared_bytes = dynamic_bytes + local_static_bytes;
+constexpr int value_shared_bytes = value_dynamic_bytes + local_static_bytes;
 
 template<bool Grouped, int BlockWarps>
 __device__ __forceinline__ void scale_keys(const Stage& stage, Bf16* scaled_keys) {
@@ -176,8 +201,8 @@ __device__ __forceinline__ void scale_keys(const Stage& stage, Bf16* scaled_keys
     }
 }
 
-template <typename S, bool Grouped>
-__device__ __forceinline__ void write_residual(const Stage& stage, const Bf16* convolved,
+template <typename S, bool Grouped, typename Frame>
+__device__ __forceinline__ void write_residual(const Frame& stage, const Bf16* convolved,
                                               const Result (&projection)[2 * time_tiles],
                                               int first, int valid, int feature, int lane,
                                               Bf16* work) {
@@ -193,6 +218,11 @@ __device__ __forceinline__ void write_residual(const Stage& stage, const Bf16* c
                 const auto* target = convolved +
                     static_cast<std::size_t>(token) * S::qkv_width +
                     2 * S::qk_width + feature + result_column(lane, element);
+                if constexpr (std::is_same_v<Frame, ValueStage>) {
+                    constexpr int width = value_stage_warps * columns;
+                    target = stage.values + position * width + (threadIdx.x / 32) * columns +
+                             result_column(lane, element);
+                }
                 const float beta = stage.beta[position];
                 const float initial = stage.initial[position];
                 const auto& projected = projection[time_tiles + task];
@@ -267,12 +297,12 @@ __device__ __forceinline__ void advance_state(const Bf16* scaled_keys, const Bf1
     }
 }
 
-template <typename S, bool Grouped, int BlockWarps = block_warps>
+template <typename S, bool Grouped, int BlockWarps = block_warps, typename Frame = Stage>
 __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
                                               const Matrices* matrices, float* recurrent,
                                               Bf16* observable) {
     alignas(32) extern __shared__ unsigned char dynamic_frames[];
-    auto* frames = reinterpret_cast<Stage*>(dynamic_frames);
+    auto* frames = reinterpret_cast<Frame*>(dynamic_frames);
     __shared__ alignas(32) Bf16 scaled_keys[rows * key_stride];
     __shared__ alignas(32) Bf16 states[BlockWarps][dimension * columns];
     __shared__ alignas(32) Bf16 workspace[BlockWarps][rows * columns];
@@ -283,7 +313,9 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
     auto* carry = recurrent + feature * dimension;
     auto* state = states[warp];
     auto* work = workspace[warp];
-    prefetch<S, BlockWarps>(frames[0], matrices[head], convolved, 0, min(count, rows), head);
+    const int first_feature = feature - warp * columns;
+    prefetch<S, BlockWarps>(frames[0], matrices[head], convolved, 0, min(count, rows), head,
+                            first_feature);
     Result accumulator[key_tiles];
     #pragma unroll
     for (int key = 0; key < key_tiles; ++key) {
@@ -305,7 +337,8 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
         if (first + rows < count) {
             prefetch<S, BlockWarps>(frames[(chunk + 1) % 2],
                                    matrices[(chunk + 1) * S::value_heads + head],
-                                   convolved, first + rows, min(count - first - rows, rows), head);
+                                   convolved, first + rows, min(count - first - rows, rows),
+                                   head, first_feature);
         }
 
         scale_keys<Grouped, BlockWarps>(stage, scaled_keys);
@@ -345,10 +378,12 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
     }
 }
 
-template <typename S = GdnFull, int BlockWarps = block_warps, bool Vector = false>
+template <typename S = GdnFull, int BlockWarps = block_warps, bool Vector = false,
+          bool StageValues = false>
 __global__ void recur_warp(int count, const Bf16* convolved, const Matrices* matrices,
                            float* recurrent, Bf16* observable) {
-    recur_segment<S, Vector, BlockWarps>(count, convolved, matrices, recurrent, observable);
+    using Frame = std::conditional_t<StageValues, ValueStage, Stage>;
+    recur_segment<S, Vector, BlockWarps, Frame>(count, convolved, matrices, recurrent, observable);
 }
 
 template <typename S = GdnFull>
@@ -360,8 +395,12 @@ void recur_segments(const __grid_constant__ Segments segments) {
 }
 #else
 constexpr int dynamic_bytes = 0;
+constexpr int value_dynamic_bytes = 0;
+constexpr int local_shared_bytes = 0;
+constexpr int value_shared_bytes = 0;
 
-template <typename S = GdnFull, int BlockWarps = block_warps, bool Vector = false>
+template <typename S = GdnFull, int BlockWarps = block_warps, bool Vector = false,
+          bool StageValues = false>
 __global__ void recur_warp(int, const Bf16*, const Matrices*, float*, Bf16*) {
     __trap();
 }

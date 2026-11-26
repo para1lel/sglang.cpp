@@ -187,10 +187,10 @@ __device__ __forceinline__ void prepare_segment(int count, const Bf16* convolved
     }
 }
 
-template <typename S = GdnFull>
+template <typename S = GdnFull, int SharedHeads = 1>
 __global__ void prepare(int count, const Bf16* convolved, const float2* gates,
                         Matrices* matrices) {
-    prepare_segment<S, 1>(count, convolved, gates, matrices);
+    prepare_segment<S, SharedHeads>(count, convolved, gates, matrices);
 }
 
 template <typename S = GdnFull>
@@ -200,7 +200,7 @@ __global__ void prepare_segments(const __grid_constant__ Segments segments) {
                                         segment.matrices);
 }
 #else
-template <typename S = GdnFull>
+template <typename S = GdnFull, int SharedHeads = 1>
 __global__ void prepare(int, const Bf16*, const float2*, Matrices*) {
     __trap();
 }
@@ -231,12 +231,17 @@ inline bool eligible(int count, const void* scratch, std::size_t bytes) {
 template <typename S>
 inline constexpr int recurrence_warps = std::is_same_v<S, GdnLocal> ? 4 : warp_mma::block_warps;
 
-template <typename S>
+template <typename S, bool StageValues = false>
 inline constexpr auto recurrence_kernel =
-    warp_mma::recur_warp<S, recurrence_warps<S>, std::is_same_v<S, GdnLocal>>;
+    warp_mma::recur_warp<S, recurrence_warps<S>, std::is_same_v<S, GdnLocal>, StageValues>;
+
+template <typename S>
+inline constexpr bool stage_values(int count) {
+    return std::is_same_v<S, GdnLocal> && count >= 1024;
+}
 
 template <typename S = GdnFull>
-inline cudaError_t configure(bool& enabled, bool grouped = false) {
+inline cudaError_t configure(bool& enabled, bool grouped = false, bool* staged_values = nullptr) {
     int device = 0, major = 0, minor = 0;
     auto status = cudaGetDevice(&device);
     if (status == cudaSuccess) {
@@ -256,28 +261,62 @@ inline cudaError_t configure(bool& enabled, bool grouped = false) {
         return cudaFuncSetAttribute(warp_mma::recur_segments<S>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, warp_mma::dynamic_bytes);
     }
+    if constexpr (std::is_same_v<S, GdnLocal>) {
+        if (staged_values) {
+            int shared_limit = 0;
+            status = cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                            device);
+            if (status != cudaSuccess) {
+                return status;
+            }
+            if (shared_limit < warp_mma::local_shared_bytes) {
+                enabled = false;
+                return cudaSuccess;
+            }
+            *staged_values = *staged_values && shared_limit >= warp_mma::value_shared_bytes;
+            if (*staged_values) {
+                return cudaFuncSetAttribute(recurrence_kernel<S, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, warp_mma::value_dynamic_bytes);
+            }
+        }
+    }
     return cudaFuncSetAttribute(recurrence_kernel<S>,
                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 warp_mma::dynamic_bytes);
 }
 
-template <typename S = GdnFull>
-inline cudaError_t launch(int count, const Bf16* convolved, const float2* gates,
-                          void* scratch, float* recurrent, Bf16* observable,
-                          cudaStream_t stream) {
+template <typename S, bool StageValues>
+inline cudaError_t launch_chunk(int count, const Bf16* convolved, const float2* gates,
+                                void* scratch, float* recurrent, Bf16* observable,
+                                cudaStream_t stream) {
     auto* matrices = static_cast<Matrices*>(scratch);
     void* prepare_args[] = {&count, &convolved, &gates, &matrices};
-    const auto status = cudaLaunchKernel(prepare<S>,
-                                         dim3(S::value_heads, (count + rows - 1) / rows),
-                                         dim3(threads), prepare_args, 0, stream);
+    constexpr int shared_heads = StageValues ? S::heads_per_qk : 1;
+    const auto status = cudaLaunchKernel(
+        prepare<S, shared_heads>, dim3(S::value_heads / shared_heads, (count + rows - 1) / rows),
+        dim3(threads * shared_heads), prepare_args, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }
     void* recur_args[] = {&count, &convolved, &matrices, &recurrent, &observable};
     return cudaLaunchKernel(
-        recurrence_kernel<S>,
+        recurrence_kernel<S, StageValues>,
         dim3(S::value_heads, dimension / (warp_mma::columns * recurrence_warps<S>)),
-        dim3(recurrence_warps<S> * 32), recur_args, warp_mma::dynamic_bytes, stream);
+        dim3(recurrence_warps<S> * 32), recur_args,
+        StageValues ? warp_mma::value_dynamic_bytes : warp_mma::dynamic_bytes, stream);
+}
+
+template <typename S = GdnFull>
+inline cudaError_t launch(int count, const Bf16* convolved, const float2* gates,
+                          void* scratch, float* recurrent, Bf16* observable,
+                          cudaStream_t stream, bool staged_values) {
+    if constexpr (std::is_same_v<S, GdnLocal>) {
+        if (staged_values) {
+            return launch_chunk<S, true>(count, convolved, gates, scratch, recurrent, observable,
+                                         stream);
+        }
+    }
+    return launch_chunk<S, false>(count, convolved, gates, scratch, recurrent, observable, stream);
 }
 
 template <typename S = GdnFull>

@@ -390,6 +390,7 @@ __device__ void correct(Shared& shared, int chunk, unsigned tensor_row) {
     tensor_store_release();
 }
 
+template <int Splits>
 __device__ void softmax(Shared& shared, const LongRequest& request, int begin, int chunks,
                         int warp, int split, int kv_head) {
     const int lane = threadIdx.x % 32;
@@ -431,8 +432,8 @@ __device__ void softmax(Shared& shared, const LongRequest& request, int begin, i
     bad |= __shfl_xor_sync(full, bad, 8);
     bad |= __shfl_xor_sync(full, bad, 16);
     if (lane < 8 && position >= 0) {
-        auto& out = partials(request.rows[member / group_heads].scratch,
-                             kv_head * group_heads + member % group_heads)[split];
+        auto& out = partials<Splits>(request.rows[member / group_heads].scratch,
+                                     kv_head * group_heads + member % group_heads)[split];
         out.mass = state.mass;
         const int repair = (bad ? 1 : 0) | (shared.bad_query[member] ? 2 : 0) |
                            (shared.bad_key <= position ? 4 : 0);
@@ -446,13 +447,14 @@ __device__ void softmax(Shared& shared, const LongRequest& request, int begin, i
         const int channel = part * stripe + warp * 32 + lane;
         #pragma unroll 1
         for (int query = 0; query < request.count * group_heads; ++query) {
-            auto& out = partials(request.rows[query / group_heads].scratch,
-                                 kv_head * group_heads + query % group_heads)[split];
+            auto& out = partials<Splits>(request.rows[query / group_heads].scratch,
+                                         kv_head * group_heads + query % group_heads)[split];
             out.value[channel] = values[query];
         }
     }
 }
 
+template <int Splits>
 __global__ __launch_bounds__(threads, 1) void decode_long(
     const __grid_constant__ LongBatch batch, const __grid_constant__ BatchMaps maps) {
     alignas(1024) extern __shared__ unsigned char storage[];
@@ -460,7 +462,7 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
     const auto& request = batch.requests[blockIdx.z];
     const int last_position = request.first + request.count - 1;
     const int split = blockIdx.x;
-    const int splits = split_count(last_position);
+    const int splits = Splits == max_splits ? split_count(last_position) : Splits;
     if (split >= splits) return;
     const int total = request.first / keys + 1;
     const int first = split * total / splits;
@@ -476,7 +478,7 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
     load_queries(shared, request, kv_head);
     __syncthreads();
     if (warp < 4) {
-        softmax(shared, request, first, last - first, warp, split, kv_head);
+        softmax<Splits>(shared, request, first, last - first, warp, split, kv_head);
     } else if (warp == mma_warp) {
         issue_mmas(shared, last - first);
     } else if (warp >= raw_warp) {
@@ -566,9 +568,13 @@ cudaError_t long_decode_status(cudaError_t status) {
 std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int requests,
                                              cudaStream_t stream) {
     if (requests < 1 || requests > long_requests) return std::nullopt;
+    bool rank_wide = requests == long_rank_wide_requests;
     for (int index = 0; index < requests; ++index) {
-        const int count = batch.requests[index].count;
-        if (count < 1 || count > long_rows) return std::nullopt;
+        const auto& request = batch.requests[index];
+        if (request.count < 1 || request.count > long_rows) return std::nullopt;
+        rank_wide &= request.count == long_rows &&
+                     request.cache.kv_heads == gqa_rank_geometry.kv_heads &&
+                     request.first >= long_min_position && request.first < long_rank_wide_end;
     }
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) return pending;
     int device;
@@ -584,15 +590,17 @@ std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int reques
     const auto encoded = encode_maps(batch, requests, maps);
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) return pending;
     if (!encoded || *encoded != cudaSuccess) return encoded;
+    const int splits = rank_wide ? long_rank_wide_splits : max_splits;
+    const auto kernel = rank_wide ? decode_long<long_rank_wide_splits> : decode_long<max_splits>;
     status = long_decode_status(cudaFuncSetAttribute(
-        decode_long, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared)));
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared)));
     if (status != cudaSuccess) return status;
     void* arguments[] = {const_cast<LongBatch*>(&batch), &maps};
-    status = long_decode_status(cudaLaunchKernel(decode_long,
-        dim3(max_splits, batch.requests[0].cache.kv_heads, requests), threads, arguments,
+    status = long_decode_status(cudaLaunchKernel(kernel,
+        dim3(splits, batch.requests[0].cache.kv_heads, requests), threads, arguments,
         sizeof(Shared), stream));
     if (status != cudaSuccess) return status;
-    return long_decode_status(combine_long_decode(batch, requests, stream));
+    return long_decode_status(combine_long_decode(batch, requests, splits, stream));
 }
 
 }

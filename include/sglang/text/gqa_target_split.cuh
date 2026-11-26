@@ -158,13 +158,15 @@ cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, i
     return cudaSuccess;
 }
 
-cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests,
+cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests, int splits,
                                             cudaStream_t stream) {
     static_assert(long_min_position >= (max_splits - 1) * min_split_chunks * split_chunk_tokens);
     void* arguments[] = {const_cast<LongBatch*>(&batch)};
-    return cudaLaunchKernel(target_split_combine<LongBatch, max_splits>,
-                            dim3(gqa_query_heads(batch.requests[0].cache.kv_heads), 1,
-                                 requests * long_rows),
+    const auto kernel = splits == long_rank_wide_splits
+        ? target_split_combine<LongBatch, long_rank_wide_splits>
+        : target_split_combine<LongBatch, max_splits>;
+    return cudaLaunchKernel(kernel, dim3(gqa_query_heads(batch.requests[0].cache.kv_heads),
+                                        1, requests * long_rows),
                             mxfp8_head_dim, arguments, 0, stream);
 }
 

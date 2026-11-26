@@ -42,8 +42,9 @@ struct alignas(16) Partial {
 static_assert(sizeof(Partial) * max_splits * mxfp8_query_heads <=
               decoder::paged_decode_scratch_bytes);
 
+template <int Stride = max_splits>
 __host__ __device__ inline Partial* partials(void* scratch, int head) {
-    return static_cast<Partial*>(scratch) + head * max_splits;
+    return static_cast<Partial*>(scratch) + head * Stride;
 }
 
 __host__ __device__ inline int split_count(int position) {
@@ -120,11 +121,13 @@ __device__ inline decoder::PagedDecodeLane resolve(const EagerTargetBatch& batch
 
 template <int FixedSplits = 0>
 __device__ inline bool combine_head(const decoder::PagedDecodeLane& lane, int head) {
-    __shared__ float weights[max_splits];
+    constexpr int stride = FixedSplits ? FixedSplits : max_splits;
+    static_assert(stride <= 32);
+    __shared__ float weights[stride];
     __shared__ float total;
     const int channel = static_cast<int>(threadIdx.x);
     const int splits = FixedSplits ? FixedSplits : split_count(lane.position);
-    auto* part = partials(lane.buffers.scratch, head);
+    auto* part = partials<stride>(lane.buffers.scratch, head);
     const float maximum = channel < splits ? part[channel].maximum : -CUDART_INF_F;
     bool invalid = __syncthreads_or(channel < splits && !isfinite(maximum));
     if (!invalid) {
@@ -140,7 +143,7 @@ __device__ inline bool combine_head(const decoder::PagedDecodeLane& lane, int he
             for (int offset = 16; offset > 0; offset /= 2) {
                 contribution += __shfl_xor_sync(0xffffffffu, contribution, offset);
             }
-            if (channel < max_splits) {
+            if (channel < stride) {
                 weights[channel] = weight;
             }
             if (channel == 0) {

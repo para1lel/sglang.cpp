@@ -203,7 +203,7 @@ __device__ void issue_raw(Shared& shared, const TensorMaps& maps, int kv_head, i
     }
 }
 
-template <int Operand, typename Decoded>
+template <int Operand, bool RemapRows, typename Decoded>
 __device__ __forceinline__ void decode_operand(Shared& shared, Decoded& decoded,
                                                 int slot, int first, int end, int producer) {
     constexpr int vector_width = 16;
@@ -214,8 +214,10 @@ __device__ __forceinline__ void decode_operand(Shared& shared, Decoded& decoded,
     const int column = channel % tmem_swizzle;
     const auto& raw = shared.raw[slot];
     int first_invalid = text_attention_max_tokens;
+    int first_row = producer / vectors;
+    if constexpr (RemapRows) first_row ^= group & 1;
     #pragma unroll 2
-    for (int index = producer / vectors; index < keys; index += copy_warps * 32 / vectors) {
+    for (int index = first_row; index < keys; index += copy_warps * 32 / vectors) {
         const int raw_index = first % raw_tokens + index;
         const int scale_row = raw_index % mxfp8_group_size;
         const int scale_column = raw_index / mxfp8_group_size * mxfp8_groups +
@@ -239,7 +241,7 @@ __device__ __forceinline__ void decode_operand(Shared& shared, Decoded& decoded,
     __syncwarp();
 }
 
-template <int Operand>
+template <int Operand, bool RemapRows>
 __device__ void load_operands(Shared& shared, const LongRequest& request, int begin,
                               int chunks, int producer) {
     for (int chunk = 0; chunk < chunks; ++chunk) {
@@ -256,11 +258,11 @@ __device__ void load_operands(Shared& shared, const LongRequest& request, int be
             wait(&consumed[previous % stages], previous / stages & 1);
         }
         if constexpr (Operand == 0) {
-            decode_operand<0>(shared, shared.key[chunk % decoded_slots], raw_slot,
-                              first, end, producer);
+            decode_operand<0, RemapRows>(shared, shared.key[chunk % decoded_slots], raw_slot,
+                                         first, end, producer);
         } else {
-            decode_operand<1>(shared, shared.value[chunk % decoded_slots], raw_slot,
-                              first, end, producer);
+            decode_operand<1, RemapRows>(shared, shared.value[chunk % decoded_slots], raw_slot,
+                                         first, end, producer);
         }
         if (!(producer % 32)) {
             arrive(Operand == 0 ? &shared.key_ready[slot] : &shared.value_ready[slot]);
@@ -454,7 +456,7 @@ __device__ void softmax(Shared& shared, const LongRequest& request, int begin, i
     }
 }
 
-template <int Splits>
+template <int Splits, bool RemapRows = false>
 __global__ __launch_bounds__(threads, 1) void decode_long(
     const __grid_constant__ LongBatch batch, const __grid_constant__ BatchMaps maps) {
     alignas(1024) extern __shared__ unsigned char storage[];
@@ -492,9 +494,11 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
             }
         }
     } else if (warp < value_warp) {
-        load_operands<0>(shared, request, first, last - first, threadIdx.x - key_warp * 32);
+        load_operands<0, RemapRows>(shared, request, first, last - first,
+                                    threadIdx.x - key_warp * 32);
     } else {
-        load_operands<1>(shared, request, first, last - first, threadIdx.x - value_warp * 32);
+        load_operands<1, RemapRows>(shared, request, first, last - first,
+                                    threadIdx.x - value_warp * 32);
     }
     __syncthreads();
     if (warp == mma_warp) tensor_dealloc(shared.tensor, tensor_columns);
@@ -569,12 +573,16 @@ std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int reques
                                              cudaStream_t stream) {
     if (requests < 1 || requests > long_requests) return std::nullopt;
     bool rank_wide = requests == long_rank_wide_requests;
+    bool deep_rank = requests == decoder::wide_mtp_lanes;
     for (int index = 0; index < requests; ++index) {
         const auto& request = batch.requests[index];
         if (request.count < 1 || request.count > long_rows) return std::nullopt;
         rank_wide &= request.count == long_rows &&
                      request.cache.kv_heads == gqa_rank_geometry.kv_heads &&
                      request.first >= long_min_position && request.first < long_rank_wide_end;
+        deep_rank &= request.count == long_rows &&
+                     request.cache.kv_heads == gqa_rank_geometry.kv_heads &&
+                     request.first >= 1024 * mxfp8_page_size;
     }
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) return pending;
     int device;
@@ -591,7 +599,8 @@ std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int reques
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) return pending;
     if (!encoded || *encoded != cudaSuccess) return encoded;
     const int splits = rank_wide ? long_rank_wide_splits : max_splits;
-    const auto kernel = rank_wide ? decode_long<long_rank_wide_splits> : decode_long<max_splits>;
+    const auto kernel = rank_wide ? decode_long<long_rank_wide_splits, true>
+        : deep_rank ? decode_long<max_splits, true> : decode_long<max_splits>;
     status = long_decode_status(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared)));
     if (status != cudaSuccess) return status;

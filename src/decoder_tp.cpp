@@ -50,7 +50,7 @@ void DecoderBatch::TpDriver::sync_peer_stream() const noexcept {
 
 void DecoderBatch::TpDriver::drain_peer(const decoder::Lane& lane) const {
     if (!lane.peer_request) return;
-    // Rank 1 mirrors rank-0 work on its own stream; wait before release.
+    
     decoder::DeviceScope peer(tp.peer_device);
     decoder::check(cudaStreamSynchronize(tp.peer_stream), "Drain peer decoder lane");
 }
@@ -68,7 +68,7 @@ void DecoderBatch::TpDriver::register_prefix_restore(
     cudaStream_t stream) const {
     auto view = decoder::restore_prefix_view(*lane.request, *read, stream, lane.draft.get(),
                                              &decoder::tp2_prefix_layouts()[0]);
-    // Rank 1 restores the same prefix without the draft tail.
+    
     auto peer_read = std::make_shared<decoder::PrefixCacheRead>(*read);
     peer_read->usable_draft = 0;
     std::optional<decoder::PendingBatchPrefix> peer;
@@ -78,17 +78,17 @@ void DecoderBatch::TpDriver::register_prefix_restore(
                                                   nullptr,
                                                   &decoder::tp2_prefix_layouts()[1]));
     }
-    // Both lane-owned allocations happen before either callback registers so a
-    // throwing allocation cannot strand a registered rank-0 future; the
-    // CacheRanks join settles callback-time failures on its own.
+    
+    
+    
     lane.prefix = std::make_unique<decoder::PendingBatchPrefix>(std::move(view));
     lane.peer_prefix = std::make_unique<decoder::PendingBatchPrefix>(std::move(*peer));
     lane.prefix->completion = lane.options.restore_prefix(lane.prefix->command);
     try {
         lane.peer_prefix->completion = lane.options.restore_prefix(lane.peer_prefix->command);
     } catch (...) {
-        // Drop rank 0's registration rather than wait on a join that
-        // will never settle; admission drains both lanes cold.
+        
+        
         lane.prefix.reset();
         lane.peer_prefix.reset();
         throw;
@@ -159,16 +159,25 @@ void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound
                                     std::byte* sampling_workspace,
                                     std::byte* logprob_workspace,
                                     const decoder::TcVocabScratch* vocabulary) const {
+    
+    
+    
+    
+    std::uint8_t* const primary_packed =
+        count > decoder_batch_max_mtp_lanes ? tp.packed[0] : nullptr;
+    std::uint8_t* const peer_packed =
+        count > decoder_batch_max_mtp_lanes ? tp.packed[1] : nullptr;
     (void)model.verify_mtp_tp(*tp.peer, rounds, peer_rounds, count, constraints,
                               sampling_workspace, stream, tp.peer_stream, *tp.group,
-                              tp.partials[0], tp.partials[1], vocabulary, logprob_workspace);
+                              tp.partials[0], tp.partials[1], vocabulary, primary_packed,
+                              peer_packed, logprob_workspace);
 }
 
 TextGdnReplayBatch* DecoderBatch::TpDriver::prepare_peer_gdn_replays() const {
-    // SGLANG_DISABLE_GDN_REPLAY_BATCH is the supported escape hatch that
-    // forces the per-layer dispatch on BOTH ranks (see
-    // decoder_batch_state.h); the per-layer path is the exact reference
-    // behavior, so disabling never changes results.
+    
+    
+    
+    
     static const bool batch_disabled =
         std::getenv("SGLANG_DISABLE_GDN_REPLAY_BATCH") != nullptr;
     if (batch_disabled || peer_replays_broken) return nullptr;
@@ -197,8 +206,8 @@ void DecoderBatch::TpDriver::commit_peer_round(decoder::Lane& lane,
     decoder::DeviceScope peer(tp.peer_device);
     lane.peer_verification->commit(round.consumed, gdn_batch);
     if (saved && *saved != &lane.request->work) {
-        // Rank 0 committed a verification row for this checkpoint;
-        // mirror it on rank 1 so exported planes are not stale.
+        
+        
         lane.peer_checkpoint_row = lane.peer_verification->checkpoint_row(round.consumed - 1);
     }
 }
@@ -208,8 +217,8 @@ void DecoderBatch::TpDriver::store_peer_checkpoint(
     const std::shared_ptr<void>& reservation,
     const std::shared_ptr<std::atomic_uint64_t>& acknowledged) const {
     if (!lane.peer_request) return;
-    // Rank 1 exports the same checkpoint through its own layout; its row
-    // mirrors rank 0's committed verification row when one exists.
+    
+    
     decoder::DeviceScope peer(tp.peer_device);
     auto peer_view =
         decoder::export_prefix_view(*lane.peer_request, 0, 0, end, tp.peer_stream, nullptr,

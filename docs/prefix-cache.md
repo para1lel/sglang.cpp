@@ -67,7 +67,7 @@ If a restore reports failure or its completed future throws a non-CUDA exception
 
 A daemon refusal increments the declined-store count. A transport failure increments the I/O error count. An asynchronous write failure leaves the checkpoint unacknowledged and preserves any result already delivered to the client. Previously submitted checkpoints can finish after the request aborts.
 
-With C++ prefix callbacks, direct MTP generation polls the restore before advancing and reports the restored prompt count in `cached_prompt_tokens`. It checks cancellation while waiting. Once `claim_completion` accepts a terminal finish, later cancellation cannot abandon that checkpoint. Returning `false` from `reserve_prefix_store` requests a retry, so synchronous callers must release capacity independently. Successful generation waits for terminal STORE submission. The daemon may acknowledge later. [Direct MTP generation](../src/decoder_batch.cpp#L753)<!-- prefix: "void Decoder" -->
+With C++ prefix callbacks, direct MTP generation polls the restore before advancing and reports the restored prompt count in `cached_prompt_tokens`. It checks cancellation while waiting. Once `claim_completion` accepts a terminal finish, later cancellation cannot abandon that checkpoint. Returning `false` from `reserve_prefix_store` requests a retry, so synchronous callers must release capacity independently. Successful generation waits for terminal STORE submission. The daemon may acknowledge later. [Direct MTP generation](../src/decoder_batch.cpp#L752)<!-- prefix: "void Decoder" -->
 
 ### Native HTTP controls
 

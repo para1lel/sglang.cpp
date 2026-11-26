@@ -1,9 +1,9 @@
 #pragma once
 
-// Shared per-layer execution machinery for the decoder forward paths
-// (TP1 forward_layers and the tensor-parallel forward_layers_tp). Split out
-// of src/decoder_forward.cpp so the TP drivers live in their own TU; the
-// kernels, widths, and dispatch rules here are unchanged.
+
+
+
+
 
 #include "sglang/decoder_internal.h"
 
@@ -23,8 +23,8 @@ namespace sglang {
 namespace decoder {
 namespace forward_detail {
 
-// Two-rank sharding for rank-local width lookups; widths are rank-blind, so
-// the rank field never matters here.
+
+
 inline constexpr WeightSharding tp2_sharding{0, 2};
 
 inline void project(Bf16Weight weight, const Bf16* input, Bf16* output, cudaStream_t stream) {
@@ -77,20 +77,20 @@ struct LayerBatch {
     bool grouped_target_attention = false;
     int target_split_end = 0;
     std::uint8_t* packed_activation = nullptr;
-    // Tensor-parallel output redirection: when set, row-parallel projections
-    // write each lane's partial into a contiguous reduction slab instead of
-    // the per-lane workspace member. Only Workspace::projected_attention and
-    // Workspace::hidden are ever redirected.
+    
+    
+    
+    
     Bf16* const* attention_output = nullptr;
     Bf16* const* hidden_output = nullptr;
-    // True when this batch runs rank-local (TP2) weights; kernels and widths
-    // below then follow the rank-local geometry. Never infer this from buffer
-    // widths: the local q_gate width equals the global query width, and the
-    // local gate+up rows sum to the global intermediate size.
+    
+    
+    
+    
     bool tensor_parallel = false;
 
-    // Rank-local widths come from WeightSharding, the loader's single source
-    // of truth for the sharded geometry.
+    
+    
     int gqa_attention_width() const {
         return tensor_parallel ? tp2_sharding.local_q_width() : text_gqa_q_width;
     }
@@ -119,7 +119,7 @@ struct LayerBatch {
     LayerBatch verification_packet(int first) const {
         auto packet = *this;
         packet.lanes += first;
-        packet.count = verification_packet_rows;
+        packet.count = std::min(verification_packet_rows, count - first);
         return packet;
     }
 
@@ -157,7 +157,7 @@ struct LayerBatch {
         if (packs_projection_activation(width)) {
             static_assert(verification_packet_rows * intermediate_size <=
                           vocab_size * sizeof(Bf16));
-            // Each projection consumes this input before the stream reuses logits scratch.
+            
             auto* packed = packed_activation ? packed_activation
                 : reinterpret_cast<std::uint8_t*>(workspace(lanes[0]).logits);
             activation.values = packed + index * width;
@@ -396,7 +396,8 @@ inline bool run_compact_gdn(const GdnLayer& layer, const LayerBatch<Verification
                             int state_index) {
     constexpr int rows_per_lane = CompactGdnVerificationBatch::rows;
     constexpr int row_capacity = CompactGdnVerificationBatch::lanes * rows_per_lane;
-    if (!batch.packed_activation || !batch.target_tc || batch.lanes[0].binding ||
+    if (batch.tensor_parallel || !batch.packed_activation || !batch.target_tc ||
+        batch.lanes[0].binding ||
         (batch.count != row_capacity / 2 && batch.count != row_capacity) ||
         layer.b.rows != batch.gdn_gate_heads() || layer.a.rows != batch.gdn_gate_heads() ||
         layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
@@ -481,11 +482,11 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
     batch.project(layer.output, &Workspace::projected_attention);
 }
 
-// Rank-local TP2 eager verification advances every lane's GDN tail for one
-// layer in a single packed launch when the lanes share a row count; the
-// packed kernel is bitwise-identical to the per-lane one. TP1 rounds,
-// mixed-shape rounds, and over-wide lane sets keep the per-verifier calls
-// (false return).
+
+
+
+
+
 inline bool run_gdn_packed_local(const GdnLayer& layer,
                                  const LayerBatch<VerificationRow>& batch, int state_index) {
     if (!batch.tensor_parallel) {
@@ -561,7 +562,10 @@ inline void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& ba
         batch.project(layer.output, &Workspace::projected_attention);
         return;
     }
-    if (batch.packed_activation) {
+    
+    
+    
+    if (batch.packed_activation && batch.count % gdn_packet_rows == 0) {
         for (int start = 0; start < batch.count; start += gdn_packet_rows) {
             run_gdn_packet(layer, batch.verification_packet(start), state_index);
         }
@@ -602,7 +606,7 @@ cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
                      ExactGqaWorkspace singleton_scores, bool vector, cudaStream_t stream) {
     const int capacity = pages.page_count * mxfp8_page_size;
     const auto scores = work.gqa_scores(capacity);
-    // Geometry is cache-inferred: TP2 caches carry kv_heads = 2, TP1 caches 4.
+    
     const GqaGeometry geometry{gqa_query_heads(cache.kv_heads), cache.kv_heads};
     if constexpr (std::is_same_v<Position, int>) {
         if (singleton_scores.scores) {
@@ -955,6 +959,6 @@ void run_mlp(const Layer& layer, const LayerBatch<Lane>& batch) {
     batch.project(layer.mlp_down, &Workspace::hidden);
 }
 
-}  // namespace forward_detail
-}  // namespace decoder
-}  // namespace sglang
+}  
+}  
+}  

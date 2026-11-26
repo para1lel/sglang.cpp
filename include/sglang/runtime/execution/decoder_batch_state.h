@@ -82,8 +82,8 @@ inline StepPlan plan_step(const BatchStorage& storage, const Selection& selected
                             budget != 0);
 }
 
-}  // namespace batch_detail
-}  // namespace decoder
+}  
+}  
 
 using namespace decoder;
 using namespace decoder::batch_detail;
@@ -99,7 +99,7 @@ struct DecoderBatch::State {
           tp_driver(parallel ? std::make_unique<TpDriver>(owner, *parallel) : nullptr) {
         validate_batch_options(options);
         DeviceScope device(model.device);
-        // Decode and verification graphs are TP1-only paths.
+        
         if (options.cuda_graphs && !tp) storage->verification_graph.emplace(execution);
         if (residency.resident() && model.mtp_weights)
             storage->verification_winners = prepare_verification_winners(options.max_lanes);
@@ -110,13 +110,15 @@ struct DecoderBatch::State {
         if (options.max_lanes >= wide_mtp_lanes &&
             options.max_num_batched_tokens >= wide_mtp_rows &&
             model.mtp_weights && storage->tc_vocab) {
-            // Rank-local verification supports whole-8-lane (40-row) packets
-            // only; keep native TP1 widths on a single rank.
-            wide_mtp_limit = tp ? std::min(model.backend.mtp_verification_lanes, wide_mtp_lanes)
-                                : model.backend.mtp_verification_lanes;
-            // Supported escape hatch: forces the 4-lane (2x20-row) packets on
-            // both ranks; also used as the baseline arm of the wide-verify
-            // A/B measurement.
+            
+            
+            
+            wide_mtp_limit = tp
+                ? std::min(model.backend.mtp_verification_lanes, wide_mtp_lanes * 2)
+                : model.backend.mtp_verification_lanes;
+            
+            
+            
             if (tp && std::getenv("SGLANG_DISABLE_TP2_WIDE_VERIFY")) {
                 wide_mtp_limit = 0;
             }
@@ -127,8 +129,8 @@ struct DecoderBatch::State {
         device.restore();
     }
 
-    /// Per-step lane bundles shared between the collection and dispatch halves
-    /// of submit(); the rank-1 mirrors parallel the primary forward lanes.
+    
+    
     struct StepLanes {
         std::array<ForwardLane, decoder_batch_max_lanes> work;
         std::array<ForwardLane, decoder_batch_max_lanes> single_prefill;
@@ -225,14 +227,14 @@ struct DecoderBatch::State {
         storage->verification_graph.reset();
     }
 
-    /// Reset the rank-0 replay collector for a commit group (lazily
-    /// allocating on the batch device); null on allocation failure, which
-    /// keeps the per-layer GDN replay dispatch. Setting the
-    /// SGLANG_DISABLE_GDN_REPLAY_BATCH environment variable forces the
-    /// per-layer dispatch on BOTH ranks (cached after the first commit
-    /// group). It is a supported escape hatch: the per-layer path is the
-    /// exact reference behavior, so this switches off the optimization
-    /// without changing results.
+    
+    
+    
+    
+    
+    
+    
+    
     TextGdnReplayBatch* prepare_gdn_replays() {
         static const bool batch_disabled =
             std::getenv("SGLANG_DISABLE_GDN_REPLAY_BATCH") != nullptr;

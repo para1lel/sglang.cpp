@@ -16,7 +16,8 @@ using namespace decoder::forward_detail;
 template <typename Lane>
 LayerBatch<Lane> tp_build_batch(const Lane* lanes, int count, cudaStream_t lane_stream,
                                 const CudaBackendPolicy& policy, Bf16* const* attention_output,
-                                Bf16* const* hidden_output, bool tensor_parallel) {
+                                Bf16* const* hidden_output, bool tensor_parallel,
+                                std::uint8_t* packed_activation) {
     LayerBatch<Lane> batch{
         lanes, count, lane_stream,
         policy.ordered_attention,
@@ -24,6 +25,7 @@ LayerBatch<Lane> tp_build_batch(const Lane* lanes, int count, cudaStream_t lane_
         policy.vector_decode_attention,
         policy.grouped_target_attention,
         policy.target_split_end,
+        packed_activation,
     };
     batch.attention_output = attention_output;
     batch.hidden_output = hidden_output;
@@ -31,9 +33,9 @@ LayerBatch<Lane> tp_build_batch(const Lane* lanes, int count, cudaStream_t lane_
     return batch;
 }
 
-// Shared RMS-normalization dispatch for both ranks of a tensor-parallel step.
-// `residuals(index, work)` supplies the (branch, residual) pair for lane
-// `index`, so the primary and peer ranks pass different slab views.
+
+
+
 template <typename Lane, typename Residuals>
 void tp_normalize(LayerBatch<Lane>& batch, int count, const Bf16* weight, const char* operation,
                   const Residuals& residuals) {
@@ -76,7 +78,7 @@ void tp_normalize(LayerBatch<Lane>& batch, int count, const Bf16* weight, const 
     }
 }
 
-// Copy the reduced hidden rows from a rank's slab into its lane workspaces.
+
 template <typename Lane>
 void tp_scatter(LayerBatch<Lane>& batch, int count, cudaStream_t lane_stream,
                 const Bf16* const* reduced) {
@@ -131,7 +133,8 @@ template <typename Lane>
 void Decoder::Model::forward_layers_tp(
     const Model& peer, const Lane* primary_lanes, const Lane* peer_lanes, int count,
     cudaStream_t stream, cudaStream_t peer_stream, decoder::TensorParallel& group,
-    const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials) const {
+    const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials,
+    std::uint8_t* primary_packed, std::uint8_t* peer_packed) const {
     if (!primary_lanes || !peer_lanes || count < 1 || count > tp_max_forward_lanes) {
         throw std::invalid_argument("Invalid tensor-parallel batch width");
     }
@@ -149,9 +152,11 @@ void Decoder::Model::forward_layers_tp(
     }
 
     auto primary = tp_build_batch(primary_lanes, count, stream, backend,
-                                  primary_attention.data(), primary_hidden.data(), tp != nullptr);
+                                  primary_attention.data(), primary_hidden.data(),
+                                  tp != nullptr, primary_packed);
     auto peer_batch = tp_build_batch(peer_lanes, count, peer_stream, peer.backend,
-                                     peer_attention.data(), peer_hidden.data(), tp != nullptr);
+                                     peer_attention.data(), peer_hidden.data(),
+                                     tp != nullptr, peer_packed);
 
     Bf16* attention_reduce[2] = {primary_partials.attention, peer_partials.attention};
     Bf16* hidden_reduce[2] = {primary_partials.hidden, peer_partials.hidden};
@@ -221,10 +226,10 @@ void Decoder::Model::forward_layers_tp(
 template void Decoder::Model::forward_layers_tp<decoder::ForwardLane>(
     const Model&, const decoder::ForwardLane*, const decoder::ForwardLane*, int, cudaStream_t,
     cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
-    const decoder::TpPartials&) const;
+    const decoder::TpPartials&, std::uint8_t*, std::uint8_t*) const;
 template void Decoder::Model::forward_layers_tp<decoder::VerificationRow>(
     const Model&, const decoder::VerificationRow*, const decoder::VerificationRow*, int,
     cudaStream_t, cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
-    const decoder::TpPartials&) const;
+    const decoder::TpPartials&, std::uint8_t*, std::uint8_t*) const;
 
 }

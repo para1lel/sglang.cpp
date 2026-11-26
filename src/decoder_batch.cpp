@@ -489,12 +489,12 @@ bool DecoderBatch::State::prepare_wide_mtp(int lanes) {
 WideMtpGroups DecoderBatch::State::prepare_wide_groups(const PrefillRows& decode,
         const WideMtpCandidates& candidates, bool& contains_mtp) {
     auto groups = wide_mtp_groups(decode, candidates, wide_mtp_limit);
-    // Under TP2 verification ignores the packed wide activation and repair
-    // runs per row, but the rank-0 depth-scoring draft reuses the same arena
-    // for its packed FC staging, FP8 activation packs, and INT8 head scratch
-    // (same multi-purpose layout and lifetime as TP1). Reserve it with the
-    // existing formula, best effort. On failure the wide verification group
-    // is unchanged and the draft falls back to the wave-major packets.
+    
+    
+    
+    
+    
+    
     if (tp) {
         contains_mtp = groups.largest > 0;
         if (groups.largest) prepare_wide_mtp(groups.largest);
@@ -568,9 +568,6 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         collect_rounds(verification_rows, next_slot, wide_groups, rounds, peer_rounds, slots);
     if (count == 0) return;
     const auto& cancel = cancel_probe();
-    // Reuse the verification activation block before target verification starts.
-    // When the reservation is unavailable (including under TP2) the draft
-    // keeps the wave-major packets.
     const bool score_together = count >= draft_projection_rows ||
         (count == wide_mtp_lanes && wide_mtp_activation != nullptr);
     const bool depth_scoring = score_together && !output && MtpDraftRequest::prepare_depth(
@@ -603,9 +600,6 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     };
     const auto commit = [&](int first, int size) {
         std::array<DraftRepairs, draft_projection_rows> repairs{};
-        // Both ranks collect their per-layer GDN prefix replays for one
-        // address-table dispatch after the lane loop; allocation failure or
-        // per-verifier ineligibility falls back to the per-layer launches.
         TextGdnReplayBatch* gdn_batch = prepare_gdn_replays();
         TextGdnReplayBatch* peer_gdn_batch =
             tp_driver ? tp_driver->prepare_peer_gdn_replays() : nullptr;
@@ -621,11 +615,16 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                               gdn_batch);
             if (tp_driver) tp_driver->commit_peer_round(lane, round, saved, peer_gdn_batch);
         }
-        // Rank-0 draft repair keeps its per-row enqueue under TP2; the grouped
-        // packed path stays a TP1 depth-scoring surface.
         auto* packed = size > packet && !tp ? wide_mtp_activation : nullptr;
-        MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed),
-                                     stream);
+        if (packed) {
+            MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed),
+                                         stream);
+        } else {
+            for (int lane = 0; lane < size; lane += packet) {
+                MtpDraftRequest::repair_wave(repairs.data() + lane, std::min(size - lane, packet),
+                                             nullptr, stream);
+            }
+        }
         if (gdn_batch) {
             check(gdn_batch->launch(tp != nullptr, stream), "Batched GDN prefix replay");
         }
@@ -633,8 +632,8 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         stats.verification_lanes += size;
     };
     const bool full = count > packet &&
-        count <= (tp ? wide_mtp_lanes : max_wide_mtp_lanes) &&
-        (!tp || count == wide_mtp_lanes) &&
+        count <= (tp ? wide_mtp_lanes * 2 : max_wide_mtp_lanes) &&
+        (!tp || count == wide_mtp_lanes || count == wide_mtp_lanes * 2) &&
         full_verification(rounds.data(), count);
     for (int first = 0; first < count;) {
         int width = std::min(count - first, packet);
@@ -681,7 +680,7 @@ Steps DecoderBatch::State::advance(const Selection& requested, bool chunked,
                &checkpoint_rows, wide_groups);
         if (stats) current.peak_request_bytes = std::max(
             live_before + current.prefill_workspace_bytes, request_bytes(*storage));
-        // Commit every lane before publishing successful final checkpoints.
+        
         for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
             auto& lane = slots[slot];
             auto& result = results[slot];
@@ -772,7 +771,7 @@ void DecoderBatch::generate_mtp(const std::vector<int>& prompt, const DecoderOpt
                 continue;
             }
             if (update.restored) result.cached_prompt_tokens = *update.restored;
-            if (!lane) return;  // Submitting a deferred terminal STORE retires the slot.
+            if (!lane) return;  
         }
         DecoderBatchStepStats stats;
         const auto step = advance_chunked({true}, &stats).front();

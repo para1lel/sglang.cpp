@@ -475,6 +475,8 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
         tp_->group = decoder::TensorParallel::create({cuda_device, tp_->peer_device});
         const std::size_t slab = std::size_t(decoder::tp_max_forward_lanes) * hidden_size *
                                  sizeof(Bf16);
+        const std::size_t packed_bytes =
+            std::size_t(decoder::max_wide_mtp_rows) * intermediate_size;
         {
             decoder::DeviceScope peer_scope(tp_->peer_device);
             tp_->peer = std::make_unique<Model>(checkpoint, tp_->peer_device,
@@ -484,6 +486,8 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
                   "Allocate rank-1 attention slab");
             check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[1].hidden), slab),
                   "Allocate rank-1 hidden slab");
+            check(cudaMalloc(reinterpret_cast<void**>(&tp_->packed[1]), packed_bytes),
+                  "Allocate rank-1 packed activation staging");
         }
         {
             decoder::DeviceScope scope(cuda_device);
@@ -491,6 +495,8 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
                   "Allocate rank-0 attention slab");
             check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[0].hidden), slab),
                   "Allocate rank-0 hidden slab");
+            check(cudaMalloc(reinterpret_cast<void**>(&tp_->packed[0]), packed_bytes),
+                  "Allocate rank-0 packed activation staging");
         }
         tp_->stream = model_->memory->stream();
         model_->tp = tp_.get();
@@ -503,9 +509,9 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
         model_->tc_vocab = model_->mtp_weights->shared_vocab();
     }
     if (tensor_parallel == 2) {
-        // Records are generated only after rank-0 MTP construction so `mtp` and
-        // the weight totals reflect the actual allocations; any accidental
-        // rank-1 draft would surface here as well.
+        
+        
+        
         auto fill = [this](int rank, int device) {
             const Model& model = rank == 0 ? *model_ : *tp_->peer;
             auto& entry = tp_info_.ranks[rank];
@@ -540,7 +546,7 @@ Decoder::TpRuntime::~TpRuntime() {
     }
     group.reset();
     peer.reset();
-    if (partials[1].attention || partials[1].hidden || peer_stream) {
+    if (partials[1].attention || partials[1].hidden || peer_stream || packed[1]) {
         decoder::DeviceScope peer_scope(peer_device);
         if (partials[1].attention) {
             check(cudaFree(partials[1].attention), "Free rank-1 attention slab");
@@ -548,17 +554,23 @@ Decoder::TpRuntime::~TpRuntime() {
         if (partials[1].hidden) {
             check(cudaFree(partials[1].hidden), "Free rank-1 hidden slab");
         }
+        if (packed[1]) {
+            check(cudaFree(packed[1]), "Free rank-1 packed activation staging");
+        }
         if (peer_stream) {
             check(cudaStreamDestroy(peer_stream), "Destroy rank-1 stream");
         }
     }
-    if (partials[0].attention || partials[0].hidden) {
+    if (partials[0].attention || partials[0].hidden || packed[0]) {
         decoder::DeviceScope scope(device);
         if (partials[0].attention) {
             check(cudaFree(partials[0].attention), "Free rank-0 attention slab");
         }
         if (partials[0].hidden) {
             check(cudaFree(partials[0].hidden), "Free rank-0 hidden slab");
+        }
+        if (packed[0]) {
+            check(cudaFree(packed[0]), "Free rank-0 packed activation staging");
         }
     }
 }
@@ -794,9 +806,9 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
         result.output_token_ids.reserve(options.max_new_tokens);
         model_->generate_serial(prompt_token_ids, options, callbacks, result);
     } else {
-        // The batch decoder fans every prefill, decode and verification step
-        // out to both ranks before rank 0 scores and commits; tensor-parallel
-        // generation always takes this path.
+        
+        
+        
         const int tile = model_->execution.prefill_limit();
         const int limit = options.max_num_batched_tokens
             ? std::min(options.max_num_batched_tokens, tile) : tile;

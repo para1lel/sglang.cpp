@@ -592,10 +592,10 @@ void decoder::project_verification_bf16(Bf16Weight weight, const VerificationRow
 
 namespace {
 
-// Scores one verification packet on this rank: per-row final RMS norm, the
-// optional tc-vocabulary fast path, then the BF16 lm-head projection with
-// argmax for unconstrained rows. Shared by the single-device and
-// tensor-parallel verification paths.
+
+
+
+
 void score_verification_packet(const DecoderModel& model, const VerificationRow* first,
                                int size, const TcVocabScratch* vocabulary,
                                cudaStream_t stream) {
@@ -628,12 +628,12 @@ void score_verification_packet(const DecoderModel& model, const VerificationRow*
     }
     bool projected = false;
     if (size >= 2 && size <= verification_packet_rows) {
-        // One full-weight read across all rows (the grouped path reads the
-        // head once per five-row group). Staging comes from the packet's own
-        // workspace arena — eager and bound rows alike — so concurrent
-        // verifiers never share scratch and captures bake arena addresses
-        // that exist before capture begins. Fall back to the grouped path
-        // unchanged when staging is unavailable or the operator declines.
+        
+        
+        
+        
+        
+        
         Bf16* staging = nullptr;
         Bf16* staging_logits = nullptr;
         if (first->verification != nullptr) {
@@ -671,7 +671,7 @@ void score_verification_packet(const DecoderModel& model, const VerificationRow*
     }
 }
 
-}  // namespace
+}  
 
 bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWorkspace& scratch,
                                 void* sampling_scratch, cudaStream_t stream,
@@ -715,8 +715,8 @@ bool Decoder::Model::verify_mtp(MtpRound* rounds, int count, const ConstraintWor
 
 namespace {
 
-// Gathers verification rows for one tensor-parallel packet and looks up the
-// input embeddings on both ranks (extracted from verify_mtp_tp).
+
+
 void gather_tp_packet(const Bf16* embedding, const Bf16* peer_embedding,
                       const auto& peer_device, const VerificationSequence* sequences,
                       TargetVerification* const* peer_verifiers, int first_lane, int end_lane,
@@ -748,10 +748,10 @@ void gather_tp_packet(const Bf16* embedding, const Bf16* peer_embedding,
     }
 }
 
-// Scores the gathered wide rows with the TP1 tail: one certified 40-row
-// vocabulary pass when every row is greedy, 20-row packets otherwise.
-// Extracted from verify_mtp_tp; score_packet forwards to the member
-// scoring entry that the enclosing class keeps private.
+
+
+
+
 void score_tp_rows(const auto& tc_vocab, const auto& final_norm, const VerificationRow* rows,
                    int total, const TcVocabScratch* vocabulary, cudaStream_t stream,
                    const auto& score_packet) {
@@ -789,14 +789,18 @@ bool Decoder::Model::verify_mtp_tp(
     const ConstraintWorkspace& scratch, void* sampling_scratch, cudaStream_t stream,
     cudaStream_t peer_stream, TensorParallel& group, const TpPartials& primary_partials,
     const TpPartials& peer_partials, const TcVocabScratch* vocabulary,
+    std::uint8_t* primary_packed, std::uint8_t* peer_packed,
     void* logprob_workspace) const {
     std::array<VerificationSequence, max_wide_mtp_lanes> sequences;
     std::array<TargetVerification*, max_wide_mtp_lanes> verifiers;
     std::array<TargetVerification*, max_wide_mtp_lanes> peer_verifiers;
-    if (count < 1 || count > wide_mtp_lanes ||
+    if (count < 1 || count > wide_mtp_lanes * 2 ||
         (count > decoder_batch_max_mtp_lanes && !wide_mtp_width(count)) || !rounds ||
         !peer_rounds) {
         throw std::invalid_argument("Invalid number of tensor-parallel MTP rounds");
+    }
+    if (count > decoder_batch_max_mtp_lanes && (!primary_packed || !peer_packed)) {
+        throw std::invalid_argument("Wide tensor-parallel MTP requires packed activation staging");
     }
     int total = 0;
     int longest = 0;
@@ -818,8 +822,6 @@ bool Decoder::Model::verify_mtp_tp(
         total += rows;
         longest = std::max(longest, rows);
     }
-    // Wide packets need complete greedy rows on both ranks; reject before any
-    // verifier begins staging so a declined packet leaves no partial state.
     if (count > decoder_batch_max_mtp_lanes && !vocabulary) {
         throw std::invalid_argument("Wide MTP requires full greedy verification rows");
     }
@@ -837,10 +839,6 @@ bool Decoder::Model::verify_mtp_tp(
     std::array<VerificationRow, max_wide_mtp_rows> peer_rows;
     int next = 0;
     if (count > decoder_batch_max_mtp_lanes) {
-        // Wide packets mirror the TP1 chunk-major row order: each run of
-        // decoder_batch_max_mtp_lanes lanes fills one verification_packet_rows
-        // scoring chunk, so a declined wide head falls back to the exact
-        // per-chunk scores the 4-lane packets produce.
         for (int first_lane = 0; first_lane < count; first_lane += decoder_batch_max_mtp_lanes) {
             gather_tp_packet(embedding, peer.embedding, peer.device, sequences.data(),
                              peer_verifiers.data(), first_lane,
@@ -853,7 +851,7 @@ bool Decoder::Model::verify_mtp_tp(
                          rows.data(), peer_rows.data(), next);
     }
     forward_layers_tp(peer, rows.data(), peer_rows.data(), total, stream, peer_stream, group,
-                      primary_partials, peer_partials);
+                      primary_partials, peer_partials, primary_packed, peer_packed);
     if (count <= decoder_batch_max_mtp_lanes) {
         score_verification_packet(*this, rows.data(), total, vocabulary, stream);
     } else {
@@ -874,9 +872,6 @@ bool Decoder::Model::verify_mtp_tp(
         round.target->enqueue_generated_logprobs(logprob_workspace);
     }
     TargetVerification::read_all(verifiers.data(), count, stream);
-    // Mirror the read_all fence on rank 1: the peer verifier's GDN commit,
-    // driven by the batch runner with the accepted row count, requires the
-    // same readiness state, and its pinned winners staging is peer-owned.
     {
         const DeviceScope peer_scope(peer.device);
         TargetVerification::read_all(peer_verifiers.data(), count, peer_stream);

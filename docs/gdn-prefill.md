@@ -77,7 +77,7 @@ Use the [batched target GDN check](../tests/decoder/README.md#batched-target-gdn
 
 Compare 80- and 160-row launches with four-lane controls on the same verification inputs. Compare BF16 scores, normalized rows, committed carry, FP8 activations, and scales. Match raw BF16 history bitwise. Exercise setup decline, propagation of CUDA errors, and reuse after retirement.
 
-MTP commit-phase GDN prefix replay is dispatched as one batched address-table launch per rank per commit group instead of two launches per layer. Per-layer kernel arguments, order, and results are unchanged. Setting `SGLANG_DISABLE_GDN_REPLAY_BATCH` forces the exact per-layer reference dispatch on both ranks. [Batched replay](../include/sglang/runtime/execution/decoder_batch_state.h#L238)<!-- prefix: "TextGdnRepla" -->
+MTP commit-phase GDN prefix replay is dispatched as one batched address-table launch per rank per commit group instead of two launches per layer. Per-layer kernel arguments, order, and results are unchanged. Setting `SGLANG_DISABLE_GDN_REPLAY_BATCH` forces the exact per-layer reference dispatch on both ranks. [Batched replay](../include/sglang/runtime/execution/decoder_batch_state.h#L239)<!-- prefix: "TextGdnRepla" -->
 
 ## Constraints and failure behavior
 

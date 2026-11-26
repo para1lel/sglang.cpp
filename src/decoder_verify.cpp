@@ -592,20 +592,18 @@ void decoder::project_verification_bf16(Bf16Weight weight, const VerificationRow
 }
 
 namespace {
-
-
-
-
+static_assert(tc_vocab_short_rows == 2 * target_verify_max_rows);
 
 void score_verification_packet(const DecoderModel& model, const VerificationRow* first,
                                int size, const TcVocabScratch* vocabulary,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, bool short_packet = false) {
     for (int index = 0; index < size; ++index) {
         const auto& row = first[index];
         model.normalize_final(*row.work, stream,
                               row.binding ? &row.binding->final_states[index] : nullptr);
     }
-    if (vocabulary && (size == tc_vocab_rows || size <= tc_vocab_narrow_rows)) {
+    const bool short_rows = short_packet && size == tc_vocab_short_rows;
+    if (vocabulary && (short_rows || size == tc_vocab_rows || size <= tc_vocab_narrow_rows)) {
         std::array<VerificationRow, tc_vocab_rows> scored;
         const auto end = std::copy_if(first, first + size, scored.begin(),
             [](const VerificationRow& row) {
@@ -618,7 +616,10 @@ void score_verification_packet(const DecoderModel& model, const VerificationRow*
                 const auto& work = *first[index].work;
                 projection[index] = {work.normalized, work.argmax};
             }
-            if (try_tc_vocab(*model.tc_vocab, *vocabulary, projection.data(), size, stream)) {
+            const bool certified = short_rows
+                ? try_tc_vocab_short(*model.tc_vocab, *vocabulary, projection.data(), stream)
+                : try_tc_vocab(*model.tc_vocab, *vocabulary, projection.data(), size, stream);
+            if (certified) {
                 if (scored_rows != 0) {
                     project_verification_bf16(model.lm_head, scored.data(), scored_rows,
                                               &Workspace::logits, stream);
@@ -856,7 +857,7 @@ bool Decoder::Model::verify_mtp_tp(
     forward_layers_tp(peer, rows.data(), peer_rows.data(), total, stream, peer_stream, group,
                       primary_partials, peer_partials, primary_packed, peer_packed);
     if (count <= decoder_batch_max_mtp_lanes) {
-        score_verification_packet(*this, rows.data(), total, vocabulary, stream);
+        score_verification_packet(*this, rows.data(), total, vocabulary, stream, count == 2);
     } else {
         score_tp_rows(tc_vocab, final_norm, rows.data(), total, vocabulary, stream,
                       [&](const VerificationRow* packet, int packet_rows) {

@@ -1,9 +1,7 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/text/decode_proj.h"
-#include "sglang/text/decode_proj_sm100.cuh"
-#include "sglang/text/mtp/tc_vocab.h"
-#include "sglang/text/mtp/tc_vocab_certificate.cuh"
+#include "sglang/text/mtp/tc_vocab_short.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,15 +17,6 @@ static_assert(vocab_size == vocabulary && hidden_size == width);
 constexpr int score_columns = 32;
 constexpr int wide_columns = 64;
 constexpr int narrow_columns = 16;
-constexpr int score_stages = 4;
-constexpr int score_chunk = 128;
-template <int Columns>
-constexpr int score_shared_bytes = score_stages * decode_proj::stage_bytes<Columns>;
-
-template <int Columns>
-constexpr unsigned score_instruction =
-    (decode_proj::tile_rows / 16 << 24) | (Columns / 8 << 17) |
-    (1u << 10) | (1u << 7) | (2u << 4);
 
 static_assert(vocabulary % decode_proj::tile_rows == 0 && width % score_chunk == 0);
 static_assert(tc_vocab_rows <= score_columns && tc_vocab_rows > 16);
@@ -47,31 +36,6 @@ void check_direct_status(cudaError_t status, const char* operation) {
         }
         check(status, operation);
     }
-}
-
-template <int Columns>
-__device__ void multiply_scores(decode_proj::DecodePipeline<score_stages>& pipe,
-                                unsigned shared) {
-    using namespace decode_proj;
-    for (int index = 0; index < width / score_chunk; ++index) {
-        const int stage = index % score_stages;
-        wait_barrier(&pipe.copy_ready[stage], (index / score_stages) & 1);
-        fence_after_sync();
-        const unsigned start = shared + stage * stage_bytes<Columns>;
-        #pragma unroll
-        for (int chunk = 0; chunk < score_chunk; chunk += 32) {
-            const auto weight = matrix_desc(start + chunk);
-            const auto input = matrix_desc(start + weight_bytes + chunk);
-            const unsigned accumulate = index | chunk;
-            asm volatile("{ .reg .pred accumulate;\n"
-                         "setp.ne.u32 accumulate, %4, 0;\n"
-                         "tcgen05.mma.cta_group::1.kind::i8 [%0], %1, %2, %3, accumulate; }"
-                         :: "r"(pipe.tmem), "l"(weight), "l"(input),
-                            "r"(score_instruction<Columns>), "r"(accumulate) : "memory");
-        }
-        commit_mma(&pipe.copy_empty[stage]);
-    }
-    commit_mma(&pipe.accum_ready[0]);
 }
 
 template <int Columns>
@@ -148,12 +112,23 @@ __global__ __launch_bounds__(decode_proj::threads, 2) void vocabulary_scores(
 
 struct TcVocabWeights {
     CUtensorMap map{};
+    CUtensorMap short_bf16_map{};
+    bool short_ready = false;
     const Bf16* original{};
     Stats* stats{};
     bool trace = false;
 };
 
 namespace {
+
+struct ShortScoreScratch {
+    CUtensorMap quantized_map{};
+    CUtensorMap packed_map{};
+    float* lower{};
+    int* seeds{};
+    ShortCandidates* candidates{};
+    Winner* partial{};
+};
 
 struct ScoreRows {
     Bf16* packed{};
@@ -204,6 +179,7 @@ struct ScoreScratch {
     ScoreRows buffers;
     CUtensorMap map{};
     std::array<CUtensorMap, tc_vocab_narrow_rows> narrow_maps{};
+    ShortScoreScratch short_score;
 };
 
 CUresult prepare_score_maps(const decode_proj::LaunchTarget& target, ScoreScratch& scratch) {
@@ -219,6 +195,41 @@ CUresult prepare_score_maps(const decode_proj::LaunchTarget& target, ScoreScratc
         if (status != CUDA_SUCCESS) return status;
     }
     return CUDA_SUCCESS;
+}
+
+void prepare_short_weights(const decode_proj::LaunchTarget& target, TcVocabWeights& weights) {
+    if (!decode_proj::aligned16(weights.original)) return;
+    const auto status = decode_proj::prepare_bf16_single_split(
+        target, short_tiles, width / decode_proj::bf16_chunk_elements);
+    if (!status) return;
+    check_direct_status(*status, "Prepare packed BF16 verification replay");
+    weights.short_ready = decode_proj::encode_map(target, weights.short_bf16_map, weights.original,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, vocabulary, width, decode_proj::tile_rows) ==
+        CUDA_SUCCESS;
+}
+
+void prepare_short_scratch(const decode_proj::LaunchTarget& target, ScoreScratch& score) {
+    auto& scratch = score.short_score;
+    if (decode_proj::encode_map(target, scratch.quantized_map, score.buffers.quantized,
+            CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, short_rows, width, short_columns) != CUDA_SUCCESS ||
+        decode_proj::encode_map(target, scratch.packed_map, score.buffers.packed,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, short_rows, width, short_columns) !=
+            CUDA_SUCCESS) {
+        return;
+    }
+    check_direct_status(cudaFuncSetAttribute(screen_short_scores,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, score_shared_bytes<short_columns>),
+        "Configure ten-row INT8 verification projection");
+    check_direct_status(cudaFuncSetAttribute(improve_short_thresholds,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, short_bf16_shared),
+        "Configure ten-row packed BF16 verification seeds");
+    check_direct_status(cudaFuncSetAttribute(replay_short_tiles,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, short_bf16_shared),
+        "Configure ten-row packed BF16 verification replay");
+    scratch.lower = score.memory.allocate<float>(short_rows * short_tiles);
+    scratch.seeds = score.memory.allocate<int>(short_rows);
+    scratch.candidates = score.memory.allocate<ShortCandidates>(1);
+    scratch.partial = score.memory.allocate<Winner>(short_rows * short_tiles);
 }
 
 }
@@ -255,6 +266,7 @@ std::shared_ptr<const TcVocabWeights> prepare_tc_vocab(const Bf16* original,
                                             score_shared_bytes<narrow_columns>),
                         "Configure narrow INT8 verification projection");
     weights->original = original;
+    prepare_short_weights(target, *weights);
     weights->stats = memory.allocate<Stats>(vocabulary);
     weights->trace = setting_enabled("SGLANG_VERIFY_TC_VOCAB_TRACE");
     shared_stats<<<vocabulary, threads, 0, memory.stream()>>>(
@@ -265,15 +277,16 @@ std::shared_ptr<const TcVocabWeights> prepare_tc_vocab(const Bf16* original,
 }
 
 std::shared_ptr<const TcVocabScratch> prepare_tc_vocab_scratch(Allocations& memory, bool wide,
-                                                               bool resident) {
+                                                               bool resident, bool short_packet) {
     decode_proj::LaunchTarget target{};
     const auto status = decode_proj::prepare_launch(memory.stream(), target);
     if (!status || *status == cudaErrorNotSupported) return {};
     check_direct_status(*status, "Prepare native INT8 verification scratch");
-    auto score = std::make_unique<ScoreScratch>(target.device,
-                                                wide ? tc_vocab_rows : tc_vocab_narrow_rows);
+    const int capacity = wide ? tc_vocab_rows : (short_packet ? short_rows : tc_vocab_narrow_rows);
+    auto score = std::make_unique<ScoreScratch>(target.device, capacity);
     if (prepare_score_maps(target, *score) != CUDA_SUCCESS) return {};
     score->allocate_rows();
+    if (short_packet) prepare_short_scratch(target, *score);
     return std::make_shared<TcVocabScratch>(
         TcVocabScratch{target, resident, wide, std::move(score), {}, {}});
 }
@@ -321,7 +334,6 @@ bool prepare_wide_scratch(const TcVocabScratch& scratch) {
         if (pending != error.status) check(pending, "Check CUDA status before M20 fallback");
         return false;
     }
-    // The session owns the slab even if its optional descriptor is unavailable.
     const auto status = decode_proj::encode_map(scratch.target, scratch.wide_map,
         storage->quantized, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, rows, width, wide_columns);
     if (!check_wide_map(status)) return false;
@@ -404,6 +416,52 @@ bool try_tc_vocab(const TcVocabWeights& weights, const TcVocabScratch& scratch,
     const auto& packet = *scratch.score;
     const auto& map = count <= tc_vocab_narrow_rows ? packet.narrow_maps[count - 1] : packet.map;
     score(weights, packet.buffers, map, batch, count, stream, false);
+    return true;
+}
+
+bool try_tc_vocab_short(const TcVocabWeights& weights, const TcVocabScratch& scratch,
+                        const TcVocabRow* batch, cudaStream_t stream) {
+    const auto& packet = *scratch.score;
+    const auto& small = packet.short_score;
+    const auto& buffers = packet.buffers;
+    if (!weights.short_ready || !small.partial) return false;
+
+    Inputs inputs{};
+    Outputs outputs{};
+    for (int row = 0; row < short_rows; ++row) {
+        inputs.rows[row] = batch[row].input;
+        outputs.rows[row] = batch[row].winner;
+    }
+    pack_inputs<<<short_rows, threads, 0, stream>>>(inputs, buffers.packed);
+    check(cudaGetLastError(), "Pack ten-row verification inputs");
+    check_direct_status(quantize_draft_head_int8(buffers.packed, short_rows, buffers.quantized,
+                                                buffers.maxima, stream),
+                        "Quantize ten-row verification inputs");
+    shared_stats<<<short_rows, threads, 0, stream>>>(
+        buffers.packed, buffers.quantized, buffers.maxima, buffers.stats);
+    check(cudaGetLastError(), "Prepare ten-row verification input bounds");
+    screen_short_scores<<<short_tiles, decode_proj::threads,
+                          score_shared_bytes<short_columns>, stream>>>(
+        weights.map, small.quantized_map, weights.stats, buffers.stats, buffers.scores,
+        small.lower);
+    check(cudaGetLastError(), "Screen ten-row verification scores");
+    select_short_seeds<<<short_rows, threads, 0, stream>>>(
+        small.lower, buffers.threshold, small.seeds);
+    check(cudaGetLastError(), "Select ten-row verification seed tiles");
+    improve_short_thresholds<<<short_rows, decode_proj::threads, short_bf16_shared, stream>>>(
+        weights.short_bf16_map, small.packed_map, small.seeds, buffers.threshold);
+    check(cudaGetLastError(), "Score ten-row verification seed tiles");
+    check_direct_status(cudaMemsetAsync(small.candidates, 0, offsetof(ShortCandidates, tiles),
+                                        stream), "Clear ten-row verification candidate counts");
+    collect_short_tiles<<<short_tiles, decode_proj::tile_rows, 0, stream>>>(
+        buffers.scores, buffers.threshold, small.candidates);
+    check(cudaGetLastError(), "Collect ten-row verification candidates");
+    replay_short_tiles<<<short_tiles, decode_proj::threads, short_bf16_shared, stream>>>(
+        weights.short_bf16_map, small.packed_map, buffers.scores, buffers.threshold,
+        small.candidates, small.partial);
+    check(cudaGetLastError(), "Replay ten-row verification BF16 tiles");
+    finish_short_rows<<<short_rows, threads, 0, stream>>>(small.candidates, small.partial, outputs);
+    check(cudaGetLastError(), "Select ten-row verification BF16 winners");
     return true;
 }
 

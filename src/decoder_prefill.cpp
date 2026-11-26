@@ -37,8 +37,8 @@ void execute_layers_tp(const std::array<Layer, layer_count>& primary_layers,
             return first ? LayerResidual{work.residual, nullptr}
                          : LayerResidual{work.hidden, work.residual};
         };
-        normalize(primary.input_norm, peer.input_norm, input);
         const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
+        normalize(primary.input_norm, peer.input_norm, input, !full_attention);
         if (full_attention) {
             attention(primary.gqa, peer.gqa, bank);
         } else {
@@ -46,7 +46,7 @@ void execute_layers_tp(const std::array<Layer, layer_count>& primary_layers,
         }
         normalize(primary.attention_norm, peer.attention_norm, [](const auto& work) {
             return LayerResidual{work.projected_attention, work.residual};
-        });
+        }, false);
         mlp(primary, peer);
     }
 }
@@ -141,13 +141,13 @@ struct PrefillGroupTp {
 
     template <typename Residuals>
     void normalize(const Bf16* weight, const Bf16* peer_weight,
-                   const Residuals& residuals) const {
+                   const Residuals& residuals, bool save_normalized) const {
         const auto [branch, residual] = residuals(chunk.work);
-        chunk.normalize(branch, residual, weight, plan.rms_launch);
+        chunk.normalize_tp(branch, residual, weight, plan.rms_launch, save_normalized);
         const auto peer_state = residuals(peer_chunk.work);
         on_peer([&] {
-            peer_chunk.normalize(peer_state.branch, peer_state.residual, peer_weight,
-                                 plan.rms_launch);
+            peer_chunk.normalize_tp(peer_state.branch, peer_state.residual, peer_weight,
+                                    plan.rms_launch, save_normalized);
         });
     }
 
@@ -353,8 +353,9 @@ void prefill_layerwise_tp(const DecoderModel& model, const DecoderModel& peer,
         });
     });
     execute_layers_tp(model.layers, peer.layers,
-        [&](const Bf16* weight, const Bf16* peer_weight, const auto& residuals) {
-            run.normalize(weight, peer_weight, residuals);
+        [&](const Bf16* weight, const Bf16* peer_weight, const auto& residuals,
+            bool save_normalized) {
+            run.normalize(weight, peer_weight, residuals, save_normalized);
         },
         [&](const auto& layer, const auto& peer_layer, int bank) {
             run.attention(layer, peer_layer, bank);
@@ -699,7 +700,7 @@ void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
         group.allreduce_bf16(reduce_buffers, reduce_streams, std::size_t(rows) * hidden_size);
     };
     execute_layers_tp(model.layers, peer.layers,
-        [&](const Bf16* weight, const Bf16* peer_weight, const auto& residuals) {
+        [&](const Bf16* weight, const Bf16* peer_weight, const auto& residuals, bool) {
             const auto [branch, residual] = residuals(buffers);
             chunk.normalize(branch, residual, weight);
             const auto peer_state = residuals(peer_buffers);

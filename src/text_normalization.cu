@@ -2,9 +2,11 @@
 
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_internal.h"
+#include "sglang/prefill_fp8.h"
 #include "sglang/text/text_cuda_primitives.cuh"
 #include "sglang/text/quantization/quantize_warp.cuh"
 #include "sglang/text/quantization/rms_quantize.cuh"
+#include "sglang/text/quantization/prefill_rms_vector.cuh"
 #include "sglang/text/mtp/draft_batch_ops.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
@@ -322,6 +324,33 @@ cudaError_t decoder::verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, in
         : verify_rms_kernel<false, WideVerifyRmsQuantizeRows>;
     return wide_verify_launch_status(cudaLaunchKernel(kernel, count, block_threads, args, 0,
                                                        stream));
+}
+
+std::optional<cudaError_t> decoder::try_prefill_rms_quantize_vector(
+    const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    __nv_bfloat16* normalized, TextFp8Activation activation, cudaStream_t stream) {
+    if (!branch || !weight || !activation.values || !activation.scales ||
+        !aligned(branch, alignof(uint4)) || !aligned(residual, alignof(uint4)) ||
+        !aligned(weight, alignof(uint4)) || !aligned(normalized, alignof(uint4)) ||
+        !aligned(activation.values, alignof(uint2)) ||
+        !aligned(activation.scales, alignof(float))) {
+        return std::nullopt;
+    }
+    cudaStreamCaptureStatus capture{};
+    const auto query = cudaStreamIsCapturing(stream, &capture);
+    if (query != cudaSuccess) return query;
+    if (capture != cudaStreamCaptureStatusNone) return std::nullopt;
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess) return pending;
+    using prefill_rms_detail::vector_rms;
+    const auto kernel = residual
+        ? (normalized ? vector_rms<true, true> : vector_rms<true, false>)
+        : (normalized ? vector_rms<false, true> : vector_rms<false, false>);
+    void* args[] = {&branch, &residual, &weight, &normalized, &activation};
+    const auto submitted = cudaLaunchKernel(kernel, grouped_prefill_max_rows,
+                                            block_threads, args, 0, stream);
+    const auto recorded = cudaGetLastError();
+    return submitted == cudaSuccess ? recorded : submitted;
 }
 
 cudaError_t decoder::tensor_core_prefill_rms_quantize(

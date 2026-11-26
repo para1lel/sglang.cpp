@@ -192,6 +192,9 @@ cudaError_t tensor_core_prefill_rms_quantize(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,
     cudaStream_t stream, RmsQuantizeLaunch launch = RmsQuantizeLaunch::ordinary);
+std::optional<cudaError_t> try_prefill_rms_quantize_vector(
+    const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    __nv_bfloat16* normalized, TextFp8Activation activation, cudaStream_t stream);
 cudaError_t tensor_core_decode_rms_project(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,

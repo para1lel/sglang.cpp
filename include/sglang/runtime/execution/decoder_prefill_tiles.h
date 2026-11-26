@@ -448,6 +448,17 @@ struct Chunk : PrefillProjections {
                                  work.normalized, residual, stream), "Normalize prefill residual");
         quantize(work.normalized, hidden_size);
     }
+
+    void normalize_tp(const Bf16* branch, Bf16* residual, const Bf16* weight,
+                      RmsQuantizeLaunch launch, bool save_normalized) const {
+        if (tensor_core_fp8 && rows == grouped_prefill_max_rows) {
+            const auto status = try_prefill_rms_quantize_vector(
+                branch, residual, weight, save_normalized ? work.normalized : nullptr,
+                activation, stream);
+            if (status) return check(*status, "Normalize and quantize TP prefill residual");
+        }
+        normalize(branch, residual, weight, launch);
+    }
 };
 
 inline void gather_embeddings(const Bf16* embedding, const int* tokens, int rows,

@@ -17,7 +17,9 @@ See `rank-receipts.json` and `metrics.json` in that directory. Each token uses 1
 
 ## Campaign record
 
-On release `36cb430a`, clean HTTP W1 took 524.241268 ms against vLLM 476.116448 ms (1.101077835), missing the ≤1.10 gate by 0.513175 ms. W2 passed at 1302.201491 ms against 1218.488949 ms (1.068702). Each recorded two LMCache stores per rank and zero restores. See `artifacts/tp2-resume/w1-fusion-release/36cb430a3fddd479ce787aa34926cb6f46480f81/` (`requalified-campaign/W1`, `official-campaign/W2`).
+Release `edca6a` failed binding HTTP W1 on GPUs 4/5 at 592.471368 ms native versus 474.298792 ms vLLM (1.249152). The supporting 6/3 run was interrupted. This campaign skipped W2–W5. See `artifacts/tp2-resume/w1-draft-caller/release-3d2cf7dc02238cd79c0abe87582422eb057bd6ba/qualification-45/W1/comparison.json`.
+
+Release `36cb430a` missed W1 by 0.513175 ms (524.241268/476.116448 ms, 1.101077835). W2 passed (1302.201491/1218.488949 ms, 1.068702). Both rows recorded two LMCache stores per rank and zero restores. See `artifacts/tp2-resume/w1-fusion-release/36cb430a3fddd479ce787aa34926cb6f46480f81/` (`requalified-campaign/W1`, `official-campaign/W2`).
 
 The earlier `168fdb1a` campaign used TP2 MTP4, ranked LMCache, vendor GDN prefill, native GQA, and disabled eager and batch graphs. Pinned vLLM `81a8cb06…` disabled KV offload, KV transfer, and CPU offload. Binary `8385a2ba…`, manifest `fda8adff…`. See `artifacts/tp2-bench/campaign-W124-GDN-168fdb1a-45-1559/five-rows.json` (`e33f270b…`). All five rows missed.
 
@@ -58,7 +60,7 @@ An untimed profile traced both engines after the W1 miss.
 
 ## W2 divergence evidence
 
-The runs below reproduced the W2 divergence under controlled changes in request arrival. They are diagnostic only; they explain the superseded determinism rejection. The `337edce7` W2 row passed under the timing-only criterion; the `168fdb1a` cohort missed.
+Changing arrival timing reproduced the superseded W2 determinism rejection. Under the timing-only gate, `337edce7` passed and `168fdb1a` missed.
 
 - **Original-wire bursts.** Three cold, complete, original-wire W2 reference bursts with lane submissions 12.0–19.4 µs apart matched the earlier official warmup exactly: all 3×1024 tokens.
 - **Stagger replay.** A 64-token diagnostic replayed the divergence with staggered submissions of 73.7–141.6 ms. The first divergence reappeared at 0-based offset 49 in a cold cohort. Lane 1 held nine output IDs before lane 0 was sent and seventeen before lane 0's first token. A 64-token logprob pair measured the top-2 candidates at offset 49: 1788 and 5215 tie at −0.6938778162002563, on the stagger cell only.

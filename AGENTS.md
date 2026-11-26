@@ -20,10 +20,6 @@ The following roles and their resources are bundled with this checkout.
 - [Test](.agents/skills/test-mode/SKILL.md) independently reviews, tests and preserves evidence.
 - [Doc](.agents/skills/doc-mode/SKILL.md) maintains the other project documents under `docs/`.
 
-For new workers, use `group/glm-5.3` with high effort for `coding-mode` and `doc-mode`.
-Use `group/gpt-6.2-astra` with high effort for `research-mode` and `test-mode`.
-Let existing workers continue with their current settings.
-
 For kernel work pass [Blackwell](.agents/skills/principle-blackwell/SKILL.md).
 For model or serving behavior pass [inference](.agents/skills/principle-inference/SKILL.md).
 For benchmarking pass [performance](.agents/skills/principle-performance/SKILL.md).

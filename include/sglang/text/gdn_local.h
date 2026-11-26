@@ -132,5 +132,20 @@ cudaError_t decode_verify_gdn_compact_local(CompactGdnVerificationBatch batch, i
 
 }  // namespace decoder
 
+/// Packed multi-lane form of text_gdn_verify_tail_local for the TP2 eager
+/// verify advance: one call per GDN layer replays every lane, replacing one
+/// call per lane. Lanes carry per-lane pointers (replay rows, states,
+/// observable and output are per-lane); all lanes replay the same
+/// token_count rows. Additive TP2 path: the per-lane entries stay
+/// authoritative for TP1 and for rounds the packed form declines.
+constexpr int gdn_verify_tail_max_lanes = 16;
+
+struct GdnVerifyTailLanes {
+    int lane_count;
+    decoder::GdnVerificationLane lanes[gdn_verify_tail_max_lanes];
+};
+
+cudaError_t text_gdn_verify_tail_local_lanes(int token_count, const GdnVerifyTailLanes& jobs,
+                                             TextGdnWeights weights, cudaStream_t stream);
 
 }  // namespace sglang

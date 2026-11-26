@@ -61,6 +61,14 @@ A bounded native-only diagnostic ran two cold cohorts on the long shapes. It is 
 - **Cache.** Both ranks acknowledged every store: sixteen per rank on the shorter shape and thirty-two on the longer one. GQA and GDN written bytes are equal across ranks.
 - **Evidence.** `artifacts/tp2-bench/long-readiness-0257/` (`results.json`, `analysis.log`).
 
+## W3 wide-verify diagnostic
+
+A W3-shaped diagnostic ran one candidate binary with the two-rank wide verifier enabled and disabled. The wide verifier combines eight greedy lanes into one forty-row round. Worst-lane end-to-end time fell from 7039.4 ms to 6573.9 ms; median per-output time fell from 5.171 ms to 4.925 ms. Both arms produced identical outputs. This single-cohort diagnostic is not a paired campaign measurement. Evidence: `artifacts/tp2-w3-throughput-dev/bench/w3_wide_verify_evidence.json`.
+
+## Two-rank wide verification
+
+Under two ranks, combination stops at eight lanes or the backend's native width, whichever is smaller. The root rank drafts proposals and owns the greedy policy; the peer rank mirrors each round without drafting. Before any verifier begins, both targets must clear a mirrored storage, stream, and position preflight. Only an all-greedy complete eight-lane group verifies as one wide round. Sampled, constrained, partial, logprob, or five-to-seven-lane compositions keep four-lane packets. An all-greedy round scores through one certified forty-row vocabulary pass. Setting `SGLANG_DISABLE_TP2_WIDE_VERIFY` forces the four-lane reference dispatch. [Wide lane cap](../../include/sglang/runtime/execution/decoder_batch_state.h#L115)<!-- prefix: "wide_mtp_lim" --> · [Group dispatch](../../src/decoder_batch.cpp#L629)<!-- prefix: "const bool f" --> · [Peer preflight](../../src/decoder_verify.cpp#L811)<!-- prefix: "throw std::i" --> · [Vocabulary pass](../../src/decoder_verify.cpp#L751)<!-- prefix: "// Scores th" -->
+
 ## Prerequisites and command
 
 Use two visible GPUs, a sharded-checkpoint build, LMCache 0.5.8, and one daemon per rank started with `tools/lmcache/serve.sh --rank N`. Then run:

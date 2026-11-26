@@ -70,13 +70,13 @@ inline bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* r
                                  int cache_index, bool vector_attention, int split_end,
                                  cudaStream_t stream) {
     if (!vector_attention || split_end != text_attention_max_tokens ||
-        count <= 1 || count > target_split_eager_max_rows) {
+        count <= 1 || count > max_wide_mtp_rows) {
         return false;
     }
-    GqaVerifyRows<GqaVerifyPreprocessRow> preprocess{};
-    GqaVerifyRows<GqaVerifyAppendRow> append{};
-    GqaVerifyRows<GqaVerifyGateRow> gate{};
-    std::array<PagedDecodeLane, target_split_eager_max_rows> reads;
+    GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows> preprocess{};
+    GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows> append{};
+    GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows> gate{};
+    std::array<PagedDecodeLane, max_wide_mtp_rows> reads;
     for (int index = 0; index < count; ++index) {
         const auto& row = rows[index];
         if (!target_split_position(row.position, split_end)) {
@@ -98,8 +98,11 @@ inline bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* r
                                geometry),
           "Normalize and rotate grouped target Q/K");
     check(gqa_verify_append(append, count, stream), "Append grouped target MXFP8 KV");
-    check(target_split_gqa(reads.data(), count, split_end, stream),
-          "Read grouped target MXFP8 attention");
+    for (int first = 0; first < count; first += target_split_eager_max_rows) {
+        const int size = std::min(target_split_eager_max_rows, count - first);
+        check(target_split_gqa(reads.data() + first, size, split_end, stream),
+              "Read grouped target MXFP8 attention");
+    }
     check(gqa_verify_postgate(gate, count, stream, geometry), "Gate grouped target attention");
     return true;
 }

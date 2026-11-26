@@ -376,52 +376,7 @@ inline constexpr int gdn_packet_rows = GdnVerificationBatch::lanes * GdnVerifica
 static_assert(GdnVerificationBatch::lanes == decoder_batch_max_mtp_lanes);
 static_assert(GdnVerificationBatch::rows == target_verify_max_rows);
 
-inline void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
-                              bool batched) {
-    if (!batch.target_tc || batch.count < 2 ||
-        layer.b.rows != batch.gdn_gate_heads() || layer.a.rows != batch.gdn_gate_heads() ||
-        layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
-        project_verification_bf16(layer.b, batch.lanes, batch.count, &Workspace::gdn_b,
-                                  batch.stream);
-        project_verification_bf16(layer.a, batch.lanes, batch.count, &Workspace::gdn_a,
-                                  batch.stream);
-        return;
-    }
-    std::array<VerifyGdnGateRow, gdn_packet_rows> gates;
-    const auto fill = [&](int first, int rows) {
-        for (int index = 0; index < rows; ++index) {
-            const auto& work = workspace(batch.lanes[first + index]);
-            gates[index] = {work.normalized, work.gdn_b, work.gdn_a};
-        }
-        const auto gates_kernel =
-            batch.tensor_parallel ? try_verify_bf16_gdn_gates_local : try_verify_bf16_gdn_gates;
-        return gates_kernel(layer.b.values, layer.a.values, gates.data(), rows, batch.stream);
-    };
-    if (batched) {
-        if (const auto status = fill(0, batch.count)) {
-            check(*status, "Run wide verification GDN gate projections");
-            return;
-        }
-    }
-    std::array<TextBf16Projection, text_fp8_max_batch> gate_b, gate_a;
-    for (int first = 0, group = 0; first < batch.count; ++group) {
-        const int rows = batch.projection_rows(group);
-        if (const auto status = fill(first, rows)) {
-            check(*status, "Run grouped BF16 verification GDN gate projections");
-        } else {
-            for (int index = 0; index < rows; ++index) {
-                const auto& gate = gates[index];
-                gate_b[index] = {gate.input, gate.output_b};
-                gate_a[index] = {gate.input, gate.output_a};
-            }
-            check(text_bf16_gemm(layer.b.values, layer.b.rows, layer.b.columns, gate_b.data(),
-                                rows, batch.stream), "Run batched BF16 GDN b projection");
-            check(text_bf16_gemm(layer.a.values, layer.a.rows, layer.a.columns, gate_a.data(),
-                                rows, batch.stream), "Run batched BF16 GDN a projection");
-        }
-        first += rows;
-    }
-}
+#include "sglang/runtime/execution/decoder_forward_gates.h"
 
 inline void run_gdn_packet(const GdnLayer& layer, const LayerBatch<VerificationRow>& packet,
                            int state_index) {
@@ -526,6 +481,65 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
     batch.project(layer.output, &Workspace::projected_attention);
 }
 
+// Rank-local TP2 eager verification advances every lane's GDN tail for one
+// layer in a single packed launch when the lanes share a row count; the
+// packed kernel is bitwise-identical to the per-lane one. TP1 rounds,
+// mixed-shape rounds, and over-wide lane sets keep the per-verifier calls
+// (false return).
+inline bool run_gdn_packed_local(const GdnLayer& layer,
+                                 const LayerBatch<VerificationRow>& batch, int state_index) {
+    if (!batch.tensor_parallel) {
+        return false;
+    }
+    const VerificationRow* lane_rows[gdn_verify_tail_max_lanes] = {};
+    int row_counts[gdn_verify_tail_max_lanes] = {};
+    int lane_count = 0;
+    for (int index = 0; index < batch.count; ++index) {
+        const auto& row = batch.lanes[index];
+        if (!row.first) {
+            continue;
+        }
+        if (lane_count == gdn_verify_tail_max_lanes) {
+            return false;
+        }
+        lane_rows[lane_count++] = &row;
+    }
+    for (int index = 0; index < batch.count; ++index) {
+        const auto& row = batch.lanes[index];
+        int lane = 0;
+        while (lane < lane_count && row.verification != lane_rows[lane]->verification) {
+            ++lane;
+        }
+        if (lane == lane_count) {
+            return false;
+        }
+        ++row_counts[lane];
+    }
+    for (int lane = 1; lane < lane_count; ++lane) {
+        if (row_counts[lane] != row_counts[0]) {
+            return false;
+        }
+    }
+    if (row_counts[0] == 0 || lane_count * row_counts[0] != batch.count) {
+        return false;
+    }
+    for (int lane = 0; lane < lane_count; ++lane) {
+        const TargetVerification* verification = lane_rows[lane]->verification;
+        if (!verification->rank_local_gdn() || verification->pending_rows() != row_counts[lane] ||
+            verification->stream() != batch.stream) {
+            return false;
+        }
+    }
+    GdnVerifyTailLanes jobs;
+    jobs.lane_count = lane_count;
+    for (int lane = 0; lane < lane_count; ++lane) {
+        jobs.lanes[lane] = lane_rows[lane]->verification->gdn_lane(state_index, layer.recurrent);
+    }
+    check(text_gdn_verify_tail_local_lanes(row_counts[0], jobs, layer.recurrent, batch.stream),
+          "Advance packed verification GDN");
+    return true;
+}
+
 inline void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
                     int state_index) {
     const auto& first = batch.lanes[0];
@@ -570,7 +584,7 @@ inline void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& ba
                                           &first.binding->tail[state_index], scratch.observable,
                                           first.work->attention, batch.stream),
                   "Advance bound verification GDN");
-        } else {
+        } else if (!run_gdn_packed_local(layer, batch, state_index)) {
             batch.each([&](const VerificationRow& row, Workspace&) {
                 if (row.first) {
                     row.verification->advance_gdn(state_index, layer.recurrent);

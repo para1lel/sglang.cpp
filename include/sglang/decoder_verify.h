@@ -49,8 +49,39 @@ void project_verification_bf16(Bf16Weight weight, const VerificationRow* rows, i
                                Bf16* Workspace::*output, cudaStream_t stream);
 
 struct VerificationWorkspace {
-    VerificationWorkspace(Allocations& memory, int rows);
-    void bind_gdn(int layer, int rows);
+    VerificationWorkspace(Allocations& memory, int rows) {
+        const int layer_elements = 2 * rows * (text_gdn_qkv_width + text_gdn_value_heads);
+        auto* storage = memory.allocate<Bf16>(gdn_layers * layer_elements);
+        for (auto& layer : replay) {
+            const int qkv = rows * text_gdn_qkv_width;
+            const int gates = rows * text_gdn_value_heads;
+            layer.inputs = {storage, storage + qkv, storage + 2 * qkv,
+                            storage + 2 * qkv + gates};
+            storage += layer_elements;
+        }
+        auto* z = memory.allocate<Bf16>(rows * text_gdn_value_width);
+        auto* attention = memory.allocate<Bf16>(rows * text_gdn_value_width);
+        observable = memory.allocate<Bf16>(rows * text_gdn_value_width);
+        winners = memory.allocate<TextLogitCandidate>(rows);
+        bf16_head_packed = memory.allocate<Bf16>(
+            static_cast<std::size_t>(verification_packet_rows) * (hidden_size + vocab_size));
+        bf16_head_packed_logits =
+            bf16_head_packed + static_cast<std::size_t>(verification_packet_rows) * hidden_size;
+        work.reserve(rows);
+        for (int index = 0; index < rows; ++index) {
+            auto& row = work.emplace_back(memory, attention + index * text_gdn_value_width,
+                                          winners + index);
+            row.gdn_z = z + index * text_gdn_value_width;
+        }
+    }
+    void bind_gdn(int layer, int rows) {
+        const auto inputs = replay[layer].inputs;
+        for (int index = 0; index < rows; ++index) {
+            work[index].gdn_qkv = inputs.qkv + index * text_gdn_qkv_width;
+            work[index].gdn_b = inputs.b + index * text_gdn_value_heads;
+            work[index].gdn_a = inputs.a + index * text_gdn_value_heads;
+        }
+    }
 
     struct ReplayLayer {
         TextGdnReplayRows inputs;
@@ -163,6 +194,7 @@ public:
                        int generated_top_logprobs = -1, bool rank_local_gdn = false);
 
     void begin(int position, int count, cudaStream_t stream);
+    bool can_begin(int position, int count, cudaStream_t stream) const;
     VerificationRow row(int index);
     const Workspace* checkpoint_row(int index);
     bool graph_eligible(const VerificationSequence& sequence) const;
@@ -184,6 +216,9 @@ public:
     const Bf16* logits(int index) const;
     bool needs_generated_logprobs() const { return host_generated_logprobs_ != nullptr; }
     std::shared_ptr<const DecoderTokenLogprobs> generated_logprobs(int index) const;
+    int pending_rows() const { return pending_rows_; }
+    bool rank_local_gdn() const { return rank_local_gdn_; }
+    cudaStream_t stream() const { return stream_; }
 
     Bf16* bf16_head_staging() const {
         return active_workspace_ ? active_workspace_->bf16_head_packed : nullptr;

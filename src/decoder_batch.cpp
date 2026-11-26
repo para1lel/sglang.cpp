@@ -489,6 +489,13 @@ bool DecoderBatch::State::prepare_wide_mtp(int lanes) {
 WideMtpGroups DecoderBatch::State::prepare_wide_groups(const PrefillRows& decode,
         const WideMtpCandidates& candidates, bool& contains_mtp) {
     auto groups = wide_mtp_groups(decode, candidates, wide_mtp_limit);
+    // The TP2 wide route never consumes the packed wide activation (peer
+    // verification ignores it, wide scoring is unused, and draft repair runs
+    // per row); skip the rank-0 scratch reservation. TP1 keeps it.
+    if (tp) {
+        contains_mtp = groups.largest > 0;
+        return groups;
+    }
     while (groups.largest) {
         contains_mtp = true;
         if (prepare_wide_mtp(groups.largest)) break;
@@ -558,7 +565,8 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     if (count == 0) return;
     const auto& cancel = cancel_probe();
     // Reuse the verification activation block before target verification starts.
-    const bool score_together = count >= draft_projection_rows || count == wide_mtp_lanes;
+    const bool score_together = count >= draft_projection_rows ||
+        (count == wide_mtp_lanes && !tp);
     const bool depth_scoring = score_together && !output && MtpDraftRequest::prepare_depth(
         *rounds.front().draft, draft_depth, wide_mtp_activation, stream);
     if (depth_scoring) {
@@ -607,7 +615,9 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
                               gdn_batch);
             if (tp_driver) tp_driver->commit_peer_round(lane, round, saved, peer_gdn_batch);
         }
-        auto* packed = size > packet ? wide_mtp_activation : nullptr;
+        // Rank-0 draft repair keeps its per-row enqueue under TP2; the grouped
+        // packed path stays a TP1 depth-scoring surface.
+        auto* packed = size > packet && !tp ? wide_mtp_activation : nullptr;
         MtpDraftRequest::repair_wave(repairs.data(), size, reinterpret_cast<Bf16*>(packed),
                                      stream);
         if (gdn_batch) {
@@ -616,7 +626,10 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         if (tp_driver) tp_driver->finish_peer_gdn_replays();
         stats.verification_lanes += size;
     };
-    const bool full = count > packet && full_verification(rounds.data(), count);
+    const bool full = count > packet &&
+        count <= (tp ? wide_mtp_lanes : max_wide_mtp_lanes) &&
+        (!tp || count == wide_mtp_lanes) &&
+        full_verification(rounds.data(), count);
     for (int first = 0; first < count;) {
         int width = std::min(count - first, packet);
         if (full) {
@@ -652,7 +665,8 @@ Steps DecoderBatch::State::advance(const Selection& requested, bool chunked,
         WideMtpCandidates wide;
         const auto plan = plan_step(*storage, selected, options.max_lanes,
                                     options.max_num_batched_tokens, chunked,
-                                    wide_mtp_limit >= wide_mtp_lanes && !output ? &wide : nullptr);
+                                    wide_mtp_limit >= wide_mtp_lanes && !output ? &wide : nullptr,
+                                    tp != nullptr);
         current.prefill_rows = plan.prefill;
         const auto live_before = stats ? request_bytes(*storage) : 0;
         const auto wide_groups = prepare_wide_groups(plan.decode, wide, contains_mtp);

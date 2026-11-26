@@ -4,7 +4,7 @@
 
 The historical packed K0 gated delta network (GDN) decode updated
 recurrent state and convolution history for each active row. Current
-verification uses its [grouped GDN forward path](../include/sglang/runtime/execution/decoder_forward_layers.h#L485)<!-- prefix: "void run_gdn" -->.
+verification uses its [grouped GDN forward path](../include/sglang/runtime/execution/decoder_forward_layers.h#L440)<!-- prefix: "void run_gdn" -->.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
@@ -20,6 +20,7 @@ verification uses its [grouped GDN forward path](../include/sglang/runtime/execu
 The [packed input projection](long-paged-decode.md#packed-rmsnorm-programmatic-launch) produces QKV and Z. The GDN gate projection reads the BF16 normalized rows from the same RMSNorm. [Gate call](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L298)<!-- prefix: "check(text_b" -->
 
 Eager execution and graph replay use the same packed dispatch. Convolution rounds its activated result to BF16 before normalizing Q and K. It writes BF16 convolved values and FP32 normalized vectors, decay, and beta to batch scratch. Each recurrence warp reuses these inputs across four value rows. Finish applies gated RMS normalization to the BF16 recurrence observable. The batch stream orders the three launches and allows the next layer to reuse the scratch.
+Under two ranks, eager verify advance packs uniform-row rounds into one three-launch call per GDN layer. Packed lanes must share one stream and rank-local GDN state, up to sixteen lanes. Mixed rows, gate mismatches, or a declined route keep the per-layer launches; results are unchanged. [Packed replay](../include/sglang/text/gdn_local.h#L148)<!-- prefix: "cudaError_t " --> · [Lane gates](../include/sglang/runtime/execution/decoder_forward_layers.h#L528)<!-- prefix: "if (!verific" --> · [Fallback](../include/sglang/runtime/execution/decoder_forward_layers.h#L587)<!-- prefix: "} else if (!" -->
 
 Submitted width selects the path, including when the replay has a shorter live prefix. Below width 8, the scalar recurrence uses eight warps per CTA and finish shifts history in separate CTAs. At width 8 and above, each convolution thread loads a tap before writing it into the preceding history slot. The final tap appends the raw current QKV sample. Finish launches only the gated normalization CTAs. [History shift](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_ops.cu#L80)<!-- prefix: "if constexpr" -->
 

@@ -57,7 +57,8 @@ static_assert(decoder_batch_max_lanes <= prefill_chunk_rows);
 static_assert(prefill_chunk_rows == mxfp8_page_size);
 
 inline StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int lanes,
-                          int budget, bool chunked, WideMtpCandidates* wide) {
+                          int budget, bool chunked, WideMtpCandidates* wide,
+                          bool tensor_parallel = false) {
     BudgetLanes work{};
     for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
@@ -70,7 +71,8 @@ inline StepPlan plan_step(const BatchStorage& storage, const Selection& selected
             wide->speculative |= bit;
             if (work[slot].proposals == decoder_batch_max_mtp_steps &&
                 lane->remaining_output() >= target_verify_max_rows &&
-                !lane->options.constraint && !lane->sampling && !lane->options.top_logits) {
+                !lane->options.constraint && !lane->sampling && !lane->options.top_logits &&
+                (!tensor_parallel || lane->options.generated_top_logprobs < 0)) {
                 wide->eligible |= bit;
                 ++wide->eligible_count;
             }
@@ -105,10 +107,19 @@ struct DecoderBatch::State {
         storage->tc_vocab = model.tc_vocab
             ? prepare_tc_vocab_scratch(execution, options.max_lanes >= 4, residency.resident())
             : nullptr;
-        if (!tp && options.max_lanes >= wide_mtp_lanes &&
+        if (options.max_lanes >= wide_mtp_lanes &&
             options.max_num_batched_tokens >= wide_mtp_rows &&
             model.mtp_weights && storage->tc_vocab) {
-            wide_mtp_limit = model.backend.mtp_verification_lanes;
+            // Rank-local verification supports whole-8-lane (40-row) packets
+            // only; keep native TP1 widths on a single rank.
+            wide_mtp_limit = tp ? std::min(model.backend.mtp_verification_lanes, wide_mtp_lanes)
+                                : model.backend.mtp_verification_lanes;
+            // Supported escape hatch: forces the 4-lane (2x20-row) packets on
+            // both ranks; also used as the baseline arm of the wide-verify
+            // A/B measurement.
+            if (tp && std::getenv("SGLANG_DISABLE_TP2_WIDE_VERIFY")) {
+                wide_mtp_limit = 0;
+            }
         }
         if (options.resident_memory_limit) {
             residency.measure_available(available_device_bytes());

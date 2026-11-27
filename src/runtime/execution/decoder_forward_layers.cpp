@@ -26,6 +26,22 @@ Workspace& workspace(const BatchGraphLane& lane) {
     return *lane.work;
 }
 
+void embed_forward_lanes(const Bf16* embedding, const ForwardLane* lanes, int count,
+                         cudaStream_t stream, const char* operation) {
+    for (int index = 0; index < count; ++index) {
+        const auto& lane = lanes[index];
+        auto* residual = workspace(lane).residual;
+        if (lane.feature != nullptr) {
+            copy_cuda_async(residual, lane.feature, hidden_size * sizeof(Bf16),
+                            cudaMemcpyDeviceToDevice, stream, "Substitute visual embedding");
+        } else {
+            check(
+                text_embedding(embedding, vocab_size, hidden_size, lane.token_id, residual, stream),
+                operation);
+        }
+    }
+}
+
 template <typename Lane>
 int LayerBatch<Lane>::gqa_attention_width() const {
     return tensor_parallel ? gqa_rank_geometry.query_heads * mxfp8_head_dim : text_gqa_q_width;
@@ -52,14 +68,17 @@ GqaGeometry LayerBatch<Lane>::gqa_geometry() const {
 }
 
 template <typename Lane>
-Bf16* LayerBatch<Lane>::lane_output(int index, Bf16* Workspace::*output) const {
-    if (output == &Workspace::projected_attention && attention_output) {
-        return attention_output[index];
+Bf16* const* LayerBatch<Lane>::output_override(Bf16* Workspace::* output) const {
+    if (output == &Workspace::projected_attention) {
+        return attention_output;
     }
-    if (output == &Workspace::hidden && hidden_output) {
-        return hidden_output[index];
-    }
-    return workspace(lanes[index]).*output;
+    return output == &Workspace::hidden ? hidden_output : nullptr;
+}
+
+template <typename Lane>
+Bf16* LayerBatch<Lane>::lane_output(int index, Bf16* Workspace::* output) const {
+    const auto* overrides = output_override(output);
+    return overrides ? overrides[index] : workspace(lanes[index]).*output;
 }
 
 template <typename Lane>
@@ -127,7 +146,58 @@ int LayerBatch<Lane>::projection_rows(int group) const {
 }
 
 template <typename Lane>
-void LayerBatch<Lane>::quantize(Bf16* Workspace::*source, int width) const {
+void LayerBatch<Lane>::normalize(const Bf16* weight, const char* operation,
+                                 Bf16* Workspace::* branch) const {
+    const auto* overrides = output_override(branch);
+    const auto residuals = [&](int index, const Workspace& work) {
+        return branch ? LayerResidual{overrides ? overrides[index] : work.*branch, work.residual}
+                      : LayerResidual{work.residual, nullptr};
+    };
+    const auto rms_row = [&](int index) -> VerifyRmsQuantizeRow {
+        const auto& work = workspace(lanes[index]);
+        const auto [input, residual] = residuals(index, work);
+        return {input, residual, work.normalized, projection_activation(index, hidden_size)};
+    };
+    if (fuse_verify_activation()) {
+        if (count == fused_verify_rows) {
+            static_assert(fused_verify_rows == 5);
+            const VerifyRmsQuantizeRows rows{
+                {rms_row(0), rms_row(1), rms_row(2), rms_row(3), rms_row(4)},
+            };
+            check(verify_rms_quantize(rows, weight, stream), operation);
+        } else {
+            VerifyRmsQuantizeRows rows{};
+            for (int index = 0; index < count; ++index) {
+                rows.entries[index] = rms_row(index);
+            }
+            check(verify_rms_quantize_partial(rows, count, weight, stream), operation);
+        }
+        return;
+    }
+    if (fuse_wide_verify_norm()) {
+        const int capacity = packed_activation != nullptr ? WideVerifyRmsQuantizeRows::capacity
+                                                          : verification_packet_rows;
+        for (int first = 0; first < count; first += capacity) {
+            WideVerifyRmsQuantizeRows rows{};
+            const int size = std::min(count - first, capacity);
+            for (int index = 0; index < size; ++index) {
+                rows.entries[index] = rms_row(first + index);
+            }
+            check(verify_rms_quantize_wide(rows, size, weight, stream), operation);
+        }
+        return;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& work = workspace(lanes[index]);
+        const auto [input, residual] = residuals(index, work);
+        check(
+            text_rms_norm(input, residual, weight, hidden_size, work.normalized, residual, stream),
+            operation);
+    }
+}
+
+template <typename Lane>
+void LayerBatch<Lane>::quantize(Bf16* Workspace::* source, int width) const {
     if (fuse_verify_activation() && width % text_fp8_group_size == 0) {
         quantize_verification(source, width);
         return;

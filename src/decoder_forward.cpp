@@ -17,17 +17,7 @@ void Decoder::Model::forward(const ForwardLane* lanes, int count, cudaStream_t s
     if (!lanes || count < 1 || count > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch width");
     }
-    for (int index = 0; index < count; ++index) {
-        const auto& lane = lanes[index];
-        auto* residual = lane.request->work.residual;
-        if (lane.feature) {
-            copy_cuda_async(residual, lane.feature, hidden_size * sizeof(Bf16),
-                            cudaMemcpyDeviceToDevice, stream, "Substitute visual embedding");
-        } else {
-            check(text_embedding(embedding, vocab_size, hidden_size, lane.token_id, residual,
-                                 stream), "Look up token embedding");
-        }
-    }
+    embed_forward_lanes(embedding, lanes, count, stream, "Look up token embedding");
     forward_layers(lanes, count, stream);
 }
 
@@ -94,60 +84,18 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
         packed_activation,
     };
     batch.tensor_parallel = tp != nullptr;
-    const auto normalize = [&](const Bf16* weight, const char* operation, const auto& residuals) {
-        if (batch.fuse_verify_activation()) {
-            VerifyRmsQuantizeRows rows;
-            for (int index = 0; index < fused_verify_rows; ++index) {
-                auto& work = workspace(lanes[index]);
-                const auto residual_pair = residuals(work);
-                rows.entries[index] = {
-                    residual_pair.branch, residual_pair.residual, work.normalized,
-                    batch.projection_activation(index, hidden_size)};
-            }
-            check(verify_rms_quantize(rows, weight, stream), operation);
-            return;
-        }
-        if (batch.fuse_wide_verify_norm()) {
-            const int capacity = packed_activation ? WideVerifyRmsQuantizeRows::capacity
-                                                   : verification_packet_rows;
-            for (int first = 0; first < count; first += capacity) {
-                WideVerifyRmsQuantizeRows rows{};
-                const int size = std::min(count - first, capacity);
-                for (int index = 0; index < size; ++index) {
-                    auto& work = workspace(lanes[first + index]);
-                    const auto residual_pair = residuals(work);
-                    rows.entries[index] = {
-                        residual_pair.branch, residual_pair.residual, work.normalized,
-                        batch.projection_activation(first + index, hidden_size)};
-                }
-                check(verify_rms_quantize_wide(rows, size, weight, stream), operation);
-            }
-            return;
-        }
-        for (int index = 0; index < count; ++index) {
-            auto& work = workspace(lanes[index]);
-            const auto residual_pair = residuals(work);
-            check(text_rms_norm(residual_pair.branch, residual_pair.residual, weight,
-                                hidden_size, work.normalized, residual_pair.residual, stream),
-                  operation);
-        }
-    };
     for (int index = 0; index < layer_count; ++index) {
         const auto& layer = layers[index];
         const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
-        const auto input = [first = index == 0](const auto& work) {
-            return first ? LayerResidual{work.residual, nullptr}
-                         : LayerResidual{work.hidden, work.residual};
-        };
-        normalize(layer.input_norm, "Normalize layer input", input);
+        batch.normalize(layer.input_norm, "Normalize layer input",
+                        index == 0 ? nullptr : &Workspace::hidden);
         if (full_attention) {
             run_gqa(layer.gqa, batch, bank);
         } else {
             run_gdn(layer.gdn, batch, bank);
         }
-        normalize(layer.attention_norm, "Normalize post-attention residual", [](const auto& work) {
-            return LayerResidual{work.projected_attention, work.residual};
-        });
+        batch.normalize(layer.attention_norm, "Normalize post-attention residual",
+                        &Workspace::projected_attention);
         run_mlp(layer, batch);
     }
 }

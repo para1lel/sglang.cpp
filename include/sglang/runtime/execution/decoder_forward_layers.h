@@ -44,6 +44,9 @@ Workspace& workspace(const VerificationRow& row);
 
 Workspace& workspace(const BatchGraphLane& lane);
 
+void embed_forward_lanes(const Bf16* embedding, const ForwardLane* lanes, int count,
+                         cudaStream_t stream, const char* operation);
+
 static_assert(wide_mtp_rows == text_target_fp8_m40_rows);
 static_assert(2 * wide_mtp_rows == text_target_fp8_m80_rows);
 static_assert(max_wide_mtp_rows == text_target_fp8_m160_rows);
@@ -90,6 +93,8 @@ struct LayerBatch {
 
     int projection_rows(int group) const;
 
+    void normalize(const Bf16* weight, const char* operation,
+                   Bf16* Workspace::* branch = nullptr) const;
 
     void quantize(Bf16* Workspace::*source, int width) const;
 
@@ -115,6 +120,9 @@ struct LayerBatch {
 
     void project_verification_packets(std::initializer_list<LayerProjection> layers, int first,
                                       int size) const;
+
+  private:
+    Bf16* const* output_override(Bf16* Workspace::* output) const;
 };
 
 template <typename Lane>

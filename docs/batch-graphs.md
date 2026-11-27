@@ -22,15 +22,7 @@ TP1 replays direct decode lanes. Separate prefill and full-hit scoring can share
 
 TP1 runs each eligible shape eagerly before thread-local capture. Replay binds live tokens, positions, and request state at fixed addresses with device page tables. It runs embedding, decoder layers, and scoring. Greedy, sampled, and [constrained selection](text-serving.md#finite-choice-constraints) share row logits.
 
-B200 K0 graph replay covers eligible singleton text decode. Other devices can
-replay eligible widths one through four. Wider steps use eager forward. See
-[grouped split target attention](singleton-gqa-decode.md#split-kv-target-attention).
-The earlier packed K0 runtime used padded buckets through width 32.
-[Selection](../src/text/decoder_graph.cpp#L96)<!-- prefix: "const bool g" -->
-
-Width one has [attention and score limits](singleton-gqa-decode.md#constraints-and-failure-behavior).
-
-[Former packed K0 winner readback](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/batch-graphs.md#runtime-path)
+B200 K0 graph replay covers eligible text singletons. Other devices can replay eligible widths 1–4. Wider steps use eager forward. See [grouped split target attention](singleton-gqa-decode.md#split-kv-target-attention) and [attention and score limits](singleton-gqa-decode.md#constraints-and-failure-behavior). [Selection](../src/text/decoder_graph.cpp#L96)<!-- prefix: "const bool g" -->
 
 In `--trace-batches`, `graph_slots` sets one bit per replayed K0 logical slot, excluding padding. `request_bytes` includes legacy lane scores. Batch scratch, graphs, and prefix storage count separately. Active steps report prefill `workspace_bytes` and allocated `sampling_workspace_bytes`. [Slot mask](../src/decoder_batch.cpp#L395)<!-- prefix: "stats.graph_" --> · [Request accounting](../src/runtime/execution/decoder_batch_state.cpp#L15)<!-- prefix: "std::size_t " --> · [Sampling trace](../apps/server/detail/batch_trace.cpp#L49)<!-- prefix: "if (stats.sa" -->
 
@@ -68,7 +60,7 @@ Each batch caches at most one executable per eligible K0 width. Sparse
 selections can rebind after retirement. Prefill runs outside these executables.
 [Capture and binding](../src/text/decoder_graph.cpp#L40)<!-- prefix: "return execu" --> · [Zero-budget completion](../src/decoder_batch.cpp#L756)<!-- prefix: "result.finis" -->
 
-The archived ordered graph used slot logits at positions 0–5,119 and allocated request scores at widths two through four when needed. Its packed scratch OOM fallback required successful error checks and partial cleanup. Terminal errors stopped decode publication. [Frozen sizing and setup](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/batch-graphs.md#constraints-and-failure-behavior) · [Fault regression](lessons.md#l009--terminal-error-during-first-packed-decode-setup)
+[Former packed K0 setup and failure rules](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/batch-graphs.md#constraints-and-failure-behavior)
 
 Batch execution owns the winner pin and allocates it on first eligible use. Clean allocation OOM keeps per-lane reads for that batch. Other errors reach batch recovery. Cleanup frees the pin after stream drain and graph teardown. A rejected free retains ownership for device-local deferred reclamation. Terminal errors retain the resources. [Allocation](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/decoder_resources.cpp#L556)<!-- prefix: "TextLogitCan" --> · [Release](../src/runtime/backend/cuda_resources.cpp#L280)<!-- prefix: "CleanupError" --> · [Retry](../src/runtime/backend/cuda_resources.cpp#L129)<!-- prefix: "static void " -->
 
@@ -90,17 +82,13 @@ A nonfinite visible score makes the merged denominator nonfinite. The merge chec
 
 ### Packed paged GQA decode
 
-Packed buckets bind live positions, KV, and page tables. Negative positions mark padding. The [fused GQA step](long-paged-decode.md#fused-packed-gqa) appends KV, attends, and gates. Split partials use batch-owned logits scratch, avoiding request-owned long scores. Warmup, replay, and eligible pre-submission fallback share one enqueue path. [Packed attention](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L311)<!-- prefix: "void PackedD" --> · [Packed dispatch](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L521)<!-- prefix: "bool run_pac" -->
+[Former packed K0 dispatch and bindings](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/batch-graphs.md#packed-paged-gqa-decode)
 
 ### Legacy narrow paged GQA decode
 
-The legacy width-two through width-four graph selects split attention per lane at 8,192 through 16,384 visible tokens. It appends the new KV, runs attention, and gates the outputs on the batch stream. Ordered score and replay nodes handle lanes outside the window. Legacy eager forwards group in-window decode lanes after KV append. Other eager rows at those widths follow the row dispatch. [Bounds](../src/text/gqa/device_geometry.cu#L22)<!-- prefix: "SGLANG_GQA_H" --> · [Bound forward](../src/runtime/execution/decoder_forward_attention.cpp#L251)<!-- prefix: "void attend_" --> · [Eager forward](../src/runtime/execution/decoder_forward_attention.cpp#L338)<!-- prefix: "void attend_" --> · [Bound fallback](../src/text/gqa/paged_decode.cu#L273)<!-- prefix: "__global__ v" -->
+Legacy width-two through width-four graphs select split attention per lane at 8,192–16,384 visible tokens. The captured sequence appends KV, attends, and gates, with ordered score and replay outside the window. Eager groups eligible decode lanes after append. Width four shares decoded KV across adjacent heads in a 16×12×4 grid with 256 threads per block. Widths one to three launch one block per query head and partition. Each split uses 16 partitions of 128-token pages and 399,360 bytes of the lane's 496,640-byte logits arena. The merge rescales FP32 numerators and masses then rounds to BF16. [Bounds](../src/text/gqa/device_geometry.cu#L22)<!-- prefix: "SGLANG_GQA_H" --> · [Bound forward](../src/runtime/execution/decoder_forward_attention.cpp#L251)<!-- prefix: "void attend_" --> · [Eager forward](../src/runtime/execution/decoder_forward_attention.cpp#L338)<!-- prefix: "void attend_" --> · [Paired split](../src/text/gqa/paged_decode.cu#L449)<!-- prefix: "__global__ v" --> · [Scratch alias](../src/text/gqa/verify_batch.cpp#L8)<!-- prefix: "PagedDecodeB" -->
 
-The split assigns 128-token KV pages to 16 partitions. It clamps the last to visible length. Bound width four and eager width four after compaction use a `(16, 12, 4)` grid with 256 threads per block. Blocks share decoded K and V between two adjacent query heads of one KV head. Split widths one through three use one block per query head and partition. [Split launch](../src/text/gqa/paged_decode.cu#L525)<!-- prefix: "void launch_" --> · [Paired split](../src/text/gqa/paged_decode.cu#L449)<!-- prefix: "__global__ v" -->
-
-Four eight-thread subgroups per warp score four channel groups per pass. Two passes preserve each head's FP32 score tree and ascending group sum. Eight warps accumulate values in the original FMA order. Each head writes separate FP32 partials. The merge rescales the weight sum and value numerator to the global maximum, divides in FP32, and rounds to BF16. Split and ordered attention can produce different logits. Each lane uses 399,360 of its 496,640 logits bytes for 16-byte-aligned partials. In-window lanes skip request-owned score binding. [Paired scores](../src/text/gqa/paged_decode.cu#L346)<!-- prefix: "__device__ v" --> · [Merge](../src/text/gqa/paged_decode.cu#L144)<!-- prefix: "__global__ v" --> · [Scratch alias](../src/text/gqa/verify_batch.cpp#L8)<!-- prefix: "PagedDecodeB" -->
-
-A nonfinite visible score, visible V scale byte above 160, or invalid partial or merged result triggers FP64 replay for that query head. The merge requires finite numerators and BF16 outputs and a finite positive weight sum. Replay widens the decoded FP32 KV, processes the visible sequence in order, and rounds to BF16. Other heads keep their results. The captured sequence includes both FP64 head replay and ordered lane fallback. [Head replay](../src/text/gqa/paged_decode.cu#L199)<!-- prefix: "__device__ v" --> · [Replay dispatch](../src/text/gqa/paged_decode.cu#L283)<!-- prefix: "__global__ v" -->
+Nonfinite scores, visible V scale above 160, or invalid partials or merge trigger ordered FP64 replay per affected head. The merge requires finite numerators and outputs and a positive finite weight sum. Capture includes head and lane fallback. Reduction order can change logits. [Head replay](../src/text/gqa/paged_decode.cu#L199)<!-- prefix: "__device__ v" --> · [Replay dispatch](../src/text/gqa/paged_decode.cu#L283)<!-- prefix: "__global__ v" -->
 
 ## Verification
 

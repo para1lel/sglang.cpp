@@ -33,37 +33,9 @@ curl --fail-with-body -N -X PUT http://127.0.0.1:17384/generate \
   --data-binary '{"input_ids":[220],"sampling_params":{"max_new_tokens":2,"temperature":0},"stream":true}'
 ```
 
-Broadcast one sampling object across text prompts.
+The scalar request shapes above also accept prompt arrays. For indexed batches, supply `text: ["A", "B"]` or `input_ids: [[220], [32, 220]]`. Broadcast one `sampling_params` object or supply one per prompt, and optionally supply per-prompt `cache_salt` and `rid`. [Copyable batch JSON and SSE examples](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/native-generate.md#runtime-path)
 
-```bash
-curl --fail-with-body http://127.0.0.1:17384/generate \
-  -H 'Content-Type: application/json' \
-  --data-binary '{
-    "text": ["The capital of France is", "The capital of Spain is"],
-    "sampling_params": {"max_new_tokens": 8, "temperature": 0, "stop": ["\n", "."]}
-  }'
-```
-
-Stream nested prompt IDs with per-prompt options and salts.
-
-```bash
-curl --fail-with-body -N http://127.0.0.1:17384/generate \
-  -H 'Content-Type: application/json' \
-  --data-binary '{
-    "input_ids": [[220], [32, 220]],
-    "sampling_params": [{"max_new_tokens": 0}, {"max_new_tokens": 2, "temperature": 0, "stop": "."}],
-    "cache_salt": ["", "example"],
-    "stream": true
-  }'
-```
-
-The reader checks shape and reserves IDs when the queue has capacity. The worker validates every item and encodes text before decoder admission.
-
-A batch shares one HTTP queue entry, worker and [decoder scheduler](http-server.md#decode-scheduling).
-An item that decodes alone can use [score-backed singleton attention](singleton-gqa-decode.md).
-Multi-item batches submit in input order, scanning from lane zero. Items beyond `--max-active` wait.
-A one-item request waits for its worker's lane even if another lane is free.
-[Lane selection](../apps/server/batch_service.cpp#L486)<!-- prefix: "void BatchSe" -->
+The reader reserves IDs after queue admission. The worker validates and encodes all items before decoder admission. A batch shares one HTTP worker and [decoder scheduler](http-server.md#decode-scheduling). Multi-item batches submit in input order from lane zero, waiting at `--max-active`. One-item requests wait for their worker's lane. An item decoding alone can use [score-backed singleton attention](singleton-gqa-decode.md). [Lane selection](../apps/server/batch_service.cpp#L486)<!-- prefix: "void BatchSe" -->
 
 ### Parallel sampling
 
@@ -90,35 +62,15 @@ SSE opens [chunked HTTP 200](http-server.md#completion-streams) after admission 
 | `meta_info.finish_reason` | `null` on intermediate events. The final value records `length`, `stop` with a string or integer `matched`, or an [abort result](native-abort.md#runtime-path). |
 | `meta_info.cached_tokens` | Number of reused prompt IDs. Present on every batch result event and in every final object. Single-prompt intermediate events omit it. |
 
-Keep state by `index`. Replace text and IDs with each event. Text can stay unchanged while IDs grow. Cumulative events can use quadratically many bytes.
-The budget finish is `{"type":"length","length":N}`. A token-ID stop gives `{"type":"stop","matched":ID}`. Its final ID counts toward `completion_tokens`. The writer omits its decoded text by default.
-Zero budget returns empty text and IDs with `{"type":"length","length":0}`.
-Successful items send one terminal object. The stream sends `data: [DONE]` once and closes.
-Any item traffic resets the connection's [keepalive timer](http-server.md#completion-streams).
-Measure TTFT at each item's first event with output IDs. Zero-budget items have no first-token sample.
-The completion worker writes outside the scheduler mutex. A blocked write can hold the batch's pending results while other ready completions advance.
-Eligible unindexed streams can use [bounded decode output](http-server.md#bounded-decode-output). Cumulative IDs, terminal metadata, and keepalives follow the same response contract.
-[Batch result delivery](../apps/server/batch_service.cpp#L573)<!-- prefix: "bool BatchSe" -->
+Replace each item's text and IDs per event. Text can stay unchanged as IDs grow and cumulative events can use quadratic bytes. An item ends with one terminal object. A budget finish is `{"type":"length","length":N}`, including empty output at zero. A token-ID stop returns `{"type":"stop","matched":ID}` and counts the ID in `completion_tokens`, hiding its text by default. Successful streams send one `[DONE]`. Measure TTFT at the first output-ID event for each item. Zero-budget items have no sample. Any item frame resets the [keepalive timer](http-server.md#completion-streams). The writer runs outside the scheduler mutex, allowing other completions to advance. Eligible unindexed streams can use [bounded decode output](http-server.md#bounded-decode-output). [Batch result delivery](../apps/server/batch_service.cpp#L573)<!-- prefix: "bool BatchSe" -->
 
 ### Text stops
 
-`sampling_params.stop` searches generated text including special token pieces, regardless of `skip_special_tokens`. A string is one stop, and a list gives the stops for one item. A single sampling object broadcasts that list to every batch item. Use a `sampling_params` array of objects to set different stops per item.
+Text stops inspect generated pieces including specials, regardless of `skip_special_tokens` or `ignore_eos`. A string or list applies per item, with one sampling object broadcasting. The matcher checks the current step's committable IDs in configured stop order, then chooses that stop's first occurrence, which can start in an earlier step. A match supersedes stop IDs and length in that step. Commit ends at the completing token, retaining its ID, usage, and scores. Other items continue. [Match order](../apps/server/detail/text_stop.cpp#L127)<!-- prefix: "int TokenTex" --> · [Checkpoint coverage](prefix-cache.md#checkpoint-boundaries) · [Commit cutoff](../apps/server/detail/text_stop.cpp#L136)<!-- prefix: "const auto e" -->
 
-The worker checks the IDs eligible to commit in the current decoder step. If several stops match, configured string order wins across the step. The worker uses that string's first occurrence, which can start in an earlier step. A text match takes precedence over a token-ID stop or length finish in that step. Text stops also apply when `ignore_eos` is true.
-[Match order](../apps/server/detail/text_stop.cpp#L127)<!-- prefix: "int TokenTex" --> · [Worker binding](../apps/server/batch_service.cpp#L525)<!-- prefix: "job->options" -->
+The final finish is `{"type":"stop","matched":"…"}`. Rendered text trims at its first occurrence by default, or through it with `no_stop_trim: true`. If hiding specials removed the match, keep rendered text through the matching token. `skip_special_tokens: false` exposes those pieces. `no_stop_trim: true` also retains a matched ID’s text if its piece is visible. Prompt IDs never enter matching. Token logprob text decodes independently. Partial UTF-8 waits for its last byte, and invalid or flushed incomplete pieces become U+FFFD. Hold partial stop prefixes until safe so cumulative text never retracts, then release them at an unmatched finish. [UTF-8 assembly](../src/utf8.cpp#L77)<!-- prefix: "std::string " --> · [UTF-8 flush](../src/utf8.cpp#L110)<!-- prefix: "std::string " --> · [Text release](../apps/server/detail/text_stop.cpp#L102)<!-- prefix: "std::string " -->
 
-The final object contains `{"type":"stop","matched":"…"}` with the configured string. IDs and usage include the token that completes it, even if the match starts inside that token. The decoder ends the lane at that ID before later candidate IDs can commit. [Checkpoint coverage](prefix-cache.md#checkpoint-boundaries) follows processed target state. Other items keep running.
-[Finish serialization](../apps/server/native_generate.cpp#L164)<!-- prefix: "if (type == " --> · [Commit cutoff](../apps/server/detail/text_stop.cpp#L136)<!-- prefix: "const auto e" -->
-
-The response searches rendered `text` for the matched string. By default it trims from the first occurrence. Set `sampling_params.no_stop_trim` to `true` to keep text through the end of that occurrence. For example, stopping on `ll` in the token `hello` returns `hell`. If the matched string is absent after special token filtering, both settings return all rendered text through the matching token. IDs, usage, finish metadata, and optional token logprobs follow the same rules with either setting.
-
-Set `sampling_params.skip_special_tokens` to `false` to show generated special tokens in `text`. A matched stop ID contributes visible text when `no_stop_trim` is true and its piece is visible. Prompt tokens stay outside the output and the stop matcher. Generated-token logprob text uses its independent piece decoding.
-
-A split UTF-8 character enters the matcher after its last byte arrives. The decoder emits U+FFFD for invalid bytes or for an incomplete character when it flushes. Stop strings match the resulting UTF-8 text, including replacement characters. The writer holds trailing stop prefixes and text starting at a rendered occurrence until it knows which bytes to release. This keeps text cumulative even when hiding a special token joins visible pieces into a stop string. An event can add IDs while its text stays unchanged. When an item ends without a text match, the terminal event releases the held text.
-[UTF-8 assembly](../src/utf8.cpp#L77)<!-- prefix: "std::string " --> · [UTF-8 flush](../src/utf8.cpp#L110)<!-- prefix: "std::string " --> · [Text release](../apps/server/detail/text_stop.cpp#L102)<!-- prefix: "std::string " -->
-
-An unscored and unconstrained scalar prompt with `n: 1` and no text stops uses ID-based callbacks. Text stops, output constraints, and scores use step delivery with the same unindexed shape. A step-delivered event can carry several MTP IDs, including on the terminal step. Positive-MTP buffering requires the per-token path. Unindexed step streams can use the K0 cohort rule. Indexed requests use ordinary scheduling.
-[Dispatch](../apps/server/native_generate.cpp#L408)<!-- prefix: "} else if (!" --> · [Bounded delivery](http-server.md#bounded-decode-output)
+Unscored unconstrained scalar `n: 1` without text stops uses per-token callbacks. Indexed prompts and scalar text stops, scores, or constraints use step delivery, which can emit multiple MTP IDs. Positive-MTP buffering requires per-token delivery. K0 can also buffer eligible step streams. Indexed requests use ordinary readiness. [Dispatch](../apps/server/native_generate.cpp#L408)<!-- prefix: "} else if (!" --> · [Bounded delivery](http-server.md#bounded-decode-output)
 
 ### Token logprobs
 
@@ -133,17 +85,9 @@ Set top-level `return_logprob: true` and `sampling_params.temperature: 0`. Scori
 | `return_text_in_logprobs` | Request-wide boolean, with omission or null using `false`. |
 | `token_ids_logprob` | Null or omission. |
 
-For the first three fields, a scalar broadcasts. Arrays require a prompt array and `n: 1`.
-`meta_info.output_token_logprobs` contains a `[logprob, token_id, text]` triple per output ID. `output_token_logprobs_length` counts them.
-Text defaults to null. When enabled, each piece decodes independently, preserving special tokens and replacing invalid UTF-8.
-`input_token_logprobs` starts with `[null, token_id, text]` at the offset, then scores later tokens from their preceding context. An offset at prompt length yields empty input arrays.
-A positive top count adds ranked triples in `input_top_logprobs` and `output_top_logprobs`. The first input entry is null. Ties rank by ascending ID.
-SSE repeats completed input scores and accumulates output scores. An early abort yields empty input arrays. Zero output yields empty output arrays. Unscored items omit score fields.
-Input scoring uses the raw target distribution. It can restore a [matching checkpoint](prefix-cache.md#checkpoint-compatibility-and-resume) through the start offset and capture scores as the remaining prompt rows run.
-[Serialization](../apps/server/native_generate.cpp#L91)<!-- prefix: "void append_" --> · [Frame](../apps/server/native_generate.cpp#L182)<!-- prefix: "if (result &" -->
+The first three fields accept a broadcast scalar or an array for prompt arrays at `n: 1`. Output scores are `meta_info.output_token_logprobs` triples `[logprob, token_id, text]` with `output_token_logprobs_length`. Text is null unless requested, then decodes pieces independently with specials and UTF-8 replacement. `meta_info.input_token_logprobs` triples begin at the offset with a null score (empty at prompt length). Positive top counts add `input_top_logprobs` and `output_top_logprobs`, with null for the first input entry and ascending IDs on ties. SSE repeats input and accumulates output scores. Early abort and zero output leave the corresponding arrays empty. Unscored items omit score fields.
 
-Each scored row adds an FP32 log-softmax reduction outside graph replay. It reads BF16 target logits or FP32 scores adjusted by [output penalties](output-penalties.md) or logit bias. The argmax supplies the selected ID. The score readback transfers the selected record and requested alternatives to pinned host memory. Scratch and readback allocate on first scored admission.
-[Scoring](../src/decoder_batch.cpp#L252)<!-- prefix: "if (lane.opt" --> · [Readback](../src/text/decoder_logprobs.cu#L192)<!-- prefix: "cudaError_t " --> · [Allocation](../src/decoder_batch.cpp#L181)<!-- prefix: "if (top \u003e= 0" -->
+Input scores use raw target distributions and can restore a [matching checkpoint](prefix-cache.md#checkpoint-compatibility-and-resume) through the score offset. Output scoring runs FP32 log-softmax outside replay over BF16 row logits or FP32 scores adjusted by penalties or logit bias. Selected records and alternatives use pinned readback allocated at first scored admission. [Serialization](../apps/server/native_generate.cpp#L91)<!-- prefix: "void append_" --> · [Frame](../apps/server/native_generate.cpp#L182)<!-- prefix: "if (result &" --> · [Readback](../src/text/decoder_logprobs.cu#L192)<!-- prefix: "cudaError_t " -->
 
 ## Constraints and failure behavior
 
@@ -216,11 +160,9 @@ Send [`POST /abort_request`](native-abort.md) from a second connection to cancel
 
 ## Verification
 
-Run the [single-prompt and batch examples](#runtime-path) on a reserved B200 with the pinned release checkpoint. Compare JSON and SSE for both methods. Check text, finish reason, token counts, cumulative IDs, one final event per item, and one `[DONE]` after all items finish. Run the batch cases at `--max-active 1` and `2`; check stable IDs, per-index counts, one-item array and SSE shapes, and zero IDs for the first nested-ID item.
+On a reserved B200, compare both methods and JSON/SSE at one and two lanes. Check indexed and one-item shapes, stable IDs, cumulative output and usage, matching text and finishes, one terminal per item and one `[DONE]`. Test zero budget and an explicit first-ID stop. Reject malformed JSON, both prompt fields, wrong sampling-array length and invalid later items before headers. Check PUT 411/415 and HEAD 405 with `Allow: POST, PUT`.
 
-Check zero budget and an explicit stop at the first greedy ID. The stop retains that ID and returns empty text. Require HTTP 400 for malformed JSON, conflicting prompts, a mismatched sampling array, or an invalid later item. SSE validation errors must precede headers. With PUT, check 411 for missing length and 415 for unsupported media type. Confirm HTTP 405 and `Allow: POST, PUT` with `curl -I http://127.0.0.1:17384/generate`.
-
-For generated scores, compare greedy JSON and SSE at K0 and positive depth. Check top three with both text settings, top zero, full and suffix prompt scores, score prefixes and IDs, zero budget, stop IDs, and mixed lanes. Require HTTP 400 for invalid offsets, requested-ID scoring, or active sampling. In managed Pixi, run this independent full-vocabulary log-softmax comparison on the reserved B200.
+Compare generated scores at K0 and positive depth for top zero/three, both text settings, prompt offsets, mixed lanes, empty output and stop IDs. Reject invalid offsets, requested-ID scoring, and active sampling. Run the independent full-vocabulary comparison in managed Pixi.
 
 ```bash
 checkpoint=/data0/shared/Qwen3.8-27B-FP8

@@ -10,7 +10,7 @@ The verifier owns rank-local projection dispatch and KV repair. [Packed projecti
 
 ### Fused packed GQA
 
-The former K0 path fused query and key preparation, packed append, split attention, and gating for two or more lanes. It used 64-token chunks, BF16 value-product inputs, and FP64 per-head recovery. [Frozen runtime and staging](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/long-paged-decode.md#fused-packed-gqa) · [Operand range regression](lessons.md#l006--fp16-operand-loss-in-split-gqa)
+The former K0 path fused KV append, split attention and gating with FP64 head recovery. [Frozen runtime and staging](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/long-paged-decode.md#fused-packed-gqa) · [Operand range regression](lessons.md#l006--fp16-operand-loss-in-split-gqa)
 
 ### Packed FP8 projections
 
@@ -32,7 +32,7 @@ For 80 rows on B200, native FP8 covers TP2 rank-local GDN QKV/Z, GQA Q/gate and 
 
 #### Packed RMSNorm programmatic launch
 
-The former packed K0 used a fused RMSNorm and quantization producer. Early programmatic launch let the consumer stage immutable weights and scales before activation and activation-scale loads. Separate producers and GEMV fallback use ordinary ordering. The post-attention trigger requires the aligned 32-row residual path. [Frozen producer, graph edge, and consumer details](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/long-paged-decode.md#packed-rmsnorm-programmatic-launch) · [Launch attribute](../src/text/decode_proj_host.cu#L238)<!-- prefix: "attributes[0" -->
+The former packed K0 overlapped consumer weight staging with RMSNorm/FP8 preparation. [Frozen producer, graph edge, and consumer details](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/long-paged-decode.md#packed-rmsnorm-programmatic-launch) · [Launch attribute](../src/text/decode_proj_host.cu#L238)<!-- prefix: "attributes[0" -->
 
 #### Ten-row TP2 verification projections
 
@@ -52,11 +52,11 @@ Match MXFP8 KV payloads, scales, and continuation proposals. Cover eager and gra
 
 ### Legacy wide eager decode
 
-The former wide K0 path compacted more than four lanes and split 32,768–262,144 visible tokens across sixteen partitions. The current [grouped split reader](singleton-gqa-decode.md#split-kv-target-attention) also supports [long draft dispatch](native-model-info.md#draft-attention). [Frozen compaction, split, and scratch layout](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/long-paged-decode.md#legacy-wide-eager-decode)
+The current [grouped split reader](singleton-gqa-decode.md#split-kv-target-attention) also supports [long draft dispatch](native-model-info.md#draft-attention). [Frozen compaction, split, and scratch layout](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/long-paged-decode.md#legacy-wide-eager-decode)
 
 ## Constraints and failure behavior
 
-The archived tensor-core and paired splits changed reduction order. Tensor-core also rounded numerator weights to BF16. The former launcher preflighted the whole group and used token-ordered FP64 replay for affected heads. [Frozen eligibility, validation, and operand guards](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/long-paged-decode.md#constraints-and-failure-behavior)
+[Frozen eligibility, validation, and operand guards](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/long-paged-decode.md#constraints-and-failure-behavior) records the former K0 launcher and BF16 numerator rounding.
 
 ## Verification
 
@@ -84,6 +84,6 @@ Record prefill overlays as separate experiments. Use identical prefill code on b
 
 ### Packed route drift evidence
 
-The historical packed comparison found nonzero KL and greedy divergence at widths above one, despite exact width-one results. Same-input FP64 probes and operator substitutions implicated FP8 projection reduction order and BF16 rounding of scaled softmax weights before the packed GQA value multiply.
+Historical packed runs diverged above width one. Fixed-input probes implicated FP8 projection reduction order and BF16 softmax-weight rounding. [Frozen drift details](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/long-paged-decode.md#packed-route-drift-evidence)
 
 The graph requirement is compare complete BF16 score rows bitwise across every eligible width and both low/high slot masks. Warmup must not consume a required mask. Full serving performance qualification remains open.

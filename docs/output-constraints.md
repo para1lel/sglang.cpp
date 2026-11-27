@@ -1,21 +1,15 @@
 # Native output constraints
 
 Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finite-choice-constraints), a regular expression, or the JSON Schema subset below. Pick one constraint per request. JSON and SSE use the same constraint. These whole-output constraints keep reasoning and tool markers in chat `content`. Text chat can also select a [tool-call constraint](#tool-call-constraints) that feeds the chat output parsers.
-`POST /generate` accepts the same subsets through [`sampling_params.regex`](#native-generate) and [`sampling_params.json_schema`](#native-json-schema).
+`POST /generate` accepts the same subsets through [`sampling_params.regex`](#native-generate), [`sampling_params.json_schema`](#native-json-schema) and [`sampling_params.ebnf`](#native-ebnf).
 
 ## Responsibilities and sources of truth
 
-| Part | Responsibility | Source |
-| --- | --- | --- |
-| HTTP request | Validate the constraint fields and compile with the checkpoint tokenizer. | [Request validation](../apps/server/text_request.cpp#L286)<!-- prefix: "void set_con" --> |
-| Regular expression compiler | Build the token transition table and compute the minimum budget. | [Tokenizer compiler](../src/tokenizer/regex_constraint.cpp#L153)<!-- prefix: "std::shared_" --> |
-| Schema compiler | Convert the supported schema to a token constraint. | [Schema compiler](../src/tokenizer/json_schema.cpp#L435)<!-- prefix: "std::shared_" --> |
-| Tool-call constraint | Compile and cache the grammar for the selected functions and request mode. | [Tool grammar cache](../apps/server/qwen/qwen_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" --> · [Trigger compiler](../src/tokenizer/regex_constraint.cpp#L166)<!-- prefix: "std::shared_" --> |
-| Decoder | Apply the request cursor to target scores and commit the selected ID. | [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [Cursor update](../src/tokenizer/constraint.cpp#L162)<!-- prefix: "bool Constra" --> |
+HTTP compiles constraints with the checkpoint tokenizer. The decoder filters each score row and advances the cursor on committed IDs. [Request validation](../apps/server/text_request.cpp#L286)<!-- prefix: "void set_con" --> · [Tokenizer compiler](../src/tokenizer/regex_constraint.cpp#L153)<!-- prefix: "std::shared_" --> · [Schema compiler](../src/tokenizer/json_schema.cpp#L435)<!-- prefix: "std::shared_" --> · [Tool grammar cache](../apps/server/qwen/qwen_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" --> · [Trigger compiler](../src/tokenizer/regex_constraint.cpp#L166)<!-- prefix: "std::shared_" --> · [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [Cursor update](../src/tokenizer/constraint.cpp#L162)<!-- prefix: "bool Constra" -->
 
 ## Runtime path
 
-The server compiles the constraint before it starts generation. The decoder filters candidates by the request cursor and updates it for each committed token. The same selection and finish rules apply at [positive MTP depths](mtp.md#constrained-mtp).
+The same [selection rules](#selection-and-finish) apply at [positive MTP depths](mtp.md#constrained-mtp).
 
 ## Constraints and failure behavior
 
@@ -32,16 +26,7 @@ Send a `regex` string with `POST /v1/completions`.
 }
 ```
 
-For `POST /v1/chat/completions`, send the same constraint with a `messages` array.
-
-```json
-{
-  "model": "Qwen3.8-27B-FP8",
-  "messages": [{"role": "user", "content": "Choose a two-digit order number."}],
-  "regex": "^ORD-[0-9]{2}$",
-  "max_tokens": 12
-}
-```
+For chat, replace `prompt` with a `messages` array. [Chat request example](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/output-constraints.md#regular-expressions)
 
 The regex matches the entire generated text. The leading `^` and trailing `$` are optional. Grouping with `(...)` or `(?:...)` has the same effect.
 
@@ -55,21 +40,11 @@ Compilation allows up to 4,096 nondeterministic states, 256 deterministic states
 
 ### Native generate
 
-Set `sampling_params.regex` to constrain generated text in `POST /generate`. Omission, null, and `""` disable that field. At most one of `regex`, `json_schema`, and `ebnf` can be active per item. A broadcast sampling object shares the compiled constraint. Each item owns its cursor and budget. Use a sampling object array for distinct constraints or to mix constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L748)<!-- prefix: "void set_gen" -->
-
-```json
-{
-  "text": ["Order number:", "Status:"],
-  "sampling_params": [
-    {"regex": "ORD-[0-9]{2}", "max_new_tokens": 12, "temperature": 0},
-    {"regex": "ready|pending", "max_new_tokens": 8, "temperature": 0}
-  ]
-}
-```
+Set `sampling_params.regex` in `POST /generate`. Each item can activate one of `regex`, `json_schema` and `ebnf`; omit a field or use null or `""` to disable it. Each item owns its cursor and budget. Broadcast one sampling object to share compilation, or pass an array to mix constraints or constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L748)<!-- prefix: "void set_gen" --> · [Batch example](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/output-constraints.md#native-generate)
 
 An accepting state with no continuation finishes immediately, including below `min_new_tokens`. An early grammar finish reports `stop` with the last generated ID as `matched` and includes its text. A match at the token budget reports `length` unless a text stop or model EOS wins that step. While a match can continue, `min_new_tokens` masks model EOS until the minimum is reached. An explicit text stop can finish earlier and trim the displayed match.
 
-Use model EOS handling and omit `stop_token_ids` when a pattern is active. An invalid pattern, insufficient budget, or same-item generated-token logprob request returns HTTP 400 before decoder submission. A batch can contain both constrained items and unconstrained scored items.
+For any active native constraint, omit `stop_token_ids` and leave `ignore_eos` false. Invalid constraints, field conflicts, insufficient budget or same-item generated logprobs return HTTP 400 before decoder admission or SSE headers. Unconstrained siblings can request scores. Native JSON and cumulative SSE retain their [usual shapes and batch indices](native-generate.md#json-and-sse).
 
 ### JSON Schema
 
@@ -114,36 +89,19 @@ C++ callers can pass an ordered schema object to `TokenConstraint::compile_json_
 
 ### Native JSON Schema
 
-Put the serialized schema in `sampling_params.json_schema` on `POST /generate`. For example, a Python client can use `json.dumps(schema)` for this field. The field accepts a string containing the schema itself.
-
-```json
-{
-  "text": "Is the order ready?",
-  "sampling_params": {
-    "json_schema": "{\"enum\":[\"ready\",\"pending\"]}",
-    "max_new_tokens": 16,
-    "temperature": 0
-  }
-}
-```
-
-The [native sampling rules](#native-generate) apply. JSON and cumulative SSE return the generated JSON as a string in `text`.
-
-The [schema subset](#json-schema) and [native finish rules](#native-generate) apply. A complete match at the token cap reports `length` unless a stop takes precedence. Text stops can trim the displayed JSON. Use model EOS handling and omit `stop_token_ids`. Zero or insufficient budget, malformed or unsupported schemas, and generated logprobs on the same constrained item return HTTP 400 before decoder admission or SSE headers. An unconstrained sibling can request generated logprobs. [Native validation](../apps/server/native_generate.cpp#L748)<!-- prefix: "void set_gen" -->
+Set `sampling_params.json_schema` to the serialized [schema](#json-schema) itself, for example `json.dumps({"enum":["ready","pending"]})` in Python. The response carries generated JSON as a string in `text`. The [native admission and finish rules](#native-generate) apply. Zero budget is invalid. Text stops can trim the JSON. [Request example](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/output-constraints.md#native-json-schema)
 
 ### Native EBNF
 
-Set `sampling_params.ebnf` to a string such as `root ::= "ready" | "pending"` on `POST /generate`. Use one `root` rule with nonempty, double-quoted UTF-8 literals and JSON escapes. The [finite-choice limits](text-serving.md#finite-choice-constraints) apply, including the 16,384-byte grammar cap, 32 alternatives, 256 bytes per decoded literal, and 2,048 decoded bytes total. Additional rules, references, concatenation, and repetition are unsupported.
-
-The [native sampling and finish rules](#native-generate) apply. Omit `stop_token_ids` and leave `ignore_eos` false when EBNF is active. Invalid syntax, field conflicts, insufficient budget, and same-item generated logprobs return HTTP 400 before decoder admission or SSE headers. Text stops can trim a literal in the response. JSON and cumulative SSE keep the normal `/generate` shapes, with `index` on batch SSE frames.
+Set `sampling_params.ebnf` to a [finite-choice grammar](text-serving.md#finite-choice-constraints), for example `root ::= "ready" | "pending"`. The [native admission and finish rules](#native-generate) apply. Text stops can trim the displayed literal.
 
 Run `tests/text/test_native_ebnf.py` with a release server and the checkpoint. It checks literal and UTF-8 boundaries, mixed constraints, per-item cursors, and the top-level OpenAI form.
 
 ### Selection and finish
 
-Each request owns its cursor. For whole-output constraints, the cursor excludes tokens that cannot lead to a match within the remaining budget. With up to 4,096 allowed IDs, CUDA gathers their BF16 scores. For larger sets it masks disallowed scores to negative infinity in a vocabulary-sized row. Both routes use the usual greedy tie rule or [sampling](text-serving.md#sampling) over the allowed scores. Selection runs after eager scoring or eligible K0 graph replay. Positive-depth requests use [constrained MTP](mtp.md#constrained-mtp).
+Each request owns its cursor. For whole-output constraints, the cursor excludes tokens that cannot lead to a match within the remaining budget. With up to 4,096 allowed IDs, CUDA gathers their BF16 scores. For larger sets it masks disallowed scores to negative infinity in a vocabulary-sized row. With adjusted FP32 scores, CUDA also masks disallowed IDs to negative infinity. Every path respects the cursor mask for greedy selection, with lowest-ID ties, or [sampling](text-serving.md#sampling). Selection runs after eager scoring or eligible K0 graph replay. Positive-depth requests use [constrained MTP](mtp.md#constrained-mtp).
 
-For whole-output constraints, a match with no continuation stops immediately. Acceptance at the last allowed token also stops. Neither case adds EOS. With budget left at a match that can continue, either model EOS ID can compete with valid continuations. A selected EOS counts in usage and diagnostic IDs. Its text is omitted. A nullable regex with `max_tokens: 0` returns no IDs and `finish_reason: "length"`. A completed match during decoding returns `stop`.
+For OpenAI routes, a match with no continuation or acceptance at the token cap reports `stop` without adding EOS. A match with no continuation can finish before `min_tokens`. With budget left at a match that can continue, model EOS IDs can compete once `min_tokens` is reached. A selected EOS counts in usage and diagnostics and omits its text. A nullable regex with `max_tokens: 0` returns no IDs and `length`. For `/generate`, use the [native finish rules](#native-generate).
 
 HTTP 400 covers conflicting constraints, invalid input, compiler limits, and an impossible token budget. Omit `stop_token_ids` entirely. Leave `ignore_eos` false. OpenAI routes require omitting nonempty text stops when using a constraint. `/generate` applies its [native text stops and finish metadata](#native-generate). The benchmark model and HTTP media chat reject `regex` and `response_format`. At K0, a full prefix hit uses the new request's constraint and seed for its first eager selection. [Prefix reuse](prefix-cache.md#runtime-path)
 

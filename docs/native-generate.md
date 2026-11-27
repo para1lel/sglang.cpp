@@ -2,14 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-| Part | Responsibility | Source |
-| --- | --- | --- |
-| HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L199)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L617)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
-| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L786)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L823)<!-- prefix: "std::vector<" --> |
-| Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L395)<!-- prefix: "void complet" --> |
-| Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L929)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L573)<!-- prefix: "bool BatchSe" --> |
-| Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L144)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L294)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L330)<!-- prefix: "void stream_" --> |
-| Text stops | Match bounded candidate IDs before commit and hold ambiguous text. | [Worker match](../apps/server/detail/text_stop.cpp#L127)<!-- prefix: "int TokenTex" --> · [Response frame](../apps/server/native_generate.cpp#L232)<!-- prefix: "std::string " --> |
+See [HTTP queue admission](http-server.md#http-admission-and-shutdown), [request preparation](../apps/server/text_request.cpp#L823)<!-- prefix: "std::vector<" --> and the [native completion worker](../apps/server/native_generate.cpp#L395)<!-- prefix: "void complet" -->. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-generate.md#responsibilities-and-sources-of-truth)
 
 ## Runtime path
 
@@ -25,25 +18,13 @@ curl --fail-with-body http://127.0.0.1:17384/generate \
   --data-binary '{"text":"The capital of France is","sampling_params":{"max_new_tokens":8,"temperature":0}}'
 ```
 
-Send prompt IDs with `stream: true` for an SSE response.
-
-```bash
-curl --fail-with-body -N -X PUT http://127.0.0.1:17384/generate \
-  -H 'Content-Type: application/json' \
-  --data-binary '{"input_ids":[220],"sampling_params":{"max_new_tokens":2,"temperature":0},"stream":true}'
-```
-
-The scalar request shapes above also accept prompt arrays. For indexed batches, supply `text: ["A", "B"]` or `input_ids: [[220], [32, 220]]`. Broadcast one `sampling_params` object or supply one per prompt, and optionally supply per-prompt `cache_salt` and `rid`. [Copyable batch JSON and SSE examples](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/native-generate.md#runtime-path)
+For SSE, set `stream: true` and use `-N` with curl. Use `input_ids: [220]` instead of `text` for a token-ID prompt. Indexed requests accept `text: ["A", "B"]` or `input_ids: [[220], [32, 220]]`; broadcast `sampling_params` or supply one per prompt, with optional per-prompt `cache_salt` and `rid`. [Copyable batch JSON and SSE examples](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/native-generate.md#runtime-path)
 
 The worker validates and encodes every item before decoder admission. Multi-item batches submit in input order from lane zero, waiting at `--max-active`. The [shared scheduler](http-server.md#http-admission-and-shutdown) handles request IDs and lane selection. A lone decoding item can use [score-backed attention](singleton-gqa-decode.md). [Lane selection](../apps/server/batch_service.cpp#L486)<!-- prefix: "void BatchSe" -->
 
 ### Parallel sampling
 
-`sampling_params.n > 1` samples each prompt in any of the four input forms. Per-prompt option objects must agree on `n`. Each sample inherits options, cache salt and any explicit seed. With omitted or null seeds, each lane seeds independently.
-
-The worker prepares each prompt once and submits samples together without warmup jobs. Each owns its decode state, output and cancellation.
-
-Results are prompt-major. SSE uses `index = prompt_position * n + sample_position`, starting at zero. Every sample receives a fresh UUID in `meta_info.id`, including when a caller supplies `rid`. Use observed IDs for [named aborts](native-abort.md#runtime-path).
+`sampling_params.n > 1` samples each prompt in all four input forms. Per-prompt objects must agree on `n`. Samples inherit options, salt and any explicit seed. Otherwise each lane seeds independently. The worker prepares each prompt once and submits samples together without warmup jobs. Each sample owns its decode state, output and cancellation. Result order is prompt-major. SSE uses `index = prompt_position * n + sample_position`. Every sample gets a fresh UUID in `meta_info.id`, even with supplied `rid`. Use observed IDs for [named aborts](native-abort.md#runtime-path).
 
 ### JSON and SSE
 
@@ -89,7 +70,7 @@ Input scores use raw target distributions and can restore a [matching checkpoint
 
 ## Constraints and failure behavior
 
-Use [HTTP/1.1 JSON framing and input limits](http-server.md#request-targets-and-redirects). Framing returns 411 for missing length or 415 for missing or unsupported media type. Send one object under the [shared JSON validation rules](text-serving.md#send-a-request).
+Send one object under [shared JSON validation](text-serving.md#send-a-request). Follow [HTTP/1.1 framing and input limits](http-server.md#request-targets-and-redirects), including 411 for missing length and 415 for missing or unsupported media type.
 
 | Request field | Accepted values |
 | --- | --- |
@@ -100,14 +81,11 @@ Use [HTTP/1.1 JSON framing and input limits](http-server.md#request-targets-and-
 | `sampling_params` | One object or one object per prompt for indexed requests. Omission or top-level null uses the defaults below. |
 | `cache_salt` | One string or one string per prompt for indexed requests. Each is at most 256 UTF-8 bytes. Omission or null uses the empty salt. See [prefix reuse](prefix-cache.md#runtime-path). |
 
-Supply exactly one non-null prompt field. A prompt array uses one prompt form. An indexed request has a prompt array, `n > 1`, or both.
-Parameter arrays have one entry per original prompt. Missing sampling keys use the defaults.
-The expanded item count is at most 32. The sum of per-prompt output budgets multiplied by `n` is at most 262,144 tokens. Each prompt plus its own budget must fit the model context. The route validates these limits before decoder admission.
-[Batch form](../apps/server/text_request.cpp#L806)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/native_generate.cpp#L798)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L838)<!-- prefix: "int remainin" -->
+Supply one non-null prompt field. Each array uses one prompt form. Parameter arrays have one entry per original prompt. A prompt array or `n > 1` makes a request indexed. Before admission, the server requires at most 32 expanded items and at most 262,144 total output tokens after multiplication by `n`. [Batch form](../apps/server/text_request.cpp#L806)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/native_generate.cpp#L798)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L838)<!-- prefix: "int remainin" -->
 
 | Sampling field | Accepted values and default |
 | --- | --- |
-| `max_new_tokens` | Nonnegative integer. Omission uses 128. Null is invalid. The prompt length plus this budget must fit 262,144 tokens. |
+| `max_new_tokens` | Nonnegative integer, default 128. Null is invalid. Prompt length plus budget must fit 262,144 tokens. |
 | `min_new_tokens` | [Minimum output](output-penalties.md#minimum-output), default zero. |
 | `temperature`, `top_p`, `top_k`, `min_p` | Use the [shared sampling limits](text-serving.md#sampling). Defaults are `1`, `1`, `-1`, and `0`, respectively. |
 | `sampling_seed` | Signed 64-bit integer, with no seed by default. |
@@ -124,13 +102,9 @@ The expanded item count is at most 32. The sum of per-prompt output budgets mult
 | `json_schema` | Optional [JSON-encoded schema string](output-constraints.md#native-json-schema). |
 | `ebnf` | Optional [finite-choice grammar string](output-constraints.md#native-ebnf). |
 
-Null uses the sampling defaults except for `max_new_tokens`. Explicit stop IDs are always validated.
-`stop` belongs inside `sampling_params`. A nested list or a non-string list element returns HTTP 400.
-The empty stop matches at the first generated step if selected by the configured order. It retains the first generated ID and returns empty text. Zero output budget still yields a length finish.
-[Stop parser](../apps/server/text_request.cpp#L78)<!-- prefix: "std::vector<" --> · [Batch options](../apps/server/text_request.cpp#L833)<!-- prefix: "const auto b" -->
-Client compatibility fields accept only disabled values.
-Use `false` or null for `return_routed_experts`, and null for `lora_path`.
-Other fields return HTTP 400, including `model`, `messages`, and top-level sampling fields.
+Null selects sampling defaults except for `max_new_tokens`. Explicit stop IDs are always validated. Put `stop` inside `sampling_params`; nested lists and non-string elements return HTTP 400. An empty stop selected by configured order retains the first generated ID and yields empty text. Zero budget still reports `length`. [Stop parser](../apps/server/text_request.cpp#L78)<!-- prefix: "std::vector<" --> · [Batch options](../apps/server/text_request.cpp#L833)<!-- prefix: "const auto b" -->
+
+Compatibility fields accept `return_routed_experts: false` or null and `lora_path: null`. Unknown fields, including `model`, `messages` and top-level sampling fields, return HTTP 400.
 
 Use the [shared status and SSE rules](http-server.md#completion-streams). A pre-header failure substitutes JSON with `error.message` for the entire result. A tokenizer load failure returns 500. A post-header failure attempts one stream-wide error with no index, `error.message: "Native decoder failed"`, `error.type: "server_error"`, `error.code: 500`, and `error.retryable: false`. Already sent events remain visible. Generation failure, disconnect, or write failure drops unsubmitted items and cancels owned jobs through retirement. Acknowledged cache checkpoints can survive. The [reset exclusion](prefix-cache.md#native-http-controls) covers the complete HTTP claim. [Batch cancellation](../apps/server/batch_service.cpp#L463)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L178)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L243)<!-- prefix: "void write_s" -->
 

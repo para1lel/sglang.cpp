@@ -10,13 +10,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 ## Responsibilities and sources of truth
 
-| Part | Responsibility | Source |
-| --- | --- | --- |
-| HTTP ingress | Select the chat route and validate the request. | [Chat route](../apps/server/prefix_controls.cpp#L163)<!-- prefix: "bool chat_ro" --> · [HTTP admission](http-server.md#http-admission-and-shutdown) · [Request parser](../apps/server/text_request.cpp#L866)<!-- prefix: "TextRequest " --> |
-| Qwen chat template | Verify checkpoint assets and render ordered messages and tools as a UTF-8 prompt. | [Asset checks](../apps/server/qwen/qwen_chat_template.cpp#L433)<!-- prefix: "QwenChatTemp" --> · [Renderer](../apps/server/qwen/qwen_chat_template.cpp#L560)<!-- prefix: "std::string " --> |
-| Media handler | Validate attachments, prepare patches, then encode features for the multimodal decoder. | [Attachment parser](../apps/server/chat_media.cpp#L341)<!-- prefix: "std::optiona" --> · [Vision completion](../apps/server/vision_completion.cpp#L67)<!-- prefix: "DecoderResul" --> |
-| Serving profile | Select the model's template and parser policy. Resolve request options and parse reasoning and tool calls. | [Qwen profile](../apps/server/qwen/qwen_serving_profile.cpp#L134)<!-- prefix: "const Servin" --> · [Request options](../apps/server/qwen/qwen_serving_profile.cpp#L99)<!-- prefix: "void set_cha" --> · [Parser](../apps/server/qwen/qwen_chat_output.cpp#L824)<!-- prefix: "bool ChatOut" --> |
-| Completion writer | Serialize committed output and own the UTF-8 state for one request. | [Token callback](../apps/server/text_completion.cpp#L581)<!-- prefix: "bool TextRes" --> · [Stream end](../apps/server/text_completion.cpp#L593)<!-- prefix: "void TextRes" --> |
+The [request parser](../apps/server/text_request.cpp#L866)<!-- prefix: "TextRequest " --> validates chat input. The [Qwen template](../apps/server/qwen/qwen_chat_template.cpp#L560)<!-- prefix: "std::string " --> renders messages and tools. The [serving profile](../apps/server/qwen/qwen_serving_profile.cpp#L134)<!-- prefix: "const Servin" --> selects parsers, and the shared completion writer owns UTF-8 state. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/chat-serving.md#responsibilities-and-sources-of-truth)
 
 ## Runtime path
 
@@ -34,9 +28,7 @@ With `return_token_ids: true`, committed IDs appear once in `token_ids`, includi
 
 ### Qwen reasoning and tool calls
 
-Enable output parsers with `--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder`. Both default to off. To parse supplied text, use [`POST /parse_function_call`](serving/parse-function-call.md).
-
-Output parsing applies to text chat with free output or a [tool-call constraint](output-constraints.md#tool-call-constraints). Media chat and chat with `response_format`, `regex`, or `ebnf` keep generated text in `content`.
+Use `--reasoning-parser qwen3` for reasoning or `--tool-call-parser qwen3_coder` for tool calls. Each defaults to off and applies to text chat with free output or a [tool-call constraint](output-constraints.md#tool-call-constraints). Media chat and requests with `response_format`, `regex` or `ebnf` keep generated text in `content`. To parse supplied text, use [`POST /parse_function_call`](serving/parse-function-call.md).
 
 With the reasoning parser active, `separate_reasoning: true` places reasoning in `reasoning_content`. Set it to `false` to keep reasoning in `content`. `enable_thinking` controls the rendered prompt. The parser starts in the reasoning section when the prompt leaves `<think>` open. It also recognizes `<think>` at the start of generated text. `</think>` ends the section. So does `<tool_call>` when tool parsing is active and the request advertises functions. Set `stream_reasoning: false` to buffer reasoning until the section ends or the request completes. Both output options are booleans and default to `true`.
 
@@ -77,13 +69,10 @@ The parser accepts an object schema for `function.parameters`, null, or omission
 | `min_tokens` | [Minimum output](output-penalties.md#minimum-output), default zero. |
 | `n` | [Multiple choices](serving/openai-choices.md), integer `1`–`4` for text. |
 | `temperature`, `top_p`, `top_k`, `min_p`, `seed` | Use the [shared sampling controls](text-serving.md#sampling). A non-null value overrides its default. |
-| `frequency_penalty`, `presence_penalty` | [Output penalties](output-penalties.md). |
-| `repetition_penalty` | [Output repetition penalty](output-penalties.md). |
-| `ebnf` | Use a [finite-choice constraint](text-serving.md#finite-choice-constraints) for the generated content. |
-| `regex` | Use a [whole-output regular expression](output-constraints.md#regular-expressions) for the generated content. |
-| `response_format` | Use a [bounded JSON Schema](output-constraints.md#json-schema) for the generated content. |
-| `cache_salt` | Optional [prefix cache key](prefix-cache.md#runtime-path) component. |
-| `stream`, `return_token_ids`, `ignore_eos`, `stop_token_ids`, `stop` | Use the [shared text options](text-serving.md#send-a-request). |
+| `frequency_penalty`, `presence_penalty`, `repetition_penalty` | [Output penalties](output-penalties.md). |
+| `ebnf`, `regex`, `response_format` | [Whole-output constraints](output-constraints.md). |
+| `cache_salt` | Optional [prefix key](prefix-cache.md#runtime-path) component. |
+| `stream`, `return_token_ids`, `ignore_eos`, `stop_token_ids`, `stop` | [Shared text options](text-serving.md#send-a-request). |
 | `stream_options` | With streaming enabled, accepts one boolean member, `include_usage`. The default omits the usage event. |
 | `logprobs`, `top_logprobs` | Optional [generated-token scores](serving/openai-logprobs.md#chat-completions). |
 | `logit_bias` | Optional [per-token logit offsets](serving/openai-logprobs.md#logit-bias). |

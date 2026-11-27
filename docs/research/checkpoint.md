@@ -2,7 +2,7 @@
 
 ## Checkpoint evidence
 
-The local copy at `/data0/shared/Qwen3.8-27B-FP8` exactly matches `Qwen/Qwen3.8-27B-FP8` revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`. On 2026-11-18, all 81 file names and sizes matched. All 67 LFS objects matched their published SHA-256 values, and the other 14 files matched their Git blob SHA-1 values. The full local read covered 30,890,041,705 bytes. [Revision manifest](https://huggingface.co/api/models/Qwen/Qwen3.8-27B-FP8/revision/c3a462cc3d38cf351f3b26cbd763469eeb74ef81?blobs=true)
+On 2026-11-18 the local `/data0/shared/Qwen3.8-27B-FP8` matched all published file names, sizes, and content hashes for `Qwen/Qwen3.8-27B-FP8` revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`. [Revision manifest](https://huggingface.co/api/models/Qwen/Qwen3.8-27B-FP8/revision/c3a462cc3d38cf351f3b26cbd763469eeb74ef81?blobs=true)
 
 | Check | Result |
 | --- | --- |
@@ -63,12 +63,5 @@ MXFP8 KV storage uses one unsigned exponent byte per 32 channels. The writer com
 - Native-context GQA ideal K/V: 8.25 GiB
 
 These figures exclude padding, allocator overhead, draft KV, live and speculative state, workspaces, and graph pools.
-
-## Provenance
-
-- Checkpoint revision: `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`
-- SGLang revision: `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`
-- Verification date: 2026-11-18
-- Evidence basis: authenticated local files, remote manifest, safe-tensor headers, and pinned source reads
 
 Historical Candidate B quality evidence is recoverable from tree `e459be98a510d3235c81c94ef5210ef76a622e75`; its baseline capture used fixture source `d6e6eb41cb4ac96ed9f992aee908ac2ea850dca4`. Broader historical measurements are tied to native revisions `6b4f734c9c1a90ce16ff3b61ed9d3f0ad128c811`, `bc07a3b56dc18a9bc32986d76c057a23953d8800`, and `18b9f47ca5dc6ab32c7d51958559407a2f5f85d1`.

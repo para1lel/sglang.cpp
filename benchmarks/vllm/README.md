@@ -58,17 +58,8 @@ Run the BF16 diagnostic with `GPU=1 bash benchmarks/vllm/run.sh benchmarks/vllm/
 
 ## Pairing with sglang.cpp
 
-1. Reuse the exact checkpoint manifest, prompt IDs, greedy sampling settings, and output length.
-   Match TP, prefix cache, eager execution, and speculation settings. The
-   [benchmark agreement](../../docs/performance.md#gqa-cache-comparison) permits measured vLLM
-   `fp8_e4m3` GQA KV against the candidate's native MXFP8 GQA KV. Verify and record both engines'
-   effective cache formats and scale policies. The historical BF16 result is diagnostic only.
-2. Run each implementation with exclusive access to the same UUID. Preserve both hardware
-   snapshots, client and runtime versions, engine logs, and warmup policy. Record differences
-   in kernel dispatch and environment.
-3. Verify actual prompt and output counts, exact greedy output IDs, and completion reason before
-   reporting a speed ratio. Compare the same call boundary and use the same rate definition.
-4. For the serving milestone, follow `docs/performance.md`. Replay the frozen W1–W6 workloads
-   through one streaming client for both engines. Preserve request arrival, first-token, last-token,
-   and terminal timestamps for TTFT, TPOT, end-to-end latency, and cohort throughput. Offline
-   samples here do not provide stream timestamps.
+For serving results, follow the live [matched B200 benchmark agreement](../../docs/performance.md), including its workload matrix, stream timing and per-row gate. The offline samples here have no stream timestamps.
+
+For an offline pair, match the checkpoint manifest, prompt IDs, greedy settings, output length, TP, prefix cache, eager execution and speculation. Run both engines sequentially with exclusive access to the same physical UUID. Verify IDs, token counts and completion reason before comparing the same call boundary and rate definition. Retain both hardware snapshots, client and runtime versions, logs, warmup policy, and dispatch and environment differences.
+
+Record effective cache formats and scale policies. The [GQA cache agreement](../../docs/performance.md#gqa-cache-comparison) permits vLLM `fp8_e4m3` against native MXFP8. The historical BF16 result is diagnostic only.

@@ -1,10 +1,6 @@
 # Paired serving benchmarks
 
-Use the [matched K4 driver](#matched-k4-timing-protocol) for the current W1–W5 suite.
-For a standalone depth-zero control, run pinned vLLM first, then native on the
-same reserved B200. Both launchers use an 8,192-token budget, 32 in-service
-requests, one warmup, and one measured cohort per workload. Match the GPU and
-CPU placement. Each output directory must be new.
+Use the [matched K4 driver](#matched-k4-timing-protocol) for the current W1–W5 suite. For the [K0 control](#observe-and-compare), run pinned vLLM, then native on the same reserved B200. Match CPU placement and use new output directories.
 
 ```bash
 export PAIRED_CHECKPOINT_MANIFEST="$PWD/artifacts/test-bench-baseline/checkpoint.sha256"
@@ -44,10 +40,7 @@ checks the fixture and request bytes. Both arms record resolved settings before 
 
 ## Matched K4 timing protocol
 
-Start a fresh campaign directory and run one row at a time on the same reserved
-B200. Use a Release binary with a verified source revision and binary digest,
-the published checkpoint manifest, and the pinned vLLM environment and
-FlashInfer cubin cache.
+Use a fresh campaign directory, a verified Release binary, the published checkpoint manifest, and the pinned vLLM environment and FlashInfer cubin cache.
 
 ```bash
 export PAIRED_CHECKPOINT_MANIFEST=/path/to/published/checkpoint.sha256
@@ -56,72 +49,17 @@ export PAIRED_NATIVE_SHA256='verified-64-character-binary-digest'
 bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4-110 W4
 ```
 
-W4 can start a fresh campaign. Run W5 after W4 passes in that campaign.
-The short rows follow W1, W2, then W3, advancing after each pass. A row starts
-fresh servers for both timed arms. The vLLM arm goes first on W1, W3 and W5. Both K4 arms use
-the same checkpoint files, physical GPU, CPU placement, request bytes, cohort
-counts, and client clock. The clients drain each SSE response after measuring
-from the earliest submit to the last valid `[DONE]`. The runner uses port 17424
-on loopback by default and holds the campaign, port, and both GPU coordination
-locks. `PAIRED_VLLM_SEED_CACHE` can point to the retained compiler cache seed.
+W4 can start a fresh campaign. W5 requires W4 to pass in that campaign. Start fresh servers for each row, with vLLM first on W1, W3 and W5. Follow the [campaign order, matching controls and SSE timing](../../docs/performance.md#measurement). The driver defaults to loopback port 17424 and holds the campaign, port and GPU coordination locks.
 
-The default profile `server-defaults` records `matched-k4-native-defaults-cache-on-v5`.
-Campaign and comparison receipts record `sampling: single-round-v1` for new captures.
-Choose the participating B200 by `GPU_INDEX`. Both engine processes use only
-that device. The row width is the requests per participating GPU multiplied by
-the number of participating GPUs. The current launcher supports one GPU.
+The TP1 launcher selects one physical B200 with `GPU_INDEX`. The default `PAIRED_K4_NATIVE_PROFILE=server-defaults` uses private 64 GiB LMCache 0.5.8 over SLC3. The campaign records `matched-k4-native-defaults-lmcache-slc3-drain` and `sampling: single-round-v1`. Pinned vLLM uses local prefix caching without KV offload. Set `PAIRED_LMCACHE_PYTHON` and `PAIRED_LMCACHE_WHEEL` to the interpreter and official wheel. `PAIRED_LMCACHE_PYTHONPATH` is optional. The daemon uses a separate loopback port selected by `PAIRED_LMCACHE_PORT` (17524 for TP1). [LMCache inputs](run_k4.sh#L114-L122)<!-- prefix: "lmcache_pyth" --> · [Protocol identity](run_k4.sh#L213-L217)<!-- prefix: "| if $lmcach" -->
 
-For two devices, use [`benchmarks/tp2/run.sh`](../../docs/serving/tp2.md#acceptance-target).
-The `tp2-paired-v2` driver uses a fresh campaign root and one private LMCache
-0.5.8 process, socket, loopback port, and `sglang` namespace. Its 128 GiB CPU L1
-is shared by both GPU UUIDs. An acknowledged reset covers both ranks. Verify
-rank-local receipts and match the active cache gate on each rank. The separate
-TP1 driver retains a private 64 GiB daemon. Set `PAIRED_LMCACHE_PORT` to
-choose the TP2 daemon’s loopback port (default 17655).
+For TP2, use [`benchmarks/tp2/run.sh` and its acceptance checks](../../docs/serving/tp2.md#acceptance-target). Use a fresh `tp2-paired-v2` root. Set `PAIRED_LMCACHE_PORT` to override its loopback daemon port (17655). The campaign records `daemon_port` and `lmcache_capacity_bytes`. Readiness and completion record one `daemon_pid` and both ranks. The `daemon/` receipts bind both UUIDs, the socket peer and process configuration. Replay `tp2-paired-v1` at its pinned revision with the original evidence. [Campaign identity](../../benchmarks/tp2/run.sh#L75)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L88)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
 
-The campaign records `daemon_port` and `lmcache_capacity_bytes`. Native
-readiness and completion receipts report one `daemon_pid` and two ranks.
-The `daemon/` receipts bind both UUIDs, the socket peer, and the process
-configuration. Replay `tp2-paired-v1` at its pinned revision with the original
-evidence. [Campaign identity](../../benchmarks/tp2/run.sh#L75)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L88)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
+Use the [named workloads](../../docs/performance.md#named-workloads). For TP1 W4/W5, point `PAIRED_FIXTURES` at the original corpus with its archived directory names. The driver checks request digests.
 
-See the [named workloads](../../docs/performance.md#named-workloads) for row sizes.
+The TP1 native timing arm supplies only `--port` and disables tracing. A separate untimed native W1 trace checks active draft depth. The driver checks launch settings against API and worker receipts and records vLLM verification counters. Follow the [scheduler controls](../../docs/performance.md#scheduler-and-reporting-policy) and [wire, ID and cold-cache gates](../../docs/performance.md#measurement). Require an acknowledged `POST /reset_prefix_cache` with `{}` after drain before each cohort. Replay checks the reset response, metrics and control timestamps.
 
-W4 selects lanes 00–07 from the immutable archived W5 corpus. W5 selects all
-four archived W6 lanes. `PAIRED_FIXTURES` takes the original corpus directory,
-including those archived directory names. Request bytes are checked by digest.
-Each row runs one warmup and one measured cohort per engine. Only the measured
-cohort supplies the comparison, so each reported makespan is a point estimate.
-
-Both arms use MTP4 and a 32,768-token budget. The native arm launches with only
-`--port` and verifies the resolved budget and active-request cap of eight times
-the participating GPU count. vLLM receives that cap through `--max-num-seqs` and
-uses async scheduling with both token caps explicitly set to 32,768. The driver
-checks the resolved scheduler and CUDA graph settings against the API and worker
-receipts and checks the launch environment. Both engines enable prefix caching.
-Drain outstanding work before each cohort. Require an acknowledged
-`POST /reset_prefix_cache` with an empty JSON object before timing. Each request
-must report zero cached tokens, and the prefix hit counter must stay unchanged.
-Replay checks the reset response, metrics, and control timestamps.
-All request bodies
-must be sent before the first valid completion, within the frozen submit-span
-bound. The comparison records whether every lane started generating before the
-first completion and reports per-request latencies and throughput from SSE
-replay.
-The native timing arm uses Release defaults with tracing disabled. A separate
-untimed W1 native trace checks active depth. The driver also checks effective
-MTP4 and records the vLLM verification counters. Both timing arms must pass
-wire, length, usage, and drain checks. Compare each engine's measured IDs with
-its own warmup.
-
-Each current row passes when native makespan is at most 1.10 times pinned vLLM
-makespan. `Wn/comparison.json` retains `native-median-at-most-110-percent` and the
-legacy median field names. Each median holds the single measured value. The
-comparison also records the ratio and `strict_passed`. Advancement checks prior
-rows under the same campaign identity. W5 requires a passing v5 W4 with the
-32,768-token budget and eight 32,768-input/4,096-output lanes on one GPU. A timing
-miss returns status 1 and keeps the captures and comparison. Invalid evidence
-stops the row before comparison.
+`Wn/comparison.json` records `native-median-at-most-110-percent`, the ratio, and the gate verdict in `passed`. The workload's `strict_passed` records whether native is strictly faster. Legacy median fields hold one measured makespan per arm in a new capture. Advancement checks prior receipts under the same campaign identity, including the expected workload and token budget. A timing miss returns status 1 and keeps captures and the comparison. Invalid evidence stops the row before comparison.
 
 Replay a saved row from the repository root with `PYTHONPATH=.` and
 `python benchmarks/paired/k4.py assess Wn FIXTURES ROW_DIR`. Replay checks native
@@ -135,10 +73,7 @@ On TP2, each arm's server log is scanned for authentic CUDA launch failures at e
 
 ### Historical K4 profiles
 
-Use the archived recipes with their matching Release. They cover exact FP8,
-ordered Tensor Core and INT8 draft, bounded and long split attention, and the
-older cache and cohort policies. Replay saved receipts with `k4.py assess`.
-[Archived K4 profiles](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/benchmarks/paired/README.md#historical-k4-profiles)
+Use the archived recipes with their matching Release and saved evidence. They cover earlier projection precision, draft, split attention, cache and cohort policies. The historical profile `server-defaults-cache-on-v5` records `matched-k4-native-defaults-cache-on-v5`. [Historical profile flags](run_k4.sh#L15-L19)<!-- prefix: "echo \"Histor" --> · [Archived K4 profiles](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/benchmarks/paired/README.md#historical-k4-profiles)
 
 ### Prefix-reuse diagnostic
 
@@ -171,56 +106,22 @@ records both rows and their original gates.
 
 ## Replay the historical GPU 2 arm
 
-Use the saved vLLM arm with its original GPU UUID, CPU placement, and NUMA
-policy. The recipe includes the evidence locations and receipt checks.
-[Archived GPU 2 replay](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/benchmarks/paired/README.md#replay-the-historical-gpu-2-arm)
+For the saved 32,768-token vLLM arm, reuse its original GPU UUID, CPU placement and NUMA policy. Use the archived checkout and saved evidence. [GPU 2 replay and receipt checks](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/benchmarks/paired/README.md#replay-the-historical-gpu-2-arm)
 
 ## Compare against the published frozen reference
 
-The archived recipe compares with the published 8,192-token W3–W6 GPU 2
-reference. The receipt identifies cross-cap and cross-device comparisons and
-sets `makespan.passed` to `null`.
-[Frozen reference recipe](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/benchmarks/paired/README.md#compare-against-the-published-frozen-reference)
+For the separate 8,192-token W3–W6 GPU 2 reference, use `PAIRED_COMPARISON_MODE=frozen` and the published manifest. The receipt identifies cross-cap and cross-device comparisons. Its `makespan.passed` is `null`. [Frozen reference invocation and checks](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/benchmarks/paired/README.md#compare-against-the-published-frozen-reference)
 
 ## Observe and compare
 
-Append any of `W1-W2 W3 W4 W5 W6` to select groups. Each group starts a fresh
-server with 32 active slots and an 8,192-token scheduling cap. The native arm uses
-the Release's automatic operator policy and enables batch CUDA graphs.
-Both arms disable MTP and prefix reuse.
-Use one warmup and one measured cohort for each workload. The W1/W2 client
-times the first `[DONE]` and drains the HTTP response. A second terminal,
-later data event, or short body invalidates the sample. Fresh W1/W2 captures
-include HTTP response end receipts. W3–W6 use a 90 s socket timeout, a 15 s
-barrier timeout, and a 360 s cohort deadline. For paired captures, all lanes connect
-before the shared barrier. Their submit timestamps must span at most 50 ms and
-every request body must be sent before the first valid `[DONE]`.
+Append any of `W1-W2 W3 W4 W5 W6` to select groups. Each group starts a fresh server with 32 active slots. The protocol uses an 8,192-token cap and one warmup plus one measured cohort per workload. Both arms disable MTP and prefix reuse. Native enables batch CUDA graphs under Release automatic operator policy.
 
-The driver saves the client command with `PYTHONPATH`, GPU samples from server
-startup, and raw streams once measurement begins. If IDs differ from a lane's
-first warmup, the observer retains the offending cohort and records the first
-differing token under `repeat_id_mismatch`. Compare separately captured diagnostic
-IDs with the first warmup before using them as repeatability evidence.
+W1/W2 measure the first valid `[DONE]` and drain the response. A second terminal, later data, or short body invalidates the sample. Fresh captures include HTTP response end receipts. W3–W6 use a 90 s socket timeout, 15 s barrier timeout and 360 s cohort deadline. Preconnect all lanes before the shared barrier. Submit within 50 ms and send all bodies before the first valid completion.
 
-The driver binds the comparison plan before launch. It replays both arms and
-checks the saved device, placement, source, settings, checkpoint, request bytes,
-and cohort schedule. Native K0 records the `automatic-k0-v1` policy and
-`/server_info` in `native-k0-policy.json`. Use separate profiling for kernel
-dispatch. Verified comparisons at the protocol cap and cohort counts use
-`same-device matched-cap`. A non-protocol cap or cohort schedule is exploratory.
+The driver binds the comparison plan before launch, saves the client command with `PYTHONPATH` and startup GPU samples, and retains raw streams once measurement begins. Each engine must repeat its own greedy IDs from the first warmup. On a mismatch, `repeat_id_mismatch` records the first differing token and the driver keeps the cohort. Match separate diagnostic IDs against that warmup before using them as repeatability evidence.
 
-For a matched K0 comparison, require native measured makespan to be strictly
-below pinned vLLM measured makespan. The cohort starts at its earliest client
-submit and ends at its last valid `[DONE]`. `GROUP/comparison.json` records the
-samples and verdict under `makespan.workloads`. Its median fields hold the single
-measured value for a new capture. W1 and W2 have independent verdicts in the
-same group. On a makespan miss, including a tie, the native driver
-keeps the comparison receipt. Any failed startup, measurement, validation, or
-makespan gate stops the native driver before the next group and exits nonzero.
+Replay checks device, placement, source, settings, checkpoint, request bytes and cohort schedule. Native records `automatic-k0-v1` and `/server_info` in `native-k0-policy.json`. Profile kernel dispatch separately. Protocol caps and cohort counts yield `same-device matched-cap`. Overrides are exploratory.
 
-Use output IDs/s, TTFT, TPOT, end-to-end latency, p95, and the intervals when all
-streams are open or generating as diagnostics. A lane can start producing
-output after another lane completes. The W1/W2 summary reports rates and latency
-under `workloads.W1` and `workloads.W2`. W3–W6 reports them under `throughput`
-and `latency_ms`. `wire_and_timing_gates` and the retained archive's
-`fresh_vllm_thresholds` keep the historical speed checks available for diagnosis.
+For each matched K0 workload, native makespan must be strictly below pinned vLLM, from earliest submit to last valid `[DONE]`. `GROUP/comparison.json` records samples and verdicts under `makespan.workloads`. New captures put the single measured value in the median fields. W1 and W2 have independent verdicts in the same group. Startup, measurement, evidence or makespan failures stop the native driver before the next group with a nonzero exit. A makespan miss, including a tie, preserves the comparison receipt.
+
+Use [stream diagnostics](../../docs/performance.md#measurement) and retain p95 latency and the intervals when all streams are open or generating. A lane can first generate after another completes. Find W1/W2 rates and latencies under `workloads.W1` and `workloads.W2`, and W3–W6 under `throughput` and `latency_ms`. Historical speed checks remain in `wire_and_timing_gates` and the archive's `fresh_vllm_thresholds`.

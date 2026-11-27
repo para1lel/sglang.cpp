@@ -598,9 +598,9 @@ static void repair_rounds(const DraftRepairs* repairs, int size, std::uint8_t* p
 }
 
 bool DecoderBatch::State::prepare_peer_repair(const MtpRound* rounds, int count) {
-    return tp_driver && !output && !options.cuda_graphs && residency.resident() &&
-        wide_mtp_activation && wide_mtp_capacity >= count &&
-        tp_driver->prepare_peer_repair(rounds, count);
+    return tp_driver && output == nullptr && residency.resident() &&
+           wide_mtp_activation != nullptr && wide_mtp_capacity >= count &&
+           tp_driver->prepare_peer_repair(rounds, count);
 }
 
 void DecoderBatch::State::repair_verification_group(const DraftRepairs* repairs, int count,

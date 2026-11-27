@@ -2,32 +2,32 @@
 
 ## Responsibilities and sources of truth
 
-| Part | Responsibility | Source |
-| --- | --- | --- |
-| Decoder | Select the prefill policy and supply activation and output buffers. | [Packed call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L104)<!-- prefix: "bool project" --> |
-| Fused RMSNorm | Produce BF16 normalized values, E4M3 activations, and FP32 activation scales for prefill and packed decode. | [Launcher](../src/text_normalization.cu#L539)<!-- prefix: "cudaError_t " --> |
-| Attention output quantizer | Convert BF16 GDN and GQA output rows for their FP8 output projections. | [Row launcher](../src/text_ops.cu#L463)<!-- prefix: "cudaError_t " --> |
-| SM100 operator | Select the tile, manage CTA-local storage, and write BF16 outputs. | [Separate dispatch](../src/prefill_fp8_sm100.cu#L602)<!-- prefix: "if (rows \u003e 1" --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L711)<!-- prefix: "if (rows \u003c 1" --> |
+The decoder selects precision and buffers. Fused RMSNorm and attention quantizers provide packed activations and scales. The SM100 operator selects and runs the BF16-output tile. [Packed call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L104)<!-- prefix: "bool project" --> · [Launcher](../src/text_normalization.cu#L539)<!-- prefix: "cudaError_t " --> · [Row launcher](../src/text_ops.cu#L463)<!-- prefix: "cudaError_t " --> · [Separate dispatch](../src/prefill_fp8_sm100.cu#L602)<!-- prefix: "if (rows \u003e 1" --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L711)<!-- prefix: "if (rows \u003c 1" -->
 
 ## Runtime path
 
 ### Exact SIMT projections
 
-Exact SIMT tries eight-row projection at 64 or more rows and more than 1,024 output channels. For inputs 5,120, 6,144, or 17,408 and output width at most 65,535, four-channel grouping requires width divisible by four. At 64–128 rows and width divisible by eight, eight-channel grouping reuses decoded operands. Both retain ordered FP32 accumulation and BF16 rounding. [Row dispatch](../src/text/fp8_projection.cu#L679)<!-- prefix: "if (rows \u003e 1" --> · [Tile selection](../src/text/fp8_projection.cu#L437)<!-- prefix: "if constexpr" -->
+Exact SIMT tries eight-row projection at ≥64 rows and >1,024 output channels. Inputs of 5,120/6,144/17,408 and output ≤65,535 use four-channel groups if output is divisible by four. At 64–128 rows and width divisible by eight, eight-channel groups reuse decoded operands. Both retain ordered FP32 accumulation and BF16 rounding. [Row dispatch](../src/text/fp8_projection.cu#L679)<!-- prefix: "if (rows \u003e 1" --> · [Tile selection](../src/text/fp8_projection.cu#L437)<!-- prefix: "if constexpr" -->
 
 ### Tensor-core projections
 
-B200 selects packed Tensor Core FP8 for eligible target rows, including media and scoring. SM100 Swap-AB supports 1–5 rows. Multi-row TMA reads row-major E4M3 activations, FP32 activation scales, and BF16 weight scales and writes BF16 slices. Fused quantizers can write packed activations directly. Otherwise the projection packs them. GDN QKV/Z, GQA QKV, and gate/up reuse activation packing. Split reductions can change scores. [Verification dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L20)<!-- prefix: "void project" -->
+B200 packed Tensor Core FP8 includes eligible media and scoring rows. Swap-AB covers 1–5 rows. Multi-row TMA reads row-major E4M3 and FP32 activation/BF16 weight scales into BF16 slices. Fused quantizers or projection packing supply activations; GDN QKV/Z, GQA QKV and gate/up share packing. Split reductions can change scores. [Verification dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L20)<!-- prefix: "void project" -->
 
-Eligible GDN verification projects BF16 B/A together for 2–5 rows with the same ordered arithmetic as the separate path. Exact, scalar, and ineligible calls use ordinary projections. [Gate launcher](../src/text_decode_bandwidth.cu#L720)<!-- prefix: "std::optiona" -->
+Eligible 2–5-row GDN verification fuses BF16 B/A with separate-path arithmetic. Exact, scalar and ineligible calls use ordinary projections. [Gate launcher](../src/text_decode_bandwidth.cu#L720)<!-- prefix: "std::optiona" -->
 
 ### Multi-lane target verification
 
-Four-lane packets pack activation quantization for 6–20 rows. [wide K4 verification](mtp.md#target-round) uses 40/80/160 rows when scratch fits. Compact GDN can fold output quantization into its finish. All preserve BF16 rounding, E4M3 activations, and FP32 scales.
+Verification preserves BF16 rounding, E4M3 activations and FP32 scales. Compact GDN may fuse output quantization.
 
-B200 uses 8/16/32 MMA columns through 20 rows. Compact M40/M80/M160 uses 48/80/160 columns and four/four/three slots, with M40 gate/up at 64 columns. Split epilogues preserve ordered FP32 K-group and rank sums with one BF16 rounding. M40 can fall back to 64 columns. Wide fallback tries 40, 20, then up to five rows. A pending or recorded CUDA error propagates, except an unavailable target may fall back when setup returns no status and records only `cudaErrorNotSupported`. [Compact arithmetic](../src/text/decode_proj_fp8.cu#L94)<!-- prefix: "template \u003cbo" --> · [Wide dispatch](../src/text/decode_proj_fp8.cu#L616)<!-- prefix: "if (count ==" -->
+| Route | Activations and B200 MMA geometry |
+| --- | --- |
+| Four-lane packets | Pack 6–20 rows. Through 20 rows use 8/16/32 MMA columns. |
+| [wide K4 verification](mtp.md#target-round) | With adequate scratch, M40/M80/M160 use 48/80/160 columns and 4/4/3 slots. M40 gate/up uses 64 columns; M40 can fall back to 64 columns. Split epilogues sum K groups and ranks in FP32 order and round once to BF16. [Compact arithmetic](../src/text/decode_proj_fp8.cu#L94)<!-- prefix: "template \u003cbo" --> |
 
-Stream-owned scratch costs 87,040 bytes per lane, up to 2,785,280 bytes. Eight TP2 lanes reserve 696,320 bytes, with 409,600 live for depth scoring. Setup failure leaves ordinary draft packets available. Resident reserve shortage or allocation OOM reduces width and replans against the 2 GiB shared reserve. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L478)<!-- prefix: "bool Decoder" --> · [Width downgrade](../src/decoder_batch.cpp#L508)<!-- prefix: "WideMtpGroup" -->
+Wide fallback tries 40, 20, then ≤5 rows. Pending/recorded CUDA errors propagate, except optional setup reporting no status with only recorded `cudaErrorNotSupported`. [Wide dispatch](../src/text/decode_proj_fp8.cu#L616)<!-- prefix: "if (count ==" -->
+
+Stream-owned scratch is 87,040 B/lane (up to 2,785,280 B). Eight TP2 lanes reserve 696,320 B with 409,600 live for depth scoring. Setup failure leaves ordinary draft packets. Resident shortage or allocation OOM reduces width and replans against the 2 GiB shared reserve. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L478)<!-- prefix: "bool Decoder" --> · [Width downgrade](../src/decoder_batch.cpp#L508)<!-- prefix: "WideMtpGroup" -->
 
 ### Large prefill tiles
 
@@ -44,15 +44,16 @@ Grouped routes allow 4,096 rows and ordinary calls 2,048. [Whole-tile MTP pairs]
 
 ### Attention output quantization
 
-Tensor Core GDN can fuse gated RMSNorm with FP8 output. BF16 GDN and separate GQA gating quantize 6,144 channels per row. The fused B200 GQA postgate supports eligible strict, partial, and causal groups at 4,096 rows and requires both TP2 ranks to agree. Clean declines gate then quantize at the granularity of the group, per grant for partial groups. [Fused finish](../src/text_attention_gdn.cu#L489)<!-- prefix: "__global__ v" --> · [TP2 dispatch](../src/decoder_prefill.cpp#L287)<!-- prefix: "if (plan.pac" --> · [Eligibility and launch](../src/text_attention_gqa.cu#L395)<!-- prefix: "std::optiona" -->
+Tensor Core GDN can fuse gated RMSNorm/FP8 output. Separate BF16 GDN and GQA quantize 6,144 channels per row. B200 fused GQA postgate needs eligible 4,096-row strict, partial or causal groups and TP2 rank agreement. Clean decline gates then quantizes at group granularity, per grant for partial groups. [Fused finish](../src/text_attention_gdn.cu#L489)<!-- prefix: "__global__ v" --> · [TP2 dispatch](../src/decoder_prefill.cpp#L287)<!-- prefix: "if (plan.pac" --> · [Eligibility and launch](../src/text_attention_gqa.cu#L395)<!-- prefix: "std::optiona" -->
 
-The 1,024×6,144 warp path requires 4-byte-aligned BF16 and E4M3 buffers and launches six CTAs per row. It writes 48 FP32 scales per row, floors maxima at `1e-10`, divides by 448 with FP32 round-to-nearest, and saturates the E4M3 conversion. [Dispatch](../src/text_ops.cu#L469)<!-- prefix: "if (rows == " --> · [Scale and conversion](../src/text/text_cuda_primitives.cu#L48)<!-- prefix: "const float " -->
+The 1,024×6,144 warp path needs 4 B alignment for BF16/E4M3, launches six CTAs per row and emits 48 FP32 scales per row. Maxima floor at `1e-10`; scale uses FP32 round-to-nearest division by 448 and saturates E4M3 conversion. [Dispatch](../src/text_ops.cu#L469)<!-- prefix: "if (rows == " --> · [Scale and conversion](../src/text/text_cuda_primitives.cu#L48)<!-- prefix: "const float " -->
 
 ### Fused activation quantization
 
-Packed decode and tensor-core prefill share the fused RMSNorm launcher. For ordinary small tiles, the eight-lane quantizer requires 2–32 launch rows, width 5,120, and a residual buffer. In packed decode, the bucket width sets the launch row count. Branch, residual, and gain buffers require 16-byte alignment. The E4M3 output requires 8-byte alignment. Eligible prefill tiles also use this path. Other valid calls use the existing fused kernel or separate RMSNorm and quantization according to width and input alignment. [Packed decode](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L270)<!-- prefix: "void PackedD" --> · [Prefill](../src/runtime/execution/decoder_prefill_tiles.cpp#L366)<!-- prefix: "void Chunk::" --> · [Selection](../src/text_normalization.cu#L563)<!-- prefix: "if (residual" -->
-
-Grouped RMSNorm supports 4,096 rows of width 5,120, with optional residuals. Eligible B200 TP2 eager groups stage rows asynchronously and quantize BF16-rounded values. GDN inputs retain normalized BF16. GQA and MLP inputs skip that store. BF16 operands require 16-byte alignment, E4M3 requires 8, and scales require 4. Capture or misalignment uses ordinary normalization and stores BF16. CUDA errors propagate. [Grouped dispatch](../src/runtime/execution/decoder_prefill_tiles.cpp#L379)<!-- prefix: "void Chunk::" --> · [Launcher](../src/text_normalization.cu#L527)<!-- prefix: "std::optiona" --> · [Vector kernel](../src/text_normalization.cu#L89)<!-- prefix: "template \u003cbo" --> · [BF16 consumers](../src/decoder_prefill.cpp#L63)<!-- prefix: "normalize(pr" -->
+| Fused RMSNorm path | Shape and fallback |
+| --- | --- |
+| Eight-lane | 2–32 launch rows of width 5,120 with residual. Packed decode uses bucket width for launch rows. Branch/residual/gain need 16 B alignment, E4M3 output 8 B. Other valid shapes use ordinary fused or separate RMSNorm/quantization by width and alignment. [Packed decode](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/src/text/decoder_graph_packed.cpp#L270)<!-- prefix: "void PackedD" --> · [Prefill](../src/runtime/execution/decoder_prefill_tiles.cpp#L366)<!-- prefix: "void Chunk::" --> · [Selection](../src/text_normalization.cu#L563)<!-- prefix: "if (residual" --> |
+| Grouped | 4,096×5,120, optional residual. Eligible eager B200 TP2 stages asynchronously, quantizes BF16-rounded values and stores normalized BF16 for GDN but skips that store for GQA/MLP. BF16/E4M3/scales need 16/8/4 B alignment. Capture/misalignment uses ordinary normalization with BF16 store. CUDA errors propagate. [Grouped dispatch](../src/runtime/execution/decoder_prefill_tiles.cpp#L379)<!-- prefix: "void Chunk::" --> · [Launcher](../src/text_normalization.cu#L527)<!-- prefix: "std::optiona" --> · [Vector kernel](../src/text_normalization.cu#L89)<!-- prefix: "template \u003cbo" --> · [BF16 consumers](../src/decoder_prefill.cpp#L63)<!-- prefix: "normalize(pr" --> |
 
 Packed decode can use [programmatic launch](long-paged-decode.md#packed-rmsnorm-programmatic-launch) to start projection weight loads during fused RMSNorm.
 

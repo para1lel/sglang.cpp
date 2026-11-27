@@ -44,24 +44,8 @@ All 407 `F8_E4M3` weight matrices use BF16 `weight_scale_inv` blocks of shape `[
 
 ## SGLang reference contract
 
-The pinned SGLang source is commit `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8`. It loads the Qwen3-VL wrapper around the dense Qwen3.5 text model and packs Q/K/V, FFN gate/up, GDN QKV/Z, and B/A. GQA applies a sigmoid output gate. For one GDN head:
-
-- `g = -exp(A_log) × softplus(a + dt_bias)`
-- `β = sigmoid(b)`
-- `H = exp(g) × S`
-- `S′ = H + β(v − Hk)kᵀ`
-- Output is `S′q` before output normalization and gating
-
-Prefix reuse must copy both convolution history `[10240,3]` and recurrent state `[48,128,128]` per GDN layer. A radix hit can resume only after the last reusable recurrent boundary. MTP concatenates normalized embeddings and hidden states, projects them, and reuses one decoder. For top-k 1, verification width is `steps + 1`; three and four proposals use widths four and five.
-
-MXFP8 KV storage uses one unsigned exponent byte per 32 channels. The writer computes `ceil(log2(max(amax,1e-30)/448)) + 127`, clamps to `[0,254]`, and stores E4M3 payloads. Scale bytes use page/head/token-within-32/token-group/channel-group order at page size 128. One FA4 scale-scatter helper requires four groups, while this model’s head width 256 needs eight. The pinned prefix-valid commit path raises for this model, so upstream D256 MXFP8 reachability remains unresolved.
+The archived comparison uses SGLang `f04d886bf79aa3d6237cbb12a3311838eb9f9bd8` and records the GDN recurrence, draft architecture, and MXFP8 layout and dispatch limits at that revision. [Archived SGLang reference](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/research/checkpoint.md#sglang-reference-contract)
 
 ## State capacity
 
-- GDN history and state: `48 × (10240×3×2 + 48×128×128×4)` = 146.8125 MiB per complete target snapshot
-- GQA ideal K/V: `16 × 2 × 4 × (256 + 8)` = 33,792 bytes/token
-- Native-context GQA ideal K/V: 8.25 GiB
-
-These figures exclude padding, allocator overhead, draft KV, live and speculative state, workspaces, and graph pools.
-
-Historical Candidate B quality evidence is recoverable from tree `e459be98a510d3235c81c94ef5210ef76a622e75`; its baseline capture used fixture source `d6e6eb41cb4ac96ed9f992aee908ac2ea850dca4`. Broader historical measurements are tied to native revisions `6b4f734c9c1a90ce16ff3b61ed9d3f0ad128c811`, `bc07a3b56dc18a9bc32986d76c057a23953d8800`, and `18b9f47ca5dc6ab32c7d51958559407a2f5f85d1`.
+One complete target GDN snapshot holds 146.8125 MiB of history and recurrent state. Ideal target GQA K/V storage is 33,792 bytes per token, or 8.25 GiB at the 262,144-token limit, excluding allocation overhead, draft state, scratch, and graph pools. [Archived sizing and quality evidence](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/research/checkpoint.md#state-capacity)

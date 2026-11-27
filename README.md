@@ -26,6 +26,8 @@ host xmake build -P . -y sglang-generate
 Use `host ./build/bin/sglang-generate --help` for token-ID generation and
 `host ./build/bin/sglang-server --help` for serving options.
 
+<a id="serve-token-ids-over-http"></a>
+
 ## Serve chat completions
 
 Select the UUID of your reserved B200 and start the server in the same shell.

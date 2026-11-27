@@ -135,24 +135,14 @@ cudaError_t take_launch_status(cudaError_t direct) {
 }
 
 std::optional<cudaError_t> descriptor_error(CUresult result) {
-    switch (result) {
-        case CUDA_ERROR_NOT_SUPPORTED: {
-            const auto recorded = cudaGetLastError();
-            if (recorded == cudaSuccess || recorded == cudaErrorNotSupported) return std::nullopt;
-            return recorded;
+    if (result == CUDA_ERROR_NOT_SUPPORTED) {
+        const auto recorded = cudaGetLastError();
+        if (recorded == cudaSuccess || recorded == cudaErrorNotSupported) {
+            return std::nullopt;
         }
-        case CUDA_ERROR_INVALID_VALUE: return take_launch_status(cudaErrorInvalidValue);
-        case CUDA_ERROR_INVALID_CONTEXT:
-            return take_launch_status(cudaErrorIncompatibleDriverContext);
-        case CUDA_ERROR_CONTEXT_IS_DESTROYED:
-            return take_launch_status(cudaErrorContextIsDestroyed);
-        case CUDA_ERROR_OUT_OF_MEMORY: return take_launch_status(cudaErrorMemoryAllocation);
-        case CUDA_ERROR_NOT_INITIALIZED: return take_launch_status(cudaErrorInitializationError);
-        case CUDA_ERROR_DEINITIALIZED: return take_launch_status(cudaErrorCudartUnloading);
-        case CUDA_ERROR_ILLEGAL_ADDRESS: return take_launch_status(cudaErrorIllegalAddress);
-        case CUDA_ERROR_LAUNCH_FAILED: return take_launch_status(cudaErrorLaunchFailure);
-        default: return take_launch_status(cudaErrorUnknown);
+        return recorded;
     }
+    return take_launch_status(CudaError::from_driver(result));
 }
 
 template <int Channels>

@@ -448,17 +448,6 @@ cudaError_t current_stream_device(cudaStream_t stream, int& device) {
     return stream_device == device ? cudaSuccess : cudaErrorInvalidResourceHandle;
 }
 
-std::optional<cudaError_t> tensor_map_failure(CUresult status) {
-    switch (status) {
-        case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-        case CUDA_ERROR_INVALID_VALUE: return cudaErrorInvalidValue;
-        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
-        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-        default: return cudaErrorUnknown;
-    }
-}
-
 cudaError_t consume_tma_error(cudaError_t direct) {
     const auto recorded = cudaGetLastError();
     return !decoder::CudaError::terminal(direct) && decoder::CudaError::terminal(recorded)
@@ -509,7 +498,10 @@ std::optional<cudaError_t> launch_tma(
         encoded = encode_map(encode, weight_map, weight, out_width, in_width, Config::cols);
     }
     if (encoded != CUDA_SUCCESS) {
-        return tensor_map_failure(encoded);
+        if (encoded == CUDA_ERROR_NOT_SUPPORTED) {
+            return std::nullopt;
+        }
+        return decoder::CudaError::from_driver(encoded);
     }
     status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   shared_bytes);

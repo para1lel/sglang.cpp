@@ -1,3 +1,4 @@
+#include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/decode_proj_sm100.cuh"
 
@@ -84,14 +85,12 @@ std::optional<cudaError_t> try_text_bf16_decode_sm100(
         encoded = encode_map(target, activation_map, input, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
                              rows, in_width, columns);
     }
-    switch (encoded) {
-        case CUDA_SUCCESS: break;
-        case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-        case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
-        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
-        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-        default: return cudaErrorInvalidValue;
+    if (encoded != CUDA_SUCCESS) {
+        if (encoded == CUDA_ERROR_NOT_SUPPORTED) {
+            return std::nullopt;
+        }
+        const auto mapped = decoder::CudaError::from_driver(encoded);
+        return mapped == cudaErrorUnknown ? cudaErrorInvalidValue : mapped;
     }
     void* args[] = {&weight_map, &activation_map, &out_width, &rows, &chunks, &output};
     const dim3 grid(plan.splits, row_blocks, (rows - 1) / columns + 1);

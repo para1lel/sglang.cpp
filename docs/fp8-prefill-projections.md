@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-The decoder selects precision and buffers. Fused RMSNorm and attention quantizers provide packed activations and scales. The SM100 operator selects and runs the BF16-output tile. [Packed call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L104)<!-- prefix: "bool project" --> · [Launcher](../src/text_normalization.cu#L539)<!-- prefix: "cudaError_t " --> · [Row launcher](../src/text_ops.cu#L463)<!-- prefix: "cudaError_t " --> · [Separate dispatch](../src/prefill_fp8_sm100.cu#L602)<!-- prefix: "if (rows \u003e 1" --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L711)<!-- prefix: "if (rows \u003c 1" -->
+The decoder selects precision and buffers. Fused RMSNorm and attention quantizers provide packed activations and scales. The SM100 operator selects and runs the BF16-output tile. [Packed call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L104)<!-- prefix: "bool project" --> · [Launcher](../src/text_normalization.cu#L539)<!-- prefix: "cudaError_t " --> · [Row launcher](../src/text_ops.cu#L463)<!-- prefix: "cudaError_t " --> · [Separate dispatch](../src/prefill_fp8_sm100.cu#L594)<!-- prefix: "if (rows \u003e 1" --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L703)<!-- prefix: "if (rows \u003c 1" -->
 
 ## Runtime path
 
@@ -31,7 +31,7 @@ Stream-owned scratch is 87,040 B/lane (up to 2,785,280 B). Eight TP2 lanes reser
 
 ### Large prefill tiles
 
-Separate K0 Tensor Core projections need at least three rows, input width divisible by 128, and 16-byte-aligned contiguous FP8. At 129–1,023 rows, output width ≥8,192 or input width ≥6,144 selects paired 128×128 TMA. Packed projections need contiguous weights and scales and slices divisible by 128. [Eligibility](../src/prefill_fp8_sm100.cu#L566)<!-- prefix: "const int pr" --> · [Separate projection tiles](../src/prefill_fp8_sm100.cu#L602)<!-- prefix: "if (rows \u003e 1" -->
+Separate K0 Tensor Core projections need at least three rows, input width divisible by 128, and 16-byte-aligned contiguous FP8. At 129–1,023 rows, output width ≥8,192 or input width ≥6,144 selects paired 128×128 TMA. Packed projections need contiguous weights and scales and slices divisible by 128. [Eligibility](../src/prefill_fp8_sm100.cu#L558)<!-- prefix: "const int pr" --> · [Separate projection tiles](../src/prefill_fp8_sm100.cu#L594)<!-- prefix: "if (rows \u003e 1" -->
 
 | Packed shape | First eligible tile |
 | --- | --- |
@@ -40,7 +40,7 @@ Separate K0 Tensor Core projections need at least three rows, input width divisi
 | Grouped 2,048 or 4,096×5,120 | 128×256 groups all row tiles per column tile. TP2 gate/up requires 4,096 rows and two 8,704-column slices. At 4,096 rows TP2 GDN uses 5,120/3,072-column slices and GQA uses 6,144/512/512, with copy batch one. |
 | Grouped 4,096-row GDN/GQA output to 5,120 channels | 128×256 with three stages at 3,072 input channels and four at 6,144. Clean decline uses narrow TMA. |
 
-Grouped routes allow 4,096 rows and ordinary calls 2,048. [Whole-tile MTP pairs](native-prefill-workspace.md#projection-pairs-for-mtp) and [partial-grant projection groups](native-prefill-workspace.md#partial-grant-projection-groups) share this guard. The SM100 CUTLASS/CuTe collective writes 5,120 BF16 channels for grouped GQA/GDN output at 6,144 inputs and MLP down at 1,024 or grouped 4,096 rows (17,408 inputs TP1, 8,704 TP2). It transposes FP32 activation scales and widens BF16 weight scales in idle gate/up storage on the workspace stream. Clean decline uses existing dispatch, including paired 128×128 down at 1,024 rows when large-row prefill is enabled. Setup and submission errors propagate. [Group guard](../src/decoder_prefill.cpp#L467)<!-- prefix: "const bool s" --> · [Shape guard](../src/text/prefill_down_sm100.cu#L157)<!-- prefix: "const bool d" --> · [Tile layout and pipeline details](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/fp8-prefill-projections.md#large-prefill-tiles)
+Grouped routes allow 4,096 rows and ordinary calls 2,048. [Whole-tile MTP pairs](native-prefill-workspace.md#projection-pairs-for-mtp) and [partial-grant projection groups](native-prefill-workspace.md#partial-grant-projection-groups) share this guard. The SM100 CUTLASS/CuTe collective writes 5,120 BF16 channels for grouped GQA/GDN output at 6,144 inputs and MLP down at 1,024 or grouped 4,096 rows (17,408 inputs TP1, 8,704 TP2). It transposes FP32 activation scales and widens BF16 weight scales in idle gate/up storage on the workspace stream. Clean decline uses existing dispatch, including paired 128×128 down at 1,024 rows when large-row prefill is enabled. Setup and submission errors propagate. [Group guard](../src/decoder_prefill.cpp#L467)<!-- prefix: "const bool s" --> · [Shape guard](../src/text/prefill_down_sm100.cu#L146)<!-- prefix: "const bool d" --> · [Tile layout and pipeline details](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/fp8-prefill-projections.md#large-prefill-tiles)
 
 ### Attention output quantization
 
@@ -61,7 +61,7 @@ The specialization preserves FP32 RMS accumulation and BF16 residuals. It quanti
 
 ## Constraints and failure behavior
 
-The `sm_100a` TMA, TMEM, and `tcgen05` path requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Output slices must be disjoint from inputs and each other. Clean separate and packed declines try the ordinary shape-selected tile and 128×128 tile, respectively. If packing declines, the decoder projects slices separately. Ineligible Tensor Core calls use SIMT. CUDA errors propagate. [Build](../xmake.lua#L177)<!-- prefix: "target(\"sgla" --> · [Narrow packed launch](../src/prefill_fp8_sm100.cu#L724)<!-- prefix: "return launc" --> · [Separate projection](../src/runtime/execution/decoder_prefill_tiles.cpp#L479)<!-- prefix: "void Prefill" -->
+The `sm_100a` TMA, TMEM, and `tcgen05` path requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Output slices must be disjoint from inputs and each other. Clean separate and packed declines try the ordinary shape-selected tile and 128×128 tile, respectively. If packing declines, the decoder projects slices separately. Ineligible Tensor Core calls use SIMT. CUDA errors propagate. [Build](../xmake.lua#L177)<!-- prefix: "target(\"sgla" --> · [Narrow packed launch](../src/prefill_fp8_sm100.cu#L716)<!-- prefix: "return launc" --> · [Separate projection](../src/runtime/execution/decoder_prefill_tiles.cpp#L479)<!-- prefix: "void Prefill" -->
 
 Attention output quantization requires a valid FP32 scale buffer with ordinary float alignment. Other valid shapes or alignments use the scalar kernel, which supports partial groups. The row launcher rejects null pointers, nonpositive widths, and row counts outside 1 through 65,535. The selected launch returns its CUDA status. Fused SwiGLU shares the warp kernel and retains its own dispatch and BF16 rounding. [Row launcher](../src/text_ops.cu#L463)<!-- prefix: "cudaError_t " --> · [SwiGLU dispatch](../src/text_ops.cu#L483)<!-- prefix: "cudaError_t " -->
 

@@ -12,7 +12,7 @@ Staged ordered attention double-buffers packed K/V and scales in 32-key blocks, 
 
 ### Grouped partial grants
 
-The [partial-grant projection path](native-prefill-workspace.md#partial-grant-projection-groups) appends new KV before selecting a reader. Each lane keeps its own page table, causal mask and unwritten KV/query-tail guards. [Grouping](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L84)<!-- prefix: "for (; first" --> · [Staged guard](../src/text/gqa/tmem_staged.cu#L494)<!-- prefix: "if (rows \u003c m" --> · [Buffer validation](../src/text/mxfp8_gqa_prefill_tmem.cu#L650)<!-- prefix: "std::optiona" -->
+The [partial-grant projection path](native-prefill-workspace.md#partial-grant-projection-groups) appends new KV before selecting a reader. Each lane keeps its own page table, causal mask and unwritten KV/query-tail guards. [Grouping](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L84)<!-- prefix: "for (; first" --> · [Staged guard](../src/text/gqa/tmem_staged.cu#L471)<!-- prefix: "if (rows \u003c m" --> · [Buffer validation](../src/text/mxfp8_gqa_prefill_tmem.cu#L650)<!-- prefix: "std::optiona" -->
 
 | Reader | Eligibility and sequence |
 | --- | --- |
@@ -24,7 +24,7 @@ Queued predecode precedes fallback on the same stream. Pending/unexpected errors
 
 ### Long serial TP2 tiles
 
-B200 eager Tensor Core TP2 stages 992–1,024 rows at 32,769–131,072 visible tokens (including new rows). Per rank, 12 Q and two KV heads have dimension 256. The page reader stages BF16 K/V, masks causal tails and writes only live rows. [Shape guard](../src/text/gqa/geometry.cpp#L48)<!-- prefix: "bool wants_l" --> · [Native reader](../src/text/gqa/tmem_staged.cu#L621)<!-- prefix: "std::optiona" -->
+B200 eager Tensor Core TP2 stages 992–1,024 rows at 32,769–131,072 visible tokens (including new rows). Per rank, 12 Q and two KV heads have dimension 256. The page reader stages BF16 K/V, masks causal tails and writes only live rows. [Shape guard](../src/text/gqa/geometry.cpp#L48)<!-- prefix: "bool wants_l" --> · [Native reader](../src/text/gqa/tmem_staged.cu#L598)<!-- prefix: "std::optiona" -->
 
 A mixed 4,096-row group can use this reader after grouped readers decline. Contiguous causal groups use their [causal reader](flash-prefill.md#same-request-causal-gqa). Clean setup decline uses ordinary per-lane GQA. CUDA errors propagate. [Lane fallback](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L107)<!-- prefix: "if (!submitt" --> · [Reader dispatch](../src/runtime/execution/decoder_prefill_tiles.cpp#L309)<!-- prefix: "void Chunk::" -->
 

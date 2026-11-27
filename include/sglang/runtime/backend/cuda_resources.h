@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -17,6 +18,7 @@ struct TransferBuffers;
 void check(cudaError_t status, const char* operation);
 struct CudaError : std::runtime_error {
     CudaError(cudaError_t status, const char* operation);
+    static cudaError_t from_driver(CUresult status) noexcept;
     static bool terminal(cudaError_t error);
     cudaError_t status;
 };

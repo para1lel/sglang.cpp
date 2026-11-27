@@ -69,15 +69,10 @@ std::optional<cudaError_t> encode_pair_maps(Mxfp8KvCache cache, PairMaps& maps) 
         result = encode_map(maps.value_scales, cache.value_scales, CU_TENSOR_MAP_DATA_TYPE_UINT32,
                             2, scale_shape, scale_stride, scale_box);
     }
-    switch (result) {
-    case CUDA_SUCCESS: return cudaSuccess;
-    case CUDA_ERROR_INVALID_VALUE:
-    case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-    case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-    case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-    case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
-    default: return cudaErrorUnknown;
+    if (result == CUDA_ERROR_INVALID_VALUE || result == CUDA_ERROR_NOT_SUPPORTED) {
+        return std::nullopt;
     }
+    return decoder::CudaError::from_driver(result);
 }
 
 std::optional<cudaError_t> encode_flash_maps(Mxfp8KvCache cache, CUtensorMap& key_map,
@@ -109,19 +104,10 @@ std::optional<cudaError_t> encode_flash_maps(Mxfp8KvCache cache, CUtensorMap& ke
     if (!automatic) {
         return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
     }
-    switch (result) {
-    case CUDA_SUCCESS: return cudaSuccess;
-    case CUDA_ERROR_INVALID_VALUE:
-    case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-    case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
-    case CUDA_ERROR_CONTEXT_IS_DESTROYED: return cudaErrorContextIsDestroyed;
-    case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-    case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-    case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
-    case CUDA_ERROR_ILLEGAL_ADDRESS: return cudaErrorIllegalAddress;
-    case CUDA_ERROR_LAUNCH_FAILED: return cudaErrorLaunchFailure;
-    default: return cudaErrorUnknown;
+    if (result == CUDA_ERROR_INVALID_VALUE || result == CUDA_ERROR_NOT_SUPPORTED) {
+        return std::nullopt;
     }
+    return decoder::CudaError::from_driver(result);
 }
 
 }
@@ -240,15 +226,13 @@ std::optional<cudaError_t> staged_stream_context(cudaStream_t stream) {
     if (status == CUDA_SUCCESS && current) {
         status = get_stream(stream, &context);
     }
-    switch (status) {
-    case CUDA_SUCCESS:
+    if (status == CUDA_SUCCESS) {
         return current && context == current ? std::optional{cudaSuccess} : std::nullopt;
-    case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-    case CUDA_ERROR_INVALID_HANDLE: return cudaErrorInvalidResourceHandle;
-    case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-    case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
-    default: return cudaErrorUnknown;
     }
+    if (status == CUDA_ERROR_NOT_SUPPORTED) {
+        return std::nullopt;
+    }
+    return decoder::CudaError::from_driver(status);
 }
 
 std::optional<cudaError_t> staged_submission(cudaError_t status) {
@@ -289,17 +273,10 @@ std::optional<cudaError_t> encode_staged_maps(int full_pages, int kv_heads,
     if (result == CUDA_SUCCESS) {
         result = encode_map(maps.values, values, value_box);
     }
-    switch (result) {
-    case CUDA_SUCCESS: return cudaSuccess;
-    case CUDA_ERROR_INVALID_VALUE:
-        if (strict) return cudaErrorInvalidValue;
+    if (result == CUDA_ERROR_NOT_SUPPORTED || (result == CUDA_ERROR_INVALID_VALUE && !strict)) {
         return std::nullopt;
-    case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-    case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-    case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-    case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
-    default: return cudaErrorUnknown;
     }
+    return decoder::CudaError::from_driver(result);
 }
 
 template <bool Strict = false>

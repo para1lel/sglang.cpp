@@ -211,7 +211,7 @@ std::shared_ptr<const TcVocabScratch> prepare_tc_vocab_scratch(Allocations& memo
 namespace {
 
 bool check_wide_map(CUresult status) {
-    const auto direct = static_cast<cudaError_t>(status);
+    const auto direct = CudaError::from_driver(status);
     const auto recorded = cudaGetLastError();
     if (CudaError::terminal(direct)) check(direct, "Encode wide INT8 verification tensor map");
     const bool declined = status == CUDA_ERROR_INVALID_VALUE || status == CUDA_ERROR_NOT_SUPPORTED;

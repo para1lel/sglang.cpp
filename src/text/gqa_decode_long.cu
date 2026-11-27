@@ -645,7 +645,7 @@ std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, Bat
                 return std::nullopt;
             }
             if (result != CUDA_SUCCESS) {
-                const auto status = static_cast<cudaError_t>(result);
+                const auto status = decoder::CudaError::from_driver(result);
                 return long_decode_status(decoder::CudaError::terminal(status)
                     ? status : cudaErrorUnknown);
             }

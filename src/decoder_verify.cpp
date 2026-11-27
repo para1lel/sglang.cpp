@@ -722,11 +722,32 @@ void gather_tp_packet(const VerificationSequence* sequences,
     }
 }
 
+void gather_vocab_rows(const VerificationRow* input, TcVocabRow* output, TcVocabRmsRows& rms) {
+    for (int index = 0; index < tc_vocab_wide_rows; ++index) {
+        const auto& work = *input[index].work;
+        output[index] = {work.normalized, work.argmax};
+        rms.rows[index] = {work.hidden, work.residual, work.normalized};
+    }
+}
+
 bool score_tp_rows(const auto& tc_vocab, const auto& final_norm, const VerificationRow* rows,
                    int total, const TcVocabScratch* vocabulary, cudaStream_t stream,
                    const auto& score_packet) {
     bool packed = true;
     static_assert(tc_vocab_wide_rows == 2 * verification_packet_rows);
+    constexpr int paired_rows = 2 * tc_vocab_wide_rows;
+    if (vocabulary && total == paired_rows) {
+        std::array<TcVocabRow, paired_rows> projection{};
+        TcVocabRmsRows rms[2];
+        for (int half = 0; half < 2; ++half) {
+            const int start = half * tc_vocab_wide_rows;
+            gather_vocab_rows(rows + start, projection.data() + start, rms[half]);
+        }
+        if (try_tc_vocab_final_pair(*tc_vocab, *vocabulary, projection.data(), rms, final_norm,
+                                    stream)) {
+            return true;
+        }
+    }
     for (int first = 0; first < total;) {
         const auto* packet = rows + first;
         if (vocabulary && total - first >= tc_vocab_wide_rows &&
@@ -737,11 +758,7 @@ bool score_tp_rows(const auto& tc_vocab, const auto& final_norm, const Verificat
                          })) {
             std::array<TcVocabRow, tc_vocab_wide_rows> projection;
             TcVocabRmsRows rms;
-            for (int index = 0; index < tc_vocab_wide_rows; ++index) {
-                const auto& work = *packet[index].work;
-                projection[index] = {work.normalized, work.argmax};
-                rms.rows[index] = {work.hidden, work.residual, work.normalized};
-            }
+            gather_vocab_rows(packet, projection.data(), rms);
             if (try_tc_vocab_final(*tc_vocab, *vocabulary, projection.data(), rms,
                                    final_norm, stream)) {
                 first += tc_vocab_wide_rows;

@@ -419,6 +419,9 @@ template __device__ void produce<128, 32, false, 4>(DecodePipeline<4>&, unsigned
     const CUtensorMap*, const CUtensorMap*, int, int, int, int);
 template __device__ void produce<128, 64, false, 4>(DecodePipeline<4>&, unsigned,
     const CUtensorMap*, const CUtensorMap*, int, int, int, int);
+template __device__ void produce<128, 80, false, 4>(DecodePipeline<4>&, unsigned,
+                                                    const CUtensorMap*, const CUtensorMap*, int,
+                                                    int, int, int);
 template __device__ void produce<128, 16, false, 8>(DecodePipeline<8>&, unsigned,
     const CUtensorMap*, const CUtensorMap*, int, int, int, int);
 

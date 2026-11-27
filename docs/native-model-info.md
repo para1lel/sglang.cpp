@@ -77,7 +77,7 @@ Complete draft depths can share normalization and projection. Sparse depths and 
 
 ### Certified Tensor Core target head
 
-The B200 certified head uses INT8 bounds and BF16 refinement to preserve target IDs, BF16 scores and lowest-ID ties. It supports eager unscored greedy MTP singletons and eligible verification packets, including M20 score retention and eager unscored M40. K0, sampling, constraints, raw logits and scored singletons use BF16. Two-row graphs retain their graph head. See [target dispatch](mtp.md#target-round) and [eligibility, memory, fallback and exactness checks](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#certified-tensor-core-target-head).
+The B200 certified head uses INT8 bounds and BF16 refinement to preserve target IDs, BF16 scores and lowest-ID ties. It supports eager unscored greedy MTP singletons and eligible verification packets, including M20 score retention and eager unscored M40. A complete TP2 group of sixteen eligible K4 lanes shares one M80 projection and certifies each half with the M40 kernels. K0, sampling, constraints, raw logits and scored singletons use BF16. Two-row graphs retain their graph head. See [target dispatch](mtp.md#target-round) and [eligibility, memory, fallback and exactness checks](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#certified-tensor-core-target-head).
 
 ### Draft attention
 

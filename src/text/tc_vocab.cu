@@ -499,7 +499,7 @@ __device__ void store_scores(const decode_proj::DecodePipeline<score_stages>& pi
         for (int row = 0; row < tc_vocab_rows; ++row) {
             scores[row * vocabulary + token] = static_cast<int>(values[row]);
         }
-    } else {
+    } else if constexpr (Columns == wide_columns) {
         unsigned values[40];
         load_tmem16(source, values);
         load_tmem16(source + 16, values + 16);
@@ -507,6 +507,17 @@ __device__ void store_scores(const decode_proj::DecodePipeline<score_stages>& pi
         #pragma unroll
         for (int row = 0; row < tc_vocab_wide_rows; ++row) {
             scores[row * vocabulary + token] = static_cast<int>(values[row]);
+        }
+    } else {
+        static_assert(Columns == paired_columns && Columns % 16 == 0);
+#pragma unroll
+        for (int first = 0; first < Columns; first += 16) {
+            unsigned values[16];
+            load_tmem16(source + first, values);
+#pragma unroll
+            for (int row = 0; row < 16; ++row) {
+                scores[((first + row) * vocabulary) + token] = static_cast<int>(values[row]);
+            }
         }
     }
     fence_before_sync();
@@ -549,6 +560,21 @@ __global__ __launch_bounds__(decode_proj::threads, 2) void vocabulary_scores(
 }
 
 namespace tc_vocab {
+
+cudaError_t configure_paired_scores() {
+    return cudaFuncSetAttribute(vocabulary_scores<paired_columns>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                score_shared_bytes<paired_columns>);
+}
+
+cudaError_t launch_paired_scores(const CUtensorMap& weight, const CUtensorMap& input, int* scores,
+                                 cudaStream_t stream) {
+    constexpr int blocks = vocabulary / decode_proj::tile_rows;
+    vocabulary_scores<paired_columns>
+        <<<blocks, decode_proj::threads, score_shared_bytes<paired_columns>, stream>>>(
+            weight, input, scores, paired_columns);
+    return cudaGetLastError();
+}
 
 cudaError_t configure_packet_scores(int count) {
     if (count <= tc_vocab_narrow_rows) {

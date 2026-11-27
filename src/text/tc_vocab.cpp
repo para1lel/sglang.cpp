@@ -2,10 +2,12 @@
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/mtp/tc_vocab_launch.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <string_view>
 
 namespace sglang::decoder {
@@ -65,17 +67,23 @@ struct ScoreRows {
     Winner* partial{};
 };
 
-struct WideScoreStorage {
-    std::uint8_t quantized[rows * width];
-    Bf16 packed[rows * width];
-    float maxima[rows];
-    Stats stats[rows];
-    int scores[rows * vocabulary];
+template <int Rows> struct WideScoreStorage {
+    std::uint8_t quantized[Rows * width];
+    Bf16 packed[Rows * width];
+    float maxima[Rows];
+    Stats stats[Rows];
+    int scores[Rows * vocabulary];
     float lower[rows * tiles];
     float threshold[rows];
     int count[rows];
     int ids[rows * slots];
     Winner partial[rows * refine_tiles];
+};
+
+struct WideScores {
+    bool prepare;
+    ScoreRows rows{};
+    CUtensorMap map{};
 };
 
 struct ScoreScratch {
@@ -159,10 +167,9 @@ void prepare_short_scratch(const decode_proj::LaunchTarget& target, ScoreScratch
 struct TcVocabScratch {
     decode_proj::LaunchTarget target;
     bool resident;
-    mutable bool try_wide;
     std::unique_ptr<ScoreScratch> score;
-    mutable ScoreRows wide;
-    mutable CUtensorMap wide_map;
+    mutable WideScores wide;
+    mutable WideScores paired;
 };
 
 std::shared_ptr<const TcVocabWeights> prepare_tc_vocab(const Bf16* original,
@@ -205,7 +212,7 @@ std::shared_ptr<const TcVocabScratch> prepare_tc_vocab_scratch(Allocations& memo
     score->allocate_rows();
     if (short_packet) prepare_short_scratch(target, *score);
     return std::make_shared<TcVocabScratch>(
-        TcVocabScratch{target, resident, wide, std::move(score), {}, {}});
+        TcVocabScratch{target, resident, std::move(score), WideScores{wide}, WideScores{wide}});
 }
 
 namespace {
@@ -224,62 +231,80 @@ bool check_wide_map(CUresult status) {
     return true;
 }
 
-bool prepare_wide_scratch(const TcVocabScratch& scratch) {
-    if (scratch.wide.packed) return true;
-    if (!scratch.try_wide) return false;
-    scratch.try_wide = false;
-    check(cudaPeekAtLastError(), "Check CUDA status before preparing M40 vocabulary scratch");
-    if (scratch.resident && available_device_bytes() <
-            decoder_shared_reserve + sizeof(WideScoreStorage)) {
+template <int Rows, int Columns>
+bool prepare_wide_scratch(const TcVocabScratch& scratch, WideScores& scores,
+                          const ScoreRows& reusable = ScoreRows{}) {
+    if (scores.rows.packed)
+        return true;
+    if (!scores.prepare)
+        return false;
+    scores.prepare = false;
+    check(cudaPeekAtLastError(), "Check CUDA status before preparing wide vocabulary scratch");
+    const DeviceScope device(scratch.target.device);
+    using Storage = WideScoreStorage<Rows>;
+    if (!reusable.packed && scratch.resident &&
+        available_device_bytes() < decoder_shared_reserve + sizeof(Storage)) {
         return false;
     }
-    const auto configured = configure_packet_scores(tc_vocab_wide_rows);
+    const auto configured =
+        Rows == paired_columns ? configure_paired_scores() : configure_packet_scores(Rows);
     if (configured == cudaErrorNotSupported || configured == cudaErrorInvalidValue) {
         const auto pending = cudaGetLastError();
-        if (pending != configured) check(pending, "Check CUDA status before M20 fallback");
+        if (pending != configured)
+            check(pending, "Check CUDA status before vocabulary fallback");
         return false;
     }
     check_direct_status(configured, "Configure wide INT8 verification projection");
 
-    WideScoreStorage* storage;
-    try {
-        storage = static_cast<WideScoreStorage*>(
-            scratch.score->memory.allocate_elements(1, sizeof(WideScoreStorage)));
-    } catch (const CudaError& error) {
-        if (error.status != cudaErrorMemoryAllocation) throw;
-        const auto pending = cudaGetLastError();
-        if (pending != error.status) check(pending, "Check CUDA status before M20 fallback");
+    auto buffers = reusable;
+    Storage* storage = nullptr;
+    if (!buffers.packed) {
+        try {
+            storage =
+                static_cast<Storage*>(scratch.score->memory.allocate_elements(1, sizeof(Storage)));
+        } catch (const CudaError& error) {
+            if (error.status != cudaErrorMemoryAllocation)
+                throw;
+            const auto pending = cudaGetLastError();
+            if (pending != error.status) {
+                check(pending, "Check CUDA status before vocabulary fallback");
+            }
+            return false;
+        }
+        buffers = {
+            storage->packed, storage->quantized, storage->maxima, storage->stats, storage->scores,
+            storage->lower,  storage->threshold, storage->count,  storage->ids,   storage->partial,
+        };
+    }
+    const auto status =
+        decode_proj::encode_map(scratch.target, scores.map, buffers.quantized,
+                                CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, Rows, width, Columns);
+    if (!check_wide_map(status)) {
+        if (storage != nullptr)
+            scratch.score->memory.free_block(storage, sizeof(Storage));
         return false;
     }
-    const auto status = decode_proj::encode_map(scratch.target, scratch.wide_map,
-        storage->quantized, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, rows, width, wide_columns);
-    if (!check_wide_map(status)) return false;
-    scratch.wide = {storage->packed, storage->quantized, storage->maxima, storage->stats,
-                    storage->scores, storage->lower, storage->threshold, storage->count,
-                    storage->ids, storage->partial};
+    scores.rows = buffers;
     return true;
 }
 
-void score(const TcVocabWeights& weights, const ScoreRows& scratch, const CUtensorMap& input_map,
-           const TcVocabRow* batch, int count, cudaStream_t stream, bool packed) {
+void quantize(const ScoreRows& scratch, int count, cudaStream_t stream) {
+    check_direct_status(
+        quantize_draft_head_int8(scratch.packed, count, scratch.quantized, scratch.maxima, stream),
+        "Quantize shared INT8 verification inputs");
+    check(launch_shared_stats(count, scratch.packed, scratch.quantized, scratch.maxima,
+                              scratch.stats, stream),
+          "Prepare shared INT8 verification input bounds");
+}
+
+void certify(const TcVocabWeights& weights, const ScoreRows& scratch, const TcVocabRow* batch,
+             int count, cudaStream_t stream) {
     Inputs inputs{};
     Outputs outputs{};
     for (int row = 0; row < count; ++row) {
         inputs.rows[row] = batch[row].input;
         outputs.rows[row] = batch[row].winner;
     }
-    if (!packed) {
-        check(launch_pack_inputs(count, inputs, scratch.packed, stream),
-              "Pack shared INT8 verification inputs");
-    }
-    check_direct_status(quantize_draft_head_int8(scratch.packed, count, scratch.quantized,
-                                                scratch.maxima, stream),
-                        "Quantize shared INT8 verification inputs");
-    check(launch_shared_stats(count, scratch.packed, scratch.quantized, scratch.maxima,
-                              scratch.stats, stream),
-          "Prepare shared INT8 verification input bounds");
-    check(launch_vocabulary_scores(weights.map, input_map, scratch.scores, count, stream),
-          "Run native INT8 verification projection");
     check(launch_lower_bounds(count, scratch.scores, weights.stats, scratch.stats, scratch.lower,
                               stream), "Bound shared INT8 verification scores");
     check(launch_thresholds(count, scratch.lower, scratch.threshold, stream),
@@ -306,6 +331,30 @@ void score(const TcVocabWeights& weights, const ScoreRows& scratch, const CUtens
     }
 }
 
+void score(const TcVocabWeights& weights, const ScoreRows& scratch, const CUtensorMap& input_map,
+           const TcVocabRow* batch, int count, cudaStream_t stream, bool packed) {
+    if (!packed) {
+        Inputs inputs{};
+        for (int row = 0; row < count; ++row)
+            inputs.rows[row] = batch[row].input;
+        check(launch_pack_inputs(count, inputs, scratch.packed, stream),
+              "Pack shared INT8 verification inputs");
+    }
+    quantize(scratch, count, stream);
+    check(launch_vocabulary_scores(weights.map, input_map, scratch.scores, count, stream),
+          "Run native INT8 verification projection");
+    certify(weights, scratch, batch, count, stream);
+}
+
+bool can_pack(const TcVocabRmsRows& rms, const Bf16* gain) {
+    return gain != nullptr && decode_proj::aligned16(gain) &&
+           std::all_of(std::begin(rms.rows), std::end(rms.rows),
+                       [](const TcVocabRmsRows::Row& row) {
+                           return row.branch != nullptr && row.residual != nullptr &&
+                                  row.normalized != nullptr && decode_proj::aligned16(row.branch) &&
+                                  decode_proj::aligned16(row.residual);
+                       });
+}
 }
 
 bool try_tc_vocab(const TcVocabWeights& weights, const TcVocabScratch& scratch,
@@ -362,21 +411,50 @@ bool try_tc_vocab_short(const TcVocabWeights& weights, const TcVocabScratch& scr
 bool try_tc_vocab_final(const TcVocabWeights& weights, const TcVocabScratch& scratch,
                         const TcVocabRow* batch, const TcVocabRmsRows& rms,
                         const Bf16* gain, cudaStream_t stream) {
-    if ((!scratch.try_wide && !scratch.wide.packed) || !gain || !decode_proj::aligned16(gain)) {
+    if (!can_pack(rms, gain) ||
+        !prepare_wide_scratch<rows, wide_columns>(scratch, scratch.wide, scratch.paired.rows)) {
         return false;
     }
-    for (const auto& row : rms.rows) {
-        if (!row.branch || !row.residual || !row.normalized ||
-            !decode_proj::aligned16(row.branch) || !decode_proj::aligned16(row.residual)) {
-            return false;
-        }
-    }
-    if (!prepare_wide_scratch(scratch)) return false;
-    const auto& buffers = scratch.wide;
+    const auto& buffers = scratch.wide.rows;
     check_direct_status(pack_tc_vocab_rms(rms, gain, buffers.packed, stream),
                         "Normalize and pack shared INT8 verification inputs");
-    score(weights, buffers, scratch.wide_map, batch, tc_vocab_wide_rows, stream, true);
+    score(weights, buffers, scratch.wide.map, batch, rows, stream, true);
     return true;
 }
 
+bool try_tc_vocab_final_pair(const TcVocabWeights& weights, const TcVocabScratch& scratch,
+                             const TcVocabRow* batch, const TcVocabRmsRows (&rms)[2],
+                             const Bf16* gain, cudaStream_t stream) {
+    if (!can_pack(rms[0], gain) || !can_pack(rms[1], gain))
+        return false;
+    auto& paired = scratch.paired;
+    if (paired.rows.packed == nullptr) {
+        if (!paired.prepare)
+            return false;
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        check(cudaStreamIsCapturing(stream, &capture), "Check vocabulary stream capture");
+        if (capture != cudaStreamCaptureStatusNone ||
+            !prepare_wide_scratch<paired_columns, paired_columns>(scratch, paired)) {
+            return false;
+        }
+    }
+
+    const auto& buffers = paired.rows;
+    for (int half = 0; half < 2; ++half) {
+        check_direct_status(
+            pack_tc_vocab_rms(rms[half], gain,
+                              buffers.packed + (static_cast<std::ptrdiff_t>(half) * rows * width),
+                              stream),
+            "Normalize and pack shared INT8 verification inputs");
+    }
+    quantize(buffers, paired_columns, stream);
+    check(launch_paired_scores(weights.map, paired.map, buffers.scores, stream),
+          "Run paired INT8 verification projection");
+    certify(weights, buffers, batch, rows, stream);
+    auto second = buffers;
+    second.stats += rows;
+    second.scores += static_cast<std::ptrdiff_t>(rows) * vocabulary;
+    certify(weights, second, batch + rows, rows, stream);
+    return true;
+}
 }

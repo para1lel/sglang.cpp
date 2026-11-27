@@ -50,8 +50,10 @@ struct ShortCandidates {
 inline constexpr int score_columns = 32;
 inline constexpr int wide_columns = 64;
 inline constexpr int narrow_columns = 16;
+inline constexpr int paired_columns = 2 * rows;
 
 cudaError_t configure_packet_scores(int count);
+cudaError_t configure_paired_scores();
 cudaError_t configure_short_screen();
 cudaError_t configure_short_seeds();
 cudaError_t configure_short_replay();
@@ -60,6 +62,8 @@ cudaError_t launch_shared_stats(int count, const Bf16* original, const std::uint
                                const float* maxima, Stats* output, cudaStream_t stream);
 cudaError_t launch_vocabulary_scores(const CUtensorMap& weight, const CUtensorMap& input,
                                     int* scores, int count, cudaStream_t stream);
+cudaError_t launch_paired_scores(const CUtensorMap& weight, const CUtensorMap& input, int* scores,
+                                 cudaStream_t stream);
 cudaError_t launch_lower_bounds(int count, int* scores, const Stats* weight, const Stats* inputs,
                                float* lower, cudaStream_t stream);
 cudaError_t launch_thresholds(int count, const float* lower, float* threshold, cudaStream_t stream);

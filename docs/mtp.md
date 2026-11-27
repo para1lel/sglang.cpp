@@ -9,7 +9,7 @@ target model. It supports greedy decoding and sampling.
 | --- | --- | --- |
 | Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L57)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L410)<!-- prefix: "BatchService" --> |
 | MTP round | Draft proposals and commit target outputs in order. | [Proposals](../src/decoder_verify.cpp#L162)<!-- prefix: "bool MtpRoun" --> · [Commit](../src/decoder_verify.cpp#L284)<!-- prefix: "bool MtpRoun" --> |
-| Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_verify.cpp#L857)<!-- prefix: "bool Decoder" --> · [State commit](../src/runtime/execution/decoder_verify_replay.cpp#L63)<!-- prefix: "void TargetV" --> |
+| Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_verify.cpp#L874)<!-- prefix: "bool Decoder" --> · [State commit](../src/runtime/execution/decoder_verify_replay.cpp#L63)<!-- prefix: "void TargetV" --> |
 
 ## Runtime path
 
@@ -49,7 +49,7 @@ C++ callers consume `token` followed by the first `extra_token_count` entries of
 
 ### Target verification graph
 
-TP1 [replay](batch-graphs.md) supports one unconstrained text lane with two target rows. Both positions must fit inline GQA scores. The last eligible pair is 5,118 and 5,119 (zero-based). Replay and eager verification share two-row projection grouping. Replay uses bound GQA dispatch, including the [split-KV position check](singleton-gqa-decode.md#split-kv-target-attention) when the split policy is active. The first eligible group runs eagerly. The next captures the verifier on the batch stream. [Group dispatch](../src/decoder_verify.cpp#L881)<!-- prefix: "if (graph &&" --> · [Row eligibility](../src/decoder_verify.cpp#L391)<!-- prefix: "bool TargetV" --> · [Capture](../src/decoder_verify.cpp#L882)<!-- prefix: "std::exchang" -->
+TP1 [replay](batch-graphs.md) supports one unconstrained text lane with two target rows. Both positions must fit inline GQA scores. The last eligible pair is 5,118 and 5,119 (zero-based). Replay and eager verification share two-row projection grouping. Replay uses bound GQA dispatch, including the [split-KV position check](singleton-gqa-decode.md#split-kv-target-attention) when the split policy is active. The first eligible group runs eagerly. The next captures the verifier on the batch stream. [Group dispatch](../src/decoder_verify.cpp#L898)<!-- prefix: "if (graph &&" --> · [Row eligibility](../src/decoder_verify.cpp#L391)<!-- prefix: "bool TargetV" --> · [Capture](../src/decoder_verify.cpp#L899)<!-- prefix: "std::exchang" -->
 
 Each launch refreshes tokens, positions, KV page tables and pointers, GDN banks, and GQA score bindings. The executable reuses fixed batch-owned scratch. Draft proposals, sampling, result readback, acceptance, and state commit run outside it. C++ reports replayed slots in `verification_graph_slots`. The HTTP `graph_slots` trace reports K0 replay. [Bindings](../src/decoder_verify.cpp#L43)<!-- prefix: "void Verific" --> · [Slot mask](../include/sglang/decoder_batch.h#L53)<!-- prefix: "std::uint32_" --> · [HTTP trace](../apps/server/detail/batch_trace.cpp#L46)<!-- prefix: "if (stats.gr" -->
 

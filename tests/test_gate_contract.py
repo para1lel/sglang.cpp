@@ -128,7 +128,7 @@ def seed_repository(
     root.mkdir(exist_ok=True)
     git_fixture(root, "init", "--quiet", "--template=")
     git_fixture(root, "config", "core.hooksPath", ".githooks")
-    names = [".githooks/pre-commit", ".githooks/run"]
+    names = [".githooks/pre-commit", ".githooks/commit-msg", ".githooks/run"]
     if style:
         names.extend([".clang-format", ".clang-tidy", "ruff.toml"])
     for name in names:
@@ -176,6 +176,7 @@ def selected_hook(
     *,
     path: str | Path | None = None,
     host_root: Path | None = None,
+    command: list[str | Path] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = clean_environment()
     if index is not None:
@@ -188,12 +189,14 @@ def selected_hook(
         environment["SGLANG_HOST_ROOT"] = str(host_root)
     indexes = {root / ".git/index"}
     if index is not None:
-        indexes.add(index)
+        indexes.add(root / index)
     original = {name: name.read_bytes() for name in indexes}
     worktree = worktree_files(root)
-    result = run_fixture(
-        ["git", "-C", root, "hook", "run", "pre-commit"], cwd=root.parent, environment=environment
-    )
+    if command is None:
+        command = ["git", "-C", root, "hook", "run", "pre-commit"]
+        result = run_fixture(command, cwd=root.parent, environment=environment)
+    else:
+        result = run_fixture(command, cwd=root, environment=environment)
     assert {name: name.read_bytes() for name in indexes} == original
     assert worktree_files(root) == worktree
     return result
@@ -543,14 +546,15 @@ def test_initial_index_checks_root_files(tmp_path: Path) -> None:
     assert_format_rejected(selected_hook(root), "root.py")
 
 
-def test_shared_policy_scan_skips_unrelated_path_only_check(tmp_path: Path) -> None:
+@pytest.mark.parametrize("changed", ["AGENTS.md", ".agents/gates.json"])
+def test_shared_policy_scan_skips_unrelated_path_only_check(tmp_path: Path, changed: str) -> None:
     configuration = json.loads((ROOT / ".agents/gates.json").read_text(encoding="utf-8"))
     configuration["checks"] = [
         {
             "name": "Full-policy sentinel",
             "kind": "static",
             "paths": ["src/*.cpp"],
-            "command": ["{python}", "-c", "print('full policy check reached')"],
+            "command": ["{python}", "-c", "import sys; print(*sys.argv[1:])", "{files}"],
         },
         {
             "name": "Path-only sentinel",
@@ -560,14 +564,15 @@ def test_shared_policy_scan_skips_unrelated_path_only_check(tmp_path: Path) -> N
             "command": ["{python}", "-c", "raise SystemExit('path-only check reached')"],
         },
     ]
-    root = seed_repository(
-        tmp_path, {".agents/gates.json": json.dumps(configuration, indent=2) + "\n"}
-    )
-    stage_files(root, {"AGENTS.md": "# Policy fixture\n"})
+    files = {"src/existing.cpp": "int existing;\n"}
+    files[".agents/gates.json"] = json.dumps(configuration, indent=2) + "\n"
+    root = seed_repository(tmp_path, files)
+    text = "# Policy fixture\n" if changed == "AGENTS.md" else (root / changed).read_text() + "\n"
+    stage_files(root, {changed: text})
     result = selected_hook(root)
     output = result.stdout + result.stderr
     assert_passed(result)
-    assert "full policy check reached" in output, output
+    assert "src/existing.cpp" in output, output
     assert "path-only check reached" not in output, output
 
     stage_files(root, {"src/probe.cpp": "int value = 42;\n"})
@@ -767,3 +772,229 @@ def test_staged_cuda_analyzes_device_branch_with_cuda_13_4(tmp_path: Path) -> No
     defect = "    int* pointer = nullptr;\n    *pointer = static_cast<int>(lane);\n"
     canonical_native_source(root, name, source.replace(guarded_ptx, guarded_ptx + defect))
     assert_rejected(selected_hook(root), name, "clang-analyzer-core.NullDereference")
+
+
+@pytest.mark.parametrize("selection", ["default", "relative"])
+def test_staged_bootstrap_and_commit_message(tmp_path: Path, selection: str) -> None:
+    root = seed_repository(tmp_path, {"probe.py": "value = 0\n"})
+    index = copy_index(root).relative_to(root) if selection == "relative" else None
+    stage_files(root, {"probe.py": "value = 1\n"}, index=index)
+    if index is not None:
+        stage_files(root, {"probe.py": "value = (\n"})
+    helper = ".agents/checks/gate_config.py"
+    valid = (root / helper).read_text()
+    staged_driver = ".agents/checks/staged_check.py"
+    failure_status = 93
+    for name in (".githooks/run", ".agents/checks/check_rules.py", helper, staged_driver):
+        bad = f"exit {failure_status}\n" if name.endswith("/run") else f"exit({failure_status})\n"
+        write_fixture(root, name, bad)
+    assert_passed(selected_hook(root, index))
+    git_fixture(root, "restore", "--", staged_driver)
+    direct = [sys.executable, "-IB", root / staged_driver, root]
+    assert_passed(selected_hook(root, index, command=direct))
+    message = root / "message"
+    write_fixture(root, "message", "test: verify selected message checker\n")
+    hook: list[str | Path] = ["git", "hook", "run", "commit-msg", "--", message]
+    if index is not None:
+        git_fixture(root, "add", "--", ".agents/checks/check_rules.py")
+        assert selected_hook(root, command=hook).returncode == failure_status
+    assert_passed(selected_hook(root, index, command=hook))
+    write_fixture(root, "message", "invalid header\n")
+    assert_rejected(selected_hook(root, index, command=hook), "Use a Conventional")
+    stage_files(root, {helper: 'raise ValueError("invalid staged helper")\n'}, index=index)
+    write_fixture(root, helper, valid)
+    for command in (None, direct):
+        assert_rejected(selected_hook(root, index, command=command), "invalid staged helper")
+    git_fixture(root, "rm", "--cached", "-f", "--", helper, index=index)
+    assert_rejected(selected_hook(root, index), helper)
+
+
+def test_frozen_policy_cannot_be_changed_or_removed(tmp_path: Path) -> None:
+    root = seed_repository(tmp_path, {})
+    name = ".agents/gates.json"
+    original = (root / name).read_text()
+    for field in ("baseline", "limits"):
+        configuration = json.loads(original)
+        if field == "baseline":
+            configuration[field]["tree_sha256"] = "1" * 64
+        else:
+            configuration["baseline"]["maxima"]["directory_entries"] = 31
+            configuration[field]["directory_entries"] = 31
+        stage_files(root, {name: json.dumps(configuration) + "\n"})
+        write_fixture(root, name, original)
+        assert_rejected(selected_hook(root), "cannot change the frozen adoption baseline or limits")
+    git_fixture(root, "rm", "--cached", "-f", "--", name)
+    assert_rejected(selected_hook(root), "cannot remove the frozen gate configuration")
+
+
+def test_replacement_ref_cannot_hide_selected_blob(tmp_path: Path) -> None:
+    root = seed_repository(tmp_path, {})
+    name = "probe.py"
+    stage_files(root, {name: "value = (\n"})
+    write_fixture(root, name, "value = 1\n")
+    blob = git_fixture(root, "rev-parse", f":{name}").strip()
+    replacement = git_fixture(root, "hash-object", "-w", name).strip()
+    git_fixture(root, "replace", blob, replacement)
+    assert git_fixture(root, "show", f":{name}") == "value = 1\n"
+    assert_rejected(selected_hook(root), name, "Python syntax is invalid")
+
+
+def test_retained_link_follows_selected_source_changes(tmp_path: Path) -> None:
+    name = "probe.py"
+    guide = '[Value](probe.py#L1)<!-- prefix: "value = 1" -->\n'
+    root = seed_repository(tmp_path, {name: "value = 1\n", "guide.md": guide})
+    stage_files(root, {name: "other = 1\n"})
+    assert_rejected(selected_hook(root), "guide.md", "prefix is stale")
+    git_fixture(root, "rm", "-f", name)
+    assert_rejected(selected_hook(root), "guide.md", "link is missing")
+    git_fixture(root, "restore", "--source=HEAD", "--staged", "--worktree", "--", name)
+    git_fixture(root, "mv", name, "renamed.py")
+    assert_rejected(selected_hook(root), "guide.md", "link is missing")
+
+
+def test_staged_skill_package_rejects_repository_only_link(tmp_path: Path) -> None:
+    package = ".agents/skills/example/"
+    name = package + "SKILL.md"
+    skill = "---\nname: example\ndescription: Example.\ndisable-model-invocation: true\n---\n"
+    policy = "policy:\n  allow_implicit_invocation: false\n"
+    root = seed_repository(
+        tmp_path, {name: skill, package + "agents/openai.yaml": policy, "guide.md": "# Guide\n"}
+    )
+    stage_files(root, {name: skill + "\n[Guide](../../../guide.md)\n"})
+    assert_rejected(selected_hook(root), "link leaves the selected directory")
+
+
+def test_physical_limits_on_the_selected_index(tmp_path: Path) -> None:
+    root = seed_repository(tmp_path, {})
+    name = "probe.cpp"
+    inside = "int probe() {\n" + "    (void)0;\n" * 97
+    ending = "    return 0;\n}\n"
+    width = "value = '" + "a" * 90 + "'\n"
+    entries = {f"entries/{index}": "initial\n" for index in range(30)}
+    exact = {name: inside + ending + "\n" * 900, "width.py": width, "guide.md": "word " * 3000}
+    stage_files(root, {**entries, **exact})
+    assert_passed(selected_hook(root))
+    extra = dict(exact)
+    extra.update({name: exact[name] + "\n", "width.py": width.replace("a'", "aa'")})
+    extra.update({"entries/extra": "one more\n", "guide.md": "word " * 3001})
+    stage_files(root, extra)
+    result = selected_hook(root)
+    assert_rejected(result, "31 entries", "more than 100 characters", "3001 visible words")
+    assert "more than 1000 lines" in result.stderr
+    git_fixture(root, "rm", "-f", "entries/extra")
+    stage_files(root, {**exact, name: inside + "    (void)0;\n" + ending + "\n" * 899})
+    output = assert_rejected(selected_hook(root), "Function probe() at line 1 exceeds")
+    assert "more than 1000 lines" not in output
+
+
+@pytest.mark.parametrize(
+    ("suffix", "definition", "declaration"),
+    [
+        ("cpp", "int probe() {\n    return 1;\n}\n", "int value;\n"),
+        ("cu", "__global__ void probe() {\n    return;\n}\n", "int value;\n"),
+        ("lua", "function probe()\n    return 1\nend\n", "local value = 1\n"),
+        ("sh", "probe() {\n    return 1\n}\n", "value=1\n"),
+    ],
+)
+def test_function_adapter_span(
+    tmp_path: Path, suffix: str, definition: str, declaration: str
+) -> None:
+    path = tmp_path / f"probe.{suffix}"
+    config = json.loads((ROOT / ".agents/gates.json").read_text())
+    arguments = config["function_adapters"][f".{suffix}"]
+    values = {"{python}": sys.executable, "{file}": str(path)}
+    command = [values.get(part, part) for part in arguments]
+    for text, expected in ((definition, [(1, 3)]), (declaration, [])):
+        write_fixture(tmp_path, path.name, text)
+        result = run_fixture(command, cwd=ROOT)
+        assert_passed(result)
+        spans = json.loads(result.stdout)
+        assert [(span["start"], span["end"]) for span in spans] == expected
+        assert all(span["name"] for span in spans)
+
+
+def test_configured_child_sees_selected_git_and_fresh_report(tmp_path: Path) -> None:
+    name = "probe/input.py"
+    config = json.loads((ROOT / ".agents/gates.json").read_text())
+    check = {"kind": "test", "command": ["{python}", "observe.py", "{files}"]}
+    check.update({"name": "Snapshot observer", "paths": [name], "report": "report.xml"})
+    config["checks"] = [check, check | {"name": "Unrelated observer", "paths": ["other/*"]}]
+    script = (
+        "import subprocess\nimport sys\nfrom pathlib import Path\n"
+        "head = subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()\n"
+        "assert head.decode() == Path('expected-head').read_text().strip()\n"
+        "changes = subprocess.check_output(['git', 'diff', '--cached', '--name-only'])\n"
+        "assert changes.splitlines() == [b'expected-head', b'probe/input.py']\n"
+        "assert sys.argv[1:] == (['probe/input.py'] if Path('probe/input.py').exists() else [])\n"
+        "for name in sys.argv[1:]:\n"
+        "    blob = subprocess.check_output(['git', 'show', ':' + name])\n"
+        "    assert blob == Path(name).read_bytes()\n"
+        "    if Path(name).read_text() == 'value = 1\\n':\n"
+        "        Path('report.xml').write_text('<testsuite><testcase/></testsuite>')\n"
+    )
+    report = "<testsuite><testcase/></testsuite>\n"
+    files = {name: "value = 0\n", "observe.py": script, "report.xml": report}
+    root = seed_repository(tmp_path, files | {".agents/gates.json": json.dumps(config) + "\n"})
+    expected = git_fixture(root, "rev-parse", "HEAD")
+    stage_files(root, {name: "value = 1\n", "expected-head": expected})
+    write_fixture(root, name, "value = 2\n")
+    result = selected_hook(root)
+    assert_passed(result)
+    output = result.stdout + result.stderr
+    assert "Running Snapshot observer" in output
+    assert "Running Unrelated observer" not in output
+    stage_files(root, {name: "value = 2\n"})
+    assert_rejected(selected_hook(root), "Running Snapshot observer", "local JUnit report")
+    git_fixture(root, "rm", "-f", name)
+    assert_rejected(selected_hook(root), "Running Snapshot observer", "local JUnit report")
+
+
+@pytest.mark.parametrize(
+    ("document", "diagnostic"),
+    [
+        ("<testsuite/>", "zero cases"),
+        ("<testsuite><testcase><skipped/></testcase></testsuite>", "skipped every case"),
+        ("<testsuite><testcase><failure/></testcase></testsuite>", "failure or error"),
+        ("<testsuite><testcase/><error/></testsuite>", "collection or suite failure"),
+        ("<testsuite><testcase/><failure/></testsuite>", "collection or suite failure"),
+        ("<testsuites errors='1'><testsuite><testcase/></testsuite></testsuites>", "suite failure"),
+        ("<testsuites failures='1'><testcase/></testsuites>", "suite failure"),
+        ("<testsuites><testsuite errors='1'><testcase/></testsuite></testsuites>", "suite failure"),
+        ("<testsuites><testsuite failures='1'><testcase/></testsuite></testsuites>", "suite fail"),
+        ("<testsuites><testsuite><testcase/></testsuite></testsuites>", None),
+        ("<testsuite><testcase/><testcase><skipped/></testcase></testsuite>", None),
+    ],
+)
+def test_required_junit_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, document: str, diagnostic: str | None
+) -> None:
+    monkeypatch.syspath_prepend(CHECKER.parent)
+    config = import_module("gate_config")
+    name = "report.xml"
+    write_fixture(tmp_path, name, document)
+    if diagnostic is None:
+        config.test_report(tmp_path, name)
+    else:
+        with pytest.raises(ValueError, match=diagnostic):
+            config.test_report(tmp_path, name)
+
+
+@pytest.mark.parametrize("command", [["missing-proof-tool"], ["{python}", "-c", "exit(23)"]])
+def test_required_static_check_fails_closed(tmp_path: Path, command: list[str]) -> None:
+    name = "probe.py"
+    config = json.loads((ROOT / ".agents/gates.json").read_text())
+    check = {"name": "Required static", "kind": "static", "paths": [name], "command": command}
+    config["checks"] = [check]
+    root = seed_repository(tmp_path, {".agents/gates.json": json.dumps(config) + "\n"})
+    stage_files(root, {name: "value = 1\n"})
+    diagnostic = command[0] if len(command) == 1 else "23"
+    assert_rejected(selected_hook(root), "Running Required static", diagnostic)
+
+
+def test_required_function_adapter_fails_closed(tmp_path: Path) -> None:
+    config = json.loads((ROOT / ".agents/gates.json").read_text())
+    config["checks"] = []
+    config["function_adapters"][".cpp"] = ["missing-proof-parser", "{file}"]
+    root = seed_repository(tmp_path, {".agents/gates.json": json.dumps(config) + "\n"})
+    stage_files(root, {"probe.cpp": "int value;\n" + "\n" * 100})
+    assert_rejected(selected_hook(root), "missing-proof-parser")

@@ -201,3 +201,11 @@ Run the formatter command printed by the hook on working-tree content that match
 clang-format --style=file:.clang-format -i ./path/to/file.cu
 ruff format --config=ruff.toml --no-cache ./path/to/file.py
 ```
+
+To replay the historical handoff proof, use a disposable clone and follow the original README's pinned Python and toolchain setup at this revision. Write the JSONL outside the checkout. [Original setup and proof](https://github.com/para1lel/sglang.cpp/blob/569818d31ee2d54b21dc41e8381e99b81762c97f/README.md#L42-L63)
+
+```bash
+git switch --detach 569818d31ee2d54b21dc41e8381e99b81762c97f
+git config --local core.hooksPath .githooks
+python -B tests/prove_handoff.py --revision 569818d31ee2d54b21dc41e8381e99b81762c97f > /outside/checkout/handoff.jsonl
+```

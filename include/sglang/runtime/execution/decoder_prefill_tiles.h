@@ -829,6 +829,25 @@ inline void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int b
                       chunk.work.gdn_scratch, dims.gdn_workspace_bytes(rows),
                       reinterpret_cast<float2*>(segment.work.keys), quantized, chunk.stream),
                   "Advance prefill Gated DeltaNet (vendor)");
+        } else if (!vendor && activation.values && chunk.tensor_core_fp8 && dims.is_local_gdn() &&
+                   count == 4 && run == 4 && rows == grouped_prefill_max_rows &&
+                   first.rows == batch_prefill_tile_rows && !first.media &&
+                   first.position % batch_prefill_tile_rows == 0) {
+            const bool ordered_first = bank == 0 && first.position == 0;
+            if (ordered_first) {
+                const auto segment = prefill_attention_segment(chunk, first, row);
+                segment.gdn_recur(layer, first.request->states[bank], bank, activation);
+            }
+            const int start = ordered_first ? 1 : 0;
+            const int offset = row + start * batch_prefill_tile_rows;
+            auto combined = grants[index + start];
+            combined.rows = rows - start * batch_prefill_tile_rows;
+            const auto segment = prefill_attention_segment(chunk, combined, offset);
+            const TextFp8Activation quantized{
+                activation.values + std::size_t(offset) * dims.gdn_value_width,
+                activation.scales + std::size_t(offset) * dims.gdn_heads,
+            };
+            segment.gdn_recur(layer, first.request->states[bank], bank, quantized);
         } else {
             for (int step = 0; step < run; ++step) {
                 const auto segment =

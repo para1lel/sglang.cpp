@@ -7,14 +7,14 @@ Compare native serving with LMCache against pinned vLLM with Simple KV Offload o
 | Input | Identity |
 | --- | --- |
 | Initial native baseline | `3813c20f53a27f31dadb5698ef3d319af25f4b99` on `bench/agentx-256k-tp1-tp2`. This build was used for the aborted TP2 warmup and operator diagnosis. |
-| vLLM source | `vllm-project/vllm` at `81a8cb063e6247fe254d7caf7e98a6691d71022a`. Use `/data1/shared/dongwu.chen/environments/vllm-81a8cb063e62`. [Baseline agreement](performance.md#implementations-and-controls) |
+| vLLM source | `vllm-project/vllm` at `81a8cb063e6247fe254d7caf7e98a6691d71022a`. Use `/data1/shared/dongwu.chen/environments/vllm-81a8cb063e62`. Both runs use `0.34.0rc1.dev787+g81a8cb063`, wheel SHA-256 `25358fa092260117176d78f4efeabfd06a0e49731d29bbcffd717dfedc498ad9`. [Baseline agreement](performance.md#implementations-and-controls) |
 | Model and tokenizer | `/data0/shared/Qwen3.8-27B-FP8` for both engines and the replay tokenizer. The checkpoint matches Qwen revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81` and supports 262,144 tokens. [Checkpoint record](research/checkpoint.md) |
 | Trace | `semianalysisai/cc-traces-weka-062126-256k`, revision `8fecd2fc56694469f758f0afbbb6335ad3043740`, file `traces.jsonl`. SHA-256 `e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef`. The corpus has 393 trajectories and 68,266 recorded requests. The largest recorded request has 255,999 combined input and output tokens. [Pinned trace][trace] · [Corpus description][corpus] |
 | Replay and scoring | `agentx-harness==1.0.14` in its own Python environment. Use InferenceX revision `d490919c996b5169a3e9345ae3c64e32ccfba357` for the published request metrics. [Standalone client][client] · [Metric source][scorer] |
 
 ## Run matrix
 
-Run TP1 and TP2 in parallel on separate NUMA nodes. At each width, run the two engines in sequence on the same ordered GPU UUIDs. Record the execution order with the results.
+TP1 and TP2 can run in parallel on separate NUMA nodes. At each width, run the two engines in sequence on the same ordered GPU UUIDs. Record the execution order with the results.
 
 | TP | Engine | CPU cache capacity | Physical GPUs in rank order | Live agent clients | Profile |
 | ---: | --- | ---: | --- | ---: | ---: |
@@ -67,7 +67,7 @@ Keep one evidence directory per run under `artifacts/agentx-256k/`. Record its p
 
 - Exact command lines, effective configs, build and dependency receipts, and binary or wheel hashes. Include model, tokenizer, trace, client, and scorer identities.
 - GPU UUIDs and rank order, topology, clock and power settings, driver versions, and competing-process snapshots. Record CPU and memory placement.
-- Replay plan, phase timestamps, raw per-request SSE, `profile_export.jsonl`, `profile_export_aiperf.json`, `dataset-manifest.json`, and logs. Preserve request IDs, phase membership, latency, terminal stream status, and final usage.
+- Replay plan, phase timestamps, raw per-request SSE in `profile_export_raw.jsonl`, `profile_export_aiperf.json`, `dataset-manifest.json`, and logs. Preserve request IDs, phase membership, latency, terminal stream status, and final usage.
 - Raw `/metrics` samples at warmup and profiling boundaries and after drain. Retain native LMCache activity and vLLM local and offload activity with the engine receipts.
 - Scoring invocation, numerators, denominators, sample counts, and any exclusion reason. Preserve the tariff source and access date.
 
@@ -89,17 +89,34 @@ The table reports the median of four trials for this operator. Both builds match
 
 `artifacts/agentx-256k/stall/diagnosis/` contains `gqa-cliff-baseline.log`, `gqa-cliff-candidate.log`, and the two `gqa-reference-candidate-tp*.log` receipts.
 
+The final GQA change is `835f877b819473fccb1bcbaf297bf50c0d56bebb`. Its shared production dispatch uses paired TMEM for eligible full 1,024-row long tiles and ordered single-CTA TMEM for eligible long partial tiles. The table below gives three-trial medians from its exact archive. [Ordered GQA dispatch](ordered-gqa-prefill.md#constraints-and-failure-behavior)
+
+| Visible tokens | Query rows | Production route | TP1 (ms) | TP2 (ms) |
+| ---: | ---: | --- | ---: | ---: |
+| 131,073 | 1,024 | Paired TMEM | 8.270 | 4.149 |
+| 131,073 | 65 | Ordered single-CTA TMEM | 7.096 | 6.924 |
+| 262,144 | 1,024 | Paired TMEM | 15.475 | 7.751 |
+
+The final archive passed six production-route cases, four direct split cases, and the exceptional-repair checker. The six production-route cases had maximum absolute error below 0.00658 at TP1 and 0.00539 at TP2 against FP64. `artifacts/agentx-256k/stall/diagnosis/structural-exact-mODDtWC6/` contains `model-tp*.log`, `split-tp*.log`, `checker-repair.log`, and `identities.sha256`.
+
 ## Timed AgentX results
 
 | TP | Engine | P90 E2E normalized interactivity (output tokens/s/user) | Input tokens/s/chip | Output tokens/s/chip | Estimated CNY/chip/hour | Actual KV hit (%) | Theoretical KV hit (%) |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | vLLM + Simple KV Offload | 53.66 | 39,992.77 | 365.52 | 157.95 | 94.24 | 95.94 |
+| 2 | vLLM + Simple KV Offload | 53.05 | 36,530.15 | 331.35 | 141.80 | 94.83 | 96.32 |
 
-The vLLM TP1 worker resolved the batch and scheduled-token limits to 32,768, with eight sequences and a 262,144-token context. Its launch uses Qwen MTP with four speculative tokens, FlashInfer attention, and FP8 E4M3 KV. The post-run counters show 1,899 completed Simple KV Offload stores and zero external prefix-cache token hits.
+Both vLLM runs resolved 32,768 batched and scheduled tokens, with eight sequences at TP1 and 16 at TP2. Both used the 262,144-token context, four-token Qwen MTP, FlashInfer attention, and FP8 E4M3 KV. The scored TP1 restart used 112 GiB of GPU KV after the 128 GiB attempt exhausted memory during warmup. TP2 used 128 GiB of GPU KV per rank. The engine reported 3,038,820 logical GPU KV token slots at TP1 and 6,947,548 at TP2.
+
+Both runs selected `SimpleCPUOffloadConnector` in eager mode. Host capacity was 64 GiB total at TP1 and 128 GiB total at TP2. The before-to-after counters include primers, warmup, and profiling. GPU-local prefix hits were 74,409,088 tokens at TP1 and 138,632,832 at TP2. External lookups covered 5,607,899 and 10,097,443 tokens, respectively, with zero external hits in both runs. The connector recorded 1,899 and 2,979 `stored` outcomes, respectively. All cache reuse in the scored vLLM runs was GPU-local.
 
 The vLLM TP1 scorer retained 837 profiling turns and all 837 final usage records. It recorded zero errors, skips, or cancellations. The 1,819.132-second span includes responses received during the drain. It counted 72,752,129 input tokens, 68,558,464 of them cached, and 664,926 output tokens. The theoretical tally was 1,086,537 hits out of 1,132,567 blocks and matched the harness aggregate.
 
 The vLLM TP1 evidence directory is `artifacts/agentx-256k/runs/vllm-tp1/`. Its `score.json` SHA-256 is `5633e6b6cce333d3311e1ea4874a15115aa0f8626b1985255428f45d853ff5cb`. Its `run.sha256` SHA-256 is `86be678c2a3c44f9d6278f143bd5897bba09298d46c382e173ee79043e37ecaa`.
+
+The vLLM TP2 scorer retained 1,260 profiling turns with complete final usage and cache details. It recorded zero errors, skips, or cancellations. The observation span was 1,804.877 seconds, including the drain. It counted 131,864,832 input tokens, 125,046,272 of them cached, and 1,196,076 output tokens. The theoretical tally was 1,978,892 hits out of 2,054,481 blocks and matched the harness aggregate.
+
+The vLLM TP2 evidence directory is `artifacts/agentx-256k/runs/vllm-tp2/`. Its `score.json` SHA-256 is `c79f6d33492c2f1408559f817b5f1020a98c9f5131f78a582082df49fce38e2b`. Its `run.sha256` SHA-256 is `a37ddc962e4d830e236f29e397aa5621c47a8c51706eb803094e2397a8431424`.
 
 [methodology]: https://inferencex.semianalysis.com/agentx/methodology
 [leaderboard]: https://inferencex.semianalysis.com/zh/infx/inference/deepseek-v41-flash

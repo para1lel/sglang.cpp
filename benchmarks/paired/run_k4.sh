@@ -81,12 +81,14 @@ if [[ $current == true && $row == W6 ]]; then
     exit 2
 fi
 case "$index" in
-    0) export PAIRED_SERVER_CPUS=0-9 PAIRED_CLIENT_CPUS=10-11 ;;
-    1|2|3) export PAIRED_SERVER_CPUS=24-33 PAIRED_CLIENT_CPUS=34-35 ;;
-    5|6) export PAIRED_SERVER_CPUS=72-81 PAIRED_CLIENT_CPUS=82-83 ;;
-    7) export PAIRED_SERVER_CPUS=84-93 PAIRED_CLIENT_CPUS=94-95 ;;
+    0) server_default=0-9 client_default=10-11 ;;
+    1|2|3) server_default=24-33 client_default=34-35 ;;
+    5|6) server_default=72-81 client_default=82-83 ;;
+    7) server_default=84-93 client_default=94-95 ;;
     *) usage >&2; exit 2 ;;
 esac
+export PAIRED_SERVER_CPUS=${PAIRED_SERVER_CPUS:-$server_default}
+export PAIRED_CLIENT_CPUS=${PAIRED_CLIENT_CPUS:-$client_default}
 case "$row" in
     W1|W3|W5) arms=(vllm-k4 native-k4) ;;
     W2|W4|W6) arms=(native-k4 vllm-k4) ;;
